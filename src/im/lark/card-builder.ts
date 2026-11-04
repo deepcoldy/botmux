@@ -18,6 +18,7 @@ import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegmen
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import {
   clampGrantQuotaForCard,
   DEFAULT_GRANT_DURATION_MS,
@@ -1142,14 +1143,17 @@ export function buildStreamingCard(
     headerActions.push(callbackButton(
       t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
       'default',
-      {
-        action: 'toggle_display',
-        // Make the user's intent idempotent before the callback enters the
-        // primary multi-replica control lane. A retry after owner failover must
-        // keep applying the same visible mode instead of toggling back.
-        target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
-        ...actionBase,
-      },
+      coordinationModeIsPrimary()
+        ? {
+            action: 'toggle_display',
+            // #2062: in primary multi-replica mode the click travels through the
+            // durable control lane, which may retry it after an owner failover.
+            // Carry the visible intent so a retry applies the same mode instead
+            // of toggling back. Single-replica cards keep the pre-#2062 payload.
+            target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
+            ...actionBase,
+          }
+        : { action: 'toggle_display', ...actionBase },
     ));
     if (displayMode !== 'hidden') {
       headerActions.push(callbackButton(

@@ -3,7 +3,7 @@ import { Aggregator, subscribeDaemon } from '../src/dashboard/aggregator.js';
 import { reconcileDaemonSessions, reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
 
 describe('Aggregator cache merge', () => {
-  it('does not treat a dormant shared row proxyPort as a local terminal owner', () => {
+  it('keeps a dormant row routable for cold start and reports worker liveness separately (#2062 F1)', () => {
     const a = new Aggregator();
     a.hydrateSessions('cli_test', [{
       sessionId: 'session-1',
@@ -12,14 +12,16 @@ describe('Aggregator cache merge', () => {
       webPort: null,
       proxyPort: 10054,
     }]);
-    expect(a.terminalProxyPortOf('session-1')).toBeUndefined();
+    // The daemon proxy behind this port cold-starts the worker on demand.
+    expect(a.terminalProxyPortOf('session-1')).toBe(10054);
+    expect(a.hasLiveTerminalWorker('session-1')).toBe(false);
     a.applyEvent('cli_test', {
       type: 'session.update',
       body: { sessionId: 'session-1', patch: { status: 'working', webPort: 44995 } },
     } as any);
-    expect(a.terminalProxyPortOf('session-1')).toBe(10054);
+    expect(a.hasLiveTerminalWorker('session-1')).toBe(true);
     a.applyEvent('cli_test', { type: 'session.exited', body: { sessionId: 'session-1' } });
-    expect(a.terminalProxyPortOf('session-1')).toBeUndefined();
+    expect(a.hasLiveTerminalWorker('session-1')).toBe(false);
   });
 
   it('upsert via session.spawned and session.update', () => {

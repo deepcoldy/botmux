@@ -2810,7 +2810,12 @@ export interface RoutingContext {
    *  （`{ ...ctx, scope, anchor }`），box 引用随拷贝共享，接纳发生在拷贝之后
    *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
-  ingressAdmission?: { admitted: boolean; retryReason?: string };
+  ingressAdmission?: {
+    admitted: boolean;
+    retryReason?: string;
+    /** See DurableInboxPrimaryDispatchResult.progressToken. */
+    retryProgressToken?: string;
+  };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
   /** Preserve confirmed command state while its task remains in the Inbox. */
@@ -4972,7 +4977,10 @@ export function createLarkEventDispatcherRuntime(
     primary: PrimaryProcessContext,
   ): DurableLarkCanonicalHandlerResult => {
     const retryReason = ctx.ingressAdmission?.retryReason?.trim();
-    if (retryReason) return { kind: 'retry', reason: retryReason };
+    if (retryReason) {
+      const progressToken = ctx.ingressAdmission?.retryProgressToken;
+      return { kind: 'retry', reason: retryReason, ...(progressToken ? { progressToken } : {}) };
+    }
     if (!ctx.ingressAdmission?.admitted) {
       return { kind: 'ignored', reason: 'canonical handler completed without task admission' };
     }
@@ -6642,7 +6650,11 @@ export function createLarkEventDispatcherRuntime(
           toast: {
             type: 'warning',
             content: t(
-              'card.action.primary_lifecycle_unavailable',
+              // #2062 F6: a refused display toggle is an old card or a viewer
+              // without operate rights, not an unsupported lifecycle action.
+              actionType === 'toggle_display'
+                ? 'card.action.primary_display_unavailable'
+                : 'card.action.primary_lifecycle_unavailable',
               undefined,
               localeForBot(larkAppId),
             ),

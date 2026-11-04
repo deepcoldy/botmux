@@ -14,6 +14,18 @@ export type DurableLifecycleSessionControlAction = Extract<
 >;
 export type DurableSessionControlSource = 'lark-card' | 'lark-command' | 'trusted-host';
 
+/** #2062: a display toggle is presentation-only and shares its Session's FIFO
+ * with close/resume. Bound it so a click no replica can apply (no live owner,
+ * owner gone mid-failover) gives the partition back after a few claims.
+ * Lifecycle controls stay unbounded: they must eventually reach their owner. */
+export const DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS = 3;
+
+export function durableSessionControlMaxAttempts(
+  control: { action: DurableLarkSessionControlAction },
+): number | undefined {
+  return control.action === 'toggle_display' ? DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS : undefined;
+}
+
 export interface DurableLarkSessionControlEnvelope {
   version: typeof DURABLE_LARK_SESSION_CONTROL_VERSION;
   type: 'botmux.lark.session-control';

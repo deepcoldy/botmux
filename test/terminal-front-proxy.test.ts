@@ -1313,3 +1313,152 @@ describe('P1-2 终端代理在客户端断开与非 101 拒绝路径上回收上
     }
   });
 });
+
+describe('#2062 cross-replica terminal routing', () => {
+  const servers: Server[] = [];
+  afterEach(async () => {
+    for (const server of servers.splice(0)) {
+      server.closeAllConnections?.();
+      await close(server);
+    }
+  });
+
+  async function serve(label: string, seen?: Array<IncomingMessage['headers']>): Promise<number> {
+    const server = createServer((req, res) => {
+      seen?.push(req.headers);
+      res.writeHead(200).end(label);
+    });
+    servers.push(server);
+    return listen(server);
+  }
+
+  async function front(options: Parameters<typeof createTerminalFrontProxy>[0]): Promise<number> {
+    const proxy = createTerminalFrontProxy(options);
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://front');
+      if (!proxy.handleHttp(req, res, url)) res.writeHead(418).end('fell-through');
+    });
+    server.on('upgrade', (req, socket, head) => {
+      if (!proxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    servers.push(server);
+    return listen(server);
+  }
+
+  async function get(port: number, path: string, headers: Record<string, string> = {}): Promise<string> {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers });
+    return `${response.status}:${await response.text()}`;
+  }
+
+  it('single replica (no remote resolver): serves any local proxy port and 404s the rest itself', async () => {
+    const local = await serve('local-daemon-proxy');
+    const port = await front({
+      resolvePort: id => (id === 'dormant-local' ? local : undefined),
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    await expect(get(port, '/s/dormant-local/')).resolves.toBe('200:local-daemon-proxy');
+    await expect(get(port, '/s/unknown/')).resolves.toBe('404:session terminal not available');
+    // A bare `/s` is still answered here, never handed to later routes.
+    await expect(get(port, '/s')).resolves.toBe('404:session terminal not available');
+  });
+
+  it('serves a live local worker without consulting the shared route store', async () => {
+    const local = await serve('local-live');
+    let resolutions = 0;
+    const port = await front({
+      resolvePort: () => local,
+      isLocalTerminalLive: () => true,
+      resolveRemoteTarget: async () => { resolutions += 1; return undefined; },
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    await expect(get(port, '/s/s1/')).resolves.toBe('200:local-live');
+    expect(resolutions).toBe(0);
+  });
+
+  it('a dormant local row yields to a live remote owner, and otherwise cold-starts locally', async () => {
+    const local = await serve('local-cold-start');
+    const remote = await serve('remote-owner');
+    let route: { host: string; port: number } | undefined = { host: '127.0.0.1', port: remote };
+    const port = await front({
+      resolvePort: () => local,
+      isLocalTerminalLive: () => false,
+      resolveRemoteTarget: async () => route,
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    await expect(get(port, '/s/s1/?viewToken=v')).resolves.toBe('200:remote-owner');
+    route = undefined;
+    await expect(get(port, '/s/s1/?viewToken=v')).resolves.toBe('200:local-cold-start');
+  });
+
+  it('dials only literal IP routes: a hostname route is refused before any DNS lookup', async () => {
+    const hit: Array<IncomingMessage['headers']> = [];
+    const target = await serve('must-not-be-reached', hit);
+    const port = await front({
+      resolvePort: () => undefined,
+      resolveRemoteTarget: async () => ({ host: 'localhost', port: target }),
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    await expect(get(port, '/s/s1/?viewToken=v')).resolves.toBe('502:terminal proxy error');
+    expect(hit).toHaveLength(0);
+  });
+
+  it('strips every internal x-botmux-* grant and ambient credential on the replica hop', async () => {
+    const seen: Array<IncomingMessage['headers']> = [];
+    const owner = await serve('owner', seen);
+    const port = await front({
+      resolvePort: () => undefined,
+      resolveRemoteTarget: async () => ({ host: '127.0.0.1', port: owner }),
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    await expect(get(port, '/s/s1/?viewToken=v', {
+      [TERMINAL_CONTROL_HEADER]: 'forged-write-grant',
+      [TERMINAL_VIEW_FORWARD_HEADER]: 'forged-view-proof',
+      [TERMINAL_WAKE_HEADER]: 'forged-wake-proof',
+      'x-botmux-role': 'owner',
+      cookie: 'botmux_session=x',
+      authorization: 'Bearer x',
+      'proxy-authorization': 'Basic x',
+    })).resolves.toBe('200:owner');
+    const headers = seen[0]!;
+    for (const name of [
+      TERMINAL_CONTROL_HEADER, TERMINAL_VIEW_FORWARD_HEADER, TERMINAL_WAKE_HEADER,
+      'x-botmux-role', 'cookie', 'authorization', 'proxy-authorization',
+    ]) {
+      expect(headers[name]).toBeUndefined();
+    }
+    expect(headers['x-botmux-terminal-route-hop']).toBe('1');
+  });
+
+  it('never follows a peer-routed WebSocket upgrade a second time', async () => {
+    let resolutions = 0;
+    const port = await front({
+      resolvePort: () => undefined,
+      resolveRemoteTarget: async () => { resolutions += 1; return { host: '127.0.0.1', port: 65535 }; },
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    const client = connect(port, '127.0.0.1');
+    try {
+      const reply = await new Promise<string>((resolve, reject) => {
+        let raw = '';
+        client.on('data', chunk => { raw += chunk.toString(); });
+        client.on('close', () => resolve(raw));
+        client.on('error', reject);
+        client.write(
+          'GET /s/s1/?viewToken=v HTTP/1.1\r\nHost: front\r\nx-botmux-terminal-route-hop: 1\r\n'
+          + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+          + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+        );
+      });
+      expect(reply).toMatch(/^HTTP\/1\.1 404/);
+      expect(resolutions).toBe(0);
+    } finally {
+      client.destroy();
+    }
+  });
+});

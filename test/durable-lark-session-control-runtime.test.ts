@@ -377,7 +377,19 @@ describe('durable Lark session control runtime', () => {
     await store.close();
   });
 
-  it('routes an idempotent display target to the live owner and durably patches the card', async () => {
+  // #2062 F3: what the owner's card handler returned decides whether the
+  // durable result carries a card for the outbox. A raw or shaped card is the
+  // callback response the receiving replica never sent, so it must be
+  // delivered; `{ toast }` means the handler already queued its own PATCH, and
+  // a second outbox update would write the same message twice. A refusal
+  // (mode unchanged) settles without retrying (F2).
+  const rawCard = { config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content: 'screen' }] };
+  it.each([
+    { shape: 'raw card', reply: rawCard, applies: true, outbox: true },
+    { shape: 'shaped raw card', reply: { card: { type: 'raw', data: rawCard } }, applies: true, outbox: true },
+    { shape: 'toast (PATCH already queued)', reply: { toast: { type: 'info', content: 'ok' } }, applies: true, outbox: false },
+    { shape: 'refusal (undefined, mode unchanged)', reply: undefined, applies: false, outbox: false },
+  ])('settles a display target on the live owner once — handler reply: $shape', async ({ reply, applies, outbox }) => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-display-owner-'));
     tempDirs.push(dir);
     const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
@@ -392,8 +404,8 @@ describe('durable Lark session control runtime', () => {
     } as DaemonSession;
     await admitDurableLarkSession({ facade, message: message(), session: persisted });
     const handlePresentationControl = vi.fn(async () => {
-      active.displayMode = 'screenshot';
-      return { config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content: 'screen' }] };
+      if (applies) active.displayMode = 'screenshot';
+      return reply;
     });
     const runtime = createDurableLarkSessionControlRuntime({
       larkAppId: 'cli_test',
@@ -405,7 +417,7 @@ describe('durable Lark session control runtime', () => {
       listPersistedSessions: () => [persisted],
       getPersistedSession: () => persisted,
       materializeClosedSession: value => value,
-      canOperate: () => false,
+      canOperate: () => true,
       closeSession: async () => ({ ok: false, error: 'not called' }),
       resumeSession: async () => ({ ok: false, error: 'not called' }),
       handlePresentationControl,
@@ -427,18 +439,74 @@ describe('durable Lark session control runtime', () => {
       signal: new AbortController().signal,
     })).resolves.toEqual({ kind: 'settled' });
     expect(handlePresentationControl).toHaveBeenCalledOnce();
-    expect(active.displayMode).toBe('screenshot');
+    expect(active.displayMode).toBe(applies ? 'screenshot' : 'hidden');
     const canonical = parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!);
     expect(canonical.controls.at(-1)).toMatchObject({
       action: 'toggle_display',
-      result: { status: 'active', displayMode: 'screenshot' },
+      result: applies
+        ? { status: 'active', displayMode: 'screenshot' }
+        : { status: 'active', applied: false, displayMode: 'hidden' },
     });
     const digest = createHash('sha256').update(input.control.operationId).digest('hex');
-    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
-      .toMatchObject({
+    const update = await store.readOutbox(`control_update_${digest}`);
+    if (outbox) {
+      expect(parseDurableLarkOutboxRecord(update!)).toMatchObject({
         target: { kind: 'update', messageId: 'om_card' },
         msgType: 'interactive',
       });
+    } else {
+      expect(update).toBeUndefined();
+    }
+    await facade.stop();
+    await store.close();
+  });
+
+  it('runs a post-ACK continuation the owner handler returned for a display target', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-display-afterack-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const persisted = session();
+    const active = {
+      session: persisted, larkAppId: 'cli_test', chatId: 'oc_chat',
+      streamCardId: 'om_card', displayMode: 'hidden',
+    } as DaemonSession;
+    await admitDurableLarkSession({ facade, message: message(), session: persisted });
+    const afterAck = vi.fn(async () => undefined);
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [active],
+      findActiveSession: () => active,
+      listPersistedSessions: () => [persisted],
+      getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      handlePresentationControl: async () => {
+        active.displayMode = 'screenshot';
+        return { toast: { type: 'info', content: 'ok' }, afterAck };
+      },
+      buildClosedCard: () => 'closed',
+      buildActiveCard: ds => JSON.stringify({ mode: ds.displayMode }),
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = displayControl();
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(afterAck).toHaveBeenCalledOnce();
     await facade.stop();
     await store.close();
   });

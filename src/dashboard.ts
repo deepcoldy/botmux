@@ -211,6 +211,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
 import {
+  createDurableTerminalRoutePublisher,
   createDurableTerminalRouteRegistry,
   durableTerminalRoutePort,
 } from './services/durable-terminal-route.js';
@@ -939,11 +940,17 @@ const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => (
     aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)
   ),
-  resolveRemoteTarget: async sessionId => {
-    if (!terminalRouteRegistry) return undefined;
-    const route = await terminalRouteRegistry.resolveSession(sessionId, terminalRouteInstanceId);
-    return route ? { host: route.host, port: route.port } : undefined;
-  },
+  // #2062: cross-replica routing exists only when primary coordination is on.
+  // Single-replica Dashboards install neither hook and keep the local-only path.
+  ...(terminalRouteRegistry
+    ? {
+        resolveRemoteTarget: async (sessionId: string) => {
+          const route = await terminalRouteRegistry.resolveSession(sessionId, terminalRouteInstanceId);
+          return route ? { host: route.host, port: route.port } : undefined;
+        },
+        isLocalTerminalLive: (sessionId: string) => aggregator.hasLiveTerminalWorker(sessionId),
+      }
+    : {}),
   resolveActor: dashboardRequestIdentity,
   control: terminalControl,
   // P1-5: bound `?viewToken=` capabilities are refused once the auth session
@@ -961,43 +968,39 @@ const terminalFrontProxy = createTerminalFrontProxy({
   wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
 });
 
+// #2062: advertise this replica's live terminals so a request landing on a
+// peer Dashboard can be forwarded here. Primary-only; a single-replica
+// Dashboard installs no listener and no timer.
 const terminalRouteHost = process.env.BOTMUX_TERMINAL_ROUTE_HOST?.trim();
 const terminalRoutePort = durableTerminalRoutePort(process.env);
-let terminalRoutePublishInFlight: Promise<void> | undefined;
-async function publishLiveTerminalRoutes(): Promise<void> {
-  if (!terminalRouteRegistry || !terminalRouteHost || terminalRoutePort === undefined) return;
-  await Promise.all(aggregator.getSessions().map(async row => {
-    if (row.status === 'closed'
-        || row.status === 'dormant'
-        || typeof row.larkAppId !== 'string'
-        || typeof row.sessionId !== 'string'
-        || typeof row.webPort !== 'number'
-        || typeof row.proxyPort !== 'number') return;
-    const result = await terminalRouteRegistry.publish({
-      larkAppId: row.larkAppId,
-      sessionId: row.sessionId,
-      ownerInstanceId: terminalRouteInstanceId,
-      host: terminalRouteHost,
-      port: terminalRoutePort,
-    });
-    if (result.kind !== 'published' && result.kind !== 'occupied') {
-      logger.warn(`[terminal-route] publish ${row.sessionId} failed: ${result.kind}`);
+if (terminalRouteRegistry && terminalRouteHost && terminalRoutePort !== undefined) {
+  const terminalRoutePublisher = createDurableTerminalRoutePublisher({
+    registry: terminalRouteRegistry,
+    listRows: () => aggregator.getSessions(),
+    ownerInstanceId: terminalRouteInstanceId,
+    host: terminalRouteHost,
+    port: terminalRoutePort,
+    onWarn: message => logger.warn(`[terminal-route] ${message}`),
+  });
+  let terminalRoutePublishInFlight: Promise<void> | undefined;
+  const scheduleTerminalRoutePublish = (): void => {
+    if (terminalRoutePublishInFlight) return;
+    terminalRoutePublishInFlight = terminalRoutePublisher.publishDue()
+      .catch(error => logger.warn(`[terminal-route] publish failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { terminalRoutePublishInFlight = undefined; });
+  };
+  aggregator.on(ev => {
+    if (ev.type === 'session.spawned' || ev.type === 'session.update') {
+      scheduleTerminalRoutePublish();
     }
-  }));
+  });
+  const terminalRouteHeartbeat = setInterval(scheduleTerminalRoutePublish, 10_000);
+  terminalRouteHeartbeat.unref?.();
+} else if (terminalRouteRegistry) {
+  logger.warn('[terminal-route] primary coordination is on but BOTMUX_TERMINAL_ROUTE_HOST / '
+    + 'BOTMUX_TERMINAL_ROUTE_PORT (or BOTMUX_DASHBOARD_PORT) is unset or invalid; '
+    + 'terminals on this replica are not reachable from peer replicas');
 }
-function scheduleTerminalRoutePublish(): void {
-  if (terminalRoutePublishInFlight) return;
-  terminalRoutePublishInFlight = publishLiveTerminalRoutes()
-    .catch(error => logger.warn(`[terminal-route] publish failed: ${error instanceof Error ? error.message : String(error)}`))
-    .finally(() => { terminalRoutePublishInFlight = undefined; });
-}
-aggregator.on(ev => {
-  if (ev.type === 'session.spawned' || ev.type === 'session.update') {
-    scheduleTerminalRoutePublish();
-  }
-});
-const terminalRouteHeartbeat = setInterval(scheduleTerminalRoutePublish, 10_000);
-terminalRouteHeartbeat.unref?.();
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {
     const daemon = registry.getByAppId(appId);
@@ -8338,6 +8341,14 @@ listenWithProbe({
     logger.warn(`[dashboard] Failed to record H5 login availability: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  // #2062 F5: the advertised route port defaults to BOTMUX_DASHBOARD_PORT, but
+  // the listener may have probed past a busy port. An explicit
+  // BOTMUX_TERMINAL_ROUTE_PORT (e.g. a NodePort mapping) is trusted as-is.
+  if (terminalRouteRegistry && !process.env.BOTMUX_TERMINAL_ROUTE_PORT?.trim()
+      && terminalRoutePort !== undefined && terminalRoutePort !== port) {
+    logger.warn(`[terminal-route] advertised port ${terminalRoutePort} differs from the listening port ${port}; `
+      + 'peer replicas will fail to reach terminals here — set BOTMUX_TERMINAL_ROUTE_PORT explicitly');
+  }
   // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
   // (crash/restart mid-delete). Best-effort and fire-and-forget.
   sweepStoreTrash();

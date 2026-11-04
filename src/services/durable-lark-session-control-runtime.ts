@@ -200,9 +200,10 @@ export function createDurableLarkSessionControlRuntime(
           && (session.status !== 'active'
             || (value?.target_display_mode !== 'hidden'
               && value?.target_display_mode !== 'screenshot')))) return false;
-    return actionType === 'toggle_display'
-      ? true
-      : options.canOperate(session.chatId, operatorOpenId);
+    // toggle_display is a SENSITIVE_CARD_ACTIONS member: the same canOperate
+    // gate the card handler applies, moved before ACK so a click it would drop
+    // never enters the durable lane (#2062 F2, defence in depth).
+    return options.canOperate(session.chatId, operatorOpenId);
   };
 
   const pendingCardBeforeAck = async (
@@ -276,6 +277,9 @@ export function createDurableLarkSessionControlRuntime(
         reason: `${control.action} card no longer owns the canonical Session lifecycle`,
       };
     }
+    // toggle_display is gated twice already: before ACK (authorizeBeforeAck)
+    // and by the card handler's SENSITIVE_CARD_ACTIONS check during execute,
+    // whose refusal settles the control (see execute below).
     if (!trustedHost && control.action !== 'toggle_display'
         && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
       return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
@@ -343,9 +347,6 @@ export function createDurableLarkSessionControlRuntime(
       rootId: control.rootId,
       operatorOpenId: control.operatorOpenId,
       cardMessageId: control.cardMessageId,
-      ...(control.action === 'toggle_display'
-        ? { targetDisplayMode: record(value)?.target_display_mode }
-        : {}),
     } as unknown as DurableJson;
     const effectiveCardMessageId = source === 'lark-card'
       ? control.cardMessageId
@@ -499,12 +500,38 @@ export function createDurableLarkSessionControlRuntime(
               return { kind: 'not_applied', error: 'presentation control is unavailable' };
             }
             const handled = await options.handlePresentationControl(control.data);
-            const cardJson = presentationCardJson(handled);
+            // The Lark ACK already went out on the receiving replica, so a
+            // post-ACK continuation the handler returned must run here.
+            const afterAck = record(handled)?.afterAck;
+            if (typeof afterAck === 'function') await (afterAck as () => Promise<void>)();
             const target = record(value)?.target_display_mode;
             const current = options.findActiveSession(control.sessionId);
-            if (!cardJson || !current || current.displayMode !== target) {
-              return { kind: 'not_applied', error: 'presentation control did not reach its target mode' };
+            if (!current) {
+              // The live owner moved while the handler ran: another replica
+              // may still apply this click.
+              return { kind: 'not_applied', error: 'presentation target left this replica' };
             }
+            if (current.displayMode !== target) {
+              // The handler declined (operator gate, stale card, busy PATCH,
+              // closed transport, ...). Retrying the same click cannot change
+              // that verdict, so settle it instead of blocking the partition's
+              // FIFO (#2062 F2). No notice: the non-durable path is silent too.
+              const mode = current.displayMode === 'hidden' || current.displayMode === 'screenshot'
+                ? current.displayMode
+                : undefined;
+              return {
+                kind: 'completed',
+                result: result('active', undefined, {
+                  applied: false,
+                  ...(mode ? { displayMode: mode } : {}),
+                }),
+              };
+            }
+            // A raw/shaped card is the callback response the original ACK
+            // never carried, so the outbox must deliver it. A `{ toast }`
+            // reply means the handler already queued its own PATCH: carrying
+            // a second card here would write the same message twice (#2062 F3).
+            const cardJson = presentationCardJson(handled);
             return {
               kind: 'completed',
               result: result('active', cardJson, { displayMode: target }),
@@ -644,7 +671,8 @@ export function createDurableLarkSessionControlRuntime(
                 && !(status === 'closed' && parsed.applied === false))
               || (control.action === 'toggle_display'
                 && (status !== 'active'
-                  || (parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
+                  || (parsed.applied !== false
+                    && parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
               || (parsed.cardJson !== undefined && typeof parsed.cardJson !== 'string')
               || (parsed.noticeText !== undefined && typeof parsed.noticeText !== 'string')) {
             throw new Error('durable lifecycle control result is invalid');
