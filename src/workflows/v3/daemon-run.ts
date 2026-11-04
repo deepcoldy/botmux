@@ -612,7 +612,7 @@ export function loadV3RunDagForRecovery(runDir: string): V3Dag | undefined {
  * failing its digest check makes the run unloadable (fail closed).
  */
 export function loadV3BotExecutedRun(runDir: string):
-  | { dag: V3Dag; nodeExecutor: 'bot'; chatId?: string; title: string }
+  | { dag: V3Dag; authorizedDag: V3Dag; nodeExecutor: 'bot'; chatId?: string; title: string }
   | undefined {
   try {
     const read = readRunEnvelope(runDir);
@@ -622,6 +622,7 @@ export function loadV3BotExecutedRun(runDir: string):
     const effective = loadEffectiveV3Dag(runDir, loaded.dag, existsSync(journalPath) ? readJournal(journalPath) : []);
     return {
       dag: effective.dag,
+      authorizedDag: loaded.dag,
       nodeExecutor: 'bot',
       ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
       title: loaded.spec?.title?.trim() || basename(runDir),

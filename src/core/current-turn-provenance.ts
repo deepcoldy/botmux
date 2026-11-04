@@ -287,7 +287,53 @@ export function resolveCurrentTurnProvenance(
     };
   }
 
-  return authenticateHumanTurn(marker.sessionId, marker.turnId, session);
+  const human = authenticateHumanTurn(marker.sessionId, marker.turnId, session);
+  // Backstop for a wake turn folded into this one (a type-ahead CLI merges
+  // input that arrives mid-turn, and the marker keeps naming the running
+  // turn; the daemon only delivers wakes to an idle session, so this should
+  // not happen): while this run's issued wake sits in the marker's queue, the
+  // request is graded like that wake turn overtaken by this one — the main
+  // bot's own decision, `--reason` required — never as this person's turn.
+  const queuedWake = queuedWakeRunOf(marker, session, options.verifyWorkflowEventTurn);
+  return queuedWake ? { ...human, overtakenWorkflowRunEvent: { runId: queuedWake } } : human;
+}
+
+/** The run of an issued wake turn of THIS session waiting in the marker's
+ *  type-ahead queue, as the caller's run-bound verifier recognizes it. */
+function queuedWakeRunOf(
+  marker: { sessionId: string; queuedTurnId?: string; queuedTurns?: Array<{ turnId: string }> },
+  session: PersistedTurnSession,
+  verify: WorkflowEventTurnVerifier | undefined,
+): string | undefined {
+  if (!verify || !nonEmpty(session.larkAppId) || !nonEmpty(session.chatId)) return undefined;
+  const queued = [
+    ...(marker.queuedTurns ?? []).map((turn) => turn.turnId),
+    ...(marker.queuedTurnId ? [marker.queuedTurnId] : []),
+  ];
+  const replyTarget = session.currentReplyTarget;
+  const rootMessageId = (session.scope ?? 'thread') === 'thread'
+    ? session.rootMessageId
+    : replyTarget?.rootMessageId;
+  for (const turnId of queued) {
+    const ref = parseWorkflowEventTurnId(turnId);
+    if (!ref) continue;
+    const verdict = verify({
+      ...ref,
+      turnId,
+      session: {
+        sessionId: marker.sessionId,
+        larkAppId: session.larkAppId,
+        chatId: session.chatId,
+        ...(nonEmpty(rootMessageId) ? { rootMessageId } : {}),
+        ...(nonEmpty(session.quoteTargetId) ? { quoteTargetId: session.quoteTargetId } : {}),
+        ...(nonEmpty(replyTarget?.turnId) ? { currentReplyTargetTurnId: replyTarget!.turnId } : {}),
+      },
+    });
+    // Issued by the owning daemon to this very session (a newer message
+    // overtaking it is still that wake).
+    if (verdict.ok || verdict.stale) return ref.runId;
+  }
+  return undefined;
 }
 
 /** The human path: authenticate `turnId` of `sessionId` as the human who

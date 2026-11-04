@@ -36,6 +36,7 @@ import {
   V3_REVISION_STATE_LABEL,
   V3_INTERVENTION_LABEL,
   V3_INTERVENTION_ROLE_LABEL,
+  V3_CHECKPOINT_LABEL,
 } from './v3-model.js';
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
@@ -563,6 +564,10 @@ function NodePanel(props: {
         ) : null}
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
         <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
+        {node.checkpoint ? <p className="v3r-checkpoint">{V3_CHECKPOINT_LABEL[node.checkpoint]}</p> : null}
+        {node.waitingOnCheckpoint?.length ? (
+          <p className="v3r-checkpoint">等检查点 {node.waitingOnCheckpoint.join('、')} 由主 Bot 看完结果后再开始</p>
+        ) : null}
         <NodeInterventions node={node} />
         {node.depends.length ? (
           <p className="v3r-deps">

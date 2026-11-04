@@ -55,6 +55,15 @@ const ASK_HUMAN_ERROR_TEXT: Record<string, string> = {
   bad_reason: '--reason 不合法（不能为空，最多 500 字）',
 };
 
+const SETTLED_TEXT: Record<string, string> = {
+  blocked: '受阻或超时',
+  reassigned: '改派',
+  cancelled: '取消',
+  drained: '被替代或取消',
+  succeeded: '已完成',
+  failed: '失败',
+};
+
 /** Map the daemon's ask-human response to CLI output + exit code. */
 export function formatV3AskHumanResponse(
   runId: string,
@@ -68,6 +77,13 @@ export function formatV3AskHumanResponse(
     // fall through with the raw body
   }
   if (response.ok && body.ok === true) {
+    if (typeof body.settledMeanwhile === 'string') {
+      return {
+        exitCode: 0,
+        text: `🙋 run ${runId} 的节点 ${nodeId} 在停下的过程中已被其他操作结束（${SETTLED_TEXT[body.settledMeanwhile] ?? body.settledMeanwhile}），` +
+          '以那次结果为准；交给人的理由已记录。先用 workflow status 看最新状态。',
+      };
+    }
     return {
       exitCode: 0,
       text: body.closedOpenAttempt === true

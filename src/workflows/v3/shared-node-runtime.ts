@@ -60,6 +60,7 @@ import {
   v3ApprovedBotScope,
   v3NodeHeldByProposal,
 } from './dag-revision.js';
+import { v3CheckpointHeldNodes, v3CheckpointMarkedSince, v3CheckpointSuccesses } from './checkpoint-hold.js';
 import {
   appendEvent,
   appendEventDurable,
@@ -736,8 +737,22 @@ export async function runWorkflow(
       return true;
     });
 
+  // Dependants of a checkpoint success nobody released yet (bot-executed
+  // runs only, design §13.6). Re-derived from the journal every tick.
+  let checkpointHeld: ReadonlySet<string> = new Set();
+  const refreshCheckpointHolds = (events: readonly StoredEvent[]): void => {
+    if (!externalMode) return;
+    checkpointHeld = v3CheckpointHeldNodes(dag, v3CheckpointSuccesses({
+      events,
+      dag,
+      markedSince: v3CheckpointMarkedSince(runDir, authorizedDag, events),
+    }));
+  };
+  /** Held back this tick: by a pending proposal, or behind a checkpoint. */
   const heldByProposal = (nodeId: string, loopId?: string): boolean =>
-    v3NodeHeldByProposal(pendingTouched, nodeId, loopId);
+    v3NodeHeldByProposal(pendingTouched, nodeId, loopId) ||
+    checkpointHeld.has(nodeId) ||
+    (loopId !== undefined && checkpointHeld.has(loopId));
 
   /** A revision's reassign / blocked re-run whose dedicated event was lost
    *  to a crash between two appends is re-appended (idempotent, §13.3). */
@@ -876,6 +891,7 @@ export async function runWorkflow(
   while (true) {
     const events = readJournal(journalPath);
     refreshEffectiveDag(events);
+    refreshCheckpointHolds(events);
     if (reconcileRevisionFollowUps(events)) continue;
     const snap = materialize(events);
     writeState(statePath, snap);

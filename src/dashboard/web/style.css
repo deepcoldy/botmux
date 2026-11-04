@@ -20454,6 +20454,7 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-attempts .o-failed { color: var(--v3r-failed); }
 .v3r-attempts .o-blocked { color: var(--v3r-blocked); }
 .v3r-attempts .o-running { color: var(--v3r-running); }
+.v3r-checkpoint { margin: 6px 0 0; color: var(--muted); }
 .v3r-interventions { margin: 6px 0 0; }
 .v3r-interventions-title { margin: 0 0 2px; color: var(--muted); }
 .v3r-interventions-list {

@@ -26,6 +26,7 @@ import type { StoredEvent } from './event-contract.js';
 import { V3_EXTERNAL_ERROR_CODES } from './external-executor.js';
 import { latestAttemptIdFor } from './attempt-numbering.js';
 import { materialize } from './state.js';
+import { v3CheckpointSuccesses, type V3CheckpointMarkedSince } from './checkpoint-hold.js';
 
 export type V3MainWakeKind =
   /** A node is stuck (blocked) or failed. */
@@ -67,12 +68,27 @@ export function pendingV3MainWakes(input: {
   /** The effective flow (checkpoint marks are read from it). */
   dag: V3Dag;
   isIssued: (eventSeq: number) => boolean;
+  /** When each mark took effect (`v3CheckpointMarkedSince`). Default: a
+   *  node marked in `dag` counts as marked from the start. */
+  markedSince?: V3CheckpointMarkedSince;
 }): V3MainWakeEvent[] {
   const events = [...input.events];
   const snap = materialize(events);
   // A cancel request already reads as `cancelling`.
   if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return [];
-  const checkpoints = new Set(input.dag.nodes.filter((node) => isGoalNode(node) && node.checkpoint === true).map((node) => node.id));
+  // A checkpoint wakes for its current, unreleased success only (once it is
+  // released — reviewed, or let go — the moment to look has passed).
+  const markedSince: V3CheckpointMarkedSince = input.markedSince
+    ?? ((nodeId) => (input.dag.nodes.some((node) => node.id === nodeId && isGoalNode(node) && node.checkpoint === true) ? 0 : undefined));
+  const checkpointSeqs = new Set(v3CheckpointSuccesses({ events, dag: input.dag, markedSince })
+    .filter((success) => !success.released)
+    .map((success) => success.eventSeq));
+  /** Attempts someone handed to a person. A decision was made about that
+   *  attempt — whatever closed it (the hand-over's own block, or a block that
+   *  came first or raced it) — so waking the main bot about it would only
+   *  invite it to undo that decision. */
+  const handed = new Set<string>();
+  for (const event of events) if (event.type === 'nodeHandedToHuman') handed.add(event.attemptId);
   const out: V3MainWakeEvent[] = [];
   events.forEach((event, index) => {
     const eventSeq = index + 1;
@@ -84,15 +100,17 @@ export function pendingV3MainWakes(input: {
     if (event.instanceId && snap.nodes.get(event.nodeId)?.effectiveInstanceId !== event.instanceId) return;
     let kind: V3MainWakeKind;
     if (event.type === 'nodeSucceeded') {
-      if (!checkpoints.has(event.nodeId) || state?.status !== 'done') return;
+      if (!checkpointSeqs.has(eventSeq)) return;
       kind = 'checkpoint';
     } else if (event.type === 'nodeBlocked') {
-      if (event.errorCode === V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN || state?.status !== 'blocked') return;
+      // A hand-over's own HANDED_TO_HUMAN block always follows its record,
+      // so the attempt is in `handed` too.
+      if (state?.status !== 'blocked' || handed.has(event.attemptId)) return;
       // The latest verdict of the attempt speaks for it (a later hand-over
       // record does not change what happened).
       kind = event.errorCode === V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED ? 'botBlocked' : 'nodeStuck';
     } else {
-      if (state?.status !== 'failed') return;
+      if (state?.status !== 'failed' || handed.has(event.attemptId)) return;
       kind = 'nodeStuck';
     }
     if (input.isIssued(eventSeq)) return;

@@ -9,7 +9,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { appendEvent } from '../src/workflows/v3/journal.js';
-import { handNodeToHuman } from '../src/workflows/v3/external-control.js';
+import { handNodeToHuman, reassignNode } from '../src/workflows/v3/external-control.js';
+import { pendingV3MainWakes } from '../src/workflows/v3/main-wake.js';
 import { openV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
 import { requestV3Retry } from '../src/workflows/v3/daemon-run.js';
 import { v3ActionRecord, v3ReasonRequiredProblem } from '../src/workflows/v3/action-provenance.js';
@@ -41,7 +42,7 @@ const REASON = 'the bot needs the prod token; only the initiator can grant it';
 
 // ─── ask-human ───────────────────────────────────────────────────────────
 
-describe('ask-human on a running node: stop, record, block — one lock', () => {
+describe('ask-human on a running node: record, stop, block', () => {
   it('stops the bot\'s turn like a timeout, then records the hand-over and blocks HANDED_TO_HUMAN', async () => {
     const run = new BotRun(reportDag('ask-running'));
     const executor = new FakeExecutor();
@@ -70,25 +71,60 @@ describe('ask-human on a running node: stop, record, block — one lock', () => 
     expect(requestV3Retry(run.base, run.dag.runId, { nodeId: 'write' })).toMatchObject({ kind: 'requested' });
   });
 
-  it('a submission landing while the turn is being stopped wins; the hand-over writes nothing', async () => {
+  it('a submission that came first wins; one that lands after the hand-over was recorded is refused', async () => {
+    // First: the bot handed in before anyone decided — nothing to hand over.
+    const done = new BotRun(reportDag('ask-first'));
+    const executorA = new FakeExecutor();
+    await done.drive(executorA);
+    const first = done.openAttempt('write');
+    done.accept(first.attemptId);
+    expect(await done.submit(first.attemptId, {
+      sessionId: 'sess-1', files: [{ key: 'report', name: 'r.md', data: Buffer.from('# r\n') }], result: { message: 'ok' },
+    })).toMatchObject({ ok: true, kind: 'succeeded' });
+    expect(await handNodeToHuman(done.runDir, { nodeId: 'write', reason: REASON, by: 'main_bot' }, { executor: executorA }))
+      .toEqual({ kind: 'rejected', reason: 'not-handable' });
+    expect(done.of('nodeHandedToHuman')).toEqual([]);
+
+    // After: the decision is on record before the turn is stopped, so a
+    // submission racing the stop no longer counts.
     const run = new BotRun(reportDag('ask-race'));
     const executor = new FakeExecutor();
     await run.drive(executor);
     const open = run.openAttempt('write');
     run.accept(open.attemptId);
+    let late: unknown;
     executor.onStop = async () => {
-      expect(await run.submit(open.attemptId, {
-        sessionId: 'sess-1',
-        files: [{ key: 'report', name: 'r.md', data: Buffer.from('# r\n') }],
-        result: { message: 'ok' },
-      })).toMatchObject({ ok: true, kind: 'succeeded' });
+      expect(run.of('nodeHandedToHuman')).toHaveLength(1);
+      late = await run.submit(open.attemptId, {
+        sessionId: 'sess-1', files: [{ key: 'report', name: 'r.md', data: Buffer.from('# r\n') }], result: { message: 'ok' },
+      });
     };
     expect(await handNodeToHuman(run.runDir, { nodeId: 'write', reason: REASON, by: 'main_bot' }, { executor }))
-      .toEqual({ kind: 'rejected', reason: 'stale-attempt' });
-    expect(run.of('nodeHandedToHuman')).toEqual([]);
-    expect(run.of('nodeBlocked')).toEqual([]);
+      .toMatchObject({ kind: 'handed', closedOpenAttempt: true });
+    expect(late).toMatchObject({ ok: false, reason: 'handed-to-human' });
+    expect(run.of('nodeSucceeded')).toEqual([]);
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'HANDED_TO_HUMAN' })]);
   });
-  it('an attempt replaced while its turn was being stopped is not the one handed over', async () => {
+
+  it('a proposal that appears while the turn is being stopped: the node is still closed, never left "running" with nobody on it', async () => {
+    const run = new BotRun(reportDag('ask-proposal'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const open = run.openAttempt('write');
+    run.accept(open.attemptId);
+    executor.onStop = async () => {
+      appendEvent(run.journalPath, {
+        type: 'dagRevisionProposed', revision: 2, baseRevision: 1, sha256: 'x', patchSha256: 'y', summary: 's',
+        by: 'ou_member', reasons: ['callerNotInitiator'], touched: ['write'],
+      });
+    };
+    expect(await handNodeToHuman(run.runDir, { nodeId: 'write', reason: REASON, by: 'main_bot' }, { executor }))
+      .toMatchObject({ kind: 'handed', closedOpenAttempt: true });
+    expect(openV3ExternalAttempts(run.events())).toEqual([]);
+    expect(run.snap().nodes.get('write')?.status).toBe('blocked');
+  });
+
+  it('closed some other way while being stopped (timed out and retried, or reassigned): that close stands, the reason stays on record', async () => {
     const run = new BotRun(reportDag('ask-replaced'));
     const executor = new FakeExecutor();
     await run.drive(executor);
@@ -105,9 +141,33 @@ describe('ask-human on a running node: stop, record, block — one lock', () => 
       await run.drive(executor);
     };
     expect(await handNodeToHuman(run.runDir, { nodeId: 'write', reason: REASON, by: 'main_bot' }, { executor }))
-      .toEqual({ kind: 'rejected', reason: 'stale-attempt' });
-    expect(run.of('nodeHandedToHuman')).toEqual([]);
-    expect(run.openAttempt('write').attemptId).not.toBe(first.attemptId);
+      .toMatchObject({ kind: 'handed', attemptId: first.attemptId, closedOpenAttempt: false, settledMeanwhile: 'blocked' });
+    // The new attempt is nobody's hand-over; the old block wakes nobody.
+    const second = run.openAttempt('write');
+    expect(second.attemptId).not.toBe(first.attemptId);
+    expect(run.of('nodeHandedToHuman')).toEqual([expect.objectContaining({ attemptId: first.attemptId })]);
+    expect(pendingV3MainWakes({ events: run.events(), dag: run.dag, isIssued: () => false })).toEqual([]);
+
+    // Reassigned by the initiator while the turn was being stopped.
+    const two = new BotRun(validateDag({
+      schemaVersion: 2, runId: 'ask-reassign',
+      nodes: [
+        { id: 'write', type: 'goal', goal: 'w', bot: 'cli_a', depends: [], inputs: [] },
+        { id: 'other', type: 'goal', goal: 'o', bot: 'cli_b', depends: ['write'], inputs: [] },
+      ],
+    }));
+    const executor2 = new FakeExecutor();
+    await two.drive(executor2);
+    const attempt = two.openAttempt('write');
+    two.accept(attempt.attemptId);
+    executor2.onStop = async () => {
+      executor2.onStop = async () => {};
+      expect(await reassignNode(two.runDir, { nodeId: 'write', toLarkAppId: 'cli_b', by: 'ou_initiator' }, { ...two.ctx(), executor: executor2 }))
+        .toMatchObject({ kind: 'reassigned' });
+    };
+    expect(await handNodeToHuman(two.runDir, { nodeId: 'write', reason: REASON, by: 'main_bot' }, { executor: executor2 }))
+      .toMatchObject({ kind: 'handed', closedOpenAttempt: false, settledMeanwhile: 'reassigned' });
+    expect(two.of('nodeBlocked')).toEqual([]);
   });
 });
 
@@ -127,6 +187,9 @@ describe('ask-human on other node states', () => {
     expect(executor.stops).toHaveLength(stopsBefore);
     expect(run.of('nodeHandedToHuman')).toEqual([expect.objectContaining({ attemptId: open.attemptId, by: 'ou_initiator' })]);
     expect(run.of('nodeBlocked')).toHaveLength(1);
+    // Its block had not woken the main bot yet: now it never will (a person
+    // decided; waking would invite the main bot to undo that).
+    expect(pendingV3MainWakes({ events: run.events(), dag: run.dag, isIssued: () => false })).toEqual([]);
   });
 
   it('refuses a node that never ran, a finished one, a run on temporary workers, and a held one', async () => {
@@ -148,12 +211,15 @@ describe('ask-human on other node states', () => {
     expect(await hand('a')).toEqual({ kind: 'rejected', reason: 'not-handable' });
     expect(await handNodeToHuman(run.runDir, { nodeId: 'a', reason: REASON, by: 'main_bot' }, { nodeExecutor: null }))
       .toEqual({ kind: 'rejected', reason: 'not-bot-run' });
-    // A pending proposal touching the node decides it first.
+    // A pending proposal touching a running node decides it first.
+    await run.drive(executor);
+    expect(run.openAttempt('b')).toBeDefined();
     appendEvent(run.journalPath, {
       type: 'dagRevisionProposed', revision: 2, baseRevision: 1, sha256: 'x', patchSha256: 'y', summary: 's',
       by: 'ou_member', reasons: ['callerNotInitiator'], touched: ['b'],
     });
     expect(await hand('b')).toEqual({ kind: 'rejected', reason: 'revision-pending' });
+    expect(run.of('nodeHandedToHuman')).toEqual([]);
   });
 });
 

@@ -20,9 +20,14 @@ import { readV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
 import {
   buildWorkflowMainWakeRequest,
   createWorkflowMainWake,
+  WORKFLOW_CHECKPOINT_HOLD_MAX_MS,
   WORKFLOW_MAIN_WAKE_MAX_RETRIES,
+  type WorkflowMainWakeDeliveryControls,
   type WorkflowMainWakeDeps,
 } from '../src/core/workflow-main-wake.js';
+import { releaseV3Checkpoint, v3CheckpointSuccesses } from '../src/workflows/v3/checkpoint-hold.js';
+import { recordV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
+import { v3ActionRecord, v3ReasonRequiredProblem } from '../src/workflows/v3/action-provenance.js';
 import { mintWorkflowEventTurnId } from '../src/core/workflow-event-turn.js';
 import { reportExternalBlocked } from '../src/workflows/v3/external-control.js';
 import {
@@ -30,7 +35,11 @@ import {
   makeAdHocRunEnvelope,
   publishRunEnvelopeOnce,
 } from '../src/workflows/v3/run-envelope.js';
-import { authorizeV3RunEditCommand } from '../src/workflows/v3/cli-daemon-command-authority.js';
+import {
+  authorizeV3DaemonCommand,
+  authorizeV3RunEditCommand,
+  V3DaemonCommandAuthorityError,
+} from '../src/workflows/v3/cli-daemon-command-authority.js';
 import { CurrentTurnProvenanceError } from '../src/core/current-turn-provenance.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { applyV3RunEdit } from '../src/workflows/v3/run-edit.js';
@@ -132,6 +141,13 @@ describe('the three wake-up events (M6)', () => {
     await run.drive(executor);
     const succeededA = run.events().findIndex((event) => event.type === 'nodeSucceeded' && event.nodeId === 'a') + 1;
     expect(wakes(run)).toEqual([expect.objectContaining({ kind: 'checkpoint', nodeId: 'a', eventSeq: succeededA })]);
+    // `b` waits for the main bot to look at `a` (released below by hand).
+    expect(executor.dispatches.filter((req) => req.nodeId === 'b')).toEqual([]);
+    expect(releaseV3Checkpoint(run.journalPath, {
+      eventSeq: succeededA, reason: 'wakeTurnEnded', dag: run.dag, markedSince: () => (id) => (id === 'a' ? 0 : undefined),
+    })).toBe('released');
+    expect(wakes(run)).toEqual([]); // reviewed: no wake any more
+    await run.drive(executor);
     await complete(run, executor, 'b');
     await run.drive(executor);
     expect(run.snap().runStatus).toBe('succeeded');
@@ -270,57 +286,87 @@ describe('issuing: one turn per event, recorded before the worker gets it', () =
     seedPersistedSessionRows(dataDir, BINDING.larkAppId, { [session.sessionId]: session });
   }
 
-  function writeMarker(turnId: string): void {
+  function writeMarker(turnId: string, extra: Record<string, unknown> = {}): void {
     const procStart = readProcessStartIdentity(process.pid);
     if (!procStart) throw new Error('test process start identity unavailable');
-    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 'sess-main', turnId, procStart }));
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 'sess-main', turnId, procStart, ...extra }));
   }
 
-  /** The issuer with a fake delivery: `accept` decides whether the trigger
-   *  reaches the write-ahead hook (a live session took the turn). */
+  type Verdict = 'dispatch' | 'refuse' | 'dispatchThenFail' | 'workerRefused';
+
+  /** The issuer over a fake trigger that behaves like `triggerSessionTurn`
+   *  at its seams: a refusal before the write-ahead hook, the hook itself
+   *  (whose throw propagates), a failure after it, or the worker refusing
+   *  the input synchronously. `state` is the main session as the daemon sees
+   *  it (busy / just opened). */
   function issuer(opts: {
     live?: boolean;
-    accept?: (request: TriggerRequest) => 'dispatch' | 'refuse' | 'dispatchThenFail';
-    timers?: Array<() => void>;
+    accept?: (request: TriggerRequest) => Verdict;
+    state?: { busy?: boolean; busyAtHook?: boolean; opening?: boolean };
+    clock?: { t: number };
   } = {}) {
     const deliveries: TriggerRequest[] = [];
+    const controls: WorkflowMainWakeDeliveryControls[] = [];
     const warnings: string[] = [];
+    const drives: string[] = [];
+    const timers: Array<() => void> = [];
+    const state = opts.state ?? {};
+    let hookRunning = false;
     const deps: WorkflowMainWakeDeps = {
       baseDir: () => baseDir,
       selfLarkAppId: () => BINDING.larkAppId,
       loadRun: (runDir) => ({ dag: validateDag(JSON.parse(readFileSync(join(runDir, 'dag.json'), 'utf-8'))) }),
       readBinding: () => BINDING,
       mainSessionAt: () => (opts.live === false ? undefined : { sessionId: 'sess-main' }),
-      sessionView: (sessionId) => ({ sessionId, rootMessageId: BINDING.rootMessageId, quoteTargetId: 'om_last_human_msg' }),
+      sessionView: (sessionId) => ({
+        sessionId, rootMessageId: BINDING.rootMessageId, quoteTargetId: 'om_last_human_msg',
+        ...(state.opening ? { opening: true } : {}),
+      }),
+      sessionBusy: () => (hookRunning ? !!state.busyAtHook : !!state.busy),
       deliver: async (request, internal): Promise<TriggerResponse> => {
         deliveries.push(request);
+        controls.push(internal);
         const verdict = opts.accept?.(request) ?? 'dispatch';
         if (verdict === 'refuse') return { ok: false, errorCode: 'session_not_runnable', error: 'initial start pending' };
+        hookRunning = true;
         try {
           internal.beforeDispatch({ sessionId: 'sess-main', workerGeneration: 1 });
-        } catch (err) {
-          return { ok: false, errorCode: 'trigger_failed', error: String(err) };
+        } finally {
+          hookRunning = false;
+        }
+        if (verdict === 'workerRefused') {
+          internal.onDispatchRefused();
+          return { ok: false, errorCode: 'trigger_failed', error: 'worker refused trigger input before acceptance' };
         }
         return verdict === 'dispatchThenFail'
           ? { ok: false, errorCode: 'trigger_failed', error: 'fork failed' }
           : { ok: true, action: 'delivered', triggerId: internal.stableTurnId };
       },
+      drive: (runId) => { drives.push(runId); },
       listRunIds: () => ['wake-run'],
+      ...(opts.clock ? { now: () => opts.clock!.t } : {}),
       warn: (message) => warnings.push(message),
       retryMs: 1_000,
-      setTimer: (fn) => { opts.timers?.push(fn); return {}; },
+      setTimer: (fn) => { timers.push(fn); return {}; },
     };
-    return { wake: createWorkflowMainWake(deps), deliveries, warnings };
+    /** Fire every pending timer once (the poll) and let its scan finish. */
+    const tick = async () => {
+      for (const fn of timers.splice(0)) fn();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    };
+    return { wake: createWorkflowMainWake(deps), deliveries, controls, warnings, drives, timers, tick };
   }
 
   it('the wake turn is the main bot acting for the initiator, its event data untrusted', async () => {
     const runDir = seedBlockedRun();
-    const { wake, deliveries } = issuer();
+    const { wake, deliveries, controls } = issuer();
     await wake.scan('wake-run');
     expect(deliveries).toHaveLength(1);
     const request = deliveries[0]!;
     const turnId = mintWorkflowEventTurnId('wake-run', 3);
     expect(request.target).toEqual({ kind: 'turn', botId: BINDING.larkAppId, sessionId: 'sess-main' });
+    // Its own turn: the worker queues it behind any turn that just started.
+    expect(controls[0]).toMatchObject({ stableTurnId: turnId, queueAfterActiveTurn: true });
     expect(request.envelope).toMatchObject({
       trusted: false,
       payload: { runId: 'wake-run', eventSeq: 3, event: 'botBlocked', nodeId: 'a', errorCode: 'BOT_REPORTED_BLOCKED' },
@@ -338,6 +384,39 @@ describe('issuing: one turn per event, recorded before the worker gets it', () =
     writeMarker(turnId);
     const authority = authorizeV3RunEditCommand({ runId: 'wake-run', baseDir, dataDir, envSessionId: 'sess-main', startPid: process.pid });
     expect(authority).toMatchObject({ origin: 'runEvent', callerOpenId: 'ou_initiator', wakeTurn: true });
+  });
+
+  it('a busy main session gets no wake typed into its turn: it waits in the daemon until the session is idle', async () => {
+    const runDir = seedBlockedRun();
+    const state = { busy: true };
+    const { wake, deliveries, tick } = issuer({ state });
+    await wake.scan('wake-run');
+    expect(deliveries).toEqual([]);
+    expect(readV3MainWakeIssued(runDir, 3)).toBeUndefined();
+    // Still busy at the poll: still waiting.
+    await tick();
+    expect(deliveries).toEqual([]);
+    // The turn ends (working → idle): the wake goes out as its own turn.
+    state.busy = false;
+    wake.onSessionIdle('sess-main', { afterWork: true });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(deliveries).toHaveLength(1);
+    expect(readV3MainWakeIssued(runDir, 3)).toBeDefined();
+  });
+
+  it('a session that turns busy right before the hand-over: aborted in the hook, nothing recorded, delivered when idle', async () => {
+    const runDir = seedBlockedRun();
+    const state = { busy: false, busyAtHook: true };
+    const { wake, deliveries, warnings } = issuer({ state });
+    await wake.scan('wake-run');
+    expect(deliveries).toHaveLength(1);
+    expect(readV3MainWakeIssued(runDir, 3)).toBeUndefined();
+    expect(warnings).toEqual([]); // a wait, not a failure: no retry budget spent
+    state.busyAtHook = false;
+    wake.onSessionIdle('sess-main', { afterWork: true });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(deliveries).toHaveLength(2);
+    expect(readV3MainWakeIssued(runDir, 3)).toBeDefined();
   });
 
   it('never wakes twice for one event: again, after a restart, or while a delivery is in flight', async () => {
@@ -359,59 +438,85 @@ describe('issuing: one turn per event, recorded before the worker gets it', () =
     expect(racing.deliveries).toHaveLength(1);
   });
 
-  it('a delivery that never reached the worker is retried; one that did is never re-issued', async () => {
+  it('a delivery that never reached the worker is retried on a back-off, a bounded number of times, then given up out loud', async () => {
     const runDir = seedBlockedRun();
-    const timers: Array<() => void> = [];
+    const clock = { t: 1_000_000 };
     let refuse = true;
-    const { wake, deliveries } = issuer({ timers, accept: () => (refuse ? 'refuse' : 'dispatch') });
+    const { wake, deliveries, warnings, tick } = issuer({ clock, accept: () => (refuse ? 'refuse' : 'dispatch') });
     await wake.scan('wake-run');
     expect(deliveries).toHaveLength(1);
     expect(readV3MainWakeIssued(runDir, 3)).toBeUndefined();
-    expect(timers).toHaveLength(1);
+    expect(warnings.at(-1)).toContain('retry 1/');
+    // A poll before the back-off ran out tries nothing.
+    await tick();
+    expect(deliveries).toHaveLength(1);
+    clock.t += 1_000;
     refuse = false;
-    timers.shift()!();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await tick();
     expect(deliveries).toHaveLength(2);
     expect(readV3MainWakeIssued(runDir, 3)).toBeDefined();
 
-    // A delivery that keeps failing is re-tried a bounded number of times on
-    // the timer; the next drive (a scan) starts the budget over.
+    // Keeps failing: 1 + MAX tries, then a clear give-up and silence.
     rmSync(join(baseDir, 'wake-run'), { recursive: true, force: true });
     seedBlockedRun();
-    const stuckTimers: Array<() => void> = [];
-    const stuck = issuer({ timers: stuckTimers, accept: () => 'refuse' });
+    const stuck = issuer({ clock, accept: () => 'refuse' });
     await stuck.wake.scan('wake-run');
-    for (let i = 0; i < 20 && stuckTimers.length > 0; i++) {
-      stuckTimers.shift()!();
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    for (let i = 0; i < 20; i++) {
+      clock.t += 1_000;
+      await stuck.tick();
     }
     expect(stuck.deliveries).toHaveLength(1 + WORKFLOW_MAIN_WAKE_MAX_RETRIES);
-    await stuck.wake.scan('wake-run');
+    expect(stuck.warnings.at(-1)).toContain('放弃');
+    expect(stuck.warnings.at(-1)).not.toContain('retry ');
+    // The main session becoming idle (say its first start finished) starts
+    // over at once; so does a drive.
+    stuck.wake.onSessionIdle('sess-main', { afterWork: false });
+    await new Promise((resolve) => setTimeout(resolve, 15));
     expect(stuck.deliveries).toHaveLength(2 + WORKFLOW_MAIN_WAKE_MAX_RETRIES);
-    expect(stuckTimers).toHaveLength(1);
+    await stuck.wake.scan('wake-run');
+    expect(stuck.deliveries).toHaveLength(3 + WORKFLOW_MAIN_WAKE_MAX_RETRIES);
+  });
 
-    // Recorded, then the dispatch failed: the turn may exist — not re-issued,
-    // and it is said out loud.
-    rmSync(join(baseDir, 'wake-run'), { recursive: true, force: true });
-    const runDir2 = seedBlockedRun();
-    const failing = issuer({ timers, accept: () => 'dispatchThenFail' });
+  it('recorded, then the hand-over failed: never re-issued, said out loud — unless the worker provably refused it', async () => {
+    const runDir = seedBlockedRun();
+    const failing = issuer({ accept: () => 'dispatchThenFail' });
     await failing.wake.scan('wake-run');
-    expect(readV3MainWakeIssued(runDir2, 3)).toBeDefined();
+    expect(readV3MainWakeIssued(runDir, 3)).toBeDefined();
     await failing.wake.scan('wake-run');
     expect(failing.deliveries).toHaveLength(1);
     expect(failing.warnings.join('\n')).toContain('issued but did not start');
+
+    // The worker refused it synchronously: the record is taken back and the
+    // wake is tried again.
+    rmSync(join(baseDir, 'wake-run'), { recursive: true, force: true });
+    const runDir2 = seedBlockedRun();
+    const clock = { t: 5_000_000 };
+    let refused = true;
+    const refusing = issuer({ clock, accept: () => (refused ? 'workerRefused' : 'dispatch') });
+    await refusing.wake.scan('wake-run');
+    expect(readV3MainWakeIssued(runDir2, 3)).toBeUndefined();
+    refused = false;
+    clock.t += 1_000;
+    await refusing.tick();
+    expect(refusing.deliveries).toHaveLength(2);
+    expect(readV3MainWakeIssued(runDir2, 3)).toBeDefined();
   });
 
-  it('a record that cannot be written aborts the turn for an existing session, never half-starts a new one', async () => {
+  it('a record that cannot be written aborts the turn for an existing session; a just-opened one goes ahead once, and only once', async () => {
     const runDir = seedBlockedRun();
     // `main-wakes` cannot be a directory: every record write fails.
     writeFileSync(join(runDir, 'main-wakes'), 'not a directory');
-    const existing = issuer({ timers: [] });
+    const existing = issuer();
     await existing.wake.scan('wake-run');
     expect(existing.warnings.join('\n')).toContain('not delivered');
-    const fresh = issuer({ live: false, timers: [] });
+    const fresh = issuer({ live: false, state: { opening: true } });
     await fresh.wake.scan('wake-run');
     expect(fresh.warnings.join('\n')).toContain('without its issuance record');
+    // The disk problem goes away: the same event does not wake again.
+    rmSync(join(runDir, 'main-wakes'));
+    await fresh.wake.scan('wake-run');
+    expect(fresh.deliveries).toHaveLength(1);
+    expect(fresh.warnings.at(-1)).toContain('not delivered again');
   });
 
   it('with no live main session the wake opens one in the main topic (no closed session is resumed)', async () => {
@@ -439,6 +544,237 @@ describe('issuing: one turn per event, recorded before the worker gets it', () =
     // A card click is a person too: refused, as before.
     writeSession({ quoteTargetId: 'cct_1', lastCallerOpenId: 'ou_member' });
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
+  });
+
+  describe('backstop: a wake folded into a running person\'s turn (type-ahead) never borrows that turn', () => {
+    // The wake was issued while the person's turn ran; the CLI merged it in
+    // and the marker still names that turn, with the wake in its queue.
+    const issueQueued = (sender: string, messageId: string): string => {
+      const turnId = mintWorkflowEventTurnId('wake-run', 3);
+      recordV3MainWakeIssued(join(baseDir, 'wake-run'), {
+        runId: 'wake-run', eventSeq: 3, turnId, sessionId: 'sess-main', larkAppId: BINDING.larkAppId, chatId: BINDING.chatId,
+        rootMessageId: BINDING.rootMessageId, issuedAt: Date.now() - 1_000, turnPointersAtIssue: { quoteTargetId: messageId },
+      });
+      writeSession({
+        quoteTargetId: messageId, lastCallerOpenId: sender,
+        replyTargets: { [messageId]: { senderOpenId: sender, participants: [{ openId: sender, isBot: false }], updatedAt: new Date().toISOString() } },
+      });
+      writeMarker(messageId, { queuedTurnId: turnId, queuedTurns: [{ turnId }] });
+      return turnId;
+    };
+    const daemonCmd = () => authorizeV3DaemonCommand({ runId: 'wake-run', baseDir, dataDir, envSessionId: 'sess-main', startPid: process.pid });
+    const editCmd = () => authorizeV3RunEditCommand({ runId: 'wake-run', baseDir, dataDir, envSessionId: 'sess-main', startPid: process.pid });
+
+    it('the initiator\'s turn: graded as the main bot\'s own decision, a reason required, recorded as main_bot', () => {
+      seedBlockedRun();
+      issueQueued('ou_initiator', 'om_init');
+      const authority = daemonCmd();
+      expect(authority.caller).toMatchObject({ origin: 'runEvent', openId: 'ou_initiator', wakeTurn: true });
+      expect(v3ReasonRequiredProblem(authority.caller, undefined)).toContain('--reason');
+      expect(v3ActionRecord(authority.caller, 'flaky')).toEqual({ by: 'main_bot', auto: { reason: 'flaky' } });
+      expect(editCmd()).toMatchObject({ origin: 'runEvent', wakeTurn: true });
+    });
+
+    it('a member\'s turn: their edit waits for the initiator, a retry stays theirs (refused) — never the initiator\'s', () => {
+      seedBlockedRun();
+      issueQueued('ou_member', 'om_member');
+      expect(editCmd()).toMatchObject({ origin: 'human', callerOpenId: 'ou_member', wakeTurn: true });
+      expect(() => daemonCmd()).toThrow(V3DaemonCommandAuthorityError);
+    });
+
+    it('nothing queued, another run\'s wake, or a wake id never issued: the person\'s turn as before', () => {
+      seedBlockedRun();
+      issueQueued('ou_initiator', 'om_init');
+      for (const queued of [mintWorkflowEventTurnId('other-run', 3), mintWorkflowEventTurnId('wake-run', 99)]) {
+        writeMarker('om_init', { queuedTurns: [{ turnId: queued }] });
+        expect(daemonCmd().caller).toMatchObject({ origin: 'human', openId: 'ou_initiator' });
+        expect(daemonCmd().caller?.wakeTurn).toBeUndefined();
+      }
+      writeMarker('om_init');
+      expect(editCmd()).toMatchObject({ origin: 'human' });
+    });
+  });
+});
+
+// ─── Checkpoints hold their dependants until the main bot has looked ─────
+
+describe('checkpoint: the dependants wait for the main bot', () => {
+  /** a (checkpoint) → b. */
+  function cpRun(runId: string) {
+    return new BotRun(validateDag({
+      schemaVersion: 2,
+      runId,
+      nodes: [
+        { id: 'a', type: 'goal', goal: 'survey', bot: 'cli_a', checkpoint: true, depends: [], inputs: [] },
+        { id: 'b', type: 'goal', goal: 'build', bot: 'cli_b', depends: ['a'], inputs: [] },
+      ],
+    }));
+  }
+  const successes = (run: BotRun) => v3CheckpointSuccesses({ events: run.events(), dag: run.dag, markedSince: (id) => (id === 'a' ? 0 : undefined) });
+  const releaseA = (run: BotRun, reason: 'wakeTurnEnded' | 'wakeNotDelivered' | 'holdTimeout' = 'wakeTurnEnded') =>
+    releaseV3Checkpoint(run.journalPath, {
+      eventSeq: successes(run)[0]!.eventSeq, reason, dag: run.dag, markedSince: () => (id) => (id === 'a' ? 0 : undefined),
+    });
+
+  it('b is not handed over while a\'s result waits for review; released, the flow goes on (and a restart keeps the hold)', async () => {
+    const run = cpRun('cp-hold');
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    await complete(run, executor, 'a');
+    const held = await run.drive(executor);
+    expect(held.reason).toBe('awaitingGate');
+    expect(executor.dispatches.filter((req) => req.nodeId === 'b')).toEqual([]);
+    // A fresh runtime (a restart) re-derives the hold from the journal.
+    await run.drive(new FakeExecutor());
+    expect(run.of('nodeDispatched').filter((event) => event.nodeId === 'b')).toEqual([]);
+    expect(releaseA(run)).toBe('released');
+    expect(releaseA(run)).toBe('not-held'); // once
+    expect(run.of('checkpointReleased')).toEqual([expect.objectContaining({ nodeId: 'a', reason: 'wakeTurnEnded' })]);
+    await run.drive(executor);
+    expect(executor.dispatches.filter((req) => req.nodeId === 'b')).toHaveLength(1);
+  });
+
+  it('a released checkpoint no longer wakes; a new instance of the node (re-run / revisit) holds and wakes again', () => {
+    const events = [
+      { type: 'runStarted', runId: 'cp-x', nodeExecutor: 'bot', ts: 1 },
+      { type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', nodeExecutor: 'bot', ts: 2 },
+      { type: 'nodeSucceeded', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', manifestPath: '/m', ts: 3 },
+      { type: 'checkpointReleased', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', eventSeq: 3, reason: 'wakeTurnEnded', ts: 4 },
+    ] as never[];
+    const dag = validateDag({ schemaVersion: 2, runId: 'cp-x', nodes: [{ id: 'a', type: 'goal', goal: 'a', bot: 'x', checkpoint: true, depends: [], inputs: [] }] });
+    const since = () => 0;
+    expect(v3CheckpointSuccesses({ events, dag, markedSince: since })).toEqual([expect.objectContaining({ eventSeq: 3, released: expect.anything() })]);
+    expect(pendingV3MainWakes({ events, dag, isIssued: () => false, markedSince: since })).toEqual([]);
+    const again = [...events,
+      { type: 'nodeInstanceSuperseded', nodeId: 'a', instanceId: 'a#001', byNodeId: 'z', reason: 'refresh', ts: 5 },
+      { type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#002', attemptId: 'a#002/attempts/001', nodeExecutor: 'bot', ts: 6 },
+      { type: 'nodeSucceeded', nodeId: 'a', instanceId: 'a#002', attemptId: 'a#002/attempts/001', manifestPath: '/m2', ts: 7 },
+    ] as never[];
+    expect(v3CheckpointSuccesses({ events: again, dag, markedSince: since })).toEqual([
+      expect.objectContaining({ instanceId: 'a#002', eventSeq: 7 }),
+    ]);
+    expect(v3CheckpointSuccesses({ events: again, dag, markedSince: since })[0]!.released).toBeUndefined();
+    // A late settle of the replaced instance is not the node's success.
+    const late = [...again,
+      { type: 'nodeSucceeded', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', manifestPath: '/m', ts: 8 },
+    ] as never[];
+    expect(v3CheckpointSuccesses({ events: late, dag, markedSince: since })).toEqual([
+      expect.objectContaining({ instanceId: 'a#002', eventSeq: 7 }),
+    ]);
+    // Completed before the mark took effect: nothing to look at.
+    expect(v3CheckpointSuccesses({ events: again, dag, markedSince: () => 7 })).toEqual([]);
+  });
+
+  /** The issuer over a BotRun (no envelope needed). */
+  function cpIssuer(run: BotRun, opts: { accept?: Verdict; clock?: { t: number }; busy?: { value: boolean } } = {}) {
+    const deliveries: TriggerRequest[] = [];
+    const drives: string[] = [];
+    const warnings: string[] = [];
+    const timers: Array<() => void> = [];
+    const wake = createWorkflowMainWake({
+      baseDir: () => run.base,
+      selfLarkAppId: () => BINDING.larkAppId,
+      loadRun: () => ({ dag: run.dag }),
+      readBinding: () => BINDING,
+      mainSessionAt: () => ({ sessionId: 'sess-main' }),
+      sessionView: (sessionId) => ({ sessionId, rootMessageId: BINDING.rootMessageId }),
+      sessionBusy: () => opts.busy?.value ?? false,
+      deliver: async (request, internal) => {
+        deliveries.push(request);
+        if (opts.accept === 'refuse') return { ok: false, errorCode: 'session_not_runnable', error: 'pending_repo' };
+        internal.beforeDispatch({ sessionId: 'sess-main', workerGeneration: 1 });
+        return { ok: true, action: 'delivered', triggerId: internal.stableTurnId };
+      },
+      drive: (runId) => { drives.push(runId); },
+      listRunIds: () => [run.dag.runId],
+      ...(opts.clock ? { now: () => opts.clock!.t } : {}),
+      warn: (message) => warnings.push(message),
+      retryMs: 1_000,
+      setTimer: (fn) => { timers.push(fn); return {}; },
+    });
+    const tick = async () => {
+      for (const fn of timers.splice(0)) fn();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    };
+    return { wake, deliveries, drives, warnings, tick };
+  }
+  type Verdict = 'dispatch' | 'refuse';
+
+  async function heldRun(runId: string) {
+    const run = cpRun(runId);
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    await complete(run, executor, 'a');
+    await run.drive(executor);
+    return { run, executor, cp: successes(run)[0]! };
+  }
+
+  it('the wake turn ending — its terminal, or the session\'s next working→idle — releases it and drives the run', async () => {
+    const { run, cp } = await heldRun('cp-end');
+    const { wake, deliveries, drives } = cpIssuer(run);
+    await wake.scan(run.dag.runId);
+    expect(deliveries).toEqual([expect.objectContaining({ envelope: expect.objectContaining({ payload: expect.objectContaining({ event: 'checkpoint' }) }) })]);
+    // Some other turn ends: still held.
+    wake.onTurnEnded('sess-main', 'om_someone_else');
+    expect(run.of('checkpointReleased')).toEqual([]);
+    wake.onTurnEnded('sess-main', mintWorkflowEventTurnId(run.dag.runId, cp.eventSeq));
+    expect(run.of('checkpointReleased')).toEqual([expect.objectContaining({ eventSeq: cp.eventSeq, reason: 'wakeTurnEnded' })]);
+    expect(drives).toEqual([run.dag.runId]);
+
+    const other = await heldRun('cp-idle');
+    const fallback = cpIssuer(other.run);
+    await fallback.wake.scan(other.run.dag.runId);
+    fallback.wake.onSessionIdle('sess-main', { afterWork: false }); // prompt ready, not the end of a turn
+    expect(other.run.of('checkpointReleased')).toEqual([]);
+    fallback.wake.onSessionIdle('sess-main', { afterWork: true });
+    expect(other.run.of('checkpointReleased')).toEqual([expect.objectContaining({ reason: 'wakeTurnEnded' })]);
+  });
+
+  it('never stuck: a wake that cannot be delivered, or the safety cap, lets the flow go on — said out loud', async () => {
+    const clock = { t: 0 };
+    const { run } = await heldRun('cp-undelivered');
+    clock.t = run.events().at(-1)!.ts;
+    const issuer1 = cpIssuer(run, { accept: 'refuse', clock });
+    await issuer1.wake.scan(run.dag.runId);
+    for (let i = 0; i < 20; i++) {
+      clock.t += 1_000;
+      await issuer1.tick();
+    }
+    expect(run.of('checkpointReleased')).toEqual([expect.objectContaining({ reason: 'wakeNotDelivered' })]);
+    expect(issuer1.warnings.join('\n')).toContain('without the main bot\'s review');
+    expect(issuer1.drives).toEqual([run.dag.runId]);
+
+    // The main session stays busy for longer than the cap.
+    const other = await heldRun('cp-cap');
+    const busy = { value: true };
+    const clock2 = { t: other.cp.at };
+    const issuer2 = cpIssuer(other.run, { busy, clock: clock2 });
+    await issuer2.wake.scan(other.run.dag.runId);
+    expect(issuer2.deliveries).toEqual([]);
+    clock2.t = other.cp.at + WORKFLOW_CHECKPOINT_HOLD_MAX_MS;
+    await issuer2.tick();
+    expect(other.run.of('checkpointReleased')).toEqual([expect.objectContaining({ reason: 'holdTimeout' })]);
+  });
+
+  it('after a restart: a hold whose wake already went out is released once the session that took it is idle', async () => {
+    const { run } = await heldRun('cp-restart');
+    const before = cpIssuer(run);
+    await before.wake.scan(run.dag.runId);
+    expect(before.deliveries).toHaveLength(1);
+    // The daemon restarts mid-review: the session is still working.
+    const busy = { value: true };
+    const after = cpIssuer(run, { busy });
+    await after.wake.coldAttach();
+    expect(run.of('checkpointReleased')).toEqual([]);
+    expect(after.deliveries).toEqual([]);
+    busy.value = false;
+    after.wake.onSessionIdle('sess-main', { afterWork: true });
+    expect(run.of('checkpointReleased')).toEqual([expect.objectContaining({ reason: 'wakeTurnEnded' })]);
+    // Restarted while it was already idle: released by the scan itself.
+    const other = await heldRun('cp-restart-idle');
+    await cpIssuer(other.run).wake.scan(other.run.dag.runId);
+    await cpIssuer(other.run).wake.coldAttach();
+    expect(other.run.of('checkpointReleased')).toEqual([expect.objectContaining({ reason: 'wakeTurnEnded' })]);
   });
 });
 

@@ -110,6 +110,12 @@ export const V3_INTERVENTION_LABEL: Record<NonNullable<RunNodeView['intervention
   handedToHuman: '交给人决定',
 };
 
+export const V3_CHECKPOINT_LABEL: Record<NonNullable<RunNodeView['checkpoint']>, string> = {
+  holding: '检查点：等主 Bot 看完结果，后续节点暂停',
+  reviewed: '检查点：主 Bot 已看过结果',
+  notReviewed: '检查点：没等到主 Bot 看结果，已按原流程继续',
+};
+
 export const V3_INTERVENTION_ROLE_LABEL: Record<NonNullable<RunNodeView['interventions']>[number]['by'], string> = {
   mainBot: '主 Bot',
   initiator: '发起人',
@@ -121,6 +127,7 @@ export function nodeStatusLine(node: RunNodeView, generatedAt: number | undefine
   const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
   const parts = [label];
   if (node.status === 'gateWaiting') parts.push('审批');
+  else if (node.status === 'pending' && node.waitingOnCheckpoint?.length) parts.push('等检查点');
   else if (nodeHandedToHuman(node)) parts.push('交给人决定');
   else if (node.status === 'blocked') parts.push('受阻');
   if (generatedAt !== undefined) {

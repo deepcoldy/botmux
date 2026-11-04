@@ -58,6 +58,9 @@ export interface V3NodeCardView {
   /** §13.6: the latest automatic handling or hand-over of this attempt,
    *  shown as one line（「主 Bot 自动重试：<理由>」/「交给人决定：<理由>」）. */
   intervention?: string;
+  /** §13.6: a completed checkpoint node — whether its dependants wait for
+   *  the main bot, or went on (and why). */
+  checkpoint?: string;
 }
 
 function plain(content: string): Record<string, unknown> {
@@ -157,6 +160,7 @@ export function buildV3NodeCard(view: V3NodeCardView): string {
     elements.push(plain(`原因：${view.status.message.slice(0, 500)}`));
   }
   if (view.intervention) elements.push(plain(view.intervention));
+  if (view.checkpoint) elements.push(plain(view.checkpoint));
   if (view.upstream.length > 0) {
     elements.push(plain(`上游：${view.upstream.map((up) => `${up.nodeId} ${up.done ? '✅' : '⏳'}`).join('  ')}`));
   }

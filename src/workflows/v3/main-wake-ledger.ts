@@ -14,7 +14,7 @@
  * create-once file is also what keeps one event from waking the bot twice.
  */
 
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
@@ -94,4 +94,16 @@ export function readV3MainWakeIssued(runDir: string, eventSeq: number): V3MainWa
   } catch {
     return undefined;
   }
+}
+
+/** Daemon side: take back the record of a wake turn the session's worker
+ *  provably never received (it refused the input synchronously, before
+ *  accepting it) so the event can be issued again. Only the exact turn this
+ *  caller recorded is removed. */
+export function retractV3MainWakeIssued(runDir: string, eventSeq: number, turnId: string): boolean {
+  const issued = readV3MainWakeIssued(runDir, eventSeq);
+  if (!issued || issued.turnId !== turnId) return false;
+  unlinkSync(recordPath(runDir, eventSeq));
+  fsyncDirectorySyncPortable(join(runDir, MAIN_WAKES_DIR));
+  return true;
 }

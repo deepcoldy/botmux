@@ -122,6 +122,13 @@ export interface V3AutoProvenance {
   reason: string;
 }
 
+/** Why a checkpoint's dependants may go on (design §13.6):
+ *  `wakeTurnEnded` — the main bot's turn for its wake-up ended (it may have
+ *  changed the flow in it); `wakeNotDelivered` — the wake-up could not be
+ *  delivered after its retries; `holdTimeout` — the safety cap on how long a
+ *  checkpoint may hold its dependants ran out. */
+export type V3CheckpointReleaseReason = 'wakeTurnEnded' | 'wakeNotDelivered' | 'holdTimeout';
+
 export type V3Event =
   | {
       type: 'runStarted';
@@ -371,6 +378,17 @@ export type V3Event =
       auto?: V3AutoProvenance;
       /** The reason a human turn gave (`--reason`), display only. */
       note?: string;
+    }
+  | {
+      /** A checkpoint node's success may now be followed by its dependants
+       *  (design §13.6; until then they are not dispatched). Names the exact
+       *  success: its attempt and journal position. Older readers skip it. */
+      type: 'checkpointReleased';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      eventSeq: number;
+      reason: V3CheckpointReleaseReason;
     }
   | {
       /** The node was handed to a human (design §13.6): a record only. The

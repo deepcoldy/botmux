@@ -7028,9 +7028,19 @@ const workflowMainWake = createWorkflowMainWake({
       ...(view.rootMessageId ? { rootMessageId: view.rootMessageId } : {}),
       ...(view.quoteTargetId ? { quoteTargetId: view.quoteTargetId } : {}),
       ...(view.currentReplyTargetTurnId ? { currentReplyTargetTurnId: view.currentReplyTargetTurnId } : {}),
+      ...(ds.initialStartPending ? { opening: true } : {}),
     };
   },
+  // The cascade's idle evidence (cli-idle-wait): a live CLI is free only once
+  // its prompt was ready and its screen is idle. No live worker: the trigger
+  // forks a fresh CLI whose first turn is the wake.
+  sessionBusy: (sessionId) => {
+    const ds = findActiveBySessionId(sessionId);
+    if (!ds?.worker || ds.worker.killed) return false;
+    return !ds.cliReady || !(ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'idle');
+  },
   deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: workflowSelfAppId(), activeSessions }, internal),
+  drive: (runId) => v3GateRunner.driveDetached(runId),
   listRunIds: () => {
     try {
       return readdirSync(v3DefaultBaseDir()).filter((name) => isValidV3RunId(name));
@@ -8349,7 +8359,10 @@ workflowDaemonMutationRoute('ask-human', async (reply, params, body, identity) =
   // A closed attempt blocks the run on the next drive (blocked card); the
   // node card shows the reason either way.
   v3GateRunner.driveDetached(runId);
-  return reply(200, { ok: true, runId, nodeId: outcome.nodeId, attemptId: outcome.attemptId, closedOpenAttempt: outcome.closedOpenAttempt });
+  return reply(200, {
+    ok: true, runId, nodeId: outcome.nodeId, attemptId: outcome.attemptId, closedOpenAttempt: outcome.closedOpenAttempt,
+    ...(outcome.settledMeanwhile ? { settledMeanwhile: outcome.settledMeanwhile } : {}),
+  });
 });
 
 // Isolated (sandboxed / read-isolated) main sessions reach status / edit
@@ -32572,6 +32585,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
       observeAutoCompact(ds, context.status);
+      // A main-bot wake waits for its main session to be idle; the end of a
+      // turn there also ends a checkpoint's review (bot-executed runs only).
+      if (context.status === 'idle' && context.prevStatus !== 'idle') {
+        workflowMainWake.onSessionIdle(ds.session.sessionId, {
+          afterWork: context.prevStatus === 'working' || context.prevStatus === 'analyzing',
+        });
+      }
       if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       try {
         if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);
@@ -32692,6 +32712,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
     async onTurnTerminal(ds, terminal, context) {
+      workflowMainWake.onTurnEnded(ds.session.sessionId, terminal.turnId);
       if (ds.session.deploymentContinuation?.state !== 'cancelled'
         && ds.session.deploymentContinuation?.workerGeneration === context.workerGeneration) {
         try { cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), terminal.turnId); }
