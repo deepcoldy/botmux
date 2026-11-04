@@ -22,6 +22,19 @@ async function request(path: string, method = 'GET', body?: unknown, admin = tru
   return { status, result, directory };
 }
 describe('feedback storage administration', () => {
+  it('accepts structured doas identity without persisting a token or command string', async () => {
+    const response = await request('/api/feedback/storage/configure', 'POST', {
+      expectedGeneration: 0, candidate: { backend: 'postgresql', postgres: {
+        host: '::1', port: 4432, database: 'aidb', schema: 'feedback', tls: { mode: 'verify-full' }, connectTimeoutMs: 3000,
+        bytepg: { computeId: 'cp-test', doas: { psm: 'data.example.service', environment: 'boe' } },
+      } },
+    });
+    expect(response.status).toBe(200);
+    expect(response.result.candidate.postgres.bytepg).toMatchObject({ computeId: 'cp-test', doas: { psm: 'data.example.service', environment: 'boe' } });
+    const stored = await readFeedbackStorageConfig(response.directory);
+    if (stored.candidate?.backend !== 'postgresql') throw new Error();
+    expect(stored.candidate.postgres.bytepg?.tokenRef).toBeUndefined();
+  });
   it('stores BytePG token privately and returns only configured status', async () => {
     const response = await request('/api/feedback/storage/configure', 'POST', {
       expectedGeneration: 0, token: 'synthetic-api-token',

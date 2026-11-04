@@ -24,7 +24,7 @@ function message(type: string, payload: Buffer) {
   const header = Buffer.alloc(5); header.write(type); header.writeInt32BE(payload.length + 4, 1);
   return Buffer.concat([header, payload]);
 }
-async function gateway(reject: boolean | 'query' = false, host = '127.0.0.1') {
+async function gateway(reject: boolean | 'query' | 'expired' | 'network' = false, host = '127.0.0.1') {
   const startups: Record<string, string>[] = [];
   const sockets = new Set<Socket>();
   const server = createServer(socket => {
@@ -39,7 +39,8 @@ async function gateway(reject: boolean | 'query' = false, host = '127.0.0.1') {
         const values: Record<string, string> = {};
         for (let index = 0; index < fields.length - 1 && fields[index]; index += 2) values[fields[index]] = fields[index + 1];
         startups.push(values); buffer = buffer.subarray(length); started = true;
-        if (reject === true) {
+        if (reject === 'network') { socket.destroy(); return; }
+        if (reject === true || (reject === 'expired' && values.options.includes('bytepg_auth_token=old-token '))) {
           const text = `SERROR\0C28000\0Mrejected ${values.options}\0D${values.options}\0\0`;
           socket.end(message('E', Buffer.from(text))); return;
         }
@@ -69,6 +70,47 @@ const target = (port: number): PostgresTarget => ({
   tls: { mode: 'disable' }, connectTimeoutMs: 1000,
 });
 describe('BytePG feedback authentication', () => {
+  it('refreshes once after authentication rejection and sends the SQL only on the successful connection', async () => {
+    const server = await gateway('expired');
+    let refreshes = 0;
+    let current = { value: 'old-token', generation: 0 };
+    const pool = feedbackPostgresPool(target(server.port), {
+      get: async () => current,
+      refresh: async generation => { expect(generation).toBe(0); refreshes++; return current = { value: 'new-token', generation: 1 }; },
+    });
+    try {
+      await pool.query('SELECT 1');
+      expect(refreshes).toBe(1);
+      expect(server.startups).toHaveLength(2);
+      expect(server.startups[1].options).toContain('bytepg_auth_token=new-token ');
+    } finally { await pool.end(); await server.close(); }
+  });
+  it.each(['network', 'query'] as const)('never cleans or retries SQL on %s failure', async failure => {
+    const server = await gateway(failure);
+    let refreshes = 0;
+    const pool = feedbackPostgresPool(target(server.port), {
+      get: async () => ({ value: 'new-token', generation: 0 }),
+      refresh: async () => { refreshes++; return { value: 'other-token', generation: 1 }; },
+    });
+    try {
+      await expect(pool.query('SELECT 1')).rejects.toThrow();
+      expect(refreshes).toBe(0);
+      expect(server.startups).toHaveLength(1);
+    } finally { await pool.end(); await server.close(); }
+  });
+  it('bounds authentication recovery to one reconnect', async () => {
+    const server = await gateway(true);
+    let refreshes = 0;
+    const pool = feedbackPostgresPool(target(server.port), {
+      get: async () => ({ value: 'old-token', generation: 0 }),
+      refresh: async () => { refreshes++; return { value: 'new-token', generation: 1 }; },
+    });
+    try {
+      await expect(pool.connect()).rejects.toThrow();
+      expect(refreshes).toBe(1);
+      expect(server.startups).toHaveLength(2);
+    } finally { await pool.end(); await server.close(); }
+  });
   it('uses the same token credential for connection tests, runtime and migration, without persisting its value', async () => {
     const server = await gateway(true);
     const token = 'synthetic-all-paths-token';

@@ -5,6 +5,11 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  'feedback.storage.tokenSource': 'Token 来源',
+  'feedback.storage.staticToken': '静态 Token / 引用',
+  'feedback.storage.doasToken': 'doas 动态获取',
+  'feedback.storage.doasEnvironment': 'doas 环境',
+  'feedback.storage.doasHelp': '专用缓存隔离。仅建连认证失败时清理并重新获取一次，不重放 SQL。需要宿主已安装 doas 并具备非交互授权。',
   'feedback.storage.authentication': '认证方式',
   'feedback.storage.passwordAuth': '用户名 / 密码',
   'feedback.storage.bytepgAuth': 'BytePG Token',
@@ -4149,6 +4154,11 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'feedback.storage.tokenSource': 'Token source',
+  'feedback.storage.staticToken': 'Static token / reference',
+  'feedback.storage.doasToken': 'Dynamic doas',
+  'feedback.storage.doasEnvironment': 'doas environment',
+  'feedback.storage.doasHelp': 'Uses an isolated cache. Cleans and fetches once only after handshake authentication failure; never replays SQL. Requires installed doas and noninteractive authorization.',
   'feedback.storage.authentication': 'Authentication',
   'feedback.storage.passwordAuth': 'Username / password',
   'feedback.storage.bytepgAuth': 'BytePG token',

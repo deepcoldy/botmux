@@ -17,7 +17,8 @@ export function feedbackStorageView(config: FeedbackStorageConfig) {
     postgres: { host: target.postgres.host, port: target.postgres.port, database: target.postgres.database,
       user: target.postgres.user, schema: target.postgres.schema, tls: { mode: target.postgres.tls.mode, hasCa: !!target.postgres.tls.caRef },
       connectTimeoutMs: target.postgres.connectTimeoutMs, hasPassword: !!target.postgres.passwordRef,
-      ...(target.postgres.bytepg ? { bytepg: { computeId: target.postgres.bytepg.computeId, hasToken: !!target.postgres.bytepg.tokenRef } } : {}) },
+      ...(target.postgres.bytepg ? { bytepg: { computeId: target.postgres.bytepg.computeId, hasToken: !!target.postgres.bytepg.tokenRef,
+        ...(target.postgres.bytepg.doas ? { doas: target.postgres.bytepg.doas } : {}) } } : {}) },
   };
   return { generation: config.generation, active: redact(config.active), candidate: config.candidate ? redact(config.candidate) : undefined };
 }
@@ -39,9 +40,14 @@ export async function configureFeedbackStorageCandidate(dataDir: string, request
     const previous = current.candidate?.backend === 'postgresql' ? current.candidate.postgres : current.active.backend === 'postgresql' ? current.active.postgres : undefined;
     if (candidate.postgres.bytepg) {
       if (request.password || candidate.postgres.passwordRef) throw new Error('feedback_storage_auth_invalid');
-      candidate.postgres.bytepg.tokenRef = request.token
-        ? await putFeedbackStorageSecret(dataDir, request.token)
-        : candidate.postgres.bytepg.tokenRef || previous?.bytepg?.tokenRef || '';
+      if (candidate.postgres.bytepg.doas) {
+        if (request.token || candidate.postgres.bytepg.tokenRef) throw new Error('feedback_storage_auth_invalid');
+        delete candidate.postgres.bytepg.tokenRef;
+      } else {
+        candidate.postgres.bytepg.tokenRef = request.token
+          ? await putFeedbackStorageSecret(dataDir, request.token)
+          : candidate.postgres.bytepg.tokenRef || previous?.bytepg?.tokenRef || '';
+      }
     } else {
       if (request.token) throw new Error('feedback_storage_auth_invalid');
       candidate.postgres.passwordRef = request.password

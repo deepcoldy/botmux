@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 import type { FeedbackStorageConfig, FeedbackStorageTarget, PostgresTarget } from './feedback-storage-types.js';
+import { createDoasTokenSource, type PostgresCredential } from './feedback-doas-token.js';
 
 const secretReference = z.string().regex(/^(env:[A-Za-z_][A-Za-z0-9_]*|file:[0-9a-f-]{36})$/);
 const postgresSchema = z.object({
@@ -15,7 +16,11 @@ const postgresSchema = z.object({
   user: z.string().min(1).max(63).optional(),
   schema: z.string().regex(/^[a-z_][a-z0-9_]{0,62}$/),
   passwordRef: secretReference.optional(),
-  bytepg: z.object({ computeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/), tokenRef: secretReference }).strict().optional(),
+  bytepg: z.object({
+    computeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/),
+    tokenRef: secretReference.optional(),
+    doas: z.object({ psm: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/), environment: z.enum(['boe', 'cn', 'row', 'nontt', 'euttp', 'usttp']) }).strict().optional(),
+  }).strict().refine(value => !!value.tokenRef !== !!value.doas, 'feedback_storage_auth_invalid').optional(),
   tls: z.object({
     mode: z.enum(['verify-full', 'disable']),
     caRef: secretReference.optional(),
@@ -140,7 +145,8 @@ export async function readFeedbackStorageSecret(dataDir: string, reference: stri
   }
 }
 
-export async function readPostgresCredential(dataDir: string, target: PostgresTarget): Promise<string> {
+export async function readPostgresCredential(dataDir: string, target: PostgresTarget): Promise<PostgresCredential> {
+  if (target.bytepg?.doas) return createDoasTokenSource(dataDir, target.bytepg.doas);
   const reference = target.bytepg?.tokenRef ?? target.passwordRef;
   if (!reference) throw new Error('feedback_storage_secret_missing');
   return readFeedbackStorageSecret(dataDir, reference);

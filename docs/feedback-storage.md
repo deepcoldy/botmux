@@ -62,7 +62,29 @@ BytePG mode does not require `passwordRef`. `user` is optional: when omitted, Bo
 
 Dashboard provides **Authentication → BytePG token**, Compute ID and a write-only token field. Leave the token blank to preserve its reference. CLI configuration accepts `tokenRef`; `--token` and `--password` credential arguments are rejected. Regular configuration, API views, migration metadata and recovery records contain only references, not token values.
 
-TLS defaults to certificate verification. Set a trusted CA when required; never disable verification to hide a certificate failure. BytePG server errors/notices are deliberately reported as generic errors because gateways may echo startup options containing the token. Token expiry does not fall back to password authentication or SQLite. After rotating the referenced token, restart the affected BotMux processes so existing pools load the new credential; automatic token issuance/refresh is not implemented.
+TLS defaults to certificate verification. Set a trusted CA when required; never disable verification to hide a certificate failure. BytePG server errors/notices are deliberately reported as generic errors because gateways may echo startup options containing the token. Token expiry does not fall back to password authentication or SQLite. Static references are loaded when pools are created; restart affected processes after rotating those references.
+
+### Dynamic doas credentials
+
+Instead of `tokenRef`, configure a structured doas source:
+
+```json
+"bytepg": {
+  "computeId": "cp-example",
+  "doas": {
+    "psm": "data.example.service",
+    "environment": "boe"
+  }
+}
+```
+
+The host must have `doas` installed and noninteractive authorization for the selected PSM/environment. BotMux executes fixed arguments equivalent to `doas --type gdpr -p <psm> --print-env -e <environment> --no-interaction`, with an explicit private identity directory. It accepts a single bare token line, never evaluates shell output, and does not expose stdout/stderr.
+
+Both acquisition and `doas clean` use the same 0700 cache root under `<dataDir>/feedback-doas/<source-hash>`, with `TMPDIR`, `TMP`, `TEMP` and `DOAS_IDENTITY_DIR` explicitly scoped. The cross-process refresh lock lives outside the cache entries removed by clean. Shared user doas caches are not copied or cleaned; a fresh private cache may require an administrator to establish noninteractive authentication.
+
+No TTL is assumed and there is no periodic clean. Only a new-connection authentication rejection (`28000` or `28P01`) triggers one serialized clean/refetch and one reconnect. Other callers that rejected the same generation reuse the replacement rather than cleaning again. Network/TLS errors and SQL/transaction errors never trigger this recovery, and SQL is never replayed. If recovery fails, the rejected generation is marked unusable instead of being served indefinitely.
+
+Dashboard provides **Token source → Dynamic doas**, PSM and environment. Token values remain in process memory; BotMux persists only a nonsecret generation marker (doas itself manages its private credential cache). Acquisition/cleanup commands have time and output bounds. No arbitrary command string can be supplied through this configuration.
 
 Local tests exercise startup-packet encoding (including IPv6), escaping, error/notice redaction and existing PostgreSQL 17 storage/migration behavior. They do not certify authorization against a production BytePG gateway; use **Test saved connection** in an authorized environment before migration, without sharing tokens in chat or logs.
 

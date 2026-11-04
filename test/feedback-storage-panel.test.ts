@@ -6,6 +6,26 @@ import { FeedbackStoragePanel } from '../src/dashboard/web/feedback-storage-pane
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => vi.unstubAllGlobals());
 describe('feedback storage panel', () => {
+  it('saves structured doas identity instead of sending a token value', async () => {
+    const writes: any[] = [];
+    vi.stubGlobal('fetch', async (_url: string, options?: RequestInit) => {
+      if (options?.method === 'POST') writes.push(JSON.parse(String(options.body)));
+      return { ok: true, status: 200, json: async () => ({ generation: 1, active: { backend: 'sqlite' }, migrations: [] }) };
+    });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(FeedbackStoragePanel)); });
+    await act(async () => { renderer.root.findByProps({ id: 'feedback-storage-backend' }).props.onChange({ target: { value: 'postgresql' } }); });
+    await act(async () => { renderer.root.findByProps({ id: 'feedback-storage-authentication' }).props.onChange({ target: { value: 'bytepg' } }); });
+    await act(async () => { renderer.root.findByProps({ id: 'feedback-storage-token-source' }).props.onChange({ target: { value: 'doas' } }); });
+    await act(async () => {
+      renderer.root.findByProps({ id: 'feedback-storage-compute-id' }).props.onChange({ target: { value: 'cp-test' } });
+      renderer.root.findByProps({ id: 'feedback-storage-doas-psm' }).props.onChange({ target: { value: 'data.example.service' } });
+    });
+    await act(async () => { renderer.root.findByProps({ id: 'feedback-storage-save' }).props.onClick(); });
+    expect(writes[0].candidate.postgres.bytepg).toEqual({ computeId: 'cp-test', doas: { psm: 'data.example.service', environment: 'boe' } });
+    expect(writes[0]).not.toHaveProperty('token');
+    await act(async () => renderer.unmount());
+  });
   it('offers BytePG token authentication and never reuses a password as the token', async () => {
     const writes: any[] = [];
     vi.stubGlobal('fetch', async (_url: string, options?: RequestInit) => {

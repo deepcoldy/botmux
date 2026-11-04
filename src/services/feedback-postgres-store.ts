@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import { feedbackPostgresPool, ensurePostgresFeedbackSchema } from './feedback-postgres-schema.js';
+import type { PostgresCredential } from './feedback-doas-token.js';
 import type { FeedbackStore, PostgresTarget } from './feedback-storage-types.js';
 import type { RecordTurnDeliveryInput, RecordTurnTerminalInput, TurnCompletionEventPayload } from './skill-feedback-store.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
@@ -262,7 +263,7 @@ class PostgresFeedbackStore implements FeedbackStore {
   async tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): Promise<Output<'tryResetExpiredFeedbackOutboxClaims'>> { return { done: true, changed: await this.resetExpiredFeedbackOutboxClaims(now, staleAfterMs) }; }
 }
 
-export async function openPostgresFeedbackStore(target: PostgresTarget, password: string, instanceId: string, ca?: string, provision = false): Promise<FeedbackStore> {
+export async function openPostgresFeedbackStore(target: PostgresTarget, password: PostgresCredential, instanceId: string, ca?: string, provision = false): Promise<FeedbackStore> {
   const pool = feedbackPostgresPool(target, password, ca);
   try {
     const client = await pool.connect();
