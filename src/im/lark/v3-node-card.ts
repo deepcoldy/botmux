@@ -107,6 +107,7 @@ const BLOCKED_REASON_TEXT: Record<string, string> = {
   HANDOFF_NOT_ACCEPTED: '执行 Bot 没有在期限内接单',
   HANDOFF_UNCERTAIN: '无法确认交接是否送达，请看一眼群消息再重试',
   BOT_REPORTED_BLOCKED: '执行 Bot 报告做不了',
+  WORKING_DIR_REFUSED: '执行 Bot 不能在指定的工作目录里执行',
   NODE_TIMEOUT: '超时未提交有效结果',
   HANDED_TO_HUMAN: '主 Bot 交给人决定',
 };

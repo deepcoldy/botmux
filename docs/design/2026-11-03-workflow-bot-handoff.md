@@ -536,7 +536,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 - 节点卡；
 - 子 Bot 在节点落点的回复卡和回报卡（规则见 5.5）；
 - 主话题进度卡：它现有的「Web 详情（需登录）」链接改成同一个入口；
-- 流程修改确认卡。
+- 流程修改确认卡，以及同属运行中修改的「追加重做额度」卡：和进度卡一样，把卡上的「Web 详情（需登录）」换成同一个入口（这两张是旧版卡片，没有签名行）。发卡、点击后的回卡、就地刷新三条路径都按 run.json 判断，只有冻结了 `nodeExecutor: "bot"` 的 run 才换；其他 run 的这两张卡与改动前逐字节相同（`test/fixtures/workflow-sidebar-cards-before.json` 存着改动前构建器的产物，测试逐字节比对）。
 
 纯文本、post 消息和流式卡片没有签名行，不加。
 
@@ -559,6 +559,8 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 |---|---|
 | Dashboard 管理员 | 完整视图（同 Dashboard 详情页，含终端和日志入口） |
 | 本群当前成员 | 精简视图：节点名、目标（交接消息里本来就发过）、负责 Bot、状态、耗时、落点链接、流程版本历史。不含终端、日志、产物内容、参数值、错误详情 |
+
+- **成员看到的流程版本历史**：从看板用的 `RunRevisionView` 按白名单重新构造，只列已生效的版本，每个版本只有版本号、时间、角色（主 Bot / 发起人 / 其他成员）、生成的计数摘要（如「+1 节点、改派 1」）、是否经过发起人确认；当前版本号一并给出。不给 open_id，也不给修改说明（note 是自由文本，可能写了参数值）；还在等确认的修改和被拒绝的修改不算版本，不列。管理员拿到的仍是完整 `RunView`（含待确认、未生效的记录），与看板一致。侧栏页面在图下方用看板的同一个版本面板展示，两种身份都显示；没改过流程的 run 不出这一块。
 | 其他人 | 403 |
 
 - **成员的身份来源**：飞书 H5 免登的会话，或平台登录透传的身份。H5 现在对非白名单用户只签发 `resultOnly` 会话；这里扩展成按路径限定的只读会话，只能访问 `/workflow/...` 和对应的只读接口。
@@ -883,6 +885,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - **降级到旧版本时（新模式的 run）**：新模式写出的 `run.json`，旧版本 daemon 读到会因 schema 的 `.strict()` 校验失败而拒绝驱动，不会被误当成旧方式执行。这一点在 PR 里用旧版本构建实测一次。
 - **降级到旧版本时（改过流程的 run）**：`.strict()` 拦不住，旧版本 daemon 会照常驱动。原因是流程版本不写进 `run.json`：版本记录在 journal 的事件（`dagRevised`、`dagRevisionProposed` 等）和 run 目录下的 `dag-revisions/` 文件里，`run.json` 和 `dag.json`（第 1 版）都不变。旧版本重放 journal 时不认识这些事件，直接跳过，于是按第 1 版继续执行：可能执行已经删掉的节点、按改前的定义跑改过的节点，也会绕过还在等发起人确认的修改（旧版本不知道要停住修改涉及的节点）。
   - 对用户的建议：改过流程的 run（run 目录下有 `dag-revisions/`，看板上显示的版本大于 1）不要降级 daemon。确实要降级，先把这些 run 取消（进度卡上的取消，或 `botmux workflow cancel <runId>`），或者等它们结束后再降级。
+- **子 Bot 是旧版本时（指定了工作目录的 run）**：上面的 `.strict()` 只管主 Bot 侧——旧版本子 Bot 的 daemon 收交接时不读 `run.json`，会在它自己的默认目录起会话，直到提交才被拒。所以带 `nodeWorkingDir` 的 run 交接前，主 Bot 先看目标 daemon 的 descriptor 是否声明 `workflowNodeWorkingDir: "v1"`（新版本 daemon 启动即写）；没有声明就不发交接，节点直接受阻（`WORKING_DIR_REFUSED`，原因「执行 Bot 的 daemon 版本过旧，不支持指定工作目录」），升级后重试或改派。不带 `--working-dir` 的 run 不查，旧版本子 Bot 照常执行。
 
 ### 15.4 `/workflow` 命令和 CLI
 
@@ -891,7 +894,15 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - `botmux report` 新增 `--output`、`--result-file`，只对工作流节点的交接有效。
 - 新增 `botmux workflow edit`、`botmux workflow status`、`botmux workflow ask-human`。
 - `botmux workflow retry` 和 `botmux workflow edit` 新增 `--reason`。由本 run 事件唤醒的回合必须带它（13.6）；人触发的回合可以不带，不带时行为与现在相同。
-- **`approve-dag --working-dir`**：新模式下节点在子 Bot 自己的会话目录里跑。指定的目录必须在该 Bot 配置的目录范围内（`defaultWorkingDir` / `workingDirs`），由子 Bot 的 daemon 起会话时校验并应用；不在范围内就在 Gate-2 拒绝。
+- **`approve-dag --working-dir`**：新模式下节点在子 Bot 自己的会话目录里跑。指定的目录必须在该 Bot 配置的目录范围内（`defaultWorkingDir` / `workingDirs`），由子 Bot 的 daemon 起会话时校验并应用；不在范围内就在 Gate-2 拒绝。实现细节：
+  - **目录范围只有一处判定**（`src/core/working-dir-range.ts`），Gate-2 和子 Bot 的 daemon 都调它。范围 = Bot 的有效默认工作目录（`defaultWorkingDir`，或 Oncall 模式的 `defaultOncall.workingDir`）加上仓库目录（`workingDir` / `workingDirs`，含逗号分隔的旧写法），目录等于其中之一或在其下即在范围内。目录必须已存在且是目录（与 `/cd` 相同的校验，不自动创建）；比较前两侧都展开 `~`、`resolve`（去掉尾斜杠和 `..`），再 `realpath` 解析软链接，所以范围内指向范围外的软链接不算，macOS 上 `/tmp` 与 `/private/tmp` 视为同一处。一个目录都没配的 Bot 不能被指定目录。现有的 `/cd`、`/repo <路径>`、dispatch `--repo` 都只做存在性校验、不限范围（信任模型是「有操作权的人显式选了目录」），所以这里没有可直接复用的范围判定；新模块复用的是已有的 `configuredWorkingDirs`、`effectiveDefaultWorkingDir` 和沙盒路径规则的 `coversPath`。
+  - **Gate-2**：先做存在性校验，再对每个执行 Bot（主 Bot 自己的节点也查）按 bots.json 当下的配置判定；任一节点不满足就拒绝批准，逐个列出「节点 → Bot：原因」，此时不跑在群 / 在线 / 授权等实时检查，也不写任何东西。拒绝文案不列出别的 Bot 配置了哪些目录。
+  - **软链接**：判定通过的目录一律按 realpath 冻结和应用——指定软链接时，实际用的是它指向的目录。若冻结链接本身，之后把链接改指到范围外，已建会话的重启、冷恢复或 `/restart` 不会再经过判定，CLI 就会在范围外起。
+  - **冻结**：与临时进程模式一样，把 realpath 写进 `bots.snapshot.json` 每个 Bot 快照的 `workingDir`；另在 `run.json` 记 `nodeWorkingDir`（只允许和 `nodeExecutor: "bot"` 同时出现），作为「这是 Gate-2 指定、要在子 Bot 侧应用的目录」的标记——新模式下快照里的 `workingDir` 平时只是展示用的默认目录，单凭快照分不清是否指定过。旧版本 daemon 读到这个键会因 `.strict()` 拒绝驱动。关开关时（临时进程模式）行为不变：原样冻结 `--working-dir` 的原始值，不做范围检查，`run.json` 不出现这个键。
+  - **子 Bot 起会话时**：daemon 收到已核验的交接后、登记接单和放入附件之前，读 `run.json`，按自己**当时**的配置再判定一次。通过：没有会话时新会话直接在这个目录起（不走 oncall / 继承 / 默认目录的解析，判定与起点在 `workflow-node-daemon.ts` 的 `admitInbound` / `workflowNodePinnedStart`，daemon.ts 只接线）。节点话题里已经有会话（有人先在话题里 @ 过子 Bot，或 `/cd` 过）时，再比较两边的 realpath，不一致就按不通过处理（「节点话题里已有会话，工作目录与指定的不一致」），不把交接塞进在别处跑的会话；一致（同一 run 前一次尝试建的会话）就继续用它。不通过：不起会话、不登记接单，向主 Bot 报 `refused`，主 Bot 把这次尝试记成受阻（`WORKING_DIR_REFUSED`，消息写明目录和原因），不改用默认目录；`run.json` 读不到也按不通过处理。`refused` 不带会话 id，已被某个会话接单的尝试不会被它关掉。
+  - **拒绝原因怎么送到**：子 Bot 先把原因签名记在这次交接的 registry 条目上（与撤销记录同一处，主 Bot 判断是否接单时会读），再直接通知主 Bot；直接通知失败（报错应答或连不上）重试一次。两次都没送到时，节点在接单期限到期时以 `HANDOFF_NOT_ACCEPTED` 受阻，消息里带上这条目录原因，子 Bot 日志里也有。
+  - **主 Bot 自己执行的节点**：走同一个判定（按主 Bot 当时的配置），而且在发节点卡和交接卡**之前**判定——不通过就什么都不发，节点直接受阻；开轮次前再查一次。
+  - **运行中修改带进来的 Bot**（改派、新增节点）不在修改时预查，由它起会话时按同一规则检查。
 - **节点的 `override.model`**：只有子 Bot 的 CLI 支持按派发指定模型时（目前是 Codex 的 dispatch 启动规格）才生效，否则 Gate-2 报错。
 - **节点的 `override.systemPromptAppend`**：拼进交接消息正文。
 - **另开小 PR 修**：`/workflow resume` 的报错让用户改用 `/workflow retry <runId>`，但 `retry` 不是保留动词，会被当成新目标进入 Grill。

@@ -2955,7 +2955,7 @@ export async function runWorkflow(
     attempt: V3ExternalAttempt,
   ): Promise<
     | { status: 'accepted'; sessionId: string; acceptedAt?: number }
-    | { status: 'notAccepted' }
+    | { status: 'notAccepted'; detail?: string }
     | { status: 'unknown' }
   > {
     const ref = externalAttemptRef(dag.runId, attempt);
@@ -2974,7 +2974,7 @@ export async function runWorkflow(
             sessionId: probe.sessionId,
             ...(probe.acceptedAt !== undefined ? { acceptedAt: probe.acceptedAt } : {}),
           }
-        : { status: 'notAccepted' };
+        : { status: 'notAccepted', ...(typeof probe.detail === 'string' && probe.detail ? { detail: probe.detail.slice(0, 2000) } : {}) };
     } catch (err) {
       // Unknown is neither "accepted" nor "not accepted".
       reportExternalError(err, attempt.attemptId, 'probe');
@@ -3068,7 +3068,9 @@ export async function runWorkflow(
               await blockExternalAttempt(attempt, 'notAccepted', {
                 errorClass: 'workerError',
                 errorCode: V3_EXTERNAL_ERROR_CODES.HANDOFF_NOT_ACCEPTED,
-                message: 'the target bot did not accept the handoff before the acceptance deadline',
+                message: probe.detail
+                  ? `the target bot did not accept the handoff before the acceptance deadline: ${probe.detail}`
+                  : 'the target bot did not accept the handoff before the acceptance deadline',
               });
             }
           }

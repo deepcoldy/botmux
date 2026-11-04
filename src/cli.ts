@@ -2753,6 +2753,7 @@ async function cmdStart(): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
   const bootHookStart = consumeAutostartUnitMarker();
+  await (await import('./setup/feedback-storage.js')).configureFeedbackStorage(resolveDataDir());
   applyCompanionOptions(process.argv.slice(3));
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
@@ -10680,7 +10681,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, ...(rendered ? { diff: { stats: rendered.stats, statsScope: rendered.statsScope, preview: rendered.preview } } : {}), card }, null, 2));
 }
 
-async function cmdSend(rest: string[]): Promise<void> {
+async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promise<void> {
   const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
   // Provider values are opaque argv tokens, but flag-shaped mention values can
   // otherwise trigger the help/dry-run early exits below before the outbound
@@ -11660,7 +11661,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
     await checkSendTopics?.(lookup);
-    return revalidateIsolatedOrigin();
+    const origin = await revalidateIsolatedOrigin();
+    beginFeedbackEffect?.();
+    return origin;
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
     await revalidateIsolatedOriginBeforeEffect(lookup);
@@ -13983,7 +13986,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
-        feedbackStore.recordTurnDelivery({
+        await feedbackStore.recordTurnDelivery({
           botAppId: appId,
           sessionId: sid,
           turnId: deliveryTurnId,
@@ -17302,6 +17305,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       ...(questions?.some(q => q.input) ? { inputs: result.kind === 'answered' ? [...result.inputs ?? questions.map(() => null)] : null } : {}),
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
+      ...(result.kind === 'answered' && result.customAnswers ? { customAnswers: result.customAnswers } : {}),
       timedOut: result.kind === 'timedOut',
     };
     stdoutPayload = JSON.stringify(out) + '\n';
@@ -17310,6 +17314,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     //
     // 用户以文字作答时落到空字符串；comment 可能含换行，塞进「一行一个 key」的
     // stdout 契约并不安全，因此 stdout 保持不变，改由 stderr 指明答案去向。
+    if (result.customAnswers?.some(Boolean)) console.error('botmux ask: 用户按题填写了自定义答案；请用 --json 读取 customAnswers。');
     if (isCustomReply(result)) {
       console.error(
         'botmux ask: 用户以文字作答，未点选任何选项；stdout 留空（stdout 只承载 option key）。' +
@@ -17594,7 +17599,7 @@ export async function runHook(
   }
 
   if (result.kind === 'answered') {
-    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment) };
+    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers) };
   }
 
   // timedOut / invalidated → passthrough 放行
@@ -20627,12 +20632,24 @@ switch (command) {
     break;
   }
   case 'send': {
-    try { await cmdSend(process.argv.slice(3)); }
+    let releaseFeedbackEffect: (() => void) | undefined;
+    try {
+      await cmdSend(process.argv.slice(3), () => {
+        releaseFeedbackEffect ??= acquireFeedbackSendLease(resolveDataDir());
+      });
+      releaseFeedbackEffect?.();
+    }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
       console.error(`botmux send refused: ${error.message}`);
       process.exitCode = 2;
     }
+    break;
+  }
+  case 'feedback': {
+    if (process.argv[3] !== 'storage') throw new Error('feedback_storage_command_required');
+    const { runFeedbackStorageCommand } = await import('./cli/feedback-storage.js');
+    process.exitCode = await runFeedbackStorageCommand(process.argv.slice(4), { input: process.stdin, output: process.stdout, error: process.stderr }, resolveDataDir());
     break;
   }
   case 'auth':     await cmdAuth(process.argv.slice(3)); break;
@@ -20714,3 +20731,4 @@ switch (command) {
     if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();
     break;
 }
+import { acquireFeedbackSendLease } from './services/feedback-maintenance.js';

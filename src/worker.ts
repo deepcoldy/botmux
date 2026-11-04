@@ -14,6 +14,7 @@ import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
+import { traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 /**
  * Worker process: manages a single CLI PTY session + web terminal.
@@ -91,6 +92,13 @@ import {
   decodeTerminalWriteFrameSource,
   terminalWriteFrame,
 } from './core/terminal-write-frame.js';
+import {
+  WEB_TERMINAL_VENDOR_SCRIPTS,
+  WEB_TERMINAL_VENDOR_STYLES,
+  xtermVendorDocumentWriteSource,
+} from './core/xterm-vendor-assets.js';
+import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
+import { WEB_TERMINAL_BOOT_ERROR_HANDLER_SOURCE } from './core/web-terminal-boot-error.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
@@ -13583,10 +13591,11 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
   if (lastInitConfig?.cliId !== 'traex' || !backendScreenEvidenceIsAuthoritativeForMutation()) return;
   const detector = idleDetector;
   const adapter = cliAdapter;
+  const generation = cliSpawnGeneration;
   const startedAt = Date.now();
   const webInputGeneration = webTerminalInputGeneration;
   const stillWaiting = (): boolean => awaitingFirstPrompt
-    && backend === observedBackend && idleDetector === detector
+    && backend === observedBackend && idleDetector === detector && cliSpawnGeneration === generation
     && webTerminalInputGeneration === webInputGeneration
     && Date.now() - startedAt < FIRST_PROMPT_HARD_TIMEOUT_MS;
   const check = async (): Promise<void> => {
@@ -13602,8 +13611,21 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
       if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
         || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
         || Date.now() - lastPtyOutputAtMs < 2_000) return;
-      const screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
-      if (!screen || !adapter?.startupReadyFromHistory?.(screen)) return;
+      let screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
+      if (!screen || !adapter?.startupReadyFromHistory?.(screen)) {
+        // A tmux CLI can draw its footer before pipe-pane attaches. Later
+        // cursor-only redraws leave the renderer nonempty but incomplete, so
+        // waiting for more stream bytes can strand a ready pane until 90s.
+        // Read the actual current cells without blocking the worker; preserve
+        // the exact generation/output/web-input fence across that await.
+        if (!(observedBackend instanceof TmuxPipeBackend)) return;
+        screen = await observedBackend.captureViewportAsync();
+        if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
+          || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
+          || Date.now() - lastPtyOutputAtMs < 2_000) return;
+        if (!screen || !adapter?.startupReadyFromHistory?.(screen)) return;
+        log(`${cliName()} initialized composer recovered from native tmux viewport`);
+      }
       if (detector?.observeStartupHistory(screen)) {
         log(`${cliName()} ${lastInitConfig?.resume ? 'restored' : 'initialized'} composer observed on screen; rechecking first-prompt readiness`);
       }
@@ -21636,6 +21658,15 @@ async function spawnCli(
     ? 'dsh-tui'
     : cfg.cliId as CliId;
   cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  if (effectiveCliId === 'traex' && cfg.resume === true && cfg.cliSessionId && cfg.adoptMode !== true) {
+    // The native resume target is host-owned. A resumed transcript can occupy
+    // the entire viewport while a nonblocking repository notice hides both
+    // footer rows, so cold-start banner cells need not remain visible.
+    cliAdapter = {
+      ...cliAdapter,
+      startupReadyFromHistory: (screen: string) => traexRestoredComposerReady(screen, { resumedSession: true }),
+    };
+  }
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
   if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
@@ -27872,6 +27903,17 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Bad Request');
         return;
       }
+      // The terminal page's xterm bundle (pinned #1940 set), served same-origin
+      // instead of from a public CDN. Public library files, so no capability:
+      // the page's `<script src>` requests can't carry its `?viewToken=` /
+      // `?token=`. Matched under ANY prefix (`/`, `/s/<id>/`, a reverse-proxy
+      // prefix) because the page derives the URL from its own path — see
+      // xtermVendorDocumentWriteSource.
+      if (handleXtermVendorHttp(req, res, url.pathname, 'anyPrefix', (err) => {
+        log(`xterm vendor asset failed: ${err instanceof Error ? err.message : String(err)}`);
+      })) {
+        return;
+      }
       // This endpoint has its own per-turn capability. A terminal read/write
       // token never grants access to host tools, and tool tokens never grant
       // terminal access.
@@ -28420,7 +28462,7 @@ function getTerminalHtml(
 <meta name="format-detection" content="telephone=no">
 <title>${cliName()} - ${label}</title>
 <link rel="icon" type="image/png" href="${TERMINAL_FAVICON_DATA_URI}">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script>${xtermVendorDocumentWriteSource(WEB_TERMINAL_VENDOR_STYLES)}</script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;background:#1a1b26;overflow:hidden;overscroll-behavior:none}
@@ -28663,35 +28705,20 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
 <div id="status-bytes" aria-hidden="true"></div>
 <div id="boot-error" aria-live="assertive"></div>
 <script>
-// Install before external scripts: a missing dependency otherwise leaves a
+// Install before the xterm scripts: a missing dependency otherwise leaves a
 // blank terminal with the initial connecting label and no visible explanation.
 // This is a STARTUP-ONLY watcher: it removes itself on ws open (see connect()),
 // so a later benign window error (e.g. ResizeObserver loop noise) can never
 // repaint a healthy connected terminal. The corner #status keeps a short word;
 // the long detail goes to the centered #boot-error (the terminal area is blank
-// while boot failed), which never overlaps the top status/login banners.
-function _wbBootstrapError(event){
-  var status=document.getElementById('status');
-  var box=document.getElementById('boot-error');
-  if(!status)return;
-  var target=event.target;
-  var detail='';
-  if(target&&target.tagName==='SCRIPT'&&target.src){
-    detail='终端组件加载失败：'+target.src.split('/').pop();
-  }else if(event.message){
-    detail='终端页面错误：'+event.message;
-  }else{return;}
-  status.textContent='加载失败';status.className='err';
-  if(box){box.textContent=detail;box.classList.add('show');}
-}
+// while boot failed), which never overlaps the top status/login banners. Only
+// the FIRST detail is kept: once a script failed to load, the ReferenceError
+// that follows from new Terminal must not hide the real cause. See
+// core/web-terminal-boot-error.ts.
+var _wbBootstrapError=${WEB_TERMINAL_BOOT_ERROR_HANDLER_SOURCE};
 window.addEventListener('error',_wbBootstrapError,true);
 </script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.18.0/lib/addon-webgl.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0.7.0/lib/addon-canvas.min.js"></script>
+<script>${xtermVendorDocumentWriteSource(WEB_TERMINAL_VENDOR_SCRIPTS)}</script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.body.classList.add('touch');}

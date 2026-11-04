@@ -32,6 +32,7 @@ import {
   stageExternalSubmissionForInstall,
 } from '../workflows/v3/external-control.js';
 import { foldV3ExternalAttempts } from '../workflows/v3/external-attempt-ledger.js';
+import { V3_EXTERNAL_ERROR_CODES } from '../workflows/v3/external-executor.js';
 import { readJournal } from '../workflows/v3/journal.js';
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import {
@@ -103,6 +104,9 @@ export type WorkflowHandoffEvent =
   /** A later turn started in the node session (clears "stopped"). */
   | (EventKey & { kind: 'active'; at?: number })
   | (EventKey & { kind: 'blocked'; reason: string })
+  /** The executing bot's daemon refused to start the node session in the
+   *  run's Gate-2 working dir (design §15.4); no session exists for it. */
+  | (Omit<EventKey, 'sessionId'> & { kind: 'refused'; reason: string })
   | (EventKey & { kind: 'progress' })
   /** A submission was staged while this daemon looked offline: drive once
    *  so the staged install is committed now rather than at the next wake. */
@@ -169,6 +173,20 @@ export async function handleWorkflowHandoffEvent(raw: unknown, deps: WorkflowHan
   const run = deps.loadRun(runDir);
   if (!run || run.nodeExecutor !== 'bot' || (run.chatId && run.chatId !== binding.targetChatId)) {
     return { status: 409, body: { ok: false, error: 'run_not_bot_executed' } };
+  }
+  if (raw.kind === 'refused') {
+    // No session was started; an attempt a session already accepted is not
+    // closed by this (reportExternalBlocked: session-mismatch).
+    const reason = typeof raw.reason === 'string' ? raw.reason : '';
+    const outcome = reportExternalBlocked(runDir, {
+      attemptId: binding.workflow.attemptId,
+      ...(binding.workflow.instanceId ? { instanceId: binding.workflow.instanceId } : {}),
+      reason,
+      errorCode: V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED,
+    });
+    if (!outcome.ok) return rejection(outcome.reason);
+    deps.drive(runId);
+    return { status: 200, body: { ok: true, outcome: 'blocked' } };
   }
   const sessionId = typeof raw.sessionId === 'string' && raw.sessionId ? raw.sessionId : undefined;
   if (!sessionId) return { status: 400, body: { ok: false, error: 'missing_session_id' } };

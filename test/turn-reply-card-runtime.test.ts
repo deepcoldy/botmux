@@ -6,12 +6,12 @@ import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { getBot } from '../src/bot-registry.js';
 import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, supersedeTurnReplyCard, sweepInterruptedReplyCards, queueTurnReplyTools, flushTurnReplyTools } from '../src/core/turn-reply-card.js';
-import { MessageWithdrawnError, updateMessage } from '../src/im/lark/client.js';
+import { MessageWithdrawnError, updateMessage, uploadFile, replyMessage, sendMessage } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 import type { CotEntry } from '../src/types.js';
-import { replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnReplyCard, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
 import { bindGroupContextDelivery, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import { readGroupContextAuthorOrigin } from '../src/services/group-context-publication.js';
@@ -25,7 +25,8 @@ vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.f
 vi.mock('../src/im/lark/card-handler.js', () => ({ resolveCardOperatorUnionId: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: vi.fn(), normalizeUsageDisplay: () => 'off' }));
 vi.mock('../src/im/lark/client.js', () => ({
-  updateMessage: vi.fn(async () => {}), uploadFile: vi.fn(), MessageWithdrawnError: class extends Error {},
+  updateMessage: vi.fn(async () => {}), uploadFile: vi.fn(), replyMessage: vi.fn(), sendMessage: vi.fn(),
+  MessageWithdrawnError: class extends Error {},
 }));
 vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh', t: (key: string) => key }));
 vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
@@ -51,6 +52,99 @@ describe('reply-card runtime eligibility and recovery', () => {
     vi.mocked(observePublishedGroupMessage).mockClear();
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+
+  it.each(['oc_mode', 'om_root'])('recovers a failed overflow with stable delivery identity for root %s', async rootId => {
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: 'app_mode', sessionId: 'sid_mode', turnId: 'om_mode' };
+    await store.prepare(key, { mode: 'unified', chatId: 'oc_mode', rootId });
+    const io = {
+      render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, { canStop: true }),
+      beforeEffect: vi.fn(), isWithdrawn: () => false,
+      send: vi.fn(async () => 'om_reply'), patch: vi.fn(async () => {}),
+      sendOverflow: vi.fn(async () => { throw new Error('upload unavailable'); }),
+    };
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'progress', text: 'Long process '.repeat(600) }, io);
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed' }, io)).rejects.toThrow('upload unavailable');
+    const record = store.read(key)!;
+    record.createdAtMs = record.updatedAtMs = 1;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+    vi.mocked(uploadFile).mockReset().mockResolvedValue('file_recovered');
+    vi.mocked(replyMessage).mockReset();
+    vi.mocked(sendMessage).mockReset();
+    const files = new Set<string>();
+    let first = true;
+    const deliver = async (uuid: string) => {
+      files.add(uuid);
+      if (first) {
+        first = false;
+        throw new Error('attachment ACK lost');
+      }
+      return 'om_file_recovered';
+    };
+    vi.mocked(replyMessage).mockImplementation(async (_app, _root, _content, _type, _thread, uuid) => deliver(uuid!));
+    vi.mocked(sendMessage).mockImplementation(async (_app, _chat, _content, _type, uuid) => deliver(uuid!));
+    vi.mocked(updateMessage).mockRejectedValueOnce(new Error('PATCH unavailable'));
+    const restartSweep = async () => {
+      // Each retry models another daemon start, after the failed attempt.
+      const persisted = store.read(key)!;
+      persisted.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(persisted));
+      await sweepInterruptedReplyCards(key.larkAppId);
+    };
+    await restartSweep();
+    expect(store.read(key)?.publishPending).toBe(true);
+    await restartSweep();
+    expect(store.read(key)).toMatchObject({ phase: 'completed', overflowMessageId: 'om_file_recovered', pendingPatch: { final: false } });
+    await restartSweep();
+    expect(store.read(key)?.publishPending).toBeUndefined();
+    expect(store.read(key)?.pendingPatch).toBeUndefined();
+    expect(uploadFile).toHaveBeenCalledTimes(2);
+    expect(files.size).toBe(1);
+    expect(rootId === 'oc_mode' ? sendMessage : replyMessage).toHaveBeenCalledTimes(2);
+    expect(rootId === 'oc_mode' ? replyMessage : sendMessage).not.toHaveBeenCalled();
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'] as const)(
+    'startup retries an unacknowledged %s PATCH and preserves its terminal facts', async phase => {
+      const ds = session();
+      const store = new TurnReplyCardStore(dir);
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      await store.prepare(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
+      const io = {
+        render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, { canStop: true }),
+        beforeEffect: vi.fn(), isWithdrawn: () => false,
+        send: vi.fn(async () => 'om_reply'), patch: vi.fn(async () => {}),
+      };
+      await store.update(key, { kind: 'start' }, io);
+      io.patch.mockRejectedValueOnce(new Error('PATCH unavailable'));
+      await expect(store.update(key, { kind: 'terminal', phase, durationMs: 1234 }, io)).rejects.toThrow();
+      const record = store.read(key)!;
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+
+      bot.config.apiOnly = true;
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).not.toHaveBeenCalled();
+      expect(store.read(key)?.pendingPatch).toEqual(record.pendingPatch);
+      bot.config.apiOnly = false;
+      await sweepInterruptedReplyCards('other_app');
+      expect(updateMessage).not.toHaveBeenCalled();
+      vi.mocked(updateMessage).mockRejectedValueOnce(new Error('provider unavailable'));
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(store.read(key)?.pendingPatch).toEqual(record.pendingPatch);
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).toHaveBeenLastCalledWith(ds.larkAppId, 'om_reply', record.pendingPatch!.content,
+        { returnAcknowledgement: true });
+      expect(store.read(key)).toMatchObject({ phase, durationMs: 1234, lastCard: record.pendingPatch!.content });
+      expect(store.read(key)?.pendingPatch).toBeUndefined();
+      expect(io.send).toHaveBeenCalledTimes(1);
+      const calls = vi.mocked(updateMessage).mock.calls.length;
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).toHaveBeenCalledTimes(calls);
+    },
+  );
 
   describe.each(['traex', 'pi'] as const)('%s transcript to reply card', cliId => {
     function harness() {

@@ -391,10 +391,19 @@ export function recordExternalStalled(
 const BOT_REPORT_MESSAGE_MAX_CHARS = 2000;
 
 /** The target bot said it cannot complete the node (`--status blocked|failed`).
- *  Both settle as `nodeBlocked(BOT_REPORTED_BLOCKED)` with the bot's reason. */
+ *  Both settle as `nodeBlocked(BOT_REPORTED_BLOCKED)` with the bot's reason.
+ *  `WORKING_DIR_REFUSED`: its daemon refused to start the node session in the
+ *  run's working dir (§15.4) — sent without a session, so an attempt some
+ *  session has already accepted is never closed by it (session-mismatch). */
 export function reportExternalBlocked(
   runDir: string,
-  input: { attemptId: string; instanceId?: string; sessionId?: string; reason: string },
+  input: {
+    attemptId: string;
+    instanceId?: string;
+    sessionId?: string;
+    reason: string;
+    errorCode?: typeof V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED | typeof V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED;
+  },
 ): V3ExternalRecordOutcome {
   const message = input.reason.trim().slice(0, BOT_REPORT_MESSAGE_MAX_CHARS) || 'bot reported blocked';
   return withJournalMutationSync(journalPathOf(runDir), ({ events, append }) => {
@@ -406,7 +415,7 @@ export function reportExternalBlocked(
       ...(current.attempt.instanceId ? { instanceId: current.attempt.instanceId } : {}),
       attemptId: current.attempt.attemptId,
       errorClass: 'workerError',
-      errorCode: V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED,
+      errorCode: input.errorCode ?? V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED,
       message,
     }, { durable: true });
     return { ok: true };

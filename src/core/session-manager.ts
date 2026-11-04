@@ -5363,6 +5363,10 @@ export interface WorkflowNodeTurnInput {
   /** Only for a handoff that carries the run initiator's delegation (design
    *  §10): publish the turn's tool identity before the CLI gets the turn. */
   prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  /** The run's Gate-2 `--working-dir`, already checked against this bot's
+   *  range (design §15.4): a NEW node session starts there instead of the
+   *  bot's default; an existing one keeps its directory. */
+  workingDir?: string;
 }
 
 /**
@@ -5449,10 +5453,14 @@ export async function deliverWorkflowNodeTurn(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: false,
-      workingDir: effectiveDefaultWorkingDir(bot.config),
+      workingDir: input.workingDir ?? effectiveDefaultWorkingDir(bot.config),
       initialStartPending: true,
       pendingPrompt: input.prompt,
     };
+    if (input.workingDir !== undefined) {
+      session.workingDir = input.workingDir;
+      sessionStore.updateSession(session);
+    }
     ensureSessionWhiteboard(ds);
     const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
       ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,

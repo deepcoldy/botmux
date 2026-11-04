@@ -7642,6 +7642,24 @@ dialog.onboarding-dialog::backdrop {
   box-sizing: border-box;
   resize: vertical;
 }
+.roles-listener-identity-keywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.roles-listener-identity-keyword {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--fg);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
 .roles-listener-policy {
   display: inline-flex;
   align-items: center;
@@ -33496,6 +33514,17 @@ a.card-menu-item {
 }
 
 /* ─── doc-watches 文档评论监听页 ─── */
+.doc-comment-failures {
+  margin: 12px 0;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow-wrap: anywhere;
+}
+.doc-comment-failures summary { cursor: pointer; font-weight: 600; }
+.doc-comment-failures p { margin: 8px 0; }
+.doc-comment-failures ul { margin: 12px 0 0; padding-left: 20px; }
+.doc-comment-failures li + li { margin-top: 12px; }
 .dw-add {
   display: grid;
   gap: 10px;
@@ -35553,6 +35582,11 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfs-detail-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .35rem; }
 .wfs-detail .v3r-nodeid { font-size: 14px; }
 .wfs-hint { margin: 0; font-size: 12px; }
+.wfs-revisions {
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: .6rem .75rem; background: var(--surface);
+}
+.wfs-revisions .v3r-revisions { margin-top: 0; }
 .wfs-denied { margin: 48px auto; max-width: 420px; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.7; }
 
 /* Dedicated-group naming keeps mode, model and feedback readable at narrow widths. */

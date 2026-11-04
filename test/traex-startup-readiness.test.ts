@@ -40,6 +40,32 @@ const REPOSITORY_NOTICE = [
 ];
 
 describe('TraeX startup repository notification', () => {
+  const resumedNotice = [
+    '■ Conversation interrupted - use /feedback if something went wrong',
+    '',
+    '────────────────────────────────────────────────────',
+    '❯ Write tests for @filename',
+    '────────────────────────────────────────────────────',
+    '  无法访问 Git 仓库 `git@example.invalid`，请确认该仓库权限或地址。',
+  ].join('\n');
+
+  it('accepts a known repository notice on an exact resumed session without a cold-start banner', () => {
+    expect(traexRestoredComposerReady(resumedNotice, { resumedSession: true })).toBe(true);
+    expect(traexRestoredComposerReady(resumedNotice)).toBe(false);
+  });
+
+  it.each([
+    resumedNotice.replace('Write tests for @filename', 'my unsent draft'),
+    resumedNotice.replace('Write tests for @filename', '1. Pick a model'),
+    `Sign in to TraeCode CLI\n${resumedNotice}`,
+    `│ model: loading /model to change │\n${resumedNotice}`,
+    resumedNotice.replace('■ Conversation interrupted - use /feedback if something went wrong', '◆ Working… (3s • esc to interrupt)'),
+    `${resumedNotice}\n  a wrapped draft continuation`,
+    resumedNotice.replace('无法访问 Git 仓库 `git@example.invalid`，请确认该仓库权限或地址。', 'Please sign in before continuing'),
+  ])('keeps blocked resumed input surfaces gated: %j', (screen) => {
+    expect(traexRestoredComposerReady(screen, { resumedSession: true })).toBe(false);
+  });
+
   it('accepts the initialized composer while the transient repository notice hides the model footer', () => {
     expect(traexRestoredComposerReady(REPOSITORY_NOTICE.join('\n'))).toBe(true);
     expect(traexRestoredComposerReady(REPOSITORY_NOTICE.join('\n').replace('Write tests for @filename', 'Ask TRAE CLI to do anything'))).toBe(true);

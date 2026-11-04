@@ -1,5 +1,7 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'feedback.storage.choose': 'Feedback storage: SQLite [default] / PostgreSQL (sqlite/postgresql): ',
+  'feedback.storage.configPath': 'PostgreSQL config JSON path (credential reference only, no plaintext password): ',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [task] — Change Codex reasoning effort; a task may follow on the same or subsequent lines and is submitted after confirmation. CLI affects future turns; App active-turn updates require step_model_switching (off by default; levels depend on the model)',
   'cmd.effort.task_not_submitted': 'The attached task was not submitted: the effort change was unconfirmed, the session changed, or input is unavailable. The task remains in the original message; retry the task. Task: {task}',
   'cmd.effort.cli_next_turn': 'This session will use {effort} starting with the next turn; the running turn keeps its original effort.',
@@ -1376,6 +1378,10 @@ export const messages: Record<string, string> = {
   'card.models.changed': 'Settings or permissions changed. Send /models again.',
   'card.models.default_title': 'Set the default model and reasoning effort',
   'card.models.default_effect': 'New sessions use this default model.',
+  'card.models.load_percent': 'Load {percent}%',
+  'card.models.load_unknown': 'Load unknown',
+  'card.models.load_unavailable': 'Load data is unavailable. Unknown does not mean idle. Models remain selectable; reopen /models to retry.',
+  'card.models.load_snapshot': 'Load snapshot: {time}. Lower values mean less busy; values can exceed 100%. Unknown means no data. Reopen /models to refresh.',
   'card.models.cli_default': 'Use the CLI default model',
   'card.reply_actions.model_loading': 'Loading available models…',
   'card.reply_actions.model_title': 'Switch this session’s model',
@@ -1714,6 +1720,7 @@ export const messages: Record<string, string> = {
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': 'Proactive start (joined chat)',
+  'daemon.auto_start_join_prompt': 'You have just joined this chat. Use the provided chat name and description, and read recent chat messages if needed, to understand its purpose and any unfinished task explicitly assigned to you. Treat history as background rather than automatically treating old requests as new tasks. If a task is clearly assigned to you, continue under the existing permissions and rules. If there is no clear task or not enough information, briefly tell the chat that you are ready and how to send you a task, then wait for a new request. Do not invent the chat purpose or tasks.',
   'daemon.auto_start_join_seed': '🚀 Joined this chat — getting to work…',
   'daemon.cmd_requires_session': '{cmd} requires an existing session (send a normal message first to start the CLI).',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} is a management command, restricted to `allowedUsers`. To authorize, ask the owner to add you to this bot\'s `allowedUsers` (Dashboard or bots.json).',
@@ -2096,6 +2103,10 @@ export const messages: Record<string, string> = {
   'card.ask.submit_confirm_empty': 'Confirm empty submit',
   'card.ask.empty_warning': "⚠️ You haven't selected any option. Multi-select allows choosing none; if you really mean an empty answer, click \"Confirm empty submit\" again, otherwise select first and submit.",
   'card.ask.toast.empty_confirm_needed': 'Nothing selected — click confirm once more to answer empty',
+  'card.ask.custom_input': "Other / custom answer",
+  'card.ask.custom_input_hint': "Enter another answer",
+  'card.ask.toast.draft_conflict': "The card changed. Review the current answers and submit again.",
+  'card.ask.toast.invalid_custom': "Answer each question and shorten custom text (1000 characters per question, 2000 total) to fit the card.",
   'card.ask.custom_reply_hint': '💬 None of the options fit? Just reply with your answer in this topic.',
   'card.ask.async_limit': 'Too many question cards are pending. Answer the existing cards before asking this question again.',
   'card.ask.async_invalid': 'This async question format is unsupported. Ask the bot to issue a new question.',

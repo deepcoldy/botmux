@@ -3,6 +3,8 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'feedback.storage.choose': '反馈存储：SQLite [默认] / PostgreSQL (sqlite/postgresql)：',
+  'feedback.storage.configPath': 'PostgreSQL 配置 JSON 路径（仅凭据引用，不填明文密码）：',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
   'cmd.effort.task_not_submitted': '附带任务未投递：推理强度修改未确认、会话已变化或输入通道不可用。任务已保留在原消息，请重试本条任务。任务：{task}',
   'cmd.effort.cli_next_turn': '当前会话的推理强度已设为 {effort}，从下一轮生效；正在执行的这一轮保持原强度。',
@@ -1375,6 +1377,10 @@ export const messages: Record<string, string> = {
   'card.models.changed': '设置或权限已变化，请重新发送 /models。',
   'card.models.default_title': '设置默认模型和思考强度',
   'card.models.default_effect': '新会话使用此默认模型。',
+  'card.models.load_percent': '负载 {percent}%',
+  'card.models.load_unknown': '负载未知',
+  'card.models.load_unavailable': '当前未获取到负载信息，未知不代表空闲。仍可选择模型，重新打开 /models 可重试。',
+  'card.models.load_snapshot': '负载快照：{time}。数值越低越空闲，也可能超过 100%；未知表示没有数据。重新打开 /models 刷新。',
   'card.models.cli_default': '使用 CLI 默认模型',
   'card.reply_actions.model_loading': '正在读取可用模型…',
   'card.reply_actions.model_title': '切换当前会话模型',
@@ -1715,6 +1721,7 @@ export const messages: Record<string, string> = {
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': '主动开工（入群）',
+  'daemon.auto_start_join_prompt': '你刚刚被加入这个群。请结合已提供的群名称、描述，按需读取近期群消息，了解群的目标和明确交给你的未完成任务。历史消息仅作背景，不要把其中的请求自动当成新任务。若有明确分配给你的任务，按现有权限和规则继续处理；若没有明确任务或信息不足，请向群里简短说明你已就绪、如何向你发起任务，然后等待新的请求。不要编造群目标或任务。',
   'daemon.auto_start_join_seed': '🚀 已加入本群，开始工作…',
   'daemon.cmd_requires_session': '{cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} 是管理命令，仅 allowedUsers 可执行。需要授权请让 owner 把你加入该 Bot 的 allowedUsers（Dashboard 或 bots.json）。',
@@ -2094,6 +2101,10 @@ export const messages: Record<string, string> = {
   'card.ask.submit_confirm_empty': '确认空提交',
   'card.ask.empty_warning': '⚠️ 你还没有勾选任何选项。多选允许「一个都不选」，如确实要以空作答，请再次点击「确认空提交」；否则先勾选再提交。',
   'card.ask.toast.empty_confirm_needed': '未勾选任何选项，如确实要空作答请再点一次确认',
+  'card.ask.custom_input': "其他／自定义",
+  'card.ask.custom_input_hint': "输入其他答案",
+  'card.ask.toast.draft_conflict': "卡片已更新，请检查当前答案后再提交",
+  'card.ask.toast.invalid_custom': "请答完每道题并缩短自定义内容（单题 1000 字，全卡 2000 字），避免卡片超长",
   'card.ask.custom_reply_hint': '💬 选项都不合适？直接在话题里回复你的答案即可。',
   'card.ask.async_limit': '待答卡片已达上限，请先回答现有卡片后重新发起此问题。',
   'card.ask.async_invalid': '这次异步提问的格式不受支持，请让机器人重新发起。',
