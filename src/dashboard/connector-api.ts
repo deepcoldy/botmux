@@ -250,6 +250,8 @@ function sameConnectorTarget(
 /** Human-readable reasons for normalize errors whose code alone does not tell
  *  the API caller what to change. */
 const NORMALIZE_ERROR_MESSAGES: Record<string, string> = {
+  trust_payload_requires_turn_target:
+    'promptEnvelope.trustPayload only applies to turn connectors; legacy workflow targets never render a trusted payload.',
   trust_payload_requires_verification:
     'promptEnvelope.trustPayload can only be enabled on a connector verified by token or hmac-sha256 with a stored secret: '
     + 'a trusted payload is executed as instructions, so unauthenticated deliveries must not be able to reach it.',
@@ -262,7 +264,15 @@ function normalizeErrorBody(error: string): { ok: false; error: string; message?
 
 function normalizeConnectorInput(
   raw: unknown,
-  opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string },
+  opts: {
+    id?: string;
+    prior?: ConnectorDefinition | null;
+    secretRef?: string;
+    /** This request will (re)write the secret after validation (PUT with
+     *  `secret` / `rotateSecret`): count it as present for the trust gate, so
+     *  a trusted connector whose secret went missing can still be repaired. */
+    secretWillBeWritten?: boolean;
+  },
 ): { ok: true; connector: ConnectorDefinition } | { ok: false; error: string } {
   const body = record(raw);
   const c = record(body.connector ?? body);
@@ -406,7 +416,13 @@ function normalizeConnectorInput(
     return { ok: false, error: 'legacy_workflow_connector_target_immutable' };
   }
   if (next.promptEnvelope.trustPayload) {
-    const blocker = connectorPayloadTrustBlocker(next, !!getWebhookSecret(next.verify.secretRef));
+    // Only turn targets render through the trusted prompt; refuse it elsewhere
+    // rather than show a setting that silently does nothing.
+    if (next.target.kind !== 'turn') return { ok: false, error: 'trust_payload_requires_turn_target' };
+    const blocker = connectorPayloadTrustBlocker(
+      next,
+      opts.secretWillBeWritten === true || !!getWebhookSecret(next.verify.secretRef),
+    );
     if (blocker) return { ok: false, error: blocker };
   }
   return { ok: true, connector: next };
@@ -539,6 +555,7 @@ export async function handleConnectorApi(
           id,
           prior,
           secretRef: prior.verify.secretRef,
+          secretWillBeWritten: (typeof body.secret === 'string' && !!body.secret) || body.rotateSecret === true,
         });
         if (!preflight.ok) {
           jsonRes(res, 400, normalizeErrorBody(preflight.error));

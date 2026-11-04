@@ -422,6 +422,26 @@ describe('connector-api write routes', () => {
       }
     });
 
+    it('lets a trusted connector whose secret went missing be repaired by setting or rotating the secret', async () => {
+      for (const body of [{ secret: 'fresh-secret' }, { rotateSecret: true }]) {
+        const { deleteConnector } = await import('../src/services/connector-store.js');
+        deleteConnector('conn_seed');
+        await seedConnector({ trustPayload: true, secretPresent: false });
+        const blocked = await put('conn_seed', { name: 'Edited' });
+        expect(blocked.status).toBe(400);
+        const repaired = await put('conn_seed', body);
+        expect(repaired.status).toBe(200);
+        expect((await json(repaired)).connector.promptEnvelope.trustPayload).toBe(true);
+      }
+    });
+
+    it('rejects trustPayload on a legacy workflow connector', async () => {
+      await seedLegacyWorkflowConnector();
+      const res = await put('conn_legacy_workflow', { promptEnvelope: { sourceName: 'legacy-report', trustPayload: true } });
+      expect(res.status).toBe(400);
+      expect((await json(res)).error).toBe('trust_payload_requires_turn_target');
+    });
+
     it('keeps an older connector (no field) off across edits, byte-identical promptEnvelope', async () => {
       const seeded = await seedConnector();
       const res = await json(await put('conn_seed', { name: 'Edited' }));

@@ -338,7 +338,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   // Mirrors the server gate (connectorPayloadTrustBlocker): a trusted payload is
   // only offered on a verified connector. The server re-checks on save and at
   // dispatch, so this is presentation, not the boundary.
-  const trustPayloadAllowed = form.verify === 'token' || form.verify === 'hmac-sha256';
+  const trustPayloadAllowed = form.kind === 'turn' && (form.verify === 'token' || form.verify === 'hmac-sha256');
 
   const groupName = useCallback((chatId: string): string => {
     const g = groups.find(x => x.chatId === chatId);
@@ -602,7 +602,9 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       } else {
         const e = r.body?.error === 'trust_payload_requires_verification'
           ? tr('connectors.errTrustPayloadVerify')
-          : r.body?.error || r.status;
+          : r.body?.error === 'trust_payload_requires_turn_target'
+            ? tr('connectors.errTrustPayloadTurn')
+            : r.body?.error || r.status;
         setCreateMsg({ text: tr('connectors.createFailed', { error: String(e) }), error: true });
       }
     } finally {
@@ -1049,7 +1051,9 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
             <span>
               <strong>{tr('connectors.trustPayload')}</strong>
               <small id="cn-trust-payload-hint">
-                {tr(trustPayloadAllowed ? 'connectors.trustPayloadHint' : 'connectors.errTrustPayloadVerify')}
+                {tr(trustPayloadAllowed
+                  ? 'connectors.trustPayloadHint'
+                  : form.kind !== 'turn' ? 'connectors.errTrustPayloadTurn' : 'connectors.errTrustPayloadVerify')}
               </small>
               {trustPayloadAllowed
                 ? <small id="cn-trust-payload-risk" className="connector-trust-payload-risk" role="note">{tr('connectors.trustPayloadRisk')}</small>

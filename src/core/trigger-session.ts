@@ -169,6 +169,13 @@ export function isTrustedPayloadRequest(req: TriggerRequest): boolean {
   return req.payloadTrusted === true && req.source.type === 'webhook';
 }
 
+/** Whether a trusted payload addressed by explicit sessionId may land in a
+ * session living in `sessionChatId`. Exported for tests. */
+export function trustedPayloadSessionInScope(requestChatId: string | undefined, sessionChatId: string): boolean {
+  if (requestChatId) return sessionChatId === requestChatId;
+  return sessionChatId.startsWith('http_async_') || sessionChatId.startsWith('http_wait_');
+}
+
 export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string): string {
   const applicationContext = buildExternalEventApplicationContext(req);
   const eventData = buildExternalEventDataContext(req, triggerId);
@@ -225,7 +232,9 @@ export function buildExternalEventDataContext(req: TriggerRequest, triggerId: st
       '',
       '<botmux_external_event trusted="true">',
       '```json',
-      JSON.stringify({ ...body, envelope: { ...body.envelope, trusted: true } }, null, 2),
+      // `<` is escaped (still valid JSON) so a payload string cannot forge a
+      // closing tag or a <botmux_task> block that outranks the owner instruction.
+      JSON.stringify({ ...body, envelope: { ...body.envelope, trusted: true } }, null, 2).replace(/</g, '\\u003c'),
       '```',
       '</botmux_external_event>',
     );
@@ -1235,6 +1244,20 @@ async function triggerSessionTurnAdmitted(
   let ds = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
   if (req.target.sessionId && !ds) {
     return { ok: false, errorCode: 'session_not_found', error: `active session not found: ${req.target.sessionId}` };
+  }
+
+  // A trusted payload executes as instructions, so it must stay inside the
+  // connector's scope. The edge enforces fixed chatId / allowChats on chatId,
+  // but an explicit sessionId resolves to whatever chat that session lives in.
+  // Require it to be the request's own chat, or (no chatId) an HTTP async/wait
+  // virtual session, i.e. the caller continuing its own programmatic session.
+  if (ds && req.target.sessionId && isTrustedPayloadRequest(req)
+    && !trustedPayloadSessionInScope(req.target.chatId, ds.chatId)) {
+    return {
+      ok: false,
+      errorCode: 'chat_not_allowed',
+      error: 'a trusted webhook payload may only continue a session in the request chatId, or an HTTP async/wait session when no chatId is given',
+    };
   }
 
   let chatId = req.target.chatId ?? ds?.chatId;
