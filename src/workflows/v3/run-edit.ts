@@ -47,6 +47,7 @@ import {
   v3RevisionFilePaths,
   V3_DAG_REVISIONS_DIR,
   V3DagPatchError,
+  V3_DAG_PATCH_NOTE_MAX,
   type V3DagPatch,
   type V3RerunBudgetBlock,
   v3RevisitBudgetEpoch,
@@ -68,6 +69,7 @@ import { voidWaitOnce } from './gate-wait-store.js';
 import { isValidRunId } from './ops-projection.js';
 import type { RunChatBinding } from './grill-state.js';
 import { resolveV3RunInitiator, type V3RunEditTurnOrigin } from './cli-daemon-command-authority.js';
+import { v3ReasonRequiredProblem } from './action-provenance.js';
 
 // ─── Who may change the flow directly (M1) ────────────────────────────────
 
@@ -77,6 +79,9 @@ export interface V3RunEditCaller {
   /** Authenticated human of the current turn. */
   openId: string;
   origin: V3RunEditTurnOrigin;
+  /** The CLI runs inside a `workflow-event:` turn: `--reason` is required
+   *  (design §13.6, see `v3ReasonRequiredProblem`). */
+  wakeTurn?: boolean;
 }
 
 export type V3RunEditTurnClass = 'initiator' | 'runEvent' | 'other';
@@ -113,10 +118,11 @@ export function v3RevisionActor(caller: V3RunEditCaller): string {
   return caller.origin === 'runEvent' ? 'main_bot' : caller.openId;
 }
 
-/** Why the main bot acted (§13.6). The reason becomes mandatory with the
- *  wake-up wiring; until then it is the edit's note (may be empty). */
-function autoProvenance(caller: V3RunEditCaller, note: string | undefined): { auto?: { reason: string } } {
-  return caller.origin === 'runEvent' ? { auto: { reason: note ?? '' } } : {};
+/** Why the main bot acted (§13.6): its `--reason` — mandatory in a wake
+ *  turn — else, for a turn that may leave it out (a scheduled turn), the
+ *  edit's note, possibly empty. */
+function autoProvenance(caller: V3RunEditCaller, note: string | undefined, reason: string | undefined): { auto?: { reason: string } } {
+  return caller.origin === 'runEvent' ? { auto: { reason: reason ?? note ?? '' } } : {};
 }
 
 function autoOf(value: { auto?: { reason: string } }): { auto?: { reason: string } } {
@@ -342,6 +348,9 @@ export interface ApplyV3RunEditInput {
   patch: unknown;
   baseRevision: number;
   caller: V3RunEditCaller;
+  /** `--reason`: why the change is made. Required in a wake turn; in a human
+   *  turn it stands in for the patch's `note` when that is absent. */
+  reason?: string;
   /** Resolve a bot the run has not used yet (proposal-only). Throws when the
    *  selector names no usable bot. */
   resolveNewBotSnapshot: (selector: string) => BotSnapshot;
@@ -462,6 +471,13 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
   } catch (err) {
     return { kind: 'invalid', problems: err instanceof V3DagPatchError ? err.problems : [String(err)] };
   }
+  const reason = input.reason?.trim() || undefined;
+  const missingReason = v3ReasonRequiredProblem(input.caller, reason);
+  if (missingReason) return { kind: 'invalid', problems: [missingReason] };
+  // A human turn's reason is its note when the patch has none (display only).
+  if (input.caller.origin === 'human' && reason && !patch.note) {
+    patch = { ...patch, note: reason.slice(0, V3_DAG_PATCH_NOTE_MAX) };
+  }
   const runDir = runDirFor(input.baseDir, input.runId);
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
@@ -482,7 +498,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
   }
   const turn = classifyV3RunEditTurn(run.initiatorOpenId, input.caller);
   const actor = v3RevisionActor(input.caller);
-  const auto = autoProvenance(input.caller, patch.note);
+  const auto = autoProvenance(input.caller, patch.note, reason);
 
   type Locked =
     | Exclude<V3RunEditOutcome, { kind: 'applied' | 'proposed' }>

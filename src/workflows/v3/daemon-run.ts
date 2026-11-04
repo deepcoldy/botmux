@@ -612,7 +612,7 @@ export function loadV3RunDagForRecovery(runDir: string): V3Dag | undefined {
  * failing its digest check makes the run unloadable (fail closed).
  */
 export function loadV3BotExecutedRun(runDir: string):
-  | { dag: V3Dag; nodeExecutor: 'bot'; chatId?: string; title: string }
+  | { dag: V3Dag; authorizedDag: V3Dag; nodeExecutor: 'bot'; chatId?: string; title: string }
   | undefined {
   try {
     const read = readRunEnvelope(runDir);
@@ -622,6 +622,7 @@ export function loadV3BotExecutedRun(runDir: string):
     const effective = loadEffectiveV3Dag(runDir, loaded.dag, existsSync(journalPath) ? readJournal(journalPath) : []);
     return {
       dag: effective.dag,
+      authorizedDag: loaded.dag,
       nodeExecutor: 'bot',
       ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
       title: loaded.spec?.title?.trim() || basename(runDir),
@@ -1280,7 +1281,14 @@ function answerPreview(s: string): string {
 export function requestV3Retry(
   baseDir: string,
   runId: string,
-  input: { nodeId?: string; expectedAttemptId?: string; answer?: V3RetryAnswerInput } = {},
+  input: {
+    nodeId?: string;
+    expectedAttemptId?: string;
+    answer?: V3RetryAnswerInput;
+    /** Who decided the retry and why (`v3ActionRecord`); absent = the
+     *  event keeps its original shape (card clicks, human turns). */
+    record?: { by?: string; auto?: { reason: string }; note?: string };
+  } = {},
 ): V3RetryOutcome {
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
@@ -1402,6 +1410,9 @@ export function requestV3Retry(
     previousErrorCode: info.errorCode,
     ...(resetGate ? { resetGate: true } : {}),
     ...(answer ? { answer } : {}),
+    ...(input.record?.by ? { by: input.record.by } : {}),
+    ...(input.record?.auto ? { auto: input.record.auto } : {}),
+    ...(input.record?.note ? { note: input.record.note } : {}),
   });
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
 }

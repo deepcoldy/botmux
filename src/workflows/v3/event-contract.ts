@@ -113,12 +113,23 @@ export interface V3RevisionEffects {
   assign?: Array<{ nodeId: string; from?: string; to: string }>;
 }
 
-/** Set when the main bot made the change on its own in a turn woken by
- *  this run's events (design §13.6). The reason becomes mandatory with the
- *  wake-up wiring; until then it carries the edit's note (may be empty). */
+/** Set when the main bot made the change on its own (`by: 'main_bot'`):
+ *  a turn woken by this run's events, or another turn no message of the
+ *  initiator opened (design §13.6). `reason` is the `--reason` the CLI
+ *  requires in a wake turn; elsewhere it may fall back to the edit's note or
+ *  be empty. */
 export interface V3AutoProvenance {
   reason: string;
 }
+
+/** Why a checkpoint's dependants may go on (design §13.6):
+ *  `wakeTurnEnded` — the main bot's turn for its wake-up ended (it may have
+ *  changed the flow in it); `wakeNotDelivered` — the wake-up could not be
+ *  delivered after its retries; `wakeSessionEnded` — the session that took
+ *  the wake-up was closed, or its CLI stopped, before that turn was seen to
+ *  end; `holdTimeout` — the safety cap on how long a checkpoint may hold its
+ *  dependants ran out. */
+export type V3CheckpointReleaseReason = 'wakeTurnEnded' | 'wakeNotDelivered' | 'wakeSessionEnded' | 'holdTimeout';
 
 export type V3Event =
   | {
@@ -361,9 +372,41 @@ export type V3Event =
       previousErrorCode?: string;
       resetGate?: boolean;
       answer?: { path: string; preview: string; by: string };
-      /** Operator (`main_bot` for an automatic retry), when recorded. */
+      /** Operator, when recorded: `main_bot` for a retry the main bot
+       *  decided on its own (with `auto`), the caller's open_id for a human
+       *  turn that gave a reason (with `note`). A retry recorded without a
+       *  reason keeps the original shape (no `by`). */
       by?: string;
       auto?: V3AutoProvenance;
+      /** The reason a human turn gave (`--reason`), display only. */
+      note?: string;
+    }
+  | {
+      /** A checkpoint node's success may now be followed by its dependants
+       *  (design §13.6; until then they are not dispatched). Names the exact
+       *  success: its attempt and journal position. Older readers skip it. */
+      type: 'checkpointReleased';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      eventSeq: number;
+      reason: V3CheckpointReleaseReason;
+    }
+  | {
+      /** The node was handed to a human (design §13.6): a record only. The
+       *  `nodeBlocked(HANDED_TO_HUMAN)` written right after it in the same
+       *  lock closes the attempt; if a crash separates the two, the runtime
+       *  writes that block on the next drive (never waiting for a deadline). */
+      type: 'nodeHandedToHuman';
+      nodeId: string;
+      instanceId?: string;
+      /** The attempt it was handed over on (open, or the latest closed one). */
+      attemptId: string;
+      reason: string;
+      /** `main_bot`, or the initiator's open_id in their own turn. */
+      by: string;
+      /** The turn that decided it (audit). */
+      turnId?: string;
     }
   | {
       type: 'gateDispatched';

@@ -30,7 +30,7 @@ import {
   nodeTerminalSignature,
 } from '../src/dashboard/web/v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../src/workflows/v3/ops-projection.js';
-import { DagNode, NodeExecution, V3CancelButton } from '../src/dashboard/web/v3-components.js';
+import { DagNode, NodeExecution, NodeInterventions, V3CancelButton } from '../src/dashboard/web/v3-components.js';
 import { ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -466,6 +466,24 @@ describe('v3 dashboard 节点：负责 Bot、五类状态与耗时', () => {
         expect(narrow.badge?.text === nodeRevisionBadge(n) || narrow.title === nodeRevisionBadge(n)).toBe(true);
       }
     });
+  });
+
+  it('节点详情列出主 Bot 的每次自动处理和每次交给人，附理由；没有时不显示', () => {
+    const html = renderToStaticMarkup(React.createElement(NodeInterventions, {
+      node: node({
+        status: 'blocked',
+        interventions: [
+          { kind: 'retry', by: 'mainBot', reason: '上游接口偶发超时', at: 0 },
+          { kind: 'handedToHuman', by: 'initiator', reason: '需要发起人给生产权限', at: MIN },
+        ],
+      }),
+    }));
+    expect(html).toContain('主 Bot 自动重试');
+    expect(html).toContain('上游接口偶发超时');
+    expect(html).toContain('交给人决定');
+    expect(html).toContain('（发起人）');
+    expect(html).toContain('需要发起人给生产权限');
+    expect(renderToStaticMarkup(React.createElement(NodeInterventions, { node: node() }))).toBe('');
   });
 
   it('节点详情列出每次尝试的结果；只有一次成功尝试时不列清单', () => {
