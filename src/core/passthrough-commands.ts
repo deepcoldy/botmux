@@ -113,6 +113,15 @@ export function cliHasNoRawPassthroughSurface(
   return NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
 }
 
+/** Card compaction can also use MiniMax's framed ACP input. This narrow
+ * capability does not enable arbitrary raw TUI commands for its runner. */
+export function cliSupportsCompactAction(
+  cliId: string | undefined,
+  opts?: { dshRuntime?: 'official' | 'tui' },
+): boolean {
+  return cliId === 'minimax' || !cliHasNoRawPassthroughSurface(cliId, opts);
+}
+
 /**
  * Normalize a single custom passthrough command: lowercase, must match the
  * slash-command shape, and must not shadow a daemon command (passthrough is

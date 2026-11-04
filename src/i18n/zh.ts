@@ -1459,6 +1459,8 @@ export const messages: Record<string, string> = {
   'card.effort.unavailable': '会话不可用或你没有操作权限。',
   'card.action.compact_sent': '🗜️ 已发送 /compact 到 {cliName}',
   'card.action.compact_no_worker': '⚠️ CLI 未运行，无法压缩',
+  'card.action.compact_busy': '⚠️ 会话仍在处理任务，请等待空闲后再压缩',
+  'card.action.compact_failed': '⚠️ 未能提交压缩，请检查会话状态后重试',
   'card.action.compact_unsupported': '⚠️ 当前环境不支持卡片压缩，请直接发送 /compact',
   'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
   'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',

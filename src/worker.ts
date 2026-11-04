@@ -3853,7 +3853,7 @@ const STARTUP_CMD_CAP_MS = 4_000;
  *  registers the match before submit) → a separate Enter, or fall back to a
  *  single write + CR. Shared by the `raw_input` IPC handler and
  *  runStartupCommands so both stay in lockstep. */
-async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
+async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string, turnId?: string): Promise<void> {
   // Long-lived framed runners (minimax, …) must receive even raw passthrough
   // lines through their frame protocol's full submit transaction. The generic
   // literal writer has no pre-flush/chunk-retry/ambiguity semantics: a dropped
@@ -3864,7 +3864,9 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   // frame never buffered (clean failure); dirty_unknown proves nothing (hold,
   // never replay in this generation).
   if (cliAdapter?.runnerFramedInput === true) {
-    const result = await cliAdapter.writeInput(be, content);
+    const result = turnId
+      ? await cliAdapter.writeInput(be, content, { turnId })
+      : await cliAdapter.writeInput(be, content);
     if (result && result.submitted === false) {
       const ambiguous = result.submissionDisposition === 'dirty_unknown';
       // submissionStarted=false only when no frame byte could have reached the
@@ -3957,6 +3959,7 @@ async function sendRawCommandLineWithRecoveryFence(
   be: NonNullable<typeof backend>,
   content: string,
   beforeWrite?: () => void,
+  turnId?: string,
 ): Promise<void> {
   const previous = commandLineWriteTail;
   let release!: () => void;
@@ -3966,7 +3969,7 @@ async function sendRawCommandLineWithRecoveryFence(
   try {
     const transaction = await runAmbiguousSubmissionTransaction(
       be,
-      () => sendRawCommandLine(be, content),
+      () => sendRawCommandLine(be, content, turnId),
       undefined,
       beforeWrite,
     );
@@ -4467,6 +4470,14 @@ function armSessionRenameIdleTimeout(): void {
  * Commands received while /rename owns the TUI are deferred by the IPC handler
  * and come through this same function after the prompt returns. */
 async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
+  // Daemon/card readiness can lag behind a committed ordinary input. MiniMax
+  // queues native turns, so changing capture ownership while it is busy would
+  // discard that ordinary turn's final. Keep ownership until the real prompt.
+  if (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+    && (!isPromptReady || commandLineWritesPending > 0)) {
+    pendingRawInputs.push(msg);
+    return;
+  }
   const writeRawInput = async (
     targetBackend: SessionBackend,
     fence?: AdoptWriteFence,
@@ -4515,7 +4526,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // transcript; arm the capture before the bytes land.
         const btwQuestion = claudeBtwQuestion(msg.content);
         if (btwQuestion) armBtwCapture(btwQuestion, msg.turnId);
-      });
+      }, msg.turnId);
       sent = true;
       if (fence && !adoptWriteFenceIsCurrent(fence)) {
         send({
@@ -4554,6 +4565,16 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       // Do not send a bundled follow-up or another queued command against a
       // backend whose literal command write failed.
       log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
+      // A MiniMax card fences repeat clicks at IPC acceptance. A proven
+      // untouched frame leaves the native prompt unchanged, so there will be
+      // no new ready edge to release that fence. Reannounce only this exact
+      // idle backend/turn; dirty frames already take the generation-fence path.
+      const untouchedCompact = lastInitConfig?.cliId === 'minimax'
+        && msg.content.trim() === '/compact'
+        && err instanceof SubmissionWriteError && !err.submissionStarted
+        && !!msg.turnId && currentBotmuxTurnId === msg.turnId
+        && targetBackend === backend && isPromptReady
+        && !cliRestartInProgress && commandLineWritesPending === 0;
       const failedTurnId = msg.followUpTurnId ?? msg.turnId;
       if (failedTurnId && !recoveryFailureReason) {
         emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed');
@@ -4568,6 +4589,14 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
           reason: recoveryFailureReason ?? '',
         }),
       });
+      if (untouchedCompact) {
+        send({ type: 'prompt_ready' });
+        // A queued command owns isFlushing until its caller's finally runs.
+        // With no native idle edge after rejection, admitted follower messages
+        // need one fresh drain after that mutex is released (never a replay of
+        // this already-dequeued command, nor recovery for an ambiguous frame).
+        setImmediate(() => { void flushPending(); });
+      }
     }
 
     const accepted = finalizeRawCommandDelivery({
@@ -18305,7 +18334,13 @@ function markPromptReady(): void {
     deliverRestartInterruptionNote();
   }
   sandboxWrapperAwaitingFirstPrompt = undefined;
-  send({ type: 'prompt_ready' });
+  // A compact click already owns the daemon's readiness fence. The prompt
+  // between the preceding business turn and this queued command must drain
+  // the command without making the button accept another click.
+  if (!(lastInitConfig?.cliId === 'minimax'
+    && pendingRawInputs.some(input => input.content.trim() === '/compact'))) {
+    send({ type: 'prompt_ready' });
+  }
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
   if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
     // Record the actual running version while its executable is still present.
@@ -31576,6 +31611,8 @@ process.on('message', async (raw: unknown) => {
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
         || startupInputGateHolds
+        || (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+          && isFlushing)
         || hookReviewInputHold || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);
         if (hookReviewInputHold) {
