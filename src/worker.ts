@@ -16,6 +16,10 @@ import {
   startSessionProtectedHttpEgressHost,
   type SessionProtectedHttpEgressHost,
 } from './core/protected-http-egress-host.js';
+import {
+  readCodexProtectedProviderBridge,
+  type CodexProtectedProviderBridgeSelection,
+} from './core/protected-http-egress-loopback.js';
 import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
@@ -23461,6 +23465,25 @@ async function spawnCli(
     }));
   }
   const cliExtraArgs = resolveCliExtraArgs();
+  let codexProtectedProviderBridge: CodexProtectedProviderBridgeSelection | undefined;
+  if (cfg.cliId === 'codex' && cfg.protectedHttpEgressPolicy) {
+    const codexConfigHome = cfg.codexProfileHome
+      ?? (cfg.cliInstanceBinding?.source !== 'legacy' ? cfg.cliInstanceBinding?.codexHome : undefined)
+      ?? isolatedCodexHome
+      ?? process.env.CODEX_HOME?.trim()
+      ?? join(homedir(), '.codex');
+    codexProtectedProviderBridge = readCodexProtectedProviderBridge({
+      configPath: join(codexConfigHome, CODEX_CONFIG_FILE),
+      policy: cfg.protectedHttpEgressPolicy.policy,
+      socketPath: sessionProtectedHttpEgressHost?.socketPath ?? '/botmux/protected-egress-unavailable',
+    });
+    if (codexProtectedProviderBridge && !sessionProtectedHttpEgressHost) {
+      throw new Error('protected model provider bridge unavailable because the HTTP egress guard is not live');
+    }
+    if (codexProtectedProviderBridge && remoteWsUrl) {
+      throw new Error('protected model provider bridge requires model execution in the sandboxed Codex process');
+    }
+  }
 
   // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
   // runs. Computed here rather than in the wrapper-install block below because
@@ -23540,6 +23563,12 @@ async function spawnCli(
     solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
+    modelProviderBaseUrlOverride: codexProtectedProviderBridge
+      ? {
+          providerId: codexProtectedProviderBridge.providerId,
+          baseUrl: codexProtectedProviderBridge.baseUrlOverride,
+        }
+      : undefined,
     modelBackendVariant: cfg.modelBackendVariant,
     // dsh runner only; other adapters ignore the field.
     turnTimeoutMs: cfg.turnTimeoutMs,
@@ -24832,6 +24861,7 @@ async function spawnCli(
           ? sessionProtectedHttpEgressHost?.socketPath
           : undefined,
         protectedEgressRequired: !!cfg.protectedHttpEgressPolicy,
+        protectedHttpBridge: codexProtectedProviderBridge?.bridge,
         larkCliDataDir: childLarkDataRoot,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,

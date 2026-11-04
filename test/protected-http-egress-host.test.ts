@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { request } from 'node:http';
 import { createConnection } from 'node:net';
+import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -245,6 +246,51 @@ describe('session protected HTTP egress host', () => {
       'status',
       'type',
     ]);
+  });
+
+  it('streams an allowed upstream response before the upstream body completes', async () => {
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const { host, auth } = await start({
+      forward: async () => ({
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body: Readable.from((async function* () {
+          yield Buffer.from('data: first\n\n');
+          await hold;
+          yield Buffer.from('data: second\n\n');
+        })()),
+      }),
+    });
+
+    let firstChunk!: (value: string) => void;
+    const first = new Promise<string>(resolve => { firstChunk = resolve; });
+    const completed = new Promise<string>((resolve, reject) => {
+      const chunks: string[] = [];
+      const req = request({
+        socketPath: host.socketPath,
+        method: 'GET',
+        path: '/v1/items/list',
+        headers: routingHeaders(auth),
+        agent: false,
+      }, res => {
+        res.setEncoding('utf8');
+        res.on('data', chunk => {
+          chunks.push(chunk);
+          if (chunks.length === 1) firstChunk(chunk);
+        });
+        res.once('end', () => resolve(chunks.join('')));
+      });
+      req.once('error', reject);
+      req.end();
+    });
+
+    await expect(Promise.race([
+      first,
+      new Promise<string>((_resolve, reject) => setTimeout(() => reject(new Error('first chunk timed out')), 500)),
+    ])).resolves.toBe('data: first\n\n');
+    release();
+    await expect(completed).resolves.toBe('data: first\n\ndata: second\n\n');
   });
 
   it('rejects conflicting content lengths at the HTTP boundary without forwarding', async () => {

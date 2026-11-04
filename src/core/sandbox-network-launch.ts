@@ -4,15 +4,40 @@ import { fileURLToPath } from 'node:url';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { bwrapExecutable } from './system-bwrap.js';
 import { compileNetworkNft, parseSandboxNetworkPolicy, type SandboxNetworkPolicy } from './sandbox-network-policy.js';
+import type { ProtectedHttpEgressLoopbackPlan } from './protected-http-egress-loopback.js';
 
-export interface NetworkLaunchPlan { nft: string; ip: string; unshare: string; slirp: string; nftRules: string; command: string; args: string[] }
+export interface NetworkLaunchPlan {
+  nft: string;
+  ip: string;
+  unshare: string;
+  slirp: string;
+  nftRules: string;
+  command: string;
+  args: string[];
+  protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
+}
+
+export function buildNetworkLaunchPlan(plan: NetworkLaunchPlan): NetworkLaunchPlan {
+  return {
+    ...plan,
+    args: [...plan.args],
+    ...(plan.protectedHttpBridge ? {
+      protectedHttpBridge: { ...plan.protectedHttpBridge },
+    } : {}),
+  };
+}
 function executable(name: string): string {
   const found = spawnSync('/bin/sh', ['-c', `command -v ${name}`], { encoding: 'utf8' });
   const path = found.stdout?.trim();
   if (found.status !== 0 || !path?.startsWith('/')) throw new Error(`sandboxNetworkPolicy requires ${name} on PATH (no automatic installation)`);
   return path;
 }
-export function sandboxNetworkLaunch(policy: SandboxNetworkPolicy, command: string, args: string[]): { bin: string; args: string[] } {
+export function sandboxNetworkLaunch(
+  policy: SandboxNetworkPolicy,
+  command: string,
+  args: string[],
+  protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan,
+): { bin: string; args: string[] } {
   if (process.platform !== 'linux') throw new Error('sandboxNetworkPolicy requires Linux');
   parseSandboxNetworkPolicy(policy);
   const slirp = executable('slirp4netns'), nft = executable('nft'), ip = executable('ip'), unshare = executable('unshare');
@@ -27,7 +52,16 @@ export function sandboxNetworkLaunch(policy: SandboxNetworkPolicy, command: stri
   const unshareHelp = spawnSync(unshare, ['--help'], { encoding: 'utf8' });
   if (!unshareHelp.stdout?.includes('--kill-child') || !unshareHelp.stdout.includes('--mount-proc')) throw new Error('sandboxNetworkPolicy requires unshare with --kill-child and --mount-proc');
   const entry = resolveEntrySpawn('sandbox-network-runner', join(dirname(fileURLToPath(import.meta.url)), '..'));
-  const plan: NetworkLaunchPlan = { nft, ip, unshare, slirp, nftRules: compileNetworkNft(policy), command, args };
+  const plan = buildNetworkLaunchPlan({
+    nft,
+    ip,
+    unshare,
+    slirp,
+    nftRules: compileNetworkNft(policy),
+    command,
+    args,
+    ...(protectedHttpBridge ? { protectedHttpBridge } : {}),
+  });
   const encoded = Buffer.from(JSON.stringify(plan)).toString('base64');
   if (Buffer.byteLength(encoded) > 98304) throw new Error('sandboxNetworkPolicy launch plan exceeds the supported 96 KiB limit');
   return { bin: entry.command, args: [...entry.args, encoded] };

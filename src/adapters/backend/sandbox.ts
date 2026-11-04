@@ -20,6 +20,7 @@
  */
 import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
+import type { ProtectedHttpEgressLoopbackPlan } from '../../core/protected-http-egress-loopback.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
 import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
@@ -1172,6 +1173,9 @@ export function prepareDirectSandbox(opts: {
   protectedEgressSocketPath?: string;
   /** A policy exists even if guard startup failed; protected origins must not fall back direct. */
   protectedEgressRequired?: boolean;
+  /** Optional loopback bridge for a process control-plane origin that overlaps
+   *  a protected target. It is started by the network-namespace runner. */
+  protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
   /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
    *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
    *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
@@ -1194,6 +1198,11 @@ export function prepareDirectSandbox(opts: {
   childTarOptions?: string;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
+  if (opts.protectedHttpBridge && (!opts.networkPolicy
+    || !opts.protectedEgressSocketPath
+    || resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath))) {
+    throw new Error('protected HTTP loopback bridge requires the matching guarded network sandbox');
+  }
   const proxyError = networkProxyError(opts.networkPolicy, process.env);
   if (proxyError) throw new Error(proxyError);
   if (!ensureSandboxDeps()) return null;
@@ -1542,7 +1551,7 @@ export function prepareDirectSandbox(opts: {
   let networkLaunch: ReturnType<typeof sandboxNetworkLaunch> | undefined;
   try {
     networkLaunch = opts.networkPolicy
-      ? sandboxNetworkLaunch(opts.networkPolicy, launch.bin, [...launch.args, ...args])
+      ? sandboxNetworkLaunch(opts.networkPolicy, launch.bin, [...launch.args, ...args], opts.protectedHttpBridge)
       : undefined;
   } catch (error) {
     rollbackSandboxSetup(sessionRoot, createdMasks);

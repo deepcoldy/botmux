@@ -7,13 +7,23 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isStandaloneBinary, resolveEntrySpawn } from './core/self-spawn.js';
 import { networkSocketFilter, type NetworkLaunchPlan } from './core/sandbox-network-launch.js';
+import {
+  materializeProtectedHttpLoopbackArgs,
+  startProtectedHttpEgressLoopbackBridge,
+  type ProtectedHttpEgressLoopbackBridge,
+} from './core/protected-http-egress-loopback.js';
 import type { Readable, Writable } from 'node:stream';
 
 const argv = process.argv.slice(isStandaloneBinary() ? 3 : 2);
 const encoded = argv[0];
 const inside = argv[1] === '--inside';
 let children: ChildProcess[] = [];
-const stop = () => { for (const child of children) { try { child.kill('SIGKILL'); } catch { /* exited */ } } };
+let protectedHttpBridge: ProtectedHttpEgressLoopbackBridge | undefined;
+const stop = () => {
+  for (const child of children) { try { child.kill('SIGKILL'); } catch { /* exited */ } }
+  void protectedHttpBridge?.close();
+  protectedHttpBridge = undefined;
+};
 process.once('exit', stop);
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.once(signal, () => { stop(); process.exit(128 + (signal === 'SIGINT' ? 2 : signal === 'SIGHUP' ? 1 : 15)); });
 const waitExit = (child: ChildProcess) => new Promise<number>((resolve, reject) => { child.once('error', reject); child.once('exit', code => resolve(code ?? 1)); });
@@ -56,9 +66,18 @@ async function main() {
       const configured = spawnSync(plan.ip, args, { encoding: 'utf8', timeout: 5000 });
       if (configured.status !== 0) throw new Error(`cannot configure private IPv6 link: ${configured.stderr}`);
     }
+    let taskArgs = plan.args;
+    if (plan.protectedHttpBridge) {
+      protectedHttpBridge = await startProtectedHttpEgressLoopbackBridge(plan.protectedHttpBridge);
+      taskArgs = materializeProtectedHttpLoopbackArgs(
+        plan.args,
+        plan.protectedHttpBridge.placeholderOrigin,
+        protectedHttpBridge.origin,
+      );
+    }
     // Feed an immutable anonymous pipe; no mutable host filter file exists.
     const octal = [...networkSocketFilter()].map(byte => `\\${byte.toString(8).padStart(3, '0')}`).join('');
-    const task = spawn('/bin/sh', ['-c', `exec 6<&0 || exit; printf '${octal}' | { exec "$@" 5<&0 0<&6 6<&-; }`, 'botmux-network-filter', plan.command, ...plan.args], { stdio: 'inherit' });
+    const task = spawn('/bin/sh', ['-c', `exec 6<&0 || exit; printf '${octal}' | { exec "$@" 5<&0 0<&6 6<&-; }`, 'botmux-network-filter', plan.command, ...taskArgs], { stdio: 'inherit' });
     children.push(task);
     return await waitExit(task);
   }

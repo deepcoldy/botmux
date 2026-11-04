@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { request as httpsRequest } from 'node:https';
 import { isIP, type Socket } from 'node:net';
 import { dirname, join } from 'node:path';
-import type { Readable } from 'node:stream';
+import { Readable } from 'node:stream';
 import {
   normalizeProtectedHttpPath,
   normalizeProtectedHttpEgressPolicy,
@@ -59,7 +59,7 @@ export interface ProtectedHttpEgressForwardRequest {
 export interface ProtectedHttpEgressForwardResponse {
   status: number;
   headers: Record<string, string | string[] | undefined>;
-  body: Buffer;
+  body: Buffer | Readable;
 }
 
 export interface ProtectedHttpEgressLogEntry {
@@ -341,23 +341,41 @@ function defaultForwarder(
         },
         lookup: (_hostname, _options, callback) => callback(null, address, family),
       }, async response => {
-        try {
-          const body = await readCappedBody(response);
-          resolve({
-            status: response.statusCode ?? 502,
-            headers: response.headers,
-            body,
-          });
-        } catch (error) {
-          response.destroy();
-          reject(error);
-        }
+        resolve({
+          status: response.statusCode ?? 502,
+          headers: response.headers,
+          body: response,
+        });
       });
       upstream.once('timeout', () => upstream.destroy(new Error('protected_http_egress_timeout')));
       upstream.once('error', reject);
       upstream.end(request.body);
     });
   };
+}
+
+async function streamCappedResponseBody(source: Readable, response: ServerResponse): Promise<void> {
+  let length = 0;
+  try {
+    for await (const raw of source) {
+      const chunk = Buffer.isBuffer(raw) ? Buffer.from(raw) : Buffer.from(raw);
+      length += chunk.length;
+      if (length > MAX_PROTECTED_HTTP_BODY_BYTES) {
+        chunk.fill(0);
+        throw new BodyLimitError('response_body_too_large');
+      }
+      await new Promise<void>((resolve, reject) => {
+        response.write(chunk, error => {
+          chunk.fill(0);
+          error ? reject(error) : resolve();
+        });
+      });
+    }
+    await new Promise<void>(resolve => response.end(resolve));
+  } catch (error) {
+    source.destroy();
+    throw error;
+  }
 }
 
 function snapshotFrozenAddresses(
@@ -473,33 +491,42 @@ export async function startSessionProtectedHttpEgressHost(
           if (!Number.isInteger(upstream.status) || upstream.status < 100 || upstream.status > 599) {
             throw new Error('invalid_protected_http_egress_status');
           }
-          if (!Buffer.isBuffer(upstream.body)) throw new Error('invalid_protected_http_egress_body');
-          pendingUpstreamBody = upstream.body;
-          sensitiveBuffers.add(upstream.body);
-          if (upstream.body.length > MAX_PROTECTED_HTTP_BODY_BYTES) {
-            sendJson(response, 502, 'botmux_protected_egress_response_too_large');
-            upstream.body.fill(0);
-            sensitiveBuffers.delete(upstream.body);
-            pendingUpstreamBody = undefined;
+          if (!Buffer.isBuffer(upstream.body) && !(upstream.body instanceof Readable)) {
+            throw new Error('invalid_protected_http_egress_body');
+          }
+          status = upstream.status;
+          upstreamRequestId = responseHeaderValue(upstream.headers, 'x-request-id');
+          if (Buffer.isBuffer(upstream.body)) {
+            pendingUpstreamBody = upstream.body;
+            sensitiveBuffers.add(upstream.body);
+            if (upstream.body.length > MAX_PROTECTED_HTTP_BODY_BYTES) {
+              status = 502;
+              sendJson(response, 502, 'botmux_protected_egress_response_too_large');
+              upstream.body.fill(0);
+              sensitiveBuffers.delete(upstream.body);
+              pendingUpstreamBody = undefined;
+            } else {
+              response.writeHead(status, sanitizedResponseHeaders(upstream.headers));
+              const responseBody = upstream.body;
+              const clearResponseBody = () => {
+                responseBody.fill(0);
+                sensitiveBuffers.delete(responseBody);
+              };
+              response.once('finish', clearResponseBody);
+              response.once('close', clearResponseBody);
+              response.end(responseBody);
+              pendingUpstreamBody = undefined;
+            }
           } else {
-            status = upstream.status;
-            upstreamRequestId = responseHeaderValue(upstream.headers, 'x-request-id');
             response.writeHead(status, sanitizedResponseHeaders(upstream.headers));
-            const responseBody = upstream.body;
-            const clearResponseBody = () => {
-              responseBody.fill(0);
-              sensitiveBuffers.delete(responseBody);
-            };
-            response.once('finish', clearResponseBody);
-            response.once('close', clearResponseBody);
-            response.end(responseBody);
-            pendingUpstreamBody = undefined;
+            await streamCappedResponseBody(upstream.body, response);
           }
         } catch (error) {
           status = 502;
           pendingUpstreamBody?.fill(0);
           if (pendingUpstreamBody) sensitiveBuffers.delete(pendingUpstreamBody);
           if (!response.headersSent) sendJson(response, 502, 'botmux_protected_egress_unavailable');
+          else if (!response.writableEnded) response.destroy();
           reportError(error);
         } finally {
           body.fill(0);
