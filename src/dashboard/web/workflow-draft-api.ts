@@ -98,7 +98,11 @@ type DraftAction =
   | { kind: 'approve-flow'; flowSummarySha256: string }
   | { kind: 'revise-spec' }
   | { kind: 'abandon' }
-  | { kind: 'delete' };
+  | { kind: 'delete' }
+  /** D4 拉群开始：群名（不带标记，daemon 补）和额外成员（邮箱 / union_id）。 */
+  | { kind: 'launch'; groupName?: string; extraMembers?: string[] }
+  | { kind: 'launch-continue' }
+  | { kind: 'launch-abandon' };
 
 /** Path and body of one draft write. `baseVersion` pins the version the page showed. */
 export function draftActionRequest(runId: string, action: DraftAction, baseVersion?: number): { path: string; body: Record<string, unknown> } {
@@ -126,6 +130,17 @@ export function draftActionRequest(runId: string, action: DraftAction, baseVersi
     case 'revise-spec': return { path: draftPath(runId, '/revise-spec'), body: { ...base } };
     case 'abandon': return { path: draftPath(runId, '/abandon'), body: {} };
     case 'delete': return { path: draftPath(runId, '/delete'), body: {} };
+    case 'launch': return {
+      path: draftPath(runId, '/launch'),
+      body: {
+        ...(action.groupName ? { groupName: action.groupName } : {}),
+        ...(action.extraMembers?.length ? { extraMembers: action.extraMembers } : {}),
+        ...base,
+      },
+    };
+    case 'launch-continue': return { path: draftPath(runId, '/launch/continue'), body: { ...base } };
+    // Abandon acts on whatever the launch is now (the daemon refuses a running one).
+    case 'launch-abandon': return { path: draftPath(runId, '/launch/abandon'), body: {} };
   }
 }
 

@@ -98,6 +98,7 @@ export function draftErrorKey(code: string): string | undefined {
     'clarify_turn_running', 'session_disconnected', 'clarify_unavailable', 'no_spec', 'flow_changed',
     'already_confirmed', 'unknown_node', 'bot_not_on_roster', 'dag_invalid', 'draft_not_stale',
     'orchestrator_ineligible', 'unknown_draft', 'network_error', 'spec_invalid',
+    'launch_running', 'launch_exists', 'no_launch', 'launch_unavailable', 'initiator_channel_unavailable', 'run_committed',
   ]);
   return known.has(code) ? `workflow.draft.err.${code}` : undefined;
 }
@@ -148,6 +149,8 @@ export const DRAFT_PHASE_KEY: Record<WorkflowDraftPhase, string> = {
   flow_confirmed: 'workflow.draft.phase.flow_confirmed',
   abandoned: 'workflow.draft.phase.abandoned',
   committed: 'workflow.draft.phase.committed',
+  launching: 'workflow.draft.phase.launching',
+  started: 'workflow.draft.phase.started',
 };
 
 /** 页面上哪些区块要展示（按阶段累积，之前的区块保留可回看）。 */
@@ -157,18 +160,136 @@ export interface DraftSections {
   architect: boolean;
   flow: boolean;
   groupSetup: boolean;
+  /** 拉群进度（D4）：一旦开始拉群就一直显示（含放弃、已启动）。 */
+  launch: boolean;
 }
 
-export function draftSections(view: Pick<WorkflowDraftView, 'phase' | 'clarify' | 'spec'>): DraftSections {
+export function draftSections(view: Pick<WorkflowDraftView, 'phase' | 'clarify' | 'spec'> & { launch?: unknown }): DraftSections {
   const phase = view.phase;
   const past = (list: WorkflowDraftPhase[]) => list.includes(phase);
   return {
     chat: true,
     spec: !!view.clarify.specCandidate || !!view.spec?.markdown || !past(['clarifying', 'abandoned']),
     architect: past(['awaiting_architect', 'architect_running']),
-    flow: past(['dag_ready', 'flow_confirmed']),
-    groupSetup: phase === 'flow_confirmed',
+    flow: past(['dag_ready', 'flow_confirmed', 'launching']),
+    groupSetup: phase === 'flow_confirmed' && !view.launch,
+    launch: !!view.launch,
   };
+}
+
+// ─── 拉群开始（§4.5，D4）────────────────────────────────────────────────
+
+/** 额外成员输入框：逗号、分号、空白分隔；只收完整邮箱或 union_id（on_…）。
+ *  `ou_` 直接拒（它只对签发它的应用有效），与 daemon 同一规则。 */
+export function parseLaunchMembersInput(text: string): { members: string[]; invalid: string[]; openIds: string[] } {
+  const items = [...new Set(text.split(/[\s,，;；]+/).map((item) => item.trim()).filter(Boolean))];
+  const members: string[] = [];
+  const invalid: string[] = [];
+  const openIds: string[] = [];
+  for (const item of items) {
+    if (/^on_[A-Za-z0-9_-]{1,128}$/.test(item) || /^[^\s@<>"']{1,128}@[^\s@<>"']{1,128}\.[^\s@<>"']{1,64}$/.test(item)) members.push(item);
+    else if (item.startsWith('ou_')) openIds.push(item);
+    else invalid.push(item);
+  }
+  return { members, invalid, openIds };
+}
+
+export type LaunchStepKey = 'intent' | 'group' | 'root' | 'migrate' | 'check' | 'grant' | 'commit' | 'start';
+export const LAUNCH_STEP_KEYS: readonly LaunchStepKey[] = ['intent', 'group', 'root', 'migrate', 'check', 'grant', 'commit', 'start'];
+export type LaunchStepStatus = 'done' | 'running' | 'failed' | 'waiting' | 'pending';
+
+export interface LaunchStepRow {
+  key: LaunchStepKey;
+  status: LaunchStepStatus;
+  /** 这一步的补充事实（迁入没成功、按标记认回等），文案键。 */
+  noteKey?: string;
+}
+
+type LaunchView = NonNullable<WorkflowDraftView['launch']>;
+
+/** 记录里某一步（含 daemon 内部的细分步）对应页面上的哪一步。 */
+function launchStepOf(step: string): LaunchStepKey {
+  switch (step) {
+    case 'members': case 'group': case 'join': return 'group';
+    case 'root': return 'root';
+    case 'migrate': return 'migrate';
+    case 'check': return 'check';
+    case 'grant': return 'grant';
+    case 'commit': return 'commit';
+    case 'start': case 'done': return 'start';
+    default: return 'intent';
+  }
+}
+
+/** 已落盘的事实推出哪几步做完了；`nextStep` 给出正在做（或停住）的那步。 */
+function launchCurrentStep(launch: LaunchView): LaunchStepKey | 'done' {
+  if (launch.start) return 'done';
+  if (launch.nextStep !== 'unknown') {
+    return launch.nextStep === 'done' ? 'done' : launchStepOf(launch.nextStep);
+  }
+  if (launch.error && launch.error.step !== 'interrupted') return launchStepOf(launch.error.step);
+  return launch.commit ? 'start' : launch.check?.ok ? 'grant' : 'check';
+}
+
+/** 8 步的状态：之前的完成，当前的进行中 / 停住 / 等待，之后的未开始。 */
+export function launchStepRows(launch: LaunchView): LaunchStepRow[] {
+  const current = launchCurrentStep(launch);
+  const index = current === 'done' ? LAUNCH_STEP_KEYS.length : LAUNCH_STEP_KEYS.indexOf(current);
+  return LAUNCH_STEP_KEYS.map((key, i) => {
+    let status: LaunchStepStatus;
+    if (i < index) status = 'done';
+    else if (i > index) status = 'pending';
+    else if (launch.running) status = 'running';
+    else if (launch.error || launch.state === 'paused') status = launch.error ? 'failed' : 'waiting';
+    else status = launch.state === 'abandoned' ? 'pending' : 'waiting';
+    const noteKey = key === 'group' && launch.chat?.recovered ? 'workflow.draft.launch.note.recovered'
+      : key === 'migrate' && launch.migrate?.status === 'unavailable' ? 'workflow.draft.launch.note.migrateUnavailable'
+        : key === 'migrate' && launch.migrate?.summaryError ? 'workflow.draft.launch.note.summaryFailed'
+          : undefined;
+    return { key, status, ...(noteKey ? { noteKey } : {}) };
+  });
+}
+
+/** 页面上拉群区块能做什么（后端会再校验发起人与状态）。 */
+/** The live check's problems, while they are about the current flow (a bot
+ *  swapped since makes them stale: the next 「继续」 checks again). */
+export function currentLaunchProblems(view: Pick<WorkflowDraftView, 'launch' | 'flowRevision'>): NonNullable<LaunchView['check']>['problems'] {
+  const launch = view.launch;
+  if (!launch?.check || launch.check.ok || launch.nextStep !== 'check' || launch.check.flowRevision !== view.flowRevision) return [];
+  return launch.check.problems;
+}
+
+export function launchControls(
+  view: Pick<WorkflowDraftView, 'phase' | 'launch' | 'flowConfirmation' | 'flowRevision'>,
+  isInitiator: boolean,
+): { canContinue: boolean; canAbandon: boolean; needsReconfirm: boolean; canSwapBots: boolean } {
+  const launch = view.launch;
+  if (!launch) return { canContinue: false, canAbandon: false, needsReconfirm: false, canSwapBots: false };
+  const idle = !launch.running && launch.state !== 'abandoned' && launch.state !== 'started';
+  // A bot swapped at step 5 voids the second confirmation: confirm the flow
+  // first (the flow panel), then 「继续」.
+  const needsReconfirm = idle && !launch.commit && view.phase === 'dag_ready';
+  return {
+    canContinue: isInitiator && idle && view.phase === 'launching',
+    canAbandon: isInitiator && idle && !launch.commit,
+    needsReconfirm,
+    canSwapBots: isInitiator && idle && !launch.commit && currentLaunchProblems(view).length > 0,
+  };
+}
+
+/** 停住的原因：按 code 取本地化文案，认不出的用 daemon 的原文。 */
+export function launchErrorKey(code: string): string | undefined {
+  const known = new Set([
+    'members_invalid', 'members_unresolved', 'members_lookup_failed', 'list_chats_failed', 'create_group_failed',
+    'initiator_not_joined', 'post_root_failed', 'bind_failed', 'bots_ineligible', 'revoke_failed', 'grant_failed',
+    'flow_changed', 'daemon_restarted', 'internal_error', 'flow_unreadable', 'launch_loop',
+  ]);
+  return known.has(code) ? `workflow.draft.launchErr.${code}` : undefined;
+}
+
+/** 启动后去运行详情页。 */
+export function startedRunHref(runId: string): string {
+  return `#/workflows/${encodeURIComponent(runId)}`;
 }
 
 /** 对话面板能不能发消息：澄清或待确认需求、没有在回的这一轮、会话没断。 */

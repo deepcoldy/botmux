@@ -40,7 +40,13 @@ import {
   flowSummarySections,
   formatDraftTime,
   initiatorSourceKey,
+  currentLaunchProblems,
+  launchControls,
+  launchErrorKey,
+  launchStepRows,
   needsContinue,
+  parseLaunchMembersInput,
+  startedRunHref,
   orchestratorOptionStates,
   sameDraftInitiator,
   specEditorText,
@@ -480,11 +486,14 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
 
   const sections = draftSections(view);
   const readOnly = !isInitiator;
-  const ended = view.phase === 'abandoned' || view.phase === 'committed';
+  const ended = view.phase === 'abandoned' || view.phase === 'committed' || view.phase === 'started';
+  // A running launch step or a written run.json: only 「继续」 (the daemon refuses abandon).
+  const abandonable = !ended && !view.launch?.running && !view.launch?.commit;
 
   const abandon = async () => {
-    if (!await confirm({ title: tr('workflow.draft.abandon'), message: tr('workflow.draft.abandonConfirm'), danger: true })) return;
-    await act({ kind: 'abandon' }, 'abandon', { pin: false });
+    const message = view.launch?.chat ? tr('workflow.draft.launch.abandonConfirm') : tr('workflow.draft.abandonConfirm');
+    if (!await confirm({ title: tr('workflow.draft.abandon'), message, danger: true })) return;
+    await act(view.launch ? { kind: 'launch-abandon' } : { kind: 'abandon' }, 'abandon', { pin: false });
   };
   const remove = async () => {
     if (!await confirm({ title: tr('workflow.draft.delete'), message: tr('workflow.draft.deleteConfirm', { title: view.title }), danger: true })) return;
@@ -509,7 +518,7 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
         phase={view.phase}
         actions={isInitiator ? (
           <>
-            {!ended ? <button type="button" className="danger" disabled={!!busy} onClick={() => { void abandon(); }}>{tr('workflow.draft.abandon')}</button> : null}
+            {abandonable ? <button type="button" className="danger" disabled={!!busy} onClick={() => { void abandon(); }}>{tr('workflow.draft.abandon')}</button> : null}
             {view.phase === 'abandoned' || view.stale
               ? <button type="button" className="danger" disabled={!!busy} onClick={() => { void remove(); }}>{tr('workflow.draft.delete')}</button>
               : null}
@@ -541,7 +550,8 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
       {sections.architect ? <ArchitectPanel view={view} fetchedAt={fetchedAt} canWrite={isInitiator} busy={busy} act={act} /> : null}
       {sections.flow && view.flow ? <FlowPanel view={view} canWrite={isInitiator} busy={busy} act={act} /> : null}
       {sections.flow && !view.flow && view.flowError ? <p className="wfd-notice wfd-error" role="alert">{tr('workflow.draft.flowError', { error: view.flowError })}</p> : null}
-      {sections.groupSetup ? <GroupSetupPlaceholder /> : null}
+      {sections.groupSetup ? <GroupSetupPanel view={view} canWrite={isInitiator} busy={busy} act={act} /> : null}
+      {sections.launch ? <LaunchPanel view={view} canWrite={isInitiator} busy={busy} act={act} botNames={botNames} /> : null}
     </>
   );
 }
@@ -827,8 +837,13 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
   // A fresh confirmation clears the "void" notice.
   if (confirmState === 'confirmed') seenConfirmed.current = true;
   // After the second confirmation a bot can still be changed: that voids it (E5).
-  const editable = props.canWrite && (props.view.phase === 'dag_ready' || props.view.phase === 'flow_confirmed');
+  // During 拉群中 only while it is stopped at the live check (§4.5 第 5 步).
+  const launchSwap = launchControls(props.view, props.canWrite).canSwapBots;
+  const editable = props.canWrite && (props.view.phase === 'dag_ready' || props.view.phase === 'flow_confirmed' || launchSwap)
+    && !props.view.launch?.running && !props.view.launch?.commit;
   const disabled = !editable || !!props.busy;
+  // Once the group exists the requirement stage is closed (the daemon refuses).
+  const launched = !!props.view.launch;
 
   const statusLineOf = (node: { id: string; isLoop?: boolean; host?: unknown }) => {
     if (node.host) return tr('workflow.draft.hostNode');
@@ -960,34 +975,225 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
             {tr('workflow.draft.approveFlow')}
           </button>
         ) : null}
-        <label htmlFor="wfd-architect-note" className="wfd-sr-only">{tr('workflow.draft.rearchitectNote')}</label>
-        <input id="wfd-architect-note" type="text" className="wfd-note" value={note} disabled={disabled}
-          placeholder={tr('workflow.draft.rearchitectNote')} onChange={(event) => setNote(event.target.value)} />
-        <button type="button" disabled={disabled}
-          onClick={() => { void props.act({ kind: 'architect', ...(note.trim() ? { note: note.trim() } : {}) }, 'architect'); setNote(''); }}>
-          {tr('workflow.draft.rearchitect')}
-        </button>
-        <button type="button" disabled={disabled} onClick={() => { void props.act({ kind: 'revise-spec' }, 'revise-spec'); }}>
-          {tr('workflow.draft.backToSpec')}
+        {launched ? null : (
+          <>
+            <label htmlFor="wfd-architect-note" className="wfd-sr-only">{tr('workflow.draft.rearchitectNote')}</label>
+            <input id="wfd-architect-note" type="text" className="wfd-note" value={note} disabled={disabled}
+              placeholder={tr('workflow.draft.rearchitectNote')} onChange={(event) => setNote(event.target.value)} />
+            <button type="button" disabled={disabled}
+              onClick={() => { void props.act({ kind: 'architect', ...(note.trim() ? { note: note.trim() } : {}) }, 'architect'); setNote(''); }}>
+              {tr('workflow.draft.rearchitect')}
+            </button>
+            <button type="button" disabled={disabled} onClick={() => { void props.act({ kind: 'revise-spec' }, 'revise-spec'); }}>
+              {tr('workflow.draft.backToSpec')}
+            </button>
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ─── 拉群开始（§4.5，D4）────────────────────────────────────────────────
+
+/** 群设置：群名（默认工作流标题，daemon 在末尾补标记）、额外成员（邮箱 / union_id）。 */
+function GroupSetupPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: string | null; act: Act }): React.JSX.Element {
+  const tr = useT();
+  const [name, setName] = useState(props.view.title);
+  const [members, setMembers] = useState('');
+  const parsed = parseLaunchMembersInput(members);
+  const nameOk = name.trim().length > 0 && Array.from(name.trim()).length <= 100;
+  const membersOk = parsed.invalid.length === 0 && parsed.openIds.length === 0;
+  const disabled = !props.canWrite || !!props.busy;
+  const start = () => {
+    if (!nameOk || !membersOk) return;
+    void props.act({
+      kind: 'launch',
+      ...(name.trim() !== props.view.title ? { groupName: name.trim() } : {}),
+      ...(parsed.members.length ? { extraMembers: parsed.members } : {}),
+    }, 'launch');
+  };
+  return (
+    <section className="overview-block wfd-panel wfd-group" aria-labelledby="wfd-group-title">
+      <div className="sect-head overview-panel-head">
+        <h2 id="wfd-group-title">{tr('workflow.draft.groupTitle')}</h2>
+        <span className="sect-head-hint">{tr('workflow.draft.launch.setupHint')}</span>
+      </div>
+      <div className="wfd-form">
+        <label htmlFor="wfd-group-name" className="wfd-label">{tr('workflow.draft.launch.groupName')}</label>
+        <input id="wfd-group-name" type="text" value={name} disabled={disabled} maxLength={100}
+          aria-describedby="wfd-group-name-help" aria-invalid={!nameOk}
+          onChange={(event) => setName(event.target.value)} />
+        <p id="wfd-group-name-help" className="wfd-help">{tr('workflow.draft.launch.groupNameHelp')}</p>
+        <label htmlFor="wfd-group-members" className="wfd-label">{tr('workflow.draft.launch.extraMembers')}</label>
+        <textarea id="wfd-group-members" rows={2} value={members} disabled={disabled}
+          placeholder={tr('workflow.draft.launch.extraMembersPlaceholder')}
+          aria-describedby="wfd-group-members-help" aria-invalid={!membersOk}
+          onChange={(event) => setMembers(event.target.value)} />
+        <p id="wfd-group-members-help" className="wfd-help">{tr('workflow.draft.launch.extraMembersHelp')}</p>
+        {parsed.openIds.length ? <p className="wfd-error" role="alert">{tr('workflow.draft.launch.openIdRefused', { ids: parsed.openIds.join('、') })}</p> : null}
+        {parsed.invalid.length ? <p className="wfd-error" role="alert">{tr('workflow.draft.launch.memberInvalid', { items: parsed.invalid.join('、') })}</p> : null}
+      </div>
+      <p className="muted">{tr('workflow.draft.launch.whoJoins')}</p>
+      <div className="wfd-actions">
+        <button type="button" className="primary" disabled={disabled || !nameOk || !membersOk}
+          title={props.canWrite ? undefined : tr('workflow.draft.onlyInitiator')}
+          onClick={start}>
+          {tr('workflow.draft.startGroup')}
         </button>
       </div>
     </section>
   );
 }
 
-/** 「群设置 + 拉群开始」占位（D4 接线）。 */
-function GroupSetupPlaceholder(): React.JSX.Element {
+const STEP_STATUS_ICON: Record<string, string> = { done: '✅', running: '⏳', failed: '⚠️', waiting: '⏸', pending: '·' };
+
+/** 拉群进度：8 步、停住的原因与「继续」、第 5 步逐节点原因与就地换 Bot、孤儿群、群链接、放弃。 */
+function LaunchPanel(props: {
+  view: WorkflowDraftView; canWrite: boolean; busy: string | null; act: Act; botNames: Map<string, string>;
+}): React.JSX.Element {
   const tr = useT();
+  const { view } = props;
+  const launch = view.launch!;
+  const rows = launchStepRows(launch);
+  const controls = launchControls(view, props.canWrite);
+  const disabled = !!props.busy;
+  const nameOf = (appId: string) => props.botNames.get(appId) ?? appId;
+  const choices = view.flow ? executorBotChoices(view.flow.roster, tr('workflow.draft.orchestratorSuffix')) : [];
+  const rowOf = new Map((view.flow?.plan.rows ?? []).map((row) => [row.nodeId, row]));
+
+  // 已启动：去运行详情页（一次）。
+  const redirected = useRef(false);
+  useEffect(() => {
+    if (view.phase === 'started' && !redirected.current) {
+      redirected.current = true;
+      window.location.hash = startedRunHref(view.runId);
+    }
+  }, [view.phase, view.runId]);
+
+  const errorText = launch.error
+    ? (() => {
+      const key = launchErrorKey(launch.error.code);
+      return key ? tr(key) : launch.error.message;
+    })()
+    : undefined;
+  const problems = currentLaunchProblems(view);
+
   return (
-    <section className="overview-block wfd-panel wfd-group" aria-labelledby="wfd-group-title">
+    <section className="overview-block wfd-panel wfd-launch" aria-labelledby="wfd-launch-title">
       <div className="sect-head overview-panel-head">
-        <h2 id="wfd-group-title">{tr('workflow.draft.groupTitle')}</h2>
-        <span className="sect-head-hint">{tr('workflow.draft.comingNext')}</span>
+        <h2 id="wfd-launch-title">{tr('workflow.draft.launch.title')}</h2>
+        <span className="sect-head-hint">
+          <code>{launch.groupName}</code>
+          {launch.attempt > 1 ? ` · ${tr('workflow.draft.launch.attempt', { attempt: launch.attempt })}` : ''}
+        </span>
       </div>
-      <p className="muted">{tr('workflow.draft.groupHelp')}</p>
+
+      <ol className="wfd-launch-steps" aria-label={tr('workflow.draft.launch.stepsLabel')} aria-live="polite">
+        {rows.map((row, index) => (
+          <li key={row.key} className={`wfd-launch-step wfd-step-${row.status}`} aria-current={row.status === 'running' || row.status === 'failed' ? 'step' : undefined}>
+            <span aria-hidden="true" className="wfd-step-icon">{STEP_STATUS_ICON[row.status]}</span>
+            <span className="wfd-step-name">{index + 1}. {tr(`workflow.draft.launch.step.${row.key}`)}</span>
+            <span className="wfd-sr-only">{tr(`workflow.draft.launch.status.${row.status}`)}</span>
+            {row.noteKey ? <small className="wfd-help">{tr(row.noteKey)}</small> : null}
+          </li>
+        ))}
+      </ol>
+
+      {launch.state === 'abandoned' ? <p className="wfd-notice" role="status">{tr('workflow.draft.launch.abandoned')}</p> : null}
+      {launch.state === 'started' ? (
+        <p className="wfd-confirmed" role="status">
+          {tr('workflow.draft.launch.started')} <a href={startedRunHref(view.runId)}>{tr('workflow.draft.launch.openRun')}</a>
+        </p>
+      ) : null}
+      {launch.running ? <p className="wfd-notice" role="status">{tr('workflow.draft.launch.running')}</p> : null}
+
+      {errorText && !launch.running && launch.state !== 'abandoned' ? (
+        <div className="wfd-problems" role="alert">
+          <p>{tr('workflow.draft.launch.stoppedAt', { step: tr(`workflow.draft.launch.step.${rows.find((r) => r.status === 'failed')?.key ?? 'intent'}`) })}{errorText}</p>
+          {launchErrorKey(launch.error!.code) && launch.error!.message ? <p className="wfd-help">{launch.error!.message}</p> : null}
+        </div>
+      ) : null}
+
+      {problems.length ? (
+        <div className="wfd-launch-problems">
+          <h3>{tr('workflow.draft.launch.checkTitle')}</h3>
+          <ul>
+            {problems.map((problem) => {
+              const selectId = `wfd-launch-bot-${problem.nodeId.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+              const current = rowOf.get(problem.nodeId)?.larkAppId ?? problem.larkAppId;
+              return (
+                <li key={`${problem.nodeId}:${problem.code}`} className="wfd-launch-problem">
+                  <p><code>{problem.nodeId}</code> → <b>{nameOf(problem.larkAppId)}</b>：{localized(tr, `workflow.draft.botProblem.${problem.code}`, problem.why)}{problem.detail ? `（${problem.detail}）` : ''}</p>
+                  {problem.code !== 'DIRECTORY_OUTPUT' && rowOf.has(problem.nodeId) ? (
+                    <>
+                      <label htmlFor={selectId} className="wfd-label">{tr('workflow.draft.launch.swapBot')}</label>
+                      <select id={selectId} value={current} disabled={!controls.canSwapBots || disabled}
+                        aria-describedby="wfd-launch-swap-help"
+                        onChange={(event) => {
+                          const larkAppId = event.target.value;
+                          if (larkAppId && larkAppId !== current) void props.act({ kind: 'node-bot', nodeId: problem.nodeId, larkAppId }, 'node-bot');
+                        }}>
+                        {choices.some((choice) => choice.larkAppId === current) ? null : <option value={current}>{nameOf(current)}</option>}
+                        {choices.map((choice) => (
+                          <option key={choice.larkAppId} value={choice.larkAppId} disabled={!!choice.disabledWhy}>
+                            {choice.disabledWhy ? `${choice.label}：${choice.disabledWhy}` : choice.label}
+                          </option>
+                        ))}
+                      </select>
+                    </>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+          <p id="wfd-launch-swap-help" className="wfd-help">{tr('workflow.draft.launch.swapHelp')}</p>
+        </div>
+      ) : null}
+
+      {controls.needsReconfirm ? <p className="wfd-warning" role="alert">{tr('workflow.draft.launch.reconfirm')}</p> : null}
+
+      {launch.chat ? (
+        <div className="wfd-launch-chat">
+          <p>
+            <span className="wfd-label">{tr('workflow.draft.launch.group')}</span>
+            {launch.chat.shareLink
+              ? <a href={launch.chat.shareLink} target="_blank" rel="noreferrer noopener">{tr('workflow.draft.launch.openGroup')}</a>
+              : <code>{launch.chat.chatId}</code>}
+          </p>
+          {launch.chat.ownerTransferError ? (
+            <p className="wfd-warning" role="status">{tr('workflow.draft.launch.ownerTransferFailed', { error: launch.chat.ownerTransferError })}</p>
+          ) : null}
+          {launch.chat.warnings?.map((warning) => <p key={warning} className="wfd-warning">⚠️ {warning}</p>)}
+        </div>
+      ) : null}
+
+      {launch.orphanSuspects?.length ? (
+        <div className="wfd-launch-orphans">
+          <h3>{tr('workflow.draft.launch.orphansTitle')}</h3>
+          <p className="wfd-help">{tr('workflow.draft.launch.orphansHelp', { marker: launch.marker })}</p>
+          <ul>
+            {launch.orphanSuspects.map((orphan, index) => (
+              <li key={`${orphan.chatId ?? orphan.attemptAt ?? ''}-${index}`}>
+                {orphan.chatId ? <code>{orphan.chatId}</code> : null}
+                {orphan.name ? ` ${orphan.name}` : ''}
+                {orphan.attemptAt ? <> <time dateTime={orphan.attemptAt}>{formatDraftTime(orphan.attemptAt)}</time></> : null}
+                {' · '}{orphan.note}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
       <div className="wfd-actions">
-        <button type="button" className="primary" disabled aria-describedby="wfd-group-soon">{tr('workflow.draft.startGroup')}</button>
-        <span id="wfd-group-soon" className="wfd-help">{tr('workflow.draft.comingNext')}</span>
+        {controls.canContinue ? (
+          <button type="button" className="primary" disabled={disabled} onClick={() => { void props.act({ kind: 'launch-continue' }, 'launch-continue'); }}>
+            {tr('workflow.draft.launch.continue')}
+          </button>
+        ) : null}
+        {!props.canWrite && launch.state !== 'started' && launch.state !== 'abandoned'
+          ? <span className="wfd-help">{tr('workflow.draft.onlyInitiator')}</span>
+          : null}
       </div>
     </section>
   );

@@ -35714,3 +35714,22 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfd-heading .v3r-title-row { min-width: 0; flex: 1 1 auto; }
 .wfd-heading h1 { min-width: 0; white-space: normal; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .wfd-phase { white-space: nowrap; flex: none; }
+
+/* 工作流拉群开始（D4）：群设置与 8 步进度。 */
+.wfd-launch { margin-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
+.wfd-form { display: grid; gap: 4px; max-width: 640px; margin-bottom: 8px; }
+.wfd-form input, .wfd-form textarea { width: 100%; }
+.wfd-form .wfd-label { margin-top: 6px; }
+.wfd-launch-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.wfd-launch-step { display: flex; align-items: baseline; gap: 8px; font-size: 13px; padding: 4px 8px; border-radius: var(--radius-md, 6px); }
+.wfd-launch-step .wfd-help { margin-left: auto; }
+.wfd-step-icon { width: 1.5em; text-align: center; }
+.wfd-step-pending { color: var(--muted); }
+.wfd-step-running { background: var(--accent-soft, var(--surface-2)); }
+.wfd-step-failed { background: var(--danger-soft); color: var(--danger); }
+.wfd-step-waiting { background: var(--surface-2); }
+.wfd-launch-problems h3, .wfd-launch-orphans h3 { font-size: 13px; margin: 0 0 6px; }
+.wfd-launch-problems ul, .wfd-launch-orphans ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; font-size: 13px; }
+.wfd-launch-problem p { margin: 0 0 4px; }
+.wfd-launch-problem select { max-width: 360px; }
+.wfd-launch-chat p { margin: 0 0 4px; font-size: 13px; }
