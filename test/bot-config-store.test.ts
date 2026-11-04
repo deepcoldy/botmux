@@ -544,6 +544,34 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('persists presentation rules through the config store and reloads the same policy', async () => {
+    const { registry, store } = await loaded({ feedback: { enabled: true } });
+    const spec = store.findConfigField('feedbackPresentation')!;
+    const input = { default: { enabled: false }, rules: [
+      { id: 'example', match: { chatId: 'chat-example' }, enabled: true, rounds: [1, 3], templateId: 'compact' },
+    ] };
+    const coerced = store.coerceConfigValue(spec, JSON.stringify(input));
+    if (!coerced.ok) throw new Error(coerced.reason);
+    expect((await store.applyConfigField('app_default', spec, coerced.value)).ok).toBe(true);
+    expect(readConfig().feedbackPresentation).toEqual(input);
+    expect(registry.getBot('app_default').config.feedbackPresentation).toEqual(input);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toEqual(input);
+    expect(readConfig().feedback).toEqual({ enabled: true });
+    expect(store.coerceConfigValue(spec, '{"default":{"buttons":[]}}')).toMatchObject({ ok: false });
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toBeUndefined();
+  });
+
+  it('rejects direct invalid presentation writes without corrupting the reloadable config', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('feedbackPresentation')!;
+    const before = readConfig();
+    const result = await store.applyConfigField('app_default', spec, { default: { rounds: [0] } });
+    expect(result.ok).toBe(false);
+    expect(readConfig()).toEqual(before);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toBeUndefined();
+  });
+
   it('hot-updates sender email hiding through botconfig and reloads it', async () => {
     const { registry, store } = await loaded({ cliId: 'codex' });
     const spec = store.findConfigField('senderTagHideEmail')!;
