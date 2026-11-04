@@ -90,8 +90,10 @@ const clarifySchema = z.object({
   sessionId: z.string().min(1).max(256).optional(),
   /** active: process may be live; suspended: idle-closed process, record kept
    *  (the next message resumes by CLI session id); disconnected: cannot be
-   *  resumed — 「继续」 starts a new one; closed: abandoned/deleted. */
-  state: z.enum(['active', 'suspended', 'disconnected', 'closed']),
+   *  resumed — 「继续」 starts a new one; closed: abandoned/deleted;
+   *  migrated: moved into the main topic by 拉群开始 (D4) — from then on it is
+   *  that topic's session, never closed or suspended as a draft's. */
+  state: z.enum(['active', 'suspended', 'disconnected', 'closed', 'migrated']),
   pending: z.object({
     triggerId: z.string().min(1).max(256),
     sentAt: iso,
@@ -150,6 +152,127 @@ const nodeOverrideSchema = z.object({
   at: iso,
 }).strict();
 
+const chatIdSchema = z.string().regex(/^oc_[A-Za-z0-9_-]{1,128}$/);
+const messageIdSchema = z.string().regex(/^om_[A-Za-z0-9_-]{1,128}$/);
+const appIdSchema = z.string().min(1).max(128);
+
+/** 群名末尾的标记：`#<runId 最后 8 位随机段>`（§4.5 第 1 步）。 */
+export const WORKFLOW_LAUNCH_MARKER_RE = /^#[0-9a-f]{8}$/;
+export const WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS = 20;
+
+const launchProblemSchema = z.object({
+  nodeId: z.string().min(1).max(512),
+  larkAppId: appIdSchema,
+  code: z.string().min(1).max(64),
+  why: z.string().max(2000),
+  detail: z.string().max(2000).optional(),
+}).strict();
+
+/**
+ * 拉群记录（§4.5 断点续做）。每一步完成就落一项；「继续」按已有的项决定下一步，
+ * 从不重做已落盘的外部副作用：
+ *   intent  —— 本记录本身（群名、标记、成员、群主通道），建群前先落盘；
+ *   createAttempts —— 每次调建群接口之前记一笔：有它、没有 chat ⟹ 可能已建成，
+ *                     先按标记反查认回；
+ *   chat    —— 群 id（建群返回即落盘，或按标记认回）；
+ *   root    —— 主话题根卡片的消息 id；
+ *   migrate —— 澄清会话迁入主话题的结果 + 摘要消息；
+ *   check   —— 实时检查（按 flowRevision 作数：流程变了就重查）；
+ *   grants  —— 已写的群内协作授权，带两侧各自命名空间里的 open_id，撤销不需要对方在群；
+ *   commit  —— run.json 已写（及其摘要）；
+ *   start   —— 已启动。
+ */
+const launchSchema = z.object({
+  attempt: z.number().int().min(1),
+  /** running: a step sequence of a live operation is in progress (its token
+   *  names it); paused: stopped at a step (see `error`) or interrupted —
+   *  「继续」 resumes; started: done; abandoned: 「放弃」. */
+  state: z.enum(['running', 'paused', 'started', 'abandoned']),
+  token: z.string().min(1).max(256).optional(),
+  startedAt: iso,
+  updatedAt: iso,
+  groupName: z.string().min(1).max(64),
+  marker: z.string().regex(WORKFLOW_LAUNCH_MARKER_RE),
+  /** Raw extra members as entered: email or union_id (on_…). */
+  extraMembers: z.array(z.string().min(1).max(256)).max(WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS),
+  /** I7 / §4.5 第 2 步：发起人进群并当群主的唯一通道（不混用）。 */
+  ownerChannel: z.enum(['union_id', 'open_id']),
+  createAttempts: z.array(iso).max(50).optional(),
+  chat: z.object({
+    chatId: chatIdSchema,
+    at: iso,
+    /** Found by its marker after a create whose result was not recorded. */
+    recovered: z.literal(true).optional(),
+    shareLink: z.string().max(2000).optional(),
+    /** Non-fatal: invites that did not go through. */
+    warnings: z.array(z.string().max(2000)).max(20).optional(),
+    /** The initiator is in the group (`joined`), or Feishu refused to add
+     *  them (`rejected` — the launch stops here until they are). Absent
+     *  (a group recovered by its marker): not known yet, checked again. */
+    initiator: z.enum(['joined', 'rejected']).optional(),
+    /** Making the initiator the group owner failed: shown, not fatal. */
+    ownerTransferError: z.string().max(2000).optional(),
+  }).strict().optional(),
+  /** 可能留下的孤儿群：extra chats carrying this marker, or create attempts
+   *  whose chat could not be found by it. Handled by a person. */
+  orphanSuspects: z.array(z.object({
+    chatId: chatIdSchema.optional(),
+    name: z.string().max(200).optional(),
+    attemptAt: iso.optional(),
+    note: z.string().max(500),
+  }).strict()).max(50).optional(),
+  root: z.object({
+    messageId: messageIdSchema,
+    at: iso,
+    /** The root card says 「这次启动已放弃」. */
+    abandonNoted: z.literal(true).optional(),
+  }).strict().optional(),
+  migrate: z.object({
+    status: z.enum(['bound', 'unavailable']),
+    at: iso,
+    sessionId: z.string().min(1).max(256).optional(),
+    error: z.string().max(2000).optional(),
+    summaryMessageId: messageIdSchema.optional(),
+    summaryError: z.string().max(2000).optional(),
+  }).strict().optional(),
+  check: z.object({
+    at: iso,
+    flowRevision: z.number().int().min(0),
+    ok: z.boolean(),
+    problems: z.array(launchProblemSchema).max(200),
+  }).strict().optional(),
+  /** Per executing bot: the talk-only grants between it and the main bot in
+   *  this chat. `mainSide`: this bot's open_id in the main bot's namespace
+   *  (main receives); `peerSide`: the main bot's open_id in this bot's
+   *  namespace (it receives). Each is used only with the app that issued it.
+   *  A side is recorded as soon as it is written, so a half-written pair is
+   *  still revocable. */
+  grants: z.record(appIdSchema, z.object({
+    at: iso,
+    mainSide: openId.optional(),
+    peerSide: openId.optional(),
+  }).strict()).optional(),
+  commit: z.object({
+    at: iso,
+    chatId: chatIdSchema,
+    rootMessageId: messageIdSchema,
+    runJsonSha256: sha,
+    flowSummarySha256: sha,
+    dagSha256: sha,
+    specSha256: sha,
+    flowRevision: z.number().int().min(0),
+  }).strict().optional(),
+  start: z.object({ at: iso }).strict().optional(),
+  error: z.object({
+    step: z.enum(['members', 'group', 'join', 'root', 'migrate', 'check', 'grant', 'commit', 'start', 'interrupted']),
+    code: z.string().min(1).max(64),
+    message: z.string().max(4000),
+    at: iso,
+    retryable: z.boolean(),
+  }).strict().optional(),
+  abandonedAt: iso.optional(),
+}).strict();
+
 export const WorkflowDraftRecordSchema = z.object({
   schemaVersion: z.literal(WORKFLOW_DRAFT_SCHEMA_VERSION),
   runId: z.string().min(1).max(256),
@@ -170,6 +293,8 @@ export const WorkflowDraftRecordSchema = z.object({
   flowConfirmation: flowConfirmationSchema.optional(),
   abandonedAt: iso.optional(),
   deletedAt: iso.optional(),
+  /** 拉群开始 (§4.5, D4). */
+  launch: launchSchema.optional(),
   orphanSessions: z.array(z.object({
     sessionId: z.string().min(1).max(256),
     headlessId: z.string().min(1).max(256).optional(),
@@ -182,6 +307,8 @@ export type WorkflowDraftTurn = z.infer<typeof turnSchema>;
 export type WorkflowDraftQuestion = z.infer<typeof questionSchema>;
 export type WorkflowDraftArchitect = z.infer<typeof architectSchema>;
 export type WorkflowDraftFlowConfirmation = z.infer<typeof flowConfirmationSchema>;
+export type WorkflowDraftLaunch = z.infer<typeof launchSchema>;
+export type WorkflowDraftLaunchProblem = z.infer<typeof launchProblemSchema>;
 
 export class WorkflowDraftBusyError extends Error {
   constructor(runId: string) {
@@ -249,18 +376,36 @@ export function workflowDraftRunDir(baseDir: string, runId: string): string | un
   return dir;
 }
 
-/** A Dashboard draft: draft.json + grill.state.json, and no run.json yet
- *  (once run.json exists it is a run, shown by /api/v3/runs). */
+/**
+ * A Dashboard draft: draft.json + grill.state.json, not started (no
+ * journal), and no run.json yet — or a run.json its own 拉群开始 wrote and has
+ * not started (§4.5 第 7、8 步之间：「继续」直接启动). Once started it is a
+ * run, shown by /api/v3/runs.
+ */
 export function isWorkflowDraftDir(runDir: string): boolean {
-  if (existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) return false;
-  return existsSync(draftPath(runDir)) && existsSync(join(runDir, 'grill.state.json'));
+  if (!existsSync(draftPath(runDir)) || !existsSync(join(runDir, 'grill.state.json'))) return false;
+  if (existsSync(join(runDir, 'journal.ndjson'))) return false;
+  if (!existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) return true;
+  // Written by this draft's own launch (possibly before its commit could be
+  // recorded): still the draft, 「继续」 finishes it.
+  return readWorkflowDraft(runDir)?.launch !== undefined;
+}
+
+/** A draft dir whose 拉群开始 has started the run (routing only: the launch
+ *  calls stay answerable, e.g. a second tab's 「继续」). */
+export function isLaunchedWorkflowDraftDir(runDir: string): boolean {
+  if (!existsSync(draftPath(runDir)) || !existsSync(join(runDir, 'grill.state.json'))) return false;
+  return readWorkflowDraft(runDir)?.launch !== undefined;
 }
 
 /**
  * What a draft is doing, for the list and the page (§4.6):
  *   clarifying 澄清中 · spec_ready 待确认需求 · awaiting_architect 待编排 ·
  *   architect_running 编排中 · dag_ready 待确认流程 · flow_confirmed 已确认流程 ·
- *   abandoned 已放弃. (拉群中 arrives with D4.)
+ *   launching 拉群中 · started 已启动 · abandoned 已放弃.
+ *
+ * A launch whose second confirmation went void (a bot was swapped at step 5)
+ * shows 待确认流程 again; confirming resumes it as 拉群中.
  *
  * `flowConfirmationValid` is the caller's verdict on the recorded second
  * confirmation (digests still match); without it a recorded one counts.
@@ -273,14 +418,20 @@ export type WorkflowDraftPhase =
   | 'dag_ready'
   | 'flow_confirmed'
   | 'abandoned'
-  | 'committed';
+  | 'committed'
+  /** 拉群中 (D4): a launch is under way (running or stopped at a step). */
+  | 'launching'
+  /** 拉群开始 finished: the run is started. */
+  | 'started';
 
 export function workflowDraftPhase(
   grill: Pick<GrillState, 'status'>,
-  draft: Pick<WorkflowDraftRecord, 'abandonedAt' | 'architect' | 'flowConfirmation'>,
+  draft: Pick<WorkflowDraftRecord, 'abandonedAt' | 'architect' | 'flowConfirmation' | 'launch'>,
   flowConfirmationValid?: boolean,
 ): WorkflowDraftPhase {
   if (draft.abandonedAt) return 'abandoned';
+  if (draft.launch?.start) return 'started';
+  if (draft.launch && (draft.launch.commit || grill.status === 'dag_approved')) return 'launching';
   if (draft.architect?.state === 'running' || grill.status === 'architect_running') return 'architect_running';
   const byStatus: Record<GrillStatus, WorkflowDraftPhase> = {
     grilling: 'clarifying',
@@ -291,7 +442,9 @@ export function workflowDraftPhase(
     dag_approved: 'committed',
   };
   const phase = byStatus[grill.status];
-  if (phase === 'dag_ready' && draft.flowConfirmation && flowConfirmationValid !== false) return 'flow_confirmed';
+  if (phase === 'dag_ready' && draft.flowConfirmation && flowConfirmationValid !== false) {
+    return draft.launch ? 'launching' : 'flow_confirmed';
+  }
   return phase;
 }
 
@@ -333,6 +486,7 @@ export function summarizeWorkflowDraft(runDir: string, now: Date = new Date()): 
   const draft = readWorkflowDraft(runDir);
   const grill = readGrillState(runDir);
   if (!draft || !grill || draft.deletedAt || grill.runId !== draft.runId || grill.chatBinding) return undefined;
+  if (draft.launch?.start) return undefined;
   const updatedAt = draft.updatedAt > grill.updatedAt ? draft.updatedAt : grill.updatedAt;
   return {
     runId: draft.runId,
@@ -348,8 +502,9 @@ export function summarizeWorkflowDraft(runDir: string, now: Date = new Date()): 
   };
 }
 
-/** Run dirs under `baseDir` that are drafts (any bot, any state). */
-export function listWorkflowDraftDirs(baseDir: string): Array<{ runId: string; runDir: string }> {
+/** Run dirs under `baseDir` that are drafts (any bot, any state); with
+ *  `launched`, also those whose launch has started the run. */
+export function listWorkflowDraftDirs(baseDir: string, opts: { launched?: boolean } = {}): Array<{ runId: string; runDir: string }> {
   let entries: import('node:fs').Dirent[];
   try {
     entries = readdirSync(baseDir, { withFileTypes: true });
@@ -357,7 +512,8 @@ export function listWorkflowDraftDirs(baseDir: string): Array<{ runId: string; r
     return [];
   }
   return entries
-    .filter((entry) => entry.isDirectory() && isValidRunId(entry.name) && isWorkflowDraftDir(join(baseDir, entry.name)))
+    .filter((entry) => entry.isDirectory() && isValidRunId(entry.name)
+      && (isWorkflowDraftDir(join(baseDir, entry.name)) || (!!opts.launched && isLaunchedWorkflowDraftDir(join(baseDir, entry.name)))))
     .map((entry) => ({ runId: entry.name, runDir: join(baseDir, entry.name) }));
 }
 
@@ -382,8 +538,9 @@ export function listWorkflowDrafts(baseDir: string, now: Date = new Date()): Wor
 /** The orchestrating bot of a draft, for routing (the Dashboard proxy). */
 export function workflowDraftOwner(baseDir: string, runId: string): string | undefined {
   const runDir = workflowDraftRunDir(baseDir, runId);
-  if (!runDir || !isWorkflowDraftDir(runDir)) return undefined;
+  if (!runDir || (!isWorkflowDraftDir(runDir) && !isLaunchedWorkflowDraftDir(runDir))) return undefined;
   const draft = readWorkflowDraft(runDir);
-  // A marked-deleted draft still routes, so a repeated delete can finish it.
+  // A marked-deleted draft still routes, so a repeated delete can finish it;
+  // a launched one too, so its launch calls answer deterministically.
   return draft && draft.runId === runId ? draft.orchestratorAppId : undefined;
 }

@@ -7907,7 +7907,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown };
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown; chatMode?: unknown; botCollaboration?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -7927,6 +7927,14 @@ const server = createServer(async (req, res) => {
         : null;
       if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      }
+      // Optional (workflow-dashboard-orchestration §8): topic group mode and
+      // the bots' collaboration grants. Not sent → forwarded body unchanged.
+      if (parsed.chatMode !== undefined && parsed.chatMode !== 'topic' && parsed.chatMode !== 'group') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_chat_mode' });
+      }
+      if (parsed.botCollaboration !== undefined && typeof parsed.botCollaboration !== 'boolean') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_bot_collaboration' });
       }
 
       const explicit = Array.isArray(parsed.userOpenIds)
@@ -7968,6 +7976,8 @@ const server = createServer(async (req, res) => {
           ? parsed.bindWorkingDir.trim()
           : undefined,
         roleProfileId: roleProfileId ?? undefined,
+        ...(parsed.chatMode !== undefined ? { chatMode: parsed.chatMode } : {}),
+        ...(parsed.botCollaboration !== undefined ? { botCollaboration: parsed.botCollaboration } : {}),
       };
       const upstream = await fetchDaemonIpc(
         creator.ipcPort,

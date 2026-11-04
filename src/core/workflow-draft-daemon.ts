@@ -19,6 +19,11 @@
  *   POST /drafts/:runId/revise-spec                                     退回改需求
  *   POST /drafts/:runId/abandon                                         放弃
  *   POST /drafts/:runId/delete                                          删除
+ *   POST /drafts/:runId/launch                  {groupName?, extraMembers?}  拉群开始（D4）
+ *   POST /drafts/:runId/launch/continue                                 断点续做
+ *   POST /drafts/:runId/launch/abandon                                  放弃（群保留）
+ *
+ * The launch record is part of GET /drafts/:runId (`launch`).
  *
  * Every write body may carry `baseVersion` (CAS on the draft version).
  *
@@ -51,6 +56,16 @@ import type { WorkflowDraftInitiator } from '../workflows/v3/draft-store.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { DaemonSession } from './types.js';
 import { initiatorFailureBody, type WorkflowInitiatorResolution } from './workflow-initiator.js';
+import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
+import { createLiveV3BotEligibilityProbe } from '../im/lark/v3-bot-eligibility.js';
+import { buildV3LaunchRootCard, buildV3LaunchSummaryText } from '../im/lark/v3-launch-card.js';
+import { replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from '../im/lark/client.js';
+import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
+import { addBotToChat, addUsersToChatByOpenId, addUsersToChatByUnionId, listChats } from '../services/groups-store.js';
+import { requestExactChatGrant } from '../cli/exact-chat-grant-client.js';
+import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
+import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
+import { getBotBrand } from '../bot-registry.js';
 
 export const WORKFLOW_DRAFTS_PATH = '/api/v3/orchestration/drafts';
 
@@ -204,6 +219,129 @@ export function registerWorkflowDraftIpcRoutes(
     await service.delete(runId, initiator);
     return { deleted: runId };
   });
+  write(draftPath('launch'), async ({ service, initiator, body, baseVersion, runId }) =>
+    ({ draft: await service.launch(runId, initiator, { groupName: body.groupName, extraMembers: body.extraMembers, baseVersion }) }));
+  write(draftPath('launch/continue'), async ({ service, initiator, baseVersion, runId }) =>
+    ({ draft: await service.continueLaunch(runId, initiator, { baseVersion }) }));
+  write(draftPath('launch/abandon'), async ({ service, initiator, runId }) =>
+    ({ draft: await service.abandonLaunch(runId, initiator) }));
+}
+
+// ─── 拉群开始 collaborators (D4) ──────────────────────────────────────────
+
+export interface ProductionDraftLaunchInput {
+  appId: string;
+  /** The daemon's own `workflow start` path (daemon.ts). */
+  startRun: DraftLaunchDeps['startRun'];
+  /** Headless bind into the main topic (dashboard-ipc-server). */
+  bindSession: DraftLaunchDeps['bindSession'];
+}
+
+/** Lark, sessions and grants for 拉群开始, all through the main bot's own app
+ *  (and each receiver's own daemon for its side of a grant). */
+export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInput): DraftLaunchDeps {
+  const { appId } = input;
+  const entry = (runId: string) => resolveWorkflowEntryLink({ mainLarkAppId: appId, runId, brand: getBotBrand(appId) });
+  const receiverDaemon = (larkAppId: string) => {
+    const daemon = findOnlineDaemon(larkAppId, config.session.dataDir);
+    if (!daemon) throw new Error(`receiver daemon offline: ${larkAppId}`);
+    return daemon;
+  };
+  return {
+    async resolveEmails(emails) {
+      const resolved = await resolveAllowedUsersWithMap(appId, emails);
+      const openIds = new Map<string, string>();
+      for (const email of emails) {
+        const openId = resolved.map.get(email);
+        if (openId?.startsWith('ou_')) openIds.set(email, openId);
+      }
+      if (openIds.size < emails.length && resolved.errored) {
+        return { ok: false, retryable: true, message: '通讯录查询暂时失败，请稍后重试' };
+      }
+      return { ok: true, openIds };
+    },
+    async createGroup(group) {
+      const owner = group.owner;
+      const result = await createGroupWithBots({
+        creatorLarkAppId: appId,
+        larkAppIds: group.botAppIds,
+        name: group.name,
+        chatMode: 'topic',
+        userOpenIds: [...(owner.channel === 'open_id' ? [owner.openId] : []), ...group.extraOpenIds],
+        ownerUnionIds: [...(owner.channel === 'union_id' ? [owner.unionId] : []), ...group.extraUnionIds],
+        ...(owner.channel === 'open_id' ? { transferOwnerTo: owner.openId } : { transferOwnerUnionId: owner.unionId }),
+        // No kickoff, no role bootstrap, no @-notice: the root card is the
+        // group's first top-level message, and nothing wakes a bot.
+        ownerNotice: false,
+        onChatCreated: group.onChatCreated,
+      });
+      const initiatorJoined = owner.channel === 'open_id'
+        ? !result.invalidUserIds.includes(owner.openId)
+        : !result.invalidOwnerUnionIds.includes(owner.unionId);
+      const warnings: string[] = [];
+      const extraUsers = result.invalidUserIds.filter((id) => owner.channel !== 'open_id' || id !== owner.openId);
+      const extraUnions = result.invalidOwnerUnionIds.filter((id) => owner.channel !== 'union_id' || id !== owner.unionId);
+      if (result.invalidBotIds.length) warnings.push(`这些 Bot 没拉进群：${result.invalidBotIds.join('、')}`);
+      if (extraUsers.length || extraUnions.length) warnings.push(`这些成员没拉进群：${[...extraUsers, ...extraUnions].join('、')}`);
+      return {
+        chatId: result.chatId,
+        ...(result.shareLink ? { shareLink: result.shareLink } : {}),
+        warnings,
+        initiatorJoined,
+        ...(initiatorJoined && result.transferError ? { ownerTransferError: result.transferError } : {}),
+      };
+    },
+    async joinInitiator(chatId, owner) {
+      const added = owner.channel === 'open_id'
+        ? await addUsersToChatByOpenId(appId, chatId, [owner.openId])
+        : await addUsersToChatByUnionId(appId, chatId, [owner.unionId]);
+      if (added.invalidUserIds.length > 0) return { joined: false, error: 'invitee_rejected' };
+      const transferred = await transferGroupOwner({
+        creatorLarkAppId: appId,
+        chatId,
+        ownerId: owner.channel === 'open_id' ? owner.openId : owner.unionId,
+        ownerIdType: owner.channel,
+      });
+      return { joined: true, ...(transferred.transferError ? { ownerTransferError: transferred.transferError } : {}) };
+    },
+    listChats: async () => (await listChats(appId)).map((chat) => ({ chatId: chat.chatId, ...(chat.name ? { name: chat.name } : {}) })),
+    async addBots(chatId, botAppIds) {
+      await addBotToChat(appId, chatId, botAppIds);
+    },
+    postRootCard: (chatId, view, uuid) => sendMessage(appId, chatId, buildV3LaunchRootCard(view, entry(view.runId)), 'interactive', uuid),
+    async updateRootCard(messageId, view) {
+      await updateMessage(appId, messageId, buildV3LaunchRootCard(view, entry(view.runId)));
+    },
+    postSummary: (rootMessageId, view, uuid) =>
+      replyMessage(appId, rootMessageId, buildV3LaunchSummaryText(view, entry(view.runId)?.url), 'text', true, uuid),
+    bindSession: input.bindSession,
+    probe: (chatId) => createLiveV3BotEligibilityProbe({ orchestratorAppId: appId, chatId, bots: loadBotConfigs() }),
+    async grant(chatId, receiver, subject) {
+      const body = await requestExactChatGrant({
+        daemon: receiverDaemon(receiver),
+        secret: loadDaemonIpcSecret(),
+        receiverLarkAppId: receiver,
+        chatId,
+        operation: 'grant',
+        subjectLarkAppIds: [subject],
+      });
+      const mapping = (body.subjectMappings as Array<{ larkAppId?: string; subjectOpenId?: string }> | undefined)
+        ?.find((item) => item.larkAppId === subject);
+      if (!mapping?.subjectOpenId) throw new Error('授权结果里没有对方的 open_id');
+      return { subjectOpenId: mapping.subjectOpenId };
+    },
+    async revoke(chatId, receiver, subjectOpenId) {
+      await requestExactChatGrant({
+        daemon: receiverDaemon(receiver),
+        secret: loadDaemonIpcSecret(),
+        receiverLarkAppId: receiver,
+        chatId,
+        operation: 'revoke',
+        subjectOpenIds: [subjectOpenId],
+      });
+    },
+    startRun: input.startRun,
+  };
 }
 
 // ─── Production collaborators ─────────────────────────────────────────────
@@ -351,7 +489,11 @@ export function resetWorkflowDraftServiceForTests(): void {
   installed = undefined;
 }
 
-export function createProductionWorkflowDraftService(appId: string, clarifier: DraftClarifier): WorkflowDraftService {
+export function createProductionWorkflowDraftService(
+  appId: string,
+  clarifier: DraftClarifier,
+  launch?: DraftLaunchDeps,
+): WorkflowDraftService {
   return new WorkflowDraftService({
     appId,
     baseDir: defaultBaseDir(),
@@ -363,6 +505,7 @@ export function createProductionWorkflowDraftService(appId: string, clarifier: D
     },
     clarifier,
     runArchitect,
+    ...(launch ? { launch } : {}),
     log: (message) => logger.info(message),
   });
 }

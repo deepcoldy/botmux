@@ -34,6 +34,8 @@ import { birthRun, readGrillState, transition, type GrillState } from './grill-s
 import {
   HostGuardError,
   adHocFlowSummary,
+  authorizeAdHocRun,
+  hostApproveDag,
   hostApproveSpec,
   hostArchitect,
   hostReviseDag,
@@ -48,7 +50,8 @@ import { loadDag as realLoadDag } from './dag-loader.js';
 import type { V3Dag } from './dag.js';
 import { validateSpec } from './spec.js';
 import { freezeDagBotSnapshots } from './bot-resolve.js';
-import { V3_RUN_ENVELOPE_FILE } from './run-envelope.js';
+import { V3_RUN_ENVELOPE_FILE, readRunEnvelope, type V3RunInitiator } from './run-envelope.js';
+import type { RunChatBinding } from './grill-state.js';
 import { v3FlowSummarySha256, type V3FlowSummary } from './flow-summary.js';
 import {
   buildV3BotRoster,
@@ -61,6 +64,7 @@ import {
 import {
   checkV3BotExecutorEligibility,
   describeV3BotEligibilityCode,
+  judgeV3BotEligibility,
   v3BotExecutorTargets,
   type V3BotEligibilityProbe,
   type V3BotEligibilityProblem,
@@ -68,12 +72,14 @@ import {
 } from './node-executor-mode.js';
 import {
   WORKFLOW_DRAFT_MAX_ORPHANS,
+  WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS,
   WORKFLOW_DRAFT_MAX_TURNS,
   WORKFLOW_DRAFT_MAX_TURN_CHARS,
   WORKFLOW_DRAFT_SCHEMA_VERSION,
   WORKFLOW_DRAFT_STALE_MS,
   WorkflowDraftBusyError,
   fileSha256,
+  isLaunchedWorkflowDraftDir,
   isWorkflowDraftDir,
   listWorkflowDraftDirs,
   readWorkflowDraft,
@@ -82,6 +88,8 @@ import {
   workflowDraftRunDir,
   writeWorkflowDraft,
   type WorkflowDraftInitiator,
+  type WorkflowDraftLaunch,
+  type WorkflowDraftLaunchProblem,
   type WorkflowDraftPhase,
   type WorkflowDraftRecord,
   type WorkflowDraftReservationHolder,
@@ -95,6 +103,17 @@ import {
   buildDraftSpecProblemsTurn,
   parseDraftClarifyOutput,
 } from './draft-clarify.js';
+import {
+  groupNameHasMarker,
+  launchGroupName,
+  launchMarker,
+  nextLaunchStep,
+  parseLaunchExtraMembers,
+  type DraftLaunchDeps,
+  type LaunchRootCardView,
+  type LaunchStep,
+  type LaunchSummaryView,
+} from './draft-launch.js';
 
 /** The existing Architect budget (architect.ts default), unchanged (§4.4). */
 export const DRAFT_ARCHITECT_TIMEOUT_MS = 10 * 60_000;
@@ -137,6 +156,18 @@ export type WorkflowDraftErrorCode =
   | 'dag_invalid'
   | 'draft_not_stale'
   | 'orchestrator_ineligible'
+  /** D4: a launch of this draft is running in this daemon right now. */
+  | 'launch_running'
+  /** D4: 「拉群开始」 again — the launch exists, 「继续」 resumes it. */
+  | 'launch_exists'
+  /** D4: 「继续」 / 「放弃」 of a launch that was never started. */
+  | 'no_launch'
+  /** D4: this daemon was built without the launch collaborators. */
+  | 'launch_unavailable'
+  /** D4: the platform login carries no union_id to put the initiator in the group with. */
+  | 'initiator_channel_unavailable'
+  /** D4: run.json is written; the draft can only be started now. */
+  | 'run_committed'
   | 'bad_request';
 
 const STATUS: Record<WorkflowDraftErrorCode, number> = {
@@ -159,6 +190,12 @@ const STATUS: Record<WorkflowDraftErrorCode, number> = {
   dag_invalid: 422,
   draft_not_stale: 409,
   orchestrator_ineligible: 422,
+  launch_running: 409,
+  launch_exists: 409,
+  no_launch: 409,
+  launch_unavailable: 503,
+  initiator_channel_unavailable: 422,
+  run_committed: 409,
   bad_request: 400,
 };
 
@@ -175,7 +212,7 @@ export class WorkflowDraftError extends Error {
   }
 
   get retryable(): boolean {
-    return this.code === 'busy' || this.code === 'clarify_unavailable';
+    return this.code === 'busy' || this.code === 'clarify_unavailable' || this.code === 'launch_running';
   }
 }
 
@@ -229,6 +266,8 @@ export interface WorkflowDraftServiceDeps {
   architectTimeoutMs?: number;
   /** Test seam for deterministic run ids. */
   randomSuffix?: () => string;
+  /** 拉群开始 (§4.5, D4). Absent: launch calls answer launch_unavailable. */
+  launch?: DraftLaunchDeps;
   log?: (message: string) => void;
   /** Whether a reservation's holder process is still running (default: pid
    *  + process start identity, as the file locks check their holders). */
@@ -281,6 +320,48 @@ export interface WorkflowDraftView {
   /** Why the flow could not be projected (e.g. a node's bot left bots.json). */
   flowError?: string;
   flowConfirmation?: NonNullable<WorkflowDraftRecord['flowConfirmation']> & { valid: boolean };
+  launch?: WorkflowDraftLaunchView;
+}
+
+/** 拉群记录 as the page shows it (§4.5): where it is, what it did. */
+export interface WorkflowDraftLaunchView {
+  state: WorkflowDraftLaunch['state'];
+  /** A step sequence is running in this daemon right now. */
+  running: boolean;
+  /** The step 「继续」 does next (`unknown` when the flow cannot be read). */
+  nextStep: LaunchStep | 'unknown';
+  attempt: number;
+  groupName: string;
+  marker: string;
+  extraMembers: string[];
+  ownerChannel: WorkflowDraftLaunch['ownerChannel'];
+  chat?: WorkflowDraftLaunch['chat'];
+  orphanSuspects?: WorkflowDraftLaunch['orphanSuspects'];
+  root?: WorkflowDraftLaunch['root'];
+  migrate?: WorkflowDraftLaunch['migrate'];
+  check?: WorkflowDraftLaunch['check'];
+  grantedBots: string[];
+  commit?: WorkflowDraftLaunch['commit'];
+  start?: WorkflowDraftLaunch['start'];
+  error?: WorkflowDraftLaunch['error'];
+  startedAt: string;
+  updatedAt: string;
+  abandonedAt?: string;
+}
+
+/** Non-main executing bots of a flow view (undefined: no readable flow). */
+function flowTargetsOf(flow: WorkflowDraftFlowView | undefined): string[] | undefined {
+  return flow ? [...new Set(flow.plan.rows.filter((row) => !row.main).map((row) => row.larkAppId))] : undefined;
+}
+
+interface MutateOpts {
+  baseVersion?: number;
+  allowAbandoned?: boolean;
+  allowDeleted?: boolean;
+  /** A launch operation (D4): not refused by a running launch (it checks itself). */
+  launchOp?: boolean;
+  /** Also a draft whose launch wrote run.json or started the run. */
+  launched?: boolean;
 }
 
 interface ArchitectTask {
@@ -353,7 +434,8 @@ function settleLostArchitect(
 function draftSessions(draft: WorkflowDraftRecord): Array<{ sessionId: string; headlessId?: string }> {
   const out = new Map<string, { sessionId: string; headlessId?: string }>();
   for (const item of draft.orphanSessions ?? []) out.set(item.sessionId, item);
-  if (draft.clarify.sessionId) {
+  // A session moved into the main topic is that topic's now, not the draft's.
+  if (draft.clarify.sessionId && draft.clarify.state !== 'migrated') {
     out.set(draft.clarify.sessionId, {
       sessionId: draft.clarify.sessionId,
       ...(draft.clarify.headlessId ? { headlessId: draft.clarify.headlessId } : {}),
@@ -414,6 +496,10 @@ export class WorkflowDraftService {
   /** This service instance (one per daemon boot) as a reservation holder. */
   private readonly holder: WorkflowDraftReservationHolder;
   private readonly holderAlive: (holder: WorkflowDraftReservationHolder) => boolean;
+  /** Launch operations (D4) running in THIS process, by token. A record on
+   *  disk saying 拉群中 whose token is not here was left by an earlier boot:
+   *  it is resumable with 「继续」, never resumed by itself. */
+  private readonly launchTokens = new Set<string>();
   private readonly now: () => Date;
   private readonly setTimer: (fn: () => void, ms: number) => () => void;
   private readonly loadDag: (path: string) => unknown;
@@ -464,11 +550,13 @@ export class WorkflowDraftService {
 
   // ── shared plumbing ──
 
-  private runDirOf(runId: string): string {
+  private runDirOf(runId: string, opts: { launched?: boolean } = {}): string {
     const runDir = workflowDraftRunDir(this.deps.baseDir, runId);
     // Checked again under the lock; this keeps a lock file from being
     // created in (or failing on) a dir that is not a draft.
-    if (!runDir || !isWorkflowDraftDir(runDir)) throw err('unknown_draft', `没有这个草稿：${runId}`);
+    if (!runDir || !(isWorkflowDraftDir(runDir) || (opts.launched && isLaunchedWorkflowDraftDir(runDir)))) {
+      throw err('unknown_draft', `没有这个草稿：${runId}`);
+    }
     return runDir;
   }
 
@@ -477,9 +565,11 @@ export class WorkflowDraftService {
     runId: string,
     runDir: string,
     initiator: WorkflowDraftInitiator | undefined,
-    opts: { baseVersion?: number; allowAbandoned?: boolean; allowDeleted?: boolean },
+    opts: MutateOpts,
   ): { draft: WorkflowDraftRecord; grill: GrillState } {
-    if (!isWorkflowDraftDir(runDir)) throw err('unknown_draft', `没有这个草稿：${runId}`);
+    if (!(isWorkflowDraftDir(runDir) || (opts.launched && isLaunchedWorkflowDraftDir(runDir)))) {
+      throw err('unknown_draft', `没有这个草稿：${runId}`);
+    }
     const draft = readWorkflowDraft(runDir);
     const grill = readGrillState(runDir);
     if (!draft || !grill || (draft.deletedAt && !opts.allowDeleted)
@@ -493,10 +583,28 @@ export class WorkflowDraftService {
       throw err('not_initiator', '只有这个草稿的发起人能继续操作；其他人可以查看或复制');
     }
     if (draft.abandonedAt && !opts.allowAbandoned) throw err('draft_abandoned', '这个草稿已放弃');
+    if (initiator) {
+      // A person's write while this daemon is running the draft's launch is
+      // refused outright (two tabs, a bot swap mid-launch): the launch's
+      // steps read the flow and the record without holding the lock.
+      if (!opts.launchOp && this.launchRunning(draft)) {
+        throw err('launch_running', '正在拉群，等这一步结束再操作');
+      }
+      // run.json is the commit: past it, only the launch may go on (start).
+      if (!opts.launched && existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) {
+        throw err('run_committed', 'run.json 已写入，这个草稿只能「继续」启动');
+      }
+    }
     if (opts.baseVersion !== undefined && opts.baseVersion !== draft.version) {
       throw err('version_conflict', '草稿已被更新，请刷新后再操作', { version: draft.version });
     }
     return { draft, grill };
+  }
+
+  /** The draft's launch is held by a live operation of THIS process. */
+  private launchRunning(draft: WorkflowDraftRecord): boolean {
+    const token = draft.launch?.state === 'running' ? draft.launch.token : undefined;
+    return !!token && this.launchTokens.has(token);
   }
 
   /**
@@ -507,10 +615,10 @@ export class WorkflowDraftService {
   private mutate<T>(
     runId: string,
     initiator: WorkflowDraftInitiator | undefined,
-    opts: { baseVersion?: number; allowAbandoned?: boolean; allowDeleted?: boolean },
+    opts: MutateOpts,
     fn: (ctx: { runDir: string; draft: WorkflowDraftRecord; grill: GrillState; healed: boolean }) => { changed: boolean; result: T },
   ): T {
-    const runDir = this.runDirOf(runId);
+    const runDir = this.runDirOf(runId, { launched: opts.launched });
     try {
       return withWorkflowDraftLock(runDir, runId, () => {
         const { draft, grill } = this.loadLocked(runId, runDir, initiator, opts);
@@ -554,6 +662,13 @@ export class WorkflowDraftService {
     const settled = settleLostArchitect(draft, grill.status, this.now().toISOString(), ['编排的结果没能记录下来，请重新编排']);
     if (settled === 'succeeded') this.flowChanged(draft, { nodeBots: true });
     return true;
+  }
+
+  /** Once 拉群开始 began, the requirement stage is closed: the clarify session
+   *  may already be the main topic's. Bots can still be swapped (§4.5 第 5 步),
+   *  or the launch abandoned. */
+  private assertNoLaunch(draft: WorkflowDraftRecord, what: string): void {
+    if (draft.launch) throw err('state_conflict', `已经开始拉群，不能再${what}；可以换执行 Bot 或放弃`);
   }
 
   private assertNotArchitecting(runId: string, draft: WorkflowDraftRecord, grill: GrillState): void {
@@ -662,6 +777,7 @@ export class WorkflowDraftService {
     const reservation = this.reserve();
     try {
       const target = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
+        this.assertNoLaunch(draft, '对话');
         this.assertNotArchitecting(runId, draft, grill);
         this.assertStatus(grill, ['grilling', 'spec_ready'], '对话');
         if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
@@ -907,6 +1023,7 @@ export class WorkflowDraftService {
     let prior: { old: { sessionId?: string; headlessId?: string }; prompt: string; title: string };
     try {
       prior = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
+        this.assertNoLaunch(draft, '继续对话');
         this.assertNotArchitecting(runId, draft, grill);
         this.assertStatus(grill, ['grilling', 'spec_ready'], '继续对话');
         if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
@@ -1022,6 +1139,7 @@ export class WorkflowDraftService {
     const note = typeof input.note === 'string' && input.note.trim() ? input.note.trim() : undefined;
     const runDir = this.runDirOf(runId);
     this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
+      this.assertNoLaunch(draft, '重新编排');
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['spec_approved', 'dag_ready'], '编排');
       if (grill.status === 'dag_ready') hostReviseDag(runDir, this.now());
@@ -1187,7 +1305,7 @@ export class WorkflowDraftService {
         ...(excluded ? { why: excluded.why } : {}),
       });
     }
-    this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
+    const stale = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['dag_ready'], '换执行 Bot');
       const dagPath = grill.dagPath;
@@ -1224,8 +1342,26 @@ export class WorkflowDraftService {
         };
       });
       this.flowChanged(draft, { nodeBots: false });
-      return { changed: true, result: undefined };
+      const launch = draft.launch;
+      return {
+        changed: true,
+        result: launch?.chat && launch.grants && Object.keys(launch.grants).length > 0
+          ? { chatId: launch.chat.chatId, grants: structuredClone(launch.grants), runDir, grill }
+          : undefined,
+      };
     });
+    // §4.5 第 6 步: a bot swapped out of a launched group keeps no grant there.
+    // Best effort now; the launch's grant step retries (and waits for it).
+    if (stale && this.deps.launch) {
+      try {
+        const grill = readGrillState(stale.runDir) ?? stale.grill;
+        const wanted = this.launchFlow(stale.runDir, grill).botTargets;
+        const failed = await this.revokeStaleLaunchGrants(runId, undefined, wanted, stale.chatId, stale.grants);
+        if (failed) this.log(`[workflow-draft] ${failed} (retried at 「继续」)`);
+      } catch (error) {
+        this.log(`[workflow-draft] revoking swapped-out grants of ${runId} failed: ${errorText(error)}`);
+      }
+    }
     return this.view(runId);
   }
 
@@ -1300,6 +1436,7 @@ export class WorkflowDraftService {
    *  and the DAG are void. */
   async reviseSpec(runId: string, initiator: WorkflowDraftInitiator, input: { baseVersion?: number } = {}): Promise<WorkflowDraftView> {
     this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
+      this.assertNoLaunch(draft, '退回改需求');
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['spec_ready', 'spec_approved', 'dag_ready'], '退回改需求');
       hostReviseSpec(runDir, this.now());
@@ -1310,24 +1447,48 @@ export class WorkflowDraftService {
     return this.view(runId);
   }
 
-  /** 放弃: the draft stays (listed as 已放弃); a running Architect is
-   *  aborted; the clarify session is closed and its record deleted. */
+  /**
+   * 放弃: the draft stays (listed as 已放弃); a running Architect is
+   * aborted; the clarify session is closed and its record deleted.
+   *
+   * With a launch (§4.5): refused while it runs (launch_running) and once
+   * run.json is written (run_committed, from loadLocked — only 「继续」 to
+   * start remains). An
+   * existing group is kept; its root card is updated to say 「这次启动已放弃」;
+   * a clarify session already moved into the main topic is that topic's and
+   * stays. A root card that could not be updated is retried by the next
+   * 「放弃」 (which is then accepted on the abandoned draft for that alone).
+   */
   async abandon(runId: string, initiator: WorkflowDraftInitiator): Promise<WorkflowDraftView> {
-    const session = this.mutate(runId, initiator, {}, ({ draft }) => {
+    const outcome = this.mutate(runId, initiator, { allowAbandoned: true }, ({ draft }) => {
+      if (draft.abandonedAt) {
+        // Only an abandoned launch whose root card does not say so yet.
+        if (draft.launch?.root && !draft.launch.root.abandonNoted) return { changed: false, result: { old: {}, note: true } };
+        throw err('draft_abandoned', '这个草稿已放弃');
+      }
       const task = this.tasks.get(runId);
       if (task) {
         task.cancelled = true;
         task.controller.abort();
       }
-      draft.abandonedAt = this.now().toISOString();
+      const at = this.now().toISOString();
+      draft.abandonedAt = at;
+      if (draft.launch) {
+        draft.launch.state = 'abandoned';
+        draft.launch.abandonedAt = at;
+        draft.launch.updatedAt = at;
+        delete draft.launch.token;
+      }
+      if (draft.clarify.state === 'migrated') return { changed: true, result: { old: {}, note: !!draft.launch?.root } };
       const old = { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId };
       draft.clarify.state = 'closed';
       delete draft.clarify.pending;
       delete draft.clarify.sessionId;
       delete draft.clarify.headlessId;
-      return { changed: true, result: old };
+      return { changed: true, result: { old, note: !!draft.launch?.root } };
     });
-    await this.closeOrRemember(runId, session);
+    await this.closeOrRemember(runId, outcome.old);
+    if (outcome.note) await this.noteRootAbandoned(runId);
     return this.view(runId);
   }
 
@@ -1390,20 +1551,909 @@ export class WorkflowDraftService {
     return out;
   }
 
+  // ── 拉群开始 (§4.5, D4) ──
+
+  private requireLaunchDeps(): DraftLaunchDeps {
+    if (!this.deps.launch) throw err('launch_unavailable', '这个 daemon 不支持拉群开始');
+    return this.deps.launch;
+  }
+
+  private reserveLaunch(): string {
+    const token = `launch:${randomUUID()}`;
+    this.launchTokens.add(token);
+    return token;
+  }
+
+  /** The current flow, and the second confirmation must hold for it — all
+   *  four pins: flow summary, DAG bytes, spec bytes, flow revision. */
+  private assertFlowConfirmed(
+    runDir: string,
+    draft: WorkflowDraftRecord,
+    grill: GrillState,
+    bots: BotConfig[],
+    nameOf: (larkAppId: string) => string,
+  ): ReturnType<WorkflowDraftService['currentFlow']> {
+    this.assertStatus(grill, ['dag_ready'], '拉群开始');
+    let flow: ReturnType<WorkflowDraftService['currentFlow']>;
+    try {
+      flow = this.currentFlow(runDir, grill, bots, nameOf);
+    } catch (error) {
+      throw err('dag_invalid', `流程读不出来：${errorText(error)}`);
+    }
+    if (!draft.flowConfirmation || !this.confirmationValid(draft, flow)) {
+      throw err('flow_changed', '流程还没确认，或确认后又改过：请先「确认流程」', { flowSummarySha256: flow.flowSummarySha256 });
+    }
+    return flow;
+  }
+
+  /**
+   * 「拉群开始」(§4.5, I6): record the intent (step 1), then run the steps
+   * in the background (the page polls). Only from 已确认流程; once a launch
+   * exists, 「继续」 resumes it.
+   */
+  async launch(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: { groupName?: unknown; extraMembers?: unknown; baseVersion?: number } = {},
+  ): Promise<WorkflowDraftView> {
+    this.requireLaunchDeps();
+    if (input.groupName !== undefined
+      && (typeof input.groupName !== 'string' || !input.groupName.trim() || Array.from(input.groupName.trim()).length > 100)) {
+      throw err('bad_request', 'groupName 必须是 1–100 个字符的字符串');
+    }
+    const members = parseLaunchExtraMembers(input.extraMembers, WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS);
+    if (!members.ok) throw err('bad_request', members.message);
+    const bots = this.deps.loadBots();
+    const nameOf = this.deps.nameOf();
+    const token = this.reserveLaunch();
+    try {
+      // `launched`: a second 「拉群开始」 after the start still answers launch_exists.
+      this.mutate(runId, initiator, { baseVersion: input.baseVersion, launchOp: true, launched: true }, ({ draft, grill, runDir }) => {
+        if (draft.launch) throw err('launch_exists', '已经开始拉群了，点「继续」从中断处接着做');
+        if (this.launchRunning(draft)) throw err('launch_running', '正在拉群');
+        this.assertNotArchitecting(runId, draft, grill);
+        this.assertFlowConfirmed(runDir, draft, grill, bots, nameOf);
+        const marker = launchMarker(runId);
+        if (!marker) throw err('state_conflict', `runId ${runId} 没有随机段，无法给群名加标记`);
+        // I7: the platform login joins by union_id, a local login as the bot
+        // owner by its open_id in this app — never both, never a guess.
+        if (draft.initiator.source === 'dashboard-platform' && !draft.initiator.unionId) {
+          throw err('initiator_channel_unavailable', '平台登录没有带 union_id，无法把发起人拉进群');
+        }
+        const at = this.now().toISOString();
+        const title = typeof input.groupName === 'string' ? input.groupName.trim() : this.titleOf(draft, grill);
+        draft.launch = {
+          attempt: 1,
+          state: 'running',
+          token,
+          startedAt: at,
+          updatedAt: at,
+          groupName: launchGroupName(title, marker),
+          marker,
+          extraMembers: members.members,
+          ownerChannel: draft.initiator.source === 'dashboard-platform' ? 'union_id' : 'open_id',
+        };
+        return { changed: true, result: undefined };
+      });
+    } catch (error) {
+      this.launchTokens.delete(token);
+      throw error;
+    }
+    this.log(`[workflow-draft] launch ${runId} by ${initiator.openId} (${initiator.source})`);
+    // In the background, like the Architect: the page polls the draft.
+    void this.driveLaunch(runId, token);
+    return this.view(runId);
+  }
+
+  /**
+   * 「继续」(§4.5 断点续做): resume a launch from what its record says. A
+   * launch left 拉群中 by an earlier daemon process is resumed only here,
+   * never by itself. Before run.json the second confirmation must hold again
+   * (a bot swapped at step 5 voids it: 「确认流程」 first).
+   */
+  async continueLaunch(runId: string, initiator: WorkflowDraftInitiator, input: { baseVersion?: number } = {}): Promise<WorkflowDraftView> {
+    this.requireLaunchDeps();
+    const bots = this.deps.loadBots();
+    const nameOf = this.deps.nameOf();
+    const token = this.reserveLaunch();
+    let go: boolean;
+    try {
+      go = this.mutate(runId, initiator, { baseVersion: input.baseVersion, launchOp: true, launched: true }, ({ draft, grill, runDir }) => {
+        const launch = draft.launch;
+        if (!launch) throw err('no_launch', '还没有开始拉群');
+        if (launch.state === 'started') return { changed: false, result: false };
+        if (this.launchRunning(draft)) throw err('launch_running', '正在拉群，等这一步结束');
+        if (!launch.commit && !existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) {
+          this.assertNotArchitecting(runId, draft, grill);
+          this.assertFlowConfirmed(runDir, draft, grill, bots, nameOf);
+        }
+        launch.state = 'running';
+        launch.token = token;
+        launch.attempt += 1;
+        launch.updatedAt = this.now().toISOString();
+        delete launch.error;
+        return { changed: true, result: true };
+      });
+    } catch (error) {
+      this.launchTokens.delete(token);
+      throw error;
+    }
+    if (go) void this.driveLaunch(runId, token);
+    else this.launchTokens.delete(token);
+    return this.view(runId);
+  }
+
+  /** 「放弃」 of a launch: the draft's abandon (keeps the group, notes it on
+   *  the root card). */
+  async abandonLaunch(runId: string, initiator: WorkflowDraftInitiator): Promise<WorkflowDraftView> {
+    this.mutate(runId, initiator, { allowAbandoned: true, launchOp: true }, ({ draft }) => {
+      if (!draft.launch) throw err('no_launch', '还没有开始拉群');
+      return { changed: false, result: undefined };
+    });
+    return this.abandon(runId, initiator);
+  }
+
+  private titleOf(draft: WorkflowDraftRecord, grill: GrillState): string {
+    const spec = this.specFacts(grill);
+    return spec?.title ?? draft.goal.replace(/\s+/g, ' ').trim().slice(0, 200);
+  }
+
+  private specFacts(grill: GrillState): { title?: string; requirement?: string; nodes: Array<{ id: string; goal: string }> } | undefined {
+    try {
+      const spec = JSON.parse(readFileSync(grill.specJsonPath, 'utf-8')) as {
+        title?: unknown; requirement?: unknown; nodes?: Array<{ sketchId?: unknown; goal?: unknown }>;
+      };
+      return {
+        ...(typeof spec.title === 'string' && spec.title.trim() ? { title: spec.title.trim().slice(0, 200) } : {}),
+        ...(typeof spec.requirement === 'string' && spec.requirement.trim() ? { requirement: spec.requirement.trim().slice(0, 2000) } : {}),
+        nodes: (Array.isArray(spec.nodes) ? spec.nodes : [])
+          .filter((node) => typeof node?.sketchId === 'string' && typeof node.goal === 'string')
+          .slice(0, 50)
+          .map((node) => ({ id: node.sketchId as string, goal: (node.goal as string).slice(0, 500) })),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** One launch transaction, only while `token` still holds the launch. */
+  private launchTx<T>(
+    runId: string,
+    token: string,
+    fn: (ctx: { runDir: string; draft: WorkflowDraftRecord; launch: WorkflowDraftLaunch; grill: GrillState }) => { changed: boolean; result: T },
+  ): { held: true; result: T } | { held: false } {
+    return this.mutate<{ held: true; result: T } | { held: false }>(runId, undefined, { launchOp: true, launched: true }, ({ runDir, draft, grill }) => {
+      const launch = draft.launch;
+      if (!launch || launch.state !== 'running' || launch.token !== token) return { changed: false, result: { held: false } };
+      const out = fn({ runDir, draft, launch, grill });
+      if (out.changed) launch.updatedAt = this.now().toISOString();
+      return { changed: out.changed, result: { held: true, result: out.result } };
+    });
+  }
+
+  /** Stop at `step` (state 拉群中, 「继续」 resumes), recording why. */
+  private stopLaunch(
+    runId: string,
+    token: string,
+    stop: { step: NonNullable<WorkflowDraftLaunch['error']>['step']; code: string; message: string; retryable: boolean },
+    patch?: (launch: WorkflowDraftLaunch, draft: WorkflowDraftRecord) => void,
+  ): void {
+    try {
+      this.launchTx(runId, token, ({ launch, draft }) => {
+        patch?.(launch, draft);
+        launch.state = 'paused';
+        delete launch.token;
+        launch.error = { ...stop, message: clip(stop.message, 4000), at: this.now().toISOString() };
+        return { changed: true, result: undefined };
+      });
+    } catch (error) {
+      // The token is released below; the record stays 拉群中 with a dead
+      // token, which 「继续」 takes over.
+      this.log(`[workflow-draft] recording launch stop of ${runId} failed: ${errorText(error)}`);
+    }
+    this.log(`[workflow-draft] launch ${runId} stopped at ${stop.step}: ${stop.code}`);
+  }
+
+  /** The flow facts a launch step needs (before run.json). */
+  private launchFlow(runDir: string, grill: GrillState): { targets: V3NodeExecutorTarget[]; botTargets: string[] } {
+    const bots = this.deps.loadBots();
+    const flow = this.currentFlow(runDir, grill, bots, this.deps.nameOf());
+    return {
+      targets: flow.targets,
+      botTargets: [...new Set(flow.targets.map((target) => target.larkAppId).filter((appId) => appId !== this.deps.appId))],
+    };
+  }
+
+  /** Where the launch held by `token` is; undefined once it is not held. */
+  private launchStepOf(runId: string, token: string): LaunchStep | undefined {
+    const out = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => {
+      if (launch.commit || existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) {
+        return { changed: false, result: launch.commit ? nextLaunchStep(launch, { flowRevision: 0, targets: [] }) : 'commit' as LaunchStep };
+      }
+      const flow = this.launchFlow(runDir, grill);
+      return { changed: false, result: nextLaunchStep(launch, { flowRevision: draft.flowRevision ?? 0, targets: flow.botTargets }) };
+    });
+    return out.held ? out.result : undefined;
+  }
+
+  private async driveLaunch(runId: string, token: string): Promise<void> {
+    try {
+      for (let round = 0; round < 16; round += 1) {
+        let step: LaunchStep | undefined;
+        try {
+          step = this.launchStepOf(runId, token);
+        } catch (error) {
+          this.stopLaunch(runId, token, { step: 'interrupted', code: 'flow_unreadable', message: `流程读不出来：${errorText(error)}`, retryable: true });
+          return;
+        }
+        if (!step || step === 'done') return;
+        if (!await this.runLaunchStep(runId, token, step)) return;
+      }
+      this.stopLaunch(runId, token, { step: 'interrupted', code: 'launch_loop', message: '拉群步骤没有推进，请点「继续」重试', retryable: true });
+    } catch (error) {
+      this.log(`[workflow-draft] launch ${runId} failed: ${errorText(error)}`);
+      this.stopLaunch(runId, token, { step: 'interrupted', code: 'internal_error', message: errorText(error), retryable: true });
+    } finally {
+      this.launchTokens.delete(token);
+      try {
+        // Whatever ended the run of steps without a recorded stop leaves 拉群中
+        // resumable, never held by a token nobody owns.
+        this.launchTx(runId, token, ({ launch }) => {
+          launch.state = 'paused';
+          delete launch.token;
+          return { changed: true, result: undefined };
+        });
+      } catch { /* a dead token is taken over by 「继续」 */ }
+    }
+  }
+
+  /** One step; true when the next one may follow. */
+  private async runLaunchStep(runId: string, token: string, step: LaunchStep): Promise<boolean> {
+    switch (step) {
+      case 'group': return this.launchGroupStep(runId, token);
+      case 'join': return this.launchJoinStep(runId, token);
+      case 'root': return this.launchRootStep(runId, token);
+      case 'migrate': return this.launchMigrateStep(runId, token);
+      case 'check': return this.launchCheckStep(runId, token);
+      case 'grant': return this.launchGrantStep(runId, token);
+      case 'commit': return this.launchCommitStep(runId, token);
+      case 'start': return this.launchStartStep(runId, token);
+      case 'done': return false;
+    }
+  }
+
+  /** Record the group (first one wins; a different one is a suspect). */
+  private recordLaunchChat(runId: string, token: string, chat: {
+    chatId: string; recovered?: boolean; shareLink?: string; warnings?: string[];
+    initiator?: 'joined' | 'rejected'; ownerTransferError?: string;
+  }): void {
+    this.launchTx(runId, token, ({ launch }) => {
+      const at = this.now().toISOString();
+      const facts = {
+        ...(chat.initiator ? { initiator: chat.initiator } : {}),
+        ...(chat.ownerTransferError ? { ownerTransferError: clip(chat.ownerTransferError, 2000) } : {}),
+      };
+      if (!launch.chat) {
+        launch.chat = {
+          chatId: chat.chatId,
+          at,
+          ...(chat.recovered ? { recovered: true as const } : {}),
+          ...(chat.shareLink ? { shareLink: chat.shareLink.slice(0, 2000) } : {}),
+          ...(chat.warnings?.length ? { warnings: chat.warnings.slice(0, 20).map((w) => clip(w, 2000)) } : {}),
+          ...facts,
+        };
+        return { changed: true, result: undefined };
+      }
+      if (launch.chat.chatId !== chat.chatId) {
+        launch.orphanSuspects = [...(launch.orphanSuspects ?? []), { chatId: chat.chatId, note: '同一次拉群又建出的另一个群' }].slice(-50);
+        return { changed: true, result: undefined };
+      }
+      if (!chat.shareLink && !chat.warnings?.length && !chat.initiator) return { changed: false, result: undefined };
+      Object.assign(launch.chat, facts);
+      if (chat.shareLink) launch.chat.shareLink = chat.shareLink.slice(0, 2000);
+      if (chat.warnings?.length) launch.chat.warnings = [...(launch.chat.warnings ?? []), ...chat.warnings].slice(0, 20).map((w) => clip(w, 2000));
+      return { changed: true, result: undefined };
+    });
+  }
+
+  /**
+   * Step 2: the topic group. A create attempt recorded without a group means
+   * it may have succeeded with the record lost: first look for the marker
+   * among the main bot's chats (recover), create only when nothing carries it.
+   */
+  private async launchGroupStep(runId: string, token: string): Promise<boolean> {
+    const deps = this.deps.launch!;
+    const snap = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => ({
+      changed: false,
+      result: { launch: structuredClone(launch), initiator: draft.initiator, botTargets: this.launchFlow(runDir, grill).botTargets },
+    }));
+    if (!snap.held) return false;
+    const { launch, initiator, botTargets } = snap.result;
+    if (launch.createAttempts?.length) {
+      let chats: Array<{ chatId: string; name?: string }>;
+      try {
+        chats = await deps.listChats();
+      } catch (error) {
+        this.stopLaunch(runId, token, {
+          step: 'group', code: 'list_chats_failed', retryable: true,
+          message: `上次建群的结果没记录下来，查主 Bot 所在的群失败；为了不重复建群先停在这里：${errorText(error)}`,
+        });
+        return false;
+      }
+      const matches = chats.filter((chat) => groupNameHasMarker(chat.name, launch.marker));
+      if (matches.length > 0) {
+        this.recordLaunchChat(runId, token, { chatId: matches[0]!.chatId, recovered: true });
+        if (matches.length > 1) {
+          this.launchTx(runId, token, ({ launch: current }) => {
+            const known = new Set((current.orphanSuspects ?? []).map((item) => item.chatId));
+            const extra = matches.slice(1).filter((chat) => !known.has(chat.chatId))
+              .map((chat) => ({ chatId: chat.chatId, ...(chat.name ? { name: chat.name.slice(0, 200) } : {}), note: '群名带同一个标记的另一个群' }));
+            if (extra.length === 0) return { changed: false, result: undefined };
+            current.orphanSuspects = [...(current.orphanSuspects ?? []), ...extra].slice(-50);
+            return { changed: true, result: undefined };
+          });
+        }
+        return true;
+      }
+      // Nothing carries the marker: those attempts made no group, or one whose
+      // name was changed since — listed for a person; a new group is built.
+      this.launchTx(runId, token, ({ launch: current }) => {
+        const known = new Set((current.orphanSuspects ?? []).map((item) => item.attemptAt));
+        const extra = (current.createAttempts ?? []).filter((at) => !known.has(at))
+          .map((at) => ({ attemptAt: at, note: '这次建群的结果没记录下来，按群名标记也没找到；如果群名被改过，它可能还在' }));
+        if (extra.length === 0) return { changed: false, result: undefined };
+        current.orphanSuspects = [...(current.orphanSuspects ?? []), ...extra].slice(-50);
+        return { changed: true, result: undefined };
+      });
+    }
+    const parsed = parseLaunchExtraMembers(launch.extraMembers, WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS);
+    if (!parsed.ok) {
+      this.stopLaunch(runId, token, { step: 'members', code: 'members_invalid', message: parsed.message, retryable: false });
+      return false;
+    }
+    let extraOpenIds: string[] = [];
+    if (parsed.emails.length > 0) {
+      let resolved: Awaited<ReturnType<DraftLaunchDeps['resolveEmails']>>;
+      try {
+        resolved = await deps.resolveEmails(parsed.emails);
+      } catch (error) {
+        resolved = { ok: false, retryable: true, message: errorText(error) };
+      }
+      const missing = resolved.ok ? parsed.emails.filter((email) => !resolved.ok || !resolved.openIds.get(email)?.startsWith('ou_')) : parsed.emails;
+      if (!resolved.ok || missing.length > 0) {
+        this.stopLaunch(runId, token, {
+          step: 'members',
+          code: resolved.ok || !resolved.retryable ? 'members_unresolved' : 'members_lookup_failed',
+          retryable: !resolved.ok && resolved.retryable,
+          message: resolved.ok ? `这些邮箱主 Bot 查不到：${missing.join('、')}` : `查额外成员失败：${resolved.message}`,
+        });
+        return false;
+      }
+      extraOpenIds = parsed.emails.map((email) => resolved.ok ? resolved.openIds.get(email)! : '');
+    }
+    const owner = launch.ownerChannel === 'union_id'
+      ? { channel: 'union_id' as const, unionId: initiator.unionId! }
+      : { channel: 'open_id' as const, openId: initiator.openId };
+    // The attempt is on disk before the call: a crash inside it is recovered
+    // by the marker, never answered by a second group.
+    const marked = this.launchTx(runId, token, ({ launch: current }) => {
+      current.createAttempts = [...(current.createAttempts ?? []), this.now().toISOString()].slice(-50);
+      return { changed: true, result: undefined };
+    });
+    if (!marked.held) return false;
+    let hooked: string | undefined;
+    try {
+      const created = await deps.createGroup({
+        name: launch.groupName,
+        botAppIds: botTargets,
+        owner,
+        extraOpenIds,
+        extraUnionIds: parsed.unionIds,
+        onChatCreated: (chatId) => {
+          hooked = chatId;
+          try { this.recordLaunchChat(runId, token, { chatId }); } catch { /* recorded after the call */ }
+        },
+      });
+      this.recordLaunchChat(runId, token, {
+        chatId: created.chatId,
+        ...(created.shareLink ? { shareLink: created.shareLink } : {}),
+        ...(created.warnings.length ? { warnings: created.warnings } : {}),
+        initiator: created.initiatorJoined ? 'joined' : 'rejected',
+        ...(created.ownerTransferError ? { ownerTransferError: created.ownerTransferError } : {}),
+      });
+      return true;
+    } catch (error) {
+      if (hooked) {
+        this.recordLaunchChat(runId, token, { chatId: hooked, warnings: [`建群后续步骤出错：${errorText(error)}`] });
+        return true;
+      }
+      this.stopLaunch(runId, token, { step: 'group', code: 'create_group_failed', message: `建群失败：${errorText(error)}`, retryable: true });
+      return false;
+    }
+  }
+
+  /**
+   * Group owner (§4.5 第 2 步, decided): the initiator must be in the group —
+   * a refused invite stops the launch here (「继续」 retries); a failed owner
+   * transfer is recorded on `chat.ownerTransferError`, shown, and the launch
+   * goes on. Also for a group recovered by its marker (unknown either way).
+   */
+  private async launchJoinStep(runId: string, token: string): Promise<boolean> {
+    const snap = this.launchTx(runId, token, ({ draft, launch }) => ({
+      changed: false,
+      result: {
+        chatId: launch.chat!.chatId,
+        owner: launch.ownerChannel === 'union_id'
+          ? { channel: 'union_id' as const, unionId: draft.initiator.unionId! }
+          : { channel: 'open_id' as const, openId: draft.initiator.openId },
+      },
+    }));
+    if (!snap.held) return false;
+    let joined: Awaited<ReturnType<DraftLaunchDeps['joinInitiator']>>;
+    try {
+      joined = await this.deps.launch!.joinInitiator(snap.result.chatId, snap.result.owner);
+    } catch (error) {
+      joined = { joined: false, error: errorText(error) };
+    }
+    if (!joined.joined) {
+      this.stopLaunch(runId, token, {
+        step: 'join', code: 'initiator_not_joined', retryable: true,
+        message: `发起人没能进群${joined.error ? `（${joined.error}）` : ''}；请确认发起人对编排 Bot 可见后点「继续」重试`,
+      }, (launch) => { if (launch.chat) launch.chat.initiator = 'rejected'; });
+      return false;
+    }
+    return this.launchTx(runId, token, ({ launch }) => {
+      if (!launch.chat) return { changed: false, result: undefined };
+      launch.chat.initiator = 'joined';
+      if (joined.ownerTransferError) launch.chat.ownerTransferError = clip(joined.ownerTransferError, 2000);
+      else delete launch.chat.ownerTransferError;
+      return { changed: true, result: undefined };
+    }).held;
+  }
+
+  private rootCardView(runId: string, draft: WorkflowDraftRecord, grill: GrillState, nodeCount: number, abandoned = false): LaunchRootCardView {
+    return {
+      runId,
+      title: this.titleOf(draft, grill),
+      initiatorOpenId: draft.initiator.openId,
+      nodeCount,
+      ...(abandoned ? { abandoned: true } : {}),
+    };
+  }
+
+  /** Step 3: the root card of the main topic (E6). */
+  private async launchRootStep(runId: string, token: string): Promise<boolean> {
+    const snap = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => ({
+      changed: false,
+      result: {
+        chatId: launch.chat!.chatId,
+        view: this.rootCardView(runId, draft, grill, this.launchFlow(runDir, grill).targets.length),
+        // The same uuid on a resend: Feishu answers it with the first message.
+        uuid: `wf-root-${launch.marker.slice(1)}-${launch.chat!.chatId.slice(-24)}`,
+      },
+    }));
+    if (!snap.held) return false;
+    let messageId: string;
+    try {
+      messageId = await this.deps.launch!.postRootCard(snap.result.chatId, snap.result.view, snap.result.uuid);
+    } catch (error) {
+      this.stopLaunch(runId, token, { step: 'root', code: 'post_root_failed', message: `发主话题卡片失败：${errorText(error)}`, retryable: true });
+      return false;
+    }
+    const recorded = this.launchTx(runId, token, ({ launch }) => {
+      if (launch.root) return { changed: false, result: undefined };
+      launch.root = { messageId, at: this.now().toISOString() };
+      return { changed: true, result: undefined };
+    });
+    return recorded.held;
+  }
+
+  /** Step 4: the clarify session moves into the main topic, then a summary
+   *  is posted there (E7). A session that no longer exists does not hold
+   *  the launch up: the topic then gets its session from its first message. */
+  private async launchMigrateStep(runId: string, token: string): Promise<boolean> {
+    const deps = this.deps.launch!;
+    const snap = this.launchTx(runId, token, ({ draft, launch, grill }) => {
+      const spec = this.specFacts(grill);
+      return {
+        changed: false,
+        result: {
+          chatId: launch.chat!.chatId,
+          rootMessageId: launch.root!.messageId,
+          session: draft.clarify.sessionId && draft.clarify.state !== 'disconnected' && draft.clarify.state !== 'closed'
+            ? { sessionId: draft.clarify.sessionId, ...(draft.clarify.headlessId ? { headlessId: draft.clarify.headlessId } : {}) }
+            : undefined,
+          summary: {
+            runId,
+            title: this.titleOf(draft, grill),
+            goal: draft.goal,
+            ...(spec?.requirement ? { requirement: spec.requirement } : {}),
+            nodes: spec?.nodes ?? [],
+          } satisfies LaunchSummaryView,
+          uuid: `wf-sum-${launch.marker.slice(1)}-${launch.root!.messageId.slice(-24)}`,
+        },
+      };
+    });
+    if (!snap.held) return false;
+    const { chatId, rootMessageId, session, summary, uuid } = snap.result;
+    let bound: Awaited<ReturnType<DraftLaunchDeps['bindSession']>>;
+    if (!session) {
+      bound = { ok: false, error: '澄清会话已断开', unavailable: true };
+    } else {
+      try {
+        bound = await deps.bindSession({ ...session, chatId, rootMessageId, title: summary.title });
+      } catch (error) {
+        bound = { ok: false, error: errorText(error), unavailable: false };
+      }
+    }
+    if (!bound.ok && !bound.unavailable) {
+      this.stopLaunch(runId, token, { step: 'migrate', code: 'bind_failed', message: `澄清会话迁入主话题失败：${bound.error}`, retryable: true });
+      return false;
+    }
+    const recorded = this.launchTx(runId, token, ({ draft, launch }) => {
+      const at = this.now().toISOString();
+      launch.migrate = bound.ok
+        ? { status: 'bound', at, sessionId: session!.sessionId }
+        : { status: 'unavailable', at, error: clip(bound.error, 2000) };
+      if (bound.ok) {
+        draft.clarify.state = 'migrated';
+        delete draft.clarify.suspendedAt;
+        delete draft.clarify.suspendRefusedAt;
+      }
+      return { changed: true, result: undefined };
+    });
+    if (!recorded.held) return false;
+    // The summary is for people (not compared with anything); its failure is
+    // shown, not retried into a second message.
+    let summaryMessageId: string | undefined;
+    let summaryError: string | undefined;
+    try {
+      summaryMessageId = await deps.postSummary(rootMessageId, {
+        ...summary,
+        ...(bound.ok ? {} : { sessionNote: `澄清会话没能迁入（${bound.error}），在主话题里发消息会开一个新会话` }),
+      }, uuid);
+    } catch (error) {
+      summaryError = errorText(error);
+    }
+    return this.launchTx(runId, token, ({ launch }) => {
+      if (!launch.migrate) return { changed: false, result: undefined };
+      if (summaryMessageId) launch.migrate.summaryMessageId = summaryMessageId;
+      if (summaryError) launch.migrate.summaryError = clip(summaryError, 2000);
+      return { changed: true, result: undefined };
+    }).held;
+  }
+
+  /**
+   * Step 5: every executing bot, live in the new group — in it (a missing one
+   * is invited once more: 「重试拉人」), its daemon online, opens topic
+   * sessions. Read only: no grant here (step 6 grants only bots that pass).
+   */
+  private async launchCheckStep(runId: string, token: string): Promise<boolean> {
+    const snap = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => ({
+      changed: false,
+      result: { chatId: launch.chat!.chatId, flowRevision: draft.flowRevision ?? 0, targets: this.launchFlow(runDir, grill).targets },
+    }));
+    if (!snap.held) return false;
+    const { chatId, flowRevision, targets } = snap.result;
+    const deps = this.deps.launch!;
+    const probe = deps.probe(chatId);
+    const verdicts = new Map<string, Awaited<ReturnType<typeof judgeV3BotEligibility>>>();
+    for (const target of targets) {
+      const appId = target.larkAppId;
+      if (appId === this.deps.appId || verdicts.has(appId)) continue;
+      let verdict = await judgeV3BotEligibility(appId, probe, { grant: false });
+      if (verdict?.code === 'BOT_NOT_IN_CHAT') {
+        try { await deps.addBots(chatId, [appId]); } catch { /* judged again below */ }
+        verdict = await judgeV3BotEligibility(appId, probe, { grant: false });
+      }
+      verdicts.set(appId, verdict);
+    }
+    const problems: WorkflowDraftLaunchProblem[] = [];
+    for (const target of targets) {
+      if (target.directoryOutputs) {
+        problems.push({ nodeId: target.nodeId, larkAppId: target.larkAppId, code: 'DIRECTORY_OUTPUT', why: describeV3BotEligibilityCode('DIRECTORY_OUTPUT'), detail: target.directoryOutputs.join(', ').slice(0, 2000) });
+      }
+      const verdict = verdicts.get(target.larkAppId);
+      if (verdict) {
+        problems.push({
+          nodeId: target.nodeId, larkAppId: target.larkAppId, code: verdict.code, why: describeV3BotEligibilityCode(verdict.code),
+          ...(verdict.detail ? { detail: clip(verdict.detail, 2000) } : {}),
+        });
+      }
+    }
+    const check = { at: this.now().toISOString(), flowRevision, ok: problems.length === 0, problems: problems.slice(0, 200) };
+    if (check.ok) {
+      return this.launchTx(runId, token, ({ launch }) => {
+        launch.check = check;
+        return { changed: true, result: undefined };
+      }).held;
+    }
+    const nameOf = this.deps.nameOf();
+    this.stopLaunch(runId, token, {
+      step: 'check', code: 'bots_ineligible', retryable: true,
+      message: ['这些节点的执行 Bot 现在不满足条件：',
+        ...problems.map((problem) => `- ${problem.nodeId} → ${nameOf(problem.larkAppId)}：${problem.why}${problem.detail ? `（${problem.detail}）` : ''}`),
+        '处理后点「继续」重试；或给节点换 Bot（需要重新确认流程）。'].join('\n'),
+    }, (launch) => { launch.check = check; });
+    return false;
+  }
+
+  /** Revoke the grants of bots that no longer execute any node (both sides,
+   *  by the open_ids recorded when they were written — no membership needed). */
+  private async revokeStaleLaunchGrants(runId: string, token: string | undefined, wanted: readonly string[], chatId: string,
+    grants: NonNullable<WorkflowDraftLaunch['grants']>): Promise<string | undefined> {
+    const deps = this.deps.launch!;
+    for (const [appId, grant] of Object.entries(grants)) {
+      if (wanted.includes(appId)) continue;
+      try {
+        if (grant.mainSide) await deps.revoke(chatId, this.deps.appId, grant.mainSide);
+        if (grant.peerSide) await deps.revoke(chatId, appId, grant.peerSide);
+      } catch (error) {
+        return `撤销 ${this.deps.nameOf()(appId)} 在这个群的协作授权失败：${errorText(error)}`;
+      }
+      const drop = ({ launch }: { launch: WorkflowDraftLaunch }) => {
+        if (!launch.grants?.[appId]) return { changed: false, result: undefined };
+        delete launch.grants[appId];
+        if (Object.keys(launch.grants).length === 0) delete launch.grants;
+        return { changed: true, result: undefined };
+      };
+      if (token) {
+        if (!this.launchTx(runId, token, drop).held) return undefined;
+      } else {
+        this.mutate(runId, undefined, { launchOp: true, launched: true, allowAbandoned: true }, ({ draft }) =>
+          draft.launch ? drop({ launch: draft.launch }) : { changed: false, result: undefined });
+      }
+      this.log(`[workflow-draft] launch ${runId}: revoked chat grants of ${appId} in ${chatId}`);
+    }
+    return undefined;
+  }
+
+  /** Step 6: grants between the main bot and every executing bot that
+   *  passed step 5, after revoking those of bots swapped out. Idempotent. */
+  private async launchGrantStep(runId: string, token: string): Promise<boolean> {
+    const snap = this.launchTx(runId, token, ({ runDir, launch, grill }) => ({
+      changed: false,
+      result: { chatId: launch.chat!.chatId, grants: structuredClone(launch.grants ?? {}), wanted: this.launchFlow(runDir, grill).botTargets },
+    }));
+    if (!snap.held) return false;
+    const { chatId, grants, wanted } = snap.result;
+    const revokeError = await this.revokeStaleLaunchGrants(runId, token, wanted, chatId, grants);
+    if (revokeError) {
+      this.stopLaunch(runId, token, { step: 'grant', code: 'revoke_failed', message: revokeError, retryable: true });
+      return false;
+    }
+    const deps = this.deps.launch!;
+    for (const appId of wanted) {
+      const have = grants[appId];
+      for (const side of ['mainSide', 'peerSide'] as const) {
+        if (have?.[side]) continue;
+        let written: { subjectOpenId: string };
+        try {
+          written = side === 'mainSide'
+            ? await deps.grant(chatId, this.deps.appId, appId)
+            : await deps.grant(chatId, appId, this.deps.appId);
+          if (!/^ou_[A-Za-z0-9_-]{1,128}$/.test(written.subjectOpenId)) throw new Error('授权返回的 open_id 不合法');
+        } catch (error) {
+          this.stopLaunch(runId, token, {
+            step: 'grant', code: 'grant_failed', retryable: true,
+            message: `${describeV3BotEligibilityCode('COLLABORATION_DENIED')}：${this.deps.nameOf()(appId)}（${errorText(error)}）`,
+          });
+          return false;
+        }
+        const recorded = this.launchTx(runId, token, ({ launch }) => {
+          const current = launch.grants?.[appId] ?? { at: this.now().toISOString() };
+          launch.grants = { ...(launch.grants ?? {}), [appId]: { ...current, [side]: written.subjectOpenId } };
+          return { changed: true, result: undefined };
+        });
+        if (!recorded.held) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Step 7: run.json. Under the draft lock (then the host lock, then the
+   * run.json lock — the documented order), the current flow is checked
+   * against the second confirmation on all four pins; the run is authorized
+   * with the binding this launch produced, the initiator and the
+   * confirmation; the grill moves to dag_approved. A run.json already there
+   * (crash after it was written) must be this launch's: then it is only
+   * recorded.
+   */
+  private async launchCommitStep(runId: string, token: string): Promise<boolean> {
+    const bots = this.deps.loadBots();
+    const nameOf = this.deps.nameOf();
+    const out = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => {
+      const chatId = launch.chat!.chatId;
+      const rootMessageId = launch.root!.messageId;
+      const envelopePath = join(runDir, V3_RUN_ENVELOPE_FILE);
+      if (!existsSync(envelopePath)) {
+        let flow: ReturnType<WorkflowDraftService['currentFlow']>;
+        try {
+          flow = this.currentFlow(runDir, grill, bots, nameOf);
+        } catch (error) {
+          throw err('dag_invalid', `流程读不出来：${errorText(error)}`);
+        }
+        if (grill.status !== 'dag_ready' || !draft.flowConfirmation || !this.confirmationValid(draft, flow)) {
+          // §9: back to 待确认流程; the page shows the current flow to confirm.
+          delete draft.flowConfirmation;
+          return { changed: true, result: 'stop' as const };
+        }
+        const wanted = [...new Set(flow.targets.map((t) => t.larkAppId).filter((appId) => appId !== this.deps.appId))];
+        if (nextLaunchStep(launch, { flowRevision: draft.flowRevision ?? 0, targets: wanted }) !== 'commit') {
+          return { changed: false, result: 'again' as const };
+        }
+      }
+      const confirmation = draft.flowConfirmation;
+      const binding: RunChatBinding = {
+        larkAppId: this.deps.appId,
+        chatId,
+        chatType: 'group',
+        rootMessageId,
+        ...(launch.migrate?.status === 'bound' && launch.migrate.sessionId ? { sessionId: launch.migrate.sessionId } : {}),
+        ownerOpenId: draft.initiator.openId,
+      };
+      const initiator: V3RunInitiator = {
+        openId: draft.initiator.openId,
+        ...(draft.initiator.source === 'dashboard-platform' && draft.initiator.unionId ? { unionId: draft.initiator.unionId } : {}),
+        source: draft.initiator.source,
+      };
+      if (existsSync(envelopePath)) {
+        // Written before its record could be (crash): it must be exactly this
+        // launch's — then authorizeAdHocRun only replays it.
+        const existing = readRunEnvelope(runDir, runId);
+        const envelope = existing.kind === 'ok' ? existing.envelope : undefined;
+        const authorization = envelope?.authorization as { initiator?: V3RunInitiator; flowConfirmation?: { flowSummarySha256?: string } } | undefined;
+        if (!envelope || envelope.source.kind !== 'ad_hoc' || envelope.chatBinding?.chatId !== chatId
+          || envelope.chatBinding.rootMessageId !== rootMessageId || envelope.chatBinding.larkAppId !== this.deps.appId
+          || authorization?.initiator?.openId !== initiator.openId || !authorization.flowConfirmation?.flowSummarySha256) {
+          throw err('state_conflict', 'run.json 已存在，但不是这次拉群写的；不会覆盖它');
+        }
+      }
+      const authorized = authorizeAdHocRun(runDir, bots, this.now(), {
+        nodeExecutor: 'bot',
+        chatBinding: binding,
+        initiator,
+        flowConfirmation: ({ dag, targets }) => {
+          // Exactly what is being frozen must be what was confirmed.
+          const flowSummary = adHocFlowSummary({ runDir, dag, targets, orchestratorAppId: this.deps.appId, bots, nameOf });
+          const flowSummarySha256 = v3FlowSummarySha256(flowSummary);
+          if (!confirmation || flowSummarySha256 !== confirmation.flowSummarySha256) {
+            throw err('flow_changed', '要写进 run.json 的流程和确认时的不一样');
+          }
+          return { confirmedByOpenId: confirmation.confirmedByOpenId, confirmedAt: confirmation.confirmedAt, flowSummary, flowSummarySha256 };
+        },
+      });
+      hostApproveDag(runDir, this.now());
+      const authorization = authorized.envelope.authorization as { flowConfirmation?: { flowSummarySha256: string } };
+      launch.commit = {
+        at: this.now().toISOString(),
+        chatId,
+        rootMessageId,
+        runJsonSha256: fileSha256(envelopePath)!,
+        flowSummarySha256: authorization.flowConfirmation!.flowSummarySha256 as `sha256:${string}`,
+        dagSha256: authorized.envelope.artifacts.dag.sha256,
+        specSha256: authorized.envelope.artifacts.spec!.sha256,
+        flowRevision: draft.flowRevision ?? 0,
+      };
+      return { changed: true, result: 'committed' as const };
+    });
+    if (!out.held) return false;
+    if (out.result === 'stop') {
+      this.stopLaunch(runId, token, {
+        step: 'commit', code: 'flow_changed', retryable: false,
+        message: '流程和第二道确认时的不一致，已回到「待确认流程」：请看最新的流程，重新确认后点「继续」',
+      });
+      return false;
+    }
+    if (out.result === 'committed') this.log(`[workflow-draft] launch ${runId}: run.json written`);
+    return true;
+  }
+
+  /** Step 8: the same start path as `botmux workflow start` (idempotent). */
+  private async launchStartStep(runId: string, token: string): Promise<boolean> {
+    let started: Awaited<ReturnType<DraftLaunchDeps['startRun']>>;
+    try {
+      started = await this.deps.launch!.startRun(runId);
+    } catch (error) {
+      started = { ok: false, status: 500, error: errorText(error) };
+    }
+    if (!started.ok) {
+      this.stopLaunch(runId, token, {
+        step: 'start', code: clip(started.error, 64), retryable: true,
+        message: `启动失败（HTTP ${started.status}）：${started.error}${started.detail ? `（${started.detail}）` : ''}`,
+      });
+      return false;
+    }
+    this.launchTx(runId, token, ({ launch }) => {
+      launch.start = { at: this.now().toISOString() };
+      launch.state = 'started';
+      delete launch.token;
+      delete launch.error;
+      return { changed: true, result: undefined };
+    });
+    this.log(`[workflow-draft] launch ${runId}: started`);
+    return false;
+  }
+
+  /** The root card says 「这次启动已放弃」 (best effort; the next 「放弃」 retries). */
+  private async noteRootAbandoned(runId: string): Promise<void> {
+    const deps = this.deps.launch;
+    if (!deps) return;
+    let target: { messageId: string; view: LaunchRootCardView } | undefined;
+    try {
+      target = this.mutate(runId, undefined, { allowAbandoned: true, launchOp: true, launched: true }, ({ runDir, draft, grill }) => {
+        const root = draft.launch?.root;
+        if (!root || root.abandonNoted) return { changed: false, result: undefined };
+        let nodeCount = 0;
+        try { nodeCount = this.launchFlow(runDir, grill).targets.length; } catch { /* unknown */ }
+        return { changed: false, result: { messageId: root.messageId, view: this.rootCardView(runId, draft, grill, nodeCount, true) } };
+      });
+    } catch {
+      return;
+    }
+    if (!target) return;
+    try {
+      await deps.updateRootCard(target.messageId, target.view);
+    } catch (error) {
+      this.log(`[workflow-draft] noting abandon on the root card of ${runId} failed: ${errorText(error)}`);
+      return;
+    }
+    try {
+      this.mutate(runId, undefined, { allowAbandoned: true, launchOp: true, launched: true }, ({ draft }) => {
+        if (!draft.launch?.root || draft.launch.root.abandonNoted) return { changed: false, result: undefined };
+        draft.launch.root.abandonNoted = true;
+        return { changed: true, result: undefined };
+      });
+    } catch { /* the next 「放弃」 updates the card again (same content) */ }
+  }
+
+  private launchView(draft: WorkflowDraftRecord, targets: string[] | undefined, running: boolean): WorkflowDraftLaunchView {
+    const launch = draft.launch!;
+    let nextStep: WorkflowDraftLaunchView['nextStep'];
+    if (launch.commit || launch.start) nextStep = nextLaunchStep(launch, { flowRevision: 0, targets: [] });
+    else if (!targets) nextStep = launch.chat && launch.root && launch.migrate ? 'unknown' : nextLaunchStep(launch, { flowRevision: draft.flowRevision ?? 0, targets: [] });
+    else nextStep = nextLaunchStep(launch, { flowRevision: draft.flowRevision ?? 0, targets });
+    return {
+      state: launch.state === 'running' && !running ? 'paused' : launch.state,
+      running,
+      nextStep,
+      attempt: launch.attempt,
+      groupName: launch.groupName,
+      marker: launch.marker,
+      extraMembers: launch.extraMembers,
+      ownerChannel: launch.ownerChannel,
+      ...(launch.chat ? { chat: launch.chat } : {}),
+      ...(launch.orphanSuspects?.length ? { orphanSuspects: launch.orphanSuspects } : {}),
+      ...(launch.root ? { root: launch.root } : {}),
+      ...(launch.migrate ? { migrate: launch.migrate } : {}),
+      ...(launch.check ? { check: launch.check } : {}),
+      grantedBots: Object.entries(launch.grants ?? {}).filter(([, g]) => g.mainSide && g.peerSide).map(([appId]) => appId),
+      ...(launch.commit ? { commit: launch.commit } : {}),
+      ...(launch.start ? { start: launch.start } : {}),
+      ...(launch.error ? { error: launch.error } : {}),
+      startedAt: launch.startedAt,
+      updatedAt: launch.updatedAt,
+      ...(launch.abandonedAt ? { abandonedAt: launch.abandonedAt } : {}),
+    };
+  }
+
   // ── reads ──
 
   /** One draft, for any Dashboard admin (§7.2). Commits a finished clarify
    *  turn on the way (mechanical; never a state decision). */
   async view(runId: string): Promise<WorkflowDraftView> {
-    const runDir = this.runDirOf(runId);
-    let snapshot: { draft: WorkflowDraftRecord; grill: GrillState };
+    const runDir = this.runDirOf(runId, { launched: true });
+    let snapshot: { draft: WorkflowDraftRecord; grill: GrillState; launchRunning: boolean };
     try {
       snapshot = withWorkflowDraftLock(runDir, runId, () => {
-        const loaded = this.loadLocked(runId, runDir, undefined, { allowAbandoned: true });
+        const loaded = this.loadLocked(runId, runDir, undefined, { allowAbandoned: true, launched: true });
         const refreshed = this.refreshClarifyInPlace(loaded.draft);
         const healed = this.healStaleArchitect(runId, loaded.draft, loaded.grill);
         if (refreshed || healed) this.persist(runDir, loaded.draft);
-        return loaded;
+        // Taken with the record: the view awaits below, and a launch step may
+        // finish meanwhile — this record is then still the one it ran on.
+        return { ...loaded, launchRunning: this.launchRunning(loaded.draft) };
       });
     } catch (error) {
       throw this.mapError(error);
@@ -1485,6 +2535,7 @@ export class WorkflowDraftService {
       ...(flow ? { flow } : {}),
       ...(flowError ? { flowError } : {}),
       ...(draft.flowConfirmation ? { flowConfirmation: { ...draft.flowConfirmation, valid: confirmationValid } } : {}),
+      ...(draft.launch ? { launch: this.launchView(draft, flowTargetsOf(flow), snapshot.launchRunning) } : {}),
     };
   }
 
@@ -1525,6 +2576,28 @@ export class WorkflowDraftService {
       }
     }
     if (recovered.length > 0) this.log(`[workflow-draft] interrupted architect → 待编排: ${recovered.join(', ')}`);
+    // A launch left 拉群中 by the previous process is NOT resumed: the page
+    // offers 「继续」 (§4.5). Its dead token is cleared and the reason recorded.
+    for (const { runId, runDir } of listWorkflowDraftDirs(this.deps.baseDir, { launched: true })) {
+      try {
+        withWorkflowDraftLock(runDir, runId, () => {
+          const draft = readWorkflowDraft(runDir);
+          const launch = draft?.launch;
+          if (!draft || !launch || draft.orchestratorAppId !== this.deps.appId || launch.state !== 'running') return;
+          if (launch.token && this.launchTokens.has(launch.token)) return;
+          launch.state = 'paused';
+          delete launch.token;
+          launch.error = {
+            step: 'interrupted', code: 'daemon_restarted', retryable: true,
+            message: 'daemon 重启，拉群中断了；点「继续」从中断处接着做', at: this.now().toISOString(),
+          };
+          launch.updatedAt = this.now().toISOString();
+          this.persist(runDir, draft);
+        });
+      } catch (error) {
+        this.log(`[workflow-draft] recovering launch of ${runId} failed: ${errorText(error)}`);
+      }
+    }
     // Deletes interrupted after their first step are finished now (the
     // session closes run in the background).
     for (const entry of this.interruptedDeletes()) {
