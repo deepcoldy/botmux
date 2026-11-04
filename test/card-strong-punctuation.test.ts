@@ -125,6 +125,19 @@ describe('repairCardStrongPunctuation: pairs CommonMark would reject', () => {
     expect(repairCardStrongPunctuation('![**图：**说明](https://example.com/a.png)'))
       .toBe('![**图：**说明](https://example.com/a.png)');
   });
+
+  it('does not let a link inside an image alt hide a repairable pair', () => {
+    // markdown-it parses an image's alt with a fresh inline state, so a link
+    // inside the alt reports offsets relative to the alt slice. Trusting those
+    // would place the label span over an unrelated part of the line and skip a
+    // pair that is plainly outside any link. Only spans measured against the
+    // line itself may be used.
+    const key = 'img_v2_041b28e3-5680-48c2-9af2-5d5d5b1f3f0';
+    expect(repairCardStrongPunctuation(`ab**标签：**正文 ![见[example](https://example.com)](${key})`))
+      .toBe(`ab**标签**：正文 ![见[example](https://example.com)](${key})`);
+    expect(repairCardStrongPunctuation('a**x：**y ![[xxxxxxxxxx](u)](i.png)'))
+      .toBe('a**x**：y ![[xxxxxxxxxx](u)](i.png)');
+  });
 });
 
 describe('repairCardStrongPunctuation: leaves everything else byte-identical', () => {

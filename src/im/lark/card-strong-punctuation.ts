@@ -144,6 +144,12 @@ interface LabelSpan { start: number; end: number }
  * hides a repairable candidate, unlike a hand-rolled bracket scan. */
 const labelProbe = new MarkdownIt({ html: false, linkify: false });
 let labelSink: LabelSpan[] = [];
+/** The exact string currently being parsed at top level. The image rule
+ * re-parses its alt with a FRESH StateInline whose `src` is the alt slice, so a
+ * link inside an alt reports alt-relative offsets; accepting those would skip a
+ * repairable pair elsewhere on the line. Only spans measured against the line
+ * itself are meaningful here. */
+let labelSource = '';
 function recognizedLabelClose(src: string, openBracket: number): number {
   // openBracket is the '[' of a label the link/image rule just validated; find
   // its close by bracket nesting (nested `[ ]` are allowed inside labels).
@@ -163,7 +169,7 @@ for (const ruleName of ['link', 'image'] as const) {
   rule.fn = function wrapped(state: any, silent: boolean): boolean {
     const start = state.pos;
     const accepted = original.call(this, state, silent);
-    if (accepted && !silent) {
+    if (accepted && !silent && state.src === labelSource) {
       const isImage = state.src.charCodeAt(start) === 0x21 /* ! */;
       if ((ruleName === 'image') === isImage) {
         const openBracket = start + (isImage ? 1 : 0);
@@ -181,9 +187,11 @@ for (const ruleName of ['link', 'image'] as const) {
 function recognizedLabelSpans(line: string): readonly LabelSpan[] {
   if (!line.includes('[')) return [];
   labelSink = [];
+  labelSource = line;
   labelProbe.parseInline(line, {});
   const spans = labelSink;
   labelSink = [];
+  labelSource = '';
   return spans;
 }
 
