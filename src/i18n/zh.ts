@@ -1352,6 +1352,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_pending_title': '⏳ 正在恢复会话',
   'card.action.resume_pending_body': '恢复请求已持久化，正在重建远程运行环境并验证 Runner 真正可服务。\n\n无需重复点击；完成或失败后，这张卡片会自动更新。',
   'card.action.primary_lifecycle_unavailable': '⚠️ 多副本持久模式暂不支持通过卡片关闭、恢复或重启会话。关闭请在话题内发送 `/close`；需要继续时请直接 @机器人创建新会话。',
+  'card.action.primary_display_unavailable': '⚠️ 这张卡片已不是该会话的最新卡片，或你没有操作该会话的权限。请在会话最新的卡片上切换显示/隐藏输出。',
   'card.action.disconnected': '⏏ 已断开，原 CLI 会话不受影响',
   'card.reply_actions.terminal': '打开终端',
   'card.reply_actions.model': '切换模型',
