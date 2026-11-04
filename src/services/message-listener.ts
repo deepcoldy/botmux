@@ -1,5 +1,5 @@
 import { getAllBots, type BotState, type MessageListenerConfig } from '../bot-registry.js';
-import { extractCardContent, extractPostListenerText, unwrapUserDslContent } from '../im/lark/message-parser.js';
+import { extractCardContent, extractMentionIdentities, extractPostListenerText, unwrapUserDslContent } from '../im/lark/message-parser.js';
 import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { resolveListenerDocumentTitles } from './message-listener-document-titles.js';
@@ -256,16 +256,32 @@ export type MessageListenerContentPolicy = NonNullable<MessageListenerConfig['co
  * process for tens of seconds every poll round. A pattern-length cap does not
  * bound backtracking. Regex can return later behind a linear-time engine.
  */
-export function matchesContentPolicy(text: string, policy: MessageListenerContentPolicy | undefined): boolean {
+export function matchesContentPolicy(text: string, policy: MessageListenerContentPolicy | undefined, message?: any): boolean {
   if (!policy) return true;
   const keywords = (policy.includeKeywords ?? []).filter(keyword => keyword.length > 0);
-  if (keywords.length === 0) return true;
+  const identities = policy.includeMentionedOpenIds;
+  if (identities !== undefined && identities.length === 0) return false;
+  if (keywords.length === 0 && identities === undefined) return true;
   const haystack = text.toLowerCase();
-  const keywordHits = (keyword: string): boolean => haystack.includes(keyword.toLowerCase());
-  if (policy.matchMode === 'all') {
-    return keywords.every(keywordHits);
+  const hits = keywords.map(keyword => haystack.includes(keyword.toLowerCase()));
+  if (identities !== undefined) {
+    // Forwarded cards may inherit mentions that the sender did not make.
+    // Only native text/post mentions may satisfy an identity keyword.
+    const type = messageTypeOf(message);
+    const mentioned = new Set(
+      type === 'text' || type === 'post'
+        ? extractMentionIdentities({
+          mentions: Array.isArray(message?.mentions) ? message.mentions : [],
+          content: listenerMessageRawContent(message),
+        }).map(person => person.openId).filter(Boolean)
+        : [],
+    );
+    hits.push(...identities.map(openId => mentioned.has(openId)));
   }
-  return keywords.some(keywordHits);
+  if (policy.matchMode === 'all') {
+    return hits.every(Boolean);
+  }
+  return hits.some(Boolean);
 }
 
 export function findMessageListenerForChat(bot: BotState, chatId: string): MessageListenerConfig | undefined {
@@ -336,13 +352,15 @@ export function evaluateMessageListener(input: {
   if (!msgTypeAllowed(listener, msgType)) return undefined;
 
   const messageText = input.messageTextOverride ?? extractListenerMessageText(input.message);
-  if (!messageText && (msgType === 'text' || msgType === 'post')) return undefined;
+  // A rich post containing only @nodes has no text projection, but can still
+  // satisfy an identity-only rule. The content policy below verifies the @.
+  if (!messageText && (msgType === 'text' || msgType === 'post') && !listener.contentPolicy?.includeMentionedOpenIds?.length) return undefined;
   const messageTitle = extractListenerMessageTitle(input.message);
 
-  // Daemon-side keyword/regex pre-filter: the shared choke point for the
+  // Daemon-side keyword pre-filter: the shared choke point for the
   // realtime, polled-backfill and dashboard-preview legs. A configured policy
   // that does not hit means the message never wakes the Agent (no model call).
-  if (!matchesContentPolicy(messageText, listener.contentPolicy)) return undefined;
+  if (!matchesContentPolicy(messageText, listener.contentPolicy, input.message)) return undefined;
 
   return {
     name: listener.name,
@@ -367,7 +385,7 @@ export async function evaluateMessageListenerWithDocumentTitles(
   const listener = findMessageListenerForChat(input.bot, input.chatId);
   const policy = listener?.contentPolicy;
   const localText = input.messageTextOverride ?? extractListenerMessageText(input.message);
-  if (policy?.resolveDocumentTitles !== true || !policy.includeKeywords?.some(keyword => keyword.trim()) || matchesContentPolicy(localText, policy)) {
+  if (policy?.resolveDocumentTitles !== true || !policy.includeKeywords?.some(keyword => keyword.trim()) || matchesContentPolicy(localText, policy, input.message)) {
     return evaluateMessageListener(input);
   }
   const msgType = messageTypeOf(input.message);
@@ -378,7 +396,14 @@ export async function evaluateMessageListenerWithDocumentTitles(
       ...input.bot.config,
       groupMessageListenerOverrides: {
         ...(input.bot.config.groupMessageListenerOverrides ?? {}),
-        [input.chatId]: { mode: 'custom', listener: { ...listener!, contentPolicy: undefined } },
+        [input.chatId]: { mode: 'custom', listener: {
+          ...listener!,
+          // Titles may satisfy text keywords, never a missing mention identity.
+          contentPolicy: policy.includeMentionedOpenIds !== undefined
+            && (policy.matchMode === 'all' || policy.includeMentionedOpenIds.length === 0)
+            ? { includeMentionedOpenIds: policy.includeMentionedOpenIds, matchMode: 'all' }
+            : undefined,
+        } },
       },
     },
   };
