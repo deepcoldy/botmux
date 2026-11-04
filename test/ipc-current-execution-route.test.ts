@@ -169,6 +169,65 @@ describe('POST /api/current-execution', () => {
     expect(await response.json()).toMatchObject({ error: 'identity_material_unavailable' });
   });
 
+  it('re-asks the platform for a turn whose grant failed transiently, on the wrapper\'s next fetch', async () => {
+    const { publishTurnCliIdentity, __resetTransientRefusalsForTest, TRANSIENT_REFUSAL_RETRY_INTERVAL_MS } =
+      await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-transient-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    const grants: Array<'down' | 'up'> = ['down', 'up'];
+    let calls = 0;
+    __resetTransientRefusalsForTest();
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant: async () => {
+        calls++;
+        return grants.shift() === 'up'
+          ? { ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+            variables: { BYTEDCLI_USER_CLOUD_JWT: 'jwt-recovered' } } }
+          : { ok: false, reason: 'network', error: '连接超时（5000ms）' };
+      },
+    });
+    const fetchIdentity = async () => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { env: string }).env;
+    };
+    const realNow = Date.now;
+    let skew = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow() + skew);
+    try {
+      await publishTurnCliIdentity({
+        botConfig: { larkAppId: 'cli_execution', larkAppSecret: 's', brand: 'feishu',
+          triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }) } as any,
+        sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice',
+        turnId: 'trigger-current', storageModel: 'proven',
+      });
+      expect(calls).toBe(1);
+      expect(await fetchIdentity()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+      skew += TRANSIENT_REFUSAL_RETRY_INTERVAL_MS;
+      const env = await fetchIdentity();
+      expect(calls).toBe(2);
+      expect(env).toContain("BYTEDCLI_USER_CLOUD_JWT='jwt-recovered'");
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      __resetTransientRefusalsForTest();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('refuses identity content for a session on the single model', async () => {
     const ds = session();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
