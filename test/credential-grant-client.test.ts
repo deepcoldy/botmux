@@ -211,6 +211,43 @@ describe('requestCredentialGrant transport failures', () => {
     expect(calls[0]! + calls[1]!).toBeLessThanOrEqual(1_400);
     expect(elapsed).toBeLessThan(1_400 + 300);
   });
+
+  // A transport may throw BEFORE returning its promise: `postJson` parses the
+  // URL and serializes the body ahead of its own `new Promise`, so a malformed
+  // binding (`platform.json` hand-edited or from an older build) throws
+  // synchronously. The retry itself was never the defect — the throw reaches
+  // the attempt's catch either way, so `calls` is 2 before and after the fix;
+  // that assertion is documentary. What the fix buys is the second half: with
+  // `run` raced directly, the race is never built, so the attempt's timeout
+  // promise has no consumer and its timer fires as an unhandledRejection. The
+  // unhandledRejection check below is the guard that actually bites.
+  it.each([
+    ['through the real postJson with an unusable platform URL', undefined],
+    ['through an injected transport that throws synchronously', 'sync'],
+  ] as const)('leaves no unhandled timeout rejection when the transport throws synchronously %s', async (_label, mode) => {
+    const unhandled: string[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason instanceof Error ? reason.message : String(reason)); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      let calls = 0;
+      const http = mode === 'sync'
+        ? { post: (() => { calls++; throw new Error('sync-throw'); }) as any }
+        : undefined;
+      const binding = mode === 'sync'
+        ? { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }
+        : { platformUrl: 'not-a-url', machineToken: 'mt', machineId: 'm-1' };
+      const r = await requestCredentialGrant(REQ, { binding, ...(http ? { http } : {}), timeoutMs: 200, totalBudgetMs: 3_000 });
+      expect(!r.ok && r.reason).toBe('network');
+      // Documentary: the retry happens with or without the fix (the throw is
+      // caught by the attempt loop). The unhandledRejection assertion is the guard.
+      if (http) expect(calls).toBe(2);
+      // Give the abandoned attempt's timer a chance to fire (timeoutMs is 200).
+      await new Promise(resolve => setTimeout(resolve, 500));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  }, 10_000);
 });
 
 describe('requestCredentialGrant against a real server (postJson transport)', () => {
