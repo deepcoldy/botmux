@@ -544,6 +544,16 @@ describe('/models shortcut', () => {
     expect(readTraexModelLoadsMock.mock.calls.length).toBe(0);
   });
 
+  it('does not probe a traex helper for a native non-traex bot shape', async () => {
+    // Bot and session consistently native non-traex: the downstream
+    // runtimeContext gate cannot save this, so the `key !== 'traex'` gate is
+    // the only thing preventing a traex-protocol app-server per render.
+    enableMenu('coco');
+    const ds = makeDs({ sessionOverrides: { cliId: 'coco' } });
+    await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    expect(readTraexModelLoadsMock.mock.calls.length).toBe(0);
+  });
+
   it.each(['permission', 'worker', 'transfer', 'killed'])('does not deliver a picker after %s changes during the load query', async change => {
     enableMenu('traex');
     let finish!: (loads: Map<string, number> | null) => void;
