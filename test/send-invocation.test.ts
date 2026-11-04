@@ -104,7 +104,12 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--files', 'a', '正文'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'missing'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'missing.sql'], ['a'])).toMatchObject({ ok: false });
+    expect(client(['--files', 'a', './my report.sql'], ['a'])).toMatchObject({ ok: false });
+    expect(client(['--files', 'a', './报告.sql'], ['a'])).toMatchObject({ ok: false });
+    expect(client(['--files', 'a', 'C:\\my dir\\x.sql'], ['a'])).toMatchObject({ ok: false });
+    expect(client(['--files', 'a', '\\\\srv\\my share\\x.sql'], ['a'])).toMatchObject({ ok: false });
     expect(client(['--files', 'a', '详见 ./out.sql 第 3 行'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', 'see report.sql'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', '见 https://x.y/z.md'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', '结论：a/b 两种方案'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'https://x.y/z.md'], ['a'])).toMatchObject({ ok: true });
