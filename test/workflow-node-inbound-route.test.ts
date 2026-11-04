@@ -19,13 +19,19 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
-  const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-wf-inbound-${process.pid}`;
+  // The dispatch-report secret lives in dirname(dataDir) and must sit in a
+  // directory the current user owns: nest the data dir one level down so its
+  // parent is this test's own directory, not the shared /tmp (owned by root
+  // on CI runners, which run as a regular user).
+  const ownRoot = `${process.env.TMPDIR ?? '/tmp'}/botmux-wf-inbound-${process.pid}`;
+  const dataDir = `${ownRoot}/data`;
   process.env.SESSION_DATA_DIR = dataDir;
   process.env.BOTS_CONFIG = `${dataDir}/bots.json`;
   delete process.env.BOTMUX_SESSION_ID;
   delete process.env.BOTMUX_LARK_APP_ID;
   let seq = 0;
   return {
+    ownRoot,
     dataDir,
     runsDir: `${dataDir}/v3-runs`,
     replyMessage: vi.fn(async (..._args: any[]) => 'om_reply'),
@@ -254,7 +260,7 @@ beforeEach(() => {
 });
 
 afterAll(() => {
-  rmSync(mocks.dataDir, { recursive: true, force: true });
+  rmSync(mocks.ownRoot, { recursive: true, force: true });
 });
 
 describe('workflow handoff with a working dir on the executing bot\'s daemon (real route)', () => {
