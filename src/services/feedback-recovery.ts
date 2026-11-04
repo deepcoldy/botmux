@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { isAtomicWriteTempName } from '../utils/atomic-write.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, FileLockTimeoutError } from '../utils/file-lock.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
-import { getFeedbackStorage } from './feedback-storage.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
+// getFeedbackStorage is imported lazily: this module sits on the daemon/send
+// static load path, and the storage selector pulls in the optional `pg` dep.
 
 export interface RecoveryDecision {
   confirmed: true;
@@ -65,7 +67,7 @@ export function inspectSendRecovery(dataDir: string): RecoveryItem[] {
     // `*.json.<pid>.<hex>.tmp` siblings. They are not leases: ignore them
     // instead of failing the whole inspection (which would be unlistable and
     // unacknowledgeable, requiring manual cleanup).
-    if (name.endsWith('.tmp')) return [];
+    if (isAtomicWriteTempName(name)) return [];
     if (!/^\d+-[0-9a-f-]+\.json$/.test(name)) throw new Error('feedback_send_lease_invalid');
     let lease: { processId: number; processStartId: string };
     try { lease = JSON.parse(readFileSync(join(directory, name), 'utf8')); }
@@ -84,6 +86,7 @@ export function inspectSendRecovery(dataDir: string): RecoveryItem[] {
 export async function inspectFeedbackRecovery(dataDir: string): Promise<RecoveryItem[]> {
   const config = await readFeedbackStorageConfig(dataDir);
   const items = inspectSendRecovery(dataDir);
+  const { getFeedbackStorage } = await import('./feedback-storage.js');
   const { store } = await getFeedbackStorage(dataDir);
   for (const row of await store.listFeedbackOutbox()) {
     // List both rows carrying an unknown-outcome marker and claims still marked

@@ -1,5 +1,9 @@
 import { Pool, type PoolClient } from 'pg';
 import type { PostgresTarget } from './feedback-storage-types.js';
+// Re-export for the PostgreSQL/migration path. SQLite-only hot paths must
+// import FEEDBACK_TABLES from ./feedback-tables.js instead, since importing
+// this module pulls in `pg` at module load time.
+export { FEEDBACK_TABLES } from './feedback-tables.js';
 
 export function feedbackPostgresPool(target: PostgresTarget, password: string, ca?: string): Pool {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(target.schema)) throw new Error('feedback_storage_schema_invalid');
@@ -15,11 +19,6 @@ export function feedbackPostgresPool(target: PostgresTarget, password: string, c
   });
   return pool;
 }
-
-export const FEEDBACK_TABLES = [
-  'interactions', 'skill_runs', 'responses', 'deliveries', 'feedback_revisions',
-  'turn_terminals', 'turn_completion_events', 'feedback_events', 'feedback_outbox',
-] as const;
 
 export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: string, instanceId: string, migrationId?: string, provision = false): Promise<void> {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new Error('feedback_storage_schema_invalid');
