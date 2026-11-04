@@ -72,6 +72,7 @@ import { ManifestValidationError, readAndValidateManifest } from './manifest.js'
 import { readRevisitRequest, validateResult } from './result-contract.js';
 import { planV3Revisit } from './revisit-plan.js';
 import { materialize, type V3RunSnapshot } from './state.js';
+import { v3NodePlacement, v3PlacementProblems } from './placement.js';
 
 // ─── Current-attempt classification ─────────────────────────────────────────
 
@@ -321,10 +322,18 @@ export type V3ExternalRecordOutcome =
  * Append `nodeHandoffAccepted` for the current attempt. The node timeout is
  * counted from `acceptedAt` (defaults to now; never later than now).
  * Idempotent for the same session; a different session is rejected.
+ *
+ * Main-topic placement (design §5.5): the target session there may be busy,
+ * so the handoff is accepted when it enters that session's queue and the
+ * timeout counts from when its own turn starts (`startedAt`, the input
+ * commit). Accepted without a start, the attempt is `startPending` with a
+ * backstop deadline of acceptedAt + timeout; a later call with `startedAt`
+ * appends `nodeHandoffStarted` and moves the deadline. Node-topic attempts
+ * ignore `startedAt` and are journalled exactly as before.
  */
 export function recordExternalAccepted(
   runDir: string,
-  input: { attemptId: string; instanceId?: string; sessionId: string; acceptedAt?: number },
+  input: { attemptId: string; instanceId?: string; sessionId: string; acceptedAt?: number; startedAt?: number },
   ctx?: V3ExternalEngineContext,
 ): { ok: true; deadlineAt: number; alreadyAccepted: boolean } | { ok: false; reason: V3ExternalAttemptRejection } {
   const dag = dagFor(runDir, ctx);
@@ -340,7 +349,7 @@ export function appendAcceptedLocked(
   events: readonly StoredEvent[],
   append: JournalMutation['append'],
   dag: V3Dag,
-  input: { attemptId: string; instanceId?: string; sessionId: string; acceptedAt?: number },
+  input: { attemptId: string; instanceId?: string; sessionId: string; acceptedAt?: number; startedAt?: number },
   now: number,
 ): { ok: true; deadlineAt: number; alreadyAccepted: boolean } | { ok: false; reason: V3ExternalAttemptRejection } {
   const current = classifyExternalAttempt(events, input.attemptId, {
@@ -349,12 +358,33 @@ export function appendAcceptedLocked(
   });
   if (!current.ok) return { ok: false, reason: current.reason };
   const { attempt } = current;
+  const queued = attempt.placement === 'main';
+  const startedAt = queued && input.startedAt !== undefined && Number.isFinite(input.startedAt)
+    ? Math.min(input.startedAt, now)
+    : undefined;
   if (attempt.phase === 'accepted') {
+    if (attempt.startPending && startedAt !== undefined) {
+      // The queued handoff's own turn started: its timeout counts from now on.
+      const started = Math.max(startedAt, attempt.acceptedAt ?? startedAt);
+      const deadlineAt = started + nodeTimeoutMs(externalAttemptNode(dag, attempt));
+      append({
+        type: 'nodeHandoffStarted',
+        nodeId: attempt.nodeId,
+        ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+        attemptId: attempt.attemptId,
+        startedAt: started,
+        deadlineAt,
+      }, { durable: true });
+      return { ok: true, deadlineAt, alreadyAccepted: false };
+    }
     return { ok: true, deadlineAt: attempt.deadlineAt!, alreadyAccepted: true };
   }
   if (attempt.phase === 'dispatched') return { ok: false, reason: 'unknown-attempt' };
   const acceptedAt = Math.min(input.acceptedAt ?? now, now);
-  const deadlineAt = acceptedAt + nodeTimeoutMs(externalAttemptNode(dag, attempt));
+  // A main-topic turn already seen to start counts from its start; one only
+  // queued counts from acceptance as a backstop until it starts.
+  const countFrom = startedAt !== undefined ? Math.max(startedAt, acceptedAt) : acceptedAt;
+  const deadlineAt = countFrom + nodeTimeoutMs(externalAttemptNode(dag, attempt));
   append({
     type: 'nodeHandoffAccepted',
     nodeId: attempt.nodeId,
@@ -363,6 +393,7 @@ export function appendAcceptedLocked(
     sessionId: input.sessionId,
     acceptedAt,
     deadlineAt,
+    ...(queued && startedAt === undefined ? { startPending: true as const } : {}),
   }, { durable: true });
   return { ok: true, deadlineAt, alreadyAccepted: false };
 }
@@ -1047,7 +1078,10 @@ export type V3ReassignOutcome =
         | 'revise-workflow-required'
         | 'not-bot-run'
         /** A pending flow-revision proposal touches the node: decide it first. */
-        | 'revision-pending';
+        | 'revision-pending'
+        /** The new bot would break a §5.2 main-topic hard rule. */
+        | 'placement-conflict';
+      detail?: string;
     };
 
 /** A caller holding the validated `run.json` passes its pinned executor;
@@ -1218,6 +1252,10 @@ export async function reassignNode(
     if (locked.kind === 'blocked' && locked.reviseRequired) {
       return { kind: 'rejected', reason: 'revise-workflow-required' };
     }
+    // §5.2 / §9.2: a main-topic node may only move to a bot that has no
+    // other main-topic node able to run at the same time (rules 1–2).
+    const conflict = reassignPlacementConflict(dagFor(runDir, ctx, events), snapshots, snap, input.nodeId, input.toLarkAppId);
+    if (conflict) return { kind: 'rejected', reason: 'placement-conflict', detail: conflict };
     const nodeState = snap.nodes.get(input.nodeId);
     const instanceId = nodeState?.effectiveInstanceId;
     append({
@@ -1251,6 +1289,30 @@ export async function reassignNode(
       ...(stopError !== undefined ? { stopError } : {}),
     };
   });
+}
+
+/** The §5.2 rule a reassignment of a main-topic node would break, or
+ *  undefined (also for every node-topic node). */
+function reassignPlacementConflict(
+  dag: V3Dag,
+  snapshots: ReadonlyMap<string, BotSnapshot>,
+  snap: ReturnType<typeof materialize>,
+  nodeId: string,
+  toLarkAppId: string,
+): string | undefined {
+  if (v3NodePlacement(dag.nodes.find((node) => node.id === nodeId)) !== 'main') return undefined;
+  const mainApp = snapshotForSelector(snapshots, '')?.larkAppId ?? '';
+  const problems = v3PlacementProblems({
+    dag,
+    mainLarkAppId: mainApp,
+    executorOf: (id) => {
+      if (id === nodeId) return toLarkAppId;
+      const node = dag.nodes.find((candidate) => candidate.id === id);
+      const selector = node && isGoalNode(node) ? node.bot : undefined;
+      return snap.assignments.get(id) ?? snapshotForSelector(snapshots, selector)?.larkAppId ?? selector ?? mainApp;
+    },
+  }).filter((problem) => problem.nodeIds.includes(nodeId));
+  return problems[0]?.message;
 }
 
 // ─── Handing a node to a human (design §13.6) ─────────────────────────────

@@ -1,3 +1,4 @@
+import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
 import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
 import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
 import { codexAppSettlementOutcome } from '../services/runner-final-outcome.js';
@@ -1202,6 +1203,11 @@ export interface WorkerPoolCallbacks {
    *  one means the bot works again. Only fired for sessions carrying a
    *  verified `workflowNode` marker. */
   onWorkflowNodeInputCommitted?: (ds: DaemonSession, context: { turnId: string; committedAt: number }) => void;
+  /** Workflow node session (§5.5): a turn's input was literally written to
+   *  the CLI (`turn_execution_started`) — for a main-topic handoff queued
+   *  behind another turn, the moment its own turn really starts. Only fired
+   *  for sessions carrying a verified `workflowNode` marker. */
+  onWorkflowNodeTurnStarted?: (ds: DaemonSession, context: { turnId: string; startedAt: number }) => void;
   /** Workflow node session (§8): a turn went from working to idle while the
    *  node's handoff has no accepted submission — shown as "Bot 已停下，未提交". */
   onWorkflowNodeTurnSettled?: (ds: DaemonSession, context: { turnId?: string; at: number }) => void;
@@ -15546,7 +15552,8 @@ export function forkWorker(
     solo: ds.soloSession === true,
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
-    ...(ds.session.workflowNode ? { workflowNodeSession: true as const } : {}),
+    // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.
+    ...(isWorkflowNodeSessionMarker(ds.session.workflowNode) ? { workflowNodeSession: true as const } : {}),
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
@@ -16499,6 +16506,7 @@ function setupWorkerHandlers(
         starts.delete(key);
         starts.set(key, { startedAtMs: msg.startedAtMs, workerGeneration, lastProgressAtMs: msg.startedAtMs });
         if (starts.size > 512) starts.delete(starts.keys().next().value!);
+        if (ds.session.workflowNode) cb.onWorkflowNodeTurnStarted?.(ds, { turnId: msg.turnId, startedAt: msg.startedAtMs });
         break;
       }
       case 'turn_input_committed': {

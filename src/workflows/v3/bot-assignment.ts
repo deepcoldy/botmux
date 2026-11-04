@@ -11,9 +11,12 @@
 import type { BotConfig } from '../../bot-registry.js';
 import { isV3SupportedCli, type Spec } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
+import type { V3MainTopicAvailability } from './placement.js';
 import {
   describeV3BotEligibilityCode,
   judgeV3BotEligibility,
+  v3BotExecutorPlanHeading,
+  v3PlacementLabel,
   type V3BotEligibilityProbe,
   type V3NodeExecutorTarget,
 } from './node-executor-mode.js';
@@ -176,6 +179,9 @@ export interface V3SketchAssignee {
 export interface V3ArchitectBotAssignment {
   roster: V3BotRoster;
   assignees: V3SketchAssignee[];
+  /** §5.2 rule 3: whether nodes may be placed in the main topic (absent =
+   *  unknown: the Architect is told to use node topics only). */
+  mainTopic?: V3MainTopicAvailability;
 }
 
 export function planV3SketchAssignees(
@@ -281,6 +287,29 @@ export function parseV3AssignmentReasons(notes: string): Map<string, { bot: stri
   return reasons;
 }
 
+const PLACEMENT_HEADING_RE = /^#{1,6}\s*placements?\b/i;
+const PLACEMENT_LINE_RE = /^\s*[-*]\s+`?([A-Za-z0-9._#-]+)`?\s*(?:→|->)\s*`?(main|topic)`?\s*[:：]\s*(.+?)\s*$/i;
+
+/** nodeId → (placement as written, reason) from the notes' `## Placements`
+ *  section (design §5.2: one line per goal node). Kept apart from
+ *  `## Bot assignments`, whose line format and parser stay as they are. */
+export function parseV3PlacementReasons(notes: string): Map<string, { placement: string; reason: string }> {
+  const reasons = new Map<string, { placement: string; reason: string }>();
+  let inSection = false;
+  for (const line of notes.split(/\r?\n/)) {
+    if (HEADING_RE.test(line)) {
+      inSection = PLACEMENT_HEADING_RE.test(line);
+      continue;
+    }
+    if (!inSection) continue;
+    const match = PLACEMENT_LINE_RE.exec(line);
+    if (!match || reasons.has(match[1]!)) continue;
+    const reason = oneLine(match[3]!, MAX_REASON_CHARS);
+    if (reason) reasons.set(match[1]!, { placement: match[2]!.toLowerCase(), reason });
+  }
+  return reasons;
+}
+
 export type V3AssigneeCheck =
   | { sketchId: string; assignee: string; status: 'honoured'; larkAppId: string; nodeIds: string[] }
   /** The name matches no configured bot, or several. */
@@ -344,6 +373,8 @@ export function formatV3Gate2BotPlan(input: {
   cliOf: (larkAppId: string) => string | undefined;
   reasons: ReadonlyMap<string, { bot: string; reason: string }>;
   assignees: readonly V3AssigneeCheck[];
+  /** §5.2: the Architect's placement reasons (`## Placements`). */
+  placementReasons?: ReadonlyMap<string, { placement: string; reason: string }>;
 }): string {
   const notHonouredByNode = new Map<string, Extract<V3AssigneeCheck, { status: 'not-honoured' }>>();
   for (const check of input.assignees) {
@@ -351,18 +382,23 @@ export function formatV3Gate2BotPlan(input: {
     for (const nodeId of check.nodeIds) notHonouredByNode.set(nodeId, check);
   }
   const named = (check: { assignee: string }) => `点名「${check.assignee}」`;
-  const lines = ['执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）'];
+  const lines = [v3BotExecutorPlanHeading(input.targets)];
   for (const target of input.targets) {
     const name = input.nameOf(target.larkAppId);
     const cli = input.cliOf(target.larkAppId);
-    const detail = [cli, target.larkAppId === input.orchestratorAppId ? '主 Bot 自己' : undefined].filter(Boolean).join('，');
+    // §5.2: every line also names where the node is handed off.
+    const placement = v3PlacementLabel(target);
+    const detail = [cli, target.larkAppId === input.orchestratorAppId ? '主 Bot 自己' : undefined, placement].filter(Boolean).join('，');
     const written = input.reasons.get(target.nodeId);
     const reasonMatches = written
       && [target.larkAppId, name].some((candidate) => normalName(candidate) === normalName(written.bot));
     const missed = notHonouredByNode.get(target.nodeId);
+    const placementWhy = target.loop ? undefined : input.placementReasons?.get(target.nodeId);
+    const placementReason = placementWhy && placementWhy.placement === (target.placement ?? 'topic') ? placementWhy.reason : undefined;
     lines.push(
       `- ${missed ? '⚠️ ' : ''}${target.nodeId} → ${name}${detail ? `（${detail}）` : ''}` +
       (reasonMatches ? `：${written.reason}` : '') +
+      (placementReason ? `${reasonMatches ? '；' : '：'}落点理由：${placementReason}` : '') +
       (missed ? ` —— ${named(missed)}未满足${missed.why ? `：${missed.why}` : ''}` : ''),
     );
   }

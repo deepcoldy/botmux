@@ -753,7 +753,7 @@ import {
 } from './im/lark/v3-saved-workflow-handler.js';
 import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
-import { v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
+import { v3MainTopicAvailability, v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon, workflowNodePinnedStart } from './core/workflow-node-daemon.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
@@ -766,7 +766,7 @@ import {
   WORKFLOW_NODE_REPORT_ROUTE,
 } from './core/workflow-node-report.js';
 import { WORKFLOW_HANDOFF_ID_PLACEHOLDER } from './im/lark/v3-node-card.js';
-import { substituteWorkflowHandoffPlaceholder, workflowNodeMarkerFromBinding } from './core/workflow-node-session.js';
+import { substituteWorkflowHandoffPlaceholder, workflowHandoffInputOptions, workflowNodeMarkerFromBinding } from './core/workflow-node-session.js';
 import { lookupWorkflowHandoff, readDispatchRegistryLoose } from './core/workflow-handoff-binding.js';
 import {
   WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE,
@@ -5565,6 +5565,8 @@ interface DaemonDescriptor {
   dispatchLaunchIpcProtocol?: 'v1';
   /** Applies a workflow run's Gate-2 working dir to node sessions (§15.4). */
   workflowNodeWorkingDir: 'v1';
+  /** Handles main-topic workflow handoffs (§5.5). */
+  workflowMainPlacement: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
   sessionStoreProtocol: 'occupancy-v1';
   /** Running binary version. Copy only; never compared by size. */
@@ -6968,6 +6970,14 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
     try { return getBot(appId).config; } catch { return undefined; }
   },
   daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
+  daemonHandlesMainPlacement: (appId) => findOnlineDaemon(appId)?.workflowMainPlacement === 'v1',
+  // §5.5 board link: the main session's topic id (`omt_…`), display only.
+  mainTopicThreadId: (binding) => {
+    const session = binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined;
+    return session?.chatId === binding.chatId && session.rootMessageId === binding.rootMessageId
+      ? session.larkThreadId
+      : undefined;
+  },
   drive: (runId) => v3GateRunner.driveDetached(runId),
   botName: (appId) => v3BotDisplayNameResolver()(appId),
   workflowEntry: daemonWorkflowSidebarEntry,
@@ -8250,6 +8260,8 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
         }
         return snapshot;
       },
+      // §5.2 rule 3, for an edit that moves a node into the main topic.
+      mainTopic: v3MainTopicAvailability(binding, binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined),
     });
   } catch (err) {
     return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -29867,6 +29879,11 @@ async function handleThreadReplyAdmitted(
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
           ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+          // Design §5.5: a main-topic handoff lands in this bot's ordinary
+          // session there, which may be busy with someone else's turn. It
+          // must start as a turn of its own (its node deadline counts from
+          // then), never be folded into the running one.
+          ...workflowHandoffInputOptions(workflowHandoff),
         });
       // Record the input as the session's last real CLI turn ONLY after the
       // worker accepted it. Recording before delivery (the old order) persisted
@@ -32436,6 +32453,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     workflowIpcProtocol: 'v1',
     ...(cfg.dispatchLaunchPolicy?.enabled === true ? { dispatchLaunchIpcProtocol: 'v1' as const } : {}),
     workflowNodeWorkingDir: 'v1',
+    workflowMainPlacement: 'v1',
     sessionStoreProtocol: SESSION_STORE_PROTOCOL,
     botmuxVersion: botmuxVersion(),
     lastHeartbeat: Date.now(),
@@ -32892,6 +32910,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onWorkflowNodeTurnSettled(ds, context) {
       workflowNodeDaemon.onTurnSettled(ds, context);
+    },
+    onWorkflowNodeTurnStarted(ds, context) {
+      workflowNodeDaemon.onTurnStarted(ds, context);
     },
     onIdentityDecision(ds, context) {
       // Fire-and-forget (the IPC switch must not serialize behind possibly

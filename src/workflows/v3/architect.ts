@@ -196,6 +196,27 @@ function architectBotAssignmentLines(assignment: V3ArchitectBotAssignment): stri
     `- Otherwise pick the roster bot whose CLI, model and role best fit the node; when unsure, use the main bot (${main}).`,
     '- architect-notes.md MUST contain a `## Bot assignments` section with exactly one line per goal node: `- <nodeId> → <larkAppId>: <one-line reason>` (a loop body node as `<loopId>.<bodyNodeId>`).',
     '- Optionally mark a goal node `"checkpoint": true` where, once it is done, its result should be looked at before deciding how the rest goes (e.g. an investigation whose findings decide the next steps). When it completes, the nodes that depend on it wait while the main bot reviews the result (it may change the rest of the flow), then the flow goes on. Do not mark routine nodes; loop body nodes cannot be checkpoints.',
+    ...architectPlacementLines(assignment),
+  ];
+}
+
+/** The bot-run-only placement part of the prompt (design 2026-11-03 §5.2). */
+function architectPlacementLines(assignment: V3ArchitectBotAssignment): string[] {
+  const mainTopic = assignment.mainTopic;
+  if (!mainTopic?.available) {
+    const why = JSON.stringify((mainTopic?.why ?? 'unknown').replace(/\s+/g, ' ').trim().slice(0, MAX_UNAVAILABLE_CHARS));
+    return [
+      `- Placement: this run has no usable main topic (${why}), so every node is handed off in a node topic of its own. Do not set \`placement\`.`,
+    ];
+  }
+  return [
+    '',
+    'Placement (where each top-level goal node is handed off):',
+    '- `"placement": "topic"` (the default; omit the field) opens a node topic: the node\'s handoff, the bot\'s progress messages, questions and report all live there. `"placement": "main"` hands the node off right in the main topic (no node topic) — for small steps whose result the people in the main topic want to see directly.',
+    '- Use a node topic when ANY of these holds: likely over ~10 minutes or several rounds of back-and-forth; may need to ask a person or discuss; many progress messages (editing code, running tests, fetching data); may be reworked by a revisit; runs in parallel with other nodes.',
+    '- Use the main topic only when ALL of these hold: a one-step small job (summarize, rewrite, format, look up one number); strictly serial with the other main-topic nodes; its result is what the main topic wants to read.',
+    '- Hard rules (the host rejects the DAG otherwise): (1) two main-topic nodes executed by the same bot must be ordered — one a transitive `depends` ancestor of the other — because a bot has only one session in the main topic; (2) the main bot\'s own main-topic nodes run in the main session itself, so rule 1 applies to them as well. Loop body nodes, loop and host nodes never take `placement`.',
+    '- architect-notes.md MUST contain a `## Placements` section with exactly one line per top-level goal node: `- <nodeId> → main|topic: <one-line reason>`.',
   ];
 }
 

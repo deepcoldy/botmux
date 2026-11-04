@@ -2735,9 +2735,8 @@ export async function runWorkflow(
         type: 'nodeHandoffPrepared',
         ...identity,
         targetLarkAppId: current.assignments.get(node.id) ?? botSnap.larkAppId,
-        placement: 'topic',
+        ...externalPlacementIntent(loopRef ? undefined : node),
         revision: dagRevision,
-        idempotency: { nodeCard: randomUUID(), handoff: randomUUID() },
         preparedAt: clock(),
       }, { durable: true });
       return true;
@@ -2746,6 +2745,18 @@ export async function runWorkflow(
     const attempt = foldV3ExternalAttempts(readJournal(journalPath)).get(attemptId);
     if (attempt && !attempt.closed) startHandoffSend(attempt, false);
     return true;
+  }
+
+  /** Where an attempt is handed off (design §5.1), frozen with its intent:
+   *  a top-level goal node's `placement`, else a node topic. Only a node
+   *  topic has a node card, so only it gets a node-card key. */
+  function externalPlacementIntent(node: V3Node | undefined): {
+    placement: 'topic' | 'main';
+    idempotency: { nodeCard?: string; handoff: string };
+  } {
+    return node && isGoalNode(node) && node.placement === 'main'
+      ? { placement: 'main', idempotency: { handoff: randomUUID() } }
+      : { placement: 'topic', idempotency: { nodeCard: randomUUID(), handoff: randomUUID() } };
   }
 
   /** Crash window inside the claim: nodeDispatched without its intent. No
@@ -2766,9 +2777,8 @@ export async function runWorkflow(
         ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
         attemptId: attempt.attemptId,
         targetLarkAppId: current.snap.assignments.get(attempt.nodeId) ?? frozen.larkAppId,
-        placement: 'topic',
+        ...externalPlacementIntent(attempt.loop ? undefined : node),
         revision: dispatched?.revision ?? 1,
-        idempotency: { nodeCard: randomUUID(), handoff: randomUUID() },
         preparedAt: clock(),
       }, { durable: true });
       return true;
@@ -3079,7 +3089,11 @@ export async function runWorkflow(
         await blockExternalAttempt(attempt, 'timeout', {
           errorClass: 'timeout',
           errorCode: V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT,
-          message: 'the node did not submit a valid result before its timeout',
+          message: attempt.startPending
+            // Main topic (§5.5): accepted into a busy session's queue, and its
+            // own turn never started within the node's whole timeout.
+            ? 'the handoff waited in the target bot\'s main-topic session queue and its turn never started before the node timeout'
+            : 'the node did not submit a valid result before its timeout',
         });
         progressed = true;
       }

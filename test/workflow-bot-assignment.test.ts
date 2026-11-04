@@ -269,8 +269,8 @@ describe('architect: a bot-executed run', () => {
     const { base } = specApprovedRun(GROUP_TOPIC);
     const { output } = await architect(base, { switchMode: 'bot', binding: GROUP_TOPIC });
     const lines = output.split('\n');
-    expect(lines).toContain('- inspect → 主Bot（claude-code，主 Bot 自己）：默认交给主 Bot');
-    expect(lines).toContain('- write → 文档Bot（claude-code）：用户点名文档Bot');
+    expect(lines).toContain('- inspect → 主Bot（claude-code，主 Bot 自己，节点话题）：默认交给主 Bot');
+    expect(lines).toContain('- write → 文档Bot（claude-code，节点话题）：用户点名文档Bot');
     const verify = lines.find((line) => line.includes('verify →'))!;
     expect(verify.startsWith('- ⚠️ ')).toBe(true);
     expect(verify).toContain('点名「测试Bot」未满足');
@@ -306,7 +306,7 @@ describe('approve-dag summary of a bot-executed run', () => {
     const output = await approve(base, fakeProbe().probe);
     expect(readRunEnvelope(runDir)).toMatchObject({ kind: 'ok', envelope: { nodeExecutor: 'bot' } });
     const lines = output.split('\n');
-    expect(lines).toContain('- write → 文档Bot（claude-code）：用户点名文档Bot');
+    expect(lines).toContain('- write → 文档Bot（claude-code，节点话题）：用户点名文档Bot');
     expect(lines.find((line) => line.includes('verify →'))).toMatch(/^- ⚠️ verify → 主Bot.*点名「测试Bot」未满足/);
     expect(lines.some((line) => line.startsWith('- ⚠️ extra') && line.includes('不是本机配置的 Bot'))).toBe(true);
   });
@@ -318,7 +318,7 @@ describe('approve-dag summary of a bot-executed run', () => {
       notes: '## Bot assignments\n- inspect → cli_main: 主 Bot 最合适',
     });
     const lines = (await approve(base, fakeProbe().probe)).split('\n');
-    expect(lines).toContain('- inspect → 文档Bot（claude-code）');
+    expect(lines).toContain('- inspect → 文档Bot（claude-code，节点话题）');
   });
 
   it('still refuses an ineligible executing bot (the #2710 check) before anything is published', async () => {

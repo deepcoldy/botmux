@@ -98,7 +98,9 @@ interface EventKey {
 }
 
 export type WorkflowHandoffEvent =
-  | (EventKey & { kind: 'accepted'; acceptedAt?: number })
+  /** `startedAt`: the handoff's own turn reached the CLI (input commit) —
+   *  for a main-topic handoff the node timeout counts from it (§5.5). */
+  | (EventKey & { kind: 'accepted'; acceptedAt?: number; startedAt?: number })
   /** The handoff's own turn ended without an accepted submission. */
   | (EventKey & { kind: 'stalled'; at?: number })
   /** A later turn started in the node session (clears "stopped"). */
@@ -201,7 +203,12 @@ export async function handleWorkflowHandoffEvent(raw: unknown, deps: WorkflowHan
   switch (raw.kind) {
     case 'accepted': {
       const acceptedAt = typeof raw.acceptedAt === 'number' && Number.isFinite(raw.acceptedAt) ? raw.acceptedAt : undefined;
-      const outcome = recordExternalAccepted(runDir, { ...identity, ...(acceptedAt !== undefined ? { acceptedAt } : {}) }, ctx);
+      const startedAt = typeof raw.startedAt === 'number' && Number.isFinite(raw.startedAt) ? raw.startedAt : undefined;
+      const outcome = recordExternalAccepted(runDir, {
+        ...identity,
+        ...(acceptedAt !== undefined ? { acceptedAt } : {}),
+        ...(startedAt !== undefined ? { startedAt } : {}),
+      }, ctx);
       if (!outcome.ok) return rejection(outcome.reason);
       if (!outcome.alreadyAccepted) deps.drive(runId);
       return { status: 200, body: { ok: true, deadlineAt: outcome.deadlineAt } };
@@ -311,6 +318,9 @@ export interface WorkflowNodeReportDeps {
   /** Deliver an event to the main bot's daemon. A rejected promise (network)
    *  or a 503 `orchestrator_offline` means it did not process the event. */
   forward(binding: WorkflowHandoffBindingPayload, event: WorkflowHandoffEvent): Promise<RouteResult>;
+  /** Main topic (§5.5): the bot reported the node blocked and the run took
+   *  it — its attempt ended without a submission. */
+  markClosed?(sessionId: string, nonce: string): void;
   /** §7.2 step 3: the main bot is offline — leave the validated submission
    *  in the attempt's staging area for it to commit on its next drive. */
   stageSubmission(binding: WorkflowHandoffBindingPayload, input: {
@@ -407,7 +417,10 @@ export async function handleWorkflowNodeReport(raw: unknown, deps: WorkflowNodeR
   };
   const content = typeof raw.content === 'string' ? raw.content : '';
   if (status === 'blocked' || status === 'failed') {
-    return deps.forward(binding, { ...key, kind: 'blocked', reason: content }).catch(() => OFFLINE);
+    const blocked = await deps.forward(binding, { ...key, kind: 'blocked', reason: content }).catch(() => OFFLINE);
+    // The attempt is over: a main-topic session is an ordinary one again.
+    if (blocked.status === 200 && blocked.body.ok === true) deps.markClosed?.(session.sessionId, binding.nonce);
+    return blocked;
   }
   if (status !== 'completed') {
     return deps.forward(binding, { ...key, kind: 'progress' }).catch(() => OFFLINE);
