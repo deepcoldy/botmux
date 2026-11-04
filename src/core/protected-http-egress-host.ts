@@ -339,7 +339,10 @@ function defaultForwarder(
             ? request.target.host
             : `${request.target.host}:${request.target.port}`,
         },
-        lookup: (_hostname, _options, callback) => callback(null, address, family),
+        lookup: (_hostname, options, callback) => {
+          if (options.all) callback(null, [{ address, family }]);
+          else callback(null, address, family);
+        },
       }, async response => {
         resolve({
           status: response.statusCode ?? 502,
