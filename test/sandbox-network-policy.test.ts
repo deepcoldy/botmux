@@ -64,9 +64,17 @@ describe('network policy', () => {
   });
   // Evaluate the emitted classic BPF against seccomp_data, including native
   // arm64 and incompatible ABIs that cannot be executed on the local host.
-  function evaluateFilter(arch: 'x64' | 'arm64', audit: number, syscall: number, family = 0): number {
+  function evaluateFilter(
+    arch: 'x64' | 'arm64',
+    audit: number,
+    syscall: number,
+    family = 0,
+    socketType = 0,
+    protocol = 0,
+  ): number {
     const program = networkSocketFilter(arch), data = Buffer.alloc(64);
     data.writeUInt32LE(syscall, 0); data.writeUInt32LE(audit, 4); data.writeUInt32LE(family, 16);
+    data.writeUInt32LE(socketType, 24); data.writeUInt32LE(protocol, 32);
     let accumulator = 0;
     for (let pc = 0; pc < program.length / 8; pc++) {
       const offset = pc * 8, op = program.readUInt16LE(offset), value = program.readUInt32LE(offset + 4);
@@ -80,9 +88,13 @@ describe('network policy', () => {
   it.each([
     ['x64', 0xc000003e, 41, 53, [272, 308, 425, 426, 427]],
     ['arm64', 0xc00000b7, 198, 199, [97, 268, 425, 426, 427]],
-  ] as const)('seccomp %s permits mounted Unix sockets but rejects other IPC, escape and alternate ABIs', (arch, audit, socket, socketpair, blocked) => {
+  ] as const)('seccomp %s permits mounted Unix, Internet and route-query sockets but rejects other IPC, escape and alternate ABIs', (arch, audit, socket, socketpair, blocked) => {
     for (const family of [1, 2, 10]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x7fff0000);
-    for (const family of [16, 17, 40]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x00050001);
+    // Node os.networkInterfaces() queries the sandbox-local interface list via
+    // AF_NETLINK + NETLINK_ROUTE. Other netlink protocols remain unavailable.
+    expect(evaluateFilter(arch, audit, socket, 16, 3 | 0x80000, 0)).toBe(0x7fff0000);
+    for (const protocol of [1, 2, 15]) expect(evaluateFilter(arch, audit, socket, 16, 3, protocol)).toBe(0x00050001);
+    for (const family of [17, 40]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x00050001);
     expect(evaluateFilter(arch, audit, socketpair, 1)).toBe(0x7fff0000);
     for (const syscall of blocked) expect(evaluateFilter(arch, audit, syscall)).toBe(0x00050001);
     expect(evaluateFilter(arch, 0x40000003, socket, 2)).toBe(0x80000000);

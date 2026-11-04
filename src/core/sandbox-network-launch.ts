@@ -68,9 +68,11 @@ export function sandboxNetworkLaunch(
 }
 
 /** The sandbox may create Internet sockets plus AF_UNIX sockets whose paths the
- * file sandbox explicitly mounted. Unmounted host sockets remain absent from
- * the bwrap root. Compat syscall ABI, namespace escape and io_uring socket
- * operations stay denied; socketpair is preserved for process-local IPC. */
+ * file sandbox explicitly mounted. AF_NETLINK is limited to NETLINK_ROUTE so
+ * runtimes can inspect only this private namespace's interfaces; other netlink
+ * protocols stay denied. Unmounted host sockets remain absent from the bwrap
+ * root. Compat syscall ABI, namespace escape and io_uring socket operations
+ * stay denied; socketpair is preserved for process-local IPC. */
 export function networkSocketFilter(arch = process.arch): Buffer {
   const abi = arch === 'x64' ? { audit: 0xc000003e, socket: 41, blocked: [272, 308, 425, 426, 427] }
     : arch === 'arm64' ? { audit: 0xc00000b7, socket: 198, blocked: [97, 268, 425, 426, 427] } : null;
@@ -82,8 +84,12 @@ export function networkSocketFilter(arch = process.arch): Buffer {
   // x32 shares AUDIT_ARCH_X86_64 but has different syscall numbers.
   if (arch === 'x64') ins.push([0x45, 0, 1, 0x40000000], [RET, 0, 0, DENY]);
   for (const syscall of abi.blocked) ins.push([JEQ, 0, 1, syscall], [RET, 0, 0, DENY]);
-  ins.push([JEQ, 1, 0, abi.socket], [RET, 0, 0, ALLOW], [LD, 0, 0, 16],
-    [JEQ, 3, 0, 1], [JEQ, 2, 0, 2], [JEQ, 1, 0, 10], [RET, 0, 0, DENY], [RET, 0, 0, ALLOW]);
+  ins.push(
+    [JEQ, 1, 0, abi.socket], [RET, 0, 0, ALLOW], [LD, 0, 0, 16],
+    [JEQ, 7, 0, 1], [JEQ, 6, 0, 2], [JEQ, 5, 0, 10], [JEQ, 1, 0, 16],
+    [RET, 0, 0, DENY], [LD, 0, 0, 32], [JEQ, 1, 0, 0],
+    [RET, 0, 0, DENY], [RET, 0, 0, ALLOW],
+  );
   const buffer = Buffer.alloc(ins.length * 8);
   ins.forEach(([code, jt, jf, value], i) => { buffer.writeUInt16LE(code, i * 8); buffer[i * 8 + 2] = jt; buffer[i * 8 + 3] = jf; buffer.writeUInt32LE(value, i * 8 + 4); });
   return buffer;
