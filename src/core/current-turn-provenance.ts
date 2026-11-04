@@ -423,11 +423,17 @@ function authenticateHumanTurn(
     rootMessageId = turnEntry.rootMessageId;
   }
   const thisTurnEntry = session.replyTargets?.[marker.turnId];
-  const callerProvenHuman = quoteJoinHolds
+  // The per-turn registry is the more specific record: when it lists the
+  // caller as a participant without `isBot === false`, that refutes any
+  // human claim from the live quote slots.
+  const registryRefutes = !!thisTurnEntry?.participants?.some(
+    p => p.openId === callerOpenId && p.isBot !== false,
+  );
+  const callerProvenHuman = !registryRefutes && (quoteJoinHolds
     ? (session.quoteTargetSenderIsBot === false && session.quoteTargetSenderOpenId === callerOpenId)
       || (registryTurnMayAuthenticateHuman(session, marker.turnId)
         && registryEntryProvesHumanSender(thisTurnEntry) && thisTurnEntry.senderOpenId === callerOpenId)
-    : registrySender === callerOpenId;
+    : registrySender === callerOpenId);
 
   // 刻意保守：chat scope 下 quoteJoinHolds && !slotJoinHolds（quote 链在本轮、
   // reply 单槽已被排队消息推进）时 root 两不取——按现有写入序列两者同批推进，

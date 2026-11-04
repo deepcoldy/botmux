@@ -209,6 +209,17 @@ describe('Gate-2 approve-dag records initiator and confirmation', () => {
     expect(summary.unplacedAssignees).toEqual([{ kind: 'unresolved', sketchId: sketch, assignee: 'ghost' }]);
   });
 
+  it('a bot run with no authenticated initiator (no ou_ owner on the binding) is approved without either record', async () => {
+    const ownerless: RunChatBinding = { larkAppId: MAIN, chatId: 'oc_group', chatType: 'group', rootMessageId: 'om_root' };
+    const { base, runDir } = await dagReadyRun({ binding: ownerless });
+    await approve(base, { nodeExecutor: 'bot', caller: ownerless, confirmer: () => OWNER });
+    expect(readGrillState(runDir)!.status).toBe('dag_approved');
+    const envelope = envelopeOf(runDir);
+    expect(envelope).toMatchObject({ nodeExecutor: 'bot' });
+    expect(envelope.authorization).not.toHaveProperty('initiator');
+    expect(envelope.authorization).not.toHaveProperty('flowConfirmation');
+  });
+
   it('switch off: the authorization has exactly the pre-feature keys', async () => {
     const { base, runDir } = await dagReadyRun();
     await approve(base, { nodeExecutor: 'ephemeral' });
@@ -274,6 +285,37 @@ describe('Gate-2 confirmer from the real turn provenance', () => {
   ])('%s: approved, no confirmer', async (_label, session) => {
     const auth = await approveAs(PEER_BOT, 'om_bot_msg', session);
     expect(auth.initiator).toEqual({ openId: PEER_BOT, source: 'feishu' });
+    expect(auth.flowConfirmation).not.toHaveProperty('confirmedByOpenId');
+  });
+
+  it('quote sender kind unknown but the per-turn registry proves the caller human: recorded', async () => {
+    const auth = await approveAs('ou_alice', 'om_alice_msg', {
+      lastCallerOpenId: 'ou_alice', quoteTargetId: 'om_alice_msg', quoteTargetSenderOpenId: 'ou_alice',
+      replyTargets: { om_alice_msg: { senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: false }] } },
+    });
+    expect(auth.flowConfirmation.confirmedByOpenId).toBe('ou_alice');
+  });
+
+  it.each([
+    // The quote slot moved to another sender (e.g. a later message) while the
+    // caller slot still names the initiator: the human proof is about someone else.
+    ['the quote sender is somebody else than the caller', {
+      lastCallerOpenId: 'ou_alice', quoteTargetId: 'om_alice_msg', quoteTargetSenderOpenId: 'ou_bob', quoteTargetSenderIsBot: false,
+    }],
+    ['the quote sender kind was never recorded', {
+      lastCallerOpenId: 'ou_alice', quoteTargetId: 'om_alice_msg', quoteTargetSenderOpenId: 'ou_alice',
+    }],
+    ['the quote says human but the per-turn registry lists the caller as a bot', {
+      lastCallerOpenId: 'ou_alice', quoteTargetId: 'om_alice_msg', quoteTargetSenderOpenId: 'ou_alice', quoteTargetSenderIsBot: false,
+      replyTargets: { om_alice_msg: { senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: true }] } },
+    }],
+    ['the quote says human but the per-turn registry leaves the caller\'s kind open', {
+      lastCallerOpenId: 'ou_alice', quoteTargetId: 'om_alice_msg', quoteTargetSenderOpenId: 'ou_alice', quoteTargetSenderIsBot: false,
+      replyTargets: { om_alice_msg: { senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice' }] } },
+    }],
+  ])('%s: approved, no confirmer', async (_label, session) => {
+    const auth = await approveAs('ou_alice', 'om_alice_msg', session);
+    expect(auth.initiator).toEqual({ openId: 'ou_alice', source: 'feishu' });
     expect(auth.flowConfirmation).not.toHaveProperty('confirmedByOpenId');
   });
 

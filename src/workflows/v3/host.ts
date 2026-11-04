@@ -1253,10 +1253,15 @@ export async function cmdWorkflowHost(
             const confirmedByOpenId = isOpenId(confirmer) && confirmer === initiator?.openId
               && confirmer === currentCaller?.ownerOpenId ? confirmer : undefined;
             const orchestratorAppId = plan.binding.larkAppId;
-            flowConfirmation = ({ dag, targets }) => adHocFlowConfirmation({
-              runDir, dag, targets, orchestratorAppId, bots, nameOf, confirmedAt: now,
-              ...(confirmedByOpenId ? { confirmedByOpenId } : {}),
-            });
+            // A run with no authenticated initiator (standalone / env binding
+            // without an ou_ owner) records neither: a confirmation belongs to
+            // an initiator (run.json requires one for it).
+            if (initiator) {
+              flowConfirmation = ({ dag, targets }) => adHocFlowConfirmation({
+                runDir, dag, targets, orchestratorAppId, bots, nameOf, confirmedAt: now,
+                ...(confirmedByOpenId ? { confirmedByOpenId } : {}),
+              });
+            }
             nodeExecutor = 'bot';
           }
         } else {

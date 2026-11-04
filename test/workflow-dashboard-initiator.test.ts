@@ -167,6 +167,13 @@ describe('Dashboard → daemon workflow initiator', () => {
     expect(resolveOpenId).not.toHaveBeenCalled();
   });
 
+  it('the route takes no GET: a body-less request would ride the platform direct path', async () => {
+    const response = await fetch(`http://127.0.0.1:${dashboardPort}${WORKFLOW_INITIATOR_PATH}`, { method: 'GET' });
+    expect(response.status).toBe(405);
+    expect(await response.json()).toEqual({ ok: false, error: 'method_not_allowed', retryable: false });
+    expect(proxied).toEqual([]);
+  });
+
   it('a request without the body the route requires is refused', async () => {
     expect(await ask({ body: '' })).toEqual({ status: 400, body: { ok: false, error: 'larkAppId_required', retryable: false } });
     expect(await ask({ body: '{' })).toEqual({ status: 400, body: { ok: false, error: 'bad_json', retryable: false } });
