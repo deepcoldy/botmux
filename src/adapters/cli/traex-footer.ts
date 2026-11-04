@@ -102,7 +102,10 @@ const EMPTY_COMPOSER_HINTS = new Set([
  * empty-session footer before token usage exists.
  * The worker supplies an authoritative rendered viewport, never raw PTY bytes.
  */
-export function traexRestoredComposerReady(screen: string): boolean {
+export function traexRestoredComposerReady(
+  screen: string,
+  opts: { resumedSession?: boolean } = {},
+): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
   while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
@@ -115,12 +118,16 @@ export function traexRestoredComposerReady(screen: string): boolean {
   // Recorded 0.212.1 cold start: marketplace Git access failure replaces
   // BOTH native footer rows with a nonblocking notification for ~30s. The
   // initialized startup banner and an empty composer still prove readiness.
-  // Accept only this known notification, never arbitrary error/dialog text.
+  // An exact resume can scroll that cold-start banner out of the viewport;
+  // its host-provided launch context replaces the banner requirement only
+  // for this known nonblocking notification, never arbitrary dialog text.
   const startupRows = rows.slice(0, composer);
   const repositoryNotice = footer.length === 1
     && /^[ \t]*无法访问 Git 仓库 `[^`\r\n]+`，请确认该仓库权限或地址。[ \t]*$/.test(footer[0]!)
-    && startupRows.some(row => /^[ \t]*(?:█ ◆ ◆ █[ \t]+)?TRAE CLI \(v\d[^\r\n]*\)[ \t]*$/.test(row))
-    && startupRows.some(row => /^[ \t]*permissions:[ \t]+\S/.test(row))
+    && (opts.resumedSession === true || (
+      startupRows.some(row => /^[ \t]*(?:█ ◆ ◆ █[ \t]+)?TRAE CLI \(v\d[^\r\n]*\)[ \t]*$/.test(row))
+      && startupRows.some(row => /^[ \t]*permissions:[ \t]+\S/.test(row))
+    ))
     && !startupRows.some(row => /(?:model|directory):[ \t]*loading\b/i.test(row));
   if (!repositoryNotice && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
