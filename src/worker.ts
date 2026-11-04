@@ -456,6 +456,7 @@ import {
   findLaunchedCliPid,
   findCliProcess,
   scheduleWrapperRealCliPid,
+  snapshotChildPids,
   readComm,
   readCmdline,
   isNonInteractiveCodexArgv,
@@ -468,6 +469,9 @@ import {
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
+import { waitForProcessQuiescence } from './services/process-quiescence.js';
+import { transferSandboxCleanupOwnership } from './services/sandbox-cleanup-transfer.js';
+import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
@@ -481,6 +485,7 @@ import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
+import { purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { detectCliStartupBlocker, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
@@ -1933,6 +1938,7 @@ let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
+let preserveExistingScratchOnNextPrepare = false;    // prepare rebuilds confinement argv around the repaired existing COW view
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
@@ -25183,6 +25189,12 @@ async function spawnCli(
         log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
       }
     } else if (process.platform === 'darwin') {
+      // APFS scratch does not yet have a fresh-process launcher reconstruction
+      // API. Never consume the one-shot into an unsandboxed launch.
+      if (preserveExistingScratchOnNextPrepare) {
+        preserveExistingScratchOnNextPrepare = false;
+        throw new Error('scratch purge respawn cannot safely reuse a macOS clone yet');
+      }
       // ── macOS: APFS clonefile COW clone + Seatbelt ──
       const prepared = prepareMacScratchSandboxDetailed({
         sessionId: cfg.sessionId,
@@ -25219,6 +25231,11 @@ async function spawnCli(
     } else {
       // ── Linux: full-root COW overlay ──
       const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
+      // prepareScratchSandboxDetailed is the fresh-process reuse API: for an
+      // existing matching tree it keeps upper/work/merged state but reconstructs
+      // the full bwrap launcher, env, masks and relay bindings.
+      const reusingRepairedScratch = preserveExistingScratchOnNextPrepare;
+      preserveExistingScratchOnNextPrepare = false;
       const prepared = prepareScratchSandboxDetailed({
         sessionId: cfg.sessionId,
         dataDir: scratchDataDir,
@@ -25239,7 +25256,9 @@ async function spawnCli(
         useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!prepared.ok) {
-        log(`scratch sandbox (${storage}) could not be established: ${prepared.failure.reason}${prepared.failure.detail ? ` (${prepared.failure.detail})` : ''}`);
+        // one-shot was consumed before prepare so a later unrelated spawn cannot
+        // inherit stale reuse intent after this failure.
+        log(`scratch sandbox (${storage})${reusingRepairedScratch ? ' reuse' : ''} could not be established: ${prepared.failure.reason}${prepared.failure.detail ? ` (${prepared.failure.detail})` : ''}`);
         throw new Error(scratchFailureNotice(prepared.failure));
       }
       const sbx = prepared.spawn;
@@ -25247,8 +25266,18 @@ async function spawnCli(
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
       if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
-      sandboxCleanup = sbx.cleanup;
+      try {
+        sandboxCleanup = transferSandboxCleanupOwnership(
+          sandboxCleanup,
+          sbx.cleanup,
+          reusingRepairedScratch,
+        );
+      } catch {
+        // Ordinary replacement failed while retiring its old owner. The freshly
+        // prepared tree must not leak if ownership cannot be installed.
+        try { sbx.cleanup(); } catch { /* best effort */ }
+        throw new Error('failed to transfer scratch sandbox cleanup ownership');
+      }
       sandboxRelayOutbox = sbx.outbox;
       scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
       scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
@@ -27485,6 +27514,9 @@ function killCli(opts: {
   /** The replacement worker reuses this logical session's sandbox tree. Stop
    * this worker's watcher but leave the tree/mountpoints for that replacement. */
   preserveSandbox?: boolean;
+  /** In-process respawn: retain both tree and cleanup ownership so spawnCli can
+   * reattach the same repaired scratch view, then clean it at final teardown. */
+  preserveSandboxForRespawn?: boolean;
   /** The CLI keeps running in its persistent pane: leave its PID marker (the
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
@@ -27583,6 +27615,11 @@ function killCli(opts: {
     // replacement will reuse.
     sandboxCleanup = null;
     sandboxTeardownDone = true;
+  } else if (opts.preserveSandboxForRespawn) {
+    // Keep the existing cleanup owner and tree. The next prepare call rebuilds
+    // confinement argv around this same COW state (never the live-pane attach
+    // path, which supplies no launcher).
+    preserveExistingScratchOnNextPrepare = true;
   } else if (sandboxCleanup) {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
@@ -27636,7 +27673,7 @@ function stopOwnedSessionScope(reason: string): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause; afterQuiesceBeforeRespawn?: () => void; preserveSandboxUntilMaintenance?: boolean } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
     codexAutoUpgrade.reject?.(new Error(reason));
@@ -27686,6 +27723,20 @@ async function restartCliProcess(
       // resume this exact thread on its fresh port.
       const rpcThreadId = remoteThreadId;
       const restartingBackend = backend;
+      const retiringCliPid = restartingBackend?.getChildPid?.();
+      const retiringProcessScope: number[] = [];
+      if (retiringCliPid) {
+        const childrenOf = snapshotChildPids();
+        const pending = [retiringCliPid];
+        const seen = new Set<number>();
+        while (pending.length > 0 && seen.size < 256) {
+          const current = pending.shift()!;
+          if (seen.has(current)) continue;
+          seen.add(current);
+          retiringProcessScope.push(current);
+          pending.push(...childrenOf(current));
+        }
+      }
       if (restartingBackend) intentionalRestartBackend = restartingBackend;
       const teardown = restartingBackend?.destroySession?.();
       let teardownOutcome: RestartTeardownOutcome = { kind: 'absent' };
@@ -27734,7 +27785,20 @@ async function restartCliProcess(
       killCli({
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
+        preserveSandboxForRespawn: opts.preserveSandboxUntilMaintenance,
       });
+      // Destructive transcript maintenance must happen only after destroy+kill
+      // AND positive process death: node-pty kill() returns before its child has
+      // necessarily stopped writing. The scratch tree is deliberately retained
+      // until maintenance has consumed the active merged-view transcript.
+      if (opts.afterQuiesceBeforeRespawn) {
+        await waitForProcessQuiescence(retiringCliPid ?? undefined, {
+          now: () => Date.now(),
+          wait: ms => delay(ms),
+          provablyGone: pid => !pidNotProvablyGone(pid),
+        }, { ownedPids: retiringProcessScope });
+        opts.afterQuiesceBeforeRespawn();
+      }
       // A normal restart cannot observe activity from the retired process.
       // Only capacity-model rotation carries that waiting latch forward.
       traexAutoModelController?.noteProcessExited(opts.restartCause === 'traex-auto-model');
@@ -31356,6 +31420,83 @@ process.on('message', async (raw: unknown) => {
           });
         }
       } else {
+        // 小图毒化恢复：该消息（失败卡按钮发出的续跑指令）要求先把会话
+        // jsonl 里尺寸不达标的图片块替换成文本，再以 --resume 重启 CLI。
+        // restartCliProcess 的同步前缀会立即置位 cliRestartInProgress，所以
+        // 必须先启动重启、再走下面的 sendToPty —— 消息因此进入 freshness
+        // 队列，respawn 完成、首个 prompt ready 后才送达，绝不会打进内存里
+        // 仍带着毒图的旧进程。只支持本地 Claude Code（其它 CLI 的 transcript
+        // 结构与 resume 语义不同）。
+        let purgeRestartPromise: Promise<void> | undefined;
+        if (msg.purgeUndersizedImages) {
+          // bridgeJsonlPath is the authoritative active transcript: it follows
+          // in-pane /clear rotations and points through the scratch merged view.
+          // backend.claudeJsonlPath is only the launch-time host-side guess.
+          const purgeTarget = resolvePurgeResumeTarget(
+            bridgeJsonlPath,
+            backend
+              ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend)
+                .claudeJsonlPath
+              : undefined,
+          );
+          const purgeSupported = lastInitConfig?.cliId === 'claude-code'
+            && !!purgeTarget && !cliRestartInProgress;
+          if (!purgeSupported || !purgeTarget) {
+            send({
+              type: 'user_notify',
+              message: t('worker.purge_images_unsupported'),
+              turnId: msg.turnId,
+            });
+            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+            break;
+          }
+          let purgeSucceeded = false;
+          purgeRestartPromise = restartCliProcess(
+            'purge undersized transcript images',
+            // 用户显式发起的上下文恢复（同 cwd-move respawn）：不计入崩溃重启
+            // 预算，否则「近期手动重启过 + 本次恢复」会被 tier-2 强制 FRESH，
+            // 反而丢掉刚救回来的会话上下文。显式钉住当前 bridge transcript，
+            // 避免进程内 /clear 后 cfg 仍指向旧 A、清理 B 却恢复 A。
+            {
+              immediate: true,
+              preservePending: true,
+              skipRestartBudget: true,
+              exactResumeSessionId: purgeTarget.sessionId,
+              preserveSandboxUntilMaintenance: true,
+              afterQuiesceBeforeRespawn: () => {
+                const purgedFiles = purgeUndersizedImages(purgeTarget.jsonlPath, {
+                  // <claudeDataDir>/projects/<cwd-key>/<sid>.jsonl. Pin the
+                  // independently known projects root so an ancestor alias in
+                  // the supplied transcript path cannot redefine containment.
+                  trustedProjectsRoot: dirname(dirname(purgeTarget.jsonlPath)),
+                });
+                const removedTotal = purgedFiles.reduce((n, f) => n + f.removed, 0);
+                if (removedTotal === 0) throw new Error(t('worker.purge_images_none'));
+                purgeSucceeded = true;
+                send({
+                  type: 'user_notify',
+                  message: t('worker.purge_images_done', {
+                    files: String(purgedFiles.length),
+                    removed: String(removedTotal),
+                  }),
+                  turnId: msg.turnId,
+                });
+              },
+            },
+          );
+          purgeRestartPromise.catch(err => {
+            send({
+              type: 'user_notify',
+              message: t(purgeSucceeded
+                ? 'worker.purge_images_restart_failed'
+                : 'worker.purge_images_failed', {
+                reason: err instanceof Error ? err.message : String(err),
+              }),
+              turnId: msg.turnId,
+            });
+            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+          });
+        }
         // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
         // so markTimeMs anchors to the actual PTY-write moment, not IPC
         // arrival. Marking now would race with a still-running previous

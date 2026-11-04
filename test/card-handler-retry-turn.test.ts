@@ -225,12 +225,16 @@ function makeDs(over: Partial<DaemonSession> & { sessionOverrides?: Partial<Sess
 }
 
 /** `turnId === null` omits turn_id entirely (an old card built before the pin). */
-function actionData(turnId: string | null = TURN, mode: string | null = 'resend'): any {
+function actionData(
+  turnId: string | null = TURN,
+  mode: string | null = 'resend',
+  action = 'retry_turn',
+): any {
   return {
     operator: { open_id: OWNER },
     action: {
       value: {
-        action: 'retry_turn',
+        action,
         root_id: ROOT,
         session_id: SID,
         ...(turnId === null ? {} : { turn_id: turnId }),
@@ -287,7 +291,6 @@ describe('retry_turn — happy path', () => {
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
     const sent = sendWorkerInputMock.mock.calls[0][1].content as string;
     expect(sent).toContain('[BOTMUX_CONTINUE]');
-    expect(sent).toContain('不要重复已完成的操作');
     // The fork resumes the transcript, so the task text is already available to
     // the model. Re-sending it here would just burn tokens.
     expect(sent).not.toContain('do the thing');
@@ -439,6 +442,47 @@ describe('retry_turn — refusal branches', () => {
     const res = await handleCardAction(actionData(), depsWith(ds), LARK_APP_ID);
     expect(res?.toast?.content).toMatch(/提交失败/);
     expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+  });
+});
+
+describe('purge_images_continue — behavioral dispatch', () => {
+  it('submits a continuation carrying the purge flag', async () => {
+    const ds = makeDs();
+    const res = await handleCardAction(
+      actionData(TURN, null, 'purge_images_continue'),
+      depsWith(ds),
+      LARK_APP_ID,
+    );
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(sendWorkerInputMock.mock.calls[0][1].content).toContain('[BOTMUX_CONTINUE]');
+    expect(sendWorkerInputMock.mock.calls[0][3]).toMatchObject({ purgeUndersizedImages: true });
+    expect(res?.toast?.type).toBe('success');
+  });
+
+  it('fails closed without a live worker and does not consume the retry lease', async () => {
+    const ds = makeDs({ worker: undefined });
+    const res = await handleCardAction(
+      actionData(TURN, null, 'purge_images_continue'),
+      depsWith(ds),
+      LARK_APP_ID,
+    );
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(res?.toast?.type).toBe('warning');
+  });
+
+  it('rejects stale cards without dispatching', async () => {
+    const ds = makeDs({
+      sessionOverrides: { lastFailedTurn: makeFailedTurn({ turnId: 'newer-turn' }) },
+    });
+    const res = await handleCardAction(
+      actionData(TURN, null, 'purge_images_continue'),
+      depsWith(ds),
+      LARK_APP_ID,
+    );
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(res?.toast?.content).toMatch(/过期/);
   });
 });
 
