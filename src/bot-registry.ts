@@ -2349,8 +2349,8 @@ export interface BotConfig {
   /**
    * 主动开工 — 场景① optional pre-configured first-turn prompt. When set, it
    * becomes the user_message of the auto-started session; when unset/blank the
-   * session starts with an empty user_message and the bot reads the group
-   * context itself. Moot when {@link autoStartOnGroupJoin} is off.
+   * session uses a built-in task to inspect the group context and report
+   * readiness if no task is assigned. Moot when {@link autoStartOnGroupJoin} is off.
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
