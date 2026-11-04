@@ -12,7 +12,7 @@ import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
-import { MessageWithdrawnError, uploadFile } from '../im/lark/client.js';
+import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '../im/lark/client.js';
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
@@ -305,18 +305,30 @@ export async function settleTurnReplyCards(ds: DaemonSession): Promise<void> {
   ds.replyCardRunningTurnId = undefined;
 }
 
-async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord): Promise<void> {
+async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord, beforeMs?: number): Promise<void> {
   // Resumable asks have already been restored by the broker at startup.
   const orphanAskIds = (record.asks ?? []).filter(entry => !entry.result && !getAskSnapshot(entry.ask.askId))
     .map(entry => entry.ask.askId);
-  await store.update(record, { kind: 'terminal', phase: 'ambiguous', disconnected: true, orphanAskIds }, {
-    beforeEffect: () => {
-      if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
-    },
+  const beforeEffect = () => {
+    if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
+  };
+  await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
+    beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
     patch: (id, card) => patchPublishedGroupCard(record.larkAppId, record.chatId, id, card, record.rootId),
+    sendOverflow: async (text, uuid) => {
+      const file = join(store.directory, `${store.id(record)}-reply.md`);
+      atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
+      beforeEffect();
+      const fileKey = await uploadFile(record.larkAppId, file);
+      beforeEffect();
+      const content = JSON.stringify({ file_key: fileKey });
+      return record.rootId && record.rootId !== record.chatId
+        ? replyMessage(record.larkAppId, record.rootId, content, 'file', true, uuid, undefined, { beforeWrite: beforeEffect })
+        : sendMessage(record.larkAppId, record.chatId, content, 'file', uuid, undefined, { beforeWrite: beforeEffect });
+    },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
-    render: state => buildTurnReplyCard({ ...state, finalCard: state.finalDelivered ? state.finalCard : undefined }, {
+    render: state => buildTurnReplyCard(state, {
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),
       locale: localeForBot(record.larkAppId), canStop: false,
     }),
@@ -334,8 +346,8 @@ export async function sweepInterruptedReplyCards(larkAppId: string): Promise<voi
       if (key.larkAppId !== larkAppId) continue;
       const record = store.read(key);
       if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn
-        || (replyCardIsTerminal(record) && record.phase !== 'ambiguous')) continue;
-      await settleDisconnectedReplyCard(store, record);
+        || (replyCardIsTerminal(record) && record.phase !== 'ambiguous' && !record.pendingPatch && !record.publishPending)) continue;
+      await settleDisconnectedReplyCard(store, record, processStartedAtMs);
     } catch (error) {
       logger.warn(`[reply-card] recovery: ${error instanceof Error ? error.message : String(error)}`);
     }
