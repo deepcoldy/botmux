@@ -326,13 +326,17 @@ export async function applyExactChatGrantByLarkAppIds(
   input: ExactChatGrantByLarkAppIdsInput,
   deps: ExactChatGrantDeps = defaultDeps,
 ): Promise<ExactChatGrantSuccess | ExactChatGrantFailure> {
-  if (input.operation !== 'grant') {
+  // Revoke by app id exists for a grant whose open_id the caller never
+  // learnt (it lost the grant's result): the receiver resolves the subject in
+  // its own namespace, exactly as for a grant. Readback stays open_id only.
+  if (input.operation !== 'grant' && input.operation !== 'revoke') {
     return failure(
       400,
       'subject_lark_app_ids_grant_only',
-      'subjectLarkAppIds may only be used with operation=grant',
+      'subjectLarkAppIds may only be used with operation=grant or revoke',
     );
   }
+  const operation = input.operation;
   if (typeof input.chatId !== 'string' || !CHAT_ID_RE.test(input.chatId)) {
     return failure(400, 'invalid_chat_id', 'chatId must be a valid oc_ chat id');
   }
@@ -391,7 +395,7 @@ export async function applyExactChatGrantByLarkAppIds(
   }
   const completeMappings = subjectMappings as CurrentChatBotAppMapping[];
   const result = await applyExactChatGrant({
-    operation: 'grant',
+    operation,
     receiverLarkAppId: input.receiverLarkAppId,
     chatId: input.chatId,
     subjectOpenIds: completeMappings.map(mapping => mapping.subjectOpenId),

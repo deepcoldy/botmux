@@ -59,13 +59,13 @@ import { initiatorFailureBody, type WorkflowInitiatorResolution } from './workfl
 import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { createLiveV3BotEligibilityProbe } from '../im/lark/v3-bot-eligibility.js';
 import { buildV3LaunchRootCard, buildV3LaunchSummaryText } from '../im/lark/v3-launch-card.js';
-import { replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from '../im/lark/client.js';
+import { listChatMessages, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from '../im/lark/client.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import { addBotToChat, addUsersToChatByOpenId, addUsersToChatByUnionId, listChats } from '../services/groups-store.js';
 import { requestExactChatGrant } from '../cli/exact-chat-grant-client.js';
 import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
-import { getBotBrand } from '../bot-registry.js';
+import { getBotBrand, getBotOpenId } from '../bot-registry.js';
 
 export const WORKFLOW_DRAFTS_PATH = '/api/v3/orchestration/drafts';
 
@@ -304,7 +304,27 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
       });
       return { joined: true, ...(transferred.transferError ? { ownerTransferError: transferred.transferError } : {}) };
     },
-    listChats: async () => (await listChats(appId)).map((chat) => ({ chatId: chat.chatId, ...(chat.name ? { name: chat.name } : {}) })),
+    listChats: async () => (await listChats(appId)).map((chat) => ({
+      chatId: chat.chatId,
+      ...(chat.name ? { name: chat.name } : {}),
+      ...(chat.chatMode ? { chatMode: chat.chatMode } : {}),
+      ...(chat.ownerId ? { ownerId: chat.ownerId } : {}),
+    })),
+    isSelfOwner: (ownerId) => !!ownerId && (ownerId === appId || ownerId === getBotOpenId(appId)),
+    async findRootCards(chatId, runId) {
+      // Top-level messages of the group, newest first; the root card is the
+      // main bot's interactive message naming this run in its signature row.
+      const messages = await listChatMessages(appId, chatId, 50);
+      const selfOpenId = getBotOpenId(appId);
+      return messages
+        .filter((message: any) => message?.msg_type === 'interactive'
+          && message?.sender?.sender_type === 'app'
+          && (message.sender.id === appId || (selfOpenId && message.sender.id === selfOpenId))
+          && typeof message?.body?.content === 'string' && message.body.content.includes(runId)
+          && !message.root_id && !message.parent_id)
+        .map((message: any) => String(message.message_id))
+        .filter((id: string) => /^om_[A-Za-z0-9_-]{1,128}$/.test(id));
+    },
     async addBots(chatId, botAppIds) {
       await addBotToChat(appId, chatId, botAppIds);
     },
@@ -338,6 +358,16 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
         chatId,
         operation: 'revoke',
         subjectOpenIds: [subjectOpenId],
+      });
+    },
+    async revokeByApp(chatId, receiver, subjectAppId) {
+      await requestExactChatGrant({
+        daemon: receiverDaemon(receiver),
+        secret: loadDaemonIpcSecret(),
+        receiverLarkAppId: receiver,
+        chatId,
+        operation: 'revoke',
+        subjectLarkAppIds: [subjectAppId],
       });
     },
     startRun: input.startRun,

@@ -49,7 +49,7 @@ const UNION_ID_RE = /^on_[A-Za-z0-9_-]{1,128}$/;
 
 export type ExtraMembersParse =
   | { ok: true; members: string[]; emails: string[]; unionIds: string[] }
-  | { ok: false; message: string };
+  | { ok: false; message: string; reason: 'malformed' | 'too_many' | 'open_id_refused' | 'unrecognized'; item?: string };
 
 /**
  * Extra members (§4.5): a full email or a union_id. An open_id is refused —
@@ -59,22 +59,22 @@ export type ExtraMembersParse =
 export function parseLaunchExtraMembers(raw: unknown, max: number): ExtraMembersParse {
   if (raw === undefined) return { ok: true, members: [], emails: [], unionIds: [] };
   if (!Array.isArray(raw) || !raw.every((item) => typeof item === 'string')) {
-    return { ok: false, message: 'extraMembers 必须是字符串数组（邮箱或 union_id）' };
+    return { ok: false, reason: 'malformed', message: 'extraMembers 必须是字符串数组（邮箱或 union_id）' };
   }
   const members = [...new Set((raw as string[]).map((item) => item.trim()).filter(Boolean))];
-  if (members.length > max) return { ok: false, message: `额外成员最多 ${max} 个` };
+  if (members.length > max) return { ok: false, reason: 'too_many', message: `额外成员最多 ${max} 个` };
   const emails: string[] = [];
   const unionIds: string[] = [];
   for (const member of members) {
     if (UNION_ID_RE.test(member)) unionIds.push(member);
     else if (EMAIL_RE.test(member)) emails.push(member.toLowerCase());
-    else if (member.startsWith('ou_')) return { ok: false, message: `不接受 open_id（${member}）：它只对签发它的应用有效，请填邮箱或 union_id` };
-    else return { ok: false, message: `无法识别的成员：${member}（请填完整邮箱或 union_id）` };
+    else if (member.startsWith('ou_')) return { ok: false, reason: 'open_id_refused', item: member, message: `不接受 open_id（${member}）：它只对签发它的应用有效，请填邮箱或 union_id` };
+    else return { ok: false, reason: 'unrecognized', item: member, message: `无法识别的成员：${member}（请填完整邮箱或 union_id）` };
   }
   return { ok: true, members, emails, unionIds };
 }
 
-export type LaunchStep = 'group' | 'join' | 'root' | 'migrate' | 'check' | 'grant' | 'commit' | 'start' | 'done';
+export type LaunchStep = 'group' | 'join' | 'root' | 'summary' | 'migrate' | 'check' | 'grant' | 'commit' | 'start' | 'done';
 
 /**
  * The next step of a launch record (§4.5 断点续做), from what it recorded —
@@ -91,7 +91,8 @@ export function nextLaunchStep(
   if (!launch.chat) return 'group';
   if (launch.chat.initiator !== 'joined') return 'join';
   if (!launch.root) return 'root';
-  if (!launch.migrate) return 'migrate';
+  if (!launch.migrate || launch.migrate.status === 'binding') return 'migrate';
+  if (!launch.migrate.summaryMessageId && !launch.migrate.summaryError) return 'summary';
   if (!launch.check || !launch.check.ok || launch.check.flowRevision !== current.flowRevision) return 'check';
   const grants = launch.grants ?? {};
   const wanted = new Set(current.targets);
@@ -173,8 +174,14 @@ export interface DraftLaunchDeps {
   >;
   /** Topic group, main bot as creator, no kickoff of any kind. */
   createGroup(input: LaunchCreateGroupInput): Promise<LaunchCreateGroupResult>;
-  /** The chats the main bot is in (name + id). */
-  listChats(): Promise<Array<{ chatId: string; name?: string }>>;
+  /** The chats the main bot is in: name, mode and owner (open_id in the
+   *  main bot's app, as the chat list reports it). */
+  listChats(): Promise<Array<{ chatId: string; name?: string; chatMode?: string; ownerId?: string }>>;
+  /** The main bot itself owns the chat (owner id as the chat list reports it). */
+  isSelfOwner(ownerId: string | undefined): boolean;
+  /** The main bot's recent top-level cards in `chatId` mentioning `runId`
+   *  (to adopt a root card whose post outlived Feishu's uuid dedup). */
+  findRootCards(chatId: string, runId: string): Promise<string[]>;
   /** Add the initiator to `chatId` and make them owner (the join step:
    *  after a refused invite, or for a group recovered by its marker). */
   joinInitiator(chatId: string, owner: LaunchCreateGroupInput['owner']): Promise<LaunchJoinInitiatorResult>;
@@ -195,6 +202,9 @@ export interface DraftLaunchDeps {
   /** Remove `subjectOpenId` (receiver's namespace) from `receiver`'s grants
    *  in `chatId`; needs no membership. */
   revoke(chatId: string, receiver: string, subjectOpenId: string): Promise<void>;
+  /** The same, for a grant written without its result recorded: `receiver`
+   *  resolves `subjectAppId` in ITS OWN namespace (no open_id crosses apps). */
+  revokeByApp(chatId: string, receiver: string, subjectAppId: string): Promise<void>;
   /** The same start path as `botmux workflow start` (idempotent). */
   startRun(runId: string): Promise<LaunchStartResult>;
 }

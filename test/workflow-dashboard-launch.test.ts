@@ -218,7 +218,10 @@ describe('拉群开始: the 8 steps', () => {
   it('extra members: an open_id is refused before anything is written; an unknown email stops before the group', async () => {
     const { h, launch } = setup();
     const runId = await confirmed(h);
-    expect(await code(h.service.launch(runId, OWNER, { extraMembers: ['ou_foreign_app_user'] }))).toBe('bad_request');
+    const refused = await h.service.launch(runId, OWNER, { extraMembers: ['ou_foreign_app_user'] }).catch((e) => e);
+    expect(refused).toMatchObject({ code: 'bad_request', details: { reason: 'open_id_refused', item: 'ou_foreign_app_user' } });
+    const unknown = await h.service.launch(runId, OWNER, { extraMembers: ['zzz'] }).catch((e) => e);
+    expect(unknown).toMatchObject({ code: 'bad_request', details: { reason: 'unrecognized' } });
     expect(readWorkflowDraft(join(base, runId))!.launch).toBeUndefined();
 
     await h.service.launch(runId, OWNER, { extraMembers: ['nobody@example.com'] });

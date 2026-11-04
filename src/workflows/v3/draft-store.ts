@@ -221,17 +221,26 @@ const launchSchema = z.object({
     attemptAt: iso.optional(),
     note: z.string().max(500),
   }).strict()).max(50).optional(),
+  /** About to post the root card: its uuid and when it was first tried.
+   *  Feishu dedups a uuid for about an hour only — later a resend is checked
+   *  against the group's messages first, never sent blindly. */
+  rootPending: z.object({ uuid: z.string().min(1).max(64), at: iso }).strict().optional(),
   root: z.object({
     messageId: messageIdSchema,
     at: iso,
     /** The root card says 「这次启动已放弃」. */
     abandonNoted: z.literal(true).optional(),
   }).strict().optional(),
+  /** binding: the move is under way (written before it) — the session may
+   *  already be the main topic's, so nothing closes or suspends it; 「继续」
+   *  reconciles. bound / unavailable: the outcome. */
   migrate: z.object({
-    status: z.enum(['bound', 'unavailable']),
+    status: z.enum(['binding', 'bound', 'unavailable']),
     at: iso,
     sessionId: z.string().min(1).max(256).optional(),
     error: z.string().max(2000).optional(),
+    /** About to post the summary (same uuid rule as the root card). */
+    summaryPending: z.object({ uuid: z.string().min(1).max(64), at: iso }).strict().optional(),
     summaryMessageId: messageIdSchema.optional(),
     summaryError: z.string().max(2000).optional(),
   }).strict().optional(),
@@ -245,12 +254,15 @@ const launchSchema = z.object({
    *  this chat. `mainSide`: this bot's open_id in the main bot's namespace
    *  (main receives); `peerSide`: the main bot's open_id in this bot's
    *  namespace (it receives). Each is used only with the app that issued it.
-   *  A side is recorded as soon as it is written, so a half-written pair is
-   *  still revocable. */
+   *  A side is recorded as `*Pending` BEFORE it is written and gets its
+   *  open_id after: a grant whose result was lost is still revoked — by the
+   *  receiver resolving the subject app in its own namespace. */
   grants: z.record(appIdSchema, z.object({
     at: iso,
     mainSide: openId.optional(),
     peerSide: openId.optional(),
+    mainPending: z.literal(true).optional(),
+    peerPending: z.literal(true).optional(),
   }).strict()).optional(),
   commit: z.object({
     at: iso,
@@ -264,7 +276,7 @@ const launchSchema = z.object({
   }).strict().optional(),
   start: z.object({ at: iso }).strict().optional(),
   error: z.object({
-    step: z.enum(['members', 'group', 'join', 'root', 'migrate', 'check', 'grant', 'commit', 'start', 'interrupted']),
+    step: z.enum(['members', 'group', 'join', 'root', 'summary', 'migrate', 'check', 'grant', 'commit', 'start', 'interrupted']),
     code: z.string().min(1).max(64),
     message: z.string().max(4000),
     at: iso,
@@ -486,7 +498,6 @@ export function summarizeWorkflowDraft(runDir: string, now: Date = new Date()): 
   const draft = readWorkflowDraft(runDir);
   const grill = readGrillState(runDir);
   if (!draft || !grill || draft.deletedAt || grill.runId !== draft.runId || grill.chatBinding) return undefined;
-  if (draft.launch?.start) return undefined;
   const updatedAt = draft.updatedAt > grill.updatedAt ? draft.updatedAt : grill.updatedAt;
   return {
     runId: draft.runId,

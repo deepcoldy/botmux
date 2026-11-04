@@ -99,6 +99,7 @@ export function draftErrorKey(code: string): string | undefined {
     'already_confirmed', 'unknown_node', 'bot_not_on_roster', 'dag_invalid', 'draft_not_stale',
     'orchestrator_ineligible', 'unknown_draft', 'network_error', 'spec_invalid',
     'launch_running', 'launch_exists', 'no_launch', 'launch_unavailable', 'initiator_channel_unavailable', 'run_committed',
+    'root_update_failed',
   ]);
   return known.has(code) ? `workflow.draft.err.${code}` : undefined;
 }
@@ -212,7 +213,7 @@ function launchStepOf(step: string): LaunchStepKey {
   switch (step) {
     case 'members': case 'group': case 'join': return 'group';
     case 'root': return 'root';
-    case 'migrate': return 'migrate';
+    case 'migrate': case 'summary': return 'migrate';
     case 'check': return 'check';
     case 'grant': return 'grant';
     case 'commit': return 'commit';
@@ -283,6 +284,7 @@ export function launchErrorKey(code: string): string | undefined {
     'members_invalid', 'members_unresolved', 'members_lookup_failed', 'list_chats_failed', 'create_group_failed',
     'initiator_not_joined', 'post_root_failed', 'bind_failed', 'bots_ineligible', 'revoke_failed', 'grant_failed',
     'flow_changed', 'daemon_restarted', 'internal_error', 'flow_unreadable', 'launch_loop',
+    'recover_ambiguous', 'root_unverified',
   ]);
   return known.has(code) ? `workflow.draft.launchErr.${code}` : undefined;
 }

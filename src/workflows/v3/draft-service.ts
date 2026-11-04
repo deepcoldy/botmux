@@ -130,6 +130,9 @@ export const DRAFT_CLARIFY_CALL_TIMEOUT_MS = 2 * 60_000;
  *  CLI process closed; the session record stays for a later resume. */
 export const DRAFT_CLARIFY_IDLE_MS = 30 * 60_000;
 const RESERVATION_PREFIX = 'reserve:';
+/** Feishu deduplicates a message uuid for about an hour; a resend later
+ *  than this after the first try is not trusted to be deduplicated. */
+export const LAUNCH_UUID_DEDUP_SAFE_MS = 55 * 60_000;
 const MAX_GOAL_CHARS = 4_000;
 const MAX_MESSAGE_CHARS = 16_000;
 const MAX_NOTE_CHARS = 4_000;
@@ -168,6 +171,8 @@ export type WorkflowDraftErrorCode =
   | 'initiator_channel_unavailable'
   /** D4: run.json is written; the draft can only be started now. */
   | 'run_committed'
+  /** D4: deleting a launched draft first marks its root card abandoned. */
+  | 'root_update_failed'
   | 'bad_request';
 
 const STATUS: Record<WorkflowDraftErrorCode, number> = {
@@ -196,6 +201,7 @@ const STATUS: Record<WorkflowDraftErrorCode, number> = {
   launch_unavailable: 503,
   initiator_channel_unavailable: 422,
   run_committed: 409,
+  root_update_failed: 503,
   bad_request: 400,
 };
 
@@ -212,7 +218,7 @@ export class WorkflowDraftError extends Error {
   }
 
   get retryable(): boolean {
-    return this.code === 'busy' || this.code === 'clarify_unavailable' || this.code === 'launch_running';
+    return this.code === 'busy' || this.code === 'clarify_unavailable' || this.code === 'launch_running' || this.code === 'root_update_failed';
   }
 }
 
@@ -430,12 +436,24 @@ function settleLostArchitect(
   return 'interrupted';
 }
 
+/**
+ * The clarify session is (or may already be) the main topic's (§4.5 第 4 步):
+ * moved, or a move under way whose outcome is not recorded. Nothing closes or
+ * suspends it as the draft's; a resumed launch reconciles a pending move.
+ */
+function clarifySessionInTopic(draft: WorkflowDraftRecord): boolean {
+  if (draft.clarify.state === 'migrated') return true;
+  const migrate = draft.launch?.migrate;
+  return !!migrate && migrate.status !== 'unavailable' && !!draft.clarify.sessionId
+    && (migrate.sessionId === undefined || migrate.sessionId === draft.clarify.sessionId);
+}
+
 /** Every clarify session a draft knows of (current + ones whose close failed). */
 function draftSessions(draft: WorkflowDraftRecord): Array<{ sessionId: string; headlessId?: string }> {
   const out = new Map<string, { sessionId: string; headlessId?: string }>();
   for (const item of draft.orphanSessions ?? []) out.set(item.sessionId, item);
   // A session moved into the main topic is that topic's now, not the draft's.
-  if (draft.clarify.sessionId && draft.clarify.state !== 'migrated') {
+  if (draft.clarify.sessionId && !clarifySessionInTopic(draft)) {
     out.set(draft.clarify.sessionId, {
       sessionId: draft.clarify.sessionId,
       ...(draft.clarify.headlessId ? { headlessId: draft.clarify.headlessId } : {}),
@@ -1342,24 +1360,35 @@ export class WorkflowDraftService {
         };
       });
       this.flowChanged(draft, { nodeBots: false });
+      // §4.5 第 6 步: a bot swapped out of a launched group keeps no grant
+      // there. The revoke runs outside the lock, so it holds the launch
+      // (a token, as a step does): a concurrent 「继续」 or another swap is
+      // refused as launch_running instead of interleaving with it.
       const launch = draft.launch;
-      return {
-        changed: true,
-        result: launch?.chat && launch.grants && Object.keys(launch.grants).length > 0
-          ? { chatId: launch.chat.chatId, grants: structuredClone(launch.grants), runDir, grill }
-          : undefined,
-      };
+      if (!launch?.chat || !launch.grants || !this.deps.launch) return { changed: true, result: undefined };
+      const wanted = this.launchFlow(runDir, readGrillState(runDir) ?? grill).botTargets;
+      if (!Object.keys(launch.grants).some((appId) => !wanted.includes(appId))) return { changed: true, result: undefined };
+      const token = this.reserveLaunch();
+      launch.state = 'running';
+      launch.token = token;
+      launch.updatedAt = this.now().toISOString();
+      return { changed: true, result: { token, chatId: launch.chat.chatId } };
     });
-    // §4.5 第 6 步: a bot swapped out of a launched group keeps no grant there.
-    // Best effort now; the launch's grant step retries (and waits for it).
-    if (stale && this.deps.launch) {
+    if (stale) {
       try {
-        const grill = readGrillState(stale.runDir) ?? stale.grill;
-        const wanted = this.launchFlow(stale.runDir, grill).botTargets;
-        const failed = await this.revokeStaleLaunchGrants(runId, undefined, wanted, stale.chatId, stale.grants);
+        const failed = await this.revokeStaleLaunchGrants(runId, stale.token, stale.chatId);
         if (failed) this.log(`[workflow-draft] ${failed} (retried at 「继续」)`);
       } catch (error) {
         this.log(`[workflow-draft] revoking swapped-out grants of ${runId} failed: ${errorText(error)}`);
+      } finally {
+        this.launchTokens.delete(stale.token);
+        try {
+          this.launchTx(runId, stale.token, ({ launch }) => {
+            launch.state = 'paused';
+            delete launch.token;
+            return { changed: true, result: undefined };
+          });
+        } catch { /* a dead token is taken over by 「继续」 */ }
       }
     }
     return this.view(runId);
@@ -1479,7 +1508,7 @@ export class WorkflowDraftService {
         draft.launch.updatedAt = at;
         delete draft.launch.token;
       }
-      if (draft.clarify.state === 'migrated') return { changed: true, result: { old: {}, note: !!draft.launch?.root } };
+      if (clarifySessionInTopic(draft)) return { changed: true, result: { old: {}, note: !!draft.launch?.root } };
       const old = { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId };
       draft.clarify.state = 'closed';
       delete draft.clarify.pending;
@@ -1501,12 +1530,34 @@ export class WorkflowDraftService {
    * finishes.
    */
   async delete(runId: string, initiator: WorkflowDraftInitiator): Promise<void> {
+    const deletable = (draft: WorkflowDraftRecord, grill: GrillState) => {
+      this.assertNotArchitecting(runId, draft, grill);
+      const last = Math.max(Date.parse(draft.updatedAt), Date.parse(grill.updatedAt));
+      if (!draft.abandonedAt && this.now().getTime() - last < WORKFLOW_DRAFT_STALE_MS) {
+        throw err('draft_not_stale', '只能删除已放弃或 30 天没有动静的草稿');
+      }
+    };
+    // A launch that posted its root card: the card says 「这次启动已放弃」
+    // before the record goes (the group stays; §4.5). Not updatable → not
+    // deleted, retry later.
+    const pre = this.mutate(runId, initiator, { allowAbandoned: true, allowDeleted: true }, ({ draft, grill }) => {
+      if (draft.deletedAt) return { changed: false, result: { needsNote: false, version: draft.version } };
+      deletable(draft, grill);
+      return { changed: false, result: { needsNote: !!draft.launch?.root && !draft.launch.root.abandonNoted, version: draft.version } };
+    });
+    let notedVersion: number | undefined;
+    if (pre.needsNote) {
+      await this.noteRootAbandoned(runId);
+      // The note itself is a write: it does not make the draft active again.
+      // (A note that failed is refused below, under the lock.)
+      const after = readWorkflowDraft(this.runDirOf(runId));
+      if (after?.launch?.root?.abandonNoted === true && after.version === pre.version + 1) notedVersion = after.version;
+    }
     const sessions = this.mutate(runId, initiator, { allowAbandoned: true, allowDeleted: true }, ({ draft, grill }) => {
       if (!draft.deletedAt) {
-        this.assertNotArchitecting(runId, draft, grill);
-        const last = Math.max(Date.parse(draft.updatedAt), Date.parse(grill.updatedAt));
-        if (!draft.abandonedAt && this.now().getTime() - last < WORKFLOW_DRAFT_STALE_MS) {
-          throw err('draft_not_stale', '只能删除已放弃或 30 天没有动静的草稿');
+        if (draft.version !== notedVersion) deletable(draft, grill);
+        if (draft.launch?.root && !draft.launch.root.abandonNoted) {
+          throw err('root_update_failed', '主话题卡片没能改成「已放弃」，草稿先不删，请稍后重试');
         }
         draft.deletedAt = this.now().toISOString();
       }
@@ -1602,7 +1653,7 @@ export class WorkflowDraftService {
       throw err('bad_request', 'groupName 必须是 1–100 个字符的字符串');
     }
     const members = parseLaunchExtraMembers(input.extraMembers, WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS);
-    if (!members.ok) throw err('bad_request', members.message);
+    if (!members.ok) throw err('bad_request', members.message, { reason: members.reason, ...(members.item ? { item: members.item } : {}) });
     const bots = this.deps.loadBots();
     const nameOf = this.deps.nameOf();
     const token = this.reserveLaunch();
@@ -1611,6 +1662,9 @@ export class WorkflowDraftService {
       this.mutate(runId, initiator, { baseVersion: input.baseVersion, launchOp: true, launched: true }, ({ draft, grill, runDir }) => {
         if (draft.launch) throw err('launch_exists', '已经开始拉群了，点「继续」从中断处接着做');
         if (this.launchRunning(draft)) throw err('launch_running', '正在拉群');
+        // The idle sweep is releasing this session's process right now: the
+        // move into the main topic would race it.
+        if (draft.clarify.sessionId && this.suspending.has(draft.clarify.sessionId)) throw err('busy', '会话正在释放空闲进程，请稍后重试');
         this.assertNotArchitecting(runId, draft, grill);
         this.assertFlowConfirmed(runDir, draft, grill, bots, nameOf);
         const marker = launchMarker(runId);
@@ -1813,6 +1867,7 @@ export class WorkflowDraftService {
       case 'group': return this.launchGroupStep(runId, token);
       case 'join': return this.launchJoinStep(runId, token);
       case 'root': return this.launchRootStep(runId, token);
+      case 'summary': return this.launchSummaryStep(runId, token);
       case 'migrate': return this.launchMigrateStep(runId, token);
       case 'check': return this.launchCheckStep(runId, token);
       case 'grant': return this.launchGrantStep(runId, token);
@@ -1870,7 +1925,7 @@ export class WorkflowDraftService {
     if (!snap.held) return false;
     const { launch, initiator, botTargets } = snap.result;
     if (launch.createAttempts?.length) {
-      let chats: Array<{ chatId: string; name?: string }>;
+      let chats: Awaited<ReturnType<DraftLaunchDeps['listChats']>>;
       try {
         chats = await deps.listChats();
       } catch (error) {
@@ -1880,20 +1935,27 @@ export class WorkflowDraftService {
         });
         return false;
       }
-      const matches = chats.filter((chat) => groupNameHasMarker(chat.name, launch.marker));
-      if (matches.length > 0) {
+      // Only a topic group this launch could have built: the name ends with
+      // the marker, and its owner is the main bot (before the transfer) or
+      // the initiator (after it). Several such groups: a person decides.
+      const matches = chats.filter((chat) => groupNameHasMarker(chat.name, launch.marker)
+        && chat.chatMode === 'topic'
+        && (chat.ownerId === initiator.openId || deps.isSelfOwner(chat.ownerId)));
+      if (matches.length === 1) {
         this.recordLaunchChat(runId, token, { chatId: matches[0]!.chatId, recovered: true });
-        if (matches.length > 1) {
-          this.launchTx(runId, token, ({ launch: current }) => {
-            const known = new Set((current.orphanSuspects ?? []).map((item) => item.chatId));
-            const extra = matches.slice(1).filter((chat) => !known.has(chat.chatId))
-              .map((chat) => ({ chatId: chat.chatId, ...(chat.name ? { name: chat.name.slice(0, 200) } : {}), note: '群名带同一个标记的另一个群' }));
-            if (extra.length === 0) return { changed: false, result: undefined };
-            current.orphanSuspects = [...(current.orphanSuspects ?? []), ...extra].slice(-50);
-            return { changed: true, result: undefined };
-          });
-        }
         return true;
+      }
+      if (matches.length > 1) {
+        this.stopLaunch(runId, token, {
+          step: 'group', code: 'recover_ambiguous', retryable: true,
+          message: `有 ${matches.length} 个群像是这次拉群建的（群名标记 ${launch.marker}），无法确定是哪个；请在飞书里处理多余的群（改名或解散）后点「继续」`,
+        }, (current) => {
+          const known = new Set((current.orphanSuspects ?? []).map((item) => item.chatId));
+          const extra = matches.filter((chat) => !known.has(chat.chatId))
+            .map((chat) => ({ chatId: chat.chatId, ...(chat.name ? { name: chat.name.slice(0, 200) } : {}), note: '候选：群名带这次的标记，主 Bot 或发起人是群主' }));
+          if (extra.length) current.orphanSuspects = [...(current.orphanSuspects ?? []), ...extra].slice(-50);
+        });
+        return false;
       }
       // Nothing carries the marker: those attempts made no group, or one whose
       // name was changed since — listed for a person; a new group is built.
@@ -2021,76 +2083,111 @@ export class WorkflowDraftService {
     };
   }
 
-  /** Step 3: the root card of the main topic (E6). */
+  /** Step 3: the root card of the main topic (E6). The uuid and the time of
+   *  the first try are recorded BEFORE posting. A resend inside Feishu's uuid
+   *  window (about an hour) is answered with the first message; past it the
+   *  group is searched for the card first and nothing is sent blindly. */
   private async launchRootStep(runId: string, token: string): Promise<boolean> {
-    const snap = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => ({
-      changed: false,
-      result: {
-        chatId: launch.chat!.chatId,
-        view: this.rootCardView(runId, draft, grill, this.launchFlow(runDir, grill).targets.length),
-        // The same uuid on a resend: Feishu answers it with the first message.
-        uuid: `wf-root-${launch.marker.slice(1)}-${launch.chat!.chatId.slice(-24)}`,
-      },
-    }));
+    const deps = this.deps.launch!;
+    const snap = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => {
+      const firstTry = !launch.rootPending;
+      if (firstTry) {
+        launch.rootPending = { uuid: `wf-root-${launch.marker.slice(1)}-${randomUUID().slice(0, 8)}`, at: this.now().toISOString() };
+      }
+      return {
+        changed: firstTry,
+        result: {
+          chatId: launch.chat!.chatId,
+          view: this.rootCardView(runId, draft, grill, this.launchFlow(runDir, grill).targets.length),
+          pending: { ...launch.rootPending! },
+          firstTry,
+        },
+      };
+    });
     if (!snap.held) return false;
-    let messageId: string;
-    try {
-      messageId = await this.deps.launch!.postRootCard(snap.result.chatId, snap.result.view, snap.result.uuid);
-    } catch (error) {
-      this.stopLaunch(runId, token, { step: 'root', code: 'post_root_failed', message: `发主话题卡片失败：${errorText(error)}`, retryable: true });
-      return false;
+    const { chatId, view, pending, firstTry } = snap.result;
+    let messageId: string | undefined;
+    if (!firstTry && this.now().getTime() - Date.parse(pending.at) > LAUNCH_UUID_DEDUP_SAFE_MS) {
+      let found: string[];
+      try {
+        found = await deps.findRootCards(chatId, runId);
+      } catch (error) {
+        this.stopLaunch(runId, token, {
+          step: 'root', code: 'root_unverified', retryable: true,
+          message: `上次发主话题卡片的结果没记下来，已超出飞书去重窗口，查群消息也失败了；为了不重复发卡先停在这里：${errorText(error)}`,
+        });
+        return false;
+      }
+      if (found.length !== 1) {
+        this.stopLaunch(runId, token, {
+          step: 'root', code: 'root_unverified', retryable: true,
+          message: found.length === 0
+            ? '上次发主话题卡片的结果没记下来，已超出飞书去重窗口，群里也没找到这张卡；请到群里确认后处理'
+            : `群里有 ${found.length} 张这个工作流的卡片（${found.join('、')}），无法确定哪张是主话题根；请到群里处理`,
+        });
+        return false;
+      }
+      messageId = found[0];
+    } else {
+      try {
+        messageId = await deps.postRootCard(chatId, view, pending.uuid);
+      } catch (error) {
+        this.stopLaunch(runId, token, { step: 'root', code: 'post_root_failed', message: `发主话题卡片失败：${errorText(error)}`, retryable: true });
+        return false;
+      }
     }
     const recorded = this.launchTx(runId, token, ({ launch }) => {
       if (launch.root) return { changed: false, result: undefined };
-      launch.root = { messageId, at: this.now().toISOString() };
+      launch.root = { messageId: messageId!, at: this.now().toISOString() };
+      delete launch.rootPending;
       return { changed: true, result: undefined };
     });
     return recorded.held;
   }
 
-  /** Step 4: the clarify session moves into the main topic, then a summary
-   *  is posted there (E7). A session that no longer exists does not hold
-   *  the launch up: the topic then gets its session from its first message. */
+  /** Step 4: the clarify session moves into the main topic (E7). The move
+   *  is written as under way (`binding`) BEFORE it: from then on nothing
+   *  closes or suspends the session as the draft's, and a crash is
+   *  reconciled here (the bind is idempotent). A session that no longer
+   *  exists does not hold the launch up: the topic then gets its session from
+   *  its first message. */
   private async launchMigrateStep(runId: string, token: string): Promise<boolean> {
     const deps = this.deps.launch!;
     const snap = this.launchTx(runId, token, ({ draft, launch, grill }) => {
-      const spec = this.specFacts(grill);
+      const sessionId = launch.migrate?.status === 'binding' ? launch.migrate.sessionId ?? draft.clarify.sessionId : draft.clarify.sessionId;
+      const usable = !!sessionId && (launch.migrate?.status === 'binding'
+        || (draft.clarify.state !== 'disconnected' && draft.clarify.state !== 'closed'));
+      const session = usable
+        ? { sessionId: sessionId!, ...(draft.clarify.headlessId && draft.clarify.sessionId === sessionId ? { headlessId: draft.clarify.headlessId } : {}) }
+        : undefined;
+      let changed = false;
+      if (session && launch.migrate?.status !== 'binding') {
+        launch.migrate = { status: 'binding', at: this.now().toISOString(), sessionId: session.sessionId };
+        changed = true;
+      }
       return {
-        changed: false,
-        result: {
-          chatId: launch.chat!.chatId,
-          rootMessageId: launch.root!.messageId,
-          session: draft.clarify.sessionId && draft.clarify.state !== 'disconnected' && draft.clarify.state !== 'closed'
-            ? { sessionId: draft.clarify.sessionId, ...(draft.clarify.headlessId ? { headlessId: draft.clarify.headlessId } : {}) }
-            : undefined,
-          summary: {
-            runId,
-            title: this.titleOf(draft, grill),
-            goal: draft.goal,
-            ...(spec?.requirement ? { requirement: spec.requirement } : {}),
-            nodes: spec?.nodes ?? [],
-          } satisfies LaunchSummaryView,
-          uuid: `wf-sum-${launch.marker.slice(1)}-${launch.root!.messageId.slice(-24)}`,
-        },
+        changed,
+        result: { chatId: launch.chat!.chatId, rootMessageId: launch.root!.messageId, session, title: this.titleOf(draft, grill) },
       };
     });
     if (!snap.held) return false;
-    const { chatId, rootMessageId, session, summary, uuid } = snap.result;
+    const { chatId, rootMessageId, session, title } = snap.result;
     let bound: Awaited<ReturnType<DraftLaunchDeps['bindSession']>>;
     if (!session) {
       bound = { ok: false, error: '澄清会话已断开', unavailable: true };
     } else {
       try {
-        bound = await deps.bindSession({ ...session, chatId, rootMessageId, title: summary.title });
+        bound = await deps.bindSession({ ...session, chatId, rootMessageId, title });
       } catch (error) {
         bound = { ok: false, error: errorText(error), unavailable: false };
       }
     }
     if (!bound.ok && !bound.unavailable) {
+      // Stays `binding`: the session is not the draft's to close any more.
       this.stopLaunch(runId, token, { step: 'migrate', code: 'bind_failed', message: `澄清会话迁入主话题失败：${bound.error}`, retryable: true });
       return false;
     }
-    const recorded = this.launchTx(runId, token, ({ draft, launch }) => {
+    return this.launchTx(runId, token, ({ draft, launch }) => {
       const at = this.now().toISOString();
       launch.migrate = bound.ok
         ? { status: 'bound', at, sessionId: session!.sessionId }
@@ -2101,24 +2198,56 @@ export class WorkflowDraftService {
         delete draft.clarify.suspendRefusedAt;
       }
       return { changed: true, result: undefined };
+    }).held;
+  }
+
+  /** Step 4, second half: the summary in the main topic (for people; not
+   *  compared with anything). Same pending-uuid rule as the root card, except
+   *  that past the window it is not looked for: it is marked unconfirmed and
+   *  never sent a second time. Its failure is shown, not retried. */
+  private async launchSummaryStep(runId: string, token: string): Promise<boolean> {
+    const snap = this.launchTx(runId, token, ({ draft, launch, grill }) => {
+      const migrate = launch.migrate!;
+      const firstTry = !migrate.summaryPending;
+      if (firstTry) migrate.summaryPending = { uuid: `wf-sum-${launch.marker.slice(1)}-${randomUUID().slice(0, 8)}`, at: this.now().toISOString() };
+      const spec = this.specFacts(grill);
+      return {
+        changed: firstTry,
+        result: {
+          rootMessageId: launch.root!.messageId,
+          pending: { ...migrate.summaryPending! },
+          firstTry,
+          summary: {
+            runId,
+            title: this.titleOf(draft, grill),
+            goal: draft.goal,
+            ...(spec?.requirement ? { requirement: spec.requirement } : {}),
+            nodes: spec?.nodes ?? [],
+            ...(migrate.status === 'unavailable'
+              ? { sessionNote: `澄清会话没能迁入（${migrate.error ?? '会话已断开'}），在主话题里发消息会开一个新会话` }
+              : {}),
+          } satisfies LaunchSummaryView,
+        },
+      };
     });
-    if (!recorded.held) return false;
-    // The summary is for people (not compared with anything); its failure is
-    // shown, not retried into a second message.
+    if (!snap.held) return false;
+    const { rootMessageId, pending, firstTry, summary } = snap.result;
     let summaryMessageId: string | undefined;
     let summaryError: string | undefined;
-    try {
-      summaryMessageId = await deps.postSummary(rootMessageId, {
-        ...summary,
-        ...(bound.ok ? {} : { sessionNote: `澄清会话没能迁入（${bound.error}），在主话题里发消息会开一个新会话` }),
-      }, uuid);
-    } catch (error) {
-      summaryError = errorText(error);
+    if (!firstTry && this.now().getTime() - Date.parse(pending.at) > LAUNCH_UUID_DEDUP_SAFE_MS) {
+      summaryError = '上次发摘要的结果没记下来，可能已经发出；为了不重复，不再补发';
+    } else {
+      try {
+        summaryMessageId = await this.deps.launch!.postSummary(rootMessageId, summary, pending.uuid);
+      } catch (error) {
+        summaryError = errorText(error);
+      }
     }
     return this.launchTx(runId, token, ({ launch }) => {
       if (!launch.migrate) return { changed: false, result: undefined };
       if (summaryMessageId) launch.migrate.summaryMessageId = summaryMessageId;
       if (summaryError) launch.migrate.summaryError = clip(summaryError, 2000);
+      delete launch.migrate.summaryPending;
       return { changed: true, result: undefined };
     }).held;
   }
@@ -2178,31 +2307,52 @@ export class WorkflowDraftService {
     return false;
   }
 
-  /** Revoke the grants of bots that no longer execute any node (both sides,
-   *  by the open_ids recorded when they were written — no membership needed). */
-  private async revokeStaleLaunchGrants(runId: string, token: string | undefined, wanted: readonly string[], chatId: string,
-    grants: NonNullable<WorkflowDraftLaunch['grants']>): Promise<string | undefined> {
+  /**
+   * Revoke the grants of bots that no longer execute any node — both sides:
+   * by the open_id recorded when a side was written (no membership needed),
+   * or, for a side whose result was lost (`*Pending`), by the receiver
+   * resolving the subject app in its own namespace. Run only while `token`
+   * holds the launch, so the flow cannot change meanwhile; still, the record
+   * is checked again under the lock before and after: a bot that executes a
+   * node again, or a run already authorized, is left alone (logged).
+   */
+  private async revokeStaleLaunchGrants(runId: string, token: string, chatId: string): Promise<string | undefined> {
     const deps = this.deps.launch!;
-    for (const [appId, grant] of Object.entries(grants)) {
-      if (wanted.includes(appId)) continue;
+    const stillStale = (appId: string) => this.launchTx(runId, token, ({ runDir, launch, grill }) => ({
+      changed: false,
+      result: !!launch.grants?.[appId] && !existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))
+        && !this.launchFlow(runDir, grill).botTargets.includes(appId),
+    }));
+    const snap = this.launchTx(runId, token, ({ launch }) => ({ changed: false, result: structuredClone(launch.grants ?? {}) }));
+    if (!snap.held) return undefined;
+    for (const [appId, grant] of Object.entries(snap.result)) {
+      const before = stillStale(appId);
+      if (!before.held) return undefined;
+      if (!before.result) continue;
       try {
         if (grant.mainSide) await deps.revoke(chatId, this.deps.appId, grant.mainSide);
+        else if (grant.mainPending) await deps.revokeByApp(chatId, this.deps.appId, appId);
         if (grant.peerSide) await deps.revoke(chatId, appId, grant.peerSide);
+        else if (grant.peerPending) await deps.revokeByApp(chatId, appId, this.deps.appId);
       } catch (error) {
         return `撤销 ${this.deps.nameOf()(appId)} 在这个群的协作授权失败：${errorText(error)}`;
       }
-      const drop = ({ launch }: { launch: WorkflowDraftLaunch }) => {
-        if (!launch.grants?.[appId]) return { changed: false, result: undefined };
+      const dropped = this.launchTx(runId, token, ({ runDir, launch }) => {
+        if (!launch.grants?.[appId]) return { changed: false, result: true };
+        if (existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) {
+          // Cannot happen while the token is held (run.json is written under
+          // it); kept for a person to see rather than silently rewritten.
+          this.log(`[workflow-draft] launch ${runId}: grants of ${appId} were revoked after run.json appeared; record kept`);
+          return { changed: false, result: false };
+        }
+        // Gone from Feishu now: also when it executes a node again (the flow
+        // changed despite the token), the record goes, so the grant step
+        // writes it afresh instead of trusting a revoked grant.
         delete launch.grants[appId];
         if (Object.keys(launch.grants).length === 0) delete launch.grants;
-        return { changed: true, result: undefined };
-      };
-      if (token) {
-        if (!this.launchTx(runId, token, drop).held) return undefined;
-      } else {
-        this.mutate(runId, undefined, { launchOp: true, launched: true, allowAbandoned: true }, ({ draft }) =>
-          draft.launch ? drop({ launch: draft.launch }) : { changed: false, result: undefined });
-      }
+        return { changed: true, result: true };
+      });
+      if (!dropped.held) return undefined;
       this.log(`[workflow-draft] launch ${runId}: revoked chat grants of ${appId} in ${chatId}`);
     }
     return undefined;
@@ -2211,22 +2361,33 @@ export class WorkflowDraftService {
   /** Step 6: grants between the main bot and every executing bot that
    *  passed step 5, after revoking those of bots swapped out. Idempotent. */
   private async launchGrantStep(runId: string, token: string): Promise<boolean> {
+    const first = this.launchTx(runId, token, ({ launch }) => ({ changed: false, result: launch.chat!.chatId }));
+    if (!first.held) return false;
+    const revokeError = await this.revokeStaleLaunchGrants(runId, token, first.result);
+    if (revokeError) {
+      this.stopLaunch(runId, token, { step: 'grant', code: 'revoke_failed', message: revokeError, retryable: true });
+      return false;
+    }
     const snap = this.launchTx(runId, token, ({ runDir, launch, grill }) => ({
       changed: false,
       result: { chatId: launch.chat!.chatId, grants: structuredClone(launch.grants ?? {}), wanted: this.launchFlow(runDir, grill).botTargets },
     }));
     if (!snap.held) return false;
     const { chatId, grants, wanted } = snap.result;
-    const revokeError = await this.revokeStaleLaunchGrants(runId, token, wanted, chatId, grants);
-    if (revokeError) {
-      this.stopLaunch(runId, token, { step: 'grant', code: 'revoke_failed', message: revokeError, retryable: true });
-      return false;
-    }
     const deps = this.deps.launch!;
     for (const appId of wanted) {
       const have = grants[appId];
       for (const side of ['mainSide', 'peerSide'] as const) {
         if (have?.[side]) continue;
+        // The intent first: a grant whose result is lost is still revocable.
+        const pendingKey = side === 'mainSide' ? 'mainPending' : 'peerPending';
+        const intent = this.launchTx(runId, token, ({ launch }) => {
+          const current = launch.grants?.[appId] ?? { at: this.now().toISOString() };
+          if (current[pendingKey]) return { changed: false, result: undefined };
+          launch.grants = { ...(launch.grants ?? {}), [appId]: { ...current, [pendingKey]: true } };
+          return { changed: true, result: undefined };
+        });
+        if (!intent.held) return false;
         let written: { subjectOpenId: string };
         try {
           written = side === 'mainSide'
@@ -2241,7 +2402,8 @@ export class WorkflowDraftService {
           return false;
         }
         const recorded = this.launchTx(runId, token, ({ launch }) => {
-          const current = launch.grants?.[appId] ?? { at: this.now().toISOString() };
+          const current = { ...(launch.grants?.[appId] ?? { at: this.now().toISOString() }) };
+          delete current[pendingKey];
           launch.grants = { ...(launch.grants ?? {}), [appId]: { ...current, [side]: written.subjectOpenId } };
           return { changed: true, result: undefined };
         });
@@ -2630,6 +2792,9 @@ export class WorkflowDraftService {
           if (draft.abandonedAt) return;
           const refreshed = this.refreshClarifyInPlace(draft);
           if (refreshed) this.persist(runDir, draft);
+          // 拉群开始 began: the clarify session is about to move (or moved)
+          // into the main topic — its lifetime is the topic's now (§4.2).
+          if (draft.launch || clarifySessionInTopic(draft)) return;
           const { clarify } = draft;
           if (clarify.state !== 'active' || clarify.pending || !clarify.sessionId || !clarify.lastMessageAt) return;
           if (this.suspending.has(clarify.sessionId)) return;
@@ -2647,7 +2812,7 @@ export class WorkflowDraftService {
       try {
         try { ok = await this.deps.clarifier.suspend(entry.sessionId); } catch { ok = false; }
         this.mutate(entry.runId, undefined, { allowAbandoned: true }, ({ draft }) => {
-          if (draft.clarify.sessionId !== entry.sessionId || draft.clarify.state !== 'active' || draft.clarify.pending) {
+          if (draft.clarify.sessionId !== entry.sessionId || draft.clarify.state !== 'active' || draft.clarify.pending || draft.launch) {
             return { changed: false, result: undefined };
           }
           if (ok) {

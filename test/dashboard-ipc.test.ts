@@ -4583,7 +4583,7 @@ describe('POST /api/grants/chat', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it('rejects stable subject app ids for revoke or readback before invoking the service', async () => {
+  it('rejects stable subject app ids for readback before invoking the service (grant and revoke resolve them)', async () => {
     const handler = vi.fn();
     setExactChatGrantHandler(handler as any);
     setLarkAppId('cli_receiver');
@@ -4594,7 +4594,7 @@ describe('POST /api/grants/chat', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
       body: JSON.stringify({
-        operation: 'revoke',
+        operation: 'readback',
         receiverLarkAppId: 'cli_receiver',
         chatId: 'oc_chat',
         subjectLarkAppIds: ['cli_pm'],

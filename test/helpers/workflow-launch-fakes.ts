@@ -17,12 +17,14 @@ import { persistV3StartIntent } from '../../src/workflows/v3/start-intent.js';
 import { MAIN } from './workflow-draft-fakes.js';
 
 export type LaunchOp =
-  | 'resolveEmails' | 'createGroup' | 'joinInitiator' | 'listChats' | 'addBots' | 'postRootCard' | 'updateRootCard'
-  | 'postSummary' | 'bindSession' | 'grant' | 'revoke' | 'startRun';
+  | 'resolveEmails' | 'createGroup' | 'joinInitiator' | 'listChats' | 'findRootCards' | 'addBots' | 'postRootCard' | 'updateRootCard'
+  | 'postSummary' | 'bindSession' | 'grant' | 'revoke' | 'revokeByApp' | 'startRun';
 
 export interface FakeChat {
   chatId: string;
   name: string;
+  /** As the chat list reports it (default topic). */
+  chatMode?: string;
   members: Set<string>;
   users: string[];
   unionUsers: string[];
@@ -54,8 +56,11 @@ export function fakeLaunch(baseDir: string) {
   let n = 0;
 
   const never = () => new Promise<never>(() => {});
+  const hangsBefore = new Set<LaunchOp>();
   async function enter(op: LaunchOp, args: unknown[]): Promise<void> {
     calls.push({ op, args });
+    // Died before the call had any effect.
+    if (hangsBefore.delete(op)) return never();
     const queued = failures.get(op);
     if (queued?.length) throw queued.shift()!;
   }
@@ -115,7 +120,21 @@ export function fakeLaunch(baseDir: string) {
     },
     async listChats() {
       await enter('listChats', []);
-      return [...chats.values()].map((chat) => ({ chatId: chat.chatId, name: chat.name }));
+      // The owner as the main bot's app reports it: the bot itself until the
+      // transfer, then the person (their open_id in the main bot's app).
+      return [...chats.values()].map((chat) => ({
+        chatId: chat.chatId,
+        name: chat.name,
+        chatMode: chat.chatMode ?? 'topic',
+        ownerId: !chat.owner ? MAIN : chat.owner.channel === 'open_id' ? chat.owner.id : `ou_${chat.owner.id.slice(3)}`,
+      }));
+    },
+    isSelfOwner: (ownerId) => ownerId === MAIN,
+    async findRootCards(chatId, runId) {
+      await enter('findRootCards', [chatId, runId]);
+      return (chats.get(chatId)?.messages ?? [])
+        .filter((m) => m.kind === 'root' && (m.view as LaunchRootCardView).runId === runId)
+        .map((m) => m.messageId);
     },
     async addBots(chatId, botAppIds) {
       await enter('addBots', [chatId, botAppIds]);
@@ -176,6 +195,12 @@ export function fakeLaunch(baseDir: string) {
       await enter('revoke', [chatId, receiver, subjectOpenId]);
       grants.get(`${chatId}|${receiver}`)?.delete(subjectOpenId);
     },
+    async revokeByApp(chatId, receiver, subjectAppId) {
+      await enter('revokeByApp', [chatId, receiver, subjectAppId]);
+      // The receiver resolves the subject in its own namespace (live members).
+      if (!chats.get(chatId)?.members.has(subjectAppId)) throw new Error('subject_lark_app_not_in_chat');
+      grants.get(`${chatId}|${receiver}`)?.delete(seenBy(receiver, subjectAppId));
+    },
     async startRun(runId) {
       await enter('startRun', [runId]);
       // The real start preflight and intent: run.json must be a startable,
@@ -200,6 +225,7 @@ export function fakeLaunch(baseDir: string) {
     starts,
     count: (op: LaunchOp) => calls.filter((call) => call.op === op).length,
     hang(op: LaunchOp) { hangs.add(op); },
+    hangBefore(op: LaunchOp) { hangsBefore.add(op); },
     failNext(op: LaunchOp, error: Error) { failures.set(op, [...(failures.get(op) ?? []), error]); },
     setOnline(next: string[]) { online = new Set(next); },
     setUnbindable(sessionId: string | undefined) { unbindable = sessionId; },
