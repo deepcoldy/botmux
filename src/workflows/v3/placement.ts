@@ -42,8 +42,28 @@ export interface V3PlacementProblem {
   message: string;
 }
 
-/** Every transitive `depends` ancestor of each node (top-level graph). */
-function ancestorSets(dag: V3Dag): Map<string, Set<string>> {
+/** Does `node` start only after EVERY node it depends on has finished?
+ *  Only the default join, all_success (a conditional `when` edge included:
+ *  it still waits for its source). `one_success` / `{ quorum }` may start as
+ *  soon as some of its sources are done — the rest may still run. */
+export function v3JoinPreservesOrder(node: Pick<V3Node, 'triggerRule'> | undefined): boolean {
+  const rule = node?.triggerRule;
+  return rule === undefined || rule === 'all_success';
+}
+
+function describeTriggerRule(node: Pick<V3Node, 'triggerRule'> | undefined): string {
+  const rule = node?.triggerRule;
+  return typeof rule === 'object' && rule ? `quorum ${rule.quorum}` : String(rule ?? 'all_success');
+}
+
+/**
+ * Every node that is guaranteed to have finished before each node starts
+ * (top-level graph): a `depends` ancestor reached only through joins that
+ * wait for all their sources — the node itself and every join on the path
+ * all_success (§5.2 rule 1). A one_success / quorum join breaks the chain:
+ * it may start while one of its sources still runs.
+ */
+export function v3OrderedAncestorSets(dag: Pick<V3Dag, 'nodes'>): Map<string, Set<string>> {
   const byId = new Map(dag.nodes.map((node) => [node.id, node]));
   const memo = new Map<string, Set<string>>();
   const visit = (id: string, stack: Set<string>): Set<string> => {
@@ -52,9 +72,12 @@ function ancestorSets(dag: V3Dag): Map<string, Set<string>> {
     const out = new Set<string>();
     if (stack.has(id)) return out; // validateDag rejects cycles; never loop here
     stack.add(id);
-    for (const dep of byId.get(id)?.depends ?? []) {
-      out.add(dep.from);
-      for (const up of visit(dep.from, stack)) out.add(up);
+    const node = byId.get(id);
+    if (v3JoinPreservesOrder(node)) {
+      for (const dep of node?.depends ?? []) {
+        out.add(dep.from);
+        for (const up of visit(dep.from, stack)) out.add(up);
+      }
     }
     stack.delete(id);
     memo.set(id, out);
@@ -62,6 +85,46 @@ function ancestorSets(dag: V3Dag): Map<string, Set<string>> {
   };
   for (const node of dag.nodes) visit(node.id, new Set());
   return memo;
+}
+
+/** Plain `depends` reachability (whatever the joins). */
+function reachableAncestorSets(dag: Pick<V3Dag, 'nodes'>): Map<string, Set<string>> {
+  const byId = new Map(dag.nodes.map((node) => [node.id, node]));
+  const out = new Map<string, Set<string>>();
+  for (const node of dag.nodes) {
+    const seen = new Set<string>();
+    const stack = [...node.depends.map((dep) => dep.from)];
+    while (stack.length > 0) {
+      const next = stack.pop()!;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      for (const dep of byId.get(next)?.depends ?? []) stack.push(dep.from);
+    }
+    out.set(node.id, seen);
+  }
+  return out;
+}
+
+/**
+ * Why `ancestor` is reachable from `node` through `depends` but not
+ * guaranteed to finish first: the join (`node` itself or one on the path)
+ * whose trigger rule lets it start early. Undefined when not reachable.
+ */
+export function v3OrderingBreak(
+  dag: Pick<V3Dag, 'nodes'>,
+  ancestor: string,
+  node: string,
+): { joinId: string; rule: string } | undefined {
+  const byId = new Map(dag.nodes.map((candidate) => [candidate.id, candidate]));
+  const reach = reachableAncestorSets(dag);
+  if (!reach.get(node)?.has(ancestor)) return undefined;
+  for (const joinId of [node, ...[...(reach.get(node) ?? [])].sort()]) {
+    const join = byId.get(joinId);
+    if (v3JoinPreservesOrder(join)) continue;
+    const viaJoin = joinId === node || reach.get(node)?.has(joinId);
+    if (viaJoin && reach.get(joinId)?.has(ancestor)) return { joinId, rule: describeTriggerRule(join) };
+  }
+  return undefined;
 }
 
 /**
@@ -83,6 +146,9 @@ export function v3PlacementProblems(input: {
   mainTopic?: V3MainTopicAvailability;
   rule3Nodes?: ReadonlySet<string>;
   nameOf?: (larkAppId: string) => string;
+  /** Why `a` and `b` are linked by `depends` yet not ordered (default: read
+   *  from `dag`); appended to the refusal. */
+  explainUnordered?: (a: string, b: string) => { joinId: string; rule: string; first: string } | undefined;
 }): V3PlacementProblem[] {
   const nameOf = input.nameOf ?? ((appId: string) => appId);
   const mainNodes = input.dag.nodes.filter((node) => isGoalNode(node) && v3NodePlacement(node) === 'main');
@@ -101,7 +167,13 @@ export function v3PlacementProblems(input: {
     }
   }
 
-  const ancestors = ancestorSets(input.dag);
+  const ancestors = v3OrderedAncestorSets(input.dag);
+  const explain = input.explainUnordered ?? ((a: string, b: string) => {
+    const ab = v3OrderingBreak(input.dag, a, b);
+    if (ab) return { ...ab, first: a };
+    const ba = v3OrderingBreak(input.dag, b, a);
+    return ba ? { ...ba, first: b } : undefined;
+  });
   const byBot = new Map<string, string[]>();
   for (const node of mainNodes) {
     const appId = input.executorOf(node.id);
@@ -114,15 +186,19 @@ export function v3PlacementProblems(input: {
         const b = nodeIds[j]!;
         if (ancestors.get(a)?.has(b) || ancestors.get(b)?.has(a)) continue;
         const self = appId === input.mainLarkAppId;
+        const why = explain(a, b);
+        const because = why
+          ? `（${why.joinId} 的触发规则是 ${why.rule}，${why.first} 不一定先于它结束）`
+          : '';
         problems.push({
           rule: self ? 2 : 1,
           nodeIds: [a, b],
           larkAppId: appId,
           message: self
             ? `落点硬规则 2：节点 ${a} 和 ${b} 都由主 Bot 自己在主话题执行，也就是都在主会话里跑，`
-              + '但两者没有先后依赖、可能同时运行；请让一个依赖另一个，或把其中一个改成节点话题'
+              + `但两者没有先后依赖、可能同时运行${because}；请让一个依赖另一个（经过的汇合节点都要等全部上游结束），或把其中一个改成节点话题`
             : `落点硬规则 1：节点 ${a} 和 ${b} 都交给 ${nameOf(appId)} 在主话题执行，`
-              + `它在主话题里只有一个会话，但两者没有先后依赖、可能同时运行；请让一个依赖另一个，或把其中一个改成节点话题`,
+              + `它在主话题里只有一个会话，但两者没有先后依赖、可能同时运行${because}；请让一个依赖另一个（经过的汇合节点都要等全部上游结束），或把其中一个改成节点话题`,
         });
       }
     }

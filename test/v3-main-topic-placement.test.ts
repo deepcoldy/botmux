@@ -446,6 +446,107 @@ describe('Architect (P1) and Gate-2', () => {
   });
 });
 
+// ─── Joins that do not wait for every source (#2806 review) ─────────────
+
+describe('a one_success / quorum join does not order its sources before it (§5.2 rules 1–2)', () => {
+  // c (topic); a (main, cli_x); b (main, cli_x, one_success over [c, a]):
+  // b may start (and a be cancelled as the early-release loser) while a runs.
+  const JOIN = (rule: unknown = 'one_success') => [
+    goal('c', { bot: 'cli_x' }),
+    goal('a', { bot: 'cli_x', placement: 'main' }),
+    goal('b', { bot: 'cli_x', placement: 'main', depends: ['c', 'a'], triggerRule: rule }),
+  ];
+  const GATED = [
+    goal('a', {
+      bot: 'cli_x', placement: 'main',
+      resultSchema: { type: 'object', properties: { decision: { type: 'string', enum: ['go', 'stop'] } }, required: ['decision'] },
+    }),
+    goal('b', { bot: 'cli_x', placement: 'main', depends: [{ from: 'a', when: { path: 'result.decision', equals: 'go' } }] }),
+    goal('z', { bot: 'cli_x', depends: [{ from: 'a', when: { path: 'result.decision', equals: 'stop' } }] }),
+  ];
+  const snapshots = new Map<string, BotSnapshot>([
+    ['', { larkAppId: MAIN, cliId: 'claude-code', workingDir: '/w' } as BotSnapshot],
+    ['cli_x', { larkAppId: 'cli_x', cliId: 'claude-code', workingDir: '/w' } as BotSnapshot],
+  ]);
+  const problemsOf = (nodes: unknown[]) => v3PlacementProblems({
+    dag: dagOf(nodes), mainLarkAppId: MAIN, executorOf: (id) => (dagOf(nodes).nodes.find((n) => n.id === id)?.bot ?? MAIN),
+  });
+
+  it('the plain check refuses it, saying which join breaks the order; quorum likewise; through an intermediate join too', () => {
+    const problems = problemsOf(JOIN());
+    expect(problems).toEqual([expect.objectContaining({ rule: 1, nodeIds: ['a', 'b'] })]);
+    expect(problems[0]!.message).toContain('b 的触发规则是 one_success，a 不一定先于它结束');
+    expect(problemsOf(JOIN({ quorum: 1 }))[0]?.message).toContain('b 的触发规则是 quorum 1');
+    const viaJoin = [
+      goal('c', { bot: 'cli_x' }),
+      goal('a', { bot: 'cli_x', placement: 'main' }),
+      goal('j', { bot: 'cli_x', depends: ['c', 'a'], triggerRule: 'one_success' }),
+      goal('b', { bot: 'cli_x', placement: 'main', depends: ['j'] }),
+    ];
+    expect(problemsOf(viaJoin)[0]?.message).toContain('j 的触发规则是 one_success，a 不一定先于它结束');
+  });
+
+  it('an all_success join — conditional edges included — still orders them', () => {
+    expect(problemsOf(JOIN('all_success'))).toEqual([]);
+    expect(problemsOf(GATED)).toEqual([]);
+  });
+
+  it('approve-dag / Saved Workflow targets refuse it too (and accept the all_success forms)', async () => {
+    const targets = v3BotExecutorTargets(dagOf(JOIN()), snapshots);
+    expect(targets.find((t) => t.nodeId === 'b')?.ancestors).toEqual([]);
+    const refused = v3TargetPlacementProblems({ targets, orchestratorAppId: MAIN, mainTopic: { available: true } });
+    expect(refused.join('\n')).toMatch(/落点硬规则 1.*b 的触发规则是 one_success，a 不一定先于它结束/);
+    for (const nodes of [JOIN('all_success'), GATED]) {
+      expect(v3TargetPlacementProblems({ targets: v3BotExecutorTargets(dagOf(nodes), snapshots), orchestratorAppId: MAIN, mainTopic: { available: true } }))
+        .toEqual([]);
+    }
+    const probe = vi.fn((): V3BotEligibilityProbe => { throw new Error('must not probe'); });
+    const out = await resolveV3NodeExecutor({
+      policy: { switchMode: 'bot', multiTopicEnabled: true, probe, nameOf: (id) => id, mainTopic: () => ({ available: true }) },
+      binding: { larkAppId: MAIN, chatId: 'oc_g', chatType: 'group', rootMessageId: 'om_root' },
+      targetsFor: () => v3BotExecutorTargets(dagOf(JOIN()), snapshots),
+    });
+    expect(out).toMatchObject({ kind: 'refused', message: expect.stringMatching(/落点硬规则 1/) });
+  });
+
+  it('a runtime edit that turns the join into one_success is refused', () => {
+    const dag = dagOf(JOIN('all_success'));
+    const planned = plan(dag, [], { ops: [{ op: 'setDepends', nodeId: 'b', depends: ['c', 'a'], inputs: [], triggerRule: 'one_success' }] });
+    expect(!planned.ok && planned.problems.join('\n')).toMatch(/落点硬规则 1.*one_success/);
+  });
+
+  it('a blocked-card reassignment that would put both on one bot is refused', async () => {
+    const { runDir } = seedBotRun([
+      goal('c', { bot: 'cli_x' }),
+      goal('a', { bot: 'cli_x', placement: 'main' }),
+      goal('b', { placement: 'main', depends: ['c', 'a'], triggerRule: 'one_success' }),
+    ]);
+    const journal = join(runDir, 'journal.ndjson');
+    appendEvent(journal, { type: 'nodeDispatched', nodeId: 'b', instanceId: 'b#001', attemptId: 'b#001/attempts/001', nodeExecutor: 'bot' });
+    appendEvent(journal, { type: 'nodeBlocked', nodeId: 'b', instanceId: 'b#001', attemptId: 'b#001/attempts/001', errorClass: 'workerError', errorCode: 'BOT_REPORTED_BLOCKED', recovery: 'retry' } as never);
+    expect(await reassignNode(runDir, { nodeId: 'b', toLarkAppId: 'cli_x', by: 'ou_owner', requireBlocked: true }))
+      .toMatchObject({ kind: 'rejected', reason: 'placement-conflict', detail: expect.stringMatching(/one_success/) });
+  });
+
+  it('the Architect gets it back, and approve-dag refuses it, naming the join', async () => {
+    const { base, runDir } = specApproved();
+    const worker = fakeArchitect(JOIN(), NOTES);
+    await host('architect', base, { runArchitect: worker.run, mainTopicAvailability: () => ({ available: true }) });
+    expect(readGrillState(runDir)!.problems?.join('\n')).toMatch(/落点硬规则 1.*b 的触发规则是 one_success/);
+
+    // approve-dag over a dag that reached dag_ready some other way.
+    const second = specApproved();
+    const ok = fakeArchitect(JOIN('all_success'), NOTES);
+    await host('architect', second.base, { runArchitect: ok.run, mainTopicAvailability: () => ({ available: true }) });
+    const state = readGrillState(second.runDir)!;
+    expect(state.status).toBe('dag_ready');
+    writeFileSync(state.dagPath!, JSON.stringify({ schemaVersion: 2, runId: 'r', nodes: JOIN() }));
+    await expect(host('approve-dag', second.base, { mainTopicAvailability: () => ({ available: true }) }))
+      .rejects.toThrow(/落点硬规则 1.*one_success/s);
+    expect(readRunEnvelope(second.runDir).kind).toBe('missing');
+  });
+});
+
 describe('board projection (§5.5, §12.2)', () => {
   it('a main-topic node shows its placement and, once handed off, when and what to look for', () => {
     const { runDir } = seedBotRun([goal('a', { bot: 'cli_x' }), goal('b', { bot: 'cli_x', placement: 'main', depends: ['a'] })]);

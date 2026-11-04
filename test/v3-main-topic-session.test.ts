@@ -429,6 +429,21 @@ describe('F5 (second review): a marker whose attempt ended out of sight does not
     expect(ds.session.workflowNode).toMatchObject({ closedAt: expect.any(String) });
   });
 
+  it('when this daemon cannot read the run, the bound is the longest a node may take — a running node is not collected early', async () => {
+    const run = new BotRun(reportDag('f5-unreadable', { placement: 'main' }));
+    const world = handoffWorld();
+    const clock = { t: Date.now() };
+    await bindingFor(world.dataDir, A, 'f5-a', clock.t);
+    const ds = session('sess-a', markerOf(A, 'f5-a', clock.t));
+    const daemon = createWorkflowNodeDaemon({ ...wiringDeps(world.dataDir, run, [ds], []), now: () => clock.t, loadRun: () => undefined });
+    await bindingFor(world.dataDir, B, 'f5-b', clock.t);
+    // Past the default node timeout + grace + slack, well inside the ceiling.
+    clock.t += (1800 + 3600 + 600 + 60) * 1000;
+    const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode);
+    expect(out).toMatchObject({ start: false, reason: expect.stringContaining('另一个工作流节点') });
+    expect(ds.session.workflowNode?.closedAt).toBeUndefined();
+  });
+
   it('an unrevoked marker whose binding is gone is not busy either', async () => {
     const run = new BotRun(reportDag('f5-unbound', { placement: 'main' }));
     const world = handoffWorld();

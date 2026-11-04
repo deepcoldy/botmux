@@ -19,7 +19,7 @@ import type { V3ExternalNodeExecutor } from '../workflows/v3/external-executor.j
 import { v3AcceptanceProbeUnknownSince } from '../workflows/v3/runtime.js';
 import { safeExternalAttemptDir } from '../workflows/v3/external-control.js';
 import { v3MainTopicQueueGraceMs } from '../workflows/v3/external-executor.js';
-import { DEFAULT_NODE_TIMEOUT_SEC } from '../workflows/v3/dag.js';
+import { DEFAULT_NODE_TIMEOUT_SEC, MAX_NODE_TIMEOUT_SEC } from '../workflows/v3/dag.js';
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import type { LarkAttachment, WorkflowNodeSessionMarker } from '../types.js';
 import type { DaemonSession } from './types.js';
@@ -446,11 +446,14 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     let over = found.kind !== 'workflow' || found.revoked;
     if (!over) {
       const runDir = runDirOf(marker.runId);
-      let timeoutSec = DEFAULT_NODE_TIMEOUT_SEC;
+      // The node's own timeout; when the run or the node cannot be read here,
+      // the ceiling any node may have — an early "over" would close the
+      // marker of a node that is still running.
+      let timeoutSec = MAX_NODE_TIMEOUT_SEC;
       try {
         const node = runDir ? deps.loadRun(runDir)?.dag.nodes.find((candidate) => candidate.id === marker.nodeId) : undefined;
-        if (node?.timeoutSec !== undefined) timeoutSec = node.timeoutSec;
-      } catch { /* the default bound */ }
+        if (node) timeoutSec = node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC;
+      } catch { /* the ceiling */ }
       const timeoutMs = timeoutSec * 1000;
       const started = marker.handoffStartedAt ? Date.parse(marker.handoffStartedAt) : NaN;
       const registered = Date.parse(marker.registeredAt);

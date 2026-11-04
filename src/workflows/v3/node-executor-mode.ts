@@ -15,7 +15,7 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
-import { v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
+import { v3OrderedAncestorSets, v3OrderingBreak, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
 import type { V3HandoffIdentityRecord, V3HandoffIdentityTool, V3HandoffIdentityUnavailableReason } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
@@ -103,6 +103,9 @@ export interface V3NodeExecutorTarget {
   directoryOutputs?: string[];
   /** §5.1: set only for a top-level goal node handed off in the main topic. */
   placement?: 'main';
+  /** With `placement`: why a `depends` ancestor is NOT among `ancestors`
+   *  (a one_success / quorum join lets the node start before it ends). */
+  unorderedAncestors?: Array<{ nodeId: string; joinId: string; rule: string }>;
   /** With `placement`: the node's transitive `depends` ancestors (top-level
    *  ids), so the §5.2 hard rules can be checked from the targets alone. */
   ancestors?: string[];
@@ -132,22 +135,28 @@ export function v3BotExecutorTargets(
     const directoryOutputs = directoryOutputsOf(outputs);
     return directoryOutputs ? { ...target, directoryOutputs } : target;
   };
-  const byId = new Map(dag.nodes.map((node) => [node.id, node]));
-  const ancestorsOf = (id: string): string[] => {
-    const seen = new Set<string>();
-    const stack = [...(byId.get(id)?.depends ?? []).map((dep) => dep.from)];
-    while (stack.length > 0) {
-      const next = stack.pop()!;
-      if (seen.has(next)) continue;
-      seen.add(next);
-      for (const dep of byId.get(next)?.depends ?? []) stack.push(dep.from);
-    }
-    return [...seen].sort();
-  };
+  // §5.2: only ancestors guaranteed to finish first (all_success joins on
+  // the whole path) order two main-topic nodes; the same rule as placement.ts.
+  const ordered = v3OrderedAncestorSets(dag);
+  const mainIds = dag.nodes.filter((node) => isGoalNode(node) && node.placement === 'main').map((node) => node.id);
   for (const node of dag.nodes) {
     if (isGoalNode(node)) {
       const target = withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs);
-      out.push(node.placement === 'main' ? { ...target, placement: 'main', ancestors: ancestorsOf(node.id) } : target);
+      if (node.placement !== 'main') {
+        out.push(target);
+        continue;
+      }
+      const unorderedAncestors = mainIds.flatMap((other) => {
+        if (other === node.id || ordered.get(node.id)?.has(other)) return [];
+        const why = v3OrderingBreak(dag, other, node.id);
+        return why ? [{ nodeId: other, ...why }] : [];
+      });
+      out.push({
+        ...target,
+        placement: 'main',
+        ancestors: [...(ordered.get(node.id) ?? [])].sort(),
+        ...(unorderedAncestors.length > 0 ? { unorderedAncestors } : {}),
+      });
     }
     if (isLoopNode(node)) {
       for (const body of node.body.nodes) {
@@ -192,6 +201,14 @@ export function v3TargetPlacementProblems(input: {
     },
     mainLarkAppId: input.orchestratorAppId,
     executorOf: (nodeId) => executor.get(nodeId) ?? input.orchestratorAppId,
+    explainUnordered: (a, b) => {
+      const find = (later: string, first: string) =>
+        main.find((target) => target.nodeId === later)?.unorderedAncestors?.find((entry) => entry.nodeId === first);
+      const ab = find(b, a);
+      if (ab) return { joinId: ab.joinId, rule: ab.rule, first: a };
+      const ba = find(a, b);
+      return ba ? { joinId: ba.joinId, rule: ba.rule, first: b } : undefined;
+    },
     mainTopic: input.mainTopic,
     ...(input.nameOf ? { nameOf: input.nameOf } : {}),
   }).map((problem) => problem.message);
