@@ -570,6 +570,23 @@ describe('/models shortcut', () => {
     expect(select.options[0].text.content).toMatch(/\b67%/);
   });
 
+  it.each(['permission', 'worker-generation', 'transfer', 'worker-killed'])(
+    'does not deliver the reply-menu model card when %s changes during the load query',
+    async change => {
+      enableMenu('traex');
+      detectModelsMock.mockResolvedValue(['GPT-5.4']);
+      const ds = makeDs({ sessionOverrides: { cliId: 'traex' } });
+      const result = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+      expect(typeof result.afterAck).toBe('function');
+      if (change === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+      else if (change === 'worker-generation') ds.workerGeneration = 42;
+      else if (change === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+      else (ds.worker as any).killed = true;
+      await result.afterAck();
+      expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+    },
+  );
+
   it('opens a session-bound picker through the real command handler while reply menus are disabled', async () => {
     const ds = makeDs({ activeModel: 'sonnet' });
     const deps = depsWith(ds);
