@@ -391,3 +391,104 @@ describe('M6: a run.json already there must be this launch\'s', () => {
     });
   }
 });
+
+describe('人工确认后重发（root_unverified / 摘要未确认）', () => {
+  async function stuckAtRoot() {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.hangBefore('postRootCard');
+    await h.service.launch(runId, OWNER, {});
+    await until(() => launch.count('postRootCard') === 1);
+    const next = restart(h);
+    h.advance(LAUNCH_UUID_DEDUP_SAFE_MS + 60_000);
+    await next.continueLaunch(runId, OWNER);
+    expect((await settled(next, runId)).launch).toMatchObject({ error: { code: 'root_unverified' } });
+    return { h, launch, next, runId };
+  }
+
+  it('only the initiator, only with confirmedAbsent, only at root_unverified: a new uuid, recorded, then the launch goes on', async () => {
+    const { launch, next, runId } = await stuckAtRoot();
+    const oldUuid = record(runId).launch!.rootPending!.uuid;
+    expect(await code(next.resendRoot(runId, ALICE_LIKE, { confirmedAbsent: true }))).toBe('not_initiator');
+    expect(await code(next.resendRoot(runId, OWNER, {}))).toBe('bad_request');
+    expect(await code(next.resendRoot(runId, OWNER, { confirmedAbsent: 'yes' }))).toBe('bad_request');
+    expect(launch.count('postRootCard')).toBe(1);
+
+    await next.resendRoot(runId, OWNER, { confirmedAbsent: true });
+    const done = await settled(next, runId);
+    expect(done.phase).toBe('started');
+    const posts = launch.calls.filter((c) => c.op === 'postRootCard').map((c) => c.args[2]);
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).not.toBe(oldUuid);
+    expect(done.launch!.rootManualResends).toEqual([expect.objectContaining({ byOpenId: OWNER.openId, uuid: posts[1] })]);
+    expect(launch.onlyChat().messages.filter((m) => m.kind === 'root')).toHaveLength(1);
+    // Not available any more once the root is recorded.
+    expect(await code(next.resendRoot(runId, OWNER, { confirmedAbsent: true }))).toBe('state_conflict');
+  });
+
+  it('refused at any other stop', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.failNext('postRootCard', new Error('down'));
+    await h.service.launch(runId, OWNER, {});
+    expect((await settled(h.service, runId)).launch).toMatchObject({ error: { code: 'post_root_failed' } });
+    expect(await code(h.service.resendRoot(runId, OWNER, { confirmedAbsent: true }))).toBe('state_conflict');
+  });
+
+  it('summary unconfirmed: resent once with a new uuid after the start, recorded; refused when not unconfirmed', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.hangBefore('postSummary');
+    await h.service.launch(runId, OWNER, {});
+    await until(() => launch.count('postSummary') === 1);
+    const next = restart(h);
+    h.advance(LAUNCH_UUID_DEDUP_SAFE_MS + 60_000);
+    await next.continueLaunch(runId, OWNER);
+    const started = await settled(next, runId);
+    expect(started.phase).toBe('started');
+    expect(started.launch!.migrate).toMatchObject({ summaryUnverified: true });
+    expect(launch.onlyChat().messages.filter((m) => m.kind === 'summary')).toHaveLength(0);
+    expect(await code(next.resendSummary(runId, OWNER, {}))).toBe('bad_request');
+    expect(await code(next.resendSummary(runId, ALICE_LIKE, { confirmedAbsent: true }))).toBe('not_initiator');
+
+    const oldUuid = launch.calls.find((c) => c.op === 'postSummary')!.args[2];
+    const view = await next.resendSummary(runId, OWNER, { confirmedAbsent: true });
+    expect(view.phase).toBe('started');
+    expect(view.launch).toMatchObject({ state: 'started', running: false });
+    expect(view.launch!.migrate).toMatchObject({ summaryManualResend: { byOpenId: OWNER.openId } });
+    expect(view.launch!.migrate!.summaryUnverified).toBeUndefined();
+    const uuids = launch.calls.filter((c) => c.op === 'postSummary').map((c) => c.args[2]);
+    expect(uuids[1]).not.toBe(oldUuid);
+    expect(launch.onlyChat().messages.filter((m) => m.kind === 'summary')).toHaveLength(1);
+    expect(await code(next.resendSummary(runId, OWNER, { confirmedAbsent: true }))).toBe('state_conflict');
+  });
+
+  it('a summary that simply failed to post (not unconfirmed) is not offered for manual resend', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.failNext('postSummary', new Error('lark 500'));
+    await h.service.launch(runId, OWNER, {});
+    const done = await settled(h.service, runId);
+    expect(done.launch!.migrate).toMatchObject({ summaryError: expect.any(String) });
+    expect(done.launch!.migrate!.summaryUnverified).toBeUndefined();
+    expect(await code(h.service.resendSummary(runId, OWNER, { confirmedAbsent: true }))).toBe('state_conflict');
+    expect(launch.count('postSummary')).toBe(1);
+  });
+
+  it('a summary resend that fails leaves it unconfirmed and the launch as it was', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.hang('postSummary');
+    await h.service.launch(runId, OWNER, {});
+    await until(() => launch.count('postSummary') === 1);
+    const next = restart(h);
+    h.advance(LAUNCH_UUID_DEDUP_SAFE_MS + 60_000);
+    await next.continueLaunch(runId, OWNER);
+    await settled(next, runId);
+    launch.failNext('postSummary', new Error('lark 500'));
+    expect(await code(next.resendSummary(runId, OWNER, { confirmedAbsent: true }))).toBe('post_failed');
+    expect((await next.view(runId)).launch).toMatchObject({ state: 'started', running: false, migrate: { summaryUnverified: true } });
+  });
+});
+
+const ALICE_LIKE = { openId: 'ou_alice', unionId: 'on_alice', source: 'dashboard-platform' as const };

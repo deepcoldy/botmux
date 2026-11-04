@@ -11,7 +11,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 
-vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: async () => true }));
+const confirmAnswer = vi.hoisted(() => ({ value: true }));
+vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: async () => confirmAnswer.value }));
 
 import {
   draftSections,
@@ -84,8 +85,8 @@ describe('拉群进度的状态（真实视图）', () => {
       ['intent', 'done'], ['group', 'done'], ['root', 'done'], ['migrate', 'done'],
       ['check', 'failed'], ['grant', 'pending'], ['commit', 'pending'], ['start', 'pending'],
     ]);
-    expect(launchControls(view, true)).toEqual({ canContinue: true, canAbandon: true, needsReconfirm: false, canSwapBots: true });
-    expect(launchControls(view, false)).toEqual({ canContinue: false, canAbandon: false, needsReconfirm: false, canSwapBots: false });
+    expect(launchControls(view, true)).toEqual({ canContinue: true, canAbandon: true, needsReconfirm: false, canSwapBots: true, canResendRoot: false, canResendSummary: false });
+    expect(launchControls(view, false)).toEqual({ canContinue: false, canAbandon: false, needsReconfirm: false, canSwapBots: false, canResendRoot: false, canResendSummary: false });
     // Only the launch panel from here on: no group setup, the flow stays visible.
     expect(draftSections(view)).toMatchObject({ groupSetup: false, launch: true, flow: true });
   });
@@ -107,7 +108,7 @@ describe('拉群进度的状态（真实视图）', () => {
     for (let i = 0; i < 200 && launch.count('postRootCard') === 0; i++) await new Promise((r) => setTimeout(r, 5));
     const running = await h.service.view(runId);
     expect(launchStepRows(running.launch!).find((row) => row.status === 'running')?.key).toBe('root');
-    expect(launchControls(running, true)).toEqual({ canContinue: false, canAbandon: false, needsReconfirm: false, canSwapBots: false });
+    expect(launchControls(running, true)).toEqual({ canContinue: false, canAbandon: false, needsReconfirm: false, canSwapBots: false, canResendRoot: false, canResendSummary: false });
 
     const { h: h2 } = setup();
     const other = await confirmed(h2);
@@ -244,6 +245,40 @@ describe('页面渲染', () => {
     expect(text(renderer.root.find((node) => node.props.className === 'wfd-launch-orphans'))).toContain('oc_lost');
     expect(buttonByText(renderer, '继续')).toEqual([]);
     expect(buttonByText(renderer, '放弃')).toEqual([]);
+    act(() => { renderer.unmount(); });
+  });
+
+  it('停在「根卡片未确认」：发起人看到重发按钮，确认后发出带 confirmedAbsent 的请求；别人看不到', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.hangBefore('postRootCard');
+    await h.service.launch(runId, OWNER, {});
+    for (let i = 0; i < 200 && launch.count('postRootCard') === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    const next = new (await import('../src/workflows/v3/draft-service.js')).WorkflowDraftService({ ...h.deps });
+    next.recoverInterrupted();
+    h.advance(56 * 60_000);
+    await next.continueLaunch(runId, OWNER);
+    let view = await next.view(runId);
+    for (let i = 0; i < 200 && view.launch!.running; i++) { await new Promise((r) => setTimeout(r, 5)); view = await next.view(runId); }
+    expect(view.launch!.error!.code).toBe('root_unverified');
+    expect(launchControls(view, true)).toMatchObject({ canResendRoot: true, canContinue: true });
+
+    const label = '我已在群里确认没有这张卡，重发';
+    const asAlice = await render(view, ALICE);
+    expect(buttonByText(asAlice.renderer, label)).toEqual([]);
+    act(() => { asAlice.renderer.unmount(); });
+    vi.unstubAllGlobals();
+
+    const { renderer, sent } = await render(view);
+    // Declining the "there may be two cards" confirmation sends nothing.
+    confirmAnswer.value = false;
+    await act(async () => { buttonByText(renderer, label)[0]!.props.onClick(); });
+    await flush();
+    expect(sent.some((call) => call.url.endsWith('/launch/resend-root'))).toBe(false);
+    confirmAnswer.value = true;
+    await act(async () => { buttonByText(renderer, label)[0]!.props.onClick(); });
+    await flush();
+    expect(sent.find((call) => call.url.endsWith('/launch/resend-root'))?.body).toEqual({ confirmedAbsent: true, baseVersion: view.version });
     act(() => { renderer.unmount(); });
   });
 

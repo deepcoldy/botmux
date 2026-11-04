@@ -102,7 +102,10 @@ type DraftAction =
   /** D4 拉群开始：群名（不带标记，daemon 补）和额外成员（邮箱 / union_id）。 */
   | { kind: 'launch'; groupName?: string; extraMembers?: string[] }
   | { kind: 'launch-continue' }
-  | { kind: 'launch-abandon' };
+  | { kind: 'launch-abandon' }
+  /** 人工确认群里没有这张卡 / 这条摘要后重发（新 uuid）。 */
+  | { kind: 'launch-resend-root' }
+  | { kind: 'launch-resend-summary' };
 
 /** Path and body of one draft write. `baseVersion` pins the version the page showed. */
 export function draftActionRequest(runId: string, action: DraftAction, baseVersion?: number): { path: string; body: Record<string, unknown> } {
@@ -141,6 +144,8 @@ export function draftActionRequest(runId: string, action: DraftAction, baseVersi
     case 'launch-continue': return { path: draftPath(runId, '/launch/continue'), body: { ...base } };
     // Abandon acts on whatever the launch is now (the daemon refuses a running one).
     case 'launch-abandon': return { path: draftPath(runId, '/launch/abandon'), body: {} };
+    case 'launch-resend-root': return { path: draftPath(runId, '/launch/resend-root'), body: { confirmedAbsent: true, ...base } };
+    case 'launch-resend-summary': return { path: draftPath(runId, '/launch/resend-summary'), body: { confirmedAbsent: true } };
   }
 }
 

@@ -345,6 +345,20 @@ describe('Dashboard → daemon workflow drafts', () => {
     expect(launch.onlyChat().users).toEqual([]);
   });
 
+  it('manual resend routes: need confirmedAbsent, the initiator, and the matching stop', async () => {
+    const runId = await confirmedOverHttp();
+    await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, {});
+    await waitPhase(runId, 'started');
+    for (const tail of ['resend-root', 'resend-summary']) {
+      const path = `${WORKFLOW_DRAFTS_PATH}/${runId}/launch/${tail}`;
+      expect(await call('POST', path, {})).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+      expect(await call('POST', path, { confirmedAbsent: true }, alice)).toMatchObject({ status: 403, body: { error: 'not_initiator' } });
+      expect(await call('POST', path, { confirmedAbsent: true })).toMatchObject({ status: 409, body: { error: 'state_conflict' } });
+    }
+    expect(launch.count('postRootCard')).toBe(1);
+    expect(launch.count('postSummary')).toBe(1);
+  });
+
   it('launch writes need a body; feature off refuses them and builds nothing', async () => {
     const runId = await confirmedOverHttp();
     expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, null)).toMatchObject({ status: 400, body: { error: 'json_body_required' } });

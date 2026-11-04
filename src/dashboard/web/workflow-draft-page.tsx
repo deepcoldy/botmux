@@ -1078,6 +1078,16 @@ function LaunchPanel(props: {
     })()
     : undefined;
   const problems = currentLaunchProblems(view);
+  /** 人工确认后重发：确认框写明「如果群里其实已有，会出现两条」。 */
+  const resend = async (what: 'root' | 'summary') => {
+    const ok = await confirm({
+      title: tr(what === 'root' ? 'workflow.draft.launch.resendRoot' : 'workflow.draft.launch.resendSummary'),
+      message: tr(what === 'root' ? 'workflow.draft.launch.resendRootConfirm' : 'workflow.draft.launch.resendSummaryConfirm'),
+      danger: true,
+    });
+    if (!ok) return;
+    await props.act(what === 'root' ? { kind: 'launch-resend-root' } : { kind: 'launch-resend-summary' }, `resend-${what}`);
+  };
 
   return (
     <section className="overview-block wfd-panel wfd-launch" aria-labelledby="wfd-launch-title">
@@ -1185,7 +1195,24 @@ function LaunchPanel(props: {
         </div>
       ) : null}
 
+      {launch.migrate?.summaryUnverified && !launch.migrate.summaryMessageId ? (
+        <p className="wfd-warning" role="status">{tr('workflow.draft.launch.summaryUnverified')}</p>
+      ) : null}
+      {launch.rootManualResends?.length ? (
+        <p className="wfd-help">{tr('workflow.draft.launch.rootResent', { count: launch.rootManualResends.length })}</p>
+      ) : null}
+
       <div className="wfd-actions">
+        {controls.canResendRoot ? (
+          <button type="button" disabled={disabled} onClick={() => { void resend('root'); }}>
+            {tr('workflow.draft.launch.resendRoot')}
+          </button>
+        ) : null}
+        {controls.canResendSummary ? (
+          <button type="button" disabled={disabled} onClick={() => { void resend('summary'); }}>
+            {tr('workflow.draft.launch.resendSummary')}
+          </button>
+        ) : null}
         {controls.canContinue ? (
           <button type="button" className="primary" disabled={disabled} onClick={() => { void props.act({ kind: 'launch-continue' }, 'launch-continue'); }}>
             {tr('workflow.draft.launch.continue')}

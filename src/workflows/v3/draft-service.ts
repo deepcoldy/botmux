@@ -173,6 +173,8 @@ export type WorkflowDraftErrorCode =
   | 'run_committed'
   /** D4: deleting a launched draft first marks its root card abandoned. */
   | 'root_update_failed'
+  /** D4: a message the initiator asked to resend did not go out. */
+  | 'post_failed'
   | 'bad_request';
 
 const STATUS: Record<WorkflowDraftErrorCode, number> = {
@@ -202,6 +204,7 @@ const STATUS: Record<WorkflowDraftErrorCode, number> = {
   initiator_channel_unavailable: 422,
   run_committed: 409,
   root_update_failed: 503,
+  post_failed: 502,
   bad_request: 400,
 };
 
@@ -218,7 +221,7 @@ export class WorkflowDraftError extends Error {
   }
 
   get retryable(): boolean {
-    return this.code === 'busy' || this.code === 'clarify_unavailable' || this.code === 'launch_running' || this.code === 'root_update_failed';
+    return this.code === 'busy' || this.code === 'clarify_unavailable' || this.code === 'launch_running' || this.code === 'root_update_failed' || this.code === 'post_failed';
   }
 }
 
@@ -344,6 +347,7 @@ export interface WorkflowDraftLaunchView {
   chat?: WorkflowDraftLaunch['chat'];
   orphanSuspects?: WorkflowDraftLaunch['orphanSuspects'];
   root?: WorkflowDraftLaunch['root'];
+  rootManualResends?: WorkflowDraftLaunch['rootManualResends'];
   migrate?: WorkflowDraftLaunch['migrate'];
   check?: WorkflowDraftLaunch['check'];
   grantedBots: string[];
@@ -2234,8 +2238,10 @@ export class WorkflowDraftService {
     const { rootMessageId, pending, firstTry, summary } = snap.result;
     let summaryMessageId: string | undefined;
     let summaryError: string | undefined;
+    let unverified = false;
     if (!firstTry && this.now().getTime() - Date.parse(pending.at) > LAUNCH_UUID_DEDUP_SAFE_MS) {
       summaryError = '上次发摘要的结果没记下来，可能已经发出；为了不重复，不再补发';
+      unverified = true;
     } else {
       try {
         summaryMessageId = await this.deps.launch!.postSummary(rootMessageId, summary, pending.uuid);
@@ -2247,9 +2253,118 @@ export class WorkflowDraftService {
       if (!launch.migrate) return { changed: false, result: undefined };
       if (summaryMessageId) launch.migrate.summaryMessageId = summaryMessageId;
       if (summaryError) launch.migrate.summaryError = clip(summaryError, 2000);
+      if (unverified) launch.migrate.summaryUnverified = true;
       delete launch.migrate.summaryPending;
       return { changed: true, result: undefined };
     }).held;
+  }
+
+  /**
+   * 「我已在群里确认没有这张卡，重发」(root): only from a launch stopped at
+   * root_unverified, by the initiator, with `confirmedAbsent: true`. The card
+   * goes out with a NEW uuid (the old one may be past Feishu's window), and
+   * who confirmed is recorded. If the card was in fact there, there will be
+   * two — the page says so before asking.
+   */
+  async resendRoot(runId: string, initiator: WorkflowDraftInitiator, input: { confirmedAbsent?: unknown; baseVersion?: number } = {}): Promise<WorkflowDraftView> {
+    this.requireLaunchDeps();
+    if (input.confirmedAbsent !== true) throw err('bad_request', '需要 confirmedAbsent: true（确认群里没有这张卡）');
+    const token = this.reserveLaunch();
+    try {
+      // `launched`: after the start it still answers (state_conflict).
+      this.mutate(runId, initiator, { baseVersion: input.baseVersion, launchOp: true, launched: true }, ({ draft }) => {
+        const launch = draft.launch;
+        if (!launch) throw err('no_launch', '还没有开始拉群');
+        if (this.launchRunning(draft)) throw err('launch_running', '正在拉群，等这一步结束');
+        if (launch.root || launch.error?.code !== 'root_unverified' || !launch.rootPending) {
+          throw err('state_conflict', '只有停在「主话题卡片未确认」时才能这样重发');
+        }
+        const at = this.now().toISOString();
+        const uuid = `wf-root-${launch.marker.slice(1)}-${randomUUID().slice(0, 8)}`;
+        launch.rootPending = { uuid, at };
+        launch.rootManualResends = [...(launch.rootManualResends ?? []), { at, byOpenId: initiator.openId, uuid }].slice(-20);
+        launch.state = 'running';
+        launch.token = token;
+        launch.attempt += 1;
+        launch.updatedAt = at;
+        delete launch.error;
+        return { changed: true, result: undefined };
+      });
+    } catch (error) {
+      this.launchTokens.delete(token);
+      throw error;
+    }
+    this.log(`[workflow-draft] launch ${runId}: root card resent after ${initiator.openId} confirmed it absent`);
+    void this.driveLaunch(runId, token);
+    return this.view(runId);
+  }
+
+  /**
+   * The same for the summary marked unconfirmed (not a stop: the launch went
+   * on). Sent once more with a new uuid, recorded with who confirmed. Allowed
+   * after the start too — it is a message for people only.
+   */
+  async resendSummary(runId: string, initiator: WorkflowDraftInitiator, input: { confirmedAbsent?: unknown } = {}): Promise<WorkflowDraftView> {
+    const deps = this.requireLaunchDeps();
+    if (input.confirmedAbsent !== true) throw err('bad_request', '需要 confirmedAbsent: true（确认群里没有这条摘要）');
+    const token = this.reserveLaunch();
+    let target: { rootMessageId: string; summary: LaunchSummaryView; uuid: string; previous: WorkflowDraftLaunch['state'] };
+    try {
+      target = this.mutate(runId, initiator, { launchOp: true, launched: true }, ({ draft, grill }) => {
+        const launch = draft.launch;
+        if (!launch) throw err('no_launch', '还没有开始拉群');
+        if (this.launchRunning(draft)) throw err('launch_running', '正在拉群，等这一步结束');
+        const migrate = launch.migrate;
+        if (!launch.root || !migrate?.summaryUnverified || migrate.summaryMessageId) {
+          throw err('state_conflict', '只有摘要「未确认」时才能这样重发');
+        }
+        const spec = this.specFacts(grill);
+        const previous = launch.state;
+        launch.state = 'running';
+        launch.token = token;
+        launch.updatedAt = this.now().toISOString();
+        return {
+          changed: true,
+          result: {
+            rootMessageId: launch.root.messageId,
+            uuid: `wf-sum-${launch.marker.slice(1)}-${randomUUID().slice(0, 8)}`,
+            previous,
+            summary: {
+              runId, title: this.titleOf(draft, grill), goal: draft.goal,
+              ...(spec?.requirement ? { requirement: spec.requirement } : {}),
+              nodes: spec?.nodes ?? [],
+            },
+          },
+        };
+      });
+    } catch (error) {
+      this.launchTokens.delete(token);
+      throw error;
+    }
+    let messageId: string | undefined;
+    let failure: string | undefined;
+    try {
+      messageId = await deps.postSummary(target.rootMessageId, target.summary, target.uuid);
+    } catch (error) {
+      failure = errorText(error);
+    } finally {
+      this.launchTokens.delete(token);
+      try {
+        this.launchTx(runId, token, ({ launch }) => {
+          launch.state = target.previous === 'running' ? 'paused' : target.previous;
+          delete launch.token;
+          if (messageId && launch.migrate) {
+            launch.migrate.summaryMessageId = messageId;
+            launch.migrate.summaryManualResend = { at: this.now().toISOString(), byOpenId: initiator.openId };
+            delete launch.migrate.summaryUnverified;
+            delete launch.migrate.summaryError;
+          }
+          return { changed: true, result: undefined };
+        });
+      } catch { /* a dead token is taken over by 「继续」 */ }
+    }
+    if (failure) throw err('post_failed', `摘要没能发出：${clip(failure, 300)}`);
+    return this.view(runId);
   }
 
   /**
@@ -2588,6 +2703,7 @@ export class WorkflowDraftService {
       ...(launch.chat ? { chat: launch.chat } : {}),
       ...(launch.orphanSuspects?.length ? { orphanSuspects: launch.orphanSuspects } : {}),
       ...(launch.root ? { root: launch.root } : {}),
+      ...(launch.rootManualResends?.length ? { rootManualResends: launch.rootManualResends } : {}),
       ...(launch.migrate ? { migrate: launch.migrate } : {}),
       ...(launch.check ? { check: launch.check } : {}),
       grantedBots: Object.entries(launch.grants ?? {}).filter(([, g]) => g.mainSide && g.peerSide).map(([appId]) => appId),

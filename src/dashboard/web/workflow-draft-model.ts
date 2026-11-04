@@ -100,6 +100,7 @@ export function draftErrorKey(code: string): string | undefined {
     'orchestrator_ineligible', 'unknown_draft', 'network_error', 'spec_invalid',
     'launch_running', 'launch_exists', 'no_launch', 'launch_unavailable', 'initiator_channel_unavailable', 'run_committed',
     'root_update_failed',
+    'post_failed',
   ]);
   return known.has(code) ? `workflow.draft.err.${code}` : undefined;
 }
@@ -263,9 +264,9 @@ export function currentLaunchProblems(view: Pick<WorkflowDraftView, 'launch' | '
 export function launchControls(
   view: Pick<WorkflowDraftView, 'phase' | 'launch' | 'flowConfirmation' | 'flowRevision'>,
   isInitiator: boolean,
-): { canContinue: boolean; canAbandon: boolean; needsReconfirm: boolean; canSwapBots: boolean } {
+): { canContinue: boolean; canAbandon: boolean; needsReconfirm: boolean; canSwapBots: boolean; canResendRoot: boolean; canResendSummary: boolean } {
   const launch = view.launch;
-  if (!launch) return { canContinue: false, canAbandon: false, needsReconfirm: false, canSwapBots: false };
+  if (!launch) return { canContinue: false, canAbandon: false, needsReconfirm: false, canSwapBots: false, canResendRoot: false, canResendSummary: false };
   const idle = !launch.running && launch.state !== 'abandoned' && launch.state !== 'started';
   // A bot swapped at step 5 voids the second confirmation: confirm the flow
   // first (the flow panel), then 「继续」.
@@ -275,6 +276,12 @@ export function launchControls(
     canAbandon: isInitiator && idle && !launch.commit,
     needsReconfirm,
     canSwapBots: isInitiator && idle && !launch.commit && currentLaunchProblems(view).length > 0,
+    // Stopped because the root card could not be confirmed past Feishu's
+    // dedup window: a person checked the group and found none.
+    canResendRoot: isInitiator && idle && !launch.root && launch.error?.code === 'root_unverified',
+    // The summary went unconfirmed (the launch went on, possibly started).
+    canResendSummary: isInitiator && !launch.running && launch.state !== 'abandoned'
+      && !!launch.migrate?.summaryUnverified && !launch.migrate.summaryMessageId,
   };
 }
 

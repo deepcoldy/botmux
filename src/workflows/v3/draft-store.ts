@@ -225,6 +225,9 @@ const launchSchema = z.object({
    *  Feishu dedups a uuid for about an hour only — later a resend is checked
    *  against the group's messages first, never sent blindly. */
   rootPending: z.object({ uuid: z.string().min(1).max(64), at: iso }).strict().optional(),
+  /** The initiator confirmed in the group that no root card is there and
+   *  asked to send it again (a fresh uuid): who and when. */
+  rootManualResends: z.array(z.object({ at: iso, byOpenId: openId, uuid: z.string().min(1).max(64) }).strict()).max(20).optional(),
   root: z.object({
     messageId: messageIdSchema,
     at: iso,
@@ -243,6 +246,11 @@ const launchSchema = z.object({
     summaryPending: z.object({ uuid: z.string().min(1).max(64), at: iso }).strict().optional(),
     summaryMessageId: messageIdSchema.optional(),
     summaryError: z.string().max(2000).optional(),
+    /** The summary's post outlived the uuid window unrecorded: it may or may
+     *  not be in the topic (not resent by itself). */
+    summaryUnverified: z.literal(true).optional(),
+    /** Sent again after the initiator confirmed it was not there. */
+    summaryManualResend: z.object({ at: iso, byOpenId: openId }).strict().optional(),
   }).strict().optional(),
   check: z.object({
     at: iso,

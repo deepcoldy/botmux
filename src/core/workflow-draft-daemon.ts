@@ -22,6 +22,8 @@
  *   POST /drafts/:runId/launch                  {groupName?, extraMembers?}  拉群开始（D4）
  *   POST /drafts/:runId/launch/continue                                 断点续做
  *   POST /drafts/:runId/launch/abandon                                  放弃（群保留）
+ *   POST /drafts/:runId/launch/resend-root      {confirmedAbsent: true} 人工确认群里没有根卡片后重发
+ *   POST /drafts/:runId/launch/resend-summary   {confirmedAbsent: true} 人工确认群里没有摘要后重发
  *
  * The launch record is part of GET /drafts/:runId (`launch`).
  *
@@ -225,6 +227,10 @@ export function registerWorkflowDraftIpcRoutes(
     ({ draft: await service.continueLaunch(runId, initiator, { baseVersion }) }));
   write(draftPath('launch/abandon'), async ({ service, initiator, runId }) =>
     ({ draft: await service.abandonLaunch(runId, initiator) }));
+  write(draftPath('launch/resend-root'), async ({ service, initiator, body, baseVersion, runId }) =>
+    ({ draft: await service.resendRoot(runId, initiator, { confirmedAbsent: body.confirmedAbsent, baseVersion }) }));
+  write(draftPath('launch/resend-summary'), async ({ service, initiator, body, runId }) =>
+    ({ draft: await service.resendSummary(runId, initiator, { confirmedAbsent: body.confirmedAbsent }) }));
 }
 
 // ─── 拉群开始 collaborators (D4) ──────────────────────────────────────────
