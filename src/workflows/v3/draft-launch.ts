@@ -179,9 +179,10 @@ export interface DraftLaunchDeps {
   listChats(): Promise<Array<{ chatId: string; name?: string; chatMode?: string; ownerId?: string }>>;
   /** The main bot itself owns the chat (owner id as the chat list reports it). */
   isSelfOwner(ownerId: string | undefined): boolean;
-  /** The main bot's recent top-level cards in `chatId` mentioning `runId`
-   *  (to adopt a root card whose post outlived Feishu's uuid dedup). */
-  findRootCards(chatId: string, runId: string): Promise<string[]>;
+  /** The main bot's top-level cards in `chatId` posted since `sinceIso`
+   *  whose signature row names exactly `runId` (to adopt a root card whose
+   *  post outlived Feishu's uuid dedup). */
+  findRootCards(chatId: string, runId: string, sinceIso: string): Promise<string[]>;
   /** Add the initiator to `chatId` and make them owner (the join step:
    *  after a refused invite, or for a group recovered by its marker). */
   joinInitiator(chatId: string, owner: LaunchCreateGroupInput['owner']): Promise<LaunchJoinInitiatorResult>;
@@ -202,9 +203,11 @@ export interface DraftLaunchDeps {
   /** Remove `subjectOpenId` (receiver's namespace) from `receiver`'s grants
    *  in `chatId`; needs no membership. */
   revoke(chatId: string, receiver: string, subjectOpenId: string): Promise<void>;
-  /** The same, for a grant written without its result recorded: `receiver`
-   *  resolves `subjectAppId` in ITS OWN namespace (no open_id crosses apps). */
-  revokeByApp(chatId: string, receiver: string, subjectAppId: string): Promise<void>;
+  /** Read only: the open_id `receiver`'s OWN app sees for bot `subjectAppId`
+   *  in `chatId` (resolved by the receiver itself; no open_id crosses apps).
+   *  Recorded before the grant, so a grant whose answer is lost is revocable
+   *  by open_id — without the subject still being in the group. */
+  resolveSubject(chatId: string, receiver: string, subjectAppId: string): Promise<string>;
   /** The same start path as `botmux workflow start` (idempotent). */
   startRun(runId: string): Promise<LaunchStartResult>;
 }

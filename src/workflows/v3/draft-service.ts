@@ -372,6 +372,8 @@ interface MutateOpts {
   launchOp?: boolean;
   /** Also a draft whose launch wrote run.json or started the run. */
   launched?: boolean;
+  /** Not activity: leave updatedAt (the staleness clock) as it is. */
+  keepUpdatedAt?: boolean;
 }
 
 interface ArchitectTask {
@@ -647,7 +649,7 @@ export class WorkflowDraftService {
         const refreshed = this.refreshClarifyInPlace(draft);
         const healed = this.healStaleArchitect(runId, draft, grill);
         const out = fn({ runDir, draft, grill, healed });
-        if (out.changed || refreshed || healed) this.persist(runDir, draft);
+        if (out.changed || refreshed || healed) this.persist(runDir, draft, { keepUpdatedAt: !!opts.keepUpdatedAt && !refreshed && !healed });
         return out.result;
       });
     } catch (error) {
@@ -655,9 +657,12 @@ export class WorkflowDraftService {
     }
   }
 
-  private persist(runDir: string, draft: WorkflowDraftRecord): void {
+  /** `keepUpdatedAt`: a bookkeeping write that is not activity (e.g. the
+   *  root card noted abandoned on the way to a delete): the 30-day clock
+   *  (§4.6) keeps running. */
+  private persist(runDir: string, draft: WorkflowDraftRecord, opts: { keepUpdatedAt?: boolean } = {}): void {
     draft.version += 1;
-    draft.updatedAt = this.now().toISOString();
+    if (!opts.keepUpdatedAt) draft.updatedAt = this.now().toISOString();
     writeWorkflowDraft(runDir, draft);
   }
 
@@ -1544,22 +1549,27 @@ export class WorkflowDraftService {
     // A launch that posted its root card: the card says 「这次启动已放弃」
     // before the record goes (the group stays; §4.5). Not updatable → not
     // deleted, retry later.
-    const pre = this.mutate(runId, initiator, { allowAbandoned: true, allowDeleted: true }, ({ draft, grill }) => {
-      if (draft.deletedAt) return { changed: false, result: { needsNote: false, version: draft.version } };
+    // Every other precondition is checked first; a stale launch that was
+    // not abandoned is abandoned on the way (so the card and the record never
+    // disagree), and neither write counts as activity.
+    const needsNote = this.mutate(runId, initiator, { allowAbandoned: true, allowDeleted: true, keepUpdatedAt: true }, ({ draft, grill }) => {
+      if (draft.deletedAt) return { changed: false, result: false };
       deletable(draft, grill);
-      return { changed: false, result: { needsNote: !!draft.launch?.root && !draft.launch.root.abandonNoted, version: draft.version } };
+      if (!draft.launch?.root || draft.launch.root.abandonNoted) return { changed: false, result: false };
+      if (!draft.abandonedAt) {
+        const at = this.now().toISOString();
+        draft.abandonedAt = at;
+        draft.launch.state = 'abandoned';
+        draft.launch.abandonedAt = at;
+        delete draft.launch.token;
+        return { changed: true, result: true };
+      }
+      return { changed: false, result: true };
     });
-    let notedVersion: number | undefined;
-    if (pre.needsNote) {
-      await this.noteRootAbandoned(runId);
-      // The note itself is a write: it does not make the draft active again.
-      // (A note that failed is refused below, under the lock.)
-      const after = readWorkflowDraft(this.runDirOf(runId));
-      if (after?.launch?.root?.abandonNoted === true && after.version === pre.version + 1) notedVersion = after.version;
-    }
+    if (needsNote) await this.noteRootAbandoned(runId);
     const sessions = this.mutate(runId, initiator, { allowAbandoned: true, allowDeleted: true }, ({ draft, grill }) => {
       if (!draft.deletedAt) {
-        if (draft.version !== notedVersion) deletable(draft, grill);
+        deletable(draft, grill);
         if (draft.launch?.root && !draft.launch.root.abandonNoted) {
           throw err('root_update_failed', '主话题卡片没能改成「已放弃」，草稿先不删，请稍后重试');
         }
@@ -1721,6 +1731,13 @@ export class WorkflowDraftService {
         if (!launch) throw err('no_launch', '还没有开始拉群');
         if (launch.state === 'started') return { changed: false, result: false };
         if (this.launchRunning(draft)) throw err('launch_running', '正在拉群，等这一步结束');
+        if (launch.start) {
+          // Started earlier; a later operation died holding it.
+          launch.state = 'started';
+          delete launch.token;
+          delete launch.error;
+          return { changed: true, result: false };
+        }
         if (!launch.commit && !existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) {
           this.assertNotArchitecting(runId, draft, grill);
           this.assertFlowConfirmed(runDir, draft, grill, bots, nameOf);
@@ -2114,7 +2131,7 @@ export class WorkflowDraftService {
     if (!firstTry && this.now().getTime() - Date.parse(pending.at) > LAUNCH_UUID_DEDUP_SAFE_MS) {
       let found: string[];
       try {
-        found = await deps.findRootCards(chatId, runId);
+        found = await deps.findRootCards(chatId, runId, pending.at);
       } catch (error) {
         this.stopLaunch(runId, token, {
           step: 'root', code: 'root_unverified', retryable: true,
@@ -2319,15 +2336,23 @@ export class WorkflowDraftService {
           throw err('state_conflict', '只有摘要「未确认」时才能这样重发');
         }
         const spec = this.specFacts(grill);
-        const previous = launch.state;
+        const previous = launch.start ? 'started' : launch.state;
+        const at = this.now().toISOString();
+        // A manual resend that died after posting is resent with the SAME
+        // uuid inside Feishu's window (deduplicated); past it, the person
+        // confirmed again, so a fresh uuid.
+        const earlier = migrate.summaryPending;
+        const reuse = earlier?.manual && this.now().getTime() - Date.parse(earlier.at) <= LAUNCH_UUID_DEDUP_SAFE_MS;
+        const uuid = reuse ? earlier!.uuid : `wf-sum-${launch.marker.slice(1)}-${randomUUID().slice(0, 8)}`;
+        migrate.summaryPending = reuse ? earlier! : { uuid, at, manual: true };
         launch.state = 'running';
         launch.token = token;
-        launch.updatedAt = this.now().toISOString();
+        launch.updatedAt = at;
         return {
           changed: true,
           result: {
             rootMessageId: launch.root.messageId,
-            uuid: `wf-sum-${launch.marker.slice(1)}-${randomUUID().slice(0, 8)}`,
+            uuid,
             previous,
             summary: {
               runId, title: this.titleOf(draft, grill), goal: draft.goal,
@@ -2358,6 +2383,7 @@ export class WorkflowDraftService {
             launch.migrate.summaryManualResend = { at: this.now().toISOString(), byOpenId: initiator.openId };
             delete launch.migrate.summaryUnverified;
             delete launch.migrate.summaryError;
+            delete launch.migrate.summaryPending;
           }
           return { changed: true, result: undefined };
         });
@@ -2445,12 +2471,13 @@ export class WorkflowDraftService {
       if (!before.held) return undefined;
       if (!before.result) continue;
       try {
-        if (grant.mainSide) await deps.revoke(chatId, this.deps.appId, grant.mainSide);
-        else if (grant.mainPending) await deps.revokeByApp(chatId, this.deps.appId, appId);
-        if (grant.peerSide) await deps.revoke(chatId, appId, grant.peerSide);
-        else if (grant.peerPending) await deps.revokeByApp(chatId, appId, this.deps.appId);
+        const mainOpenId = grant.mainSide ?? grant.mainPending;
+        const peerOpenId = grant.peerSide ?? grant.peerPending;
+        if (mainOpenId) await deps.revoke(chatId, this.deps.appId, mainOpenId);
+        if (peerOpenId) await deps.revoke(chatId, appId, peerOpenId);
       } catch (error) {
-        return `撤销 ${this.deps.nameOf()(appId)} 在这个群的协作授权失败：${errorText(error)}`;
+        return `撤销 ${this.deps.nameOf()(appId)} 在这个群的协作授权失败（${errorText(error)}）；`
+          + '撤销不要求它还在群里，但需要接收方的 daemon 在线：确认主 Bot 和它的 daemon 都在线后点「继续」';
       }
       const dropped = this.launchTx(runId, token, ({ runDir, launch }) => {
         if (!launch.grants?.[appId]) return { changed: false, result: true };
@@ -2494,15 +2521,31 @@ export class WorkflowDraftService {
       const have = grants[appId];
       for (const side of ['mainSide', 'peerSide'] as const) {
         if (have?.[side]) continue;
-        // The intent first: a grant whose result is lost is still revocable.
+        // The intent first, with the exact open_id the receiver's own app
+        // sees for the subject: a grant whose result is lost is still
+        // revocable by open_id (no membership needed then).
         const pendingKey = side === 'mainSide' ? 'mainPending' : 'peerPending';
-        const intent = this.launchTx(runId, token, ({ launch }) => {
-          const current = launch.grants?.[appId] ?? { at: this.now().toISOString() };
-          if (current[pendingKey]) return { changed: false, result: undefined };
-          launch.grants = { ...(launch.grants ?? {}), [appId]: { ...current, [pendingKey]: true } };
-          return { changed: true, result: undefined };
-        });
-        if (!intent.held) return false;
+        const receiver = side === 'mainSide' ? this.deps.appId : appId;
+        const subject = side === 'mainSide' ? appId : this.deps.appId;
+        if (!have?.[pendingKey]) {
+          let subjectOpenId: string;
+          try {
+            subjectOpenId = await deps.resolveSubject(chatId, receiver, subject);
+            if (!/^ou_[A-Za-z0-9_-]{1,128}$/.test(subjectOpenId)) throw new Error('换算出的 open_id 不合法');
+          } catch (error) {
+            this.stopLaunch(runId, token, {
+              step: 'grant', code: 'grant_failed', retryable: true,
+              message: `${describeV3BotEligibilityCode('COLLABORATION_DENIED')}：${this.deps.nameOf()(appId)}（${errorText(error)}）`,
+            });
+            return false;
+          }
+          const intent = this.launchTx(runId, token, ({ launch }) => {
+            const current = launch.grants?.[appId] ?? { at: this.now().toISOString() };
+            launch.grants = { ...(launch.grants ?? {}), [appId]: { ...current, [pendingKey]: subjectOpenId } };
+            return { changed: true, result: undefined };
+          });
+          if (!intent.held) return false;
+        }
         let written: { subjectOpenId: string };
         try {
           written = side === 'mainSide'
@@ -2677,7 +2720,7 @@ export class WorkflowDraftService {
       return;
     }
     try {
-      this.mutate(runId, undefined, { allowAbandoned: true, launchOp: true, launched: true }, ({ draft }) => {
+      this.mutate(runId, undefined, { allowAbandoned: true, launchOp: true, launched: true, keepUpdatedAt: true }, ({ draft }) => {
         if (!draft.launch?.root || draft.launch.root.abandonNoted) return { changed: false, result: undefined };
         draft.launch.root.abandonNoted = true;
         return { changed: true, result: undefined };
@@ -2861,7 +2904,17 @@ export class WorkflowDraftService {
         withWorkflowDraftLock(runDir, runId, () => {
           const draft = readWorkflowDraft(runDir);
           const launch = draft?.launch;
-          if (!draft || !launch || draft.orchestratorAppId !== this.deps.appId || launch.state !== 'running') return;
+          if (!draft || !launch || draft.orchestratorAppId !== this.deps.appId) return;
+          // Started is final: a later operation that died while holding the
+          // launch (a summary resend) leaves it started, not paused.
+          if (launch.start && launch.state !== 'started' && launch.state !== 'abandoned') {
+            launch.state = 'started';
+            delete launch.token;
+            delete launch.error;
+            this.persist(runDir, draft, { keepUpdatedAt: true });
+            return;
+          }
+          if (launch.state !== 'running') return;
           if (launch.token && this.launchTokens.has(launch.token)) return;
           launch.state = 'paused';
           delete launch.token;

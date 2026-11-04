@@ -60,8 +60,8 @@ import type { DaemonSession } from './types.js';
 import { initiatorFailureBody, type WorkflowInitiatorResolution } from './workflow-initiator.js';
 import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { createLiveV3BotEligibilityProbe } from '../im/lark/v3-bot-eligibility.js';
-import { buildV3LaunchRootCard, buildV3LaunchSummaryText } from '../im/lark/v3-launch-card.js';
-import { listChatMessages, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from '../im/lark/client.js';
+import { buildV3LaunchRootCard, buildV3LaunchSummaryText, isLaunchRootCardOf } from '../im/lark/v3-launch-card.js';
+import { getMessageDetail, listChatMessagesUntil, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from '../im/lark/client.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import { addBotToChat, addUsersToChatByOpenId, addUsersToChatByUnionId, listChats } from '../services/groups-store.js';
 import { requestExactChatGrant } from '../cli/exact-chat-grant-client.js';
@@ -70,6 +70,11 @@ import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { getBotBrand, getBotOpenId } from '../bot-registry.js';
 
 export const WORKFLOW_DRAFTS_PATH = '/api/v3/orchestration/drafts';
+
+/** How far back (messages) / how many candidates are read in full when
+ *  looking for a root card past Feishu's uuid window. */
+const ROOT_CARD_SCAN_MAX = 500;
+const ROOT_CARD_DETAIL_MAX = 30;
 
 /** How often the daemon closes idle clarify processes (§4.2). */
 const IDLE_SWEEP_MS = 5 * 60_000;
@@ -317,19 +322,32 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
       ...(chat.ownerId ? { ownerId: chat.ownerId } : {}),
     })),
     isSelfOwner: (ownerId) => !!ownerId && (ownerId === appId || ownerId === getBotOpenId(appId)),
-    async findRootCards(chatId, runId) {
-      // Top-level messages of the group, newest first; the root card is the
-      // main bot's interactive message naming this run in its signature row.
-      const messages = await listChatMessages(appId, chatId, 50);
+    async findRootCards(chatId, runId, sinceIso) {
+      // Newest first, back to the first try (a minute of slack for clock
+      // skew), bounded. The list API gives schema-2.0 cards as a placeholder,
+      // so every candidate — the main bot's own top-level interactive
+      // message — is read in full and matched on its signature row.
+      const sinceMs = Date.parse(sinceIso) - 60_000;
+      const scanned = await listChatMessagesUntil(appId, chatId, {
+        pageSize: 50,
+        stopAfter: (message: any, seen: number) => Number(message?.create_time) < sinceMs || seen >= ROOT_CARD_SCAN_MAX,
+      });
       const selfOpenId = getBotOpenId(appId);
-      return messages
-        .filter((message: any) => message?.msg_type === 'interactive'
-          && message?.sender?.sender_type === 'app'
-          && (message.sender.id === appId || (selfOpenId && message.sender.id === selfOpenId))
-          && typeof message?.body?.content === 'string' && message.body.content.includes(runId)
-          && !message.root_id && !message.parent_id)
+      const candidates = scanned
+        .filter((message: any) => message?.msg_type === 'interactive' && message.deleted !== true
+          && (message?.sender?.sender_type === 'app' || message?.sender?.sender_type === 'bot')
+          && (message.sender.id === appId || (!!selfOpenId && message.sender.id === selfOpenId))
+          && !message.root_id && !message.parent_id
+          && Number(message.create_time) >= sinceMs
+          && /^om_[A-Za-z0-9_-]{1,128}$/.test(String(message.message_id)))
         .map((message: any) => String(message.message_id))
-        .filter((id: string) => /^om_[A-Za-z0-9_-]{1,128}$/.test(id));
+        .slice(-ROOT_CARD_DETAIL_MAX);
+      const found: string[] = [];
+      for (const messageId of candidates) {
+        const detail = await getMessageDetail(appId, messageId, { userCardContent: true });
+        if (isLaunchRootCardOf(detail?.items?.[0]?.body?.content, runId)) found.push(messageId);
+      }
+      return found;
     },
     async addBots(chatId, botAppIds) {
       await addBotToChat(appId, chatId, botAppIds);
@@ -366,15 +384,19 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
         subjectOpenIds: [subjectOpenId],
       });
     },
-    async revokeByApp(chatId, receiver, subjectAppId) {
-      await requestExactChatGrant({
+    async resolveSubject(chatId, receiver, subjectAppId) {
+      const body = await requestExactChatGrant({
         daemon: receiverDaemon(receiver),
         secret: loadDaemonIpcSecret(),
         receiverLarkAppId: receiver,
         chatId,
-        operation: 'revoke',
+        operation: 'resolve',
         subjectLarkAppIds: [subjectAppId],
       });
+      const mapping = (body.subjectMappings as Array<{ larkAppId?: string; subjectOpenId?: string }> | undefined)
+        ?.find((item) => item.larkAppId === subjectAppId);
+      if (!mapping?.subjectOpenId) throw new Error('接收方没有给出对方的 open_id');
+      return mapping.subjectOpenId;
     },
     startRun: input.startRun,
   };

@@ -18,7 +18,7 @@ import { MAIN } from './workflow-draft-fakes.js';
 
 export type LaunchOp =
   | 'resolveEmails' | 'createGroup' | 'joinInitiator' | 'listChats' | 'findRootCards' | 'addBots' | 'postRootCard' | 'updateRootCard'
-  | 'postSummary' | 'bindSession' | 'grant' | 'revoke' | 'revokeByApp' | 'startRun';
+  | 'postSummary' | 'bindSession' | 'grant' | 'revoke' | 'resolveSubject' | 'startRun';
 
 export interface FakeChat {
   chatId: string;
@@ -130,8 +130,8 @@ export function fakeLaunch(baseDir: string) {
       }));
     },
     isSelfOwner: (ownerId) => ownerId === MAIN,
-    async findRootCards(chatId, runId) {
-      await enter('findRootCards', [chatId, runId]);
+    async findRootCards(chatId, runId, sinceIso) {
+      await enter('findRootCards', [chatId, runId, sinceIso]);
       return (chats.get(chatId)?.messages ?? [])
         .filter((m) => m.kind === 'root' && (m.view as LaunchRootCardView).runId === runId)
         .map((m) => m.messageId);
@@ -195,11 +195,11 @@ export function fakeLaunch(baseDir: string) {
       await enter('revoke', [chatId, receiver, subjectOpenId]);
       grants.get(`${chatId}|${receiver}`)?.delete(subjectOpenId);
     },
-    async revokeByApp(chatId, receiver, subjectAppId) {
-      await enter('revokeByApp', [chatId, receiver, subjectAppId]);
+    async resolveSubject(chatId, receiver, subjectAppId) {
+      await enter('resolveSubject', [chatId, receiver, subjectAppId]);
       // The receiver resolves the subject in its own namespace (live members).
       if (!chats.get(chatId)?.members.has(subjectAppId)) throw new Error('subject_lark_app_not_in_chat');
-      grants.get(`${chatId}|${receiver}`)?.delete(seenBy(receiver, subjectAppId));
+      return seenBy(receiver, subjectAppId);
     },
     async startRun(runId) {
       await enter('startRun', [runId]);

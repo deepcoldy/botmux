@@ -242,8 +242,9 @@ const launchSchema = z.object({
     at: iso,
     sessionId: z.string().min(1).max(256).optional(),
     error: z.string().max(2000).optional(),
-    /** About to post the summary (same uuid rule as the root card). */
-    summaryPending: z.object({ uuid: z.string().min(1).max(64), at: iso }).strict().optional(),
+    /** About to post the summary (same uuid rule as the root card);
+     *  `manual`: a resend the initiator asked for. */
+    summaryPending: z.object({ uuid: z.string().min(1).max(64), at: iso, manual: z.literal(true).optional() }).strict().optional(),
     summaryMessageId: messageIdSchema.optional(),
     summaryError: z.string().max(2000).optional(),
     /** The summary's post outlived the uuid window unrecorded: it may or may
@@ -262,15 +263,16 @@ const launchSchema = z.object({
    *  this chat. `mainSide`: this bot's open_id in the main bot's namespace
    *  (main receives); `peerSide`: the main bot's open_id in this bot's
    *  namespace (it receives). Each is used only with the app that issued it.
-   *  A side is recorded as `*Pending` BEFORE it is written and gets its
-   *  open_id after: a grant whose result was lost is still revoked — by the
-   *  receiver resolving the subject app in its own namespace. */
+   *  Before a side is written its open_id — resolved by that receiver in its
+   *  own app — is recorded as `*Pending`; after, it moves to the side. A grant
+   *  whose answer was lost is thus revocable by open_id, also once the
+   *  subject has left the group. */
   grants: z.record(appIdSchema, z.object({
     at: iso,
     mainSide: openId.optional(),
     peerSide: openId.optional(),
-    mainPending: z.literal(true).optional(),
-    peerPending: z.literal(true).optional(),
+    mainPending: openId.optional(),
+    peerPending: openId.optional(),
   }).strict()).optional(),
   commit: z.object({
     at: iso,

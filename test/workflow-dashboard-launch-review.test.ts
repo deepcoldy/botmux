@@ -146,7 +146,7 @@ describe('P2-1: a swap-out revoke holds the launch', () => {
 });
 
 describe('P2-2: a grant whose result was lost is still revoked', () => {
-  it('written, crash before its record: swapping the bot out revokes it by app id on the receiver', async () => {
+  it('written, crash before its record: the open_id recorded before the grant revokes it, also after the bot left the group', async () => {
     const { h, launch } = setup();
     const runId = await confirmed(h);
     launch.hang('grant');
@@ -154,16 +154,59 @@ describe('P2-2: a grant whose result was lost is still revoked', () => {
     await until(() => launch.count('grant') === 1);
     const chat = launch.onlyChat();
     expect(launch.granted(chat.chatId, MAIN)).toEqual([seenBy(MAIN, DOC)]);
-    expect(record(runId).launch!.grants?.[DOC]).toMatchObject({ mainPending: true });
+    // Resolved by the receiver (the main bot) in its own app, before writing.
+    expect(launch.calls.filter((c) => c.op === 'resolveSubject').map((c) => c.args)).toEqual([[chat.chatId, MAIN, DOC]]);
+    expect(record(runId).launch!.grants?.[DOC]).toEqual(expect.objectContaining({ mainPending: seenBy(MAIN, DOC) }));
     const next = restart(h);
+    chat.members.delete(DOC);
     await next.setNodeBot(runId, OWNER, 'write', { larkAppId: REVIEW });
-    expect(launch.calls.filter((c) => c.op === 'revokeByApp').map((c) => c.args)).toEqual([[chat.chatId, MAIN, DOC]]);
     expect(launch.granted(chat.chatId, MAIN)).toEqual([]);
+    expect(record(runId).launch!.grants).toBeUndefined();
     await reconfirm(next, runId);
     await next.continueLaunch(runId, OWNER);
     expect((await settled(next, runId)).phase).toBe('started');
     expect(launch.granted(chat.chatId, MAIN)).toEqual([seenBy(MAIN, REVIEW)]);
     expect(launch.granted(chat.chatId, DOC)).toEqual([]);
+  });
+
+  it('peer side: resolved by the executing bot\'s own daemon before its grant, revoked by that open_id', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    // First side completes; the second hangs after its effect.
+    let calls = 0;
+    const realGrant = launch.deps.grant;
+    launch.deps.grant = async (...args) => {
+      calls += 1;
+      if (calls === 2) { await realGrant(...args); return new Promise(() => {}); }
+      return realGrant(...args);
+    };
+    await h.service.launch(runId, OWNER, {});
+    await until(() => calls === 2);
+    const chat = launch.onlyChat();
+    expect(launch.calls.filter((c) => c.op === 'resolveSubject').map((c) => c.args[1])).toEqual([MAIN, DOC]);
+    expect(record(runId).launch!.grants?.[DOC]).toEqual(expect.objectContaining({ mainSide: seenBy(MAIN, DOC), peerPending: seenBy(DOC, MAIN) }));
+    launch.deps.grant = realGrant;
+    const next = restart(h);
+    chat.members.delete(DOC);
+    await next.setNodeBot(runId, OWNER, 'write', { larkAppId: REVIEW });
+    expect(launch.granted(chat.chatId, DOC)).toEqual([]);
+    expect(launch.granted(chat.chatId, MAIN)).toEqual([]);
+  });
+
+  it('a revoke that cannot go through stops with an actionable reason', async () => {
+    const { h, launch } = setup();
+    const runId = await grantedThenStopped(h, launch);
+    launch.failNext('revoke', new Error('receiver daemon offline: cli_doc'));
+    launch.failNext('revoke', new Error('receiver daemon offline: cli_doc'));
+    await h.service.setNodeBot(runId, OWNER, 'write', { larkAppId: REVIEW });
+    await reconfirm(h.service, runId);
+    await h.service.continueLaunch(runId, OWNER);
+    const stopped = await settled(h.service, runId);
+    expect(stopped.launch).toMatchObject({ error: { step: 'grant', code: 'revoke_failed' } });
+    expect(stopped.launch!.error!.message).toContain('daemon 都在线后点「继续」');
+    // Once it can go through, 「继续」 finishes.
+    await h.service.continueLaunch(runId, OWNER);
+    expect((await settled(h.service, runId)).phase).toBe('started');
   });
 });
 
@@ -492,3 +535,65 @@ describe('人工确认后重发（root_unverified / 摘要未确认）', () => {
 });
 
 const ALICE_LIKE = { openId: 'ou_alice', unionId: 'on_alice', source: 'dashboard-platform' as const };
+
+describe('第二轮：手动重发摘要中途崩溃、删除时改卡后崩溃', () => {
+  async function summaryUnverifiedStarted() {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.hangBefore('postSummary');
+    await h.service.launch(runId, OWNER, {});
+    await until(() => launch.count('postSummary') === 1);
+    const next = restart(h);
+    h.advance(LAUNCH_UUID_DEDUP_SAFE_MS + 60_000);
+    await next.continueLaunch(runId, OWNER);
+    expect((await settled(next, runId)).phase).toBe('started');
+    return { h, launch, next, runId };
+  }
+
+  it('B1: the resend posted, then the daemon died: the launch comes back started; resending again inside the window reuses the uuid (one summary)', async () => {
+    const { h, launch, next, runId } = await summaryUnverifiedStarted();
+    launch.hang('postSummary');
+    void next.resendSummary(runId, OWNER, { confirmedAbsent: true });
+    await until(() => launch.count('postSummary') === 2);
+    expect(record(runId).launch!.migrate!.summaryPending).toMatchObject({ manual: true });
+    const again = restart(h);
+    expect((await again.view(runId)).launch).toMatchObject({ state: 'started', running: false });
+    expect(record(runId).launch!.error).toBeUndefined();
+    await again.resendSummary(runId, OWNER, { confirmedAbsent: true });
+    const uuids = launch.calls.filter((c) => c.op === 'postSummary').map((c) => c.args[2]);
+    expect(uuids[2]).toBe(uuids[1]);
+    expect(launch.onlyChat().messages.filter((m) => m.kind === 'summary')).toHaveLength(1);
+    expect(record(runId).launch).toMatchObject({ state: 'started', migrate: { summaryManualResend: { byOpenId: OWNER.openId } } });
+  });
+
+  it('B1: a launch left paused after its start is put back to started by 「继续」 without starting again', async () => {
+    const { launch, next, runId } = await summaryUnverifiedStarted();
+    const draft = record(runId);
+    draft.launch!.state = 'paused';
+    writeWorkflowDraft(join(base, runId), draft);
+    expect((await next.continueLaunch(runId, OWNER)).launch).toMatchObject({ state: 'started' });
+    expect(launch.starts).toEqual([runId]);
+  });
+
+  it('B3: the root card is noted on the way to a delete without restarting the 30-day clock; a stale launch is abandoned first', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.setOnline([MAIN]);
+    await h.service.launch(runId, OWNER, {});
+    expect((await settled(h.service, runId)).launch).toMatchObject({ error: { step: 'check' } });
+    h.advance(31 * 24 * 3600_000);
+    const before = record(runId).updatedAt;
+    // The card cannot be updated: not deleted, but abandoned on the way —
+    // the card and the record never disagree — and the clock is untouched.
+    launch.failNext('updateRootCard', new Error('lark 500'));
+    expect(await code(h.service.delete(runId, OWNER))).toBe('root_update_failed');
+    expect(record(runId)).toMatchObject({ abandonedAt: expect.any(String), updatedAt: before, launch: { state: 'abandoned' } });
+    // The next delete notes the card and dies before removing anything.
+    await (h.service as any).noteRootAbandoned(runId);
+    expect(record(runId)).toMatchObject({ updatedAt: before, launch: { root: { abandonNoted: true } } });
+    const next = restart(h);
+    await next.delete(runId, OWNER);
+    expect(existsSync(join(base, runId))).toBe(false);
+    expect(launch.onlyChat().messages[0]!.updates).toHaveLength(1);
+  });
+});

@@ -53,6 +53,40 @@ export function buildV3LaunchRootCard(view: LaunchRootCardView, entry?: Workflow
   });
 }
 
+const RUN_ID_CHAR = /[A-Za-z0-9._-]/;
+
+function stringsOf(value: unknown, out: string[] = []): string[] {
+  if (typeof value === 'string') out.push(value);
+  else if (Array.isArray(value)) for (const item of value) stringsOf(item, out);
+  else if (value && typeof value === 'object') for (const item of Object.values(value)) stringsOf(item, out);
+  return out;
+}
+
+/**
+ * The card JSON (as `GET /im/v1/messages/:id` with
+ * `card_msg_content_type=user_card_content` returns it) is a launch root card
+ * of exactly `runId`: some text of it carries the signature
+ * 「botmux · 工作流 <runId>」with `runId` as a whole word (a longer run id that
+ * merely starts with it does not count).
+ */
+export function isLaunchRootCardOf(rawContent: unknown, runId: string): boolean {
+  if (typeof rawContent !== 'string' || !runId) return false;
+  let card: unknown;
+  try { card = JSON.parse(rawContent); } catch { return false; }
+  const needle = `botmux · 工作流 ${runId}`;
+  for (const text of stringsOf(card)) {
+    let from = 0;
+    for (;;) {
+      const at = text.indexOf(needle, from);
+      if (at < 0) break;
+      const next = text[at + needle.length];
+      if (next === undefined || !RUN_ID_CHAR.test(next)) return true;
+      from = at + 1;
+    }
+  }
+  return false;
+}
+
 /** The summary text replied into the main topic. `flowUrl`: the run page. */
 export function buildV3LaunchSummaryText(view: LaunchSummaryView, flowUrl?: string): string {
   const lines = [`工作流「${view.title}」已拉群，下面是确认过的需求：`, '', `目标：${view.goal.slice(0, 2000)}`];

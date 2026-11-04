@@ -18,6 +18,11 @@ import {
 import { addChatGrant, removeChatGrant } from './grant-store.js';
 
 export type ExactChatGrantOperation = 'grant' | 'revoke' | 'readback';
+/** `resolve` (stable app ids only): which open_id the receiver's app sees
+ *  for each subject bot in this chat — read only, nothing is written. Lets a
+ *  caller record the exact open_id BEFORE asking for a grant, so a grant
+ *  whose answer is lost can still be revoked by open_id later. */
+export type ExactChatGrantByLarkAppIdsOperation = 'grant' | 'resolve';
 
 export interface ExactChatGrantInput {
   operation: unknown;
@@ -326,14 +331,11 @@ export async function applyExactChatGrantByLarkAppIds(
   input: ExactChatGrantByLarkAppIdsInput,
   deps: ExactChatGrantDeps = defaultDeps,
 ): Promise<ExactChatGrantSuccess | ExactChatGrantFailure> {
-  // Revoke by app id exists for a grant whose open_id the caller never
-  // learnt (it lost the grant's result): the receiver resolves the subject in
-  // its own namespace, exactly as for a grant. Readback stays open_id only.
-  if (input.operation !== 'grant' && input.operation !== 'revoke') {
+  if (input.operation !== 'grant' && input.operation !== 'resolve') {
     return failure(
       400,
       'subject_lark_app_ids_grant_only',
-      'subjectLarkAppIds may only be used with operation=grant or revoke',
+      'subjectLarkAppIds may only be used with operation=grant or resolve',
     );
   }
   const operation = input.operation;
@@ -394,8 +396,22 @@ export async function applyExactChatGrantByLarkAppIds(
     });
   }
   const completeMappings = subjectMappings as CurrentChatBotAppMapping[];
+  if (operation === 'resolve') {
+    return {
+      ok: true,
+      operation: 'readback',
+      permissionSource: 'chatGrant',
+      talkOnly: true,
+      receiverLarkAppId: input.receiverLarkAppId,
+      chatId: input.chatId,
+      grantsTalk: false,
+      grantsOperate: false,
+      subjects: [],
+      subjectMappings: completeMappings,
+    };
+  }
   const result = await applyExactChatGrant({
-    operation,
+    operation: 'grant',
     receiverLarkAppId: input.receiverLarkAppId,
     chatId: input.chatId,
     subjectOpenIds: completeMappings.map(mapping => mapping.subjectOpenId),
