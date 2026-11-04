@@ -27121,8 +27121,10 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
  * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) at least one of its
  * allowedUsers is a member of the chat (D7). Working dir per D6: the bot's
  * default working dir, else degrade to the repo-selection card. The first-turn
- * prompt is the configured prompt, or empty (the role/identity envelope still
- * makes it a non-empty CLI turn — the bot reads the group context itself, D8).
+ * prompt is the configured prompt when non-blank, else a localized built-in
+ * join task (inspect the chat context, report readiness when no task is
+ * assigned); an explicit forcePrompt — including the empty string used by
+ * meeting prewarm — bypasses both the toggle and that default task.
  *
  * Scope is mode-aware: a 普通群 keeps a chat-scope session anchored at chatId.
  * When its reply mode is shared, a top-level seed supplies the visible topic

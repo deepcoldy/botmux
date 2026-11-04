@@ -209,9 +209,33 @@ describe('handleBotAdded — 默认入群任务', () => {
     await daemon.__testOnly_handleBotAdded(chatId, undefined, appId, { forcePrompt: forced });
 
     expect(mocks.forkWorker).toHaveBeenCalledOnce();
-    const input = mocks.forkWorker.mock.calls[0][1];
+    const [ds, input] = mocks.forkWorker.mock.calls[0];
     const userMessage = input.content.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1];
     expect(userMessage?.trim()).toBe(forced);
+    // 非空 forcePrompt 直接作为会话标题（Issue Board 领取行为）；空串不进标题，
+    // 回退内置入群标题。
+    expect(ds.session.title).toBe(forced || t('daemon.auto_start_join_title'));
+  });
+
+  it('forcePrompt 为空串时 codex-app 的可见 sidecar 回退为内置标题而非空 UserMessage（会议预热路径）', async () => {
+    const { daemon, registry } = modules;
+    const appId = 'app_forced_empty_codex_app';
+    const chatId = 'oc_forced_empty_codex_app';
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'codex-app', lang: 'zh',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: false,
+      defaultWorkingDir: tempDir('repo-forced-empty-codex-app'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId, { forcePrompt: '' });
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const input = mocks.forkWorker.mock.calls[0][1];
+    const userMessage = input.content.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1];
+    expect(userMessage?.trim()).toBe('');
+    // 空开场 PTY 正文为空，但 codex-app 需要非空可见 UserMessage：用本地化标题兜底。
+    expect(input.codexAppInput).toBeTruthy();
+    expect(input.codexAppInput.text).toBe(t('daemon.auto_start_join_title', undefined, 'zh'));
   });
 });
 
