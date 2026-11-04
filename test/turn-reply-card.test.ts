@@ -1178,6 +1178,38 @@ describe('public process and fallback compatibility', () => {
       // zero native img keys above.
     });
 
+    it('keeps stripping to a fixed point when replacement brackets resync an image out of a link destination (panel)', () => {
+      // Nested-link carrier: the inner image is in the outer link's TEXT and
+      // the key-shaped token is inert inside its DESTINATION. Replacing the
+      // inner image inserts "[Image omitted] [" and re-forms the parse,
+      // promoting the destination token to a live image on re-parse. A single
+      // sanitizer pass leaked it and still rejected the whole card; the
+      // fixed-point strip must leave zero image tokens in the panel.
+      const alienKey = 'img_v3_02k_carrier_alien_key';
+      const carrier = `x[![y](/tmp/y.png)!](![z](${alienKey}))`;
+      const record = imageRecord();
+      record.progress = [carrier];
+      record.activity = [{ kind: 'progress', id: 'p0', text: carrier }];
+      const audit = auditCard(buildTurnReplyCard(record, presentation));
+      expect(audit.panelImageSources).toEqual([]);
+      expect(audit.panelNativeImgKeys).toEqual([]);
+      expect(audit.invalidMarkdownImageSources).toEqual([]);
+      expect(audit.validBodyImageRefs).toEqual([bodyKey]);
+    });
+
+    it('keeps stripping to a fixed point on the live working branch carrier', () => {
+      const alienKey = 'img_v3_02k_carrier_alien_key_live';
+      const carrier = `x[![y](/tmp/y.png)!](![z](${alienKey}))`;
+      const record = imageRecord('working', false);
+      record.progress = [carrier];
+      record.tools = [];
+      record.activity = [{ kind: 'progress', id: 'p0', text: carrier }];
+      const cardJson = buildTurnReplyCard(record, presentation);
+      const audit = auditCard(cardJson);
+      expect(audit.markdownImageSources).toEqual([]);
+      expect(audit.nativeImgKeys).toEqual([]);
+    });
+
     it('leaves fenced code, inline code, escaped syntax and ordinary links untouched in the process panel', () => {
       const text = [
         '围栏代码：',
