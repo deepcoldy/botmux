@@ -1291,6 +1291,22 @@ function normalizeCardImages(input: string, omitAll = false): string {
     unsupported.has(offset) ? '[Image omitted] [' : match);
 }
 
+/**
+ * Neutralize every Markdown image token in display-only text (the turn
+ * reply-card's process panel: progress narration, thinking, tool labels and
+ * results). Such text has no upload/key-resolution path, so any image syntax —
+ * `img:N` placeholders, local paths, URLs, even a well-formed Feishu key —
+ * would be validated by Feishu as part of the *whole* card, collapsed panel
+ * included. One bad key rejects the entire card (230099 / 200570 "card contains
+ * invalid image keys"), and the whole-card image fallback then removes the
+ * valid body images too. Code spans/fences, escaped syntax and ordinary links
+ * are left intact; the body rendering pipeline keeps its own key-aware
+ * normalization and is unaffected.
+ */
+export function stripCardMarkdownImages(input: string): string {
+  return normalizeCardImages(input, true);
+}
+
 /** Last-resort image-free version of a rejected reply card. Keep the card
  * envelope, text, tables, code and controls so existing delivery accounting
  * can continue to use the same message type and provider UUID. */

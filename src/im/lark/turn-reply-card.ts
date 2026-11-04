@@ -5,7 +5,7 @@ import {
   replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
-import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard } from './md-card.js';
+import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard, stripCardMarkdownImages } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
 
@@ -61,7 +61,12 @@ function bounded(text: string, bytes: number, measure = (value: string) => Buffe
 
 function publicText(text: string): string {
   // Tool arguments/results are display data; never execute their @mentions.
-  return text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
+  const withoutMentions = text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]');
+  // This text has no image-upload path: strip image syntax so an invalid key in
+  // the process panel cannot get the whole card rejected (which would also
+  // delete the body's valid images via the whole-card fallback). Code examples,
+  // escaped syntax and ordinary links are preserved.
+  return stripCardMarkdownImages(withoutMentions)
     .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
@@ -198,7 +203,13 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   }
   if (!record.finalCard && !pendingAsks.length) {
     const latest = record.progress.at(-1);
-    const content = latest ? bounded(latest, 6000)
+    // Live progress is display-only text with no image upload path, just like
+    // the process panel: strip its image syntax BEFORE the body renderer. The
+    // renderer's key-aware normalization would otherwise keep a key-shaped but
+    // invalid token (hallucinated or another Lark app's app-scoped key), which
+    // can reject this working PATCH and persist the whole-card downgrade that
+    // later deletes the final answer's valid images.
+    const content = latest ? stripCardMarkdownImages(bounded(latest, 6000))
       : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
         : (en ? 'Working on your request…' : '正在处理你的请求…');
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
