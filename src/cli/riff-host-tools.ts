@@ -12,6 +12,7 @@ import {
   type RiffHostBinding, type RiffHostRequest, type RiffHostResult,
 } from '../services/riff-host-tools.js';
 import { RIFF_HOST_UNREACHABLE_HINT } from '../services/riff-host-hint.js';
+import { RIFF_UPLOAD_PREFIX } from '../services/riff-upload-placeholder.js';
 import { defaultStatFile, parseSendInvocation, validateClientSendInvocation } from './send-invocation.js';
 
 function bindingPath(env: NodeJS.ProcessEnv): string {
@@ -75,7 +76,7 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
     if (total * 4 / 3 > RIFF_HOST_MAX_BYTES - 1024 * 1024) throw new Error('riff_host_upload_too_large');
     // Keep only an inert filename; paths and unicode names never select host files.
     const name = basename(path).replace(/[^\w. -]/g, '_').slice(-160) || `upload${extname(path)}`;
-    args[i] = `riff-upload:${files.length}`;
+    args[i] = `${RIFF_UPLOAD_PREFIX}${files.length}`;
     files.push({ name, dataBase64: bytes.toString('base64') });
   }
   // cmdSend reads stdin only when neither a positional body nor a card/content

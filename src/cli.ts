@@ -10435,6 +10435,11 @@ async function preflightSendInvocation(rest: string[]): Promise<SendPreflight> {
   // Read stdin before session/ledger/marker resolution. This is the same read
   // the command used to perform later, but doing it here keeps a rejected body
   // from advancing a queued turn or copying an open socket into a transport.
+  // Trade-off: this read also precedes the workflow/transport/capability gates
+  // inside cmdSend, so a non-TTY stdin that never reaches EOF blocks before
+  // those gates can refuse. That fd shape is not reachable in production (the
+  // worker hands the CLI a TTY; remote-runner uses --content-file with
+  // stdio:'ignore'), and the queued-turn ordering win is worth it.
   const stdinContent = await readStdin();
   const loneDash = plan.invocation.positionals.length === 1 && plan.invocation.positionals[0] === '-';
   if (loneDash && !stdinContent.trim()) {
@@ -10443,9 +10448,19 @@ async function preflightSendInvocation(rest: string[]): Promise<SendPreflight> {
       message: "botmux send: 位置参数 '-' 表示从 stdin 读正文，但 stdin 没有内容；多行正文请直接用 botmux send <<'EOF' … EOF。",
     };
   }
+  // `--as independent|suggestion` synthesizes its whole body later in cmdSend
+  // (crossPrincipalAsKeyword), the same category as --diff's rendered card:
+  // an empty stdin is legal with it. Validate its value here as well, so a
+  // typo reports the --as usage error instead of being masked by the empty-body
+  // error below (same ordering as image-mode/response-kind above).
+  const asChoice = parseCrossPrincipalAsFlag(plan.invocation.flags['--as']?.[0]);
+  if (Object.hasOwn(plan.invocation.flags, '--as') && !asChoice) {
+    return { kind: 'error', message: t('xpi.send.as_usage') };
+  }
   const hasAttachments = plan.attachments.images.length + plan.attachments.files.length
     + plan.attachments.videos.length + plan.attachments.videoCovers.length > 0;
-  if (!loneDash && !stdinContent.trim() && !hasAttachments && !Object.hasOwn(plan.invocation.flags, '--diff')) {
+  if (!loneDash && !stdinContent.trim() && !hasAttachments
+    && !Object.hasOwn(plan.invocation.flags, '--diff') && !asChoice) {
     return { kind: 'error', message: 'botmux send: 正文为空（stdin 没有内容）。' };
   }
   return { kind: 'plan', plan: { ...plan, stdinContent } };
