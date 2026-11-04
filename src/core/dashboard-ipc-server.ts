@@ -14,6 +14,14 @@ import {
   dashboardCreatorFromRequest,
   resolveDashboardScheduleCreator,
 } from './dashboard-schedule-creator.js';
+import {
+  DASHBOARD_INITIATOR_SOURCE_HEADER,
+  DASHBOARD_INITIATOR_UNION_HEADER,
+  WORKFLOW_INITIATOR_PATH,
+  initiatorFailureBody,
+  resolveDashboardWorkflowInitiator,
+  type WorkflowInitiatorResolution,
+} from './workflow-initiator.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -211,7 +219,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig, isDispatchTaskTreeCardEnabled } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -6500,6 +6508,56 @@ async function dashboardScheduleCreator(
   logger.info(`[schedule-creator] dashboard feishu login recorded as creator ${subject} open=${creator.openId}`);
   return { openId: creator.openId, unionId: creator.unionId };
 }
+
+/**
+ * The verified initiator of a Dashboard workflow request on THIS daemon's bot
+ * (design 2026-11-03 workflow-dashboard-orchestration §7.1, I1–I5; see
+ * core/workflow-initiator). Every Dashboard workflow write that names an
+ * initiator goes through this one function. Only this bot's own app resolves
+ * the person; a refusal never falls back to the bot owner.
+ */
+async function dashboardWorkflowInitiator(req: IncomingMessage): Promise<WorkflowInitiatorResolution> {
+  const result = await resolveDashboardWorkflowInitiator(
+    {
+      source: req.headers[DASHBOARD_INITIATOR_SOURCE_HEADER],
+      unionId: req.headers[DASHBOARD_INITIATOR_UNION_HEADER],
+    },
+    {
+      appId: cachedLarkAppId,
+      featureEnabled: isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      trustedHost: isTrustedHostIpcRequest(req),
+      ownerOpenId: getOwnerOpenId,
+      resolveOpenId: resolveTargetAppOpenId,
+      canOperate: (app, openId, union) => canOperate(app, undefined, openId, union),
+    },
+  );
+  const source = req.headers[DASHBOARD_INITIATOR_SOURCE_HEADER];
+  if (result.ok) {
+    logger.info(`[workflow-initiator] app=${cachedLarkAppId} source=${result.initiator.source} open=${result.initiator.openId}`);
+  } else if (result.error !== 'feature_disabled') {
+    logger.warn(`[workflow-initiator] refused (${result.error}) app=${cachedLarkAppId} source=${typeof source === 'string' ? source : '?'}`);
+  }
+  return result;
+}
+
+// Who the Dashboard login initiates a workflow as on this bot, or why nobody.
+// Body `{ larkAppId }` is the bot the Dashboard routed to; answering for
+// another one would let a mis-routed request pass the gate under the wrong
+// app. POST with a body for the platform-routing reason in
+// core/workflow-initiator.
+ipcRoute('POST', WORKFLOW_INITIATOR_PATH, requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson(req, res);
+  if (body === BAD_JSON) return;
+  const asked = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as Record<string, unknown>).larkAppId
+    : undefined;
+  if (asked !== cachedLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'bot_mismatch', retryable: false });
+  }
+  const result = await dashboardWorkflowInitiator(req);
+  if (!result.ok) return jsonRes(res, result.status, initiatorFailureBody(result));
+  return jsonRes(res, 200, { ok: true, initiator: result.initiator });
+}, NOT_BOUND_BODY.okFalse));
 
 ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   let body: unknown;
