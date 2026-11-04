@@ -1,7 +1,7 @@
 import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
 import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
 import { codexAppSettlementOutcome } from '../services/runner-final-outcome.js';
-import { canTalk } from '../im/lark/event-dispatcher.js';
+import { canTalk, evaluateTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
@@ -16751,13 +16751,16 @@ function setupWorkerHandlers(
         if (sink.kind === 'im') {
           if (ds.chatId !== sink.chatId || ds.chatType !== sink.chatType || privateReplyEnabled(ds.session) !== !!sink.privateReply) throw new OutputDeliveryTerminalError('output_original_channel_changed');
           const actor = sink.context.requesterOpenId ?? sink.context.replyTargetSenderOpenId;
-          // canTalk depends on resolvedAllowedUsers/grant sidecar which load
-          // asynchronously and are briefly empty during the startup window.
-          // A false here is therefore RECOVERABLE (allowlist API hiccup,
-          // sidecar not loaded, /grant not yet persisted) — keep the row in
-          // blocked and re-check on the next pump; never make it a one-way
-          // terminal rejection that latches the session's attention forever.
-          if (actor && !canTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType)) throw new Error('output_permission_pending');
+          if (actor) {
+            // Distinguish a governance blocklist decision (irrecoverable) from
+            // a not-yet-resolved allowlist (reason 'none': sidecar/grant still
+            // loading during the startup window, API hiccup) which self-heals.
+            const talk = evaluateTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType);
+            if (!talk.allowed) {
+              if (talk.reason === 'blocked') throw new OutputDeliveryTerminalError('output_permission_revoked');
+              throw new Error('output_permission_pending');
+            }
+          }
         }
         if (sink.kind === 'http') {
           if (sink.mode === 'wait' && !ds.pendingWaitPromises?.has(record.output.turnId) && !record.output.codexAppSettlement) return { status: 'captured', owner: 'expired_http_wait' };
@@ -16789,11 +16792,17 @@ function setupWorkerHandlers(
           if (receipt?.owner !== 'codex_app_dispatch_persisted') return undefined;
           return receipt;
         }
-        // Non-native undefined receipt means a deterministic drop (session/
-        // Hermes mismatch), not an in-flight write: IM is receipt-gated by the
-        // ledger, doc by the effect table, HTTP by the strict store. File it
-        // terminal instead of looping blocked forever.
-        if (!receipt) throw new OutputDeliveryTerminalError('output_dropped_without_receipt');
+        // An undefined receipt is terminal ONLY for a deterministic drop that
+        // provably never posted (session/Hermes binding mismatch). Every other
+        // false completion is recoverable — transfer/generation change, a doc
+        // 5xx, an async-store EIO, an image-prep ownership loss, a withdrawn
+        // ledger owner — and must stay blocked so the next pump self-heals
+        // instead of latching a false terminal on an in-flight answer.
+        if (!receipt
+          && (shouldDropMismatchedFinalOutput(ds, record.output, t)
+            || shouldDropMismatchedHermesFinalOutput(ds, record.output, t))) {
+          throw new OutputDeliveryTerminalError('output_dropped_without_receipt');
+        }
         return receipt;
       },
       settled: record => {

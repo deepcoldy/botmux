@@ -48,6 +48,11 @@ requester 与引用作者分别保存。原 IM 目标、chat/type、私聊策略
 - HTTP wait 过期、doc target 缺失、native managed/suppressed sink：继续对应原生结算，不 fallback 到普通群消息。
 - 恢复扫描：每轮固定插入上水位并轮转，旧的等待项、后续新流入或晚到的旧时间戳不会阻止到期租约和后面的 ready 输出被重新访问。
 - 租约过期或取消：旧 owner 不能开始下一项 effect 或结算新 owner 的记录；已有返回回执可作为对账证据保存。
+- 投递结果三态：
+  - **可恢复（blocked，5s 冷却后重投）**：平台 5xx/网络抖动、transfer 或 worker 换代中途丢权（`isStillOwned()` 翻转）、HTTP completion 落盘失败（内存结果不晋升、宿主不发 ACK、恢复记录保留）、文档分块中途丢权、图片准备失败、provider UUID 去重窗口内的未知、以及权限评估为「未解析」（`reason:'none'`：启动期 allowlist/grant sidecar 还在异步加载）。这些都不是正文「不会到达」，下一轮 pump 自愈。
+  - **终态 rejected（不再重投、不 ACK worker，行留存待人工核对）**：冻结的原 chat/type 或私聊策略结构性变更、HTTP async owner 永久消失、provider UUID 去重窗口过期（结果永久未知）、治理黑名单撤销（`evaluateTalk().reason === 'blocked'`）、session/Hermes 绑定不匹配的确定性丢弃。注意「权限未解析」与「黑名单」分开：前者可恢复，后者不可逆。
+  - **settled**：真实回执落盘，ACK worker 并在本会话无其它未决/终态输出时清除 attention。
+  - codex native 未拿到 `codex_app_dispatch_persisted` 视为在途（blocked），不进终态。
 
 关开关停止新 V2 输出准入，匹配版本继续恢复已有副本；切回旧构建前先处理未结算的 V2 输出。旧构建没有 V2 恢复合同。
 

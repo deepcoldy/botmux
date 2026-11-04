@@ -57,9 +57,14 @@ describe('attention lifecycle', () => {
       bridgeEntries?: any[];
       chatId?: string; chatType?: 'group' | 'p2p'; privateReplyOn?: boolean;
       asyncResults?: Map<string, unknown>;
+      /** talk evaluation: false-ish values map to the recoverable 'none'
+       *  reason unless talkReason:'blocked' is given (governance blocklist). */
       canTalk?: boolean | (() => boolean);
+      talkReason?: string;
+      sessionMismatch?: boolean;
     } = {},
   ) => {
+    const talkAllowed = typeof options.canTalk === 'function' ? options.canTalk : () => (options.canTalk ?? true);
     const worker = { send: vi.fn() };
     const sink = options.sink ?? record.sink;
     const ds: any = { larkAppId: app, chatId: options.chatId ?? 'oc', chatType: options.chatType ?? 'group',
@@ -74,6 +79,7 @@ describe('attention lifecycle', () => {
       ownsLifecycleMutation: () => true,
       processFinalOutput: options.processFinalOutput ?? vi.fn(async () => ({ status: 'suppressed' as const })),
       canTalk: typeof options.canTalk === 'function' ? options.canTalk : () => options.canTalk ?? true,
+      evaluateTalk: () => { const a = talkAllowed(); return { allowed: a, reason: a ? 'allowedUser' : (options.talkReason ?? 'none') }; },
       FinalOutputHandoffStore: { exists: () => options.v1Exists ?? false },
       finalOutputHandoffHost: () => ({ store: { attentionPending: () => options.v1Attention ? {} : undefined } }),
       readBridgeTurnJournal: () => options.bridgeEntries ?? [], publishAttentionPatch, join,
@@ -81,6 +87,8 @@ describe('attention lifecycle', () => {
       privateReplyEnabled: () => options.privateReplyOn ?? false,
       asyncTriggerStore: { lookupStrict: () => undefined },
       FinalPublicationUnknownError, OutputDeliveryTerminalError,
+      shouldDropMismatchedFinalOutput: () => options.sessionMismatch ?? false,
+      shouldDropMismatchedHermesFinalOutput: () => false,
       logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     };
     record = { ...record, sink };
@@ -195,16 +203,52 @@ describe('attention lifecycle', () => {
     expect(ctx.ds.agentAttention).toBeUndefined();
     vi.useRealTimers();
   });
-  it('files a deterministic non-native drop (undefined receipt) as terminal rejected', async () => {
+  it('files a deterministic non-native drop (binding mismatch, undefined receipt) as terminal rejected', async () => {
     const dir = directory(); const db = database();
     const record = db.accept(outputSnapshot(app, output),
       { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
-    // processFinalOutput returns undefined for a session/Hermes mismatch:
-    // a definite "this output will never be posted", not an in-flight write.
-    const ctx = scopeFor(db, record, dir, { processFinalOutput: vi.fn(async () => undefined) });
+    // processFinalOutput returns undefined AND the binding mismatch predicate
+    // fires: a definite "this output will never be posted", not an in-flight write.
+    const ctx = scopeFor(db, record, dir, {
+      sessionMismatch: true,
+      processFinalOutput: vi.fn(async () => undefined),
+    });
     await ctx.run();
     expect(db.read(record.id)?.state).toBe('rejected');
     expect(db.read(record.id)?.reason).toContain('output_dropped_without_receipt');
+  });
+  it('keeps an undefined receipt from a recoverable failure (transfer/EIO/doc 5xx) in blocked, not terminal', async () => {
+    vi.useFakeTimers();
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    // No binding mismatch: the undefined receipt is a transient false-completion
+    // (ownership lost mid-transfer, store EIO, doc 5xx) — must self-heal.
+    let attempts = 0;
+    const ctx = scopeFor(db, record, dir, {
+      sessionMismatch: false,
+      processFinalOutput: vi.fn(async () => { if (++attempts === 1) return undefined; return { status: 'delivered' as const, messageId: 'om_ok' }; }),
+    });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('blocked');
+    await vi.advanceTimersByTimeAsync(5_001);
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(attempts).toBe(2);
+    vi.useRealTimers();
+  });
+  it('files a governance blocklist decision (reason blocked) as terminal, but keeps reason none recoverable', async () => {
+    vi.useFakeTimers();
+    const dir = directory(); const db = database();
+    const blocked = db.accept(outputSnapshot(app, output),
+      { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' }, requesterOpenId: 'ou_banned' }, chatId: 'oc', chatType: 'group' });
+    const ctxB = scopeFor(db, blocked, dir, {
+      canTalk: false, talkReason: 'blocked',
+      processFinalOutput: vi.fn(async () => ({ status: 'delivered' as const })),
+    });
+    await ctxB.run();
+    expect(db.read(blocked.id)?.state).toBe('rejected');
+    vi.useRealTimers();
   });
   it('keeps a native final without its codex ACK in blocked (in flight, never terminal)', async () => {
     vi.useFakeTimers();
