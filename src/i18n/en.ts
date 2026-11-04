@@ -1,5 +1,7 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'feedback.storage.choose': 'Feedback storage: SQLite [default] / PostgreSQL (sqlite/postgresql): ',
+  'feedback.storage.configPath': 'PostgreSQL config JSON path (credential reference only, no plaintext password): ',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [task] — Change Codex reasoning effort; a task may follow on the same or subsequent lines and is submitted after confirmation. CLI affects future turns; App active-turn updates require step_model_switching (off by default; levels depend on the model)',
   'cmd.effort.task_not_submitted': 'The attached task was not submitted: the effort change was unconfirmed, the session changed, or input is unavailable. The task remains in the original message; retry the task. Task: {task}',
   'cmd.effort.cli_next_turn': 'This session will use {effort} starting with the next turn; the running turn keeps its original effort.',

@@ -1,5 +1,7 @@
 # 5-minute quick setup
 
+Feedback defaults to SQLite. A fresh interactive start also offers PostgreSQL; existing installations can use `botmux feedback storage configure/test/migrate/status` or the Feedback page storage panel. Migration requires a maintenance window and retains the original SQLite database without automatic fallback.
+
 > 💡 **TL;DR**: `curl -fsSL .../install.sh | sh` → `botmux setup` (**a single Lark QR scan** creates the app + configures all permissions + publishes) → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
 
 **Before you start**: confirm the [Prerequisites](/en/prerequisites) (target CLI installed and logged in, tmux) — a missing prerequisite here is the most common cause of "installed but won't connect."
