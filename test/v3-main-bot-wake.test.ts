@@ -193,6 +193,31 @@ describe('the three wake-up events (M6)', () => {
     expect(wakes(third)).toEqual([]);
   });
 
+  it('a failed node wakes as stuck, with outcome failed', async () => {
+    const run = new BotRun(reportDag('wake-failed'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const open = run.openAttempt('write');
+    appendEvent(run.journalPath, {
+      type: 'nodeFailed', nodeId: 'write', ...(open.instanceId ? { instanceId: open.instanceId } : {}), attemptId: open.attemptId,
+      errorClass: 'hostError', errorCode: 'HOST_INPUT_PREPARE_FAILED',
+    });
+    expect(wakes(run)).toEqual([expect.objectContaining({ kind: 'nodeStuck', nodeId: 'write', outcome: 'failed' })]);
+  });
+
+  it('a working directory the executing bot refuses wakes the main bot as stuck, not as a bot report', async () => {
+    const run = new BotRun(reportDag('wake-wd-refused'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = executor.dispatches[0]!.attemptId;
+    expect(reportExternalBlocked(run.runDir, {
+      attemptId, reason: 'not in the bot\'s range', errorCode: 'WORKING_DIR_REFUSED',
+    })).toEqual({ ok: true });
+    expect(wakes(run)).toEqual([
+      expect.objectContaining({ kind: 'nodeStuck', nodeId: 'write', outcome: 'blocked', errorCode: 'WORKING_DIR_REFUSED' }),
+    ]);
+  });
+
   it('a checkpoint wake carries what the node produced — as untrusted data only', async () => {
     const run = twoNodeRun('wake-cp-data');
     const executor = new FakeExecutor();
