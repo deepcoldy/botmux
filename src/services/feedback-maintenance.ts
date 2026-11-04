@@ -1,13 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { atomicWriteFileSync, isAtomicWriteTempName } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
-import { FEEDBACK_TABLES } from './feedback-postgres-schema.js';
-import { closeFeedbackStorage, getFeedbackStorage } from './feedback-storage.js';
+import { FEEDBACK_TABLES } from './feedback-tables.js';
+// `pg`-backed modules are loaded lazily: this module is statically imported by
+// daemon startup and `botmux send`, which must run with SQLite-only installs.
 import { inspectSendRecovery, recoveryAcknowledged, webhookRecoveryFingerprint } from './feedback-recovery.js';
 
 export interface MaintenanceReport {
@@ -94,6 +95,8 @@ export function startFeedbackMaintenanceParticipant(
         if (!blockers.length) {
           await stopOutbox();
           stoppedOutbox = true;
+          // Lazy import keeps `pg` out of the daemon/send module-load graph.
+          const { closeFeedbackStorage, getFeedbackStorage } = await import('./feedback-storage.js');
           await closeFeedbackStorage(dataDir);
           if (config.active.backend === 'postgresql') await getFeedbackStorage(dataDir);
           ready = true;
@@ -136,7 +139,7 @@ export async function inspectFeedbackMaintenance(dataDir: string, migrationId: s
   const directory = join(dataDir, 'feedback-participants');
   for (const name of existsSync(directory) ? readdirSync(directory) : []) {
     // Ignore atomic-write rename intermediates (see inspectSendRecovery).
-    if (name.endsWith('.tmp')) continue;
+    if (isAtomicWriteTempName(name)) continue;
     let participant: Participant;
     try { participant = JSON.parse(readFileSync(join(directory, name), 'utf8')); }
     catch { throw new Error('feedback_participant_state_invalid'); }

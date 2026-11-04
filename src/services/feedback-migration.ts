@@ -6,7 +6,10 @@ import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { readFeedbackStorageConfig, readFeedbackStorageSecret, activateFeedbackStorageCandidate } from './feedback-storage-config.js';
 import type { PostgresTarget } from './feedback-storage-types.js';
-import { feedbackPostgresPool, ensurePostgresFeedbackSchema, FEEDBACK_TABLES } from './feedback-postgres-schema.js';
+// This module is imported even for `feedback storage status` (to list job
+// files), so the pg-backed schema/pool helpers load lazily; FEEDBACK_TABLES
+// comes from the dependency-free module.
+import { FEEDBACK_TABLES } from './feedback-tables.js';
 import { beginFeedbackMaintenance, freezeFeedbackSource, retireFeedbackSource, releaseFeedbackMaintenance, inspectFeedbackMaintenance } from './feedback-maintenance.js';
 import { closeFeedbackStorage, getFeedbackStorage } from './feedback-storage.js';
 import { canonicalFeedbackRow, createFeedbackSnapshot, feedbackRows, workingFeedbackSnapshot } from './feedback-snapshot.js';
@@ -51,6 +54,7 @@ export async function listFeedbackMigrations(dataDir: string): Promise<Migration
 async function poolFor(dataDir: string, target: PostgresTarget): Promise<Pool> {
   const password = await readFeedbackStorageSecret(dataDir, target.passwordRef);
   const ca = target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined;
+  const { feedbackPostgresPool } = await import('./feedback-postgres-schema.js');
   return feedbackPostgresPool(target, password, ca);
 }
 function digest(rows: Record<string, unknown>[]): string {
@@ -124,6 +128,7 @@ export async function resumeFeedbackMigration(dataDir: string, migrationId: stri
       if (config.instanceId !== job.sourceInstanceId) throw new Error('feedback_migration_identity_conflict');
       pool = await poolFor(dataDir, job.target);
       client = await pool.connect();
+      const { ensurePostgresFeedbackSchema } = await import('./feedback-postgres-schema.js');
       await ensurePostgresFeedbackSchema(client, job.target.schema, job.sourceInstanceId, migrationId);
       if (!alreadyActivated) {
         await phase('draining');
