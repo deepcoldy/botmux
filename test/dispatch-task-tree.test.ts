@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  buildDispatchTaskTree, safeRequirementUrl, recordDispatchLastReport, renderDispatchTaskTreeCard, renderDispatchTaskTreeText,
+  buildDispatchTaskTree, safeRequirementUrl, taskTreeDisplayTitle, recordDispatchLastReport, renderDispatchTaskTreeCard, renderDispatchTaskTreeText,
 } from '../src/core/dispatch-task-tree.js';
 import type { DispatchRegistry } from '../src/core/dispatch-registry.js';
 
@@ -173,5 +173,31 @@ describe('renderDispatchTaskTreeCard', () => {
 
   it('text rendering lists every node', () => {
     expect(renderDispatchTaskTreeText(t)).toContain('om_a');
+  });
+
+  it('cuts long or multi-line titles to one short line for display', () => {
+    const long = '长'.repeat(500);
+    const wide = buildDispatchTaskTree({
+      registry: { om_a: entry({ title: `第一行\n${long}` }) },
+      orchSessionId: ORCH, title: long, sessions: [], localAppIds: LOCAL,
+    });
+    const rendered = JSON.stringify(renderDispatchTaskTreeCard(wide));
+    expect(rendered).not.toContain('长'.repeat(40));
+    expect(rendered).not.toContain('\\n长');
+    expect(renderDispatchTaskTreeText(wide)).not.toContain('长'.repeat(40));
+    expect(wide.nodes[0]!.title).toContain(long);
+    expect(taskTreeDisplayTitle('a\n b')).toBe('a b');
+    expect(taskTreeDisplayTitle('😀'.repeat(41))).toBe(`${'😀'.repeat(39)}…`);
+    expect(taskTreeDisplayTitle('短标题')).toBe('短标题');
+    expect(taskTreeDisplayTitle('  x  ')).toBe('x');
+    expect(taskTreeDisplayTitle('👨‍👩‍👧'.repeat(41))).toBe(`${'👨‍👩‍👧'.repeat(39)}…`);
+    const escaped = buildDispatchTaskTree({
+      registry: { om_a: entry({ title: `${'a'.repeat(38)}&bc` }), om_b: entry({ title: ' \n ' }) },
+      orchSessionId: ORCH, title: 't', sessions: [], localAppIds: LOCAL,
+    });
+    const card = JSON.stringify(renderDispatchTaskTreeCard(escaped));
+    expect(card).toContain(`${'a'.repeat(38)}&amp;…`);
+    expect(card).not.toContain('****');
+    expect(renderDispatchTaskTreeText(escaped)).toContain('子任务');
   });
 });
