@@ -2,7 +2,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
-import { mergeOutputReplay, validateOutputSnapshot, type OutputSnapshot } from './universal-output-handoff.js';
+import { mergeOutputReplay, validateOutputSnapshot, OUTPUT_JOURNAL_APP_ID_RE, type OutputSnapshot } from './universal-output-handoff.js';
 import type { FrozenSessionReplyContext } from '../types.js';
 
 export type OutputSink =
@@ -37,7 +37,7 @@ export class OutputDeliveryJournal {
   private readonly scanCursors = new Map<string, { after: { createdAt: number; id: string }; upperRowId: number }>();
   readonly filename: string;
   constructor(dataDir: string, readonly appId: string) {
-    if (!/^cli_[A-Za-z0-9_-]+$/.test(appId)) throw new Error('invalid_output_app');
+    if (!OUTPUT_JOURNAL_APP_ID_RE.test(appId)) throw new Error('invalid_output_app');
     const directory = join(dataDir, 'output-delivery-journals');
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.filename = join(directory, `${appId}.db`);
@@ -206,6 +206,11 @@ export class OutputDeliveryJournal {
   settled(sessionId: string, turnId: string): OutputDeliveryRecord[] {
     return (this.db.prepare("SELECT id FROM outputs WHERE session_id=? AND turn_id=? AND state='settled' ORDER BY created_at")
       .all(sessionId, turnId) as Array<{ id: string }>).map(row => this.read(row.id)!);
+  }
+  /** Any unsettled row (pending/processing/blocked) for a session. Does not
+   *  advance the recovery scan watermark. */
+  hasUnsettled(sessionId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM outputs WHERE session_id=? AND state!='settled' LIMIT 1").get(sessionId);
   }
 }
 

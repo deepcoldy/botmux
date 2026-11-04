@@ -1360,8 +1360,8 @@ export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefi
 
 let finalOutputHandoffTimer: ReturnType<typeof setInterval> | undefined;
 const finalOutputHandoffHosts = new Map<string, FinalOutputHandoffHost>();
-const FINAL_HANDOFF_WAIT_REASON = '最终答复等待交接：原请求身份或持久存储尚未验证，恢复记录已保留';
-const FINAL_HANDOFF_DELIVERY_REASON = '最终答复交接或投递未完成，请核对输出记录';
+export const FINAL_HANDOFF_WAIT_REASON = '最终答复等待交接：原请求身份或持久存储尚未验证，恢复记录已保留';
+export const FINAL_HANDOFF_DELIVERY_REASON = '最终答复交接或投递未完成，请核对输出记录';
 
 function finalOutputHandoffSupported(_ds: DaemonSession): boolean { return true; }
 function finalOutputHandoffAdmitNew(_ds: DaemonSession): boolean {
@@ -16778,6 +16778,24 @@ function setupWorkerHandlers(
           if (record.output.codexAppSettlement && record.receipt?.owner === 'codex_app_dispatch_persisted') worker.send({ type: 'codex_app_dispatch_persisted', requestId: record.output.codexAppSettlement.requestId, ok: true });
           worker.send(claim);
         } catch { /* worker retains its journal until receipt */ } }
+        // A transient failure sets FINAL_HANDOFF_* attention; the replacement
+        // delivery that settles must release it again, otherwise the session is
+        // permanently pinned out of idle reclaim/auto-close/auto-compact even
+        // though the answer actually landed. Clear only when no other durable
+        // output (V2 journal, V1 store or legacy bridge mark) is still pending.
+        if ([FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON].includes(ds.agentAttention?.reason ?? '')) {
+          try {
+            const sessionId = record.output.sessionId;
+            if (!sessionId) return;
+            const v1Attention = FinalOutputHandoffStore.exists(config.session.dataDir, ds.larkAppId)
+              ? finalOutputHandoffHost(ds.larkAppId).store.attentionPending(sessionId) !== undefined
+              : false;
+            const stillPending = journal.hasUnsettled(sessionId)
+              || v1Attention
+              || readBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${sessionId}.json`)).some(entry => !!entry.pendingFinal);
+            if (!stillPending) { ds.agentAttention = undefined; publishAttentionPatch(ds); }
+          } catch (error) { logger.warn(`[${t}] Final output attention clear deferred: ${String(error)}`); }
+        }
       },
       error: error => {
         ds.agentAttention = { kind: 'blocked', reason: FINAL_HANDOFF_DELIVERY_REASON, at: Date.now() };

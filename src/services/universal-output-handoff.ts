@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto';
 import type { WorkerFinalOutput } from '../types.js';
 
+/** Filesystem key for per-app journals/stores. The app id is config-controlled
+ *  (production ids look like `cli_…`) and these stores must stay constructible
+ *  for any safe basename; path containment is the security boundary, not the
+ *  `cli_` prefix, which is validated at Feishu protocol edges instead. */
+export const OUTPUT_JOURNAL_APP_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
 export interface OutputHandoffClaim {
   version: 2;
   id: string;

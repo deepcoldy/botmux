@@ -2,14 +2,14 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } f
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
-import { mergeOutputReplay, validateOutputSnapshot, type OutputSnapshot } from './universal-output-handoff.js';
+import { mergeOutputReplay, validateOutputSnapshot, OUTPUT_JOURNAL_APP_ID_RE, type OutputSnapshot } from './universal-output-handoff.js';
 
 /** Independent of transcript format, local/remote backend and native queue.
  * No eviction: a failed write must retain the producer's original owner. */
 export class WorkerOutputJournal {
   readonly directory: string;
   constructor(dataDir: string, readonly appId: string, readonly sessionId: string) {
-    if (!/^cli_[A-Za-z0-9_-]+$/.test(appId) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)) throw new Error('invalid_output_journal_identity');
+    if (!OUTPUT_JOURNAL_APP_ID_RE.test(appId) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)) throw new Error('invalid_output_journal_identity');
     this.directory = join(dataDir, 'worker-final-outputs', appId, sessionId);
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     if (lstatSync(this.directory).isSymbolicLink()) throw new Error('unsafe_output_journal');

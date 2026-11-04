@@ -6,9 +6,11 @@ import { UniversalOutputHandoff, outputSnapshot, type OutputHandoffReceipt } fro
 import { WorkerOutputJournal } from '../src/services/worker-output-journal.js';
 import { OutputDeliveryJournal, type OutputDeliveryRecord } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
+import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
 import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { committedCodexAppSequence, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
+import { FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON } from '../src/core/worker-pool.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerFinalOutput } from '../src/types.js';
 
@@ -20,6 +22,61 @@ function directory() { const value = mkdtempSync(join(tmpdir(), 'universal-outpu
 function database(dir = directory()) { const journal = new OutputDeliveryJournal(dir, app); dbs.push(journal); return journal; }
 function receipt(sent: WorkerFinalOutput): OutputHandoffReceipt { return { type: 'final_output_settled', ...sent.handoff! }; }
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const db of dbs.splice(0)) try { db.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+describe('journal app identity', () => {
+  it('accepts any safe-basename app id but rejects path-shaped ids', () => {
+    const dir = directory();
+    // Non-`cli_` ids (test fixtures and config-controlled ids) must boot:
+    // the `cli_` prefix is validated at Feishu protocol edges, not here.
+    expect(() => new OutputDeliveryJournal(dir, 'app_test')).not.toThrow();
+    expect(() => new WorkerOutputJournal(dir, 'app_test', output.sessionId!)).not.toThrow();
+    expect(() => FinalOutputHandoffStore.exists(dir, 'app_test')).not.toThrow();
+    for (const bad of ['../x', 'a/b', String.raw`cli_x\y`, '.', '..', '', 'x'.repeat(129), 'a b', 'a.b']) {
+      expect(() => new OutputDeliveryJournal(dir, bad)).toThrow('invalid_output_app');
+      expect(() => new WorkerOutputJournal(dir, bad, output.sessionId!)).toThrow('invalid_output_journal_identity');
+      expect(() => FinalOutputHandoffStore.path(dir, bad)).toThrow('invalid_handoff_app');
+    }
+  });
+});
+
+describe('attention lifecycle', () => {
+  const loadRunOutput = (scope: Record<string, any>) =>
+    loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope);
+  const scopeFor = (db: OutputDeliveryJournal, record: OutputDeliveryRecord, dir: string) => {
+    const worker = { send: vi.fn() };
+    const ds: any = { larkAppId: app, chatId: 'oc', chatType: 'group', session: { sessionId: output.sessionId! },
+      worker, initConfig: { finalOutputHandoff: { version: 2, token: 'tok' } }, agentAttention: { kind: 'blocked' as const, reason: FINAL_HANDOFF_DELIVERY_REASON } };
+    const publishAttentionPatch = vi.fn();
+    const coordinator = new OutputDeliveryCoordinator(db);
+    const scope: any = {
+      ds, worker, t: 'probe', journal: db, coordinator, config: { session: { dataDir: dir } },
+      ownsLifecycleMutation: () => true, processFinalOutput: vi.fn(async () => ({ status: 'suppressed' as const })),
+      FinalOutputHandoffStore: { exists: () => false }, finalOutputHandoffHost: () => { throw new Error('should not construct V1 store'); },
+      readBridgeTurnJournal: () => [], publishAttentionPatch, join,
+      FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON,
+      logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    };
+    return { scope, ds, publishAttentionPatch, run: () => loadRunOutput(scope)(record) };
+  };
+  it('clears the durable-output attention after a replacement delivery settles', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output), { kind: 'suppressed', reason: 'probe' });
+    const ctx = scopeFor(db, record, dir);
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.ds.agentAttention).toBeUndefined();
+    expect(ctx.publishAttentionPatch).toHaveBeenCalledOnce();
+  });
+  it('keeps the attention while another durable output for the session is still unsettled', async () => {
+    const dir = directory(); const db = database();
+    const first = db.accept(outputSnapshot(app, output), { kind: 'suppressed', reason: 'probe' });
+    db.accept(outputSnapshot(app, { ...output, turnId: 'om_other', lastUuid: 'other' }), { kind: 'suppressed', reason: 'probe' });
+    const ctx = scopeFor(db, first, dir);
+    await ctx.run();
+    expect(ctx.ds.agentAttention).toBeDefined();
+    expect(ctx.publishAttentionPatch).not.toHaveBeenCalled();
+  });
+});
 
 describe('universal output recovery', () => {
   it('persists the full envelope before IPC and replays it after replacement', () => {
