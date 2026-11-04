@@ -22,6 +22,8 @@ import {
   resolveDashboardWorkflowInitiator,
   type WorkflowInitiatorResolution,
 } from './workflow-initiator.js';
+import { createProductionDraftClarifier, registerWorkflowDraftIpcRoutes, workflowDraftService } from './workflow-draft-daemon.js';
+import type { DraftClarifier } from '../workflows/v3/draft-service.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -239,7 +241,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -336,6 +338,7 @@ import {
   listHeadlessSessions,
   readHeadlessSession,
   updateHeadlessSession,
+  deleteHeadlessSession,
   type HeadlessSessionRecord,
 } from '../services/headless-session-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
@@ -6542,6 +6545,33 @@ ipcRoute('POST', WORKFLOW_INITIATOR_PATH, requireBoundBot(async (req, res) => {
   if (!result.ok) return jsonRes(res, result.status, initiatorFailureBody(result));
   return jsonRes(res, 200, { ok: true, initiator: result.initiator });
 }, NOT_BOUND_BODY.okFalse));
+
+// Dashboard workflow drafts (design 2026-11-03 workflow-dashboard-orchestration
+// D2): routes and service live in core/workflow-draft-daemon; every write
+// resolves the initiator through dashboardWorkflowInitiator above.
+registerWorkflowDraftIpcRoutes(ipcRoute, {
+  appId: () => cachedLarkAppId,
+  featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+  trustedHost: isTrustedHostIpcRequest,
+  resolveInitiator: dashboardWorkflowInitiator,
+  service: workflowDraftService,
+  readJsonBody: (req) => readJsonBody(req, 1024 * 1024),
+  jsonRes,
+});
+
+/** The drafts' clarify sessions over this daemon's headless sessions. */
+export function productionWorkflowDraftClarifier(): DraftClarifier {
+  return createProductionDraftClarifier({
+    activeSessions: getActiveSessionsRegistry,
+    createHeadlessSession: (active, args) => withBotTurnAdmission(args.larkAppId, () => createHeadlessSession(active, undefined, args)),
+    triggerSessionTurn,
+    lookupTriggerResult: buildAsyncTriggerLookupResponse,
+    sessionStatus: (sessionId) => (findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId))?.status,
+    suspendWorker,
+    closeSession: (sessionId) => closeSessionForBackgroundCleanup(sessionId, 'workflow draft clarify session'),
+    deleteHeadlessRecord: (headlessId) => { deleteHeadlessSession(headlessId); },
+  });
+}
 
 ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   let body: unknown;
