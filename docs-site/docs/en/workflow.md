@@ -14,7 +14,7 @@ State your goal in the Feishu topic, or send `/workflow <goal>` explicitly (equi
 2. **Gate-1: confirm the requirement**: the bot gives you a summary (which steps, what each produces, acceptance criteria, explicit non-goals) and you confirm.
 3. **Auto-orchestrate the DAG**: the system compiles the requirement into an executable dependency graph.
 4. **Gate-2: confirm the flow**: the bot explains the nodes, the dependency order, and which nodes pause for approval at execution time; confirm and it starts.
-5. **Concurrent execution**: nodes run concurrently in dependency order (up to 4 at a time by default), popping cards in the topic as needed (see below).
+5. **Concurrent execution**: nodes run concurrently in dependency order (see "Concurrency caps" below for the defaults), popping cards in the topic as needed (see below).
 
 ### What you'll encounter once it's running (human-in-the-loop)
 
@@ -148,6 +148,38 @@ Members are identified through the existing Feishu H5 passwordless login, with n
 
 **Without H5 login only admins can view it**: the sidebar is a separate browser context that cannot carry your Dashboard login, so the button then opens the run's Dashboard page in the browser instead (like the progress card's former "Web 详情"), where your existing Dashboard login applies.
 
+### Concurrency caps
+
+How many nodes of one run execute at once is bounded by three caps, all applied together (the tightest one wins):
+
+| Cap | Meaning | Default |
+|---|---|---|
+| `global` | nodes in flight for the whole run | 4 |
+| `perBot` | nodes in flight on the same bot (Lark app) | 1 |
+| `perCli` | nodes in flight on the same CLI type (claude-code / codex…) | 2 |
+
+The defaults are conservative: every node spawns a full CLI process, and one CLI type usually shares one subscription account that rate-limits. With the defaults, nodes on the same bot run one after another. The caps are per run: two runs going at once can each use their full caps. If your CLI is backed by a pay-as-you-go API and the host has memory to spare, raise them in `~/.botmux/config.json`:
+
+```json
+{
+  "workflow": {
+    "enabled": true,
+    "concurrency": {
+      "global": 16,
+      "perBot": 4,
+      "perCli": 2,
+      "perCliById": { "claude-code": 8 }
+    }
+  }
+}
+```
+
+- ⚠️ All nodes on one bot run in that bot's working directory (`workingDir`). With `perBot` above 1, several nodes read and write the same directory at once. If nodes edit code or files, make sure they touch different files, or give them different bots.
+- Every field is optional; a missing field keeps its default. Values are integers from 1 to 64. Invalid values are ignored on read and dropped the next time the workflow settings are saved from the Dashboard.
+- `perCliById` sets a cap per CLI type; CLIs not listed use `perCli`.
+- The config is re-read every time a run is driven, so a change applies to the next start or resume without restarting the daemon.
+- When nodes are handed to bots in the chat (`nodeExecutor: "bot"`), only `global` and `perBot` apply; `perCli` does not.
+
 ### Limits
 
 - An ad-hoc workflow's nodes can currently only use bots on the **claude-code / codex / seed** CLIs; orchestrating to a bot on another CLI errors out at startup.
@@ -191,6 +223,6 @@ The v2 template runtime is retired: `/template run`, `botmux workflow ls / tail 
 
 ## Dev / self-test: `botmux v3 run`
 
-`botmux v3 run <dag.json> [--max-parallel <n>]` runs a **hand-written** v3 dag.json on a real local ephemeral worker pool, with humanGate over terminal y/N and **no Feishu cards**. It's only for developing / debugging v3 orchestration; for a real ad-hoc workflow run, go through Feishu `/workflow` + `start`.
+`botmux v3 run <dag.json> [--max-parallel <n>] [--max-per-bot <n>] [--max-per-cli <n>]` runs a **hand-written** v3 dag.json on a real local ephemeral worker pool, with humanGate over terminal y/N and **no Feishu cards**. It's only for developing / debugging v3 orchestration; for a real ad-hoc workflow run, go through Feishu `/workflow` + `start`. The three flags override the concurrency config for this run only; `--max-per-cli` applies to every CLI and overrides `perCliById`.
 
 > Workflow is an experimental capability and still evolving. For everyday use, `/workflow <goal>` in Feishu is all you need; the rest of this page is for ops / troubleshooting and orchestration development.
