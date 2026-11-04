@@ -25945,35 +25945,40 @@ async function spawnCli(
         } catch { /* The timestamp boundary remains usable when no rollout is readable yet. */ }
       }
     }
+    const spawnBackend = backend;
+    const spawnCliBin = cliAdapter.resolvedBin;
     spawnWithCodexModelLaunch({
       dataDir: config.session.dataDir, sessionId: cfg.sessionId, launch: nativeModelLaunch,
-      reattached: () => !!backend && 'isReattach' in backend && backend.isReattach === true,
+      reattached: () => 'isReattach' in spawnBackend && spawnBackend.isReattach === true,
       publish: send,
-      spawn: () => backend!.spawn(spawnBin, spawnArgs, {
-        cwd: spawnCwd,
-        cols: PTY_COLS,
-        rows: PTY_ROWS,
-        env: childEnv as Record<string, string>,
-        injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
-        gitConfigPairs,
-        // Already removed from childEnv; shell-wrapped backends also `env -u`
-        // them after the pane's rcfile / terminal-server env (session env overlay).
-        unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
-        launchShell: lastInitConfig?.launchShell,
-        // tmux reads the pane's launch argv from a private file here instead of
-        // its ~16 KB command line (pane-launch.ts).
-        paneLaunchDir: paneLaunchDir(config.session.dataDir, cfg.sessionId),
-        strictEnv: cfg.envPolicy?.mode === 'strict',
-        strictEnvReattach: willReattachPersistent,
-        remoteResumeMode: cfg.remoteResumeMode,
-        // spawnBin may now be a launch wrapper (session scope / wrapperCli /
-        // credential sandbox); the Herdr facade still needs the real CLI name.
-        cliBin: cliAdapter!.resolvedBin,
-        cliId: cfg.cliId,
-        model: cfg.model,
-        modelBackendVariant: cfg.modelBackendVariant,
-        reasoningEffort: cfg.reasoningEffort,
-      }),
+      spawn: () => {
+        const backend = spawnBackend;
+        backend.spawn(spawnBin, spawnArgs, {
+          cwd: spawnCwd,
+          cols: PTY_COLS,
+          rows: PTY_ROWS,
+          env: childEnv as Record<string, string>,
+          injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+          gitConfigPairs,
+          // Already removed from childEnv; shell-wrapped backends also `env -u`
+          // them after the pane's rcfile / terminal-server env (session env overlay).
+          unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
+          launchShell: lastInitConfig?.launchShell,
+          // tmux reads the pane's launch argv from a private file here instead of
+          // its ~16 KB command line (pane-launch.ts).
+          paneLaunchDir: paneLaunchDir(config.session.dataDir, cfg.sessionId),
+          strictEnv: cfg.envPolicy?.mode === 'strict',
+          strictEnvReattach: willReattachPersistent,
+          remoteResumeMode: cfg.remoteResumeMode,
+          // spawnBin may now be a launch wrapper (session scope / wrapperCli /
+          // credential sandbox); the Herdr facade still needs the real CLI name.
+          cliBin: spawnCliBin,
+          cliId: cfg.cliId,
+          model: cfg.model,
+          modelBackendVariant: cfg.modelBackendVariant,
+          reasoningEffort: cfg.reasoningEffort,
+        });
+      },
     });
     if (!willReattachPersistent) {
       writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
