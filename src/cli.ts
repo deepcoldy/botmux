@@ -19611,6 +19611,11 @@ switch (command) {
     break;
   }
   case 'clone': await cmdClone(process.argv.slice(3)); break;
+  case 'secretary': {
+    const { runSecretaryCommand } = await import('./cli/secretary-command.js');
+    process.exitCode = await runSecretaryCommand(process.argv.slice(3));
+    break;
+  }
   case 'start':   await runFleetMutationCommand('start', cmdStart); break;
   case '__watchdog': await cmdWatchdog(); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;

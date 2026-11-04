@@ -1808,6 +1808,9 @@ type FollowUpOpts = {
   solo?: boolean;
   /** solo 裸文本时剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** 不注入 <botmux_reminder>（「至少回应一次」）：群秘书这类默认静默的回合用，
+   *  否则提醒与「无事不发」直接矛盾。 */
+  omitReminder?: boolean;
 };
 
 function buildFollowUpBlocks(
@@ -1851,7 +1854,7 @@ function buildFollowUpBlocks(
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
   // → buildFollowUpCliInput 回退 inline 且不写 sidecar）。
-  if (opts?.cliId !== 'mira' && !transcript) {
+  if (opts?.cliId !== 'mira' && !transcript && !opts?.omitReminder) {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
     // anti-resend variant only when the experimental dashboard toggle is on
@@ -5212,6 +5215,7 @@ export async function deliverOwnerBatchTurn(
           sender,
           turnId,
           trustedCaller,
+          ...(input.silent ? { omitReminder: true } : {}),
         });
         rememberLastCliInput(existing, input.prompt, payload);
         if (input.silent) armSilentScheduledTurn(existing, turnId);

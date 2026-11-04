@@ -573,6 +573,7 @@ import {
 import { createGroupSecretaryRuntime, setGroupSecretaryRuntime } from './services/group-secretary-runtime.js';
 import { fetchObserveSnapshot } from './services/session-observe-command-fetch.js';
 import { fetchSessionRecentTranscript } from './services/group-secretary-transcript.js';
+import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
@@ -33664,7 +33665,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     fetchSnapshot: () => fetchObserveSnapshot(),
     fetchTranscript: (appId, sessionId) => fetchSessionRecentTranscript(appId, sessionId),
     fetchRecentMessages: chatId => listChatMessages(cfg.larkAppId, chatId, 50),
-    deliver: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+    groupContextEnabled: (chatId: string) => getGroupContextSettings(cfg.larkAppId, chatId).enabled,
+    manualWatches: () => listSecretaryWatches(cfg.larkAppId),
+    deliver: async input => {
+      // 秘书回合没有触发消息，Context Sharing 默认拿不到锚点（只会注入空壳）。这里替本轮按
+      // 「整群」范围准备一份增量：与 @ 秘书的普通回合共用同一条已投递记录，互不重复。
+      if (getGroupContextSettings(cfg.larkAppId, input.chatId).enabled) {
+        const ds = activeSessions.get(sessionKey(input.chatId, cfg.larkAppId));
+        const cliId = ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? getBot(cfg.larkAppId).config.cliId;
+        try {
+          await prepareGroupContextForTurn({
+            appId: cfg.larkAppId, chatId: input.chatId, turnId: input.turnId,
+            query: '群秘书：通览全群最新动态', createTime: Date.now(), scope: 'all',
+            ...(ds ? {
+              sessionId: ds.session.sessionId,
+              epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, input.turnId),
+            } : {}),
+          });
+        } catch {
+          logger.warn('[group-secretary] group context preparation failed; delivering without it');
+        }
+      }
+      return withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
       larkAppId: cfg.larkAppId,
       chatId: input.chatId,
       turnId: input.turnId,
@@ -33676,7 +33698,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       silent: true,
     }, activeSessions, refreshCliVersion, {
       prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
-    })),
+    }));
+    },
     log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
   }));
   // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。

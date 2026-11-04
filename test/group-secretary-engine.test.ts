@@ -51,6 +51,11 @@ function msg(id: string, patch: Partial<SecretaryMessage> = {}): SecretaryMessag
   };
 }
 
+/** 只看某类事件（消息感知会额外产生 new_messages）。 */
+function only(kind: string, digests: ReturnType<GroupSecretaryEngine['takeDigests']>) {
+  return digests.flatMap(d => d.events.filter(ev => ev.kind === kind));
+}
+
 /** 前进时间并取一次摘要。 */
 function advance(e: GroupSecretaryEngine, ms: number) {
   clock += ms;
@@ -164,22 +169,22 @@ describe('GroupSecretaryEngine — session transitions', () => {
 
 describe('GroupSecretaryEngine — unaddressed messages', () => {
   it('a top-level human message with no @ becomes a task candidate after the grace period', () => {
-    const e = engine();
+    const e = engine({ minFlushIntervalMs: 0 });
     e.observeMessage(msg('om_1'));
-    expect(advance(e, 19_000)).toEqual([]);
+    expect(only('unaddressed_task', advance(e, 19_000))).toEqual([]);
     const digests = advance(e, 6_000);
-    expect(digests).toHaveLength(1);
-    expect(digests[0].events[0].kind).toBe('unaddressed_task');
-    expect(digests[0].events[0].message?.messageId).toBe('om_1');
+    const ev = only('unaddressed_task', digests);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].message?.messageId).toBe('om_1');
     expect(digests[0].context.map(m => m.messageId)).toContain('om_1');
-  });
+  });;
 
   it('a bot reply under the message during the grace period cancels the candidate', () => {
     const e = engine();
     e.observeMessage(msg('om_1'));
     clock += 3_000;
     e.observeMessage(msg('om_2', { senderType: 'bot', senderOpenId: 'ou_bot_b', rootId: 'om_1', text: '收到' }));
-    expect(advance(e, 60_000)).toEqual([]);
+    expect(only('unaddressed_task', advance(e, 60_000))).toEqual([]);
   });
 
   it('skips messages that @ anyone, @ the secretary, live in a thread, come from a bot, or are trivial', () => {
@@ -190,7 +195,7 @@ describe('GroupSecretaryEngine — unaddressed messages', () => {
     e.observeMessage(msg('om_d', { senderType: 'bot' }));
     e.observeMessage(msg('om_e', { fromSelf: true, senderType: 'bot' }));
     e.observeMessage(msg('om_f', { text: '嗯' }));
-    expect(advance(e, 60_000)).toEqual([]);
+    expect(only('unaddressed_task', advance(e, 60_000))).toEqual([]);
   });
 
   it('drops pending state once the chat is disabled', () => {
@@ -242,15 +247,15 @@ describe('GroupSecretaryEngine — hardening', () => {
   it('messages from senders without talk permission are context only', () => {
     const e = engine({ isTrustedHuman: (_c, id) => id === 'ou_human' });
     e.observeMessage(msg('om_x', { senderOpenId: 'ou_stranger' }));
-    expect(advance(e, 60_000)).toEqual([]);
+    expect(only('unaddressed_task', advance(e, 60_000))).toEqual([]);
     e.observeMessage(msg('om_y', { createTime: clock }));
-    expect(advance(e, 60_000)[0].events.map(ev => ev.message?.messageId)).toEqual(['om_y']);
+    expect(only('unaddressed_task', advance(e, 60_000)).map(ev => ev.message?.messageId)).toEqual(['om_y']);
   });
 
   it('stale (replayed) messages never become task candidates', () => {
     const e = engine();
     e.observeMessage(msg('om_old', { createTime: clock - 60 * 60_000 }));
-    expect(advance(e, 60_000)).toEqual([]);
+    expect(only('unaddressed_task', advance(e, 60_000))).toEqual([]);
   });
 
   it('requeue gives up after maxDeliveryAttempts and caps the backlog', () => {
@@ -306,7 +311,7 @@ describe('GroupSecretaryEngine — delivery-time revalidation and context', () =
     e.observeSessions([session('s1')]);
     e.observeSessions([session('s1', { turn: 'idle' })]);
     const [digest] = advance(e, 5_000);
-    expect(digest.events[0].ownMessagesSinceHuman).toBe(2);
+    expect(only('turn_ended', [digest])[0].ownMessagesSinceHuman).toBe(2);
     expect(digest.ownRecent?.map(m => m.messageId)).toEqual(['om_n1', 'om_n2']);
   });
 
@@ -320,7 +325,7 @@ describe('GroupSecretaryEngine — delivery-time revalidation and context', () =
     e.observeMessage(msg('om_n3', { fromSelf: true, senderType: 'bot', rootId: root }));
     e.observeSessions([session('s1')]);
     e.observeSessions([session('s1', { turn: 'idle' })]);
-    expect(advance(e, 5_000)[0].events[0].ownMessagesSinceHuman).toBe(1);
+    expect(only('turn_ended', advance(e, 5_000))[0].ownMessagesSinceHuman).toBe(1);
   });
 
   it('lists active local sessions in the chat so relays can target the right thread', () => {
@@ -334,3 +339,90 @@ describe('GroupSecretaryEngine — delivery-time revalidation and context', () =
     expect(prompt).toContain('thread_root="om_e"');
   });
 });
+
+describe('GroupSecretaryEngine — message perception and follow-ups', () => {
+  it('every human / bot message wakes the secretary in a batch; own messages and status noise do not', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    e.observeMessage(msg('om_a', { mentionCount: 1, text: '@A 帮我看下日志' }));
+    e.observeMessage(msg('om_b', { senderType: 'bot', rootId: 'om_a', text: '好的，我先看' }));
+    e.observeMessage(msg('om_self', { fromSelf: true, senderType: 'bot' }));
+    e.observeMessage(msg('om_noise', { senderType: 'bot', text: 'Working' }));
+    const msgs = only('new_messages', advance(e, 5_000));
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].messages?.map(m => m.messageId)).toEqual(['om_a', 'om_b']);
+    expect(advance(e, 60_000).length).toBe(0);
+  });
+
+  it('a steady message stream still flushes after maxBatchWaitMs', () => {
+    const e = engine({ minFlushIntervalMs: 0, debounceMs: 5_000, maxBatchWaitMs: 10_000 });
+    for (let i = 0; i < 4; i++) {
+      e.observeMessage(msg(`om_${i}`, { mentionCount: 1 }));
+      const out = advance(e, 3_000);
+      if (i < 3) expect(out).toEqual([]);
+      else expect(only('new_messages', out)[0].messages).toHaveLength(4);
+    }
+  });
+
+  it('holds batches while the secretary is busy, up to maxBusyHoldMs', () => {
+    let busy = true;
+    const e = engine({ minFlushIntervalMs: 0, isSecretaryBusy: () => busy, maxBusyHoldMs: 60_000 });
+    e.observeMessage(msg('om_1', { mentionCount: 1 }));
+    expect(advance(e, 30_000)).toEqual([]);
+    e.observeMessage(msg('om_2', { mentionCount: 1 }));
+    expect(advance(e, 31_000)[0].events[0].messages?.map(m => m.messageId)).toEqual(['om_1', 'om_2']);
+    busy = false;
+    e.observeMessage(msg('om_3', { mentionCount: 1 }));
+    expect(advance(e, 5_000)).toHaveLength(1);
+  });
+
+  it('follows a working session with check-ins at growing intervals and stops when it goes idle', () => {
+    const e = engine({ minFlushIntervalMs: 0, checkInIntervalsMs: [5 * 60_000, 10 * 60_000] });
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    const tick = (ms: number) => { clock += ms; e.observeSessions([session('s1', { turn: 'working' })]); clock += 5_000; const out = only('check_in', e.takeDigests()); clock -= 5_000; return out; };
+    expect(tick(4 * 60_000)).toEqual([]);
+    const first = tick(60_000);
+    expect(first).toHaveLength(1);
+    expect(first[0].checkNo).toBe(1);
+    expect(first[0].elapsedMs).toBe(5 * 60_000);
+    expect(tick(9 * 60_000)).toEqual([]);
+    expect(tick(60_000)[0]?.checkNo).toBe(2);
+    clock += 60_000;
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    expect(only('turn_ended', advance(e, 5_000))).toHaveLength(1);
+    expect(tick(60 * 60_000)).toEqual([]);
+  });
+
+  it('check-ins are exempt from the hourly event cap', () => {
+    const e = engine({ minFlushIntervalMs: 0, perSessionEventsPerHour: 1, checkInIntervalsMs: [5 * 60_000] });
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    let n = 0;
+    for (let i = 0; i < 6; i++) { clock += 5 * 60_000; e.observeSessions([session('s1', { turn: 'working' })]); n += only('check_in', advance(e, 5_000)).length; clock -= 5_000; }
+    expect(n).toBe(6);
+  });
+
+  it('manual watches produce check-ins at their own interval with the note attached', () => {
+    const watches = [{ chatId: CHAT, threadRoot: 'om_root_s1', everyMs: 10 * 60_000, note: '盯着做完告诉我', createdAt: clock }];
+    const e = engine({ minFlushIntervalMs: 0, manualWatches: () => watches, checkInIntervalsMs: [999 * 60_000] });
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    clock += 9 * 60_000; e.observeSessions([session('s1', { turn: 'working' })]);
+    expect(only('check_in', e.takeDigests())).toEqual([]);
+    clock += 60_000; e.observeSessions([session('s1', { turn: 'working' })]);
+    const ev = only('check_in', advance(e, 5_000));
+    expect(ev).toHaveLength(1);
+    expect(ev[0].manualNote).toBe('盯着做完告诉我');
+    expect(ev[0].session?.sessionId).toBe('s1');
+  });
+
+  it('renders new messages inline only when Context Sharing is not injecting them', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    e.observeMessage(msg('om_x', { mentionCount: 1, text: '大家好' }));
+    const [digest] = advance(e, 5_000);
+    expect(renderGroupSecretaryPrompt(digest, { enabledByOpenId: 'ou_o' })).toContain('大家好');
+    const withShared = renderGroupSecretaryPrompt(digest, { enabledByOpenId: 'ou_o', groupContextInjected: true });
+    expect(withShared).not.toContain('大家好');
+    expect(withShared).toContain('shared_group_context');
+  });
+});
+

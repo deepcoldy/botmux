@@ -20,7 +20,7 @@ export interface GroupContextTurnRequest {
   createTime: number;
   rootId?: string;
   /** Physical conversation boundary, distinct from session reply-mode. */
-  scope?: 'main' | 'thread';
+  scope?: 'main' | 'thread' | 'all';
   threadId?: string;
   sessionId?: string;
   epoch?: string;

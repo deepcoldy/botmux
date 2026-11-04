@@ -5,7 +5,8 @@
  * event-dispatcher 每收到一条群消息调用 observeGroupSecretaryMessage（永不抛出）。
  * 没有任何群开启秘书时，定时器只做一次 Map 查询就返回，不拉会话快照。
  */
-import { GroupSecretaryEngine, type SecretaryDigest, type SecretarySessionView } from './group-secretary-engine.js';
+import { createHash } from 'node:crypto';
+import { GroupSecretaryEngine, type SecretaryDigest, type SecretaryManualWatch, type SecretarySessionView } from './group-secretary-engine.js';
 import { renderGroupSecretaryPrompt } from './group-secretary-prompt.js';
 import { getGroupSecretaryChat, isGroupSecretaryChat, listGroupSecretaryChats } from './group-secretary-store.js';
 import { extractListenerMessageText, listenerSenderType } from './message-listener.js';
@@ -16,6 +17,10 @@ export interface GroupSecretaryRuntimeDeps {
   selfOpenId: () => string | undefined;
   fetchSnapshot: () => Promise<ObserveSnapshot>;
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
+  /** 该群是否开了 Context Sharing：开了就由它注入群消息增量，摘要里不再重复附带新消息。 */
+  groupContextEnabled?: (chatId: string) => boolean;
+  /** 秘书手动要求盯的话题（botmux secretary watch 写入的登记）。 */
+  manualWatches?: () => SecretaryManualWatch[];
   /** 拉某群最近的消息（飞书 REST 形态，新→旧或旧→新均可），用于启动时补上下文。 */
   fetchRecentMessages?: (chatId: string) => Promise<any[]>;
   /** 读某会话最近几条对话（本机 daemon insight）；拿不到返回 undefined。 */
@@ -134,11 +139,17 @@ export function staggeredGraceMs(larkAppId: string): number {
 
 export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): GroupSecretaryRuntime {
   const now = deps.now ?? Date.now;
+  /** 秘书自己的群级会话正在跑的群（忙时新消息继续攒）。 */
+  const ownBusy = new Set<string>();
+  /** check_in 进展判断：每个会话上次回访时的对话指纹。 */
+  const transcriptSig = new Map<string, string>();
   const engine = new GroupSecretaryEngine({
     selfAppId: deps.larkAppId,
     isEnabledChat: chatId => isGroupSecretaryChat(deps.larkAppId, chatId),
     isTrustedHuman: (chatId, openId) => !!openId && deps.canTalk(chatId, openId),
     unaddressedGraceMs: staggeredGraceMs(deps.larkAppId),
+    isSecretaryBusy: chatId => ownBusy.has(chatId),
+    manualWatches: () => deps.manualWatches?.() ?? [],
     now,
   });
   const deliverTimeoutMs = deps.deliverTimeoutMs ?? 90_000;
@@ -182,10 +193,19 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         try {
           const lines = await deps.fetchTranscript!(event.session.larkAppId, event.session.sessionId);
           if (lines?.length) event.transcript = lines;
+          if (event.kind === 'check_in' && lines?.length) {
+            const sig = createHash('sha1').update(JSON.stringify(lines)).digest('hex');
+            const prev = transcriptSig.get(event.session.sessionId);
+            if (prev !== undefined) event.progressed = prev !== sig;
+            transcriptSig.set(event.session.sessionId, sig);
+          }
         } catch { /* 无证据照常投递 */ }
       }));
     }
-    const prompt = renderGroupSecretaryPrompt(digest, { enabledByOpenId: entry.enabledBy });
+    const prompt = renderGroupSecretaryPrompt(digest, {
+      enabledByOpenId: entry.enabledBy,
+      groupContextInjected: deps.groupContextEnabled?.(digest.chatId) ?? false,
+    });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), deliverTimeoutMs);
@@ -222,7 +242,15 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
       if (now() - lastPollAt >= sessionPollMs) {
         lastPollAt = now();
         try {
-          engine.observeSessions(snapshotToSessionViews(await deps.fetchSnapshot()));
+          const views = snapshotToSessionViews(await deps.fetchSnapshot());
+          ownBusy.clear();
+          for (const v of views) {
+            if (v.larkAppId === deps.larkAppId && v.scope === 'chat' && v.chatId
+              && v.liveness === 'alive' && (v.turn === 'working' || v.turn === 'starting' || v.turn === 'analyzing')) {
+              ownBusy.add(v.chatId);
+            }
+          }
+          engine.observeSessions(views);
         } catch (err) {
           deps.log('warn', `[group-secretary] session snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
         }

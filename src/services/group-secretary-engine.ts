@@ -58,7 +58,23 @@ export interface SecretarySessionView {
   lastActivityAt?: number;
 }
 
-export type SecretaryEventKind = 'turn_ended' | 'stuck' | 'attention' | 'stopped' | 'unaddressed_task';
+export type SecretaryEventKind =
+  | 'new_messages'
+  | 'check_in'
+  | 'turn_ended'
+  | 'stuck'
+  | 'attention'
+  | 'stopped'
+  | 'unaddressed_task';
+
+/** 秘书主动要求盯的话题（botmux secretary watch 写入），到点生成 check_in。 */
+export interface SecretaryManualWatch {
+  chatId: string;
+  threadRoot: string;
+  everyMs: number;
+  note?: string;
+  createdAt: number;
+}
 
 export interface SecretaryEvent {
   kind: SecretaryEventKind;
@@ -74,6 +90,14 @@ export interface SecretaryEvent {
   ownMessagesSinceHuman?: number;
   /** 投递前由 runtime 补上的会话最近对话（本机 daemon insight，已脱敏）；拿不到就缺省。 */
   transcript?: Array<{ role: string; text: string }>;
+  /** new_messages：本批新消息（按时间升序）。 */
+  messages?: SecretaryMessage[];
+  /** check_in：已经干了多久、第几次回访、是否秘书手动要求盯的。 */
+  elapsedMs?: number;
+  checkNo?: number;
+  manualNote?: string;
+  /** check_in：自上次回访以来会话对话有没有变化（runtime 比对 transcript 得出）。 */
+  progressed?: boolean;
 }
 
 export interface SecretaryDigest {
@@ -113,6 +137,23 @@ export interface GroupSecretaryEngineOptions {
   maxPendingPerChat?: number;
   /** 会话事件超过这个年龄就视为过期丢弃（如网关故障期间攒下、恢复后才投递的事件）。 */
   staleEventMs?: number;
+  /** 一批新消息最长等多久就必须投递（消息持续不断时也不会一直攒）。 */
+  maxBatchWaitMs?: number;
+  /** 秘书会话是否正在处理上一批；忙时继续攒，最长攒 maxBusyHoldMs。 */
+  isSecretaryBusy?: (chatId: string) => boolean;
+  maxBusyHoldMs?: number;
+  /** 在跑会话的回访间隔（逐次拉长，最后一档循环使用）。 */
+  checkInIntervalsMs?: number[];
+  /** 秘书手动要求盯的话题。 */
+  manualWatches?: () => SecretaryManualWatch[];
+}
+
+/** 卡片状态、定时任务提示这类机器噪音：只进上下文，不叫醒秘书。 */
+export function isSecretaryNoiseMessage(m: SecretaryMessage): boolean {
+  if (m.senderType !== 'bot') return false;
+  const t = m.text.trim();
+  return t === '' || t === 'Working' || t === 'Completed' || t === 'Task failed'
+    || t.startsWith('[卡片: 🖥️') || t.startsWith('🕐 定时任务') || t.startsWith('[卡片: ⚠️');
 }
 
 const WORKING_TURNS = new Set(['working', 'starting', 'analyzing']);
@@ -125,8 +166,19 @@ interface SessionMemo {
   attentionAt?: number;
 }
 
+interface WatchState {
+  chatId: string;
+  startedAt: number;
+  nextCheckAt: number;
+  checks: number;
+}
+
 interface ChatState {
   messages: SecretaryMessage[];
+  /** 自上次投递以来的新消息（触发「感知」）。 */
+  newMessages: SecretaryMessage[];
+  /** 本批第一条待投递内容进来的时间（0 = 没有积压）。 */
+  firstPendingAt: number;
   pending: SecretaryEvent[];
   unaddressed: Array<{ message: SecretaryMessage; dueAt: number }>;
   lastEventAt: number;
@@ -142,6 +194,10 @@ export class GroupSecretaryEngine {
   private readonly sessionEventTimes = new Map<string, number[]>();
   /** 每个会话最近一次快照（投递前复核事件是否仍然成立、列出在跑会话）。 */
   private readonly latest = new Map<string, SecretarySessionView>();
+  /** 跟进清单：在跑会话 → 下次回访时间。 */
+  private readonly watches = new Map<string, WatchState>();
+  /** 手动盯的话题上次回访时间（key = chatId + threadRoot）。 */
+  private readonly manualLastCheck = new Map<string, number>();
 
   constructor(options: GroupSecretaryEngineOptions) {
     this.opts = {
@@ -149,7 +205,7 @@ export class GroupSecretaryEngine {
       selfAppId: options.selfAppId,
       isEnabledChat: options.isEnabledChat,
       debounceMs: options.debounceMs ?? 5_000,
-      minFlushIntervalMs: options.minFlushIntervalMs ?? 20_000,
+      minFlushIntervalMs: options.minFlushIntervalMs ?? 0,
       unaddressedGraceMs: options.unaddressedGraceMs ?? 20_000,
       perSessionEventsPerHour: options.perSessionEventsPerHour ?? 3,
       contextMessagesPerChat: options.contextMessagesPerChat ?? 200,
@@ -158,13 +214,18 @@ export class GroupSecretaryEngine {
       maxDeliveryAttempts: options.maxDeliveryAttempts ?? 3,
       maxPendingPerChat: options.maxPendingPerChat ?? 20,
       staleEventMs: options.staleEventMs ?? 10 * 60_000,
+      maxBatchWaitMs: options.maxBatchWaitMs ?? 10_000,
+      isSecretaryBusy: options.isSecretaryBusy ?? (() => false),
+      maxBusyHoldMs: options.maxBusyHoldMs ?? 3 * 60_000,
+      checkInIntervalsMs: options.checkInIntervalsMs ?? [5 * 60_000, 10 * 60_000, 20 * 60_000],
+      manualWatches: options.manualWatches ?? (() => []),
     };
   }
 
   private chat(chatId: string): ChatState {
     let state = this.chats.get(chatId);
     if (!state) {
-      state = { messages: [], pending: [], unaddressed: [], lastEventAt: 0, lastFlushAt: 0, pendingAttempts: 0 };
+      state = { messages: [], newMessages: [], firstPendingAt: 0, pending: [], unaddressed: [], lastEventAt: 0, lastFlushAt: 0, pendingAttempts: 0 };
       this.chats.set(chatId, state);
     }
     return state;
@@ -175,6 +236,7 @@ export class GroupSecretaryEngine {
     state.pending.push(event);
     this.trimPending(state);
     state.lastEventAt = this.opts.now();
+    if (!state.firstPendingAt) state.firstPendingAt = state.lastEventAt;
   }
 
   private trimPending(state: ChatState): void {
@@ -200,6 +262,13 @@ export class GroupSecretaryEngine {
     }
     if (state.messages.length > this.opts.contextMessagesPerChat) {
       state.messages.splice(0, state.messages.length - this.opts.contextMessagesPerChat);
+    }
+    // 感知：除了秘书自己发的和机器噪音，每条新消息都进本批，攒够了叫醒秘书。
+    if (!message.fromSelf && !isSecretaryNoiseMessage(message)) {
+      state.newMessages.push(message);
+      if (state.newMessages.length > this.opts.contextMessagesPerChat) state.newMessages.shift();
+      state.lastEventAt = this.opts.now();
+      if (!state.firstPendingAt) state.firstPendingAt = state.lastEventAt;
     }
     // 有 bot（含秘书自己）在某条消息下接了话：那条就不算无人认领。
     if (message.senderType === 'bot' || message.fromSelf) {
@@ -232,6 +301,7 @@ export class GroupSecretaryEngine {
       seen.add(row.sessionId);
       this.latest.set(row.sessionId, row);
       const prev = this.sessions.get(row.sessionId);
+      this.trackWatch(row, prev, now);
       this.sessions.set(row.sessionId, {
         liveness: row.liveness,
         turn: row.turn,
@@ -254,11 +324,15 @@ export class GroupSecretaryEngine {
         this.pushEvent(row.chatId, event);
       }
     }
+    this.dueManualWatches(now);
     for (const id of [...this.sessions.keys()]) {
       if (!seen.has(id)) this.sessions.delete(id);
     }
     for (const id of [...this.latest.keys()]) {
       if (!seen.has(id)) this.latest.delete(id);
+    }
+    for (const id of [...this.watches.keys()]) {
+      if (!seen.has(id)) this.watches.delete(id);
     }
     // 限流计数与会话记忆分开过期：会话因探测失败暂时从快照里消失时，计数不能被清零，
     // 否则「催 → 停 → 再催」的循环会绕过每小时上限。
@@ -266,6 +340,49 @@ export class GroupSecretaryEngine {
       const live = times.filter(t => now - t < HOUR_MS);
       if (live.length === 0) this.sessionEventTimes.delete(id);
       else this.sessionEventTimes.set(id, live);
+    }
+  }
+
+  /**
+   * 跟进清单：会话开工（或第一次看到时已在工作）就加入；在跑期间按间隔生成 check_in，
+   * 间隔逐次拉长；停下 / 消失就移出（停下由 turn_ended 做收尾检查）。
+   * check_in 是我们自己排的回访，不受每小时事件上限约束。
+   */
+  private trackWatch(row: SecretarySessionView, prev: SessionMemo | undefined, now: number): void {
+    const working = row.liveness === 'alive' && WORKING_TURNS.has(row.turn);
+    const existing = this.watches.get(row.sessionId);
+    if (!working) {
+      if (existing) this.watches.delete(row.sessionId);
+      return;
+    }
+    const intervals = this.opts.checkInIntervalsMs;
+    if (!existing) {
+      this.watches.set(row.sessionId, { chatId: row.chatId!, startedAt: now, nextCheckAt: now + intervals[0]!, checks: 0 });
+      return;
+    }
+    if (!prev || now < existing.nextCheckAt) return;
+    existing.checks++;
+    existing.nextCheckAt = now + intervals[Math.min(existing.checks, intervals.length - 1)]!;
+    this.pushEvent(row.chatId!, {
+      kind: 'check_in', at: now, session: row, elapsedMs: now - existing.startedAt, checkNo: existing.checks,
+    });
+  }
+
+  private dueManualWatches(now: number): void {
+    for (const w of this.opts.manualWatches()) {
+      if (!this.opts.isEnabledChat(w.chatId)) continue;
+      const key = `${w.chatId}\u0000${w.threadRoot}`;
+      const last = this.manualLastCheck.get(key) ?? w.createdAt;
+      if (now - last < w.everyMs) continue;
+      this.manualLastCheck.set(key, now);
+      const session = [...this.latest.values()]
+        .filter(v => v.chatId === w.chatId && v.rootMessageId === w.threadRoot)
+        .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))[0];
+      this.pushEvent(w.chatId, {
+        kind: 'check_in', at: now, elapsedMs: now - w.createdAt, manualNote: w.note ?? `秘书在盯的话题 ${w.threadRoot}`,
+        ...(session ? { session } : {}),
+        ...(!session ? { detail: `thread_root=${w.threadRoot}（本机没有找到对应会话）` } : {}),
+      });
     }
   }
 
@@ -304,12 +421,24 @@ export class GroupSecretaryEngine {
       // 投递前复核：过期的、会话状态已经变了的事件直接丢弃（网关故障期间攒下的事件恢复后
       // 不会原样重放，避免去催一个早就做完、或者已经重新开工的任务）。
       if (state.pending.length > 0) state.pending = state.pending.filter(e => this.stillValid(e, now));
-      if (state.pending.length === 0) continue;
-      if (now - state.lastEventAt < this.opts.debounceMs) continue;
+      if (state.pending.length === 0 && state.newMessages.length === 0) {
+        state.firstPendingAt = 0;
+        continue;
+      }
+      const waited = now - (state.firstPendingAt || now);
+      // 攒批：安静 debounceMs 后投递；消息一直不断时，最长等 maxBatchWaitMs 也要投。
+      if (now - state.lastEventAt < this.opts.debounceMs && waited < this.opts.maxBatchWaitMs) continue;
       if (now - state.lastFlushAt < this.opts.minFlushIntervalMs) continue;
+      // 秘书还在处理上一批：继续攒（最长 maxBusyHoldMs，之后照投，交给 CLI 排队）。
+      if (this.opts.isSecretaryBusy(chatId) && waited < this.opts.maxBusyHoldMs) continue;
       const events = state.pending;
+      if (state.newMessages.length > 0) {
+        events.unshift({ kind: 'new_messages', at: now, messages: state.newMessages });
+      }
       const attempts = state.pendingAttempts;
       state.pending = [];
+      state.newMessages = [];
+      state.firstPendingAt = 0;
       state.pendingAttempts = 0;
       state.lastFlushAt = now;
       for (const event of events) {
@@ -343,9 +472,13 @@ export class GroupSecretaryEngine {
     if (attempts >= this.opts.maxDeliveryAttempts) return false;
     if (!this.opts.isEnabledChat(digest.chatId)) return false;
     const state = this.chat(digest.chatId);
-    state.pending = [...digest.events, ...state.pending];
+    for (const e of digest.events) {
+      if (e.kind === 'new_messages') state.newMessages = [...(e.messages ?? []), ...state.newMessages];
+      else state.pending.push(e);
+    }
     this.trimPending(state);
     state.pendingAttempts = Math.max(state.pendingAttempts, attempts);
+    if (!state.firstPendingAt) state.firstPendingAt = this.opts.now();
     return true;
   }
 
@@ -356,6 +489,8 @@ export class GroupSecretaryEngine {
     const cur = this.latest.get(event.session.sessionId);
     if (!cur) return true;
     switch (event.kind) {
+      case 'check_in':
+        return !!event.manualNote || (cur.liveness === 'alive' && WORKING_TURNS.has(cur.turn));
       case 'turn_ended':
         return cur.liveness === 'alive' && cur.turn === 'idle';
       case 'stuck':
