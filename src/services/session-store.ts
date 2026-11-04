@@ -14,6 +14,7 @@ import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
+import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
@@ -2841,6 +2842,9 @@ export function closeSession(
     // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
     // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
     removePaneLaunchDir(config.session.dataDir, sessionId);
+    // Codex 启动回执（codex-model-selection.ts）：每会话一份，仅服务恢复时的
+    // 启动基线确认，关会话一并删除（best-effort，内部吞错）。
+    removeCodexModelLaunchReceipt(config.session.dataDir, sessionId);
     // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
     // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
     removeSessionSkillRuntime(sessionId, config.session.dataDir);

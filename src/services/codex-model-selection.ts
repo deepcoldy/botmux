@@ -216,6 +216,14 @@ export function readCodexModelLaunchReceipt(dataDir: string, sessionId: string):
   } catch { return undefined; }
 }
 
+/** Remove a session's launch receipt when the session is closed, so
+ *  codex-model-launches/ cannot grow one small file per session forever. */
+export function removeCodexModelLaunchReceipt(dataDir: string, sessionId: string): void {
+  try {
+    unlinkSync(launchReceiptPath(dataDir, sessionId));
+  } catch { /* already absent */ }
+}
+
 /** The real backend spawn and its publication share this executable seam.
  * Reattachment is tested AFTER spawn: a backend can discover a late live pane. */
 export function spawnWithCodexModelLaunch(options: {

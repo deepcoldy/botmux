@@ -121,6 +121,32 @@ describe('Codex model selection across interrupted and overlapping launches', ()
     expect(model).toBe('A');
   });
 
+  it('refuses inherit while the newest settings record is still a half-written line', () => {
+    const ds = subject();
+    appendFileSync(path, settings('A', 10) + settings('B', 100));
+    now(200);
+    expect(latestModelForRespawn(ds)).toBe('B');
+    const durable = readPersistedSessionRows(dataDir, appId)[ds.session.sessionId];
+
+    // A /model write is straddling the tail (no terminating newline yet). The
+    // current native model is unprovable, so the reset must fail closed rather
+    // than checkpoint a stale frontier and let the pending row resurrect B.
+    const incoming = settings('C', 250);
+    appendFileSync(path, incoming.slice(0, 12));
+    expect(resetSessionCodexModelSelection(ds)).toBe(false);
+    expect(readPersistedSessionRows(dataDir, appId)[ds.session.sessionId]).toEqual(durable);
+    expect(ds.session).toEqual(durable);
+
+    // Once the record terminates, the checkpoint is complete and inherit works.
+    appendFileSync(path, incoming.slice(12));
+    now(300);
+    expect(resetSessionCodexModelSelection(ds)).toBe(true);
+    expect(readPersistedSessionRows(dataDir, appId)[ds.session.sessionId].codexModelSelection.override).toBeUndefined();
+    bot.config.model = 'D';
+    now(400);
+    expect(latestModelForRespawn(ds)).toBe('D');
+  });
+
   it('a failed launch handoff does not label the still-running old model as a new native preference', () => {
     const ds = subject();
     appendFileSync(path, settings('A', 10));

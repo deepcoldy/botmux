@@ -13,7 +13,7 @@ import {
 } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { tmpdir } from 'os';
-import { recordCodexModelLaunch, refreshCodexModelSelection } from '../src/services/codex-model-selection.js';
+import { readCodexModelLaunchReceipt, recordCodexModelLaunch, refreshCodexModelSelection, spawnWithCodexModelLaunch } from '../src/services/codex-model-selection.js';
 import { resolveSessionLaunchModel } from '../src/core/session-model.js';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
@@ -2736,6 +2736,24 @@ describe('closeSession()', () => {
     expect(existsSync(unread.path)).toBe(false);
     expect(existsSync(paneLaunchDir(tempDir, closing.sessionId))).toBe(false);
     expect(existsSync(sibling.path)).toBe(true);
+  });
+
+  it('removes the Codex launch receipt of the closed session only', () => {
+    const closing = createSession('chat1', 'root-receipt-close', 'Close With Receipt');
+    const other = createSession('chat1', 'root-receipt-other', 'Stays Open');
+    const writeReceipt = (sessionId: string): void => spawnWithCodexModelLaunch({
+      dataDir: tempDir, sessionId,
+      launch: { model: 'gpt-test', startedAtMs: 1234 },
+      spawn: () => {}, reattached: () => false, publish: () => {},
+    });
+    writeReceipt(closing.sessionId);
+    writeReceipt(other.sessionId);
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeDefined();
+
+    closeSession(closing.sessionId);
+
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeUndefined();
+    expect(readCodexModelLaunchReceipt(tempDir, other.sessionId)).toBeDefined();
   });
 
   it('snapshots token usage in the same durable close write', () => {

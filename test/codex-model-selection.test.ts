@@ -96,6 +96,29 @@ describe('confirmed native Codex model preferences', () => {
     expect(resolve(session)).toBe('partial-C');
   });
 
+  it('does not replay pre-launch records from a replaced rollout file', () => {
+    // A resumed generation lives in a DIFFERENT rollout path whose rows carry
+    // the thread's OLD timestamps. When the resolver starts pointing at that
+    // new file, the launch-time boundary must not replay them as a preference.
+    const session = subject();
+    recordCodexModelLaunch(session, 'A');
+    writeFileSync(path, settings('A', start + 100));
+    refreshCodexModelSelection(session, path, 'A');
+    expect(session.codexModelSelection?.override).toBeUndefined();
+
+    const nextPath = join(dir, 'rollout-next-generation.jsonl');
+    writeFileSync(nextPath, settings('old-B', start - 1000));
+    refreshCodexModelSelection(session, nextPath, 'A');
+    expect(session.codexModelSelection?.override).toBeUndefined();
+    expect(session.codexModelSelection?.observedModel).toBe('A');
+    expect(resolve(session)).toBe('A');
+
+    // A record written after the launch in the new file IS observed normally.
+    appendFileSync(nextPath, settings('B', start + 200));
+    refreshCodexModelSelection(session, nextPath, 'A');
+    expect(resolve(session)).toBe('B');
+  });
+
   it('does not replay legacy history to freeze a model that still follows defaults', () => {
     const session = subject();
     writeFileSync(path, settings('historical-B', start - 2000) + settings('A', start - 1000));
