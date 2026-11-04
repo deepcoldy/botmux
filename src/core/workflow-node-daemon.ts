@@ -11,7 +11,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { V3_RUN_ENVELOPE_FILE, frozenNodeWorkingDir, readRunEnvelope } from '../workflows/v3/run-envelope.js';
 import type { V3Dag } from '../workflows/v3/dag.js';
@@ -23,6 +23,7 @@ import type { DaemonSession } from './types.js';
 import {
   isWorkflowHandoffRevoked,
   readDispatchRegistryLoose,
+  recordWorkflowHandoffRefusal,
   resolveInboundWorkflowHandoff,
   type InboundWorkflowHandoff,
   type WorkflowHandoffBindingPayload,
@@ -63,10 +64,29 @@ import { createV3BotHandoffExecutor, readV3HandoffTopics, type V3SelfTurnRequest
 import { createV3NodeCardSync } from '../im/lark/v3-node-card-sync.js';
 import { buildV3NodeReportCard } from '../im/lark/v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
-import { checkBotWorkingDir, describeBotWorkingDirRefusal, type BotWorkingDirConfig } from './working-dir-range.js';
+import { checkBotWorkingDir, describeBotWorkingDirRefusal, realWorkingDir, type BotWorkingDirConfig } from './working-dir-range.js';
+import { expandHome } from './working-dir.js';
 
 /** Where a node session for one handoff starts on the executing bot
  *  (design §15.4). */
+export type WorkflowInboundAdmission =
+  | { start: false; reason: string }
+  | { start: true; workingDir?: string };
+
+/**
+ * Where a NEW session for an admitted handoff starts, in the shape of the
+ * daemon's ordinary start-dir resolution: exactly the run's directory when it
+ * pinned one — none of the oncall / inherited / bot-default layers, no oncall
+ * auto-bind — otherwise `undefined`, and the caller resolves as for any
+ * message.
+ */
+export function workflowNodePinnedStart(admission: WorkflowInboundAdmission | undefined):
+  | { pinnedWorkingDir: string; oncallEntry: undefined; inheritedFrom: null; pinnedFromBotDefault: false }
+  | undefined {
+  if (!admission?.start || admission.workingDir === undefined) return undefined;
+  return { pinnedWorkingDir: admission.workingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false };
+}
+
 type WorkflowNodeWorkingDir =
   /** No Gate-2 directory: the bot's own default resolution, as for any
    *  message it receives. */
@@ -137,6 +157,9 @@ export interface WorkflowNodeDaemonDeps {
   /** A bot's directory configuration as this daemon runs it right now
    *  (§15.4: checked when the node session starts, not as approved). */
   botWorkingDirConfig(larkAppId: string): BotWorkingDirConfig | undefined;
+  /** Whether that bot's running daemon applies a run's Gate-2 working dir
+   *  (advertised in its descriptor; an older daemon would ignore it). */
+  daemonAppliesNodeWorkingDir(larkAppId: string): boolean;
   drive(runId: string): void;
   botName(larkAppId: string): string;
   /** §11: a run's「工作流 ›」sidebar entry, keyed by its main bot; undefined
@@ -182,13 +205,18 @@ export interface WorkflowNodeDaemon {
   isRevoked(nonce: string): boolean;
   /** Gate for an inbound handoff on the executing bot (design §15.4): the
    *  run's Gate-2 directory checked against `executingLarkAppId`'s configured
-   *  range now. `start: false` = refused (the main bot is told, so the node
-   *  blocks with `reason`; nothing may be registered or started for it);
-   *  otherwise start / continue the node, a NEW session in `workingDir` when
-   *  the run pinned one. */
-  admitInbound(binding: WorkflowHandoffBindingPayload, handoffMessageId: string, executingLarkAppId: string):
-    | { start: false; reason: string }
-    | { start: true; workingDir?: string };
+   *  range now — and, when the node topic already has a session
+   *  (`existingSessionDir` = the directory it runs in), against that session.
+   *  `start: false` = refused (the main bot is told, so the node blocks with
+   *  `reason`; nothing may be registered or started for it); otherwise start
+   *  / continue the node, a NEW session in `workingDir` when the run pinned
+   *  one. */
+  admitInbound(
+    binding: WorkflowHandoffBindingPayload,
+    handoffMessageId: string,
+    executingLarkAppId: string,
+    existingSessionDir?: string,
+  ): WorkflowInboundAdmission;
   /** Copy the node's upstream products into this turn's attachment dir. */
   stageInbound(binding: WorkflowHandoffBindingPayload, messageId: string): LarkAttachment[];
   /** A session just registered a verified handoff: the node is accepted
@@ -268,20 +296,36 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     };
   }
 
-  /** Tell the main bot this handoff's node session was not started. One
-   *  retry: a missed notice only degrades to the acceptance deadline. */
-  function refuse(binding: { nonce: string; sourceLarkAppId: string }, handoffMessageId: string, reason: string): Promise<void> {
+  /** Tell the main bot this handoff's node session was not started. The
+   *  reason is first recorded on the handoff's registry entry, where the main
+   *  bot's acceptance check reads it; the direct notice that blocks the node
+   *  at once is retried once — after an error answer or an unreachable daemon
+   *  alike. Should both fail, the node still blocks at the acceptance
+   *  deadline (HANDOFF_NOT_ACCEPTED), with this reason in its message. */
+  async function refuse(binding: { nonce: string; sourceLarkAppId: string }, handoffMessageId: string, reason: string): Promise<void> {
+    try {
+      await recordWorkflowHandoffRefusal(deps.dataDir(), deps.bindingSecret(), binding.nonce, reason);
+    } catch (err) {
+      deps.warn(`[workflow] recording the refusal of ${binding.nonce} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     const event: WorkflowHandoffEvent = { kind: 'refused', nonce: binding.nonce, dispatchRoot: handoffMessageId, reason };
-    const attempt = (retry: boolean): Promise<void> => forward(binding.sourceLarkAppId, event).then(async (result) => {
-      if (result.status < 400 || result.status === 409) return;
-      if (!retry) {
-        deps.warn(`[workflow] refused notice for ${binding.nonce} failed: ${String(result.body.error ?? result.status)}`);
-        return;
+    /** undefined = delivered (or refused for good: 409); else why it failed. */
+    const send = async (): Promise<string | undefined> => {
+      try {
+        const result = await forward(binding.sourceLarkAppId, event);
+        return result.status < 400 || result.status === 409 ? undefined : String(result.body.error ?? result.status);
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
       }
-      await new Promise((resolve) => { const timer = setTimeout(resolve, deps.noticeRetryMs ?? 3_000); timer.unref?.(); });
-      await attempt(false);
-    }).catch((err) => deps.warn(`[workflow] refused notice for ${binding.nonce} failed: ${err instanceof Error ? err.message : String(err)}`));
-    return attempt(true);
+    };
+    const first = await send();
+    if (first === undefined) return;
+    await new Promise((resolve) => { const timer = setTimeout(resolve, deps.noticeRetryMs ?? 3_000); timer.unref?.(); });
+    const second = await send();
+    if (second !== undefined) {
+      deps.warn(`[workflow] refused notice for ${binding.nonce} failed twice (${first}; ${second}); `
+        + `the node blocks at the acceptance deadline instead. Reason: ${reason}`);
+    }
   }
 
   /** The target bot's own check, in-process for the main bot itself, else
@@ -380,6 +424,21 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       if (result.status >= 400) throw new Error(`stop failed: ${String(result.body.error ?? result.status)}`);
     },
     workflowEntry: (runId) => deps.workflowEntry?.(deps.selfLarkAppId(), runId),
+    workingDirPreflight: (request) => {
+      const self = deps.selfLarkAppId();
+      // The main bot's own node: decided here, before its cards go out.
+      if (request.targetLarkAppId === self) {
+        const dir = nodeWorkingDir(request.runDir, request.runId, self);
+        return dir.kind === 'refused' ? dir.reason : undefined;
+      }
+      // Another bot decides against its own range when the handoff arrives;
+      // a daemon that does not know about the directory would start the node
+      // in its default one instead, so it is not handed off at all.
+      const read = readRunEnvelope(request.runDir, request.runId);
+      if (read.kind !== 'ok' || frozenNodeWorkingDir(read.envelope) === undefined) return undefined;
+      if (deps.daemonAppliesNodeWorkingDir(request.targetLarkAppId)) return undefined;
+      return `${deps.botName(request.targetLarkAppId)} 的 daemon 版本过旧，不支持指定工作目录；把它升级到与主 Bot 相同的版本后重试，或改派`;
+    },
     startSelfTurn: async (input: V3SelfTurnRequest) => {
       const runDir = input.runDir;
       // §15.4 for the main bot's own nodes too: its current configuration
@@ -566,8 +625,15 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       },
     }),
     isRevoked,
-    admitInbound: (binding, handoffMessageId, executingLarkAppId) => {
-      const dir = nodeWorkingDir(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId);
+    admitInbound: (binding, handoffMessageId, executingLarkAppId, existingSessionDir) => {
+      let dir = nodeWorkingDir(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId);
+      // The node topic already has a session (someone @-ed the bot there, or
+      // moved it with /cd): the handoff would run where that session runs.
+      if (dir.kind === 'pinned' && existingSessionDir !== undefined
+        && realWorkingDir(resolve(expandHome(existingSessionDir))) !== dir.dir) {
+        deps.warn(`[workflow] handoff ${handoffMessageId}: the node topic's session runs in ${existingSessionDir}, not ${dir.dir}`);
+        dir = { kind: 'refused', reason: '节点话题里已有会话，工作目录与指定的不一致；请在这个话题里关闭该会话后重试，或改派' };
+      }
       if (dir.kind === 'refused') {
         void refuse(binding, handoffMessageId, dir.reason);
         return { start: false, reason: dir.reason };

@@ -186,6 +186,8 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     },
     attachmentsDir: (appId, messageId) => join(dataDir, 'attachments', appId, messageId),
     loadRun: () => undefined,
+    botWorkingDirConfig: () => ({}),
+    daemonAppliesNodeWorkingDir: () => true,
     drive: () => {},
     botName: (appId) => `bot(${appId})`,
     warn: () => {},

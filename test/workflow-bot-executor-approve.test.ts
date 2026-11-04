@@ -8,7 +8,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -296,10 +296,30 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
     expect(result.error).toBeUndefined();
     expect(frozenExecutor(result.envelope)).toBe('bot');
     if (result.envelope.kind !== 'ok') throw new Error('no envelope');
-    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(d.project);
-    expect(snapshotDirs(result.runDir)).toEqual([d.project, d.project]);
-    expect(result.output).toContain(d.project);
+    const real = realpathSync(d.project);
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(real);
+    expect(snapshotDirs(result.runDir)).toEqual([real, real]);
+    expect(result.output).toContain(real);
     expect(readGrillState(result.runDir)!.status).toBe('dag_approved');
+  });
+
+  it('a symlink is frozen as the directory it points to, so retargeting the link later moves nothing', async () => {
+    const d = dirs();
+    const link = join(d.root, 'outside-link');
+    symlinkSync(d.project, link);
+    const nodes = NODES.filter((node) => node.id !== 'verify');
+    const result = await approveWithDir(link, d.bots, { nodes });
+    expect(result.error).toBeUndefined();
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    const real = realpathSync(d.project);
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(real);
+    expect(snapshotDirs(result.runDir)).toEqual([real, real]);
+    // The link is pointed somewhere else afterwards: the frozen value is not the link.
+    rmSync(link);
+    symlinkSync(d.lab, link);
+    const reread = readRunEnvelope(result.runDir);
+    if (reread.kind !== 'ok') throw new Error('no envelope');
+    expect(frozenNodeWorkingDir(reread.envelope)).toBe(real);
   });
 
   it('a node whose bot does not allow the directory refuses the approval, names node → bot, probes nothing and publishes nothing', async () => {
@@ -309,7 +329,7 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
     const message = (result.error as Error).message;
     expect(message).toMatch(/verify → bot\(cli_test\)：指定的工作目录不在它配置的目录范围内/);
     expect(message).not.toMatch(/inspect →|write →/);
-    expect(message).toContain(d.project);
+    expect(message).toContain(realpathSync(d.project));
     expect(result.probeFactory).not.toHaveBeenCalled();
     expect(result.envelope.kind).toBe('missing');
     expect(readGrillState(result.runDir)!.status).toBe('dag_ready');

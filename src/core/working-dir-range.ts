@@ -17,6 +17,12 @@
  * both sides (`realpath`, as the sandbox's own path checks do) before the
  * containment test — a link inside the range that points outside it is out of
  * range, and macOS's `/tmp` → `/private/tmp` style links compare equal.
+ *
+ * An accepted directory is returned as its realpath, and that is what gets
+ * frozen and started in: a symlink is followed once, here, and its target is
+ * used from then on. Keeping the link itself would let whoever controls the
+ * link retarget it after the check — and a session restart, cold resume or
+ * `/restart` starts the CLI in the stored path without checking it again.
  */
 
 import { realpathSync, statSync } from 'node:fs';
@@ -29,8 +35,9 @@ import { configuredWorkingDirs, expandHomePath } from '../utils/working-dir.js';
 export type BotWorkingDirConfig = Pick<BotConfig, 'defaultWorkingDir' | 'defaultOncall' | 'workingDir' | 'workingDirs'>;
 
 export type BotWorkingDirVerdict =
-  /** `path` is the absolute (lexical, symlinks kept) form to start in. */
+  /** `path` is the directory's realpath: what to freeze and start in. */
   | { ok: true; path: string }
+  /** `path` is the directory as given (absolute, lexical), for the message. */
   | { ok: false; path: string; reason: 'missing' | 'not_directory' | 'no_range' | 'outside_range' };
 
 /** The configured roots, as written in the config (`~` not expanded). */
@@ -47,7 +54,10 @@ function botWorkingDirRoots(cfg: BotWorkingDirConfig): string[] {
   return roots;
 }
 
-function canonical(path: string): string {
+/** `path` (absolute) with every symlink resolved; a path that cannot be
+ *  resolved (gone, unreadable) stays as it is. The same comparison form the
+ *  range check uses. */
+export function realWorkingDir(path: string): string {
   let real: string;
   try { real = realpathSync(path); } catch { real = path; }
   return normalizeFsPath(real) ?? real;
@@ -63,9 +73,9 @@ export function checkBotWorkingDir(cfg: BotWorkingDirConfig, dir: string): BotWo
   }
   const roots = botWorkingDirRoots(cfg);
   if (roots.length === 0) return { ok: false, path, reason: 'no_range' };
-  const target = canonical(path);
-  const inside = roots.some((root) => coversPath(canonical(resolve(expandHomePath(root))), target));
-  return inside ? { ok: true, path } : { ok: false, path, reason: 'outside_range' };
+  const target = realWorkingDir(path);
+  const inside = roots.some((root) => coversPath(realWorkingDir(resolve(expandHomePath(root))), target));
+  return inside ? { ok: true, path: target } : { ok: false, path, reason: 'outside_range' };
 }
 
 const REASON_TEXT: Record<Exclude<BotWorkingDirVerdict, { ok: true }>['reason'], string> = {

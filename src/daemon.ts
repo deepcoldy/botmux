@@ -754,7 +754,7 @@ import {
 import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
-import { createWorkflowNodeDaemon } from './core/workflow-node-daemon.js';
+import { createWorkflowNodeDaemon, workflowNodePinnedStart } from './core/workflow-node-daemon.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
 import { isRemoteCliId } from './core/remote-cli-ids.js';
@@ -5560,6 +5560,8 @@ interface DaemonDescriptor {
   workflowIpcProtocol: 'v1';
   /** Present only when the target explicitly enables the internal launch policy. */
   dispatchLaunchIpcProtocol?: 'v1';
+  /** Applies a workflow run's Gate-2 working dir to node sessions (§15.4). */
+  workflowNodeWorkingDir: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
   sessionStoreProtocol: 'occupancy-v1';
   /** Running binary version. Copy only; never compared by size. */
@@ -6959,6 +6961,7 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   botWorkingDirConfig: (appId) => {
     try { return getBot(appId).config; } catch { return undefined; }
   },
+  daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
   drive: (runId) => v3GateRunner.driveDetached(runId),
   botName: (appId) => v3BotDisplayNameResolver()(appId),
   workflowEntry: daemonWorkflowSidebarEntry,
@@ -28644,14 +28647,13 @@ async function handleThreadReplyAdmitted(
   // this bot's configured directory range as it stands now. Out of range, the
   // node blocks with the reason — never a silent fall back to the default dir.
   const workflowAdmission = workflowHandoff
-    ? workflowNodeDaemon.admitInbound(workflowHandoff, parsed.messageId, larkAppId)
+    ? workflowNodeDaemon.admitInbound(workflowHandoff, parsed.messageId, larkAppId, ds ? getSessionWorkingDir(ds) : undefined)
     : undefined;
   if (workflowHandoff && workflowAdmission && !workflowAdmission.start) {
     logger.info(`[${larkAppId}] workflow handoff ${parsed.messageId} not started (run ${workflowHandoff.workflow.runId}): ${workflowAdmission.reason}`);
     markIngressAdmitted(ctx);
     return;
   }
-  const workflowWorkingDir = workflowAdmission?.start ? workflowAdmission.workingDir : undefined;
   if (ds && workflowHandoff) {
     ds.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff, parsed.messageId);
     sessionStore.updateSession(ds.session);
@@ -29299,9 +29301,9 @@ async function handleThreadReplyAdmitted(
     // so stale inherited peers are ignored consistently in both spawn paths.
     // A workflow node of a run approved with --working-dir starts exactly in
     // that (just range-checked) directory instead (design §15.4).
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = workflowWorkingDir !== undefined
-      ? { pinnedWorkingDir: workflowWorkingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false }
-      : await resolvePinnedWorkingDir({
+    const workflowStart = workflowNodePinnedStart(workflowAdmission);
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = workflowStart
+      ?? await resolvePinnedWorkingDir({
         scope,
         anchor,
         chatId: autoCreateChatId,
@@ -29431,7 +29433,7 @@ async function handleThreadReplyAdmitted(
         ? `oncall-bound chat ${autoCreateChatId}`
         : inheritedFrom
         ? `inherited from peer session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
-        : workflowWorkingDir !== undefined
+        : workflowStart
         ? `workflow run ${workflowHandoff!.workflow.runId} working dir`
         : `bot defaultWorkingDir`;
       logger.info(`[${tag(newDs)}] ${reason} → workingDir=${pinnedWorkingDir}, skipped repo select`);
@@ -32299,6 +32301,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     bootInstanceId: getDaemonBootId(),
     workflowIpcProtocol: 'v1',
     ...(cfg.dispatchLaunchPolicy?.enabled === true ? { dispatchLaunchIpcProtocol: 'v1' as const } : {}),
+    workflowNodeWorkingDir: 'v1',
     sessionStoreProtocol: SESSION_STORE_PROTOCOL,
     botmuxVersion: botmuxVersion(),
     lastHeartbeat: Date.now(),

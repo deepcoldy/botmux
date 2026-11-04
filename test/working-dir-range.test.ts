@@ -32,9 +32,9 @@ describe('checkBotWorkingDir', () => {
   it('a directory at or below a repo root (workingDirs) or the default working dir is in range', () => {
     const t = tree();
     const cfg = { workingDirs: [t.repos], defaultWorkingDir: t.pinned };
-    expect(checkBotWorkingDir(cfg, t.repos)).toEqual({ ok: true, path: t.repos });
-    expect(checkBotWorkingDir(cfg, join(t.project, 'sub'))).toEqual({ ok: true, path: join(t.project, 'sub') });
-    expect(checkBotWorkingDir(cfg, t.pinned)).toEqual({ ok: true, path: t.pinned });
+    expect(checkBotWorkingDir(cfg, t.repos)).toEqual({ ok: true, path: realpathSync(t.repos) });
+    expect(checkBotWorkingDir(cfg, join(t.project, 'sub'))).toEqual({ ok: true, path: realpathSync(join(t.project, 'sub')) });
+    expect(checkBotWorkingDir(cfg, t.pinned)).toEqual({ ok: true, path: realpathSync(t.pinned) });
   });
 
   it('a sibling, a parent, or a name that only shares a prefix is out of range', () => {
@@ -69,7 +69,7 @@ describe('checkBotWorkingDir', () => {
 
   it('trailing slashes and `..` segments are normalised the same way on both sides', () => {
     const t = tree();
-    expect(checkBotWorkingDir({ workingDirs: [`${t.repos}/`] }, `${t.project}/sub/../`)).toEqual({ ok: true, path: t.project });
+    expect(checkBotWorkingDir({ workingDirs: [`${t.repos}/`] }, `${t.project}/sub/../`)).toEqual({ ok: true, path: realpathSync(t.project) });
   });
 
   it('`~` expands to the home directory on both sides', () => {
@@ -79,8 +79,8 @@ describe('checkBotWorkingDir', () => {
     // that `~` alone is a root covering everything below the home dir.
     const insideHome = !relative(home, t.project).startsWith('..');
     const viaTilde = insideHome ? `~/${relative(home, t.project)}` : undefined;
-    if (viaTilde) expect(checkBotWorkingDir({ workingDirs: [t.repos] }, viaTilde)).toEqual({ ok: true, path: t.project });
-    expect(checkBotWorkingDir({ workingDirs: ['~'] }, home)).toEqual({ ok: true, path: home });
+    if (viaTilde) expect(checkBotWorkingDir({ workingDirs: [t.repos] }, viaTilde)).toEqual({ ok: true, path: realpathSync(t.project) });
+    expect(checkBotWorkingDir({ workingDirs: ['~'] }, home)).toEqual({ ok: true, path: realpathSync(home) });
   });
 
   it('symlinks are resolved before comparing: a link inside the range that leads outside is refused', () => {
@@ -90,14 +90,14 @@ describe('checkBotWorkingDir', () => {
     expect(checkBotWorkingDir({ workingDirs: [t.repos] }, escape)).toMatchObject({ ok: false, reason: 'outside_range', path: escape });
   });
 
-  it('…and a link to a directory inside the range (or a linked root) is accepted, keeping the path as given', () => {
+  it('…and a link to a directory inside the range (or a linked root) is accepted as its target: frozen and started in is the realpath', () => {
     const t = tree();
     const alias = join(t.outside, 'project-link');
     symlinkSync(t.project, alias);
-    expect(checkBotWorkingDir({ workingDirs: [t.repos] }, alias)).toEqual({ ok: true, path: alias });
+    expect(checkBotWorkingDir({ workingDirs: [t.repos] }, alias)).toEqual({ ok: true, path: realpathSync(t.project) });
     const linkedRoot = join(t.root, 'repos-link');
     symlinkSync(t.repos, linkedRoot);
-    expect(checkBotWorkingDir({ workingDirs: [linkedRoot] }, t.project)).toEqual({ ok: true, path: t.project });
+    expect(checkBotWorkingDir({ workingDirs: [linkedRoot] }, t.project)).toEqual({ ok: true, path: realpathSync(t.project) });
     // The real path of the temp root itself (macOS: /var → /private/var).
     expect(checkBotWorkingDir({ workingDirs: [realpathSync(t.repos)] }, t.project)).toMatchObject({ ok: true });
   });

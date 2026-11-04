@@ -22,7 +22,7 @@ import { readFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
-import { checkBotWorkingDir } from '../../core/working-dir-range.js';
+import { checkBotWorkingDir, realWorkingDir } from '../../core/working-dir-range.js';
 import { resolveCurrentTurnProvenance } from '../../core/current-turn-provenance.js';
 import { isHumanInboundTurnId } from '../../core/reply-target.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -640,14 +640,15 @@ export async function planAdHocNodeExecutor(
   });
   if (decision.mode === 'ephemeral') return { kind: 'ephemeral', decision };
   const binding = cur.chatBinding!;
-  // Same typo guard as `/cd` (exists, is a directory, never created); the
-  // resolved absolute path is what gets frozen — the executing bots' daemons
-  // run with other working directories than this command.
+  // Same typo guard as `/cd` (exists, is a directory, never created). What
+  // gets frozen is the realpath: absolute because the executing bots' daemons
+  // run with other working directories than this command, and with symlinks
+  // resolved so a link retargeted later cannot move the node (§15.4).
   let workingDir: string | undefined;
   if (input.workingDirOverride !== undefined) {
     const checked = validateWorkingDir(input.workingDirOverride);
     if (!checked.ok) throw new HostGuardError(`approve-dag --working-dir：${checked.error}`);
-    workingDir = checked.resolvedPath;
+    workingDir = realWorkingDir(checked.resolvedPath);
   }
   if (!cur.dagPath) throw new Error('dag_ready 状态缺 dagPath（内部不一致）');
   const dag = loadDag(cur.dagPath);
