@@ -309,7 +309,9 @@ export class GroupSecretaryEngine {
       });
       if (!prev) continue;
       const events: SecretaryEvent[] = [];
-      const wasWorking = prev.liveness === 'alive' && WORKING_TURNS.has(prev.turn);
+      // 只认真正在干活（working / analyzing）。'starting' 是 CLI 启动 / 重启恢复，
+      // 重启后一批恢复的会话 starting→idle 不是「一轮做完」，不能当 turn_ended。
+      const wasWorking = prev.liveness === 'alive' && (prev.turn === 'working' || prev.turn === 'analyzing');
       if (row.attention && row.attention.at !== prev.attentionAt) {
         events.push({ kind: 'attention', at: now, session: row, detail: `${row.attention.kind}: ${row.attention.reason}` });
       } else if (STUCK_TURNS.has(row.turn) && row.turn !== prev.turn) {
@@ -349,7 +351,7 @@ export class GroupSecretaryEngine {
    * check_in 是我们自己排的回访，不受每小时事件上限约束。
    */
   private trackWatch(row: SecretarySessionView, prev: SessionMemo | undefined, now: number): void {
-    const working = row.liveness === 'alive' && WORKING_TURNS.has(row.turn);
+    const working = row.liveness === 'alive' && (row.turn === 'working' || row.turn === 'analyzing');
     const existing = this.watches.get(row.sessionId);
     if (!working) {
       if (existing) this.watches.delete(row.sessionId);

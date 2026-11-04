@@ -426,3 +426,15 @@ describe('GroupSecretaryEngine — message perception and follow-ups', () => {
   });
 });
 
+describe('GroupSecretaryEngine — restart noise', () => {
+  it('a restored session going starting → idle is not a finished turn', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    e.observeSessions([session('s1', { turn: 'starting' })]);
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    expect(only('turn_ended', advance(e, 5_000))).toEqual([]);
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    expect(only('turn_ended', advance(e, 5_000))).toHaveLength(1);
+  });
+});
+
