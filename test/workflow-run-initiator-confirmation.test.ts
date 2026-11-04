@@ -8,10 +8,12 @@
  *   - Feishu Gate-2 `approve-dag`: writes them only for a bot run; the
  *     confirmer only when a human message opened the approving turn;
  *     switch off ⇒ the authorization has exactly the pre-feature keys;
+ *   - Feishu `/workflow run` (Saved Workflow): the initiator is the sender,
+ *     bot runs only, union_id only when already resolved;
  *   - flow summary: a function of the confirmed facts, not of listing order,
  *     display names or hint wording.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -41,7 +43,14 @@ import {
 } from '../src/workflows/v3/flow-summary.js';
 import type { V3Gate2BotPlan } from '../src/workflows/v3/bot-assignment.js';
 import type { V3Node } from '../src/workflows/v3/dag.js';
-import type { V3HandoffIdentityPolicy } from '../src/workflows/v3/node-executor-mode.js';
+import type { V3HandoffIdentityPolicy, V3InitiatorUnionLookup, V3NodeExecutorPolicy } from '../src/workflows/v3/node-executor-mode.js';
+import {
+  computeSavedWorkflowGateDigest,
+  type SavedWorkflowRevisionDraft,
+  type V3DagTemplate,
+} from '../src/workflows/v3/library-schema.js';
+import { createSavedWorkflow } from '../src/workflows/v3/library-store.js';
+import { instantiatePublishedSavedWorkflow } from '../src/workflows/v3/library-service.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -312,5 +321,84 @@ describe('flow summary', () => {
     expect(summary.sideEffects).toEqual([]);
     expect(buildV3FlowSummary({ dagNodes: [...DAG_NODES, hostNode], plan: plan() }).sideEffects)
       .toEqual([{ nodeId: 'notify', kind: 'feishu-send' }]);
+  });
+});
+
+describe('Saved Workflow /workflow run records the sender as initiator', () => {
+  const SENDER = { openId: 'ou_sender_in_main', larkAppId: MAIN };
+  function revision(): SavedWorkflowRevisionDraft {
+    const dagTemplate: V3DagTemplate = { schemaVersion: 2, nodes: [
+      { id: 'write', type: 'goal', goal: 'write', bot: 'cli_doc', depends: [], inputs: [], humanGate: null },
+    ] };
+    return {
+      inputs: {}, contextRefs: [],
+      specTemplate: { schemaVersion: 1, title: '周报', requirement: 'weekly', nodes: [{ sketchId: 'write', goal: 'write', input_needs: [], expected_outputs: ['r.md'], acceptance: 'ok', risk_gate: false, unknowns: [] }] },
+      specStatus: 'current', dagTemplate,
+      safety: { gateDigest: computeSavedWorkflowGateDigest(dagTemplate), sideEffects: [] },
+    };
+  }
+  let root: string;
+  let workflowId: string;
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), 'wf-saved-initiator-'));
+    dirs.push(root);
+    const created = await createSavedWorkflow(join(root, 'data'), {
+      displayName: '周报', owner: { openId: 'ou_author', larkAppId: MAIN }, scope: { kind: 'chat', chatId: 'oc_a' },
+      revision: revision(), publish: true, workflowId: 'wf_1234567890abcdef1234567890abcdef',
+    });
+    workflowId = created.metadata.workflowId;
+  });
+  function identityPolicy(lookup: V3InitiatorUnionLookup) {
+    const asked: Array<[string, string]> = [];
+    const policy: V3HandoffIdentityPolicy = {
+      lookupUnionId: async (appId, openId) => { asked.push([appId, openId]); return lookup; },
+      botTools: (appId) => (appId === MAIN ? ['lark-cli'] : []),
+    };
+    return { policy, asked };
+  }
+  const executorPolicy = (handoffIdentity?: V3HandoffIdentityPolicy): V3NodeExecutorPolicy => ({
+    switchMode: 'bot', multiTopicEnabled: true,
+    probe: () => ({ isConfigured: () => true, isDaemonOnline: () => true, inChat: async () => 'yes', opensTopicSessions: async () => 'yes', ensureGrant: async () => {} }),
+    nameOf: (appId) => appId,
+    ...(handoffIdentity ? { handoffIdentity } : {}),
+  });
+  const instantiate = (opts: { policy?: V3NodeExecutorPolicy; chatType?: 'group' | 'p2p'; baseDir?: string } = {}) => instantiatePublishedSavedWorkflow({
+    dataDir: join(root, 'data'), ref: workflowId, bots: BOTS, baseDir: opts.baseDir ?? join(root, 'runs'),
+    runId: 'saved-run', now: new Date('2026-11-05T02:00:00.000Z'),
+    context: { actor: SENDER, chatId: 'oc_a', chatType: opts.chatType ?? 'group', rootMessageId: 'om_root', sessionId: 's', humanTurn: true },
+    ...(opts.policy ? { nodeExecutorPolicy: opts.policy } : {}),
+  });
+
+  it('bot run: initiator = the sender, source feishu, and no lookup of its own', async () => {
+    const run = await instantiate({ policy: executorPolicy() });
+    expect(run.envelope).toMatchObject({ nodeExecutor: 'bot', chatBinding: { ownerOpenId: SENDER.openId } });
+    expect((run.envelope.authorization as any).initiator).toEqual({ openId: SENDER.openId, source: 'feishu' });
+    expect(readRunEnvelope(run.runDir).kind).toBe('ok');
+  });
+
+  it('with 交接带发起人身份 on, reuses the union_id that lookup already resolved', async () => {
+    const { policy, asked } = identityPolicy({ status: 'resolved', unionId: 'on_sender' });
+    const run = await instantiate({ policy: executorPolicy(policy) });
+    expect(asked).toEqual([[MAIN, SENDER.openId]]);
+    expect((run.envelope.authorization as any).initiator).toEqual({ openId: SENDER.openId, unionId: 'on_sender', source: 'feishu' });
+  });
+
+  it('a union_id the lookup could not resolve is left out, not looked up again', async () => {
+    const { policy, asked } = identityPolicy({ status: 'unavailable' });
+    const run = await instantiate({ policy: executorPolicy(policy) });
+    expect(asked).toHaveLength(1);
+    expect((run.envelope.authorization as any).initiator).toEqual({ openId: SENDER.openId, source: 'feishu' });
+  });
+
+  it.each([
+    ['the switch is off', {}],
+    ['the switch is on but the run stays ephemeral (private chat)', { policy: executorPolicy(), chatType: 'p2p' as const }],
+  ])('no initiator when %s: run.json has exactly the pre-feature keys', async (_label, opts) => {
+    const run = await instantiate(opts);
+    expect(run.envelope).not.toHaveProperty('nodeExecutor');
+    expect(Object.keys(run.envelope.authorization).sort()).toEqual(
+      ['authorizedAt', 'dagSha256', 'definitionSnapshotSha256', 'kind', 'revisionId', 'specSha256', 'workflowId'],
+    );
+    expect(readFileSync(join(run.runDir, 'run.json'), 'utf-8')).not.toMatch(/initiator/);
   });
 });

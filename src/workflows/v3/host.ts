@@ -50,6 +50,7 @@ import {
 } from './bot-resolve.js';
 import {
   artifactRef,
+  feishuRunInitiator,
   frozenHandoffIdentity,
   frozenNodeWorkingDir,
   loadAuthorizedV3Run,
@@ -1004,20 +1005,6 @@ function isOpenId(value: string | undefined): value is string {
   return typeof value === 'string' && OPEN_ID_RE.test(value);
 }
 
-/** A Feishu-born run's initiator: the grill's authenticated caller, with the
- *  union_id when 交接带发起人身份 already resolved it (no extra lookup). */
-function feishuRunInitiator(
-  binding: RunChatBinding,
-  handoffIdentity: V3HandoffIdentityRecord | undefined,
-): V3RunInitiator | undefined {
-  if (!isOpenId(binding.ownerOpenId)) return undefined;
-  return {
-    openId: binding.ownerOpenId,
-    ...(handoffIdentity && 'unionId' in handoffIdentity ? { unionId: handoffIdentity.unionId } : {}),
-    source: 'feishu',
-  };
-}
-
 export async function cmdWorkflowHost(
   sub: string,
   rest: string[],
@@ -1229,7 +1216,7 @@ export async function cmdWorkflowHost(
             // confirmer — only when a human message opened it; otherwise (or
             // when the turn cannot be proven) the confirmer is unknown and not
             // written, never guessed, and the approval goes on.
-            initiator = feishuRunInitiator(plan.binding, handoffIdentity);
+            initiator = feishuRunInitiator(plan.binding.ownerOpenId, handoffIdentity);
             let humanTurn = false;
             try {
               humanTurn = isHumanInboundTurnId((deps.resolveCurrentTurnId ?? currentTurnIdFromEnv)());

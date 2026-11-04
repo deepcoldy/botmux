@@ -198,6 +198,22 @@ const flowConfirmationSchema = z.object({
 }).strict();
 
 export type V3RunInitiator = z.infer<typeof runInitiatorSchema>;
+
+/** A Feishu-born run's initiator: the authenticated caller frozen on its chat
+ *  binding (Gate-2: the grill's caller; Saved Workflow: the `/workflow run`
+ *  sender), with the union_id only when 交接带发起人身份 already resolved it —
+ *  no extra lookup. Undefined when the binding names no open_id. */
+export function feishuRunInitiator(
+  ownerOpenId: string | undefined,
+  handoffIdentity: V3HandoffIdentityRecord | undefined,
+): V3RunInitiator | undefined {
+  if (!ownerOpenId || !openIdSchema.safeParse(ownerOpenId).success) return undefined;
+  return {
+    openId: ownerOpenId,
+    ...(handoffIdentity && 'unionId' in handoffIdentity ? { unionId: handoffIdentity.unionId } : {}),
+    source: 'feishu',
+  };
+}
 export type V3FlowConfirmation = z.infer<typeof flowConfirmationSchema>;
 
 const adHocEnvelopeSchema = z.object({
