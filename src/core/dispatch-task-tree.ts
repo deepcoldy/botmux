@@ -51,6 +51,8 @@ export interface TaskTree {
 
 const REPORT_STATUSES = new Set<DispatchReportStatus>(['pending', 'in_progress', 'blocked', 'completed', 'failed']);
 const LINE_MAX = 80;
+const TITLE_MAX = 40;
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
 export function isDispatchReportStatus(value: unknown): value is DispatchReportStatus {
   return typeof value === 'string' && REPORT_STATUSES.has(value as DispatchReportStatus);
@@ -61,6 +63,14 @@ export function reportDisplayLine(content: string): string | undefined {
   const line = content.split('\n').map(part => part.trim()).find(part => part.length > 0);
   if (!line) return undefined;
   return line.length > LINE_MAX ? `${line.slice(0, LINE_MAX - 1)}…` : line;
+}
+
+/** A title on one line, cut for display only; the registry keeps the full
+ *  text. Unbounded titles × many nodes could push the card past Lark's size
+ *  limit, and a failed update is not retried. */
+export function taskTreeDisplayTitle(title: string, max = TITLE_MAX): string {
+  const chars = Array.from(GRAPHEMES.segment(title.replace(/\s+/g, ' ').trim()), part => part.segment);
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : chars.join('');
 }
 
 /** Record a child's report on its dispatch entry (inside a registry update).
@@ -237,7 +247,7 @@ function timeLabel(iso: string | undefined, timeZone: string): string | undefine
 function nodeMarkdown(node: TaskTreeNode, brand: Brand, timeZone: string): string {
   const tag = node.kind === 'review' ? '［审查］' : '';
   const remote = node.otherMachine ? '（另一台机器，状态取自派发记录）' : '';
-  const lines = [`**${tag}${escapeMd(node.title)}**　${STATE_LABEL[node.state]}${remote}`];
+  const lines = [`**${tag}${escapeMd(taskTreeDisplayTitle(node.title) || '子任务')}**　${STATE_LABEL[node.state]}${remote}`];
   if (node.lastLine) lines.push(`<font color='grey'>${escapeMd(node.lastLine)}</font>`);
   const when = timeLabel(node.updatedAt, timeZone);
   const link = node.targetChatId && node.threadId ? `[打开话题](${threadAppLink(node.targetChatId, node.threadId, brand)})` : '';
@@ -273,7 +283,7 @@ export function renderDispatchTaskTreeCard(tree: TaskTree, opts: {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },
     header: {
-      title: { tag: 'plain_text', content: tree.title || '编排任务' },
+      title: { tag: 'plain_text', content: taskTreeDisplayTitle(tree.title) || '编排任务' },
       subtitle: { tag: 'plain_text', content: '任务树' },
       template: headerTemplate(tree),
     },
@@ -285,13 +295,13 @@ export function renderDispatchTaskTreeText(tree: TaskTree): string {
   const plain: Record<TaskTreeNodeState, string> = {
     running: '在跑', waiting: '等人', done: '已完成', failed: '失败', dispatched: '已派发', closed: '已关闭',
   };
-  const lines = [`${tree.title || '编排任务'}（${summary(tree)}）`];
+  const lines = [`${taskTreeDisplayTitle(tree.title) || '编排任务'}（${summary(tree)}）`];
   if (tree.requirement) lines.push(`需求：${tree.requirement.id ?? ''} ${tree.requirement.url ?? ''}`.trim());
   tree.nodes.forEach((node, i) => {
     const last = i === tree.nodes.length - 1;
     const kind = node.kind === 'review' ? '[审查] ' : '';
     const remote = node.otherMachine ? '，另一台机器' : '';
-    lines.push(`${last ? '└─' : '├─'} ${kind}${node.title}  [${plain[node.state]}${remote}]  ${node.dispatchRoot}`);
+    lines.push(`${last ? '└─' : '├─'} ${kind}${taskTreeDisplayTitle(node.title) || '子任务'}  [${plain[node.state]}${remote}]  ${node.dispatchRoot}`);
     if (node.lastLine) lines.push(`${last ? '   ' : '│  '}  ${node.lastLine}`);
   });
   return lines.join('\n');
