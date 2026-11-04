@@ -458,7 +458,15 @@ jobs:
       # manifest, and BEFORE the compile that bakes the value in.
       - run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
 
+      # macos-15 runners have 7 GB RAM, so Node's default old-space cap is
+      # smaller than on the 16 GB linux runners, and the whole-repo `tsc` in
+      # `bun run build` (~2.4 GB used locally, `tsc --extendedDiagnostics`)
+      # now sits right at it: a PR adding ~30 MB of types aborted with
+      # "Reached heap limit … JavaScript heap out of memory" (exit 134) while
+      # its base passed. Give it explicit headroom instead of riding the edge.
       - run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
 
       - name: Compile both darwin binaries
         # BOTH arches, because the shipped set is both and the defect lives in

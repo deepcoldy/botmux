@@ -53,6 +53,12 @@ export interface ConnectorDefinition {
     // Trusted task ("what should the bot do with this event"); injected above the
     // untrusted event data when a turn fires. Empty/absent = no extra instruction.
     instruction?: string;
+    /** Connector-owner opt-in: render the (authenticated) event body as a
+     *  trusted task request instead of untrusted event data. For callers whose
+     *  body IS the task (e.g. an agent platform dispatching work). Only allowed
+     *  on a connector with token / hmac-sha256 verification — see
+     *  connectorPayloadTrustBlocker. Absent (older stores) = false. */
+    trustPayload?: boolean;
   };
   /** Feishu topic seed shown when this webhook has to open a new topic.
    *  Missing on older stores means `default` for backwards compatibility. */
@@ -110,6 +116,25 @@ export interface ConnectorDefinition {
   };
   createdAt: string;
   updatedAt: string;
+}
+
+const VERIFIED_TYPES: readonly string[] = ['token', 'hmac-sha256'];
+
+/** Why `promptEnvelope.trustPayload` cannot be on for this connector, or null
+ *  when it may. Trusting the body is only meaningful when every delivery is
+ *  authenticated: without a token / HMAC secret anyone who learns the URL
+ *  could inject instructions. `hasSecret` reports whether verify.secretRef
+ *  resolves to a stored secret (callers pass the webhook-key lookup). */
+export function connectorPayloadTrustBlocker(
+  connector: Pick<ConnectorDefinition, 'verify'>,
+  hasSecret: boolean,
+): 'trust_payload_requires_verification' | null {
+  const verify = connector.verify as Partial<ConnectorDefinition['verify']> | undefined;
+  if (!verify || typeof verify.type !== 'string' || !VERIFIED_TYPES.includes(verify.type)) {
+    return 'trust_payload_requires_verification';
+  }
+  if (!verify.secretRef || !hasSecret) return 'trust_payload_requires_verification';
+  return null;
 }
 
 export interface ConnectorStoreFile {
