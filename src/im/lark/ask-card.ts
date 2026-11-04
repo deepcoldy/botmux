@@ -12,7 +12,7 @@ import type {
   PendingAsk,
 } from '../../core/ask-types.js';
 import { AskDispatchError } from '../../core/ask-types.js';
-import { getAskSnapshot, submitAsk, submitAskForm, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
+import { applyAskForm, getAskSnapshot, submitAsk, submitAskForm, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
@@ -32,6 +32,9 @@ export const ASK_SUBMIT_ACTION = 'ask_submit';
 /** 旧 Card 1.0 的累积勾选动作；输入表单使用独立 Card 2.0 提交。 */
 export const ASK_TOGGLE_ACTION = 'ask_toggle';
 export const ASK_FORM_ACTION = 'ask_form_submit';
+
+import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
+import { buildAskCustomForm } from './ask-custom-form.js';
 
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
@@ -248,6 +251,23 @@ export async function handleAskCardAction(
   }
   // Stale controls from another presentation cannot reset a user's form draft.
   if (pending && hasAskForm(pending.questions)) return staleToast(locale);
+  if (value?.custom_form === 'v1' && (action === ASK_TOGGLE_ACTION || action === ASK_SUBMIT_ACTION)) {
+    const outcome = applyAskForm({ askId, nonce, by, revision: asNumber(value.revision),
+      fields: data.action?.form_value ?? {},
+      canRenderDraft: draft => turnReplyCardRequestBytes(buildAskCard(draft), draft.deliveryTarget?.openId ?? draft.chatId,
+        draft.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE) <= TURN_REPLY_CARD_MAX_BYTES - (draft.replyCardTarget ? 4000 : 0),
+      ...(action === ASK_TOGGLE_ACTION ? { toggle: { questionIndex: asNumber(value.question_index), key: asString(value.key) ?? '', custom: value.custom_choice === 'true' } } : {}),
+      confirmEmpty: value.confirm_empty === 'true',
+    });
+    if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
+    const updated = getAskSnapshot(askId);
+    if (outcome === 'accepted') return settledCardResponse(askId, updated?.result!);
+    if ((outcome === 'toggled' || outcome === 'draft_conflict') && updated) {
+      return refreshedDraftResponse(updated, locale, outcome === 'draft_conflict');
+    }
+    if (outcome === 'invalid_custom') return { toast: { type: 'warning', content: t('card.ask.toast.invalid_custom', undefined, locale) } };
+    return outcomeResponse(outcome);
+  }
 
   // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）。
   // accepted 时直接返回终态卡片，让飞书在回调响应里同步替换——不依赖 onSettle 异步 PATCH
@@ -270,7 +290,15 @@ export async function handleAskCardAction(
     const questionIndex = asNumber(value?.question_index);
     const key = asString(value?.key);
     if (!Number.isInteger(questionIndex) || !key) return staleToast(locale);
-    const outcome = toggleAsk({ askId, nonce, questionIndex, key, by });
+    const outcome = pending && supportsAskCustomInput(pending)
+      ? applyAskForm({ askId, nonce, by, revision: 0, fields: {}, toggle: { questionIndex, key },
+        canRenderDraft: draft => turnReplyCardRequestBytes(buildAskCard(draft), draft.chatId, draft.dispatchUuid)
+          <= TURN_REPLY_CARD_MAX_BYTES - (draft.replyCardTarget ? 4000 : 0) })
+      : toggleAsk({ askId, nonce, questionIndex, key, by });
+    if (outcome === 'draft_conflict') {
+      const current = getAskSnapshot(askId);
+      if (current) return refreshedDraftResponse(current, locale, true);
+    }
     if (outcome !== 'toggled') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
     if (!updated) return staleToast(locale);
@@ -360,6 +388,14 @@ function settledCardResponse(askId: string, result: AskResult): Record<string, u
   if (!updated) return undefined;
   if (updated.replyCardTarget) return inlineAskResponse(updated, result);
   return JSON.parse(buildAskCard(updated, result)) as Record<string, unknown>;
+}
+
+function refreshedDraftResponse(ask: PendingAsk, locale: Locale, conflict = false): Record<string, unknown> {
+  const response = ask.replyCardTarget ? inlineAskResponse(ask)
+    : { card: { type: 'raw', data: JSON.parse(buildAskCard(ask)) } };
+  return { ...response, ...(conflict ? { toast: {
+    type: 'warning', content: t('card.ask.toast.draft_conflict', undefined, locale),
+  } } : {}) };
 }
 
 function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArmed = false): Record<string, unknown> {
@@ -518,6 +554,19 @@ function renderAskCardWithCap(
       text: { tag: 'lark_md', content: status },
     });
   } else {
+    if (supportsAskCustomInput(ask)) return JSON.stringify({
+      schema: '2.0', config: { width_mode: 'fill' },
+      header: { template: 'blue', title: { tag: 'plain_text', content: t('card.ask.title', undefined, locale) } },
+      body: { elements: [
+        { tag: 'markdown', content: metaDiv.fields.map(f => f.text.content).join('\n') },
+        ...(ask.deliveryTarget ? [{ tag: 'markdown', content: t('card.ask.document_origin', {
+          document: ask.deliveryTarget.fileToken, comment: ask.deliveryTarget.commentId,
+        }, locale) }] : []),
+        buildAskCustomForm(ask, locale, confirmEmptyArmed, text => escapeQuestion(capPrompt(text, promptCap, locale))),
+        ...(ask.deliveryTarget || ask.originKind === 'native-user-input-async' ? [{ tag: 'markdown', text_size: 'notation', content:
+          t(ask.deliveryTarget ? 'card.ask.document_reply_hint' : 'card.ask.async_reply_hint', undefined, locale) }] : []),
+      ] },
+    });
     // 未 settle：只用 action/buttons，避免 form+select 被飞书服务端静默丢弃。
     elements.push({ tag: 'hr' });
 
@@ -618,6 +667,17 @@ function renderAskCardWithCap(
     });
   }
 
+  if (supportsAskCustomInput(ask)) return JSON.stringify({
+    schema: '2.0', config: { width_mode: 'fill' },
+    header: { template: result ? templateForResult(result) : 'blue',
+      title: { tag: 'plain_text', content: t('card.ask.title_done', undefined, locale) } },
+    body: { elements: elements.map(element => {
+      if (element.tag === 'hr') return element;
+      const div = element as { text?: { content: string }; fields?: Array<{ text: { content: string } }>; elements?: Array<{ content: string }> };
+      return { tag: 'markdown', content: div.text?.content ?? div.fields?.map(f => f.text.content).join('\n')
+        ?? div.elements?.map(e => e.content).join('\n') ?? '' };
+    }) },
+  });
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
@@ -741,6 +801,10 @@ function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { 
       return { toast: { type: 'info', content: t('card.ask.toast.already_settled', undefined, locale) } };
     case 'stale':
       return staleToast(locale);
+    case 'invalid_custom':
+      return { toast: { type: 'warning', content: t('card.ask.toast.invalid_custom', undefined, locale) } };
+    case 'draft_conflict':
+      return { toast: { type: 'warning', content: t('card.ask.toast.draft_conflict', undefined, locale) } };
     case 'toggled':
       // 累积勾选，不弹 toast
       return undefined;
@@ -775,7 +839,14 @@ function settleStatus(result: AskResult, ask: PendingAsk, locale?: Locale): stri
       const q = ask.questions[i];
       if (!q) return t('card.ask.q_unparseable', { n: i + 1 }, locale);
       const labels = keys.map((key) => q.options.find((o) => o.key === key)?.label ?? key);
-      return t('card.ask.q_summary_line', { n: i + 1, labels: labels.join(', ') }, locale);
+      // Per-question custom text is answerer-controlled free text; the outer
+      // escapeMd keeps <at> mentions intact by design, so neutralise angle
+      // brackets HERE or a crafted answer would render a bot-authored mention.
+      const custom = result.customAnswers?.[i];
+      const display = custom
+        ? custom.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        : labels.join(', ');
+      return t('card.ask.q_summary_line', { n: i + 1, labels: display }, locale);
     });
     const summary = lines.join('\n');
     const commentLine = result.comment ? `\n${t('card.ask.supplement', { comment: escapeMd(result.comment) }, locale)}` : '';

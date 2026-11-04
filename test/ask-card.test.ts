@@ -565,8 +565,8 @@ describe('handleAskCardAction', () => {
       },
     });
 
-    expect(JSON.stringify(patch)).toContain('☑ A');
-    expect(JSON.stringify(patch)).toContain('☐ B');
+    expect(JSON.stringify(patch)).toContain('custom_0');
+    expect(JSON.stringify(patch)).toContain('\"type\":\"primary\"');
   });
 });
 
@@ -865,7 +865,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
     const result = await handleAskCardAction({
       operator: { open_id: 'ou_owner' },
       action: {
-        value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce },
+        value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce, custom_form: 'v1', revision: '1' },
       },
     });
 
@@ -890,7 +890,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
       questions: [
-        { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+        { prompt: 'q', multiSelect: true, allowCustom: false, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
       ],
       timeoutMs: 10_000,
       ...overrides,
@@ -911,7 +911,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
     // 关键（外层整形契约）：arm 响应必须包成 { card: { type:'raw', data }, toast }，
     // 不能把 card 字段摊在顶层——否则 event-dispatcher 只认 toast、raw card 不 patch。
     expect(r.card?.type).toBe('raw');
-    expect(r.card?.data?.elements).toBeDefined();
+    expect(r.card?.data?.body?.elements ?? r.card?.data?.elements).toBeDefined();
     expect('elements' in r).toBe(false); // 顶层不得直接暴露 card 字段
     expect(r.toast?.type).toBe('warning');
     // arm 卡片里有红色「确认空提交」按钮 + confirm_empty 标志 + 警示文案

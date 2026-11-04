@@ -1,3 +1,4 @@
+import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -6508,6 +6509,16 @@ const server = createServer(async (req, res) => {
       try { body = JSON.parse(raw); }
       catch { return jsonRes(res, 502, { ok: false, error: 'invalid_daemon_response' }); }
       return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
+    }
+
+    // Owner authentication above applies; never fall back to a broad interrupt.
+    const sessionStop = await proxySessionStopControl(req.method, url.pathname, {
+      ownerOf: sid => aggregator.ownerOf(sid), proxyToDaemon,
+    });
+    if (sessionStop) {
+      res.writeHead(sessionStop.status, { 'content-type': 'application/json' });
+      res.end(await sessionStop.text());
+      return;
     }
 
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
