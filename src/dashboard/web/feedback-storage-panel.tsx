@@ -8,6 +8,7 @@ type Target = {
     connectTimeoutMs: number; tls: { mode: 'verify-full' | 'disable'; hasCa?: boolean }; hasPassword?: boolean };
 };
 type StorageStatus = { generation: number; active: Target; candidate?: Target; migrations: Array<{ migrationId: string; phase: string; blockers: string[] }> };
+type RecoveryItem = { kind: 'webhook' | 'send'; id: string; fingerprint: string; status: string; live: boolean; acknowledged: boolean; eventId?: string; destinationId?: string; marker?: string };
 const defaults: NonNullable<Target['postgres']> = {
   host: 'localhost', port: 5432, database: 'botmux', user: 'botmux', schema: 'botmux_feedback',
   connectTimeoutMs: 5000, tls: { mode: 'verify-full' },
@@ -24,6 +25,9 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
   const [message, setMessage] = useState('');
   const [forbidden, setForbidden] = useState(false);
   const [requestId, setRequestId] = useState<string>();
+  const [recovery, setRecovery] = useState<RecoveryItem[]>([]);
+  const [reason, setReason] = useState('');
+  const [evidence, setEvidence] = useState('');
   async function reload(initial = false) {
     const response = await fetch('/api/feedback/storage');
     if (response.status === 403) { setForbidden(true); return; }
@@ -58,12 +62,19 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
       setMessage(t('feedback.storage.success'));
       if (path === 'configure') { setPassword(''); setCa(''); setRequestId(undefined); }
       await reload();
+      if (path.startsWith('recovery/')) await loadRecovery();
     } catch (error) { setMessage(error instanceof Error ? error.message : 'feedback_storage_operation_failed'); }
     finally { setBusy(false); }
   }
+  async function loadRecovery() {
+    const response = await fetch('/api/feedback/storage/recovery');
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error ?? 'feedback_storage_operation_failed');
+    setRecovery(body.items ?? []);
+  }
   if (forbidden || !status) return null;
-  const latest = status.migrations.at(-1);
-  const migrating = latest && latest.phase !== 'complete';
+  const latest = status.migrations.find(job => !['complete', 'cancelled'].includes(job.phase)) ?? status.migrations.at(-1);
+  const migrating = latest && !['complete', 'cancelled'].includes(latest.phase);
   return <details className="panel feedback-storage-panel">
     <summary>{t('feedback.storage.title')} · {status.active.backend === 'sqlite' ? 'SQLite' : 'PostgreSQL'}</summary>
     <p>{t('feedback.storage.help')}</p>
@@ -105,6 +116,23 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
       <button disabled={busy || !confirmed || !status.candidate || !!migrating} onClick={() => void action('enable-empty', { expectedGeneration: status.generation, confirmed: true })}>{t('feedback.storage.empty')}</button>
       {latest?.phase === 'blocked' && <button disabled={busy || !confirmed} onClick={() => void action(`migrations/${latest.migrationId}/resume`)}>{t('feedback.storage.resume')}</button>}
     </div>
+    <details style={{ marginTop: 16 }}>
+      <summary>{t('feedback.storage.recovery')}</summary>
+      <p>{t('feedback.storage.recoveryHelp')}</p>
+      <label>{t('feedback.storage.reason')}<input id="feedback-recovery-reason" value={reason} onChange={event => setReason(event.target.value)} /></label>
+      <label>{t('feedback.storage.evidence')}<input id="feedback-recovery-evidence" value={evidence} onChange={event => setEvidence(event.target.value)} /></label>
+      {migrating && <button id="feedback-storage-cancel" disabled={busy || !confirmed || !reason.trim() || !evidence.trim()} onClick={() =>
+        void action(`migrations/${latest.migrationId}/cancel`, { confirmed, reason, evidence })}>{t('feedback.storage.cancel')}</button>}
+      <button onClick={() => void loadRecovery().catch(error => setMessage(error.message))}>{t('feedback.storage.inspectRecovery')}</button>
+      {recovery.map(item => <div key={`${item.kind}:${item.id}`} style={{ marginTop: 12, overflowWrap: 'anywhere' }}>
+        <strong>{item.kind}: {item.id}</strong>
+        <p>{item.status} {item.eventId} {item.destinationId} {item.marker}</p>
+        <button disabled={busy || item.live || item.acknowledged || !confirmed || !reason.trim() || !evidence.trim()}
+          onClick={() => void action('recovery/acknowledge', { kind: item.kind, id: item.id, fingerprint: item.fingerprint, confirmed, reason, evidence })}>
+          {item.acknowledged ? t('feedback.storage.acknowledged') : t('feedback.storage.acknowledge')}
+        </button>
+      </div>)}
+    </details>
     {latest && <p role="status">{latest.migrationId}: {latest.phase} {latest.blockers?.join(', ')}</p>}
     {message && <p role="status">{message}</p>}
   </details>;

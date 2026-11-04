@@ -6,15 +6,15 @@ import { Pool, Client } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { readFeedbackStorageConfig, saveFeedbackStorageCandidate } from '../src/services/feedback-storage-config.js';
-import { startFeedbackMigration, resumeFeedbackMigration, prepareFeedbackMigration } from '../src/services/feedback-migration.js';
+import { startFeedbackMigration, resumeFeedbackMigration, prepareFeedbackMigration, cancelFeedbackMigration } from '../src/services/feedback-migration.js';
 import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
-import { restoreFeedbackSource } from '../src/services/feedback-maintenance.js';
+import { restoreFeedbackSource, assertFeedbackAdmission, writeFeedbackParticipant } from '../src/services/feedback-maintenance.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { once } from 'node:events';
 import { openDatabaseSync } from '../src/services/sqlite-compat.js';
 
 describe('SQLite to PostgreSQL migration', () => {
-  it.each(['normal', 'restored-source', 'crash-import', 'crash-retire'])('preserves source continuity and resumes safely: %s', async scenario => {
+  it.each(['normal', 'restored-source', 'crash-import', 'crash-retire', 'cancel-import', 'cancel-retire', 'cancel-draining'])('preserves source continuity and resumes safely: %s', async scenario => {
     const address = process.env.BOTMUX_TEST_POSTGRES_URL;
     if (!address) throw new Error('BOTMUX_TEST_POSTGRES_URL_required');
     const url = new URL(address);
@@ -72,10 +72,27 @@ describe('SQLite to PostgreSQL migration', () => {
         expect(source.getResponse(later.responseId)).toHaveProperty('responseId', later.responseId);
         return;
       }
-      if (scenario.startsWith('crash-')) {
-        const child = spawnTsScript('test/helpers/feedback-migration-crash-child.ts', [directory, prepared.migrationId, scenario === 'crash-import' ? 'import' : 'retire'], { stdio: ['ignore', 'ignore', 'pipe'] });
+      if (scenario.startsWith('crash-') || scenario.startsWith('cancel-')) {
+        if (scenario === 'cancel-draining') writeFeedbackParticipant(directory, { generation: candidate.generation, ready: false, blockers: ['active-test-turn'] });
+        const boundary = scenario.endsWith('import') ? 'import' : scenario.endsWith('draining') ? 'draining' : 'retire';
+        const child = spawnTsScript('test/helpers/feedback-migration-crash-child.ts', [directory, prepared.migrationId, boundary], { stdio: ['ignore', 'ignore', 'pipe'] });
         const [, signal] = await once(child, 'exit');
         expect(signal).toBe('SIGKILL');
+        if (scenario.startsWith('cancel-')) {
+          const decision = { confirmed: true as const, actor: 'test-admin', reason: 'Recover interrupted migration', evidence: 'test:verified-target' };
+          if (scenario === 'cancel-retire') {
+            await expect(cancelFeedbackMigration(directory, prepared.migrationId, decision)).rejects.toThrow('feedback_source_retired');
+          } else {
+            const cancelled = await cancelFeedbackMigration(directory, prepared.migrationId, decision);
+            expect(cancelled.phase).toBe('cancelled');
+            expect(() => assertFeedbackAdmission(directory)).not.toThrow();
+            expect(source.createResponse({ interactionId: 'after-cancel', content: 'retained' })).toHaveProperty('responseId');
+            expect((await resumeFeedbackMigration(directory, prepared.migrationId)).phase).toBe('cancelled');
+            const rows = (await admin.query(`SELECT COUNT(*) count FROM "${schema}".responses`)).rows[0];
+            expect(Number(rows.count)).toBe(scenario === 'cancel-import' ? 2 : 0);
+            return;
+          }
+        }
       }
       const result = await startFeedbackMigration(directory, { requestId: 'migration-test', expectedGeneration: candidate.generation, maintenanceConfirmed: true });
       expect(result.phase).toBe('complete');

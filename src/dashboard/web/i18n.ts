@@ -5,6 +5,14 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  'feedback.storage.recovery': '人工恢复与裁决',
+  'feedback.storage.recoveryHelp': '取消仅恢复尚未退役的 SQLite，不删除 PG 数据。裁决前核对目标端事件/幂等键和发送记录；裁决不触发重发，也不撤销维护窗口。请勿填写密码或令牌。',
+  'feedback.storage.reason': '操作原因',
+  'feedback.storage.evidence': '外部核对凭据（工单/回执引用）',
+  'feedback.storage.cancel': '取消迁移并恢复原库',
+  'feedback.storage.inspectRecovery': '列出未知投递与发送租约',
+  'feedback.storage.acknowledge': '确认已核对该项结果',
+  'feedback.storage.acknowledged': '已记录裁决',
   'feedback.storage.title': '反馈存储设置',
   'feedback.storage.help': '当前后端与候选配置分开管理。保存配置不会自动迁移或切换历史数据。',
   'feedback.storage.backend': '后端',
@@ -4128,6 +4136,14 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'feedback.storage.recovery': 'Manual recovery and resolution',
+  'feedback.storage.recoveryHelp': 'Cancel restores only a non-retired SQLite source and never deletes PostgreSQL data. Verify destination event/idempotency keys and send receipts before acknowledging. Acknowledgement never resends or ends maintenance. Do not enter passwords or tokens.',
+  'feedback.storage.reason': 'Reason',
+  'feedback.storage.evidence': 'External verification evidence (ticket/receipt reference)',
+  'feedback.storage.cancel': 'Cancel migration and restore source',
+  'feedback.storage.inspectRecovery': 'List unknown deliveries and send leases',
+  'feedback.storage.acknowledge': 'Acknowledge verified outcome',
+  'feedback.storage.acknowledged': 'Resolution recorded',
   'feedback.storage.title': 'Feedback storage',
   'feedback.storage.help': 'Active storage and candidate settings are separate. Saving does not migrate or switch existing data.',
   'feedback.storage.backend': 'Backend',

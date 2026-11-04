@@ -6,6 +6,25 @@ import { FeedbackStoragePanel } from '../src/dashboard/web/feedback-storage-pane
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => vi.unstubAllGlobals());
 describe('feedback storage panel', () => {
+  it('keeps cancellation disabled until explicit confirmation and evidence are supplied', async () => {
+    const writes: Array<{ url: string; body: any }> = [];
+    vi.stubGlobal('fetch', async (url: string, options?: RequestInit) => {
+      if (options?.method === 'POST') writes.push({ url, body: JSON.parse(String(options.body)) });
+      return { ok: true, status: 200, json: async () => ({ generation: 1, active: { backend: 'sqlite' }, migrations: [{ migrationId: 'blocked-job', phase: 'blocked', blockers: [] }] }) };
+    });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(FeedbackStoragePanel)); });
+    expect(renderer.root.findByProps({ id: 'feedback-storage-cancel' }).props.disabled).toBe(true);
+    await act(async () => {
+      renderer.root.findByProps({ id: 'feedback-recovery-reason' }).props.onChange({ target: { value: 'cancel bad target' } });
+      renderer.root.findByProps({ id: 'feedback-recovery-evidence' }).props.onChange({ target: { value: 'ticket:123' } });
+      renderer.root.findByProps({ type: 'checkbox' }).props.onChange({ target: { checked: true } });
+    });
+    expect(renderer.root.findByProps({ id: 'feedback-storage-cancel' }).props.disabled).toBe(false);
+    await act(async () => { renderer.root.findByProps({ id: 'feedback-storage-cancel' }).props.onClick(); });
+    expect(writes[0]).toEqual({ url: '/api/feedback/storage/migrations/blocked-job/cancel', body: { confirmed: true, reason: 'cancel bad target', evidence: 'ticket:123' } });
+    await act(async () => renderer.unmount());
+  });
   it('offers PostgreSQL and saves a candidate without sending a blank password', async () => {
     const writes: any[] = [];
     vi.stubGlobal('fetch', async (_url: string, options?: RequestInit) => {

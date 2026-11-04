@@ -10,11 +10,15 @@ import { feedbackPostgresPool, ensurePostgresFeedbackSchema, FEEDBACK_TABLES } f
 import { beginFeedbackMaintenance, freezeFeedbackSource, retireFeedbackSource, releaseFeedbackMaintenance, inspectFeedbackMaintenance } from './feedback-maintenance.js';
 import { closeFeedbackStorage, getFeedbackStorage } from './feedback-storage.js';
 import { canonicalFeedbackRow, createFeedbackSnapshot, feedbackRows, workingFeedbackSnapshot } from './feedback-snapshot.js';
+import { validateRecoveryDecision, withFeedbackRecoveryLock, type RecoveryDecision } from './feedback-recovery.js';
+import { currentFeedbackMaintenance, restoreFeedbackSource } from './feedback-maintenance.js';
+import { openDatabaseSync } from './sqlite-compat.js';
+import { existsSync } from 'node:fs';
 
 export interface MigrationStatus {
   migrationId: string;
   requestId: string;
-  phase: 'preflight' | 'draining' | 'frozen' | 'snapshot' | 'importing' | 'verifying' | 'retiring' | 'activating' | 'complete' | 'blocked';
+  phase: 'preflight' | 'draining' | 'frozen' | 'snapshot' | 'importing' | 'verifying' | 'retiring' | 'activating' | 'complete' | 'blocked' | 'cancelling' | 'cancelled';
   expectedGeneration: number;
   sourceInstanceId: string;
   target: PostgresTarget;
@@ -22,6 +26,7 @@ export interface MigrationStatus {
   snapshotPath?: string;
   targetGeneration?: number;
   blockers: string[];
+  cancellation?: RecoveryDecision & { at: string };
 }
 const jobPath = (dataDir: string, migrationId: string) => {
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(migrationId)) throw new Error('feedback_migration_id_invalid');
@@ -88,7 +93,7 @@ export async function prepareFeedbackMigration(dataDir: string, request: { reque
     const jobs = await listFeedbackMigrations(dataDir);
     const previous = jobs.find(job => job.requestId === request.requestId);
     if (previous) return previous;
-    if (jobs.some(job => job.phase !== 'complete')) throw new Error('feedback_migration_conflict');
+    if (jobs.some(job => !['complete', 'cancelled'].includes(job.phase))) throw new Error('feedback_migration_conflict');
     const config = await readFeedbackStorageConfig(dataDir);
     if (config.generation !== request.expectedGeneration) throw new Error('feedback_storage_generation_conflict');
     if (config.active.backend !== 'sqlite' || config.candidate?.backend !== 'postgresql') throw new Error('feedback_migration_target_required');
@@ -105,9 +110,10 @@ export async function startFeedbackMigration(dataDir: string, request: { request
   return resumeFeedbackMigration(dataDir, job.migrationId);
 }
 export async function resumeFeedbackMigration(dataDir: string, migrationId: string): Promise<MigrationStatus> {
-  return withFileLock(join(dataDir, 'feedback-migrations', 'runner'), async () => {
+  return withFeedbackRecoveryLock(dataDir, async () => {
     const job = await getFeedbackMigration(dataDir, migrationId);
-    if (job.phase === 'complete') return job;
+    if (job.phase === 'complete' || job.phase === 'cancelled') return job;
+    if (job.phase === 'cancelling') return finishCancellation(dataDir, job);
     const phase = async (value: MigrationStatus['phase']) => { job.phase = value; job.blockers = []; await save(dataDir, job); };
     let pool: Pool | undefined;
     let client: PoolClient | undefined;
@@ -123,7 +129,7 @@ export async function resumeFeedbackMigration(dataDir: string, migrationId: stri
         await phase('draining');
         await beginFeedbackMaintenance(dataDir, migrationId);
         let report = await inspectFeedbackMaintenance(dataDir, migrationId);
-        const deadline = Date.now() + 15000;
+        const deadline = Date.now() + 45000;
         while (report.blockers.length && Date.now() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 250));
           report = await inspectFeedbackMaintenance(dataDir, migrationId);
@@ -191,5 +197,51 @@ export async function resumeFeedbackMigration(dataDir: string, migrationId: stri
       await save(dataDir, job);
       return job;
     } finally { client?.release(); await pool?.end(); }
+  });
+}
+
+async function checkCancellation(dataDir: string, job: MigrationStatus): Promise<void> {
+  const config = await readFeedbackStorageConfig(dataDir);
+  if (config.instanceId !== job.sourceInstanceId) throw new Error('feedback_migration_identity_conflict');
+  if (config.active.backend !== 'sqlite') throw new Error('feedback_migration_already_activated_resume_required');
+  const control = currentFeedbackMaintenance(dataDir);
+  if (control && control.state !== 'complete' && control.migrationId !== job.migrationId) throw new Error('feedback_migration_identity_conflict');
+  const path = join(dataDir, 'botmux-feedback.sqlite');
+  if (!existsSync(path)) {
+    if (control && control.state !== 'draining' && control.state !== 'complete') throw new Error('feedback_source_missing');
+    return;
+  }
+  const database = await openDatabaseSync(path, { readOnly: true });
+  try {
+    if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_guard'").get()) {
+      const guard = database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined;
+      if (guard?.state === 'retired') throw new Error('feedback_source_retired');
+      if (guard && guard.migration_id !== job.migrationId) throw new Error('feedback_migration_identity_conflict');
+    }
+  } finally { database.close(); }
+}
+async function finishCancellation(dataDir: string, job: MigrationStatus): Promise<MigrationStatus> {
+  await checkCancellation(dataDir, job);
+  if (!job.cancellation) throw new Error('feedback_recovery_evidence_required');
+  const control = currentFeedbackMaintenance(dataDir);
+  if (control?.migrationId === job.migrationId) await restoreFeedbackSource(dataDir, job.migrationId);
+  job.phase = 'cancelled';
+  job.blockers = [];
+  await save(dataDir, job);
+  return job;
+}
+export async function cancelFeedbackMigration(dataDir: string, migrationId: string, decision: RecoveryDecision): Promise<MigrationStatus> {
+  validateRecoveryDecision(decision);
+  return withFeedbackRecoveryLock(dataDir, async () => {
+    const job = await getFeedbackMigration(dataDir, migrationId);
+    if (job.phase === 'cancelled') return job;
+    if (job.phase === 'complete') throw new Error('feedback_migration_already_activated_resume_required');
+    await checkCancellation(dataDir, job);
+    if (job.phase !== 'cancelling') {
+      job.cancellation = { confirmed: true, actor: decision.actor, reason: decision.reason, evidence: decision.evidence, at: new Date().toISOString() };
+      job.phase = 'cancelling';
+      await save(dataDir, job);
+    }
+    return finishCancellation(dataDir, job);
   });
 }

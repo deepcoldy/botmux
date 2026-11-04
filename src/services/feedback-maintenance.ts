@@ -8,6 +8,7 @@ import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
 import { FEEDBACK_TABLES } from './feedback-postgres-schema.js';
 import { closeFeedbackStorage, getFeedbackStorage } from './feedback-storage.js';
+import { inspectSendRecovery, recoveryAcknowledged, webhookRecoveryFingerprint } from './feedback-recovery.js';
 
 export interface MaintenanceReport {
   migrationId: string;
@@ -143,15 +144,15 @@ export async function inspectFeedbackMaintenance(dataDir: string, migrationId: s
     }
     blockers.push(...participant.blockers);
   }
-  const leases = join(dataDir, 'feedback-send-leases');
-  for (const name of existsSync(leases) ? readdirSync(leases) : []) {
-    const lease = JSON.parse(readFileSync(join(leases, name), 'utf8'));
-    if (readDurableProcessIdentity(lease.processId) === lease.processStartId) blockers.push(`send_in_progress:${lease.processId}`);
-    else blockers.push(`send_outcome_unknown:${lease.processId}`);
+  for (const lease of inspectSendRecovery(dataDir)) {
+    if (lease.live) blockers.push(`send_in_progress:${lease.processId}`);
+    else if (!lease.acknowledged) blockers.push(`send_outcome_unknown:${lease.processId}`);
   }
   const fleetPath = join(process.env.HOME ?? homedir(), '.botmux', 'fleet-state.json');
   if (existsSync(fleetPath)) {
-    const fleet = JSON.parse(readFileSync(fleetPath, 'utf8'));
+    let fleet;
+    try { fleet = JSON.parse(readFileSync(fleetPath, 'utf8')); }
+    catch { throw new Error('feedback_fleet_state_invalid'); }
     if (!Array.isArray(fleet.procs)) throw new Error('feedback_fleet_state_invalid');
     for (const processState of fleet.procs) {
       if (processState.name === 'botmux-dashboard' || processState.entry === 'dashboard' || processState.external || !processState.pid) continue;
@@ -170,14 +171,17 @@ async function source(dataDir: string): Promise<DatabaseSyncLike> {
   return database;
 }
 export async function freezeFeedbackSource(dataDir: string, migrationId: string): Promise<void> {
+  const config = await readFeedbackStorageConfig(dataDir);
   const report = await inspectFeedbackMaintenance(dataDir, migrationId);
   if (report.blockers.length) throw new Error(`feedback_maintenance_blocked:${report.blockers.join(',')}`);
   const database = await source(dataDir);
   try {
     database.exec('BEGIN IMMEDIATE');
     if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_outbox'").get()) {
-      const inflight = database.prepare("SELECT COUNT(*) count FROM feedback_outbox WHERE status='inflight' OR last_error LIKE 'webhook_outcome_unknown:%'").get() as { count: number };
-      if (inflight.count) throw new Error('feedback_outbox_unsettled');
+      const unsettled = database.prepare("SELECT * FROM feedback_outbox WHERE status='inflight' OR last_error LIKE 'webhook_outcome_unknown:%'").all() as Array<{
+        outbox_id: string; event_id: string; destination_id: string; last_error: string; status: string; attempts: number;
+      }>;
+      if (unsettled.some(row => row.status === 'inflight' || !recoveryAcknowledged(dataDir, webhookRecoveryFingerprint(config.instanceId, config.active, row)))) throw new Error('feedback_outbox_unsettled');
     }
     const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
     if (version < 1 || version > 8) throw new Error('feedback_source_schema_unsupported');
@@ -215,18 +219,28 @@ export async function retireFeedbackSource(dataDir: string, migrationId: string)
 export async function restoreFeedbackSource(dataDir: string, migrationId: string): Promise<void> {
   const control = readControl(dataDir);
   if (!control || control.migrationId !== migrationId) throw new Error('feedback_migration_identity_conflict');
+  if (!existsSync(join(dataDir, 'botmux-feedback.sqlite'))) {
+    if (control.state !== 'draining' && control.state !== 'complete') throw new Error('feedback_source_missing');
+    withFileLockSync(controlPath(dataDir), () => {
+      const current = readControl(dataDir);
+      if (!current || current.migrationId !== migrationId) throw new Error('feedback_migration_identity_conflict');
+      writeControl(dataDir, { ...current, state: 'complete' });
+    });
+    return;
+  }
   const database = await source(dataDir);
   try {
     database.exec('BEGIN IMMEDIATE');
-    const guard = database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined;
-    if (!guard || guard.migration_id !== migrationId) throw new Error('feedback_migration_identity_conflict');
-    if (guard.state === 'retired') throw new Error('feedback_source_retired');
+    const hasGuard = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_guard'").get();
+    const guard = hasGuard ? database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined : undefined;
+    if (guard && guard.migration_id !== migrationId) throw new Error('feedback_migration_identity_conflict');
+    if (guard?.state === 'retired') throw new Error('feedback_source_retired');
     database.exec('CREATE TABLE IF NOT EXISTS feedback_source_restorations(migration_id TEXT PRIMARY KEY)');
     database.prepare('INSERT OR IGNORE INTO feedback_source_restorations VALUES(?)').run(migrationId);
     for (const table of FEEDBACK_TABLES) {
       for (const action of ['insert', 'update', 'delete']) database.exec(`DROP TRIGGER IF EXISTS feedback_guard_${table}_${action}`);
     }
-    database.exec('DELETE FROM feedback_source_guard');
+    if (hasGuard) database.exec('DELETE FROM feedback_source_guard');
     database.exec('COMMIT');
     withFileLockSync(controlPath(dataDir), () => {
       const control = readControl(dataDir);

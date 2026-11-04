@@ -60,6 +60,34 @@ Do not remove migration files or guards to bypass a blocker. PostgreSQL is never
 
 Restoring a pre-activation source invalidates that migration's snapshot identity. Its old job cannot subsequently retire the source or reuse the snapshot after new SQLite writes. Unknown webhook attempt outcomes remain migration blockers even when a retry is no longer in flight.
 
+### Cancel or resolve an interrupted migration
+
+Use the original task ID, not manual deletion of migration files:
+
+```bash
+botmux feedback storage cancel MIGRATION_ID --yes \
+  --reason "Incorrect candidate configuration" --evidence "ticket:reviewed-original-operation"
+```
+
+- Before freezing: cancellation releases maintenance, including an interrupted draining stage without a guard table.
+- After freezing but before retirement: cancellation restores SQLite writes and invalidates the old snapshot identity.
+- After retirement or PostgreSQL activation: cancellation is refused. Resume the original migration or recover PostgreSQL; never switch to the stale SQLite source.
+- A cancelled task remains in history and cannot resume its import. Configure a corrected candidate and start a new request ID. PostgreSQL data and snapshots are retained; if the old task already created its target schema, use a new empty schema or perform a separately reviewed database cleanup. Cancellation never drops target data.
+- An active runner owns a cross-process lock. Concurrent recovery returns `feedback_migration_busy_retry`; wait for the current operation or retry after its process has exited. It does not clear a live lock.
+
+Unknown webhooks and dead `botmux send` leases require an explicit outcome decision:
+
+```bash
+botmux feedback storage recovery list
+botmux feedback storage recovery acknowledge --kind webhook --id OUTBOX_ID \
+  --fingerprint FINGERPRINT --yes --reason "Destination receipt checked" \
+  --evidence "ticket:receipt-and-idempotency-key"
+```
+
+Use `--kind send` with the exact lease filename for a dead send process. Before acknowledging, verify the destination event/idempotency key or original send receipts and record the evidence reference. The service rejects live processes, in-flight webhooks and stale fingerprints. Acknowledgement retains the original marker/lease and records an audit entry; it neither sends anything nor clears unrelated items. New attempts or changed outcomes invalidate the old fingerprint.
+
+The same operations are available under **Feedback storage → Manual recovery and resolution** in Dashboard. Host administrator and CSRF checks apply. Confirmation, reason and external evidence are mandatory; do not place credentials in audit text.
+
 ## Dashboard
 
 Open **Feedback → Feedback storage**. The panel separates active and candidate backends and provides connection testing, migration, empty initialization and recovery. Host administrator authentication is required; writes also require the Dashboard CSRF token.
@@ -75,6 +103,7 @@ Passwords are write-only. Leave blank to preserve an existing credential. Dashbo
 - External reports directly opening `botmux-feedback.sqlite` need adaptation before cutover.
 - Duration depends on active work and data size; no fixed downtime is promised.
 - This feature does not install a production database or deploy itself.
+- Plan PostgreSQL `max_connections` for every daemon plus Dashboard/CLI connection pools. Each pool is capped at five connections, but this is a per-process limit, not a fleet-wide limit.
 
 ## Development verification
 
