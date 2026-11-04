@@ -440,6 +440,7 @@ import {
   authorizeV3DaemonCommand,
   authorizeV3RunEditCommand,
 } from './workflows/v3/cli-daemon-command-authority.js';
+import { v3ReasonRequiredProblem } from './workflows/v3/action-provenance.js';
 import {
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
@@ -7254,7 +7255,11 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
     process.exit(1);
   }
   // Isolated main session → session relay (the daemon derives the caller).
-  const relayed = await tryWorkflowSessionRelayMutation(runId, 'edit', { patch, base: parsed.base });
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'edit', {
+    patch,
+    base: parsed.base,
+    ...(parsed.reason ? { reason: parsed.reason } : {}),
+  });
   if (relayed) {
     response = relayed;
   } else try {
@@ -7263,6 +7268,11 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
       dataDir: resolveDataDir(),
       envSessionId: process.env.BOTMUX_SESSION_ID,
     });
+    const missingReason = v3ReasonRequiredProblem(authority.wakeTurn ? { origin: authority.origin, wakeTurn: true } : undefined, parsed.reason);
+    if (missingReason) {
+      console.error(`❌ ${missingReason}`);
+      process.exit(1);
+    }
     const daemon = findDaemon(authority.larkAppId);
     if (!daemon) {
       console.error('❌ 没有在线 daemon；运行中修改需要拥有该 run 的 daemon 执行。');
@@ -7275,7 +7285,8 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
       body: {
         patch,
         base: parsed.base,
-        caller: { openId: authority.callerOpenId, origin: authority.origin },
+        caller: { openId: authority.callerOpenId, origin: authority.origin, ...(authority.wakeTurn ? { wakeTurn: true } : {}) },
+        ...(parsed.reason ? { reason: parsed.reason } : {}),
       },
     });
   } catch (err) {
@@ -7296,15 +7307,39 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
  *  走 daemon 的 retry IPC（journal 写入留在 daemon 进程内，单写者），daemon append
  *  `nodeRetryRequested` 后以新 attempt 重驱动；已退休的 v2 `resume` 不再参与分发。 */
 async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Promise<void> {
+  const { V3_RUN_RETRY_USAGE } = await import('./cli/v3-run-actions.js');
+  const { parseV3ReasonFlag } = await import('./cli/v3-run-edit.js');
   if (!runId) {
-    console.error('用法: botmux workflow retry <runId> [--node <nodeId>] [--bot <larkAppId>]');
+    console.error(V3_RUN_RETRY_USAGE);
     process.exit(1);
   }
   const nodeId = argValue(rest, '--node');
-  let response = await tryWorkflowSessionRelayMutation(runId, 'retry', nodeId ? { nodeId } : {});
+  const parsedReason = parseV3ReasonFlag(rest);
+  if (!parsedReason.ok) {
+    console.error(`❌ ${parsedReason.error}`);
+    console.error(V3_RUN_RETRY_USAGE);
+    process.exit(1);
+  }
+  const reason = parsedReason.reason;
+  // Isolated session: the daemon derives who decided (and refuses a wake
+  // turn without a reason) from its own live session record.
+  let response = await tryWorkflowSessionRelayMutation(runId, 'retry', {
+    ...(nodeId ? { nodeId } : {}),
+    ...(reason ? { reason } : {}),
+  });
   if (!response) {
-    const larkAppId = authorizeWorkflowDaemonCommand(runId, rest);
-    const daemon = findDaemon(larkAppId);
+    const authority = authorizeV3DaemonCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+      requestedLarkAppId: argValue(rest, '--bot'),
+    });
+    const missingReason = v3ReasonRequiredProblem(authority.caller, reason);
+    if (missingReason) {
+      console.error(`❌ ${missingReason}`);
+      process.exit(1);
+    }
+    const daemon = findDaemon(authority.larkAppId);
     if (!daemon) {
       console.error('❌ 没有在线 daemon；blocked 重试需要 daemon 驱动。');
       process.exit(1);
@@ -7314,7 +7349,14 @@ async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Prom
         daemon,
         runId,
         mutation: 'retry',
-        body: nodeId ? { nodeId } : {},
+        // A human retry without a reason sends exactly the old body (an older
+        // daemon still accepts it); who decided is sent only when it changes
+        // what the daemon records.
+        body: {
+          ...(nodeId ? { nodeId } : {}),
+          ...(reason ? { reason } : {}),
+          ...(authority.caller && (reason || authority.caller.origin === 'runEvent') ? { caller: authority.caller } : {}),
+        },
       });
     } catch (err: any) {
       console.error(`❌ ${err?.message ?? err}`);
@@ -7322,7 +7364,9 @@ async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Prom
     }
   }
   if (!response.ok) {
-    if (response.bodyRaw.includes('loop_node_use_grant')) {
+    if (response.bodyRaw.includes('reason_required')) {
+      console.error(`❌ ${v3ReasonRequiredProblem({ origin: 'runEvent', wakeTurn: true }, undefined)}`);
+    } else if (response.bodyRaw.includes('loop_node_use_grant')) {
       console.error(`❌ 该受阻的是一个 loop（轮数耗尽），不是节点 attempt——用 \`botmux workflow grant ${runId}\` 追加一轮。`);
     } else {
       console.error(`❌ retry 失败 (HTTP ${response.status}): ${response.bodyRaw}`);
@@ -7330,6 +7374,66 @@ async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Prom
     process.exit(1);
   }
   console.log(`🔄 v3 run "${runId}" 重试已受理，节点将以新 attempt 重跑。`);
+}
+
+/** `botmux workflow ask-human <runId> --node <id> --reason "…"` — hand a node
+ *  to a human (design §13.6). Same strict caller check as `retry`: only the
+ *  initiator's own turn or a turn this run's events woke. The owning daemon
+ *  stops the node's running attempt and blocks it as HANDED_TO_HUMAN (or
+ *  records the hand-over on a node already blocked). */
+async function cmdWorkflowAskHuman(runId: string | undefined, rest: string[]): Promise<void> {
+  const {
+    V3_RUN_ASK_HUMAN_USAGE,
+    formatV3AskHumanResponse,
+    parseV3AskHumanCliOptions,
+  } = await import('./cli/v3-run-actions.js');
+  if (!runId) {
+    console.error(V3_RUN_ASK_HUMAN_USAGE);
+    process.exit(1);
+  }
+  const parsed = parseV3AskHumanCliOptions(rest);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    console.error(V3_RUN_ASK_HUMAN_USAGE);
+    process.exit(1);
+  }
+  let response = await tryWorkflowSessionRelayMutation(runId, 'ask-human', { nodeId: parsed.nodeId, reason: parsed.reason });
+  if (!response) {
+    let authority;
+    try {
+      authority = authorizeV3DaemonCommand({
+        runId,
+        dataDir: resolveDataDir(),
+        envSessionId: process.env.BOTMUX_SESSION_ID,
+      });
+    } catch (err) {
+      console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    if (authority.mode !== 'chat' || !authority.caller) {
+      console.error('❌ ask-human 只能在 run 主会话的当前 botmux 回合里使用（发起人本人的回合，或本 run 的事件唤醒的回合）');
+      process.exit(1);
+    }
+    const daemon = findDaemon(authority.larkAppId);
+    if (!daemon) {
+      console.error('❌ 没有在线 daemon；交给人需要拥有该 run 的 daemon 执行。');
+      process.exit(1);
+    }
+    try {
+      response = await postWorkflowDaemonMutation({
+        daemon,
+        runId,
+        mutation: 'ask-human',
+        body: { nodeId: parsed.nodeId, reason: parsed.reason, caller: authority.caller },
+      });
+    } catch (err: any) {
+      console.error(`❌ ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  }
+  const out = formatV3AskHumanResponse(runId, parsed.nodeId, response);
+  (out.exitCode === 0 ? console.log : console.error)(out.text);
+  if (out.exitCode !== 0) process.exit(out.exitCode);
 }
 
 /** `botmux workflow grant <runId> [--loop <id>]` — 耗尽 loop 追加一轮入口（CLI 侧）。
@@ -7834,8 +7938,10 @@ ${SEND_HELP_BODY}
                                        持久化取消 v3 run 并中断活动节点
   workflow retry|grant [...]           处理受阻节点 / loop
   workflow status <runId> [--json]     查看运行中流程的当前版本、节点状态和待确认修改
-  workflow edit <runId> --patch-file <文件|-> --base <版本>
+  workflow edit <runId> --patch-file <文件|-> --base <版本> [--reason <理由>]
                                        运行中按版本修改流程（越界修改转发起人确认）
+  workflow ask-human <runId> --node <id> --reason <理由>
+                                       把节点交给人决定（停下正在跑的尝试，转受阻卡）
   template migrate-v3 [id|path ...] [--all] [--commit ...]
                                        v2 定义迁移：默认 dry-run，写入需显式 owner/app/scope
   template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]
@@ -19161,6 +19267,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'grant',
     'cancel',
     'edit',
+    'ask-human',
   ]);
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
@@ -20462,6 +20569,11 @@ switch (command) {
     if (wfSub === 'edit') {
       // v3 runtime flow edit (design §13.2).
       await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'ask-human') {
+      // v3: the main bot hands a node to a human (design §13.6).
+      await cmdWorkflowAskHuman(process.argv[4], process.argv.slice(5));
       break;
     }
     const { cmdWorkflow } = await import('./cli/workflow.js');

@@ -195,6 +195,7 @@ function architectBotAssignmentLines(assignment: V3ArchitectBotAssignment): stri
       : []),
     `- Otherwise pick the roster bot whose CLI, model and role best fit the node; when unsure, use the main bot (${main}).`,
     '- architect-notes.md MUST contain a `## Bot assignments` section with exactly one line per goal node: `- <nodeId> → <larkAppId>: <one-line reason>` (a loop body node as `<loopId>.<bodyNodeId>`).',
+    '- Optionally mark a goal node `"checkpoint": true` where, once it is done, its result should be looked at before deciding how the rest goes (e.g. an investigation whose findings decide the next steps). When it completes the main bot is woken to review it and may change the remaining flow; downstream nodes do not wait. Do not mark routine nodes; loop body nodes cannot be checkpoints.',
   ];
 }
 

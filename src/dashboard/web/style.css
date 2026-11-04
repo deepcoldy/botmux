@@ -20454,6 +20454,25 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-attempts .o-failed { color: var(--v3r-failed); }
 .v3r-attempts .o-blocked { color: var(--v3r-blocked); }
 .v3r-attempts .o-running { color: var(--v3r-running); }
+.v3r-interventions { margin: 6px 0 0; }
+.v3r-interventions-title { margin: 0 0 2px; color: var(--muted); }
+.v3r-interventions-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.v3r-intervention {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .6em;
+  color: var(--muted);
+}
+.v3r-intervention .k { color: var(--fg); }
+.v3r-intervention.kind-handedToHuman .k { color: var(--v3r-blocked); }
+.v3r-intervention .r { color: var(--fg); overflow-wrap: anywhere; }
 
 .v3r-dep,
 .v3r-granted-tag,

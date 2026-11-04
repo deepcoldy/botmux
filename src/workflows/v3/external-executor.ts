@@ -33,6 +33,8 @@ export const V3_EXTERNAL_ERROR_CODES = {
   HANDOFF_UNCERTAIN: 'HANDOFF_UNCERTAIN',
   BOT_REPORTED_BLOCKED: 'BOT_REPORTED_BLOCKED',
   NODE_TIMEOUT: 'NODE_TIMEOUT',
+  /** The main bot (or the initiator) handed the node to a human (§13.6). */
+  HANDED_TO_HUMAN: 'HANDED_TO_HUMAN',
 } as const;
 
 export type V3ExternalErrorCode =
@@ -129,7 +131,8 @@ export type V3ExternalStopReason =
   | 'uncertain'
   | 'reassigned'
   | 'obsolete'
-  | 'runBoundary';
+  | 'runBoundary'
+  | 'handedToHuman';
 
 export interface V3ExternalStopRequest extends V3ExternalAttemptRef {
   reason: V3ExternalStopReason;

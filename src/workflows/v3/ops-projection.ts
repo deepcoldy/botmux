@@ -24,6 +24,7 @@ import {
   v3RevisionFilePaths,
   type V3RevisionHistory,
 } from './dag-revision.js';
+import { foldV3NodeInterventions } from './interventions.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
  *  caller-supplied runId, so it can't escape runsDir via traversal. */
@@ -133,6 +134,18 @@ export interface RunNodeView {
   /** What the pending (unconfirmed) proposal would do to this node. The
    *  dashboard draws these dashed. `add` nodes exist only in the proposal. */
   pendingChange?: 'add' | 'remove' | 'change';
+  /** The main bot's automatic retries / reassignments / re-runs of this node
+   *  and every hand-over to a human, oldest first (design §13.6). Roles and
+   *  the reasons as given only — never an open_id. Absent when none. */
+  interventions?: RunNodeInterventionView[];
+}
+
+export interface RunNodeInterventionView {
+  kind: 'retry' | 'reassign' | 'rerun' | 'handedToHuman';
+  by: 'mainBot' | 'initiator' | 'other';
+  reason: string;
+  at: number;
+  attemptId?: string;
 }
 
 export interface RunRevisionEntryView {
@@ -146,6 +159,8 @@ export interface RunRevisionEntryView {
   /** Went through the initiator's confirmation card. */
   confirmed: boolean;
   rejectedReason?: 'rejected' | 'stale' | 'superseded' | 'runEnded';
+  /** `by: 'mainBot'` only: why the main bot made it (design §13.6). */
+  reason?: string;
 }
 
 export interface RunRevisionView {
@@ -349,6 +364,7 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
   const approvedNodes = readDagNodes(runDir);
   const botSnapshots = readBotSnapshots(runDir);
   const revisions = projectRevisions(runDir, events, approvedNodes, botSnapshots);
+  const interventions = foldV3NodeInterventions(events, readInitiatorOpenId(runDir));
   const dagNodes = revisions?.effectiveNodes ?? approvedNodes;
 
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
@@ -602,6 +618,8 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     if (mark) view.revisionMark = mark;
     const pendingChange = revisions?.pendingChanges.get(id);
     if (pendingChange) view.pendingChange = pendingChange;
+    const handled = interventions.get(id);
+    if (handled?.length) view.interventions = handled.map((item) => ({ ...item }));
     return view;
   });
 
@@ -724,6 +742,7 @@ function projectRevisions(
         at: record.appliedAt ?? record.ts,
         confirmed: !!record.approvedBy,
         ...(record.rejected ? { rejectedReason: record.rejected.reason } : {}),
+        ...(record.by === 'main_bot' && record.auto?.reason ? { reason: record.auto.reason } : {}),
       })),
       ...(pending ? { pending: { revision: pending.revision, summary: pending.summary } } : {}),
       ...(integrityError ? { integrityError: true } : {}),

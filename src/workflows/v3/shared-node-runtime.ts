@@ -2912,7 +2912,7 @@ export async function runWorkflow(
   async function blockExternalAttempt(
     attempt: V3ExternalAttempt,
     stopReason: V3ExternalStopReason,
-    verdict: { errorClass: V3ErrorClass; errorCode: string; message: string },
+    verdict: { errorClass: V3ErrorClass; errorCode: string; message: string; recovery?: 'retry' },
   ): Promise<boolean> {
     // A crash-left install is settled (next tick) before any deadline close.
     if (hasExternalInstallIntent(runDir, attempt.attemptId)) return true;
@@ -2973,6 +2973,7 @@ export async function runWorkflow(
    *                                 acceptance deadline; accepted → record it,
    *                                 deadline passed → HANDOFF_NOT_ACCEPTED
    *   accepted                    → NODE_TIMEOUT once the deadline passed
+   *   handed to a human, not closed → HANDED_TO_HUMAN at once (any phase)
    * Returns true when the journal may have changed (an append here, or any
    * awaited transport call during which another caller may have appended),
    * so the caller re-reads before deciding.
@@ -2984,6 +2985,18 @@ export async function runWorkflow(
       if (handoffControllers.has(attempt.attemptId)) continue; // send in flight here
       if (!classifyExternalAttempt(events, attempt.attemptId).ok) continue;
       const now = clock();
+      if (attempt.handedToHuman) {
+        // A hand-over (§13.6) recorded but not closed — a crash between its
+        // two writes. Finish it now rather than at the node's deadline.
+        await blockExternalAttempt(attempt, 'handedToHuman', {
+          errorClass: 'workerError',
+          errorCode: V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN,
+          message: attempt.handedToHuman.reason,
+          recovery: 'retry',
+        });
+        progressed = true;
+        continue;
+      }
       if (attempt.phase === 'dispatched') {
         progressed = appendMissingHandoffIntent(attempt) || progressed;
       } else if (attempt.phase === 'prepared') {

@@ -1280,7 +1280,14 @@ function answerPreview(s: string): string {
 export function requestV3Retry(
   baseDir: string,
   runId: string,
-  input: { nodeId?: string; expectedAttemptId?: string; answer?: V3RetryAnswerInput } = {},
+  input: {
+    nodeId?: string;
+    expectedAttemptId?: string;
+    answer?: V3RetryAnswerInput;
+    /** Who decided the retry and why (`v3ActionRecord`); absent = the
+     *  event keeps its original shape (card clicks, human turns). */
+    record?: { by?: string; auto?: { reason: string }; note?: string };
+  } = {},
 ): V3RetryOutcome {
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
@@ -1402,6 +1409,9 @@ export function requestV3Retry(
     previousErrorCode: info.errorCode,
     ...(resetGate ? { resetGate: true } : {}),
     ...(answer ? { answer } : {}),
+    ...(input.record?.by ? { by: input.record.by } : {}),
+    ...(input.record?.auto ? { auto: input.record.auto } : {}),
+    ...(input.record?.note ? { note: input.record.note } : {}),
   });
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
 }

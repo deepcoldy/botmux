@@ -22,6 +22,11 @@ import {
 import { V3_EXTERNAL_ERROR_CODES } from '../../workflows/v3/external-executor.js';
 import { readJournal } from '../../workflows/v3/journal.js';
 import { materialize } from '../../workflows/v3/state.js';
+import {
+  foldV3NodeInterventions,
+  formatV3Intervention,
+  latestV3InterventionFor,
+} from '../../workflows/v3/interventions.js';
 import { buildV3NodeCard, type V3NodeCardStatus, type V3NodeCardView } from './v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
@@ -135,6 +140,9 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
     }
     const goalIds = run.dag.nodes.filter((node) => isGoalNode(node)).map((node) => node.id);
     const entry = deps.workflowEntry?.(runId);
+    // Roles only: whether the initiator or someone else handed a node over
+    // does not change the card line.
+    const interventions = foldV3NodeInterventions(events);
     for (const [messageId, attempt] of latestByCard) {
       const instanceStatus = attempt.instanceId
         ? snap.instances.get(attempt.instanceId)?.status
@@ -153,6 +161,8 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
       }));
       const target = attempt.targetLarkAppId ?? deps.selfLarkAppId;
       const index = goalIds.indexOf(authored?.id ?? '');
+      const handled = latestV3InterventionFor(interventions.get(attempt.nodeId), attempt.attemptId);
+      const intervention = handled ? formatV3Intervention(handled) : undefined;
       const view: V3NodeCardView = {
         runTitle: run.title,
         runId,
@@ -166,10 +176,11 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
         upstream,
         now: now(),
         ...(entry ? { entry } : {}),
+        ...(intervention ? { intervention } : {}),
       };
       // Elapsed time is not part of the change signal: a card is patched when
       // the node's state changes, not on every drive.
-      const signature = JSON.stringify({ attempt: attempt.attemptId, status: { ...status, ...('since' in status ? { since: 0 } : {}) }, upstream, target, key: nodeTopicKey(attempt) });
+      const signature = JSON.stringify({ attempt: attempt.attemptId, status: { ...status, ...('since' in status ? { since: 0 } : {}) }, upstream, target, key: nodeTopicKey(attempt), intervention });
       if (shown.get(messageId) === signature) continue;
       await deps.patchCard(messageId, buildV3NodeCard(view));
       shown.set(messageId, signature);

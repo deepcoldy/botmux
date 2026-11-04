@@ -34,6 +34,8 @@ import {
   V3_NODE_HEADING,
   V3_REVISION_ROLE_LABEL,
   V3_REVISION_STATE_LABEL,
+  V3_INTERVENTION_LABEL,
+  V3_INTERVENTION_ROLE_LABEL,
 } from './v3-model.js';
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
@@ -561,6 +563,7 @@ function NodePanel(props: {
         ) : null}
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
         <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
+        <NodeInterventions node={node} />
         {node.depends.length ? (
           <p className="v3r-deps">
             <span>依赖</span>
@@ -661,6 +664,30 @@ export function NodeExecution(props: { node: RunNodeView; generatedAt: number | 
           })}
         </ol>
       ) : null}
+    </div>
+  );
+}
+
+/** Every automatic handling by the main bot and every hand-over to a
+ *  person, with the reason as given (design §13.6). */
+export function NodeInterventions(props: { node: RunNodeView }): React.JSX.Element | null {
+  const items = props.node.interventions ?? [];
+  if (items.length === 0) return null;
+  return (
+    <div className="v3r-interventions">
+      <p className="v3r-interventions-title">自动处理与交给人</p>
+      <ol className="v3r-interventions-list">
+        {items.map((item, index) => (
+          <li key={`${item.at}-${index}`} className={`v3r-intervention kind-${item.kind}`}>
+            <span className="t">{formatClock(item.at)}</span>
+            <span className="k">{V3_INTERVENTION_LABEL[item.kind]}</span>
+            {item.kind === 'handedToHuman' && item.by !== 'mainBot' ? (
+              <span className="b">（{V3_INTERVENTION_ROLE_LABEL[item.by]}）</span>
+            ) : null}
+            {item.reason ? <span className="r">{item.reason}</span> : null}
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }

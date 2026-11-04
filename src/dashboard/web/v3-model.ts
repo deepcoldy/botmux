@@ -98,11 +98,30 @@ export function nodeWaitingMs(node: RunNodeView, generatedAt: number): number | 
   return since === undefined ? undefined : Math.max(0, generatedAt - since);
 }
 
+/** A blocked node the main bot handed to a human (design §13.6). */
+export function nodeHandedToHuman(node: RunNodeView): boolean {
+  return node.status === 'blocked' && node.errorCode === 'HANDED_TO_HUMAN';
+}
+
+export const V3_INTERVENTION_LABEL: Record<NonNullable<RunNodeView['interventions']>[number]['kind'], string> = {
+  retry: '主 Bot 自动重试',
+  reassign: '主 Bot 自动改派',
+  rerun: '主 Bot 自动重做',
+  handedToHuman: '交给人决定',
+};
+
+export const V3_INTERVENTION_ROLE_LABEL: Record<NonNullable<RunNodeView['interventions']>[number]['by'], string> = {
+  mainBot: '主 Bot',
+  initiator: '发起人',
+  other: '其他成员',
+};
+
 /** Third row of a graph node: display state, then elapsed / attempt count. */
 export function nodeStatusLine(node: RunNodeView, generatedAt: number | undefined): string {
   const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
   const parts = [label];
   if (node.status === 'gateWaiting') parts.push('审批');
+  else if (nodeHandedToHuman(node)) parts.push('交给人决定');
   else if (node.status === 'blocked') parts.push('受阻');
   if (generatedAt !== undefined) {
     const elapsed = nodeElapsedMs(node, generatedAt);

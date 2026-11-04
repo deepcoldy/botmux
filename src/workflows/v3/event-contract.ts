@@ -113,9 +113,11 @@ export interface V3RevisionEffects {
   assign?: Array<{ nodeId: string; from?: string; to: string }>;
 }
 
-/** Set when the main bot made the change on its own in a turn woken by
- *  this run's events (design §13.6). The reason becomes mandatory with the
- *  wake-up wiring; until then it carries the edit's note (may be empty). */
+/** Set when the main bot made the change on its own (`by: 'main_bot'`):
+ *  a turn woken by this run's events, or another turn no message of the
+ *  initiator opened (design §13.6). `reason` is the `--reason` the CLI
+ *  requires in a wake turn; elsewhere it may fall back to the edit's note or
+ *  be empty. */
 export interface V3AutoProvenance {
   reason: string;
 }
@@ -361,9 +363,30 @@ export type V3Event =
       previousErrorCode?: string;
       resetGate?: boolean;
       answer?: { path: string; preview: string; by: string };
-      /** Operator (`main_bot` for an automatic retry), when recorded. */
+      /** Operator, when recorded: `main_bot` for a retry the main bot
+       *  decided on its own (with `auto`), the caller's open_id for a human
+       *  turn that gave a reason (with `note`). A retry recorded without a
+       *  reason keeps the original shape (no `by`). */
       by?: string;
       auto?: V3AutoProvenance;
+      /** The reason a human turn gave (`--reason`), display only. */
+      note?: string;
+    }
+  | {
+      /** The node was handed to a human (design §13.6): a record only. The
+       *  `nodeBlocked(HANDED_TO_HUMAN)` written right after it in the same
+       *  lock closes the attempt; if a crash separates the two, the runtime
+       *  writes that block on the next drive (never waiting for a deadline). */
+      type: 'nodeHandedToHuman';
+      nodeId: string;
+      instanceId?: string;
+      /** The attempt it was handed over on (open, or the latest closed one). */
+      attemptId: string;
+      reason: string;
+      /** `main_bot`, or the initiator's open_id in their own turn. */
+      by: string;
+      /** The turn that decided it (audit). */
+      turnId?: string;
     }
   | {
       type: 'gateDispatched';

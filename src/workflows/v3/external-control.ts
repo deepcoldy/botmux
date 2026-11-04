@@ -1233,3 +1233,139 @@ export async function reassignNode(
     };
   });
 }
+
+// ─── Handing a node to a human (design §13.6) ─────────────────────────────
+
+/** Longest `--reason` kept on a hand-over (also the IPC bound). */
+export const V3_HAND_TO_HUMAN_REASON_MAX = 500;
+
+export type V3HandToHumanOutcome =
+  | {
+      kind: 'handed';
+      nodeId: string;
+      /** The attempt it was handed over on. */
+      attemptId: string;
+      /** True when an open attempt was stopped and closed by this hand-over;
+       *  false when the node was already blocked (recorded only). */
+      closedOpenAttempt: boolean;
+      stopError?: unknown;
+    }
+  | {
+      kind: 'rejected';
+      reason:
+        | 'missing'
+        | 'not-bot-run'
+        | 'run-not-running'
+        | 'unknown-node'
+        /** Never dispatched: nothing to hand over (change its definition). */
+        | 'never-dispatched'
+        /** Not running and not blocked (done, waiting, skipped, …). */
+        | 'not-handable'
+        /** The attempt settled while it was being stopped. */
+        | 'stale-attempt'
+        | 'revision-pending';
+    };
+
+type HandPlan =
+  | { kind: 'open'; attempt: V3ExternalAttempt }
+  | { kind: 'blocked'; attemptId: string; instanceId?: string }
+  | { kind: 'rejected'; reason: Extract<V3HandToHumanOutcome, { kind: 'rejected' }>['reason'] };
+
+function planHandToHuman(events: readonly StoredEvent[], nodeId: string, inFlow: (nodeId: string) => boolean): HandPlan {
+  const snap = materialize([...events]);
+  if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return { kind: 'rejected', reason: 'run-not-running' };
+  const state = snap.nodes.get(nodeId);
+  const key = state?.effectiveInstanceId ?? nodeId;
+  const latest = latestAttemptIdFor([...events], key);
+  if (!state || !latest) return { kind: 'rejected', reason: state || inFlow(nodeId) ? 'never-dispatched' : 'unknown-node' };
+  if (state.status === 'running') {
+    const attempt = foldV3ExternalAttempts(events).get(snap.attempts.get(key) ?? '');
+    // Only a bot-executed goal attempt can be stopped and handed over here.
+    if (!attempt || attempt.closed) return { kind: 'rejected', reason: 'not-handable' };
+    return { kind: 'open', attempt };
+  }
+  if (state.status === 'blocked') {
+    return { kind: 'blocked', attemptId: latest, ...(state.effectiveInstanceId ? { instanceId: state.effectiveInstanceId } : {}) };
+  }
+  return { kind: 'rejected', reason: 'not-handable' };
+}
+
+/**
+ * `botmux workflow ask-human`: hand a node to a human, with the reason shown
+ * as is (design §13.6). Only a node with a running or a latest attempt:
+ *
+ * - running: its bot's turn is stopped first (the same close path as a
+ *   timeout), then — in one journal lock, after re-checking that this is still
+ *   the current open attempt — `nodeHandedToHuman` (record) and
+ *   `nodeBlocked{ workerError, retry, HANDED_TO_HUMAN }` (the close) are
+ *   written. A submission that lands in between wins: the hand-over reports
+ *   `stale-attempt` and writes nothing.
+ * - blocked: its attempt is already stopped and closed; only the record is
+ *   written, the block it has (and its recovery) stays.
+ *
+ * Either way the existing blocked card handles it from there (retry,
+ * reassign, cancel); no extra deadline.
+ */
+export async function handNodeToHuman(
+  runDir: string,
+  input: { nodeId: string; reason: string; by: string; turnId?: string },
+  ctx: Pick<V3ReassignContext, 'executor' | 'nodeExecutor' | 'dag'> = {},
+): Promise<V3HandToHumanOutcome> {
+  const journalPath = journalPathOf(runDir);
+  if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
+  const before = readJournal(journalPath);
+  if (!isBotExecutedRun(before, ctx.nodeExecutor)) return { kind: 'rejected', reason: 'not-bot-run' };
+  const reason = input.reason.trim().slice(0, V3_HAND_TO_HUMAN_REASON_MAX);
+  if (v3PendingProposalHolds(before, input.nodeId)) return { kind: 'rejected', reason: 'revision-pending' };
+  // Only to tell "not started yet" from "no such node" in the refusal.
+  const inFlow = (nodeId: string): boolean => {
+    try {
+      return dagFor(runDir, ctx, before).nodes.some((node) => node.id === nodeId);
+    } catch {
+      return false;
+    }
+  };
+  const plan = planHandToHuman(before, input.nodeId, inFlow);
+  if (plan.kind === 'rejected') return plan;
+
+  let stopError: unknown;
+  if (plan.kind === 'open') {
+    const stopped = await stopExternalAttempt(ctx.executor, basename(runDir), plan.attempt, 'handedToHuman');
+    if (!stopped.ok) stopError = stopped.error;
+  }
+
+  return withJournalMutationSync(journalPath, ({ events, append }): V3HandToHumanOutcome => {
+    if (v3PendingProposalHolds(events, input.nodeId)) return { kind: 'rejected', reason: 'revision-pending' };
+    const locked = planHandToHuman(events, input.nodeId, inFlow);
+    if (locked.kind === 'rejected') return plan.kind === 'open' ? { kind: 'rejected', reason: 'stale-attempt' } : locked;
+    if (locked.kind !== plan.kind) return { kind: 'rejected', reason: 'stale-attempt' };
+    const attemptId = locked.kind === 'open' ? locked.attempt.attemptId : locked.attemptId;
+    if (plan.kind === 'open' && plan.attempt.attemptId !== attemptId) return { kind: 'rejected', reason: 'stale-attempt' };
+    const instanceId = locked.kind === 'open' ? locked.attempt.instanceId : locked.instanceId;
+    const identity = { nodeId: input.nodeId, ...(instanceId ? { instanceId } : {}), attemptId };
+    append({
+      type: 'nodeHandedToHuman',
+      ...identity,
+      reason,
+      by: input.by,
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+    }, { durable: true });
+    if (locked.kind === 'open') {
+      append({
+        type: 'nodeBlocked',
+        ...identity,
+        errorClass: 'workerError',
+        errorCode: V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN,
+        message: reason,
+        recovery: 'retry',
+      }, { durable: true });
+    }
+    return {
+      kind: 'handed',
+      nodeId: input.nodeId,
+      attemptId,
+      closedOpenAttempt: locked.kind === 'open',
+      ...(stopError !== undefined ? { stopError } : {}),
+    };
+  });
+}
