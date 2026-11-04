@@ -264,6 +264,30 @@ describe('requestCredentialGrant against a real server (postJson transport)', ()
     expect(ports[1]).not.toBe(ports[0]);
   });
 
+  it('a peer that trickles bytes is cut at the hard timeout: the first request does not linger', async () => {
+    const closedAt: number[] = [];
+    let first: ServerResponse | undefined;
+    const binding = await platform((n, res) => {
+      if (n === 1) {
+        first = res;
+        res.socket?.on('close', () => closedAt.push(Date.now()));
+        res.writeHead(200, { 'content-type': 'application/json' });
+        const tick = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write(' '); else clearInterval(tick); }, 50);
+        res.on('close', () => clearInterval(tick));
+        return;
+      }
+      answer(res);
+    });
+    const t0 = Date.now();
+    const r = await requestCredentialGrant(REQ, { binding, timeoutMs: 300, totalBudgetMs: 2_000 });
+    expect(r.ok).toBe(true);
+    // Idle timeout alone never fires on a trickle; the abort must have closed it.
+    await new Promise(res => setTimeout(res, 100));
+    expect(first).toBeDefined();
+    expect(closedAt).toHaveLength(1);
+    expect(closedAt[0]! - t0).toBeLessThan(1_000);
+  });
+
   it('a real 403 is returned after one request', async () => {
     let hits = 0;
     const binding = await platform((_n, res) => {

@@ -176,15 +176,20 @@ function classify(status: number, json: unknown, platformUrl: string): Credentia
   return { ok: false, reason: 'client', status, error: error || `http_${status}` };
 }
 
-/** Settle no later than `ms`, whatever the transport underneath does. The real
- *  transport destroys its own socket on the same budget; this keeps the call's
- *  total time bounded even for one that does not. */
-function withHardTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+/** Settle no later than `ms`, whatever the transport underneath does, and
+ *  abort the request then. The socket's own timeout is an IDLE timeout: a peer
+ *  that trickles bytes never trips it, and without the abort the retry would
+ *  leave the first request still running against the platform. */
+function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`连接超时（${ms}ms）`)), ms);
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`连接超时（${ms}ms）`));
+    }, ms);
   });
-  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+  return Promise.race([run(controller.signal), timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -239,10 +244,11 @@ async function requestCredentialGrantInner(
       // keep-alive socket saves one handshake but can be one the path already
       // dropped silently — the request then waits out the whole budget with no
       // response at all, and the platform never sees it.
-      const r = await withHardTimeout(http.post(url, body, {
+      const r = await withHardTimeout(signal => http.post(url, body, {
         headers: { authorization: `Bearer ${binding.machineToken}` },
         timeoutMs,
         freshConnection: true,
+        signal,
       }), timeoutMs);
       status = r.status;
       json = r.json;

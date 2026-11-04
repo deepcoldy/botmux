@@ -1565,10 +1565,14 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // A refusal published because the platform was unreachable when the turn
     // was prepared gets another chance on this call (rate-limited, CAS-guarded).
     // The Codebase companion is published together with bytedcli.
-    await retryTransientTurnIdentity({
-      sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
-      tool: tool === 'codebase' ? 'bytedcli' : tool,
-    });
+    let currentBotConfig: BotConfig | undefined;
+    try { currentBotConfig = getBot(ds.larkAppId).config; } catch { currentBotConfig = undefined; }
+    if (currentBotConfig) {
+      await retryTransientTurnIdentity({
+        sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
+        tool: tool === 'codebase' ? 'bytedcli' : tool, botConfig: currentBotConfig,
+      });
+    }
     const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
     if (env) {
       return jsonRes(res, 200, {

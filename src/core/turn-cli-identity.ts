@@ -17,6 +17,7 @@ import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
 import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
+import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
@@ -308,9 +309,12 @@ async function publishOne(
         const local = await resolveIdentityFor(tool, botConfig, senderOpenId);
         if (local) return publish(local, true);
       }
-      const outcome = refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform);
-      if (platform.state === 'unavailable' && turnId && storageModel === 'proven') {
-        rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId });
+      // Proven model only: the wrapper asks the daemon on every invocation, so
+      // a transient refusal can be re-asked there (see retryTransientTurnIdentity).
+      const retryable = platform.state === 'unavailable' && !!turnId && storageModel === 'proven';
+      const outcome = refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform, retryable);
+      if (retryable) {
+        rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId! });
       }
       return outcome;
     }
@@ -335,8 +339,15 @@ async function publishOne(
 // Only `unavailable` qualifies: an HTTP answer about the person (not
 // authorized, no consent, not a teammate, forbidden) is final for the turn.
 
-/** Minimum spacing between re-asks for one turn/tool. */
+/** Minimum spacing between re-asks for one turn/tool. The FIRST re-ask is not
+ *  spaced: preparing the turn already waited out a full grant budget, and the
+ *  agent's first tool call is usually the only one before it gives up. */
 export const TRANSIENT_REFUSAL_RETRY_INTERVAL_MS = 10_000;
+/** Longest a wrapper's identity fetch waits on a re-ask. Stays well inside the
+ *  wrapper's own 20s IPC timeout (a contact lookup plus a grant can exceed it);
+ *  past this the current refusal is served and the attempt finishes in the
+ *  background for the next call. */
+export const TRANSIENT_REFUSAL_WAIT_CAP_MS = 10_000;
 /** Re-asks per turn/tool; an agent stuck in a retry loop cannot hammer the platform. */
 export const TRANSIENT_REFUSAL_MAX_RETRIES = 5;
 /** Forget an entry after this long even if its turn's material is still held. */
@@ -353,6 +364,9 @@ interface TransientRefusal {
   turnId: string;
   /** The refusal body this module published; the CAS token. */
   body: string;
+  /** The person's local credential epoch when the refusal was published; a
+   *  revocation (`/logout`, Dashboard revoke) bumps it and ends the re-asks. */
+  authEpoch: number;
   createdAt: number;
   lastAttemptAt: number;
   retries: number;
@@ -365,13 +379,16 @@ function transientKey(sessionDataDir: string, sessionId: string, turnId: string,
   return JSON.stringify([sessionDataDir, sessionId, turnId, tool]);
 }
 
-function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'createdAt' | 'lastAttemptAt' | 'retries'>): void {
+function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEpoch' | 'createdAt' | 'lastAttemptAt' | 'retries'>): void {
   const body = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool);
   if (!body) return; // the refusal did not land; nothing to compare against
   const now = Date.now();
   const key = transientKey(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool);
   transientRefusals.delete(key);
-  transientRefusals.set(key, { ...entry, body, createdAt: now, lastAttemptAt: now, retries: 0 });
+  transientRefusals.set(key, {
+    ...entry, body, authEpoch: readCliAuthEpoch(entry.senderOpenId),
+    createdAt: now, lastAttemptAt: Number.NEGATIVE_INFINITY, retries: 0,
+  });
   while (transientRefusals.size > TRANSIENT_REFUSAL_MAX_ENTRIES) {
     const oldest = transientRefusals.keys().next().value;
     if (oldest === undefined) break;
@@ -382,62 +399,94 @@ function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'create
 /**
  * Called by the proven identity route before it serves a turn's identity. When
  * what is in force is a transient platform refusal this module published, ask
- * the platform again (at most once per {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS})
- * and publish the answer if the refusal is still the one in force. Concurrent
- * callers share one attempt. Never throws.
+ * the platform again (the first time right away, then at most once per
+ * {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS}) and publish the answer if the
+ * refusal is still the one in force. Concurrent callers share one attempt; no
+ * caller waits longer than {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
+ *
+ * `botConfig` is the bot's CURRENT config, checked for its policy only: a
+ * policy changed mid-turn (tool no longer governed, source switched to local)
+ * ends the re-asks instead of fetching under the policy the turn started with.
  */
 export async function retryTransientTurnIdentity(args: {
   sessionDataDir: string;
   sessionId: string;
   turnId: string;
   tool: TriggerUserAuthTool;
+  botConfig?: BotConfig;
 }): Promise<void> {
   const key = transientKey(args.sessionDataDir, args.sessionId, args.turnId, args.tool);
   const entry = transientRefusals.get(key);
   if (!entry) return;
-  if (entry.inFlight) return entry.inFlight;
-  const now = Date.now();
-  const current = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool);
-  if (current !== entry.body || now - entry.createdAt > TRANSIENT_REFUSAL_TTL_MS
-    || entry.retries >= TRANSIENT_REFUSAL_MAX_RETRIES) {
-    transientRefusals.delete(key);
-    return;
-  }
-  if (now - entry.lastAttemptAt < TRANSIENT_REFUSAL_RETRY_INTERVAL_MS) return;
-  entry.lastAttemptAt = now;
-  entry.retries++;
-  entry.inFlight = (async () => {
-    try {
-      const platform = await resolvePlatformIdentity({
-        botConfig: entry.botConfig, tool: entry.tool, openId: entry.senderOpenId,
-        sessionId: entry.sessionId, turnId: entry.turnId,
-      });
-      // Compare-and-set: synchronous from here to the write.
-      if (recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool) !== entry.body
-        || transientRefusals.get(key) !== entry) {
-        transientRefusals.delete(key);
-        return;
-      }
-      if (platform.state === 'granted') {
-        writeSessionIdentity(entry.sessionDataDir, entry.sessionId,
-          { ...platform.identity, turnId: entry.turnId, openId: entry.senderOpenId }, 'proven');
-        transientRefusals.delete(key);
-        logger.info(`[trigger-user-auth] platform ${entry.tool} grant recovered for session ${entry.sessionId} on retry`);
-        return;
-      }
-      if (platform.state === 'unavailable') return; // keep the refusal; retry later
-      // The platform now answered about the person: publish that answer, final.
-      refuseViaPlatform(entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId, entry.senderOpenId,
-        entry.locale, entry.turnId, 'proven', platform);
+  if (!entry.inFlight) {
+    const now = Date.now();
+    const policy = (args.botConfig ?? entry.botConfig).triggerUserAuth;
+    if (!stillInForce(entry)
+      || now - entry.createdAt > TRANSIENT_REFUSAL_TTL_MS
+      || entry.retries >= TRANSIENT_REFUSAL_MAX_RETRIES
+      || !triggerUserAuthApplies(policy, entry.tool)
+      || credentialSourceOf(policy) === 'local') {
       transientRefusals.delete(key);
-    } catch (e) {
-      logger.warn(`[trigger-user-auth] retry of ${entry.tool} identity failed for session ${entry.sessionId}: `
-        + `${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      entry.inFlight = undefined;
+      return;
     }
-  })();
-  return entry.inFlight;
+    if (now - entry.lastAttemptAt < TRANSIENT_REFUSAL_RETRY_INTERVAL_MS) return;
+    entry.lastAttemptAt = now;
+    entry.retries++;
+    entry.inFlight = runTransientRetry(key, entry)
+      .finally(() => { entry.inFlight = undefined; });
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    entry.inFlight,
+    new Promise<void>(resolve => { timer = setTimeout(resolve, TRANSIENT_REFUSAL_WAIT_CAP_MS); }),
+  ]);
+  clearTimeout(timer);
+}
+
+/** The refusal this entry published is still what the turn has, and the
+ *  person has not revoked their credentials since. */
+function stillInForce(entry: TransientRefusal): boolean {
+  return recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool) === entry.body
+    && readCliAuthEpoch(entry.senderOpenId) === entry.authEpoch;
+}
+
+async function runTransientRetry(key: string, entry: TransientRefusal): Promise<void> {
+  // Only ever drop THIS entry: a republication of the same turn registers a
+  // fresh one under the same key, which an older attempt must not erase.
+  const drop = () => { if (transientRefusals.get(key) === entry) transientRefusals.delete(key); };
+  try {
+    const platform = await resolvePlatformIdentity({
+      botConfig: entry.botConfig, tool: entry.tool, openId: entry.senderOpenId,
+      sessionId: entry.sessionId, turnId: entry.turnId,
+    });
+    // Compare-and-set: synchronous from here to the write.
+    if (transientRefusals.get(key) !== entry || !stillInForce(entry)) {
+      drop();
+      return;
+    }
+    if (platform.state === 'granted') {
+      writeSessionIdentity(entry.sessionDataDir, entry.sessionId,
+        { ...platform.identity, turnId: entry.turnId, openId: entry.senderOpenId }, 'proven');
+      drop();
+      logger.info(`[trigger-user-auth] platform ${entry.tool} grant recovered for session ${entry.sessionId} on retry`);
+      return;
+    }
+    if (platform.state === 'unavailable') return; // keep the refusal; retry later
+    if (platform.state === 'unbound') {
+      // Unbound mid-turn: what applies now depends on the source (auto falls
+      // back to local logins) and is the next turn's decision. Keep the
+      // refusal the turn has; stop asking a platform that is gone.
+      drop();
+      return;
+    }
+    // The platform now answered about the person: publish that answer, final.
+    refuseViaPlatform(entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId, entry.senderOpenId,
+      entry.locale, entry.turnId, 'proven', platform);
+    drop();
+  } catch (e) {
+    logger.warn(`[trigger-user-auth] retry of ${entry.tool} identity failed for session ${entry.sessionId}: `
+      + `${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 /** @internal test-only */
@@ -460,6 +509,8 @@ function refuseViaPlatform(
   turnId: string | undefined,
   storageModel: IdentityStorageModel,
   platform: Exclude<PlatformIdentityResolution, { state: 'granted' }>,
+  /** The daemon will re-ask on the turn's next call (proven model). */
+  retryable = false,
 ): ToolIdentityOutcome {
   const provider = tool === 'bytedcli' ? 'ByteCloud' : t('trigger_user_auth.provider_lark', undefined, locale);
   const vars = { tool, provider };
@@ -484,7 +535,9 @@ function refuseViaPlatform(
         : t('trigger_user_auth.denied_platform_forbidden', { ...vars, detail: platform.detail }, locale)];
       break;
     case 'unavailable':
-      tail = [t('trigger_user_auth.denied_platform_unavailable', vars, locale)];
+      tail = [t(retryable
+        ? 'trigger_user_auth.denied_platform_unavailable_retryable'
+        : 'trigger_user_auth.denied_platform_unavailable', vars, locale)];
       state = 'unavailable';
       break;
   }

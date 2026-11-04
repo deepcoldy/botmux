@@ -24,10 +24,19 @@ export interface PostJsonOptions {
    * 一直等到 {@link timeoutMs} 才失败。
    */
   freshConnection?: boolean;
+  /** 中止即销毁底层请求与连接（调用方的总时长上限靠它真正落地）。 */
+  signal?: AbortSignal;
+}
+
+function bindAbort(req: { destroy(err?: Error): unknown }, signal: AbortSignal | undefined): void {
+  if (!signal) return;
+  const abort = () => req.destroy(new Error('请求已中止'));
+  if (signal.aborted) { abort(); return; }
+  signal.addEventListener('abort', abort, { once: true });
 }
 
 export function postJson(url: string, body: unknown, opts: PostJsonOptions = {}): Promise<PostJsonResult> {
-  const { family, timeoutMs = 10_000, headers, freshConnection } = opts;
+  const { family, timeoutMs = 10_000, headers, freshConnection, signal } = opts;
   const u = new URL(url);
   const doRequest = u.protocol === 'https:' ? httpsRequest : httpRequest;
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -67,13 +76,14 @@ export function postJson(url: string, body: unknown, opts: PostJsonOptions = {})
     );
     req.on('timeout', () => req.destroy(new Error(`连接超时（${timeoutMs}ms）`)));
     req.on('error', reject);
+    bindAbort(req, signal);
     req.end(payload);
   });
 }
 
 /** 同 {@link postJson} 的连接口径（含 family 钉死），只是不带请求体的 GET。 */
 export function getJson(url: string, opts: PostJsonOptions = {}): Promise<PostJsonResult> {
-  const { family, timeoutMs = 10_000, headers, freshConnection } = opts;
+  const { family, timeoutMs = 10_000, headers, freshConnection, signal } = opts;
   const u = new URL(url);
   const doRequest = u.protocol === 'https:' ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
@@ -105,6 +115,7 @@ export function getJson(url: string, opts: PostJsonOptions = {}): Promise<PostJs
     );
     req.on('timeout', () => req.destroy(new Error(`连接超时（${timeoutMs}ms）`)));
     req.on('error', reject);
+    bindAbort(req, signal);
     req.end();
   });
 }
