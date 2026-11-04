@@ -19,7 +19,7 @@ import type { V3ExternalNodeExecutor } from '../workflows/v3/external-executor.j
 import { v3AcceptanceProbeUnknownSince } from '../workflows/v3/runtime.js';
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import type { LarkAttachment, WorkflowNodeSessionMarker } from '../types.js';
-import { sessionKey, type DaemonSession } from './types.js';
+import type { DaemonSession } from './types.js';
 import {
   isWorkflowHandoffRevoked,
   readDispatchRegistryLoose,
@@ -133,6 +133,14 @@ export interface WorkflowNodeDaemonDeps {
    *  default-dir fallbacks the spawn paths use (§15.4 existing-session
    *  comparison for the main bot's own nodes). */
   getSessionWorkingDir(ds: DaemonSession): string;
+  /** The session a node turn delivered to this topic anchor would reuse —
+   *  the exact lookup {@link deliverWorkflowNodeTurn} performs
+   *  (`activeSessions.get(sessionKey(anchor, app))`, a virtual principal-lane
+   *  anchor included), NOT a re-derivation from `session.rootMessageId`. The
+   *  §15.4 existing-session gate must judge the same session reuse actually
+   *  happens; a lookup of its own would both false-block a principal-lane
+   *  session and miss a session stored under a deferred-routing anchor. */
+  findNodeSession(anchor: string, larkAppId: string): DaemonSession | undefined;
   /** Send ^C to the session's CLI (the "停止" path); false = not possible.
    *  `evenIfIdle`: the turn is known to have just been handed in (its screen
    *  may not show it yet) — used only for a handoff revoked under it. */
@@ -288,16 +296,6 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
 
   function isRevoked(nonce: string): boolean {
     return isWorkflowHandoffRevoked(readDispatchRegistryLoose(deps.dataDir()), nonce, deps.bindingSecret());
-  }
-
-  /** The live session keyed to a topic anchor, like the inbound route's
-   *  `activeSessions.get(sessionKey(anchor, app))` lookup. */
-  function findActiveSession(anchor: string, larkAppId: string): DaemonSession | undefined {
-    for (const ds of deps.activeSessions()) {
-      if (ds.larkAppId !== larkAppId || ds.session.status === 'closed') continue;
-      if (sessionKey(ds.session.rootMessageId, ds.larkAppId) === sessionKey(anchor, larkAppId)) return ds;
-    }
-    return undefined;
   }
 
   function nodeWorkingDir(runDir: string | undefined, runId: string, executingLarkAppId: string): WorkflowNodeWorkingDir {
@@ -480,7 +478,10 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         // execute the node outside the pinned directory, so block instead —
         // never hand the turn to that session or fall back to any default.
         const self = deps.selfLarkAppId();
-        const existing = findActiveSession(input.publishRoot, self);
+        const found = deps.findNodeSession(input.publishRoot, self);
+        // A closed session at this key is not reused either — the turn starts
+        // a new one in the pinned directory, so it is no conflict.
+        const existing = found && found.session.status !== 'closed' ? found : undefined;
         const existingDir = existing ? deps.getSessionWorkingDir(existing) : undefined;
         if (workflowNodeSessionDirConflicts(dir.dir, existingDir)) {
           const reason = '节点话题里已有会话，工作目录与指定的不一致；请在这个话题里关闭该会话后重试，或改派';

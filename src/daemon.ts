@@ -6949,6 +6949,8 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   activeSessions: () => activeSessions.values(),
   updateSession: (ds) => sessionStore.updateSession(ds.session),
   getSessionWorkingDir,
+  // Byte-for-byte the lookup deliverWorkflowNodeTurn makes with this same map.
+  findNodeSession: (anchor, larkAppId) => activeSessions.get(sessionKey(anchor, larkAppId)),
   interruptTurn: interruptWorkflowNodeTurn,
   withdrawHandoffIdentity: withdrawWorkflowHandoffIdentity,
   proveBotSender: proveWorkflowBotSender,

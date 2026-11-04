@@ -179,6 +179,7 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     activeSessions: () => [],
     updateSession: () => {},
     getSessionWorkingDir: (ds) => ds.workingDir ?? ds.session.workingDir ?? '',
+    findNodeSession: () => undefined,
     interruptTurn: () => true,
     proveBotSender: async () => true,
     deliverSelfTurn: async (input) => {

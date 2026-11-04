@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { createWorkflowNodeDaemon, workflowNodePinnedStart, type WorkflowNodeDaemonDeps } from '../src/core/workflow-node-daemon.js';
 import { BotRun, cleanupBotRuns, expectTerminal, reportDag, trackTempDir } from './helpers/v3-external-harness.js';
 import { CHAT, MAIN, SECRET, handoffWorld, nonceOf } from './helpers/workflow-handoff-harness.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkflowNodeSessionMarker } from '../src/types.js';
 import { readDispatchRegistryLoose, revokeWorkflowHandoff } from '../src/core/workflow-handoff-binding.js';
 import { authorizeRun } from './helpers/workflow-identity-world.js';
@@ -50,6 +50,7 @@ function daemon(self: string, dataDir: string, baseDir: string, run: BotRun, ove
     activeSessions: () => sessions,
     updateSession: () => {},
     getSessionWorkingDir: (ds: DaemonSession) => ds.workingDir ?? ds.session.workingDir ?? '',
+    findNodeSession: (anchor, appId) => [...deps.activeSessions()].find((ds) => activeSessionKey(ds) === sessionKey(anchor, appId)),
     interruptTurn: (ds, opts) => { interrupted.push(`${ds.session.sessionId}${opts?.evenIfIdle ? ':force' : ''}`); return true; },
     proveBotSender: async () => true,
     noticeRetryMs: 5,
@@ -562,16 +563,18 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
 
   it('the main bot\'s own node: a session already in its topic that runs elsewhere blocks the node too (same gate as another bot\'s handoff)', async () => {
     const d = dirs();
-    for (const [existingDir, expectBlocked, runId] of [
-      [d.lab, true, 'wdd-self-mismatch'],
-      [d.project, false, 'wdd-self-match'],
+    for (const [existingDir, status, expectBlocked, runId] of [
+      [d.lab, 'active', true, 'wdd-self-mismatch'],
+      [d.project, 'active', false, 'wdd-self-match'],
+      // A closed session at the key is not reused: no conflict, new in pinned.
+      [d.lab, 'closed', false, 'wdd-self-closed'],
     ] as const) {
       const run = new BotRun(reportDag(runId, { bot: undefined }));
       authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.project });
       const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-self-existing-data-')));
       const delivered: Array<{ workingDir?: string }> = [];
       const existingSession = {
-        session: { sessionId: 'sess-existing', rootMessageId: 'om_node_card', status: 'active', workingDir: existingDir },
+        session: { sessionId: 'sess-existing', rootMessageId: 'om_node_card', status, workingDir: existingDir },
         larkAppId: MAIN, chatId: CHAT, chatType: 'group', scope: 'thread', workingDir: existingDir,
       } as unknown as DaemonSession;
       const main = daemon(MAIN, dataDir, run.base, run, {
@@ -621,5 +624,70 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     await settle();
     expect(delivered).toEqual([]);
     expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
+  });
+
+  it('the main bot\'s own node: a principal-lane session stored under a virtual anchor is not reused by the turn and must not be blocked (its rootMessageId happens to be the node card)', async () => {
+    const d = dirs();
+    const run = new BotRun(reportDag('wdd-self-lane', { bot: undefined }));
+    authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.project });
+    const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-self-lane-data-')));
+    const delivered: Array<{ workingDir?: string }> = [];
+    // Registered under a virtual principal-lane anchor (rootMessageId is the
+    // node card, but the storage key is not): deliverWorkflowNodeTurn would
+    // start a new session in the pinned directory, never reuse this one.
+    const laneSession = {
+      session: { sessionId: 'sess-lane', rootMessageId: 'om_node_card', status: 'active', workingDir: d.lab },
+      larkAppId: MAIN, chatId: CHAT, chatType: 'group', scope: 'thread',
+      workingDir: d.lab, runtimeRoutingAnchor: 'principal-lane:om_node_card',
+    } as unknown as DaemonSession;
+    const main = daemon(MAIN, dataDir, run.base, run, {
+      botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
+      activeSessions: () => [laneSession],
+      sendCard: async () => 'om_node_card',
+      replyCard: async () => 'om_handoff_card',
+      deliverSelfTurn: async (input) => {
+        delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) });
+        return { sessionId: 'sess-new' };
+      },
+    });
+    await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+    await settle();
+    expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]);
+    expect(run.of('nodeBlocked')).toEqual([]);
+  });
+
+  it('the main bot\'s own node: a session stored under the node-card key with a different rootMessageId IS the one the turn reuses, so it blocks when it runs elsewhere', async () => {
+    const d = dirs();
+    const run = new BotRun(reportDag('wdd-self-deferred', { bot: undefined }));
+    authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.project });
+    const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-self-deferred-data-')));
+    const delivered: Array<{ workingDir?: string }> = [];
+    // A deferred-routing shape: stored at the node-card anchor, but the
+    // session's own rootMessageId is a different value. Matching by
+    // rootMessageId would miss it; the node would run in /elsewhere.
+    const deferredSession = {
+      session: {
+        sessionId: 'sess-deferred', rootMessageId: 'om_scheduled', status: 'active', workingDir: d.lab,
+        deferredScheduleRun: { routingAnchor: 'om_node_card' },
+      },
+      larkAppId: MAIN, chatId: CHAT, chatType: 'group', scope: 'thread', workingDir: d.lab,
+    } as unknown as DaemonSession;
+    const main = daemon(MAIN, dataDir, run.base, run, {
+      botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
+      activeSessions: () => [deferredSession],
+      sendCard: async () => 'om_node_card',
+      replyCard: async () => 'om_handoff_card',
+      deliverSelfTurn: async (input) => {
+        delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) });
+        return { sessionId: 'sess-deferred' };
+      },
+    });
+    await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+    await settle();
+    expect(delivered).toEqual([]);
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
+      errorCode: 'WORKING_DIR_REFUSED',
+      message: expect.stringContaining('节点话题里已有会话'),
+    })]);
   });
 });
