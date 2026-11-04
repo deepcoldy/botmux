@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { resolveCurrentTurnProvenance } from '../../core/current-turn-provenance.js';
+import { isHumanInboundTurnId } from '../../core/reply-target.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import {
@@ -47,15 +48,17 @@ import {
 } from './bot-resolve.js';
 import {
   artifactRef,
+  frozenHandoffIdentity,
   loadAuthorizedV3Run,
   makeAdHocRunEnvelope,
   publishRunEnvelopeOnce,
   readRunEnvelope,
   type PublishRunEnvelopeResult,
   type V3AdHocRunEnvelope,
+  type V3HandoffIdentityRecord,
 } from './run-envelope.js';
 import { V3_SUPPORTED_CLIS, isV3SupportedCli, type BotSnapshot } from './contract.js';
-import { isMultiTopicOrchestrationEnabled, workflowNodeExecutorMode } from '../../global-config.js';
+import { isMultiTopicOrchestrationEnabled, workflowHandoffIdentityEnabled, workflowNodeExecutorMode } from '../../global-config.js';
 import {
   buildV3BotRoster,
   checkV3Assignees,
@@ -73,8 +76,10 @@ import {
   decideV3NodeExecutor,
   describeV3EphemeralFallback,
   formatV3BotEligibilityRefusal,
+  resolveV3HandoffIdentity,
   v3BotExecutorTargets,
   type V3BotEligibilityProbe,
+  type V3HandoffIdentityPolicy,
   type V3BotEligibilityProblem,
   type V3NodeExecutorDecision,
   type V3NodeExecutorSwitch,
@@ -103,6 +108,20 @@ export function hostNew(opts: {
  * A genuine standalone/dev invocation (no session claim or marker) keeps the
  * old minimal env binding for card experiments, but never claims an owner.
  */
+/** The current authenticated turn's id (undefined for a standalone/dev
+ *  invocation). Same proof as {@link chatBindingFromEnv}. */
+export function currentTurnIdFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  startPid: number = process.ppid,
+): string | undefined {
+  if (!env.SESSION_DATA_DIR) return undefined;
+  return resolveCurrentTurnProvenance({
+    dataDir: env.SESSION_DATA_DIR,
+    envSessionId: env.BOTMUX_SESSION_ID,
+    startPid,
+  })?.turnId;
+}
+
 export function chatBindingFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   startPid: number = process.ppid,
@@ -480,7 +499,7 @@ export function authorizeAdHocRun(
   runDir: string,
   bots: BotConfig[],
   now: Date = new Date(),
-  opts: { workingDirOverride?: string; nodeExecutor?: 'bot' } = {},
+  opts: { workingDirOverride?: string; nodeExecutor?: 'bot'; handoffIdentity?: V3HandoffIdentityRecord } = {},
 ): AdHocRunAuthorizationResult {
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
@@ -560,6 +579,7 @@ export function authorizeAdHocRun(
       ...(cur.chatBinding ? { chatBinding: cur.chatBinding } : {}),
       ...(cur.chatBinding?.ownerOpenId ? { authorizedByOpenId: cur.chatBinding.ownerOpenId } : {}),
       ...(opts.nodeExecutor ? { nodeExecutor: opts.nodeExecutor } : {}),
+      ...(opts.nodeExecutor && opts.handoffIdentity ? { handoffIdentity: opts.handoffIdentity } : {}),
       artifacts: {
         dag: artifactRef(runDir, 'dag.json'),
         spec: artifactRef(runDir, 'spec.json'),
@@ -815,10 +835,29 @@ export interface WorkflowHostCommandDeps {
   botEligibilityProbe?: (binding: RunChatBinding, bots: BotConfig[]) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
   /** Bot display names for the Gate-2 summary (default: bots-info.json). */
   botDisplayName?: () => (larkAppId: string) => string;
+  /** 交接带发起人身份 switch (default: live global config). */
+  handoffIdentitySwitch?: () => boolean;
+  /** Seams that freeze the initiator (default: the main bot's live Lark app
+   *  + bots.json). Only built while that switch is on. */
+  handoffIdentityPolicy?: (bots: BotConfig[]) => V3HandoffIdentityPolicy | Promise<V3HandoffIdentityPolicy>;
+  /** The current turn's id (default: fresh current-turn provenance). Read
+   *  only to freeze the initiator: only a human-opened turn may. */
+  resolveCurrentTurnId?: () => string | undefined;
   /** Capability labels for the Architect roster (default: bot profiles). */
   botRole?: () => (larkAppId: string) => string | undefined;
   /** Test seam for the architect worker (default: the real ephemeral pool). */
   runArchitect?: ArchitectDeps['runArchitect'];
+}
+
+async function liveHandoffIdentityPolicy(bots: BotConfig[]): Promise<V3HandoffIdentityPolicy> {
+  // The union_id lookup talks through the main bot's own Lark app; a CLI
+  // process registers the configured apps first (as the eligibility probe does).
+  const { registerBot } = await import('../../bot-registry.js');
+  for (const bot of bots) {
+    try { registerBot(bot); } catch { /* an unusable entry simply fails its own lookup */ }
+  }
+  const { createLiveV3HandoffIdentityPolicy } = await import('../../im/lark/v3-bot-eligibility.js');
+  return createLiveV3HandoffIdentityPolicy(bots);
 }
 
 async function liveBotEligibilityProbe(binding: RunChatBinding, bots: BotConfig[]): Promise<V3BotEligibilityProbe> {
@@ -1017,6 +1056,7 @@ export async function cmdWorkflowHost(
       // A replay of an already-published approval never re-decides it.
       const summary: string[] = [];
       let nodeExecutor: 'bot' | undefined;
+      let handoffIdentity: V3HandoffIdentityRecord | undefined;
       if (before.kind === 'missing') {
         const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
         if (switchMode === 'bot') {
@@ -1036,8 +1076,22 @@ export async function cmdWorkflowHost(
             if (plan.kind === 'refused') {
               throw new HostGuardError(formatV3BotEligibilityRefusal(plan.problems, nameOf));
             }
+            // 交接带发起人身份 (design §10.2 item 1): decided once, here, with
+            // the executor, and frozen into the same authorization.
+            if ((deps.handoffIdentitySwitch ?? workflowHandoffIdentityEnabled)()) {
+              const identity = await resolveV3HandoffIdentity(
+                plan.binding,
+                await (deps.handoffIdentityPolicy ?? liveHandoffIdentityPolicy)(bots),
+                { humanTurn: isHumanInboundTurnId((deps.resolveCurrentTurnId ?? currentTurnIdFromEnv)()) },
+                { targets: plan.targets, nameOf },
+              );
+              handoffIdentity = identity.record;
+              summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
+              if (identity.summary) summary.push(identity.summary);
+            } else {
+              summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
+            }
             nodeExecutor = 'bot';
-            summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
           }
         } else {
           const ignored = describeIgnoredAssignees(runDir);
@@ -1045,10 +1099,12 @@ export async function cmdWorkflowHost(
         }
       } else if (before.kind === 'ok' && 'nodeExecutor' in before.envelope && before.envelope.nodeExecutor === 'bot') {
         summary.push('执行方式：节点交给群里的 Bot 执行（已在首次批准时冻结）');
+        if (frozenHandoffIdentity(before.envelope)) summary.push('交接带发起人身份：开（已在首次批准时冻结）');
       }
       const authorized = authorizeAdHocRun(runDir, bots, now, {
         workingDirOverride,
         ...(nodeExecutor ? { nodeExecutor } : {}),
+        ...(handoffIdentity ? { handoffIdentity } : {}),
       });
       const { state } = hostApproveDag(runDir, now);
       const dagPath = authorized.dagPath;

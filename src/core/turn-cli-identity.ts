@@ -66,7 +66,40 @@ export interface DelegatedCliIdentity {
   unionId: string;
   tools: TriggerUserAuthTool[];
   dispatchRoot: string;
-  denialReason?: 'target_access_denied' | 'target_validation_unavailable';
+  /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
+   *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
+  denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
+    /** A workflow delegation passed on from a node session into a session
+     *  that keeps identities on disk: it could not be re-checked per use. */
+    | 'passed_on_unsupported';
+  /** A workflow handoff's delegation (design 2026-11-03 §10). */
+  workflowHandoff?: true;
+  /** Workflow handoff only: re-run its run / attempt / revocation checks
+   *  (local reads) and say why it no longer holds. Consulted on every use,
+   *  so a stop that never reached this daemon still ends it. Daemon memory
+   *  only; never serialized. */
+  recheck?: () => string | undefined;
+}
+
+/** Replace one tool's published identity for `turnId` with the refusal for
+ *  `delegated` (its `denialReason` explains it). Used when a workflow
+ *  delegation stops holding while its turn is still running. */
+export function publishDelegationRefusal(args: {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  tool: TriggerUserAuthTool;
+  delegated: DelegatedCliIdentity;
+  storageModel: IdentityStorageModel;
+}): void {
+  denyDelegated(args.tool, {
+    botConfig: {} as BotConfig,
+    sessionDataDir: args.sessionDataDir,
+    sessionId: args.sessionId,
+    senderOpenId: undefined,
+    turnId: args.turnId,
+    storageModel: args.storageModel,
+  }, args.delegated);
 }
 
 export interface PublishTurnIdentityArgs {
@@ -157,7 +190,11 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
     ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
     : user.denialReason === 'target_access_denied'
       ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
-      : 'The source must ask the original human to authorize.';
+      : user.denialReason === 'delegation_inactive'
+        ? 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn), so the requester\'s identity no longer applies; do not request another login.'
+        : user.denialReason === 'passed_on_unsupported'
+          ? 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call, and this session does not. Tools that need the person\'s authorization refuse here; do not request another login.'
+          : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),

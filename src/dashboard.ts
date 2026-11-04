@@ -1247,8 +1247,10 @@ interface ResolvedDashboardSettings {
   /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. `nodeExecutor`
-   *  is the experimental executor frozen into newly authorized runs. */
-  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+   *  is the experimental executor frozen into newly authorized runs;
+   *  `handoffIdentity` whether those runs hand their initiator's identity to
+   *  the node bots. */
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
@@ -1894,6 +1896,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     workflow: {
       enabled: global.workflow?.enabled === true, // default OFF
       nodeExecutor: global.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral', // default ephemeral
+      handoffIdentity: global.workflow?.handoffIdentity === true, // default OFF
     },
     sessionCleanup: {
       archiveCodex: global.sessionCleanup?.archiveCodex === true,

@@ -15,6 +15,7 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
+import type { V3HandoffIdentityRecord, V3HandoffIdentityTool, V3HandoffIdentityUnavailableReason } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
 
@@ -269,6 +270,90 @@ export function formatV3BotExecutorPlan(
   ].join('\n');
 }
 
+// ─── 交接带发起人身份 (design §10.2, D5): frozen at authorization ─────────
+
+/** open_id → union_id through the main bot's own app (`resolveUnionIdFromOpenIdStrict`). */
+export type V3InitiatorUnionLookup =
+  | { status: 'resolved'; unionId: string }
+  /** Definitive: the app may not see this person's union_id (scope / visibility). */
+  | { status: 'unavailable' }
+  | { status: 'retryable'; error: string };
+
+/** Live seams for freezing the initiator; present only while the switch is on. */
+export interface V3HandoffIdentityPolicy {
+  lookupUnionId(larkAppId: string, openId: string): Promise<V3InitiatorUnionLookup>;
+  /** The tools a sender runs as themselves on this bot right now
+   *  (`triggerUserAuth.tools` when enabled, else none). */
+  botTools(larkAppId: string): V3HandoffIdentityTool[];
+}
+
+export type V3HandoffIdentityResolution = {
+  /** What run.json records: the frozen initiator, or why there is none. */
+  record: V3HandoffIdentityRecord;
+  /** A line for the Gate-2 / command reply; empty when there is nothing a
+   *  person needs to know (no node bot runs a tool as its trigger user). */
+  summary: string;
+};
+
+/** Plain-language reason a run carries no initiator identity. */
+export const V3_HANDOFF_IDENTITY_UNAVAILABLE_TEXT: Record<V3HandoffIdentityUnavailableReason, string> = {
+  not_human_turn: '这次批准不是发起人本人在群里发来的消息（定时任务、事件唤醒等自动回合）',
+  no_initiator: '这个 run 没有经过认证的发起人',
+  lookup_unavailable: '主 Bot 查不到发起人的跨应用身份（通常是缺少通讯录权限，或发起人对本应用不可见）',
+  lookup_failed: '批准时查询发起人的跨应用身份失败',
+  no_tools: '主 Bot 没开「按触发人鉴权」，发起人没有可交出的工具',
+};
+
+/**
+ * Freeze the initiator of a bot-executed run (design §10.2 item 1): the
+ * authenticated person of the authorizing turn (`binding.ownerOpenId`, the
+ * main bot's view), their union_id resolved now through the main bot's app,
+ * and the tools they had on the main bot now — the ceiling every later
+ * handoff's delegation is narrowed from (§10.2 item 5).
+ *
+ * Never refuses the authorization (design §10 principle: permission is asked
+ * for only when a tool really needs it). When the identity cannot be frozen —
+ * a scheduled task's or other synthetic turn (ADR dispatch-user-delegation §7:
+ * such turns carry no delegation), no authenticated initiator, the lookup
+ * unavailable or failing, no tool to hand on — the run records why and is
+ * approved without it; the summary names the nodes whose bot runs tools as
+ * its trigger user, since only those will ask for authorization later.
+ */
+export async function resolveV3HandoffIdentity(
+  binding: RunChatBinding,
+  policy: V3HandoffIdentityPolicy,
+  /** The authorizing turn was opened by a human message (`om_…` / `join_…`). */
+  turn: { humanTurn: boolean },
+  plan: { targets: readonly V3NodeExecutorTarget[]; nameOf: (larkAppId: string) => string },
+): Promise<V3HandoffIdentityResolution> {
+  const unavailable = (reason: V3HandoffIdentityUnavailableReason): V3HandoffIdentityResolution => {
+    const governing = plan.targets.filter((target) => policy.botTools(target.larkAppId).length > 0);
+    return {
+      record: { unavailable: reason },
+      summary: governing.length === 0 ? '' : `这个 run 不带发起人身份：${V3_HANDOFF_IDENTITY_UNAVAILABLE_TEXT[reason]}；`
+        + `开了「按触发人鉴权」的 Bot（${governing.map((target) => `${target.nodeId} → ${plan.nameOf(target.larkAppId)}`).join('、')}）`
+        + '调用需要个人授权的工具时，会提示授权',
+    };
+  };
+  if (!turn.humanTurn) return unavailable('not_human_turn');
+  if (!binding.ownerOpenId) return unavailable('no_initiator');
+  let lookup: V3InitiatorUnionLookup;
+  try {
+    lookup = await policy.lookupUnionId(binding.larkAppId, binding.ownerOpenId);
+  } catch (err) {
+    lookup = { status: 'retryable', error: err instanceof Error ? err.message : String(err) };
+  }
+  if (lookup.status === 'retryable') return unavailable('lookup_failed');
+  if (lookup.status === 'unavailable') return unavailable('lookup_unavailable');
+  const tools = [...new Set(policy.botTools(binding.larkAppId))];
+  if (tools.length === 0) return unavailable('no_tools');
+  return {
+    record: { unionId: lookup.unionId, tools },
+    summary: `交接带发起人身份：开。开了「按触发人鉴权」的子 Bot 以发起人本人的身份执行，可委托工具不超过：${tools.join('、')}；`
+      + '某个节点交接时带不上身份的，照常交接，用到需要个人授权的工具时会提示授权',
+  };
+}
+
 /** Everything an authorization entry point needs to decide the executor. */
 export interface V3NodeExecutorPolicy {
   switchMode: V3NodeExecutorSwitch;
@@ -276,13 +361,16 @@ export interface V3NodeExecutorPolicy {
   /** Built only for a `bot` decision (it may talk to Lark / daemons). */
   probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
   nameOf: (larkAppId: string) => string;
+  /** 交接带发起人身份 switch: present only while it is on. */
+  handoffIdentity?: V3HandoffIdentityPolicy;
 }
 
 export type V3NodeExecutorResolution =
   /** `note` explains a fallback when the switch is on (P4 / §6.1 item 5). */
   | { kind: 'ephemeral'; note?: string }
-  /** `summary` lists node → executing bot for the Gate-2 / command reply. */
-  | { kind: 'bot'; targets: V3NodeExecutorTarget[]; summary: string }
+  /** `summary` lists node → executing bot for the Gate-2 / command reply;
+   *  `handoffIdentity` is the initiator to freeze when that switch is on. */
+  | { kind: 'bot'; targets: V3NodeExecutorTarget[]; summary: string; handoffIdentity?: V3HandoffIdentityRecord }
   /** Refuse the authorization; `message` lists node → bot: reason. */
   | { kind: 'refused'; problems: V3BotEligibilityProblem[]; message: string };
 
@@ -295,6 +383,8 @@ export async function resolveV3NodeExecutor(input: {
   policy: V3NodeExecutorPolicy;
   binding: RunChatBinding | undefined;
   targetsFor: (binding: RunChatBinding) => V3NodeExecutorTarget[];
+  /** See {@link resolveV3HandoffIdentity}; absent = not proven human. */
+  humanTurn?: boolean;
 }): Promise<V3NodeExecutorResolution> {
   const decision = decideV3NodeExecutor({
     switchMode: input.policy.switchMode,
@@ -319,7 +409,16 @@ export async function resolveV3NodeExecutor(input: {
       message: formatV3BotEligibilityRefusal(checked.problems, input.policy.nameOf),
     };
   }
-  return { kind: 'bot', targets, summary: formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf) };
+  const summary = formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf);
+  if (!input.policy.handoffIdentity) return { kind: 'bot', targets, summary };
+  const identity = await resolveV3HandoffIdentity(binding, input.policy.handoffIdentity,
+    { humanTurn: input.humanTurn === true }, { targets, nameOf: input.policy.nameOf });
+  return {
+    kind: 'bot',
+    targets,
+    summary: identity.summary ? `${summary}\n${identity.summary}` : summary,
+    handoffIdentity: identity.record,
+  };
 }
 
 /**

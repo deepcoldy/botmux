@@ -52,6 +52,7 @@ function daemon(self: string, dataDir: string, baseDir: string, run: BotRun, ove
     proveBotSender: async () => true,
     noticeRetryMs: 5,
     deliverSelfTurn: async () => ({ sessionId: 'self-session' }),
+    prepareTurnIdentity: async () => {},
     attachmentsDir: (appId, messageId) => join(dataDir, 'attachments', appId, messageId),
     loadRun: () => ({ dag: run.dag, nodeExecutor: 'bot', chatId: CHAT, title: 't' }),
     drive: () => {},
@@ -155,6 +156,39 @@ describe('workflow node daemon wiring', () => {
     // The main bot's daemon cannot stop someone else's handoff on this bot.
     const wrong = daemon('cli_b', world.dataDir, run.base, run);
     expect(wrong.wiring.stopRoute({ nonce: marker.nonce })).toMatchObject({ status: 409 });
+  });
+
+  it('a submission the main bot took withdraws that handoff turn\'s identity at once', async () => {
+    const { run, world, attempt, marker } = await handedOff('wd-submit-identity');
+    const withdrawn: string[] = [];
+    const target = daemon('cli_a', world.dataDir, run.base, run, {
+      withdrawHandoffIdentity: async (ds, turnId) => { withdrawn.push(`${ds.session.sessionId}:${turnId}`); },
+    });
+    target.sessions.push(fakeSession('sess-a', marker));
+    const result = await target.wiring.reportRoute(
+      {
+        dispatchRoot: attempt.handoffMessageId, status: 'completed', content: 'done',
+        files: [{ key: 'report', name: 'report.md', data: Buffer.from('# r').toString('base64') }],
+        resultText: '{"message":"ok"}',
+      },
+      authorize({ sessionId: 'sess-a', rootMessageId: attempt.nodeCardMessageId!, larkAppId: 'cli_a' }),
+    );
+    expect(result).toMatchObject({ status: 200 });
+    expect(withdrawn).toEqual([`sess-a:${marker.handoffMessageId}`]);
+  });
+
+  it('a stop also withdraws the tool identity of exactly that handoff turn (交接带发起人身份, §10.3)', async () => {
+    const { run, world, marker } = await handedOff('wd-stop-identity');
+    const withdrawn: string[] = [];
+    const target = daemon('cli_a', world.dataDir, run.base, run, {
+      withdrawHandoffIdentity: async (ds, turnId) => { withdrawn.push(`${ds.session.sessionId}:${turnId}`); },
+    });
+    target.sessions.push(
+      fakeSession('sess-other', { ...marker, nonce: 'wfh_aaaaaaaaaaaaaaaaaaaaaaaa', handoffMessageId: 'om_other' }),
+      fakeSession('sess-a', marker),
+    );
+    target.wiring.stopRoute({ nonce: marker.nonce, sessionId: 'sess-a' });
+    expect(withdrawn).toEqual([`sess-a:${marker.handoffMessageId}`]);
   });
 
   it('registration and the handoff turn\'s idle notify the main bot; a submitted handoff stays quiet', async () => {

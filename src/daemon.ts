@@ -580,6 +580,7 @@ import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-c
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
+import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
@@ -747,6 +748,7 @@ import {
   deliverV3SavedWorkflowNotification,
   executeV3SavedWorkflowCommand,
   resolveV3SavedWorkflowMessageTargets,
+  v3SavedWorkflowMessageContext,
   type V3SavedWorkflowExecutionEffect,
 } from './im/lark/v3-saved-workflow-handler.js';
 import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
@@ -766,6 +768,13 @@ import {
 import { WORKFLOW_HANDOFF_ID_PLACEHOLDER } from './im/lark/v3-node-card.js';
 import { substituteWorkflowHandoffPlaceholder, workflowNodeMarkerFromBinding } from './core/workflow-node-session.js';
 import { lookupWorkflowHandoff, readDispatchRegistryLoose } from './core/workflow-handoff-binding.js';
+import {
+  WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE,
+  checkWorkflowHandoffIdentityTarget,
+  inheritWorkflowDelegation,
+  workflowDelegationRefusal,
+  type WorkflowDelegationRefusal,
+} from './core/workflow-handoff-identity.js';
 import {
   createV3GateRunner,
   loadV3BotExecutedRun,
@@ -4279,9 +4288,17 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
   return refreshTurnCliIdentity(ds, turnId);
 }
 
-async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
+/** `keepInactiveWorkflow`: also return a workflow handoff's delegation that no
+ *  longer holds (the caller reports why). Every other caller — the inherited
+ *  authority of a dispatch / `--mention` handoff, schedule creation — gets no
+ *  delegation from it. */
+async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean } = {}) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
-  if (!reply) return undefined;
+  // The main bot's own workflow node turn has no inbound message (design
+  // §6.5): its turn id is the handoff it posted, its topic the node card.
+  const ownWorkflowNodeTurn = !reply && ds.session.workflowNode?.handoffMessageId === turnId
+    && ds.session.workflowNode.orchestratorAppId === ds.larkAppId;
+  if (!reply && !ownWorkflowNodeTurn) return undefined;
   const active = ds.activeInteractiveTurn;
   const recoveryCaller = ds.session.failedTurnRecovery?.turnId === turnId
     ? ds.session.failedTurnRecovery.caller : undefined;
@@ -4290,15 +4307,46 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
   // does not depend on the unrelated delegation store being readable.
   if (caller?.senderType === 'user' && !caller.source
     && caller.requestLarkAppId === ds.larkAppId && caller.requestUserOpenId) return undefined;
-  return resolveDispatchUser({
+  const record = await resolveDispatchUser({
     dataDir: config.session.dataDir,
     secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     appId: ds.larkAppId, chatId: ds.chatId, turnId,
-    rootId: reply.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+    rootId: reply?.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+  });
+  // A workflow handoff's delegation (design 2026-11-03 §10) holds only while
+  // its run attempt does; past that it is no delegation at all.
+  if (!record || !('workflow' in record) || opts.keepInactiveWorkflow) return record;
+  const refusal = workflowDelegationRefusalFor(ds, turnId, record);
+  if (!refusal) return record;
+  logger.info(`[dispatch-user:audit] workflow delegation inactive target=${ds.larkAppId} turn=${turnId} `
+    + `run=${record.workflow.runId} attempt=${record.workflow.attemptId} reason=${refusal}`);
+  return undefined;
+}
+
+/** The workflow checks of a received handoff delegation (core/workflow-handoff-identity). */
+function workflowDelegationRefusalFor(
+  ds: DaemonSession,
+  turnId: string,
+  record: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserPayload,
+): WorkflowDelegationRefusal | undefined {
+  return workflowDelegationRefusal({
+    record,
+    turnId,
+    receiverLarkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    marker: ds.session.workflowNode,
+    registry: readDispatchRegistryLoose(config.session.dataDir),
+    secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    baseDir: v3DefaultBaseDir(),
   });
 }
 
-async function targetUserForDelegation(ds: DaemonSession, user: import('./core/dispatch-user-delegation.js').DispatchUserAuthority): Promise<string | undefined> {
+/** Reads only the bot, chat and chat type of `ds`, so the pre-handoff check
+ *  of a workflow delegation runs it for a chat this bot has no session in. */
+async function targetUserForDelegation(
+  ds: Pick<DaemonSession, 'larkAppId' | 'chatId' | 'chatType'>,
+  user: Pick<import('./core/dispatch-user-delegation.js').DispatchUserAuthority, 'unionId'>,
+): Promise<string | undefined> {
   const resolved = await resolveTargetAppOpenId(ds.larkAppId, user.unionId);
   if (resolved.status !== 'resolved'
     || !evaluateTalk(ds.larkAppId, ds.chatId, resolved.openId, user.unionId, undefined, ds.chatType).allowed) return;
@@ -4572,22 +4620,46 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   let delegationBlocked = false;
   let delegationRecord: Awaited<ReturnType<typeof dispatchUserForTurn>>;
   try {
-    const delegation = delegationRecord = await dispatchUserForTurn(ds, turnId);
+    const delegation = delegationRecord = await dispatchUserForTurn(ds, turnId, { keepInactiveWorkflow: true });
     if (delegation) {
+      const workflow = 'workflow' in delegation;
       // Keep a denial tied to the originating task even if contact/membership
       // lookup throws; never turn this back into "ask the peer bot to log in".
       delegatedIdentity = {
         credentialOpenId: delegation.authority.openId, unionId: delegation.authority.unionId,
         tools: [],
         // A top-level handoff has no thread; the handoff message itself is
-        // what a refusal report points back at.
-        dispatchRoot: delegation.rootId ?? delegation.messageId ?? turnId,
+        // what a refusal report points back at. A workflow node always
+        // reports to its handoff message, not to the node topic (a record
+        // passed on from a node follows the dispatch rule).
+        dispatchRoot: ('workflow' in delegation && !delegation.workflow.hop ? delegation.messageId : delegation.rootId)
+          ?? delegation.messageId ?? turnId,
         denialReason: 'target_access_denied',
+        ...(workflow ? { workflowHandoff: true as const } : {}),
       };
-      const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
+      const workflowRefusal = workflow ? workflowDelegationRefusalFor(ds, turnId, delegation) : undefined;
+      if (workflowRefusal) {
+        delegatedIdentity.denialReason = 'delegation_inactive';
+        logger.info(`[dispatch-user:audit] workflow delegation inactive target=${ds.larkAppId} turn=${turnId} reason=${workflowRefusal}`);
+      }
+      // A workflow delegation passed on from a node session (`hop`) has no
+      // stop path to this session: it ends only through the per-use re-check,
+      // which identities kept on disk (the single model) never go through.
+      // Such a session gets an explicit refusal, never the credentials.
+      const passedOnToFileSession = !workflowRefusal && 'workflow' in delegation && !!delegation.workflow.hop
+        && identityStorageModelForDaemonSession(ds) !== 'proven';
+      if (passedOnToFileSession) {
+        delegatedIdentity.denialReason = 'passed_on_unsupported';
+        logger.info(`[dispatch-user:audit] workflow delegation passed on into a file-identity session target=${ds.larkAppId} turn=${turnId}`);
+      }
+      const targetOpenId = workflowRefusal || passedOnToFileSession
+        ? undefined : await targetUserForDelegation(ds, delegation.authority);
       if (targetOpenId) delegatedIdentity = {
         ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
         denialReason: undefined,
+        // Re-checked on every use (dashboard-ipc-server): the run attempt can
+        // end, or the handoff be withdrawn, while this turn still runs.
+        ...(workflow ? { recheck: () => workflowDelegationRefusalFor(ds, turnId, delegation) } : {}),
       };
     }
   } catch (error) {
@@ -6082,12 +6154,9 @@ async function handleV3SavedWorkflowCommandIfAny(
     return true;
   }
 
-  const context: SavedWorkflowActorContext = {
-    actor: { openId: initiatorOpenId, larkAppId },
-    chatId,
-    chatType,
-    rootMessageId: targets.runRootMessageId,
-  };
+  const context: SavedWorkflowActorContext = v3SavedWorkflowMessageContext({
+    initiatorOpenId, larkAppId, chatId, chatType, runRootMessageId: targets.runRootMessageId, messageId, botSender,
+  });
   const dataDir = dirname(v3DefaultBaseDir());
   const baseDir = v3DefaultBaseDir();
   if (command.kind === 'save' && command.distill) {
@@ -6872,16 +6941,68 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   activeSessions: () => activeSessions.values(),
   updateSession: (ds) => sessionStore.updateSession(ds.session),
   interruptTurn: interruptWorkflowNodeTurn,
+  withdrawHandoffIdentity: withdrawWorkflowHandoffIdentity,
   proveBotSender: proveWorkflowBotSender,
   deliverSelfTurn: (input) => withBotTurnAdmission(input.larkAppId,
     () => deliverWorkflowNodeTurn(input, activeSessions, refreshCliVersion)),
+  prepareTurnIdentity: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   attachmentsDir: getAttachmentsDir,
   loadRun: workflowLoadBotRun,
   drive: (runId) => v3GateRunner.driveDetached(runId),
   botName: (appId) => v3BotDisplayNameResolver()(appId),
   workflowEntry: daemonWorkflowSidebarEntry,
   warn: (message) => logger.warn(message),
+  handoffIdentity: {
+    botTools: (appId) => {
+      const policy = loadBotConfigs().find((bot) => bot.larkAppId === appId)?.triggerUserAuth;
+      return policy?.enabled ? [...policy.tools] : [];
+    },
+    checkSelf: workflowHandoffIdentityCheck,
+  },
 });
+
+/** A stopped handoff whose turn carried a workflow delegation: publish the
+ *  turn's identity again, which now resolves as inactive (the binding was
+ *  revoked first) and replaces the delegated credentials with a refusal.
+ *  Other handoffs carry no delegation and are left untouched. */
+async function withdrawWorkflowHandoffIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  // A finished turn holds nothing to withdraw (and a restore re-resolves it).
+  if (!triggerUserAuthEnabledFor(ds) || !identityDecisionTurnIsLive(ds, turnId)) return;
+  const remembered = getLarkToolDelegation(config.session.dataDir, ds.session.sessionId, turnId);
+  if (!remembered?.workflowHandoff) return;
+  // Unconditionally: a submitted node may still be waiting for the main bot
+  // (its attempt not yet closed), yet its delegation is done.
+  const { recheck: _recheck, targetOpenId: _target, ...rest } = remembered;
+  await publishTurnCliIdentity({
+    botConfig: getBot(ds.larkAppId).config,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId: undefined,
+    delegatedIdentity: { ...rest, tools: [], denialReason: 'delegation_inactive' },
+    locale: localeForBot(ds.larkAppId),
+    turnId,
+    storageModel: identityModelForPublication(ds),
+  });
+}
+
+/**
+ * This bot's verdict on carrying a workflow run's initiator into `chatId`
+ * (design 2026-11-03 §10.2 item 3): the same union_id → open_id, talk and
+ * chat-membership check a received dispatch delegation passes, run before
+ * the handoff is sent so the main bot knows whether to sign it (a failure
+ * hands the node off without the initiator, saying why).
+ */
+async function workflowHandoffIdentityCheck(
+  request: import('./core/workflow-handoff-identity.js').WorkflowHandoffIdentityCheckRequest,
+): Promise<import('./core/workflow-handoff-identity.js').WorkflowHandoffIdentityCheck> {
+  const appId = workflowSelfAppId();
+  return checkWorkflowHandoffIdentityTarget({
+    policy: getBot(appId).config.triggerUserAuth,
+    offeredTools: request.tools,
+    // Node runs live in a group chat only (node-executor-mode).
+    targetUser: () => targetUserForDelegation({ larkAppId: appId, chatId: request.chatId, chatType: 'group' }, { unionId: request.unionId }),
+  });
+}
 
 /** 「改派」 on bot-executed runs' blocked cards: the same live §6.1 probe the
  *  approval uses, against the run's chat. */
@@ -8622,9 +8743,20 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // schedule:create; `--no-delegate schedule:create` keeps the caller's own
     // immediate tool delegation.
     const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
-    const inherited = needsDelegation && turnId && !serviceGrant
+    let inherited = needsDelegation && turnId && !serviceGrant
       ? await dispatchUserForTurn(ds, turnId) : undefined;
-    if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
+    let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
+    if (inherited && 'workflow' in inherited) {
+      // A workflow node's delegation goes on only within its run (approved
+      // bots, the run's chat, the live attempt); otherwise this dispatch goes
+      // ahead without the initiator — never refused (design §10).
+      const passedOn = await inheritWorkflowDelegation({
+        inherited, targetAppIds, chatId, baseDir: v3DefaultBaseDir(),
+        targetUserAllowed: async (authority) => !!await targetUserForDelegation(ds, authority),
+      });
+      if (passedOn.inherit) inheritedWorkflow = passedOn.workflow;
+      else inherited = undefined;
+    } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return jsonRes(res, 403, { ok: false, error: 'delegated_caller_not_allowed' });
     }
     let authority = needsDelegation && turnId && !serviceGrant ? await authorityForDispatch({
@@ -8669,6 +8801,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           payload: {
             sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
             rootId, chatId, targetAppIds, authority,
+            ...(inheritedWorkflow && !scheduleCreateCapabilities(authority).length ? { workflow: inheritedWorkflow } : {}),
           }, send,
         })
       : await send();
@@ -8755,8 +8888,17 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     // lead that is handed a report by one bot can still hand the same person
     // on to the next. Re-checked against this chat and narrowed to this bot's
     // tools; a schedule or a plain bot-to-bot message still has no sender.
-    const inherited = await dispatchUserForTurn(ds, turnId);
-    if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
+    let inherited = await dispatchUserForTurn(ds, turnId);
+    let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
+    if (inherited && 'workflow' in inherited) {
+      // Same rule as `botmux dispatch` from a workflow node (design §10).
+      const passedOn = await inheritWorkflowDelegation({
+        inherited, targetAppIds: targets, chatId, baseDir: v3DefaultBaseDir(),
+        targetUserAllowed: async (authority) => !!await targetUserForDelegation(ds, authority),
+      });
+      if (passedOn.inherit) inheritedWorkflow = passedOn.workflow;
+      else inherited = undefined;
+    } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
     const authority = await authorityForDispatch({
@@ -8778,6 +8920,7 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
       payload: {
         sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
         chatId, targetAppIds: targets, authority,
+        ...(inheritedWorkflow ? { workflow: inheritedWorkflow } : {}),
       },
     });
     logger.info(
@@ -9495,6 +9638,20 @@ ipcRoute('POST', WORKFLOW_HANDOFF_EVENT_ROUTE, async (req, res) => {
     });
   }
   const result = await workflowNodeDaemon.eventRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Executing bot's daemon ← main bot's daemon, before a handoff that would
+// carry the run initiator's delegation: would this bot accept them here?
+ipcRoute('POST', WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = await workflowNodeDaemon.identityCheckRoute(raw);
   return jsonRes(res, result.status, result.body);
 });
 

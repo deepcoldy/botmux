@@ -111,7 +111,7 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
-  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
@@ -286,6 +286,7 @@ function parseSettings(s: any): DashboardSettings {
     workflow: {
       enabled: s?.workflow?.enabled === true,
       nodeExecutor: s?.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral',
+      handoffIdentity: s?.workflow?.handoffIdentity === true,
     },
     sessionCleanup: {
       archiveCodex: s?.sessionCleanup?.archiveCodex === true,
@@ -1164,6 +1165,15 @@ export function SettingsBody(props: {
             onChange={value => {
               const nodeExecutor = value ? 'bot' as const : 'ephemeral' as const;
               void props.onSave('workflow', { workflow: { nodeExecutor } }, s => ({ ...s, workflow: { ...s.workflow, nodeExecutor } }));
+            }}
+          />
+          <ToggleRow
+            title={tr('settings.workflowHandoffIdentity')}
+            help={tr('settings.workflowHandoffIdentityHelp')}
+            checked={settings.workflow.handoffIdentity}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              void props.onSave('workflow', { workflow: { handoffIdentity: value } }, s => ({ ...s, workflow: { ...s.workflow, handoffIdentity: value } }));
             }}
           />
         </SettingsBlock>
