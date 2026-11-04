@@ -115,7 +115,7 @@ describe.skipIf(!enabled)('real Linux sandbox network boundary', () => {
         source,
         undefined,
         'default',
-        { gateway: gatewayPath, unrelated: unrelatedPath },
+        { gateway: '/run/botmux-mcp/g.sock', unrelated: unrelatedPath },
         gatewayPath,
       )).toEqual([false, true, false]);
     } finally {
