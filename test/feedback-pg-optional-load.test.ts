@@ -1,36 +1,37 @@
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
-// K1-style module-graph guard for the optional PostgreSQL dependency. The
-// daemon and `botmux send` statically import the feedback maintenance/store
-// modules on every startup, so those modules must not transitively value-import
-// `pg` — otherwise a SQLite-only install (node_modules without pg, e.g. a
-// checkout that deployed new dist without re-running `bun install`) crashes at
-// module load before any try/catch can fail soft. The guard uses a real Node
-// resolve hook that makes `pg` unresolvable and then loads the actual modules.
+// K1-style module-graph guard for the optional PostgreSQL dependency, run
+// against the BUILT dist. The daemon, dashboard and `botmux send` statically
+// import the feedback subsystem on every startup, and the default SQLite
+// backend must fully work even when `pg` is not installed: importing the
+// modules is necessary but not sufficient, so the child really opens storage,
+// writes a delivery + terminal and reads the reconciled event back. A static
+// `import ... from 'pg'` anywhere on that path (load-time OR a stray dynamic
+// import on the SQLite branch) makes this red.
 const here = dirname(fileURLToPath(import.meta.url));
-const child = join(here, 'helpers', 'feedback-pg-optional-child.ts');
+const repoRoot = resolve(here, '..');
+const distDir = resolve(repoRoot, 'dist');
+const child = join(here, 'helpers', 'feedback-pg-optional-dist-child.mjs');
 const registerHook = join(here, 'helpers', 'register-block-pg.mjs');
 
-describe('feedback hot path without the optional pg dependency', () => {
-  // Custom resolve hooks are a Node ESM-loader feature; the bun production leg
-  // is verified the same way manually (bun dist/cli.js with pg removed) and by
-  // the bun-binary smoke matrix, which bundles pg.
-  it.skipIf(!!process.versions.bun)('daemon/send modules load when pg cannot be resolved', async () => {
+describe('feedback default backend without the optional pg dependency (built dist)', () => {
+  it.skipIf(!!process.versions.bun || !existsSync(resolve(distDir, 'cli.js')))('SQLite hot path reads and writes with pg unresolvable', async () => {
     const processRef = spawnNodeTsScript(child, [], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      // nodeTsRunnerPrefix supplies ['--import','tsx']; add the pg-block hook.
-      env: { ...process.env, NODE_OPTIONS: `--import ${registerHook}` },
+      env: { ...process.env, BOTMUX_DIST_DIR: distDir, NODE_OPTIONS: `--import ${registerHook}` },
     });
     let stdout = '';
     let stderr = '';
     processRef.stdout!.on('data', chunk => { stdout += chunk; });
     processRef.stderr!.on('data', chunk => { stderr += chunk; });
-    const code = await new Promise<number | null>(resolve => processRef.on('exit', exitCode => resolve(exitCode)));
-    expect({ code, stdout: stdout.trim(), stderr: stderr.slice(-400) }).toMatchObject({
-      code: 0, stdout: 'feedback hot path loads without pg',
+    const code = await new Promise<number | null>(exitResolve => processRef.on('exit', exitCode => exitResolve(exitCode)));
+    expect({ code, stdout: stdout.trim(), stderr: stderr.slice(-500) }).toMatchObject({
+      code: 0, stdout: 'dist sqlite hot path reads and writes without pg',
     });
   });
 });
