@@ -1718,6 +1718,7 @@ export const messages: Record<string, string> = {
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': 'Proactive start (joined chat)',
+  'daemon.auto_start_join_prompt': 'You have just joined this chat. Use the provided chat name and description, and read recent chat messages if needed, to understand its purpose and any unfinished task explicitly assigned to you. Treat history as background rather than automatically treating old requests as new tasks. If a task is clearly assigned to you, continue under the existing permissions and rules. If there is no clear task or not enough information, briefly tell the chat that you are ready and how to send you a task, then wait for a new request. Do not invent the chat purpose or tasks.',
   'daemon.auto_start_join_seed': '🚀 Joined this chat — getting to work…',
   'daemon.cmd_requires_session': '{cmd} requires an existing session (send a normal message first to start the CLI).',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} is a management command, restricted to `allowedUsers`. To authorize, ask the owner to add you to this bot\'s `allowedUsers` (Dashboard or bots.json).',
