@@ -544,14 +544,16 @@ describe('/models shortcut', () => {
     expect(readTraexModelLoadsMock.mock.calls.length).toBe(0);
   });
 
-  it.each(['permission', 'worker'])('does not deliver a picker after %s changes during the load query', async change => {
+  it.each(['permission', 'worker', 'transfer', 'killed'])('does not deliver a picker after %s changes during the load query', async change => {
     enableMenu('traex');
     let finish!: (loads: Map<string, number> | null) => void;
     readTraexModelLoadsMock.mockImplementation(() => new Promise(r => { finish = r; }));
     const ds = makeDs({ sessionOverrides: { cliId: 'traex' } });
     const pending = showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
     if (change === 'permission') vi.mocked(canOperate).mockReturnValue(false);
-    else ds.workerGeneration = 42;
+    else if (change === 'worker') ds.workerGeneration = 42;
+    else if (change === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+    else (ds.worker as any).killed = true;
     finish(new Map([['gpt-5.4', 0]]));
     await pending;
     expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
