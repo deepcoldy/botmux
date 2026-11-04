@@ -2183,7 +2183,7 @@ describe('GET /api/bot-default-oncall — oncall chat counts', () => {
 });
 
 describe('GET /api/bot-default-oncall — schedule host paths', () => {
-  it('reports the execution cwd and trusted file root without persisting either as bot config', async () => {
+  it('reports the validated Bot default and trusted file root without persisting either as extra bot config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-cwd-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-schedule-cwd-app';
@@ -2192,6 +2192,7 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
     try {
       process.env.BOTS_CONFIG = configPath;
       config.session.dataDir = join(dir, 'daemon-data');
+      mkdirSync(join(dir, 'session-default'));
       writeFileSync(configPath, JSON.stringify([{
         larkAppId: appId,
         larkAppSecret: 'secret',
@@ -2206,7 +2207,7 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
       const response = await fetch(`${base}/api/bot-default-oncall`);
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({
-        scheduleWorkingDir: process.cwd(),
+        scheduleWorkingDir: join(dir, 'session-default'),
         schedulePreconditionFileRoot: join(
           config.session.dataDir,
           'schedule-preconditions',
@@ -6768,6 +6769,7 @@ describe('POST /api/schedules — creator identity binding', () => {
       const bot = registerBot({
         larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
         allowedUsers: [ownerOpenId],
+        defaultWorkingDir: dir,
       });
       bot.resolvedAllowedUsers = [ownerOpenId];
       bot.rawAllowedUserResolution.set(ownerUnionId, ownerOpenId);
@@ -6808,6 +6810,7 @@ describe('POST /api/schedules — creator identity binding', () => {
       const bot = registerBot({
         larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
         allowedUsers: ['ou_owner'],
+        defaultWorkingDir: dir,
       });
       bot.resolvedAllowedUsers = ['ou_owner'];
       bot.rawAllowedUserResolution.set('on_owner', 'ou_someone_else');
@@ -6851,7 +6854,14 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
       config.session.dataDir = join(dir, 'data');
       scheduleStore.setScheduleScope(APP);
       setLarkAppId(APP);
-      registerBot({ larkAppId: APP, larkAppSecret: '', cliId: cliId as any, apiOnly: true, ...(model ? { model } : {}) });
+      registerBot({
+        larkAppId: APP,
+        larkAppSecret: '',
+        cliId: cliId as any,
+        apiOnly: true,
+        defaultWorkingDir: dir,
+        ...(model ? { model } : {}),
+      });
       local = await startIpcServer({ port: 0, host: '127.0.0.1' });
       return await run(`http://127.0.0.1:${local.port}`);
     } finally {
@@ -6953,7 +6963,13 @@ describe('POST/PATCH /api/schedules — local work calendar', () => {
       process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
       scheduleStore.setScheduleScope(app);
       setLarkAppId(app);
-      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'opencode', apiOnly: true });
+      registerBot({
+        larkAppId: app,
+        larkAppSecret: '',
+        cliId: 'opencode',
+        apiOnly: true,
+        defaultWorkingDir: dir,
+      });
       const { workCalendarPath } = await import('../src/services/work-calendar.js');
       const fixture = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
       mkdirSync(join(dir, 'bots', app), { recursive: true });
@@ -8017,6 +8033,7 @@ describe('POST /api/schedules execution position', () => {
         name: '每日巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_target',
         executionPosition: 'new-topic',
         topicTitle: '每日发布巡检',
@@ -8056,6 +8073,7 @@ describe('POST /api/schedules execution position', () => {
         name: '多群巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_first',
         chatIds: ['oc_first', 'oc_second', 'oc_second'],
         executionPosition: 'top-level',
@@ -8117,6 +8135,7 @@ describe('POST /api/schedules execution position', () => {
         name: '静默巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_target',
         executionPosition: 'new-topic',
         silent: true,

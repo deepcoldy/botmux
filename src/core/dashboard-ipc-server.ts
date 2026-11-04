@@ -496,7 +496,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, listOncallChats, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
@@ -6339,9 +6339,34 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   return jsonRes(res, 200, toggleTaskDeliveryWithPrecondition(p.id, effectiveAppId));
 });
 
+type DashboardScheduleWorkingDir =
+  | { ok: true; workingDir: string }
+  | { ok: false; error: 'invalid_working_dir' | 'schedule_working_dir_unavailable'; message?: string };
+
+/** Resolve the cwd shared by the Dashboard form and create route. An explicit
+ * request wins; otherwise the primary target chat's oncall binding wins over
+ * the Bot's effective default. Every selected value must already be a real
+ * directory: a schedule must not be persisted in a state that can never run. */
+function resolveDashboardScheduleWorkingDir(
+  larkAppId: string,
+  chatId?: string,
+  explicit?: unknown,
+): DashboardScheduleWorkingDir {
+  let raw: unknown = explicit;
+  if (raw === undefined) {
+    raw = (chatId ? findOncallChat(larkAppId, chatId)?.workingDir : undefined)
+      ?? effectiveDefaultWorkingDir(getBot(larkAppId).config);
+  }
+  if (raw === undefined) return { ok: false, error: 'schedule_working_dir_unavailable' };
+  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'invalid_working_dir' };
+  const checked = validateWorkingDir(raw);
+  return checked.ok
+    ? { ok: true, workingDir: checked.resolvedPath }
+    : { ok: false, error: 'invalid_working_dir', message: checked.error };
+}
+
 // Create a new scheduled task from the dashboard. chatIds selects one or more
 // chats owned by this bot; legacy clients may keep sending only chatId.
-// workingDir defaults to the daemon's cwd.
 /** The person a Dashboard schedule write is recorded as (see
  *  core/dashboard-schedule-creator), or undefined when the write keeps the
  *  token-login attribution. Every outcome is logged: this decides whose
@@ -6479,6 +6504,15 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   if (executionPosition === 'task' && rootMessageId) {
     return jsonRes(res, 400, { ok: false, error: 'task_root_not_user_settable', field: 'rootMessageId' });
   }
+  const workingDir = resolveDashboardScheduleWorkingDir(cachedLarkAppId, chatId, b.workingDir);
+  if (!workingDir.ok) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: workingDir.error,
+      field: 'workingDir',
+      ...(workingDir.message ? { message: workingDir.message } : {}),
+    });
+  }
   // Note: bot↔chat membership is intentionally NOT validated here.
   // listChatBotMembers returns [] both when the API is unavailable and when
   // no bot has been observed in the chat yet, so we cannot reliably tell
@@ -6508,7 +6542,7 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
       name,
       schedule,
       prompt,
-      workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
+      workingDir: workingDir.workingDir,
       chatId,
       chatIds: chatIds.length > 1 ? chatIds : undefined,
       // Only topic execution retains a root anchor; at top-level/new-topic the
@@ -8373,9 +8407,12 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
-    // Dashboard-created schedules default to this daemon process directory.
-    // It remains the Bash execution cwd, not a file-path resolution base.
-    scheduleWorkingDir: process.cwd(),
+    // This is the same validated Bot-level fallback used by schedule creation;
+    // the selected target chat may override it server-side through oncall.
+    scheduleWorkingDir: (() => {
+      const resolved = resolveDashboardScheduleWorkingDir(cachedLarkAppId);
+      return resolved.ok ? resolved.workingDir : null;
+    })(),
     // Private Dashboard payload only. File-backed preconditions must live under
     // this daemon-owned host directory; it is never derived from workingDir.
     schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
