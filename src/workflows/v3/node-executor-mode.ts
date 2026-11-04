@@ -389,9 +389,14 @@ export function formatV3BotExecutorPlan(
 ): string {
   return [
     v3BotExecutorPlanHeading(targets),
-    ...targets.map((target) =>
-      `- ${target.nodeId} → ${nameOf(target.larkAppId)}` +
-      `（${[target.larkAppId === orchestratorAppId ? '主 Bot 自己' : undefined, v3PlacementLabel(target)].filter(Boolean).join('，')}）`),
+    ...targets.map((target) => {
+      const detail = [
+        target.larkAppId === orchestratorAppId ? '主 Bot 自己' : undefined,
+        // Named only when some node goes to the main topic (lines unchanged otherwise).
+        targets.some((other) => other.placement === 'main') ? v3PlacementLabel(target) : undefined,
+      ].filter(Boolean).join('，');
+      return `- ${target.nodeId} → ${nameOf(target.larkAppId)}${detail ? `（${detail}）` : ''}`;
+    }),
   ].join('\n');
 }
 

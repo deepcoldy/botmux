@@ -32,7 +32,12 @@ import {
 import { readV3HandoffCardInput } from '../src/im/lark/v3-bot-handoff-executor.js';
 import { createV3NodeCardSync } from '../src/im/lark/v3-node-card-sync.js';
 import { safeExternalAttemptDir } from '../src/workflows/v3/external-control.js';
-import { V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS } from '../src/workflows/v3/external-executor.js';
+import { V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS, V3_MAIN_TOPIC_QUEUE_GRACE_MIN_MS } from '../src/workflows/v3/external-executor.js';
+import { foldV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
+import type { StoredEvent } from '../src/workflows/v3/event-contract.js';
+
+/** The backstop of a queued main-topic handoff: timeout + max(timeout, 1 h). */
+const BACKSTOP_MS = TIMEOUT_SEC * 1000 + Math.max(TIMEOUT_SEC * 1000, V3_MAIN_TOPIC_QUEUE_GRACE_MIN_MS);
 
 afterEach(() => cleanupBotRuns());
 
@@ -119,7 +124,7 @@ describe('acceptance and the node deadline in the main topic', () => {
     const { run, world, attempt, route, key } = await sent('m-queue');
     const queuedAt = run.clock.t;
     expect(await route({ ...key, kind: 'accepted', acceptedAt: queuedAt })).toMatchObject({ status: 200 });
-    expect(run.of('nodeHandoffAccepted')).toEqual([expect.objectContaining({ startPending: true, deadlineAt: queuedAt + TIMEOUT_SEC * 1000 })]);
+    expect(run.of('nodeHandoffAccepted')).toEqual([expect.objectContaining({ startPending: true, deadlineAt: queuedAt + BACKSTOP_MS })]);
 
     // Well past the acceptance window: queued, so no HANDOFF_NOT_ACCEPTED.
     run.clock.t += V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS * 10;
@@ -144,15 +149,40 @@ describe('acceptance and the node deadline in the main topic', () => {
     expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ attemptId: attempt.attemptId, errorCode: 'NODE_TIMEOUT' })]);
   });
 
-  it('a queued turn that never starts times out at the backstop, saying it waited in the queue', async () => {
+  it('a queued turn behind a long one survives the node timeout; one that never starts times out at the backstop, saying so', async () => {
     const { run, world, route, key } = await sent('m-queue-backstop');
     const queuedAt = run.clock.t;
     await route({ ...key, kind: 'accepted', acceptedAt: queuedAt });
-    run.clock.t = queuedAt + TIMEOUT_SEC * 1000;
+    // The turn ahead of it runs longer than the node's whole timeout.
+    run.clock.t = queuedAt + TIMEOUT_SEC * 1000 + 1;
+    expectAwaitingExternal(await run.drive(world.executor, { opts: { chatBinding: BINDING } }));
+    expect(run.of('nodeBlocked')).toEqual([]);
+    run.clock.t = queuedAt + BACKSTOP_MS;
     expect(expectTerminal(await run.drive(world.executor, { opts: { chatBinding: BINDING } })).runStatus).toBe('blocked');
     const [blocked] = run.of('nodeBlocked');
     expect(blocked).toMatchObject({ errorCode: 'NODE_TIMEOUT' });
-    expect(blocked!.message).toContain('queue');
+    expect(blocked!.message).toContain('一直在执行 Bot 的主话题会话里排队');
+    expect(blocked!.message).toContain('节点话题');
+  });
+
+  it('the ledger takes one start per attempt, and only after a queued acceptance (journal written out of order)', async () => {
+    const { run, attempt, route, key } = await sent('m-ledger-start');
+    await route({ ...key, kind: 'accepted', acceptedAt: run.clock.t });
+    const events = run.events();
+    const seq = events.length;
+    const ident = { nodeId: 'write', ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}), attemptId: attempt.attemptId };
+    const started = (n: number, at: number) =>
+      ({ type: 'nodeHandoffStarted', ...ident, startedAt: at, deadlineAt: at + 1, ts: at, seq: seq + n } as unknown as StoredEvent);
+    const fold = (extra: StoredEvent[]) => foldV3ExternalAttempts([...events, ...extra]).get(attempt.attemptId)!;
+    const once = fold([started(1, 5_000)]);
+    expect(once).toMatchObject({ startedAt: 5_000, deadlineAt: 5_001 });
+    expect(once.startPending).toBeUndefined();
+    // A second start (a duplicate or a stray write) moves nothing.
+    expect(fold([started(1, 5_000), started(2, 9_000)])).toMatchObject({ startedAt: 5_000, deadlineAt: 5_001 });
+    // A start before any acceptance is ignored.
+    const beforeAccept = foldV3ExternalAttempts([...events.filter((event) => event.type !== 'nodeHandoffAccepted'), started(1, 5_000)])
+      .get(attempt.attemptId)!;
+    expect(beforeAccept.startedAt).toBeUndefined();
   });
 
   it('a start seen before any acceptance is one acceptance counting from the start', async () => {
@@ -196,10 +226,26 @@ describe('reports in the main topic', () => {
     const { route } = orchestratorEvent(world, run.base, run.dag, () => run.clock.t);
     const closed: string[] = [];
     const { report } = targetReport(world, 'cli_a', route, { markClosed: (sessionId) => { closed.push(sessionId); } });
+    const marker = (state: { started?: boolean; active?: boolean; nonce?: string }) => ({
+      handoffMessageId: attempt.handoffMessageId!, nonce: state.nonce ?? nonceOf(attempt), placement: 'main' as const,
+      started: state.started ?? true, active: state.active ?? true,
+    });
+    const as = (workflowNode: ReturnType<typeof marker> | undefined, rootMessageId = ROOT) =>
+      ({ sessionId: 'sess-a', rootMessageId, ...(workflowNode ? { workflowNode } : {}) });
     // A session of the node in some other topic is refused.
-    expect(await report({ dispatchRoot: attempt.handoffMessageId, status: 'blocked', content: 'x' }, { sessionId: 'sess-a', rootMessageId: 'om_other' }))
+    expect(await report({ dispatchRoot: attempt.handoffMessageId, status: 'blocked', content: 'x' }, as(marker({}), 'om_other')))
       .toMatchObject({ status: 403 });
-    expect(await report({ dispatchRoot: attempt.handoffMessageId, status: 'blocked', content: '缺权限' }, { sessionId: 'sess-a', rootMessageId: ROOT }))
+    // ADV-4: in the shared main-topic session, only while the node's own turn
+    // has started and its attempt is in progress — never from a turn that ran
+    // before it (queued), after it ended, or from a session that does not hold it.
+    const files = { dispatchRoot: attempt.handoffMessageId, status: 'completed', content: 'done',
+      files: [{ key: 'report', name: 'r.md', data: Buffer.from('# r').toString('base64') }], resultText: '{"message":"ok"}' };
+    expect(await report(files, as(marker({ started: false })))).toMatchObject({ status: 409, body: { error: 'handoff_not_started' } });
+    expect(await report(files, as(marker({ active: false })))).toMatchObject({ status: 409, body: { error: 'handoff_not_active' } });
+    expect(await report(files, as(undefined))).toMatchObject({ status: 409, body: { error: 'handoff_not_active' } });
+    expect(await report(files, as(marker({ nonce: 'wfh_other_handoff_nonce_00' })))).toMatchObject({ status: 409, body: { error: 'handoff_not_active' } });
+    expect(run.of('nodeSucceeded')).toEqual([]);
+    expect(await report({ dispatchRoot: attempt.handoffMessageId, status: 'blocked', content: '缺权限' }, as(marker({}))))
       .toMatchObject({ status: 200, body: { outcome: 'blocked' } });
     expect(closed).toEqual(['sess-a']);
     expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'BOT_REPORTED_BLOCKED' })]);

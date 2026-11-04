@@ -244,12 +244,15 @@ export interface WorkflowNodeDaemon {
    *  `start: false` = refused (the main bot is told, so the node blocks with
    *  `reason`; nothing may be registered or started for it); otherwise start
    *  / continue the node, a NEW session in `workingDir` when the run pinned
-   *  one. */
+   *  one. `existingMarker`: that session's workflow-node marker — a
+   *  main-topic session already carrying another node in progress refuses
+   *  the new one (§5.5, MAIN_TOPIC_BUSY). */
   admitInbound(
     binding: WorkflowHandoffBindingPayload,
     handoffMessageId: string,
     executingLarkAppId: string,
     existingSessionDir?: string,
+    existingMarker?: WorkflowNodeSessionMarker,
   ): WorkflowInboundAdmission;
   /** Copy the node's upstream products into this turn's attachment dir. */
   stageInbound(binding: WorkflowHandoffBindingPayload, messageId: string): LarkAttachment[];
@@ -307,12 +310,30 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       .catch((err) => deps.warn(`[workflow] withdrawing identity of ${turnId} failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
-  /** The last turn each session started under a marker (§5.5): a
-   *  main-topic session is shared, so only the handoff's own running turn is
-   *  ever stopped there. In memory: after a restart nothing is interrupted
-   *  until that turn is seen to start again (a stale turn's report is
-   *  refused by the journal either way). */
+  /** The last turn each session started under a marker (§5.5), in memory.
+   *  Only consulted for a main-topic node's LATER turns (after its handoff
+   *  turn went idle); the handoff turn itself is tracked on the persisted
+   *  marker (`handoffStartedAt` / `handoffSettledAt`). */
   const lastStartedTurn = new Map<string, string>();
+
+  /**
+   * Main topic (§5.5): should a stop interrupt what this shared session runs
+   * now? While the handoff's own CLI turn is in progress — started and not
+   * yet idle again, persisted on the marker so a restart keeps knowing — yes,
+   * whatever else was folded into it: a person's message typed in while it
+   * ran (a CLI with type-ahead merges it into the running turn) is part of
+   * that same CLI turn. Interrupting it interrupts that person's message too;
+   * not interrupting it would leave the bot working on a node that is
+   * already stopped (timed out, cancelled, reassigned). The node being over
+   * wins; the person can send the message again. Before the handoff turn
+   * starts nothing is interrupted (it is stopped the moment it starts); after
+   * it went idle, only a later turn of the node itself is.
+   */
+  function mainTopicNodeTurnRunning(ds: DaemonSession, marker: WorkflowNodeSessionMarker): boolean {
+    if (marker.handoffStartedAt && !marker.handoffSettledAt) return true;
+    const last = lastStartedTurn.get(ds.session.sessionId);
+    return !!marker.handoffSettledAt && !!last && last !== marker.handoffMessageId && !!marker.turnIds?.includes(last);
+  }
 
   function stopHandoffTurn(nonce: string, sessionId: string | undefined, opts?: { evenIfIdle?: boolean }): boolean {
     for (const ds of deps.activeSessions()) {
@@ -328,9 +349,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         ds.session.workflowNode = { ...marker, closedAt: new Date().toISOString() };
         deps.updateSession(ds);
       }
-      return lastStartedTurn.get(ds.session.sessionId) === marker.handoffMessageId
-        ? deps.interruptTurn(ds, opts)
-        : false;
+      return mainTopicNodeTurnRunning(ds, marker) ? deps.interruptTurn(ds, opts) : false;
     }
     return false;
   }
@@ -378,13 +397,41 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
    *  at once is retried once — after an error answer or an unreachable daemon
    *  alike. Should both fail, the node still blocks at the acceptance
    *  deadline (HANDOFF_NOT_ACCEPTED), with this reason in its message. */
-  async function refuse(binding: { nonce: string; sourceLarkAppId: string }, handoffMessageId: string, reason: string): Promise<void> {
+  /**
+   * §5.5: one main-topic session carries at most one node at a time. Another
+   * run in the same topic handing a main-topic node to the same bot while its
+   * node is in progress would overwrite that marker — the first node could
+   * then neither be stopped nor tell its turns apart. The later handoff is
+   * refused, visibly (the node blocks; its main bot is woken and may reassign
+   * it or move it to a node topic). An earlier node whose handoff was revoked
+   * (its stop may not have reached this daemon) no longer counts.
+   */
+  function mainTopicBusyReason(
+    placement: 'main' | undefined,
+    nonce: string,
+    existing: WorkflowNodeSessionMarker | undefined,
+    executingLarkAppId: string,
+  ): string | undefined {
+    if (placement !== 'main' || !existing || existing.placement !== 'main' || existing.nonce === nonce) return undefined;
+    if (!workflowNodeMarkerActive(existing) || isRevoked(existing.nonce)) return undefined;
+    return `${deps.botName(executingLarkAppId)} 在主话题里正在执行另一个工作流节点（run ${existing.runId} 的 ${existing.nodeId}），`
+      + '同一个会话不能同时执行两个节点；等它结束后重试，或改派，或把这个节点改成节点话题';
+  }
+
+  async function refuse(
+    binding: { nonce: string; sourceLarkAppId: string },
+    handoffMessageId: string,
+    reason: string,
+    errorCode?: 'MAIN_TOPIC_BUSY',
+  ): Promise<void> {
     try {
       await recordWorkflowHandoffRefusal(deps.dataDir(), deps.bindingSecret(), binding.nonce, reason);
     } catch (err) {
       deps.warn(`[workflow] recording the refusal of ${binding.nonce} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const event: WorkflowHandoffEvent = { kind: 'refused', nonce: binding.nonce, dispatchRoot: handoffMessageId, reason };
+    const event: WorkflowHandoffEvent = {
+      kind: 'refused', nonce: binding.nonce, dispatchRoot: handoffMessageId, reason, ...(errorCode ? { errorCode } : {}),
+    };
     /** undefined = delivered (or refused for good: 409); else why it failed. */
     const send = async (): Promise<string | undefined> => {
       try {
@@ -519,6 +566,16 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     },
     startSelfTurn: async (input: V3SelfTurnRequest) => {
       const runDir = input.runDir;
+      // §5.5: the main session already carries another run's main-topic node.
+      const reused = deps.findNodeSession(input.publishRoot, deps.selfLarkAppId());
+      const busy = reused && reused.session.status !== 'closed'
+        ? mainTopicBusyReason(input.marker.placement, input.marker.nonce, reused.session.workflowNode, deps.selfLarkAppId())
+        : undefined;
+      if (busy) {
+        deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId} not started: ${busy}`);
+        await refuse({ nonce: input.marker.nonce, sourceLarkAppId: deps.selfLarkAppId() }, input.handoffMessageId, busy, 'MAIN_TOPIC_BUSY');
+        return { refused: true as const };
+      }
       // §15.4 for the main bot's own nodes too: its current configuration
       // decides, and a refusal blocks the node (nothing is started).
       const dir = nodeWorkingDir(runDir, input.marker.runId, deps.selfLarkAppId());
@@ -730,7 +787,13 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       },
     }),
     isRevoked,
-    admitInbound: (binding, handoffMessageId, executingLarkAppId, existingSessionDir) => {
+    admitInbound: (binding, handoffMessageId, executingLarkAppId, existingSessionDir, existingMarker) => {
+      const busy = mainTopicBusyReason(binding.placement, binding.nonce, existingMarker, executingLarkAppId);
+      if (busy) {
+        deps.warn(`[workflow] handoff ${handoffMessageId} not started: ${busy}`);
+        void refuse(binding, handoffMessageId, busy, 'MAIN_TOPIC_BUSY');
+        return { start: false, reason: busy };
+      }
       let dir = nodeWorkingDir(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId);
       // The node topic already has a session (someone @-ed the bot there, or
       // moved it with /cd): the handoff would run where that session runs.
@@ -772,8 +835,10 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       // A main-topic session is shared with the main bot's own synthetic turns
       // (event wakes, schedules, report relays): only the handoff's turn and
       // turns opened by messages in the topic belong to the node.
+      // Before the handoff's own turn started, no other turn is the node's
+      // either: it is someone else's turn ahead of it in the queue.
       if (marker.placement === 'main' && context.turnId !== marker.handoffMessageId
-        && !/^(om_|join_)/.test(context.turnId)) return;
+        && (!marker.handoffStartedAt || !/^(om_|join_)/.test(context.turnId))) return;
       // Remember every turn started under this handoff: any of them ending
       // without a submission shows the node as stopped.
       if (!marker.turnIds?.includes(context.turnId)) {
@@ -793,11 +858,16 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       // Only turns started under this handoff: an idle edge of a turn that
       // was already in flight before it was registered must not stall it.
       if (context.turnId !== marker.handoffMessageId && !marker.turnIds?.includes(context.turnId)) return;
+      if (marker.placement === 'main' && marker.handoffStartedAt && !marker.handoffSettledAt) {
+        // The CLI turn the handoff ran in (with anything folded into it) is over.
+        ds.session.workflowNode = { ...marker, handoffSettledAt: new Date(context.at).toISOString() };
+        deps.updateSession(ds);
+      }
       notify({ kind: 'stalled', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId: ds.session.sessionId, at: context.at },
         marker.orchestratorAppId);
     },
     onTurnStarted: (ds, context) => {
-      const marker = ds.session.workflowNode;
+      let marker = ds.session.workflowNode;
       if (!marker) return;
       const sessionId = ds.session.sessionId;
       lastStartedTurn.set(sessionId, context.turnId);
@@ -805,6 +875,13 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       // Only a main-topic handoff's own turn: a node topic's timeout already
       // counts from acceptance.
       if (marker.placement !== 'main' || context.turnId !== marker.handoffMessageId) return;
+      if (!marker.handoffStartedAt) {
+        // Persisted: a stop (also after a restart) knows the node's turn runs.
+        marker = { ...marker, handoffStartedAt: new Date(context.startedAt).toISOString() };
+        ds.session.workflowNode = marker;
+        deps.updateSession(ds);
+      }
+      const started = marker;
       if (!workflowNodeMarkerActive(marker) || isRevoked(marker.nonce)) {
         // Stopped while it waited in the queue: it must not run.
         if (!marker.closedAt && !marker.submittedAt) {
@@ -823,7 +900,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         dispatchRoot: marker.handoffMessageId,
         sessionId,
         startedAt: context.startedAt,
-      }, marker.orchestratorAppId, (result) => stopIfRevoked(result, sessionId, marker.nonce));
+      }, started.orchestratorAppId, (result) => stopIfRevoked(result, sessionId, started.nonce));
     },
   };
 }

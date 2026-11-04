@@ -108,7 +108,9 @@ export type WorkflowHandoffEvent =
   | (EventKey & { kind: 'blocked'; reason: string })
   /** The executing bot's daemon refused to start the node session in the
    *  run's Gate-2 working dir (design §15.4); no session exists for it. */
-  | (Omit<EventKey, 'sessionId'> & { kind: 'refused'; reason: string })
+  /** `errorCode`: `MAIN_TOPIC_BUSY` when the bot's main-topic session is
+   *  executing another node (§5.5); absent = the working-dir refusal. */
+  | (Omit<EventKey, 'sessionId'> & { kind: 'refused'; reason: string; errorCode?: 'MAIN_TOPIC_BUSY' })
   | (EventKey & { kind: 'progress' })
   /** A submission was staged while this daemon looked offline: drive once
    *  so the staged install is committed now rather than at the next wake. */
@@ -184,7 +186,9 @@ export async function handleWorkflowHandoffEvent(raw: unknown, deps: WorkflowHan
       attemptId: binding.workflow.attemptId,
       ...(binding.workflow.instanceId ? { instanceId: binding.workflow.instanceId } : {}),
       reason,
-      errorCode: V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED,
+      errorCode: raw.errorCode === V3_EXTERNAL_ERROR_CODES.MAIN_TOPIC_BUSY
+        ? V3_EXTERNAL_ERROR_CODES.MAIN_TOPIC_BUSY
+        : V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED,
     });
     if (!outcome.ok) return rejection(outcome.reason);
     deps.drive(runId);
@@ -302,8 +306,10 @@ export interface WorkflowNodeReportSession {
   chatId: string;
   scope?: 'thread' | 'chat';
   rootMessageId?: string;
-  /** The session's verified handoff marker, if any. */
-  workflowNode?: { handoffMessageId: string; nonce: string };
+  /** The session's verified handoff marker, if any. For a main-topic
+   *  handoff (§5.5) also whether its own turn has started and whether the
+   *  attempt is still in progress in this session. */
+  workflowNode?: { handoffMessageId: string; nonce: string; placement?: 'main'; started?: boolean; active?: boolean };
 }
 
 export interface WorkflowNodeReportDeps {
@@ -408,6 +414,19 @@ export async function handleWorkflowNodeReport(raw: unknown, deps: WorkflowNodeR
     || (session.scope ?? 'thread') !== 'thread'
     || session.rootMessageId !== binding.publishRoot) {
     return { status: 403, body: { ok: false, error: 'handoff_route_mismatch', message: '请在交接消息所在的节点话题里提交' } };
+  }
+  // §5.5: the main-topic session is shared with the topic's other
+  // conversation. A report for the node counts only from the session that
+  // holds this handoff, after its own turn started, while the attempt is in
+  // progress — not from a turn that ran before it (queued) or after it ended.
+  if (binding.placement === 'main') {
+    const marker = session.workflowNode;
+    if (!marker || marker.nonce !== binding.nonce || marker.active !== true) {
+      return { status: 409, body: { ok: false, error: 'handoff_not_active', message: '这个工作流节点在本会话里的这次执行已经结束（或不是交给本会话的），不能再提交' } };
+    }
+    if (marker.started !== true) {
+      return { status: 409, body: { ok: false, error: 'handoff_not_started', message: '这个工作流节点的交接还在排队，它这一轮开始后才能提交' } };
+    }
   }
 
   const key = {

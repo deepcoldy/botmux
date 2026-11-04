@@ -306,9 +306,15 @@ botmux · 发送给：@文档Bot                  [工作流 ›]
 - **运行中修改**：`updateNode` 可以改 `placement`，只对还没开始（含还在等 Gate、尚未交接）的节点生效；已开始的节点改成不同落点就拒绝，写回同一个落点不算修改。只改落点不算改了节点的工作，不作废等待中的 Gate，也不重做。
 - **交接消息**：主话题落点不发节点卡、不分配节点卡的幂等 key，交接卡直接回复主话题根，顶部多一段状态行（与节点卡同一套状态文案），由节点卡同步按日志就地更新；同步需要的卡片内容在发出时存到尝试目录的 `handoff-card.json`。绑定与节点话题相同（按交接消息 id，签名里多一个 `placement: "main"`，`publishRoot` 是主话题根）；节点话题的绑定字节不变。
 - **执行 Bot 的 daemon 版本**：新版 daemon 在 descriptor 里声明 `workflowMainPlacement: "v1"`；没声明的子 Bot 不发主话题交接，节点受阻（`COLLABORATION_DENIED`，写明版本过旧）。旧版本收到也认不出带 `placement` 的签名，不会把交接当成普通消息执行。
-- **接单与期限**：子 Bot 的会话登记交接即接单（与节点话题相同）；主话题落点时，这次接单写成 `nodeHandoffAccepted { startPending: true }`，期限先按「接单时刻 + 节点超时」兜底。交接这一轮的输入真正写进 CLI 时（worker 的 `turn_execution_started`，排队时间不算），子 Bot 的 daemon 报告 `startedAt`，主 Bot 写 `nodeHandoffStarted { startedAt, deadlineAt }`，期限改从这里算，每个尝试最多一次。一直排不上、排队超过兜底期限，节点以 `NODE_TIMEOUT` 受阻，原因写明「在队列里没轮到」。开始通知丢失时按兜底期限计时。节点话题的尝试忽略 `startedAt`，日志与原来一致。
+- **接单与期限**：子 Bot 的会话登记交接即接单（与节点话题相同）；主话题落点时，这次接单写成 `nodeHandoffAccepted { startPending: true }`，期限先按「接单时刻 + 节点超时 + 排队宽限」兜底，宽限取节点超时、至少 60 分钟（`v3MainTopicQueueGraceMs`）：排在前面的回合本身可能很长（编码类 CLI 几十分钟的回合很常见），宽限随节点规模放大，又不让短节点排在一个普通长回合后面就超时。交接这一轮的输入真正写进 CLI 时（worker 的 `turn_execution_started`，排队时间不算），子 Bot 的 daemon 报告 `startedAt`，主 Bot 写 `nodeHandoffStarted { startedAt, deadlineAt }`，期限改从这里算，每个尝试最多一次（ledger 也只认接单之后的第一条）。一直没开始、排到兜底期限，节点以 `NODE_TIMEOUT` 受阻，原因写明「这一轮一直在排队，没开始」，并建议重试或改成节点话题（节点卡显示这条原因）。开始通知丢失时按兜底期限计时。节点话题的尝试忽略 `startedAt`，日志与原来一致。
 - **复用会话**：交接在子 Bot 这一侧作为独立的一轮排在当前轮次后面（`queueAfterActiveTurn`），不会并进别人正在进行的那一轮；主 Bot 自己的主话题节点在主会话里同样排队。主话题会话已有、但工作目录与 run 指定的不一致时，按 #2770 的规则拒绝（理由文案改为「主话题里已有会话……请把节点改成节点话题，或改派」）。
-- **会话标记**：主话题落点的 `workflowNode` 标记带 `placement: "main"`，只在本节点这次尝试进行期间算数（`workflowNodeMarkerActive`）：交上产出（`submittedAt`）、被停止或撤销、报告做不了（`closedAt`）之后就不算。这样的标记从不让会话变成节点会话（不改技能、不换插件目录、不设 `BOTMUX_WORKFLOW_NODE_SESSION`），所以 N3 的「不提供编排类 skill」对主话题落点不适用：复用的会话启动时已经加载了这些 skill，标记也不会在会话重启后把它变成节点会话。侧栏入口只在尝试进行期间出现在这个会话的回复卡上。停止只打断交接自己那一轮（daemon 记录的最近开始的一轮是交接轮次时才发 ^C），别人的轮次不受影响；排着队时被停止的交接轮次，一开始就被打断。主 Bot 自己的唤醒、定时等合成轮次不计入节点的轮次（不会让节点显示「已停下」）。
+- **一个主话题会话同时只执行一个节点**：同一个主话题里另一个 run 的主话题节点交给同一个 Bot，而这个 Bot 的主话题会话上还有进行中的节点（标记仍在进行、交接没被撤销）时，新的交接不接、不覆盖原标记，子 Bot 侧报 `refused`，节点以 `MAIN_TOPIC_BUSY` 受阻（原因写明「正在执行另一个工作流节点」），主 Bot 被唤醒后可以改派或改成节点话题。主 Bot 自己的主话题节点遇到主会话上有别的 run 的节点时同样处理。选拒绝而不是排队：排队要再加一套等待状态和超时，拒绝简单且可见。
+- **会话标记**：主话题落点的 `workflowNode` 标记带 `placement: "main"`，只在本节点这次尝试进行期间算数（`workflowNodeMarkerActive`）：交上产出（`submittedAt`）、被停止或撤销、报告做不了（`closedAt`）之后就不算。交接这一轮开始（`handoffStartedAt`）和这一轮的 CLI 回合回到空闲（`handoffSettledAt`）记在标记上、随会话落盘。这样的标记从不让会话变成节点会话（不改技能、不换插件目录、不设 `BOTMUX_WORKFLOW_NODE_SESSION`），所以 N3 的「不提供编排类 skill」对主话题落点不适用：复用的会话启动时已经加载了这些 skill，标记也不会在会话重启后把它变成节点会话。侧栏入口只在尝试进行期间出现在这个会话的回复卡上。
+- **停止打断什么**：交接这一轮已开始、还没回到空闲时，停止就打断会话当前在跑的回合——哪怕期间有人的消息并进了这一轮（CLI 支持边跑边输入时，跨发起人隔离默认关，消息直接写进正在跑的这一轮）。取舍：打断就把那个人的消息一起打断了；不打断，节点已经判超时 / 取消 / 改派，Bot 却还在干节点的活。节点已结束优先，那个人可以再发一次。状态记在标记上，daemon 重启后照样生效。交接这一轮还在排队时什么都不打断，等它一开始就打断它；这一轮回到空闲之后，只打断本节点后续的回合（人在主话题里回答它问题开出的回合）。
+- **哪些回合算节点的**：交接这一轮，以及它开始之后、尝试进行期间由主话题消息（`om_` / `join_`）开出的回合；交接开始之前的回合（排在它前面的别人的回合）、主 Bot 自己的唤醒和定时等合成回合都不算，不会让节点显示「已停下，未提交」。节点卡判断「已停下」时也看 `startedAt`：早于交接这一轮开始的停下不算。
+- **提交**：主话题会话是共用的，提交只在标记属于这次交接、交接这一轮已开始、尝试仍在进行时接受；排队中提交（`handoff_not_started`）、尝试结束后提交或不是这个会话的交接（`handoff_not_active`）都以 409 拒绝并说明原因。daemon 的 IPC 鉴权（含宿主信任的调用）不带「当前是哪一轮」的证明，所以进行期间无法再细分到具体回合，这一点与节点话题会话一致（节点会话里任一回合都能提交）。
+- **委托**（§10）：发起人身份的委托只绑定交接这一轮（`messageId` 等于交接消息 id），会话里的其它回合拿不到；往下派发仍只限本 run 批准过的 Bot；尝试结束或交接撤销后委托随之失效。与节点话题相同，有回归用例。
+- **主 Bot 唤醒（§5.2 规则 2）**：主会话在跑交接这一轮（含并进来的消息）时是忙的，唤醒在 daemon 侧排队，等回到空闲再作为独立的一轮发出；停止打断这一轮后，会话回到空闲，唤醒照常发出。
 - **看板**：`RunNodeView` 增加 `placement`（主话题节点）和 `handoff { placement, at, title }`；节点框第二行在 Bot 后标「主话题」，节点详情显示交接时间和交接卡标题。侧栏的落点链接沿用现有逻辑，主话题落点时交接记录带上主会话的话题 id，「打开」进主话题。
 
 ---
@@ -898,12 +904,18 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - **降级到旧版本时（新模式的 run）**：新模式写出的 `run.json`，旧版本 daemon 读到会因 schema 的 `.strict()` 校验失败而拒绝驱动，不会被误当成旧方式执行。这一点在 PR 里用旧版本构建实测一次。
 - **降级到旧版本时（改过流程的 run）**：`.strict()` 拦不住，旧版本 daemon 会照常驱动。原因是流程版本不写进 `run.json`：版本记录在 journal 的事件（`dagRevised`、`dagRevisionProposed` 等）和 run 目录下的 `dag-revisions/` 文件里，`run.json` 和 `dag.json`（第 1 版）都不变。旧版本重放 journal 时不认识这些事件，直接跳过，于是按第 1 版继续执行：可能执行已经删掉的节点、按改前的定义跑改过的节点，也会绕过还在等发起人确认的修改（旧版本不知道要停住修改涉及的节点）。
   - 对用户的建议：改过流程的 run（run 目录下有 `dag-revisions/`，看板上显示的版本大于 1）不要降级 daemon。确实要降级，先把这些 run 取消（进度卡上的取消，或 `botmux workflow cancel <runId>`），或者等它们结束后再降级。
+- **降级到没有主话题落点的版本时（用了主话题落点的 run）**：这类版本已经支持 bot 执行模式，读得了 `run.json`，会照常驱动。按代码推断（未用旧版本构建实测）：
+  - `dag.json` 里的 `placement` 被旧版本的 DAG 归一化丢掉，之后新开的尝试都按节点话题交接；已经写了 `nodeHandoffPrepared { placement: "main" }`、还没发出的尝试，旧版本的交接执行器拒绝发送（「placement "main" is not supported yet」），节点以 `COLLABORATION_DENIED` 受阻。
+  - 已经接单的主话题尝试：旧版本不认识 `nodeHandoffStarted`，重放时跳过，`nodeHandoffAccepted` 上多出的 `startPending` 也被忽略；期限按接单时写下的兜底期限（接单 + 节点超时 + 排队宽限）算，比真实期限晚，不会提前判超时。
+  - 子 Bot 侧旧版本的会话会把主话题 marker 当成节点会话的 marker（换插件目录、去掉 workflow 和编排类 skill，且一直不清），侧栏入口也一直带着，直到会话关闭。
+  - 建议：用了主话题落点、还在跑的 run 不要降级；确实要降级，先取消这些 run 或等它们结束。
+- **子 Bot 是旧版本时（主话题落点）**：新版本 daemon 在 descriptor 里声明 `workflowMainPlacement: "v1"`；没声明的子 Bot 不发主话题交接，节点受阻（写明版本过旧），所以旧版本子 Bot 读不到带 `placement` 的绑定，也不会出现上一条子 Bot 侧的情况——那只在子 Bot 先升级、接了主话题交接、再降级时发生。
 - **子 Bot 是旧版本时（指定了工作目录的 run）**：上面的 `.strict()` 只管主 Bot 侧——旧版本子 Bot 的 daemon 收交接时不读 `run.json`，会在它自己的默认目录起会话，直到提交才被拒。所以带 `nodeWorkingDir` 的 run 交接前，主 Bot 先看目标 daemon 的 descriptor 是否声明 `workflowNodeWorkingDir: "v1"`（新版本 daemon 启动即写）；没有声明就不发交接，节点直接受阻（`WORKING_DIR_REFUSED`，原因「执行 Bot 的 daemon 版本过旧，不支持指定工作目录」），升级后重试或改派。不带 `--working-dir` 的 run 不查，旧版本子 Bot 照常执行。
 
 ### 15.4 `/workflow` 命令和 CLI
 
 - `/workflow` 和 `/workflow new｜save｜run｜list｜show｜cancel` 的语法和语义不变。
-- 新模式下，Gate-2 摘要多出「节点 → 子 Bot（落点，理由）」，阻塞卡多一个「改派」。
+- 新模式下，Gate-2 摘要多出「节点 → 子 Bot（理由）」，有主话题节点时每行再标「主话题 / 节点话题」和落点理由（全是节点话题时不标）；阻塞卡多一个「改派」。
 - `botmux report` 新增 `--output`、`--result-file`，只对工作流节点的交接有效。
 - 新增 `botmux workflow edit`、`botmux workflow status`、`botmux workflow ask-human`。
 - `botmux workflow retry` 和 `botmux workflow edit` 新增 `--reason`。由本 run 事件唤醒的回合必须带它（13.6）；人触发的回合可以不带，不带时行为与现在相同。

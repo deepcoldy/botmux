@@ -45,6 +45,23 @@ export function workflowHandoffInputOptions(
   return handoff?.placement === 'main' ? { queueAfterActiveTurn: true } : {};
 }
 
+/** What the report route needs of a session's marker (§5.5). */
+export function workflowNodeReportMarker(marker: WorkflowNodeSessionMarker): {
+  handoffMessageId: string;
+  nonce: string;
+  placement?: 'main';
+  started?: boolean;
+  active?: boolean;
+} {
+  return {
+    handoffMessageId: marker.handoffMessageId,
+    nonce: marker.nonce,
+    ...(marker.placement === 'main'
+      ? { placement: 'main' as const, started: !!marker.handoffStartedAt, active: workflowNodeMarkerActive(marker) }
+      : {}),
+  };
+}
+
 /**
  * Does this marker make its session a node session (session kind
  * `botNode`: no workflow / multi-bot skills, the node plugin dir)? A node

@@ -20,7 +20,8 @@ import { join } from 'node:path';
 
 import { createWorkflowNodeDaemon, type WorkflowNodeDaemonDeps } from '../src/core/workflow-node-daemon.js';
 import { BotRun, cleanupBotRuns, reportDag } from './helpers/v3-external-harness.js';
-import { CHAT, MAIN, SECRET, handoffWorld, nonceOf } from './helpers/workflow-handoff-harness.js';
+import { CHAT, MAIN, SECRET, handoffWorld, nonceOf, orchestratorEvent } from './helpers/workflow-handoff-harness.js';
+import { authorizeRun } from './helpers/workflow-identity-world.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkflowNodeSessionMarker } from '../src/types.js';
 import { revokeWorkflowHandoff } from '../src/core/workflow-handoff-binding.js';
@@ -37,9 +38,8 @@ afterEach(() => cleanupBotRuns());
 const ROOT = 'om_main_topic';
 const BINDING = { larkAppId: MAIN, chatId: CHAT, chatType: 'group' as const, rootMessageId: ROOT };
 
-async function mainHandoff(runId: string) {
+async function mainHandoff(runId: string, world = handoffWorld()) {
   const run = new BotRun(reportDag(runId, { placement: 'main' }));
-  const world = handoffWorld();
   await run.drive(world.executor, { opts: { chatBinding: BINDING } });
   const attempt = run.openAttempt('write');
   const marker: WorkflowNodeSessionMarker = {
@@ -54,7 +54,19 @@ function wiring(dataDir: string, run: BotRun, sessions: DaemonSession[]) {
   const posted: Array<{ path: string; body: any }> = [];
   const interrupted: string[] = [];
   const updated: string[] = [];
-  const deps: WorkflowNodeDaemonDeps = {
+  const deps = wiringDeps(dataDir, run, sessions, posted, interrupted, updated);
+  return { daemon: createWorkflowNodeDaemon(deps), posted, interrupted, updated };
+}
+
+function wiringDeps(
+  dataDir: string,
+  run: BotRun,
+  sessions: DaemonSession[],
+  posted: Array<{ path?: string; body: any }>,
+  interrupted: string[] = [],
+  updated: string[] = [],
+): WorkflowNodeDaemonDeps {
+  return {
     selfLarkAppId: () => 'cli_a',
     dataDir: () => dataDir,
     baseDir: () => run.base,
@@ -88,7 +100,6 @@ function wiring(dataDir: string, run: BotRun, sessions: DaemonSession[]) {
     warn: () => {},
     handoffIdentity: { botTools: () => [], checkSelf: async () => ({ status: 'not_required' }) },
   };
-  return { daemon: createWorkflowNodeDaemon(deps), posted, interrupted, updated };
 }
 
 const session = (sessionId: string, marker: WorkflowNodeSessionMarker) =>
@@ -154,6 +165,46 @@ describe('stopping a main-topic attempt', () => {
     expect(interrupted).toEqual(['sess-a']);
   });
 
+  it('ADV-1: a person\'s message folded into the running handoff turn does not shield it: the stop interrupts it', async () => {
+    const { run, world, marker } = await mainHandoff('ms-stop-merged');
+    const ds = session('sess-a', marker);
+    const { daemon, interrupted } = wiring(world.dataDir, run, [ds]);
+    daemon.onTurnStarted(ds, { turnId: marker.handoffMessageId, startedAt: run.clock.t });
+    // Type-ahead: the worker writes the person's message into the running CLI turn.
+    daemon.onTurnStarted(ds, { turnId: 'om_person_merged', startedAt: run.clock.t + 1 });
+    daemon.onInputCommitted(ds, { turnId: 'om_person_merged', committedAt: run.clock.t + 1 });
+    await revokeWorkflowHandoff(world.dataDir, SECRET, marker.nonce, 'timeout', run.clock.t);
+    daemon.stopRoute({ nonce: marker.nonce, sessionId: 'sess-a', reason: 'timeout' });
+    expect(interrupted).toEqual(['sess-a']);
+  });
+
+  it('ADV-7: the handoff turn running is kept on the persisted marker — a stop after a restart still interrupts it', async () => {
+    const { run, world, marker } = await mainHandoff('ms-stop-restart');
+    const ds = session('sess-a', marker);
+    wiring(world.dataDir, run, [ds]).daemon.onTurnStarted(ds, { turnId: marker.handoffMessageId, startedAt: run.clock.t });
+    expect(ds.session.workflowNode).toMatchObject({ handoffStartedAt: expect.any(String) });
+    // A fresh daemon (nothing in memory) over the same persisted session row.
+    const restored = session('sess-a', JSON.parse(JSON.stringify(ds.session.workflowNode)));
+    const after = wiring(world.dataDir, run, [restored]);
+    await revokeWorkflowHandoff(world.dataDir, SECRET, marker.nonce, 'runCancelled', run.clock.t);
+    after.daemon.stopRoute({ nonce: marker.nonce, sessionId: 'sess-a', reason: 'runCancelled' });
+    expect(after.interrupted).toEqual(['sess-a']);
+  });
+
+  it('once the handoff turn went idle, a later unrelated turn of the shared session is not interrupted', async () => {
+    const { run, world, marker } = await mainHandoff('ms-stop-settled');
+    const ds = session('sess-a', marker);
+    const { daemon, interrupted } = wiring(world.dataDir, run, [ds]);
+    daemon.onTurnStarted(ds, { turnId: marker.handoffMessageId, startedAt: run.clock.t });
+    daemon.onInputCommitted(ds, { turnId: marker.handoffMessageId, committedAt: run.clock.t });
+    daemon.onTurnSettled(ds, { turnId: marker.handoffMessageId, at: run.clock.t + 10 });
+    expect(ds.session.workflowNode).toMatchObject({ handoffSettledAt: expect.any(String) });
+    daemon.onTurnStarted(ds, { turnId: 'workflow-event:other:7', startedAt: run.clock.t + 20 });
+    await revokeWorkflowHandoff(world.dataDir, SECRET, marker.nonce, 'timeout', run.clock.t);
+    daemon.stopRoute({ nonce: marker.nonce, sessionId: 'sess-a', reason: 'timeout' });
+    expect(interrupted).toEqual([]);
+  });
+
   it('a node topic\'s session is stopped exactly as before (whatever turn it runs)', async () => {
     const run = new BotRun(reportDag('ms-stop-topic'));
     const world = handoffWorld();
@@ -202,14 +253,123 @@ describe('while the attempt is in progress', () => {
     const { run, world, marker } = await mainHandoff('ms-synthetic');
     const ds = session('sess-a', marker);
     const { daemon, posted } = wiring(world.dataDir, run, [ds]);
+    // The handoff turn is under way; then a wake turn of the main bot runs.
+    daemon.onTurnStarted(ds, { turnId: marker.handoffMessageId, startedAt: 4 });
+    await flush();
+    posted.splice(0);
     daemon.onInputCommitted(ds, { turnId: 'workflow-event:other:3', committedAt: 5 });
     daemon.onTurnSettled(ds, { turnId: 'workflow-event:other:3', at: 6 });
     await flush();
     expect(posted).toEqual([]);
+    expect(ds.session.workflowNode?.turnIds ?? []).not.toContain('workflow-event:other:3');
     // A message in the topic (someone answering the bot) is.
     daemon.onInputCommitted(ds, { turnId: 'om_answer', committedAt: 7 });
     await flush();
     expect(posted).toEqual([expect.objectContaining({ body: expect.objectContaining({ kind: 'active', sessionId: 'sess-a' }) })]);
+  });
+});
+
+describe('what the report route sees of the marker (ADV-4)', () => {
+  it('started only once the handoff turn started; active only while the attempt is in progress', async () => {
+    const { run, world, marker } = await mainHandoff('ms-report-marker');
+    const { workflowNodeReportMarker } = await import('../src/core/workflow-node-session.js');
+    const ds = session('sess-a', marker);
+    expect(workflowNodeReportMarker(ds.session.workflowNode!)).toMatchObject({ placement: 'main', started: false, active: true });
+    const { daemon } = wiring(world.dataDir, run, [ds]);
+    daemon.onTurnStarted(ds, { turnId: marker.handoffMessageId, startedAt: run.clock.t });
+    expect(workflowNodeReportMarker(ds.session.workflowNode!)).toMatchObject({ started: true, active: true });
+    expect(workflowNodeReportMarker({ ...ds.session.workflowNode!, closedAt: 'x' })).toMatchObject({ active: false });
+    // A node topic's marker carries none of it (its report rules are unchanged).
+    const { placement: _placement, ...topicMarker } = marker;
+    expect(workflowNodeReportMarker(topicMarker)).toEqual({ handoffMessageId: marker.handoffMessageId, nonce: marker.nonce });
+  });
+});
+
+describe('ADV-2: turns ahead of the queued handoff are not the node\'s', () => {
+  it('someone else\'s turn ending before the handoff turn starts reports nothing for the node', async () => {
+    const { run, world, marker } = await mainHandoff('ms-ahead');
+    const ds = session('sess-a', marker);
+    const { daemon, posted } = wiring(world.dataDir, run, [ds]);
+    daemon.onInputCommitted(ds, { turnId: 'om_person_ahead', committedAt: 1 });
+    daemon.onTurnSettled(ds, { turnId: 'om_person_ahead', at: 2 });
+    await flush();
+    expect(posted).toEqual([]);
+    expect(ds.session.workflowNode?.turnIds).toBeUndefined();
+    // Once the handoff turn started, a person answering the bot counts again.
+    daemon.onTurnStarted(ds, { turnId: marker.handoffMessageId, startedAt: 3 });
+    daemon.onInputCommitted(ds, { turnId: 'om_person_answer', committedAt: 4 });
+    await flush();
+    expect(posted.map((entry) => entry.body.kind)).toEqual(['accepted', 'active']);
+  });
+
+  it('the card does not show a stall that came before the handoff turn started', async () => {
+    const { v3NodeStalled } = await import('../src/im/lark/v3-node-card.js');
+    expect(v3NodeStalled({ kind: 'running', acceptedAt: 0, stalledAt: 2, startedAt: 62 })).toBe(false);
+    expect(v3NodeStalled({ kind: 'running', acceptedAt: 0, stalledAt: 70, startedAt: 62 })).toBe(true);
+    expect(v3NodeStalled({ kind: 'running', acceptedAt: 0, stalledAt: 2 })).toBe(true);
+  });
+});
+
+describe('ADV-3: one main-topic session carries one node at a time', () => {
+  async function twoRuns() {
+    const a = await mainHandoff('ms-busy-a');
+    const b = await mainHandoff('ms-busy-b', a.world);
+    return { a, b };
+  }
+
+  it('a second run\'s main-topic handoff to the same bot is refused while the first is in progress — visibly, and the first marker stays', async () => {
+    const { a, b } = await twoRuns();
+    const ds = session('sess-a', a.marker);
+    const { daemon, posted } = wiring(a.world.dataDir, a.run, [ds]);
+    const { lookupWorkflowHandoff, readDispatchRegistryLoose } = await import('../src/core/workflow-handoff-binding.js');
+    const found = lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(a.world.dataDir), dispatchRoot: b.attempt.handoffMessageId!, secret: SECRET });
+    if (found.kind !== 'workflow') throw new Error('no binding');
+    const admission = daemon.admitInbound(found.binding, b.attempt.handoffMessageId!, 'cli_a', undefined, ds.session.workflowNode);
+    expect(admission).toMatchObject({ start: false, reason: expect.stringContaining('正在执行另一个工作流节点') });
+    expect(ds.session.workflowNode?.nonce).toBe(a.marker.nonce);
+    await flush();
+    expect(posted).toEqual([expect.objectContaining({ body: expect.objectContaining({ kind: 'refused', errorCode: 'MAIN_TOPIC_BUSY', nonce: b.marker.nonce }) })]);
+
+    // The same handoff again (a re-delivery), or one after the first ended or
+    // was revoked: not refused as busy (the next gate is the run's directory).
+    const notBusy = (existing: WorkflowNodeSessionMarker) => {
+      const out = daemon.admitInbound(found.binding, b.attempt.handoffMessageId!, 'cli_a', undefined, existing);
+      return out.start || !out.reason.includes('另一个工作流节点');
+    };
+    expect(notBusy(b.marker)).toBe(true);
+    expect(notBusy({ ...a.marker, submittedAt: 'x' })).toBe(true);
+    expect(notBusy({ ...a.marker, placement: undefined })).toBe(true);
+    expect(notBusy(a.marker)).toBe(false);
+    await revokeWorkflowHandoff(a.world.dataDir, SECRET, a.marker.nonce, 'runCancelled', a.run.clock.t);
+    expect(notBusy(a.marker)).toBe(true);
+  });
+
+  it('the refusal blocks the second node with MAIN_TOPIC_BUSY on its main bot', async () => {
+    const { b } = await twoRuns();
+    const { route } = orchestratorEvent(b.world, b.run.base, b.run.dag, () => b.run.clock.t);
+    expect(await route({ kind: 'refused', nonce: b.marker.nonce, dispatchRoot: b.attempt.handoffMessageId, reason: '忙', errorCode: 'MAIN_TOPIC_BUSY' }))
+      .toMatchObject({ status: 200, body: { outcome: 'blocked' } });
+    expect(b.run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'MAIN_TOPIC_BUSY', message: '忙' })]);
+  });
+
+  it('the main bot\'s own main-topic node is not started in a main session carrying another run\'s node', async () => {
+    const { a } = await twoRuns();
+    const busy = session('main-session', { ...a.marker, nonce: 'wfh_another_runs_nonce_000', runId: 'other-run' });
+    const delivered: string[] = [];
+    const run = new BotRun(reportDag('ms-busy-self', { placement: 'main', bot: MAIN }));
+    authorizeRun(run, { identity: null, selectors: [MAIN] });
+    const world = handoffWorld();
+    const posted: Array<{ body: any }> = [];
+    const daemon = createWorkflowNodeDaemon({
+      ...wiringDeps(world.dataDir, run, [busy], posted),
+      selfLarkAppId: () => MAIN,
+      findNodeSession: () => busy,
+      deliverSelfTurn: async () => { delivered.push('x'); return { sessionId: 'main-session' }; },
+    });
+    await run.drive(daemon.executor, { opts: { chatBinding: BINDING } });
+    expect(delivered).toEqual([]);
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'MAIN_TOPIC_BUSY' })]);
+    expect(busy.session.workflowNode?.nonce).toBe('wfh_another_runs_nonce_000');
   });
 });
 
@@ -219,9 +379,14 @@ describe('after the attempt ends', () => {
     run.accept(attempt.attemptId, 'sess-a');
     const ds = session('sess-a', marker);
     const { daemon, posted, updated } = wiring(world.dataDir, run, [ds]);
+    daemon.onTurnStarted(ds, { turnId: marker.handoffMessageId, startedAt: run.clock.t });
+    const { workflowNodeReportMarker } = await import('../src/core/workflow-node-session.js');
     const result = await daemon.reportRoute(
       { dispatchRoot: attempt.handoffMessageId, status: 'blocked', content: '缺权限' },
-      () => ({ ok: true, session: { sessionId: 'sess-a', larkAppId: 'cli_a', chatId: CHAT, scope: 'thread', rootMessageId: ROOT } }),
+      () => ({ ok: true, session: {
+        sessionId: 'sess-a', larkAppId: 'cli_a', chatId: CHAT, scope: 'thread', rootMessageId: ROOT,
+        workflowNode: workflowNodeReportMarker(ds.session.workflowNode!),
+      } }),
     );
     expect(result).toMatchObject({ status: 200 });
     expect(ds.session.workflowNode).toMatchObject({ closedAt: expect.any(String) });

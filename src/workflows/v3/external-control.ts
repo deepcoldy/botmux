@@ -63,6 +63,7 @@ import {
 import {
   V3_EXTERNAL_CALL_TIMEOUT_MS,
   V3_EXTERNAL_ERROR_CODES,
+  v3MainTopicQueueGraceMs,
   type V3ExternalAttemptRef,
   type V3ExternalNodeExecutor,
   type V3ExternalStopReason,
@@ -382,9 +383,12 @@ export function appendAcceptedLocked(
   if (attempt.phase === 'dispatched') return { ok: false, reason: 'unknown-attempt' };
   const acceptedAt = Math.min(input.acceptedAt ?? now, now);
   // A main-topic turn already seen to start counts from its start; one only
-  // queued counts from acceptance as a backstop until it starts.
+  // queued counts from acceptance plus a queue grace as a backstop until it
+  // starts (the turn ahead of it may be long).
+  const timeoutMs = nodeTimeoutMs(externalAttemptNode(dag, attempt));
+  const pending = queued && startedAt === undefined;
   const countFrom = startedAt !== undefined ? Math.max(startedAt, acceptedAt) : acceptedAt;
-  const deadlineAt = countFrom + nodeTimeoutMs(externalAttemptNode(dag, attempt));
+  const deadlineAt = countFrom + timeoutMs + (pending ? v3MainTopicQueueGraceMs(timeoutMs) : 0);
   append({
     type: 'nodeHandoffAccepted',
     nodeId: attempt.nodeId,
@@ -393,7 +397,7 @@ export function appendAcceptedLocked(
     sessionId: input.sessionId,
     acceptedAt,
     deadlineAt,
-    ...(queued && startedAt === undefined ? { startPending: true as const } : {}),
+    ...(pending ? { startPending: true as const } : {}),
   }, { durable: true });
   return { ok: true, deadlineAt, alreadyAccepted: false };
 }
@@ -433,7 +437,9 @@ export function reportExternalBlocked(
     instanceId?: string;
     sessionId?: string;
     reason: string;
-    errorCode?: typeof V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED | typeof V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED;
+    errorCode?: typeof V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED
+      | typeof V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED
+      | typeof V3_EXTERNAL_ERROR_CODES.MAIN_TOPIC_BUSY;
   },
 ): V3ExternalRecordOutcome {
   const message = input.reason.trim().slice(0, BOT_REPORT_MESSAGE_MAX_CHARS) || 'bot reported blocked';

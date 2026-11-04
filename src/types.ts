@@ -520,6 +520,12 @@ export interface WorkflowNodeSessionMarker {
   /** Main-topic placement: the attempt ended without this session handing
    *  in work (stopped, revoked, reported blocked). */
   closedAt?: string;
+  /** Main-topic placement: the handoff's own turn reached the CLI. Persisted
+   *  so a stop after a restart still knows the node's turn may be running. */
+  handoffStartedAt?: string;
+  /** Main-topic placement: the CLI turn the handoff started in (with any
+   *  messages folded into it) went idle again. */
+  handoffSettledAt?: string;
 }
 
 export interface Session {

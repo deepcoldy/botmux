@@ -82,8 +82,9 @@ export function v3NodeCardStatusFor(
       const message = verdict && 'message' in verdict && typeof verdict.message === 'string' ? verdict.message : undefined;
       const errorCode = closed.errorCode ?? (closed.kind === 'failed' ? 'failed' : undefined);
       // A timeout reads as its own state; the engine's own timeout text adds
-      // nothing to "超时未提交有效结果".
-      return errorCode === V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT
+      // nothing to "超时未提交有效结果" — except for a main-topic handoff that
+      // never left the queue (§5.5), whose reason is the point.
+      return errorCode === V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT && !attempt.startPending
         ? { kind: 'blocked', errorCode }
         : { kind: 'blocked', ...(errorCode ? { errorCode } : {}), ...(message ? { message } : {}) };
     }

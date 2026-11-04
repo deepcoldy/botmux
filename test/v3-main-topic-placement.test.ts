@@ -415,6 +415,18 @@ describe('Architect (P1) and Gate-2', () => {
     expect(readRunEnvelope(runDir)).toMatchObject({ kind: 'ok', envelope: { nodeExecutor: 'bot' } });
   });
 
+  it('a run whose nodes all open topics keeps its Gate-2 lines as before (no placement named)', async () => {
+    const { base } = specApproved();
+    const topicOnly = [goal('collect', { bot: 'cli_x' }), goal('summary', { bot: MAIN, depends: ['collect'] })];
+    const worker = fakeArchitect(topicOnly, NOTES);
+    const mainTopicAvailability = () => ({ available: true as const });
+    await host('architect', base, { runArchitect: worker.run, mainTopicAvailability });
+    const lines = (await host('approve-dag', base, { mainTopicAvailability })).output.split('\n');
+    expect(lines).toContain('执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）');
+    expect(lines).toContain('- collect → 文档Bot（claude-code）：文档Bot 擅长整理');
+    expect(lines).toContain('- summary → 主Bot（claude-code，主 Bot 自己）：汇总给主话题看');
+  });
+
   it('approve-dag refuses placements the main topic cannot host (rule 3), publishing nothing', async () => {
     const { base, runDir } = specApproved();
     const worker = fakeArchitect(NODES, NOTES);

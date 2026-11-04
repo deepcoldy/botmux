@@ -78,9 +78,12 @@ function escapeMarkdown(text: string): string {
   return text.replace(/[\\*_~`[\]<>]/g, (c) => `\\${c}`);
 }
 
-/** "Stopped without submitting" until a later turn starts in the session. */
+/** "Stopped without submitting" until a later turn starts in the session.
+ *  A stall before a main-topic handoff's own turn started (§5.5: someone
+ *  else's turn ahead of it in the queue) is not the node's. */
 export function v3NodeStalled(status: Extract<V3NodeCardStatus, { kind: 'running' }>): boolean {
   if (status.stalledAt === undefined || status.stalledAt < status.acceptedAt) return false;
+  if (status.startedAt !== undefined && status.stalledAt < status.startedAt) return false;
   return status.activeAt === undefined || status.activeAt <= status.stalledAt;
 }
 
@@ -110,6 +113,7 @@ const BLOCKED_REASON_TEXT: Record<string, string> = {
   HANDOFF_UNCERTAIN: '无法确认交接是否送达，请看一眼群消息再重试',
   BOT_REPORTED_BLOCKED: '执行 Bot 报告做不了',
   WORKING_DIR_REFUSED: '执行 Bot 不能在指定的工作目录里执行',
+  MAIN_TOPIC_BUSY: '执行 Bot 在主话题里正在执行另一个工作流节点',
   NODE_TIMEOUT: '超时未提交有效结果',
   HANDED_TO_HUMAN: '主 Bot 交给人决定',
 };

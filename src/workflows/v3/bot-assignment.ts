@@ -383,17 +383,20 @@ export function formatV3Gate2BotPlan(input: {
   }
   const named = (check: { assignee: string }) => `点名「${check.assignee}」`;
   const lines = [v3BotExecutorPlanHeading(input.targets)];
+  // Placements are named only when some node goes to the main topic: a run
+  // whose nodes all open topics keeps its lines exactly as before.
+  const placed = input.targets.some((target) => target.placement === 'main');
   for (const target of input.targets) {
     const name = input.nameOf(target.larkAppId);
     const cli = input.cliOf(target.larkAppId);
     // §5.2: every line also names where the node is handed off.
-    const placement = v3PlacementLabel(target);
+    const placement = placed ? v3PlacementLabel(target) : undefined;
     const detail = [cli, target.larkAppId === input.orchestratorAppId ? '主 Bot 自己' : undefined, placement].filter(Boolean).join('，');
     const written = input.reasons.get(target.nodeId);
     const reasonMatches = written
       && [target.larkAppId, name].some((candidate) => normalName(candidate) === normalName(written.bot));
     const missed = notHonouredByNode.get(target.nodeId);
-    const placementWhy = target.loop ? undefined : input.placementReasons?.get(target.nodeId);
+    const placementWhy = !placed || target.loop ? undefined : input.placementReasons?.get(target.nodeId);
     const placementReason = placementWhy && placementWhy.placement === (target.placement ?? 'topic') ? placementWhy.reason : undefined;
     lines.push(
       `- ${missed ? '⚠️ ' : ''}${target.nodeId} → ${name}${detail ? `（${detail}）` : ''}` +

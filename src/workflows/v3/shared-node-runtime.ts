@@ -3091,8 +3091,8 @@ export async function runWorkflow(
           errorCode: V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT,
           message: attempt.startPending
             // Main topic (§5.5): accepted into a busy session's queue, and its
-            // own turn never started within the node's whole timeout.
-            ? 'the handoff waited in the target bot\'s main-topic session queue and its turn never started before the node timeout'
+            // own turn never started within the backstop (timeout + grace).
+            ? '这一轮一直在执行 Bot 的主话题会话里排队，到期限还没开始（它前面的回合一直没结束）；可以重试，或把节点改成节点话题'
             : 'the node did not submit a valid result before its timeout',
         });
         progressed = true;

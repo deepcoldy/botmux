@@ -766,7 +766,12 @@ import {
   WORKFLOW_NODE_REPORT_ROUTE,
 } from './core/workflow-node-report.js';
 import { WORKFLOW_HANDOFF_ID_PLACEHOLDER } from './im/lark/v3-node-card.js';
-import { substituteWorkflowHandoffPlaceholder, workflowHandoffInputOptions, workflowNodeMarkerFromBinding } from './core/workflow-node-session.js';
+import {
+  substituteWorkflowHandoffPlaceholder,
+  workflowHandoffInputOptions,
+  workflowNodeMarkerFromBinding,
+  workflowNodeReportMarker,
+} from './core/workflow-node-session.js';
 import { lookupWorkflowHandoff, readDispatchRegistryLoose } from './core/workflow-handoff-binding.js';
 import {
   WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE,
@@ -9858,7 +9863,7 @@ ipcRoute('POST', WORKFLOW_NODE_REPORT_ROUTE, async (req, res) => {
         scope: ds.scope ?? ds.session.scope,
         ...(ds.session.rootMessageId ? { rootMessageId: ds.session.rootMessageId } : {}),
         ...(ds.session.workflowNode ? {
-          workflowNode: { handoffMessageId: ds.session.workflowNode.handoffMessageId, nonce: ds.session.workflowNode.nonce },
+          workflowNode: workflowNodeReportMarker(ds.session.workflowNode),
         } : {}),
       },
     };
@@ -28772,7 +28777,9 @@ async function handleThreadReplyAdmitted(
   // this bot's configured directory range as it stands now. Out of range, the
   // node blocks with the reason — never a silent fall back to the default dir.
   const workflowAdmission = workflowHandoff
-    ? workflowNodeDaemon.admitInbound(workflowHandoff, parsed.messageId, larkAppId, ds ? getSessionWorkingDir(ds) : undefined)
+    ? workflowNodeDaemon.admitInbound(
+      workflowHandoff, parsed.messageId, larkAppId, ds ? getSessionWorkingDir(ds) : undefined, ds?.session.workflowNode,
+    )
     : undefined;
   if (workflowHandoff && workflowAdmission && !workflowAdmission.start) {
     logger.info(`[${larkAppId}] workflow handoff ${parsed.messageId} not started (run ${workflowHandoff.workflow.runId}): ${workflowAdmission.reason}`);
