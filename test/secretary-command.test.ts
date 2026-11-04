@@ -32,6 +32,17 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: (id: string) => ({ config: { larkAppId: id } }),
   effectiveBotDisplayName: (st: any) => `Bot-${st.config.larkAppId}`,
 }));
+// 群描述标记：用内存 Map 模拟飞书群描述（跨机器共享的权威登记）。
+const markerByChat = new Map<string, string>();
+const mockWriteMarker = vi.fn(async (_app: string, chat: string, appId: string | null) => {
+  const previous = markerByChat.get(chat);
+  if (appId) markerByChat.set(chat, appId); else markerByChat.delete(chat);
+  return { ok: true as const, ...(previous ? { previous } : {}) };
+});
+vi.mock('../src/services/group-secretary-marker.js', () => ({
+  readSecretaryMarker: async (_app: string, chat: string) => markerByChat.get(chat),
+  writeSecretaryMarker: (...a: any[]) => (mockWriteMarker as any)(...a),
+}));
 const mockForget = vi.fn();
 vi.mock('../src/services/group-secretary-runtime.js', () => ({ forgetGroupSecretaryChat: (...a: any[]) => mockForget(...a) }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
@@ -109,7 +120,7 @@ describe('tryHandleSecretaryCommand', () => {
     expect(lastReply()).toBe('cmd.secretary.enabled');
   });
 
-  it('one secretary per group per machine: a second bot must take over explicitly', async () => {
+  it('one secretary per group (across machines): a second bot must take over explicitly', async () => {
     const OTHER = 'cli_other';
     const chat = 'oc_shared';
     await tryHandleSecretaryCommand(APP, msg('/secretary on', 'group', chat), USER, true);
@@ -132,5 +143,28 @@ describe('tryHandleSecretaryCommand', () => {
     await tryHandleSecretaryCommand(APP, msg('/secretary takeover', 'group', 'oc_free'), USER, true);
     expect(lastReply()).toBe('cmd.secretary.enabled');
     expect(isGroupSecretaryChat(APP, 'oc_free')).toBe(true);
+  });
+
+  it('a bot on another machine (marker only, no local entry) blocks on and is reported in status', async () => {
+    markerByChat.set('oc_remote', 'cli_on_other_machine');
+    await tryHandleSecretaryCommand(APP, msg('/secretary on', 'group', 'oc_remote'), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.taken');
+    await tryHandleSecretaryCommand(APP, msg('/secretary', 'group', 'oc_remote'), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.status_other');
+    await tryHandleSecretaryCommand(APP, msg('/secretary takeover', 'group', 'oc_remote'), USER, true);
+    expect(markerByChat.get('oc_remote')).toBe(APP);
+    expect(isGroupSecretaryChat(APP, 'oc_remote')).toBe(true);
+  });
+
+  it('off clears the group marker; a marker write failure leaves the local entry untouched', async () => {
+    await tryHandleSecretaryCommand(APP, msg('/secretary on', 'group', 'oc_m'), USER, true);
+    expect(markerByChat.get('oc_m')).toBe(APP);
+    mockWriteMarker.mockResolvedValueOnce({ ok: false, reason: 'chat_update_failed(1)' } as any);
+    await tryHandleSecretaryCommand(APP, msg('/secretary off', 'group', 'oc_m'), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.failed');
+    expect(isGroupSecretaryChat(APP, 'oc_m')).toBe(true);
+    await tryHandleSecretaryCommand(APP, msg('/secretary off', 'group', 'oc_m'), USER, true);
+    expect(markerByChat.has('oc_m')).toBe(false);
+    expect(isGroupSecretaryChat(APP, 'oc_m')).toBe(false);
   });
 });

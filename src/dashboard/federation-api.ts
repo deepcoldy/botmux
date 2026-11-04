@@ -28,6 +28,10 @@ import {
   setTeamBoardEntry,
 } from '../services/team-board-store.js';
 import { findMembershipByDelegationToken } from '../services/federation-membership-store.js';
+import { isFederationPeerToken } from '../services/group-secretary-federation.js';
+import { snapshotToSessionViews } from '../services/group-secretary-runtime.js';
+import { fetchSessionRecentTranscript } from '../services/group-secretary-transcript.js';
+import { fetchObserveSnapshot } from '../services/session-observe-command-fetch.js';
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import {
@@ -161,6 +165,33 @@ export async function handleFederationApi(
   if (!path.startsWith('/api/federation/')) return false;
   const dataDir = deps.dataDir ?? config.session.dataDir;
   const method = req.method ?? 'GET';
+
+  // 群秘书跨机器只读接口：本机 bot 在某群的会话投影 / 某会话最近对话（已脱敏）。
+  // 鉴权：federation 团队凭证（hub→spoke 的 delegationToken 或 spoke→hub 的 syncToken）。
+  if (path === '/api/federation/secretary/sessions' && method === 'GET') {
+    if (!isFederationPeerToken(dataDir, bearerOnly(req))) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const chatId = url.searchParams.get('chatId') ?? '';
+    if (!chatId.startsWith('oc_')) { jsonRes(res, 400, { ok: false, error: 'chat_required' }); return true; }
+    try {
+      const views = snapshotToSessionViews(await fetchObserveSnapshot());
+      const now = Date.now();
+      const sessions = views.filter(v => v.chatId === chatId
+        && (v.liveness === 'alive' || (v.lastActivityAt !== undefined && now - v.lastActivityAt < 24 * 3_600_000)));
+      jsonRes(res, 200, { ok: true, deploymentId: getDeploymentIdentity(dataDir).deploymentId, sessions });
+    } catch {
+      jsonRes(res, 503, { ok: false, error: 'observe_unavailable' });
+    }
+    return true;
+  }
+  if (path === '/api/federation/secretary/transcript' && method === 'GET') {
+    if (!isFederationPeerToken(dataDir, bearerOnly(req))) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const appId = url.searchParams.get('appId') ?? '';
+    const sessionId = url.searchParams.get('sessionId') ?? '';
+    if (!appId || !sessionId) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
+    const lines = await fetchSessionRecentTranscript(appId, sessionId);
+    jsonRes(res, 200, { ok: true, lines: lines ?? [] });
+    return true;
+  }
 
   // Spoke registers via an invite → issued a syncToken bound to the team.
   if (path === '/api/federation/join' && method === 'POST') {

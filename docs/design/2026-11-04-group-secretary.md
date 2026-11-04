@@ -27,9 +27,13 @@
 - 不得自行修改系统与配置；传话用 `dispatch --into <话题>` 发进对方所在话题。
 - 同一话题自最近一条真人消息后已发 ≥2 条：只能向 leader 告警。
 
-## 开关
-`/secretary on | off | takeover | status`。当前登记在本机共享数据目录（同机唯一）。
+## 开关与全群唯一
+`/secretary on | off | takeover | status`。权威登记写在群描述里的一行 `[botmux:secretary=<larkAppId>]`（`services/group-secretary-marker.ts`），所有机器读同一份，因此一个群只有一个秘书；`takeover` 改写该行，原秘书的 daemon 每分钟核对标记，发现指向别人即停手。本机文件 `group-secretary.json` 只记本 bot 的开启人等细节；旧版本只有本机登记的，运行时首次核对时补写标记。
 
-## 下一步：全群唯一 + 跨机器
-- 登记改写进群描述标记（所有机器可读），`takeover` 改写标记。
-- 秘书所在 daemon 经 federation（hub/spoke 的 delegationToken / syncToken）拉取其它机器上 bot 在本群的会话状态与对话片段，与本机会话一起进入判定引擎。
+## 跨机器
+- 每台部署的 dashboard 提供只读接口（在 token 网关之前，federation 团队凭证鉴权）：
+  - `GET /api/federation/secretary/sessions?chatId=` → 本机 bot 在该群的会话投影（与 `botmux observe` 同源）
+  - `GET /api/federation/secretary/transcript?appId=&sessionId=` → 该会话最近几句脱敏对话
+  - 鉴权：hub→spoke 用 spoke 发给 hub 的 delegationToken；spoke→hub 用 hub 发给 spoke 的 syncToken。
+- 秘书所在 daemon 每次轮询本机会话时，按 federation 记录向所有对端拉取并合并进判定引擎；对端不可达只当暂时看不到，不回退旧数据。
+- 催办与传话本来就走飞书，跨机器天然可用。

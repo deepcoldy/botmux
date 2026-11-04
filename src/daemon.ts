@@ -573,6 +573,8 @@ import {
 import { createGroupSecretaryRuntime, setGroupSecretaryRuntime } from './services/group-secretary-runtime.js';
 import { fetchObserveSnapshot } from './services/session-observe-command-fetch.js';
 import { fetchSessionRecentTranscript } from './services/group-secretary-transcript.js';
+import { readSecretaryMarker, writeSecretaryMarker } from './services/group-secretary-marker.js';
+import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecretaryPeers, type SecretaryPeer } from './services/group-secretary-federation.js';
 import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
@@ -33658,12 +33660,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // 群秘书（/secretary on）：旁听开启群的消息 + 每 10 秒拉一次本机会话快照，摘要以静默回合
   // 送进本 bot 在该群的 chat 级会话。没有开启的群时每拍只做一次查表。
+  let secretaryRemoteAppPeer = new Map<string, SecretaryPeer>();
   setGroupSecretaryRuntime(createGroupSecretaryRuntime({
     larkAppId: cfg.larkAppId,
     selfOpenId: () => getBot(cfg.larkAppId).botOpenId,
     canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
     fetchSnapshot: () => fetchObserveSnapshot(),
-    fetchTranscript: (appId, sessionId) => fetchSessionRecentTranscript(appId, sessionId),
+    fetchTranscript: async (appId, sessionId) => {
+      const local = await fetchSessionRecentTranscript(appId, sessionId);
+      if (local) return local;
+      const peer = appId ? secretaryRemoteAppPeer.get(appId) : undefined;
+      return peer && appId ? fetchRemoteSecretaryTranscript(peer, appId, sessionId) : undefined;
+    },
+    readMarker: chatId => readSecretaryMarker(cfg.larkAppId, chatId),
+    writeMarker: (chatId, appId) => writeSecretaryMarker(cfg.larkAppId, chatId, appId),
+    fetchRemoteViews: async chatIds => {
+      const peers = listSecretaryPeers(config.session.dataDir);
+      if (peers.length === 0 || chatIds.length === 0) return [];
+      const remote = await fetchRemoteSecretarySessions(peers, chatIds);
+      secretaryRemoteAppPeer = remote.appPeer;
+      return remote.views;
+    },
     fetchRecentMessages: chatId => listChatMessages(cfg.larkAppId, chatId, 50),
     groupContextEnabled: (chatId: string) => getGroupContextSettings(cfg.larkAppId, chatId).enabled,
     manualWatches: () => listSecretaryWatches(cfg.larkAppId),

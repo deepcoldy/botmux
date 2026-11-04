@@ -11,6 +11,7 @@ import { isSessionGroup } from '../../services/session-groups-store.js';
 import { getGroupSecretaryOwner, setGroupSecretaryChat } from '../../services/group-secretary-store.js';
 import { getBot, effectiveBotDisplayName } from '../../bot-registry.js';
 import { forgetGroupSecretaryChat } from '../../services/group-secretary-runtime.js';
+import { readSecretaryMarker, writeSecretaryMarker } from '../../services/group-secretary-marker.js';
 import { logger } from '../../utils/logger.js';
 
 export async function tryHandleSecretaryCommand(
@@ -48,13 +49,23 @@ export async function tryHandleSecretaryCommand(
   }
 
   const arg = match[1]?.trim().toLowerCase();
-  const owner = getGroupSecretaryOwner(chatId);
-  const ownerName = owner ? (owner.botName ?? owner.larkAppId) : '';
-  const isMine = owner?.larkAppId === larkAppId;
+  // 权威登记 = 群描述里的 [botmux:secretary=…] 标记（跨机器可见）；本机文件只记本 bot 的开启人等细节。
+  let markerAppId: string | undefined;
+  try {
+    markerAppId = await readSecretaryMarker(larkAppId, chatId);
+  } catch {
+    await reply(t('cmd.secretary.failed', { reason: 'chat_read_failed' }, loc));
+    return true;
+  }
+  const local = getGroupSecretaryOwner(chatId);
+  const isMine = markerAppId === larkAppId;
+  const ownerName = markerAppId
+    ? (local?.larkAppId === markerAppId && local.botName ? local.botName : markerAppId)
+    : '';
   if (!arg || arg === 'status') {
     if (!canTalk) return true;
-    if (!owner) await reply(t('cmd.secretary.status_off', undefined, loc));
-    else if (isMine) await reply(t('cmd.secretary.status_on', { at: new Date(owner.enabledAt).toISOString() }, loc));
+    if (!markerAppId) await reply(t('cmd.secretary.status_off', undefined, loc));
+    else if (isMine) await reply(t('cmd.secretary.status_on', { at: local?.larkAppId === larkAppId ? new Date(local.enabledAt).toISOString() : '-' }, loc));
     else await reply(t('cmd.secretary.status_other', { name: ownerName }, loc));
     return true;
   }
@@ -69,40 +80,55 @@ export async function tryHandleSecretaryCommand(
     await reply(t('cmd.secretary.owner_only', undefined, loc));
     return true;
   }
-  if ((enable || takeover) && isMine) {
-    await reply(t('cmd.secretary.already_on', undefined, loc));
+  let selfName: string | undefined;
+  try { selfName = effectiveBotDisplayName(getBot(larkAppId)); } catch { selfName = undefined; }
+  const localEntry = { larkAppId, ...(selfName ? { botName: selfName } : {}), enabledBy: senderOpenId, enabledAt: Date.now() };
+
+  if (enable || takeover) {
+    if (isMine) {
+      // 标记已是自己：补齐本机登记（例如换机器后重开）即可。
+      if (local?.larkAppId !== larkAppId) setGroupSecretaryChat(chatId, localEntry);
+      await reply(t('cmd.secretary.already_on', undefined, loc));
+      return true;
+    }
+    // 全群只能有一个秘书（跨机器）：已有别的 bot 在当，必须显式接管。
+    if (enable && markerAppId) {
+      await reply(t('cmd.secretary.taken', { name: ownerName }, loc));
+      return true;
+    }
+    const wrote = await writeSecretaryMarker(larkAppId, chatId, larkAppId);
+    if (!wrote.ok) {
+      await reply(t('cmd.secretary.failed', { reason: wrote.reason }, loc));
+      return true;
+    }
+    const res = setGroupSecretaryChat(chatId, localEntry);
+    if (!res.ok) {
+      await reply(t('cmd.secretary.failed', { reason: res.reason }, loc));
+      return true;
+    }
+    logger.info(`[secretary] ${markerAppId ? `took over from ${markerAppId}` : 'enabled'} chat=${chatId.slice(0, 12)} by=${senderOpenId.slice(0, 12)}`);
+    await reply(markerAppId
+      ? t('cmd.secretary.took_over', { name: ownerName }, loc)
+      : t('cmd.secretary.enabled', undefined, loc));
     return true;
   }
-  // 本机同一个群只能有一个秘书：已有别的 bot 在当，必须显式接管，避免两个秘书各催各的、互相触发。
-  if (enable && owner && !isMine) {
-    await reply(t('cmd.secretary.taken', { name: ownerName }, loc));
-    return true;
-  }
-  if (disable && !isMine) {
-    await reply(owner
+
+  // off：只有当前秘书自己能关。
+  if (!isMine) {
+    if (local?.larkAppId === larkAppId) setGroupSecretaryChat(chatId, null); // 清掉过期的本机登记
+    await reply(markerAppId
       ? t('cmd.secretary.not_mine', { name: ownerName }, loc)
       : t('cmd.secretary.already_off', undefined, loc));
     return true;
   }
-  let selfName: string | undefined;
-  try { selfName = effectiveBotDisplayName(getBot(larkAppId)); } catch { selfName = undefined; }
-  const res = setGroupSecretaryChat(chatId, disable ? null : {
-    larkAppId,
-    ...(selfName ? { botName: selfName } : {}),
-    enabledBy: senderOpenId,
-    enabledAt: Date.now(),
-  });
-  if (!res.ok) {
-    await reply(t('cmd.secretary.failed', { reason: res.reason }, loc));
+  const cleared = await writeSecretaryMarker(larkAppId, chatId, null);
+  if (!cleared.ok) {
+    await reply(t('cmd.secretary.failed', { reason: cleared.reason }, loc));
     return true;
   }
-  if (disable) forgetGroupSecretaryChat(chatId);
-  logger.info(`[secretary] ${disable ? 'disabled' : takeover && owner ? `took over from ${owner.larkAppId}` : 'enabled'} `
-    + `chat=${chatId.slice(0, 12)} by=${senderOpenId.slice(0, 12)}`);
-  if (takeover && owner) {
-    await reply(t('cmd.secretary.took_over', { name: ownerName }, loc));
-    return true;
-  }
-  await reply(t(disable ? 'cmd.secretary.disabled' : 'cmd.secretary.enabled', undefined, loc));
+  if (local?.larkAppId === larkAppId) setGroupSecretaryChat(chatId, null);
+  forgetGroupSecretaryChat(chatId);
+  logger.info(`[secretary] disabled chat=${chatId.slice(0, 12)} by=${senderOpenId.slice(0, 12)}`);
+  await reply(t('cmd.secretary.disabled', undefined, loc));
   return true;
 }

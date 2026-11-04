@@ -270,3 +270,60 @@ describe('group secretary runtime — startup backfill', () => {
     rt.stop();
   });
 });
+
+describe('group secretary runtime — group marker and federation', () => {
+  it('stands down when the group marker points at another bot, and resumes when it comes back', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    let marker: string | undefined = 'cli_other';
+    const deliver = vi.fn(async () => undefined);
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      readMarker: async () => marker, writeMarker: vi.fn(async () => ({ ok: true })),
+      deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
+    });
+    await rt.tick();
+    rt.observeMessageEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_1', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '有人吗' }), mentions: [] } });
+    clock += 30_000; await rt.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    marker = APP;
+    clock += 60_000; await rt.tick();
+    rt.observeMessageEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_2', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '现在呢' }), mentions: [] } });
+    clock += 30_000; await rt.tick();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    rt.stop();
+  });
+
+  it('migrates a legacy local-only registration by writing the marker once', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const writeMarker = vi.fn(async () => ({ ok: true }));
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      readMarker: async () => undefined, writeMarker,
+      deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
+    });
+    await rt.tick(); clock += 61_000; await rt.tick();
+    expect(writeMarker).toHaveBeenCalledTimes(1);
+    expect(writeMarker).toHaveBeenCalledWith(CHAT, APP);
+    rt.stop();
+  });
+
+  it('merges remote (federated) sessions so their transitions raise events too', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const remote = [{ sessionId: 'r1', larkAppId: 'cli_fox', botName: 'fox', chatId: CHAT, scope: 'thread' as const, rootMessageId: 'om_r', liveness: 'alive' as const, turn: 'working' }];
+    const deliver = vi.fn(async () => undefined);
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      fetchRemoteViews: async () => remote.map(r => ({ ...r })),
+      deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, sessionPollMs: 10_000,
+    });
+    await rt.tick();
+    remote[0]!.turn = 'idle';
+    clock += 10_000; await rt.tick();
+    clock += 5_000; await rt.tick();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect((deliver.mock.calls[0] as any[])[0].prompt).toContain('bot_name="fox"');
+    rt.stop();
+  });
+});

@@ -17,6 +17,12 @@ export interface GroupSecretaryRuntimeDeps {
   selfOpenId: () => string | undefined;
   fetchSnapshot: () => Promise<ObserveSnapshot>;
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
+  /** 读 / 写群描述里的秘书标记（全群唯一登记）。不提供时只按本机登记判断。 */
+  readMarker?: (chatId: string) => Promise<string | undefined>;
+  writeMarker?: (chatId: string, appId: string) => Promise<{ ok: boolean }>;
+  markerRefreshMs?: number;
+  /** 其它机器（federation 对端）上 bot 在这些群的会话；拿不到返回空数组。 */
+  fetchRemoteViews?: (chatIds: string[]) => Promise<SecretarySessionView[]>;
   /** 该群是否开了 Context Sharing：开了就由它注入群消息增量，摘要里不再重复附带新消息。 */
   groupContextEnabled?: (chatId: string) => boolean;
   /** 秘书手动要求盯的话题（botmux secretary watch 写入的登记）。 */
@@ -143,9 +149,41 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
   const ownBusy = new Set<string>();
   /** check_in 进展判断：每个会话上次回访时的对话指纹。 */
   const transcriptSig = new Map<string, string>();
+  /** 群描述标记的最近读数：chatId → 标记里的 appId（undefined = 无标记）。缺项 = 还没读到。 */
+  const markers = new Map<string, string | undefined>();
+  const markerReadAt = new Map<string, number>();
+  const migrated = new Set<string>();
+  const markerRefreshMs = deps.markerRefreshMs ?? 60_000;
+  /** 本机登记是自己，且群描述标记没有指向别的 bot（读不到时按本机登记继续，不因网络抖动停手）。 */
+  const isActiveChat = (chatId: string | undefined): boolean => {
+    if (!isGroupSecretaryChat(deps.larkAppId, chatId)) return false;
+    if (!deps.readMarker || !markers.has(chatId!)) return true;
+    return markers.get(chatId!) === deps.larkAppId;
+  };
+  const refreshMarkers = async (): Promise<void> => {
+    if (!deps.readMarker) return;
+    for (const { chatId } of listGroupSecretaryChats(deps.larkAppId)) {
+      if (now() - (markerReadAt.get(chatId) ?? 0) < markerRefreshMs) continue;
+      markerReadAt.set(chatId, now());
+      try {
+        let marker = await deps.readMarker(chatId);
+        // 旧版本只在本机登记、群描述里没有标记：本进程首次看到时补写一次（迁移）。
+        if (marker === undefined && !migrated.has(chatId) && deps.writeMarker) {
+          migrated.add(chatId);
+          if ((await deps.writeMarker(chatId, deps.larkAppId)).ok) marker = deps.larkAppId;
+        }
+        migrated.add(chatId);
+        const before = markers.get(chatId);
+        markers.set(chatId, marker);
+        if (marker !== deps.larkAppId && before !== marker) {
+          deps.log('info', `[group-secretary] marker for chat=${chatId.slice(0, 12)} is ${marker ?? 'absent'}; standing down`);
+        }
+      } catch { /* 读失败：保留上一次读数 */ }
+    }
+  };
   const engine = new GroupSecretaryEngine({
     selfAppId: deps.larkAppId,
-    isEnabledChat: chatId => isGroupSecretaryChat(deps.larkAppId, chatId),
+    isEnabledChat: chatId => isActiveChat(chatId),
     isTrustedHuman: (chatId, openId) => !!openId && deps.canTalk(chatId, openId),
     unaddressedGraceMs: staggeredGraceMs(deps.larkAppId),
     isSecretaryBusy: chatId => ownBusy.has(chatId),
@@ -238,11 +276,20 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     if (listGroupSecretaryChats(deps.larkAppId).length === 0) return;
     inFlight = true;
     try {
+      await refreshMarkers();
       await backfill();
       if (now() - lastPollAt >= sessionPollMs) {
         lastPollAt = now();
         try {
-          const views = snapshotToSessionViews(await deps.fetchSnapshot());
+          const localViews = snapshotToSessionViews(await deps.fetchSnapshot());
+          let remoteViews: SecretarySessionView[] = [];
+          if (deps.fetchRemoteViews) {
+            try {
+              remoteViews = await deps.fetchRemoteViews(listGroupSecretaryChats(deps.larkAppId).map(c => c.chatId));
+            } catch { remoteViews = []; }
+          }
+          const localIds = new Set(localViews.map(v => v.sessionId));
+          const views = [...localViews, ...remoteViews.filter(v => !localIds.has(v.sessionId))];
           ownBusy.clear();
           for (const v of views) {
             if (v.larkAppId === deps.larkAppId && v.scope === 'chat' && v.chatId
@@ -270,7 +317,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     observeMessageEvent(data: any): void {
       try {
         const chatId = data?.message?.chat_id;
-        if (!isGroupSecretaryChat(deps.larkAppId, chatId)) return;
+        if (!isActiveChat(chatId)) return;
         const message = larkEventToSecretaryMessage(data, deps.selfOpenId(), deps.larkAppId);
         if (!message) return;
         // 开启之前的消息（重放 / 补拉）不进秘书视野。
