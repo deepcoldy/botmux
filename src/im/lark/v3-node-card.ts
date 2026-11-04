@@ -55,6 +55,12 @@ export interface V3NodeCardView {
   now: number;
   /** §11: the「工作流 ›」sidebar entry at the signature row's right end. */
   entry?: WorkflowSidebarEntryLink;
+  /** §13.6: the latest automatic handling or hand-over of this attempt,
+   *  shown as one line（「主 Bot 自动重试：<理由>」/「交给人决定：<理由>」）. */
+  intervention?: string;
+  /** §13.6: a completed checkpoint node — whether its dependants wait for
+   *  the main bot, or went on (and why). */
+  checkpoint?: string;
 }
 
 function plain(content: string): Record<string, unknown> {
@@ -101,7 +107,9 @@ const BLOCKED_REASON_TEXT: Record<string, string> = {
   HANDOFF_NOT_ACCEPTED: '执行 Bot 没有在期限内接单',
   HANDOFF_UNCERTAIN: '无法确认交接是否送达，请看一眼群消息再重试',
   BOT_REPORTED_BLOCKED: '执行 Bot 报告做不了',
+  WORKING_DIR_REFUSED: '执行 Bot 不能在指定的工作目录里执行',
   NODE_TIMEOUT: '超时未提交有效结果',
+  HANDED_TO_HUMAN: '主 Bot 交给人决定',
 };
 
 function statusLine(view: V3NodeCardView): { text: string; template: string } {
@@ -126,6 +134,7 @@ function statusLine(view: V3NodeCardView): { text: string; template: string } {
         template: 'green',
       };
     case 'blocked': {
+      if (status.errorCode === 'HANDED_TO_HUMAN') return { text: `等人工确认：主 Bot 交给人决定 ${attempt}`, template: 'blue' };
       const reason = (status.errorCode && BLOCKED_REASON_TEXT[status.errorCode]) ?? '受阻';
       return { text: `已停下：${reason} ${attempt}`, template: status.errorCode === 'NODE_TIMEOUT' ? 'red' : 'orange' };
     }
@@ -147,9 +156,12 @@ export function buildV3NodeCard(view: V3NodeCardView): string {
     plain(`执行：${view.botName}${view.selfExecuted ? '（主 Bot 自己）' : ''}`),
     plain(`状态：${text}`),
   ];
-  if (view.status.kind === 'blocked' && view.status.message) {
+  // A hand-over's reason is the intervention line below, not repeated here.
+  if (view.status.kind === 'blocked' && view.status.message && !(view.status.errorCode === 'HANDED_TO_HUMAN' && view.intervention)) {
     elements.push(plain(`原因：${view.status.message.slice(0, 500)}`));
   }
+  if (view.intervention) elements.push(plain(view.intervention));
+  if (view.checkpoint) elements.push(plain(view.checkpoint));
   if (view.upstream.length > 0) {
     elements.push(plain(`上游：${view.upstream.map((up) => `${up.nodeId} ${up.done ? '✅' : '⏳'}`).join('  ')}`));
   }

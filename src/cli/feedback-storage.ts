@@ -13,7 +13,7 @@ export async function runFeedbackStorageCommand(args: string[], io: {
     return index < 0 ? undefined : args[index + 1];
   };
   try {
-    if (args.some(value => value === '--password' || value.startsWith('--password='))) throw new Error('feedback_storage_use_secret_reference');
+    if (args.some(value => value === '--password' || value.startsWith('--password=') || value === '--token' || value.startsWith('--token='))) throw new Error('feedback_storage_use_secret_reference');
     let result: unknown;
     switch (args[0] ?? 'status') {
       case 'cancel': {

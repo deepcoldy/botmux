@@ -19,6 +19,7 @@
 
 import { readV3RevisionWait, type V3RevisionWait } from '../../workflows/v3/run-edit.js';
 import { buildV3RevisionCard } from './v3-revision-card.js';
+import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
 /** Bound on carried hops and on re-render rounds (each round is a state change). */
 const MAX_HOPS = 16;
@@ -43,7 +44,13 @@ const VOID_DETAIL: Record<NonNullable<V3RevisionWait['voidReason']>, string> = {
  * What a card first posted for `revision` must show now: the wait at the end
  * of its `carriedTo` chain, rendered. `undefined` when there is no wait.
  */
-export function v3RevisionCardState(runDir: string, runId: string, revision: number): V3RevisionCardState | undefined {
+export function v3RevisionCardState(
+  runDir: string,
+  runId: string,
+  revision: number,
+  /** §11.1: the run's「工作流 ›」entry, rendered in place of「Web 详情」. */
+  workflowEntry?: WorkflowSidebarEntryLink,
+): V3RevisionCardState | undefined {
   let wait = readV3RevisionWait(runDir, revision);
   for (let hops = 0; wait && wait.status === 'voided' && wait.carriedTo !== undefined && hops < MAX_HOPS; hops++) {
     const next = readV3RevisionWait(runDir, wait.carriedTo);
@@ -57,7 +64,7 @@ export function v3RevisionCardState(runDir: string, runId: string, revision: num
         : { kind: 'void' as const, detail: wait.voidReason ? VOID_DETAIL[wait.voidReason] : VOID_DETAIL.stale };
   return {
     key: `${wait.revision}:${wait.status}`,
-    card: buildV3RevisionCard({ runId, view: wait.view, ...(resolution ? { resolution } : {}) }),
+    card: buildV3RevisionCard({ runId, view: wait.view, ...(resolution ? { resolution } : {}), ...(workflowEntry ? { workflowEntry } : {}) }),
     revision: wait.revision,
     status: wait.status,
   };
@@ -89,6 +96,8 @@ export function createV3RevisionCardSync(deps: {
   runDir: (runId: string) => string;
   updateMessage: (larkAppId: string, messageId: string, card: string) => Promise<void>;
   warn?: (message: string) => void;
+  /** §11.1: the run's「工作流 ›」entry (bot-executed runs only). */
+  workflowEntry?: (runId: string) => WorkflowSidebarEntryLink | undefined;
 }): V3RevisionCardSync {
   const tails = new Map<string, Promise<unknown>>();
 
@@ -98,7 +107,7 @@ export function createV3RevisionCardSync(deps: {
     for (let round = 0; round < MAX_ROUNDS; round++) {
       let state: V3RevisionCardState | undefined;
       try {
-        state = v3RevisionCardState(runDir, runId, revision);
+        state = v3RevisionCardState(runDir, runId, revision, deps.workflowEntry?.(runId));
       } catch (err) {
         deps.warn?.(`[v3:${runId}] revision card state unreadable: ${err instanceof Error ? err.message : String(err)}`);
         return shown ? { kind: 'shown', state: shown } : { kind: 'failed' };

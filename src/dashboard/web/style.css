@@ -7642,6 +7642,24 @@ dialog.onboarding-dialog::backdrop {
   box-sizing: border-box;
   resize: vertical;
 }
+.roles-listener-identity-keywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.roles-listener-identity-keyword {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--fg);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
 .roles-listener-policy {
   display: inline-flex;
   align-items: center;
@@ -20454,6 +20472,26 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-attempts .o-failed { color: var(--v3r-failed); }
 .v3r-attempts .o-blocked { color: var(--v3r-blocked); }
 .v3r-attempts .o-running { color: var(--v3r-running); }
+.v3r-checkpoint { margin: 6px 0 0; color: var(--muted); }
+.v3r-interventions { margin: 6px 0 0; }
+.v3r-interventions-title { margin: 0 0 2px; color: var(--muted); }
+.v3r-interventions-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.v3r-intervention {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .6em;
+  color: var(--muted);
+}
+.v3r-intervention .k { color: var(--fg); }
+.v3r-intervention.kind-handedToHuman .k { color: var(--v3r-blocked); }
+.v3r-intervention .r { color: var(--fg); overflow-wrap: anywhere; }
 
 .v3r-dep,
 .v3r-granted-tag,
@@ -35544,6 +35582,11 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfs-detail-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .35rem; }
 .wfs-detail .v3r-nodeid { font-size: 14px; }
 .wfs-hint { margin: 0; font-size: 12px; }
+.wfs-revisions {
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: .6rem .75rem; background: var(--surface);
+}
+.wfs-revisions .v3r-revisions { margin-top: 0; }
 .wfs-denied { margin: 48px auto; max-width: 420px; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.7; }
 
 /* Dedicated-group naming keeps mode, model and feedback readable at narrow widths. */

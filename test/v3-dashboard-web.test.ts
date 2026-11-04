@@ -14,6 +14,7 @@ import {
   nodeRevisionBadge,
   nodeStatusLine,
   nodeWaitingMs,
+  V3_CHECKPOINT_LABEL,
   resolveLoopTerminalNode,
   v3RunIdFromHash,
 } from '../src/dashboard/web/v3-model.js';
@@ -30,7 +31,7 @@ import {
   nodeTerminalSignature,
 } from '../src/dashboard/web/v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../src/workflows/v3/ops-projection.js';
-import { DagNode, NodeExecution, V3CancelButton } from '../src/dashboard/web/v3-components.js';
+import { DagNode, NodeExecution, NodeInterventions, V3CancelButton } from '../src/dashboard/web/v3-components.js';
 import { ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -385,6 +386,24 @@ describe('v3 dashboard 节点：负责 Bot、五类状态与耗时', () => {
     expect(nodeStatusLine(node({ status: 'pending' }), 9 * MIN)).toBe('等待');
   });
 
+  it('状态行：未开始且在等检查点的节点显示「等检查点」，优先于普通「等待」', () => {
+    // M23: waitingOnCheckpoint renders on the graph node (ops-projection).
+    expect(nodeStatusLine(node({ status: 'pending', waitingOnCheckpoint: ['survey'] }), 9 * MIN)).toBe('等待 · 等检查点');
+    // Only pending nodes wait; a running node never shows it.
+    expect(nodeStatusLine(node({ status: 'running', startedAt: 0, waitingOnCheckpoint: ['survey'] }), 9 * MIN)).toBe('进行中 · 9分');
+    expect(nodeStatusLine(node({ status: 'pending' }), 9 * MIN)).toBe('等待');
+  });
+
+  it('检查点三态标签：holding / reviewed / notReviewed 文案各不相同', () => {
+    // M24: the dashboard must distinguish "reviewed by the main bot" from
+    // "went on without that review" (a failed delivery, a closed session,
+    // the timeout) — collapsing them would hide a safety event.
+    expect(V3_CHECKPOINT_LABEL.holding).toBe('检查点：等主 Bot 看完结果，后续节点暂停');
+    expect(V3_CHECKPOINT_LABEL.reviewed).toBe('检查点：主 Bot 已看过结果');
+    expect(V3_CHECKPOINT_LABEL.notReviewed).toBe('检查点：没等到主 Bot 看结果，已按原流程继续');
+    expect(new Set(Object.values(V3_CHECKPOINT_LABEL)).size).toBe(3);
+  });
+
   it('等人时长：审批从发卡算起，受阻从卡住算起', () => {
     expect(nodeWaitingMs(node({ status: 'gateWaiting', gateSince: MIN }), 4 * MIN)).toBe(3 * MIN);
     expect(nodeWaitingMs(node({ status: 'blocked', startedAt: 0, endedAt: 2 * MIN }), 7 * MIN)).toBe(5 * MIN);
@@ -466,6 +485,24 @@ describe('v3 dashboard 节点：负责 Bot、五类状态与耗时', () => {
         expect(narrow.badge?.text === nodeRevisionBadge(n) || narrow.title === nodeRevisionBadge(n)).toBe(true);
       }
     });
+  });
+
+  it('节点详情列出主 Bot 的每次自动处理和每次交给人，附理由；没有时不显示', () => {
+    const html = renderToStaticMarkup(React.createElement(NodeInterventions, {
+      node: node({
+        status: 'blocked',
+        interventions: [
+          { kind: 'retry', by: 'mainBot', reason: '上游接口偶发超时', at: 0 },
+          { kind: 'handedToHuman', by: 'initiator', reason: '需要发起人给生产权限', at: MIN },
+        ],
+      }),
+    }));
+    expect(html).toContain('主 Bot 自动重试');
+    expect(html).toContain('上游接口偶发超时');
+    expect(html).toContain('交给人决定');
+    expect(html).toContain('（发起人）');
+    expect(html).toContain('需要发起人给生产权限');
+    expect(renderToStaticMarkup(React.createElement(NodeInterventions, { node: node() }))).toBe('');
   });
 
   it('节点详情列出每次尝试的结果；只有一次成功尝试时不列清单', () => {

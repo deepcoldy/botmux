@@ -625,6 +625,22 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(cfg.messageListeners?.oc_legacy.autoCloseAfterCompletion).toBeUndefined();
   });
 
+  it('retains identity keyword semantics across global, custom and legacy config reloads', () => {
+    const listener = { enabled: true, prompt: 'triage', contentPolicy: { includeMentionedOpenIds: ['ou_member'], matchMode: 'all' } };
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      globalMessageListener: listener,
+      groupMessageListenerOverrides: { oc_custom: { mode: 'custom', listener } },
+      messageListeners: { oc_legacy: listener },
+    })]));
+    expect(cfg.globalMessageListener?.contentPolicy).toEqual(listener.contentPolicy);
+    expect(cfg.groupMessageListenerOverrides?.oc_custom).toMatchObject({ mode: 'custom', listener: { contentPolicy: listener.contentPolicy } });
+    expect(cfg.messageListeners?.oc_legacy.contentPolicy).toEqual(listener.contentPolicy);
+    const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      globalMessageListener: { ...listener, contentPolicy: { includeKeywords: ['ask'], includeMentionedOpenIds: ['bad'], matchMode: 'all' } },
+    })]));
+    expect(invalid.globalMessageListener?.contentPolicy).toEqual({ includeKeywords: ['ask'], includeMentionedOpenIds: [], matchMode: 'all' });
+  });
+
   it('normalizes per-chat messageListeners without enabling them by default', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {

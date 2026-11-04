@@ -12,6 +12,8 @@ import {
   type RiffHostBinding, type RiffHostRequest, type RiffHostResult,
 } from '../services/riff-host-tools.js';
 import { RIFF_HOST_UNREACHABLE_HINT } from '../services/riff-host-hint.js';
+import { RIFF_UPLOAD_PREFIX } from '../services/riff-upload-placeholder.js';
+import { defaultStatFile, parseSendInvocation, validateClientSendInvocation } from './send-invocation.js';
 
 function bindingPath(env: NodeJS.ProcessEnv): string {
   if (!env.BOTMUX_SESSION_ID) throw new Error('riff_host_session_missing');
@@ -29,9 +31,31 @@ export function installRiffHostBinding(encoded: string, env = process.env): void
   atomicWriteFileSync(path, JSON.stringify(b), { mode: 0o600 });
 }
 
+/** Return stdin at most once. The top-level send preflight may already have
+ *  read it; passing that cached value keeps the Riff path from consuming the
+ *  same pipe twice while still allowing a standalone Riff call to read it. */
+export function makeRiffStdinReader(
+  cached: string | undefined,
+  readStdin: () => Promise<string>,
+): () => Promise<string> {
+  return async () => cached !== undefined ? cached : readStdin();
+}
+
+export class RiffSendPreflightError extends Error {}
+
 export async function prepareRiffHostRequest(argv: string[], readStdin: () => Promise<string>): Promise<RiffHostRequest> {
   const args = [...argv];
   if (args[0] === 'ask' && args[1]?.startsWith('--')) args.splice(1, 0, 'buttons');
+  const sendInvocation = args[0] === 'send' ? parseSendInvocation(args.slice(1)) : undefined;
+  if (sendInvocation) {
+    if (sendInvocation.rawDoubleDashToken) {
+      throw new RiffSendPreflightError("botmux send: '--' 分隔符尚未支持；正文以 -- 开头请用 --content-file 或 heredoc。");
+    }
+    if (!sendInvocation.freeHelpRequested) {
+      const validated = validateClientSendInvocation(sendInvocation, { cwd: process.cwd(), statFile: defaultStatFile });
+      if (!validated.ok) throw new RiffSendPreflightError(validated.message);
+    }
+  }
   const paths = riffHostFileArguments(args);
   const files: NonNullable<RiffHostRequest['files']> = [];
   let total = 0;
@@ -52,21 +76,14 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
     if (total * 4 / 3 > RIFF_HOST_MAX_BYTES - 1024 * 1024) throw new Error('riff_host_upload_too_large');
     // Keep only an inert filename; paths and unicode names never select host files.
     const name = basename(path).replace(/[^\w. -]/g, '_').slice(-160) || `upload${extname(path)}`;
-    args[i] = `riff-upload:${files.length}`;
+    args[i] = `${RIFF_UPLOAD_PREFIX}${files.length}`;
     files.push({ name, dataBase64: bytes.toString('base64') });
   }
   // cmdSend reads stdin only when neither a positional body nor a card/content
   // file was supplied. An empty pipe must not swallow a positional message.
   let body: string | undefined;
-  const hasFlag = (flag: string) => args.some(a => a === flag || a.startsWith(`${flag}=`));
-  if (args[0] === 'send' && !hasFlag('--content-file') && !hasFlag('--card-file') && !hasFlag('--card-json')) {
-    const valueFlags = new Set(['--response-kind', '--mention', '--layout', '--expected-link', '--quote', '--as', '--plugin-card-action', '--image-mode', '--images', '--image', '--files', '--file', '--videos', '--video-covers', '--completion-proposal-file']);
-    let positional = false;
-    for (let i = 1; i < args.length; i++) {
-      if (valueFlags.has(args[i]!)) { i++; continue; }
-      if (!args[i]!.startsWith('-')) positional = true;
-    }
-    if (!positional) body = await stdin();
+  if (sendInvocation?.bodySource === 'stdin' && !sendInvocation.freeHelpRequested) {
+    body = await stdin();
   }
   const request = { operationId: randomUUID(), argv: args, stdin: body, ...(files.length ? { files } : {}) };
   if (Buffer.byteLength(JSON.stringify(request)) > RIFF_HOST_MAX_BYTES) throw new Error('riff_host_request_too_large');
@@ -217,7 +234,17 @@ export async function maybeRunRiffHostTool(argv: string[], readStdin: () => Prom
     || (argv[0] === 'send' && argv.includes('--dry-run'))) return false;
   const b = JSON.parse(readFileSync(path, 'utf8')) as RiffHostBinding;
   if (b.sessionId !== env.BOTMUX_SESSION_ID) throw new Error('riff_host_session_mismatch');
-  const result = restoreRiffHostAttachments(await callRiffHostTool(b, await prepareRiffHostRequest(argv, readStdin)));
+  let request: RiffHostRequest;
+  try {
+    request = await prepareRiffHostRequest(argv, readStdin);
+  } catch (error) {
+    if (error instanceof RiffSendPreflightError) {
+      console.error(error.message);
+      process.exit(2);
+    }
+    throw error;
+  }
+  const result = restoreRiffHostAttachments(await callRiffHostTool(b, request));
   await Promise.all([writeAndFlush(process.stdout, result.stdout), writeAndFlush(process.stderr, result.stderr)]);
   process.exitCode = result.exitCode;
   return true;

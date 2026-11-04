@@ -13363,6 +13363,9 @@ export function sendWorkerInput(
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
     trustedCaller?: TrustedCaller;
+    /** Queue behind a running turn instead of folding into it (type-ahead):
+     *  the input must start as a turn of its own. */
+    queueAfterActiveTurn?: true;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
@@ -13536,9 +13539,9 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined
+    ...(opts.queueAfterActiveTurn || (opts.dispatchAttempt === undefined
       && (opts.trustedCaller?.source === 'schedule_creator'
-        || isSerialGroupInput(ds, opts.trustedCaller))
+        || isSerialGroupInput(ds, opts.trustedCaller)))
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }

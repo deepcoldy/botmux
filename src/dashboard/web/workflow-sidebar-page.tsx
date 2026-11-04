@@ -4,6 +4,8 @@
  * - 数据只来自 `/api/workflow-sidebar/<app>/<run>`：管理员拿到完整 RunView（含终端 / 日志入口），
  *   群成员拿到服务端裁好的精简视图。页面不另做权限判断，只按服务端给的受众渲染。
  * - 复用看板的流程图组件，350–800px 宽度改成竖排；每 2 秒刷新，run 结束后停；点节点展开详情。
+ * - 运行中改过流程时，图下方列出流程版本（复用看板的版本面板）：管理员看到的与看板一致；
+ *   群成员只有已生效的版本（版本号、时间、角色、摘要、是否经过确认）。
  */
 import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
@@ -20,6 +22,7 @@ import {
   DagNode,
   NodeErrorLine,
   NodeExecution,
+  RevisionHistory,
   TerminalSlot,
   V3Legend,
 } from './v3-components.js';
@@ -106,12 +109,20 @@ export function sidebarModel(payload: WorkflowSidebarPayload): SidebarModel {
   }
   const landings = new Map<string, WorkflowSidebarLanding>();
   for (const node of payload.view.nodes) if (node.landing) landings.set(node.id, node.landing);
+  const revisions = payload.view.revisions;
   return {
     audience: 'member',
     view: {
       runId: payload.view.runId,
       runStatus: payload.view.runStatus,
       nodes: payload.view.nodes.map(memberNodeAsRunNode),
+      // Members only ever get versions that took effect.
+      ...(revisions ? {
+        revision: {
+          current: revisions.current,
+          history: revisions.history.map((entry) => ({ ...entry, state: 'applied' as const })),
+        },
+      } : {}),
       generatedAt: payload.view.generatedAt,
     },
     landings,
@@ -306,6 +317,9 @@ export function WorkflowSidebarPage(props: { target: WorkflowSidebarTarget; fetc
         <V3Legend />
       </div>
       {selected ? <NodeDetail model={model} node={selected} /> : <p className="muted wfs-hint">点一个节点看详情</p>}
+      {model.view.revision ? (
+        <div className="wfs-revisions"><RevisionHistory revision={model.view.revision} /></div>
+      ) : null}
     </section>
   );
 }

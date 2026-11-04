@@ -8,7 +8,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -22,7 +22,7 @@ import {
 } from '../src/workflows/v3/host.js';
 import { readGrillState, type RunChatBinding } from '../src/workflows/v3/grill-state.js';
 import { SPEC_SCHEMA_VERSION } from '../src/workflows/v3/contract.js';
-import { readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
+import { frozenNodeWorkingDir, readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import type { V3BotEligibilityProbe } from '../src/workflows/v3/node-executor-mode.js';
 import { checkV3BotExecutorEligibility } from '../src/workflows/v3/node-executor-mode.js';
 
@@ -203,7 +203,7 @@ describe('approve-dag freezes the node executor', () => {
   });
 });
 
-describe('approve-dag refusals added by review (P2-3 / P2-4 / P2-5)', () => {
+describe('approve-dag refusals added by review (P2-3 / P2-4)', () => {
   async function refusal(nodes: unknown[], probe: V3BotEligibilityProbe, extraArgs: string[] = []) {
     const { base, runDir } = await dagReadyRun(GROUP_TOPIC, nodes);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -243,31 +243,128 @@ describe('approve-dag refusals added by review (P2-3 / P2-4 / P2-5)', () => {
     expect((error as Error).message).toContain('tree');
     expect(readRunEnvelope(runDir).kind).toBe('missing');
   });
+});
 
-  it('P2-5: --working-dir is refused in bot mode before any probe runs; still frozen when the switch is off', async () => {
+describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
+  /** Real directories: main and doc may work under `repos`, test only under `lab`. */
+  function dirs() {
+    const root = mkdtempSync(join(tmpdir(), 'wf-approve-dir-'));
+    bases.push(root);
+    const repos = join(root, 'repos');
+    const project = join(repos, 'project');
+    const lab = join(root, 'lab');
+    mkdirSync(project, { recursive: true });
+    mkdirSync(lab, { recursive: true });
+    const bots = [
+      { larkAppId: MAIN, name: 'main', cliId: 'claude-code', defaultWorkingDir: repos },
+      { larkAppId: 'cli_doc', name: 'doc', cliId: 'claude-code', workingDirs: [repos] },
+      { larkAppId: 'cli_test', name: 'test', cliId: 'codex', workingDir: lab },
+    ] as any[];
+    return { root, repos, project, lab, bots };
+  }
+
+  async function approveWithDir(dir: string, bots: any[], opts: { switchMode?: 'bot' | 'ephemeral'; nodes?: unknown[] } = {}) {
+    const { base, runDir } = await dagReadyRun(GROUP_TOPIC, opts.nodes);
     const probeFactory = vi.fn(() => tableProbe({}).probe);
-    const { base, runDir } = await dagReadyRun(GROUP_TOPIC);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    let error: unknown;
     try {
-      await expect(cmdWorkflowHost('approve-dag', ['r', '--base-dir', base, '--working-dir', '/srv/task'], {
-        loadBots: () => BOTS,
+      await cmdWorkflowHost('approve-dag', ['r', '--base-dir', base, '--working-dir', dir], {
+        loadBots: () => bots,
         resolveChatBinding: () => GROUP_TOPIC,
-        nodeExecutorSwitch: () => 'bot',
+        nodeExecutorSwitch: () => opts.switchMode ?? 'bot',
         multiTopicEnabled: () => true,
         botEligibilityProbe: probeFactory,
-        botDisplayName: () => (appId) => appId,
-      })).rejects.toThrow(/--working-dir/);
-      expect(probeFactory).not.toHaveBeenCalled();
-      expect(readRunEnvelope(runDir).kind).toBe('missing');
-      await cmdWorkflowHost('approve-dag', ['r', '--base-dir', base, '--working-dir', '/srv/task'], {
-        loadBots: () => BOTS,
-        resolveChatBinding: () => GROUP_TOPIC,
-        nodeExecutorSwitch: () => 'ephemeral',
+        botDisplayName: () => (appId) => `bot(${appId})`,
       });
-      expect(frozenExecutor(readRunEnvelope(runDir))).toBeUndefined();
-    } finally {
-      log.mockRestore();
+    } catch (err) {
+      error = err;
     }
+    const output = log.mock.calls.flat().join('\n');
+    log.mockRestore();
+    return { error, output, runDir, probeFactory, envelope: readRunEnvelope(runDir) };
+  }
+
+  const snapshotDirs = (runDir: string) => Object.values(
+    JSON.parse(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')) as Record<string, { workingDir: string }>,
+  ).map((snapshot) => snapshot.workingDir);
+
+  it('a directory inside every executing bot\'s range is frozen like an ephemeral run, and marked for the bots to apply', async () => {
+    const d = dirs();
+    const nodes = NODES.filter((node) => node.id !== 'verify');
+    const result = await approveWithDir(`${d.project}/`, d.bots, { nodes });
+    expect(result.error).toBeUndefined();
+    expect(frozenExecutor(result.envelope)).toBe('bot');
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    const real = realpathSync(d.project);
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(real);
+    expect(snapshotDirs(result.runDir)).toEqual([real, real]);
+    expect(result.output).toContain(real);
+    expect(readGrillState(result.runDir)!.status).toBe('dag_approved');
+  });
+
+  it('a symlink is frozen as the directory it points to, so retargeting the link later moves nothing', async () => {
+    const d = dirs();
+    const link = join(d.root, 'outside-link');
+    symlinkSync(d.project, link);
+    const nodes = NODES.filter((node) => node.id !== 'verify');
+    const result = await approveWithDir(link, d.bots, { nodes });
+    expect(result.error).toBeUndefined();
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    const real = realpathSync(d.project);
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(real);
+    expect(snapshotDirs(result.runDir)).toEqual([real, real]);
+    // The link is pointed somewhere else afterwards: the frozen value is not the link.
+    rmSync(link);
+    symlinkSync(d.lab, link);
+    const reread = readRunEnvelope(result.runDir);
+    if (reread.kind !== 'ok') throw new Error('no envelope');
+    expect(frozenNodeWorkingDir(reread.envelope)).toBe(real);
+  });
+
+  it('a node whose bot does not allow the directory refuses the approval, names node → bot, probes nothing and publishes nothing', async () => {
+    const d = dirs();
+    const result = await approveWithDir(d.project, d.bots);
+    expect(result.error).toBeInstanceOf(Error);
+    const message = (result.error as Error).message;
+    expect(message).toMatch(/verify → bot\(cli_test\)：指定的工作目录不在它配置的目录范围内/);
+    expect(message).not.toMatch(/inspect →|write →/);
+    expect(message).toContain(realpathSync(d.project));
+    expect(result.probeFactory).not.toHaveBeenCalled();
+    expect(result.envelope.kind).toBe('missing');
+    expect(readGrillState(result.runDir)!.status).toBe('dag_ready');
+  });
+
+  it('the main bot\'s own nodes are checked too, and a bot without any directory cannot be given one', async () => {
+    const d = dirs();
+    const noDirs = await approveWithDir(d.lab, [{ ...d.bots[0], defaultWorkingDir: d.lab }, { ...d.bots[1], workingDirs: undefined }, d.bots[2]]);
+    const message = (noDirs.error as Error).message;
+    expect(message).toMatch(/write → bot\(cli_doc\)：它没有配置目录范围/);
+    expect(message).not.toMatch(/inspect →|verify →/);
+    const mainOutside = await approveWithDir(d.project, [{ ...d.bots[0], defaultWorkingDir: d.lab }, d.bots[1], { ...d.bots[2], workingDir: d.repos }]);
+    expect((mainOutside.error as Error).message).toMatch(/inspect → bot\(cli_main\)：指定的工作目录不在/);
+    expect((mainOutside.error as Error).message).not.toMatch(/write →|verify →/);
+  });
+
+  it('a directory that does not exist is refused before anything else', async () => {
+    const d = dirs();
+    const result = await approveWithDir(join(d.repos, 'missing'), d.bots);
+    // Said as what it is, not as a range problem of some bot.
+    expect((result.error as Error).message).toMatch(/--working-dir.*(目录不存在|does not exist)/);
+    expect((result.error as Error).message).not.toMatch(/→/);
+    expect(result.probeFactory).not.toHaveBeenCalled();
+    expect(result.envelope.kind).toBe('missing');
+  });
+
+  it('with the switch off the flag behaves as before: the raw value goes into the snapshots, run.json has no marker, no range check', async () => {
+    const d = dirs();
+    const result = await approveWithDir('/srv/task', d.bots, { switchMode: 'ephemeral' });
+    expect(result.error).toBeUndefined();
+    expect(frozenExecutor(result.envelope)).toBeUndefined();
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(result.runDir, 'run.json'), 'utf-8'))).not.toHaveProperty('nodeWorkingDir');
+    expect(new Set(snapshotDirs(result.runDir))).toEqual(new Set(['/srv/task']));
   });
 });
 

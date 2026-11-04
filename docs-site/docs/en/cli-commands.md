@@ -27,6 +27,17 @@ local hard kill.
 
 When `BOTMUX_COORDINATION_MODE=primary`, the durable PostgreSQL Session is the canonical truth. In this mode, `delete`, `resume`, non-dry-run `suspend`, `maintenance suspend-idle`, and delete/wake actions in the interactive `list` are rejected explicitly. `list` remains available as a read-only local view, but skips local auto-pruning. Use the session card in the original topic to close or resume through the fenced durable session-control lane.
 
+### Web terminal and "Show/Hide output" with multiple replicas
+
+In primary mode the worker runs only on the replica that owns the Session, while Lark callbacks and browser requests can land on any replica:
+
+- **"Show/Hide output" button**: the click enters the same durable session-control lane and is applied by the owner replica, which updates the original card. It takes effect only for people allowed to operate the Session; clicking an old card or lacking permission shows a hint to use the latest card.
+- **Cross-replica Web terminal forwarding**: each Dashboard publishes the Sessions with a live worker on its replica to shared storage (45 s expiry, refreshed periodically). A request that lands on a non-owner replica is forwarded to the owner's Dashboard using that record, for one hop only; the address must be a literal IP, and Cookie, Authorization and every `x-botmux-*` header never cross replicas.
+  - `BOTMUX_TERMINAL_ROUTE_HOST`: the IP other replicas can reach this one at (e.g. the Pod IP). Nothing is published when unset.
+  - `BOTMUX_TERMINAL_ROUTE_PORT`: the port other replicas use for this Dashboard (e.g. a NodePort). Defaults to `BOTMUX_DASHBOARD_PORT`; the startup log warns when it differs from the actual listening port.
+- **Capability boundary**: only **Lark card links** that carry their own credential (`?viewToken=` / `?token=`, verified by the owner's worker) work across replicas. The terminal embedded in the Dashboard workbench (login cookie), the touch-screen dynamic view link, and takeover with write access all rely on credentials issued by the receiving replica and are refused by the owner (403) across replicas — those must reach the owner replica (session-sticky load balancing, or open the owner directly).
+- Single-replica deployments (primary off) publish no routes and forward nothing; all of the above behaves exactly as before.
+
 ## Idle Session Maintenance
 
 ```bash

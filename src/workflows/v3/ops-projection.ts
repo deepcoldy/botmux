@@ -20,10 +20,14 @@ import { materialize, type V3RunStatus } from './state.js';
 import type { V3NodeStatus } from './orchestrator.js';
 import {
   foldV3Revisions,
+  tryLoadEffectiveV3Dag,
   v3RevisionDigest,
   v3RevisionFilePaths,
   type V3RevisionHistory,
 } from './dag-revision.js';
+import { foldV3NodeInterventions } from './interventions.js';
+import { v3CheckpointMarkedSince, v3CheckpointSuccesses } from './checkpoint-hold.js';
+import { loadDag } from './dag-loader.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
  *  caller-supplied runId, so it can't escape runsDir via traversal. */
@@ -133,6 +137,25 @@ export interface RunNodeView {
   /** What the pending (unconfirmed) proposal would do to this node. The
    *  dashboard draws these dashed. `add` nodes exist only in the proposal. */
   pendingChange?: 'add' | 'remove' | 'change';
+  /** The main bot's automatic retries / reassignments / re-runs of this node
+   *  and every hand-over to a human, oldest first (design §13.6). Roles and
+   *  the reasons as given only — never an open_id. Absent when none. */
+  interventions?: RunNodeInterventionView[];
+  /** A completed checkpoint node of a bot-executed run (design §13.6):
+   *  `holding` — its dependants wait for the main bot; `reviewed` — the main
+   *  bot's turn ended and they went on; `notReviewed` — they went on without
+   *  that review (the wake could not be delivered, or the wait timed out). */
+  checkpoint?: 'holding' | 'reviewed' | 'notReviewed';
+  /** Checkpoint nodes this not-yet-started node waits behind. */
+  waitingOnCheckpoint?: string[];
+}
+
+export interface RunNodeInterventionView {
+  kind: 'retry' | 'reassign' | 'rerun' | 'handedToHuman';
+  by: 'mainBot' | 'initiator' | 'other';
+  reason: string;
+  at: number;
+  attemptId?: string;
 }
 
 export interface RunRevisionEntryView {
@@ -146,6 +169,8 @@ export interface RunRevisionEntryView {
   /** Went through the initiator's confirmation card. */
   confirmed: boolean;
   rejectedReason?: 'rejected' | 'stale' | 'superseded' | 'runEnded';
+  /** `by: 'mainBot'` only: why the main bot made it (design §13.6). */
+  reason?: string;
 }
 
 export interface RunRevisionView {
@@ -349,6 +374,8 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
   const approvedNodes = readDagNodes(runDir);
   const botSnapshots = readBotSnapshots(runDir);
   const revisions = projectRevisions(runDir, events, approvedNodes, botSnapshots);
+  const interventions = foldV3NodeInterventions(events, readInitiatorOpenId(runDir));
+  const checkpoints = projectCheckpoints(runDir, events);
   const dagNodes = revisions?.effectiveNodes ?? approvedNodes;
 
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
@@ -602,6 +629,12 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     if (mark) view.revisionMark = mark;
     const pendingChange = revisions?.pendingChanges.get(id);
     if (pendingChange) view.pendingChange = pendingChange;
+    const handled = interventions.get(id);
+    if (handled?.length) view.interventions = handled.map((item) => ({ ...item }));
+    const checkpoint = checkpoints?.states.get(id);
+    if (checkpoint) view.checkpoint = checkpoint;
+    const waitingOn = checkpoints?.waiting.get(id);
+    if (waitingOn?.length && status === 'pending') view.waitingOnCheckpoint = waitingOn;
     return view;
   });
 
@@ -622,6 +655,38 @@ interface ProjectedRevisions {
   pendingNodes?: DagNodeLite[];
   marks: Map<string, 'added' | 'changed'>;
   pendingChanges: Map<string, 'add' | 'remove' | 'change'>;
+}
+
+/** Checkpoint holds of a bot-executed run (display only; degrades to none). */
+function projectCheckpoints(
+  runDir: string,
+  events: ReturnType<typeof readJournal>,
+): { states: Map<string, 'holding' | 'reviewed' | 'notReviewed'>; waiting: Map<string, string[]> } | undefined {
+  if (!events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot')) return undefined;
+  try {
+    const authorized = loadDag(join(runDir, 'dag.json'));
+    const effective = tryLoadEffectiveV3Dag(runDir, authorized, events)?.dag ?? authorized;
+    const successes = v3CheckpointSuccesses({
+      events,
+      dag: effective,
+      markedSince: v3CheckpointMarkedSince(runDir, authorized, events),
+    });
+    if (successes.length === 0) return undefined;
+    const states = new Map<string, 'holding' | 'reviewed' | 'notReviewed'>();
+    for (const success of successes) {
+      states.set(success.nodeId, !success.released ? 'holding'
+        : success.released.reason === 'wakeTurnEnded' ? 'reviewed' : 'notReviewed');
+    }
+    const holding = new Set(successes.filter((success) => !success.released).map((success) => success.nodeId));
+    const waiting = new Map<string, string[]>();
+    for (const node of effective.nodes) {
+      const behind = node.depends.map((dep) => dep.from).filter((from) => holding.has(from));
+      if (behind.length > 0) waiting.set(node.id, behind);
+    }
+    return { states, waiting };
+  } catch {
+    return undefined;
+  }
 }
 
 /** Minimal read of run.json for the initiator role (no schema import: this
@@ -724,6 +789,7 @@ function projectRevisions(
         at: record.appliedAt ?? record.ts,
         confirmed: !!record.approvedBy,
         ...(record.rejected ? { rejectedReason: record.rejected.reason } : {}),
+        ...(record.by === 'main_bot' && record.auto?.reason ? { reason: record.auto.reason } : {}),
       })),
       ...(pending ? { pending: { revision: pending.revision, summary: pending.summary } } : {}),
       ...(integrityError ? { integrityError: true } : {}),

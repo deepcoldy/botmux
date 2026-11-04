@@ -2,6 +2,7 @@ import type { Pool } from 'pg';
 import type { FeedbackAnalytics, PostgresTarget } from './feedback-storage-types.js';
 import type { FeedbackAnalyticsFilters, FeedbackDeliveryAnalyticsItem } from './feedback-analytics.js';
 import { feedbackPostgresPool } from './feedback-postgres-schema.js';
+import type { PostgresCredential } from './feedback-doas-token.js';
 
 const latest = `SELECT DISTINCT ON(delivery_id,operator_subject_id) * FROM feedback_revisions ORDER BY delivery_id,operator_subject_id,revision DESC`;
 function where(filters: FeedbackAnalyticsFilters, feedback = false) {
@@ -78,7 +79,7 @@ class PostgresFeedbackAnalytics implements FeedbackAnalytics {
     return { items, ...(nextCursor ? { nextCursor } : {}) };
   }
 }
-export async function openPostgresFeedbackAnalytics(target: PostgresTarget, password: string, ca?: string): Promise<FeedbackAnalytics> {
+export async function openPostgresFeedbackAnalytics(target: PostgresTarget, password: PostgresCredential, ca?: string): Promise<FeedbackAnalytics> {
   const pool = feedbackPostgresPool(target, password, ca);
   try { await pool.query('SELECT 1'); } catch (error) { await pool.end(); throw error; }
   return new PostgresFeedbackAnalytics(pool);
