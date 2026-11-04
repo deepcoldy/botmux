@@ -81,10 +81,10 @@ describe('repairCardStrongPunctuation: pairs CommonMark would reject', () => {
   });
 
   it('still repairs the tail of a long reply when one candidate cannot pair', () => {
-    // `[**文档：**说明](url)` can never be accepted — pairing it would create a
-    // strong span *inside* a link, which the gate rejects — so the batch attempt
-    // fails for the whole reply and everything goes through the fallback. That
-    // one candidate must not stop the labels after it from being repaired.
+    // The bold inside link text is recognised by the label prefilter, and a
+    // truncated trailing `**` (below) makes its own candidate fail the gate —
+    // either way the whole-reply batch is not accepted, so chunked fallback
+    // verification must still repair every label in the tail.
     const input = ['详见 [**文档：**说明](https://example.com/doc)。', '',
       ...Array.from({ length: 100 }, (_, i) => `- **要点${i}：**说明文字`)].join('\n');
     const repaired = repairCardStrongPunctuation(input);
@@ -93,6 +93,23 @@ describe('repairCardStrongPunctuation: pairs CommonMark would reject', () => {
     // The unrepairable candidate itself keeps the author's bytes.
     expect(repaired).toContain('[**文档：**说明](https://example.com/doc)');
     // Repaired output is stable: a second pass must not find more work.
+    expect(repairCardStrongPunctuation(repaired)).toBe(repaired);
+  });
+
+  it('keeps repairing through the chunked fallback when a stray run spoils the batch', () => {
+    // Unlike link text, `**注意：**正文**` (one extra unpaired `**`, e.g. a
+    // truncated stream) is NOT removed by the label prefilter: its candidate
+    // makes the batched verification fail, so this is the shape that actually
+    // forces the chunked fallback. It stays byte-identical, and the 100 labels
+    // after it — past both the old 64-candidate budget and chunk boundaries —
+    // must all be repaired.
+    const stray = '**注意：**正文**';
+    const input = [stray, '',
+      ...Array.from({ length: 100 }, (_, i) => `- **要点${i}：**说明文字`)].join('\n');
+    const repaired = repairCardStrongPunctuation(input);
+    expect(repaired.startsWith(`${stray}\n`)).toBe(true);
+    expect(repaired).toContain('**要点99**：说明文字');
+    expect((repaired.match(/要点\d+：\*\*/g) ?? []).length).toBe(0);
     expect(repairCardStrongPunctuation(repaired)).toBe(repaired);
   });
 
