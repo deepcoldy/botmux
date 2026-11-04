@@ -14,6 +14,7 @@ import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
+import { traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 /**
  * Worker process: manages a single CLI PTY session + web terminal.
@@ -13590,10 +13591,11 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
   if (lastInitConfig?.cliId !== 'traex' || !backendScreenEvidenceIsAuthoritativeForMutation()) return;
   const detector = idleDetector;
   const adapter = cliAdapter;
+  const generation = cliSpawnGeneration;
   const startedAt = Date.now();
   const webInputGeneration = webTerminalInputGeneration;
   const stillWaiting = (): boolean => awaitingFirstPrompt
-    && backend === observedBackend && idleDetector === detector
+    && backend === observedBackend && idleDetector === detector && cliSpawnGeneration === generation
     && webTerminalInputGeneration === webInputGeneration
     && Date.now() - startedAt < FIRST_PROMPT_HARD_TIMEOUT_MS;
   const check = async (): Promise<void> => {
@@ -13609,8 +13611,21 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
       if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
         || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
         || Date.now() - lastPtyOutputAtMs < 2_000) return;
-      const screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
-      if (!screen || !adapter?.startupReadyFromHistory?.(screen)) return;
+      let screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
+      if (!screen || !adapter?.startupReadyFromHistory?.(screen)) {
+        // A tmux CLI can draw its footer before pipe-pane attaches. Later
+        // cursor-only redraws leave the renderer nonempty but incomplete, so
+        // waiting for more stream bytes can strand a ready pane until 90s.
+        // Read the actual current cells without blocking the worker; preserve
+        // the exact generation/output/web-input fence across that await.
+        if (!(observedBackend instanceof TmuxPipeBackend)) return;
+        screen = await observedBackend.captureViewportAsync();
+        if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
+          || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
+          || Date.now() - lastPtyOutputAtMs < 2_000) return;
+        if (!screen || !adapter?.startupReadyFromHistory?.(screen)) return;
+        log(`${cliName()} initialized composer recovered from native tmux viewport`);
+      }
       if (detector?.observeStartupHistory(screen)) {
         log(`${cliName()} ${lastInitConfig?.resume ? 'restored' : 'initialized'} composer observed on screen; rechecking first-prompt readiness`);
       }
@@ -21643,6 +21658,15 @@ async function spawnCli(
     ? 'dsh-tui'
     : cfg.cliId as CliId;
   cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  if (effectiveCliId === 'traex' && cfg.resume === true && cfg.cliSessionId && cfg.adoptMode !== true) {
+    // The native resume target is host-owned. A resumed transcript can occupy
+    // the entire viewport while a nonblocking repository notice hides both
+    // footer rows, so cold-start banner cells need not remain visible.
+    cliAdapter = {
+      ...cliAdapter,
+      startupReadyFromHistory: (screen: string) => traexRestoredComposerReady(screen, { resumedSession: true }),
+    };
+  }
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
   if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
