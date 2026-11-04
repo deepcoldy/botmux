@@ -187,6 +187,29 @@ describe('bot-config store', () => {
     expect(readConfig().reasoningEffort).toBeUndefined();
   });
 
+  it('saves MiniMax effort and requires clearing it before switching to a model without levels', async () => {
+    const { registry, store } = await loaded({ cliId: 'minimax', model: 'minimax/MiniMax-M3.1-Flash' });
+    const effort = store.findConfigField('reasoningEffort')!;
+    expect((await store.applyConfigField('app_default', effort, 'xhigh')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('xhigh');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('xhigh');
+    expect(await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readConfig()).toMatchObject({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'xhigh' });
+    expect((await store.applyConfigField('app_default', effort, null)).ok).toBe(true);
+    expect((await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it.each([undefined, 'minimax/MiniMax-M3', 'other/MiniMax-M3.1-Flash'])('rejects MiniMax effort for an unverified model %s without persisting it', async model => {
+    const { store } = await loaded({ cliId: 'minimax', model });
+    expect(await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'xhigh'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
     const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
     const spec = store.findConfigField('envPolicy')!;
