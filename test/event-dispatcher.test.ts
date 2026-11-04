@@ -2512,7 +2512,53 @@ describe('Lark event dispatcher — durable primary processor', () => {
     },
   );
 
-  it.each(['close', 'resume'].flatMap(action =>
+  it('#2062 F6: a refused primary display toggle points at the latest card, not at unsupported lifecycle', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const enqueuePrimaryControl = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary, enqueuePrimaryControl, authorizePrimaryControl: () => false },
+    );
+    runtime.connect();
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: {
+        action: 'toggle_display',
+        target_display_mode: 'screenshot',
+        session_id: 'session-primary',
+        root_id: 'om_primary_root',
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_old_card' },
+    });
+    expect(result).toEqual({
+      toast: { type: 'warning', content: expect.stringContaining('最新的卡片') },
+    });
+    expect(enqueuePrimaryControl).not.toHaveBeenCalled();
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('#2062: without a primary runtime a display toggle stays on the direct card handler', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu');
+    runtime.connect();
+    await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'toggle_display', session_id: 'session-local', root_id: 'om_root' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    });
+    await vi.waitFor(() => expect(handlers.handleCardAction).toHaveBeenCalledOnce());
+    runtime.close();
+  });
+
+  it.each(['close', 'resume', 'toggle_display'].flatMap(action =>
     ['object', 'string', 'behaviors', 'envelope', 'envelope-behaviors'].map(shape => [action, shape]),
   ))(
     'persists a stable %s interaction in %s payloads before ACK when a control consumer is wired',
@@ -2544,6 +2590,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
         action,
         session_id: 'session-primary',
         root_id: 'om_primary_root',
+        ...(action === 'toggle_display' ? { target_display_mode: 'screenshot' } : {}),
       };
       const wrapped = shape === 'envelope' || shape === 'envelope-behaviors';
       const innerShape = shape === 'envelope' ? 'string' : shape;

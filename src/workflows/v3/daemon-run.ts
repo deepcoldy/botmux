@@ -22,6 +22,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
+import { workflowConcurrencyConfig, type WorkflowConcurrencyConfig } from '../../global-config.js';
+import { resolveV3Concurrency } from './concurrency-config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { isHostNode, isLoopNode, type V3Dag } from './dag.js';
@@ -869,7 +871,11 @@ export interface V3DaemonRunDeps {
   postRevisitGrantCard?: (binding: RunChatBinding, info: V3RevisitBudgetBlockedInfo, runId: string) => Promise<void>;
   /** Report a terminal run (final card / message).  Optional. */
   onTerminal?: (runId: string, outcome: V3TerminalOutcome, binding?: RunChatBinding) => Promise<void>;
+  /** Explicit global cap; wins over `workflow.concurrency.global`. */
   maxParallel?: number;
+  /** Host concurrency config source (default: `workflow.concurrency` in
+   *  `~/.botmux/config.json`, read on every drive). Tests inject. */
+  concurrencyConfig?: () => WorkflowConcurrencyConfig | undefined;
   /** Low-latency interrupt delivery. Durable intent always lives in journal. */
   cancelSignal?: AbortSignal;
   /**
@@ -974,7 +980,10 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     ...(context.botSnapshots ? { frozenBotSnapshots: context.botSnapshots } : {}),
     ...(context.authorizedArtifacts ? { authorizedArtifacts: true } : {}),
     ...(context.resolvedWorkflowData ? { resolvedWorkflowData: context.resolvedWorkflowData } : {}),
-    ...(deps.maxParallel ? { globalConcurrency: deps.maxParallel } : {}),
+    ...resolveV3Concurrency(
+      (deps.concurrencyConfig ?? workflowConcurrencyConfig)(),
+      deps.maxParallel ? { global: deps.maxParallel } : {},
+    ),
     ...(deps.cancelSignal ? { cancelSignal: deps.cancelSignal } : {}),
     // Real BOTMUX_* identity env for worker CLI children (see RunNodeRequest.chatBinding).
     ...(binding ? { chatBinding: binding } : {}),

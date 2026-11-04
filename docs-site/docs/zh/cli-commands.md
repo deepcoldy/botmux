@@ -25,6 +25,17 @@ daemon 拒绝或 IPC 连接失败时命令返回失败，不会继续本地强�
 
 当 `BOTMUX_COORDINATION_MODE=primary` 时，PostgreSQL 中的 durable Session 才是 canonical truth。此模式下 `delete`、`resume`、非 dry-run 的 `suspend`、`maintenance suspend-idle`，以及交互式 `list` 中的删除/唤醒都会明确拒绝；`list` 仍可只读展示，但会跳过本地自动清理。关闭或恢复请在原话题使用会话卡片，确保操作经过带 fencing 的 durable session-control 通道。
 
+### 多副本下的 Web 终端与「显示/隐藏输出」
+
+primary 模式下，worker 只跑在持有会话的那个副本（owner）上，而飞书回调和浏览器请求可能落到任意副本：
+
+- **「显示/隐藏输出」按钮**：点击进入同一条 durable session-control 通道，由 owner 副本执行并更新原卡片。只有能操作该会话的人点击才会生效；点旧卡片或无权限时会提示改用最新卡片。
+- **Web 终端跨副本转发**：Dashboard 把本副本上有活 worker 的会话发布到共享存储（45 秒过期、定期续写）。请求落到非 owner 副本时，按这条记录转发到 owner 的 Dashboard，只转发一跳；地址必须是 IP 字面量，Cookie、Authorization 与所有 `x-botmux-*` 头都不会跨副本。
+  - `BOTMUX_TERMINAL_ROUTE_HOST`：本副本对其它副本可达的 IP（如 Pod IP），不设置则不发布。
+  - `BOTMUX_TERMINAL_ROUTE_PORT`：其它副本访问本 Dashboard 用的端口（如 NodePort），未设置时用 `BOTMUX_DASHBOARD_PORT`；与实际监听端口不一致时启动日志会告警。
+- **能力边界**：只有自带凭据的**飞书卡片链接**（`?viewToken=` / `?token=`，由 owner 的 worker 校验）可以跨副本使用。Dashboard 工作台内嵌终端（靠登录 Cookie）、触屏动态换链，以及需要写权限的接管，都依赖本副本签发的凭据，跨副本会被 owner 拒绝（403）——这些操作需要落在 owner 副本上（负载均衡按会话粘滞，或直接访问 owner）。
+- 单副本部署（未开启 primary）不发布路由、不转发，以上行为都与之前一致。
+
 ## 空闲会话维护
 
 ```bash
