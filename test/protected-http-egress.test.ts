@@ -117,7 +117,7 @@ describe('protected HTTP egress worker policy collection', () => {
   function installPolicyPlugin(
     pluginId: string,
     policy = validPolicy,
-    protectedCapability = policy.id,
+    protectedCapability = 'fixture.actor-write.v1',
   ): void {
     const source = join(home, `${pluginId}-source`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
@@ -144,6 +144,7 @@ describe('protected HTTP egress worker policy collection', () => {
 
     expect(collected).toEqual([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy: validPolicy,
       policyDigest: protectedHttpEgressPolicyDigest(validPolicy),
     }]);
@@ -162,14 +163,18 @@ describe('protected HTTP egress worker policy collection', () => {
     expect(() => collectProtectedHttpEgressPolicies(['fixture-plugin'])).toThrow();
   });
 
-  it('rejects a policy whose id is not bound to the same plugin protected capability', () => {
-    installPolicyPlugin('fixture-plugin', validPolicy, 'fixture.unrelated.v1');
+  it('binds distinct descriptor capability and policy identifiers to the same plugin snapshot', () => {
+    installPolicyPlugin('fixture-plugin', validPolicy, 'fixture.actor-write.v1');
 
-    expect(() => collectProtectedHttpEgressPolicies(['fixture-plugin']))
-      .toThrow('plugin_mcp_protected_egress_capability_mismatch:fixture-plugin');
+    expect(collectProtectedHttpEgressPolicies(['fixture-plugin'])).toEqual([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy: validPolicy,
+      policyDigest: protectedHttpEgressPolicyDigest(validPolicy),
+    }]);
   });
 
-  it('freezes unique A and AAAA results once per target and caps each target at 32 addresses', async () => {
+  it('freezes unique A and AAAA results once per target', async () => {
     const policy = normalizeProtectedHttpEgressPolicy({
       id: 'fixture.resolve.v1',
       targets: [
@@ -187,7 +192,7 @@ describe('protected HTTP egress worker policy collection', () => {
           { address: '10.20.30.40', family: 4 as const },
         ];
       }
-      return Array.from({ length: 40 }, (_, index) => ({
+      return Array.from({ length: 32 }, (_, index) => ({
         address: `2001:db8::${(index + 1).toString(16)}`,
         family: 6 as const,
       }));
@@ -203,6 +208,16 @@ describe('protected HTTP egress worker policy collection', () => {
     expect(frozen[1]).toHaveLength(32);
     expect(frozen[1][0]).toBe('2001:db8::1');
     expect(frozen[1][31]).toBe('2001:db8::20');
+  });
+
+  it('fails closed when DNS returns a 33rd unique address instead of leaving it directly reachable', async () => {
+    const results = Array.from({ length: 33 }, (_, index) => ({
+      address: `2001:db8::${(index + 1).toString(16)}`,
+      family: 6 as const,
+    }));
+
+    await expect(resolveProtectedHttpEgressTargets(validPolicy, async () => results))
+      .rejects.toThrow('protected_http_egress_target_address_limit_exceeded');
   });
 
   it('fails closed when a target resolves to no usable address', async () => {
@@ -225,7 +240,7 @@ describe('protected HTTP egress route decisions', () => {
   })!;
 
   const decide = (method: string, path: string) => (
-    protectedHttpEgressDecision(policy, policy.id, method, path)
+    protectedHttpEgressDecision(policy, policy.id, 0, method, path)
   );
 
   it('denies exact registered method/path pairs without treating reads or sibling routes as writes', () => {
@@ -266,10 +281,46 @@ describe('protected HTTP egress route decisions', () => {
     expect(() => protectedHttpEgressDecision(
       policy,
       'fixture.other.write.v1',
+      0,
       'POST',
       '/v1/items/update',
     )).toThrow('protected_http_egress_policy_mismatch');
     expect(() => decide('POST GET', '/v1/items/update'))
       .toThrow('invalid_protected_http_method');
+  });
+
+  it('decides routes only against the selected target', () => {
+    const multiTarget = normalizeProtectedHttpEgressPolicy({
+      id: 'fixture.multi.write.v1',
+      targets: [
+        {
+          scheme: 'https',
+          host: 'one.internal.example',
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/one/update' }],
+        },
+        {
+          scheme: 'https',
+          host: 'two.internal.example',
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/two/update' }],
+        },
+      ],
+    })!;
+
+    expect(protectedHttpEgressDecision(
+      multiTarget,
+      multiTarget.id,
+      0,
+      'POST',
+      '/v1/two/update',
+    )).toBe('allow');
+    expect(protectedHttpEgressDecision(
+      multiTarget,
+      multiTarget.id,
+      1,
+      'POST',
+      '/v1/two/update',
+    )).toBe('deny');
   });
 });

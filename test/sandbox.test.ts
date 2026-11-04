@@ -127,6 +127,39 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
       rmSandboxScratch(root);
     }
   });
+
+  it('marks protected egress as required even when the guard socket is unavailable', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-protected-egress-required-'));
+    const socketDir = join(root, 'sockets');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const gatewayPath = join(socketDir, 'g.sock');
+    const gateway = await listen(gatewayPath);
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'protected-egress-required',
+        dataDir,
+        policy: { rules: [], net: true, writeRegexes: [] },
+        chdir: root,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: [],
+        mcpGatewaySocketPath: gatewayPath,
+        protectedEgressRequired: true,
+      });
+      expect(plan).not.toBeNull();
+      expect(plan!.env.BOTMUX_PROTECTED_EGRESS_REQUIRED).toBe('1');
+      expect(plan!.env.BOTMUX_PROTECTED_EGRESS_SOCKET).toBeUndefined();
+      expect(JSON.stringify(plan!.env)).not.toContain(socketDir);
+    } finally {
+      plan?.cleanup();
+      await new Promise<void>(resolve => gateway.close(() => resolve()));
+      rmSandboxScratch(root);
+    }
+  });
 });
 
 describe('credential-only managed-origin carve-out', () => {

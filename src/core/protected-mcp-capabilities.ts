@@ -32,7 +32,7 @@ export interface ProtectedMcpCapabilityConfig {
     name: string;
   };
   principal?: 'verified-human-email';
-  containmentProfile: typeof PROTECTED_MCP_CONTAINMENT_PROFILE;
+  containmentProfile: ProtectedMcpContainmentProfile;
   isolation?: {
     protectedHomePaths?: string[];
     redactEnv?: string[];
@@ -128,7 +128,8 @@ function normalizeCapabilityConfig(raw: unknown): ProtectedMcpCapabilityConfig |
     || raw.secret.source !== 'env'
     || !isValidEnvironmentVariableName(raw.secret.name)) return undefined;
   if (raw.principal !== undefined && raw.principal !== 'verified-human-email') return undefined;
-  if (raw.containmentProfile !== PROTECTED_MCP_CONTAINMENT_PROFILE) return undefined;
+  if (raw.containmentProfile !== PROTECTED_MCP_CONTAINMENT_PROFILE
+    && raw.containmentProfile !== PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE) return undefined;
 
   let isolation: ProtectedMcpCapabilityConfig['isolation'];
   if (raw.isolation !== undefined) {
@@ -154,7 +155,7 @@ function normalizeCapabilityConfig(raw: unknown): ProtectedMcpCapabilityConfig |
     allowedPluginIds,
     secret: { source: 'env', name: raw.secret.name },
     ...(raw.principal === 'verified-human-email' ? { principal: raw.principal } : {}),
-    containmentProfile: PROTECTED_MCP_CONTAINMENT_PROFILE,
+    containmentProfile: raw.containmentProfile,
     ...(isolation ? { isolation } : {}),
   };
 }
@@ -350,11 +351,14 @@ export function prepareProtectedMcpWorkerProvisioning(
   for (const [id, capability] of Object.entries(config ?? {})) {
     if (!capability.enabled) continue;
     if (!capability.allowedPluginIds.some(pluginId => enabledPlugins.has(pluginId))) continue;
-    if (protectedHttpEgressPolicy && (
-      id !== protectedHttpEgressPolicy.policy.id
-      || !capability.allowedPluginIds.includes(protectedHttpEgressPolicy.pluginId)
-      || !enabledPlugins.has(protectedHttpEgressPolicy.pluginId)
-    )) continue;
+    if (protectedHttpEgressPolicy) {
+      if (id !== protectedHttpEgressPolicy.capabilityId
+        || capability.containmentProfile !== PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE
+        || !capability.allowedPluginIds.includes(protectedHttpEgressPolicy.pluginId)
+        || !enabledPlugins.has(protectedHttpEgressPolicy.pluginId)) continue;
+    } else if (capability.containmentProfile !== PROTECTED_MCP_CONTAINMENT_PROFILE) {
+      continue;
+    }
     const secret = protectedSecretValue(env, capability.secret.name);
     if (!secret) continue;
     workerPolicy.capabilities.push({

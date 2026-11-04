@@ -155,6 +155,31 @@ describe('global dashboard config', () => {
     });
   });
 
+  it('accepts the fixed egress-guard containment profile in machine-wide config', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.actor-write.v1': {
+          enabled: false,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          principal: 'verified-human-email',
+          containmentProfile: 'local-stdio-secret-egress-guard-v1',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.actor-write.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'env', name: 'FIXTURE_SECRET' },
+        principal: 'verified-human-email',
+        containmentProfile: 'local-stdio-secret-egress-guard-v1',
+      },
+    });
+  });
+
   it('drops malformed protected MCP capability entries without widening access', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       protectedMcpCapabilities: {

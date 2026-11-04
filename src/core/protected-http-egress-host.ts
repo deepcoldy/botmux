@@ -16,6 +16,7 @@ import {
 import { ensurePrivateGatewayDir, sessionMcpGatewaySocketDir } from './plugins/mcp/socket-dir.js';
 
 export const PROTECTED_HTTP_EGRESS_SOCKET_ENV = 'BOTMUX_PROTECTED_EGRESS_SOCKET';
+export const PROTECTED_HTTP_EGRESS_REQUIRED_ENV = 'BOTMUX_PROTECTED_EGRESS_REQUIRED';
 export const PROTECTED_HTTP_EGRESS_AUTH_FILENAME = 'egress-auth';
 export const MAX_PROTECTED_HTTP_BODY_BYTES = 16 * 1024 * 1024;
 
@@ -434,7 +435,7 @@ export async function startSessionProtectedHttpEgressHost(
 
         method = normalizedMethod(request.method);
         path = normalizeProtectedHttpPath(request.url ?? '');
-        const decision = protectedHttpEgressDecision(policy, policyId, method, path);
+        const decision = protectedHttpEgressDecision(policy, policyId, targetIndex, method, path);
         if (decision === 'deny') {
           request.resume();
           sendJson(response, 403, 'botmux_protected_write_required');
@@ -495,6 +496,7 @@ export async function startSessionProtectedHttpEgressHost(
             pendingUpstreamBody = undefined;
           }
         } catch (error) {
+          status = 502;
           pendingUpstreamBody?.fill(0);
           if (pendingUpstreamBody) sensitiveBuffers.delete(pendingUpstreamBody);
           if (!response.headersSent) sendJson(response, 502, 'botmux_protected_egress_unavailable');

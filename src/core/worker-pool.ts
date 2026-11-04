@@ -119,6 +119,10 @@ import {
   resolveProtectedHttpEgressTargets,
   type ProtectedHttpEgressWorkerPolicy,
 } from './protected-http-egress.js';
+import {
+  PROTECTED_HTTP_EGRESS_REQUIRED_ENV,
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+} from './protected-http-egress-host.js';
 import { resolveSessionEnv, type ResolvedSessionEnv } from './session-env-resolve.js';
 import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
 import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
@@ -994,7 +998,7 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', 'BOTMUX_PROTECTED_EGRESS_SOCKET', PROTECTED_MCP_SECRET_FD_ENV] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_HTTP_EGRESS_SOCKET_ENV, PROTECTED_HTTP_EGRESS_REQUIRED_ENV, PROTECTED_MCP_SECRET_FD_ENV] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv, protectedEnvKeys: readonly string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };

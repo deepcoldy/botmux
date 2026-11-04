@@ -449,6 +449,7 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
   it('freezes the enabled plugin policy into worker init even when no actor capability is enabled', async () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy,
       policyDigest: 'd'.repeat(64),
     }]);
@@ -463,6 +464,7 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     const init = vi.mocked(worker.send).mock.calls[0][0];
     expect(init.protectedHttpEgressPolicy).toEqual({
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy,
       policyDigest: 'd'.repeat(64),
       frozenAddresses: [['10.20.30.40', '2001:db8::40']],
@@ -472,8 +474,18 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
 
   it('fails closed before forking when more than one enabled plugin declares a policy', () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([
-      { pluginId: 'fixture-one', policy, policyDigest: '1'.repeat(64) },
-      { pluginId: 'fixture-two', policy: { ...policy, id: 'fixture.other.v1' }, policyDigest: '2'.repeat(64) },
+      {
+        pluginId: 'fixture-one',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: '1'.repeat(64),
+      },
+      {
+        pluginId: 'fixture-two',
+        capabilityId: 'fixture.other-actor-write.v1',
+        policy: { ...policy, id: 'fixture.other.v1' },
+        policyDigest: '2'.repeat(64),
+      },
     ]);
     vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-one', 'fixture-two'] }));
 
@@ -486,6 +498,7 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
   it('surfaces DNS freeze failure through the caller-owned admission notice lane', async () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy,
       policyDigest: 'd'.repeat(64),
     }]);
@@ -511,6 +524,7 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     standaloneBinaryMock.mockReturnValue(true);
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy,
       policyDigest: 'd'.repeat(64),
     }]);
@@ -566,6 +580,7 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     standaloneBinaryMock.mockReturnValue(true);
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy,
       policyDigest: 'd'.repeat(64),
     }]);
@@ -628,6 +643,7 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     standaloneBinaryMock.mockReturnValue(true);
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy,
       policyDigest: 'd'.repeat(64),
     }]);
@@ -699,6 +715,7 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
   it('reports a post-freeze preparation exception as preparation failure rather than DNS failure', async () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy,
       policyDigest: 'd'.repeat(64),
     }]);
@@ -984,6 +1001,7 @@ describe('host memory pressure worker admission', () => {
       'GITHUB_TOKEN',
       'GH_TOKEN',
       'BOTMUX_PROTECTED_EGRESS_SOCKET',
+      'BOTMUX_PROTECTED_EGRESS_REQUIRED',
     ] as const;
     const prev = keys.map(key => process.env[key]);
     keys.forEach(key => { process.env[key] = 'leaked'; });
@@ -6988,6 +7006,7 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
   it('protected HTTP egress policy → refuses adopt because an existing process cannot receive the frozen network boundary', () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
       policy: {
         id: 'fixture.write.v1',
         targets: [{

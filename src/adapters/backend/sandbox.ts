@@ -37,7 +37,10 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
-import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../../core/protected-http-egress-host.js';
+import {
+  PROTECTED_HTTP_EGRESS_REQUIRED_ENV,
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+} from '../../core/protected-http-egress-host.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
 import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
@@ -1167,6 +1170,8 @@ export function prepareDirectSandbox(opts: {
   mcpGatewaySocketPath?: string;
   /** Worker-owned protected HTTP egress guard socket beside the MCP socket. */
   protectedEgressSocketPath?: string;
+  /** A policy exists even if guard startup failed; protected origins must not fall back direct. */
+  protectedEgressRequired?: boolean;
   /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
    *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
    *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
@@ -1480,6 +1485,9 @@ export function prepareDirectSandbox(opts: {
   }
   if (sandboxProtectedEgressSocketPath) {
     env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] = sandboxProtectedEgressSocketPath;
+  }
+  if (opts.protectedEgressRequired) {
+    env[PROTECTED_HTTP_EGRESS_REQUIRED_ENV] = '1';
   }
   for (const k of PROXY_ENV_KEYS) {
     const v = process.env[k];

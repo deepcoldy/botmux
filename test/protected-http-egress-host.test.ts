@@ -471,7 +471,7 @@ describe('session protected HTTP egress host', () => {
 
   it('zeros an upstream body when unsafe response headers abort forwarding', async () => {
     const responseBody = Buffer.from('response-secret');
-    const { host, auth } = await start({
+    const { host, auth, logs } = await start({
       forward: async () => ({
         status: 200,
         headers: { 'x-invalid': 'value\nsmuggled' },
@@ -488,6 +488,7 @@ describe('session protected HTTP egress host', () => {
 
     expect(response.status).toBe(502);
     expect(responseBody.every(byte => byte === 0)).toBe(true);
+    expect(logs.at(-1)?.status).toBe(502);
   });
 
   it('fails closed when the supplied socket directory is a symlink', async () => {

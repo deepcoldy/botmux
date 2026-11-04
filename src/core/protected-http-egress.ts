@@ -8,6 +8,7 @@ import { readPluginMcpDescriptor } from './plugins/mcp/private-store.js';
 export const MAX_PROTECTED_EGRESS_TARGETS = 8;
 export const MAX_PROTECTED_EGRESS_ROUTES = 128;
 export const MAX_PROTECTED_EGRESS_METHODS = 8;
+export const MAX_PROTECTED_EGRESS_ADDRESSES_PER_TARGET = 32;
 
 export interface ProtectedHttpEgressRoute {
   methods: string[];
@@ -28,6 +29,7 @@ export interface ProtectedHttpEgressPolicy {
 
 export interface CollectedProtectedHttpEgressPolicy {
   pluginId: string;
+  capabilityId: string;
   policy: ProtectedHttpEgressPolicy;
   policyDigest: string;
 }
@@ -165,11 +167,12 @@ export function collectProtectedHttpEgressPolicies(
     if (descriptor.transport !== 'stdio' || !descriptor.protectedEgressPolicy) continue;
     const policy = normalizeProtectedHttpEgressPolicy(descriptor.protectedEgressPolicy);
     if (!policy) throw new Error(`invalid_plugin_mcp_protected_egress_policy:${pluginId}`);
-    if (descriptor.protectedCapability !== policy.id) {
-      throw new Error(`plugin_mcp_protected_egress_capability_mismatch:${pluginId}`);
+    if (!descriptor.protectedCapability) {
+      throw new Error(`plugin_mcp_protected_egress_capability_required:${pluginId}`);
     }
     collected.push({
       pluginId,
+      capabilityId: descriptor.protectedCapability,
       policy,
       policyDigest: protectedHttpEgressPolicyDigest(policy),
     });
@@ -197,9 +200,11 @@ export async function resolveProtectedHttpEgressTargets(
         throw new Error('protected_http_egress_target_not_frozen');
       }
       if (seen.has(result.address)) continue;
+      if (seen.size >= MAX_PROTECTED_EGRESS_ADDRESSES_PER_TARGET) {
+        throw new Error('protected_http_egress_target_address_limit_exceeded');
+      }
       seen.add(result.address);
       addresses.push(result.address);
-      if (addresses.length === 32) break;
     }
     if (addresses.length === 0) throw new Error('protected_http_egress_target_not_frozen');
     frozen.push(addresses);
@@ -271,18 +276,21 @@ export function normalizeProtectedHttpPath(raw: string): string {
 export function protectedHttpEgressDecision(
   policy: ProtectedHttpEgressPolicy,
   policyId: string,
+  targetIndex: number,
   method: string,
   path: string,
 ): 'allow' | 'deny' {
   if (policyId !== policy.id) throw new Error('protected_http_egress_policy_mismatch');
+  const target = policy.targets[targetIndex];
+  if (!Number.isSafeInteger(targetIndex) || !target) {
+    throw new Error('protected_http_egress_target_mismatch');
+  }
   const normalizedMethod = normalizeProtectedHttpMethod(method);
   const normalizedPath = normalizeProtectedHttpPath(path);
   const requestPathname = normalizedPath.split('?', 1)[0];
-  for (const target of policy.targets) {
-    for (const route of target.denyRoutes) {
-      const routePath = normalizeProtectedHttpPath(route.path).split('?', 1)[0];
-      if (route.methods.includes(normalizedMethod) && routePath === requestPathname) return 'deny';
-    }
+  for (const route of target.denyRoutes) {
+    const routePath = normalizeProtectedHttpPath(route.path).split('?', 1)[0];
+    if (route.methods.includes(normalizedMethod) && routePath === requestPathname) return 'deny';
   }
   return 'allow';
 }

@@ -37,8 +37,9 @@ const contained = parseSandboxNetworkPolicy({
 
 const frozenEgress: ProtectedHttpEgressWorkerPolicy = {
   pluginId: 'fixture-plugin',
+  capabilityId: 'fixture.actor-write.v1',
   policy: {
-    id: 'fixture.secret.v1',
+    id: 'fixture.platform-write.v1',
     targets: [{
       scheme: 'https',
       host: 'fixture.internal.example',
@@ -192,9 +193,10 @@ describe('protected MCP worker provisioning', () => {
       ['fixture-plugin'],
       { FIXTURE_SECRET: 'fixture-value' },
       {
-        'fixture.secret.v1': fixtureCapability({
+        'fixture.actor-write.v1': fixtureCapability({
           enabled: true,
           allowedPluginIds: ['fixture-plugin', 'unrelated-plugin'],
+          containmentProfile: 'local-stdio-secret-egress-guard-v1',
         }),
         'fixture.unrelated.v1': fixtureCapability({
           enabled: true,
@@ -205,22 +207,49 @@ describe('protected MCP worker provisioning', () => {
       frozenEgress,
     );
     expect(enabled.workerPolicy.capabilities).toEqual([{
-      id: 'fixture.secret.v1',
+      id: 'fixture.actor-write.v1',
       allowedPluginIds: ['fixture-plugin'],
       principal: 'verified-human-email',
       containmentProfile: 'local-stdio-secret-egress-guard-v1',
     }]);
-    expect([...enabled.secrets.keys()]).toEqual(['fixture.secret.v1']);
+    expect([...enabled.secrets.keys()]).toEqual(['fixture.actor-write.v1']);
 
     const disabled = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
       { FIXTURE_SECRET: 'fixture-value' },
-      { 'fixture.secret.v1': fixtureCapability({ enabled: false }) },
+      { 'fixture.actor-write.v1': fixtureCapability({
+        enabled: false,
+        containmentProfile: 'local-stdio-secret-egress-guard-v1',
+      }) },
       true,
       frozenEgress,
     );
     expect(disabled.workerPolicy.capabilities).toEqual([]);
     expect(disabled.secrets.size).toBe(0);
+  });
+
+  it('requires the egress containment profile only for the descriptor-bound capability', () => {
+    const oldProfile = prepareProtectedMcpWorkerProvisioning(
+      ['fixture-plugin'],
+      { FIXTURE_SECRET: 'fixture-value' },
+      { 'fixture.actor-write.v1': fixtureCapability({ enabled: true }) },
+      true,
+      frozenEgress,
+    );
+    expect(oldProfile.workerPolicy.capabilities).toEqual([]);
+    expect(oldProfile.secrets.size).toBe(0);
+
+    const egressProfileWithoutDescriptor = prepareProtectedMcpWorkerProvisioning(
+      ['fixture-plugin'],
+      { FIXTURE_SECRET: 'fixture-value' },
+      { 'fixture.other.v1': fixtureCapability({
+        enabled: true,
+        containmentProfile: 'local-stdio-secret-egress-guard-v1',
+      }) },
+      true,
+    );
+    expect(egressProfileWithoutDescriptor.workerPolicy.capabilities).toEqual([]);
+    expect(egressProfileWithoutDescriptor.secrets.size).toBe(0);
   });
 
   it('authorizes the egress-guard profile only with live digest-bound guard and complete sandbox proof', () => {

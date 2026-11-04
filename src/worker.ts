@@ -11,6 +11,8 @@ import {
   protectedMcpRedactedEnvKeys,
 } from './core/protected-mcp-capabilities.js';
 import {
+  PROTECTED_HTTP_EGRESS_REQUIRED_ENV,
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
   startSessionProtectedHttpEgressHost,
   type SessionProtectedHttpEgressHost,
 } from './core/protected-http-egress-host.js';
@@ -23658,6 +23660,8 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy);
+  delete childEnv[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
+  delete childEnv[PROTECTED_HTTP_EGRESS_REQUIRED_ENV];
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
   // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
   // The worker pin above is the single source for CLI and worker scratch.
@@ -24827,6 +24831,7 @@ async function spawnCli(
         protectedEgressSocketPath: sessionMcpGatewayHost
           ? sessionProtectedHttpEgressHost?.socketPath
           : undefined,
+        protectedEgressRequired: !!cfg.protectedHttpEgressPolicy,
         larkCliDataDir: childLarkDataRoot,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
