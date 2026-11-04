@@ -29,10 +29,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import {
-  DURABLE_INBOX_LANE_LARK_MESSAGE,
-  SqliteDurableCoordinationStore,
-} from '../src/services/sqlite-durable-coordination.js';
+import { DURABLE_INBOX_LANE_LARK_MESSAGE } from '../src/services/durable-coordination.js';
+import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import {
   startDurableInboxPrimaryConsumer,
   type DurableInboxPrimaryDispatchResult,
