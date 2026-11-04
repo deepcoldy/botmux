@@ -3,11 +3,13 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readFeedbackStorageConfig, saveFeedbackStorageCandidate, putFeedbackStorageSecret, readFeedbackStorageSecret, readPostgresCredential, activateFeedbackStorageCandidate } from './feedback-storage-config.js';
 import type { FeedbackStorageConfig, FeedbackStorageTarget } from './feedback-storage-types.js';
-import { feedbackPostgresPool, FEEDBACK_TABLES } from './feedback-postgres-schema.js';
+import { FEEDBACK_TABLES } from './feedback-tables.js';
 import { SkillFeedbackStore } from './skill-feedback-store.js';
 import { openDatabaseSync } from './sqlite-compat.js';
 import { closeFeedbackStorage } from './feedback-storage.js';
-import { listFeedbackMigrations, startFeedbackMigration } from './feedback-migration.js';
+// PG pool and migration runner pull in the optional `pg` dependency; load them
+// lazily so `feedback storage status` and the Dashboard storage panel work on
+// SQLite-only installs (pg is required only when actually using PostgreSQL).
 import { randomUUID } from 'node:crypto';
 import { currentFeedbackMaintenance } from './feedback-maintenance.js';
 
@@ -24,6 +26,7 @@ export function feedbackStorageView(config: FeedbackStorageConfig) {
 }
 export async function feedbackStorageStatus(dataDir: string) {
   const config = await readFeedbackStorageConfig(dataDir);
+  const { listFeedbackMigrations } = await import('./feedback-migration.js');
   const jobs = await listFeedbackMigrations(dataDir);
   return { ...feedbackStorageView(config), maintenance: currentFeedbackMaintenance(dataDir),
     migrations: jobs.map(job => ({ migrationId: job.migrationId, phase: job.phase, blockers: job.blockers })) };
@@ -66,6 +69,7 @@ export async function testFeedbackStorageConnection(dataDir: string): Promise<{ 
   const selected = config.candidate ?? config.active;
   if (selected.backend === 'sqlite') return { ok: true, backend: 'sqlite' };
   const target = selected.postgres;
+  const { feedbackPostgresPool } = await import('./feedback-postgres-schema.js');
   const pool = feedbackPostgresPool(target, await readPostgresCredential(dataDir, target), target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined);
   try {
     const client = await pool.connect();
@@ -98,6 +102,7 @@ export async function initializeFeedbackStorage(dataDir: string, expectedGenerat
   if (config.candidate.backend === 'postgresql') {
     const source = await SkillFeedbackStore.open(dataDir);
     source.close();
+    const { startFeedbackMigration } = await import('./feedback-migration.js');
     const job = await startFeedbackMigration(dataDir, {
       requestId: `initialize-${randomUUID()}`, expectedGeneration, maintenanceConfirmed: true,
     });

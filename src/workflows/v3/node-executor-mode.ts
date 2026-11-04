@@ -129,7 +129,12 @@ export type V3BotEligibilityCode =
   | 'NO_TOPIC_SESSION'
   | 'TOPIC_SESSION_UNKNOWN'
   /** The node declares a directory output, which a bot cannot submit. */
-  | 'DIRECTORY_OUTPUT';
+  | 'DIRECTORY_OUTPUT'
+  /** `approve-dag --working-dir` lies outside this bot's configured
+   *  directory range (design §15.4). */
+  | 'WORKING_DIR_OUT_OF_RANGE'
+  /** `approve-dag --working-dir`, but this bot configures no directory. */
+  | 'WORKING_DIR_NO_RANGE';
 
 export interface V3BotEligibilityProblem {
   nodeId: string;
@@ -234,26 +239,45 @@ const PROBLEM_TEXT: Record<V3BotEligibilityCode, string> = {
   NO_TOPIC_SESSION: '它在本群设成了「整群一个会话」（chat / shared），节点话题里的交接会并进群会话，无法提交；请把它在本群的回复模式改成 new-topic 或 chat-topic，或改派',
   TOPIC_SESSION_UNKNOWN: '暂时查不到本群是话题群还是普通群，请稍后重试',
   DIRECTORY_OUTPUT: '节点声明了目录型产出，交给 Bot 执行时无法提交目录；请改成文件产出，或在 Dashboard 关闭该开关改用临时进程执行',
+  WORKING_DIR_OUT_OF_RANGE: '指定的工作目录不在它配置的目录范围内（默认工作目录 / 仓库目录）',
+  WORKING_DIR_NO_RANGE: '它没有配置目录范围（默认工作目录 / 仓库目录），不能给它指定工作目录',
 };
+
+const WORKING_DIR_CODES: ReadonlySet<V3BotEligibilityCode> = new Set(['WORKING_DIR_OUT_OF_RANGE', 'WORKING_DIR_NO_RANGE']);
 
 /** One user-facing reason for an eligibility code. */
 export function describeV3BotEligibilityCode(code: V3BotEligibilityCode): string {
   return PROBLEM_TEXT[code];
 }
 
-/** "Node → bot: reason" lines for a refused approval. */
+/** "Node → bot: reason" lines for a refused approval. `workingDir`: the
+ *  directory `approve-dag --working-dir` asked for, named once when a node
+ *  was refused for it. */
 export function formatV3BotEligibilityRefusal(
   problems: readonly V3BotEligibilityProblem[],
   nameOf: (larkAppId: string) => string,
+  opts: { workingDir?: string } = {},
 ): string {
   const lines = problems.map((problem) =>
     `- ${problem.nodeId} → ${nameOf(problem.larkAppId)}：${PROBLEM_TEXT[problem.code]}` +
     (problem.detail ? `（${problem.detail}）` : ''));
+  const dirRefused = opts.workingDir !== undefined && problems.some((problem) => WORKING_DIR_CODES.has(problem.code));
   return [
     '「节点交给群里的 Bot 执行」已开启，但以下节点的执行 Bot 不满足条件，已拒绝批准：',
+    ...(dirRefused ? [`指定的工作目录：${opts.workingDir}`] : []),
     ...lines,
+    ...(dirRefused
+      ? ['节点在执行 Bot 自己的会话里跑，指定的目录必须落在每个执行 Bot 配置的默认工作目录或仓库目录之内；'
+        + '可换一个目录、给这些 Bot 的默认工作目录或仓库目录补上它，或去掉 --working-dir 让各 Bot 用自己的默认目录。']
+      : []),
     '处理后重新批准；或用 revise-dag 改派节点，或在 Dashboard 关闭该开关改用临时进程执行。',
   ].join('\n');
+}
+
+/** The Gate-2 summary line for a bot run approved with `--working-dir`. */
+export function describeV3NodeWorkingDir(workingDir: string): string {
+  return `工作目录：${workingDir}（每个执行 Bot 起节点会话时会按它当时的配置再核对一次；`
+    + '到时不在它的目录范围内，该节点会受阻并写明原因，不会改用它的默认目录）';
 }
 
 /** "Node → executing bot" lines for the Gate-2 summary of a bot run. */

@@ -67,6 +67,14 @@ export interface TriggerSessionInternalOptions {
    *  of botmux's persisted Session.lastUserPrompt/lastCliInput fields; receipt
    *  recovery asks the hub to resend the frozen envelope instead. */
   persistInputHistory?: boolean;
+  /** A live worker queues this turn behind one that is running instead of
+   *  folding it into that turn (type-ahead). Used by turns that must start
+   *  as their own turn (workflow wake-ups). */
+  queueAfterActiveTurn?: true;
+  /** Called when the live worker refused the input synchronously, before
+   *  accepting it — after `beforeDispatch` ran, so its caller can undo what
+   *  it prepared for a turn that provably never reached the worker. */
+  onDispatchRefused?: () => void;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -1582,8 +1590,10 @@ async function triggerSessionTurnAdmitted(
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+        ...(internal?.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       });
       if (!accepted) {
+        internal?.onDispatchRefused?.();
         disarmLoudFinalSuppression(target);
         return {
           ok: false,

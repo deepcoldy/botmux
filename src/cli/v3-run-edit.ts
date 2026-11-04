@@ -10,13 +10,14 @@ import { WORKFLOW_DAEMON_IPC_BODY_LIMIT_BYTES } from '../workflows/v3/daemon-ipc
 import { V3_REVISION_REASON_LABELS } from '../im/lark/v3-revision-card.js';
 import type { V3RevisionConfirmReason } from '../workflows/v3/event-contract.js';
 import { formatV3RunStatus, type V3RunStatusView } from '../workflows/v3/run-edit.js';
+import { V3_ACTION_REASON_MAX } from '../workflows/v3/action-provenance.js';
 
 export const V3_RUN_EDIT_USAGE =
-  '用法: botmux workflow edit <runId> --patch-file <文件|-> --base <版本> [--json]';
+  '用法: botmux workflow edit <runId> --patch-file <文件|-> --base <版本> [--reason "<为什么改>"] [--json]';
 export const V3_RUN_STATUS_USAGE = '用法: botmux workflow status <runId> [--json]';
 
 export type V3RunEditCliOptions =
-  | { ok: true; patchFile: string; base: number; json: boolean }
+  | { ok: true; patchFile: string; base: number; json: boolean; reason?: string }
   | { ok: false; error: string };
 
 function flagValue(args: readonly string[], flag: string): string | undefined {
@@ -27,7 +28,7 @@ function flagValue(args: readonly string[], flag: string): string | undefined {
 }
 
 export function parseV3RunEditCliOptions(rest: readonly string[]): V3RunEditCliOptions {
-  const known = new Set(['--patch-file', '--base', '--json']);
+  const known = new Set(['--patch-file', '--base', '--json', '--reason']);
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]!;
     if (!arg.startsWith('--')) continue;
@@ -40,7 +41,18 @@ export function parseV3RunEditCliOptions(rest: readonly string[]): V3RunEditCliO
   if (!baseRaw) return { ok: false, error: '缺少 --base <版本>（先用 botmux workflow status 读当前版本）' };
   const base = Number(baseRaw);
   if (!Number.isSafeInteger(base) || base < 1) return { ok: false, error: `--base 必须是正整数（收到 ${baseRaw}）` };
-  return { ok: true, patchFile, base, json: rest.includes('--json') };
+  const reason = parseV3ReasonFlag(rest);
+  if (!reason.ok) return reason;
+  return { ok: true, patchFile, base, json: rest.includes('--json'), ...(reason.reason ? { reason: reason.reason } : {}) };
+}
+
+/** `--reason "<text>"`: absent, or a non-empty text within the IPC bound. */
+export function parseV3ReasonFlag(rest: readonly string[]): { ok: true; reason?: string } | { ok: false; error: string } {
+  if (!rest.includes('--reason')) return { ok: true };
+  const value = flagValue(rest, '--reason')?.trim();
+  if (!value) return { ok: false, error: '--reason 需要写明理由' };
+  if (value.length > V3_ACTION_REASON_MAX) return { ok: false, error: `--reason 最多 ${V3_ACTION_REASON_MAX} 个字` };
+  return { ok: true, reason: value };
 }
 
 /** Read and parse the patch JSON from a file or `-` (stdin). The engine

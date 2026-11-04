@@ -151,6 +151,7 @@ export const V3_UPDATE_NODE_FIELDS = [
   'humanGate',
   'override',
   'revisitTo',
+  'checkpoint',
   'input',
   'maxIterations',
   'body',
@@ -831,6 +832,14 @@ function nodeDefinitionWithoutWiring(node: V3Node): unknown {
   return rest;
 }
 
+/** What the node's executor works on: its definition minus the checkpoint
+ *  mark, which only says whether the main bot looks at the result once the
+ *  node is done (§13.6). Toggling it never invalidates work in progress. */
+function nodeWorkDefinition(node: V3Node): unknown {
+  const { checkpoint: _checkpoint, ...rest } = nodeDefinitionWithoutWiring(node) as V3Node;
+  return rest;
+}
+
 function collectBotSelectors(node: V3Node, inherited?: string): Array<{ nodeId: string; selector: string }> {
   const out: Array<{ nodeId: string; selector: string }> = [];
   if (node.type === 'goal' || node.type === 'loop') {
@@ -1200,6 +1209,9 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
     const after = nextById.get(nodeId);
     return !!before && !!after && canonical(nodeDefinitionWithoutWiring(before)) !== canonical(nodeDefinitionWithoutWiring(after));
   });
+  // A checkpoint-only change is recorded like any change but redoes nothing.
+  const workChanged = changed.filter((nodeId) =>
+    canonical(nodeWorkDefinition(originalById.get(nodeId)!)) !== canonical(nodeWorkDefinition(nextById.get(nodeId)!)));
   const rewired = [...dependsChanged].filter((nodeId) => {
     const before = originalById.get(nodeId);
     const after = nextById.get(nodeId);
@@ -1283,13 +1295,13 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   // change leaves it blocked for a later retry.
   const retries: V3RevisionPlan['retries'] = [];
   const regate: NonNullable<V3RevisionEffects['regate']> = [];
-  for (const nodeId of [...new Set([...changed, ...reassigned.keys()])]) {
+  for (const nodeId of [...new Set([...workChanged, ...reassigned.keys()])]) {
     if (v3NodeLifecycle(snap, originalById.get(nodeId)!) === 'blocked') {
       if (reassigned.has(nodeId)) retryBlocked.add(nodeId);
       // Its gate approval covered the OLD definition: however the node is
       // retried later, it must pass the (new) gate again.
       const state = snap.nodes.get(nodeId);
-      if (changed.includes(nodeId) && state?.gateCleared && state.effectiveInstanceId && nextById.get(nodeId)?.humanGate) {
+      if (workChanged.includes(nodeId) && state?.gateCleared && state.effectiveInstanceId && nextById.get(nodeId)?.humanGate) {
         regate.push({ nodeId, instanceId: state.effectiveInstanceId });
       }
       continue;
@@ -1303,7 +1315,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       problems.push(`node "${nodeId}" has an external effect whose outcome is unknown; reconcile it before re-running`);
       continue;
     }
-    if (blockedEvent?.reviseRequired && !changed.includes(nodeId)) {
+    if (blockedEvent?.reviseRequired && !workChanged.includes(nodeId)) {
       problems.push(`node "${nodeId}" broke its output contract; change its definition in the same edit to re-run it`);
       continue;
     }

@@ -119,3 +119,19 @@ describe('deliverWorkflowNodeTurn identity step', () => {
     expect(order).toEqual(['fork:om_handoff']);
   });
 });
+
+describe('deliverWorkflowNodeTurn working dir (design §15.4)', () => {
+  const forkedDs = () => wp.forkWorker.mock.calls.at(-1)![0] as { workingDir?: string; session: { workingDir?: string } };
+
+  it('a new node session starts in the run\'s (already checked) directory and keeps it on record', async () => {
+    await deliverWorkflowNodeTurn({ ...INPUT, workingDir: '/srv/task' }, new Map(), () => false);
+    expect(forkedDs().workingDir).toBe('/srv/task');
+    expect(forkedDs().session.workingDir).toBe('/srv/task');
+  });
+
+  it('without one it starts where it always did (the bot\'s default)', async () => {
+    await deliverWorkflowNodeTurn(INPUT, new Map(), () => false);
+    expect(forkedDs().workingDir).toBeUndefined();
+    expect(forkedDs().session.workingDir).toBeUndefined();
+  });
+});
