@@ -87,8 +87,8 @@ botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
 
-真人当前回合创建的 direct 任务，以及宿主显式启用了 self-management 的委托任务，
-在自己的 scheduled turn 内都可用 \`botmux schedule pause self\` 或
+真人当前回合创建的 direct 任务、不记录真人创建者的 direct 任务（例如在宿主终端用 \`botmux schedule add\` 建的），
+以及宿主显式启用了 self-management 的委托任务，在自己的 scheduled turn 内都可用 \`botmux schedule pause self\` 或
 \`botmux schedule remove self\` 停止自己。
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
 

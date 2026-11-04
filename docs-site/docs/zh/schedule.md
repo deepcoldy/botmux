@@ -71,7 +71,7 @@ scheduled turn 不从未受管工具继承机器登录态，目标 Bot 必须同
 
 `runScopes` 默认空；配置为 `["bytedcli"]` 后，委托任务可在未来每次触发时使用原真人的 bytedcli 授权。来源 Bot 和目标 Bot 都必须启用 `triggerUserAuth`，且目标 Bot 应让 `lark-cli`、`bytedcli` 都经过隔离 wrapper，以保证复用会话不会继承历史身份；否则创建或执行会 fail-closed。该能力不会让 scheduled turn 变成通用真人 current actor，也不会持久化 lark-cli 权限。
 
-真人当前回合创建的 direct 任务，其 scheduled turn 可用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务。跨 Bot delegated 任务仍需 `selfManageEnabled:true`。两类任务都只能管理当前精确 task，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回 delegated task 的对应持久权限。
+真人当前回合创建的 direct 任务，其 scheduled turn 可用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务；每次都会重新确认创建它的真人仍是该 Bot 管理员、仍在当前群里。不记录任何真人创建者字段的 direct 任务（结构条件：open_id 与 union_id 都未记录；例如在宿主终端用 `botmux schedule add` 建的任务，创建者就是宿主管理员）同样可以停止自己，不做这项真人复核。跨 Bot delegated 任务仍需 `selfManageEnabled:true`。这几类任务都只能管理当前精确 task，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回 delegated task 的对应持久权限。
 
 需要先发送最终结果再删除自身时，使用一个单一收口命令：
 
