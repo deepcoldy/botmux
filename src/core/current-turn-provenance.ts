@@ -6,6 +6,11 @@ import {
   parseScheduledTurnId,
   scheduledTurnAuthErrorMessage,
 } from './scheduled-turn-provenance.js';
+import {
+  isInboundMessageTurnId,
+  parseWorkflowEventTurnId,
+  type WorkflowEventTurnVerifier,
+} from './workflow-event-turn.js';
 
 interface PersistedTurnSession {
   sessionId: string;
@@ -50,6 +55,21 @@ export interface CurrentTurnProvenance {
    * a chat-top-level turn deliberately has no root.
    */
   rootMessageId?: string;
+  /**
+   * Set only for a `workflow-event:<runId>:<seq>` turn (the daemon opened it
+   * to hand THIS run's own events to its main session, design §13.1/§13.6)
+   * that the caller's run-bound verifier accepted. Never from env/argv.
+   */
+  workflowRunEvent?: { runId: string };
+  /**
+   * Set when the process marker is a `workflow-event:<runId>:<seq>` turn that
+   * a newer inbound message overtook, so the request was authenticated as
+   * that message's turn instead (identity = its sender). The CLI still runs
+   * inside the wake turn: the main bot, not that sender, decided what this
+   * request does — a consumer that grades "the caller's own turn" must not
+   * count it as one (design §13.1).
+   */
+  overtakenWorkflowRunEvent?: { runId: string };
 }
 
 export class CurrentTurnProvenanceError extends Error {
@@ -101,6 +121,9 @@ export interface ResolveCurrentTurnProvenanceOptions {
   startPid?: number;
   /** Exact daemon-backed liveness proof for an auto-disabled one-shot. */
   isScheduledTurnLive?: (turnId: string) => boolean;
+  /** Run-bound verifier for daemon-minted workflow event turns. Without it
+   *  such a turn is refused (it has no human sender to authenticate). */
+  verifyWorkflowEventTurn?: WorkflowEventTurnVerifier;
 }
 
 /**
@@ -153,6 +176,68 @@ export function resolveCurrentTurnProvenance(
 
   const replyTarget = session.currentReplyTarget;
 
+  // Daemon-minted workflow event turn (`workflow-event:<runId>:<seq>`): no
+  // human message opened it. It authenticates only through the caller's
+  // run-bound verifier; every other command refuses it.
+  const workflowEvent = parseWorkflowEventTurnId(marker.turnId);
+  if (workflowEvent) {
+    if (!options.verifyWorkflowEventTurn) {
+      throw new CurrentTurnProvenanceError(
+        `turn ${marker.turnId} 是 workflow 事件唤醒的回合，只能用于该 run 的流程命令`,
+      );
+    }
+    let eventRootMessageId: string | undefined;
+    if ((session.scope ?? 'thread') === 'thread') {
+      if (!nonEmpty(session.rootMessageId)) {
+        throw new CurrentTurnProvenanceError(`thread session ${marker.sessionId} 缺少 rootMessageId`);
+      }
+      eventRootMessageId = session.rootMessageId;
+    } else if (replyTarget && nonEmpty(replyTarget.rootMessageId)) {
+      eventRootMessageId = replyTarget.rootMessageId;
+    }
+    const verdict = options.verifyWorkflowEventTurn({
+      ...workflowEvent,
+      turnId: marker.turnId,
+      session: {
+        sessionId: marker.sessionId,
+        larkAppId: session.larkAppId,
+        chatId: session.chatId,
+        ...(eventRootMessageId ? { rootMessageId: eventRootMessageId } : {}),
+        ...(nonEmpty(session.quoteTargetId) ? { quoteTargetId: session.quoteTargetId } : {}),
+        ...(nonEmpty(replyTarget?.turnId) ? { currentReplyTargetTurnId: replyTarget!.turnId } : {}),
+      },
+    });
+    if (!verdict.ok) {
+      // A newer inbound message overtook the wake turn (folded into it, or
+      // queued behind it). The request now runs as that message's sender:
+      // authenticate it exactly as a command of that turn would be, rather
+      // than failing a request the human may just have made — but mark it,
+      // because the marker is still the wake turn and the model there acts
+      // on its own: a runtime edit grades it as the main bot's turn when the
+      // sender is the initiator, and as that member's turn otherwise (M1).
+      const overtaking = session.quoteTargetId;
+      if (verdict.stale && nonEmpty(overtaking) && isInboundMessageTurnId(overtaking)) {
+        return {
+          ...authenticateHumanTurn(marker.sessionId, overtaking, session),
+          overtakenWorkflowRunEvent: { runId: workflowEvent.runId },
+        };
+      }
+      throw new CurrentTurnProvenanceError(`workflow 事件回合校验失败：${verdict.reason}`);
+    }
+    return {
+      sessionId: marker.sessionId,
+      turnId: marker.turnId,
+      callerOpenId: verdict.callerOpenId,
+      larkAppId: session.larkAppId,
+      chatId: session.chatId,
+      ...(session.chatType === 'group' || session.chatType === 'p2p'
+        ? { chatType: session.chatType }
+        : {}),
+      ...(eventRootMessageId ? { rootMessageId: eventRootMessageId } : {}),
+      workflowRunEvent: { runId: workflowEvent.runId },
+    };
+  }
+
   // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
   // inbound message exists, so quoteTargetId/lastCallerOpenId were never set
   // for this turn. Authenticate via the task binding + owner gate instead of
@@ -202,6 +287,22 @@ export function resolveCurrentTurnProvenance(
     };
   }
 
+  return authenticateHumanTurn(marker.sessionId, marker.turnId, session);
+}
+
+/** The human path: authenticate `turnId` of `sessionId` as the human who
+ *  opened it (generation join on the live quote/reply chain, or the durable
+ *  per-turn registry). */
+function authenticateHumanTurn(
+  sessionId: string,
+  turnId: string,
+  session: PersistedTurnSession,
+): CurrentTurnProvenance {
+  const marker = { sessionId, turnId };
+  const replyTarget = session.currentReplyTarget;
+  if (!nonEmpty(session.larkAppId) || !nonEmpty(session.chatId)) {
+    throw new CurrentTurnProvenanceError(`session ${sessionId} 缺少 larkAppId/chatId`);
+  }
   // quoteTargetId / currentReplyTarget are the live UI quote chain: a queued
   // follow-up (submitQueuedMessage) advances both to the NEXT turn's message
   // while this turn is still running, so they cannot vouch for the running

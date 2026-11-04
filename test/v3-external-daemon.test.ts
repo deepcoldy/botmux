@@ -20,6 +20,7 @@ import {
   publishRunEnvelopeOnce,
   serializeRunEnvelope,
   validateRunEnvelope,
+  frozenNodeWorkingDir,
   RunEnvelopeValidationError,
 } from '../src/workflows/v3/run-envelope.js';
 import {
@@ -180,6 +181,19 @@ describe('run.json nodeExecutor', () => {
       artifacts: { dag: artifacts.dag, botSnapshots: artifacts.botSnapshots },
     });
     expect(() => validateRunEnvelope({ ...manual, nodeExecutor: 'bot' })).toThrow(RunEnvelopeValidationError);
+  });
+
+  it('nodeWorkingDir (design §15.4): only an absolute path, only on a bot-executed ad-hoc run', () => {
+    const base = freshBase();
+    const runDir = join(base, 'env-dir');
+    const artifacts = seedAdHocArtifacts(runDir, 'env-dir');
+    const common = { runId: 'env-dir', createdAt: CREATED_AT, authorizedAt: AUTHORIZED_AT, artifacts };
+    const pinned = makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot', nodeWorkingDir: '/srv/task' });
+    expect(frozenNodeWorkingDir(pinned)).toBe('/srv/task');
+    expect(frozenNodeWorkingDir(makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot' }))).toBeUndefined();
+    expect(() => makeAdHocRunEnvelope({ ...common, nodeWorkingDir: '/srv/task' })).toThrow(RunEnvelopeValidationError);
+    expect(() => makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot', nodeWorkingDir: 'srv/task' })).toThrow(RunEnvelopeValidationError);
+    expect(() => makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot', nodeWorkingDir: '' })).toThrow(RunEnvelopeValidationError);
   });
 });
 

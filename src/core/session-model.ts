@@ -1,3 +1,4 @@
+import { reasoningEffortsForCliModel, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
 import type { CliId } from '../adapters/cli/types.js';
 import {
@@ -122,4 +123,15 @@ export function resolveSessionLaunchModel(
   botCfg?: LaunchModelBotConfig,
 ): string | undefined {
   return resolveSessionLaunchModelChoice(ds, botCfg).model;
+}
+
+/** A topic override is used only for the model it was chosen for. */
+export function resolveTopicReasoningEffort(
+  session: { topicReasoningEffort?: { model: string; effort: CodexReasoningEffort } },
+  cliId: string, model: string | undefined, fallback: CodexReasoningEffort | undefined,
+): CodexReasoningEffort | undefined {
+  const selected = session.topicReasoningEffort;
+  return cliId === 'traex' && selected && typeof selected.model === 'string'
+    && selected.model.trim().toLowerCase() === model?.trim().toLowerCase()
+    && reasoningEffortsForCliModel(cliId, model).includes(selected.effort) ? selected.effort : fallback;
 }

@@ -1,3 +1,4 @@
+import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -15,6 +16,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
 import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
@@ -94,6 +96,14 @@ import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-
 import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
+import { handleWorkflowSidebar } from './dashboard/workflow-sidebar-api.js';
+import { publishDashboardH5Presence } from './core/dashboard-h5-presence.js';
+import {
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+  WorkflowSidebarMembershipCache,
+  type WorkflowSidebarMembershipRequest,
+  type WorkflowViewerMembership,
+} from './core/workflow-sidebar-membership.js';
 import {
   defaultRunsDir as v3RunsDir,
   liveV3TerminalPortForSession,
@@ -122,7 +132,8 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
-import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
+import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
+import { getFeedbackStorage, closeFeedbackStorage } from './services/feedback-storage.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -135,6 +146,7 @@ import {
   createDashboardH5AuthController,
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
+  dashboardH5LoginUsable,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
@@ -486,6 +498,31 @@ const dashboardH5Auth = createDashboardH5AuthController({
   audit: dashboardControlAudit,
 });
 const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+const workflowSidebarMembership = new WorkflowSidebarMembershipCache();
+const WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS = 10_000;
+
+/** Ask the run's main bot daemon (its own app) whether the viewer is in the
+ *  run's chat. Offline daemon / any error → unavailable (the sidebar denies). */
+async function askWorkflowSidebarMembership(
+  mainLarkAppId: string,
+  request: WorkflowSidebarMembershipRequest,
+): Promise<WorkflowViewerMembership> {
+  try {
+    const response = await proxyToDaemon(mainLarkAppId, WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: request.chatId, ...request.principal }),
+      // The daemon makes up to one contact call plus the chat's member pages.
+      signal: AbortSignal.timeout(WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS),
+    });
+    if (!response.ok) return 'unavailable';
+    const body = await response.json().catch(() => null) as { ok?: unknown; member?: unknown } | null;
+    if (body?.ok !== true || typeof body.member !== 'boolean') return 'unavailable';
+    return body.member ? 'member' : 'not_member';
+  } catch {
+    return 'unavailable';
+  }
+}
 try {
   pluginResultArtifacts.sweepExpired();
 } catch (error) {
@@ -1213,8 +1250,10 @@ interface ResolvedDashboardSettings {
   /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. `nodeExecutor`
-   *  is the experimental executor frozen into newly authorized runs. */
-  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+   *  is the experimental executor frozen into newly authorized runs;
+   *  `handoffIdentity` whether those runs hand their initiator's identity to
+   *  the node bots. */
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
@@ -1225,8 +1264,9 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON; the nested
+   *  dispatch task-tree card switch is default OFF. */
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1859,6 +1899,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     workflow: {
       enabled: global.workflow?.enabled === true, // default OFF
       nodeExecutor: global.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral', // default ephemeral
+      handoffIdentity: global.workflow?.handoffIdentity === true, // default OFF
     },
     sessionCleanup: {
       archiveCodex: global.sessionCleanup?.archiveCodex === true,
@@ -1867,7 +1908,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
-    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
+    multiTopic: {
+      enabled: global.multiTopic?.enabled !== false, // default ON
+      taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
+    },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     httpProxy: global.httpProxy ?? null,
@@ -4008,10 +4052,6 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
-let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
-function analyticsService(): FeedbackAnalyticsService {
-  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
-}
 
 const companionApi = (() => {
   try {
@@ -4110,6 +4150,14 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
+    // Pinned xterm 5.5.0 browser bundle (the #1940 set) for pages rendered at
+    // the Dashboard root — the v3 terminal replay iframe — instead of a public
+    // CDN. Public library files, so no auth (same as the worker's copy under
+    // `/s/<id>/`, which still reaches the worker through the front proxy).
+    if (handleXtermVendorHttp(req, res, url.pathname, 'root', (err) => {
+      logger.warn(`[dashboard] xterm vendor asset failed: ${err instanceof Error ? err.message : String(err)}`);
+    })) return;
+
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
@@ -4152,6 +4200,23 @@ const server = createServer(async (req, res) => {
         if (!dashboardH5AuthConfig.enabled) return undefined;
         return `${dashboardH5AuthConfig.entryPath}?returnTo=${encodeURIComponent(returnTo)}`;
       },
+    })) return;
+
+    // Workflow sidebar (design 2026-11-03 §11): the `/workflow/<app>/<run>`
+    // entry and its read-only data route own their D6 gate — admins see the
+    // full run, current chat members a server-trimmed view, everyone else 403.
+    // Mounted before the ordinary gate because the H5 session it accepts for
+    // non-allowlisted members is invisible to every other route.
+    if (await handleWorkflowSidebar(req, res, url, {
+      runsDir: v3RunsDir(),
+      identity: () => dashboardRequestIdentity(req),
+      h5: () => dashboardH5Auth.resolve(req),
+      h5Config: dashboardH5AuthConfig,
+      platformLoginUrl: returnTo => buildPlatformDashboardLoginUrl(returnTo),
+      membership: workflowSidebarMembership,
+      askMembership: askWorkflowSidebarMembership,
+      brand: appId => normalizeBrand(configuredBrands().get(appId)),
+      botName: v3RunBotNameResolver(),
     })) return;
 
     // Session Web preview is an authenticated, same-origin reverse proxy to an
@@ -4558,7 +4623,13 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
-      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
+      return;
+    }
+    if (url.pathname.startsWith('/api/feedback/storage')) {
+      if (!legacyAuthed || requestIdentity?.kind !== 'legacy-dashboard') return jsonRes(res, 403, { error: 'feedback_storage_admin_required' });
+      if (req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity)) return;
+      await handleFeedbackStorageApi(req, res, url, { dataDir: config.session.dataDir, isHostAdmin: true, csrfValid: true });
       return;
     }
 
@@ -6443,6 +6514,16 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
     }
 
+    // Owner authentication above applies; never fall back to a broad interrupt.
+    const sessionStop = await proxySessionStopControl(req.method, url.pathname, {
+      ownerOf: sid => aggregator.ownerOf(sid), proxyToDaemon,
+    });
+    if (sessionStop) {
+      res.writeHead(sessionStop.status, { 'content-type': 'application/json' });
+      res.end(await sessionStop.text());
+      return;
+    }
+
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
     // 四态 running/completed/failed/not_found，daemon 重启后从持久化结果兜底
     // 重建 completed。owner-only（写权限 cookie），代理到 owner daemon 同名 IPC。
@@ -8194,6 +8275,11 @@ listenWithProbe({
   try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
+  // Card builders (daemons / CLIs never see the H5 config) read this to pick
+  // the「工作流 ›」link: the Feishu sidebar only when H5 login can work there.
+  try { publishDashboardH5Presence(dashboardH5LoginUsable(dashboardH5AuthConfig)); } catch (e) {
+    logger.warn(`[dashboard] Failed to record H5 login availability: ${(e as Error).message}`);
+  }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
   // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
   // (crash/restart mid-delete). Best-effort and fire-and-forget.
@@ -8380,7 +8466,7 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 }
 
 // Graceful shutdown
-function shutdown(): void {
+async function shutdown(): Promise<void> {
   codexNotifierAbort.abort();
   stopAutoCleanup();
   for (const sub of subs.values()) sub.off();
@@ -8389,7 +8475,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   hostTerminalManager.shutdown();
-  feedbackAnalyticsService?.close();
+  await closeFeedbackStorage(config.session.dataDir);
   setDurableConfigCoordinator(undefined);
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => {

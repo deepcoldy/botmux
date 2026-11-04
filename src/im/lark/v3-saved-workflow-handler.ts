@@ -25,6 +25,7 @@ import {
 import type { V3NodeExecutorPolicy } from '../../workflows/v3/node-executor-mode.js';
 import type { V3SavedWorkflowCommand } from './v3-saved-workflow-command.js';
 import { v3SavedWorkflowAdHocRunEscapeHint } from './v3-saved-workflow-command.js';
+import { isHumanInboundTurnId } from '../../core/reply-target.js';
 
 export type ExecutableV3SavedWorkflowCommand = Exclude<V3SavedWorkflowCommand, { kind: 'invalid' }>;
 
@@ -64,6 +65,28 @@ export function resolveV3SavedWorkflowMessageTargets(
     replyAnchor: replyRootId || input.anchor,
     runRootMessageId,
     quotaMessageId: messageId,
+  };
+}
+
+/** The actor context of a Saved Workflow command received as a Lark message.
+ *  `humanTurn` (who may be frozen as a run initiator, design §10.2): only a
+ *  person's own inbound message, never another bot's. */
+export function v3SavedWorkflowMessageContext(input: {
+  initiatorOpenId: string;
+  larkAppId: string;
+  chatId: string;
+  chatType?: 'group' | 'p2p';
+  runRootMessageId: string;
+  messageId: string;
+  /** Absent = not known to be a person: fails closed. */
+  botSender: boolean | undefined;
+}): SavedWorkflowActorContext {
+  return {
+    actor: { openId: input.initiatorOpenId, larkAppId: input.larkAppId },
+    chatId: input.chatId,
+    chatType: input.chatType,
+    rootMessageId: input.runRootMessageId,
+    humanTurn: input.botSender === false && isHumanInboundTurnId(input.messageId),
   };
 }
 
@@ -271,6 +294,9 @@ export async function executeV3SavedWorkflowCommand(
           `revision: v${result.revision.payload.humanVersion} (${result.revision.revisionId})`,
           `scope: ${savedWorkflowScopeLabel(result.metadata.scope)}`,
           `status: ${result.metadata.status}`,
+          ...(result.runtimeRevisions > 0
+            ? [`本流程在运行中修改过 ${result.runtimeRevisions} 次，保存的是最终生效的版本，请核对节点与审批设置。`]
+            : []),
         ].join('\n'),
       };
     }

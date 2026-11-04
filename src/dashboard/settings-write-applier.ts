@@ -123,10 +123,11 @@ export interface ResolvedDashboardSettingsView {
   localDevInstall: boolean;
   autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
-  /** Machine-wide v3 Workflow feature switch (default OFF) and the
+  /** Machine-wide v3 Workflow feature switch (default OFF), the
    *  experimental node executor for newly authorized runs (default
-   *  `ephemeral`). */
-  workflow: { enabled: boolean; nodeExecutor?: 'ephemeral' | 'bot' };
+   *  `ephemeral`) and whether their handoffs carry the initiator's identity
+   *  (default off). */
+  workflow: { enabled: boolean; nodeExecutor?: 'ephemeral' | 'bot'; handoffIdentity?: boolean };
   /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
    *  null = not configured (off). Bots override it field by field. */
   promptCache: PromptCacheConfig | null;
@@ -138,8 +139,9 @@ export interface ResolvedDashboardSettingsView {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON. The nested
+   *  task-tree card switch is default OFF and optional. */
+  multiTopic: { enabled: boolean; taskTreeCard?: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Proxy for binary self-update downloads, null/absent = unset. */
@@ -304,6 +306,7 @@ export type ApplySettingsWriteError =
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
   | 'invalid_workflow_nodeExecutor'
+  | 'invalid_workflow_handoffIdentity'
   | 'invalid_promptCache'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
@@ -736,11 +739,15 @@ export async function applySettingsWrite(
     const wf = raw as Record<string, unknown>;
     const hasEnabled = 'enabled' in wf;
     const hasNodeExecutor = 'nodeExecutor' in wf;
-    if ((hasEnabled || !hasNodeExecutor) && typeof wf.enabled !== 'boolean') {
+    const hasHandoffIdentity = 'handoffIdentity' in wf;
+    if ((hasEnabled || (!hasNodeExecutor && !hasHandoffIdentity)) && typeof wf.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_workflow_enabled' };
     }
     if (hasNodeExecutor && wf.nodeExecutor !== 'ephemeral' && wf.nodeExecutor !== 'bot') {
       return { ok: false, error: 'invalid_workflow_nodeExecutor' };
+    }
+    if (hasHandoffIdentity && typeof wf.handoffIdentity !== 'boolean') {
+      return { ok: false, error: 'invalid_workflow_handoffIdentity' };
     }
     // Merge over existing so a future sibling key in the workflow block survives.
     const next: Record<string, unknown> = { ...(deps.readGlobalConfig().workflow ?? {}) };
@@ -750,6 +757,11 @@ export async function applySettingsWrite(
       // removes the key so an untouched install keeps no trace of it.
       if (wf.nodeExecutor === 'bot') next.nodeExecutor = 'bot';
       else delete next.nodeExecutor;
+    }
+    if (hasHandoffIdentity) {
+      // Same rule: off is the default and leaves no key behind.
+      if (wf.handoffIdentity === true) next.handoffIdentity = true;
+      else delete next.handoffIdentity;
     }
     deps.mergeGlobalConfig({ workflow: Object.keys(next).length > 0 ? next as GlobalConfig['workflow'] : null });
     touched = true;
@@ -821,8 +833,17 @@ export async function applySettingsWrite(
     if (typeof multiTopic.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_multiTopic_enabled' };
     }
+    if (multiTopic.taskTreeCard !== undefined && typeof multiTopic.taskTreeCard !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_taskTreeCard' };
+    }
     const current = deps.readGlobalConfig().multiTopic ?? {};
-    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
+    deps.mergeGlobalConfig({
+      multiTopic: {
+        ...current,
+        enabled: multiTopic.enabled,
+        ...(typeof multiTopic.taskTreeCard === 'boolean' ? { taskTreeCard: multiTopic.taskTreeCard } : {}),
+      },
+    });
     touched = true;
   }
 

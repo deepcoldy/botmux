@@ -25,6 +25,7 @@ import {
   type IdleCleanupHours,
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { DocCommentFailures } from './doc-comment-failures.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
@@ -2701,6 +2702,8 @@ function SessionsPage(): React.JSX.Element {
           ) : null}
         </div>
       </div>
+
+      <DocCommentFailures />
 
       <div className="session-runtime-stats" aria-live="polite">
         <span><b>{runtimeCounts.logical}</b>{t('sessions.runtime.logical')}</span>

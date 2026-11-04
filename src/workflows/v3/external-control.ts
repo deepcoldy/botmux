@@ -48,6 +48,12 @@ import {
   type V3Node,
 } from './dag.js';
 import { loadDag } from './dag-loader.js';
+import {
+  loadEffectiveV3Dag,
+  snapshotForSelector,
+  v3ApprovedBotScope,
+  v3PendingProposalHolds,
+} from './dag-revision.js';
 import type { StoredEvent, V3ErrorClass, V3LoopRef } from './event-contract.js';
 import {
   foldV3ExternalAttempts,
@@ -239,8 +245,16 @@ function journalPathOf(runDir: string): string {
   return join(runDir, 'journal.ndjson');
 }
 
-function dagFor(runDir: string, ctx: V3ExternalEngineContext | undefined): V3Dag {
-  return ctx?.dag ?? loadDag(join(runDir, 'dag.json'));
+/** The EFFECTIVE flow (authorized DAG + applied runtime revisions): a node a
+ *  revision changed is validated against its new contract. Without revisions
+ *  this is the authorized DAG itself. */
+function dagFor(
+  runDir: string,
+  ctx: V3ExternalEngineContext | undefined,
+  events: readonly StoredEvent[] = readJournal(journalPathOf(runDir)),
+): V3Dag {
+  const base = ctx?.dag ?? loadDag(join(runDir, 'dag.json'));
+  return loadEffectiveV3Dag(runDir, base, events).dag;
 }
 
 function clockOf(ctx: V3ExternalEngineContext | undefined): () => number {
@@ -367,10 +381,19 @@ export function recordExternalStalled(
 const BOT_REPORT_MESSAGE_MAX_CHARS = 2000;
 
 /** The target bot said it cannot complete the node (`--status blocked|failed`).
- *  Both settle as `nodeBlocked(BOT_REPORTED_BLOCKED)` with the bot's reason. */
+ *  Both settle as `nodeBlocked(BOT_REPORTED_BLOCKED)` with the bot's reason.
+ *  `WORKING_DIR_REFUSED`: its daemon refused to start the node session in the
+ *  run's working dir (§15.4) — sent without a session, so an attempt some
+ *  session has already accepted is never closed by it (session-mismatch). */
 export function reportExternalBlocked(
   runDir: string,
-  input: { attemptId: string; instanceId?: string; sessionId?: string; reason: string },
+  input: {
+    attemptId: string;
+    instanceId?: string;
+    sessionId?: string;
+    reason: string;
+    errorCode?: typeof V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED | typeof V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED;
+  },
 ): V3ExternalRecordOutcome {
   const message = input.reason.trim().slice(0, BOT_REPORT_MESSAGE_MAX_CHARS) || 'bot reported blocked';
   return withJournalMutationSync(journalPathOf(runDir), ({ events, append }) => {
@@ -382,7 +405,7 @@ export function reportExternalBlocked(
       ...(current.attempt.instanceId ? { instanceId: current.attempt.instanceId } : {}),
       attemptId: current.attempt.attemptId,
       errorClass: 'workerError',
-      errorCode: V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED,
+      errorCode: input.errorCode ?? V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED,
       message,
     }, { durable: true });
     return { ok: true };
@@ -1012,7 +1035,9 @@ export type V3ReassignOutcome =
         | 'not-reassignable'
         | 'stale-attempt'
         | 'revise-workflow-required'
-        | 'not-bot-run';
+        | 'not-bot-run'
+        /** A pending flow-revision proposal touches the node: decide it first. */
+        | 'revision-pending';
     };
 
 /** A caller holding the validated `run.json` passes its pinned executor;
@@ -1036,9 +1061,14 @@ export interface V3ReassignContext extends V3ExternalEngineContext {
 }
 
 function botSnapshotsFor(runDir: string, ctx: V3ReassignContext): ReadonlyMap<string, BotSnapshot> {
-  if (ctx.botSnapshots) return ctx.botSnapshots;
-  const raw = JSON.parse(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')) as Record<string, BotSnapshot>;
-  return new Map(Object.entries(raw));
+  const frozen = ctx.botSnapshots ?? new Map(Object.entries(
+    JSON.parse(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')) as Record<string, BotSnapshot>,
+  ));
+  // Bots an applied runtime revision brought in are part of the run's set.
+  const base = ctx.dag ?? loadDag(join(runDir, 'dag.json'));
+  const additions = loadEffectiveV3Dag(runDir, base, readJournal(journalPathOf(runDir))).botAdditions;
+  // No revision brought a bot in: the caller's map is the scope as-is.
+  return additions.size === 0 ? frozen : v3ApprovedBotScope(frozen, additions);
 }
 
 /** Which node-scoped definition a reassign targets: an authored goal node, or
@@ -1139,9 +1169,10 @@ export async function reassignNode(
   if (!botSet.has(input.toLarkAppId)) return { kind: 'rejected', reason: 'not-in-bot-set' };
 
   const before = readJournal(journalPath);
+  if (v3PendingProposalHolds(before, input.nodeId)) return { kind: 'rejected', reason: 'revision-pending' };
   const selector = reassignTargetSelector(dag, before, input.nodeId);
   if (selector === undefined) return { kind: 'rejected', reason: 'unknown-node' };
-  const frozenTarget = snapshots.get(selector)?.larkAppId;
+  const frozenTarget = snapshotForSelector(snapshots, selector)?.larkAppId;
   if (!frozenTarget) return { kind: 'rejected', reason: 'unknown-node' };
 
   const currentTarget = materialize(before).assignments.get(input.nodeId) ?? frozenTarget;
@@ -1163,6 +1194,8 @@ export async function reassignNode(
   }
 
   return withJournalMutationSync(journalPath, ({ events, append }): V3ReassignOutcome => {
+    // A proposal that touches the node may have been filed meanwhile.
+    if (v3PendingProposalHolds(events, input.nodeId)) return { kind: 'rejected', reason: 'revision-pending' };
     const snap = materialize([...events]);
     const from = snap.assignments.get(input.nodeId) ?? frozenTarget;
     if (from === input.toLarkAppId) return { kind: 'rejected', reason: 'same-bot' };

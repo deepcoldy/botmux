@@ -23,6 +23,7 @@ import { V3_EXTERNAL_ERROR_CODES } from '../../workflows/v3/external-executor.js
 import { readJournal } from '../../workflows/v3/journal.js';
 import { materialize } from '../../workflows/v3/state.js';
 import { buildV3NodeCard, type V3NodeCardStatus, type V3NodeCardView } from './v3-node-card.js';
+import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
 /** The card status an external attempt projects to (pure). */
 export function v3NodeCardStatusFor(
@@ -91,6 +92,8 @@ export interface V3NodeCardSyncDeps {
   activity?(runDir: string, attemptId: string): { activeAt?: number };
   /** Node cards by topic key, recorded when each card was sent. */
   topicCards?(runDir: string): Record<string, string>;
+  /** §11: the run's「工作流 ›」sidebar entry (this daemon's bot is the main bot). */
+  workflowEntry?(runId: string): WorkflowSidebarEntryLink | undefined;
   now?(): number;
 }
 
@@ -131,6 +134,7 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
       if (cardId) latestByCard.set(cardId, attempt);
     }
     const goalIds = run.dag.nodes.filter((node) => isGoalNode(node)).map((node) => node.id);
+    const entry = deps.workflowEntry?.(runId);
     for (const [messageId, attempt] of latestByCard) {
       const instanceStatus = attempt.instanceId
         ? snap.instances.get(attempt.instanceId)?.status
@@ -161,6 +165,7 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
         status,
         upstream,
         now: now(),
+        ...(entry ? { entry } : {}),
       };
       // Elapsed time is not part of the change signal: a card is patched when
       // the node's state changes, not on every drive.

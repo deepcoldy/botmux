@@ -61,6 +61,7 @@ import { normalizeEnvPolicy, type EnvPolicy } from './core/env-policy.js';
 import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
+import { normalizeListenerContentPolicy, type ListenerContentPolicy } from './services/message-listener-content-policy.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import {
@@ -286,11 +287,11 @@ export interface MessageListenerConfig {
     scope?: 'top_level';
   };
   /**
-   * Optional daemon-side keyword pre-filter. Absent or all-empty = match every
-   * message (legacy behavior). When configured, a message matches the listener
-   * ONLY when its text satisfies the policy, so non-matching messages never
-   * wake the Agent. Keywords are case-insensitive substrings (linear-time
-   * `String.includes`, safe against attacker-controlled message text).
+   * Optional daemon-side keyword pre-filter. Absent or empty text keywords =
+   * match every message (legacy behavior). Text keywords use case-insensitive
+   * substrings; identity keywords match native text/post @mentions by this
+   * bot application's open_id, independent of display names / @_user_N keys.
+   * A present but invalid/empty identity list fails closed.
    * `matchMode` 'any' (default) matches when at least one keyword hits; 'all'
    * requires every keyword to hit.
    *
@@ -301,15 +302,9 @@ export interface MessageListenerConfig {
    * message. A regex mode can return later behind a linear-time engine (RE2).
    *
    * bots.json example:
-   * `{"messageListeners":{"oc_xxx":{"enabled":true,"prompt":"...","contentPolicy":{"includeKeywords":["报错","500"],"matchMode":"any"}}}}`
+   * `{"messageListeners":{"oc_xxx":{"enabled":true,"prompt":"...","contentPolicy":{"includeKeywords":["ask"],"includeMentionedOpenIds":["ou_example"],"matchMode":"all"}}}}`
    */
-  contentPolicy?: {
-    includeKeywords?: string[];
-    matchMode?: 'any' | 'all';
-    /** Default false. Resolve supported document titles using only this bot's
-     * application identity when local keyword matching missed. */
-    resolveDocumentTitles?: boolean;
-  };
+  contentPolicy?: ListenerContentPolicy;
   replyPolicy?: {
     /** `thread` replies under the triggering message; `chat` posts at group top level. */
     mode?: 'thread' | 'chat';
@@ -1201,21 +1196,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   const contentRaw = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
     ? entry.contentPolicy as Record<string, unknown>
     : undefined;
-  let contentPolicy: MessageListenerConfig['contentPolicy'];
-  if (contentRaw) {
-    const includeKeywords = normalizeMessageListenerStringList(contentRaw.includeKeywords);
-    // V1 is keyword-substring only (see the contentPolicy type doc for why no
-    // regexes on the daemon main loop). Only persist non-default flags; an
-    // all-empty policy is dropped entirely (matchesContentPolicy treats
-    // absent/empty as match-all).
-    if (includeKeywords) {
-      contentPolicy = {
-        includeKeywords,
-        ...(contentRaw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
-        ...(contentRaw.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
-      };
-    }
-  }
+  const contentPolicy = normalizeListenerContentPolicy(contentRaw);
 
   return {
     enabled,
@@ -1392,12 +1373,15 @@ export interface SessionGroupConfig {
   naming?: {
     /**
      * 'ai-summary' (default): create with a truncated placeholder name, then
-     * asynchronously ask the bot's own CLI (one-shot headless call) for a
-     * short title and rename the chat when it lands. Falls back to the
+     * asynchronously generate a short title through the configured CLI. Codex
+     * uses an isolated, low-effort title call. Falls back to the
      * placeholder on failure/timeout.
+     * 'session-title': reuse the resident Agent's published session title; no extra model call.
      * 'truncate': placeholder only — zero cost, zero delay.
      */
-    mode?: 'ai-summary' | 'truncate';
+    mode?: 'ai-summary' | 'session-title' | 'truncate';
+    /** Optional model for Codex AI-summary calls; absent inherits the bot model. */
+    model?: string;
     /** Max title length in characters for the AI summary (12). */
     maxLen?: number;
   };
@@ -2346,8 +2330,8 @@ export interface BotConfig {
   /**
    * 主动开工 — 场景① optional pre-configured first-turn prompt. When set, it
    * becomes the user_message of the auto-started session; when unset/blank the
-   * session starts with an empty user_message and the bot reads the group
-   * context itself. Moot when {@link autoStartOnGroupJoin} is off.
+   * session uses a built-in task to inspect the group context and report
+   * readiness if no task is assigned. Moot when {@link autoStartOnGroupJoin} is off.
    */
   autoStartOnGroupJoinPrompt?: string;
   /**

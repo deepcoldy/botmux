@@ -10,6 +10,12 @@ Every conversation turn produces a live-updating Lark card, your primary window 
 - **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive (buttons removed).
 - **A "recoverable" card on close**: it carries a "▶️ Resume session" button to click back in anytime; **if the CLI supports native resume** (the adapter implements `buildResumeCommand` and a native session id exists), it also includes the native command (e.g. `claude --resume <id>`) for manual recovery; when unsupported, only botmux's resume button plus a short note is shown.
 
+## Dynamic single reply cards
+
+Set `/botconfig set replyCardMode unified` to update public progress, tool activity and the final answer in one card per turn; the next turn creates a new card. This supports ordinary Claude Code / Codex / Grok / TraeX / Pi Feishu conversations without a file sandbox, including group and topic sessions. Changes take effect from the next turn. `/botconfig set replyCardMode legacy` restores separate messages. The terminal status card remains independently controlled by `disableStreamingCard` and `/card off`.
+
+TraeX and Pi reuse their structured transcript bridges for turn attribution. A retriable Pi error keeps the card working until a native settlement marker or the existing error timeout resolves it. A custom tool that returns `terminate:true` without persisting a terminal record can leave the card working until a later input supersedes it. Sandboxed sessions and other unsupported entry points retain their existing delivery behavior.
+
 ## The four display layers of a turn
 
 botmux's "presence" in Lark has four independently switched layers:

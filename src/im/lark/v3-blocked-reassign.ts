@@ -1,12 +1,15 @@
 /**
  * 受阻卡上的「改派」（design 2026-11-03 §9.2 / §10.3）：只在节点交给群里 Bot
- * 执行的 run 上出现。渲染时按本 run 批准时选定的 Bot（`bots.snapshot.json`）现查
- * 谁还能接手；点「确认改派」时只认发起人，再现查一次目标 Bot，然后交给引擎的
- * `reassignNode`（受阻节点在同一实例里以新 attempt 交给新 Bot），最后重驱动。
+ * 执行的 run 上出现。渲染时按本 run 的批准范围（`v3ApprovedBotScope`：批准时
+ * 选定的 Bot，加上发起人在修改确认卡上批准加入的 Bot）现查谁还能接手；点
+ * 「确认改派」时只认发起人，再现查一次目标 Bot，然后交给引擎的 `reassignNode`
+ * （受阻节点在同一实例里以新 attempt 交给新 Bot），最后重驱动。节点按有效流程
+ * （含运行中修改）查找。
  *
  * 普通 run（临时进程执行）的受阻卡与以前逐字节一致：这里根本不读它的 Bot。
- * 改派给批准范围之外的 Bot 要走发起人重新确认（§13.5），那条路径还没有，所以
- * 下拉框只列批准时的 Bot，点击时也只认它们。
+ * 改派给批准范围之外的 Bot 要走运行中修改（`workflow edit` 的 reassign，新 Bot
+ * 由发起人在修改确认卡上确认，§13.5），这里的下拉框和点击都只认批准范围。
+ * 待确认的修改挂着这个节点时不改派（与 ask 作答一致），先处理修改确认卡。
  */
 
 import { existsSync } from 'node:fs';
@@ -31,6 +34,11 @@ import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 import { loadAuthorizedV3Run } from '../../workflows/v3/run-envelope.js';
 import { materialize } from '../../workflows/v3/state.js';
 import {
+  loadEffectiveV3Dag,
+  v3ApprovedBotScope,
+  v3PendingProposalHolds,
+} from '../../workflows/v3/dag-revision.js';
+import {
   V3_BLOCKED_REASSIGN_FIELD,
   buildV3BlockedCard,
   v3BlockedCardNonce,
@@ -50,12 +58,18 @@ export interface V3BlockedReassignDeps {
 }
 
 interface V3BotRunView {
+  /** The approved flow (`dag.json`): what the engine folds revisions onto. */
+  baseDag: V3Dag;
+  /** The effective flow (every applied runtime revision folded in). */
   dag: V3Dag;
+  /** The snapshots frozen at approval. */
+  frozen: Map<string, BotSnapshot>;
+  /** The run's approved bot scope ({@link v3ApprovedBotScope}). */
   snapshots: Map<string, BotSnapshot>;
   binding: RunChatBinding;
   /** The run's initiator as the main bot's app sees them (§10.3). */
   initiatorOpenId?: string;
-  /** The bots frozen at approval, in snapshot order. */
+  /** The approved bots' app ids, frozen ones first. */
   approved: string[];
 }
 
@@ -64,14 +78,19 @@ function loadBotRun(runDir: string): V3BotRunView | undefined {
   const loaded = loadAuthorizedV3Run(runDir);
   const envelope = loaded.envelope;
   if (!('nodeExecutor' in envelope) || envelope.nodeExecutor !== 'bot' || !envelope.chatBinding) return undefined;
-  const snapshots = parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
+  const frozen = parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
+  const journalPath = join(runDir, 'journal.ndjson');
+  const effective = loadEffectiveV3Dag(runDir, loaded.dag, existsSync(journalPath) ? readJournal(journalPath) : []);
+  const snapshots = v3ApprovedBotScope(frozen, effective.botAdditions);
   // Ad-hoc: the Gate-2 approver. Saved Workflow: the person who sent
   // `/workflow run` (its chat binding owner) — both authenticated turns.
   const initiatorOpenId = envelope.source.kind === 'ad_hoc' && 'authorizedByOpenId' in envelope.authorization
     ? envelope.authorization.authorizedByOpenId
     : envelope.source.kind === 'saved_definition' ? envelope.chatBinding.ownerOpenId : undefined;
   return {
-    dag: loaded.dag,
+    baseDag: loaded.dag,
+    dag: effective.dag,
+    frozen,
     snapshots,
     binding: envelope.chatBinding,
     ...(initiatorOpenId ? { initiatorOpenId } : {}),
@@ -160,8 +179,10 @@ export async function buildV3BlockedCardForRun(input: {
     errorCode: info.errorCode,
     message: info.message,
     retryForbidden: info.retryForbidden,
-    // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）。
+    // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）；流程修改后已作废
+    // → 只留「按新定义重跑」。ask 卡（含作废态）都不出改派区。
     ...(info.ask ? { ask: info.ask } : {}),
+    ...(info.askVoided ? { askVoided: true } : {}),
   };
   if (!input.reassign || info.ask || info.retryForbidden) return buildV3BlockedCard(base);
   let offer: V3BlockedReassignOffer | undefined;
@@ -191,12 +212,13 @@ const REJECTION_TEXT: Record<Extract<V3ReassignOutcome, { kind: 'rejected' }>['r
   missing: '该 run 不存在或已清理',
   'run-not-running': '这个工作流已经结束，不能再改派',
   'unknown-node': '找不到这个节点，卡片已失效',
-  'not-in-bot-set': '只能改派给本 run 批准时选定的 Bot',
+  'not-in-bot-set': '只能改派给本 run 已批准的 Bot（批准时选定的，或在修改确认卡上批准加入的）',
   'same-bot': '这个节点已经由这个 Bot 执行',
   'not-reassignable': '该节点已不在受阻状态，这张卡已失效（看最新那张卡）',
   'stale-attempt': '该节点已进入新一轮 attempt，这张旧卡失效（看最新那张卡）',
   'revise-workflow-required': '产物契约与 Workflow 定义不一致，改派也无法完成；请修订并发布新版本',
   'not-bot-run': '这个 run 的节点不是交给群里的 Bot 执行的，不能改派',
+  'revision-pending': '这个节点有待确认的流程修改，请先处理修改确认卡',
 };
 
 type V3ClickState =
@@ -204,7 +226,19 @@ type V3ClickState =
   | { kind: 'run-over' }
   /** The node is no longer blocked on the card's attempt. */
   | { kind: 'moved'; current?: string }
+  /** A pending revision proposal touches the node. */
+  | { kind: 'held' }
+  /** An applied flow revision removed the node. */
+  | { kind: 'removed' }
   | { kind: 'blocked'; current?: string };
+
+/** The node (or the loop it ran in) is no longer in the effective flow. */
+function removedByRevision(view: V3BotRunView, events: readonly StoredEvent[], nodeId: string): boolean {
+  if (view.dag.nodes.some((node) => node.id === nodeId)) return false;
+  const loopId = events.find((event): event is StoredEvent & { type: 'nodeDispatched' } =>
+    event.type === 'nodeDispatched' && event.nodeId === nodeId && !!event.loop)?.loop?.loopId;
+  return loopId === undefined || !view.dag.nodes.some((node) => node.id === loopId);
+}
 
 /** Where the run and the card's node stand now, from the journal alone. */
 function clickState(runDir: string, view: V3BotRunView, nodeId: string, attemptId: string): V3ClickState {
@@ -213,6 +247,8 @@ function clickState(runDir: string, view: V3BotRunView, nodeId: string, attemptI
   const events = readJournal(journalPath);
   const snap = materialize([...events]);
   if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return { kind: 'run-over' };
+  if (removedByRevision(view, events, nodeId)) return { kind: 'removed' };
+  if (v3PendingProposalHolds(events, nodeId)) return { kind: 'held' };
   const current = currentTarget(view, events, nodeId);
   const node = snap.nodes.get(nodeId);
   const blockedHere = node?.status === 'blocked'
@@ -294,6 +330,9 @@ export async function handleV3BlockedReassign(
   const state = clickState(runDir, view, value.nodeId, value.attemptId);
   if (state.kind === 'missing') return toast('warning', REJECTION_TEXT.missing);
   if (state.kind === 'run-over') return toast('warning', REJECTION_TEXT['run-not-running']);
+  if (state.kind === 'removed') return toast('warning', '这个节点已被流程修改删除，这张卡已失效');
+  // Before the chat grant: nothing is written for a node a proposal holds.
+  if (state.kind === 'held') return toast('warning', REJECTION_TEXT['revision-pending']);
   if (state.kind === 'moved') {
     if (state.current !== target) return toast('warning', REJECTION_TEXT['stale-attempt']);
     // A repeated click after the node already went to this bot.
@@ -308,6 +347,13 @@ export async function handleV3BlockedReassign(
     why = err instanceof Error ? err.message : String(err);
   }
   if (why) return toast('warning', `不能改派给 ${name}：${why}`);
+  // The chat grant was an await: a proposal touching the node may have been
+  // filed meanwhile. Re-check before finishing a half-written reassignment or
+  // calling the engine (which re-checks under its lock too). The grant itself
+  // is idempotent and stays.
+  if (v3PendingProposalHolds(readJournal(join(runDir, 'journal.ndjson')), value.nodeId)) {
+    return toast('warning', REJECTION_TEXT['revision-pending']);
+  }
 
   if (state.current === target) {
     // Still blocked although already assigned to this bot: an earlier
@@ -328,8 +374,9 @@ export async function handleV3BlockedReassign(
       expectedAttemptId: value.attemptId,
       requireBlocked: true,
     }, {
-      dag: view.dag,
-      botSnapshots: view.snapshots,
+      // The engine folds the applied revisions and the approved bots onto these itself.
+      dag: view.baseDag,
+      botSnapshots: view.frozen,
       nodeExecutor: 'bot',
       ...(reassignDeps.executor ? { executor: reassignDeps.executor } : {}),
     });

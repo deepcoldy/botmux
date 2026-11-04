@@ -25,6 +25,7 @@ import { promisify } from 'node:util';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
 import { join } from 'node:path';
+import { updateDispatchRegistry } from './dispatch-registry.js';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
 import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
@@ -210,7 +211,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -239,6 +240,11 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
+import { updateMessage } from '../im/lark/client.js';
+import { safeRequirementUrl } from './dispatch-task-tree.js';
+import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
+import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
+import { knownBotAppIds } from '../services/known-bot-app-ids.js';
 import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
@@ -520,7 +526,8 @@ import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
-import { getLarkToolDelegation } from './lark-tool-delegation.js';
+import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
+import { publishDelegationRefusal } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1176,7 +1183,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1545,6 +1552,16 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     const ds = findActiveBySessionId(sessionId);
     if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
     const identityTurnId = document.identityTurnId ?? document.turnId;
+    // A workflow handoff's delegation is re-checked on every use: once its
+    // attempt ended or it was withdrawn, this turn's tool refuses from now on
+    // (even if the stop never reached this daemon).
+    const delegation = currentLarkToolDelegation(config.session.dataDir, sessionId, identityTurnId);
+    if (delegation?.workflowHandoff && delegation.denialReason === 'delegation_inactive') {
+      publishDelegationRefusal({
+        sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
+        tool: tool === 'codebase' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
+      });
+    }
     const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
     if (env) {
       return jsonRes(res, 200, {
@@ -2173,7 +2190,7 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
     try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
-    const result = recordRelayedTurnDelivery({
+    const result = await recordRelayedTurnDelivery({
       ds,
       body,
       store: await getSkillFeedbackStore(config.session.dataDir),
@@ -3341,7 +3358,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
   }
   const delegated = detachedForUser ? undefined
-    : getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
+    : currentLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
   const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
   if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
     || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
@@ -3484,7 +3501,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const requestingUser = (): string | undefined => {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
-      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.identityTurnId ?? liveOrigin.turnId);
+      const grant = currentLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.identityTurnId ?? liveOrigin.turnId);
       if (!grant) return liveOrigin.callerOpenId;
       if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
         || !triggerUserAuthApplies(getBot(ds.larkAppId).config.triggerUserAuth, 'lark-cli')) return undefined;
@@ -3852,6 +3869,97 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
           || detail === 'project_workstream_title_required' || detail === 'project_workstream_title_too_long' ? 400
           : 502;
     return jsonRes(res, status, { ok: false, error: detail });
+  }
+});
+
+// ─── 编排任务树卡片 ──────────────────────────────────────────────────────────
+
+/** Shown (via the CLI) when the default-off task-tree card is invoked while
+ *  disabled. Produced by the daemon because sandboxed/read-isolated CLIs cannot
+ *  read the host global config themselves. */
+const DISPATCH_TASK_TREE_DISABLED_HINT = '任务树卡片默认关闭：在 Dashboard「全局设置 → 多话题编排 → 任务树卡片」开启，或设 BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=true。';
+
+const dispatchTaskTreeCards = createDispatchTaskTreeCards({
+  dataDir: () => config.session.dataDir,
+  listSessions: roots => listDispatchTreeSessionRows(roots, config.session.dataDir),
+  localAppIds: () => knownBotAppIds({ dataDir: config.session.dataDir }),
+  resolveThreadId: (larkAppId, messageId) => getMessageThreadId(larkAppId, messageId),
+  post: (orch, cardJson) => orch.rootMessageId
+    ? replyMessage(orch.larkAppId, orch.rootMessageId, cardJson, 'interactive', true)
+    : sendMessage(orch.larkAppId, orch.chatId, cardJson, 'interactive'),
+  update: (larkAppId, messageId, cardJson) => updateMessage(larkAppId, messageId, cardJson),
+  isMessageGone: isTaskTreeCardGone,
+  brand: larkAppId => getBotBrand(larkAppId),
+  log: message => logger.warn(message),
+});
+
+function taskTreeOrchestrator(ds: NonNullable<ReturnType<typeof findActiveBySessionId>>): TaskTreeOrchestrator {
+  const scope = ds.scope ?? ds.session.scope ?? 'thread';
+  return {
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    ...(scope !== 'chat' && ds.session.rootMessageId ? { rootMessageId: ds.session.rootMessageId } : {}),
+    title: ds.session.title,
+  };
+}
+
+function taskTreeRequirement(body: Record<string, unknown> | undefined): { id?: string; url?: string } | undefined {
+  const id = typeof body?.taskId === 'string' && body.taskId.trim() ? body.taskId.trim().slice(0, 128) : undefined;
+  const url = typeof body?.taskUrl === 'string' ? safeRequirementUrl(body.taskUrl.slice(0, 2048)) : undefined;
+  return id || url ? { ...(id ? { id } : {}), ...(url ? { url } : {}) } : undefined;
+}
+
+/** `botmux dispatch tree` and the dispatch CLI: refresh (or first post) this
+ *  orchestrating session's task-tree card. Same session-scoped auth as /project. */
+ipcRoute('POST', '/api/sessions/:sessionId/dispatch-tree', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  // Default-off feature gate (3.2(c)): when off, behave exactly as the
+  // pre-card build — no entry label write, no card record file, no post/patch.
+  if (!isDispatchTaskTreeCardEnabled()) {
+    return jsonRes(res, 200, { ok: true, enabled: false, hint: DISPATCH_TASK_TREE_DISABLED_HINT, text: '', messageId: null, posted: false, nodes: 0 });
+  }
+  const requirement = taskTreeRequirement(body);
+  try {
+    const dispatchRoot = typeof body?.dispatchRoot === 'string' ? body.dispatchRoot : '';
+    if (dispatchRoot && (body?.kind === 'review' || body?.kind === 'task')) {
+      // Only this session's own dispatch entries can be labelled.
+      await updateDispatchRegistry(join(config.session.dataDir, 'orchestrate-dispatch.json'), registry => {
+        const entry = registry[dispatchRoot] as Record<string, unknown> | undefined;
+        if (entry && entry.orchSessionId === ds.session.sessionId) entry.kind = body.kind;
+      });
+    }
+    const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds), requirement ? { requirement } : {});
+    return jsonRes(res, 200, { ok: true, enabled: true, text: result.text, messageId: result.messageId ?? null, posted: result.posted, nodes: result.tree.nodes.length });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
+  }
+});
+
+/** A child's report landed (recorded on the dispatch entry by the reporting
+ *  daemon): patch the orchestrator's card. Host-local callers only. */
+ipcRoute('POST', '/api/dispatch-tree/refresh', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const sessionId = typeof body?.orchSessionId === 'string' ? body.orchSessionId : '';
+  const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  // Default-off: no card refresh (and no card record write) when disabled.
+  if (!isDispatchTaskTreeCardEnabled()) {
+    return jsonRes(res, 200, { ok: true, enabled: false, hint: DISPATCH_TASK_TREE_DISABLED_HINT, messageId: null, posted: false });
+  }
+  try {
+    const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds));
+    return jsonRes(res, 200, { ok: true, enabled: true, messageId: result.messageId ?? null, posted: result.posted });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
   }
 });
 
@@ -9830,6 +9938,43 @@ ipcRoute('POST', '/api/session-group-tag-auth', requireBoundBot(async (_req, res
 // GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）+ 标签名。
 // tagName = 用户配置的自定义名（没配就是空串）；defaultTagName = 留空时实际生效的
 // 默认名「<bot 显示名>会话」，Dashboard 拿它做输入框 placeholder。
+/** Read the per-bot group naming policy; absence retains the existing AI-summary default. */
+ipcRoute('GET', '/api/session-group-naming-config', requireBoundBot(async (_req, res) => {
+  const naming = getBot(cachedLarkAppId).config.sessionGroup?.naming;
+  jsonRes(res, 200, { ok: true, mode: naming?.mode ?? 'ai-summary', model: naming?.model ?? '' });
+}));
+
+/** Persist a validated naming mode/model while retaining unrelated session-group settings. */
+ipcRoute('PUT', '/api/session-group-naming-config', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ mode?: unknown; model?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  if (!body || Array.isArray(body) || typeof body.mode !== 'string' || !['ai-summary', 'session-title', 'truncate'].includes(body.mode)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  const mode = body.mode as 'ai-summary' | 'session-title' | 'truncate';
+  if (body.model !== undefined && (typeof body.model !== 'string' || body.model.length > 200 || /[\u0000-\u001f]/.test(body.model))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_model' });
+  }
+  try {
+    const bot = getBot(cachedLarkAppId);
+    const result = await rmwBotEntry(cachedLarkAppId, entry => {
+      const group = (entry.sessionGroup ?? {}) as import('../bot-registry.js').SessionGroupConfig;
+      const naming = { ...group.naming, mode };
+      if (typeof body.model === 'string') {
+        if (body.model.trim()) naming.model = body.model.trim();
+        else delete naming.model;
+      }
+      entry.sessionGroup = { ...group, naming };
+      return { write: true, result: naming };
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    bot.config.sessionGroup = { ...bot.config.sessionGroup, naming: result.result };
+    jsonRes(res, 200, { ok: true, mode: result.result.mode, model: result.result.model ?? '' });
+  } catch (error: unknown) {
+    jsonRes(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}));
+
 ipcRoute('GET', '/api/session-group-tag-status', requireBoundBot(async (_req, res) => {
   try {
     const cfg = getBot(cachedLarkAppId).config;

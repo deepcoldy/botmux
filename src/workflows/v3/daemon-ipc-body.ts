@@ -1,4 +1,4 @@
-/** Strict JSON schemas for the four authenticated Workflow daemon mutations. */
+/** Strict JSON schemas for the authenticated Workflow daemon mutations. */
 
 import type { WorkflowDaemonMutation } from './daemon-ipc-client.js';
 import { V3_DAG_SEGMENT_RE } from './dag.js';
@@ -9,13 +9,22 @@ export type WorkflowDaemonMutationBody =
   | { mutation: 'start'; value: Record<string, never> }
   | { mutation: 'cancel'; value: { reason?: string } }
   | { mutation: 'retry'; value: { nodeId?: string } }
-  | { mutation: 'grant'; value: { loopId?: string } };
+  | { mutation: 'grant'; value: { loopId?: string } }
+  | { mutation: 'edit'; value: WorkflowEditMutationBody };
+
+/** `botmux workflow edit`: the patch is validated by the engine planner; the
+ *  caller is the turn identity the CLI authenticated (main-session check). */
+export interface WorkflowEditMutationBody {
+  patch: unknown;
+  base: number;
+  caller: { openId: string; origin: 'human' | 'runEvent' };
+}
 
 export type WorkflowDaemonMutationBodyResult =
   | { ok: true; body: WorkflowDaemonMutationBody }
   | {
       ok: false;
-      error: 'bad_json' | 'bad_body' | 'bad_reason' | 'bad_node_id' | 'bad_loop_id';
+      error: 'bad_json' | 'bad_body' | 'bad_reason' | 'bad_node_id' | 'bad_loop_id' | 'bad_edit';
     };
 
 function plainJsonObject(value: unknown): value is Record<string, unknown> {
@@ -70,6 +79,31 @@ export function parseWorkflowDaemonMutationBody(
       return { ok: false, error: 'bad_node_id' };
     }
     return { ok: true, body: { mutation, value: { nodeId: parsed.nodeId } } };
+  }
+
+  if (mutation === 'edit') {
+    if (!exactKeys(parsed, ['patch', 'base', 'caller'])) return { ok: false, error: 'bad_body' };
+    const caller = parsed.caller;
+    if (
+      (!plainJsonObject(parsed.patch) && !Array.isArray(parsed.patch)) ||
+      typeof parsed.base !== 'number' || !Number.isSafeInteger(parsed.base) || parsed.base < 1 ||
+      !plainJsonObject(caller) || !exactKeys(caller, ['openId', 'origin']) ||
+      typeof caller.openId !== 'string' || !caller.openId.trim() ||
+      (caller.origin !== 'human' && caller.origin !== 'runEvent')
+    ) {
+      return { ok: false, error: 'bad_edit' };
+    }
+    return {
+      ok: true,
+      body: {
+        mutation,
+        value: {
+          patch: parsed.patch,
+          base: parsed.base,
+          caller: { openId: caller.openId, origin: caller.origin },
+        },
+      },
+    };
   }
 
   if (!exactKeys(parsed, ['loopId'])) return { ok: false, error: 'bad_body' };

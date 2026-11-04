@@ -21,7 +21,10 @@
 import { readFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
+import { validateWorkingDir } from '../../core/working-dir.js';
+import { checkBotWorkingDir, realWorkingDir } from '../../core/working-dir-range.js';
 import { resolveCurrentTurnProvenance } from '../../core/current-turn-provenance.js';
+import { isHumanInboundTurnId } from '../../core/reply-target.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import {
@@ -47,15 +50,18 @@ import {
 } from './bot-resolve.js';
 import {
   artifactRef,
+  frozenHandoffIdentity,
+  frozenNodeWorkingDir,
   loadAuthorizedV3Run,
   makeAdHocRunEnvelope,
   publishRunEnvelopeOnce,
   readRunEnvelope,
   type PublishRunEnvelopeResult,
   type V3AdHocRunEnvelope,
+  type V3HandoffIdentityRecord,
 } from './run-envelope.js';
 import { V3_SUPPORTED_CLIS, isV3SupportedCli, type BotSnapshot } from './contract.js';
-import { isMultiTopicOrchestrationEnabled, workflowNodeExecutorMode } from '../../global-config.js';
+import { isMultiTopicOrchestrationEnabled, workflowHandoffIdentityEnabled, workflowNodeExecutorMode } from '../../global-config.js';
 import {
   buildV3BotRoster,
   checkV3Assignees,
@@ -72,9 +78,12 @@ import {
   checkV3BotExecutorEligibility,
   decideV3NodeExecutor,
   describeV3EphemeralFallback,
+  describeV3NodeWorkingDir,
   formatV3BotEligibilityRefusal,
+  resolveV3HandoffIdentity,
   v3BotExecutorTargets,
   type V3BotEligibilityProbe,
+  type V3HandoffIdentityPolicy,
   type V3BotEligibilityProblem,
   type V3NodeExecutorDecision,
   type V3NodeExecutorSwitch,
@@ -103,6 +112,20 @@ export function hostNew(opts: {
  * A genuine standalone/dev invocation (no session claim or marker) keeps the
  * old minimal env binding for card experiments, but never claims an owner.
  */
+/** The current authenticated turn's id (undefined for a standalone/dev
+ *  invocation). Same proof as {@link chatBindingFromEnv}. */
+export function currentTurnIdFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  startPid: number = process.ppid,
+): string | undefined {
+  if (!env.SESSION_DATA_DIR) return undefined;
+  return resolveCurrentTurnProvenance({
+    dataDir: env.SESSION_DATA_DIR,
+    envSessionId: env.BOTMUX_SESSION_ID,
+    startPid,
+  })?.turnId;
+}
+
 export function chatBindingFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   startPid: number = process.ppid,
@@ -480,8 +503,13 @@ export function authorizeAdHocRun(
   runDir: string,
   bots: BotConfig[],
   now: Date = new Date(),
-  opts: { workingDirOverride?: string; nodeExecutor?: 'bot' } = {},
+  opts: { workingDirOverride?: string; nodeExecutor?: 'bot'; handoffIdentity?: V3HandoffIdentityRecord } = {},
 ): AdHocRunAuthorizationResult {
+  // A bot-executed run freezes the directory exactly as an ephemeral one does
+  // (every snapshot's workingDir) and also records it in run.json, where the
+  // executing bots' daemons read it as an explicit choice to check and apply
+  // (design §15.4). Callers pass the absolute, already range-checked path.
+  const nodeWorkingDir = opts.nodeExecutor === 'bot' ? opts.workingDirOverride : undefined;
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
   // run.json publishers. Keep this exact order; see the lock-order invariant
@@ -560,6 +588,8 @@ export function authorizeAdHocRun(
       ...(cur.chatBinding ? { chatBinding: cur.chatBinding } : {}),
       ...(cur.chatBinding?.ownerOpenId ? { authorizedByOpenId: cur.chatBinding.ownerOpenId } : {}),
       ...(opts.nodeExecutor ? { nodeExecutor: opts.nodeExecutor } : {}),
+      ...(nodeWorkingDir !== undefined ? { nodeWorkingDir } : {}),
+      ...(opts.nodeExecutor && opts.handoffIdentity ? { handoffIdentity: opts.handoffIdentity } : {}),
       artifacts: {
         dag: artifactRef(runDir, 'dag.json'),
         spec: artifactRef(runDir, 'spec.json'),
@@ -574,6 +604,8 @@ export function authorizeAdHocRun(
 export interface AdHocNodeExecutorPlanInput {
   switchMode: V3NodeExecutorSwitch;
   multiTopicEnabled: boolean;
+  /** `approve-dag --working-dir`. For a `bot` decision it must name an
+   *  existing directory inside every executing bot's configured range. */
   workingDirOverride?: string;
   /** Live §6.1 probe for the run's chat; only built for a `bot` decision. */
   probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
@@ -581,15 +613,19 @@ export interface AdHocNodeExecutorPlanInput {
 
 export type AdHocNodeExecutorPlan =
   | { kind: 'ephemeral'; decision: Extract<V3NodeExecutorDecision, { mode: 'ephemeral' }> }
-  | { kind: 'bot'; binding: RunChatBinding; targets: V3NodeExecutorTarget[] }
-  | { kind: 'refused'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; problems: V3BotEligibilityProblem[] };
+  /** `workingDir`: the absolute Gate-2 directory, when one was asked for. */
+  | { kind: 'bot'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; workingDir?: string }
+  | { kind: 'refused'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; problems: V3BotEligibilityProblem[]; workingDir?: string };
 
 /**
  * Gate-2 executor decision for a not-yet-authorized ad-hoc run (design §6.3):
  * the experimental switch, the run's chat shape and — for a `bot` decision —
  * each goal node's executing bot (frozen exactly as {@link authorizeAdHocRun}
  * will freeze it, default = the bot the grill was born in) checked against
- * §6.1 items 1–4. Read-only: nothing is published here.
+ * §6.1 items 1–4. A `--working-dir` must exist and lie inside every executing
+ * bot's configured directory range (§15.4, the main bot included); a node
+ * whose bot does not allow it refuses the approval before any live probe.
+ * Read-only: nothing is published here.
  */
 export async function planAdHocNodeExecutor(
   runDir: string,
@@ -603,31 +639,60 @@ export async function planAdHocNodeExecutor(
     multiTopicEnabled: input.multiTopicEnabled,
   });
   if (decision.mode === 'ephemeral') return { kind: 'ephemeral', decision };
-  // Bot-executed nodes run in each bot's own session directory; a Gate-2
-  // working dir would be frozen into the snapshot yet silently ignored. Until
-  // target-authoritative working dirs exist (§15.4), refuse it explicitly.
-  if (input.workingDirOverride !== undefined) {
-    throw new HostGuardError(
-      '「节点交给群里的 Bot 执行」已开启：节点在执行 Bot 自己的会话目录（它配置的默认工作目录）里跑，' +
-      '暂不支持 approve-dag --working-dir。请去掉 --working-dir 重新批准；需要指定目录时，在 Dashboard 关闭该开关后再批准。',
-    );
-  }
   const binding = cur.chatBinding!;
+  // Same typo guard as `/cd` (exists, is a directory, never created). What
+  // gets frozen is the realpath: absolute because the executing bots' daemons
+  // run with other working directories than this command, and with symlinks
+  // resolved so a link retargeted later cannot move the node (§15.4).
+  let workingDir: string | undefined;
+  if (input.workingDirOverride !== undefined) {
+    const checked = validateWorkingDir(input.workingDirOverride);
+    if (!checked.ok) throw new HostGuardError(`approve-dag --working-dir：${checked.error}`);
+    workingDir = realWorkingDir(checked.resolvedPath);
+  }
   if (!cur.dagPath) throw new Error('dag_ready 状态缺 dagPath（内部不一致）');
   const dag = loadDag(cur.dagPath);
   const snapshots = freezeDagBotSnapshots(dag, bots, {
     defaultSelector: binding.larkAppId,
-    workingDirOverride: input.workingDirOverride,
+    workingDirOverride: workingDir,
   });
   const targets = v3BotExecutorTargets(dag, snapshots);
+  const withDir = workingDir !== undefined ? { workingDir } : {};
+  if (workingDir !== undefined) {
+    const dirProblems = v3WorkingDirProblems(targets, bots, workingDir);
+    if (dirProblems.length > 0) return { kind: 'refused', binding, targets, problems: dirProblems, ...withDir };
+  }
   const checked = await checkV3BotExecutorEligibility({
     orchestratorAppId: binding.larkAppId,
     targets,
     probe: await input.probe(binding),
   });
   return checked.ok
-    ? { kind: 'bot', binding, targets }
-    : { kind: 'refused', binding, targets, problems: checked.problems };
+    ? { kind: 'bot', binding, targets, ...withDir }
+    : { kind: 'refused', binding, targets, problems: checked.problems, ...withDir };
+}
+
+/** §15.4 at Gate-2: one problem per node whose executing bot's configured
+ *  directory range (bots.json as of now) does not contain `workingDir`. */
+function v3WorkingDirProblems(
+  targets: readonly V3NodeExecutorTarget[],
+  bots: readonly BotConfig[],
+  workingDir: string,
+): V3BotEligibilityProblem[] {
+  const problems: V3BotEligibilityProblem[] = [];
+  for (const target of targets) {
+    const bot = bots.find((candidate) => candidate.larkAppId === target.larkAppId);
+    // An unknown bot is reported by the eligibility check (BOT_NOT_CONFIGURED).
+    if (!bot) continue;
+    const verdict = checkBotWorkingDir(bot, workingDir);
+    if (verdict.ok) continue;
+    problems.push({
+      nodeId: target.nodeId,
+      larkAppId: target.larkAppId,
+      code: verdict.reason === 'no_range' ? 'WORKING_DIR_NO_RANGE' : 'WORKING_DIR_OUT_OF_RANGE',
+    });
+  }
+  return problems;
 }
 
 /**
@@ -815,10 +880,29 @@ export interface WorkflowHostCommandDeps {
   botEligibilityProbe?: (binding: RunChatBinding, bots: BotConfig[]) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
   /** Bot display names for the Gate-2 summary (default: bots-info.json). */
   botDisplayName?: () => (larkAppId: string) => string;
+  /** 交接带发起人身份 switch (default: live global config). */
+  handoffIdentitySwitch?: () => boolean;
+  /** Seams that freeze the initiator (default: the main bot's live Lark app
+   *  + bots.json). Only built while that switch is on. */
+  handoffIdentityPolicy?: (bots: BotConfig[]) => V3HandoffIdentityPolicy | Promise<V3HandoffIdentityPolicy>;
+  /** The current turn's id (default: fresh current-turn provenance). Read
+   *  only to freeze the initiator: only a human-opened turn may. */
+  resolveCurrentTurnId?: () => string | undefined;
   /** Capability labels for the Architect roster (default: bot profiles). */
   botRole?: () => (larkAppId: string) => string | undefined;
   /** Test seam for the architect worker (default: the real ephemeral pool). */
   runArchitect?: ArchitectDeps['runArchitect'];
+}
+
+async function liveHandoffIdentityPolicy(bots: BotConfig[]): Promise<V3HandoffIdentityPolicy> {
+  // The union_id lookup talks through the main bot's own Lark app; a CLI
+  // process registers the configured apps first (as the eligibility probe does).
+  const { registerBot } = await import('../../bot-registry.js');
+  for (const bot of bots) {
+    try { registerBot(bot); } catch { /* an unusable entry simply fails its own lookup */ }
+  }
+  const { createLiveV3HandoffIdentityPolicy } = await import('../../im/lark/v3-bot-eligibility.js');
+  return createLiveV3HandoffIdentityPolicy(bots);
 }
 
 async function liveBotEligibilityProbe(binding: RunChatBinding, bots: BotConfig[]): Promise<V3BotEligibilityProbe> {
@@ -1017,6 +1101,9 @@ export async function cmdWorkflowHost(
       // A replay of an already-published approval never re-decides it.
       const summary: string[] = [];
       let nodeExecutor: 'bot' | undefined;
+      let handoffIdentity: V3HandoffIdentityRecord | undefined;
+      /** Bot mode: the absolute, range-checked `--working-dir`. */
+      let botWorkingDir: string | undefined;
       if (before.kind === 'missing') {
         const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
         if (switchMode === 'bot') {
@@ -1034,10 +1121,28 @@ export async function cmdWorkflowHost(
           } else {
             const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
             if (plan.kind === 'refused') {
-              throw new HostGuardError(formatV3BotEligibilityRefusal(plan.problems, nameOf));
+              throw new HostGuardError(formatV3BotEligibilityRefusal(plan.problems, nameOf, {
+                ...(plan.workingDir !== undefined ? { workingDir: plan.workingDir } : {}),
+              }));
             }
+            botWorkingDir = plan.workingDir;
+            // 交接带发起人身份 (design §10.2 item 1): decided once, here, with
+            // the executor, and frozen into the same authorization.
+            if ((deps.handoffIdentitySwitch ?? workflowHandoffIdentityEnabled)()) {
+              const identity = await resolveV3HandoffIdentity(
+                plan.binding,
+                await (deps.handoffIdentityPolicy ?? liveHandoffIdentityPolicy)(bots),
+                { humanTurn: isHumanInboundTurnId((deps.resolveCurrentTurnId ?? currentTurnIdFromEnv)()) },
+                { targets: plan.targets, nameOf },
+              );
+              handoffIdentity = identity.record;
+              summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
+              if (identity.summary) summary.push(identity.summary);
+            } else {
+              summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
+            }
+            if (botWorkingDir !== undefined) summary.push(describeV3NodeWorkingDir(botWorkingDir));
             nodeExecutor = 'bot';
-            summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
           }
         } else {
           const ignored = describeIgnoredAssignees(runDir);
@@ -1045,10 +1150,14 @@ export async function cmdWorkflowHost(
         }
       } else if (before.kind === 'ok' && 'nodeExecutor' in before.envelope && before.envelope.nodeExecutor === 'bot') {
         summary.push('执行方式：节点交给群里的 Bot 执行（已在首次批准时冻结）');
+        if (frozenHandoffIdentity(before.envelope)) summary.push('交接带发起人身份：开（已在首次批准时冻结）');
+        const frozenDir = frozenNodeWorkingDir(before.envelope);
+        if (frozenDir !== undefined) summary.push(`工作目录：${frozenDir}（已在首次批准时冻结）`);
       }
       const authorized = authorizeAdHocRun(runDir, bots, now, {
-        workingDirOverride,
+        workingDirOverride: nodeExecutor === 'bot' ? botWorkingDir : workingDirOverride,
         ...(nodeExecutor ? { nodeExecutor } : {}),
+        ...(handoffIdentity ? { handoffIdentity } : {}),
       });
       const { state } = hostApproveDag(runDir, now);
       const dagPath = authorized.dagPath;

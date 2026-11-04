@@ -147,6 +147,13 @@ export interface WorkflowFeatureGlobalConfig {
    *  Frozen into `run.json` at authorization, so flipping it never changes a
    *  run that already started. Only the non-default value is ever stored. */
   nodeExecutor?: 'bot';
+  /** Experimental (design 2026-11-03 §10, §15.5, D5): a bot-executed run
+   *  authorized from now on freezes its initiator's identity, and every
+   *  handoff of that run carries a delegation signed from it, so the node bot
+   *  runs its `triggerUserAuth` tools as the initiator. Absent = off (the node
+   *  bot runs as itself). Frozen into `run.json` at authorization; only `true`
+   *  is ever stored. */
+  handoffIdentity?: true;
 }
 
 export type WorkflowNodeExecutorMode = 'ephemeral' | 'bot';
@@ -156,6 +163,12 @@ export interface MultiTopicGlobalConfig {
    *  backwards compatibility. When disabled, botmux-orchestrate is hidden and
    *  `botmux dispatch` may only append to an existing topic via `--into`. */
   enabled?: boolean;
+  /** Dispatch task-tree card. Default OFF (missing !== true): the first
+   *  dispatch posts no card, no dispatch-task-tree-cards.json is written, and
+   *  reports record nothing — exactly the pre-card behaviour. Opt in from
+   *  Dashboard 全局设置 → 多话题编排 → 任务树卡片. Read live, so turning it
+   *  off stops new card posts/updates immediately (a kill switch). */
+  taskTreeCard?: boolean;
 }
 
 export interface WorkerConfig {
@@ -868,6 +881,7 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   const out: WorkflowFeatureGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   if (v.nodeExecutor === 'bot') out.nodeExecutor = 'bot';
+  if (v.handoffIdentity === true) out.handoffIdentity = true;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -876,6 +890,7 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
   const v = raw as Record<string, unknown>;
   const out: MultiTopicGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (typeof v.taskTreeCard === 'boolean') out.taskTreeCard = v.taskTreeCard;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1144,6 +1159,14 @@ export function workflowNodeExecutorMode(): WorkflowNodeExecutorMode {
   return readGlobalConfig().workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral';
 }
 
+/** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):
+ *  whether bot-executed runs authorized from now on hand their initiator's
+ *  identity to the node bots. Read live; only consulted at authorization,
+ *  where the outcome is frozen into `run.json`. */
+export function workflowHandoffIdentityEnabled(): boolean {
+  return readGlobalConfig().workflow?.handoffIdentity === true;
+}
+
 /** Machine-wide multi-topic orchestration switch. Defaults ON for backwards
  * compatibility. The env override is also injected into managed CLI sessions
  * so sandboxed commands agree with the host daemon. */
@@ -1154,6 +1177,45 @@ export function isMultiTopicOrchestrationEnabled(env: NodeJS.ProcessEnv = proces
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().multiTopic?.enabled !== false;
+}
+
+/** Machine-wide dispatch task-tree card switch. Defaults OFF: a fresh install
+ *  sends no task-tree card (3.2(c) — a feature that adds a message must be
+ *  opted in). `BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED` wins when set, otherwise
+ *  the Dashboard toggle `multiTopic.taskTreeCard`. The DAEMON side (card post /
+ *  patch, report recording) reads it live from the short-TTL (~2s) global-config
+ *  cache, each daemon expiring its own (a Dashboard write invalidates only its
+ *  own process), so card behaviour follows the toggle within ~2s without a
+ *  restart. A CLI inside a sandboxed/file-isolated pane cannot read the config
+ *  file; the worker projects the value into spawn-time env, so the in-pane
+ *  `attemptAt` decision for an already-running session follows the NEXT session
+ *  (new spawn), while new dispatch-time card gating on the daemon is live. */
+export function isDispatchTaskTreeCardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().multiTopic?.taskTreeCard === true;
+}
+
+/**
+ * Host-resolved machine-wide on/off switches the daemon projects into spawned
+ * panes as `'true'`/`'false'` strings. This is the single step that turns the
+ * daemon-side config value into the env a file-sandboxed CLI reads (the child-env
+ * allowlist alone only forwards whatever stale value is already present). Pass
+ * the resolved env explicitly so tests can stub it instead of process.env.
+ * Covers the workflow feature, multi-topic orchestration and dispatch
+ * task-tree card switches (the latter two default the opposite way: multiTopic
+ * is on unless false, the card is off unless true — the readers already encode
+ * that, so this only stringifies their result).
+ */
+export function paneSwitchEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  return {
+    BOTMUX_WORKFLOW_ENABLED: isWorkflowFeatureEnabled(env) ? 'true' : 'false',
+    BOTMUX_MULTI_TOPIC_ENABLED: isMultiTopicOrchestrationEnabled(env) ? 'true' : 'false',
+    BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: isDispatchTaskTreeCardEnabled(env) ? 'true' : 'false',
+  };
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

@@ -70,6 +70,7 @@
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {
+    "pg": "8.23.1",
     "@base-ui/react": "1.9.0",
     "@larksuiteoapi/node-sdk": "^1.64.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -92,6 +93,7 @@
     "@napi-rs/canvas": "^0.1.65"
   },
   "devDependencies": {
+    "@types/pg": "8.23.1",
     "@midscene/test": "1.13.1",
     "@midscene/web": "1.13.1",
     "@playwright/test": "^1.58.2",

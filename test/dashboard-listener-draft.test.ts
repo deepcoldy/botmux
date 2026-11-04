@@ -147,4 +147,19 @@ describe('describeListenerWidening', () => {
     expect(widen(any('bug'), { ...base, contentPolicy: undefined })).toEqual(['keywords']);
     expect(widen({ ...base, contentPolicy: undefined }, any('bug'))).toEqual([]);
   });
+
+  it('includes identity terms in widening checks without conflating them with text', () => {
+    const identity = { ...base, contentPolicy: { includeMentionedOpenIds: ['ou_target'], matchMode: 'all' as const } };
+    const both = patchListenerContentPolicy(identity, { includeKeywords: ['ask'] });
+    expect(widen(identity, both)).toEqual([]);
+    expect(widen(both, identity)).toEqual(['keywords']);
+    expect(widen(identity, patchListenerContentPolicy(identity, { includeMentionedOpenIds: undefined }))).toEqual(['keywords']);
+    const any = patchListenerContentPolicy(identity, { matchMode: 'any' });
+    expect(widen(any, patchListenerContentPolicy(any, { includeMentionedOpenIds: ['ou_target', 'ou_other'] }))).toEqual(['keywords']);
+    const lookalike = patchListenerContentPolicy(identity, { includeMentionedOpenIds: undefined, includeKeywords: ['ou_target'] });
+    expect(widen(identity, lookalike)).toEqual(['keywords']);
+    const invalid = patchListenerContentPolicy(identity, { includeMentionedOpenIds: [] });
+    expect(widen(invalid, identity)).toEqual(['keywords']);
+    expect(widen(identity, invalid)).toEqual([]);
+  });
 });

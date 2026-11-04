@@ -69,6 +69,10 @@ export interface CodexPendingTurn {
   turnId: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
+  /** This attribution mark came from the previous worker generation's durable
+   * journal. Recovery-only cleanup may retire these marks without touching a
+   * new turn that the replacement process accepted during startup. */
+  restoredFromJournal?: boolean;
   started: boolean;
   contentFingerprint?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
@@ -141,6 +145,30 @@ export interface CodexPendingTurn {
    *  falsely release idle and prune a still-running turn). Cleared by the
    *  terminal edge or an explicit stop. */
   rpcActive?: boolean;
+}
+
+/** Journal-restored marks whose lifecycle the PREVIOUS worker process had
+ *  already accepted when it died: the replacement CLI cannot complete them, so
+ *  a cold-resume first prompt may retire them and let the restart-interruption
+ *  note own recovery.
+ *
+ *  The activity disjunction is load-bearing. `restorePendingTurns()` rebuilds
+ *  every mark as `started:false` with none of the submit/rpc flags. A mark
+ *  that never reached the transcript (its user record was still buffered when
+ *  the process died) must STAY queued: the resumed CLI may still emit that
+ *  user record — or genuinely run queued input — and a later ingest owns the
+ *  attribution. Only a mark the baseline replay proved the dead process had
+ *  already started / queued / confirmed is safe to retire. */
+export function selectStaleRestoredJournalTurns(
+  turns: readonly CodexPendingTurn[],
+): CodexPendingTurn[] {
+  return turns.filter(turn => turn.restoredFromJournal === true
+    && turn.finalText === undefined
+    && (turn.started
+      || turn.rpcActive === true
+      || turn.cliQueuedAtMs !== undefined
+      || turn.submitConfirmedAtMs !== undefined
+      || turn.submitVerificationStartedAtMs !== undefined));
 }
 
 export class CodexBridgeQueue {
@@ -368,6 +396,7 @@ export class CodexBridgeQueue {
       if (existing.has(entry.turnId)) continue;
       existing.add(entry.turnId);
       restored.push({ turnId: entry.turnId, started: false,
+        restoredFromJournal: true,
         ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         recoveryJsonlPathAtMark: entry.jsonlPath,

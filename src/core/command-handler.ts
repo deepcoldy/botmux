@@ -1,3 +1,4 @@
+import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -48,6 +49,7 @@ import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
 import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
@@ -598,6 +600,8 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface CommandHandlerDeps {
+  /** Source entry, independent of a shared session or newly created topic. */
+  invocationContext?: 'new-topic' | 'thread';
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
@@ -1511,7 +1515,7 @@ export async function handleCardCommand(
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
   const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
-    && ['claude-code', 'codex', 'grok'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
+    && supportsUnifiedReplyCardCli(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
@@ -1869,6 +1873,20 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/models': {
+        const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
+        if (atTopLevel && larkAppId) {
+          await showDefaultModelPicker(larkAppId, rootId, message.senderId, sessionReply, loc);
+          break;
+        }
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        await showSessionModelPicker(ds, rootId, message.senderId, message.senderUnionId, sessionReply, loc);
+        break;
+      }
+
       case '/queue': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2927,6 +2945,10 @@ export async function handleCommand(
           break;
         }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (ds.session.pendingForkSession && effectiveCliId === 'antigravity') {
+          await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
+          break;
+        }
         if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
@@ -6760,6 +6782,7 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.models', undefined, loc),
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
           t('help.idlecompact', undefined, loc),

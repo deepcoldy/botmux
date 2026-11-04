@@ -80,7 +80,8 @@ export function codexUserInputAnswer(
       || new Set(selected).size !== selected.length || (!entry.question.multiSelect && selected.length > 1)) {
       throw new Error(`ask returned invalid answers for question ${index + 1}`);
     }
-    const values = selected.length ? [...selected] : comment ? [comment] : [];
+    const custom = result.customAnswers?.[index]?.trim();
+    const values = custom ? [custom] : selected.length ? [...selected] : comment ? [comment] : [];
     if (!values.length && !entry.question.multiSelect) {
       throw new Error(`ask returned no answer for question ${index + 1}`);
     }

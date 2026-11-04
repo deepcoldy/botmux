@@ -4582,7 +4582,10 @@ async function processCommentEvent(
 
   // 2) 拉评论 thread 取权威正文 / 作者 / @ 列表（事件 payload 不保证带全），
   //    同时用最新一条回复作为"触发回复"。
-  const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
+  let commentReadError: string | undefined;
+  const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId, {
+    onError: message => { commentReadError = message; },
+  });
   if (!comment || comment.replies.length === 0) {
     logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
     // ⚠️ 这个丢弃点在 mention-only 闸（下面第 4 步）**之前** —— 而 mention-only
@@ -4603,7 +4606,7 @@ async function processCommentEvent(
     } else {
       rollbackAutoSub();
     }
-    noteOutcome('no-comment');
+    noteOutcome('no-comment', commentReadError ?? '评论正文为空或不可用，未投递给会话');
     return;
   }
   const trigger = parsed.replyId

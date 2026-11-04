@@ -35,6 +35,15 @@ import {
 import { handleV3BlockedAction } from '../src/im/lark/v3-blocked-card-handler.js';
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from '../src/im/lark/v3-blocked-reassign.js';
 import { reassignNode } from '../src/workflows/v3/external-control.js';
+import {
+  applyV3RunEdit,
+  decideV3RevisionProposal,
+  projectV3RunStatus,
+  readV3RevisionWait,
+} from '../src/workflows/v3/run-edit.js';
+import { resolveV3GateClick } from '../src/workflows/v3/daemon-run.js';
+import { materialize } from '../src/workflows/v3/state.js';
+import { V3_BLOCKED_RETRY_ACTION } from '../src/im/lark/v3-blocked-card.js';
 import { BotRun, FakeExecutor } from './helpers/v3-external-harness.js';
 
 const MAIN = 'cli_main';
@@ -459,6 +468,9 @@ describe('改派 hardening', () => {
   it.each([
     ['a contract error that needs a revised workflow', { retryForbidden: 'revise-workflow-required' as const }],
     ['a human-ask', { ask: { question: 'Q?', options: ['a'] } }],
+    // A flow revision voided the question: still an ask card (only the
+    // 「按新定义重跑」 button), so — like every ask card — no 改派 section.
+    ['a human-ask voided by a flow revision', { ask: { question: 'Q?', options: ['a'] }, askVoided: true }],
   ])('no 改派 section on %s, and no bot is probed for it', async (_label, extra) => {
     const run = await blockedBotRun('rh-forbidden');
     const info = { ...blockedInfoFor(readJournal(join(run.runDir, 'journal.ndjson')), 'write'), ...extra };
@@ -485,5 +497,342 @@ describe('engine: reassignNode(requireBlocked)', () => {
     }, ctx)).toEqual({ kind: 'rejected', reason: 'not-reassignable' });
     expect(run.of('nodeReassigned')).toEqual([]);
     expect(executor.stops).toEqual([]);
+  });
+});
+
+// ─── One approved bot scope, one reassignment (runtime flow edits, §13) ─────
+
+const MEMBER = 'ou_member';
+const newBotSnapshot = (selector: string) => ({ larkAppId: selector, cliId: 'claude-code', workingDir: '/tmp' });
+const editRun = (base: string, runId: string, patch: unknown, baseRevision: number, by = OWNER) => applyV3RunEdit({
+  baseDir: base, runId, patch, baseRevision, caller: { openId: by, origin: 'human' }, resolveNewBotSnapshot: newBotSnapshot,
+});
+const journalOf = (runDir: string) => readJournal(join(runDir, 'journal.ndjson'));
+const cardFor = (run: { base: string; runId: string; runDir: string; deps: V3BlockedReassignDeps }, nodeId: string) =>
+  buildV3BlockedCardForRun({
+    runDir: run.runDir, runId: run.runId, info: blockedInfoFor(journalOf(run.runDir), nodeId), reassign: run.deps,
+  });
+function buttonActions(card: string): string[] {
+  const out: string[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (!node || typeof node !== 'object') return;
+    const record = node as Record<string, unknown>;
+    if (record.tag === 'button' && record.value && typeof record.value === 'object') {
+      out.push(String((record.value as { action?: unknown }).action));
+    }
+    Object.values(record).forEach(walk);
+  };
+  walk(JSON.parse(card));
+  return out;
+}
+
+/** A bot run with custom nodes, driven by the daemon gate runner. */
+async function customBotRun(runId: string, nodes: unknown[], reject: (req: { nodeId: string; attemptNumber: number }) => boolean) {
+  const base = mkdtempSync(join(tmpdir(), 'v3-reassign-edit-'));
+  bases.push(base);
+  const runDir = join(base, runId);
+  mkdirSync(runDir, { recursive: true });
+  writeJson(join(runDir, 'dag.json'), { schemaVersion: 2, runId, nodes });
+  writeJson(join(runDir, 'spec.json'), {
+    schemaVersion: 1, runId, title: 'reassign', requirement: 'r',
+    nodes: [{ sketchId: 'write', goal: 'write', input_needs: [], expected_outputs: ['r.md'], acceptance: 'ok', risk_gate: false, unknowns: [] }],
+  });
+  writeJson(join(runDir, 'bots.snapshot.json'), SNAPSHOTS);
+  publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
+    runId, createdAt: CREATED_AT, authorizedAt: AUTHORIZED_AT, chatBinding: BINDING, authorizedByOpenId: OWNER,
+    artifacts: {
+      dag: artifactRef(runDir, 'dag.json'), spec: artifactRef(runDir, 'spec.json'), botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+    },
+    nodeExecutor: 'bot',
+  }));
+  const executor = new FakeExecutor();
+  executor.onDispatch = (req) => (reject(req) ? { kind: 'rejected', code: 'BOT_OFFLINE' } : { kind: 'sent', handoffMessageId: `om_${req.attemptId}` });
+  const { probe, asked } = tableProbe();
+  const deps = reassignDeps(probe);
+  const gates: string[] = [];
+  const runner = createV3GateRunner({
+    baseDir: base,
+    loadBots: () => BOTS,
+    makeRunNode: () => async () => { throw new Error('bot mode never spawns a worker'); },
+    externalExecutor: executor,
+    now: () => 10_000,
+    postCard: async (_binding, gate) => { gates.push(gate.waitId); },
+    postBlockedCard: async () => {},
+    scheduleWake: () => {},
+  });
+  const click = async (nodeId: string, target: string) => handleV3BlockedAction(
+    reassignValueOf(await cardFor({ base, runId, runDir, deps }, nodeId)),
+    OWNER,
+    { baseDir: base, driveRun: () => {}, canResolve: () => true, reassign: deps },
+    { [V3_BLOCKED_REASSIGN_FIELD]: target },
+    MAIN,
+  );
+  return { base, runDir, runId, executor, runner, deps, asked, gates, click };
+}
+
+describe('the approved bot scope is the same for flow edits and 改派', () => {
+  it('a bot a flow revision brought in can be picked on the blocked card, and the move goes through', async () => {
+    const run = await blockedBotRun('rs-scope');
+    expect(optionsOf(run.cards[0]!)).not.toContain('cli_x');
+    // The initiator's own change brings in a new bot directly (M2 乙) …
+    expect(editRun(run.base, run.runId, [
+      { op: 'addNode', node: { id: 'publish', type: 'goal', goal: 'publish', bot: 'cli_x', depends: ['write'], inputs: [] } },
+    ], 1)).toMatchObject({ kind: 'applied' });
+    // … after which it is part of the run's approved scope everywhere.
+    const card = await cardFor(run, 'write');
+    expect(optionsOf(card)).toContain('cli_x');
+    const frozen = await run.click(OWNER, 'cli_x') as any;
+    expect(frozen.header.title.content).toContain('已改派');
+    expect(reassignedEvents(run.runDir)).toEqual([expect.objectContaining({ nodeId: 'write', from: 'cli_a', to: 'cli_x' })]);
+    await run.runner.drive(run.runId);
+    expect(run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)).toMatchObject({ targetLarkAppId: 'cli_x' });
+  });
+
+  it('a node added while the run was running gets the 改派 section when it is blocked', async () => {
+    const run = await customBotRun('rs-added', [NODES[0]], (req) => req.nodeId === 'extra' && req.attemptNumber === 1);
+    await run.runner.drive(run.runId);
+    expect(editRun(run.base, run.runId, [
+      { op: 'addNode', node: { id: 'extra', type: 'goal', goal: 'extra', bot: 'cli_b', depends: [], inputs: [] } },
+    ], 1)).toMatchObject({ kind: 'applied' });
+    await run.runner.drive(run.runId);
+    expect(materialize(journalOf(run.runDir)).nodes.get('extra')?.status).toBe('blocked');
+    const card = await cardFor(run, 'extra');
+    expect(optionsOf(card)).toEqual(['cli_a', 'cli_c']);
+    expect(await run.click('extra', 'cli_a')).toMatchObject({ header: expect.anything() });
+    expect(reassignedEvents(run.runDir)).toEqual([expect.objectContaining({ nodeId: 'extra', from: 'cli_b', to: 'cli_a' })]);
+  });
+});
+
+describe('改派 while a flow revision touching the node waits for confirmation', () => {
+  it('is refused before any chat grant or event, like an ask answer; after the decision it works', async () => {
+    const run = await blockedBotRun('rs-held');
+    expect(editRun(run.base, run.runId, [{ op: 'updateNode', nodeId: 'write', set: { goal: 'member idea' } }], 1, MEMBER))
+      .toMatchObject({ kind: 'proposed' });
+    const before = journalOf(run.runDir).length;
+    const refused = await run.click(OWNER, 'cli_b') as any;
+    expect(refused.toast).toBeDefined();
+    expect(journalOf(run.runDir)).toHaveLength(before);
+    expect(run.asked.filter((entry) => entry.startsWith('grant:'))).toEqual([]);
+    // The engine refuses on its own too.
+    const attemptId = blockedInfoFor(journalOf(run.runDir), 'write').attemptId;
+    expect(await reassignNode(run.runDir, {
+      nodeId: 'write', toLarkAppId: 'cli_b', by: OWNER, expectedAttemptId: attemptId, requireBlocked: true,
+    }, { nodeExecutor: 'bot' })).toEqual({ kind: 'rejected', reason: 'revision-pending' });
+    expect(decideV3RevisionProposal({ baseDir: run.base, runId: run.runId, revision: 2, decision: 'reject', by: OWNER }))
+      .toMatchObject({ kind: 'rejected' });
+    expect(await run.click(OWNER, 'cli_b')).toMatchObject({ header: expect.anything() });
+    expect(reassignedEvents(run.runDir)).toHaveLength(1);
+  });
+
+  it('the engine refuses before stopping an open attempt the proposal holds', async () => {
+    const run = await customBotRun('rs-held-open', [NODES[0], NODES[1]], () => false);
+    await run.runner.drive(run.runId);
+    const open = run.executor.dispatches.find((req) => req.nodeId === 'write')!;
+    expect(editRun(run.base, run.runId, [{ op: 'updateNode', nodeId: 'write', set: { goal: 'member idea' } }], 1, MEMBER))
+      .toMatchObject({ kind: 'proposed' });
+    expect(await reassignNode(run.runDir, {
+      nodeId: 'write', toLarkAppId: 'cli_b', by: OWNER, expectedAttemptId: open.attemptId,
+    }, { nodeExecutor: 'bot', executor: run.executor })).toEqual({ kind: 'rejected', reason: 'revision-pending' });
+    expect(run.executor.stops).toEqual([]);
+  });
+
+  it('the engine re-checks under the journal lock (a proposal filed while the open attempt is being stopped)', async () => {
+    const run = await customBotRun('rs-held-lock', [NODES[0], NODES[1]], () => false);
+    await run.runner.drive(run.runId);
+    const open = run.executor.dispatches.find((req) => req.nodeId === 'write')!;
+    run.executor.onStop = () => {
+      expect(editRun(run.base, run.runId, [{ op: 'updateNode', nodeId: 'write', set: { goal: 'member idea' } }], 1, MEMBER))
+        .toMatchObject({ kind: 'proposed' });
+    };
+    expect(await reassignNode(run.runDir, {
+      nodeId: 'write', toLarkAppId: 'cli_b', by: OWNER, expectedAttemptId: open.attemptId,
+    }, { nodeExecutor: 'bot', executor: run.executor })).toEqual({ kind: 'rejected', reason: 'revision-pending' });
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+  });
+});
+
+describe('改派 of a node whose definition changed after its gate was passed', () => {
+  it('re-runs through a fresh gate: nothing is handed to the new bot before it is approved again', async () => {
+    const gated = { ...NODES[0], humanGate: { prompt: 'ship it?' } };
+    const run = await customBotRun('rs-regate', [gated, NODES[1]], (req) => req.nodeId === 'write' && req.attemptNumber === 1);
+    await run.runner.drive(run.runId);
+    expect(run.gates).toEqual(['write#001-gate']);
+    resolveV3GateClick(run.base, run.runId, { waitId: 'write#001-gate', selected: 'approve', by: OWNER });
+    await run.runner.drive(run.runId);
+    expect(materialize(journalOf(run.runDir)).nodes.get('write')?.status).toBe('blocked');
+    // The initiator changes the definition: the old approval no longer covers it.
+    expect(editRun(run.base, run.runId, [{ op: 'updateNode', nodeId: 'write', set: { goal: 'write it differently' } }], 1))
+      .toMatchObject({ kind: 'applied' });
+    const dispatchesBefore = run.executor.dispatches.length;
+    expect(await run.click('write', 'cli_b')).toMatchObject({ header: expect.anything() });
+    await run.runner.drive(run.runId);
+    expect(run.gates).toEqual(['write#001-gate', 'write#002-gate']);
+    expect(run.executor.dispatches).toHaveLength(dispatchesBefore);
+    resolveV3GateClick(run.base, run.runId, { waitId: 'write#002-gate', selected: 'approve', by: OWNER });
+    await run.runner.drive(run.runId);
+    expect(run.executor.dispatches.at(-1)).toMatchObject({ nodeId: 'write', targetLarkAppId: 'cli_b' });
+  });
+});
+
+describe('ask cards and 改派', () => {
+  it('a voided ask card keeps only the re-run button', async () => {
+    const run = await blockedBotRun('rs-ask-voided');
+    const info = {
+      ...blockedInfoFor(journalOf(run.runDir), 'write'),
+      ask: { question: 'which region?', options: ['sg'] },
+      askVoided: true,
+    };
+    const card = await buildV3BlockedCardForRun({ runDir: run.runDir, runId: run.runId, info, reassign: run.deps });
+    expect(buttonActions(card)).toEqual([V3_BLOCKED_RETRY_ACTION]);
+  });
+});
+
+// ─── The node's current executor is the same for 改派 and flow edits ───────
+
+describe('after a blocked-card 改派, flow edits and status see who executes the node now', () => {
+  const statusBot = (run: { base: string; runId: string }) =>
+    projectV3RunStatus(run.base, run.runId).nodes.find((node) => node.id === 'write')?.bot?.larkAppId;
+
+  it('status shows the new bot; moving it back, or on, records where it actually comes from (b1)', async () => {
+    const run = await blockedBotRun('rs-b1');
+    expect(await run.click(OWNER, 'cli_b')).toMatchObject({ header: expect.anything() });
+    expect(statusBot(run)).toBe('cli_b');
+    // Back to the bot its definition names: a real move (from cli_b), not "nothing changes".
+    expect(editRun(run.base, run.runId, [{ op: 'reassign', nodeId: 'write', bot: 'cli_a' }], 1))
+      .toMatchObject({ kind: 'applied', changes: { reassigned: [{ nodeId: 'write', from: 'cli_b', to: 'cli_a' }] } });
+    expect(reassignedEvents(run.runDir).at(-1)).toMatchObject({ from: 'cli_b', to: 'cli_a' });
+    expect(statusBot(run)).toBe('cli_a');
+    expect(editRun(run.base, run.runId, [{ op: 'reassign', nodeId: 'write', bot: 'cli_c' }], 2))
+      .toMatchObject({ kind: 'applied', changes: { reassigned: [{ nodeId: 'write', from: 'cli_a', to: 'cli_c' }] } });
+    expect(reassignedEvents(run.runDir).at(-1)).toMatchObject({ from: 'cli_a', to: 'cli_c' });
+  });
+
+  it('a member\'s proposal shows the initiator the real "from" (b4)', async () => {
+    const run = await blockedBotRun('rs-b4');
+    await run.click(OWNER, 'cli_b');
+    expect(editRun(run.base, run.runId, [{ op: 'reassign', nodeId: 'write', bot: 'cli_c' }], 1, MEMBER))
+      .toMatchObject({ kind: 'proposed' });
+    expect(readV3RevisionWait(run.runDir, 2)?.view.changes.reassigned).toEqual([{ nodeId: 'write', from: 'cli_b', to: 'cli_c' }]);
+    expect(decideV3RevisionProposal({ baseDir: run.base, runId: run.runId, revision: 2, decision: 'approve', by: OWNER }))
+      .toMatchObject({ kind: 'approved' });
+    expect(reassignedEvents(run.runDir).at(-1)).toMatchObject({ from: 'cli_b', to: 'cli_c' });
+  });
+
+  it('"reassign to the bot it is already running on" changes nothing and never stops that run (b5)', async () => {
+    const run = await blockedBotRun('rs-b5');
+    await run.click(OWNER, 'cli_b');
+    await run.runner.drive(run.runId);
+    const running = run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)!;
+    expect(running).toMatchObject({ targetLarkAppId: 'cli_b', attemptNumber: 2 });
+    expect(statusBot(run)).toBe('cli_b');
+    const before = journalOf(run.runDir).length;
+    expect(editRun(run.base, run.runId, [{ op: 'reassign', nodeId: 'write', bot: 'cli_b' }], 1))
+      .toMatchObject({ kind: 'invalid' });
+    await run.runner.drive(run.runId);
+    expect(run.executor.stops).toEqual([]);
+    expect(journalOf(run.runDir).slice(before).some((event) => event.type === 'nodeReassigned' || event.type === 'dagRevised')).toBe(false);
+    expect(run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)).toBe(running);
+  });
+
+  // One patch naming the same node several times: only the net move counts,
+  // measured from where the node ran when the patch began.
+  it('several reassigns of one node in a patch: the last target wins, "from" is where it ran before the patch', async () => {
+    const run = await blockedBotRun('rs-multi');
+    await run.click(OWNER, 'cli_b');
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_a' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_c' },
+    ], 1)).toMatchObject({ kind: 'applied', changes: { reassigned: [{ nodeId: 'write', from: 'cli_b', to: 'cli_c' }] } });
+    expect(reassignedEvents(run.runDir).at(-1)).toMatchObject({ from: 'cli_b', to: 'cli_c' });
+    expect(statusBot(run)).toBe('cli_c');
+  });
+
+  it('moving a node away and back to where it already runs, in one patch, is no move', async () => {
+    const run = await blockedBotRun('rs-roundtrip');
+    // Before any 改派: away and back to the bot its definition names.
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_b' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_a' },
+    ], 1)).toMatchObject({ kind: 'invalid' });
+    expect(statusBot(run)).toBe('cli_a');
+    await run.click(OWNER, 'cli_b');
+    // Back to its definition's bot first, then to where it runs now: the
+    // node stays on cli_b (the last op's target).
+    const before = journalOf(run.runDir).length;
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_a' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_b' },
+    ], 1)).toMatchObject({ kind: 'invalid' });
+    expect(journalOf(run.runDir).slice(before).some((event) => event.type === 'nodeReassigned' || event.type === 'dagRevised')).toBe(false);
+    expect(statusBot(run)).toBe('cli_b');
+    // A running turn is not stopped by a round trip either.
+    await run.runner.drive(run.runId);
+    const running = run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)!;
+    expect(running).toMatchObject({ targetLarkAppId: 'cli_b' });
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_c' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_b' },
+    ], 1)).toMatchObject({ kind: 'invalid' });
+    await run.runner.drive(run.runId);
+    expect(run.executor.stops).toEqual([]);
+    expect(run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)).toBe(running);
+  });
+});
+
+describe('改派 hardening — windows around the chat grant', () => {
+  /** Deps whose chat grant files a member's proposal touching `write`. */
+  const grantFilesProposal = (run: { base: string; runId: string }) => {
+    const { probe, asked } = tableProbe();
+    const ensureGrant = probe.ensureGrant;
+    probe.ensureGrant = async (appId, ...rest) => {
+      expect(editRun(run.base, run.runId, [{ op: 'updateNode', nodeId: 'write', set: { goal: 'member idea' } }], 1, MEMBER))
+        .toMatchObject({ kind: 'proposed' });
+      return ensureGrant!(appId, ...rest);
+    };
+    return { deps: reassignDeps(probe), asked };
+  };
+
+  it('a proposal filed during the grant stops a half-written reassignment from being finished (b3)', async () => {
+    const run = await blockedBotRun('rs-b3');
+    // An earlier reassignment wrote its nodeReassigned but not its retry.
+    appendEvent(join(run.runDir, 'journal.ndjson'), {
+      type: 'nodeReassigned', nodeId: 'write', instanceId: 'write#001', from: 'cli_a', to: 'cli_b', by: OWNER,
+    });
+    const { deps, asked } = grantFilesProposal(run);
+    const result = await handleV3BlockedAction(
+      reassignValueOf(run.cards[0]!), OWNER,
+      { baseDir: run.base, driveRun: () => {}, canResolve: () => true, reassign: deps },
+      { [V3_BLOCKED_REASSIGN_FIELD]: 'cli_b' }, MAIN,
+    ) as any;
+    expect(asked).toContain('grant:cli_b');
+    expect(result.toast).toBeDefined();
+    expect(journalOf(run.runDir).some((event) => event.type === 'nodeRetryRequested')).toBe(false);
+  });
+
+  it('a proposal filed during the grant is refused before the engine is asked (b2)', async () => {
+    const run = await blockedBotRun('rs-b2');
+    const { deps } = grantFilesProposal(run);
+    const result = await handleV3BlockedAction(
+      reassignValueOf(run.cards[0]!), OWNER,
+      { baseDir: run.base, driveRun: () => {}, canResolve: () => true, reassign: deps },
+      { [V3_BLOCKED_REASSIGN_FIELD]: 'cli_b' }, MAIN,
+    ) as any;
+    expect(result.toast).toBeDefined();
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+  });
+
+  it('an old card of a node a flow revision removed says so (c1)', async () => {
+    const run = await blockedBotRun('rs-c1');
+    expect(editRun(run.base, run.runId, [
+      { op: 'removeNode', nodeId: 'review' },
+      { op: 'removeNode', nodeId: 'audit' },
+      { op: 'removeNode', nodeId: 'write' },
+      { op: 'addNode', node: { id: 'z', type: 'goal', goal: 'z', bot: 'cli_b', depends: [], inputs: [] } },
+    ], 1)).toMatchObject({ kind: 'applied' });
+    const result = await run.click(OWNER, 'cli_b') as any;
+    expect(result.toast.content).toContain('删除');
+    expect(result.toast.content).not.toContain('新一轮');
+    expect(reassignedEvents(run.runDir)).toEqual([]);
   });
 });

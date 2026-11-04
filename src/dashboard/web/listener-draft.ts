@@ -1,5 +1,6 @@
 import { resolveExcludeSenderKinds } from './listener-filters.js';
 import { mergeListenerContentPolicy, type MessageListenerData } from './roles.js';
+import { normalizeListenerContentPolicy } from '../../services/message-listener-content-policy.js';
 
 // Pure draft mutations + save normalization for the message-listener editor.
 //
@@ -75,19 +76,9 @@ export function buildListenerSavePayload(
   // bots.json): round-trip it so saving another field cannot drop an exclusion.
   const excludeSenderTypes = [...new Set(senderPolicy.excludeSenderTypes ?? [])].filter((type): type is SenderType => type === 'user' || type === 'bot');
   const includeMsgTypes = [...new Set(messagePolicy.includeMsgTypes ?? [])].filter(Boolean);
-  // An all-empty keyword list is omitted so the listener keeps matching every
-  // message (the legacy default) instead of persisting a dangling matchMode.
-  const contentPolicy = (() => {
-    const raw = listener.contentPolicy;
-    if (!raw) return undefined;
-    const includeKeywords = [...new Set((raw.includeKeywords ?? []).map(value => value.trim()).filter(Boolean))];
-    if (includeKeywords.length === 0) return undefined;
-    return {
-      includeKeywords,
-      ...(raw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
-      ...(raw.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
-    };
-  })();
+  // Empty text keywords keep the legacy match-all default. Identity-only
+  // rules and invalid identity lists must survive save / reload unchanged.
+  const contentPolicy = normalizeListenerContentPolicy(listener.contentPolicy);
   return {
     enabled: listener.enabled,
     // The daemon keeps this opt-in only when it is true; leaving it out of the
@@ -150,12 +141,17 @@ function added(before: readonly string[], after: readonly string[]): boolean {
 //   any → any: a keyword was added      all → all: a keyword was dropped
 //   all → any: always                   any → all: no keyword in common
 function keywordFilterWidened(before: ContentPolicy | undefined, after: ContentPolicy | undefined): boolean {
+  if (after?.includeMentionedOpenIds?.length === 0) return false;
+  if (before?.includeMentionedOpenIds?.length === 0) return true;
   if (!before) return false;
   if (!after) return true;
   if (!before.resolveDocumentTitles && after.resolveDocumentTitles) return true;
-  const lower = (list: readonly string[] | undefined) => (list ?? []).map(value => value.toLowerCase());
-  const b = lower(before.includeKeywords);
-  const a = lower(after.includeKeywords);
+  const terms = (policy: ContentPolicy) => [
+    ...(policy.includeKeywords ?? []).map(value => 'text:' + value.toLowerCase()),
+    ...(policy.includeMentionedOpenIds ?? []).map(value => 'identity:' + value),
+  ];
+  const b = terms(before);
+  const a = terms(after);
   const bAll = before.matchMode === 'all';
   const aAll = after.matchMode === 'all';
   if (bAll && !aAll) return true;

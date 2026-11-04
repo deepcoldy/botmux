@@ -1,5 +1,7 @@
 # 5 分钟快速接入
 
+反馈默认使用 SQLite。全新交互式启动可选 PostgreSQL；已有数据可通过 `botmux feedback storage configure/test/migrate/status` 或反馈页的存储面板配置迁移。迁移需要维护窗口，保留原 SQLite，但不会在 PostgreSQL 故障时自动回退。
+
 > 💡 **TL;DR**：`curl -fsSL .../install.sh | sh` → `botmux setup`（**一次飞书扫码**连续建应用 + 配全权限 + 发版）→ `botmux start` → `botmux autostart enable` → 拉机器人进群开聊。
 
 **开始前**：先确认 [前置要求](/prerequisites)（目标 CLI 已装并登录、tmux）——这里缺件是「装完连不上」最常见的原因。

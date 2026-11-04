@@ -252,6 +252,13 @@ export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
  *   keeps logicalTurnId === currentTurnId on the live turn;
  * - every other synthetic mint (trg_, bmx-*, …) is refused here regardless of
  *   what its registry entry carries. */
+/** Whether `turnId` names a turn a human message opened (`om_…` inbound
+ *  message, `join_…` auto-start join). Every synthetic turn — `schedule:…`,
+ *  `trg_…`, `board:…`, `workflow-event:…` — has no human behind it. */
+export function isHumanInboundTurnId(turnId: string | undefined): boolean {
+  return typeof turnId === 'string' && (turnId.startsWith('om_') || turnId.startsWith('join_'));
+}
+
 export function registryTurnMayAuthenticateHuman(
   s: {
     ordinaryTurnRecovery?: { logicalTurnId: string; currentTurnId: string };
@@ -260,7 +267,7 @@ export function registryTurnMayAuthenticateHuman(
   },
   turnId: string,
 ): boolean {
-  if (!turnId.startsWith('om_') && !turnId.startsWith('join_')) return false;
+  if (!isHumanInboundTurnId(turnId)) return false;
   const ordinary = s.ordinaryTurnRecovery;
   if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
   if (s.failedTurnRecovery?.turnId === turnId) return false;

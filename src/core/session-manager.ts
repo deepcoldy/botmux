@@ -5360,6 +5360,13 @@ export interface WorkflowNodeTurnInput {
   prompt: string;
   attachments: LarkAttachment[];
   sessionTitle: string;
+  /** Only for a handoff that carries the run initiator's delegation (design
+   *  §10): publish the turn's tool identity before the CLI gets the turn. */
+  prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  /** The run's Gate-2 `--working-dir`, already checked against this bot's
+   *  range (design §15.4): a NEW node session starts there instead of the
+   *  bot's default; an existing one keeps its directory. */
+  workingDir?: string;
 }
 
 /**
@@ -5397,6 +5404,7 @@ export async function deliverWorkflowNodeTurn(
       if (isRelayableRealSession(existing) || existing.session.suspendedColdResume) {
         existing.session.workflowNode = input.marker;
         sessionStore.updateSession(existing.session);
+        await input.prepareTurnIdentity?.(existing, turnId);
         markSessionActivity(existing, Date.now(), { human: false });
         const payload = buildFollowUpCliInput(input.prompt, existing.session.sessionId, {
           isAdoptMode: false,
@@ -5445,10 +5453,14 @@ export async function deliverWorkflowNodeTurn(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: false,
-      workingDir: effectiveDefaultWorkingDir(bot.config),
+      workingDir: input.workingDir ?? effectiveDefaultWorkingDir(bot.config),
       initialStartPending: true,
       pendingPrompt: input.prompt,
     };
+    if (input.workingDir !== undefined) {
+      session.workingDir = input.workingDir;
+      sessionStore.updateSession(session);
+    }
     ensureSessionWhiteboard(ds);
     const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
       ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
@@ -5463,6 +5475,12 @@ export async function deliverWorkflowNodeTurn(
         turnId,
         workflowNodeSession: true,
       });
+    try {
+      await input.prepareTurnIdentity?.(ds, turnId);
+    } catch (err) {
+      sessionStore.closeSession(session.sessionId);
+      throw err;
+    }
     if (!setActiveSessionIfActive(activeSessions, key, ds)) {
       await closeSession(session.sessionId);
       throw new Error(`workflow node turn lost active-session registration for ${anchor}`);

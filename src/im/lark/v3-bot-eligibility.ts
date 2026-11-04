@@ -14,9 +14,14 @@ import { findOnlineDaemon } from '../../utils/daemon-discovery.js';
 import { readBotsInfoJson } from '../../services/bots-info-cache.js';
 import { normalizeBotsInfoRouteEntries } from '../../services/bots-info-shape.js';
 import type { BotConfig } from '../../bot-registry.js';
-import { isMultiTopicOrchestrationEnabled, workflowNodeExecutorMode } from '../../global-config.js';
-import { v3OpensTopicSessions, type V3BotEligibilityProbe, type V3NodeExecutorPolicy } from '../../workflows/v3/node-executor-mode.js';
-import { getChatModeStrict, resolveCurrentChatBotOpenIdsByLarkAppIds } from './client.js';
+import { isMultiTopicOrchestrationEnabled, workflowHandoffIdentityEnabled, workflowNodeExecutorMode } from '../../global-config.js';
+import {
+  v3OpensTopicSessions,
+  type V3BotEligibilityProbe,
+  type V3HandoffIdentityPolicy,
+  type V3NodeExecutorPolicy,
+} from '../../workflows/v3/node-executor-mode.js';
+import { getChatModeStrict, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveUnionIdFromOpenIdStrict } from './client.js';
 
 export interface LiveV3BotEligibilityInput {
   orchestratorAppId: string;
@@ -72,6 +77,22 @@ export function v3BotDisplayNameResolver(dataDir: string = config.session.dataDi
 }
 
 /**
+ * 交接带发起人身份 seams (design §10.2): the initiator's union_id through the
+ * main bot's own app (strict: a definitive miss and a transient failure stay
+ * distinguishable), and the tools a sender runs as themselves on a bot — its
+ * `triggerUserAuth.tools` while that policy is on.
+ */
+export function createLiveV3HandoffIdentityPolicy(bots: readonly BotConfig[]): V3HandoffIdentityPolicy {
+  return {
+    lookupUnionId: (larkAppId, openId) => resolveUnionIdFromOpenIdStrict(larkAppId, openId),
+    botTools: (larkAppId) => {
+      const policy = bots.find((bot) => bot.larkAppId === larkAppId)?.triggerUserAuth;
+      return policy?.enabled ? [...policy.tools] : [];
+    },
+  };
+}
+
+/**
  * The experimental executor policy for an authorization entry point, or
  * `undefined` while the switch is off — callers then take today's path
  * without consulting chats, daemons or Lark at all.
@@ -89,5 +110,6 @@ export function liveV3NodeExecutorPolicy(bots: readonly BotConfig[], opts: { dat
       ...(opts.dataDir ? { dataDir: opts.dataDir } : {}),
     }),
     nameOf: v3BotDisplayNameResolver(opts.dataDir),
+    ...(workflowHandoffIdentityEnabled() ? { handoffIdentity: createLiveV3HandoffIdentityPolicy(bots) } : {}),
   };
 }

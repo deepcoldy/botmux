@@ -33,8 +33,8 @@ const actionShapes = [
 async function setup(deliveryPolicy = policy) {
   const store = await getSkillFeedbackStore(config.session.dataDir);
   const messageId = `om_${randomUUID()}`;
-  const response = store.createResponse({ interactionId: messageId, content: '原回答正文' });
-  const delivery = store.createDelivery({
+  const response = await store.createResponse({ interactionId: messageId, content: '原回答正文' });
+  const delivery = await store.createDelivery({
     responseId: response.responseId, platform: 'lark', platformAppId: 'cli_test',
     platformMessageId: messageId, requesterSubjectId: 'ou_requester', policy: deliveryPolicy,
     baseCard: { schema: '2.0', body: { elements: [
@@ -57,7 +57,7 @@ describe('feedback payload through the public card handler', () => {
     const generated = (buildFeedbackElement(customPolicy) as any).columns[0].elements[0];
     const result = await handleCardAction({ context, operator, action: generated }, deps, 'cli_test');
     expect(JSON.stringify(result.card.data)).toContain('已选择：**准确完整**');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toMatchObject([
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toMatchObject([
       { result: 'accurate_complete', semantic: 'positive' },
     ]);
   });
@@ -79,7 +79,7 @@ describe('feedback payload through the public card handler', () => {
     const result = await handleCardAction({ header: { event_id: 'evt_comment' }, event: {
       context, operator, action: { value: JSON.stringify(submit.value), form_value: { comment: '补充细节' } },
     } }, deps, 'cli_test');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toMatchObject([
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toMatchObject([
       { revision: 1, result: 'incorrect' },
       { revision: 2, reasonKey: 'wrong_result' },
       { revision: 3, reasonKey: 'wrong_result', comment: '补充细节' },
@@ -94,11 +94,11 @@ describe('feedback payload through the public card handler', () => {
     expect(result?.card?.type).toBe('raw');
     expect(JSON.stringify(result.card.data)).toContain('原回答正文');
     expect(JSON.stringify(result.card.data)).toContain('已选择：**结论可用**');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toMatchObject([
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toMatchObject([
       { result: 'conclusive_usable', revision: 1 },
     ]);
     await handleCardAction({ context, operator, action } as any, deps, 'cli_test');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(1);
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(1);
   });
 
   it('accepts the complete card.action.trigger envelope without losing identity or message context', async () => {
@@ -108,7 +108,7 @@ describe('feedback payload through the public card handler', () => {
       event: { context, operator, action: { tag: 'button', value: JSON.stringify(value) } },
     } as any, deps, 'cli_test');
     expect(result?.card?.type).toBe('raw');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(1);
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(1);
   });
 
   it('keeps requester authorization when identity fields are supplied in a callback value', async () => {
@@ -117,8 +117,8 @@ describe('feedback payload through the public card handler', () => {
       behaviors: [{ type: 'callback', value: { ...value, open_id: 'ou_requester', operator: { open_id: 'ou_requester' } } }],
     } } as any, deps, 'cli_test');
     expect(result?.toast?.content).toBe('仅本次提问者可反馈');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(0);
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_other')).toHaveLength(0);
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(0);
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_other')).toHaveLength(0);
   });
 
   it('normalizes the direct feedback handler as well as the shared entry point', async () => {
@@ -127,6 +127,6 @@ describe('feedback payload through the public card handler', () => {
       value: JSON.stringify(value),
     } } as any, 'cli_test', { store });
     expect(result?.card?.type).toBe('raw');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(1);
+    expect(await store.listFeedbackRevisions(delivery.deliveryId, 'ou_requester')).toHaveLength(1);
   });
 });

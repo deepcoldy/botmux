@@ -16,6 +16,11 @@
  */
 
 import { appendReplyCardFooterToV2Card } from './md-card.js';
+import {
+  attachWorkflowSidebarEntry,
+  workflowSignatureRow,
+  type WorkflowSidebarEntryLink,
+} from './workflow-sidebar-entry.js';
 
 /** Stands in for the handoff's own message id, which Lark assigns only after
  *  the card is sent. The sender patches the posted card with the real id and
@@ -48,6 +53,8 @@ export interface V3NodeCardView {
   status: V3NodeCardStatus;
   upstream: Array<{ nodeId: string; done: boolean }>;
   now: number;
+  /** §11: the「工作流 ›」sidebar entry at the signature row's right end. */
+  entry?: WorkflowSidebarEntryLink;
 }
 
 function plain(content: string): Record<string, unknown> {
@@ -94,6 +101,7 @@ const BLOCKED_REASON_TEXT: Record<string, string> = {
   HANDOFF_NOT_ACCEPTED: '执行 Bot 没有在期限内接单',
   HANDOFF_UNCERTAIN: '无法确认交接是否送达，请看一眼群消息再重试',
   BOT_REPORTED_BLOCKED: '执行 Bot 报告做不了',
+  WORKING_DIR_REFUSED: '执行 Bot 不能在指定的工作目录里执行',
   NODE_TIMEOUT: '超时未提交有效结果',
 };
 
@@ -147,7 +155,7 @@ export function buildV3NodeCard(view: V3NodeCardView): string {
     elements.push(plain(`上游：${view.upstream.map((up) => `${up.nodeId} ${up.done ? '✅' : '⏳'}`).join('  ')}`));
   }
   elements.push({ tag: 'hr' });
-  elements.push(md(`<font color='grey'>botmux · 工作流 ${escapeMarkdown(view.runId)}</font>`));
+  elements.push(workflowSignatureRow(md(`<font color='grey'>botmux · 工作流 ${escapeMarkdown(view.runId)}</font>`), view.entry));
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },
@@ -185,6 +193,11 @@ export interface V3HandoffCardInput {
   reassignedFrom?: string;
   /** Mention target, or the main bot itself (§6.5: no mention). */
   target: { kind: 'bot'; openId: string } | { kind: 'self' };
+  /** 交接带发起人身份 (design §10): why this handoff goes out without the
+   *  initiator's identity, in plain words. Absent = nothing to say. */
+  identityNote?: string;
+  /** §11: the「工作流 ›」sidebar entry at the signature row's right end. */
+  entry?: WorkflowSidebarEntryLink;
 }
 
 /** The exact `botmux report` command lines for a handoff (also used in the
@@ -224,6 +237,7 @@ export function v3HandoffBodyText(input: V3HandoffCardInput): string {
     lines.push(`上次的情况：${reason}${input.retryOf.message ? `（${input.retryOf.message.slice(0, 300)}）` : ''}`, '');
   }
   if (input.reassignedFrom) lines.push('本节点已改派给你。', '');
+  if (input.identityNote) lines.push(`未带发起人身份：${input.identityNote}；需要个人授权的工具会在调用时提示授权，用不到就照常做。`, '');
   const preview = (text: string) => (input.overflowAttachment ? clip(text, OVERFLOW_PREVIEW_CHARS) : text);
   if (input.overflowAttachment) {
     lines.push(`要求较长，完整内容见附件 ${input.overflowAttachment}（已放进你的会话），以附件为准。`, '');
@@ -322,13 +336,13 @@ export function buildV3HandoffCard(input: V3HandoffCardInput): string {
   if (input.target.kind === 'self') {
     (card.body as { elements: unknown[] }).elements.push(
       { tag: 'hr' },
-      md("<font color='grey'>botmux · 执行：主 Bot 自己</font>"),
+      workflowSignatureRow(md("<font color='grey'>botmux · 执行：主 Bot 自己</font>"), input.entry),
     );
     return JSON.stringify(card);
   }
   const withFooter = appendReplyCardFooterToV2Card(card, { recipientOpenIds: [input.target.openId], locale: 'zh' });
   if (!withFooter) throw new Error('v3 handoff card: cannot attach the mention footer');
-  return JSON.stringify(withFooter);
+  return attachWorkflowSidebarEntry(JSON.stringify(withFooter), input.entry);
 }
 
 export interface V3NodeReportCardInput {
@@ -337,6 +351,8 @@ export interface V3NodeReportCardInput {
   summary: string;
   files: Array<{ key: string; name: string; bytes: number }>;
   elapsedMs?: number;
+  /** §11: the「工作流 ›」sidebar entry at the signature row's right end. */
+  entry?: WorkflowSidebarEntryLink;
 }
 
 function formatBytes(bytes: number): string {
@@ -355,7 +371,10 @@ export function buildV3NodeReportCard(input: V3NodeReportCardInput): string {
     elements.push(plain(['产出：', ...input.files.map((file) => `· ${file.key}：${file.name}（${formatBytes(file.bytes)}）`)].join('\n')));
   }
   elements.push({ tag: 'hr' });
-  elements.push(md(`<font color='grey'>botmux · ${escapeMarkdown(input.botName)} 已提交${input.elapsedMs !== undefined ? ` · 用时 ${formatV3Elapsed(input.elapsedMs)}` : ''}</font>`));
+  elements.push(workflowSignatureRow(
+    md(`<font color='grey'>botmux · ${escapeMarkdown(input.botName)} 已提交${input.elapsedMs !== undefined ? ` · 用时 ${formatV3Elapsed(input.elapsedMs)}` : ''}</font>`),
+    input.entry,
+  ));
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },
