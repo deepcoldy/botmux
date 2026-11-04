@@ -95,7 +95,7 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--content-file', 'body.md', '-'])).toMatchObject({ ok: false });
   });
 
-  it('rejects attachment extra paths only when every extra token is a real file', () => {
+  it('rejects extra attachment-looking paths even when the path does not exist', () => {
     expect(client(['--files', 'a', 'b'], ['a', 'b'])).toMatchObject({
       ok: false,
       message: expect.stringContaining('额外路径'),
@@ -103,6 +103,7 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--images', 'p1', 'p2'], ['p1', 'p2'])).toMatchObject({ ok: false });
     expect(client(['--files', 'a', '正文'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'missing'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', 'missing.sql'], ['a'])).toMatchObject({ ok: false });
   });
 
   it('rejects --content-file - and card positional arguments before reading files', () => {
@@ -113,6 +114,10 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--card-file', 'card.json', 'extra'])).toMatchObject({
       ok: false,
       message: expect.stringContaining('不接受正文参数'),
+    });
+    expect(client(['--content-file', 'body.md', 'extra'])).toMatchObject({
+      ok: false,
+      message: expect.stringContaining('不能混用'),
     });
   });
 

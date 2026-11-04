@@ -263,6 +263,21 @@ export function parseSendInvocation(argv: string[]): SendInvocation {
   };
 }
 
+/** A positional token that is almost certainly a file path rather than prose.
+ *  The ④ heuristic already stats existing files; this catches the case where a
+ *  mistyped/missing attachment path does not exist on the client (and Riff's
+ *  host, which deliberately never stats). Keep the list deliberately narrow:
+ *  explicit path syntax or a common attachment extension. */
+function looksLikePathToken(token: string): boolean {
+  const value = token.trim();
+  if (!value) return false;
+  if (value === '.' || value === '..') return true;
+  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../') || value.startsWith('~/')) return true;
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+  if (/[\\/]/.test(value)) return true;
+  return /\.(?:sql|csv|tsv|jsonl?|md|txt|log|ya?ml|toml|ini|png|jpe?g|gif|webp|bmp|svg|pdf|zip|tar|gz|tgz|bz2|xz|mp4|mov|avi|webm|m4v|xlsx?|docx?|pptx?|html?|sh|py|ts|js|go|rs|java|c|cc|cpp|h)$/i.test(value);
+}
+
 function findClientRiffPlaceholder(invocation: SendInvocation): string | undefined {
   for (const token of invocation.argv) {
     if (isRiffUploadPlaceholder(token, 'client-loose')) return token;
@@ -315,6 +330,12 @@ export function validateClientSendInvocation(
       message: "botmux send: --content-file 不支持 '-'；多行正文请直接用 botmux send <<'EOF' … EOF，或用裸 '-' 作为唯一位置参数。",
     };
   }
+  if (contentFile !== undefined && invocation.positionals.length > 0) {
+    return {
+      ok: false,
+      message: `botmux send: --content-file 与位置参数正文不能混用；多余的参数：${invocation.positionals.join(' ')}。正文请只保留一种来源。`,
+    };
+  }
 
   if (invocation.positionals.includes('-')
     && !(invocation.bodySource === 'stdin' && invocation.positionals.length === 1)) {
@@ -337,7 +358,8 @@ export function validateClientSendInvocation(
     const allFiles = invocation.positionals.every(token => {
       try { return statFile(token, opts.cwd) === 'file'; } catch { return false; }
     });
-    if (allFiles) {
+    const pathLike = invocation.positionals.some(looksLikePathToken);
+    if (allFiles || pathLike) {
       return {
         ok: false,
         message: `botmux send: 检测到附件 flag 后面的额外路径被当成了正文：${invocation.positionals.join(' ')}。多个附件请重复写 --files/--images（例如 --files a --files b）；正文请用 heredoc/stdin 或 --content-file。`,
