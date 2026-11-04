@@ -116,6 +116,8 @@ describe('入口（§4.1）', () => {
     expect(byId.get('cli_off')?.unavailable?.code).toBe('daemon_offline');
     expect(byId.get('cli_nobypass')?.unavailable?.code).toBe('bypass_disabled');
     expect(byId.get('cli_profile')?.unavailable?.code).toBe('codex_profile');
+    // The steward bot (fakes: cli_steward, steward.enabled) cannot orchestrate.
+    expect(byId.get('cli_steward')?.unavailable?.code).toBe('steward');
     expect(byId.get(MAIN)?.name).toBe(`名字-${MAIN}`);
 
     const checks = new Map<string, InitiatorCheck>([

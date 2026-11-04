@@ -29,6 +29,7 @@ import { logger } from '../utils/logger.js';
 import type { BotConfig } from '../bot-registry.js';
 import { v3BotStaticExclusion } from '../workflows/v3/bot-assignment.js';
 import { isV3SupportedCli } from '../workflows/v3/contract.js';
+import { isStewardBot } from '../core/decision-board/model.js';
 
 export const WORKFLOW_DRAFTS_API_PATH = '/api/v3/orchestration/drafts';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -210,6 +211,8 @@ export type WorkflowOrchestratorUnavailableCode =
   | 'cli_unsupported'
   | 'bypass_disabled'
   | 'codex_profile'
+  /** The steward bot does not orchestrate (daemon refuses with orchestrator_ineligible). */
+  | 'steward'
   | 'daemon_offline';
 
 export interface WorkflowOrchestratorBotOption {
@@ -222,8 +225,9 @@ export interface WorkflowOrchestratorBotOption {
 
 /**
  * The orchestrator picker rows: every bot in bots.json, in file order. The
- * static rule is the one draft creation enforces on the daemon
- * (`v3BotStaticExclusion`); the code only picks the label.
+ * static rules are the ones draft creation enforces on the daemon
+ * (`v3BotStaticExclusion`, and the steward bot via `isStewardBot`); the code
+ * only picks the label.
  */
 export function workflowOrchestratorBotOptions(
   bots: readonly BotConfig[],
@@ -232,10 +236,12 @@ export function workflowOrchestratorBotOptions(
 ): WorkflowOrchestratorBotOption[] {
   return bots.map((bot) => {
     const online = isOnline(bot.larkAppId);
-    const why = v3BotStaticExclusion(bot);
-    const code: WorkflowOrchestratorUnavailableCode | undefined = why
+    const staticWhy = v3BotStaticExclusion(bot);
+    const steward = !staticWhy && isStewardBot(bot.steward);
+    const why = staticWhy ?? (steward ? '管家 Bot 不能当编排 Bot' : undefined);
+    const code: WorkflowOrchestratorUnavailableCode | undefined = staticWhy
       ? (!isV3SupportedCli(bot.cliId) ? 'cli_unsupported' : bot.disableCliBypass === true ? 'bypass_disabled' : 'codex_profile')
-      : online ? undefined : 'daemon_offline';
+      : steward ? 'steward' : online ? undefined : 'daemon_offline';
     return {
       larkAppId: bot.larkAppId,
       name: nameOf(bot.larkAppId),
