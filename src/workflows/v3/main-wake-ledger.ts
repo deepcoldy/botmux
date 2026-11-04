@@ -7,11 +7,14 @@
  * nothing: a `workflow-event:` turn is recognised only when the daemon that
  * owns the run recorded, before starting the turn, exactly which session it
  * issued it to. Records are create-once files under the run directory (host
- * state; masked from sandboxed CLIs). Nothing issues them yet — the wake-up
- * wiring lands separately.
+ * state; masked from sandboxed CLIs). The issuer is the main-wake wiring
+ * (`core/workflow-main-wake.ts`): it records the turn in the trigger's
+ * write-ahead hook, right before the turn reaches the session's worker, so a
+ * record exists exactly for wake turns that were handed to a worker — and the
+ * create-once file is also what keeps one event from waking the bot twice.
  */
 
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
@@ -32,17 +35,17 @@ export interface V3MainWakeRecord {
    *  a request from it is authenticated as that newer message's turn instead
    *  (its sender: the initiator stays direct, anyone else proposes).
    *
-   *  Contract for the issuer (the M6 wake-up, PR 5b): it MUST record this
+   *  Contract for the issuer (the M6 wake-up): it MUST record this
    *  snapshot when it opens the wake turn. A record without it counts as
    *  overtaken whenever the session has any pointer (the verifier cannot
    *  tell an old pointer from a newer message), so the wake turn would never
    *  act for the initiator.
    *
-   *  Open for 5b: the verifier cannot tell WHO advanced a pointer. A synthetic
-   *  turn that moves them (e.g. a `trg_` report relay opening a turn in the
-   *  main session) also makes the wake turn stale. Whether such turns should
-   *  leave the pointers alone, record their own provenance, or re-issue the
-   *  wake turn is the issuer's decision; this PR keeps the strict rule. */
+   *  Synthetic turns: a pointer an unattended daemon-minted turn moved
+   *  (`trg_` report relay, another `workflow-event:` wake, `schedule:`) does
+   *  not count as overtaking — nobody interjected — so such a turn queued
+   *  behind the wake turn leaves it acting. Only those prefixes are exempt
+   *  (`isUnattendedSyntheticTurnId`); every other pointer still counts. */
   turnPointersAtIssue?: { quoteTargetId?: string; currentReplyTargetTurnId?: string };
 }
 
@@ -91,4 +94,16 @@ export function readV3MainWakeIssued(runDir: string, eventSeq: number): V3MainWa
   } catch {
     return undefined;
   }
+}
+
+/** Daemon side: take back the record of a wake turn the session's worker
+ *  provably never received (it refused the input synchronously, before
+ *  accepting it) so the event can be issued again. Only the exact turn this
+ *  caller recorded is removed. */
+export function retractV3MainWakeIssued(runDir: string, eventSeq: number, turnId: string): boolean {
+  const issued = readV3MainWakeIssued(runDir, eventSeq);
+  if (!issued || issued.turnId !== turnId) return false;
+  unlinkSync(recordPath(runDir, eventSeq));
+  fsyncDirectorySyncPortable(join(runDir, MAIN_WAKES_DIR));
+  return true;
 }

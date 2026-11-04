@@ -26,7 +26,7 @@ import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-bro
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
@@ -784,6 +784,9 @@ import {
   requestV3Retry,
   requestV3LoopGrant,
 } from './workflows/v3/daemon-run.js';
+import { v3ActionActor, v3ActionRecord, v3ReasonRequiredProblem } from './workflows/v3/action-provenance.js';
+import { handNodeToHuman } from './workflows/v3/external-control.js';
+import { createWorkflowMainWake, workflowMainWakeSessionState } from './core/workflow-main-wake.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3RerunGrantCard, buildV3RevisionCard } from './im/lark/v3-revision-card.js';
 import {
@@ -7021,6 +7024,45 @@ async function workflowHandoffIdentityCheck(
   });
 }
 
+/** M6: a bot-executed run's stuck / failed node, a bot reporting it cannot
+ *  do a node, or a completed checkpoint node opens one turn in the run's main
+ *  session (design 2026-11-03 §13.6). Only runs this daemon's bot owns. */
+const workflowMainWake = createWorkflowMainWake({
+  baseDir: () => v3DefaultBaseDir(),
+  selfLarkAppId: () => selfDaemonLarkAppId ?? undefined,
+  loadRun: workflowLoadBotRun,
+  readBinding: (runDir) => readV3RunChatBinding(runDir),
+  mainSessionAt: (binding) => {
+    const ds = binding.rootMessageId ? activeSessions.get(sessionKey(binding.rootMessageId, binding.larkAppId)) : undefined;
+    return ds && ds.session.status === 'active' ? { sessionId: ds.session.sessionId } : undefined;
+  },
+  sessionView: (sessionId) => {
+    const ds = findActiveBySessionId(sessionId);
+    if (!ds) return undefined;
+    const view = v3RelaySessionView(ds);
+    return {
+      sessionId,
+      ...(view.rootMessageId ? { rootMessageId: view.rootMessageId } : {}),
+      ...(view.quoteTargetId ? { quoteTargetId: view.quoteTargetId } : {}),
+      ...(view.currentReplyTargetTurnId ? { currentReplyTargetTurnId: view.currentReplyTargetTurnId } : {}),
+      ...(ds.initialStartPending ? { opening: true } : {}),
+    };
+  },
+  // The cascade's idle evidence (cli-idle-wait); until restore re-attached
+  // the CLIs that survived a restart, every session counts as busy.
+  sessionState: (sessionId) => workflowMainWakeSessionState(findActiveBySessionId(sessionId), { sessionsRestored }),
+  deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: workflowSelfAppId(), activeSessions }, internal),
+  drive: (runId) => v3GateRunner.driveDetached(runId),
+  listRunIds: () => {
+    try {
+      return readdirSync(v3DefaultBaseDir()).filter((name) => isValidV3RunId(name));
+    } catch {
+      return [];
+    }
+  },
+  warn: (message) => logger.warn(message),
+});
+
 /** 「改派」 on bot-executed runs' blocked cards: the same live §6.1 probe the
  *  approval uses, against the run's chat. */
 const v3BlockedReassignDeps: V3BlockedReassignDeps = {
@@ -7138,11 +7180,12 @@ const v3GateRunner = createV3GateRunner({
   },
   onDriveBegin: (runId) => v3ProgressCardManager.observe(runId),
   onDriveEnd: async (runId) => {
-    // Node cards exist only for bot-executed runs; the sync returns at once
-    // for every other run.
+    // Node cards and main-bot wakes exist only for bot-executed runs; both
+    // return at once for every other run.
     await Promise.all([
       v3ProgressCardManager.stopAndRefresh(runId),
       workflowNodeDaemon.syncNodeCards(runId),
+      workflowMainWake.scan(runId),
     ]);
   },
   onError: (runId, err) => {
@@ -7810,9 +7853,10 @@ const workflowDaemonIpcNonces = createWorkflowDaemonIpcNonceStore();
 interface WorkflowDaemonMutationBodies {
   start: Record<string, never>;
   cancel: { reason?: string };
-  retry: { nodeId?: string };
+  retry: import('./workflows/v3/daemon-ipc-body.js').WorkflowRetryMutationBody;
   grant: { loopId?: string };
   edit: import('./workflows/v3/daemon-ipc-body.js').WorkflowEditMutationBody;
+  'ask-human': import('./workflows/v3/daemon-ipc-body.js').WorkflowAskHumanMutationBody;
 }
 
 type WorkflowDaemonMutationHandler<K extends WorkflowDaemonMutation> = (
@@ -8119,10 +8163,15 @@ workflowDaemonMutationRoute('retry', async (reply, params, body, identity) => {
   if (binding.larkAppId !== identity.larkAppId) {
     return reply(409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
   }
+  // A wake turn must say why it retries (design §13.6); a human turn may not.
+  const missingReason = v3ReasonRequiredProblem(body.caller, body.reason);
+  if (missingReason) return reply(400, { ok: false, error: 'reason_required', detail: missingReason });
   let outcome;
   try {
+    const record = v3ActionRecord(body.caller, body.reason);
     outcome = requestV3Retry(v3DefaultBaseDir(), runId, {
       ...(body.nodeId ? { nodeId: body.nodeId } : {}),
+      ...(Object.keys(record).length > 0 ? { record } : {}),
     });
   } catch (err) {
     return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -8193,6 +8242,7 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
       patch: body.patch,
       baseRevision: body.base,
       caller: body.caller,
+      ...(body.reason ? { reason: body.reason } : {}),
       resolveNewBotSnapshot: (selector) => {
         const snapshot = botToSnapshot(resolveBotConfig(selector, loadBotConfigs()));
         if (!isV3SupportedCli(snapshot.cliId)) {
@@ -8288,6 +8338,48 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
         ...(outcome.detail ? { detail: outcome.detail } : {}),
       });
   }
+});
+
+// v3 hand a node to a human (design §13.6): stop its running attempt (the
+// timeout close path), record why, and block it as HANDED_TO_HUMAN — or, for a
+// node already blocked, record why. The blocked card handles it from there.
+// Same owner posture as /retry (the CLI checked the caller is the initiator or
+// this run's wake turn). Body: { nodeId, reason, caller }.
+workflowDaemonMutationRoute('ask-human', async (reply, params, body, identity) => {
+  const runId = params.runId;
+  if (!isValidV3RunId(runId)) return reply(400, { ok: false, error: 'bad_run_id' });
+  const runDir = join(v3DefaultBaseDir(), runId);
+  const binding = readV3RunChatBinding(runDir);
+  if (!binding) return reply(404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (binding.larkAppId !== identity.larkAppId) {
+    return reply(409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+  }
+  const run = loadV3BotExecutedRun(runDir);
+  if (!run) return reply(409, { ok: false, error: 'not_bot_run' });
+  let outcome;
+  try {
+    outcome = await handNodeToHuman(runDir, {
+      nodeId: body.nodeId,
+      reason: body.reason,
+      by: v3ActionActor(body.caller),
+      ...(body.caller.turnId ? { turnId: body.caller.turnId } : {}),
+    }, { executor: workflowNodeDaemon.executor, nodeExecutor: 'bot' });
+  } catch (err) {
+    return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+  if (outcome.kind === 'rejected') {
+    return reply(outcome.reason === 'missing' ? 404 : 409, { ok: false, error: outcome.reason });
+  }
+  if (outcome.stopError !== undefined) {
+    logger.warn(`[v3:${runId}] ask-human stop of ${outcome.attemptId} failed: ${outcome.stopError instanceof Error ? outcome.stopError.message : String(outcome.stopError)}`);
+  }
+  // A closed attempt blocks the run on the next drive (blocked card); the
+  // node card shows the reason either way.
+  v3GateRunner.driveDetached(runId);
+  return reply(200, {
+    ok: true, runId, nodeId: outcome.nodeId, attemptId: outcome.attemptId, closedOpenAttempt: outcome.closedOpenAttempt,
+    ...(outcome.settledMeanwhile ? { settledMeanwhile: outcome.settledMeanwhile } : {}),
+  });
 });
 
 // Isolated (sandboxed / read-isolated) main sessions reach status / edit
@@ -32569,6 +32661,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
       observeAutoCompact(ds, context.status);
+      // A main-bot wake waits for its main session to be idle; the end of a
+      // wake turn there also ends a checkpoint's review (bot-executed runs only).
+      workflowMainWake.onScreenStatus(ds.session.sessionId, {
+        status: context.status,
+        ...(context.prevStatus !== undefined ? { prevStatus: context.prevStatus } : {}),
+        ...(context.turnId ? { turnId: context.turnId } : {}),
+      });
       if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       try {
         if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);
@@ -32689,6 +32788,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
     async onTurnTerminal(ds, terminal, context) {
+      workflowMainWake.onTurnEnded(ds.session.sessionId, terminal.turnId);
       if (ds.session.deploymentContinuation?.state !== 'cancelled'
         && ds.session.deploymentContinuation?.workerGeneration === context.workerGeneration) {
         try { cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), terminal.turnId); }
@@ -34493,6 +34593,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   await v3ProgressCardManager.coldAttach(cfg.larkAppId).catch((err) => {
     logger.warn(`[v3] progress-card cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
+  });
+  // Main-bot wakes a crash or restart left unissued (bot-executed runs only;
+  // a blocked run is not re-driven, so the drive hook alone would miss them).
+  void workflowMainWake.coldAttach().catch((err) => {
+    logger.warn(`[v3] main-wake cold-attach failed: ${err instanceof Error ? err.message : String(err)}`);
   });
 
   // Opt-in owner notifications (`schedule add --notify`); target and wording

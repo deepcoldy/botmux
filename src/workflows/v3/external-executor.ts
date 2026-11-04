@@ -36,6 +36,8 @@ export const V3_EXTERNAL_ERROR_CODES = {
    *  run's Gate-2 working dir: not inside its configured range (design §15.4). */
   WORKING_DIR_REFUSED: 'WORKING_DIR_REFUSED',
   NODE_TIMEOUT: 'NODE_TIMEOUT',
+  /** The main bot (or the initiator) handed the node to a human (§13.6). */
+  HANDED_TO_HUMAN: 'HANDED_TO_HUMAN',
 } as const;
 
 export type V3ExternalErrorCode =
@@ -137,7 +139,8 @@ export type V3ExternalStopReason =
   | 'uncertain'
   | 'reassigned'
   | 'obsolete'
-  | 'runBoundary';
+  | 'runBoundary'
+  | 'handedToHuman';
 
 export interface V3ExternalStopRequest extends V3ExternalAttemptRef {
   reason: V3ExternalStopReason;
