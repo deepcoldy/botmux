@@ -5,13 +5,17 @@ import { join } from 'node:path';
 import { inspect } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { feedbackPostgresPool } from '../src/services/feedback-postgres-schema.js';
-import { configureFeedbackStorageCandidate, feedbackStorageView } from '../src/services/feedback-storage-management.js';
+import { configureFeedbackStorageCandidate, feedbackStorageView, testFeedbackStorageConnection } from '../src/services/feedback-storage-management.js';
 import { readFeedbackStorageConfig, readPostgresCredential } from '../src/services/feedback-storage-config.js';
 import type { PostgresTarget } from '../src/services/feedback-storage-types.js';
 import type { PoolClient } from 'pg';
+import { prepareFeedbackMigration, resumeFeedbackMigration } from '../src/services/feedback-migration.js';
+import { getFeedbackStorage, closeAllFeedbackStorage } from '../src/services/feedback-storage.js';
+import { writeFile } from 'node:fs/promises';
 
 const directories: string[] = [];
 afterEach(async () => {
+  await closeAllFeedbackStorage();
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
   delete process.env.BYTEPG_TEST_TOKEN;
 });
@@ -64,6 +68,26 @@ const target = (port: number): PostgresTarget => ({
   tls: { mode: 'disable' }, connectTimeoutMs: 1000,
 });
 describe('BytePG feedback authentication', () => {
+  it('uses the same token credential for connection tests, runtime and migration, without persisting its value', async () => {
+    const server = await gateway(true);
+    const token = 'synthetic-all-paths-token';
+    const directory = await mkdtemp(join(tmpdir(), 'bytepg-paths-')); directories.push(directory);
+    process.env.BYTEPG_TEST_TOKEN = token;
+    const initial = await readFeedbackStorageConfig(directory);
+    const configured = await configureFeedbackStorageCandidate(directory, { expectedGeneration: initial.generation, candidate: { backend: 'postgresql', postgres: target(server.port) } });
+    try {
+      await expect(testFeedbackStorageConnection(directory)).rejects.toThrow('feedback_bytepg_connection_or_query_failed');
+      const job = await prepareFeedbackMigration(directory, { requestId: 'synthetic-request', expectedGeneration: configured.generation, maintenanceConfirmed: true });
+      const stopped = await resumeFeedbackMigration(directory, job.migrationId);
+      expect(stopped.phase).toBe('blocked');
+      expect(JSON.stringify(stopped)).not.toContain(token);
+      expect(await readFile(join(directory, 'feedback-migrations', `${job.migrationId}.json`), 'utf8')).not.toContain(token);
+      await writeFile(join(directory, 'feedback-storage.json'), JSON.stringify({ ...configured, active: configured.candidate, candidate: undefined }));
+      await expect(getFeedbackStorage(directory)).rejects.toThrow('feedback_bytepg_connection_or_query_failed');
+      expect(server.startups).toHaveLength(3);
+      for (const startup of server.startups) expect(startup.options).toContain(`bytepg_auth_token=${token}`);
+    } finally { await server.close(); }
+  });
   it('supports IPv6 hosts and redacts query errors and notices echoed by a gateway', async () => {
     const server = await gateway('query', '::1'), token = 'synthetic-ipv6-query-token';
     const pool = feedbackPostgresPool({ ...target(server.port), host: '::1' }, token);
