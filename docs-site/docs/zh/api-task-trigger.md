@@ -103,6 +103,8 @@
 
 **`envelope.trusted` 必须是 `false`** 是防注入设计：它声明「以下 envelope 内容是不可信外部数据」，daemon 才会把整个 envelope 包进 `<botmux_external_event trusted="false">` 并明确告诉模型不要执行其中夹带的指令。**你真正要机器人执行的事情放在顶层 `instruction`**，它会渲染成 `<botmux_task trusted="true">` 置于事件数据之上。
 
+> 例外：Webhook 接入点打开「[把事件内容当作可信指令](/webhook#把事件内容当作可信指令可选默认关)」时，Dashboard 会在转发的请求顶层带上 `payloadTrusted: true`（`envelope.trusted` 仍为 `false`），daemon 把事件数据按可信任务渲染。该字段只接受 `source.type: "webhook"` 且 `target.kind: "turn"` 的请求，其它组合返回 400；直接调用 `/api/trigger` 时不需要它，要执行的事放 `instruction` 即可。
+
 ### 3.4 `presentation`（可选，控制飞书里的呈现）
 
 | 字段 | 取值 | 默认 |

@@ -17347,6 +17347,9 @@ form.dashboard-toolbar > input[type="text"]:focus {
 .connector-log-policy > span { display: grid; gap: 4px; }
 .connector-log-policy strong { color: var(--fg); font-size: 12px; }
 .connector-log-policy small { color: var(--muted); font-size: 11.5px; font-weight: 600; line-height: 1.45; }
+.connector-log-policy small.connector-trust-payload-risk { color: var(--warning); }
+.connector-trust-payload:has(input:checked) { border-color: color-mix(in srgb, var(--warning) 55%, var(--border-soft)); }
+.connector-trust-payload:has(input:disabled) { cursor: not-allowed; }
 
 .connector-created-wrap {
   margin-top: 12px;
