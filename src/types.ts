@@ -526,6 +526,15 @@ export interface WorkflowNodeSessionMarker {
   /** Main-topic placement: the CLI turn the handoff started in (with any
    *  messages folded into it) went idle again. */
   handoffSettledAt?: string;
+  /** Main-topic placement: the worker generation the handoff turn started
+   *  in. Another generation (daemon restart, respawned worker) means that
+   *  CLI turn is over, whatever idle signal was missed. */
+  handoffWorkerGeneration?: number;
+  /** Main-topic placement: the latest turn that started in the session
+   *  while the attempt was in progress, and when the session next went idle
+   *  — persisted so a stop after a restart still finds the node's later
+   *  turn (a CLI kept by a persistent backend may still be running it). */
+  lastTurn?: { turnId: string; settledAt?: string };
 }
 
 export interface Session {

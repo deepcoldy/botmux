@@ -572,6 +572,7 @@ function NodePanel(props: {
           <p className="v3r-exec-row">
             <span>落点</span>主话题
             {node.handoff?.at !== undefined ? ` · ${formatClock(node.handoff.at)} 交接` : '（还没交接）'}
+            {node.handoff?.queued ? ' · 排队中：等执行 Bot 在主话题里的当前一轮结束' : ''}
             {node.handoff?.title ? ` · 在主话题里找「${node.handoff.title}」` : ''}
           </p>
         ) : null}

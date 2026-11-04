@@ -18,11 +18,14 @@ import type { V3Dag } from '../workflows/v3/dag.js';
 import type { V3ExternalNodeExecutor } from '../workflows/v3/external-executor.js';
 import { v3AcceptanceProbeUnknownSince } from '../workflows/v3/runtime.js';
 import { safeExternalAttemptDir } from '../workflows/v3/external-control.js';
+import { v3MainTopicQueueGraceMs } from '../workflows/v3/external-executor.js';
+import { DEFAULT_NODE_TIMEOUT_SEC } from '../workflows/v3/dag.js';
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import type { LarkAttachment, WorkflowNodeSessionMarker } from '../types.js';
 import type { DaemonSession } from './types.js';
 import {
   isWorkflowHandoffRevoked,
+  lookupWorkflowHandoffByNonce,
   readDispatchRegistryLoose,
   recordWorkflowHandoffRefusal,
   resolveInboundWorkflowHandoff,
@@ -310,11 +313,6 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       .catch((err) => deps.warn(`[workflow] withdrawing identity of ${turnId} failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
-  /** The last turn each session started under a marker (§5.5), in memory.
-   *  Only consulted for a main-topic node's LATER turns (after its handoff
-   *  turn went idle); the handoff turn itself is tracked on the persisted
-   *  marker (`handoffStartedAt` / `handoffSettledAt`). */
-  const lastStartedTurn = new Map<string, string>();
 
   /**
    * Main topic (§5.5): should a stop interrupt what this shared session runs
@@ -330,9 +328,17 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
    * it went idle, only a later turn of the node itself is.
    */
   function mainTopicNodeTurnRunning(ds: DaemonSession, marker: WorkflowNodeSessionMarker): boolean {
-    if (marker.handoffStartedAt && !marker.handoffSettledAt) return true;
-    const last = lastStartedTurn.get(ds.session.sessionId);
-    return !!marker.handoffSettledAt && !!last && last !== marker.handoffMessageId && !!marker.turnIds?.includes(last);
+    if (!marker.handoffStartedAt) return false;
+    // The handoff turn is over once the session went idle after it started
+    // (any idle edge, whatever turn it names) — or the worker it started in
+    // is gone (restart / respawn: an idle signal may never come).
+    const settled = !!marker.handoffSettledAt || marker.handoffWorkerGeneration !== ds.workerGeneration;
+    if (!settled) return true;
+    // After it: only a later turn of the node itself that has not gone idle
+    // (persisted: a CLI a persistent backend kept across a restart may still
+    // run it; on an idle screen the interrupt is a no-op anyway).
+    const last = marker.lastTurn;
+    return !!last && !last.settledAt && last.turnId !== marker.handoffMessageId && !!marker.turnIds?.includes(last.turnId);
   }
 
   function stopHandoffTurn(nonce: string, sessionId: string | undefined, opts?: { evenIfIdle?: boolean }): boolean {
@@ -345,10 +351,11 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       // Main topic: the attempt is over for this ordinary session; stop only
       // the handoff's own turn, never someone else's turn in the same session
       // (a queued handoff turn is stopped when it starts, onTurnStarted).
-      if (!marker.closedAt && !marker.submittedAt) {
-        ds.session.workflowNode = { ...marker, closedAt: new Date().toISOString() };
-        deps.updateSession(ds);
-      }
+      // Already over before this call (a second stop, a late "revoked"
+      // answer): whatever runs now is not the node's — nothing to interrupt.
+      if (marker.closedAt || marker.submittedAt) return false;
+      ds.session.workflowNode = { ...marker, closedAt: new Date().toISOString() };
+      deps.updateSession(ds);
       return mainTopicNodeTurnRunning(ds, marker) ? deps.interruptTurn(ds, opts) : false;
     }
     return false;
@@ -356,10 +363,10 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
 
   /** Main topic: the attempt ended here without work handed in (the bot
    *  reported it cannot do it) — the session is ordinary again. */
-  function closeMainMarker(sessionId: string, nonce: string): void {
+  function closeMainMarker(sessionId: string | undefined, nonce: string): void {
     for (const ds of deps.activeSessions()) {
       const marker = ds.session.workflowNode;
-      if (ds.session.sessionId !== sessionId || marker?.nonce !== nonce || marker.placement !== 'main') continue;
+      if ((sessionId !== undefined && ds.session.sessionId !== sessionId) || marker?.nonce !== nonce || marker.placement !== 'main') continue;
       if (marker.closedAt || marker.submittedAt) continue;
       ds.session.workflowNode = { ...marker, closedAt: new Date().toISOString() };
       deps.updateSession(ds);
@@ -413,9 +420,47 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     executingLarkAppId: string,
   ): string | undefined {
     if (placement !== 'main' || !existing || existing.placement !== 'main' || existing.nonce === nonce) return undefined;
-    if (!workflowNodeMarkerActive(existing) || isRevoked(existing.nonce)) return undefined;
+    if (closeMainMarkerIfOver(existing)) return undefined;
     return `${deps.botName(executingLarkAppId)} 在主话题里正在执行另一个工作流节点（run ${existing.runId} 的 ${existing.nodeId}），`
       + '同一个会话不能同时执行两个节点；等它结束后重试，或改派，或把这个节点改成节点话题';
+  }
+
+  /** Slack on top of a main-topic attempt's latest possible deadline. */
+  const MAIN_MARKER_EXPIRY_SLACK_MS = 10 * 60_000;
+
+  /**
+   * F5: is this main-topic marker's attempt over, even though no stop or
+   * submission reached this session? Over when it is no longer active, its
+   * handoff was revoked, its binding is gone (registry entries are pruned
+   * after two days, revocations included — a marker whose binding cannot be
+   * found is never treated as a node in progress), or it is past the latest
+   * deadline the attempt can have (from its start: the node timeout; never
+   * started: acceptance + timeout + queue grace) plus a slack. An over marker
+   * is closed in every session holding it, so the session stops counting as
+   * occupied and stops reporting for it.
+   */
+  function closeMainMarkerIfOver(marker: WorkflowNodeSessionMarker): boolean {
+    if (marker.placement !== 'main') return false;
+    if (!workflowNodeMarkerActive(marker)) return true;
+    const found = lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(deps.dataDir()), nonce: marker.nonce, secret: deps.bindingSecret() });
+    let over = found.kind !== 'workflow' || found.revoked;
+    if (!over) {
+      const runDir = runDirOf(marker.runId);
+      let timeoutSec = DEFAULT_NODE_TIMEOUT_SEC;
+      try {
+        const node = runDir ? deps.loadRun(runDir)?.dag.nodes.find((candidate) => candidate.id === marker.nodeId) : undefined;
+        if (node?.timeoutSec !== undefined) timeoutSec = node.timeoutSec;
+      } catch { /* the default bound */ }
+      const timeoutMs = timeoutSec * 1000;
+      const started = marker.handoffStartedAt ? Date.parse(marker.handoffStartedAt) : NaN;
+      const registered = Date.parse(marker.registeredAt);
+      const latest = Number.isFinite(started)
+        ? started + timeoutMs
+        : (Number.isFinite(registered) ? registered : 0) + timeoutMs + v3MainTopicQueueGraceMs(timeoutMs);
+      over = (deps.now ?? Date.now)() > latest + MAIN_MARKER_EXPIRY_SLACK_MS;
+    }
+    if (over) closeMainMarker(undefined, marker.nonce);
+    return over;
   }
 
   async function refuse(
@@ -824,6 +869,12 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     },
     onRegistered: registered,
     onInputCommitted: (ds, context) => {
+      // F5: a main-topic marker whose attempt ended out of this daemon's
+      // sight (a stop that never arrived) is collected on the next input.
+      const held = ds.session.workflowNode;
+      // (A revoked one goes the stop path below: its running turn is interrupted.)
+      if (held?.placement === 'main' && workflowNodeMarkerActive(held) && !isRevoked(held.nonce)
+        && closeMainMarkerIfOver(held)) return;
       const marker = openMarker(ds);
       if (!marker) return;
       const sessionId = ds.session.sessionId;
@@ -853,16 +904,35 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       marker.orchestratorAppId, (result) => stopIfRevoked(result, sessionId, marker.nonce));
     },
     onTurnSettled: (ds, context) => {
+      let current = ds.session.workflowNode;
+      if (current?.placement === 'main' && current.lastTurn && !current.lastTurn.settledAt) {
+        // Whatever turn that was, the session is idle again.
+        current = { ...current, lastTurn: { ...current.lastTurn, settledAt: new Date(context.at).toISOString() } };
+        ds.session.workflowNode = current;
+        deps.updateSession(ds);
+      }
+      if (current?.placement === 'main' && current.handoffStartedAt && !current.handoffSettledAt) {
+        // §5.5: the first working → idle edge after the handoff turn started
+        // ends that CLI turn, whatever turn id the frame names (a respawned
+        // worker sends none; another turn may have taken over the envelope).
+        ds.session.workflowNode = { ...current, handoffSettledAt: new Date(context.at).toISOString() };
+        deps.updateSession(ds);
+        // The start notice may have been lost; it is idempotent on the main
+        // bot's side, so say it once more (the deadline then counts from it).
+        if (workflowNodeMarkerActive(current)) {
+          const sessionId = ds.session.sessionId;
+          const startedAt = Date.parse(current.handoffStartedAt);
+          notify({
+            kind: 'accepted', nonce: current.nonce, dispatchRoot: current.handoffMessageId, sessionId,
+            ...(Number.isFinite(startedAt) ? { startedAt } : {}),
+          }, current.orchestratorAppId);
+        }
+      }
       const marker = openMarker(ds);
       if (!marker || !context.turnId) return;
       // Only turns started under this handoff: an idle edge of a turn that
       // was already in flight before it was registered must not stall it.
       if (context.turnId !== marker.handoffMessageId && !marker.turnIds?.includes(context.turnId)) return;
-      if (marker.placement === 'main' && marker.handoffStartedAt && !marker.handoffSettledAt) {
-        // The CLI turn the handoff ran in (with anything folded into it) is over.
-        ds.session.workflowNode = { ...marker, handoffSettledAt: new Date(context.at).toISOString() };
-        deps.updateSession(ds);
-      }
       notify({ kind: 'stalled', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId: ds.session.sessionId, at: context.at },
         marker.orchestratorAppId);
     },
@@ -870,14 +940,23 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       let marker = ds.session.workflowNode;
       if (!marker) return;
       const sessionId = ds.session.sessionId;
-      lastStartedTurn.set(sessionId, context.turnId);
-      if (lastStartedTurn.size > 1024) lastStartedTurn.delete(lastStartedTurn.keys().next().value!);
+      if (marker.placement === 'main' && workflowNodeMarkerActive(marker) && context.turnId !== marker.handoffMessageId) {
+        // Persisted (F2): a stop after a restart still finds the node's
+        // later turn — and knows which worker generation it ran in.
+        marker = { ...marker, lastTurn: { turnId: context.turnId } };
+        ds.session.workflowNode = marker;
+        deps.updateSession(ds);
+      }
       // Only a main-topic handoff's own turn: a node topic's timeout already
       // counts from acceptance.
       if (marker.placement !== 'main' || context.turnId !== marker.handoffMessageId) return;
       if (!marker.handoffStartedAt) {
         // Persisted: a stop (also after a restart) knows the node's turn runs.
-        marker = { ...marker, handoffStartedAt: new Date(context.startedAt).toISOString() };
+        marker = {
+          ...marker,
+          handoffStartedAt: new Date(context.startedAt).toISOString(),
+          ...(ds.workerGeneration !== undefined ? { handoffWorkerGeneration: ds.workerGeneration } : {}),
+        };
         ds.session.workflowNode = marker;
         deps.updateSession(ds);
       }

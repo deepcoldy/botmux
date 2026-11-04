@@ -156,7 +156,7 @@ export interface RunNodeView {
   /** Bot-executed runs (§5.5): the node's latest handoff — where it went, when,
    *  and for the main topic the handoff card's title to find it there by (no
    *  stable AppLink to a single message exists). Absent before a handoff. */
-  handoff?: { placement: 'topic' | 'main'; at?: number; title?: string };
+  handoff?: { placement: 'topic' | 'main'; at?: number; title?: string; queued?: true };
 }
 
 export interface RunNodeInterventionView {
@@ -701,6 +701,8 @@ function projectHandoffs(
       placement,
       ...(attempt.sentAt !== undefined ? { at: attempt.sentAt } : {}),
       ...(title ? { title } : {}),
+      // Accepted into a busy main-topic session's queue, not started (§5.5).
+      ...(attempt.startPending && !attempt.closed ? { queued: true as const } : {}),
     });
   }
   return out;

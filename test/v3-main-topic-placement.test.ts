@@ -465,5 +465,16 @@ describe('board projection (§5.5, §12.2)', () => {
     expect(a.placement).toBeUndefined();
     expect(b.placement).toBe('main');
     expect(b.handoff).toEqual({ placement: 'main', at: 1_700_000_000_000, title: '【工作流任务】周报 · b（第 1 次）' });
+    // Accepted into a busy session's queue: the board says so (§5.5).
+    appendEvent(journal, {
+      type: 'nodeHandoffAccepted', nodeId: 'b', instanceId: 'b#001', attemptId: 'b#001/attempts/001',
+      sessionId: 's', acceptedAt: 1_700_000_001_000, deadlineAt: 1_700_009_000_000, startPending: true,
+    });
+    expect(projectRun('r', runDir).nodes.find((node) => node.id === 'b')!.handoff).toMatchObject({ queued: true });
+    appendEvent(journal, {
+      type: 'nodeHandoffStarted', nodeId: 'b', instanceId: 'b#001', attemptId: 'b#001/attempts/001',
+      startedAt: 1_700_000_002_000, deadlineAt: 1_700_000_602_000,
+    });
+    expect(projectRun('r', runDir).nodes.find((node) => node.id === 'b')!.handoff).not.toHaveProperty('queued');
   });
 });

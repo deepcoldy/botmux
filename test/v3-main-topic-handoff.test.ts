@@ -161,6 +161,7 @@ describe('acceptance and the node deadline in the main topic', () => {
     expect(expectTerminal(await run.drive(world.executor, { opts: { chatBinding: BINDING } })).runStatus).toBe('blocked');
     const [blocked] = run.of('nodeBlocked');
     expect(blocked).toMatchObject({ errorCode: 'NODE_TIMEOUT' });
+    expect(blocked!.message).toContain('没收到这一轮开始的信号');
     expect(blocked!.message).toContain('一直在执行 Bot 的主话题会话里排队');
     expect(blocked!.message).toContain('节点话题');
   });

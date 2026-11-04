@@ -3092,7 +3092,7 @@ export async function runWorkflow(
           message: attempt.startPending
             // Main topic (§5.5): accepted into a busy session's queue, and its
             // own turn never started within the backstop (timeout + grace).
-            ? '这一轮一直在执行 Bot 的主话题会话里排队，到期限还没开始（它前面的回合一直没结束）；可以重试，或把节点改成节点话题'
+            ? '到期限还没收到这一轮开始的信号：多半是一直在执行 Bot 的主话题会话里排队（它前面的回合一直没结束），也可能是开始信号没送到；可以重试，或把节点改成节点话题'
             : 'the node did not submit a valid result before its timeout',
         });
         progressed = true;

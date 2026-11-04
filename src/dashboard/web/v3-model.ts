@@ -158,7 +158,8 @@ export function nodeInMainTopic(node: RunNodeView): boolean {
  *  node topic is the default and is not marked). */
 export function nodeBoxBotLine(node: RunNodeView): string {
   const line = nodeBotLine(node);
-  return line && nodeInMainTopic(node) ? `${line} · 主话题` : line;
+  if (!line || !nodeInMainTopic(node)) return line;
+  return node.handoff?.queued ? `${line} · 主话题 · 排队中` : `${line} · 主话题`;
 }
 
 export const V3_DECISION_LABEL: Record<string, string> = {

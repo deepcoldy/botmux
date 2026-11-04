@@ -123,7 +123,7 @@ const SECRET = 'host-binding-secret';
 const NONCE = 'wfh_aaaaaaaaaaaaaaaaaaaaaaaa';
 const H = 'om_handoff';
 
-async function world() {
+async function world(initialStatus: string | undefined = 'working') {
   // The binding secret lives next to the data dir: keep both in our own dir.
   const dataDir = join(mkdtempSync(join(tmpdir(), 'wp-main-topic-')), 'data');
   mkdirSync(dataDir, { recursive: true });
@@ -144,7 +144,7 @@ async function world() {
       createdAt: new Date().toISOString(), chatType: 'group', cliId: 'claude-code', workingDir: '/repo', workflowNode: marker },
     worker, workerPort: 9999, workerToken: 'tok', larkAppId: 'app_test', chatId: 'oc_chat', chatType: 'group',
     scope: 'thread', spawnedAt: 1, lastMessageAt: 2, hasHistory: true, workingDir: '/repo',
-    displayMode: 'hidden', lastScreenContent: '', lastScreenStatus: 'working',
+    displayMode: 'hidden', lastScreenContent: '', lastScreenStatus: initialStatus, workerReady: true,
   } as unknown as DaemonSession;
   const interrupted: string[] = [];
   const deps = {
@@ -165,10 +165,14 @@ async function world() {
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_notice'), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(),
     onWorkflowNodeTurnStarted: (session: DaemonSession, context: { turnId: string; startedAt: number }) => nodeDaemon.onTurnStarted(session, context),
+    onWorkflowNodeTurnSettled: (session: DaemonSession, context: { turnId?: string; at: number }) => nodeDaemon.onTurnSettled(session, context),
+    onWorkflowNodeInputCommitted: (session: DaemonSession, context: { turnId: string; committedAt: number }) => nodeDaemon.onInputCommitted(session, context),
   } as any);
   __testOnly_setupWorkerHandlers(ds, worker as any);
   const started = (turnId: string) => worker.emit('message', { type: 'turn_execution_started', turnId, startedAtMs: Date.now() });
-  return { dataDir, ds, nodeDaemon, interrupted, started };
+  const screen = (status: string, turnId?: string) =>
+    worker.emit('message', { type: 'screen_update', content: 'x', status, ...(turnId ? { turnId } : {}) });
+  return { dataDir, ds, nodeDaemon, interrupted, started, screen };
 }
 
 describe('a main-topic handoff turn with a person\'s message folded in (worker IPC seam)', () => {
@@ -184,6 +188,41 @@ describe('a main-topic handoff turn with a person\'s message folded in (worker I
     await revokeWorkflowHandoff(w.dataDir, SECRET, NONCE, 'timeout', Date.now());
     w.nodeDaemon.stopRoute({ nonce: NONCE, sessionId: 'sid-main-topic', reason: 'timeout' });
     expect(w.interrupted).toEqual(['sid-main-topic']);
+  });
+
+  it('WP-a: the working → idle edge of the handoff turn settles it', async () => {
+    const w = await world();
+    dir = w.dataDir;
+    w.started(H); w.screen('working', H); w.screen('idle', H);
+    expect(w.ds.session.workflowNode).toMatchObject({ handoffSettledAt: expect.any(String) });
+  });
+
+  it('WP-c: an idle edge that names no turn (a respawned worker\'s envelope) settles it too — a later wake is not interrupted', async () => {
+    const w = await world();
+    dir = w.dataDir;
+    w.started(H); w.screen('working'); w.screen('idle');
+    expect(w.ds.session.workflowNode).toMatchObject({ handoffSettledAt: expect.any(String) });
+    w.started('workflow-event:other:1');
+    await revokeWorkflowHandoff(w.dataDir, SECRET, NONCE, 'timeout', Date.now());
+    w.nodeDaemon.stopRoute({ nonce: NONCE, sessionId: 'sid-main-topic', reason: 'timeout' });
+    expect(w.interrupted).toEqual([]);
+  });
+
+  it('WP-b: restored after a restart (no idle edge to see, another worker generation) — a later wake is not interrupted', async () => {
+    const w = await world(undefined);
+    dir = w.dataDir;
+    // The persisted marker of the run before the restart: started in an
+    // earlier worker generation, its idle never observed.
+    w.ds.session.workflowNode = {
+      ...w.ds.session.workflowNode!, handoffStartedAt: new Date().toISOString(),
+      handoffWorkerGeneration: (w.ds.workerGeneration ?? 0) - 1,
+    };
+    // No idle edge reaches the daemon for that turn.
+    expect(w.ds.session.workflowNode?.handoffSettledAt).toBeUndefined();
+    w.started('workflow-event:other:1');
+    await revokeWorkflowHandoff(w.dataDir, SECRET, NONCE, 'timeout', Date.now());
+    w.nodeDaemon.stopRoute({ nonce: NONCE, sessionId: 'sid-main-topic', reason: 'timeout' });
+    expect(w.interrupted).toEqual([]);
   });
 
   it('before the handoff turn started (only someone else\'s turn running), nothing is interrupted', async () => {
