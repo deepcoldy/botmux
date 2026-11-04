@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, realpath, access } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, realpath, access, chmod, chown } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -56,6 +56,46 @@ describe('isolated doas token source', () => {
     const outside = join(root, 'outside'); await mkdir(outside);
     await symlink(outside, join(root, 'feedback-doas'));
     await expect(createDoasTokenSource(root, config, executable).get()).rejects.toThrow('feedback_doas_cache_unsafe');
+  });
+  it('rejects a cache root whose mode grants access to group or others', async () => {
+    const { root, executable, config } = await fixture();
+    const source = createDoasTokenSource(root, config, executable);
+    await source.get();
+    try {
+      for (const mode of [0o755, 0o777, 0o705]) {
+        await chmod(source.directory, mode);
+        await expect(createDoasTokenSource(root, config, executable).get()).rejects.toThrow('feedback_doas_cache_unsafe');
+      }
+    } finally { await chmod(source.directory, 0o700); }
+  });
+  it('rejects a cache root owned by another user even with 0700 mode', async () => {
+    // Foreign ownership can only be staged by a privileged runner; unprivileged
+    // environments cannot create it, so the case is a no-op there rather than
+    // a fake failure. The mode-bits case above is the reachable branch on a
+    // shared host running as the daemon user.
+    if (typeof process.getuid !== 'function' || process.getuid() !== 0) return;
+    const { root, executable, config } = await fixture();
+    const source = createDoasTokenSource(root, config, executable);
+    await source.get();
+    await chown(source.directory, 65534, 65534);
+    try {
+      await expect(createDoasTokenSource(root, config, executable).get()).rejects.toThrow('feedback_doas_cache_unsafe');
+    } finally { await chown(source.directory, 0, 0); }
+  });
+  it.each([
+    '{',
+    '{"generation":1}',
+    '{"generation":"1","unusable":false}',
+    '{"generation":-1,"unusable":false}',
+    '{"generation":1,"unusable":"yes"}',
+    '{"generation":1,"unusable":false,"rejectedHash":"zz"}',
+    '{"generation":1,"unusable":false,"tokenHash":"tooshort"}',
+  ])('rejects a malformed generation state (%s) instead of guessing a generation', async corrupted => {
+    const { root, executable, config } = await fixture();
+    const source = createDoasTokenSource(root, config, executable);
+    await source.get();
+    await writeFile(join(source.directory, 'generation.json'), corrupted, 'utf8');
+    await expect(createDoasTokenSource(root, config, executable).get()).rejects.toThrow('feedback_doas_state_invalid');
   });
   it('suppresses command stderr and fails closed on malformed output', async () => {
     const { root, executable, config } = await fixture();

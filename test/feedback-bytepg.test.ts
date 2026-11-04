@@ -241,5 +241,18 @@ describe('BytePG feedback authentication', () => {
         passwordRef: 'env:PASSWORD', tls: { mode: 'disable' }, connectTimeoutMs: 1000 } },
       token: 'mixed-mode-token',
     })).rejects.toThrow('feedback_storage_auth_invalid');
+    // A doas candidate must reject both an inline token and a static reference,
+    // so the persisted source can never address two credential mechanisms.
+    const doasCandidate = { backend: 'postgresql' as const, postgres: { ...target(4432),
+      bytepg: { computeId: 'cp-test-compute', doas: { psm: 'data.example.service', environment: 'boe' as const } } } };
+    await expect(configureFeedbackStorageCandidate(directory, {
+      expectedGeneration: current.generation, candidate: doasCandidate, token: 'doas-inline-token',
+    })).rejects.toThrow('feedback_storage_auth_invalid');
+    await expect(configureFeedbackStorageCandidate(directory, {
+      expectedGeneration: current.generation,
+      candidate: { backend: 'postgresql', postgres: { ...target(4432), bytepg: {
+        computeId: 'cp-test-compute', doas: { psm: 'data.example.service', environment: 'boe' }, tokenRef: 'env:BYTEPG_TEST_TOKEN',
+      } } },
+    })).rejects.toThrow('feedback_storage_auth_invalid');
   });
 });

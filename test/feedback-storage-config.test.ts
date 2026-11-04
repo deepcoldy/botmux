@@ -106,6 +106,37 @@ describe('feedback storage configuration', () => {
     expect(reread.active.backend).toBe('postgresql');
   });
   it.each([
+    { bytepg: { computeId: 'cp', tokenRef: 'env:BOTMUX_TEST_PG_TOKEN', doas: { psm: 'p.s', environment: 'boe' } } },
+    { bytepg: { computeId: 'cp' } },
+  ])('rejects a persisted BytePG target carrying both or neither credential source', async auth => {
+    const path = await directory();
+    const persisted = {
+      version: 1, generation: 1, instanceId: randomUUID(),
+      active: { backend: 'postgresql', postgres: {
+        host: 'localhost', port: 5432, database: 'feedback', schema: 'feedback_test',
+        tls: { mode: 'disable' }, connectTimeoutMs: 5000, ...auth,
+      } },
+    };
+    await writeFile(join(path, 'feedback-storage.json'), JSON.stringify(persisted), 'utf8');
+    await expect(readFeedbackStorageConfig(path)).rejects.toThrow('feedback_storage_config_invalid');
+  });
+  it('accepts a persisted doas-only BytePG target without any token reference', async () => {
+    const path = await directory();
+    const persisted = {
+      version: 1, generation: 1, instanceId: randomUUID(),
+      active: { backend: 'postgresql', postgres: {
+        host: 'localhost', port: 5432, database: 'feedback', schema: 'feedback_test',
+        bytepg: { computeId: 'cp', doas: { psm: 'data.example.service', environment: 'boe' } },
+        tls: { mode: 'verify-full' }, connectTimeoutMs: 5000,
+      } },
+    };
+    await writeFile(join(path, 'feedback-storage.json'), JSON.stringify(persisted), 'utf8');
+    const reread = await readFeedbackStorageConfig(path);
+    if (reread.active.backend !== 'postgresql') throw new Error();
+    expect(reread.active.postgres.bytepg?.doas).toEqual({ psm: 'data.example.service', environment: 'boe' });
+    expect(reread.active.postgres.bytepg?.tokenRef).toBeUndefined();
+  });
+  it.each([
     { ...target, postgres: { ...target.postgres, schema: 'x;DROP SCHEMA public' } },
     { ...target, postgres: { ...target.postgres, password: 'not-a-reference' } },
     { ...target, postgres: { ...target.postgres, tls: { mode: 'ignore-errors' } } },
