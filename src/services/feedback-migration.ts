@@ -217,6 +217,7 @@ async function checkCancellation(dataDir: string, job: MigrationStatus): Promise
       const guard = database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined;
       if (guard?.state === 'retired') throw new Error('feedback_source_retired');
       if (guard && guard.migration_id !== job.migrationId) throw new Error('feedback_migration_identity_conflict');
+      if (guard && control?.migrationId !== job.migrationId) throw new Error('feedback_maintenance_state_missing');
     }
   } finally { database.close(); }
 }

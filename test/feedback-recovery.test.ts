@@ -84,6 +84,13 @@ describe('manual feedback recovery', () => {
     expect((await resumeFeedbackMigration(directory, job.migrationId)).phase).toBe('cancelled');
     expect(() => assertFeedbackAdmission(directory)).not.toThrow();
   });
+  it('does not report cancellation successful when a frozen source lost its maintenance identity', async () => {
+    const { directory, job } = await fixture();
+    await beginFeedbackMaintenance(directory, job.migrationId);
+    await freezeFeedbackSource(directory, job.migrationId);
+    await rm(join(directory, 'feedback-maintenance.json'));
+    await expect(cancelFeedbackMigration(directory, job.migrationId, decision)).rejects.toThrow('feedback_maintenance_state_missing');
+  });
   it('cancels pre-freeze maintenance after candidate edits without requiring the PG endpoint', async () => {
     const { directory, candidate, saved, job } = await fixture();
     await beginFeedbackMaintenance(directory, job.migrationId);
