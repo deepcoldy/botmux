@@ -157,6 +157,10 @@ vi.mock('../src/global-config.js', () => ({
 
 const staticModelChoicesMock = vi.fn(() => ['fable', 'opus', 'sonnet', 'haiku']);
 const detectModelsMock = vi.fn(async () => null);
+const readTraexModelLoadsMock = vi.fn(async (..._args: any[]) => null as Map<string, number> | null);
+vi.mock('../src/services/traex-model-load.js', () => ({
+  readTraexModelLoads: (...args: any[]) => readTraexModelLoadsMock(...args),
+}));
 vi.mock('../src/services/model-catalog.js', () => ({
   staticModelChoices: (...args: any[]) => staticModelChoicesMock(...args),
   detectModels: (...args: any[]) => detectModelsMock(...args),
@@ -287,6 +291,7 @@ beforeEach(() => {
   deliverEphemeralOrReplyMock.mockClear();
   staticModelChoicesMock.mockReset().mockImplementation(() => ['fable', 'opus', 'sonnet', 'haiku']);
   detectModelsMock.mockReset().mockResolvedValue(null);
+  readTraexModelLoadsMock.mockReset().mockResolvedValue(null);
   remoteAccessEnabledMock.mockReset().mockReturnValue(false);
   platformTerminalBaseUrlMock.mockReset().mockReturnValue(null);
   resetTerminalProxy();
@@ -495,6 +500,105 @@ describe('reply_model_pick action', () => {
 });
 
 describe('/models shortcut', () => {
+  it('annotates every native model without changing the switch payload or losing zero and overload', async () => {
+    enableMenu('traex');
+    const models = ['GPT-5.4', 'GPT-6.1-Sol', 'Seed-Code'];
+    detectModelsMock.mockResolvedValue(models);
+    readTraexModelLoadsMock.mockResolvedValue(new Map([['gpt-5.4', 0], ['gpt-6.1-sol', 123]]));
+    const ds = makeDs({ activeModel: models[0], sessionOverrides: { cliId: 'traex' } });
+    await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((o: any) => o.value)).toEqual(models);
+    expect(select.options[0].text.content).toMatch(/\b0%/);
+    expect(select.options[1].text.content).toMatch(/\b123%/);
+    expect(select.options[2].text.content).not.toMatch(/\d+%/);
+    expect(select.initial_option).toBe(models[0]);
+    expect(readTraexModelLoadsMock).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/tmp/proj', env: expect.any(Object) }));
+    expect(ds.activeModel).toBe(models[0]);
+    const deliver = vi.fn();
+    const data = pickData(models[1]);
+    data.action.value.action = 'session_model_pick';
+    await handleCardAction(data, depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver.mock.calls[0][1]).toBe('/model GPT-6.1-Sol');
+  });
+
+  it.each(['null', 'error'])('keeps all models selectable when the load query returns %s', async failure => {
+    enableMenu('traex');
+    detectModelsMock.mockResolvedValue(['GPT-5.4', 'Seed-Code']);
+    if (failure === 'error') readTraexModelLoadsMock.mockRejectedValue(new Error('offline'));
+    const ds = makeDs({ sessionOverrides: { cliId: 'traex' } });
+    await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'en');
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((o: any) => o.value)).toEqual(['GPT-5.4', 'Seed-Code']);
+    expect(select.options.every((o: any) => !/\d+%/.test(o.text.content))).toBe(true);
+  });
+
+  it.each(['other-cli', 'wrapper', 'remote', 'changed-default'])('does not probe a host TraeX account for %s', async kind => {
+    enableMenu(kind === 'changed-default' ? 'claude-code' : 'traex');
+    const ds = makeDs({ sessionOverrides: { cliId: kind === 'other-cli' ? 'claude-code' : 'traex',
+      ...(kind === 'wrapper' ? { wrapperCli: 'ttadk' } : {}),
+      ...(kind === 'remote' ? { backendType: 'remote-runner' } : {}) } });
+    await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    expect(readTraexModelLoadsMock.mock.calls.length).toBe(0);
+  });
+
+  it('does not probe a traex helper for a native non-traex bot shape', async () => {
+    // Bot and session consistently native non-traex: the downstream
+    // runtimeContext gate cannot save this, so the `key !== 'traex'` gate is
+    // the only thing preventing a traex-protocol app-server per render.
+    enableMenu('coco');
+    const ds = makeDs({ sessionOverrides: { cliId: 'coco' } });
+    await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    expect(readTraexModelLoadsMock.mock.calls.length).toBe(0);
+  });
+
+  it.each(['permission', 'worker', 'transfer', 'killed'])('does not deliver a picker after %s changes during the load query', async change => {
+    enableMenu('traex');
+    let finish!: (loads: Map<string, number> | null) => void;
+    readTraexModelLoadsMock.mockImplementation(() => new Promise(r => { finish = r; }));
+    const ds = makeDs({ sessionOverrides: { cliId: 'traex' } });
+    const pending = showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    if (change === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    else if (change === 'worker') ds.workerGeneration = 42;
+    else if (change === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+    else (ds.worker as any).killed = true;
+    finish(new Map([['gpt-5.4', 0]]));
+    await pending;
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('includes load metadata in the reply menu after the acknowledgement', async () => {
+    enableMenu('traex');
+    detectModelsMock.mockResolvedValue(['GPT-5.4']);
+    readTraexModelLoadsMock.mockResolvedValue(new Map([['gpt-5.4', 67]]));
+    const ds = makeDs({ sessionOverrides: { cliId: 'traex' } });
+    const result = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+    await result.afterAck();
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options[0].value).toBe('GPT-5.4');
+    expect(select.options[0].text.content).toMatch(/\b67%/);
+  });
+
+  it.each(['permission', 'worker-generation', 'transfer', 'worker-killed'])(
+    'does not deliver the reply-menu model card when %s changes during the load query',
+    async change => {
+      enableMenu('traex');
+      detectModelsMock.mockResolvedValue(['GPT-5.4']);
+      const ds = makeDs({ sessionOverrides: { cliId: 'traex' } });
+      const result = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+      expect(typeof result.afterAck).toBe('function');
+      if (change === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+      else if (change === 'worker-generation') ds.workerGeneration = 42;
+      else if (change === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+      else (ds.worker as any).killed = true;
+      await result.afterAck();
+      expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+    },
+  );
+
   it('opens a session-bound picker through the real command handler while reply menus are disabled', async () => {
     const ds = makeDs({ activeModel: 'sonnet' });
     const deps = depsWith(ds);
@@ -653,6 +757,42 @@ describe('/models bot defaults at top level', () => {
       context: { open_message_id: 'om_defaults' } };
   }
   const modelSpec = { key: 'model', kind: 'string', configKey: 'model', clearable: true } as any;
+
+  it('loads all top-level model labels and keeps the CLI default entry separate', async () => {
+    const bot = adminBot();
+    bot.config.cliId = 'traex';
+    bot.config.model = 'GPT-5.4';
+    detectModelsMock.mockResolvedValue(['GPT-5.4', 'Seed-Code']);
+    readTraexModelLoadsMock.mockResolvedValue(new Map([['gpt-5.4', 48]]));
+    const deps = depsWith(undefined);
+    deps.invocationContext = 'new-topic';
+    await handleCommand('/models', ROOT, { messageId: 'om_top', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    const card = JSON.parse(deps.sessionReply.mock.calls[0][1]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', 'GPT-5.4', 'Seed-Code']);
+    expect(select.options[0].text.content).not.toMatch(/\d+%/);
+    expect(select.options[1].text.content).toMatch(/\b48%/);
+    expect(select.options[2].text.content).not.toMatch(/\d+%/);
+    expect(select.initial_option).toBe('GPT-5.4');
+  });
+
+  it('retains model load annotations after saving the default model', async () => {
+    const bot = adminBot();
+    bot.config.cliId = 'traex';
+    detectModelsMock.mockResolvedValue(['GPT-5.4']);
+    readTraexModelLoadsMock.mockResolvedValue(new Map([['gpt-5.4', 31]]));
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'GPT-5.4' } as any);
+    vi.mocked(applyConfigField).mockImplementation(async (_app, _spec, value) => {
+      bot.config.model = value;
+      return { ok: true, newText: 'GPT-5.4' } as any;
+    });
+    const result = await handleCardAction(defaultPick('GPT-5.4', { selection_key: 'traex' }), depsWith(undefined), LARK_APP_ID);
+    const select = result.card.data.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.initial_option).toBe('GPT-5.4');
+    expect(select.options[1].text.content).toMatch(/\b31%/);
+    expect(result.toast.type).toBe('success');
+  });
 
   it.each([false, true])('top-level /models shows bot defaults with an existing flat session: %s', async existing => {
     adminBot();
