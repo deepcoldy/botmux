@@ -1565,14 +1565,19 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // A refusal published because the platform was unreachable when the turn
     // was prepared gets another chance on this call (rate-limited, CAS-guarded).
     // The Codebase companion is published together with bytedcli.
-    let currentBotConfig: BotConfig | undefined;
-    try { currentBotConfig = getBot(ds.larkAppId).config; } catch { currentBotConfig = undefined; }
-    if (currentBotConfig) {
-      await retryTransientTurnIdentity({
-        sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
-        tool: tool === 'codebase' ? 'bytedcli' : tool, botConfig: currentBotConfig,
-      });
-    }
+    //
+    // The policy is passed as a READER, not a config: a Dashboard edit replaces
+    // the whole bot config object, so anything captured here would be a stale
+    // snapshot that cannot see a change made while the re-ask is in flight —
+    // exactly the window in which the answer gets written to disk.
+    const liveAppId = ds.larkAppId;
+    await retryTransientTurnIdentity({
+      sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
+      tool: tool === 'codebase' ? 'bytedcli' : tool,
+      // A bot that no longer exists is "no longer governed": policyStillWants
+      // treats a throwing reader as a refusal to publish.
+      currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
+    });
     const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
     if (env) {
       return jsonRes(res, 200, {
