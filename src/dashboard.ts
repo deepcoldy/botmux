@@ -1,4 +1,4 @@
-import { proxyExactTurnInterrupt } from './dashboard/exact-turn-interrupt.js';
+import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -6445,12 +6445,12 @@ const server = createServer(async (req, res) => {
     }
 
     // Owner authentication above applies; never fall back to a broad interrupt.
-    const exactInterrupt = await proxyExactTurnInterrupt(req.method, url.pathname, {
+    const sessionStop = await proxySessionStopControl(req.method, url.pathname, {
       ownerOf: sid => aggregator.ownerOf(sid), proxyToDaemon,
     });
-    if (exactInterrupt) {
-      res.writeHead(exactInterrupt.status, { 'content-type': 'application/json' });
-      res.end(await exactInterrupt.text());
+    if (sessionStop) {
+      res.writeHead(sessionStop.status, { 'content-type': 'application/json' });
+      res.end(await sessionStop.text());
       return;
     }
 
