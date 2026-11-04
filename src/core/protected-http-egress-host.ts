@@ -38,6 +38,12 @@ const HOP_BY_HOP_HEADERS = new Set([
   'upgrade',
 ]);
 const SINGLE_CREDENTIAL_HEADERS = ['authorization', 'cookie', 'x-jwt-token'] as const;
+const ROUTING_OVERRIDE_HEADERS = [
+  'x-http-method-override',
+  'x-method-override',
+  'x-original-url',
+  'x-rewrite-url',
+] as const;
 
 export interface ProtectedHttpEgressForwardRequest {
   policyId: string;
@@ -156,6 +162,9 @@ function sanitizedRequestHeaders(request: IncomingMessage): Record<string, strin
   if (SINGLE_CREDENTIAL_HEADERS.some(name => rawHeaderValues(request, name).length > 1)) {
     throw new InvalidRequestError('duplicate_credential_header');
   }
+  if (ROUTING_OVERRIDE_HEADERS.some(name => request.headers[name] !== undefined)) {
+    throw new InvalidRequestError('routing_override_header');
+  }
   const connectionNamed = new Set(
     String(request.headers.connection ?? '')
       .split(',')
@@ -247,11 +256,23 @@ function responseHeaderValue(
 function sanitizedResponseHeaders(
   headers: Record<string, string | string[] | undefined>,
 ): Record<string, string | string[]> {
+  const connectionNamed = new Set<string>();
+  for (const [rawName, value] of Object.entries(headers)) {
+    if (rawName.toLowerCase() !== 'connection' || value === undefined) continue;
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      for (const name of item.split(',')) {
+        const normalized = name.trim().toLowerCase();
+        if (normalized) connectionNamed.add(normalized);
+      }
+    }
+  }
   const result: Record<string, string | string[]> = {};
   for (const [rawName, value] of Object.entries(headers)) {
     const name = rawName.toLowerCase();
     if (value === undefined
       || HOP_BY_HOP_HEADERS.has(name)
+      || connectionNamed.has(name)
       || name === 'content-length'
       || name.startsWith('x-botmux-')
       || isProxyHeader(name)) continue;

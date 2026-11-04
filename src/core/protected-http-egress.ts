@@ -164,6 +164,9 @@ export function normalizeProtectedHttpPath(raw: string): string {
   const queryAt = raw.indexOf('?');
   const pathname = queryAt < 0 ? raw : raw.slice(0, queryAt);
   const query = queryAt < 0 ? '' : raw.slice(queryAt);
+  if ((pathname.length > 1 && pathname.endsWith('/')) || pathname.includes('//')) {
+    throw new Error('invalid_protected_http_path');
+  }
   try {
     decodeURIComponent(pathname);
   } catch {
@@ -172,7 +175,8 @@ export function normalizeProtectedHttpPath(raw: string): string {
   for (const match of pathname.matchAll(HTTP_PATH_PERCENT)) {
     const byte = Number.parseInt(match[1], 16);
     const character = String.fromCharCode(byte);
-    if (byte === 0x2f
+    if (byte === 0x25
+      || byte === 0x2f
       || byte === 0x5c
       || byte <= 0x1f
       || byte === 0x7f

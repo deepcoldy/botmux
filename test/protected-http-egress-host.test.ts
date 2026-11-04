@@ -285,6 +285,50 @@ describe('session protected HTTP egress host', () => {
     expect(forwarded).toHaveLength(0);
   });
 
+  it.each([
+    ['x-http-method-override', 'POST'],
+    ['x-method-override', 'POST'],
+    ['x-original-url', '/api/v2/catalog/info'],
+    ['x-rewrite-url', '/api/v2/catalog/info'],
+  ])('rejects the routing override header %s before forwarding', async (name, value) => {
+    const { host, auth, forwarded } = await start();
+
+    const response = await unixHttpRequest(
+      host.socketPath,
+      'GET',
+      '/api/v2/catalog/list',
+      { ...routingHeaders(auth), [name]: value },
+    );
+
+    expect(response.status).toBe(400);
+    expect(forwarded).toHaveLength(0);
+  });
+
+  it('removes response headers nominated by Connection', async () => {
+    const { host, auth } = await start({
+      forward: async () => ({
+        status: 200,
+        headers: {
+          connection: 'x-private, keep-alive',
+          'x-private': 'must-not-cross',
+          'x-safe-fixture': 'kept',
+        },
+        body: Buffer.from('ok'),
+      }),
+    });
+
+    const response = await unixHttpRequest(
+      host.socketPath,
+      'GET',
+      '/api/v2/catalog/list',
+      routingHeaders(auth),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers['x-private']).toBeUndefined();
+    expect(response.headers['x-safe-fixture']).toBe('kept');
+  });
+
   it('caps request and response bodies at 16 MiB', async () => {
     const { host, auth, forwarded } = await start({
       forward: async incoming => {
