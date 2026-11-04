@@ -76,6 +76,15 @@ const turnSchema = z.object({
   hasSpec: z.literal(true).optional(),
 }).strict();
 
+const reservationHolderSchema = z.object({
+  pid: z.number().int().min(1),
+  procStart: z.string().min(1).max(256).optional(),
+  bootId: z.string().min(1).max(256).optional(),
+  instance: z.string().min(1).max(64),
+}).strict();
+
+export type WorkflowDraftReservationHolder = z.infer<typeof reservationHolderSchema>;
+
 const clarifySchema = z.object({
   headlessId: z.string().min(1).max(256).optional(),
   sessionId: z.string().min(1).max(256).optional(),
@@ -83,7 +92,13 @@ const clarifySchema = z.object({
    *  (the next message resumes by CLI session id); disconnected: cannot be
    *  resumed — 「继续」 starts a new one; closed: abandoned/deleted. */
   state: z.enum(['active', 'suspended', 'disconnected', 'closed']),
-  pending: z.object({ triggerId: z.string().min(1).max(256), sentAt: iso }).strict().optional(),
+  pending: z.object({
+    triggerId: z.string().min(1).max(256),
+    sentAt: iso,
+    /** For a reservation: the process (and service instance) holding it, so
+     *  another process only drops it once that holder is gone. */
+    holder: reservationHolderSchema.optional(),
+  }).strict().optional(),
   /** Last activity: a message sent or a reply landed (idle clock, §4.2). */
   lastMessageAt: iso.optional(),
   suspendedAt: iso.optional(),

@@ -6572,6 +6572,7 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
     isSuspendable: (ds) => isSuspendableBackendType(ds.initConfig?.backendType),
     canRetireWorker: (ds) => !isRemoteBackendSession(ds) && !isSessionTransferring(ds) && !hasProtectedSessionMutationOwnership(ds),
     killWorker: (ds) => killWorker(ds),
+    lifecycleInFlight: isSessionLifecycleInFlight,
     closeSession: (sessionId) => closeSessionForBackgroundCleanup(sessionId, 'workflow draft clarify session'),
     deleteHeadlessRecord: (headlessId) => { deleteHeadlessSession(headlessId); },
   });

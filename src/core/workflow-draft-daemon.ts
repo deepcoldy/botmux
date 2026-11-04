@@ -223,6 +223,8 @@ export interface ProductionDraftClarifierDeps {
   /** Not remote, not in transfer, no protected dispatch ownership. */
   canRetireWorker: (ds: DaemonSession) => boolean;
   killWorker: (ds: DaemonSession) => void;
+  /** A worker of this session is being retired / restarted right now. */
+  lifecycleInFlight: (ds: DaemonSession) => boolean;
   closeSession: (sessionId: string) => Promise<unknown>;
   deleteHeadlessRecord: (headlessId: string) => void;
 }
@@ -250,6 +252,10 @@ export function createProductionDraftClarifier(deps: ProductionDraftClarifierDep
       // the spec so far (§9).
       const status = deps.sessionStatus(sessionId);
       if (!status || status === 'closed') return { ok: false, error: 'session_closed', disconnected: true };
+      // Between retiring a worker (idle release, restart) and the old worker's
+      // exit, a turn would race the dying process: ask to retry instead.
+      const live = findActive(sessionId);
+      if (live && deps.lifecycleInFlight(live)) return { ok: false, error: 'session_lifecycle_in_flight', disconnected: false, busy: true };
       const request: TriggerRequest = {
         source: {
           type: 'headless',

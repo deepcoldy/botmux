@@ -83,8 +83,11 @@ import {
   type WorkflowDraftInitiator,
   type WorkflowDraftPhase,
   type WorkflowDraftRecord,
+  type WorkflowDraftReservationHolder,
   type WorkflowDraftTurn,
 } from './draft-store.js';
+import { readLinuxBootIdentity, readProcessStartIdentity } from '../../utils/process-identity.js';
+import { pidIsSignalable } from '../../utils/process-alive.js';
 import {
   buildDraftClarifyKickoff,
   buildDraftClarifyResume,
@@ -94,6 +97,15 @@ import {
 
 /** The existing Architect budget (architect.ts default), unchanged (§4.4). */
 export const DRAFT_ARCHITECT_TIMEOUT_MS = 10 * 60_000;
+/**
+ * Upper bound on one clarify-session call (create a session / start a turn).
+ * Neither waits for the model: creating registers a session, and an async
+ * turn returns once the turn is admitted. The slow case is a cold CLI start
+ * behind the admission (tens of seconds for the slowest CLIs); 2 minutes is
+ * several times that. A call past it is treated as lost: its reservation is
+ * released so the draft does not stay locked behind it.
+ */
+export const DRAFT_CLARIFY_CALL_TIMEOUT_MS = 2 * 60_000;
 /** §4.2: a draft whose clarify session got no message for this long has its
  *  CLI process closed; the session record stays for a later resume. */
 export const DRAFT_CLARIFY_IDLE_MS = 30 * 60_000;
@@ -185,8 +197,10 @@ export interface DraftClarifier {
     { ok: true; headlessId: string; sessionId: string } | { ok: false; error: string }
   >;
   /** Start one turn. `disconnected`: the session cannot take turns anymore. */
+  /** Start one turn. `busy`: the session is restarting / being retired
+   *  right now; try again shortly. */
   send(input: { larkAppId: string; sessionId: string; headlessId: string; prompt: string; requestId: string }): Promise<
-    { ok: true; triggerId: string } | { ok: false; error: string; disconnected: boolean }
+    { ok: true; triggerId: string } | { ok: false; error: string; disconnected: boolean; busy?: true }
   >;
   result(sessionId: string, triggerId: string): DraftClarifyResult;
   /** Close the CLI process, keep the session record (idle, §4.2). False:
@@ -215,6 +229,9 @@ export interface WorkflowDraftServiceDeps {
   /** Test seam for deterministic run ids. */
   randomSuffix?: () => string;
   log?: (message: string) => void;
+  /** Whether a reservation's holder process is still running (default: pid
+   *  + process start identity, as the file locks check their holders). */
+  isHolderAlive?: (holder: WorkflowDraftReservationHolder) => boolean;
 }
 
 // ─── Views ────────────────────────────────────────────────────────────────
@@ -295,6 +312,42 @@ function pushTurn(draft: WorkflowDraftRecord, turn: WorkflowDraftTurn): void {
   }
 }
 
+const TIMED_OUT = Symbol('timed_out');
+
+/** The live holder check used by file locks: same boot, same process start. */
+function defaultHolderAlive(holder: WorkflowDraftReservationHolder): boolean {
+  if (holder.bootId) {
+    const live = readLinuxBootIdentity();
+    if (live !== undefined && live !== holder.bootId) return false;
+  }
+  if (holder.procStart) {
+    const live = readProcessStartIdentity(holder.pid);
+    if (live !== undefined) return live === holder.procStart;
+  }
+  return holder.pid === process.pid || pidIsSignalable(holder.pid);
+}
+
+/**
+ * The outcome a lost Architect run settles to (boot recovery, or a run whose
+ * outcome could not be recorded): a grill that reached 待确认流程 means the
+ * attempt did succeed — its DAG is validated and on disk; anything else is
+ * an interruption.
+ */
+function settleLostArchitect(
+  draft: WorkflowDraftRecord,
+  grillStatus: GrillState['status'] | undefined,
+  at: string,
+  problems: string[],
+): 'succeeded' | 'interrupted' {
+  const { problems: _old, ...rest } = draft.architect!;
+  if (grillStatus === 'dag_ready') {
+    draft.architect = { ...rest, state: 'succeeded', finishedAt: at };
+    return 'succeeded';
+  }
+  draft.architect = { ...rest, state: 'interrupted', finishedAt: at, problems };
+  return 'interrupted';
+}
+
 /** Every clarify session a draft knows of (current + ones whose close failed). */
 function draftSessions(draft: WorkflowDraftRecord): Array<{ sessionId: string; headlessId?: string }> {
   const out = new Map<string, { sessionId: string; headlessId?: string }>();
@@ -357,6 +410,9 @@ export class WorkflowDraftService {
   private readonly suspending = new Set<string>();
   /** Clarify sessions whose close failed; the sweep retries them. */
   private readonly orphans = new Map<string, { sessionId: string; headlessId?: string }>();
+  /** This service instance (one per daemon boot) as a reservation holder. */
+  private readonly holder: WorkflowDraftReservationHolder;
+  private readonly holderAlive: (holder: WorkflowDraftReservationHolder) => boolean;
   private readonly now: () => Date;
   private readonly setTimer: (fn: () => void, ms: number) => () => void;
   private readonly loadDag: (path: string) => unknown;
@@ -371,6 +427,36 @@ export class WorkflowDraftService {
     });
     this.loadDag = deps.loadDag ?? realLoadDag;
     this.log = deps.log ?? (() => {});
+    const procStart = readProcessStartIdentity(process.pid);
+    const bootId = readLinuxBootIdentity();
+    this.holder = {
+      pid: process.pid,
+      ...(procStart ? { procStart } : {}),
+      ...(bootId ? { bootId } : {}),
+      instance: randomUUID(),
+    };
+    this.holderAlive = deps.isHolderAlive ?? defaultHolderAlive;
+  }
+
+  /** A pending entry for a new reservation of this instance. */
+  private reservationEntry(reservation: string): { triggerId: string; sentAt: string; holder: WorkflowDraftReservationHolder } {
+    return { triggerId: reservation, sentAt: this.now().toISOString(), holder: this.holder };
+  }
+
+  /** Race `promise` against the call timeout (on the injected clock). A call
+   *  that loses keeps running; `late` sees its eventual result. */
+  private async bounded<T>(promise: Promise<T>, late?: (value: T) => void): Promise<T | typeof TIMED_OUT> {
+    let cancel = () => {};
+    const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+      cancel = this.setTimer(() => resolve(TIMED_OUT), DRAFT_CLARIFY_CALL_TIMEOUT_MS);
+    });
+    try {
+      const winner = await Promise.race([promise, timeout]);
+      if (winner === TIMED_OUT && late) void promise.then(late, () => {});
+      return winner;
+    } finally {
+      cancel();
+    }
   }
 
   get appId(): string { return this.deps.appId; }
@@ -464,13 +550,8 @@ export class WorkflowDraftService {
    */
   private healStaleArchitect(runId: string, draft: WorkflowDraftRecord, grill: GrillState): boolean {
     if (draft.architect?.state !== 'running' || this.tasks.has(runId) || grill.status === 'architect_running') return false;
-    const { problems: _old, ...rest } = draft.architect;
-    draft.architect = {
-      ...rest,
-      state: 'interrupted',
-      finishedAt: this.now().toISOString(),
-      problems: ['编排的结果没能记录下来，请重新编排'],
-    };
+    const settled = settleLostArchitect(draft, grill.status, this.now().toISOString(), ['编排的结果没能记录下来，请重新编排']);
+    if (settled === 'succeeded') this.flowChanged(draft, { nodeBots: true });
     return true;
   }
 
@@ -506,6 +587,15 @@ export class WorkflowDraftService {
     if (!pending) return false;
     if (pending.triggerId.startsWith(RESERVATION_PREFIX)) {
       if (this.inflight.has(pending.triggerId)) return false;
+      // Held by another live process (or another instance in this one): it
+      // releases it itself, within the call timeout. Ours and not in flight,
+      // or its holder is gone: left over, dropped.
+      const holder = pending.holder;
+      if (holder && holder.instance !== this.holder.instance) {
+        let alive = true;
+        try { alive = this.holderAlive(holder); } catch { alive = true; }
+        if (alive) return false;
+      }
       delete draft.clarify.pending;
       return true;
     }
@@ -579,14 +669,21 @@ export class WorkflowDraftService {
           throw err('session_disconnected', '会话已断开，点「继续」重新起会话');
         }
         if (this.suspending.has(draft.clarify.sessionId)) throw err('busy', '会话正在释放空闲进程，请稍后重试');
-        draft.clarify.pending = { triggerId: reservation, sentAt: this.now().toISOString() };
+        draft.clarify.pending = this.reservationEntry(reservation);
         return { changed: true, result: { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId } };
       });
       let sent: Awaited<ReturnType<DraftClarifier['send']>>;
+      let timedOut = false;
       try {
-        sent = await this.deps.clarifier.send({
+        const outcome = await this.bounded(this.deps.clarifier.send({
           larkAppId: this.deps.appId, ...target, prompt: input.text, requestId: `${runId}:${reservation}`,
-        });
+        }));
+        if (outcome === TIMED_OUT) {
+          timedOut = true;
+          sent = { ok: false, error: 'timeout', disconnected: false };
+        } else {
+          sent = outcome;
+        }
       } catch (error) {
         sent = { ok: false, error: errorText(error), disconnected: false };
       }
@@ -606,6 +703,18 @@ export class WorkflowDraftService {
           return { changed: true, result: undefined };
         }
         delete draft.clarify.pending;
+        if (timedOut) {
+          // Treated like a displaced send: the call may still land later, and
+          // its reply would not be tracked — say so.
+          pushTurn(draft, {
+            role: 'system',
+            text: `这条消息没有在 ${Math.round(DRAFT_CLARIFY_CALL_TIMEOUT_MS / 60_000)} 分钟内发出去，已放弃等待；如果它稍后送达，回复不会显示：${clip(input.display, 200)}`,
+            at,
+          });
+          draft.clarify.error = '发送超时';
+          return { changed: true, result: undefined };
+        }
+        if (!sent.ok && sent.busy) return { changed: true, result: undefined };
         if (sent.ok) {
           draft.clarify.pending = { triggerId: sent.triggerId, sentAt: at };
           draft.clarify.state = 'active';
@@ -625,7 +734,9 @@ export class WorkflowDraftService {
       if (displaced) {
         throw err('state_conflict', '消息发出时草稿已被另一个操作更新，这条消息的回复不会显示，请刷新后再发');
       }
+      if (timedOut) throw err('clarify_unavailable', '发送超时，请稍后重试');
       if (!sent.ok) {
+        if (sent.busy) throw err('busy', '会话正在重启，请稍后重试');
         throw sent.disconnected
           ? err('session_disconnected', '会话已断开，点「继续」重新起会话')
           : err('clarify_unavailable', `没能把消息发给编排 Bot：${clip(sent.error, 300)}`);
@@ -648,20 +759,26 @@ export class WorkflowDraftService {
     let keep = false;
     try {
       try {
-        created = await this.deps.clarifier.create({ larkAppId: this.deps.appId, title });
+        // A create that answers after the timeout made a session nobody
+        // records: close it when it lands.
+        const outcome = await this.bounded(this.deps.clarifier.create({ larkAppId: this.deps.appId, title }), (late) => {
+          if (late.ok) void this.closeOrRemember(undefined, { sessionId: late.sessionId, headlessId: late.headlessId });
+        });
+        created = outcome === TIMED_OUT ? { ok: false, error: '创建会话超时' } : outcome;
       } catch (error) {
         created = { ok: false, error: errorText(error) };
       }
       let sent: Awaited<ReturnType<DraftClarifier['send']>> | undefined;
       if (created.ok) {
         try {
-          sent = await this.deps.clarifier.send({
+          const outcome = await this.bounded(this.deps.clarifier.send({
             larkAppId: this.deps.appId,
             sessionId: created.sessionId,
             headlessId: created.headlessId,
             prompt,
             requestId: `${runId}:${reservation}`,
-          });
+          }));
+          sent = outcome === TIMED_OUT ? { ok: false, error: '发送第一轮超时', disconnected: false } : outcome;
         } catch (error) {
           sent = { ok: false, error: errorText(error), disconnected: false };
         }
@@ -715,7 +832,7 @@ export class WorkflowDraftService {
       this.orphans.set(entry.sessionId, entry);
       if (runId) {
         try {
-          this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
+          this.mutate(runId, undefined, { allowAbandoned: true, allowDeleted: true }, ({ draft }) => {
             const list = draft.orphanSessions ?? [];
             if (list.some((item) => item.sessionId === entry.sessionId)) return { changed: false, result: undefined };
             draft.orphanSessions = [...list, entry].slice(-WORKFLOW_DRAFT_MAX_ORPHANS);
@@ -759,7 +876,7 @@ export class WorkflowDraftService {
       version: 1,
       // The session slot is reserved from birth: a second tab's 「继续」 or
       // message waits for this create instead of starting a second session.
-      clarify: { state: 'active', turns: [{ role: 'user', text: goal, at }], pending: { triggerId: reservation, sentAt: at } },
+      clarify: { state: 'active', turns: [{ role: 'user', text: goal, at }], pending: this.reservationEntry(reservation) },
     };
     try {
       withWorkflowDraftLock(runDir, runId, () => writeWorkflowDraft(runDir, record));
@@ -795,7 +912,7 @@ export class WorkflowDraftService {
         const specMarkdown = readTextOrUndefined(grill.specPath) ?? draft.clarify.specCandidate?.markdown;
         const prompt = buildDraftClarifyResume({ runId, goal: draft.goal, specMarkdown, turns: draft.clarify.turns });
         // Reserve so a second 「继续」 cannot start a second session.
-        draft.clarify.pending = { triggerId: reservation, sentAt: this.now().toISOString() };
+        draft.clarify.pending = this.reservationEntry(reservation);
         delete draft.clarify.sessionId;
         delete draft.clarify.headlessId;
         return { changed: true, result: { old, prompt, title: clip(draft.goal.replace(/\s+/g, ' '), 80) } };
@@ -1214,9 +1331,10 @@ export class WorkflowDraftService {
   /**
    * 删除 (§4.6): an abandoned draft, or one without activity for 30 days.
    * Three steps, each safe to repeat: mark deletedAt (from here no other write
-   * succeeds and the draft is not listed), remove the run dir, close the
-   * clarify sessions. A crash after the mark leaves a marked dir that the
-   * next delete, the boot recovery or the sweep finishes.
+   * succeeds and the draft is not listed), close the clarify sessions, and
+   * only then remove the run dir. A crash or a refused close after the mark
+   * leaves a marked dir that the next delete, the boot recovery or the sweep
+   * finishes.
    */
   async delete(runId: string, initiator: WorkflowDraftInitiator): Promise<void> {
     const sessions = this.mutate(runId, initiator, { allowAbandoned: true, allowDeleted: true }, ({ draft, grill }) => {
@@ -1236,11 +1354,25 @@ export class WorkflowDraftService {
     await this.finishDelete(runId, this.runDirOf(runId), sessions);
   }
 
-  /** Steps 2 and 3 of a delete. */
-  private async finishDelete(runId: string, runDir: string, sessions: Array<{ sessionId: string; headlessId?: string }>): Promise<void> {
+  /**
+   * Steps 2 and 3 of a delete: close every session the draft knows of, and
+   * only once all are closed remove the run dir. A close that fails is
+   * written to the marked draft's orphanSessions and the dir stays — the
+   * marked dir is what lets the sweep / the next boot find and retry it.
+   */
+  private async finishDelete(runId: string, runDir: string, sessions: Array<{ sessionId: string; headlessId?: string }>): Promise<boolean> {
+    let allClosed = true;
+    for (const session of sessions) {
+      if (!(await this.closeOrRemember(runId, session))) allClosed = false;
+    }
+    if (!allClosed) {
+      this.log(`[workflow-draft] delete of ${runId} waits for its clarify sessions to close`);
+      return false;
+    }
     if (!existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) rmSync(runDir, { recursive: true, force: true, maxRetries: 3 });
-    for (const session of sessions) await this.closeOrRemember(undefined, session);
+    for (const session of sessions) this.orphans.delete(session.sessionId);
     this.log(`[workflow-draft] deleted ${runId}`);
+    return true;
   }
 
   /** Marked-deleted drafts of this bot whose dir is still there (a delete
@@ -1379,14 +1511,8 @@ export class WorkflowDraftService {
             });
           }
           if (draft.architect) {
-            // hostArchitect may have reached 待确认流程 just before the crash:
-            // that attempt did succeed (its DAG is validated and on disk).
-            const reached = readGrillState(runDir)?.status === 'dag_ready';
-            const { problems: _old, ...rest } = draft.architect;
-            draft.architect = reached
-              ? { ...rest, state: 'succeeded', finishedAt: this.now().toISOString() }
-              : { ...rest, state: 'interrupted', finishedAt: this.now().toISOString(), problems };
-            if (reached) this.flowChanged(draft, { nodeBots: true });
+            const settled = settleLostArchitect(draft, readGrillState(runDir)?.status, this.now().toISOString(), problems);
+            if (settled === 'succeeded') this.flowChanged(draft, { nodeBots: true });
           }
           this.persist(runDir, draft);
           recovered.push(runId);

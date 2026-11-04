@@ -150,9 +150,9 @@ describe('clarify session start', () => {
     const creating = old.create(OWNER, { goal: 'g' });
     await tick();
     const runId = onlyRunId();
-    // Another process (a restarted daemon) does not hold that reservation:
-    // it drops it and starts its own session.
-    const fresh = new WorkflowDraftService(h.deps);
+    // Another process (a restarted daemon; the holder of that reservation is
+    // gone) drops it and starts its own session.
+    const fresh = new WorkflowDraftService({ ...h.deps, isHolderAlive: () => false });
     expect((await fresh.view(runId)).clarify.pending).toBe(false);
     await fresh.continueClarify(runId, OWNER);
     gate.resolve();
@@ -172,6 +172,112 @@ describe('clarify session start', () => {
     const draft = readWorkflowDraft(runDir)!;
     writeWorkflowDraft(runDir, { ...draft, clarify: { ...draft.clarify, pending: { triggerId: 'reserve:from-a-dead-process', sentAt: draft.updatedAt } } });
     expect((await h.service.view(runId)).clarify.pending).toBe(false);
+  });
+});
+
+describe('reservation holders and call timeouts', () => {
+  it('a reservation held by another live process is not dropped; the other process gets clarify_turn_running', async () => {
+    const h = makeService(base);
+    const { runId } = await h.service.create(OWNER, { goal: 'g' });
+    h.clarify.reply('q?');
+    await h.service.view(runId);
+    const gate = deferred();
+    const inner = h.clarify.clarifier;
+    let slow = true;
+    const a = new WorkflowDraftService({ ...h.deps, clarifier: { ...inner, send: async (input) => { if (slow) { slow = false; await gate.promise; } return inner.send(input); } } });
+    const b = new WorkflowDraftService(h.deps);
+    const tabA = code(a.sendMessage(runId, OWNER, { text: 'A' }));
+    await tick();
+    expect((await b.view(runId)).clarify.pending).toBe(true);
+    expect(await code(b.sendMessage(runId, OWNER, { text: 'B' }))).toBe('clarify_turn_running');
+    gate.resolve();
+    expect(await tabA).toBe('ok');
+    expect(h.clarify.sessions.get('sess-1')!.prompts.slice(1)).toEqual(['A']);
+  });
+
+  it('a reservation of this very instance that is no longer in flight is dropped, even though its process is alive', async () => {
+    const h = makeService(base);
+    const gate = deferred();
+    const inner = h.clarify.clarifier;
+    const service = new WorkflowDraftService({ ...h.deps, clarifier: { ...inner, create: async (input) => { await gate.promise; return inner.create(input); } } });
+    const creating = service.create(OWNER, { goal: 'g' });
+    await tick();
+    const runId = onlyRunId();
+    const runDir = join(base, runId);
+    const ownHolder = readWorkflowDraft(runDir)!.clarify.pending!.holder!;
+    gate.resolve();
+    await creating;
+    h.clarify.reply('q?');
+    await service.view(runId);
+    // e.g. a send whose second step could not be written
+    const draft = readWorkflowDraft(runDir)!;
+    writeWorkflowDraft(runDir, { ...draft, clarify: { ...draft.clarify, pending: { triggerId: 'reserve:lost-second-step', sentAt: draft.updatedAt, holder: ownHolder } } });
+    expect((await service.view(runId)).clarify.pending).toBe(false);
+  });
+
+  it('a send that never returns gives up after the call timeout: reservation released, a system turn says so', async () => {
+    const h = makeService(base);
+    const { runId } = await h.service.create(OWNER, { goal: 'g' });
+    h.clarify.reply('q?');
+    await h.service.view(runId);
+    const inner = h.clarify.clarifier;
+    const service = new WorkflowDraftService({ ...h.deps, clarifier: { ...inner, send: () => new Promise(() => {}) } });
+    const stuck = code(service.sendMessage(runId, OWNER, { text: 'A' }));
+    await tick();
+    expect(await code(service.sendMessage(runId, OWNER, { text: 'x' }))).toBe('clarify_turn_running');
+    h.timers.fire();
+    expect(await stuck).toBe('clarify_unavailable');
+    const view = await service.view(runId);
+    expect(view.clarify.pending).toBe(false);
+    expect(view.clarify.turns.at(-1)).toMatchObject({ role: 'system', text: expect.stringContaining('A') });
+    const fine = new WorkflowDraftService(h.deps);
+    expect(await code(fine.sendMessage(runId, OWNER, { text: 'again' }))).toBe('ok');
+  });
+
+  it('a session create that answers after the timeout is closed when it lands', async () => {
+    const h = makeService(base);
+    const gate = deferred();
+    const inner = h.clarify.clarifier;
+    const service = new WorkflowDraftService({ ...h.deps, clarifier: { ...inner, create: async (input) => { await gate.promise; return inner.create(input); } } });
+    const creating = service.create(OWNER, { goal: 'g' });
+    await tick();
+    h.timers.fire();
+    const view = await creating;
+    expect(view.clarify).toMatchObject({ state: 'disconnected', pending: false });
+    gate.resolve();
+    await vi.waitFor(() => expect(sessionStates(h)).toEqual([true]));
+  });
+
+  it('a session restarting / being retired answers busy; nothing is recorded as sent', async () => {
+    const h = makeService(base);
+    const { runId } = await h.service.create(OWNER, { goal: 'g' });
+    h.clarify.reply('q?');
+    await h.service.view(runId);
+    const service = new WorkflowDraftService({ ...h.deps, clarifier: { ...h.clarify.clarifier, send: async () => ({ ok: false, error: 'lifecycle', disconnected: false, busy: true }) } });
+    const before = (await service.view(runId)).clarify.turns.length;
+    expect(await code(service.sendMessage(runId, OWNER, { text: 'x' }))).toBe('busy');
+    const view = await service.view(runId);
+    expect(view.clarify).toMatchObject({ state: 'active', pending: false });
+    expect(view.clarify.error).toBeUndefined();
+    expect(view.clarify.turns.length).toBe(before);
+  });
+});
+
+describe('a lost outcome that did succeed', () => {
+  it('healing a draft whose grill reached 待确认流程 records success and a new flow revision, not an interruption', async () => {
+    const h = makeService(base);
+    const runId = await specApproved(h);
+    await h.service.startArchitect(runId, OWNER);
+    await architectSettled(h.service, runId);
+    const runDir = join(base, runId);
+    const draft = readWorkflowDraft(runDir)!;
+    // The success record was lost: the draft still says 编排中.
+    writeWorkflowDraft(runDir, { ...draft, architect: { ...draft.architect!, state: 'running' }, flowRevision: 0 });
+    const view = await h.service.view(runId);
+    expect(view).toMatchObject({ phase: 'dag_ready', architect: { state: 'succeeded' } });
+    expect(view.architect!.problems).toBeUndefined();
+    expect(view.flowRevision).toBe(1);
+    expect(await code(h.service.approveFlow(runId, OWNER, { flowSummarySha256: view.flow!.flowSummarySha256 }))).toBe('ok');
   });
 });
 
@@ -239,7 +345,7 @@ describe('closing sessions and deleting drafts', () => {
     expect(readWorkflowDraft(join(base, runId))!.orphanSessions).toBeUndefined();
   });
 
-  it('the run dir goes before the session close is awaited', async () => {
+  it('the run dir stays until its sessions are closed (a process dying in between leaves a marked dir, never a leaked session)', async () => {
     const h = makeService(base);
     const hang = deferred();
     const inner = h.clarify.clarifier;
@@ -248,11 +354,33 @@ describe('closing sessions and deleting drafts', () => {
     const { runId } = await service.create(OWNER, { goal: 'g' });
     h.advance(31 * 24 * 60 * 60_000);
     holdClose = true;
-    const deleting = service.delete(runId, OWNER);
+    void service.delete(runId, OWNER);
     await tick();
+    // The process "dies" here: the session is still open, the dir is still there.
+    expect(existsSync(join(base, runId))).toBe(true);
+    expect(sessionStates(h)).toEqual([false]);
+    const next = new WorkflowDraftService({ ...h.deps, clarifier: inner });
+    await next.sweepIdleClarify();
+    expect(sessionStates(h)).toEqual([true]);
     expect(existsSync(join(base, runId))).toBe(false);
     hang.resolve();
-    await deleting;
+  });
+
+  it('a delete whose session close is refused keeps the marked dir and the failed id on disk until a later sweep closes it', async () => {
+    const h = makeService(base);
+    const inner = h.clarify.clarifier;
+    const refusing = new WorkflowDraftService({ ...h.deps, clarifier: { ...inner, close: async () => { throw new Error('close refused'); } } });
+    const { runId } = await refusing.create(OWNER, { goal: 'g' });
+    h.advance(31 * 24 * 60 * 60_000);
+    await refusing.delete(runId, OWNER);
+    const runDir = join(base, runId);
+    expect(existsSync(runDir)).toBe(true);
+    expect(readWorkflowDraft(runDir)).toMatchObject({ deletedAt: expect.any(String), orphanSessions: [{ sessionId: 'sess-1' }] });
+    expect(listWorkflowDrafts(base)).toEqual([]);
+    // After a restart (nothing in memory) the next boot finishes it.
+    const next = new WorkflowDraftService({ ...h.deps, clarifier: inner });
+    next.recoverInterrupted();
+    await vi.waitFor(() => expect(existsSync(runDir)).toBe(false));
     expect(sessionStates(h)).toEqual([true]);
   });
 
@@ -270,7 +398,7 @@ describe('closing sessions and deleting drafts', () => {
       expect(workflowDraftOwner(base, runId)).toBe(draft.orchestratorAppId);
       const fresh = new WorkflowDraftService(h.deps);
       if (finish === 'delete') await fresh.delete(runId, OWNER);
-      else if (finish === 'recover') { fresh.recoverInterrupted(); await vi.waitFor(() => expect(sessionStates(h)).toEqual([true])); }
+      else if (finish === 'recover') { fresh.recoverInterrupted(); await vi.waitFor(() => expect(existsSync(runDir)).toBe(false)); }
       else await fresh.sweepIdleClarify();
       expect(existsSync(runDir), finish).toBe(false);
       expect(sessionStates(h), finish).toEqual([true]);
@@ -339,6 +467,7 @@ describe('production clarifier: releasing a process', () => {
       isSuspendable: (session) => (session as any).backend === 'tmux',
       canRetireWorker: (session) => (session as any).backend !== 'riff',
       killWorker: () => { calls.push('kill'); },
+      lifecycleInFlight: (session) => (session as any).retiring === true,
       closeSession: async () => ({ ok: false, error: 'refused' }),
       deleteHeadlessRecord: () => { calls.push('delete-record'); },
     });
@@ -358,6 +487,13 @@ describe('production clarifier: releasing a process', () => {
     const riff = harness(live('riff'));
     expect(await riff.clarifier.suspend('s1')).toBe(false);
     expect(riff.calls).toEqual([]);
+  });
+
+  it('a turn sent while the session\'s worker is being retired is refused as busy, not raced into the dying process', async () => {
+    const ds = { ...live('pty'), retiring: true };
+    const { clarifier } = harness(ds);
+    expect(await clarifier.send({ larkAppId: 'app', sessionId: 's1', headlessId: 'hl_x', prompt: 'p', requestId: 'r' }))
+      .toMatchObject({ ok: false, busy: true, disconnected: false });
   });
 
   it('a refused close is an error (so the draft keeps the id) and the record is not deleted', async () => {
