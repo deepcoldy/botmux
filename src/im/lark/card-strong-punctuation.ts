@@ -133,17 +133,66 @@ function strongRuns(line: string): number[] {
   return runs;
 }
 
-function insideInlineLink(line: string, start: number, end: number): boolean {
-  for (let open = line.indexOf('['); open >= 0 && open < end; open = line.indexOf('[', open + 1)) {
-    const closeBracket = line.indexOf(']', open + 1);
-    if (closeBracket < 0) break;
-    if (line[closeBracket + 1] !== '(') continue;
-    if (start > open && end <= closeBracket) return true;
+/** Source span of a link label or image alt that markdown-it recognises:
+ * `[LABEL](…)` / `![ALT](…)` (resolved reference forms are caught by the
+ * strong-in-link gate, since per-line parsing has no reference definitions). */
+interface LabelSpan { start: number; end: number }
+
+/** A private parser whose inline link/image rules report the exact label spans
+ * they accepted. Anchoring on a successful rule means a bracket that is not a
+ * real link (one inside a code span, or one with an invalid destination) never
+ * hides a repairable candidate, unlike a hand-rolled bracket scan. */
+const labelProbe = new MarkdownIt({ html: false, linkify: false });
+let labelSink: LabelSpan[] = [];
+function recognizedLabelClose(src: string, openBracket: number): number {
+  // openBracket is the '[' of a label the link/image rule just validated; find
+  // its close by bracket nesting (nested `[ ]` are allowed inside labels).
+  let depth = 0;
+  for (let index = openBracket; index < src.length; index++) {
+    if (src[index] === '\\') { index++; continue; }
+    if (src[index] === '[') depth++;
+    else if (src[index] === ']') { depth--; if (depth === 0) return index; }
+    else if (src[index] === '\n') return -1;
   }
-  return false;
+  return -1;
+}
+for (const ruleName of ['link', 'image'] as const) {
+  const rule = (labelProbe.inline.ruler as unknown as { __rules__: { name: string; fn: (state: any, silent: boolean) => boolean }[] })
+    .__rules__.find(rule => rule.name === ruleName)!;
+  const original = rule.fn;
+  rule.fn = function wrapped(state: any, silent: boolean): boolean {
+    const start = state.pos;
+    const accepted = original.call(this, state, silent);
+    if (accepted && !silent) {
+      const isImage = state.src.charCodeAt(start) === 0x21 /* ! */;
+      if ((ruleName === 'image') === isImage) {
+        const openBracket = start + (isImage ? 1 : 0);
+        const close = recognizedLabelClose(state.src, openBracket);
+        if (close > 0) labelSink.push({ start: openBracket + 1, end: close });
+      }
+    }
+    return accepted;
+  };
 }
 
-function lineCandidates(line: string, lineStart: number, ranges: readonly MarkdownLiteralRange[]): Candidate[] {
+/** Link/image label interiors on this line, exactly as markdown-it parses
+ * them. Link structure cannot span a line break, so per-line parsing agrees
+ * with the document parse for this question. */
+function recognizedLabelSpans(line: string): readonly LabelSpan[] {
+  if (!line.includes('[')) return [];
+  labelSink = [];
+  labelProbe.parseInline(line, {});
+  const spans = labelSink;
+  labelSink = [];
+  return spans;
+}
+
+function lineCandidates(
+  line: string,
+  lineStart: number,
+  ranges: readonly MarkdownLiteralRange[],
+  labels: readonly LabelSpan[],
+): Candidate[] {
   const candidates: Candidate[] = [];
   const runs = strongRuns(line);
   for (let k = 0; k + 1 < runs.length; k++) {
@@ -155,7 +204,10 @@ function lineCandidates(line: string, lineStart: number, ranges: readonly Markdo
     // is fine (`**用 `bun`：**`), the moved punctuation sits next to them.
     if (insideLiteral(ranges, lineStart + open, lineStart + open + 2)
       || insideLiteral(ranges, lineStart + close, lineStart + close + 2)) continue;
-    if (insideInlineLink(line, open, close + 2)) continue;
+    // A pair inside real link text or image alt can never pass the gate
+    // (strong-in-link invariant) or be measured at all (image children); skip
+    // it so it cannot spoil the batched verification for the whole reply.
+    if (labels.some(label => open >= label.start && close + 2 <= label.end)) continue;
     // Bare URLs may be autolinked by Feishu; their bytes are not prose.
     const word = line.slice(0, close).split(/\s/).at(-1) ?? '';
     if (/:\/\/|www\./i.test(word)) continue;
@@ -204,7 +256,8 @@ export function repairCardStrongPunctuation(input: string): string {
   let lineStart = 0;
   for (const line of input.split('\n')) {
     if (line.includes('**')) {
-      for (const candidate of lineCandidates(line, lineStart, ranges)) {
+      const labels = recognizedLabelSpans(line);
+      for (const candidate of lineCandidates(line, lineStart, ranges, labels)) {
         // Consecutive pairs share a run; keep the earlier, non-overlapping one.
         const last = candidates.at(-1);
         if (!last || candidate.start >= last.start + last.before.length) candidates.push(candidate);

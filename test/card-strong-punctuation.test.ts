@@ -95,6 +95,19 @@ describe('repairCardStrongPunctuation: pairs CommonMark would reject', () => {
     // Repaired output is stable: a second pass must not find more work.
     expect(repairCardStrongPunctuation(repaired)).toBe(repaired);
   });
+
+  it('recognises link labels via the parser, not a raw bracket scan', () => {
+    // A '[' inside an inline code span is literal: the later `](u)` does not
+    // open a link, so the label must still be repaired.
+    expect(repairCardStrongPunctuation('`[n` **x：**y](u)')).toBe('`[n` **x**：y](u)');
+    // A space in an unwrapped destination is not a valid link either.
+    expect(repairCardStrongPunctuation('[a **x：**y](1 2)')).toBe('[a **x**：y](1 2)');
+    // Real link text and image alt stay byte-for-byte untouched.
+    expect(repairCardStrongPunctuation('详见 [**文档：**说明](https://example.com)。'))
+      .toBe('详见 [**文档：**说明](https://example.com)。');
+    expect(repairCardStrongPunctuation('![**图：**说明](https://example.com/a.png)'))
+      .toBe('![**图：**说明](https://example.com/a.png)');
+  });
 });
 
 describe('repairCardStrongPunctuation: leaves everything else byte-identical', () => {
