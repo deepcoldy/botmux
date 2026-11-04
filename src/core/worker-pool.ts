@@ -235,7 +235,10 @@ const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
 type WorkerIpcBootstrapState = {
   ready: boolean;
-  pending: Array<() => void>;
+  pending: Array<{
+    dispatch: () => void;
+    onAbort?: () => void;
+  }>;
   timer: ReturnType<typeof setTimeout>;
 };
 
@@ -263,8 +266,20 @@ function initializeWorkerIpcBootstrap(worker: ChildProcess): void {
   worker.once('exit', () => {
     worker.off('message', onMessage);
     clearTimeout(state.timer);
-    state.pending.length = 0;
+    if (workerIpcBootstrapStates.get(worker) !== state || state.ready) return;
     workerIpcBootstrapStates.delete(worker);
+    const pending = state.pending.splice(0);
+    for (const entry of pending) {
+      try {
+        entry.onAbort?.();
+      } catch (error) {
+        logger.error(
+          `Failed to abort standalone worker IPC bootstrap queue entry: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
   });
   worker.send({ type: 'worker_ipc_probe' } satisfies DaemonToWorker);
 }
@@ -278,9 +293,9 @@ function releaseWorkerIpcBootstrap(
   clearTimeout(state.timer);
   workerIpcBootstrapStates.delete(worker);
   const pending = state.pending.splice(0);
-  for (const dispatch of pending) {
+  for (const entry of pending) {
     try {
-      dispatch();
+      entry.dispatch();
     } catch (error) {
       logger.error(
         `Failed to flush standalone worker IPC bootstrap queue: ${
@@ -291,14 +306,18 @@ function releaseWorkerIpcBootstrap(
   }
 }
 
-function afterWorkerIpcBootstrap(worker: ChildProcess, dispatch: () => void): boolean {
+function afterWorkerIpcBootstrap(
+  worker: ChildProcess,
+  dispatch: () => void,
+  onAbort?: () => void,
+): boolean {
   const state = workerIpcBootstrapStates.get(worker);
   if (!state || state.ready) {
     dispatch();
     return true;
   }
   if (worker.killed || worker.connected === false) return false;
-  state.pending.push(dispatch);
+  state.pending.push({ dispatch, onAbort });
   return true;
 }
 
@@ -14319,6 +14338,7 @@ interface PendingProtectedHttpEgressFork {
   waiters: Array<{
     resumeOrTurnId: ForkResumeOrTurnId;
     opts: ForkWorkerOptions;
+    queuedActivationTailId?: string;
   }>;
 }
 
@@ -14406,6 +14426,7 @@ function queueBehindPendingProtectedHttpEgressFork(
 ): boolean {
   const payload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+  let queuedActivationTailId: string | undefined;
   if (payload.content.length > 0) {
     const queuedTurnId = turnId ?? `queued-protected-egress-${randomUUID()}`;
     const trustedCaller = payload.trustedCaller
@@ -14414,7 +14435,7 @@ function queueBehindPendingProtectedHttpEgressFork(
         : undefined);
     const trustedController = trustedSessionController(ds);
     try {
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: payload.content,
         cliInput: {
           content: payload.content,
@@ -14431,6 +14452,7 @@ function queueBehindPendingProtectedHttpEgressFork(
           && resumeOrTurnId !== null
           && resumeOrTurnId.codexAppInputGateFrozen === true,
       });
+      queuedActivationTailId = admitted.id;
     } catch (error) {
       logger.error(
         `[${tag(ds)}] Failed to durably queue input behind protected egress DNS freeze: `
@@ -14440,7 +14462,7 @@ function queueBehindPendingProtectedHttpEgressFork(
       return true;
     }
   }
-  pending.waiters.push({ resumeOrTurnId, opts });
+  pending.waiters.push({ resumeOrTurnId, opts, queuedActivationTailId });
   opts.onAdmission?.('deferred');
   return true;
 }
@@ -14502,10 +14524,34 @@ export function forkWorker(
     waiters: [],
   };
   pendingProtectedHttpEgressForks.set(ds.session.sessionId, activePending);
+  let activePendingSettled = false;
   const clearActivePending = () => {
     if (pendingProtectedHttpEgressForks.get(ds.session.sessionId) === activePending) {
       pendingProtectedHttpEgressForks.delete(ds.session.sessionId);
     }
+  };
+  const abortActivePending = () => {
+    if (activePendingSettled) return;
+    activePendingSettled = true;
+    const queuedTailIds = new Set(activePending.waiters.flatMap(waiter =>
+      waiter.queuedActivationTailId ? [waiter.queuedActivationTailId] : []));
+    if (queuedTailIds.size > 0) {
+      const retainedTail = (ds.session.queuedActivationTail ?? [])
+        .filter(entry => !queuedTailIds.has(entry.id));
+      ds.session.queuedActivationTail = retainedTail.length > 0 ? retainedTail : undefined;
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (error) {
+        logger.error(
+          `[${tag(ds)}] Failed to persist protected egress follower cleanup after pre-ready exit: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    for (const waiter of activePending.waiters) {
+      waiter.opts.onAdmission?.('rejected');
+    }
+    clearActivePending();
   };
   void resolveProtectedHttpEgressTargets(collectedPolicy.policy).then(
     frozenAddresses => {
@@ -14525,6 +14571,8 @@ export function forkWorker(
         if (started) {
           const worker = ds.worker;
           const promoteAfterOpeningInit = () => {
+            if (activePendingSettled) return;
+            activePendingSettled = true;
             try {
               const promoted = activePending.waiters.length === 0
                 || promoteQueuedActivationTail(ds);
@@ -14543,15 +14591,15 @@ export function forkWorker(
               clearActivePending();
             }
           };
-          if (!worker || !afterWorkerIpcBootstrap(worker, promoteAfterOpeningInit)) {
-            for (const waiter of activePending.waiters) {
-              waiter.opts.onAdmission?.('rejected');
-            }
-            clearActivePending();
+          if (!worker || !afterWorkerIpcBootstrap(
+            worker,
+            promoteAfterOpeningInit,
+            abortActivePending,
+          )) {
+            abortActivePending();
           }
         } else if (!started) {
-          for (const waiter of activePending.waiters) waiter.opts.onAdmission?.('rejected');
-          clearActivePending();
+          abortActivePending();
         }
       } catch (error) {
         reportProtectedHttpEgressForkFailure(

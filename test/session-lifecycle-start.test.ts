@@ -562,6 +562,68 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     });
   });
 
+  it('rejects and removes DNS followers when the standalone worker exits before IPC bootstrap', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishFirstLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock
+      .mockReturnValueOnce(new Promise(resolve => {
+        finishFirstLookup = resolve;
+      }))
+      .mockResolvedValueOnce([['10.20.30.41']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const firstFollowerAdmission = vi.fn();
+    const secondFollowerAdmission = vi.fn();
+
+    expect(forkWorker(ds, 'opening protected turn', { turnId: 'om_egress_opening' })).toBe(true);
+    expect(forkWorker(ds, 'first queued protected follower', {
+      turnId: 'om_egress_follower_1',
+    }, { onAdmission: firstFollowerAdmission })).toBe(true);
+    expect(forkWorker(ds, 'second queued protected follower', {
+      turnId: 'om_egress_follower_2',
+    }, { onAdmission: secondFollowerAdmission })).toBe(true);
+    expect(firstFollowerAdmission).toHaveBeenCalledWith('deferred');
+    expect(secondFollowerAdmission).toHaveBeenCalledWith('deferred');
+    const followerTailIds = ds.session.queuedActivationTail?.map(entry => entry.id) ?? [];
+    expect(followerTailIds).toHaveLength(2);
+    const unrelatedTail = admitQueuedActivationTail(ds, {
+      userPrompt: 'unrelated queued turn',
+      cliInput: { content: 'unrelated queued turn' },
+      turnId: 'om_unrelated_tail',
+    });
+
+    finishFirstLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const persistedTailsAfterExit: Array<typeof ds.session.queuedActivationTail> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persistedTailsAfterExit.push(structuredClone(session.queuedActivationTail));
+    });
+    const firstWorker = forkMock.mock.results[0]!.value;
+    firstWorker.emit('exit', 1, null);
+
+    await vi.waitFor(() => expect(firstFollowerAdmission).toHaveBeenLastCalledWith('rejected'));
+    expect(secondFollowerAdmission).toHaveBeenLastCalledWith('rejected');
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ id: unrelatedTail.id, turnId: 'om_unrelated_tail' }),
+    ]);
+    expect(ds.session.queuedActivationTail?.some(entry => followerTailIds.includes(entry.id))).toBe(false);
+    expect(persistedTailsAfterExit).toContainEqual([
+      expect.objectContaining({ id: unrelatedTail.id, turnId: 'om_unrelated_tail' }),
+    ]);
+
+    expect(forkWorker(ds, 'retry protected turn', { turnId: 'om_egress_retry' })).toBe(true);
+    await vi.waitFor(() => expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    const retryWorker = forkMock.mock.results[1]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+  });
+
   it('reports a post-freeze preparation exception as preparation failure rather than DNS failure', async () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
