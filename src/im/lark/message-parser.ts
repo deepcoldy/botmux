@@ -254,7 +254,7 @@ export function extractMentionIdentities(message: {
   const out = (message?.mentions ?? []).map(mentionIdentity);
   try {
     const content = JSON.parse(message?.content ?? '{}');
-    const inner = content.zh_cn ?? content.en_us ?? content;
+    const inner = resolvePostBody(content);
     if (Array.isArray(inner?.content)) {
       for (const paragraph of inner.content) {
         if (!Array.isArray(paragraph)) continue;

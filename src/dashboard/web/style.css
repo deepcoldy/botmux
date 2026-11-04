@@ -7642,6 +7642,24 @@ dialog.onboarding-dialog::backdrop {
   box-sizing: border-box;
   resize: vertical;
 }
+.roles-listener-identity-keywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.roles-listener-identity-keyword {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--fg);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
 .roles-listener-policy {
   display: inline-flex;
   align-items: center;
