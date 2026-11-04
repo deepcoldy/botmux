@@ -12,6 +12,54 @@ import { t, type Locale } from '../../i18n/index.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { canOperate } from './event-dispatcher.js';
 import { deliverEphemeralOrReply, isSessionTransferring, topicReasoningControl } from '../../core/worker-pool.js';
+import { readTraexModelLoads } from '../../services/traex-model-load.js';
+import { isRemoteBackendId } from '../../core/remote-cli-ids.js';
+
+export interface ModelPickerLoad {
+  /** Missing entries and an unavailable query both mean unknown, never idle. */
+  loads: ReadonlyMap<string, number> | null;
+  checkedAt: number | null;
+}
+
+async function pickerLoad(key: string, cfg: BotConfig, session?: DaemonSession): Promise<ModelPickerLoad> {
+  const unavailable = { loads: null, checkedAt: null };
+  // Only a native local TraeX catalogue advertises load metadata. Do not
+  // substitute a host account for a wrapper/remote/session-selected runtime.
+  const snapshot = session?.session.cliLaunchSnapshot;
+  if (key !== 'traex' || cfg.wrapperCli || cfg.cliLaunchMode
+    || session?.session.wrapperCli || session?.session.cliLaunchMode || snapshot?.wrapperCli || snapshot?.cliLaunchMode
+    || isRemoteBackendId(session?.session.backendType ?? cfg.backendType ?? 'pty')) return unavailable;
+  try {
+    const probe = modelCatalogProbeContext(key, cfg, process.env);
+    if (!probe.runtimeContext) return unavailable;
+    const executable = snapshot?.cliRuntime?.executable ?? snapshot?.cliPathOverride
+      ?? session?.session.cliPathOverride ?? probe.runtimeExecutable;
+    const loads = await readTraexModelLoads({
+      cliBin: createCliAdapterSync('traex', executable ?? undefined).resolvedBin,
+      env: probe.probeEnv,
+      cwd: session?.session.workingDir,
+      timeoutMs: 2_500,
+    });
+    return { loads, checkedAt: loads ? Date.now() : null };
+  } catch { return unavailable; }
+}
+
+function modelOptionLabel(model: string, load: ModelPickerLoad | undefined, loc: Locale): string {
+  if (!load) return model;
+  const percent = load.loads?.get(model.trim().toLowerCase());
+  const label = percent === undefined
+    ? t('card.models.load_unknown', undefined, loc)
+    : t('card.models.load_percent', { percent }, loc);
+  return `${model} · ${label}`;
+}
+
+function modelLoadNote(load: ModelPickerLoad | undefined, loc: Locale) {
+  if (!load) return [];
+  return [{ tag: 'div', text: { tag: 'plain_text', content: load.checkedAt === null
+    ? t('card.models.load_unavailable', undefined, loc)
+    : t('card.models.load_snapshot', { time: new Date(load.checkedAt).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' }, loc),
+  } }];
+}
 
 function sessionCliId(ds: DaemonSession) {
   return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
@@ -59,6 +107,16 @@ export async function sessionModelChoices(ds: DaemonSession): Promise<readonly s
   return mergeModelChoices(catalogue.staticChoices, live).models;
 }
 
+/** Display metadata is separate from the command whitelist: a failed load
+ * query must never make a selectable model disappear or change its slug. */
+export async function sessionModelPickerData(ds: DaemonSession) {
+  const key = selectionKeyForBot(sessionCliId(ds), ds.session.wrapperCli, ds.session.cliLaunchMode);
+  const [models, load] = await Promise.all([
+    sessionModelChoices(ds).catch(() => staticModelChoices(key)), pickerLoad(key, getBot(ds.larkAppId).config, ds),
+  ]);
+  return { models, load };
+}
+
 export function buildSessionModelPickerCard(
   ds: DaemonSession,
   rootId: string,
@@ -66,6 +124,7 @@ export function buildSessionModelPickerCard(
   currentModel: string | undefined,
   loc: Locale,
   action: 'reply_model_pick' | 'session_model_pick' = 'reply_model_pick',
+  load?: ModelPickerLoad,
 ): string {
   // Only render slugs the inject path would accept: a live-detected catalogue
   // entry with exotic characters must not render into a dead option.
@@ -108,21 +167,22 @@ export function buildSessionModelPickerCard(
           options: safeModels.slice(0, 50).map(model => ({
             text: {
               tag: 'plain_text',
-              content: model === currentModel
-                ? `${model} ${t('card.reply_actions.model_current', undefined, loc)}`
-                : model,
+              content: modelOptionLabel(model, load, loc)
+                + (model === currentModel ? ` ${t('card.reply_actions.model_current', undefined, loc)}` : ''),
             },
             value: model,
           })),
           value: { action, session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId },
         }],
       },
+      ...modelLoadNote(load, loc),
       ...effortElements,
     ],
   });
 }
 
-/** Read-only shortcut: opening the picker never starts a CLI or changes a model. */
+/** Read-only shortcut: a short-lived catalogue helper creates no conversation
+ * and never changes the model of the running CLI. */
 export async function showSessionModelPicker(
   ds: DaemonSession,
   rootId: string,
@@ -142,10 +202,18 @@ export async function showSessionModelPicker(
     notice = t('card.reply_actions.model_unsupported', undefined, loc);
   }
   if (notice) { await reply(rootId, notice); return; }
-  const models = (await sessionModelChoices(ds)).filter(model => MODEL_SLUG_PATTERN.test(model));
+  const worker = ds.worker;
+  const generation = ds.workerGeneration;
+  const data = await sessionModelPickerData(ds);
+  if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId, operatorUnionId)
+    || ds.worker !== worker || ds.workerGeneration !== generation || ds.worker?.killed || isSessionTransferring(ds)) {
+    await reply(rootId, t('card.models.changed', undefined, loc));
+    return;
+  }
+  const models = data.models.filter(model => MODEL_SLUG_PATTERN.test(model));
   const card = models.length > 0
     ? buildSessionModelPickerCard(ds, rootId, models,
-      ds.activeModel?.trim() || ds.session.model?.trim() || undefined, loc, 'session_model_pick')
+      ds.activeModel?.trim() || ds.session.model?.trim() || undefined, loc, 'session_model_pick', data.load)
     : JSON.stringify({ config: { wide_screen_mode: true }, elements: [
       { tag: 'markdown', content: t('card.reply_actions.model_empty', undefined, loc) },
     ] });
@@ -165,6 +233,15 @@ export async function defaultModelChoices(appId: string): Promise<readonly strin
   return mergeModelChoices(catalogue.staticChoices, live).models;
 }
 
+export async function defaultModelPickerData(appId: string) {
+  const cfg = getBot(appId).config;
+  const key = defaultModelSelectionKey(appId);
+  const [models, load] = await Promise.all([
+    defaultModelChoices(appId).catch(() => staticModelChoices(key)), pickerLoad(key, cfg),
+  ]);
+  return { models, load };
+}
+
 export function buildDefaultModelPickerCard(
   appId: string,
   models: readonly string[],
@@ -172,6 +249,7 @@ export function buildDefaultModelPickerCard(
   loc: Locale,
   selectionKey: string,
   reasoning?: { cliId: string; effort?: string },
+  load?: ModelPickerLoad,
 ): string {
   const safe = [...new Set(models)].filter(model => MODEL_SLUG_PATTERN.test(model));
   if (currentModel && MODEL_SLUG_PATTERN.test(currentModel)) {
@@ -180,7 +258,7 @@ export function buildDefaultModelPickerCard(
     safe.unshift(currentModel);
   }
   const choices = [{ text: t('card.models.cli_default', undefined, loc), value: CONFIG_UNSET },
-    ...safe.slice(0, 49).map(model => ({ text: model, value: model }))];
+    ...safe.slice(0, 49).map(model => ({ text: modelOptionLabel(model, load, loc), value: model }))];
   const initial = currentModel && choices.some(c => c.value === currentModel) ? currentModel : CONFIG_UNSET;
   const efforts = reasoning ? reasoningEffortsForCliModel(reasoning.cliId, currentModel) : [];
   const effortControls = reasoning && isConfigurableReasoningCliId(reasoning.cliId) ? [
@@ -205,6 +283,7 @@ export function buildDefaultModelPickerCard(
       options: choices.map(c => ({ text: { tag: 'plain_text', content: c.text }, value: c.value })),
       value: { action: 'models_default_pick', lark_app_id: appId, selection_key: selectionKey, loc },
     }] },
+    ...modelLoadNote(load, loc),
     ...effortControls,
   ] });
 }
@@ -227,7 +306,7 @@ export async function showDefaultModelPicker(
     return;
   }
   const selectionKey = defaultModelSelectionKey(appId);
-  const models = await defaultModelChoices(appId);
+  const { models, load } = await defaultModelPickerData(appId);
   // Reading the catalogue can yield; re-read defaults and permission for display.
   const current = getBot(appId);
   if (!current.resolvedAllowedUsers.includes(operatorOpenId)) {
@@ -238,5 +317,5 @@ export async function showDefaultModelPicker(
     await reply(rootId, t('card.models.changed', undefined, loc));
     return;
   }
-  await reply(rootId, buildDefaultModelPickerCard(appId, models, current.config.model, loc, selectionKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }), 'interactive');
+  await reply(rootId, buildDefaultModelPickerCard(appId, models, current.config.model, loc, selectionKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }, load), 'interactive');
 }

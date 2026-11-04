@@ -1,7 +1,7 @@
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
-import { MODEL_SLUG_PATTERN, sessionModelChoices, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelChoices, defaultModelSelectionKey } from './session-model-picker.js';
+import { MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -2465,8 +2465,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (ttadkChoices !== null) return ttadkChoices;
       try { return createCliAdapterSync(cbot.config.cliId, cbot.config.cliPathOverride).modelChoices ?? []; } catch { return []; }
     })();
-    const reRender = () => {
-      if (defaultPicker) return { card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, modelChoices, cbot.config.model, loc, defaultModelSelectionKey(larkAppId), { cliId: cbot.config.cliId, effort: cbot.config.reasoningEffort })) } };
+    const reRender = async () => {
+      if (defaultPicker) {
+        const refreshKey = defaultModelSelectionKey(larkAppId);
+        const { models, load } = await defaultModelPickerData(larkAppId);
+        const current = getBot(larkAppId);
+        if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
+          || !current.resolvedAllowedUsers.includes(operatorOpenId)) return {};
+        return { card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, models, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }, load)) } };
+      }
       const d = getConfigCardData(larkAppId, modelChoices);
       return d ? { card: { type: 'raw' as const, data: JSON.parse(buildConfigCard(d, loc)) } } : {};
     };
@@ -2553,7 +2560,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const raw = (action as any)?.option ?? '';
       // legacy 是只读初始项，用来让历史 >1000 额度仍能生成合法下拉卡。
       if (raw === 'legacy') {
-        return { toast: { type: 'info', content: t('card.config.quota_legacy_unchanged', undefined, loc) }, ...reRender() };
+        return { toast: { type: 'info', content: t('card.config.quota_legacy_unchanged', undefined, loc) }, ...(await reRender()) };
       }
       let limit: number | null = null;
       if (raw !== 'off') {
@@ -2565,7 +2572,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
       const qr = await updateBotGrantPrefs(larkAppId, { messageQuotaDefaultLimit: limit });
       if (!qr.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: qr.reason }, loc) } };
-      return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...reRender() };
+      return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...(await reRender()) };
     }
 
     const field = defaultPicker ? (effortPicker ? 'reasoningEffort' : 'model') : value.field as string | undefined;
@@ -2593,11 +2600,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return { toast: { type: 'error', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.reply_actions.model_unsupported', undefined, loc) } };
       }
       if (raw === CONFIG_UNSET) {
-        if (!spec.clearable) return { toast: { type: 'error', content: t('cmd.config.not_clearable', { field: spec.key }, loc) }, ...reRender() };
+        if (!spec.clearable) return { toast: { type: 'error', content: t('cmd.config.not_clearable', { field: spec.key }, loc) }, ...(await reRender()) };
         r = await commitValue(null);
       } else {
         const coerced = coerceConfigValue(spec, raw);
-        if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) }, ...reRender() };
+        if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) }, ...(await reRender()) };
         r = await commitValue(coerced.value);
       }
     }
@@ -2606,22 +2613,22 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
       }
       if (defaultPicker && r.reason === 'reasoning_effort_not_supported_by_model') {
-        return { toast: { type: 'warning', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.models.effort_incompatible', undefined, loc) }, ...reRender() };
+        return { toast: { type: 'warning', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.models.effort_incompatible', undefined, loc) }, ...(await reRender()) };
       }
       return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
     }
     if (defaultPicker) {
       const refreshKey = defaultModelSelectionKey(larkAppId);
-      const choices = await defaultModelChoices(larkAppId).catch(() => modelChoices);
+      const { models: choices, load } = await defaultModelPickerData(larkAppId);
       const current = getBot(larkAppId);
       if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
         || !current.resolvedAllowedUsers.includes(operatorOpenId)) {
         return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText} · ${t('card.models.changed', undefined, loc)}` } };
       }
       return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` },
-        card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort })) } };
+        card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }, load)) } };
     }
-    return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...reRender() };
+    return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...(await reRender()) };
   }
 
   // ─── /relay picker: confirm transfer (stage 2 → done) ──────────────────
@@ -3386,12 +3393,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (!mutation.acquired) return warning('card.effort.busy');
       if (mutation.value !== 'saved') return warning(mutation.value === 'stale' ? 'card.topic_effort.stale' : `card.effort.${mutation.value}`);
       if (requested) return { toast: { type: 'info', content: t('card.topic_effort.restart_in_progress', undefined, loc) } };
-      const models = await sessionModelChoices(ds);
+      const { models, load } = await sessionModelPickerData(ds);
       if (getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) !== ds
         || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) return warning('card.topic_effort.stale');
       return { toast: { type: 'success', content: t('card.topic_effort.saved', undefined, loc) },
         card: { type: 'raw' as const, data: JSON.parse(buildSessionModelPickerCard(ds, rootId, models,
-          ds.activeModel ?? ds.session.model, loc, 'session_model_pick')) } };
+          ds.activeModel ?? ds.session.model, loc, 'session_model_pick', load)) } };
     }
 
     if (actionType === 'set_reasoning_effort') {
@@ -4900,10 +4907,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           return {};
         }
         const pickerDs = ds;
+        const pickerWorker = ds.worker;
+        const pickerGeneration = ds.workerGeneration;
         return {
           toast: { type: 'info', content: t('card.reply_actions.model_loading', undefined, loc) },
           afterAck: async () => {
-            const models = await sessionModelChoices(pickerDs);
+            const { models, load } = await sessionModelPickerData(pickerDs);
+            if (!canOperate(pickerDs.larkAppId, pickerDs.chatId, operatorOpenId)
+              || pickerDs.worker !== pickerWorker || pickerDs.workerGeneration !== pickerGeneration
+              || pickerDs.worker?.killed || isSessionTransferring(pickerDs)) return;
             const cardJson = models.length > 0
               ? buildSessionModelPickerCard(
                 pickerDs,
@@ -4911,6 +4923,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
                 models,
                 pickerDs.activeModel?.trim() || pickerDs.session.model?.trim() || undefined,
                 loc,
+                'reply_model_pick',
+                load,
               )
               : menuNoticeCard(t('card.reply_actions.model_empty', undefined, loc));
             await deliverEphemeralOrReply(pickerDs, operatorOpenId, cardJson, 'interactive',
