@@ -49,6 +49,7 @@ function daemon(self: string, dataDir: string, baseDir: string, run: BotRun, ove
     isProcessAlive: () => true,
     activeSessions: () => sessions,
     updateSession: () => {},
+    getSessionWorkingDir: (ds: DaemonSession) => ds.workingDir ?? ds.session.workingDir ?? '',
     interruptTurn: (ds, opts) => { interrupted.push(`${ds.session.sessionId}${opts?.evenIfIdle ? ':force' : ''}`); return true; },
     proveBotSender: async () => true,
     noticeRetryMs: 5,
@@ -557,5 +558,68 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
         expect(blocked!.message).toContain('版本过旧');
       }
     }
+  });
+
+  it('the main bot\'s own node: a session already in its topic that runs elsewhere blocks the node too (same gate as another bot\'s handoff)', async () => {
+    const d = dirs();
+    for (const [existingDir, expectBlocked, runId] of [
+      [d.lab, true, 'wdd-self-mismatch'],
+      [d.project, false, 'wdd-self-match'],
+    ] as const) {
+      const run = new BotRun(reportDag(runId, { bot: undefined }));
+      authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.project });
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-self-existing-data-')));
+      const delivered: Array<{ workingDir?: string }> = [];
+      const existingSession = {
+        session: { sessionId: 'sess-existing', rootMessageId: 'om_node_card', status: 'active', workingDir: existingDir },
+        larkAppId: MAIN, chatId: CHAT, chatType: 'group', scope: 'thread', workingDir: existingDir,
+      } as unknown as DaemonSession;
+      const main = daemon(MAIN, dataDir, run.base, run, {
+        botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
+        activeSessions: () => [existingSession],
+        sendCard: async () => 'om_node_card',
+        replyCard: async () => 'om_handoff_card',
+        deliverSelfTurn: async (input) => {
+          delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) });
+          return { sessionId: 'sess-existing' };
+        },
+      });
+      await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+      await settle();
+      if (expectBlocked) {
+        expect(delivered).toEqual([]);
+        expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
+          errorCode: 'WORKING_DIR_REFUSED',
+          message: expect.stringContaining('节点话题里已有会话'),
+        })]);
+      } else {
+        expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]);
+        expect(run.of('nodeBlocked')).toEqual([]);
+      }
+    }
+  });
+
+  it('the main bot\'s own node: the directory is re-checked when the turn starts — narrowing the configuration after preflight blocks it', async () => {
+    const d = dirs();
+    const run = new BotRun(reportDag('wdd-self-narrowed', { bot: undefined }));
+    authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.project });
+    const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-self-narrowed-data-')));
+    let reads = 0;
+    const delivered: Array<{ workingDir?: string }> = [];
+    const main = daemon(MAIN, dataDir, run.base, run, {
+      // First read: workingDirPreflight (in range, so the cards go out).
+      // Second read: startSelfTurn (the configuration was narrowed meanwhile).
+      botWorkingDirConfig: () => (reads++ === 0 ? { defaultWorkingDir: d.repos } : { defaultWorkingDir: d.lab }),
+      sendCard: async () => 'om_node_card',
+      replyCard: async () => 'om_handoff_card',
+      deliverSelfTurn: async (input) => {
+        delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) });
+        return { sessionId: 'self-session' };
+      },
+    });
+    await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+    await settle();
+    expect(delivered).toEqual([]);
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
   });
 });

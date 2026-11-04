@@ -19,7 +19,7 @@ import type { V3ExternalNodeExecutor } from '../workflows/v3/external-executor.j
 import { v3AcceptanceProbeUnknownSince } from '../workflows/v3/runtime.js';
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import type { LarkAttachment, WorkflowNodeSessionMarker } from '../types.js';
-import type { DaemonSession } from './types.js';
+import { sessionKey, type DaemonSession } from './types.js';
 import {
   isWorkflowHandoffRevoked,
   readDispatchRegistryLoose,
@@ -87,6 +87,16 @@ export function workflowNodePinnedStart(admission: WorkflowInboundAdmission | un
   return { pinnedWorkingDir: admission.workingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false };
 }
 
+/** §15.4: a pinned node may not land in a node-topic session that runs
+ *  elsewhere — someone @-ed the bot there first, or moved it with `/cd`.
+ *  Both sides are realpaths (a link in the pinned directory retargeted
+ *  elsewhere counts as elsewhere). Applied on the inbound route for another
+ *  bot's handoff and on the main bot's own node delivery, with one rule. */
+export function workflowNodeSessionDirConflicts(pinnedDir: string, existingSessionDir: string | undefined): boolean {
+  return existingSessionDir !== undefined
+    && realWorkingDir(resolve(expandHome(existingSessionDir))) !== pinnedDir;
+}
+
 type WorkflowNodeWorkingDir =
   /** No Gate-2 directory: the bot's own default resolution, as for any
    *  message it receives. */
@@ -119,6 +129,10 @@ export interface WorkflowNodeDaemonDeps {
   isProcessAlive(pid: number): boolean;
   activeSessions(): Iterable<DaemonSession>;
   updateSession(ds: DaemonSession): void;
+  /** The directory a session actually launches the CLI in, with the same
+   *  default-dir fallbacks the spawn paths use (§15.4 existing-session
+   *  comparison for the main bot's own nodes). */
+  getSessionWorkingDir(ds: DaemonSession): string;
   /** Send ^C to the session's CLI (the "停止" path); false = not possible.
    *  `evenIfIdle`: the turn is known to have just been handed in (its screen
    *  may not show it yet) — used only for a handoff revoked under it. */
@@ -274,6 +288,16 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
 
   function isRevoked(nonce: string): boolean {
     return isWorkflowHandoffRevoked(readDispatchRegistryLoose(deps.dataDir()), nonce, deps.bindingSecret());
+  }
+
+  /** The live session keyed to a topic anchor, like the inbound route's
+   *  `activeSessions.get(sessionKey(anchor, app))` lookup. */
+  function findActiveSession(anchor: string, larkAppId: string): DaemonSession | undefined {
+    for (const ds of deps.activeSessions()) {
+      if (ds.larkAppId !== larkAppId || ds.session.status === 'closed') continue;
+      if (sessionKey(ds.session.rootMessageId, ds.larkAppId) === sessionKey(anchor, larkAppId)) return ds;
+    }
+    return undefined;
   }
 
   function nodeWorkingDir(runDir: string | undefined, runId: string, executingLarkAppId: string): WorkflowNodeWorkingDir {
@@ -448,6 +472,22 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId} not started: ${dir.reason}`);
         await refuse({ nonce: input.marker.nonce, sourceLarkAppId: deps.selfLarkAppId() }, input.handoffMessageId, dir.reason);
         return { refused: true as const };
+      }
+      if (dir.kind === 'pinned') {
+        // §15.4, the same gate the receiving daemon applies to another bot's
+        // handoff: the main bot's own node topic may already hold a session
+        // (someone @-ed it there first, or moved it with /cd). Reusing it would
+        // execute the node outside the pinned directory, so block instead —
+        // never hand the turn to that session or fall back to any default.
+        const self = deps.selfLarkAppId();
+        const existing = findActiveSession(input.publishRoot, self);
+        const existingDir = existing ? deps.getSessionWorkingDir(existing) : undefined;
+        if (workflowNodeSessionDirConflicts(dir.dir, existingDir)) {
+          const reason = '节点话题里已有会话，工作目录与指定的不一致；请在这个话题里关闭该会话后重试，或改派';
+          deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId}: the node topic's session runs in ${existingDir}, not ${dir.dir}`);
+          await refuse({ nonce: input.marker.nonce, sourceLarkAppId: self }, input.handoffMessageId, reason);
+          return { refused: true as const };
+        }
       }
       const inputs = readWorkflowAttemptInputs(runDir, input.marker.attemptId) ?? input.inputs;
       const staged = stageWorkflowNodeInputs({
@@ -629,8 +669,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       let dir = nodeWorkingDir(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId);
       // The node topic already has a session (someone @-ed the bot there, or
       // moved it with /cd): the handoff would run where that session runs.
-      if (dir.kind === 'pinned' && existingSessionDir !== undefined
-        && realWorkingDir(resolve(expandHome(existingSessionDir))) !== dir.dir) {
+      if (dir.kind === 'pinned' && workflowNodeSessionDirConflicts(dir.dir, existingSessionDir)) {
         deps.warn(`[workflow] handoff ${handoffMessageId}: the node topic's session runs in ${existingSessionDir}, not ${dir.dir}`);
         dir = { kind: 'refused', reason: '节点话题里已有会话，工作目录与指定的不一致；请在这个话题里关闭该会话后重试，或改派' };
       }

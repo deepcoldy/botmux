@@ -6948,6 +6948,7 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   isProcessAlive: isWorkflowWorkerAlive,
   activeSessions: () => activeSessions.values(),
   updateSession: (ds) => sessionStore.updateSession(ds.session),
+  getSessionWorkingDir,
   interruptTurn: interruptWorkflowNodeTurn,
   withdrawHandoffIdentity: withdrawWorkflowHandoffIdentity,
   proveBotSender: proveWorkflowBotSender,
