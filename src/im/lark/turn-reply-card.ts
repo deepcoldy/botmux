@@ -8,6 +8,7 @@ import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask
 import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
+import { repairCardStrongPunctuation } from './card-strong-punctuation.js';
 
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
@@ -63,6 +64,12 @@ function publicText(text: string): string {
   // Tool arguments/results are display data; never execute their @mentions.
   return text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
     .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Model narration is markdown prose rendered by Feishu, like the reply body:
+ * apply the same strong-emphasis punctuation repair (tool output stays raw). */
+function narrationText(text: string): string {
+  return repairCardStrongPunctuation(publicText(text));
 }
 
 /** Match the tool categories used by CoT, including Codex's exec command names. */
@@ -212,7 +219,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // narration visible until a newer narration or another card view replaces it.
     const latest = record.activity?.slice().reverse().find(item => item.kind === 'thinking' && item.text.trim());
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
-      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: `💭 ${publicText(bounded(latest.text, 600))}` });
+      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: `💭 ${narrationText(bounded(latest.text, 600))}` });
     }
     if (!terminal && !record.finalCard && !pendingAsks.length && presentation.showTools !== false && record.tools.length) {
       card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_tools', content: record.tools.slice(-2).map(tool =>
@@ -226,12 +233,12 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   ];
   for (const item of activity) {
     if (item.kind === 'progress') {
-      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${publicText(item.text)}` });
+      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${narrationText(item.text)}` });
     } else if (item.kind === 'ask') {
       const entry = record.asks?.find(entry => entry.ask.askId === item.id);
       if (entry?.result) process.push({ kind: 'text', content: turnReplyAskSummary(entry, presentation.locale) });
     } else if (presentation.showProcess && item.kind === 'thinking') {
-      process.push({ kind: 'text', content: `💭 ${publicText(item.text)}` });
+      process.push({ kind: 'text', content: `💭 ${narrationText(item.text)}` });
     } else if (presentation.showProcess && presentation.showTools !== false && item.kind === 'tool') {
       const tool = record.tools.find(tool => tool.id === item.id);
       if (tool) process.push({ kind: 'tool', label: toolLine({ ...tool, subject: '' }), content: toolLine(tool)

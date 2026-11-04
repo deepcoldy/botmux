@@ -26,6 +26,7 @@ import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
+import { repairCardStrongPunctuation } from './card-strong-punctuation.js';
 import type Token from 'markdown-it/lib/token.mjs';
 import StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs';
 import { t, type Locale } from '../../i18n/index.js';
@@ -1418,6 +1419,10 @@ export function buildCardBodyElements(
   // Only sanitize at the rendering boundary: sandbox relay preparation runs
   // before --images uploads resolve img:N placeholders to real image keys.
   input = normalizeCardImages(input);
+  // Feishu's markdown component pairs `**` by CommonMark flanking rules, so a
+  // label like `**说明：**正文` shows raw asterisks. Move the punctuation
+  // across the delimiter; already-renderable markdown stays byte-identical.
+  input = repairCardStrongPunctuation(input);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
