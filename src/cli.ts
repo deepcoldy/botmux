@@ -9625,6 +9625,8 @@ import {
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
   validateSecretaryAction,
+  findSecretaryDuplicate,
+  SECRETARY_TURN_PREFIX,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
 import { describeScheduleState } from './services/schedule-until-done.js';
@@ -9828,7 +9830,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -12443,8 +12445,36 @@ async function cmdSend(rest: string[]): Promise<void> {
   const secretaryGate = validateSecretaryAction({
     turnId: currentTurnId,
     action: argValue(rest, '--secretary-action'),
+    reason: argValue(rest, '--secretary-reason'),
   });
   if (!secretaryGate.ok) { console.error(secretaryGate.error); process.exit(2); }
+  if (secretaryGate.action && currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.chatId && s.larkAppId) {
+    // 复述拦截：与群里最近的消息高度重复（把别人刚交付的结论再说一遍）→ 拒发。拉不到历史时放行。
+    try {
+      const { listChatMessages } = await import('./im/lark/client.js');
+      const { restMessageToEventData, larkEventToSecretaryMessage } = await import('./services/group-secretary-runtime.js');
+      const items = await listChatMessages(s.larkAppId, s.chatId, 30);
+      const recent = items
+        .map(item => larkEventToSecretaryMessage(restMessageToEventData(item, s.chatId!), undefined))
+        .filter((m): m is NonNullable<typeof m> => !!m && !!m.text && !m.text.startsWith('[卡片消息'))
+        .map(m => ({ id: m.messageId, text: m.text }));
+      const dup = findSecretaryDuplicate(content, recent);
+      if (dup) {
+        console.error(`botmux send refused: 这条内容与群里最近的消息 ${dup} 高度重复——复述已有结论属于旁白，不要发。真有新信息就只写新增的部分。`);
+        process.exit(2);
+      }
+    } catch { /* 历史拉取失败：不拦 */ }
+    try {
+      const { appendFileSync, mkdirSync: mk } = await import('node:fs');
+      const dir = resolveDataDir();
+      mk(dir, { recursive: true });
+      appendFileSync(join(dir, `group-secretary-actions-${s.larkAppId}.jsonl`), JSON.stringify({
+        at: new Date().toISOString(), chatId: s.chatId, turnId: currentTurnId,
+        action: secretaryGate.action, reason: argValue(rest, '--secretary-reason')?.slice(0, 300),
+        text: content.slice(0, 300),
+      }) + '\n');
+    } catch { /* 审计日志写失败不挡发送 */ }
+  }
 
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
 

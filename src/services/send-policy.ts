@@ -50,6 +50,8 @@ export const SECRETARY_TURN_PREFIX = 'secretary:';
 export function validateSecretaryAction(args: {
   turnId?: string;
   action?: string;
+  /** --secretary-reason：为什么要发（进审计日志）。秘书回合必填。 */
+  reason?: string;
 }): { ok: true; action?: SecretarySendAction } | { ok: false; error: string } {
   const action = args.action?.trim().toLowerCase();
   if (action !== undefined && action !== '' && !(SECRETARY_SEND_ACTIONS as readonly string[]).includes(action)) {
@@ -64,7 +66,44 @@ export function validateSecretaryAction(args: {
         + `（${SECRETARY_SEND_ACTIONS.join(' | ')}）。没有需要催办 / 请示 / 派活 / 交付 / 告警的事就不要发消息，直接结束本轮。`,
     };
   }
+  if ((args.reason?.trim().length ?? 0) < 4) {
+    return {
+      ok: false,
+      error: 'botmux send refused: 群秘书回合的消息必须用 --secretary-reason "<一句话：为什么现在要发、对方会因此做什么>" 说明理由；说不出理由就不要发。',
+    };
+  }
   return { ok: true, action: action as SecretarySendAction };
+}
+
+function bigrams(s: string): Set<string> {
+  const t = s.replace(/[\s\p{P}\p{S}]+/gu, '').toLowerCase();
+  const out = new Set<string>();
+  for (let i = 0; i < t.length - 1; i++) out.add(t.slice(i, i + 2));
+  return out;
+}
+
+/**
+ * 秘书的「复述」检测：待发内容的字符二元组有 ≥ threshold 的比例已出现在最近某一条群消息里，
+ * 视为把别人（或自己）刚说过的话又说一遍。短消息（< minChars）不判，避免误伤「收到」类。
+ * 返回被复述的那条消息 id。
+ */
+export function findSecretaryDuplicate(
+  content: string,
+  recent: Array<{ id: string; text: string }>,
+  opts: { threshold?: number; minChars?: number } = {},
+): string | undefined {
+  const minChars = opts.minChars ?? 20;
+  const threshold = opts.threshold ?? 0.7;
+  const mine = bigrams(content);
+  if (mine.size < minChars) return undefined;
+  for (const m of recent) {
+    const theirs = bigrams(m.text);
+    if (theirs.size === 0) continue;
+    let hit = 0;
+    for (const g of mine) if (theirs.has(g)) hit++;
+    if (hit / mine.size >= threshold) return m.id;
+  }
+  return undefined;
 }
 
 export interface ExplicitRecipientReplyArgs {
