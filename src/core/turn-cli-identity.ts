@@ -126,6 +126,10 @@ export interface PublishTurnIdentityArgs {
    *  legacy single-snapshot file (single). The caller derives this with the
    *  same predicate the worker uses to render the wrapper. */
   storageModel: IdentityStorageModel;
+  /** The turn's chat is a 1:1 chat between the sender and the bot. Only then
+   *  may a refusal carry an authorization link for the agent to relay: in a
+   *  group, whoever opens the link authorizes as themselves. */
+  privateChat?: boolean;
 }
 
 /**
@@ -191,6 +195,7 @@ async function publishTurnCliIdentityNow(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
   const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel } = args;
+  const privateChat = args.privateChat === true;
   const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
   // Record before the new-entry shortcut (and before first worker spawn).
@@ -213,7 +218,7 @@ async function publishTurnCliIdentityNow(
     try {
       outcomes.push(args.delegatedIdentity
         ? await publishDelegated(tool, args, args.delegatedIdentity)
-        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel));
+        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat));
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
@@ -236,7 +241,7 @@ async function publishTurnCliIdentityNow(
       }
       outcomes.push(args.delegatedIdentity
         ? denyDelegated(tool, args, args.delegatedIdentity)
-        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel));
+        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat));
     }
   }
   return outcomes;
@@ -326,9 +331,10 @@ async function publishOne(
   locale: Locale | undefined,
   turnId: string | undefined,
   storageModel: IdentityStorageModel,
+  privateChat: boolean,
 ): Promise<ToolIdentityOutcome> {
   const withheld = async () =>
-    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel);
+    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
 
   // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
   // there is no "trigger user" to act as. Withhold — never reach for the session
@@ -661,7 +667,16 @@ async function withholdIdentity(
   locale: Locale | undefined,
   turnId: string | undefined,
   storageModel: IdentityStorageModel,
+  privateChat: boolean,
 ): Promise<ToolIdentityOutcome> {
+  // Outside a 1:1 chat no link is minted for the agent: it would relay it into
+  // the group. The refusal points at /login instead, whose reply goes to the
+  // sender privately.
+  if (!privateChat) {
+    writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel,
+      undefined, undefined, senderOpenId ? 'not_authorized' : 'no_sender');
+    return { tool, state: 'needs-authorization' };
+  }
   // Pre-fetch a ready, valid authorization link for either tool so the moment a
   // governed command is actually refused, the agent has a link to relay instead
   // of asking the person to type a command. Beginning only mints a link and

@@ -253,7 +253,7 @@ import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
 import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { updateMessage } from '../im/lark/client.js';
+import { updateMessage, sendUserMessage } from '../im/lark/client.js';
 import { safeRequirementUrl } from './dispatch-task-tree.js';
 import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
 import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
@@ -3714,13 +3714,25 @@ for (const action of ['auth-request', 'auth-status']) {
           && (!!boundTool || triggerUserAuthApplies(currentConfig.triggerUserAuth, 'lark-cli'));
       } catch { return false; }
     };
+    // Authorization links reach only the initiator. In anything but the 1:1
+    // chat with the bot, botmux DMs the link itself and the agent never sees it:
+    // a link posted to a group lets any member authorize as themselves.
+    const privateChat = ds.chatType === 'p2p';
+    const loc = localeForBot(ds.larkAppId);
     for (const [requestId, request] of sessionAuthRequests.entries()) {
       if (request.sessionId === params.sessionId && request.appId === cfg.larkAppId
         && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
         && request.expiresAt > Date.now()
         && scopes.every(scope => request.authorization.scopes.includes(scope))) {
+        const remaining = Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000));
+        // Outside a 1:1 chat the link already went to the person privately when
+        // this request was created; never hand it to the agent to post.
+        if (!privateChat) {
+          return jsonRes(res, 200, { ok: true, requestId, delivery: 'dm', message: t('auth_link.request_dm_agent', undefined, loc),
+            scopes: request.authorization.scopes, expiresIn: remaining, autoCallback: true });
+        }
         return jsonRes(res, 200, { ok: true, requestId, authUrl: request.authorization.authUrl,
-          scopes: request.authorization.scopes, expiresIn: Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000)), autoCallback: true });
+          scopes: request.authorization.scopes, expiresIn: remaining, autoCallback: true });
       }
     }
     let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
@@ -3735,6 +3747,28 @@ for (const action of ['auth-request', 'auth-status']) {
     accepted = true;
     trackSessionAuthorization(requestId, { sessionId: params.sessionId, appId: cfg.larkAppId,
       callerOpenId, identityTurnId, authorization, isCurrent, isValid: isAuthorizationValid });
+    if (!privateChat) {
+      try {
+        await sendUserMessage(cfg.larkAppId, callerOpenId, [
+          t('auth_link.request_dm_title', undefined, loc),
+          authorization.authUrl,
+          t('auth_link.request_dm_footer', {
+            scopes: authorization.scopes.join(' '),
+            minutes: Math.max(1, Math.round(authorization.expiresIn / 60)),
+          }, loc),
+        ].join('\n'));
+      } catch {
+        const tracked = sessionAuthRequests.get(requestId);
+        tracked?.dispose();
+        sessionAuthRequests.delete(requestId);
+        return jsonRes(res, 409, { ok: false, error: 'auth_link_private_delivery_failed',
+          message: t('auth_link.request_dm_failed_agent', undefined, loc) });
+      }
+      return jsonRes(res, 200, {
+        ok: true, requestId, delivery: 'dm', message: t('auth_link.request_dm_agent', undefined, loc),
+        scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
+      });
+    }
     return jsonRes(res, 200, {
       ok: true, authUrl: authorization.authUrl, requestId,
       scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
