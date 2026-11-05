@@ -3665,7 +3665,7 @@ for (const action of ['auth-request', 'auth-status']) {
     // (the app's availability range excludes them); their lark-cli identity
     // comes from the platform, so send them there instead of a dead link.
     const platformRedirect = await platformAuthRequestRedirect({
-      bot: cfg, openId: callerOpenId, delegated: !!delegated,
+      bot: cfg, openId: callerOpenId, delegated: !!delegated, scopes,
       botAppToken: openId => resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), openId),
     });
     if (platformRedirect) {
