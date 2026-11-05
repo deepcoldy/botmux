@@ -1,6 +1,6 @@
 # 可配置反馈卡与动作扩展
 
-状态：主要运行链路已实现，本轮已修复普通群/代理交付及状态恢复阻断。仍保留 CI 与原生客户端验证门槛；未部署。
+状态：主要运行链路已实现，完整 daemon/真实 CLI 三轮验收完成，可进入代码评审。只做过获准的临时测试并已恢复原服务；未合并或正式发布。
 
 ## 本次基础变更
 
@@ -29,7 +29,7 @@
 ## 验收限制
 
 - 发布前需核对同一 PR 最新 CI；不能把已证明的上游失败归为本功能通过。
-- 普通群、代理、卡片状态和权限边界已有隔离组件/IPC回归，原生飞书客户端及真实账号四按钮验证尚未执行，需独立测试环境授权。
+- 普通群、代理、卡片状态和权限边界已有隔离组件/IPC回归；完整 daemon/真实 CLI 和真实用户三轮验证结果见下节。不要将该结果扩大为所有平台/客户端组合验证。
 - 通用布局/素材控件支持仍以当前受校验模板 schema 为限；不接受任意回调或执行型卡片内容。
 - 不把构建、限定审查或专项通过当作生产上线验收，也不承诺外部业务 exactly-once。
 
@@ -79,7 +79,28 @@ bun run test test/bot-config-store.test.ts test/feedback-presentation.test.ts te
 - 负向点击后两次立即 PATCH 返回平台 `230099 / 11310: card action is lock`。定位为临时接收器在回调 ACK 前等待 PATCH，未遵循产品 `deferredCard` 协议；不是根据现象推断反馈写入失败。
 - 正式 `event-dispatcher` 已先返回空 ACK，再安排 deferred PATCH。针对快速 deferred 更新、保留 toast 和 deferred 失败的三个现有回归本次全部通过。临时接收器已改为相同顺序，但修正后的真实客户端复测尚未执行。
 
-这是“真实 transport + PR 组件”的有界验证，不是完整 daemon/CLI 自动轮次流程验收。移动/桌面双端布局、未授权用户、progress 按钮和修正后的 deferred PATCH 仍需补充。不要以一次回调返回或 job 状态代替实际副作用回执。
+以上是第一轮“真实 transport + PR 组件”验证，不是完整 daemon/CLI 自动轮次流程。后续完整 daemon 的验证单独记录如下。不要以一次回调返回或 job 状态代替实际副作用回执。
+
+### 完整 daemon / 真实 CLI 验收
+
+用户明确免除独立 progress 回调测试与修正后的临时接收器负向 PATCH 复测；免测不记为通过。随后使用隔离 HOME、配置、数据库、tmux socket 和端口启动本 PR 的完整 `dist/index-daemon.js`，由真人在同一话题发起三轮消息，不使用固定答案接收器或伪造 terminal。
+
+验证的代码提交为 `793bf60e05dd334b9e43c4812bfdd89d21476dc1`，真实 CLI 为 TraeX，模型 DeepSeek-V4.1-Flash，standard/medium。可观测链路为消息接入 → worker → 原生 CLI session → terminal → bridge final output → delivery → 独立反馈卡。
+
+| 轮次 | 原回答完成并送达（北京时间） | 独立反馈卡 |
+| --- | --- | --- |
+| 1 | 2026-11-05 12:25:58 | 有，绑定第1轮 |
+| 2 | 2026-11-05 12:28:04 | 无 |
+| 3 | 2026-11-05 12:28:44 | 有，绑定第3轮 |
+
+- 源库三条 delivery 均为 completed、同一原生 CLI session；surface 表恰好两条，round 为1和3。
+- 用户自发点击的 progress、negative 及补充说明均有反馈 revision；因此本次 progress 有实际观察，但没有重新强制执行此前免测项。
+- fake Hook 恰好一个成功任务和一条实际文件回执。没有值班查询、真人通知或建群。
+- 最终 dirty-surface 队列为空，未看到第一轮简化接收器的 `11310 card action is lock` 错误；此观察不扩大为所有负向场景均通过。
+- 12:30 提前结束测试，worker 正常退出；原应用服务恢复在线，其他机器人及 Dashboard PID 不变，临时凭证已删除。
+- 同一代码 SHA 的13项 GitHub checks 全部 success。后续文档提交的检查须独立观察，不把已完成检查移植为新的运行证据。
+
+代码评审就绪不代表可以自动合并或部署。桌面/移动双端截图、全部未授权账号组合及业务脚本生产权限不在本次已完成真实验证范围；权限安全仍由对应自动化测试和服务端校验覆盖。
 
 真实临时 PostgreSQL 提交顺序测试及带流正常迁移的既有验证保留。本轮未更改其数据库算法。
 
