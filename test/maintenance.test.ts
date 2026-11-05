@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -894,10 +894,23 @@ describe('spawnDetachedRestart', () => {
     try {
       const child = spawnDetachedRestart('test', packageRoot, 'lease-123');
       expect(child.pid).toEqual(expect.any(Number));
-      for (let i = 0; i < 50 && !existsSync(output); i++) {
-        await new Promise(resolve => setTimeout(resolve, 20));
+      // Wait for COMPLETE json, not mere existence: writeFileSync creates the
+      // file empty before writing, and the detached driver chain (CLI → driver)
+      // can take >1s on a loaded CI runner, where an existence-only 1s poll
+      // read the empty file and failed JSON.parse (Unexpected EOF).
+      let parsed: unknown;
+      let attempts = 0;
+      for (;;) {
+        try {
+          parsed = JSON.parse(readFileSync(output, 'utf8'));
+          break;
+        } catch {
+          attempts += 1;
+          if (attempts > 500) throw new Error('detached restart driver never wrote complete driver.json');
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
       }
-      expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual({
+      expect(parsed).toEqual({
         id: 'lease-123',
         dir: dataDir,
         args: ['restart'],
