@@ -16,7 +16,7 @@ import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
-import { isLarkToolBound } from './lark-tool-binding.js';
+import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
@@ -4371,15 +4371,33 @@ export async function handleCommand(
         // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
         // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
         const loginOpenId = message.senderId;
-        // Only sessions created with the new entry use the receiving app here.
-        // Existing sessions keep the original login flow below.
-        if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)
-          && (subCmd === '' || subCmd === 'lark')) {
-          const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
-            normalizeBrand(botCfg2.brand), [], loginOpenId);
-          await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
-          break;
-        }
+        // Sessions on the managed lark-cli binding authorize the receiving app;
+        // legacy sessions keep the original login flow below. Decided from
+        // configuration, so a new topic's first /login (no worker yet) gets the
+        // same answer it will get after the CLI starts.
+        const larkBound = !!ds && sessionLarkToolBound({
+          botConfig: botCfg2,
+          dataDir: config.session.dataDir,
+          sessionId: ds.session.sessionId,
+          workerLive: !!ds.worker && !ds.worker.killed,
+          spawnFacts: {
+            sessionId: ds.session.sessionId,
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            apiOnly: botCfg2.apiOnly,
+            adoptMode: !!ds.session.adoptedFrom,
+            existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
+            backendType: ds.session.backendType ?? botCfg2.backendType ?? config.daemon.backendType,
+            larkToolBinding: botCfg2.larkToolBinding,
+          },
+          workflow: process.env.BOTMUX_WORKFLOW === '1',
+        });
+        // credentialSource = platform: a bound session's `lark-cli --as user` takes
+        // the sender's token from the platform only, so a bot-app authorization
+        // would be useless there. The platform branch below already answers the
+        // bare and explicit forms; status/done must not report one either.
+        const larkPlatformOnly = credentialSourceOf(botCfg2.triggerUserAuth) === 'platform'
+          && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
         // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
         // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
         // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
@@ -4441,6 +4459,15 @@ export async function handleCommand(
           break;
         }
 
+        // After the platform branch: on a platform-bound machine the bare /login
+        // always points at the platform page, whatever state the session is in.
+        if (larkBound && (subCmd === '' || subCmd === 'lark')) {
+          const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand), [], loginOpenId);
+          await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
+          break;
+        }
+
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
@@ -4450,7 +4477,12 @@ export async function handleCommand(
               url: platformCredsUrl,
             }, loc));
           }
-          if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)) {
+          if (larkPlatformOnly) {
+            // The platform is the only source of this person's lark-cli identity:
+            // the platform line above is the answer. Neither the bot-app token nor
+            // a machine-local device login would ever be used here.
+            if (!platformCredsUrl) lines.push(t('cmd.login.platform_unbound', undefined, loc));
+          } else if (larkBound) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
@@ -4480,9 +4512,12 @@ export async function handleCommand(
         // matching side suppressing the other.
         if (subCmd === 'done' || subCmd === '完成') {
           const doneLines: string[] = [];
-          const boundLark = !!ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId);
-          const larkPending = boundLark ? null : pendingLarkCliChallenge(loginOpenId);
-          if (boundLark) {
+          const boundLark = larkBound && !larkPlatformOnly;
+          // platform-only: no machine-local lark-cli login is ever consulted.
+          const larkPending = boundLark || larkPlatformOnly ? null : pendingLarkCliChallenge(loginOpenId);
+          if (larkPlatformOnly) {
+            // nothing to finish or report for lark-cli on this machine
+          } else if (boundLark) {
             doneLines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (larkPending) {
             const { state, detail } = await completeLarkCliLogin(loginOpenId);

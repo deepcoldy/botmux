@@ -675,7 +675,7 @@ export const messages: Record<string, string> = {
   'cmd.login.step2_auto': '2. 授权完成后浏览器会显示「✅ 授权成功」，到这里就结束了——不需要复制任何东西，回到本话题重试即可。',
   'cmd.login.step2_auto_fallback': '   若浏览器停在报错页（回调地址暂时不可达），把地址栏里那条完整网址发回本话题也能完成。',
   'cmd.login.step2': '2. 授权后浏览器会跳到一个「打不开 / 无法访问此网站（ERR_CONNECTION_REFUSED）」的页面——这是正常的（回调地址是本机 127.0.0.1，daemon 在远端故连不上）',
-  'cmd.login.step3': '3. 复制地址栏里那条 http://127.0.0.1:9768/callback?code=... 的完整网址，发回本话题即可。\n   ⚠️ 若地址栏看不到（被页面拦截 / 没跳转）：按 F12 开控制台 → Network（网络）→ 勾 All（全部）→ 再点「授权」→ 找到对 127.0.0.1:9768 的那条请求 → 右键 Copy → Copy URL，发回本话题。',
+  'cmd.login.step3': '3. 复制地址栏里那条 http://127.0.0.1:9768/callback?code=... 的完整网址，发回本话题即可。\n   ⚠️ 若地址栏看不到（被页面拦截 / 没跳转）：按 F12 开控制台 → Network（网络）→ 勾 All（全部）→ 再点「授权」→ 找到对 127.0.0.1:9768 的那条请求 → 右键 Copy → Copy URL，发回本话题。\n   本机也运行着 BotMux 时，浏览器会显示「这条授权不是本机 BotMux 发起的」，照样把网址发回本话题即可。',
   'cmd.login.footer': '授权后可下载第三方卡片中的图片等资源。',
   'cmd.login.status_hint': '查看状态：/login status',
   'cmd.subdoc.no_session': '⚠️ /subscribe-lark-doc 需要在一个活跃会话里用：先在本话题正常发起会话，再订阅文档。',
