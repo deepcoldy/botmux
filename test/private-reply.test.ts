@@ -122,3 +122,20 @@ describe('private delivery with the existing group session', () => {
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('durable private output', () => {
+  it('uses the original requester even after the per-turn projection is removed', async () => {
+    writeRoleReplyPrivately(APP, GROUP, true);
+    const s = session(); delete s.replyTargets;
+    const beforeWrite = vi.fn();
+    expect(await sendPrivateReply(s, 'turn_a', 'answer', 'text', 'stable', { senderOpenId: 'ou_original', senderIsBot: false, failClosed: true, beforeWrite })).toBe('om_private');
+    expect(sendUserMessage).toHaveBeenCalledWith(APP, 'ou_original', 'answer', 'text', 'stable');
+    expect(beforeWrite).toHaveBeenCalledOnce();
+  });
+  it('retains unknown private delivery instead of falling back to the group', async () => {
+    writeRoleReplyPrivately(APP, GROUP, true);
+    vi.mocked(sendUserMessage).mockRejectedValue(new Error('receipt lost'));
+    await expect(sendPrivateReply(session(), 'turn_a', 'answer', 'text', 'stable', { senderOpenId: 'ou_original', failClosed: true })).rejects.toThrow('receipt lost');
+    expect(replyMessage).not.toHaveBeenCalled();
+  });
+});

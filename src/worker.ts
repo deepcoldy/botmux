@@ -133,6 +133,11 @@ import {
   type InterruptedWork,
 } from './services/restart-interruption.js';
 import { isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
+import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
+import { WorkerOutputJournal } from './services/worker-output-journal.js';
+import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
+import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
+import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -8342,6 +8347,69 @@ function restoreScheduledTaskAnchorsOnce(): void {
   syncCronTaskAnchorsToDaemon();
 }
 
+let universalOutputHandoff: UniversalOutputHandoff | undefined;
+let workerFinalOutputHandoff: WorkerFinalOutputHandoff | undefined;
+let finalHandoffAdmissionEnabled = false;
+const finalHandoffAdmissions = new Map<string, BridgeTurnJournalEntry>();
+let initHandoffRejectedTurnId: string | undefined;
+
+function canAdmitFinalOutputHandoff(turnId: string): boolean {
+  return finalHandoffAdmissionEnabled && !!lastInitConfig?.larkAppId && !!sessionId && !!process.env.SESSION_DATA_DIR
+    && new TurnSendLedger(process.env.SESSION_DATA_DIR).handoffFenced({ larkAppId: lastInitConfig.larkAppId, sessionId, turnId });
+}
+
+function applyInitFinalOutputBackpressure(cfg: Extract<DaemonToWorker, { type: 'init' }>, turnId?: string): boolean {
+  if (!cfg.prompt || !turnId?.startsWith('om_') || !finalHandoffAdmissionEnabled
+    || (workerFinalOutputHandoff?.size() ?? 0) < FINAL_OUTPUT_HANDOFF_MAX_PENDING) return false;
+  initHandoffRejectedTurnId = turnId;
+  send({ type: 'turn_input_rejected', turnId, reason: 'final_output_handoff_backpressure', rejectedBeforeAdmission: true });
+  cfg.prompt = '';
+  initialInputOwnershipPending = false;
+  return true;
+}
+
+function initializeFinalOutputHandoff(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  workerFinalOutputHandoff?.stop();
+  workerFinalOutputHandoff = undefined;
+  universalOutputHandoff?.stop();
+  universalOutputHandoff = undefined;
+  if (cfg.finalOutputHandoff?.version === 2 && cfg.larkAppId && process.env.SESSION_DATA_DIR) {
+    const journal = new WorkerOutputJournal(process.env.SESSION_DATA_DIR, cfg.larkAppId, cfg.sessionId);
+    universalOutputHandoff = new UniversalOutputHandoff({
+      appId: cfg.larkAppId, sessionId: cfg.sessionId, token: cfg.finalOutputHandoff.token,
+      persist: snapshot => journal.save(snapshot), remove: snapshot => journal.remove(snapshot),
+      restore: () => journal.readPending(), send: output => { if (!closeRequested) process.send?.(output); },
+      error: error => log(`Universal output recovery pending: ${String(error)}`),
+    });
+    if (cfg.finalOutputHandoff.admitNew && cfg.turnId) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: cfg.larkAppId, sessionId: cfg.sessionId, turnId: cfg.turnId });
+    universalOutputHandoff.start();
+  }
+  finalHandoffAdmissionEnabled = cfg.finalOutputHandoff?.version === 1 && cfg.finalOutputHandoff.admitNew === true;
+  const path = bridgeTurnJournalFilePath();
+  if (!cfg.larkAppId || !path) return;
+  if (!cfg.finalOutputHandoff) {
+    const pending = readBridgeTurnJournal(path).filter(entry => !!entry.pendingFinal);
+    if (pending.length) send({ type: 'user_notify', turnId: pending[0].turnId,
+      message: '最终答复仍保存在恢复记录中，但当前 daemon 未协商输出交接协议；请使用支持该协议的版本恢复。' });
+    return;
+  }
+  workerFinalOutputHandoff = new WorkerFinalOutputHandoff({
+    appId: cfg.larkAppId, sessionId: cfg.sessionId, token: cfg.finalOutputHandoff.token,
+    persist: snapshot => {
+      if (!readBridgeTurnJournal(path).some(entry => entry.turnId === snapshot.output.turnId)) {
+        const admission = finalHandoffAdmissions.get(snapshot.output.turnId);
+        if (admission) appendBridgeTurnJournalEntry(path, admission);
+      }
+      stageBridgeFinalOutput(path, snapshot, canAdmitFinalOutputHandoff(snapshot.output.turnId));
+    },
+    clear: snapshot => acknowledgeBridgeFinalOutput(path, snapshot),
+    send: offer => send(offer),
+    accepted: snapshot => { finalHandoffAdmissions.delete(snapshot.output.turnId); emitTurnTerminal(snapshot.output.turnId, 'completed'); },
+    error: error => log(`Final output handoff pending: ${String(error)}`),
+  });
+  workerFinalOutputHandoff.restore(readBridgeTurnJournal(path).flatMap(entry => entry.pendingFinal ? [entry.pendingFinal] : []));
+}
+
 function journalBridgeTurnMark(entry: {
   turnId: string;
   dispatchAttempt?: number;
@@ -8355,7 +8423,16 @@ function journalBridgeTurnMark(entry: {
   const path = bridgeTurnJournalFilePath();
   if (!path) return;
   try {
-    appendBridgeTurnJournalEntry(path, entry);
+    const admission: BridgeTurnJournalEntry = {
+      ...entry,
+      ...(canAdmitFinalOutputHandoff(entry.turnId) && entry.dispatchAttempt === undefined && entry.turnId.startsWith('om_')
+        ? { handoffVersion: 1 as const } : {}),
+    };
+    if (admission.handoffVersion === 1) {
+      if (!finalHandoffAdmissions.has(entry.turnId) && finalHandoffAdmissions.size >= FINAL_OUTPUT_HANDOFF_MAX_PENDING) throw new Error('final_output_handoff_backpressure');
+      finalHandoffAdmissions.set(entry.turnId, admission);
+    }
+    appendBridgeTurnJournalEntry(path, admission);
   } catch (err: any) {
     log(`Bridge turn journal write failed (${err.message}) — restart recovery unavailable for turn ${entry.turnId.substring(0, 8)}`);
   }
@@ -8366,6 +8443,7 @@ function journalBridgeTurnClear(turnId: string, dispatchAttempt?: number): void 
   if (!path) return;
   try {
     removeBridgeTurnJournalEntry(path, turnId, dispatchAttempt);
+    if (!workerFinalOutputHandoff?.hasTurn(turnId)) finalHandoffAdmissions.delete(turnId);
   } catch (err: any) {
     log(`Bridge turn journal clear failed (${err.message}) for turn ${turnId.substring(0, 8)}`);
   }
@@ -8884,7 +8962,7 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   if (!bridgeRestoreGate.mayRestoreOnThisBaseline()) return false;
   const journalPath = bridgeTurnJournalFilePath();
   if (!journalPath || !bridgeJsonlPath) return false;
-  const entries = readBridgeTurnJournal(journalPath);
+  const entries = readBridgeTurnJournal(journalPath).filter(entry => !entry.pendingFinal);
   if (entries.length === 0) return false;
   const restorable = selectRestorableBridgeTurns(entries, {
     currentJsonlPath: bridgeJsonlPath,
@@ -10346,12 +10424,22 @@ function emitReadyTurns(opts: {
         onlyTurn: opts.onlyTurn,
       });
   if (ready.length === 0) return;
+  const handoffPath = workerFinalOutputHandoff ? bridgeTurnJournalFilePath() : undefined;
+  const handoffEntries = handoffPath ? readBridgeTurnJournal(handoffPath) : [];
+  const handoffTurnIds = new Set(handoffEntries.filter(entry => entry.handoffVersion === 1).map(entry => entry.turnId));
+  if (finalHandoffAdmissionEnabled) for (const turn of ready) {
+    // A persisted legacy admission retains its old contract. A newly observed
+    // turn without a mark must backpressure, never silently fall back to IPC.
+    if (!turn.isLocal && turn.dispatchAttempt === undefined && turn.turnId.startsWith('om_') && canAdmitFinalOutputHandoff(turn.turnId)
+      && !handoffEntries.some(entry => entry.turnId === turn.turnId && entry.handoffVersion !== 1)) handoffTurnIds.add(turn.turnId);
+  }
+  const unsubmitted = new Set<string>();
   // Every popped turn is terminal (emitted or suppressed below) — retire its
   // durable journal entry NOW, before the final_output IPC. Clear-before-send:
   // if the worker dies in between, the answer is lost rather than duplicated
   // (the daemon-side dedupe key does not survive restarts).
   for (const turn of ready) {
-    if (!turn.isLocal) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
+    if (!universalOutputHandoff && !turn.isLocal && !handoffTurnIds.has(turn.turnId)) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
   }
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Send markers (`botmux send` landed in own thread) + the queue's first
@@ -10376,7 +10464,10 @@ function emitReadyTurns(opts: {
   // rationale. Tracked by object identity across this function's two loops so
   // the terminal can carry positive silence evidence for a durable/async caller.
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
+  let emitIndex = 0;
+  try {
   for (let i = 0; i < ready.length; i++) {
+    emitIndex = i;
     const turn = ready[i];
     // A restored structured turn may predate every in-memory admission map in
     // this worker generation. Re-freeze its exact journaled mode before the
@@ -10533,10 +10624,23 @@ function emitReadyTurns(opts: {
     // a worker restart — label it so the user can tell it from a live answer.
     // Prefix is applied AFTER the suppress gate so dedup compares the model's
     // own text, never the notice.
-    const deliveredText = turn.restoredFromJournal
+    const deliveredText = turn.restoredFromJournal && !universalOutputHandoff
       ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
       : postText;
     usageLimitTracker.noteTurnCompleted('answered');
+    const handoffOutput = { sessionId: sessionId!, content: deliveredText, lastUuid: lastUuid!, turnId: turn.turnId };
+    if (workerFinalOutputHandoff && handoffTurnIds.has(turn.turnId) && !turn.isLocal && turn.dispatchAttempt === undefined
+      && canHandoffFinalOutput(handoffOutput)) {
+      try { workerFinalOutputHandoff.offer(handoffOutput); }
+      catch (error) {
+        const remaining = ready.slice(i);
+        bridgeQueue.restoreDrained(remaining);
+        for (const item of remaining) unsubmitted.add(item.turnId);
+        log(`Final output snapshot was not committed; retaining queue/journal: ${String(error)}`);
+        break;
+      }
+      continue;
+    }
     send({
       type: 'final_output',
       content: deliveredText,
@@ -10554,11 +10658,17 @@ function emitReadyTurns(opts: {
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
     });
   }
+  } catch (error) {
+    bridgeQueue.restoreDrained(ready.slice(emitIndex));
+    throw error;
+  }
   // A visible fallback is optional: it may be empty or deliberately suppressed
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
   for (const turn of ready) {
+    if (unsubmitted.has(turn.turnId) || workerFinalOutputHandoff?.hasTurn(turn.turnId)) continue;
+    if (universalOutputHandoff || handoffTurnIds.has(turn.turnId)) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
     if (turn.rateLimited) continue;
     const outcome = turn.terminalOutcome;
     // A SYNTHESISED local turn has no Lark turn behind it: `local-*` /
@@ -12958,8 +13068,7 @@ function drainReliableTerminalBeforeInterrupt(): void {
 
 function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
   const ready = settledQuotaTurns ?? codexBridgeQueue.drainEmittable().filter(turn => !recoverTraexQuotaTurn(turn));
-  checkpointCodexAdoptRecovery();
-  checkpointStructuredBridgeRecovery();
+  if (!universalOutputHandoff) { checkpointCodexAdoptRecovery(); checkpointStructuredBridgeRecovery(); }
   if (ready.length === 0) return;
   if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
     armPostTerminalInputFence();
@@ -12990,7 +13099,10 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
   const nextPendingMarkTimeMs = remaining.length > 0 && remaining[0].started
     ? remaining[0].markTimeMs
     : undefined;
+  let emitIndex = 0;
+  try {
   for (let i = 0; i < ready.length; i++) {
+    emitIndex = i;
     const turn = ready[i];
     // A shared App Server session still owns the BotMux remote TUI, so its
     // Lark-originated turns retain normal send-marker deduplication. Only a
@@ -13134,6 +13246,12 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       } : {}),
     });
   }
+  } catch (error) {
+    codexBridgeQueue.restoreDrained(ready.slice(emitIndex));
+    throw error;
+  }
+  checkpointCodexAdoptRecovery();
+  checkpointStructuredBridgeRecovery();
   for (const turn of ready) {
     releaseInputDeliveryQuarantineForStructuredTerminal(
       turn.turnId,
@@ -30369,10 +30487,9 @@ function send(msg: WorkerToDaemon): void {
     return;
   }
   const payload = workerIpcPayload(msg);
-  if (isWorkflowWorker() && payload.type === 'final_output') {
-    workflowFinalOutputSent = true;
-  }
-  process.send?.(payload);
+  if (payload.type === 'final_output' && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew === true) universalOutputHandoff.publish(payload);
+  else process.send?.(payload);
+  if (isWorkflowWorker() && payload.type === 'final_output') workflowFinalOutputSent = true;
 }
 
 function deferNativeCodexInputCommit(dispatchAttempt?: number): boolean {
@@ -30395,6 +30512,7 @@ function acknowledgeTurnInputCommitted(
   durablePrimaryInbox?: true,
 ): void {
   if (!turnId) return;
+  if (universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId, dispatchAttempt });
   ordinaryImTurnDedupe.commit(turnId);
   send({
     type: 'turn_input_committed',
@@ -30405,6 +30523,7 @@ function acknowledgeTurnInputCommitted(
 }
 
 function acknowledgeTurnInputReceived(turnId?: string): void {
+  if (turnId && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId });
   if (turnId) send({ type: 'turn_input_received', turnId });
 }
 
@@ -30693,6 +30812,10 @@ process.on('message', async (raw: unknown) => {
         ? msg.turnId
         : undefined;
       if (lastInitConfig) {
+        if (msg.turnId && msg.turnId === initHandoffRejectedTurnId) {
+          send({ type: 'turn_input_rejected', turnId: msg.turnId, reason: 'final_output_handoff_backpressure', rejectedBeforeAdmission: true });
+          return;
+        }
         // Only an exact retry of this generation's init may be acknowledged.
         // A different init is still rejected as an invalid re-initialization.
         if (ordinaryImTurnId && lastInitConfig.turnId === ordinaryImTurnId) {
@@ -30748,6 +30871,8 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
+      initializeFinalOutputHandoff(msg);
+      applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
       // Dashboard grants stay per-boot, while the Lark-card capability is
       // revocable at the logical Session lifecycle boundary.
       refreshTerminalWriteToken();
@@ -31230,6 +31355,18 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'final_output_settled': {
+      try { universalOutputHandoff?.acknowledge(msg); }
+      catch (error) { log(`Output receipt cleanup deferred: ${String(error)}`); }
+      break;
+    }
+
+    case 'final_output_accepted': {
+      try { workerFinalOutputHandoff?.acknowledge(msg); }
+      catch (error) { log(`Final output ACK cleanup deferred: ${String(error)}`); }
+      break;
+    }
+
     case 'message': {
       if (lastInitConfig?.deploymentContinuation || restoredDeploymentTurnId) discardDeploymentContinuation();
       // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
@@ -31256,6 +31393,12 @@ process.on('message', async (raw: unknown) => {
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {
+        if (finalHandoffAdmissionEnabled && ordinaryImTurnId.startsWith('om_')
+          && !finalHandoffAdmissions.has(ordinaryImTurnId) && !workerFinalOutputHandoff?.hasTurn(ordinaryImTurnId)
+          && Math.max(workerFinalOutputHandoff?.size() ?? 0, finalHandoffAdmissions.size) >= FINAL_OUTPUT_HANDOFF_MAX_PENDING) {
+          send({ type: 'turn_input_rejected', turnId: ordinaryImTurnId, reason: 'final_output_handoff_backpressure', rejectedBeforeAdmission: true });
+          break;
+        }
         const duplicateState = receiveOrdinaryImTurn(ordinaryImTurnId);
         // ACK process ownership synchronously, before crash recovery or any
         // other awaited work. Actual queue ownership remains committed below.
@@ -32649,6 +32792,7 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  workerFinalOutputHandoff?.stop();
   if (codexUpgradeTimer) clearInterval(codexUpgradeTimer);
   codexUpgradeTimer = undefined;
   stopNativeSessionTitleSync();
