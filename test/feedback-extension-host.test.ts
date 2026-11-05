@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const mock = vi.hoisted(() => ({
-  source: undefined as any, reply: vi.fn(), mode: vi.fn(), detail: vi.fn(),
+  source: undefined as any, reply: vi.fn(), mode: vi.fn(), detail: vi.fn(), threadId: vi.fn(),
   botConfig: { feedback: { enabled: true, audience: 'everyone' } } as Record<string, unknown>,
 }));
 vi.mock('../src/services/skill-feedback-store.js', async original => ({
@@ -12,7 +12,7 @@ vi.mock('../src/services/skill-feedback-store.js', async original => ({
 }));
 vi.mock('../src/im/lark/client.js', async original => ({
   ...await original<any>(), resolveUserUnionId: async () => ({}), replyMessage: mock.reply,
-  getChatModeStrict: mock.mode, getMessageDetail: mock.detail,
+  getChatModeStrict: mock.mode, getMessageDetail: mock.detail, getMessageThreadId: mock.threadId,
 }));
 vi.mock('../src/bot-registry.js', async original => ({
   ...await original<any>(), getBot: () => ({ config: mock.botConfig }),
@@ -30,6 +30,10 @@ const dispose: Array<() => void> = [];
 afterEach(() => {
   for (const close of dispose.splice(0)) close();
   mock.botConfig = { feedback: { enabled: true, audience: 'everyone' } };
+  mock.reply.mockReset();
+  mock.mode.mockReset();
+  mock.detail.mockReset();
+  mock.threadId.mockReset();
 });
 
 async function fixture() {
@@ -134,12 +138,44 @@ describe('feedback extension host callback', () => {
       feedbackPresentation: { default: { enabled: true, rounds: [1], mode: 'separate', actionIds: ['help'] }, rules: [] } };
     const current = await readFeedbackExtensionConfig(data.directory);
     await saveFeedbackExtensionConfig(data.directory, current.version, { ...current, hooks: [{
-      ...current.hooks[0], version: 2, command: [process.execPath, '-e',
+      ...current.hooks[0], version: 2, timeoutMs: 5000, command: [process.execPath, '-e',
         "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const i=JSON.parse(d);process.stdout.write(JSON.stringify({schemaVersion:1,executionId:i.executionId,outcome:'succeeded',publicMessage:'ok',receiptRefs:['file:x']}));});"],
     }] }, 'test-admin');
     await handleFeedbackExtensionCard(data.callback('feedback_custom_action', { action_id: 'help' }), 'app', data.directory);
     await tickFeedbackExtensions(data.directory, 'app');
     const jobId = createHash('sha256').update(JSON.stringify(['app', 'chat', 'question', 'help'])).digest('hex');
     expect(data.extensions.job(jobId)).toMatchObject({ status: 'succeeded' });
+  });
+  it('lets an explicit extension-file presentation disable an action that bot config enables', async () => {
+    const data = await fixture();
+    mock.botConfig = { feedback: { enabled: true, audience: 'everyone' },
+      feedbackPresentation: { default: { enabled: true, rounds: [1], mode: 'separate', actionIds: ['help'] }, rules: [] } };
+    const current = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, current.version, { ...current,
+      presentations: { app: { default: { enabled: false }, rules: [] } } }, 'test-admin');
+    await handleFeedbackExtensionCard(data.callback('feedback_custom_action', { action_id: 'help' }), 'app', data.directory);
+    await tickFeedbackExtensions(data.directory, 'app');
+    const jobId = createHash('sha256').update(JSON.stringify(['app', 'chat', 'question', 'help'])).digest('hex');
+    expect(data.extensions.job(jobId)).toMatchObject({ status: 'blocked' });
+  });
+  it('does not ingest a surface job when the extension file explicitly disables a rule that bot config enables', async () => {
+    const data = await fixture();
+    mock.botConfig = { feedback: { enabled: true, audience: 'everyone' },
+      feedbackPresentation: { default: { enabled: true, rounds: [1], mode: 'separate' }, rules: [] } };
+    const current = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, current.version, { ...current,
+      presentations: { app: { default: { enabled: false }, rules: [] } } }, 'test-admin');
+    data.extensions.activate('app', '2000-01-01T00:00:00.000Z');
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+    // Stub the whole send path so sendFeedbackSurface reaches the write
+    // boundary, and mirror the real client.ts contract: beforeWrite runs
+    // before the message is sent (args[7] is the options bag).
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('group');
+    mock.threadId.mockResolvedValue(undefined);
+    mock.reply.mockImplementation(async (...args: any[]) => { await args[7]?.beforeWrite?.(); return 'surface-msg'; });
+    await tickFeedbackExtensions(data.directory, 'app');
+    expect(mock.reply).not.toHaveBeenCalled();
+    expect(data.extensions.jobsForApp('app').filter(job => job.kind === 'surface')).toHaveLength(0);
   });
 });
