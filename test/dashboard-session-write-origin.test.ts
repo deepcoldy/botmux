@@ -56,17 +56,23 @@ describe('dashboard 会话写操作跨站 Origin 门禁', () => {
     expect(reached).toEqual([`POST /api/sessions/${op}`]);
   });
 
-  it.each(['cleanup-idle', 'create'])('会话集合级写接口 %s 同样被拦', async op => {
-    const url = `${base}/api/sessions/${op}`;
-    expect((await fetch(url, { method: 'POST', headers: { origin: 'https://evil.example' } })).status).toBe(403);
-    expect((await fetch(url, { method: 'POST', headers: { origin: base } })).status).toBe(200);
-    expect(reached).toEqual([`POST /api/sessions/${op}`]);
-  });
-
   it('不影响 GET 与无关路径', async () => {
     const get = await fetch(`${base}/api/sessions/s1/close`, { headers: { origin: 'https://evil.example' } });
     expect(get.status).toBe(200);
     const other = await fetch(`${base}/api/other`, { method: 'POST', headers: { origin: 'https://evil.example' } });
     expect(other.status).toBe(200);
+  });
+
+  it.each(['/api/trigger', '/api/asks/answer'])('非 sessions 前缀的 cookie 写接口 %s：跨站拒、同源与无信号放行', async path => {
+    const url = `${base}${path}`;
+    for (const origin of ['https://evil.example', 'http://127.0.0.1:1', 'null']) {
+      expect((await fetch(url, { method: 'POST', headers: { origin } })).status).toBe(403);
+    }
+    expect((await fetch(url, { method: 'POST', headers: { 'sec-fetch-site': 'cross-site' } })).status).toBe(403);
+    expect((await fetch(url, { method: 'POST', headers: { 'sec-fetch-site': 'same-site' } })).status).toBe(403);
+    expect(reached).toEqual([]);
+    expect((await fetch(url, { method: 'POST', headers: { origin: base } })).status).toBe(200);
+    expect((await fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(reached).toEqual([`POST ${path}`, `POST ${path}`]);
   });
 });

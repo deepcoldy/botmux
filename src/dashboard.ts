@@ -4554,7 +4554,7 @@ const server = createServer(async (req, res) => {
     }
 
     // 会话写操作的跨站门禁（cookie 是 Lax，跨站 POST 仍会带上）。放在鉴权判决之后、
-    // 所有会话路由之前，按 /api/sessions/ 前缀默认拦截，新增写接口自动覆盖。
+    // 所有会话路由之前，按 /api/sessions/ 前缀加显式名单（/api/trigger、/api/asks/answer）拦截。
     if (!sessionWriteOriginAllowed(req, url.pathname)) {
       return dashboardControlJson(res, 403, { ok: false, error: 'control_origin_forbidden' });
     }
