@@ -465,6 +465,43 @@ describe('P3-5 / P3-6 / 确认被 bots.json 变化作废', () => {
     expect(await listSavedWorkflowRevisions(library, first.workflowId)).toHaveLength(2);
   });
 
+  it('a new template retried with the same request key: a changed summary or name is a conflict, not the old one', async () => {
+    const { h } = setup();
+    const runId = await draftAtFlow(h, NODES);
+    const first = await h.service.previewTemplateSave(runId, OWNER, {});
+    const saved = await h.service.saveAsTemplate(runId, OWNER, { flowSummarySha256: first.flowSummarySha256, requestKey: 'req-new-00001', displayName: '风险报告' });
+    // The very same request again: the same template.
+    expect(await h.service.saveAsTemplate(runId, OWNER, { flowSummarySha256: first.flowSummarySha256, requestKey: 'req-new-00001', displayName: '风险报告' }))
+      .toMatchObject({ workflowId: saved.workflowId, created: false });
+    // Only the name differs.
+    expect(await code(h.service.saveAsTemplate(runId, OWNER, { flowSummarySha256: first.flowSummarySha256, requestKey: 'req-new-00001', displayName: '另一个名字' })))
+      .toBe('save_conflict');
+    // Only the confirmed summary differs: the same DAG, but a bot changed CLI
+    // (bots.json), so the flow was confirmed again with another summary.
+    fleet = fleet.map((bot) => (bot.larkAppId === DOC ? { ...bot, cliId: 'codex' } : bot));
+    const reread = await h.service.view(runId);
+    await h.service.approveFlow(runId, OWNER, { flowSummarySha256: reread.flow!.flowSummarySha256 });
+    const second = await h.service.previewTemplateSave(runId, OWNER, {});
+    expect(second.flowSummarySha256).not.toBe(first.flowSummarySha256);
+    expect(await code(h.service.saveAsTemplate(runId, OWNER, { flowSummarySha256: second.flowSummarySha256, requestKey: 'req-new-00001', displayName: '风险报告' })))
+      .toBe('save_conflict');
+    const revisions = await listSavedWorkflowRevisions(library, saved.workflowId);
+    expect(revisions).toHaveLength(1);
+    expect((revisions[0]!.payload.provenance as any).confirmation.flowSummarySha256).toBe(first.flowSummarySha256);
+    expect((await readSavedWorkflowMetadata(library, saved.workflowId)).displayName).toBe('风险报告');
+  });
+
+  it('a new template from a run retried with the same request key and another name is a conflict', async () => {
+    const { h } = setup();
+    seedFinishedRun('src-261101-080000-000-dddd0010');
+    const saved = await h.service.saveRunAsTemplate('src-261101-080000-000-dddd0010', OWNER, { requestKey: 'req-new-00002', displayName: '周报' });
+    expect(await h.service.saveRunAsTemplate('src-261101-080000-000-dddd0010', OWNER, { requestKey: 'req-new-00002', displayName: '周报' }))
+      .toMatchObject({ workflowId: saved.workflowId, created: false });
+    expect(await code(h.service.saveRunAsTemplate('src-261101-080000-000-dddd0010', OWNER, { requestKey: 'req-new-00002', displayName: '月报' }))).toBe('save_conflict');
+    expect(await listSavedWorkflowRevisions(library, saved.workflowId)).toHaveLength(1);
+    expect((await readSavedWorkflowMetadata(library, saved.workflowId)).displayName).toBe('周报');
+  });
+
   it('a confirmation voided by a bots.json change: saving with the new summary is refused', async () => {
     const { h } = setup();
     const runId = await draftAtFlow(h, NODES);

@@ -67,6 +67,9 @@ export const DAEMON_ENV_KEYS = [
   // old read-only key remains a compatibility alias during rollout.
   'BOTMUX_TASK_CONTINUATION_ENABLED',
   'BOTMUX_READONLY_CONTINUATION_ENABLED',
+  // Session wrappers may scrub this non-secret rollout switch from inherited
+  // env; managed restart must re-read it from the authoritative file.
+  'BOTMUX_FINAL_OUTPUT_HANDOFF',
   // Provider-neutral durable coordination bootstrap. Secrets remain in
   // provider-owned environment/files; the executable path and JSON argv must
   // stay credential-free as required by the public provider contract.

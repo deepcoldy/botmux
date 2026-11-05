@@ -48,4 +48,6 @@ Lark long-connection events
 4. The worker continuously reads PTY output, converts it to Markdown via terminal-renderer, and updates the streaming card.
 5. The CLI proactively sends messages to the topic via injected Skills / commands like `botmux send`.
 
+All worker final-output producers share the durable handoff boundary (`BOTMUX_FINAL_OUTPUT_HANDOFF=1`): complete snapshots are persisted before IPC, and the daemon freezes each sink and commits settlement before acknowledging. Native Codex, remote tools, HTTP, document comments, private replies and managed output retain their own authorization and receipt protocols. See `docs/final-output-handoff.md` in the repository.
+
 Key point: **the worker and the CLI are decoupled through the backend (PTY or tmux)**. With the tmux backend, when the daemon/worker restarts the CLI process stays alive inside tmux, and the next message automatically re-attaches — no need to reload context with `--resume`. See [Persistent tmux sessions](/en/tmux) for details.
