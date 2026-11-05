@@ -591,7 +591,13 @@ export function workflowDraftPhase(
   // A template run that needs no confirmation (I13) stands where a confirmed
   // flow does; `flowConfirmationValid` then says its files are intact.
   const confirmed = draft.template && !workflowTemplateRunNeedsConfirmation(draft) ? true : !!draft.flowConfirmation;
-  if (phase === 'dag_ready' && confirmed && flowConfirmationValid !== false) {
+  // §5.2 refused the flow at the commit step (nothing written): the launch is
+  // paused for editing, not underway. Show 待确认流程 so the bot swap / node
+  // edits are reachable; for a no-confirmation template run a swap is the
+  // recovery (it then confirms as an ad-hoc flow).
+  const placementRefused = draft.launch?.error?.code === 'placement_refused'
+    && !draft.launch.commit && !draft.launch.start && grill.status === 'dag_ready';
+  if (phase === 'dag_ready' && confirmed && flowConfirmationValid !== false && !placementRefused) {
     return draft.launch ? 'launching' : 'flow_confirmed';
   }
   return phase;

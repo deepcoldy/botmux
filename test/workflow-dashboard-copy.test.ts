@@ -677,3 +677,186 @@ describe('§5.2 落点闸在 Dashboard 提交点（复制后启动）', () => {
     expect(existsSync(join(base, draft.runId, 'run.json'))).toBe(false);
   });
 });
+
+describe('§5.2 落点闸拒绝后的恢复路径', () => {
+  it('refusal voids the second confirmation: back to dag_ready, swap → re-confirm → 继续 starts', async () => {
+    const launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    const hh = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library });
+    hh.setOnline(ONLINE);
+    // Same seed as the rule-2 case: a/b both main, unordered, distinct source bots.
+    const runId = 'src-261101-080000-000-ee000001';
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    const nodes = [
+      { id: 'a', type: 'goal', bot: MAIN, placement: 'main', goal: '任务甲', depends: [] as string[], inputs: [] },
+      { id: 'b', type: 'goal', bot: DOC, placement: 'main', goal: '任务乙', depends: [], inputs: [] },
+    ];
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({ schemaVersion: 2, runId, nodes }));
+    writeFileSync(join(runDir, 'spec.json'), JSON.stringify({
+      schemaVersion: 1, runId, title: '双主话题', requirement: '两个主话题节点',
+      nodes: [
+        { sketchId: 'a', goal: '任务甲', input_needs: [], expected_outputs: ['a.md'], acceptance: 'x', risk_gate: false, unknowns: [] },
+        { sketchId: 'b', goal: '任务乙', input_needs: [], expected_outputs: ['b.md'], acceptance: 'x', risk_gate: false, unknowns: [], assignee: DOC },
+      ],
+    }));
+    writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+      [MAIN]: { larkAppId: MAIN, cliId: 'claude-code', workingDir: '/source' },
+      [DOC]: { larkAppId: DOC, cliId: 'claude-code', workingDir: '/source' },
+    }));
+    publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
+      runId,
+      createdAt: '2026-11-01T08:00:00.000Z',
+      authorizedAt: '2026-11-01T08:01:00.000Z',
+      chatBinding: { larkAppId: MAIN, chatId: 'oc_src', chatType: 'group', rootMessageId: 'om_src', ownerOpenId: OWNER.openId },
+      artifacts: {
+        dag: artifactRef(runDir, 'dag.json'),
+        spec: artifactRef(runDir, 'spec.json'),
+        botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+      },
+    }));
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId });
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runSucceeded' });
+
+    const draft = await hh.service.createFromSource(OWNER, { source: { kind: 'run', runId } });
+    await hh.service.approveSpec(draft.runId, OWNER);
+    const swapped = await hh.service.setNodeBot(draft.runId, OWNER, 'b', { larkAppId: MAIN });
+    await hh.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: swapped.flow!.flowSummarySha256 });
+    await hh.service.launch(draft.runId, OWNER, {});
+    const stopped = await settled(hh.service, draft.runId);
+    expect(stopped.launch?.error?.code).toBe('placement_refused');
+
+    // The recovery state: back at 待确认流程 with no held confirmation.
+    expect(stopped.phase).toBe('dag_ready');
+    expect(stopped.flowConfirmation).toBeUndefined();
+    expect(existsSync(join(base, draft.runId, 'run.json'))).toBe(false);
+    // The group from the stopped launch is reused (no second launch record).
+
+    // Fix it: put b on a different bot, re-confirm, then 继续.
+    const fixed = await hh.service.setNodeBot(draft.runId, OWNER, 'b', { larkAppId: REVIEW });
+    await hh.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: fixed.flow!.flowSummarySha256 });
+    await hh.service.continueLaunch(draft.runId, OWNER, {});
+    const done = await settled(hh.service, draft.runId);
+    expect(done.phase).toBe('started');
+    expect(done.launch?.error).toBeUndefined();
+    expect(existsSync(join(base, draft.runId, 'run.json'))).toBe(true);
+  });
+
+  it('a template run (needsConfirmation=false) whose revision already has two same-bot main nodes is refused at commit', async () => {
+    const launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    const hh = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library });
+    hh.setOnline(ONLINE);
+    // Build the violating flow via a copy + swap, confirm it, then save it as
+    // a template (saving does not run the placement gate).
+    const runId = 'src-261101-080000-000-ee000002';
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    const nodes = [
+      { id: 'a', type: 'goal', bot: MAIN, placement: 'main', goal: '任务甲', depends: [] as string[], inputs: [] },
+      { id: 'b', type: 'goal', bot: DOC, placement: 'main', goal: '任务乙', depends: [], inputs: [] },
+    ];
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({ schemaVersion: 2, runId, nodes }));
+    writeFileSync(join(runDir, 'spec.json'), JSON.stringify({
+      schemaVersion: 1, runId, title: '双主话题', requirement: '两个主话题节点',
+      nodes: [
+        { sketchId: 'a', goal: '任务甲', input_needs: [], expected_outputs: ['a.md'], acceptance: 'x', risk_gate: false, unknowns: [] },
+        { sketchId: 'b', goal: '任务乙', input_needs: [], expected_outputs: ['b.md'], acceptance: 'x', risk_gate: false, unknowns: [], assignee: DOC },
+      ],
+    }));
+    writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+      [MAIN]: { larkAppId: MAIN, cliId: 'claude-code', workingDir: '/source' },
+      [DOC]: { larkAppId: DOC, cliId: 'claude-code', workingDir: '/source' },
+    }));
+    publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
+      runId,
+      createdAt: '2026-11-01T08:00:00.000Z',
+      authorizedAt: '2026-11-01T08:01:00.000Z',
+      chatBinding: { larkAppId: MAIN, chatId: 'oc_src', chatType: 'group', rootMessageId: 'om_src', ownerOpenId: OWNER.openId },
+      artifacts: {
+        dag: artifactRef(runDir, 'dag.json'),
+        spec: artifactRef(runDir, 'spec.json'),
+        botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+      },
+    }));
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId });
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runSucceeded' });
+
+    const copied = await hh.service.createFromSource(OWNER, { source: { kind: 'run', runId } });
+    await hh.service.approveSpec(copied.runId, OWNER);
+    const swapped = await hh.service.setNodeBot(copied.runId, OWNER, 'b', { larkAppId: MAIN });
+    await hh.service.approveFlow(copied.runId, OWNER, { flowSummarySha256: swapped.flow!.flowSummarySha256 });
+    const preview = await hh.service.previewTemplateSave(copied.runId, OWNER, {});
+    const saved = await hh.service.saveAsTemplate(copied.runId, OWNER, {
+      flowSummarySha256: preview.flowSummarySha256, requestKey: 'req-placement-tpl',
+    });
+
+    // Run that template as-is: the two same-bot unordered main nodes must be
+    // refused at the template commit step, with no run.json.
+    const tRun = await hh.service.createFromTemplate(OWNER, { workflowId: saved.workflowId, params: {} });
+    await hh.service.launch(tRun.runId, OWNER, {});
+    const stopped = await settled(hh.service, tRun.runId);
+    expect(stopped.launch?.error?.code).toBe('placement_refused');
+    expect(stopped.launch!.error!.message).toContain('硬规则 2');
+    expect(existsSync(join(base, tRun.runId, 'run.json'))).toBe(false);
+    expect(stopped.phase).toBe('dag_ready');
+
+    // Recovery: swap b to a different bot (the run now commits as ad-hoc),
+    // re-confirm, and 「继续」 the same (already built) group.
+    const fixed = await hh.service.setNodeBot(tRun.runId, OWNER, 'b', { larkAppId: REVIEW });
+    expect(fixed.phase).toBe('dag_ready');
+    await hh.service.approveFlow(tRun.runId, OWNER, { flowSummarySha256: fixed.flow!.flowSummarySha256 });
+    await hh.service.continueLaunch(tRun.runId, OWNER, {});
+    const done = await settled(hh.service, tRun.runId);
+    expect(done.phase).toBe('started');
+    expect(existsSync(join(base, tRun.runId, 'run.json'))).toBe(true);
+  });
+
+  it('no mainTopic seam on the launch deps: fail closed (rule 3), never run', async () => {
+    const launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    const deps = { ...launch.deps } as Partial<typeof launch.deps>;
+    delete (deps as Record<string, unknown>).mainTopicAvailability;
+    const hh = makeService(base, { loadBots: () => FLEET, launch: deps as typeof launch.deps, libraryDataDir: library });
+    hh.setOnline(ONLINE);
+    const runId = 'src-261101-080000-000-ee000003';
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+      schemaVersion: 2, runId,
+      nodes: [{ id: 'a', type: 'goal', bot: MAIN, placement: 'main', goal: '任务甲', depends: [], inputs: [] }],
+    }));
+    writeFileSync(join(runDir, 'spec.json'), JSON.stringify({
+      schemaVersion: 1, runId, title: '单主话题', requirement: '一个主话题节点',
+      nodes: [
+        { sketchId: 'a', goal: '任务甲', input_needs: [], expected_outputs: ['a.md'], acceptance: 'x', risk_gate: false, unknowns: [] },
+      ],
+    }));
+    writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+      [MAIN]: { larkAppId: MAIN, cliId: 'claude-code', workingDir: '/source' },
+    }));
+    publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
+      runId,
+      createdAt: '2026-11-01T08:00:00.000Z',
+      authorizedAt: '2026-11-01T08:01:00.000Z',
+      chatBinding: { larkAppId: MAIN, chatId: 'oc_src', chatType: 'group', rootMessageId: 'om_src', ownerOpenId: OWNER.openId },
+      artifacts: {
+        dag: artifactRef(runDir, 'dag.json'),
+        spec: artifactRef(runDir, 'spec.json'),
+        botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+      },
+    }));
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId });
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runSucceeded' });
+
+    const draft = await hh.service.createFromSource(OWNER, { source: { kind: 'run', runId } });
+    await hh.service.approveSpec(draft.runId, OWNER);
+    const view = await hh.service.view(draft.runId);
+    await hh.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: view.flow!.flowSummarySha256 });
+    await hh.service.launch(draft.runId, OWNER, {});
+    const stopped = await settled(hh.service, draft.runId);
+    expect(stopped.launch?.error?.code).toBe('placement_refused');
+    expect(stopped.launch!.error!.message).toContain('硬规则 3');
+    expect(existsSync(join(base, draft.runId, 'run.json'))).toBe(false);
+  });
+});

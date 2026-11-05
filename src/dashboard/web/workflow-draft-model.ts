@@ -330,7 +330,7 @@ export function launchErrorKey(code: string): string | undefined {
     'members_invalid', 'members_unresolved', 'members_lookup_failed', 'list_chats_failed', 'create_group_failed',
     'initiator_not_joined', 'post_root_failed', 'bind_failed', 'bots_ineligible', 'revoke_failed', 'grant_failed',
     'flow_changed', 'daemon_restarted', 'internal_error', 'flow_unreadable', 'launch_loop',
-    'recover_ambiguous', 'root_unverified',
+    'recover_ambiguous', 'root_unverified', 'placement_refused',
   ]);
   return known.has(code) ? `workflow.draft.launchErr.${code}` : undefined;
 }

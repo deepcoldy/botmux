@@ -3842,7 +3842,13 @@ export class WorkflowDraftService {
       return false;
     }
     if (typeof out.result === 'object' && 'placement' in out.result) {
-      this.stopLaunch(runId, token, { step: 'commit', code: 'placement_refused', retryable: false, message: out.result.placement });
+      // Same recovery shape as flow_changed: the second confirmation is for
+      // a flow the hard rules reject, so void it — phase falls back to
+      // 待确认流程, where the bot / dependencies can be changed and the flow
+      // re-confirmed before 「继续」. Otherwise 「继续」 just re-runs the same
+      // refusal with no editable panel.
+      this.stopLaunch(runId, token, { step: 'commit', code: 'placement_refused', retryable: false, message: out.result.placement },
+        (_launch, draft) => { delete draft.flowConfirmation; });
       return false;
     }
     if (out.result === 'committed') this.log(`[workflow-draft] launch ${runId}: run.json written`);
@@ -4010,7 +4016,11 @@ export class WorkflowDraftService {
     }
     if (typeof out.result === 'object') {
       if ('placement' in out.result) {
-        this.stopLaunch(runId, token, { step: 'commit', code: 'placement_refused', retryable: false, message: out.result.placement });
+        // Void the confirmation (same recovery shape as the ad-hoc path):
+        // back to 待确认流程 to change the bot, then 复制后启动 commits the
+        // adjusted flow.
+        this.stopLaunch(runId, token, { step: 'commit', code: 'placement_refused', retryable: false, message: out.result.placement },
+          (_launch, draft) => { delete draft.flowConfirmation; });
         return false;
       }
       this.stopLaunch(runId, token, { step: 'commit', code: 'template_unavailable', retryable: true, message: out.result.unavailable });
