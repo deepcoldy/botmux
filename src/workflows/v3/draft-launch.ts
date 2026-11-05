@@ -9,6 +9,8 @@
  */
 
 import type { V3BotEligibilityProbe } from './node-executor-mode.js';
+import type { V3MainTopicAvailability } from './placement.js';
+import type { RunChatBinding } from './grill-state.js';
 import type { WorkflowDraftLaunch } from './draft-store.js';
 
 /** Same cap as the other group-creating paths (issue-claim-flow, command-handler). */
@@ -282,4 +284,8 @@ export interface DraftLaunchDeps {
   resolveSubject(chatId: string, receiver: string, subjectAppId: string): Promise<string>;
   /** The same start path as `botmux workflow start` (idempotent). */
   startRun(runId: string): Promise<LaunchStartResult>;
+  /** §5.2 rule 3 at the Dashboard commit point: can the prepared group's
+   *  main topic host `main` nodes? Read from the bound main session, the same
+   *  way the Feishu `/workflow run` entry answers it. */
+  mainTopicAvailability(binding: RunChatBinding): V3MainTopicAvailability;
 }

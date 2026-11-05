@@ -33313,6 +33313,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         };
       },
       bindSession: productionWorkflowDraftSessionBinder(),
+      // §5.2 rule 3 at the Dashboard commit point: same read the Feishu
+      // /workflow run entry uses (the bound session is that topic's own).
+      mainTopicAvailability: (binding) => v3MainTopicAvailability(
+        binding,
+        binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined,
+      ),
     }),
   ));
   setDeviceIsolationDaemonIdentity({

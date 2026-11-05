@@ -302,6 +302,8 @@ export interface ProductionDraftLaunchInput {
   startRun: DraftLaunchDeps['startRun'];
   /** Headless bind into the main topic (dashboard-ipc-server). */
   bindSession: DraftLaunchDeps['bindSession'];
+  /** §5.2 rule 3: main-topic availability from the bound session. */
+  mainTopicAvailability: DraftLaunchDeps['mainTopicAvailability'];
 }
 
 /** Lark, sessions and grants for 拉群开始, all through the main bot's own app
@@ -487,6 +489,7 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
       return mapping.subjectOpenId;
     },
     startRun: input.startRun,
+    mainTopicAvailability: input.mainTopicAvailability,
   };
 }
 

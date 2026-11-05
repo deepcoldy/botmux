@@ -19,6 +19,8 @@ import {
 } from './helpers/workflow-draft-fakes.js';
 import { fakeLaunch } from './helpers/workflow-launch-fakes.js';
 import { REVIEW, seedRun, treeDigest } from './helpers/workflow-copy-fakes.js';
+import { publishRunEnvelopeOnce, makeAdHocRunEnvelope, artifactRef } from '../src/workflows/v3/run-envelope.js';
+import { appendEvent } from '../src/workflows/v3/journal.js';
 
 const FLEET = [...BOTS, { larkAppId: REVIEW, larkAppSecret: 's-rv', name: 'review', cliId: 'claude-code' }] as any[];
 const ONLINE = [MAIN, DOC, REVIEW, STEWARD, PI];
@@ -549,5 +551,129 @@ describe('复核修复（D6）', () => {
     const refused = await refusal(h.service.launch(draft.runId, OWNER, {}));
     expect(refused.code).toBe('unresolved_params');
     expect(refused.details).toMatchObject({ params: ['focus'] });
+  });
+});
+
+describe('§5.2 落点闸在 Dashboard 提交点（复制后启动）', () => {
+  /** A run whose two nodes are both in the main topic. */
+  function seedMainPlacementRun(runId: string, depends: boolean) {
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    const nodes = [
+      { id: 'a', type: 'goal', bot: MAIN, placement: 'main', goal: '任务甲', depends: [] as string[], inputs: [] },
+      { id: 'b', type: 'goal', bot: DOC, placement: 'main', goal: '任务乙', depends: depends ? ['a'] : [], inputs: [] },
+    ];
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({ schemaVersion: 2, runId, nodes }));
+    writeFileSync(join(runDir, 'spec.json'), JSON.stringify({
+      schemaVersion: 1, runId, title: '双主话题', requirement: '两个主话题节点',
+      nodes: [
+        { sketchId: 'a', goal: '任务甲', input_needs: [], expected_outputs: ['a.md'], acceptance: 'x', risk_gate: false, unknowns: [] },
+        { sketchId: 'b', goal: '任务乙', input_needs: [], expected_outputs: ['b.md'], acceptance: 'x', risk_gate: false, unknowns: [], assignee: DOC },
+      ],
+    }));
+    writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+      [MAIN]: { larkAppId: MAIN, cliId: 'claude-code', workingDir: '/source' },
+      [DOC]: { larkAppId: DOC, cliId: 'claude-code', workingDir: '/source' },
+    }));
+    publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
+      runId,
+      createdAt: '2026-11-01T08:00:00.000Z',
+      authorizedAt: '2026-11-01T08:01:00.000Z',
+      chatBinding: { larkAppId: MAIN, chatId: 'oc_src', chatType: 'group', rootMessageId: 'om_src', ownerOpenId: OWNER.openId },
+      artifacts: {
+        dag: artifactRef(runDir, 'dag.json'),
+        spec: artifactRef(runDir, 'spec.json'),
+        botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+      },
+    }));
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId });
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runSucceeded' });
+    return runDir;
+  }
+
+  /** Copy → swap b onto the orchestrator → confirm → launch; returns the settled view. */
+  async function copiedSwappedAndLaunched(runId: string, launch: ReturnType<typeof fakeLaunch>) {
+    const draft = await h!.service.createFromSource(OWNER, { source: { kind: 'run', runId } });
+    await h!.service.approveSpec(draft.runId, OWNER);
+    const swapped = await h!.service.setNodeBot(draft.runId, OWNER, 'b', { larkAppId: MAIN });
+    await h!.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: swapped.flow!.flowSummarySha256 });
+    await h!.service.launch(draft.runId, OWNER, {});
+    const view = await settled(h!.service, draft.runId);
+    return { runId: draft.runId, view };
+  }
+
+  let h: ReturnType<typeof makeService> | undefined;
+  let launch: ReturnType<typeof fakeLaunch> | undefined;
+
+  it('two same-bot unordered main nodes after a swap: 拉群开始 stops with 硬规则 2, run.json is not written', async () => {
+    launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    h = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library });
+    h.setOnline(ONLINE);
+    seedMainPlacementRun('src-261101-080000-000-dd000001', false);
+    const { runId, view } = await copiedSwappedAndLaunched('src-261101-080000-000-dd000001', launch);
+    expect(view.phase).not.toBe('started');
+    expect(view.launch?.error).toMatchObject({ step: 'commit', code: 'placement_refused', retryable: false });
+    expect(view.launch!.error!.message).toContain('硬规则 2');
+    expect(existsSync(join(base, runId, 'run.json'))).toBe(false);
+  });
+
+  it('the same two nodes ordered by depends: the rule does not fire, the run starts', async () => {
+    launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    h = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library });
+    h.setOnline(ONLINE);
+    seedMainPlacementRun('src-261101-080000-000-dd000002', true);
+    const { runId, view } = await copiedSwappedAndLaunched('src-261101-080000-000-dd000002', launch);
+    expect(view.phase).toBe('started');
+    expect(view.launch?.error).toBeUndefined();
+    expect(existsSync(join(base, runId, 'run.json'))).toBe(true);
+  });
+
+  it('a main node with no usable main topic (rule 3): stopped just the same', async () => {
+    launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    launch.setMainTopic({ available: false, why: '主会话不在这个 run 的主话题里' });
+    h = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library });
+    h.setOnline(ONLINE);
+    // A single main node on the orchestrator: only rule 3 can fire.
+    const runId = 'src-261101-080000-000-dd000003';
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    const nodes = [
+      { id: 'a', type: 'goal', bot: MAIN, placement: 'main', goal: '任务甲', depends: [], inputs: [] },
+    ];
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({ schemaVersion: 2, runId, nodes }));
+    writeFileSync(join(runDir, 'spec.json'), JSON.stringify({
+      schemaVersion: 1, runId, title: '单主话题', requirement: '一个主话题节点',
+      nodes: [
+        { sketchId: 'a', goal: '任务甲', input_needs: [], expected_outputs: ['a.md'], acceptance: 'x', risk_gate: false, unknowns: [] },
+      ],
+    }));
+    writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+      [MAIN]: { larkAppId: MAIN, cliId: 'claude-code', workingDir: '/source' },
+    }));
+    publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
+      runId,
+      createdAt: '2026-11-01T08:00:00.000Z',
+      authorizedAt: '2026-11-01T08:01:00.000Z',
+      chatBinding: { larkAppId: MAIN, chatId: 'oc_src', chatType: 'group', rootMessageId: 'om_src', ownerOpenId: OWNER.openId },
+      artifacts: {
+        dag: artifactRef(runDir, 'dag.json'),
+        spec: artifactRef(runDir, 'spec.json'),
+        botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+      },
+    }));
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId });
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runSucceeded' });
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId } });
+    await h.service.approveSpec(draft.runId, OWNER);
+    const view0 = await h.service.view(draft.runId);
+    await h.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: view0.flow!.flowSummarySha256 });
+    await h.service.launch(draft.runId, OWNER, {});
+    const settledView = await settled(h.service, draft.runId);
+    expect(settledView.launch?.error).toMatchObject({ code: 'placement_refused' });
+    expect(settledView.launch!.error!.message).toContain('硬规则 3');
+    expect(existsSync(join(base, draft.runId, 'run.json'))).toBe(false);
   });
 });

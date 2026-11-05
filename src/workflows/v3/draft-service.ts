@@ -99,12 +99,15 @@ import {
 import {
   checkV3BotExecutorEligibility,
   describeV3BotEligibilityCode,
+  formatV3PlacementRefusal,
   judgeV3BotEligibility,
   v3BotExecutorTargets,
+  v3TargetPlacementProblems,
   type V3BotEligibilityProbe,
   type V3BotEligibilityProblem,
   type V3NodeExecutorTarget,
 } from './node-executor-mode.js';
+import type { V3MainTopicAvailability } from './placement.js';
 import {
   WORKFLOW_DRAFT_MAX_ORPHANS,
   WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS,
@@ -3720,6 +3723,25 @@ export class WorkflowDraftService {
    * (crash after it was written) must be this launch's: then it is only
    * recorded.
    */
+  /** §5.2 placement hard rules at the Dashboard commit point — the same
+   *  gate as `approve-dag` and `resolveV3NodeExecutor`
+   *  (`authorizeAdHocRun` / `commitSavedWorkflowRunInPlace` stay pure and
+   *  never read the session). Refusal lines; [] = run.json may be written. */
+  private commitPlacementProblems(
+    targets: readonly V3NodeExecutorTarget[],
+    binding: RunChatBinding,
+  ): string[] {
+    if (!targets.some((target) => target.placement === 'main' && !target.loop)) return [];
+    const unavailable: V3MainTopicAvailability = { available: false, why: '无法确认主会话是不是话题里的会话' };
+    const mainTopic = this.deps.launch?.mainTopicAvailability?.(binding) ?? unavailable;
+    return v3TargetPlacementProblems({
+      targets,
+      orchestratorAppId: this.deps.appId,
+      mainTopic,
+      nameOf: this.deps.nameOf(),
+    });
+  }
+
   private async launchCommitStep(runId: string, token: string): Promise<boolean> {
     // 运行模板 as is (§5.3): run.json is the template's (saved_definition).
     // A swapped bot made it 复制后启动: the ad-hoc commit below.
@@ -3727,10 +3749,25 @@ export class WorkflowDraftService {
     if (peek?.template && Object.keys(peek.nodeBots ?? {}).length === 0) return this.launchTemplateCommitStep(runId, token, peek.template);
     const bots = this.deps.loadBots();
     const nameOf = this.deps.nameOf();
-    const out = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => {
+    type Outcome = undefined | 'stop' | 'again' | 'committed' | { placement: string };
+    const out = this.launchTx<Outcome>(runId, token, ({ runDir, draft, launch, grill }) => {
       const chatId = launch.chat!.chatId;
       const rootMessageId = launch.root!.messageId;
       const envelopePath = join(runDir, V3_RUN_ENVELOPE_FILE);
+      const binding: RunChatBinding = {
+        larkAppId: this.deps.appId,
+        chatId,
+        chatType: 'group',
+        rootMessageId,
+        ...(launch.migrate?.status === 'bound' && launch.migrate.sessionId ? { sessionId: launch.migrate.sessionId } : {}),
+        ownerOpenId: draft.initiator.openId,
+      };
+      const initiator: V3RunInitiator = {
+        openId: draft.initiator.openId,
+        ...(draft.initiator.source === 'dashboard-platform' && draft.initiator.unionId ? { unionId: draft.initiator.unionId } : {}),
+        source: draft.initiator.source,
+      };
+      let placementRefusal: string | undefined;
       if (!existsSync(envelopePath)) {
         let flow: ReturnType<WorkflowDraftService['currentFlow']>;
         try {
@@ -3747,22 +3784,15 @@ export class WorkflowDraftService {
         if (nextLaunchStep(launch, { flowRevision: draft.flowRevision ?? 0, targets: wanted }) !== 'commit') {
           return { changed: false, result: 'again' as const };
         }
+        // §5.2 hard rules before run.json exists (the Feishu /workflow run
+        // entry enforces them at approve-dag; a copied/swapped flow bypassed
+        // that entry). A replay below already passed this gate.
+        const problems = this.commitPlacementProblems(flow.targets, binding);
+        if (problems.length > 0) placementRefusal = formatV3PlacementRefusal(problems);
       }
       if (draft.template && Object.keys(draft.nodeBots ?? {}).length === 0) return { changed: false, result: 'again' as const };
+      if (placementRefusal) return { changed: true, result: { placement: placementRefusal } as const };
       const confirmation = draft.flowConfirmation;
-      const binding: RunChatBinding = {
-        larkAppId: this.deps.appId,
-        chatId,
-        chatType: 'group',
-        rootMessageId,
-        ...(launch.migrate?.status === 'bound' && launch.migrate.sessionId ? { sessionId: launch.migrate.sessionId } : {}),
-        ownerOpenId: draft.initiator.openId,
-      };
-      const initiator: V3RunInitiator = {
-        openId: draft.initiator.openId,
-        ...(draft.initiator.source === 'dashboard-platform' && draft.initiator.unionId ? { unionId: draft.initiator.unionId } : {}),
-        source: draft.initiator.source,
-      };
       if (existsSync(envelopePath)) {
         // Written before its record could be (crash): it must be exactly this
         // launch's — then authorizeAdHocRun only replays it.
@@ -3811,6 +3841,10 @@ export class WorkflowDraftService {
       });
       return false;
     }
+    if (typeof out.result === 'object' && 'placement' in out.result) {
+      this.stopLaunch(runId, token, { step: 'commit', code: 'placement_refused', retryable: false, message: out.result.placement });
+      return false;
+    }
     if (out.result === 'committed') this.log(`[workflow-draft] launch ${runId}: run.json written`);
     return true;
   }
@@ -3845,7 +3879,7 @@ export class WorkflowDraftService {
     }
     const bots = this.deps.loadBots();
     const nameOf = this.deps.nameOf();
-    type Outcome = 'again' | 'stop' | 'committed' | { unavailable: string };
+    type Outcome = 'again' | 'stop' | 'committed' | { unavailable: string } | { placement: string };
     const out = this.launchTx<Outcome>(runId, token, ({ runDir, draft, launch, grill }) => {
       const template = draft.template;
       if (!template || template.revisionId !== pinned.revisionId || Object.keys(draft.nodeBots ?? {}).length > 0) {
@@ -3855,6 +3889,7 @@ export class WorkflowDraftService {
       const rootMessageId = launch.root!.messageId;
       const envelopePath = join(runDir, V3_RUN_ENVELOPE_FILE);
       let summarySha: string | undefined;
+      let pendingTargets: readonly V3NodeExecutorTarget[] | undefined;
       const exists = existsSync(envelopePath);
       if (!exists) {
         if (!library) return { changed: false, result: 'again' as const };
@@ -3881,6 +3916,9 @@ export class WorkflowDraftService {
           return { changed: false, result: 'again' as const };
         }
         summarySha = flow.flowSummarySha256;
+        // §5.2 hard rules before run.json exists (resolveV3NodeExecutor gates
+        // the Feishu entry; this Dashboard commit writes in place without it).
+        pendingTargets = flow.targets;
       } else {
         // The record of a replayed commit: the confirmation run.json carries,
         // else the summary of the flow on disk; never a different digest.
@@ -3907,6 +3945,10 @@ export class WorkflowDraftService {
         ...(draft.initiator.source === 'dashboard-platform' && draft.initiator.unionId ? { unionId: draft.initiator.unionId } : {}),
         source: draft.initiator.source,
       };
+      if (pendingTargets) {
+        const problems = this.commitPlacementProblems(pendingTargets, binding);
+        if (problems.length > 0) return { changed: true, result: { placement: formatV3PlacementRefusal(problems) } };
+      }
       const rawParams = Object.create(null) as Record<string, RawParamInput>;
       for (const [name, value] of Object.entries(template.params)) rawParams[name] = { kind: 'string', value };
       // Lock order: draft (held) → grill/host → run.json.
@@ -3967,6 +4009,10 @@ export class WorkflowDraftService {
       return false;
     }
     if (typeof out.result === 'object') {
+      if ('placement' in out.result) {
+        this.stopLaunch(runId, token, { step: 'commit', code: 'placement_refused', retryable: false, message: out.result.placement });
+        return false;
+      }
       this.stopLaunch(runId, token, { step: 'commit', code: 'template_unavailable', retryable: true, message: out.result.unavailable });
       return false;
     }

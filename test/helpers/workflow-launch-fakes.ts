@@ -60,6 +60,8 @@ export function fakeLaunch(baseDir: string) {
     /** The member list cannot be read. */
     memberCheckFails: false,
   };
+  /** §5.2 rule 3 answer for the prepared group's main topic. */
+  let mainTopic: { available: boolean; why?: string } = { available: true };
   /** Run just before `grant` answers (tamper hooks). */
   let beforeGrantReturn: (() => void) | undefined;
   let n = 0;
@@ -246,6 +248,9 @@ export function fakeLaunch(baseDir: string) {
       if (hangNow('startRun')) return never();
       return { ok: true };
     },
+    // §5.2 rule 3: the fake's groups always bind a usable main topic; tests
+    // flip this to an unavailable reason to exercise the rule-3 refusal.
+    mainTopicAvailability: () => mainTopic,
   };
 
   return {
@@ -265,6 +270,7 @@ export function fakeLaunch(baseDir: string) {
     refusedPeople,
     noOwner,
     switches,
+    setMainTopic(next: { available: boolean; why?: string }) { mainTopic = next; },
     set beforeGrantReturn(fn: (() => void) | undefined) { beforeGrantReturn = fn; },
     granted: (chatId: string, receiver: string) => [...(grants.get(`${chatId}|${receiver}`) ?? [])].sort(),
     onlyChat(): FakeChat {
