@@ -22,6 +22,10 @@ interface PersistedTurnSession {
   rootMessageId?: string;
   lastCallerOpenId?: string;
   quoteTargetId?: string;
+  /** Sender of the message the live quote chain names, and whether Lark said
+   *  it is a bot (written with quoteTargetId). */
+  quoteTargetSenderOpenId?: string;
+  quoteTargetSenderIsBot?: boolean;
   currentReplyTarget?: {
     rootMessageId?: string;
     turnId?: string;
@@ -70,6 +74,16 @@ export interface CurrentTurnProvenance {
    * count it as one (design §13.1).
    */
   overtakenWorkflowRunEvent?: { runId: string };
+  /**
+   * The caller is proven to be a human, not just the sender of the message
+   * that opened the turn: the durable per-turn registry records them as a
+   * non-bot participant (registryEntryProvesHumanSender), or the live quote
+   * chain's sender is them with Lark's `isBot === false`. Absent for a
+   * bot-opened turn (a peer bot's message also has an `om_` id), for every
+   * synthetic turn, and for an old record that carries no such evidence.
+   * Consumers that record "the person who confirmed" require it.
+   */
+  callerProvenHuman?: true;
 }
 
 export class CurrentTurnProvenanceError extends Error {
@@ -408,6 +422,19 @@ function authenticateHumanTurn(
   } else if (!quoteJoinHolds && nonEmpty(turnEntry?.rootMessageId)) {
     rootMessageId = turnEntry.rootMessageId;
   }
+  const thisTurnEntry = session.replyTargets?.[marker.turnId];
+  // The per-turn registry is the more specific record: when it lists the
+  // caller as a participant without `isBot === false`, that refutes any
+  // human claim from the live quote slots.
+  const registryRefutes = !!thisTurnEntry?.participants?.some(
+    p => p.openId === callerOpenId && p.isBot !== false,
+  );
+  const callerProvenHuman = !registryRefutes && (quoteJoinHolds
+    ? (session.quoteTargetSenderIsBot === false && session.quoteTargetSenderOpenId === callerOpenId)
+      || (registryTurnMayAuthenticateHuman(session, marker.turnId)
+        && registryEntryProvesHumanSender(thisTurnEntry) && thisTurnEntry.senderOpenId === callerOpenId)
+    : registrySender === callerOpenId);
+
   // 刻意保守：chat scope 下 quoteJoinHolds && !slotJoinHolds（quote 链在本轮、
   // reply 单槽已被排队消息推进）时 root 两不取——按现有写入序列两者同批推进，
   // 该组合本就不可达；真出现只能说明状态部分损坏，此时缺 root 比借一个
@@ -423,5 +450,6 @@ function authenticateHumanTurn(
       ? { chatType: session.chatType }
       : {}),
     ...(rootMessageId ? { rootMessageId } : {}),
+    ...(callerProvenHuman ? { callerProvenHuman: true as const } : {}),
   };
 }
