@@ -20,6 +20,13 @@ import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import MarkdownIt from 'markdown-it';
 import * as cotMessage from '../src/im/lark/cot-message.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { outputSnapshot } from '../src/services/universal-output-handoff.js';
+import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
+import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
+import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
+import { FinalOutputHandoffHost, FinalOutputRejectedError } from '../src/services/final-output-handoff-host.js';
+import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
@@ -2721,8 +2728,55 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).toHaveBeenCalledOnce();
-    expect(complete).toHaveBeenCalledWith(true);
+    expect(complete).toHaveBeenCalledWith(true, 'om_provider_confirmed');
     expect(clearPendingDraft).toHaveBeenCalledOnce();
+  });
+
+  it.each(['revoked_after_receipt', 'card_rejected'] as const)('settles the real handoff delivery pipeline for %s', async scenario => {
+    const previousDir = config.session.dataDir;
+    const directory = mkdtempSync(join(tmpdir(), 'handoff-real-pool-'));
+    (config.session as any).dataDir = directory;
+    const store = new FinalOutputHandoffStore(directory, 'cli_test');
+    try {
+      const ds = makeDs(); ds.adoptedFrom = undefined; ds.larkAppId = 'cli_test'; ds.scope = 'thread';
+      const output = { sessionId: ds.session.sessionId, turnId: 'om_handoff', lastUuid: 'handoff-native', content: 'final answer' };
+      const snapshot = finalOutputSnapshot(ds.larkAppId, output);
+      store.accept(snapshot, { mode: 'thread', rootMessageId: 'om_original_target' }, 'ou_original_requester');
+      let allowed = true;
+      const sessionReply = vi.fn(async (_root: string, body: string, kind: string) => {
+        if (scenario === 'card_rejected' && kind === 'interactive') throw { response: { data: { code: 230099, msg: 'rejected card' } } };
+        if (scenario === 'revoked_after_receipt') allowed = false;
+        return kind === 'text' ? 'om_aux_notice' : 'om_known_final';
+      });
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js');
+      const ledger = new TurnSendLedger(directory);
+      const host = new FinalOutputHandoffHost(store, {
+        available: () => allowed ? 'ready' : 'cancelled', error: vi.fn(),
+        knownReceipt: () => { const final = ledger.read({ larkAppId: ds.larkAppId, sessionId: output.sessionId, turnId: output.turnId })?.final; return final ? { messageId: final.messageId } : undefined; },
+        deliver: (record, control) => {
+          const context: any = { record, store, control, suppressed: false };
+          return new Promise((resolve, reject) => __testOnly_deliverFinalOutput(ds, { type: 'final_output', ...output }, 'handoff-test', 0,
+            (ok, id) => context.rejectedReason ? reject(new FinalOutputRejectedError(context.rejectedReason))
+              : ok && id ? resolve({ messageId: id }) : reject(new Error('unconfirmed')),
+            control.owns, record.target, undefined, undefined, { omitImages: true }, context));
+        },
+      });
+      const run = host.pump();
+      await vi.advanceTimersByTimeAsync(100);
+      await run;
+      if (scenario === 'revoked_after_receipt') {
+        expect(sessionReply).toHaveBeenCalledTimes(1);
+        expect(store.read(snapshot.intentId)).toMatchObject({ state: 'delivered', messageId: 'om_known_final' });
+      } else {
+        expect(sessionReply).toHaveBeenCalledTimes(2);
+        expect(sessionReply.mock.calls[0][2]).toBe('interactive');
+        expect(sessionReply.mock.calls[1][2]).toBe('text');
+        expect(sessionReply.mock.calls[1][1]).not.toBe(sessionReply.mock.calls[0][1]);
+        expect(store.read(snapshot.intentId)?.state).toBe('rejected');
+        expect(ledger.read({ larkAppId: ds.larkAppId, sessionId: output.sessionId, turnId: output.turnId })?.publication).toBeUndefined();
+      }
+    } finally { store.close(); (config.session as any).dataDir = previousDir; rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {
@@ -3574,6 +3628,21 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
       await vi.advanceTimersByTimeAsync(2000);
       expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
+    });
+
+    it('keeps a V2 frozen dispatcher on the report path without adding an IM mention', async () => {
+      await bindTopicToDispatcher();
+      const sessionReply = vi.fn(async () => 'om_reply'); const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs(); ds.adoptedFrom = undefined; ds.session.cliId = 'antigravity'; ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1'; ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot'; ds.session.quoteTargetSenderIsBot = true;
+      const message = finalOutputMsg();
+      const control: any = { record: { sink: { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' }, requesterOpenId: 'ou_dispatcher_bot', requesterIsBot: true } } }, owns: () => true, freezeTransport: (_key: string, proposed: unknown) => proposed };
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js') as any;
+      deliver(ds, message, 'probe', 0, undefined, control.owns, undefined, undefined, { openId: 'ou_dispatcher_bot', isBot: true }, undefined, undefined, control);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(sessionReply).toHaveBeenCalledOnce(); expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
       expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
     });
 
@@ -5565,4 +5634,20 @@ describe('keyed turn input-commit observation', () => {
       expect(record).toHaveBeenCalledTimes(2);
     } finally { record.mockRestore(); }
   });
+});
+
+it('keeps V2 requester addressing frozen after the current sender changes', async () => {
+  vi.useFakeTimers();
+  const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+  const ds = makeDs(); ds.larkAppId = 'cli_test'; ds.session.ownerOpenId = 'ou_newer'; ds.session.quoteTargetSenderOpenId = 'ou_newer';
+  const sessionReply = vi.fn(async () => 'om_answer');
+  initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+  const message = { ...finalOutputMsg(), sessionId: ds.session.sessionId };
+  const journal = new OutputDeliveryJournal(config.session.dataDir, 'cli_test');
+  const record = journal.accept(outputSnapshot('cli_test', message), { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' }, requesterOpenId: 'ou_original' }, chatId: ds.chatId, chatType: ds.chatType });
+  const coordinator = new OutputDeliveryCoordinator(journal);
+  const run = coordinator.deliver(record, { owns: () => true, process: (_record, control) => new Promise(resolve => { deliver(ds, message, 'probe', 0, (ok, id) => resolve(ok ? { status: 'delivered', messageId: id } : undefined), control.owns, record.sink.kind === 'im' ? record.sink.context.target : undefined, undefined, undefined, undefined, undefined, control); }), settled: vi.fn(), error: vi.fn() });
+  await vi.advanceTimersByTimeAsync(100); await run;
+  expect(sessionReply).toHaveBeenCalledOnce(); expect(sessionReply.mock.calls[0][1]).toContain('ou_original'); expect(sessionReply.mock.calls[0][1]).not.toContain('ou_newer');
+  journal.close(); vi.useRealTimers();
 });

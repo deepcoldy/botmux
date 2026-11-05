@@ -1870,6 +1870,9 @@ export type FrozenSessionReplyTarget =
 
 export interface FrozenSessionReplyContext {
   target: FrozenSessionReplyTarget;
+  /** Actual authenticated inbound requester; distinct from the quoted author. */
+  requesterOpenId?: string;
+  requesterIsBot?: boolean;
   sourceMessageId?: string;
   quoteTargetId?: string;
   replyTargetSenderOpenId?: string;
@@ -2015,6 +2018,8 @@ export interface CodexAppEffortResult {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
+  | import('./services/universal-output-handoff.js').OutputHandoffReceipt
+  | import('./services/final-output-handoff.js').FinalOutputAccepted
   | { type: 'deployment_continuation_cancelled'; requestId: string; ok: boolean }
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
@@ -2166,6 +2171,8 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
         /** Experimental, off by default: only an explicit true lets the worker
          *  suppress a failure notice after an exact acknowledged final. */
         suppressDeliveredFinalFailureNotice?: boolean;
+        /** Explicit, off-by-default ordinary bridge handoff negotiation. */
+        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
       }
     : Message
   : never;
@@ -2228,8 +2235,88 @@ export interface ModelFallbackState {
   claudeSessionId?: string;
 }
 
+export interface WorkerFinalOutput {
+  type: 'final_output';
+  /** Worker-side botmux session identity. Daemon validates this before
+   *  routing the reply so a stale/wrongly-bound worker cannot post into
+   *  another Lark thread. Optional for one release to accept older workers. */
+  sessionId?: string;
+  /** Native Hermes messages.session_id that actually produced this
+   *  content. Daemon uses it as a second consistency check after the
+   *  worker-side Hermes state.db filter, catching stale/missing stamps
+   *  without making this field the sole source-binding mechanism. */
+  sourceHermesSessionId?: string;
+  content: string;
+  lastUuid: string;
+  turnId: string;
+  replyTurnId?: string;
+  /** Zero-injection terminal input uses normal final rendering, with the
+   * reply context captured by terminal_turn_started. */
+  terminalLocal?: boolean;
+  /** Measured native execution time for this exact turn/attempt, excluding queueing. */
+  durationMs?: number;
+  /** Literal CLI input time, from the same execution window as durationMs. */
+  executionStartedAtMs?: number;
+  /** Durable receiver attempt attribution. Final output suppression is
+   *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
+  dispatchAttempt?: number;
+  /** Admission-frozen mode for this exact turn. Absence is disabled. */
+  linkRefMode?: 'observe' | 'enabled';
+  // Discriminator for the daemon-side renderer. Default ('bridge' /
+  // omitted) renders `content` through the regular markdown card. The
+  // local-turn variants ship the user prompt as a separate field so
+  // the daemon can lay it out in a quoted block (rather than the
+  // worker stitching label + user + assistant into one markdown blob,
+  // which mixes presentation with payload).
+  kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
+  /** True when `content` is the worker's FAILED-turn fallback notice (a
+   *  provider/gateway error card), not a model answer. The daemon uses it
+   *  to @mention a human on the failure card when the session has no human
+   *  recipient (bot-to-bot dispatch), so model-service outages don't pass
+   *  silently. Presentation-only — never affects turn settlement. */
+  turnFailed?: boolean;
+  /** Structured failed terminal accompanying the diagnostic; never model text. */
+  turnFailureCode?: string;
+  /** Redacted terminal diagnostic only, without partial model text. May
+   * surface as auxiliary failure UI when a loud trigger hides its answer. */
+  turnFailureNotice?: string;
+  userText?: string;
+  /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
+  codexAppSettlement?: {
+    requestId: string;
+    generation: string;
+    seq: number;
+    dispatchId: string;
+    /** Real completion instant / native execution span for the terminal the
+     *  daemon synthesizes from this settlement. The daemon persists that
+     *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
+     *  the store's INSERT OR IGNORE keeps whichever lands first — so without
+     *  these the durable path would durably win with a timing-less row and
+     *  permanently mask the worker's real numbers. Same optional-means-
+     *  unknown contract as `turn_terminal`. */
+    completedAtMs?: number;
+    durationMs?: number;
+  };
+  /** The model already delivered through botmux send; settle without fallback output. */
+  suppressDelivery?: boolean;
+  /** Ordered-steer N-final expansion (codex-app): a `steer_superseded` member
+   *  is durably settled (advances the FIFO) but never delivered and carries no
+   *  usage — only the group's final real member delivers. Absent = ordinary final. */
+  disposition?: 'steer_superseded';
+  /** Per-turn token usage (codex-app). Daemon persists it with the async
+   *  trigger result so trigger-result's completed state can report it. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
+  handoff?: import('./services/universal-output-handoff.js').OutputHandoffClaim;
+}
+
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
+  | import('./services/final-output-handoff.js').FinalOutputOffer
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
@@ -2512,83 +2599,7 @@ export type WorkerToDaemon =
       entries: Array<Pick<CodexAppDispatchLedgerEntry, 'dispatchId' | 'turnId' | 'dispatchAttempt'>>;
     }
   | { type: 'codex_app_generation_active'; sessionId: string; generation: string; fresh: boolean }
-  | {
-      type: 'final_output';
-      /** Worker-side botmux session identity. Daemon validates this before
-       *  routing the reply so a stale/wrongly-bound worker cannot post into
-       *  another Lark thread. Optional for one release to accept older workers. */
-      sessionId?: string;
-      /** Native Hermes messages.session_id that actually produced this
-       *  content. Daemon uses it as a second consistency check after the
-       *  worker-side Hermes state.db filter, catching stale/missing stamps
-       *  without making this field the sole source-binding mechanism. */
-      sourceHermesSessionId?: string;
-      content: string;
-      lastUuid: string;
-      turnId: string;
-      replyTurnId?: string;
-      /** Zero-injection terminal input uses normal final rendering, with the
-       * reply context captured by terminal_turn_started. */
-      terminalLocal?: boolean;
-      /** Measured native execution time for this exact turn/attempt, excluding queueing. */
-      durationMs?: number;
-      /** Literal CLI input time, from the same execution window as durationMs. */
-      executionStartedAtMs?: number;
-      /** Durable receiver attempt attribution. Final output suppression is
-       *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
-      dispatchAttempt?: number;
-      /** Admission-frozen mode for this exact turn. Absence is disabled. */
-      linkRefMode?: 'observe' | 'enabled';
-      // Discriminator for the daemon-side renderer. Default ('bridge' /
-      // omitted) renders `content` through the regular markdown card. The
-      // local-turn variants ship the user prompt as a separate field so
-      // the daemon can lay it out in a quoted block (rather than the
-      // worker stitching label + user + assistant into one markdown blob,
-      // which mixes presentation with payload).
-      kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
-      /** True when `content` is the worker's FAILED-turn fallback notice (a
-       *  provider/gateway error card), not a model answer. The daemon uses it
-       *  to @mention a human on the failure card when the session has no human
-       *  recipient (bot-to-bot dispatch), so model-service outages don't pass
-       *  silently. Presentation-only — never affects turn settlement. */
-      turnFailed?: boolean;
-      /** Structured failed terminal accompanying the diagnostic; never model text. */
-      turnFailureCode?: string;
-      /** Redacted terminal diagnostic only, without partial model text. May
-       * surface as auxiliary failure UI when a loud trigger hides its answer. */
-      turnFailureNotice?: string;
-      userText?: string;
-      /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
-      codexAppSettlement?: {
-        requestId: string;
-        generation: string;
-        seq: number;
-        dispatchId: string;
-        /** Real completion instant / native execution span for the terminal the
-         *  daemon synthesizes from this settlement. The daemon persists that
-         *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
-         *  the store's INSERT OR IGNORE keeps whichever lands first — so without
-         *  these the durable path would durably win with a timing-less row and
-         *  permanently mask the worker's real numbers. Same optional-means-
-         *  unknown contract as `turn_terminal`. */
-        completedAtMs?: number;
-        durationMs?: number;
-      };
-      /** The model already delivered through botmux send; settle without fallback output. */
-      suppressDelivery?: boolean;
-      /** Ordered-steer N-final expansion (codex-app): a `steer_superseded` member
-       *  is durably settled (advances the FIFO) but never delivered and carries no
-       *  usage — only the group's final real member delivers. Absent = ordinary final. */
-      disposition?: 'steer_superseded';
-      /** Per-turn token usage (codex-app). Daemon persists it with the async
-       *  trigger result so trigger-result's completed state can report it. */
-      usage?: {
-        inputTokens: number;
-        outputTokens: number;
-        cacheReadTokens: number;
-        cacheCreateTokens: number;
-      };
-    }
+  | WorkerFinalOutput
   | {
       type: 'turn_terminal';
       /** Worker-side botmux session identity. Unlike the temporary
