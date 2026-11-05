@@ -1,3 +1,4 @@
+import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
@@ -1319,7 +1320,7 @@ function frozenSessionSandbox(sessionId: string): Session['sandbox'] | undefined
 /** The session row carries a verified workflow-node marker (design
  *  2026-11-03 §4.2); set before its opening input is built. */
 function isWorkflowNodeSessionRow(sessionId: string): boolean {
-  return !!sessionStore.getSession(sessionId)?.workflowNode;
+  return isWorkflowNodeSessionMarker(sessionStore.getSession(sessionId)?.workflowNode);
 }
 
 function inputPromptInjection(sessionId: string, larkAppId?: string, cliId?: string): PromptInjection {
@@ -5420,7 +5421,11 @@ export async function deliverWorkflowNodeTurn(
           turnId,
         });
         rememberLastCliInput(existing, input.prompt, payload);
-        if (existing.worker && !existing.worker.killed && sendWorkerInput(existing, payload, turnId)) {
+        // Design §5.5: a main-topic node of the main bot runs in the main
+        // session, which may be in the middle of another turn (the one that
+        // started the run, a wake): queue behind it as a turn of its own.
+        if (existing.worker && !existing.worker.killed
+          && sendWorkerInput(existing, payload, turnId, workflowHandoffInputOptions(input.marker))) {
           return { sessionId: existing.session.sessionId };
         }
         forkWorker(existing, payload, { resume: existing.hasHistory, turnId });

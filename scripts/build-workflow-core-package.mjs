@@ -132,6 +132,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/journal.ts',
     'src/workflows/v3/manifest.ts',                   // node built-ins + contract.ts
     'src/workflows/v3/orchestrator.ts',
+    'src/workflows/v3/placement.ts',                  // pure §5.2 placement rules + dag.ts
     'src/workflows/v3/portable-artifact-snapshot.ts',
     'src/workflows/v3/portable-final-outputs.ts',
     'src/workflows/v3/portable-run-snapshot.ts',

@@ -43,6 +43,11 @@ export interface V3ExternalAttempt {
   sessionId?: string;
   acceptedAt?: number;
   deadlineAt?: number;
+  /** Main-topic placement: accepted into the session's queue, its own turn
+   *  not yet started (`deadlineAt` is the backstop until it does). */
+  startPending?: true;
+  /** Main-topic placement: when the handoff's own turn started. */
+  startedAt?: number;
   stalledAt?: number;
   /** A `nodeHandedToHuman` was recorded while the attempt was still open:
    *  its closing `nodeBlocked(HANDED_TO_HUMAN)` is owed (crash between the
@@ -146,6 +151,14 @@ export function foldV3ExternalAttempts(
         attempt.phase = 'accepted';
         attempt.sessionId = event.sessionId;
         attempt.acceptedAt = event.acceptedAt;
+        attempt.deadlineAt = event.deadlineAt;
+        if (event.startPending) attempt.startPending = true;
+        break;
+      case 'nodeHandoffStarted':
+        // Only the first start of a queued acceptance moves the deadline.
+        if (attempt.phase !== 'accepted' || !attempt.startPending) break;
+        delete attempt.startPending;
+        attempt.startedAt = event.startedAt;
         attempt.deadlineAt = event.deadlineAt;
         break;
       case 'nodeStalled':

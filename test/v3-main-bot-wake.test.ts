@@ -438,6 +438,34 @@ describe('issuing: one turn per event, recorded before the worker gets it', () =
     expect(readV3MainWakeIssued(runDir, 3)).toBeDefined();
   });
 
+  it('§5.2 rule 2: while the main bot\'s own main-topic node runs in the main session, a wake waits for that turn to end', async () => {
+    const runDir = seedBlockedRun();
+    // The main session as the daemon holds it: the node's handoff turn is
+    // running in it (its marker is a main-topic one: still an ordinary session).
+    const ds = {
+      session: {
+        sessionId: 'sess-main', status: 'active',
+        workflowNode: { runId: 'other-run', nodeId: 'n', attemptId: 'n/attempts/001', handoffMessageId: 'om_handoff', nonce: 'wfh_x', publishRoot: BINDING.rootMessageId, orchestratorAppId: BINDING.larkAppId, registeredAt: new Date().toISOString(), placement: 'main' },
+      },
+      worker: { killed: false }, cliReady: true, lastScreenStatus: 'working',
+    } as unknown as DaemonSession;
+    const state = { busy: workflowMainWakeSessionState(ds, { sessionsRestored: true }) === 'busy' };
+    expect(state.busy).toBe(true);
+    const gated = issuer({ state });
+    await gated.wake.scan('wake-run');
+    expect(gated.deliveries).toEqual([]);
+    expect(readV3MainWakeIssued(runDir, 3)).toBeUndefined();
+    // The node's turn ends: the session is idle again and the wake goes out
+    // as a turn of its own.
+    (ds as { lastScreenStatus: string }).lastScreenStatus = 'idle';
+    state.busy = workflowMainWakeSessionState(ds, { sessionsRestored: true }) === 'busy';
+    expect(state.busy).toBe(false);
+    gated.wake.onScreenStatus('sess-main', { status: 'idle', prevStatus: 'working', turnId: 'om_handoff' });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(gated.deliveries).toHaveLength(1);
+    expect(gated.controls[0]).toMatchObject({ queueAfterActiveTurn: true });
+  });
+
   it('a session that turns busy right before the hand-over: aborted in the hook, nothing recorded, delivered when idle', async () => {
     const runDir = seedBlockedRun();
     const state = { busy: false, busyAtHook: true };

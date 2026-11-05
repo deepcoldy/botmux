@@ -15,7 +15,11 @@ import { readBotsInfoJson } from '../../services/bots-info-cache.js';
 import { normalizeBotsInfoRouteEntries } from '../../services/bots-info-shape.js';
 import type { BotConfig } from '../../bot-registry.js';
 import { isMultiTopicOrchestrationEnabled, workflowHandoffIdentityEnabled, workflowNodeExecutorMode } from '../../global-config.js';
+import { readSessionRowCopiesAcrossStores } from '../../services/session-store.js';
+import type { RunChatBinding } from '../../workflows/v3/grill-state.js';
+import type { V3MainTopicAvailability } from '../../workflows/v3/placement.js';
 import {
+  v3MainTopicAvailability,
   v3OpensTopicSessions,
   type V3BotEligibilityProbe,
   type V3HandoffIdentityPolicy,
@@ -65,6 +69,22 @@ export function createLiveV3BotEligibilityProbe(input: LiveV3BotEligibilityInput
   };
 }
 
+/**
+ * §5.2 hard rule 3 from the persisted main session of the run (any process:
+ * the CLI at Gate-2, the daemon at Saved Workflow materialization). A row
+ * that cannot be read exactly once is "unknown" — the caller refuses `main`.
+ */
+export function liveV3MainTopicAvailability(binding: RunChatBinding, dataDir: string = config.session.dataDir): V3MainTopicAvailability {
+  let session: { scope?: 'thread' | 'chat'; rootMessageId?: string | null } | undefined;
+  try {
+    const rows = binding.sessionId ? readSessionRowCopiesAcrossStores(binding.sessionId, dataDir).matches : [];
+    session = rows.length === 1 ? rows[0] : undefined;
+  } catch {
+    session = undefined;
+  }
+  return v3MainTopicAvailability(binding, session);
+}
+
 /** Display name from the shared bots-info.json, falling back to the app id. */
 export function v3BotDisplayNameResolver(dataDir: string = config.session.dataDir): (larkAppId: string) => string {
   let names = new Map<string, string>();
@@ -110,6 +130,7 @@ export function liveV3NodeExecutorPolicy(bots: readonly BotConfig[], opts: { dat
       ...(opts.dataDir ? { dataDir: opts.dataDir } : {}),
     }),
     nameOf: v3BotDisplayNameResolver(opts.dataDir),
+    mainTopic: (binding) => liveV3MainTopicAvailability(binding, opts.dataDir),
     ...(workflowHandoffIdentityEnabled() ? { handoffIdentity: createLiveV3HandoffIdentityPolicy(bots) } : {}),
   };
 }
