@@ -1,3 +1,4 @@
+import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
@@ -6,7 +7,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -16,6 +17,7 @@ import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
+import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
@@ -139,7 +141,7 @@ import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
-import { rehomeReplyTargetState } from './reply-target.js';
+import { rehomeReplyTargetState, inheritTurnReplyRouting } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
@@ -154,7 +156,8 @@ import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../serv
 import { readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
-import { isPlatformTeamBot } from '../services/platform-team-store.js';
+import { isPlatformTeamBot, readPlatformTeamSync } from '../services/platform-team-store.js';
+import { platformMachineOwner } from '../platform/binding.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
@@ -3208,8 +3211,8 @@ export async function handleCommand(
                 codexAppInputGateFrozen: true,
               };
             }
-            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput);
-            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput);
+            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput, current.pendingRawTurnId ?? current.pendingTurnId ?? current.session.pendingRepoSetup?.turnId);
+            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput, current.pendingTurnId ?? current.session.pendingRepoSetup?.turnId);
 
             // forkWorker performs the synchronous pre-accept/write-ahead work.
             // Keep the opening reservation and every buffered field intact if
@@ -3395,6 +3398,7 @@ export async function handleCommand(
                 current.session = session;
                 current.lastUserPrompt = undefined;
                 current.lastCliInput = undefined;
+                current.lastCliInputTurnId = undefined;
                 current.workingDir = selectedPath;
                 session.workingDir = selectedPath;
                 session.larkAppId = current.larkAppId;
@@ -3735,25 +3739,28 @@ export async function handleCommand(
           content: failedTurn.cliInput,
           ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
         };
+        const retryTurnId = `retry-${randomUUID()}`;
+        const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
         let accepted = false;
         try {
           if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput);
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId);
           } else {
-            forkWorker(ds, retryInput, ds.hasHistory);
-            accepted = true;
+            accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (!accepted) {
+          rollbackReplyRouting();
+          sessionStore.updateSession(ds.session);
           await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
           break;
         }
         // Update retry state + record the input as the session's last CLI turn
         // (same post-acceptance pattern as the daemon's live-worker path).
         markRetryAttempt(ds.session);
-        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
@@ -4003,16 +4010,19 @@ export async function handleCommand(
               const savedReplay = {
                 lastUserPrompt: current.session.lastUserPrompt,
                 lastCliInput: current.session.lastCliInput,
+                lastCliInputTurnId: current.session.lastCliInputTurnId,
                 lastFailedTurn: current.session.lastFailedTurn,
               };
               current.session.lastUserPrompt = undefined;
               current.session.lastCliInput = undefined;
+              current.session.lastCliInputTurnId = undefined;
               current.session.lastFailedTurn = undefined;
               try {
                 sessionStore.updateSession(current.session);
               } catch (err) {
                 current.session.lastUserPrompt = savedReplay.lastUserPrompt;
                 current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
                 current.session.lastFailedTurn = savedReplay.lastFailedTurn;
                 return asError(err, 'could not persist rewind state');
               }
@@ -4024,6 +4034,7 @@ export async function handleCommand(
                 // attempt leaves the session as it was.
                 current.session.lastUserPrompt = savedReplay.lastUserPrompt;
                 current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
                 current.session.lastFailedTurn = savedReplay.lastFailedTurn;
                 try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
                 return asError(err);
@@ -4403,6 +4414,32 @@ export async function handleCommand(
           break;
         }
         if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
+          // The platform only issues to the machine owner or a teammate of theirs.
+          // Someone outside every team would authorize there and still get nothing
+          // here, so tell them that up front and offer what does work.
+          const senderUnionId = message.senderUnionId
+            ?? (loginOpenId ? (await resolveUserUnionId(botCfg2.larkAppId, loginOpenId)).unionId : undefined);
+          const owner = platformMachineOwner();
+          const teammate = platformTeammateVerdict({
+            senderUnionId,
+            ownerUnionId: owner.unionId,
+            teams: readPlatformTeamSync(config.session.dataDir),
+          });
+          if (teammate === 'not_teammate') {
+            const localCommands = [larkGoverned ? '/login lark' : '', bytedcliGoverned ? '/login bytedcli' : '']
+              .filter(Boolean).join(t('cmd.login.platform_not_teammate_or', undefined, loc));
+            await sessionReply(rootId, [
+              t('cmd.login.platform_not_teammate_title', undefined, loc), '',
+              t('cmd.login.platform_not_teammate_body', {
+                owner: owner.name ?? t('cmd.login.platform_not_teammate_owner_fallback', undefined, loc),
+              }, loc), '',
+              credSource === 'auto'
+                ? t('cmd.login.platform_not_teammate_local', { commands: localCommands }, loc)
+                : t('cmd.login.platform_not_teammate_platform_only', undefined, loc),
+              t('cmd.login.platform_not_teammate_join', { url: platformCredsUrl }, loc),
+            ].join('\n'));
+            break;
+          }
           const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
             : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
           const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
