@@ -1149,6 +1149,13 @@ export class BridgeTurnQueue {
     return out;
   }
 
+  /** A journal write failed before offer. Restore these exact drained objects;
+   * already submitted siblings stay with their output owner. */
+  restoreDrained(turns: readonly BridgePendingTurn[]): void {
+    const existing = new Set(this.queue.map(turn => `${turn.turnId}:${turn.dispatchAttempt ?? ''}`));
+    this.queue.unshift(...turns.filter(turn => !existing.has(`${turn.turnId}:${turn.dispatchAttempt ?? ''}`)));
+  }
+
   /** Number of queued (not-yet-emitted) Lark turns. */
   size(): number {
     return this.queue.length;

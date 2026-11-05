@@ -13,6 +13,7 @@ const lark = vi.hoisted(() => ({
 }));
 vi.mock('../src/im/lark/client.js', async (orig) => ({
   ...(await orig() as any),
+  resolveAllowedUsersWithMap: vi.fn(async (_app: string, raw: string[]) => ({ resolved: [], map: new Map(raw.filter((r) => r === 'on_alice').map((r) => [r, 'ou_alice_in_main'])), entryStatus: new Map(), definitiveMisses: [] })),
   listChatMessagesUntil: vi.fn(async (_app: string, _chat: string, options: { stopAfter?: (m: any, n: number) => boolean }) => {
     const newestFirst = [...lark.messages].reverse();
     const out: any[] = [];
@@ -37,6 +38,18 @@ vi.mock('../src/cli/exact-chat-grant-client.js', async (orig) => ({
 vi.mock('../src/utils/daemon-discovery.js', async (orig) => ({
   ...(await orig() as any),
   findOnlineDaemon: (larkAppId: string) => ({ larkAppId, ipcPort: 1 }),
+}));
+const groups = vi.hoisted(() => ({ owner: undefined as string | undefined, members: [] as string[], invalid: [] as string[], calls: [] as string[] }));
+vi.mock('../src/services/groups-store.js', async (orig) => ({
+  ...(await orig() as any),
+  getChatOwner: vi.fn(async (_app: string, _chat: string, type: string) => { groups.calls.push(`owner:${type}`); return groups.owner; }),
+  listChatMemberDisplays: vi.fn(async () => { groups.calls.push('members'); return groups.members.map((openId) => ({ openId, name: openId, memberType: 'user' })); }),
+  addUsersToChatByOpenId: vi.fn(async (_a: string, _c: string, ids: string[]) => { groups.calls.push(`add-open:${ids}`); return { invalidUserIds: groups.invalid }; }),
+  addUsersToChatByUnionId: vi.fn(async (_a: string, _c: string, ids: string[]) => { groups.calls.push(`add-union:${ids}`); return { invalidUserIds: groups.invalid }; }),
+}));
+vi.mock('../src/services/group-creator.js', async (orig) => ({
+  ...(await orig() as any),
+  transferGroupOwner: vi.fn(async (o: any) => { groups.calls.push(`transfer:${o.ownerIdType}:${o.ownerId}`); return { ownerTransferredTo: o.ownerId, transferError: null }; }),
 }));
 vi.mock('../src/core/daemon-ipc-auth.js', async (orig) => ({ ...(await orig() as any), loadDaemonIpcSecret: () => 'secret' }));
 
@@ -142,5 +155,34 @@ describe('production resolveSubject', () => {
     expect(grantIpc.calls).toEqual([expect.objectContaining({ operation: 'resolve', receiverLarkAppId: 'cli_main', chatId: 'oc_x', subjectLarkAppIds: ['cli_doc'] })]);
     grantIpc.answer = { ok: true, subjectMappings: [{ larkAppId: 'cli_other', subjectOpenId: 'ou_wrong' }] };
     await expect(deps().resolveSubject('oc_x', 'cli_main', 'cli_doc')).rejects.toThrow();
+  });
+});
+
+describe('production joinInitiator (#2811)', () => {
+  beforeEach(() => { groups.owner = undefined; groups.members = []; groups.invalid = []; groups.calls = []; });
+
+  it('the initiator already owns the group: one read, no write (union_id channel compares union_ids)', async () => {
+    groups.owner = 'on_alice';
+    expect(await deps().joinInitiator('oc_x', { channel: 'union_id', unionId: 'on_alice' })).toEqual({ joined: true });
+    expect(groups.calls).toEqual(['owner:union_id']);
+  });
+
+  it('union_id channel: membership is read by the open_id the main bot\'s own app resolves; a member is not invited', async () => {
+    groups.owner = 'on_someone_else';
+    groups.members = ['ou_alice_in_main'];
+    expect(await deps().joinInitiator('oc_x', { channel: 'union_id', unionId: 'on_alice' })).toEqual({ joined: true });
+    expect(groups.calls).toEqual(['owner:union_id', 'members', 'transfer:union_id:on_alice']);
+  });
+
+  it('an invite answered "not added" is checked again; only a confirmed absence is a refusal', async () => {
+    groups.invalid = ['ou_bob'];
+    expect(await deps().joinInitiator('oc_x', { channel: 'open_id', openId: 'ou_bob' })).toEqual({ joined: false, error: 'invitee_rejected' });
+    expect(groups.calls).toEqual(['owner:open_id', 'members', 'add-open:ou_bob', 'members']);
+    groups.calls = [];
+    const listing = vi.mocked((await import('../src/services/groups-store.js')).listChatMemberDisplays);
+    listing.mockImplementationOnce(async () => { groups.calls.push('members'); return []; });
+    listing.mockImplementationOnce(async () => { groups.calls.push('members'); return [{ openId: 'ou_bob', name: 'b', memberType: 'user' }]; });
+    expect(await deps().joinInitiator('oc_x', { channel: 'open_id', openId: 'ou_bob' })).toEqual({ joined: true });
+    expect(groups.calls).toEqual(['owner:open_id', 'members', 'add-open:ou_bob', 'members', 'transfer:open_id:ou_bob']);
   });
 });

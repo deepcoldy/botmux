@@ -20,3 +20,23 @@ export function loadWorkerPoolFunction<T extends (...args: any[]) => any>(
   });
   return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;
 }
+
+/** Transitional seam for a production handler closure while its host lifetime
+ * still belongs to setupWorkerHandlers. Execute its body, not source assertions. */
+export function loadWorkerPoolClosure<T extends (...args: any[]) => any>(name: string, scope: Record<string, any>): T {
+  const source = ts.createSourceFile('worker-pool.ts', readFileSync('src/core/worker-pool.ts', 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  let declaration: ts.VariableDeclaration | undefined;
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name) declaration = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  if (!declaration) throw new Error(`Missing pool closure: ${name}`);
+  const compiled = ts.transpileModule(`const ${declaration.getText(source)};`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
+  const proxy = new Proxy(scope, {
+    has: (_target, key) => key !== Symbol.unscopables,
+    get: (target, key) => key in target ? target[key as string] : (globalThis as any)[key],
+    set: (target, key, value) => { target[key as string] = value; return true; },
+  });
+  return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;
+}

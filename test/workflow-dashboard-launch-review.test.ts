@@ -695,3 +695,77 @@ describe('P3-2: self-healing is not activity', () => {
     expect(record(created.runId).updatedAt).not.toBe(before);
   });
 });
+
+describe('#2811: the join step reads before it writes', () => {
+  /** Group built, record lost: 「继续」 recovers it by its marker. */
+  async function recovered(prepare: (launch: ReturnType<typeof fakeLaunch>) => void = () => {}) {
+    const { h, launch } = setup();
+    prepare(launch);
+    const runId = await confirmed(h);
+    launch.hang('createGroup');
+    await h.service.launch(runId, OWNER, {});
+    await until(() => launch.chats.size === 1);
+    return { h, launch, runId, next: restart(h) };
+  }
+  const joinOps = (launch: ReturnType<typeof fakeLaunch>) => ['joinOwnerCheck', 'joinMemberCheck', 'joinInvite', 'joinTransfer']
+    .map((op) => launch.count(op as any));
+
+  it('recovered, the initiator already owns it: joined with no write at all (a repeated invite would fail)', async () => {
+    const { launch, runId, next } = await recovered();
+    expect(launch.switches.duplicateInviteFails).toBe(true);
+    await next.continueLaunch(runId, OWNER);
+    const done = await settled(next, runId);
+    expect(done.phase).toBe('started');
+    expect(done.launch!.chat).toMatchObject({ recovered: true, initiator: 'joined' });
+    expect(joinOps(launch)).toEqual([1, 0, 0, 0]);
+  });
+
+  it('recovered, a member but not the owner: no invite, only the transfer', async () => {
+    const { launch, runId, next } = await recovered((l) => l.noOwner.add(OWNER.openId));
+    launch.noOwner.delete(OWNER.openId);
+    await next.continueLaunch(runId, OWNER);
+    expect((await settled(next, runId)).phase).toBe('started');
+    expect(joinOps(launch)).toEqual([1, 1, 0, 1]);
+    expect(launch.onlyChat().owner).toEqual({ channel: 'open_id', id: OWNER.openId });
+  });
+
+  it('not a member, the invite says "not added" but the member list shows them: joined', async () => {
+    const { h, launch } = setup();
+    launch.refusedPeople.add(OWNER.openId);
+    const runId = await confirmed(h);
+    await h.service.launch(runId, OWNER, {});
+    expect((await settled(h.service, runId)).launch).toMatchObject({ error: { code: 'initiator_not_joined' } });
+    launch.refusedPeople.delete(OWNER.openId);
+    launch.switches.inviteReportsInvalid = true;
+    const before = joinOps(launch);
+    await h.service.continueLaunch(runId, OWNER);
+    expect((await settled(h.service, runId)).phase).toBe('started');
+    const after = joinOps(launch);
+    expect(after.map((n, i) => n - before[i]!)).toEqual([1, 2, 1, 1]);
+  });
+
+  it('really refused: still initiator_not_joined, after checking the member list again', async () => {
+    const { h, launch } = setup();
+    launch.refusedPeople.add(OWNER.openId);
+    const runId = await confirmed(h);
+    await h.service.launch(runId, OWNER, {});
+    await settled(h.service, runId);
+    const before = joinOps(launch);
+    await h.service.continueLaunch(runId, OWNER);
+    expect((await settled(h.service, runId)).launch).toMatchObject({ error: { step: 'join', code: 'initiator_not_joined' } });
+    expect(joinOps(launch).map((n, i) => n - before[i]!)).toEqual([1, 2, 1, 0]);
+  });
+
+  it('the member list cannot be read after an invite that says "not added": not joined, the reason says why', async () => {
+    const { h, launch } = setup();
+    launch.refusedPeople.add(OWNER.openId);
+    const runId = await confirmed(h);
+    await h.service.launch(runId, OWNER, {});
+    await settled(h.service, runId);
+    launch.switches.memberCheckFails = true;
+    await h.service.continueLaunch(runId, OWNER);
+    const stopped = await settled(h.service, runId);
+    expect(stopped.launch).toMatchObject({ error: { code: 'initiator_not_joined' } });
+    expect(stopped.launch!.error!.message).toContain('membership could not be checked');
+  });
+});

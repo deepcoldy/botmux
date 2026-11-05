@@ -125,6 +125,54 @@ export function nextLaunchStep(
   return 'commit';
 }
 
+// ─── The initiator into the group (join step) ─────────────────────────────
+
+/** Feishu reads/writes the join step needs, all through the main bot's own
+ *  app and in the initiator's one channel (open_id or union_id). */
+export interface JoinInitiatorPrimitives {
+  /** The group owner, in the channel's id type; undefined = unknown. */
+  owner(): Promise<string | undefined>;
+  /** Whether the initiator is in the group; throws when it cannot be told. */
+  isMember(): Promise<boolean>;
+  /** Invite the initiator. `invalid`: Feishu listed them as not added —
+   *  which it also does for someone already in the group. */
+  invite(): Promise<{ invalid: boolean }>;
+  transferOwner(): Promise<{ error?: string }>;
+}
+
+/**
+ * The join step (§4.5 第 2 步, the decided group-owner rule): the initiator
+ * must be in the group; becoming owner is best effort. Reads first, so a
+ * recovered group whose owner already is the initiator costs no write:
+ *   1. owner already the initiator → joined, nothing written;
+ *   2. already a member → no invite;
+ *   3. otherwise invite; an `invalid` answer is checked against the member
+ *      list once more (Feishu answers a repeated invite the same way) and
+ *      only a confirmed absence is a refusal;
+ *   4. owner transfer; its failure is reported, not fatal.
+ */
+export async function joinLaunchInitiator(initiatorId: string, p: JoinInitiatorPrimitives): Promise<LaunchJoinInitiatorResult> {
+  let owner: string | undefined;
+  try { owner = await p.owner(); } catch { owner = undefined; }
+  if (owner === initiatorId) return { joined: true };
+  let member: boolean | undefined;
+  try { member = await p.isMember(); } catch { member = undefined; }
+  if (member !== true) {
+    const invited = await p.invite();
+    if (invited.invalid) {
+      let present: boolean;
+      try {
+        present = await p.isMember();
+      } catch (error) {
+        return { joined: false, error: `invite answered invalid and membership could not be checked: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      if (!present) return { joined: false, error: 'invitee_rejected' };
+    }
+  }
+  const transferred = await p.transferOwner();
+  return { joined: true, ...(transferred.error ? { ownerTransferError: transferred.error } : {}) };
+}
+
 // ─── Collaborators ────────────────────────────────────────────────────────
 
 /** The root card of the main topic (§4.5 第 3 步, E6). */
