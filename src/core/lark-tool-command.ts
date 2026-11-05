@@ -32,8 +32,6 @@ function parseHelp(text: string): CommandHelp {
     if (section !== 'commands') {
       // Structured type placeholders may contain spaces; Cobra separates the
       // type from its description with two or more spaces.
-      // Structured type placeholders may contain spaces; Cobra separates the
-      // type from its description with two or more spaces.
       const match = /^\s+(?:(-[A-Za-z0-9]),\s+)?(--[A-Za-z0-9][A-Za-z0-9_-]*)(?: ([^\s].*?))?\s{2,}/.exec(line);
       if (!match) continue;
       // A "[mnemonic]" placeholder (e.g. "[row=N]") is an optional value:

@@ -86,6 +86,25 @@ describe('lark-cli argv metadata', () => {
     ))).toEqual(['docs', '+fetch', '--values', '[["alice",95]]', '--dry-run', '--as', 'bot']);
   });
 
+  it.each([
+    ['--nums', '[1, 2, 3]'],
+    ['--neg', '[-1.5, 0]'],
+    ['--bools', '[true, false]'],
+    ['--nulls', '[null]'],
+    ['--objs', '[{"k": "v"}]'],
+  ])('treats a %s JSON-array example as a required value', (flag, type) => {
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch'
+        ? help.replace('      --dry-run', `      ${flag} ${type}   JSON array value\n      --dry-run`)
+        : help;
+    };
+    expect(() => parseLarkToolInvocation(['docs', '+fetch', flag], binding, readHelp)).toThrow('requires a value');
+    expect(larkToolExecutionArgs(parseLarkToolInvocation(
+      ['docs', '+fetch', flag, type, '--dry-run'], binding, readHelp,
+    ))).toEqual(['docs', '+fetch', flag, type, '--dry-run', '--as', 'bot']);
+  });
+
   it('resolves a lone subcommand listed with Cobra single-space padding', () => {
     const readHelp = (cmd: readonly string[]) => {
       const key = cmd.join(' ');
