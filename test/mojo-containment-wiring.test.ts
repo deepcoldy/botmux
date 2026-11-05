@@ -37,6 +37,7 @@ import {
   proveWorkerlessLocalSubtree,
 } from '../src/adapters/backend/mojo-backend.js';
 import { classifyUnprovenTermination } from '../src/adapters/backend/destroy-result.js';
+import { scanMojoTree } from '../src/adapters/backend/mojo-process-tree.js';
 import { isLinux, syntheticProcRoot } from './helpers/synthetic-proc.js';
 import {
   containmentHandles,
@@ -49,8 +50,10 @@ const STORE = 'mojo-containment-handles.json';
 /** Linux-only: needs a real /proc and real process signalling. */
 const describeLinux = describe.runIf(isLinux);
 
-/** Every pid a synthetic /proc fixture creates. */
-const SYNTHETIC_FIXTURE_PIDS = [4242, 4243, 5150, 5151, 7000, 8000, 9000, 9100] as const;
+/** Every pid a synthetic /proc fixture creates. Typed as a plain number array
+ * (not `as const`): a literal-tuple type makes `pid === RUNNER_PID` below a
+ * TS2367 ("no overlap") once this file is type-checked strictly. */
+const SYNTHETIC_FIXTURE_PIDS: readonly number[] = [4242, 4243, 5150, 5151, 7000, 8000, 9000, 9100];
 /**
  * Fake runner identity for synthetic-/proc cases. `MojoBackend.selfPids()`
  * excludes `[process.pid, process.ppid]` from every tree scan so cleanup can
@@ -806,6 +809,17 @@ describe('inherited signalling is gated by what each fact licenses', () => {
       // them (no PGID claim can happen for a root that cannot be verified).
       rootPid: 9000, bootId: proc.bootId, startTime: 300, nonce: 'nonce-self-pids',
     } as const;
+
+    // POSITIVE CONTROL: without the exclusion the scan MUST claim both members,
+    // otherwise "nothing was signalled" would also hold for a scan that simply
+    // stopped seeing them (and this guard would go quietly vacuous).
+    const control = scanMojoTree(handle.rootPid, handle.nonce, { procRoot: proc.path });
+    expect(control.ok).toBe(true);
+    if (!control.ok) return;
+    // Sort before comparing: member order follows readdirSync, which bun and Node
+    // return in opposite orders here (unsorted made the bun leg a false red).
+    expect(control.members.map(m => m.pid).sort((a, b) => a - b))
+      .toEqual([RUNNER_PID, RUNNER_PPID].sort((a, b) => a - b));
 
     const sent: number[] = [];
     const spy = vi.mocked(process.kill).mockImplementation(pid => { sent.push(pid); return true; });
