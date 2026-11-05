@@ -730,7 +730,7 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
                     disabled={props.busy}
                     onClick={() => setDraftHours(hours)}
                   >
-                    {option.label}
+                    {hours === 0 ? t('sessions.idleCleanupAll') : option.label}
                   </button>
                 );
               })}
@@ -2479,7 +2479,7 @@ function SessionsPage(): React.JSX.Element {
 
   const runIdleCleanup = useCallback(async (hours: IdleCleanupHours): Promise<void> => {
     const nextHours = parseIdleCleanupHours(hours);
-    if (!nextHours) return;
+    if (nextHours === null) return;
     const groups = idleCleanupCandidatesFor(nextHours);
     const candidates = [...groups.idle, ...groups.dormant];
     if (candidates.length === 0) return;

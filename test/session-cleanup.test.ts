@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
+  AUTO_CLEANUP_HOUR_OPTIONS,
   cleanupIdleSessions,
   idleCleanupCutoffMs,
   isDormantCleanupCandidate,
@@ -24,7 +25,12 @@ function row(id: string, patch: Record<string, unknown> = {}) {
 
 describe('dashboard idle session cleanup selection', () => {
   it('accepts only the supported cleanup thresholds', () => {
-    expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual(SESSION_CLEANUP_HOUR_OPTIONS);
+    expect(AUTO_CLEANUP_HOUR_OPTIONS).toEqual(SESSION_CLEANUP_HOUR_OPTIONS);
+    expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([1, 24, 72, 168, 0]);
+    expect(parseIdleCleanupHours(1)).toBe(1);
+    expect(parseIdleCleanupHours('1')).toBe(1);
+    expect(parseIdleCleanupHours(0)).toBe(0);
+    expect(parseIdleCleanupHours('all')).toBe(0);
     expect(parseIdleCleanupHours(24)).toBe(24);
     expect(parseIdleCleanupHours('72')).toBe(72);
     expect(parseIdleCleanupHours('7d')).toBe(168);
@@ -33,6 +39,37 @@ describe('dashboard idle session cleanup selection', () => {
     expect(parseIdleCleanupHours(12)).toBeNull();
     expect(parseIdleCleanupHours('24h')).toBeNull();
     expect(parseIdleCleanupHours('bad')).toBeNull();
+    for (const invalid of [undefined, null, false, true, '', ' ', [], {}, -1]) {
+      expect(parseIdleCleanupHours(invalid)).toBeNull();
+    }
+  });
+  it('selects only sessions idle for more than one hour', () => {
+    expect(selectIdleCleanupCandidates([
+      row('older', { lastMessageAt: NOW - 2 * hour }),
+      row('boundary', { lastMessageAt: NOW - hour }),
+      row('recent', { lastMessageAt: NOW - hour / 2 }),
+    ], 1, NOW).map(s => s.sessionId)).toEqual(['older']);
+  });
+  it('all removes only the age filter, preserving idle and dormant protections', async () => {
+    const rows = [
+      row('recent', { lastMessageAt: NOW }),
+      row('unknown-time', { lastMessageAt: undefined }),
+      row('dormant', { status: 'dormant', lastMessageAt: undefined }),
+      row('working', { status: 'working' }),
+      row('starting', { status: 'starting' }),
+      row('closed', { status: 'closed' }),
+      row('locked', { locked: true }),
+      row('repo', { pendingRepo: true }),
+      row('prompt', { tuiPromptActive: true }),
+      row('attention', { agentAttention: { kind: 'blocked' } }),
+      row('served-dormant', { status: 'dormant', webPort: 1234 }),
+    ];
+    const closed: string[] = [];
+    const result = await cleanupIdleSessions(rows, 0, async s => {
+      closed.push(s.sessionId); return { sessionId: s.sessionId, ok: true };
+    }, NOW);
+    expect(closed).toEqual(['recent', 'unknown-time', 'dormant']);
+    expect(result.matched).toBe(3); expect(result.olderThanHours).toBe(0);
   });
 
   it('selects idle sessions older than the threshold and skips unsafe statuses', () => {

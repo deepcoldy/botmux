@@ -5292,6 +5292,17 @@ table[hidden] { display: none !important; }
   background: color-mix(in srgb, var(--border-soft) 60%, transparent);
   color: var(--accent-strong);
 }
+#idle-cleanup-threshold {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+#idle-cleanup-threshold button {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
 .idle-cleanup-threshold-options button.active,
 .idle-cleanup-threshold-options button[aria-pressed="true"] {
   background: var(--idle-cleanup-segment-active-bg);

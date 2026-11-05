@@ -1,9 +1,11 @@
 import type { ParsedCloseResidual } from '../core/close-residual.js';
-export const IDLE_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
+export const AUTO_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
+/** Zero means every eligible idle/dormant row, without an age filter. */
+export const IDLE_CLEANUP_HOUR_OPTIONS = [1, ...AUTO_CLEANUP_HOUR_OPTIONS, 0] as const;
 export type IdleCleanupHours = typeof IDLE_CLEANUP_HOUR_OPTIONS[number];
 
 export function idleCleanupHoursLabel(hours: IdleCleanupHours): string {
-  return hours === 168 ? '7d' : `${hours}H`;
+  return hours === 0 ? 'All' : hours === 168 ? '7d' : `${hours}H`;
 }
 
 export interface IdleCleanupSessionRow {
@@ -24,7 +26,10 @@ export interface IdleCleanupSessionRow {
 const OPTIONS = new Set<number>(IDLE_CLEANUP_HOUR_OPTIONS);
 
 export function parseIdleCleanupHours(value: unknown): IdleCleanupHours | null {
-  const normalized = value === '7d' ? 168 : Number(value);
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const text = typeof value === 'string' ? value.trim() : undefined;
+  if (text !== undefined && !/^(0|1|24|72|168|7d|all)$/.test(text)) return null;
+  const normalized = text === 'all' ? 0 : text === '7d' ? 168 : Number(value);
   if (!Number.isFinite(normalized) || !OPTIONS.has(normalized)) return null;
   return normalized as IdleCleanupHours;
 }
@@ -47,6 +52,7 @@ export function isIdleCleanupCandidate(
   if (row.status !== 'idle') return false;
   if (row.locked) return false;
   if (row.pendingRepo || row.tuiPromptActive || row.agentAttention) return false;
+  if (hours === 0) return true;
   const last = numericTime(row.lastMessageAt);
   return last !== null && last < idleCleanupCutoffMs(hours, now);
 }
@@ -66,6 +72,7 @@ export function isDormantCleanupCandidate(
   if (row.locked) return false;
   if (row.pendingRepo || row.tuiPromptActive || row.agentAttention) return false;
   if (row.webPort !== undefined && row.webPort !== null) return false;
+  if (hours === 0) return true;
   const last = numericTime(row.lastMessageAt);
   return last !== null && last < idleCleanupCutoffMs(hours, now);
 }

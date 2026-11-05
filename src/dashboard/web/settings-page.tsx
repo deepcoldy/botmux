@@ -25,7 +25,7 @@ import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/pr
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
-  IDLE_CLEANUP_HOUR_OPTIONS,
+  AUTO_CLEANUP_HOUR_OPTIONS as IDLE_CLEANUP_HOUR_OPTIONS,
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
