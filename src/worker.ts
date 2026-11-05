@@ -7581,15 +7581,11 @@ const bridgeQueue = new BridgeTurnQueue(
     syncCronTaskAnchorsToDaemon();
   },
   notifyNativeTranscriptConsumedLarkTurn,
+  // Every transcript read that feeds the queue (the polling read, rotation
+  // switches, fingerprint follow, journal recovery, retired secondary paths)
+  // also feeds the StopFailure evidence.
+  (events, path) => claudeStopFailureEvidence.observe(events, path),
 );
-/** Feed transcript events the bridge read to its turn queue. Every read that
- *  feeds the queue (the polling read, rotation switches, fingerprint follow,
- *  journal recovery, retired secondary paths) goes through here, so the
- *  StopFailure evidence sees every main-chain terminal record the bridge read. */
-function ingestBridgeEvents(...args: Parameters<BridgeTurnQueue['ingest']>): void {
-  bridgeQueue.ingest(...args);
-  if (args[1]) claudeStopFailureEvidence.observe(args[0], args[1]);
-}
 /** Background work (Agent / Bash / Monitor; Grok bash / monitor) launched by
  *  the CLI and not yet stopped, plus whether the main turn is open.
  *  - `pendingTurnAgents()`, at the PTY idle edge (markPromptReady): a main turn
@@ -9155,7 +9151,7 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   const cutoffMs = Math.min(...restorable.map(entry => entry.markTimeMs)) - 5_000;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
-  if (live.length > 0) ingestBridgeEvents(live, bridgeJsonlPath);
+  if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
   // The old CLI's queue died with it: a replayed enqueue proves nothing now.
   bridgeQueue.forgetCliQueue();
   observeModelFallbackEvents(bridgeJsonlPath, drained.events);
@@ -9231,7 +9227,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // re-proves `seen` if the new file carries a marker.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) ingestBridgeEvents(live, matched);
+  if (live.length > 0) bridgeQueue.ingest(live, matched);
   // The switch moved us onto another Claude session: rebind the fallback
   // tracker to it (seed always publishes, so the daemon drops whatever the
   // previous session left behind) before folding this file's own events in.
@@ -9516,7 +9512,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // not carry over; absorb re-proves `seen` from the new file.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) ingestBridgeEvents(live, newPath);
+  if (live.length > 0) bridgeQueue.ingest(live, newPath);
   // Same as the fingerprint switch: rebind the fallback tracker to the Claude
   // session we just rotated onto, then fold this file's own events in.
   seedModelFallbackFromTranscript();
@@ -10135,7 +10131,7 @@ function bridgeIngest(): void {
     // exists", which this makes true in every mode.
     cliTranscriptEverExisted = true;
   }
-  ingestBridgeEvents(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
   // Arm (or keep) the no-idle-edge watchdog for a fresh head now waiting on
   // its closing records. No-op while an idle settle owns the wait.
   updateProvisionalExitWatch();
@@ -10880,7 +10876,7 @@ function emitReadyTurns(opts: {
  *  caller to commit (or discard, if it's about to switch paths). */
 function drainPathInto(path: string, fromOffset: number): { offset: number; tail: string } {
   const result = drainTranscript(path, fromOffset);
-  ingestBridgeEvents(result.events, path);
+  bridgeQueue.ingest(result.events, path);
   // Drain-before-switch runs while `path` is still the primary, so these are
   // the bound session's own trailing bytes — a switch record Claude wrote just
   // before the rotation lands here and nowhere else.
@@ -13485,7 +13481,7 @@ function drainSecondaryPaths(): void {
   for (const [path, offset] of bridgeSecondaryPaths) {
     try {
       const result = drainTranscript(path, offset);
-      if (result.events.length > 0) ingestBridgeEvents(result.events, path);
+      if (result.events.length > 0) bridgeQueue.ingest(result.events, path);
       // Retired paths belong to a Claude session we already left, so the router
       // drops them; routed anyway so the "every queue-feeding drain goes
       // through one entry" rule has no exception to reason about.
