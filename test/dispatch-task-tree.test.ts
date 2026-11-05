@@ -219,4 +219,13 @@ describe('renderDispatchTaskTreeCard', () => {
       expect(renderDispatchTaskTreeText(blank).split('\n')[0]).toMatch(/^编排任务（/);
     }
   });
+
+  it('shows a non-empty orchestration title verbatim in the card header and text heading', () => {
+    const named = buildDispatchTaskTree({
+      registry: { om_a: entry({}) }, orchSessionId: ORCH, title: '主任务标题', sessions: [], localAppIds: LOCAL,
+    });
+    const header = renderDispatchTaskTreeCard(named).header as { title: { content: string } };
+    expect(header.title.content).toBe('主任务标题');
+    expect(renderDispatchTaskTreeText(named).split('\n')[0]).toMatch(/^主任务标题（/);
+  });
 });
