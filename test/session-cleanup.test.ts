@@ -27,6 +27,11 @@ describe('dashboard idle session cleanup selection', () => {
   it('accepts only the supported cleanup thresholds', () => {
     expect(AUTO_CLEANUP_HOUR_OPTIONS).toEqual(SESSION_CLEANUP_HOUR_OPTIONS);
     expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([1, 24, 72, 168, 0]);
+    // Lock the option table to the parser: a new option added without updating
+    // the string whitelist must not silently parse to null in the UI.
+    for (const hours of IDLE_CLEANUP_HOUR_OPTIONS) {
+      expect(parseIdleCleanupHours(hours)).toBe(hours);
+    }
     expect(parseIdleCleanupHours(1)).toBe(1);
     expect(parseIdleCleanupHours('1')).toBe(1);
     expect(parseIdleCleanupHours(0)).toBe(0);
@@ -55,6 +60,7 @@ describe('dashboard idle session cleanup selection', () => {
       row('recent', { lastMessageAt: NOW }),
       row('unknown-time', { lastMessageAt: undefined }),
       row('dormant', { status: 'dormant', lastMessageAt: undefined }),
+      row('queued-fresh', { queued: true, lastMessageAt: NOW }),
       row('working', { status: 'working' }),
       row('starting', { status: 'starting' }),
       row('closed', { status: 'closed' }),
@@ -70,6 +76,17 @@ describe('dashboard idle session cleanup selection', () => {
     }, NOW);
     expect(closed).toEqual(['recent', 'unknown-time', 'dormant']);
     expect(result.matched).toBe(3); expect(result.olderThanHours).toBe(0);
+  });
+
+  it('never sweeps queued backlog rows at any threshold', () => {
+    // dashboard-rows projects queued sessions as status 'idle'; their parked
+    // queuedPrompt draft must keep them out of every sweep, including 1H and
+    // the age-less 0 / "all" mode.
+    const parked = row('queued-old', { queued: true, lastMessageAt: NOW - 30 * 24 * hour });
+    expect(selectIdleCleanupCandidates([parked], 0, NOW)).toEqual([]);
+    expect(selectIdleCleanupCandidates([parked], 1, NOW)).toEqual([]);
+    expect(selectIdleCleanupCandidates([parked], 24, NOW)).toEqual([]);
+    expect(selectCleanupCandidates([parked], 0, NOW)).toEqual({ idle: [], dormant: [] });
   });
 
   it('selects idle sessions older than the threshold and skips unsafe statuses', () => {

@@ -202,9 +202,12 @@ export interface WorkerConfig {
   sessionMemoryMaxBytes?: number;
 }
 
-/** Supported idle thresholds (hours) for both the manual「清理空闲」button and
- *  scheduled auto-cleanup. Kept in lockstep with session-cleanup's
- *  IDLE_CLEANUP_HOUR_OPTIONS so the two paths never diverge. */
+/** Supported idle thresholds (hours) for scheduled auto-cleanup ONLY.
+ *  Deliberately a strict subset of the manual button's options
+ *  (session-cleanup IDLE_CLEANUP_HOUR_OPTIONS additionally offers 1 and 0 =
+ *  "all"); never align the two — a 0 leaking into unattended sweeps means
+ *  "close every eligible session". The invariant is
+ *  AUTO_CLEANUP_HOUR_OPTIONS === SESSION_CLEANUP_HOUR_OPTIONS (unit-tested). */
 export const SESSION_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
 export type SessionCleanupHours = typeof SESSION_CLEANUP_HOUR_OPTIONS[number];
 /** Bounds for the check cadence. A 5-minute floor keeps a hand-edited config
@@ -218,7 +221,8 @@ export interface SessionCleanupGlobalConfig {
   archiveCodex?: boolean;
   /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
   enabled?: boolean;
-  /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
+  /** 空闲阈值（小时）。定时自动清理仅接受 24 / 72 / 168；手动清理按钮另提供
+   *  1 与 0（全部）。缺省 168（7 天）。 */
   olderThanHours?: SessionCleanupHours;
   /** 检查频率（分钟）。缺省 60，最小 5（低于则回退到最小值）。 */
   intervalMinutes?: number;
