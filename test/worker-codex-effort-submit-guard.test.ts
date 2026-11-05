@@ -15,6 +15,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
+import { hasEmptyCodexComposer, parseCodexEffortMenu } from '../src/utils/codex-effort-menu.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 
 const FULL_ACCESS_DIALOG = [
@@ -132,6 +133,9 @@ describe('discarding the typed /model after a refused guard', () => {
       detectCodexChoiceModal,
       log: vi.fn(),
     };
+    // The discard path shares its "may we send a clear key" predicate with the
+    // recovery self-heal; load the real one.
+    scope.codexEffortOrphanedLiteral = loadWorkerFunction<(s: string) => boolean>('codexEffortOrphanedLiteral', scope);
     const discard = loadWorkerFunction<(t: unknown, current: () => boolean) => Promise<void>>(
       'discardTypedCodexEffortCommand', scope,
     );
@@ -172,6 +176,80 @@ describe('discarding the typed /model after a refused guard', () => {
     expect((await loadDiscard({ screen: '' }).discard({ write: () => true }, () => true))).toBeUndefined();
     const { discard, target, writes } = loadDiscard({ screen: COMPOSER_WITH_OUR_TEXT });
     await discard(target, () => false);
+    expect(writes).toEqual([]);
+  });
+});
+
+describe('recovery hold self-heals an orphaned /model draft', () => {
+  // Failure shape, reproduced against real 0.164: a popup appears inside the
+  // submit beat, the guard refuses, and `discardTypedCommand` correctly declines
+  // to send a clear key into the popup. The literal then stays in the composer.
+  // Without this self-heal the recovery hold — which keeps queued input out until
+  // the composer is provably empty — never releases: every later Lark message is
+  // silently swallowed, with no visible reason, until someone clears the terminal
+  // by hand. The trigger is exactly the working-session window this PR opens.
+  const POPUP_WITH_OUR_LITERAL = [
+    '                         Enable full access?',
+    '› /model                   When Codex runs with full access…',
+    '› 1. Yes, continue anyway  Apply full access for this session',
+    '  2. Cancel                Go back without enabling full access',
+    '',
+    '                          enter select · esc back',
+  ].join('\n');
+  const ORPHAN = ['Working', '› /model', '', '  GPT-6.1-Sol xhigh · /tmp/p · ← for agents'].join('\n');
+  const CLEAN = ['Working', '› Ask Codex to do anything', '', '  GPT-6.1-Sol xhigh · /tmp/p · ← for agents'].join('\n');
+
+  function loadRecovery(initial: string, opts: { ignoreClear?: boolean } = {}) {
+    const backend: Record<string, unknown> = { id: 'pane' };
+    let screen = initial;
+    const writes: string[] = [];
+    backend.write = (data: string) => {
+      writes.push(data);
+      if (!opts.ignoreClear) screen = CLEAN;
+      return true;
+    };
+    const scope: Record<string, unknown> = {
+      backend,
+      cliLifetimeNonce: 7,
+      codexCliEffortRecovery: { backend, lifetime: 7 },
+      codexEffortRecoveryClearAttempted: false,
+      hasEmptyCodexComposer,
+      parseCodexEffortMenu,
+      detectCodexChoiceModal,
+      stripAnsiScreenText,
+      captureBackendScreen: () => screen,
+      log: vi.fn(),
+    };
+    scope.codexEffortOrphanedLiteral = loadWorkerFunction<(s: string) => boolean>('codexEffortOrphanedLiteral', scope);
+    const needs = loadWorkerFunction<(self?: unknown) => boolean>('codexCliEffortNeedsRecovery', scope);
+    return { needs, writes, scope };
+  }
+
+  it('holds while the popup still owns the keyboard, and sends no key', async () => {
+    const { needs, writes } = loadRecovery(POPUP_WITH_OUR_LITERAL);
+    expect(needs({})).toBe(true);
+    expect(needs({})).toBe(true);
+    expect(writes).toEqual([]);
+  });
+
+  it('clears the orphan once the popup is gone, then releases the hold', () => {
+    const { needs, writes, scope } = loadRecovery(ORPHAN);
+    expect(needs({})).toBe(true);
+    expect(writes).toEqual(['\x15']);
+    // Next frame: composer is clean, so queued input resumes.
+    expect(needs({})).toBe(false);
+    expect(scope.codexCliEffortRecovery).toBeUndefined();
+  });
+
+  it('does not loop keystrokes when the CLI ignores the clear', () => {
+    const { needs, writes } = loadRecovery(ORPHAN, { ignoreClear: true });
+    for (let i = 0; i < 4; i++) expect(needs({})).toBe(true);
+    expect(writes).toEqual(['\x15']);
+  });
+
+  it('still releases normally when the composer was already clean', () => {
+    const { needs, writes } = loadRecovery(CLEAN);
+    expect(needs({})).toBe(false);
     expect(writes).toEqual([]);
   });
 });

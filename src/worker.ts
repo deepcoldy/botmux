@@ -3982,16 +3982,32 @@ async function discardTypedCodexEffortCommand(
       : renderer?.rawSnapshot();
   } catch { return; }
   if (!screen) return;
-  // A selection surface owns the keyboard: do not inject a clear key into it.
-  if (detectCodexChoiceModal(screen)) return;
-  const text = stripAnsiScreenText(screen);
-  // Only our own untouched literal. Any other composer content (a user draft that
-  // arrived meanwhile) is not ours to clear.
-  const promptRow = text.split(/\r?\n/).reverse().find(line => /^\s*[›»]/.test(line));
-  if (!promptRow || promptRow.trim().replace(/^[›»]\s*/, '') !== '/model') return;
+  // A selection surface owns the keyboard (do not inject a clear key into it), or
+  // the composer holds something that is not our untouched literal.
+  if (!codexEffortOrphanedLiteral(screen)) return;
   if (!current()) return;
   try { target.write('\x15'); } catch { /* draft stays; the hold below keeps input out */ }
 }
+
+/**
+ * Composer holds our exact, unsubmitted `/model` literal and no selection
+ * surface owns the keyboard — the only case where a clear key is safe.
+ *
+ * Shared by the post-refusal discard and the recovery hold's self-heal, so the
+ * two cannot disagree about when Ctrl-U may be sent.
+ */
+function codexEffortOrphanedLiteral(screen: string): boolean {
+  if (detectCodexChoiceModal(screen)) return false;
+  const text = stripAnsiScreenText(screen);
+  // Only our own untouched literal. Any other composer content (a user draft
+  // that arrived meanwhile) is not ours to clear.
+  const promptRow = text.split(/\r?\n/).reverse().find(line => /^\s*[›»]/.test(line));
+  return !!promptRow && promptRow.trim().replace(/^[›»]\s*/, '') === '/model';
+}
+
+/** One-shot latch: the recovery hold clears a leftover `/model` at most once per
+ *  hold, so a CLI that ignores the key cannot turn this into a keystroke loop. */
+let codexEffortRecoveryClearAttempted = false;
 
 /** Serialize one complete raw command-line transaction (fence -> text -> Enter
  * -> commit/cancel). raw_input deliberately keeps its legacy "send while busy"
@@ -4008,15 +4024,32 @@ function codexCliEffortNeedsRecovery(): boolean {
   if (!hold) return false;
   if (hold.backend !== backend || hold.lifetime !== cliLifetimeNonce) {
     codexCliEffortRecovery = undefined;
+    codexEffortRecoveryClearAttempted = false;
     return false;
   }
   try {
     // Observe backends return ANSI full history for web seeding. Input admission
     // must instead inspect the current viewport's text, never old picker rows.
-    const screen = stripAnsiScreenText(captureBackendScreen(hold.backend));
+    const raw = captureBackendScreen(hold.backend);
+    const screen = stripAnsiScreenText(raw);
     if (hasEmptyCodexComposer(screen) && !parseCodexEffortMenu(screen)) {
       codexCliEffortRecovery = undefined;
+      codexEffortRecoveryClearAttempted = false;
       return false;
+    }
+    // The refusal path could not clear its typed `/model` because a popup owned
+    // the keyboard (clearing there would be consumed as menu input). Once that
+    // popup is gone the literal is merely an orphan draft — and leaving it would
+    // hold queued input forever, with no user-visible reason (the operator has
+    // already dismissed the popup and expects the session to work again).
+    // Self-heal exactly once per hold, on the recovery frame, then let the next
+    // frame confirm the composer is empty before releasing.
+    if (!codexEffortRecoveryClearAttempted && codexEffortOrphanedLiteral(raw)) {
+      codexEffortRecoveryClearAttempted = true;
+      try {
+        hold.backend.write('\x15');
+        log('Codex effort recovery: cleared an orphaned /model draft so queued input can resume');
+      } catch { /* Missing evidence keeps queued input held. */ }
     }
   } catch { /* Missing screen evidence keeps queued input held. */ }
   return true;
@@ -31726,6 +31759,7 @@ process.on('message', async (raw: unknown) => {
           },
           command: () => {
             codexCliEffortRecovery = { backend: target, lifetime };
+            codexEffortRecoveryClearAttempted = false;
             // Type only: the submitting Enter is deferred until submitGuard below
             // has re-read the screen. `command()` used to submit, which left the
             // 200ms beat between text and Enter with no modal check at all.
