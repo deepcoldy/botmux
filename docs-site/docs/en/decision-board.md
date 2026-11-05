@@ -76,7 +76,7 @@ A PR merged long ago, or the work an item waited on is done, yet the board still
 - **Steward notice**: new hints from one run are combined into **one** message in the steward chat and sent to the steward session; each hint is sent once. A failed delivery is retried on the next run.
 - **Dismissing**: changing the item's state, or `botmux board set <n> --dismiss-hint`, clears the hint; the same hint does not come back.
 - **Items without conditions are untouched**: an item with no linked PR, dependencies or check time is ignored.
-- PR checks use this machine's GitHub credentials (`GITHUB_TOKEN` / `GH_TOKEN`, `~/.botmux/.env`, or `gh auth login`), and fall back to anonymous requests (60 per hour, shared by the whole machine). An open PR is checked at most every 10 minutes; merged or closed PRs are not checked again. PRs that cannot be checked (not on GitHub, no access, rate limited) are left undecided for that run.
+- PR checks use this machine's GitHub credentials (`GITHUB_TOKEN` / `GH_TOKEN`, `~/.botmux/.env`, or `gh auth login`), and fall back to anonymous requests (60 per hour, shared by the whole machine). Open or closed PRs are checked at most every 10 minutes (a closed PR may be reopened, so it keeps being rechecked); only a merged PR is final and is not checked again. PRs that cannot be checked (not on GitHub, no access, rate limited) are left undecided for that run.
 
 ## Deciding on the board
 
