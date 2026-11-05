@@ -5131,6 +5131,11 @@ export interface OwnerBatchTurnInput {
    * 也不刷新人活动钟、不清会话举手（这不是真人刚发的消息）。缺省 = 看板批次原行为。
    */
   silent?: boolean;
+  /**
+   * 群秘书话题巡查：回合投进本 bot 在这个话题（thread_root）的 thread 级会话，没有就新建。
+   * 不发横幅、不看群回复模式，落点就是这个话题——会话里的 botmux send 默认回到这个话题。
+   */
+  threadRootId?: string;
 }
 
 /**
@@ -5151,9 +5156,11 @@ export async function deliverOwnerBatchTurn(
   runtime?: {
     prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
   },
-): Promise<{ sessionId: string }> {
+): Promise<{ sessionId: string; created: boolean }> {
   const bot = getAllBots().find(b => b.config.larkAppId === input.larkAppId);
   if (!bot) throw new Error(`steward bot ${input.larkAppId} is not loaded`);
+  const threadRootId = input.threadRootId?.trim() || undefined;
+  if (threadRootId && !/^om_[A-Za-z0-9_-]{1,128}$/.test(threadRootId)) throw new Error(`invalid thread root ${threadRootId}`);
   const { larkAppId, chatId, turnId } = input;
   const { getChatMode, sendMessage, replyMessage, uploadImage } = await import('../im/lark/client.js');
   const chatMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
@@ -5165,7 +5172,7 @@ export async function deliverOwnerBatchTurn(
   //  - shared / chat / p2p：锚点就是 chatId，横幅只是通知和 shared 模式的回复根。必须等锁内
   //    开场保留 / 恢复归属检查通过后再发——否则管家会话还在选仓库时投递被拒，页面每重投一次
   //    群里就多一条横幅。
-  const independentByMode = chatMode === 'topic' || regularGroupMode === 'new-topic';
+  const independentByMode = !threadRootId && (chatMode === 'topic' || regularGroupMode === 'new-topic');
   let bannerId: string | undefined;
   let bannerAttempted = false;
   const [firstText = '', ...moreTexts] = input.announcement.texts;
@@ -5206,9 +5213,9 @@ export async function deliverOwnerBatchTurn(
   if (independentByMode) await postBanner();
   // 横幅发送失败时回落 chat 锚点（与定时任务 chat 级触发同形）。
   const opensIndependentTopic = independentByMode && !!bannerId;
-  const anchor = opensIndependentTopic ? bannerId! : chatId;
+  const anchor = threadRootId ?? (opensIndependentTopic ? bannerId! : chatId);
   const sharedRootFor = (id: string | undefined): string | undefined =>
-    !opensIndependentTopic && id && chatMode === 'group' && regularGroupMode === 'shared' ? id : undefined;
+    !threadRootId && !opensIndependentTopic && id && chatMode === 'group' && regularGroupMode === 'shared' ? id : undefined;
   const trustedCaller: CliTurnPayload['trustedCaller'] = input.ownerOpenId
     ? { requestUserOpenId: input.ownerOpenId, requestLarkAppId: larkAppId, senderType: 'user' }
     : undefined;
@@ -5277,7 +5284,7 @@ export async function deliverOwnerBatchTurn(
           try {
             if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
               logger.info(`[decision-board] Batch turn ${turnId} injected into steward session ${existing.session.sessionId}`);
-              return { sessionId: existing.session.sessionId };
+              return { sessionId: existing.session.sessionId, created: false };
             }
           } catch (err: any) {
             logger.warn(`[decision-board] Live injection threw (${err.message}); cold-resuming steward session`);
@@ -5294,7 +5301,7 @@ export async function deliverOwnerBatchTurn(
           throw err;
         }
         logger.info(`[decision-board] Batch turn ${turnId} cold-resumed steward session ${existing.session.sessionId}`);
-        return { sessionId: existing.session.sessionId };
+        return { sessionId: existing.session.sessionId, created: false };
       }
       if (isDisposableCommandScratch(existing)) {
         await closeSession(existing.session.sessionId);
@@ -5377,7 +5384,7 @@ export async function deliverOwnerBatchTurn(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     logger.info(`[decision-board] Batch turn ${turnId} spawned steward session ${session.sessionId} (anchor ${anchor})`);
-    return { sessionId: session.sessionId };
+    return { sessionId: session.sessionId, created: true };
   });
 }
 

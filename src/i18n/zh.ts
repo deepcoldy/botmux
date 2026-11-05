@@ -543,6 +543,7 @@ export const messages: Record<string, string> = {
   'cmd.secretary.unsupported': '⚠️ /secretary 只支持群聊，私聊和会话群不支持。',
   'cmd.secretary.owner_only': '⚠️ 只有 owner/allowedUsers 可以开关本群秘书。',
   'cmd.secretary.session_title': '群秘书',
+  'cmd.secretary.patrol_session_title': '秘书话题巡查',
   'cmd.secretary.status_other': '本群秘书现在是 {name}，不是我。\n要换成我：@我 /secretary takeover',
   'cmd.secretary.taken': '本群已经有秘书：{name}。一个群只能有一个秘书（不分机器）。\n要换成我：@我 /secretary takeover（{name} 一分钟内自动停手）',
   'cmd.secretary.not_mine': '本群秘书是 {name}，不是我。要关闭请 @{name} /secretary off。',

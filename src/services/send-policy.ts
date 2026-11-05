@@ -75,6 +75,70 @@ export function validateSecretaryAction(args: {
   return { ok: true, action: action as SecretarySendAction };
 }
 
+/**
+ * 话题巡查回合的 turn id：`secretary:patrol:<appId>:<chatId>:<threadRoot>:<ts>:<seq>`。
+ * 前缀仍是 `secretary:`，动作 / 理由 / 复述三道闸照常生效；另外落点被锁在 threadRoot。
+ */
+export const SECRETARY_PATROL_TURN_PREFIX = `${SECRETARY_TURN_PREFIX}patrol:`;
+
+export function secretaryPatrolTurnId(appId: string, chatId: string, threadRoot: string, ts: number, seq: number): string {
+  return `${SECRETARY_PATROL_TURN_PREFIX}${appId}:${chatId}:${threadRoot}:${ts}:${seq}`;
+}
+
+/** 巡查回合 → 被锁定的话题根；不是巡查回合返回 undefined。 */
+export function parseSecretaryPatrolRoot(turnId: string | undefined): string | undefined {
+  if (!turnId?.startsWith(SECRETARY_PATROL_TURN_PREFIX)) return undefined;
+  const parts = turnId.slice(SECRETARY_PATROL_TURN_PREFIX.length).split(':');
+  const root = parts[2];
+  return root && root.startsWith('om_') ? root : undefined;
+}
+
+/**
+ * 群秘书回合的落点闸（与 validateSecretaryAction 叠加）：
+ *
+ *   - 巡查回合（话题会话）：只能发在被巡查的那个话题里。--top-level、跨群 --chat-id、
+ *     --into 别的话题、--quote（可能把回复挂到别处）一律拒发。要让主群知道的事用
+ *     `botmux secretary report --escalate` 交给总管。
+ *   - 总管回合（主群会话）：@ 了某个 bot 却没有 --into / --quote —— 这会让那个 bot 在主群
+ *     顶层新开一个没有话题上下文的会话 —— 拒发，提示改用 --into <话题根>。
+ *
+ * 非秘书回合不受影响。
+ */
+export function validateSecretaryRouting(args: {
+  turnId?: string;
+  mentionOpenIds: readonly string[];
+  /** 本 app 视角下已知的 bot open_id（bot-openids cross-ref + bots-info）。 */
+  knownBotOpenIds: ReadonlySet<string>;
+  sendInto?: string;
+  explicitQuote?: string;
+  sendTopLevel?: boolean;
+  overrideChatId?: string;
+  sessionChatId?: string;
+}): { ok: true } | { ok: false; error: string } {
+  if (!args.turnId?.startsWith(SECRETARY_TURN_PREFIX)) return { ok: true };
+  const patrolRoot = parseSecretaryPatrolRoot(args.turnId);
+  if (patrolRoot) {
+    const crossChat = !!args.overrideChatId && args.overrideChatId !== args.sessionChatId;
+    if (args.sendTopLevel || crossChat || (args.sendInto && args.sendInto !== patrolRoot) || args.explicitQuote !== undefined) {
+      return {
+        ok: false,
+        error: `botmux send refused: 这是话题巡查回合，消息只能发在被巡查的话题 ${patrolRoot} 里（直接 botmux send，不要带 --top-level / --chat-id / --into 别的话题 / --quote）。`
+          + '需要让 leader 在主群看到的事，用 botmux secretary report --status <状态> --summary "<摘要>" --escalate "<要上报的话>" 交给总管。',
+      };
+    }
+    return { ok: true };
+  }
+  if (args.sendInto || args.explicitQuote !== undefined) return { ok: true };
+  const bots = args.mentionOpenIds.filter(id => args.knownBotOpenIds.has(id));
+  if (bots.length === 0) return { ok: true };
+  return {
+    ok: false,
+    error: `botmux send refused: 秘书不能在主群顶层 @ bot（${bots.join(', ')}）——它会在主群新开一个没有话题上下文的会话。`
+      + '要找在话题里干活的 bot：botmux send --into <它的 thread_root> ...，或 botmux dispatch --into <thread_root> --bot-app <bot_app_id> --brief "..."；'
+      + '确实要它在主群回复，就 --quote 主群里那条相关消息。',
+  };
+}
+
 function bigrams(s: string): Set<string> {
   const t = s.replace(/[\s\p{P}\p{S}]+/gu, '').toLowerCase();
   const out = new Set<string>();

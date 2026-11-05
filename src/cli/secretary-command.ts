@@ -9,11 +9,15 @@ import {
   upsertSecretaryWatch,
   DEFAULT_WATCH_TTL_MS,
 } from '../services/group-secretary-watch-store.js';
+import { LEDGER_STATUSES, listLedger, recordLedger, type LedgerStatus } from '../services/group-secretary-ledger-store.js';
 
 const USAGE = `用法：
   botmux secretary watch <话题根消息 om_...> [--every 10m] [--for 24h] [--note "要盯什么"]
   botmux secretary unwatch <话题根消息 om_...>
-  botmux secretary watches`;
+  botmux secretary watches
+  botmux secretary report --status <${LEDGER_STATUSES.join('|')}> --summary "<一两句话>" [--escalate "<要让 leader 在主群知道的话>"]
+      （只在话题巡查回合里用：写本话题的台账；--escalate 交给主群总管去重后上报）
+  botmux secretary ledger`;
 
 function flag(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
@@ -33,6 +37,34 @@ export async function runSecretaryCommand(argv: string[]): Promise<number> {
     return 2;
   }
   try {
+    if (sub === 'ledger') {
+      process.stdout.write(`${JSON.stringify({ ok: true, ledger: listLedger(appId, chatId) })}\n`);
+      return 0;
+    }
+    if (sub === 'report') {
+      const root = process.env.BOTMUX_ROOT_MESSAGE_ID;
+      if (!root?.startsWith('om_')) {
+        process.stderr.write('botmux secretary report 只能在话题会话（巡查回合）里用：当前会话没有话题根（BOTMUX_ROOT_MESSAGE_ID）。\n');
+        return 2;
+      }
+      const status = flag(argv, '--status')?.trim().toLowerCase();
+      const summary = flag(argv, '--summary')?.trim();
+      if (!status || !(LEDGER_STATUSES as readonly string[]).includes(status)) {
+        process.stderr.write(`--status 只接受 ${LEDGER_STATUSES.join(' | ')}\n`);
+        return 2;
+      }
+      if (!summary || summary.length < 4) {
+        process.stderr.write('--summary 必填：一两句话说清楚这个话题现在怎样\n');
+        return 2;
+      }
+      const escalate = flag(argv, '--escalate')?.trim();
+      const entry = recordLedger(appId, {
+        chatId, threadRoot: root, status: status as LedgerStatus, summary,
+        ...(escalate ? { escalate } : {}),
+      });
+      process.stdout.write(`${JSON.stringify({ ok: true, threadRoot: root, status: entry.status, escalated: !!escalate })}\n`);
+      return 0;
+    }
     if (sub === 'watches') {
       const mine = listSecretaryWatches(appId).filter(w => w.chatId === chatId);
       process.stdout.write(`${JSON.stringify({ ok: true, watches: mine })}\n`);

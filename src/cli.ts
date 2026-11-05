@@ -9898,6 +9898,8 @@ import {
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
   validateSecretaryAction,
+  validateSecretaryRouting,
+  parseSecretaryPatrolRoot,
   findSecretaryDuplicate,
   SECRETARY_TURN_PREFIX,
 } from './services/send-policy.js';
@@ -12942,6 +12944,21 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
   }
   // ───────────────────────────────────────────────────────────────────────────
+  // 群秘书落点闸：巡查回合锁在被巡查的话题；总管回合不许在主群顶层 @ bot。
+  if (currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.larkAppId) {
+    const { botEntries: secBotEntries, crossRef: secCrossRef } = loadBotMentionIdentityMap(resolveDataDir(), s.larkAppId);
+    const routing = validateSecretaryRouting({
+      turnId: currentTurnId,
+      mentionOpenIds: mentions.map(m => m.open_id),
+      knownBotOpenIds: knownBotOpenIdsFromCrossRef(secCrossRef, secBotEntries, s.larkAppId),
+      ...(sendInto ? { sendInto } : {}),
+      ...(explicitQuote !== undefined ? { explicitQuote } : {}),
+      sendTopLevel,
+      ...(overrideChatId ? { overrideChatId } : {}),
+      ...(s.chatId ? { sessionChatId: s.chatId } : {}),
+    });
+    if (!routing.ok) { console.error(routing.error); process.exit(2); }
+  }
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
   let oncallGroupPolicy: import('./services/oncall-group-policy.js').OncallGroupPolicy | undefined;
   let oncallGroupCard: Record<string, any> | undefined;
@@ -15398,6 +15415,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const dispatchTurnId = dispatchContext?.sessionId === dispatchOrigin.sessionId
     ? dispatchContext.turnId : undefined;
   const dispatchTurn = pickTurnReplyTarget(dispatchOrigin, dispatchTurnId);
+  // 话题巡查回合只能往被巡查的那个话题里派 / 追加，不能另开话题或派到别的话题。
+  const patrolRoot = parseSecretaryPatrolRoot(dispatchTurnId);
+  if (patrolRoot && dispatchArgs.into !== patrolRoot) {
+    console.error(`botmux dispatch refused: 这是话题巡查回合，只能 --into ${patrolRoot}（被巡查的话题）。别的话题或主群的事用 botmux secretary report --escalate 交给总管。`);
+    process.exit(2);
+  }
   const dispatchSourceAppId = dispatchOrigin.larkAppId!;
   const dispatchSource = resolveSendTarget({
     topLevel: false, chatScope: (dispatchOrigin.scope ?? 'thread') === 'chat', chatId: dispatchOrigin.chatId,

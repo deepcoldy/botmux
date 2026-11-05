@@ -65,7 +65,9 @@ export type SecretaryEventKind =
   | 'stuck'
   | 'attention'
   | 'stopped'
-  | 'unaddressed_task';
+  | 'unaddressed_task'
+  /** 话题巡查写进台账、要让 leader 在主群知道的事（只进主群总管回合）。 */
+  | 'escalation';
 
 /** 秘书主动要求盯的话题（botmux secretary watch 写入），到点生成 check_in。 */
 export interface SecretaryManualWatch {
@@ -100,10 +102,18 @@ export interface SecretaryEvent {
   manualNote?: string;
   /** check_in：自上次回访以来会话对话有没有变化（runtime 比对 transcript 得出）。 */
   progressed?: boolean;
+  /** 手动盯的话题根（check_in 找不到会话时也能定位到话题）。 */
+  threadRoot?: string;
+  /** escalation：哪个话题、上报了什么。 */
+  escalation?: { threadRoot: string; text: string; at: number; status?: string; summary?: string; botName?: string };
 }
+
+/** 摘要的落点：主群总管回合，或某个话题的巡查回合。缺省 = 旧版单会话（不拆分）。 */
+export type SecretaryDigestTarget = { kind: 'main' } | { kind: 'patrol'; threadRoot: string };
 
 export interface SecretaryDigest {
   chatId: string;
+  target?: SecretaryDigestTarget;
   /** 已投递失败的次数（requeue 时累加）。 */
   attempts?: number;
   events: SecretaryEvent[];
@@ -141,13 +151,22 @@ export interface GroupSecretaryEngineOptions {
   staleEventMs?: number;
   /** 一批新消息最长等多久就必须投递（消息持续不断时也不会一直攒）。 */
   maxBatchWaitMs?: number;
-  /** 秘书会话是否正在处理上一批；忙时继续攒，最长攒 maxBusyHoldMs。 */
-  isSecretaryBusy?: (chatId: string) => boolean;
+  /**
+   * 秘书会话是否正在处理上一批；忙时继续攒，最长攒 maxBusyHoldMs。
+   * 拆分模式下 threadRoot 有值 = 问该话题的巡查是否在跑（或巡查名额已满）。
+   */
+  isSecretaryBusy?: (chatId: string, threadRoot?: string) => boolean;
   maxBusyHoldMs?: number;
   /** 在跑会话的回访间隔（逐次拉长，最后一档循环使用）。 */
   checkInIntervalsMs?: number[];
   /** 秘书手动要求盯的话题。 */
   manualWatches?: () => SecretaryManualWatch[];
+  /**
+   * 拆分模式（总管 + 话题巡查）：话题里的会话事件按 thread_root 各出一份巡查摘要，主群只收
+   * 顶层消息、无人认领、上报；话题内的消息只当上下文，不再叫醒主群总管；秘书自己的所有会话
+   * （包括巡查会话）都不观察，免得巡查自己触发自己。缺省 false = 旧版单会话行为。
+   */
+  splitPatrol?: boolean;
 }
 
 /**
@@ -240,6 +259,7 @@ export class GroupSecretaryEngine {
       maxBusyHoldMs: options.maxBusyHoldMs ?? 3 * 60_000,
       checkInIntervalsMs: options.checkInIntervalsMs ?? [5 * 60_000, 10 * 60_000, 20 * 60_000],
       manualWatches: options.manualWatches ?? (() => []),
+      splitPatrol: options.splitPatrol ?? false,
     };
     this.startedAt = this.opts.now();
   }
@@ -312,6 +332,8 @@ export class GroupSecretaryEngine {
   /** 感知：除了秘书自己发的、@ 秘书的（走普通对话回合，否则同一条会被处理两次）和机器噪音，都进本批。 */
   private perceive(state: ChatState, message: SecretaryMessage, now: number): void {
     if (message.fromSelf || message.mentionsSelf || isSecretaryNoiseMessage(message)) return;
+    // 拆分模式：话题里的消息归该话题的巡查（作为上下文），不叫醒主群总管。
+    if (this.opts.splitPatrol && message.rootId) return;
     state.newMessages.push(message);
     if (state.newMessages.length > this.opts.contextMessagesPerChat) state.newMessages.shift();
     state.lastEventAt = now;
@@ -333,8 +355,8 @@ export class GroupSecretaryEngine {
     const seen = new Set<string>();
     for (const row of rows) {
       if (!row.chatId || !this.opts.isEnabledChat(row.chatId)) continue;
-      // 摘要落点（秘书自己的群级会话）不观察，避免自激。
-      if (row.larkAppId === this.opts.selfAppId && row.scope === 'chat') continue;
+      // 摘要落点（秘书自己的群级会话）不观察，避免自激；拆分模式下巡查会话也是秘书自己的，一并跳过。
+      if (row.larkAppId === this.opts.selfAppId && (row.scope === 'chat' || this.opts.splitPatrol)) continue;
       seen.add(row.sessionId);
       this.latest.set(row.sessionId, row);
       const prev = this.sessions.get(row.sessionId);
@@ -426,6 +448,7 @@ export class GroupSecretaryEngine {
         .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))[0];
       this.pushEvent(w.chatId, {
         kind: 'check_in', at: now, elapsedMs: now - w.createdAt, manualNote: w.note ?? `秘书在盯的话题 ${w.threadRoot}`,
+        threadRoot: w.threadRoot,
         ...(session ? { session } : {}),
         ...(!session ? { detail: `thread_root=${w.threadRoot}（本机没有找到对应会话）` } : {}),
       });
@@ -475,6 +498,10 @@ export class GroupSecretaryEngine {
       // 攒批：安静 debounceMs 后投递；消息一直不断时，最长等 maxBatchWaitMs 也要投。
       if (now - state.lastEventAt < this.opts.debounceMs && waited < this.opts.maxBatchWaitMs) continue;
       if (now - state.lastFlushAt < this.opts.minFlushIntervalMs) continue;
+      if (this.opts.splitPatrol) {
+        this.takeSplit(chatId, state, now, waited, out);
+        continue;
+      }
       // 秘书还在处理上一批：继续攒（最长 maxBusyHoldMs，之后照投，交给 CLI 排队）。
       if (this.opts.isSecretaryBusy(chatId) && waited < this.opts.maxBusyHoldMs) continue;
       const events = state.pending;
@@ -491,11 +518,7 @@ export class GroupSecretaryEngine {
         const root = event.session?.scope === 'thread' ? event.session.rootMessageId : undefined;
         if (root) event.ownMessagesSinceHuman = this.ownMessagesSinceHuman(state, root);
       }
-      const activeSessions = [...this.latest.values()]
-        .filter(v => v.chatId === chatId
-          && (v.liveness === 'alive' || (v.lastActivityAt !== undefined && now - v.lastActivityAt < 24 * HOUR_MS)))
-        .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
-        .slice(0, 15);
+      const activeSessions = this.activeSessionsFor(chatId, now);
       const ownRecent = state.messages.filter(m => m.fromSelf).slice(-6);
       out.push({
         chatId,
@@ -507,6 +530,95 @@ export class GroupSecretaryEngine {
       });
     }
     return out;
+  }
+
+  private activeSessionsFor(chatId: string, now: number, threadRoot?: string): SecretarySessionView[] {
+    return [...this.latest.values()]
+      .filter(v => v.chatId === chatId
+        && (threadRoot === undefined || v.rootMessageId === threadRoot)
+        && (v.liveness === 'alive' || (v.lastActivityAt !== undefined && now - v.lastActivityAt < 24 * HOUR_MS)))
+      .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
+      .slice(0, 15);
+  }
+
+  /** 事件归哪个话题巡查；undefined = 主群总管。 */
+  static patrolRootOf(event: SecretaryEvent): string | undefined {
+    if (event.kind === 'new_messages' || event.kind === 'unaddressed_task' || event.kind === 'escalation') return undefined;
+    if (event.session?.scope === 'thread' && event.session.rootMessageId) return event.session.rootMessageId;
+    return event.threadRoot;
+  }
+
+  /**
+   * 拆分模式出摘要：主群一份（顶层新消息、无人认领、上报、chat 级会话事件），每个有事的话题一份。
+   * 各落点独立判忙：某个话题的巡查还在跑，只压住那个话题的事件，不挡主群和别的话题。
+   */
+  private takeSplit(chatId: string, state: ChatState, now: number, waited: number, out: SecretaryDigest[]): void {
+    const groups = new Map<string | undefined, SecretaryEvent[]>();
+    for (const e of state.pending) {
+      const root = GroupSecretaryEngine.patrolRootOf(e);
+      const list = groups.get(root) ?? [];
+      list.push(e);
+      groups.set(root, list);
+    }
+    if (state.newMessages.length > 0 && !groups.has(undefined)) groups.set(undefined, []);
+    const attempts = state.pendingAttempts;
+    const keep: SecretaryEvent[] = [];
+    let flushed = false;
+    for (const [root, events] of groups) {
+      // 主群总管忙：最长攒 maxBusyHoldMs 后照投（交给 CLI 排队）。巡查忙或名额满：一直压着，
+      // 过期的会话事件由投递前复核丢弃——巡查宁可晚，不能超并发把机器内存打满。
+      const busy = this.opts.isSecretaryBusy(chatId, root);
+      if (busy && (root !== undefined || waited < this.opts.maxBusyHoldMs)) {
+        keep.push(...events);
+        continue;
+      }
+      flushed = true;
+      if (root === undefined) {
+        if (state.newMessages.length > 0) {
+          events.unshift({ kind: 'new_messages', at: now, messages: state.newMessages });
+          state.newMessages = [];
+        }
+        const activeSessions = this.activeSessionsFor(chatId, now);
+        const ownRecent = state.messages.filter(m => m.fromSelf && !m.rootId).slice(-6);
+        out.push({
+          chatId,
+          target: { kind: 'main' },
+          events,
+          context: this.contextFor(state, events),
+          ...(activeSessions.length ? { activeSessions } : {}),
+          ...(ownRecent.length ? { ownRecent } : {}),
+          ...(attempts ? { attempts } : {}),
+        });
+        continue;
+      }
+      const own = this.ownMessagesSinceHuman(state, root);
+      for (const e of events) e.ownMessagesSinceHuman = own;
+      const activeSessions = this.activeSessionsFor(chatId, now, root);
+      const ownRecent = state.messages.filter(m => m.fromSelf && (m.rootId === root || m.messageId === root)).slice(-6);
+      const threadMessages = state.messages.filter(m => m.messageId === root || m.rootId === root);
+      out.push({
+        chatId,
+        target: { kind: 'patrol', threadRoot: root },
+        events,
+        // 巡查只看这一个话题：话题里的消息多带一些（不按每事件上限截），主群顶层一条都不带。
+        context: threadMessages.slice(-Math.max(this.opts.contextPerEvent * 2, 16)),
+        ...(activeSessions.length ? { activeSessions } : {}),
+        ...(ownRecent.length ? { ownRecent } : {}),
+        ...(attempts ? { attempts } : {}),
+      });
+    }
+    state.pending = keep;
+    if (flushed) state.lastFlushAt = now;
+    if (keep.length === 0 && state.newMessages.length === 0) {
+      state.firstPendingAt = 0;
+      state.pendingAttempts = 0;
+    }
+  }
+
+  /** 话题巡查写了待上报（runtime 从台账读到）：作为主群总管的一个事件。同一次上报由 runtime 去重。 */
+  noteEscalation(chatId: string, escalation: NonNullable<SecretaryEvent['escalation']>): void {
+    if (!this.opts.isEnabledChat(chatId)) return;
+    this.pushEvent(chatId, { kind: 'escalation', at: this.opts.now(), escalation });
   }
 
   /**

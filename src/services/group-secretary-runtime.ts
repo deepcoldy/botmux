@@ -7,7 +7,10 @@
  */
 import { createHash } from 'node:crypto';
 import { GroupSecretaryEngine, type SecretaryDigest, type SecretaryManualWatch, type SecretarySessionView } from './group-secretary-engine.js';
-import { renderGroupSecretaryPrompt } from './group-secretary-prompt.js';
+import { renderGroupSecretaryPrompt, renderMainSecretaryPrompt, renderPatrolPrompt } from './group-secretary-prompt.js';
+import { getLedgerEntry, listLedger, markEscalationsDelivered, pendingEscalations, recordLedger, type LedgerStatus } from './group-secretary-ledger-store.js';
+import { secretaryPatrolTurnId } from './send-policy.js';
+import type { SecretaryEvent } from './group-secretary-engine.js';
 import { getGroupSecretaryChat, getGroupSecretaryOwner, isGroupSecretaryChat, listGroupSecretaryChats, setGroupSecretaryChat, type GroupSecretaryChatEntry } from './group-secretary-store.js';
 import { extractListenerMessageText, listenerSenderType } from './message-listener.js';
 import type { ObserveSnapshot } from './session-observe.js';
@@ -17,6 +20,17 @@ export interface GroupSecretaryRuntimeDeps {
   selfOpenId: () => string | undefined;
   fetchSnapshot: () => Promise<ObserveSnapshot>;
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
+  /**
+   * 话题巡查：把一个静默回合投进秘书在该话题的 thread 会话（没有就新建）。提供了它就进入
+   * 拆分模式（主群总管 + 话题巡查）；不提供 = 旧版单会话。created=true 表示会话是为这次巡查新建的。
+   */
+  deliverPatrol?: (input: { chatId: string; threadRoot: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<{ sessionId: string; created: boolean }>;
+  /** 关掉一次性巡查会话（巡查回合结束后）。 */
+  closePatrolSession?: (sessionId: string) => Promise<unknown>;
+  /** 同时最多跑几个巡查会话（maxsvr 内存紧，默认 2）。 */
+  maxConcurrentPatrols?: number;
+  /** 巡查会话最长跟踪多久（超时视为结束，照常收尾）。 */
+  patrolMaxMs?: number;
   /** 读 / 写群描述里的秘书标记（全群唯一登记）。不提供时只按本机登记判断。 */
   readMarker?: (chatId: string) => Promise<string | undefined>;
   /** appId 为 null 表示清除标记。 */
@@ -148,8 +162,51 @@ export function staggeredGraceMs(larkAppId: string): number {
   return 20_000 + (h % 15_000);
 }
 
+/** 巡查没有写台账时，按触发事件兜底一行（让总管和下一次巡查至少知道发生过什么）。 */
+function fallbackLedgerStatus(events: SecretaryEvent[]): LedgerStatus {
+  const kinds = new Set(events.map(e => e.kind));
+  if (kinds.has('attention')) return 'waiting_human';
+  if (kinds.has('stuck') || kinds.has('stopped')) return 'stalled';
+  if (kinds.has('turn_ended')) return 'idle';
+  return 'working';
+}
+
+const PATROL_KIND_LABEL: Partial<Record<SecretaryEvent['kind'], string>> = {
+  check_in: '回访', turn_ended: '一轮结束', stuck: '卡住', attention: '举手', stopped: '进程消失',
+};
+
+interface PatrolRun {
+  chatId: string;
+  threadRoot: string;
+  startedAt: number;
+  created: boolean;
+  sawBusy: boolean;
+  events: SecretaryEvent[];
+  botName?: string;
+}
+
 export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): GroupSecretaryRuntime {
   const now = deps.now ?? Date.now;
+  const splitPatrol = !!deps.deliverPatrol;
+  const maxConcurrentPatrols = Math.max(1, deps.maxConcurrentPatrols ?? 2);
+  const patrolMaxMs = deps.patrolMaxMs ?? 20 * 60_000;
+  /** 在跑的巡查：sessionId → 巡查信息（投递成功后登记，回合结束收尾时移除）。 */
+  const patrols = new Map<string, PatrolRun>();
+  /** 正在投递中的巡查（chatId\0threadRoot）。 */
+  const patrolInflight = new Set<string>();
+  /** 已交给引擎的上报（threadRoot\0at），避免每拍重复推。 */
+  const notedEscalations = new Set<string>();
+  const patrolKey = (chatId: string, root: string) => `${chatId}\u0000${root}`;
+  const runningPatrolCount = () => patrols.size + patrolInflight.size;
+  /** 本拍 takeDigests 里已经放行的巡查数（投递是并行的，放行时就要占名额）。 */
+  let reservedPatrols = 0;
+  const patrolBusy = (chatId: string, root: string): boolean => {
+    if (patrolInflight.has(patrolKey(chatId, root))) return true;
+    for (const p of patrols.values()) if (p.chatId === chatId && p.threadRoot === root) return true;
+    if (runningPatrolCount() + reservedPatrols >= maxConcurrentPatrols) return true;
+    reservedPatrols++;
+    return false;
+  };
   /** 秘书自己的群级会话正在跑的群（忙时新消息继续攒）。 */
   const ownBusy = new Set<string>();
   /** check_in 进展判断：每个会话上次回访时的对话指纹。 */
@@ -244,7 +301,10 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     isEnabledChat: chatId => isActiveChat(chatId),
     isTrustedHuman: (chatId, openId) => !!openId && deps.canTalk(chatId, openId),
     unaddressedGraceMs: staggeredGraceMs(deps.larkAppId),
-    isSecretaryBusy: chatId => ownBusy.has(chatId),
+    isSecretaryBusy: (chatId, threadRoot) => threadRoot === undefined
+      ? ownBusy.has(chatId)
+      : patrolBusy(chatId, threadRoot),
+    splitPatrol,
     manualWatches: () => deps.manualWatches?.() ?? [],
     now,
   });
@@ -304,10 +364,21 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
       deps.log('info', `[group-secretary] registration changed before delivery chat=${digest.chatId.slice(0, 12)}; dropped ${digest.events.length} event(s)`);
       return;
     }
-    const prompt = renderGroupSecretaryPrompt(digest, {
-      enabledByOpenId: entry.enabledBy,
-      groupContextInjected: deps.groupContextEnabled?.(digest.chatId) ?? false,
-    });
+    if (digest.target?.kind === 'patrol') {
+      await deliverPatrolDigest(digest, entry, digest.target.threadRoot);
+      return;
+    }
+    const isMain = digest.target?.kind === 'main';
+    const prompt = isMain
+      ? renderMainSecretaryPrompt(digest, {
+        enabledByOpenId: entry.enabledBy,
+        groupContextInjected: deps.groupContextEnabled?.(digest.chatId) ?? false,
+        ledger: listLedger(deps.larkAppId, digest.chatId, undefined, now()),
+      })
+      : renderGroupSecretaryPrompt(digest, {
+        enabledByOpenId: entry.enabledBy,
+        groupContextInjected: deps.groupContextEnabled?.(digest.chatId) ?? false,
+      });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), deliverTimeoutMs);
@@ -323,8 +394,14 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         deps.log('warn', `[group-secretary] deliver timed out chat=${digest.chatId.slice(0, 12)}; dropped ${digest.events.length} event(s)`);
         return;
       }
+      if (isMain) {
+        const escalated = digest.events
+          .filter(e => e.kind === 'escalation' && e.escalation)
+          .map(e => ({ threadRoot: e.escalation!.threadRoot, at: e.escalation!.at }));
+        try { markEscalationsDelivered(deps.larkAppId, digest.chatId, escalated, now()); } catch { /* 下次照样在台账里 */ }
+      }
       deps.log('info', `[group-secretary] delivered ${digest.events.length} event(s) chat=${digest.chatId.slice(0, 12)} `
-        + `kinds=${digest.events.map(e => e.kind).join(',')}`);
+        + `${isMain ? 'target=main ' : ''}kinds=${digest.events.map(e => e.kind).join(',')}`);
     } catch (err) {
       const requeued = engine.requeue(digest);
       deps.log('warn', `[group-secretary] deliver failed chat=${digest.chatId.slice(0, 12)}`
@@ -332,6 +409,124 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         + `${err instanceof Error ? err.message : String(err)}`);
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  };
+
+  /**
+   * 话题巡查投递。便宜的预筛先过一遍：自动回访（非手动盯）只有「两次回访之间对话没变化」才值得
+   * 叫醒巡查；第一次回访只记指纹做基线。预筛后没事件了就不起会话。
+   */
+  const deliverPatrolDigest = async (digest: SecretaryDigest, entry: GroupSecretaryChatEntry, threadRoot: string): Promise<void> => {
+    const events = digest.events.filter(e => e.kind !== 'check_in' || !!e.manualNote || e.progressed === false);
+    if (events.length === 0) return;
+    const patrolDigest: SecretaryDigest = { ...digest, events };
+    const key = patrolKey(digest.chatId, threadRoot);
+    const turnId = secretaryPatrolTurnId(deps.larkAppId, digest.chatId, threadRoot, now(), ++seq);
+    const watched = (deps.manualWatches?.() ?? []).some(w => w.chatId === digest.chatId && w.threadRoot === threadRoot);
+    const prompt = renderPatrolPrompt(patrolDigest, {
+      enabledByOpenId: entry.enabledBy,
+      threadRoot,
+      ledgerEntry: getLedgerEntry(deps.larkAppId, digest.chatId, threadRoot, undefined, now()),
+      watched,
+    });
+    const startedAt = now();
+    patrolInflight.add(key);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>(resolve => {
+      timer = setTimeout(() => resolve('timeout'), deliverTimeoutMs);
+      timer.unref?.();
+    });
+    try {
+      const result = await Promise.race([
+        deps.deliverPatrol!({ chatId: digest.chatId, threadRoot, turnId, prompt, ownerOpenId: entry.enabledBy }),
+        timeout,
+      ]);
+      if (result === 'timeout') {
+        deps.log('warn', `[group-secretary] patrol deliver timed out chat=${digest.chatId.slice(0, 12)} root=${threadRoot.slice(0, 16)}; dropped ${events.length} event(s)`);
+        return;
+      }
+      const botName = events.find(e => e.session?.botName)?.session?.botName;
+      patrols.set(result.sessionId, {
+        chatId: digest.chatId, threadRoot, startedAt, created: result.created, sawBusy: false, events,
+        ...(botName ? { botName } : {}),
+      });
+      deps.log('info', `[group-secretary] patrol started chat=${digest.chatId.slice(0, 12)} root=${threadRoot.slice(0, 16)} `
+        + `session=${result.sessionId.slice(0, 8)}${result.created ? ' (new)' : ''} kinds=${events.map(e => e.kind).join(',')}`);
+    } catch (err) {
+      const requeued = engine.requeue(patrolDigest);
+      deps.log('warn', `[group-secretary] patrol deliver failed chat=${digest.chatId.slice(0, 12)} root=${threadRoot.slice(0, 16)}`
+        + `${requeued ? ' (will retry)' : `; dropped ${events.length} event(s) after retries`}: `
+        + `${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      patrolInflight.delete(key);
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  /** 巡查回合结束：没写台账就兜底一行；会话是为巡查新建、期间也没有真人来过，就关掉（一次性）。 */
+  const finishPatrol = async (sessionId: string, run: PatrolRun, lastActivityAt: number | undefined): Promise<void> => {
+    patrols.delete(sessionId);
+    try {
+      const cur = getLedgerEntry(deps.larkAppId, run.chatId, run.threadRoot, undefined, now());
+      if (!cur || cur.updatedAt < run.startedAt) {
+        const kinds = [...new Set(run.events.map(e => PATROL_KIND_LABEL[e.kind] ?? e.kind))].join('、');
+        recordLedger(deps.larkAppId, {
+          chatId: run.chatId, threadRoot: run.threadRoot, status: fallbackLedgerStatus(run.events),
+          summary: `巡查没有写台账（触发：${kinds}）${cur?.summary ? `；上次：${cur.summary}` : ''}`,
+          ...(run.botName ? { botName: run.botName } : {}),
+          auto: true, at: now(),
+        });
+      } else if (run.botName && !cur.botName) {
+        recordLedger(deps.larkAppId, { ...cur, botName: run.botName, at: cur.updatedAt });
+      }
+    } catch (err) {
+      deps.log('warn', `[group-secretary] patrol ledger fallback failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // 巡查期间有人在话题里 @ 了秘书（会话有新的真人活动）：这已经是一个正常对话会话，不关。
+    const humanCameIn = lastActivityAt !== undefined && lastActivityAt > run.startedAt + 30_000;
+    if (!run.created || humanCameIn || !deps.closePatrolSession) return;
+    try {
+      await deps.closePatrolSession(sessionId);
+      deps.log('info', `[group-secretary] patrol session ${sessionId.slice(0, 8)} closed root=${run.threadRoot.slice(0, 16)}`);
+    } catch (err) {
+      deps.log('warn', `[group-secretary] closing patrol session ${sessionId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  /** 每次拉到会话快照后：推进在跑巡查的状态，结束的收尾。 */
+  const trackPatrols = async (views: SecretarySessionView[]): Promise<void> => {
+    if (patrols.size === 0) return;
+    const byId = new Map(views.map(v => [v.sessionId, v]));
+    for (const [sessionId, run] of [...patrols]) {
+      const v = byId.get(sessionId);
+      const age = now() - run.startedAt;
+      const busy = !!v && v.liveness === 'alive' && (v.turn === 'working' || v.turn === 'starting' || v.turn === 'analyzing');
+      if (busy) run.sawBusy = true;
+      // 结束：跑过一轮又回到空闲；或者一直没看到它忙（回合太短，两次快照之间就做完了）但已过 90 秒；
+      // 或者会话已经停了 / 超过最长跟踪时间。快照里暂时看不到（探测失败）不算结束，免得关掉还在跑的巡查。
+      const idle = !!v && v.liveness === 'alive' && !busy;
+      const done = (idle && (run.sawBusy || age > 90_000))
+        || (!!v && v.liveness !== 'alive')
+        || age > patrolMaxMs;
+      if (done) await finishPatrol(sessionId, run, v?.lastActivityAt);
+    }
+  };
+
+  /** 台账里新的待上报 → 主群总管事件（每次开启的进程里每条只推一次；重启后未交付的会再推）。 */
+  const pullEscalations = (): void => {
+    for (const { chatId } of listGroupSecretaryChats(deps.larkAppId)) {
+      if (!isActiveChat(chatId)) continue;
+      let pending: ReturnType<typeof pendingEscalations> = [];
+      try { pending = pendingEscalations(deps.larkAppId, chatId, undefined, now()); } catch { continue; }
+      for (const e of pending) {
+        const k = `${chatId}\u0000${e.threadRoot}\u0000${e.escalation!.at}`;
+        if (notedEscalations.has(k)) continue;
+        notedEscalations.add(k);
+        engine.noteEscalation(chatId, {
+          threadRoot: e.threadRoot, text: e.escalation!.text, at: e.escalation!.at,
+          status: e.status, summary: e.summary, ...(e.botName ? { botName: e.botName } : {}),
+        });
+      }
     }
   };
 
@@ -362,12 +557,17 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
             }
           }
           engine.observeSessions(views);
+          if (splitPatrol) await trackPatrols(views);
         } catch (err) {
           deps.log('warn', `[group-secretary] session snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
+      if (splitPatrol) pullEscalations();
       // 各群并行投递：一个群卡住不拖累其它群（单次投递另有超时兜底）。
-      await Promise.allSettled(engine.takeDigests().map(deliver));
+      reservedPatrols = 0;
+      const digests = engine.takeDigests();
+      reservedPatrols = 0;
+      await Promise.allSettled(digests.map(deliver));
     } finally {
       inFlight = false;
     }

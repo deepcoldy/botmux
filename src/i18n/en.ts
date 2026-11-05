@@ -545,6 +545,7 @@ export const messages: Record<string, string> = {
   'cmd.secretary.unsupported': '⚠️ /secretary only works in group chats (not DMs or session groups).',
   'cmd.secretary.owner_only': '⚠️ Only owner/allowedUsers can toggle the group secretary.',
   'cmd.secretary.session_title': 'Group secretary',
+  'cmd.secretary.patrol_session_title': 'Secretary topic patrol',
   'cmd.secretary.status_other': 'The group secretary here is {name}, not me.\nTo switch to me: @me /secretary takeover',
   'cmd.secretary.taken': '{name} is already the secretary of this group. One secretary per group, across machines.\nTo switch to me: @me /secretary takeover ({name} stops within a minute)',
   'cmd.secretary.not_mine': 'The group secretary is {name}, not me. To turn it off, @{name} /secretary off.',
