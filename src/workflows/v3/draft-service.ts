@@ -443,6 +443,9 @@ export interface WorkflowDraftView {
     inputs?: WorkflowDraftCopy['inputs'];
     goalEditedAt?: string;
     unresolved?: { params: string[]; context: string[] };
+    prefillStale?: true;
+    /** Nodes whose copied bot cannot run them; `resolved`: swapped (or usable again). */
+    needsBot?: Array<{ nodeId: string; larkAppId: string; why: string; placeholder?: true; resolved: boolean }>;
   };
 }
 
@@ -661,7 +664,32 @@ function countGates(nodes: readonly V3Node[]): number {
 /** spec.md of a copied spec: the title, the requirement, and the one
  *  canonical json block hostSpecFinalize reads. */
 function renderCopySpecMarkdown(spec: { title: string; requirement: string }): string {
-  return `# ${spec.title}\n\n## 需求\n\n${spec.requirement}\n\n\`\`\`json\n${JSON.stringify(spec, null, 2)}\n\`\`\`\n`;
+  // The narrative is for people; the json block is what is finalized. Fences
+  // in the text would read as a second block, so they are defused there (the
+  // json block keeps the exact text: JSON escapes its newlines).
+  const narrative = (text: string) => text.replace(/`{3,}/g, '``');
+  return `# ${narrative(spec.title)}\n\n## 需求\n\n${narrative(spec.requirement)}\n\n\`\`\`json\n${JSON.stringify(spec, null, 2)}\n\`\`\`\n`;
+}
+
+/** Drop a copy's prefilled flow and what came with it (the nodes needing a
+ *  new bot belong to that flow). */
+function dropCopyPrefill(draft: WorkflowDraftRecord): boolean {
+  const copy = draft.copy;
+  if (!copy || (!copy.prefill && !copy.needsBot)) return false;
+  delete copy.prefill;
+  delete copy.needsBot;
+  return true;
+}
+
+/** Goal nodes of a DAG by page id (top level, or `<loop>.<body>`) with their bot. */
+function goalNodeBots(nodes: readonly V3Node[], prefix = ''): Array<{ nodeId: string; node: V3Node }> {
+  const out: Array<{ nodeId: string; node: V3Node }> = [];
+  for (const node of nodes) {
+    const nodeId = prefix ? `${prefix}.${node.id}` : node.id;
+    if (node.type === 'loop' && node.body) out.push(...goalNodeBots(node.body.nodes, nodeId));
+    else if (node.type !== 'host') out.push({ nodeId, node });
+  }
+  return out;
 }
 
 /** The parameters a flow (and its spec) still refers to, of those declared. */
@@ -1459,24 +1487,44 @@ export class WorkflowDraftService {
     try {
       let spec: ReturnType<typeof validateSpec>;
       let dag: V3Dag;
+      // A node whose bot is no longer configured here goes on the
+      // orchestrating bot for now and is marked (§5.3: 复制后换 Bot) — the
+      // copy is not refused for who executes it, only for its structure.
+      const configured = new Set(bots.map((candidate) => candidate.larkAppId));
+      const needsBot: NonNullable<WorkflowDraftCopy['needsBot']> = {};
+      const placeholders = (nodes: V3Node[], prefix = ''): V3Node[] => nodes.map((node) => {
+        const nodeId = prefix ? `${prefix}.${node.id}` : node.id;
+        const next: V3Node = { ...node };
+        if (node.type !== 'host' && typeof node.bot === 'string' && !configured.has(node.bot)) {
+          if (node.type !== 'loop') needsBot[nodeId] = { larkAppId: node.bot, why: '已不在本机 bots.json 里', placeholder: true };
+          next.bot = this.deps.appId;
+        }
+        if (node.type === 'loop' && node.body) next.body = { nodes: placeholders(node.body.nodes, nodeId) };
+        return next;
+      });
       try {
         spec = validateSpec({ ...material.spec, runId });
       } catch (error) {
         throw err('dag_invalid', '复制来的需求没有通过校验', { problems: (error as { problems?: string[] }).problems ?? [errorText(error)] });
       }
       try {
-        dag = validateDag({ ...(material.schemaVersion !== undefined ? { schemaVersion: material.schemaVersion } : {}), runId, nodes: material.nodes });
+        dag = validateDag({ ...(material.schemaVersion !== undefined ? { schemaVersion: material.schemaVersion } : {}), runId, nodes: placeholders(material.nodes) });
       } catch (error) {
         throw err('dag_invalid', '复制来的流程没有通过校验', { problems: error instanceof DagValidationError ? error.problems : [errorText(error)] });
       }
-      // The planned group's roster, as for an Architect result (§4.4).
-      const problems = v3RosterSelectorProblems(dag, roster);
+      // The planned group's roster (§4.4): a bot that is configured but
+      // cannot run a node there (offline, excluded) is kept and marked.
+      for (const { nodeId, node } of goalNodeBots(dag.nodes)) {
+        const appId = node.bot ?? this.deps.appId;
+        if (needsBot[nodeId] || roster.bots.some((candidate) => candidate.larkAppId === appId)) continue;
+        const excluded = roster.excluded.find((entry) => entry.larkAppId === appId);
+        needsBot[nodeId] = { larkAppId: appId, why: clip(excluded?.why ?? '不在可用 Bot 名单里', 500) };
+      }
       try {
         freezeDagBotSnapshots(dag, bots, { defaultSelector: this.deps.appId });
       } catch (error) {
-        problems.push(errorText(error));
+        throw err('dag_invalid', '复制来的流程没有通过校验', { problems: [errorText(error)] });
       }
-      if (problems.length > 0) throw err('dag_invalid', '复制来的流程没有通过校验', { problems });
       const copyPath = join(runDir, WORKFLOW_COPY_DAG_FILE);
       atomicWriteFileSync(copyPath, `${JSON.stringify(dag, null, 2)}\n`, { mode: 0o600 });
       atomicWriteFileSync(state.specPath, renderCopySpecMarkdown(spec), { mode: 0o600 });
@@ -1484,7 +1532,8 @@ export class WorkflowDraftService {
       // The requirement is written: the grill starts at 待确认需求 (§6).
       writeGrillState(runDir, { ...state, status: 'spec_ready', updatedAt: at });
       const dagSha256 = fileSha256(copyPath);
-      if (!dagSha256) throw new Error('copy.dag.json 写入后读不到');
+      const specSha256 = fileSha256(state.specJsonPath);
+      if (!dagSha256 || !specSha256) throw new Error('copy.dag.json / spec.json 写入后读不到');
       const source = material.source;
       const what = source.kind === 'run'
         ? `运行 ${source.runId}${source.unfinished ? '（尚未结束，复制的是复制时的版本）' : ''}`
@@ -1505,7 +1554,8 @@ export class WorkflowDraftService {
         copy: {
           source,
           copiedAt: at,
-          prefill: { dagSha256 },
+          prefill: { dagSha256, specSha256 },
+          ...(Object.keys(needsBot).length ? { needsBot } : {}),
           ...(inputs ? { inputs: inputs as WorkflowDraftCopy['inputs'] } : {}),
         },
       };
@@ -1525,6 +1575,25 @@ export class WorkflowDraftService {
   private assertCopy(draft: WorkflowDraftRecord, what: string): WorkflowDraftCopy {
     if (!draft.copy) throw err('not_a_copy', `只有「复制为新工作流」得到的草稿能${what}`);
     return draft.copy;
+  }
+
+  /** The prefilled flow still belongs to the requirement on disk: it was
+   *  pinned to it, and only 「只改文字」 moves the pin (§6). */
+  private copyPrefillUsable(grill: GrillState, draft: WorkflowDraftRecord): boolean {
+    const prefill = draft.copy?.prefill;
+    return !!prefill && fileSha256(grill.specJsonPath) === prefill.specSha256;
+  }
+
+  /** Nodes of a copy still waiting for a new bot: not swapped, and either put
+   *  on the orchestrating bot for now or still off the planned roster. */
+  private outstandingCopyBots(draft: WorkflowDraftRecord, roster: V3BotRoster): Array<{ nodeId: string; larkAppId: string; why: string }> {
+    const out: Array<{ nodeId: string; larkAppId: string; why: string }> = [];
+    for (const [nodeId, entry] of Object.entries(draft.copy?.needsBot ?? {})) {
+      if (draft.nodeBots?.[nodeId]) continue;
+      if (!entry.placeholder && roster.bots.some((candidate) => candidate.larkAppId === entry.larkAppId)) continue;
+      out.push({ nodeId, larkAppId: entry.larkAppId, why: entry.why });
+    }
+    return out;
   }
 
   /**
@@ -1586,11 +1655,11 @@ export class WorkflowDraftService {
         if (mode === 'reclarify') {
           if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
           const copiedSpecMarkdown = readTextOrUndefined(grill.specPath);
-          // The copied flow goes first (its own write): a requirement sent
-          // back must never come round to 「确认需求」 with it still attached.
-          delete copy.prefill;
-          this.persist(runDir, draft);
+          // The grill moves first: a refusal there leaves the copy as it was.
+          // The copied flow is dropped in the same write as the rest; a crash
+          // in between leaves a clarifying grill whose next spec drops it.
           hostReviseSpec(runDir, this.now());
+          dropCopyPrefill(draft);
           delete draft.specConfirmation;
           this.flowChanged(draft, { nodeBots: true });
           draft.goal = goal;
@@ -1615,11 +1684,6 @@ export class WorkflowDraftService {
         } catch (error) {
           throw err('dag_invalid', '改完的需求没有通过校验', { problems: (error as { problems?: string[] }).problems ?? [errorText(error)] });
         }
-        if (mode === 'rearchitect') {
-          // As above: dropped before the requirement changes.
-          delete copy.prefill;
-          this.persist(runDir, draft);
-        }
         const previous = readTextOrUndefined(grill.specPath);
         atomicWriteFileSync(grill.specPath, renderCopySpecMarkdown({ ...spec, requirement: goal } as { title: string; requirement: string }), { mode: 0o600 });
         const finalized = hostSpecFinalize(runDir, this.now());
@@ -1631,6 +1695,14 @@ export class WorkflowDraftService {
         this.flowChanged(draft, { nodeBots: true });
         delete draft.specConfirmation;
         draft.goal = goal;
+        // Only now that the new requirement is in place: a refused edit keeps
+        // the copied flow. A crash before this write leaves a spec the
+        // prefill is not pinned to — 「确认需求」 then orchestrates anew.
+        if (mode === 'rearchitect') dropCopyPrefill(draft);
+        else if (copy.prefill) {
+          const specSha256 = fileSha256(grill.specJsonPath);
+          if (specSha256) copy.prefill.specSha256 = specSha256;
+        }
         if (mode === 'text_only') {
           copy.goalEditedAt = at;
           pushTurn(draft, { role: 'system', text: `目标改为：${clip(goal, 200)}（只改文字，保留复制来的流程）`, at });
@@ -2053,7 +2125,7 @@ export class WorkflowDraftService {
       // A spec written in clarifying is a new requirement: a copy's prefilled
       // flow belongs to the one it was copied with (an edit at 待确认需求
       // keeps it — 「只改文字」).
-      if (grill.status === 'grilling' && draft.copy) delete draft.copy.prefill;
+      if (grill.status === 'grilling') dropCopyPrefill(draft);
       return { changed: true, result: { ok: true, problems: [] } };
     });
     if (!outcome.ok && input.relayProblems === true && outcome.problems.length > 0) {
@@ -2091,8 +2163,11 @@ export class WorkflowDraftService {
         specSha256,
       };
       this.persist(runDir, draft);
-      // A copy with its prefilled flow goes straight to 待确认流程 (§6).
-      const prefilled = !!draft.copy?.prefill;
+      // A copy with its prefilled flow goes straight to 待确认流程 (§6) — for
+      // the requirement it was pinned to; a requirement changed since is
+      // orchestrated anew.
+      const prefilled = this.copyPrefillUsable(grill, draft);
+      if (!prefilled && dropCopyPrefill(draft)) this.persist(runDir, draft);
       try {
         if (prefilled) this.applyCopyPrefill(runDir, draft.copy!);
         else hostApproveSpec(runDir, this.now());
@@ -2311,7 +2386,9 @@ export class WorkflowDraftService {
         let problems: string[];
         try {
           const dag = this.loadDag(dagPath) as V3Dag;
-          problems = v3RosterSelectorProblems(dag, roster);
+          // A copy may still have other nodes waiting for a new bot: they do
+          // not block this swap (「确认流程」 waits for them instead).
+          problems = draft.copy ? [] : v3RosterSelectorProblems(dag, roster);
           freezeDagBotSnapshots(dag, bots, { defaultSelector: this.deps.appId });
         } catch (error) {
           problems = (error as { problems?: string[] }).problems ?? [errorText(error)];
@@ -2394,9 +2471,15 @@ export class WorkflowDraftService {
     if (!/^sha256:[0-9a-f]{64}$/.test(shown)) throw err('bad_request', 'flowSummarySha256 必须是页面显示的流程摘要哈希');
     const bots = this.deps.loadBots();
     const nameOf = this.deps.nameOf();
+    const roster = await this.plannedRoster(bots, nameOf);
     this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['dag_ready'], '确认流程');
+      // A copy's nodes whose bot cannot run them are swapped first (§6).
+      const outstanding = this.outstandingCopyBots(draft, roster);
+      if (outstanding.length > 0) {
+        throw err('bot_not_on_roster', `先给这些节点换执行 Bot：${outstanding.map((item) => `${item.nodeId}（${item.why}）`).join('、')}`, { nodes: outstanding });
+      }
       let flow: ReturnType<WorkflowDraftService['currentFlow']>;
       try {
         flow = this.currentFlow(runDir, grill, bots, nameOf);
@@ -2440,15 +2523,12 @@ export class WorkflowDraftService {
       this.assertNoLaunch(draft, '退回改需求');
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['spec_ready', 'spec_approved', 'dag_ready'], '退回改需求');
-      // A copy's prefilled flow is for the requirement it was copied with: a
-      // revised requirement is orchestrated anew (§6). Dropped in its own
-      // write first, so a crash after the grill moved cannot leave it
-      // attached to the next 「确认需求」.
-      if (draft.copy?.prefill) {
-        delete draft.copy.prefill;
-        this.persist(runDir, draft);
-      }
       hostReviseSpec(runDir, this.now());
+      // A copy's prefilled flow is for the requirement it was copied with: a
+      // revised requirement is orchestrated anew (§6). Dropped after the grill
+      // moved (a refusal keeps it); a crash in between leaves a clarifying
+      // grill whose next spec drops it.
+      dropCopyPrefill(draft);
       delete draft.specConfirmation;
       this.flowChanged(draft, { nodeBots: true });
       return { changed: true, result: undefined };
@@ -2655,7 +2735,9 @@ export class WorkflowDraftService {
         if (draft.copy) {
           // A copy commits as an ad-hoc run: nothing resolves a template's
           // parameters there (§6: 参数保留为参数).
-          const left = unresolvedFlowMarkers(confirmed.dag.nodes);
+          let specJson: unknown;
+          try { specJson = JSON.parse(readFileSync(grill.specJsonPath, 'utf-8')) as unknown; } catch { specJson = undefined; }
+          const left = unresolvedFlowMarkers(confirmed.dag.nodes, specJson);
           if (left.params.length || left.context.length) {
             throw err('unresolved_params', '流程里还有参数没换成具体内容：先「存为模板」再带参数运行，或把这些参数改成具体文字', left);
           }
@@ -4048,19 +4130,37 @@ export class WorkflowDraftService {
     }
     let copyView: WorkflowDraftView['copy'];
     if (draft.copy) {
-      const prefilled = !!draft.copy.prefill && grill.status === 'spec_ready';
+      const usable = grill.status === 'spec_ready' && this.copyPrefillUsable(grill, draft);
       let prefillDag: V3Dag | undefined;
-      if (prefilled) {
+      if (usable) {
         try { prefillDag = this.loadDag(join(runDir, WORKFLOW_COPY_DAG_FILE)) as V3Dag; } catch { prefillDag = undefined; }
       }
-      const markers = flow ? unresolvedFlowMarkers(flow.dag.nodes) : prefillDag ? unresolvedFlowMarkers(prefillDag.nodes) : undefined;
+      let specJson: unknown;
+      try { specJson = JSON.parse(readFileSync(grill.specJsonPath, 'utf-8')) as unknown; } catch { specJson = undefined; }
+      const nodes = flow ? flow.dag.nodes : prefillDag?.nodes;
+      const markers = nodes ? unresolvedFlowMarkers(nodes, specJson) : undefined;
+      let needsBot: NonNullable<WorkflowDraftView['copy']>['needsBot'];
+      if (draft.copy.needsBot) {
+        let outstanding: Set<string> | undefined;
+        try {
+          const roster = await this.plannedRoster(this.deps.loadBots(), this.deps.nameOf());
+          outstanding = new Set(this.outstandingCopyBots(draft, roster).map((item) => item.nodeId));
+        } catch { outstanding = undefined; }
+        needsBot = Object.entries(draft.copy.needsBot).map(([nodeId, entry]) => ({
+          nodeId, ...entry, resolved: outstanding ? !outstanding.has(nodeId) : !!draft.nodeBots?.[nodeId],
+        }));
+      }
       copyView = {
         source: draft.copy.source,
         copiedAt: draft.copy.copiedAt,
-        prefilled,
+        prefilled: usable && !!prefillDag,
+        // The requirement changed since the copy (chat, a hand-edited spec):
+        // 「确认需求」 orchestrates anew instead of using the copied flow.
+        ...(grill.status === 'spec_ready' && draft.copy.prefill && !usable ? { prefillStale: true } : {}),
         ...(prefillDag ? { prefillDag } : {}),
         ...(draft.copy.inputs ? { inputs: draft.copy.inputs } : {}),
         ...(draft.copy.goalEditedAt ? { goalEditedAt: draft.copy.goalEditedAt } : {}),
+        ...(needsBot ? { needsBot } : {}),
         ...(markers && (markers.params.length || markers.context.length) ? { unresolved: markers } : {}),
       };
     }

@@ -4,12 +4,12 @@
  * 一半（dag.json 写了、grill 没动）后重来。真实草稿服务与真实目录。
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { WorkflowDraftError } from '../src/workflows/v3/draft-service.js';
-import { readGrillState, writeGrillState } from '../src/workflows/v3/grill-state.js';
+import { mintV3RunId, readGrillState, writeGrillState } from '../src/workflows/v3/grill-state.js';
 import { BOTS, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
 import { REVIEW, seedRun } from './helpers/workflow-copy-fakes.js';
 
@@ -65,19 +65,15 @@ describe('复制的交叠与半写入', () => {
     }
   });
 
-  it('a copy refused half-way leaves nothing behind, and the source is still copyable', async () => {
+  it('a copy failing at its last write leaves nothing behind, and the source is still copyable', async () => {
     const h = setup();
-    let fail = true;
-    const flaky = makeService(base, {
-      loadBots: () => FLEET,
-      libraryDataDir: root,
-      // The roster probe throws once (e.g. the registry is unreadable).
-      isDaemonOnline: (appId) => { if (fail && appId === REVIEW) { fail = false; throw new Error('registry'); } return true; },
-    });
-    expect(await settle(flaky.service.createFromSource(OWNER, { source: { kind: 'run', runId: RUN } }))).toBe('dag_invalid');
+    // The next draft id is known (fixed clock, counter suffix): its draft.json
+    // cannot be written (a directory is in the way).
+    const runId = mintV3RunId('代码风险报告', new Date('2026-11-05T10:00:00.000Z'), '00000001');
+    mkdirSync(join(base, runId, 'draft.json'), { recursive: true });
+    expect(await settle(h.service.createFromSource(OWNER, { source: { kind: 'run', runId: RUN } }))).toBe('dag_invalid');
     expect(readdirSync(base)).toEqual([RUN]);
-    expect((await flaky.service.createFromSource(OWNER, { source: { kind: 'run', runId: RUN } })).phase).toBe('spec_ready');
-    void h;
+    expect((await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: RUN } })).phase).toBe('spec_ready');
   });
 
   it('确认需求 interrupted after the flow file was written but before the grill moved: the retry finishes it', async () => {
@@ -102,9 +98,11 @@ describe('复制的交叠与半写入', () => {
     const view = await h.service.view(draft.runId);
     expect(view.copy!.prefilled).toBe(false);
     expect(existsSync(join(runDir, 'copy.dag.json'))).toBe(true);
+    // Even the very spec it was copied with, written again in clarifying, is
+    // a requirement of its own: orchestrated anew.
+    const copiedSpec = readFileSync(join(runDir, 'spec.md'), 'utf-8');
     await h.service.continueClarify(draft.runId, OWNER);
-    h.clarify.reply(`好的。\n<botmux-spec>\n${specMarkdown(SKETCHES)}\n</botmux-spec>`);
-    expect((await h.service.finalizeSpec(draft.runId, OWNER, {})).ok).toBe(true);
+    expect((await h.service.finalizeSpec(draft.runId, OWNER, { specMarkdown: copiedSpec })).ok).toBe(true);
     expect((await h.service.approveSpec(draft.runId, OWNER)).phase).toBe('awaiting_architect');
   });
 });

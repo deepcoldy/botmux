@@ -35778,3 +35778,8 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfc-node-edit { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
 .wfc-node-edit textarea { width: 100%; box-sizing: border-box; }
 .wfl-version-head .wfd-small { margin-left: auto; }
+
+.wfc-needs-bot { margin: 0; }
+.wfc-needs-bot p { margin: 0 0 4px; }
+.wfc-needs-bot ul { margin: 0; padding-left: 18px; font-size: 13px; }
+.wfc-stale { margin: 0; }

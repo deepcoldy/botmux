@@ -226,9 +226,22 @@ const copySourceSchema = z.discriminatedUnion('kind', [
 const copySchema = z.object({
   source: copySourceSchema,
   copiedAt: iso,
-  /** The prefilled flow, used by 「确认需求」 instead of the Architect. Gone
-   *  once the requirement is sent back (退回改需求) or re-orchestrated. */
-  prefill: z.object({ dagSha256: sha }).strict().optional(),
+  /** The prefilled flow, used by 「确认需求」 instead of the Architect — for
+   *  the requirement it is pinned to (`specSha256`, moved along by 「只改文字」):
+   *  a requirement changed any other way (chat, a hand-edited spec) is
+   *  orchestrated anew. Gone once the requirement is sent back (退回改需求)
+   *  or re-orchestrated. */
+  prefill: z.object({ dagSha256: sha, specSha256: sha }).strict().optional(),
+  /** Nodes whose copied bot cannot run them in a planned group (left
+   *  bots.json, offline, excluded): kept, or — for a bot no longer configured
+   *  here — put on the orchestrating bot for now. The page asks for a new
+   *  bot; 「确认流程」 waits until each is swapped (or usable again). */
+  needsBot: z.record(z.string().min(1).max(512), z.object({
+    larkAppId: z.string().min(1).max(128),
+    why: z.string().min(1).max(500),
+    /** The bot was not in bots.json: the node is on the orchestrating bot. */
+    placeholder: z.literal(true).optional(),
+  }).strict()).optional(),
   /** Parameters kept from a template (§6: 参数保留为参数); 存为模板 declares
    *  them again, 拉群开始 refuses a flow that still has their markers. */
   inputs: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/), copyParamSchema).optional(),

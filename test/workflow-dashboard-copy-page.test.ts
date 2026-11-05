@@ -219,3 +219,46 @@ describe('页面渲染', () => {
     act(() => { renderer.unmount(); });
   });
 });
+
+describe('复核修复的页面（D6）', () => {
+  const text = (node: TestRenderer.ReactTestInstance): string => node.children.map((c) => typeof c === 'string' ? c : text(c)).join('');
+  const flush = async () => { for (let i = 0; i < 8; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
+  async function render(view: unknown) {
+    const location = { hash: `#/workflows/drafts/${(view as { runId: string }).runId}` };
+    vi.stubGlobal('location', location);
+    vi.stubGlobal('window', { setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms === 2000 ? 1e9 : ms), clearTimeout, setInterval: () => 0, clearInterval: () => {}, location });
+    vi.stubGlobal('sessionStorage', { getItem: () => null, setItem: () => {} });
+    vi.stubGlobal('fetch', async (url: string) => {
+      const body = url === '/api/settings' ? { settings: { workflow: { enabled: true, nodeExecutor: 'bot' } } }
+        : url === '/api/v3/orchestration/initiator' ? { ok: true, initiator: OWNER }
+          : url === '/api/v3/orchestration/bots' ? { ok: true, bots: [] }
+            : url.includes('/drafts/') ? { ok: true, draft: view } : { ok: false, error: 'not_found' };
+      return { ok: (body as { ok?: boolean }).ok !== false, status: 200, json: async () => body } as Response;
+    });
+    const { V3RunsPage } = await import('../src/dashboard/web/v3-components.js');
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(V3RunsPage)); });
+    await flush();
+    return renderer;
+  }
+
+  it('节点需换 Bot：草稿页列出原因，流程图上标出；需求改过时提示将重新编排', async () => {
+    const h = service();
+    seedRun(base, RUN);
+    h.setOnline([MAIN, REVIEW]);
+    const copied = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: RUN } });
+    const flow = await h.service.approveSpec(copied.runId, OWNER);
+    const renderer = await render(flow);
+    const page = text(renderer.root);
+    expect(page).toContain('这些节点要换执行 Bot');
+    expect(page).toContain('⚠️ 需换执行 Bot');
+    act(() => { renderer.unmount(); });
+
+    seedRun(base, 'src-261101-080000-000-aaaa0031');
+    const other = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0031' } });
+    const edited = await h.service.finalizeSpec(other.runId, OWNER, { specMarkdown: specMarkdown(SKETCHES, { title: '另一份需求' }) });
+    const stale = await render(edited.draft);
+    expect(text(stale.root)).toContain('确认需求后将按新需求重新编排');
+    act(() => { stale.unmount(); });
+  });
+});

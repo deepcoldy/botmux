@@ -82,6 +82,15 @@ async function savedTemplate(h: ReturnType<typeof makeService>, opts: { initiato
   });
 }
 
+/** A template run started through 拉群开始 (a real saved_definition run). */
+async function startedTemplateRun(h: ReturnType<typeof makeService>, workflowId: string, params: Record<string, string>): Promise<string> {
+  const draft = await h.service.createFromTemplate(OWNER, { workflowId, params });
+  if (draft.template!.needsConfirmation) await h.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: draft.flow!.flowSummarySha256 });
+  await h.service.launch(draft.runId, OWNER, {});
+  expect((await settled(h.service, draft.runId)).phase).toBe('started');
+  return draft.runId;
+}
+
 async function settled(service: WorkflowDraftService, runId: string) {
   for (let i = 0; i < 400; i++) {
     const view = await service.view(runId);
@@ -162,16 +171,69 @@ describe('从运行复制（§6）', () => {
     expect((await h.service.approveSpec(draft.runId, ALICE)).phase).toBe('dag_ready');
   });
 
-  it('checked like an Architect result before anything is written: a node bot off the planned roster refuses with problems', async () => {
+  it('a node bot that cannot run in the planned group does not block the copy: marked, swapped at 待确认流程, 确认流程 waits for it', async () => {
     const { h } = setup();
-    // DOC ran `write`; its daemon is offline now, so the planned group cannot use it.
+    seedRun(base, 'src-261101-080000-000-aaaa0005');
+    // DOC ran `write`; its daemon is offline now.
     h.setOnline([MAIN, REVIEW]);
-    seedRun(base, 'src-261101-080000-000-aaaa0006');
-    const refused = await refusal(h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0006' } }));
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0005' } });
+    expect(draft.copy!.needsBot).toEqual([{ nodeId: 'write', larkAppId: DOC, why: expect.any(String), resolved: false }]);
+    expect(nodeBots(draft.copy!.prefillDag!.nodes)).toEqual({ inspect: MAIN, write: DOC });
+    const flow = await h.service.approveSpec(draft.runId, OWNER);
+    expect(flow.phase).toBe('dag_ready');
+    const refused = await refusal(h.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: flow.flow!.flowSummarySha256 }));
+    expect(refused.code).toBe('bot_not_on_roster');
+    expect(refused.details.nodes).toEqual([{ nodeId: 'write', larkAppId: DOC, why: expect.any(String) }]);
+    const swapped = await h.service.setNodeBot(draft.runId, OWNER, 'write', { larkAppId: REVIEW });
+    expect(swapped.copy!.needsBot![0]!.resolved).toBe(true);
+    await h.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: swapped.flow!.flowSummarySha256 });
+    expect((await h.service.view(draft.runId)).phase).toBe('flow_confirmed');
+  });
+
+  it('two nodes waiting for a new bot: swapping one is not refused because of the other', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0009', { reassign: { nodeId: 'inspect', from: MAIN, to: DOC } });
+    h.setOnline([MAIN, REVIEW]);
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0009' } });
+    expect(draft.copy!.needsBot!.map((item) => item.nodeId).sort()).toEqual(['inspect', 'write']);
+    await h.service.approveSpec(draft.runId, OWNER);
+    const one = await h.service.setNodeBot(draft.runId, OWNER, 'write', { larkAppId: REVIEW });
+    expect(one.copy!.needsBot!.find((item) => item.nodeId === 'write')!.resolved).toBe(true);
+    expect(await code(h.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: one.flow!.flowSummarySha256 }))).toBe('bot_not_on_roster');
+    const both = await h.service.setNodeBot(draft.runId, OWNER, 'inspect', { larkAppId: MAIN });
+    expect((await h.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: both.flow!.flowSummarySha256 })).phase).toBe('flow_confirmed');
+  });
+
+  it('a bot no longer in bots.json: the node waits on the orchestrating bot, marked; the flow is still shown and swappable', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0008');
+    const gone = makeService(base, { loadBots: () => FLEET.filter((bot) => bot.larkAppId !== DOC), libraryDataDir: library });
+    gone.setOnline([MAIN, REVIEW]);
+    const draft = await gone.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0008' } });
+    expect(draft.copy!.needsBot).toEqual([{ nodeId: 'write', larkAppId: DOC, why: '已不在本机 bots.json 里', placeholder: true, resolved: false }]);
+    expect(nodeBots(draft.copy!.prefillDag!.nodes)).toEqual({ inspect: MAIN, write: MAIN });
+    const flow = await gone.service.approveSpec(draft.runId, OWNER);
+    expect(flow.flow).toBeDefined();
+    // On the orchestrating bot only for now: still not confirmable as is.
+    expect(await code(gone.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: flow.flow!.flowSummarySha256 }))).toBe('bot_not_on_roster');
+    const swapped = await gone.service.setNodeBot(draft.runId, OWNER, 'write', { larkAppId: REVIEW });
+    expect((await gone.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: swapped.flow!.flowSummarySha256 })).phase).toBe('flow_confirmed');
+    void h;
+  });
+
+  it('a structurally invalid copy is still refused before anything is written', async () => {
+    const { h } = setup();
+    const runDir = seedRun(base, 'src-261101-080000-000-aaaa0006');
+    // A template run whose parameter value empties a node goal: the copy's
+    // DAG would not validate.
+    void runDir;
+    const saved = await savedTemplate(h, { paramEdits: [{ name: 'focus', type: 'string', nodeId: 'inspect', field: 'goal', text: 'inspect' }] });
+    const templateRun = await startedTemplateRun(h, saved.workflowId, { focus: ' ' });
+    const refused = await refusal(h.service.createFromSource(OWNER, { source: { kind: 'run', runId: templateRun } }));
     expect(refused.code).toBe('dag_invalid');
-    expect((refused.details.problems as string[]).join('\n')).toContain(DOC);
-    // No draft dir was left behind.
-    expect(readdirSync(base)).toEqual(['src-261101-080000-000-aaaa0006']);
+    const before = readdirSync(base).length;
+    await code(h.service.createFromSource(OWNER, { source: { kind: 'run', runId: templateRun } }));
+    expect(readdirSync(base).length).toBe(before);
   });
 
   it('only a known run; the orchestrator defaults to the source\'s and must be this daemon\'s', async () => {
@@ -368,5 +430,121 @@ describe('复制后改什么（§6）', () => {
     expect(view.phase).toBe('spec_ready');
     expect(view.specConfirmation).toBeUndefined();
     expect(existsSync(join(base, draft.runId, 'dag.json'))).toBe(false);
+  });
+});
+
+describe('复核修复（D6）', () => {
+  const draftJson = (runId: string) => JSON.parse(readFileSync(join(base, runId, 'draft.json'), 'utf-8'));
+  const edits = [{ name: 'focus', type: 'string', nodeId: 'inspect', field: 'goal', text: 'inspect' }];
+
+  it('a run started from a template is copied as it ran: its parameter values are in, nothing left to resolve — it launches and saves', async () => {
+    const { h } = setup();
+    const saved = await savedTemplate(h, { paramEdits: edits });
+    const templateRun = await startedTemplateRun(h, saved.workflowId, { focus: '看 auth 模块' });
+    expect(readFileSync(join(base, templateRun, 'dag.json'), 'utf-8')).toContain('${params.focus}');
+    const draft = await h.service.createFromSource(ALICE, { source: { kind: 'run', runId: templateRun } });
+    expect(draft.copy!.unresolved).toBeUndefined();
+    expect(draft.copy!.inputs).toBeUndefined();
+    expect(draft.copy!.prefillDag!.nodes.find((node) => node.id === 'inspect')!.goal).toBe('看 auth 模块');
+    const flow = await h.service.approveSpec(draft.runId, ALICE);
+    await h.service.approveFlow(draft.runId, ALICE, { flowSummarySha256: flow.flow!.flowSummarySha256 });
+    // 存模板 works (no undeclared parameter)...
+    const preview = await h.service.previewTemplateSave(draft.runId, ALICE, {});
+    expect(preview.inputs).toEqual({});
+    await h.service.saveAsTemplate(draft.runId, ALICE, { flowSummarySha256: preview.flowSummarySha256, requestKey: 'req-tr-00001' });
+    // ...and so does 拉群开始.
+    await h.service.launch(draft.runId, ALICE, {});
+    expect((await settled(h.service, draft.runId)).phase).toBe('started');
+  });
+
+  it('a host node input `$ref: params.x` takes the value itself', async () => {
+    const { substituteParams } = await import('../src/workflows/v3/draft-copy.js');
+    expect(substituteParams({ input: { to: { $ref: 'params.target' }, text: '发给 ${params.target}，${params.n} 份' } }, { target: ['a', 'b'], n: 3 }))
+      .toEqual({ input: { to: ['a', 'b'], text: '发给 ["a","b"]，3 份' } });
+    expect(substituteParams('保留 ${params.missing} 与 ${context.chatId}', {})).toBe('保留 ${params.missing} 与 ${context.chatId}');
+  });
+
+  it('a requirement changed after the copy (a hand-edited spec): 确认需求 orchestrates anew, and the page is told beforehand', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0021', { revised: true });
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0021' } });
+    const finalized = await h.service.finalizeSpec(draft.runId, OWNER, { specMarkdown: specMarkdown(SKETCHES, { title: '完全不同的周报' }) });
+    expect(finalized.ok).toBe(true);
+    expect(finalized.draft.copy).toMatchObject({ prefilled: false, prefillStale: true });
+    const approved = await h.service.approveSpec(draft.runId, OWNER);
+    expect(approved.phase).toBe('awaiting_architect');
+    expect(draftJson(draft.runId).copy.prefill).toBeUndefined();
+  });
+
+  it('「只改文字」 moves the pin: the copied flow is still used', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0022', { revised: true });
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0022' } });
+    const before = draftJson(draft.runId).copy.prefill.specSha256;
+    await h.service.editCopyGoal(draft.runId, OWNER, { goal: '只看安全', mode: 'text_only' });
+    expect(draftJson(draft.runId).copy.prefill.specSha256).not.toBe(before);
+    expect((await h.service.approveSpec(draft.runId, OWNER)).phase).toBe('dag_ready');
+  });
+
+  it('a goal with a fenced block: 改目标 still works (the narrative does not read as a second spec block)', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0023');
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0023' } });
+    const goal = '按这个格式出：\n```json\n{"a":1}\n```';
+    const edited = await h.service.editCopyGoal(draft.runId, OWNER, { goal, mode: 'text_only' });
+    expect((edited.spec!.json as any).requirement).toBe(goal);
+  });
+
+  it('a refused 按新目标重新编排 keeps the copied flow (both ways)', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0024');
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0024' } });
+    const runDir = join(base, draft.runId);
+    // A requirement that does not validate is refused before anything moves.
+    const specPath = join(runDir, 'spec.json');
+    const good = readFileSync(specPath, 'utf-8');
+    writeFileSync(specPath, JSON.stringify({ ...JSON.parse(good), nodes: [] }));
+    expect(await code(h.service.editCopyGoal(draft.runId, OWNER, { goal: '新目标', mode: 'rearchitect' }))).toBe('dag_invalid');
+    writeFileSync(specPath, good);
+    expect(draftJson(draft.runId).copy.prefill).toBeDefined();
+    // The grill cannot be written (its temp file is blocked): the step that
+    // moves it fails, for either way — the record keeps the copied flow.
+    const blocked = join(runDir, 'grill.state.json.tmp');
+    mkdirSync(blocked);
+    for (const mode of ['rearchitect', 'reclarify'] as const) {
+      await expect(h.service.editCopyGoal(draft.runId, OWNER, { goal: '新目标', mode })).rejects.toThrow();
+      expect(draftJson(draft.runId).copy.prefill).toBeDefined();
+    }
+    rmSync(blocked, { recursive: true });
+  });
+
+  it('退回改需求 and 「按新目标重新编排 → 先澄清」 remove the copied flow from the record', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0025');
+    const a = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0025' } });
+    await h.service.reviseSpec(a.runId, OWNER);
+    expect(draftJson(a.runId).copy.prefill).toBeUndefined();
+    const b = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0025' } });
+    await h.service.editCopyGoal(b.runId, OWNER, { goal: '新目标', mode: 'reclarify' });
+    expect(draftJson(b.runId).copy.prefill).toBeUndefined();
+  });
+
+  it('parameter markers left in the spec alone also stop 拉群开始, and the page is told', async () => {
+    const { h } = setup();
+    seedRun(base, 'src-261101-080000-000-aaaa0026');
+    const draft = await h.service.createFromSource(OWNER, { source: { kind: 'run', runId: 'src-261101-080000-000-aaaa0026' } });
+    const spec = JSON.parse(specMarkdown(SKETCHES).match(/```json\n([\s\S]*?)\n```/)![1]!);
+    spec.requirement = '出 ${params.focus} 的报告';
+    await h.service.finalizeSpec(draft.runId, OWNER, { specMarkdown: `## 需求\n\n\`\`\`json\n${JSON.stringify(spec)}\n\`\`\`` });
+    // A changed requirement: orchestrated anew (the Architect keeps the markers out of the DAG).
+    await h.service.approveSpec(draft.runId, OWNER);
+    await h.service.startArchitect(draft.runId, OWNER);
+    await architectSettled(h.service, draft.runId);
+    const flow = await h.service.view(draft.runId);
+    expect(flow.copy!.unresolved).toEqual({ params: ['focus'], context: [] });
+    await h.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: flow.flow!.flowSummarySha256 });
+    const refused = await refusal(h.service.launch(draft.runId, OWNER, {}));
+    expect(refused.code).toBe('unresolved_params');
+    expect(refused.details).toMatchObject({ params: ['focus'] });
   });
 });

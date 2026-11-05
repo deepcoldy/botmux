@@ -14,7 +14,10 @@
  * What comes out is a definition with no run id: goal nodes carry the bot
  * that actually ran them (a run) or the bot the template names, the spec
  * without its run id, and the template's parameter declarations (kept as
- * parameters: their `${params.…}` markers stay in the text).
+ * parameters: their `${params.…}` markers stay in the text). A run that was
+ * itself started from a template is copied as it ran: its parameters are
+ * replaced by the values it ran with (`params.resolved.json`), so the copy
+ * has none left (§6: run 取最终生效的版本).
  */
 
 import { existsSync } from 'node:fs';
@@ -169,8 +172,13 @@ export function readRunCopyMaterial(baseDir: string, runId: string): WorkflowCop
   // Every goal node names the bot that runs it (an inherited default is
   // resolved through the frozen snapshots), so the copy does not depend on
   // which bot orchestrates it.
-  const nodes = withExplicitBots(flow.nodes, (selector) => flow.scope.get(selector)?.larkAppId);
-  const { runId: _runId, ...spec } = flow.spec;
+  let nodes = withExplicitBots(flow.nodes, (selector) => flow.scope.get(selector)?.larkAppId);
+  let { runId: _runId, ...spec } = flow.spec;
+  if (loaded.envelope.source.kind === 'saved_definition') {
+    const values = resolvedParamValues(loaded.resolvedParams);
+    nodes = substituteParams(nodes, values) as V3Node[];
+    spec = substituteParams(spec, values) as typeof spec;
+  }
   const orchestratorAppId = loaded.envelope.chatBinding?.larkAppId;
   return {
     source: {
@@ -233,11 +241,69 @@ export async function templateCopyDefaultOrchestrator(dataDir: string, workflowI
   }
 }
 
-/** `${params.…}` / `${context.…}` markers left in a flow: an ad-hoc run has
- *  nothing to resolve them with. */
-export function unresolvedFlowMarkers(nodes: readonly V3Node[]): { params: string[]; context: string[] } {
+const SPEC_MARKER_RE = /\$\{(params|context)\.([A-Za-z_][A-Za-z0-9_]{0,63})\}/g;
+
+/** `${params.…}` / `${context.…}` markers left in a flow (and, given, its
+ *  spec): an ad-hoc run has nothing to resolve them with. */
+export function unresolvedFlowMarkers(nodes: readonly V3Node[], spec?: unknown): { params: string[]; context: string[] } {
   const bindings = collectSavedWorkflowTemplateBindings({ schemaVersion: 2, nodes: nodes as V3Node[] });
-  return { params: [...bindings.params].sort(), context: [...bindings.context].sort() };
+  const params = new Set<string>(bindings.params);
+  const context = new Set<string>(bindings.context);
+  if (spec !== undefined) {
+    for (const match of JSON.stringify(spec).matchAll(SPEC_MARKER_RE)) {
+      (match[1] === 'params' ? params : context).add(match[2]!);
+    }
+  }
+  return { params: [...params].sort(), context: [...context].sort() };
+}
+
+/** The `params` a template run ran with (`params.resolved.json`). */
+function resolvedParamValues(raw: unknown): Record<string, unknown> {
+  const params = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as { params?: unknown }).params : undefined;
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    throw new WorkflowCopySourceError('source_unreadable', '这个从模板运行的 run 没有可读的参数值（params.resolved.json）');
+  }
+  return params as Record<string, unknown>;
+}
+
+const PARAM_TEXT_RE = /\$\{params\.([A-Za-z_][A-Za-z0-9_]{0,63}(?:\.[A-Za-z0-9_]+)*)\}/g;
+
+function paramAt(values: Record<string, unknown>, path: string): { found: boolean; value?: unknown } {
+  let cursor: unknown = values;
+  for (const segment of path.split('.')) {
+    if (!cursor || typeof cursor !== 'object' || !Object.prototype.hasOwnProperty.call(cursor, segment)) return { found: false };
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  return { found: true, value: cursor };
+}
+
+/**
+ * Parameters → the values a template run ran with: a `${params.x}` in text
+ * becomes the value's text (a structured value as JSON); a host input's exact
+ * `{ "$ref": "params.x" }` becomes the value itself. Context markers stay
+ * (they name the source run's chat, not the copy's). A name with no value
+ * stays as it is (and is refused later as unresolved).
+ */
+export function substituteParams(value: unknown, values: Record<string, unknown>): unknown {
+  if (typeof value === 'string') {
+    if (!value.includes('${params.')) return value;
+    return value.replace(PARAM_TEXT_RE, (whole, path: string) => {
+      const hit = paramAt(values, path);
+      if (!hit.found) return whole;
+      return typeof hit.value === 'string' ? hit.value : JSON.stringify(hit.value);
+    });
+  }
+  if (Array.isArray(value)) return value.map((item) => substituteParams(item, values));
+  if (!value || typeof value !== 'object') return value;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length === 1 && keys[0] === '$ref' && typeof record.$ref === 'string' && record.$ref.startsWith('params.')) {
+    const hit = paramAt(values, record.$ref.slice('params.'.length));
+    return hit.found ? clone(hit.value) : clone(record);
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(record)) out[key] = substituteParams(child, values);
+  return out;
 }
 
 function clone<T>(value: T): T {

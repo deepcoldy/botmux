@@ -137,6 +137,8 @@ export function CopyInfoPanel(props: {
   const line = copySourceLine(copy);
   const params = Object.keys(copy.inputs ?? {});
   const unresolved = copyUnresolvedNames(copy);
+  // Shown until every one is swapped (the list stays readable meanwhile).
+  const pendingBots = copy.needsBot?.some((item) => !item.resolved) ? copy.needsBot! : [];
   const editable = canEditCopyGoal(view, props.canWrite) && !props.busy;
   const changed = goal.trim() && goal.trim() !== view.goal;
 
@@ -158,6 +160,21 @@ export function CopyInfoPanel(props: {
       {params.length ? <p className="muted">{tr('workflow.copy.paramsKept', { names: params.join('、') })}</p> : null}
       {unresolved.length ? <p className="wfd-warning" role="note">⚠️ {tr('workflow.copy.unresolved', { names: unresolved.join('、') })}</p> : null}
       {copy.goalEditedAt && copy.prefilled ? <p className="wfd-confirmed">{tr('workflow.copy.goalEdited')}</p> : null}
+      {copy.prefillStale ? <p className="wfd-warning wfc-stale" role="note">⚠️ {tr('workflow.copy.prefillStale')}</p> : null}
+      {pendingBots.length ? (
+        <div className="wfd-warning wfc-needs-bot" role="note">
+          <p>⚠️ {tr('workflow.copy.needsBotTitle')}</p>
+          <ul>
+            {copy.needsBot!.map((item) => (
+              <li key={item.nodeId}>
+                <code>{item.nodeId}</code>：{nameOf(item.larkAppId)}（{item.why}{item.placeholder ? `，${tr('workflow.copy.needsBotPlaceholder')}` : ''}）
+                {item.resolved ? <span className="wfd-confirmed"> {tr('workflow.copy.needsBotResolved')}</span> : null}
+              </li>
+            ))}
+          </ul>
+          {view.flow ? <p className="muted">{tr('workflow.copy.needsBotFlowHint')}</p> : null}
+        </div>
+      ) : null}
 
       {canEditCopyGoal(view, props.canWrite) || (view.phase === 'spec_ready' && !props.canWrite) ? (
         <fieldset className="wfc-goal" disabled={!editable}>

@@ -862,6 +862,8 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
 
   const statusLineOf = (node: { id: string; isLoop?: boolean; host?: unknown }) => {
     if (node.host) return tr('workflow.draft.hostNode');
+    // A copied node whose bot cannot run it (D6): swap before 「确认流程」.
+    if (props.view.copy?.needsBot?.some((item) => item.nodeId === node.id && !item.resolved)) return `⚠️ ${tr('workflow.copy.needsBotNode')}`;
     if (node.isLoop) return tr('workflow.draft.loopNode', { count: assignableRows(node.id, flow.plan.rows, flow.dag).length });
     const row = rowOf.get(node.id);
     if (row?.missedAssignee) return `⚠️ ${tr('workflow.draft.assigneeMissed', { bot: row.missedAssignee.assignee })}`;
