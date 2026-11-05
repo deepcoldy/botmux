@@ -6,7 +6,7 @@
  * source entry through tsx keeps this unit test independent of a prior build.
  */
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -60,12 +60,18 @@ function runAsk(
   });
 }
 
+/** Fake servers only handle the ask POST; any other probe gets 404 without its body being parsed. */
+function isAskPost(req: IncomingMessage): boolean {
+  return req.method === 'POST' && (req.url === '/api/asks' || req.url === '/api/asks/form-v1');
+}
+
 describe('botmux ask — CLI boundary', () => {
   it('normalizes literal paragraph separators in a positional prompt', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-newlines-'));
     tempDirs.push(dataDir);
     let requestBody: Record<string, unknown> | undefined;
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (body !== undefined) requestBody = body;
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -93,6 +99,7 @@ describe('botmux ask — CLI boundary', () => {
     tempDirs.push(dataDir);
     let requestBody: Record<string, unknown> | undefined;
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (body !== undefined) requestBody = body;
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -120,6 +127,7 @@ describe('botmux ask — CLI boundary', () => {
     tempDirs.push(dataDir);
     let requestBody: Record<string, unknown> | undefined;
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (body !== undefined) requestBody = body;
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -157,6 +165,7 @@ describe('botmux ask — CLI boundary', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'ask-sigint-')); tempDirs.push(dataDir);
     let child: ChildProcessWithoutNullStreams;
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (!request) { res.writeHead(400).end(); return; }
       if (!request.acknowledge) child.kill('SIGINT');
@@ -184,6 +193,7 @@ describe('botmux ask — CLI boundary', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'ask-reconnect-')); tempDirs.push(dataDir);
     const requests: Record<string, unknown>[] = [];
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const parsed = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (!parsed) { res.writeHead(400).end(); return; }
       requests.push(parsed);
@@ -208,6 +218,7 @@ describe('botmux ask — CLI boundary', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'ask-custom-cli-')); tempDirs.push(dataDir);
     const requests: Record<string, unknown>[] = [];
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (!body) { res.writeHead(400).end(); return; }
       requests.push(body);
@@ -235,6 +246,7 @@ describe('botmux ask — CLI boundary', () => {
     let requestBody: Record<string, unknown> | undefined;
 
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const parsed = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (!parsed) { res.writeHead(400).end(); return; }
       requestBody = parsed;
@@ -287,6 +299,7 @@ describe('botmux ask — CLI boundary', () => {
     tempDirs.push(dataDir);
 
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       if (await readRequestBodyJson(req, { strict: true }) === undefined) { res.writeHead(400).end(); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
@@ -422,6 +435,7 @@ describe('question file CLI', () => {
     const file = join(dataDir, 'round.json'); writeFileSync(file, JSON.stringify(questions));
     let body: any;
     const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
       const parsed = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
       if (!parsed) { res.writeHead(400).end(); return; }
       body = parsed;
