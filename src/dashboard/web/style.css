@@ -35733,3 +35733,29 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfd-launch-problem p { margin: 0 0 4px; }
 .wfd-launch-problem select { max-width: 360px; }
 .wfd-launch-chat p { margin: 0 0 4px; font-size: 13px; }
+
+/* ─── Workflow templates (design 2026-11-03 workflow-dashboard-orchestration D5) ─── */
+.wfl-section { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.wfl-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.wfl-filters input[type="search"] { min-width: 200px; }
+.wfl-table td, .wfl-table th { vertical-align: top; }
+.wfl-num { text-align: right; font-variant-numeric: tabular-nums; }
+.wfl-scope-chat { background: var(--surface-muted); color: var(--muted); }
+.wfl-scope-global { background: var(--accent-soft); color: var(--accent); }
+.wfl-owner-note { margin: 0 0 8px; font-size: 12px; }
+.wfl-versions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.wfl-version { border: 1px solid var(--border-soft); border-radius: var(--radius-lg, 8px); padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
+.wfl-version p { margin: 0; font-size: 13px; }
+.wfl-version-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.wfl-published { background: var(--success-soft, var(--accent-soft)); color: var(--success); }
+.wfl-param-form { display: flex; flex-direction: column; gap: 6px; max-width: 720px; }
+.wfl-param-row { display: flex; flex-direction: column; gap: 4px; }
+.wfl-save h3 { margin: 6px 0 2px; font-size: 14px; }
+.wfl-target { border: 0; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.wfl-target label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; }
+.wfl-inline { display: flex; flex-direction: column; gap: 4px; padding-left: 22px; max-width: 520px; }
+.wfl-fewer { font-weight: 600; margin: 0; }
+.wfl-param-editor { display: flex; flex-direction: column; gap: 6px; max-width: 720px; border-top: 1px solid var(--border-soft); padding-top: 8px; }
+.wfl-param-editor textarea { font: inherit; width: 100%; }
+.wfl-param-grid { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 10px; align-items: center; }
+.wfl-save-entry { margin: 0 0 12px; }

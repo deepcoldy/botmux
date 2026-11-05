@@ -18,6 +18,7 @@ export type WorkflowsRoute =
   | { kind: 'new' }
   | { kind: 'draft'; runId: string }
   | { kind: 'library' }
+  | { kind: 'template'; workflowId: string }
   | { kind: 'run'; runId: string };
 
 function decodeSegment(raw: string): string {
@@ -38,7 +39,11 @@ export function parseWorkflowsRoute(hash: string): WorkflowsRoute {
     const id = segments[1] ? decodeSegment(segments[1]) : '';
     return id && segments.length === 2 ? { kind: 'draft', runId: id } : { kind: 'list' };
   }
-  if (head === 'library') return { kind: 'library' };
+  if (head === 'library') {
+    // D5: `library/<workflowId>` is one template; anything deeper is the list.
+    const id = segments[1] ? decodeSegment(segments[1]) : '';
+    return id && segments.length === 2 ? { kind: 'template', workflowId: id } : { kind: 'library' };
+  }
   if (!head) return { kind: 'list' };
   // 运行详情：与原来的解析一致（整段都是 runId）。
   return { kind: 'run', runId: decodeSegment(m[1]) };
@@ -101,6 +106,9 @@ export function draftErrorKey(code: string): string | undefined {
     'launch_running', 'launch_exists', 'no_launch', 'launch_unavailable', 'initiator_channel_unavailable', 'run_committed',
     'root_update_failed',
     'post_failed',
+    // D5 模板
+    'unknown_run', 'template_run', 'template_not_found', 'template_scope', 'template_not_published',
+    'bad_params', 'template_invalid', 'not_owner', 'save_conflict', 'unsafe_literals', 'library_unavailable',
   ]);
   return known.has(code) ? `workflow.draft.err.${code}` : undefined;
 }
@@ -164,12 +172,32 @@ export interface DraftSections {
   groupSetup: boolean;
   /** 拉群进度（D4）：一旦开始拉群就一直显示（含放弃、已启动）。 */
   launch: boolean;
+  /** 运行模板（D5）：模板来源与参数；没有澄清、spec、编排。 */
+  template: boolean;
+  /** 「存为模板」（D5）：通过第二道确认、还没写 run.json 的普通草稿。 */
+  saveTemplate: boolean;
 }
 
-export function draftSections(view: Pick<WorkflowDraftView, 'phase' | 'clarify' | 'spec'> & { launch?: unknown }): DraftSections {
+export function draftSections(
+  view: Pick<WorkflowDraftView, 'phase' | 'clarify' | 'spec'> & { launch?: { commit?: unknown }; template?: unknown; flowConfirmation?: { valid: boolean } },
+): DraftSections {
   const phase = view.phase;
   const past = (list: WorkflowDraftPhase[]) => list.includes(phase);
+  if (view.template) {
+    return {
+      chat: false,
+      spec: false,
+      architect: false,
+      flow: past(['dag_ready', 'flow_confirmed', 'launching']),
+      groupSetup: phase === 'flow_confirmed' && !view.launch,
+      launch: !!view.launch,
+      template: true,
+      saveTemplate: false,
+    };
+  }
   return {
+    template: false,
+    saveTemplate: !!view.flowConfirmation?.valid && (phase === 'flow_confirmed' || phase === 'launching') && !view.launch?.commit,
     chat: true,
     spec: !!view.clarify.specCandidate || !!view.spec?.markdown || !past(['clarifying', 'abandoned']),
     architect: past(['awaiting_architect', 'architect_running']),

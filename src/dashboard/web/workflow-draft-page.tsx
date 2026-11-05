@@ -62,6 +62,7 @@ import {
 import type { WorkflowDraftView } from '../../workflows/v3/draft-service.js';
 import type { WorkflowDraftSummary } from '../../workflows/v3/draft-store.js';
 import type { WorkflowOrchestratorBotOption } from '../workflow-drafts-api.js';
+import { SaveTemplateDialog, TEMPLATE_GROUP_SETUP_KEY, TemplateRunInfo } from './workflow-library-page.js';
 
 type Translate = ReturnType<typeof useT>;
 
@@ -70,7 +71,7 @@ function isDocumentHidden(): boolean {
 }
 
 /** 错误码 → 本地化文案；不认识的码带上服务端的 message。 */
-function describeError(tr: Translate, result: { error: string; message?: string }): string {
+export function describeError(tr: Translate, result: { error: string; message?: string }): string {
   const key = draftErrorKey(result.error);
   if (key) {
     const text = tr(key);
@@ -93,7 +94,7 @@ export function useWorkflowSwitches(): WorkflowSwitches | null {
 }
 
 /** 当前登录在各编排 Bot 视角下的发起人（按需查，查过的缓存）。 */
-function useInitiatorChecks(): [Map<string, InitiatorCheck>, (larkAppId: string, force?: boolean) => void] {
+export function useInitiatorChecks(): [Map<string, InitiatorCheck>, (larkAppId: string, force?: boolean) => void] {
   const [checks, setChecks] = useState<Map<string, InitiatorCheck>>(() => new Map());
   const inflight = useRef(new Set<string>());
   const known = useRef(new Map<string, InitiatorCheck>());
@@ -426,6 +427,7 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
   const attempted = useRef(new Set<string>());
   const autoFailures = useRef(0);
   const [botNames, setBotNames] = useState<Map<string, string>>(() => new Map());
+  const [saving, setSaving] = useState(false);
   useEffect(() => {
     void fetchOrchestratorBots().then((result) => {
       if (result.ok) setBotNames(new Map(result.bots.map((bot) => [bot.larkAppId, bot.name])));
@@ -533,7 +535,8 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
       {me?.state === 'ok' && readOnly ? <p className="wfd-notice" role="status">{tr('workflow.draft.readOnly')}</p> : null}
       {me?.state === 'failed' ? <p className="wfd-notice" role="status">{tr('workflow.draft.readOnly')}（{describeError(tr, me)}）</p> : null}
       {notice ? <p className={`wfd-notice${notice.error ? ' wfd-error' : ''}`} role={notice.error ? 'alert' : 'status'}>{notice.text}</p> : null}
-      <div className={`wfd-layout${sections.spec ? ' wfd-two' : ''}`}>
+      {sections.template && view.template ? <TemplateRunInfo template={view.template} isOwner={me?.state === 'ok' && me.initiator.openId === view.template.ownerOpenId} /> : null}
+      {sections.chat ? <div className={`wfd-layout${sections.spec ? ' wfd-two' : ''}`}>
         <ChatPanel view={view} canWrite={isInitiator} busy={busy} act={act} />
         {sections.spec ? (
           <SpecPanel
@@ -546,10 +549,17 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
             onRevise={() => { void act({ kind: 'revise-spec' }, 'revise-spec'); }}
           />
         ) : null}
-      </div>
+      </div> : null}
       {sections.architect ? <ArchitectPanel view={view} fetchedAt={fetchedAt} canWrite={isInitiator} busy={busy} act={act} /> : null}
       {sections.flow && view.flow ? <FlowPanel view={view} canWrite={isInitiator} busy={busy} act={act} /> : null}
       {sections.flow && !view.flow && view.flowError ? <p className="wfd-notice wfd-error" role="alert">{tr('workflow.draft.flowError', { error: view.flowError })}</p> : null}
+      {sections.saveTemplate && isInitiator && !saving ? (
+        <div className="wfd-actions wfl-save-entry">
+          <button type="button" disabled={!!busy} onClick={() => setSaving(true)}>{tr('workflow.library.saveFromDraft')}</button>
+          <span className="muted">{tr('workflow.library.saveFromDraftHint')}</span>
+        </div>
+      ) : null}
+      {saving ? <SaveTemplateDialog source={{ kind: 'draft', runId: view.runId }} botNames={botNames} onClose={() => setSaving(false)} /> : null}
       {sections.groupSetup ? <GroupSetupPanel view={view} canWrite={isInitiator} busy={busy} act={act} /> : null}
       {sections.launch ? <LaunchPanel view={view} canWrite={isInitiator} busy={busy} act={act} botNames={botNames} /> : null}
     </>
@@ -842,6 +852,8 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
   const editable = props.canWrite && (props.view.phase === 'dag_ready' || props.view.phase === 'flow_confirmed' || launchSwap)
     && !props.view.launch?.running && !props.view.launch?.commit;
   const disabled = !editable || !!props.busy;
+  // A template with parameters keeps its bots (the daemon refuses a swap: 复制 is D6).
+  const swapDisabled = disabled || !!props.view.template?.hasInputs;
   // Once the group exists the requirement stage is closed (the daemon refuses).
   const launched = !!props.view.launch;
 
@@ -889,7 +901,7 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
                     <select
                       id={selectId}
                       value={row.larkAppId}
-                      disabled={disabled}
+                      disabled={swapDisabled}
                       onChange={(event) => {
                         const larkAppId = event.target.value;
                         if (larkAppId && larkAppId !== row.larkAppId) {
@@ -968,14 +980,16 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
       ) : null}
 
       <div className="wfd-actions wfd-gate">
-        {confirmState !== 'confirmed' ? (
+        {props.view.template && !props.view.template.needsConfirmation ? (
+          <p className="muted">{tr('workflow.library.runNoConfirm')}</p>
+        ) : confirmState !== 'confirmed' ? (
           <button type="button" className="primary" disabled={disabled}
             title={props.canWrite ? undefined : tr('workflow.draft.onlyInitiator')}
             onClick={() => { void props.act({ kind: 'approve-flow', flowSummarySha256: flow.flowSummarySha256 }, 'approve-flow'); }}>
             {tr('workflow.draft.approveFlow')}
           </button>
         ) : null}
-        {launched ? null : (
+        {launched || props.view.template ? null : (
           <>
             <label htmlFor="wfd-architect-note" className="wfd-sr-only">{tr('workflow.draft.rearchitectNote')}</label>
             <input id="wfd-architect-note" type="text" className="wfd-note" value={note} disabled={disabled}
@@ -999,8 +1013,15 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
 /** 群设置：群名（默认工作流标题，daemon 在末尾补标记）、额外成员（邮箱 / union_id）。 */
 function GroupSetupPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: string | null; act: Act }): React.JSX.Element {
   const tr = useT();
-  const [name, setName] = useState(props.view.title);
-  const [members, setMembers] = useState('');
+  // A template run's form (D5) already asked for these: carried over once.
+  const carried = useMemo(() => {
+    try {
+      const raw = sessionStorage.getItem(`${TEMPLATE_GROUP_SETUP_KEY}:${props.view.runId}`);
+      return raw ? JSON.parse(raw) as { groupName?: string; members?: string } : undefined;
+    } catch { return undefined; }
+  }, [props.view.runId]);
+  const [name, setName] = useState(carried?.groupName || props.view.title);
+  const [members, setMembers] = useState(carried?.members ?? '');
   const parsed = parseLaunchMembersInput(members);
   const nameOk = name.trim().length > 0 && Array.from(name.trim()).length <= 100;
   const membersOk = parsed.invalid.length === 0 && parsed.openIds.length === 0;

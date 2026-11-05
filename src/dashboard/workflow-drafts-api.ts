@@ -48,9 +48,9 @@ export function isWorkflowDraftsPath(pathname: string): boolean {
   return pathname === WORKFLOW_DRAFTS_API_PATH || pathname.startsWith(`${WORKFLOW_DRAFTS_API_PATH}/`);
 }
 
-class BodyTooLargeError extends Error {}
+export class BodyTooLargeError extends Error {}
 
-async function readRawBody(req: IncomingMessage): Promise<string> {
+export async function readRawBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -62,7 +62,7 @@ async function readRawBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf-8');
 }
 
-async function relay(res: ServerResponse, upstream: Response): Promise<void> {
+export async function relay(res: ServerResponse, upstream: Response): Promise<void> {
   const text = await upstream.text();
   let body: unknown;
   try { body = JSON.parse(text); } catch { body = undefined; }

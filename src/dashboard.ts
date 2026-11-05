@@ -385,6 +385,7 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
 import { handleWorkflowDraftsApi, handleWorkflowOrchestratorBotsApi, workflowOrchestratorBotOptions } from './dashboard/workflow-drafts-api.js';
+import { handleWorkflowLibraryApi } from './dashboard/workflow-library-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -6873,6 +6874,21 @@ const server = createServer(async (req, res) => {
       canManageHost: authed,
       platformBound: !!readPlatformBinding(),
       featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      runsDir: v3RunsDir(),
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // Workflow templates (design 2026-11-03 workflow-dashboard-orchestration
+    // D5): the list and detail read disk; saves and runs go to the daemon of
+    // the run's main bot / the template's bot, which checks the person.
+    if (await handleWorkflowLibraryApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      libraryDataDir: dirname(v3RunsDir()),
       runsDir: v3RunsDir(),
       proxyToDaemon,
     })) {

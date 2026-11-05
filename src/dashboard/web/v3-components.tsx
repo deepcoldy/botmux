@@ -41,6 +41,8 @@ import {
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
 import { NewWorkflowEntry, WorkflowDraftPage, WorkflowDraftsSection, WorkflowNewPage, useWorkflowSwitches } from './workflow-draft-page.js';
 import { parseWorkflowsRoute, workflowEntryMode } from './workflow-draft-model.js';
+import { SaveTemplateDialog, WorkflowLibraryEntry, WorkflowLibraryPage, WorkflowTemplatePage } from './workflow-library-page.js';
+import { fetchOrchestratorBots } from './workflow-draft-api.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
 
 function isDocumentHidden(): boolean {
@@ -138,6 +140,7 @@ function V3ListPage(): React.JSX.Element {
   const headingActions = (
     <div className="page-heading-actions v3r-run-toolbar">
       <span className="v3r-run-count">{runs.length}</span>
+      {entryMode === 'ready' ? <WorkflowLibraryEntry /> : null}
       {entryMode !== 'hidden' ? <NewWorkflowEntry mode={entryMode} /> : null}
     </div>
   );
@@ -182,8 +185,19 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
   const [cancelBusy, setCancelBusy] = useState(false);
   const [cancelSubmitted, setCancelSubmitted] = useState(false);
   const [cancelNotice, setCancelNotice] = useState<string | null>(null);
+  // 「保存为模板」(D5): only with Dashboard orchestration on, on a finished run.
+  const entryMode = workflowEntryMode(useWorkflowSwitches());
+  const [saving, setSaving] = useState(false);
+  const [botNames, setBotNames] = useState<Map<string, string>>(() => new Map());
+  useEffect(() => {
+    if (!saving || botNames.size) return;
+    void fetchOrchestratorBots().then((result) => {
+      if (result.ok) setBotNames(new Map(result.bots.map((bot) => [bot.larkAppId, bot.name])));
+    });
+  }, [botNames.size, saving]);
 
   useEffect(() => {
+    setSaving(false);
     setSelectedId(null);
     setInstanceId(null);
     setInstancePinned(false);
@@ -266,6 +280,9 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           <span className={`${statusClass} v3r-run-status-pill`}>{statusText}</span>
         </div>
         <div className="page-heading-actions">
+          {entryMode === 'ready' && ui.authed && terminal && !saving ? (
+            <button type="button" onClick={() => setSaving(true)}>{tr('workflow.library.saveFromRun')}</button>
+          ) : null}
           <V3CancelButton
             runStatus={view?.runStatus}
             busy={cancelBusy || cancelSubmitted}
@@ -278,6 +295,7 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           {cancelNotice}
         </div>
       ) : null}
+      {saving ? <SaveTemplateDialog source={{ kind: 'run', runId: props.runId }} botNames={botNames} onClose={() => setSaving(false)} /> : null}
       <div className="v3r-wrap">
         <section className="overview-block v3r-graph-section">
           <SectionHeader
@@ -894,6 +912,12 @@ export function TerminalSlot(props: { runId: string; node: RunNodeView | null })
   return <div id="v3-term-slot" className="v3r-term-slot" ref={ref} />;
 }
 
+/** The template pages exist only with Dashboard orchestration on (§10). */
+function LibraryGate(props: { children: React.ReactNode }): React.JSX.Element {
+  const mode = workflowEntryMode(useWorkflowSwitches());
+  return mode === 'ready' ? <>{props.children}</> : <V3ListPage />;
+}
+
 export function V3RunsPage(): React.JSX.Element {
   // Route table (E13): new / drafts / library before run detail.
   const route = parseWorkflowsRoute(typeof location !== 'undefined' ? location.hash : '');
@@ -904,7 +928,11 @@ export function V3RunsPage(): React.JSX.Element {
         ? <WorkflowNewPage />
         : route.kind === 'draft'
           ? <WorkflowDraftPage runId={route.runId} />
-          : runId ? <V3DetailPage runId={runId} /> : <V3ListPage />}
+          : route.kind === 'library'
+            ? <LibraryGate><WorkflowLibraryPage /></LibraryGate>
+            : route.kind === 'template'
+              ? <LibraryGate><WorkflowTemplatePage workflowId={route.workflowId} /></LibraryGate>
+              : runId ? <V3DetailPage runId={runId} /> : <V3ListPage />}
     </section>
   );
 }
