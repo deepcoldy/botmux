@@ -105,3 +105,73 @@ describe('effort submit re-check (worker implementation)', () => {
     expect(await allowed({}, () => current)).toBe(false);
   });
 });
+
+describe('discarding the typed /model after a refused guard', () => {
+  const COMPOSER_WITH_OUR_TEXT = [
+    'Working',
+    '› /model',
+    '',
+    '  GPT-6.1-Sol xhigh · /tmp/project · ← for agents',
+  ].join('\n');
+
+  function loadDiscard(harness: { screen?: string; throws?: boolean }) {
+    const writes: string[] = [];
+    const target = { write: (data: string) => { writes.push(data); return true; } };
+    const scope = {
+      renderer: {
+        rawSnapshot: () => {
+          if (harness.throws) throw new Error('renderer exploded');
+          return harness.screen ?? '';
+        },
+      },
+      renderCols: 160,
+      renderRows: 50,
+      isObserveBackend: () => false,
+      snapshotToText: vi.fn(async () => null),
+      stripAnsiScreenText,
+      detectCodexChoiceModal,
+      log: vi.fn(),
+    };
+    const discard = loadWorkerFunction<(t: unknown, current: () => boolean) => Promise<void>>(
+      'discardTypedCodexEffortCommand', scope,
+    );
+    return { discard, target, writes };
+  }
+
+  it('clears our own untouched /model literal', async () => {
+    const { discard, target, writes } = loadDiscard({ screen: COMPOSER_WITH_OUR_TEXT });
+    await discard(target, () => true);
+    // Ctrl-U (kill_line_start) — the composer-only clear binding.
+    expect(writes).toEqual(['\x15']);
+  });
+
+  it('never clears a selection surface that owns the keyboard', async () => {
+    // A dialog whose composer row BELOW it happens to read exactly `/model`
+    // (the resize shape): the surface check is the only thing standing between
+    // this key and the popup, since the literal check would pass.
+    const dialogOverOurLiteral = [
+      FULL_ACCESS_DIALOG,
+      '› /model',
+      '',
+      '  GPT-6.1-Sol xhigh · /tmp/x · ← for agents',
+    ].join('\n');
+    const { discard, target, writes } = loadDiscard({ screen: dialogOverOurLiteral });
+    await discard(target, () => true);
+    expect(writes).toEqual([]);
+  });
+
+  it('never clears somebody else’s draft', async () => {
+    const { discard, target, writes } = loadDiscard({
+      screen: ['Working', '› /model please also check the logs', '', '  GPT-6.1-Sol xhigh · /tmp/p'].join('\n'),
+    });
+    await discard(target, () => true);
+    expect(writes).toEqual([]);
+  });
+
+  it('does nothing on an unreadable screen or a stale generation', async () => {
+    expect((await loadDiscard({ screen: '' }).discard({ write: () => true }, () => true))).toBeUndefined();
+    const { discard, target, writes } = loadDiscard({ screen: COMPOSER_WITH_OUR_TEXT });
+    await discard(target, () => false);
+    expect(writes).toEqual([]);
+  });
+});

@@ -89,6 +89,17 @@ export interface CodexEffortMenuIO {
    * Absent = the backend cannot render such a popup.
    */
   submitGuard?(): Promise<boolean>;
+  /**
+   * Undo the text `command()` typed without submitting it.
+   *
+   * A refused guard must not leave `/model` sitting in the composer: the next
+   * user message would be appended to it (`/model` + `fix the bug` →
+   * `modelfix the bug`) and the user's turn would be lost as a slash command.
+   * Only ever called for text THIS operation typed, and only when the screen is
+   * still a plain composer — never into a popup, where a clear key would be
+   * consumed as menu input.
+   */
+  discardTypedCommand?(): Promise<void>;
   key(key: 'Up' | 'Down' | 'Enter' | 'Escape' | 's'): void;
   /** Only settings appended AFTER this operation started, from its exact rollout. */
   settings(): CodexThreadSettings | undefined;
@@ -136,6 +147,9 @@ export async function applyCodexEffortMenu(
     // means the backend cannot show such a popup, not that the screen is clear.
     if (io.submitGuard && !await io.submitGuard()) {
       io.unavailable?.('modal_surface');
+      // The typed line is still in the composer. Remove it before returning so a
+      // queued user message cannot be appended onto it.
+      await io.discardTypedCommand?.();
       return { status: 'unavailable', reason: 'cli_menu_unavailable' };
     }
     if (!alive()) return { status: 'error' };

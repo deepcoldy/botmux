@@ -366,3 +366,32 @@ describe('Codex CLI effort menu: modal surface guards', () => {
     expect(keys).toEqual([]);
   });
 });
+
+describe('Codex CLI effort menu: refused guard must not leave /model behind', () => {
+  // Reproduced on a real 0.164 PTY: with `/model` left in the composer, the next
+  // user message is appended (`/model` + `fix the bug` → `modelfix the bug`) and
+  // the turn is lost as a malformed slash command.
+  it('discards the typed line when the guard refuses', async () => {
+    const { io, keys } = fixture();
+    io.submitGuard = async () => false;
+    io.discardTypedCommand = vi.fn(async () => {});
+    expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max')).toMatchObject({ status: 'unavailable' });
+    expect(io.discardTypedCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not discard anything when the guard allows the submit', async () => {
+    const { io } = fixture();
+    io.discardTypedCommand = vi.fn(async () => {});
+    expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max'))
+      .toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(io.discardTypedCommand).not.toHaveBeenCalled();
+  });
+
+  it('does not discard before typing when the initial check already refuses', async () => {
+    const { io } = fixture();
+    io.discardTypedCommand = vi.fn(async () => {});
+    io.screen = async () => '› important unsent draft';
+    await applyCodexEffortMenu(io, 'gpt-6-astra', 'max');
+    expect(io.discardTypedCommand).not.toHaveBeenCalled();
+  });
+});
