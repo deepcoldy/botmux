@@ -57,21 +57,28 @@ describe('supportsZeroPromptInjection', () => {
     expect(isScratchSandbox({})).toBe(false);
   });
 
-  it('allows cursor/antigravity under the oncall bwrap sandbox (transcript dirs are directory-bound to the host fs)', () => {
-    // ~/.cursor / ~/.gemini are adapter authPaths → real --bind in the oncall
-    // bwrap, so the daemon reads the same transcript paths the CLI writes.
+  it('allows cursor/antigravity/doubao under the oncall bwrap sandbox (transcript dirs are directory-bound to the host fs)', () => {
+    // ~/.cursor / ~/.gemini / ~/.local/share/doubao_cli are adapter authPaths →
+    // real --bind in the oncall bwrap, so the daemon reads the same transcript
+    // paths the CLI writes.
     expect(supportsZeroPromptInjection('cursor', { sandbox: true })).toBe(true);
     expect(supportsZeroPromptInjection('cursor', { sandbox: 'oncall' })).toBe(true);
     expect(supportsZeroPromptInjection('antigravity', { sandbox: true, backendType: 'tmux' })).toBe(true);
+    expect(supportsZeroPromptInjection('doubao', { sandbox: true })).toBe(true);
+    expect(supportsZeroPromptInjection('doubao', { sandbox: 'oncall' })).toBe(true);
     expect(supportsZeroPromptInjection('cursor', { readIsolation: true })).toBe(true);
     expect(supportsZeroPromptInjection('antigravity', { sandbox: false, readIsolation: true })).toBe(true);
   });
 
-  it('rejects cursor/antigravity under the full-root scratch COW sandbox (structured bridge cannot resolve the merged tree yet)', () => {
+  it('rejects cursor/antigravity/doubao under the full-root scratch COW sandbox (structured bridge cannot resolve the merged tree yet)', () => {
     expect(supportsZeroPromptInjection('cursor', { sandbox: 'scratch' })).toBe(false);
     expect(supportsZeroPromptInjection('antigravity', { sandbox: 'scratch', backendType: 'pty' })).toBe(false);
+    // #2828: doubao 的 .sessions 树没有 scratch host-view 映射，零注入会强制
+    // transcript 而桥读不到 merged 树 → 整轮静默，写配置/ spawn 两处都必须拒。
+    expect(supportsZeroPromptInjection('doubao', { sandbox: 'scratch' })).toBe(false);
     // Explicit off is fine.
     expect(supportsZeroPromptInjection('antigravity', { sandbox: 'off' })).toBe(true);
+    expect(supportsZeroPromptInjection('doubao', { sandbox: 'off' })).toBe(true);
     // The classic structured CLIs keep their existing scratch behaviour
     // (their host-view gap predates this PR and is not widened here).
     expect(supportsZeroPromptInjection('codex', { sandbox: 'scratch' })).toBe(true);

@@ -247,10 +247,13 @@ import {
   cancelReadonlyTaskContinuationExplicit,
   startReadonlyTaskContinuation,
 } from '../services/readonly-task-continuation.js';
-import { listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { findOnlineDaemon, listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { ensureBotChatGrantMatrix } from '../cli/exact-chat-grant-client.js';
+import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
+import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { updateMessage } from '../im/lark/client.js';
+import { updateMessage, sendUserMessage } from '../im/lark/client.js';
 import { safeRequirementUrl } from './dispatch-task-tree.js';
 import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
 import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
@@ -514,7 +517,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, listOncallChats, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
@@ -539,7 +542,7 @@ import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
-import { publishDelegationRefusal, retryTransientTurnIdentity } from './turn-cli-identity.js';
+import { publishDelegationRefusal, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1590,7 +1593,14 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       // treats a throwing reader as a refusal to publish.
       currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
     });
-    const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    let env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    if (!env) {
+      // The turn's identity may still be on its way (a new session's opening
+      // turn is republished after the worker reports its model). Wait for that
+      // publication instead of refusing as if nothing would ever come.
+      await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
+      env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    }
     if (env) {
       return jsonRes(res, 200, {
         schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
@@ -3704,13 +3714,25 @@ for (const action of ['auth-request', 'auth-status']) {
           && (!!boundTool || triggerUserAuthApplies(currentConfig.triggerUserAuth, 'lark-cli'));
       } catch { return false; }
     };
+    // Authorization links reach only the initiator. In anything but the 1:1
+    // chat with the bot, botmux DMs the link itself and the agent never sees it:
+    // a link posted to a group lets any member authorize as themselves.
+    const privateChat = ds.chatType === 'p2p';
+    const loc = localeForBot(ds.larkAppId);
     for (const [requestId, request] of sessionAuthRequests.entries()) {
       if (request.sessionId === params.sessionId && request.appId === cfg.larkAppId
         && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
         && request.expiresAt > Date.now()
         && scopes.every(scope => request.authorization.scopes.includes(scope))) {
+        const remaining = Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000));
+        // Outside a 1:1 chat the link already went to the person privately when
+        // this request was created; never hand it to the agent to post.
+        if (!privateChat) {
+          return jsonRes(res, 200, { ok: true, requestId, delivery: 'dm', message: t('auth_link.request_dm_agent', undefined, loc),
+            scopes: request.authorization.scopes, expiresIn: remaining, autoCallback: true });
+        }
         return jsonRes(res, 200, { ok: true, requestId, authUrl: request.authorization.authUrl,
-          scopes: request.authorization.scopes, expiresIn: Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000)), autoCallback: true });
+          scopes: request.authorization.scopes, expiresIn: remaining, autoCallback: true });
       }
     }
     let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
@@ -3725,6 +3747,28 @@ for (const action of ['auth-request', 'auth-status']) {
     accepted = true;
     trackSessionAuthorization(requestId, { sessionId: params.sessionId, appId: cfg.larkAppId,
       callerOpenId, identityTurnId, authorization, isCurrent, isValid: isAuthorizationValid });
+    if (!privateChat) {
+      try {
+        await sendUserMessage(cfg.larkAppId, callerOpenId, [
+          t('auth_link.request_dm_title', undefined, loc),
+          authorization.authUrl,
+          t('auth_link.request_dm_footer', {
+            scopes: authorization.scopes.join(' '),
+            minutes: Math.max(1, Math.round(authorization.expiresIn / 60)),
+          }, loc),
+        ].join('\n'));
+      } catch {
+        const tracked = sessionAuthRequests.get(requestId);
+        tracked?.dispose();
+        sessionAuthRequests.delete(requestId);
+        return jsonRes(res, 409, { ok: false, error: 'auth_link_private_delivery_failed',
+          message: t('auth_link.request_dm_failed_agent', undefined, loc) });
+      }
+      return jsonRes(res, 200, {
+        ok: true, requestId, delivery: 'dm', message: t('auth_link.request_dm_agent', undefined, loc),
+        scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
+      });
+    }
     return jsonRes(res, 200, {
       ok: true, authUrl: authorization.authUrl, requestId,
       scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
@@ -5072,6 +5116,44 @@ ipcRoute('POST', '/api/headless/sessions/:sessionId/publish', requireBoundBot(as
   }
 }, NOT_BOUND_BODY.botNotFound));
 
+/** After a headless session moved into a chat / topic: the headless record
+ *  and the session's own `headless` block say where it is bound now. */
+function recordHeadlessBinding(
+  record: HeadlessSessionRecord,
+  bound: { boundAt: string; chatId: string; rootMessageId: string; scope: 'thread' | 'chat'; replayMessageId?: string },
+): { updated: HeadlessSessionRecord | null; metadataWarning?: string } {
+  let updated: HeadlessSessionRecord | null = null;
+  let metadataWarning: string | undefined;
+  try {
+    updated = updateHeadlessSession(record.id, current => {
+      current.boundAt = bound.boundAt;
+      current.boundChatId = bound.chatId;
+      current.boundRootMessageId = bound.rootMessageId;
+      current.boundScope = bound.scope;
+      if (bound.replayMessageId) {
+        current.lastPublishedAt = bound.boundAt;
+        current.lastPublishedMessageId = bound.replayMessageId;
+      }
+    });
+  } catch (error) {
+    metadataWarning = ipcErrorText(error);
+    logger.warn(`[headless] bind metadata update failed for ${record.id}: ${metadataWarning}`);
+  }
+  const session = findOwnedSessionRecord(record.sessionId);
+  if (session?.headless) {
+    session.headless.boundAt = bound.boundAt;
+    session.headless.boundChatId = bound.chatId;
+    session.headless.boundRootMessageId = bound.rootMessageId;
+    session.headless.boundScope = bound.scope;
+    if (bound.replayMessageId) {
+      session.headless.lastPublishedAt = bound.boundAt;
+      session.headless.lastPublishedMessageId = bound.replayMessageId;
+    }
+    sessionStore.updateSession(session);
+  }
+  return { updated, ...(metadataWarning ? { metadataWarning } : {}) };
+}
+
 ipcRoute('POST', '/api/headless/sessions/:sessionId/bind', requireBoundBot(async (req, res, params) => {
   const record = findHeadlessRecordForThisDaemon(params.sessionId);
   if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
@@ -5148,35 +5230,9 @@ ipcRoute('POST', '/api/headless/sessions/:sessionId/bind', requireBoundBot(async
       logger.warn(`[headless] replay failed after bind for ${record.id}: ${replayError}`);
     }
   }
-  let updated: HeadlessSessionRecord | null = null;
-  let metadataWarning: string | undefined;
-  try {
-    updated = updateHeadlessSession(record.id, current => {
-      current.boundAt = boundAt;
-      current.boundChatId = targetChatId;
-      current.boundRootMessageId = rootMessageId;
-      current.boundScope = targetScope;
-      if (replayMessageId) {
-        current.lastPublishedAt = boundAt;
-        current.lastPublishedMessageId = replayMessageId;
-      }
-    });
-  } catch (error) {
-    metadataWarning = ipcErrorText(error);
-    logger.warn(`[headless] bind metadata update failed for ${record.id}: ${metadataWarning}`);
-  }
-  const session = findOwnedSessionRecord(record.sessionId);
-  if (session?.headless) {
-    session.headless.boundAt = boundAt;
-    session.headless.boundChatId = targetChatId;
-    session.headless.boundRootMessageId = rootMessageId;
-    session.headless.boundScope = targetScope;
-    if (replayMessageId) {
-      session.headless.lastPublishedAt = boundAt;
-      session.headless.lastPublishedMessageId = replayMessageId;
-    }
-    sessionStore.updateSession(session);
-  }
+  const { updated, metadataWarning } = recordHeadlessBinding(record, {
+    boundAt, chatId: targetChatId, rootMessageId, scope: targetScope, ...(replayMessageId ? { replayMessageId } : {}),
+  });
   return jsonRes(res, 200, {
     ok: true,
     sessionId: record.sessionId,
@@ -6475,9 +6531,34 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   return jsonRes(res, 200, toggleTaskDeliveryWithPrecondition(p.id, effectiveAppId));
 });
 
+type DashboardScheduleWorkingDir =
+  | { ok: true; workingDir: string }
+  | { ok: false; error: 'invalid_working_dir' | 'schedule_working_dir_unavailable'; message?: string };
+
+/** Resolve the cwd shared by the Dashboard form and create route. An explicit
+ * request wins; otherwise the primary target chat's oncall binding wins over
+ * the Bot's effective default. Every selected value must already be a real
+ * directory: a schedule must not be persisted in a state that can never run. */
+function resolveDashboardScheduleWorkingDir(
+  larkAppId: string,
+  chatId?: string,
+  explicit?: unknown,
+): DashboardScheduleWorkingDir {
+  let raw: unknown = explicit;
+  if (raw === undefined) {
+    raw = (chatId ? findOncallChat(larkAppId, chatId)?.workingDir : undefined)
+      ?? effectiveDefaultWorkingDir(getBot(larkAppId).config);
+  }
+  if (raw === undefined) return { ok: false, error: 'schedule_working_dir_unavailable' };
+  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'invalid_working_dir' };
+  const checked = validateWorkingDir(raw);
+  return checked.ok
+    ? { ok: true, workingDir: checked.resolvedPath }
+    : { ok: false, error: 'invalid_working_dir', message: checked.error };
+}
+
 // Create a new scheduled task from the dashboard. chatIds selects one or more
 // chats owned by this bot; legacy clients may keep sending only chatId.
-// workingDir defaults to the daemon's cwd.
 /** The person a Dashboard schedule write is recorded as (see
  *  core/dashboard-schedule-creator), or undefined when the write keeps the
  *  token-login attribution. Every outcome is logged: this decides whose
@@ -6594,6 +6675,31 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
   });
 }
 
+/**
+ * 拉群开始 第 4 步 (design 2026-11-03 workflow-dashboard-orchestration §4.5,
+ * E7): move a draft's clarify session into the main topic — the same
+ * transferSession + headless metadata as `POST /api/headless/sessions/:id/bind`
+ * (thread scope, no replay: the launch posts its own summary). Already bound
+ * there → ok (a resumed launch). A session that is not active any more is
+ * reported unavailable; anything else (busy, …) is retried later.
+ */
+export function productionWorkflowDraftSessionBinder(): DraftLaunchDeps['bindSession'] {
+  return async ({ sessionId, headlessId, chatId, rootMessageId }) => {
+    const live = findActiveBySessionId(sessionId);
+    if (live && live.session.chatId === chatId && live.session.rootMessageId === rootMessageId) return { ok: true };
+    const result = await transferSession(sessionId, chatId, rootMessageId, 'group', 'thread');
+    if (!result.ok) {
+      if (result.error === 'same_anchor') return { ok: true };
+      return { ok: false, error: result.error, unavailable: result.error === 'session_not_active' };
+    }
+    const record = findHeadlessRecordForThisDaemon(headlessId ?? sessionId);
+    if (record && record.sessionId === sessionId) {
+      recordHeadlessBinding(record, { boundAt: new Date().toISOString(), chatId, rootMessageId, scope: 'thread' });
+    }
+    return { ok: true };
+  };
+}
+
 ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
@@ -6696,6 +6802,15 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   if (executionPosition === 'task' && rootMessageId) {
     return jsonRes(res, 400, { ok: false, error: 'task_root_not_user_settable', field: 'rootMessageId' });
   }
+  const workingDir = resolveDashboardScheduleWorkingDir(cachedLarkAppId, chatId, b.workingDir);
+  if (!workingDir.ok) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: workingDir.error,
+      field: 'workingDir',
+      ...(workingDir.message ? { message: workingDir.message } : {}),
+    });
+  }
   // Note: bot↔chat membership is intentionally NOT validated here.
   // listChatBotMembers returns [] both when the API is unavailable and when
   // no bot has been observed in the chat yet, so we cannot reliably tell
@@ -6725,7 +6840,7 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
       name,
       schedule,
       prompt,
-      workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
+      workingDir: workingDir.workingDir,
       chatId,
       chatIds: chatIds.length > 1 ? chatIds : undefined,
       // Only topic execution retains a root anchor; at top-level/new-topic the
@@ -7055,11 +7170,11 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
       message: 'Provide exactly one of subjectOpenIds or subjectLarkAppIds',
     });
   }
-  if (hasSubjectLarkAppIds && body.operation !== 'grant') {
+  if (hasSubjectLarkAppIds && body.operation !== 'grant' && body.operation !== 'resolve') {
     return jsonRes(res, 400, {
       ok: false,
       error: 'subject_lark_app_ids_grant_only',
-      message: 'subjectLarkAppIds may only be used with operation=grant',
+      message: 'subjectLarkAppIds may only be used with operation=grant or resolve',
     });
   }
   // Optional quota/validity window. Absent keys keep the legacy CLI wire shape
@@ -8403,7 +8518,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
-  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则缺省 send）
+  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则按 CLI 缺省，
+  // doubao 缺省 transcript、其余 send）
   // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
   let replyDelivery: 'send' | 'transcript' = 'send';
   let replyDeliveryDefault: 'send' | 'transcript' = 'send';
@@ -8590,9 +8706,12 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
-    // Dashboard-created schedules default to this daemon process directory.
-    // It remains the Bash execution cwd, not a file-path resolution base.
-    scheduleWorkingDir: process.cwd(),
+    // This is the same validated Bot-level fallback used by schedule creation;
+    // the selected target chat may override it server-side through oncall.
+    scheduleWorkingDir: (() => {
+      const resolved = resolveDashboardScheduleWorkingDir(cachedLarkAppId);
+      return resolved.ok ? resolved.workingDir : null;
+    })(),
     // Private Dashboard payload only. File-backed preconditions must live under
     // this daemon-owned host directory; it is never derived from workingDir.
     schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
@@ -10206,7 +10325,7 @@ botConfigPutRoute('/api/bot-topic-unavailable-policy', 'topicUnavailablePolicy',
 //     模型不再被要求 botmux send；仅 claude-code 与结构化转写白名单 CLI 支持，其它
 //     CLI 由 store 拒绝（400 reply_delivery_unsupported）。落盘 'transcript'
 //   • 'send' → 模型必须自己 botmux send。落盘 'send'
-//   • ''/其它 → 删 key，回到缺省 send
+//   • ''/其它 → 删 key，回到该 CLI 的缺省（doubao 缺省 transcript，其余缺省 send）
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
 // 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
 botConfigPutRoute<{ promptInjection?: unknown }>('/api/bot-prompt-injection', 'promptInjection', {
@@ -11239,6 +11358,8 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     notifyOwnerOpenId?: unknown;
     bindWorkingDir?: unknown;
     roleProfileId?: unknown;
+    chatMode?: unknown;
+    botCollaboration?: unknown;
   };
   try {
     body = await readJsonBody<{
@@ -11289,6 +11410,11 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
   if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
   }
+  // Optional (design 2026-11-03 workflow-dashboard-orchestration §8): a topic
+  // group, and the talk-only grant matrix between the bots that joined (what
+  // CLI create-group writes). Absent → today's behaviour, byte for byte.
+  const groupCreationExtras = parseGroupCreateExtras(body);
+  if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error });
   const bindWorkingDir = typeof body.bindWorkingDir === 'string' ? body.bindWorkingDir.trim() : '';
   let bindResolvedPath: string | undefined;
   if (bindWorkingDir) {
@@ -11308,12 +11434,42 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,
       roleProfileId: roleProfileId ?? undefined,
+      ...(groupCreationExtras.chatMode ? { chatMode: groupCreationExtras.chatMode } : {}),
+      ...(groupCreationExtras.botCollaboration
+        ? { ensureBotCollaboration: async (chatId: string, joined: string[]) => { await ensureLocalBotChatGrantMatrix(chatId, joined); } }
+        : {}),
     });
     jsonRes(res, 200, bindResolvedPath ? { ...r, bindResolvedPath } : r);
   } catch (e) {
     jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });
   }
 }));
+
+/** The optional `/api/groups/create` fields (absent = unchanged behaviour). */
+export function parseGroupCreateExtras(body: { chatMode?: unknown; botCollaboration?: unknown }):
+  | { ok: true; chatMode?: 'topic' | 'group'; botCollaboration: boolean }
+  | { ok: false; error: string } {
+  if (body.chatMode !== undefined && body.chatMode !== 'topic' && body.chatMode !== 'group') {
+    return { ok: false, error: 'invalid_chat_mode' };
+  }
+  if (body.botCollaboration !== undefined && typeof body.botCollaboration !== 'boolean') {
+    return { ok: false, error: 'invalid_bot_collaboration' };
+  }
+  return {
+    ok: true,
+    ...(body.chatMode !== undefined ? { chatMode: body.chatMode as 'topic' | 'group' } : {}),
+    botCollaboration: body.botCollaboration === true,
+  };
+}
+
+/** The talk-only grant matrix between local bots in one chat, through each
+ *  receiver's own daemon (the call CLI create-group / dispatch make). */
+async function ensureLocalBotChatGrantMatrix(chatId: string, participantAppIds: string[]): Promise<void> {
+  await ensureBotChatGrantMatrix(chatId, participantAppIds, {
+    findDaemon: (larkAppId) => findOnlineDaemon(larkAppId, config.session.dataDir),
+    secret: () => loadDaemonIpcSecret(),
+  });
+}
 
 // Complete a deferred team-group owner transfer after another deployment has
 // added the operator to the chat. The caller sends union_id so no app-scoped

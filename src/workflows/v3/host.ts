@@ -563,6 +563,11 @@ export function authorizeAdHocRun(
     /** Bot runs only: the second-gate record, built inside the lock from the
      *  exact DAG and executing bots being frozen. */
     flowConfirmation?: (frozen: { dag: V3Dag; targets: V3NodeExecutorTarget[] }) => V3FlowConfirmation;
+    /** A Dashboard draft (design 2026-11-03 workflow-dashboard-orchestration
+     *  §4.5 第 7 步) is born without a chat; its binding (main bot, the group,
+     *  the main topic root, the session, the initiator) is produced by
+     *  拉群开始 and given here. Refused when the grill has a binding of its own. */
+    chatBinding?: RunChatBinding;
   } = {},
 ): AdHocRunAuthorizationResult {
   // A bot-executed run freezes the directory exactly as an ephemeral one does
@@ -613,6 +618,10 @@ export function authorizeAdHocRun(
       throw new HostGuardError(`approve-dag 需要 status=dag_ready，当前 ${cur.status}`);
     }
     if (!cur.dagPath) throw new Error('dag_ready 状态缺 dagPath（内部不一致）');
+    if (opts.chatBinding && cur.chatBinding) {
+      throw new HostGuardError('这个 run 出生时已绑定话题，不能再给它另一个绑定');
+    }
+    const chatBinding = cur.chatBinding ?? opts.chatBinding;
     const dag = loadDag(cur.dagPath);
     if (dag.runId !== cur.runId) {
       throw new Error(`DAG runId=${dag.runId} 与 grill runId=${cur.runId} 不一致`);
@@ -626,7 +635,7 @@ export function authorizeAdHocRun(
       // A node that omits `bot` inherits the bot where this grill was born,
       // never the first unrelated entry in bots.json. Standalone/dev runs have
       // no binding and retain the legacy first-supported fallback.
-      defaultSelector: cur.chatBinding?.larkAppId,
+      defaultSelector: chatBinding?.larkAppId,
       workingDirOverride: opts.workingDirOverride,
     });
 
@@ -645,8 +654,8 @@ export function authorizeAdHocRun(
       runId: cur.runId,
       createdAt: cur.createdAt,
       authorizedAt: now.toISOString(),
-      ...(cur.chatBinding ? { chatBinding: cur.chatBinding } : {}),
-      ...(cur.chatBinding?.ownerOpenId ? { authorizedByOpenId: cur.chatBinding.ownerOpenId } : {}),
+      ...(chatBinding ? { chatBinding } : {}),
+      ...(chatBinding?.ownerOpenId ? { authorizedByOpenId: chatBinding.ownerOpenId } : {}),
       ...(opts.nodeExecutor ? { nodeExecutor: opts.nodeExecutor } : {}),
       ...(nodeWorkingDir !== undefined ? { nodeWorkingDir } : {}),
       ...(opts.nodeExecutor && opts.handoffIdentity ? { handoffIdentity: opts.handoffIdentity } : {}),

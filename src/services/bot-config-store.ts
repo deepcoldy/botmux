@@ -177,7 +177,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
-  { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型必须自己 botmux send（**所有 CLI 的缺省**，与上游一致）｜transcript=从 CLI 转写自动取最终回复发卡，模型不再被要求 botmux send（opt-in，需显式开启）；仅 claude-code 与 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor 支持 transcript；系统提示需 /restart 才换新值，逐轮信封立即生效；unset 回缺省 send' },
+  { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型必须自己 botmux send｜transcript=从 CLI 转写自动取最终回复发卡，模型不再被要求 botmux send；缺省按 CLI：doubao 缺省 transcript（其工具命令跑在账号级常驻 service 进程，botmux send 归属不可靠），其余 CLI 缺省 send、与上游一致；仅 doubao 与 claude-code 及 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor 支持 transcript，当前沙盒不支持时运行时回落 send；系统提示需 /restart 才换新值，逐轮信封立即生效；unset 回该 CLI 缺省' },
   { key: 'senderTagHideEmail', configKey: 'senderTagHideEmail', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏 <sender> 邮箱 on|off（默认 off）：开启后只省略 email，保留姓名和 ID；不影响鉴权与 --mention-back。下一次新构造的输入生效，不清理历史或用户正文中的邮箱' },
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
@@ -478,7 +478,8 @@ async function applyConfigFieldInternal(
     : formatFieldValue(spec, (bot.config as any)[spec.configKey], bot.config);
 
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
-  // replyDelivery 的 send / transcript 都显式落盘；缺省为 send，只有 unset 才删 key。
+  // replyDelivery 的 send / transcript 都显式落盘；缺省按 CLI（doubao=transcript，
+  // 其余=send），只有 unset 才删 key。
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null
     : value;
   const nextCliId = spec.kind === 'cli' && typeof effective === 'string'

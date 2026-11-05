@@ -138,6 +138,7 @@ import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { readBotsInfoJson } from './services/bots-info-cache.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -347,7 +348,8 @@ import {
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
-import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
+import { generateAuthUrl, handleCallbackUrl, isCallbackUrl, callbackOrigin } from './utils/user-token.js';
+import { answerOAuthLoopbackCallback } from './utils/oauth-loopback-page.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
@@ -383,7 +385,8 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
-import { handleWorkflowDraftsApi } from './dashboard/workflow-drafts-api.js';
+import { handleWorkflowDraftsApi, handleWorkflowOrchestratorBotsApi, workflowOrchestratorBotOptions } from './dashboard/workflow-drafts-api.js';
+import { handleWorkflowLibraryApi } from './dashboard/workflow-library-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -4924,7 +4927,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
       const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
-      if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
+      if (olderThanHours === null) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
 
       // WYSIWYG: the UI scopes cleanup to the rows currently visible under the
       // page filters and sends their sessionIds, so the closed set matches the
@@ -6873,7 +6876,46 @@ const server = createServer(async (req, res) => {
       platformBound: !!readPlatformBinding(),
       featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
       runsDir: v3RunsDir(),
+      libraryDataDir: dirname(v3RunsDir()),
       proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // Workflow templates (design 2026-11-03 workflow-dashboard-orchestration
+    // D5): the list and detail read disk; saves and runs go to the daemon of
+    // the run's main bot / the template's bot, which checks the person.
+    if (await handleWorkflowLibraryApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      libraryDataDir: dirname(v3RunsDir()),
+      runsDir: v3RunsDir(),
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // The orchestrator picker of 「新建工作流」 (design 2026-11-03 §4.1, D3):
+    // bots.json + the daemon registry, read only.
+    if (handleWorkflowOrchestratorBotsApi(req, res, url, {
+      canManageHost: authed,
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      listBots: () => {
+        // Offline bots have no registry row: their name comes from bots-info.json.
+        const fileNames = new Map<string, string>();
+        try {
+          for (const entry of normalizeBotsInfoRouteEntries(readBotsInfoJson(config.session.dataDir))) {
+            if (entry.botName) fileNames.set(entry.larkAppId, entry.botName);
+          }
+        } catch { /* unreadable: ids */ }
+        return workflowOrchestratorBotOptions(
+          loadBotConfigs(),
+          (larkAppId) => !!registry.getByAppId(larkAppId),
+          (larkAppId) => registry.getByAppId(larkAppId)?.botName || fileNames.get(larkAppId) || larkAppId,
+        );
+      },
     })) {
       return;
     }
@@ -7883,7 +7925,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown };
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown; chatMode?: unknown; botCollaboration?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -7903,6 +7945,14 @@ const server = createServer(async (req, res) => {
         : null;
       if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      }
+      // Optional (workflow-dashboard-orchestration §8): topic group mode and
+      // the bots' collaboration grants. Not sent → forwarded body unchanged.
+      if (parsed.chatMode !== undefined && parsed.chatMode !== 'topic' && parsed.chatMode !== 'group') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_chat_mode' });
+      }
+      if (parsed.botCollaboration !== undefined && typeof parsed.botCollaboration !== 'boolean') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_bot_collaboration' });
       }
 
       const explicit = Array.isArray(parsed.userOpenIds)
@@ -7944,6 +7994,8 @@ const server = createServer(async (req, res) => {
           ? parsed.bindWorkingDir.trim()
           : undefined,
         roleProfileId: roleProfileId ?? undefined,
+        ...(parsed.chatMode !== undefined ? { chatMode: parsed.chatMode } : {}),
+        ...(parsed.botCollaboration !== undefined ? { botCollaboration: parsed.botCollaboration } : {}),
       };
       const upstream = await fetchDaemonIpc(
         creator.ipcPort,
@@ -8251,18 +8303,19 @@ const oauthCallbackServer = createServer(async (req, res) => {
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     return res.end('Not found');
   }
-  let ok = false;
-  try {
-    const message = await handleCallbackUrl(url.toString());
-    ok = typeof message === 'string' && message.startsWith('✅');
-  } catch (error) {
-    logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`);
-  }
-  res.writeHead(ok ? 200 : 400, {
+  // A callback whose login this process never started belongs to another
+  // BotMux (the issuing daemon). Do not consume it here; tell the person where
+  // to send it.
+  const page = await answerOAuthLoopbackCallback(url.toString(), {
+    origin: callbackOrigin,
+    consume: handleCallbackUrl,
+    onError: error => logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`),
+  });
+  res.writeHead(page.status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
   });
-  return res.end(`<!doctype html><meta charset="utf-8"><title>${ok ? '授权成功' : '授权失败'}</title><style>body{font-family:system-ui,sans-serif;max-width:560px;margin:80px auto;padding:24px;color:#111827}h1{font-size:28px}</style><h1>${ok ? '授权成功' : '授权失败'}</h1><p>${ok ? 'BotMux 已完成授权。你可以关闭此页面并返回 Dashboard。' : '授权链接无效或已过期。请返回 Dashboard 后重新发起授权。'}</p>`);
+  return res.end(page.html);
 });
 
 oauthCallbackServer.on('error', error => {

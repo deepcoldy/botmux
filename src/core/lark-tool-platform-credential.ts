@@ -25,6 +25,8 @@ import type { BotConfig } from '../bot-registry.js';
 import { credentialSourceOf, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import {
   platformAuthorizeUrl,
+  platformRefusalReason,
+  reasonTag,
   resolvePlatformIdentity,
   type PlatformIdentityResolution,
 } from './platform-credential-source.js';
@@ -98,7 +100,10 @@ function platformRefusal(resolution: PlatformIdentityResolution, delegated: bool
   const who = delegated ? 'The original user' : 'This user';
   const url = (resolution.state === 'not_authorized' ? resolution.authorizeUrl : undefined) ?? platformAuthorizeUrl() ?? undefined;
   const link = url ? ` at ${url}` : '';
-  const withUrl = (error: string) => ({ ok: false as const, reason: 'platform' as const, error, ...(url ? { authorizeUrl: url } : {}) });
+  // The cause travels with the text: the agent (and whoever reads its report)
+  // must tell "authorize first" from "the platform is down, wait".
+  const tag = resolution.state === 'granted' ? '' : ` ${reasonTag(platformRefusalReason(resolution))}`;
+  const withUrl = (error: string) => ({ ok: false as const, reason: 'platform' as const, error: `${error}${tag}`, ...(url ? { authorizeUrl: url } : {}) });
   const noBotApp = 'Do not ask them to authorize the bot application or run botmux auth request for it.';
   switch (resolution.state) {
     case 'not_authorized':

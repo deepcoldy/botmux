@@ -486,7 +486,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(payload.content.match(/CURRENT_REPLY_SENTINEL/g)).toHaveLength(1);
     expect(payload).not.toHaveProperty('codexAppInput');
 
-    rememberLastCliInput(restored, 'CURRENT_REPLY_SENTINEL', payload);
+    rememberLastCliInput(restored, 'CURRENT_REPLY_SENTINEL', payload, 'om_current');
     expect(restored.lastCliInput).toBe(payload.content);
     expect(restored.lastCodexAppInput).toBeUndefined();
     expect(restored.session.lastCodexAppInput).toBeUndefined();

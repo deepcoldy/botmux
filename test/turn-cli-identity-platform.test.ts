@@ -84,7 +84,7 @@ function botConfig(triggerUserAuth: unknown) {
   } as any;
 }
 const publish = (config: any, sender: string | undefined, turnId = 'om_t1') =>
-  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId });
+  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId, privateChat: true });
 const read = (tool: 'lark-cli' | 'bytedcli') => readFileSync(sessionIdentityPath(dir, SESSION, tool), 'utf8');
 const granted = (tool: 'lark-cli' | 'bytedcli') => ({
   ok: true,
@@ -195,6 +195,7 @@ describe('credentialSource = auto, machine bound', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
     expect(read('lark-cli')).toContain('中心化平台暂时不可达');
+    expect(read('lark-cli')).toContain('[reason=platform_unreachable]');
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });
 
@@ -210,6 +211,7 @@ describe('credentialSource = auto, machine bound', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(read('lark-cli')).toContain('不在同一个团队');
+    expect(read('lark-cli')).toContain('[reason=platform_not_teammate]');
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });
 
@@ -217,6 +219,7 @@ describe('credentialSource = auto, machine bound', () => {
     unionIds.set(ALICE, null);
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+    expect(read('lark-cli')).toContain('[reason=union_id_unresolved]');
     expect(grantCalls).toHaveLength(0);
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });

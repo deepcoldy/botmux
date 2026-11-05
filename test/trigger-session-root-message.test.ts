@@ -235,7 +235,8 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {
@@ -610,7 +611,8 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(CHAT, APP));
     expect(ds?.scope).toBe('chat');
     expect(ds?.session.externalTriggerTopicless).toBe(true);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('rejects cross-chat rootMessageId without creating a session', async () => {
@@ -1113,6 +1115,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(
       activeSessions.get(sessionKey(ROOT, APP)),
       expect.objectContaining({ codexAppInput: { text: '外部事件触发' } }),
+      mockRememberLastCliInput.mock.calls.at(-1)?.[3],
     );
   });
 
@@ -1399,8 +1402,9 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
 
     const ds = activeSessions.get(sessionKey(ROOT, APP))!;
     expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
-    // Loud fork keeps the legacy 2-arg shape (no turnId stamped).
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    // Loud delivery carries the same input owner without enabling suppression.
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('N1: waitForFinalOutput never arms suppression even when the option is set', async () => {

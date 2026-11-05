@@ -1,166 +1,324 @@
-# Workflow (Experimental)
+# Workflow (experimental)
 
-One fuzzy goal → auto-interrogate, orchestrate a DAG, execute concurrently; a flow that works can be saved as a **Saved Workflow** and reused. Runs are stored in `~/.botmux/v3-runs`; their state lives in the **Dashboard's v3 view** (every Feishu card carries a "Web details" link straight to it).
+Workflow turns a goal that **takes several steps** into a flow that runs on its own:
 
-> ⚠️ Workflow is **off by default**. Turn on the "Workflow" switch on the Dashboard settings page, or set `BOTMUX_WORKFLOW_ENABLED=true`. While it is off, ad-hoc orchestration and running/saving Saved Workflows are refused, but in-flight runs can still be managed with `botmux workflow cancel / retry / grant`.
+- the bot first asks you questions, one at a time, until the requirement is clear;
+- it then compiles the requirement into a **DAG** (a step graph with dependencies; each step is a "node");
+- once you confirm, it runs automatically, with independent steps in parallel;
+- a flow that worked can be saved as a **Saved Workflow** and rerun with one command.
 
-## Ad-hoc workflow
+It fits tasks with **a clear end and one deliverable**, like "research three competitors and produce a comparison report" or "pull the logs, analyze them, and make charts". You don't need it for single-step questions or ordinary code changes, and it is not meant for long-running projects where several bots keep splitting and coordinating work.
 
-### How to use it
+## Turn it on first
 
-State your goal in the Feishu topic, or send `/workflow <goal>` explicitly (equivalent to `/workflow new <goal>`). The bot walks you through end to end, one question at a time in the current topic — all you do is answer and confirm:
+Workflow is **off by default**. Turn it on either way:
 
-1. **Interrogate (grill)**: the bot asks one question at a time, each with a recommended default. Say "use the defaults / stop asking" any time.
-2. **Gate-1: confirm the requirement**: the bot gives you a summary (which steps, what each produces, acceptance criteria, explicit non-goals) and you confirm.
-3. **Auto-orchestrate the DAG**: the system compiles the requirement into an executable dependency graph.
-4. **Gate-2: confirm the flow**: the bot explains the nodes, the dependency order, and which nodes pause for approval at execution time; confirm and it starts.
-5. **Concurrent execution**: nodes run concurrently in dependency order (see "Concurrency caps" below for the defaults), popping cards in the topic as needed (see below).
+- Dashboard → "Global settings → Workflow" → enable **"Enable the workflow feature"**;
+- or set the environment variable `BOTMUX_WORKFLOW_ENABLED=true`.
 
-### What you'll encounter once it's running (human-in-the-loop)
+The switch takes effect on the next session, no restart needed. If the environment variable is set, it wins and the Dashboard switch has no effect. While it is off, starting an ad-hoc flow, running or saving Saved Workflows, and `botmux goal run` are refused; runs already in flight can still be wound down with `botmux workflow cancel / retry / grant`.
 
-Once nodes start, these card types may pop in the topic for you to handle:
+## Quick start: an ad-hoc workflow
 
-- **Approval card**: a node marked for approval at authoring time (e.g. an outbound send) pops a card **before** doing its work — you tap "✅ Approve / ❌ Reject". Options and approvers are customizable.
-- **Mid-run question**: if a node needs you to decide or supply information partway through, it pops a card — a multiple choice (buttons) or a fill-in-the-blank (text input). Once you answer, it re-runs that step with your answer and continues.
-- **Grant another loop iteration**: when a rework loop (see below) hits its iteration cap without passing, a card asks whether to "➕ grant 1 more round"; if you don't, it stays blocked.
-- **Permit a revisit**: when downstream sending an upstream node back for redo hits its budget cap, a card asks whether to "➕ permit one more revisit".
-- **Node retry**: when a node is blocked by a contract / semantic problem, a card lets you tap "🔄 Retry" to re-run it as a fresh attempt.
+Send this in a Feishu topic:
 
-> These cards persist to disk — they survive a daemon restart (and get re-posted), so no approval is lost on a restart.
+```
+/workflow Research pricing of three competitors and put it in a comparison table
+```
 
-### What a workflow can express (node capabilities)
+`/workflow <goal>` is the same as `/workflow new <goal>`. You can also just describe a multi-step task in plain words: the bot will first ask "should I run this as a workflow?" and only starts after you agree. Sending `/workflow` skips that question.
 
-The architect uses these structures when orchestrating, so the flow you see at Gate-2 may not be a straight line:
+Everything then happens in the current topic. You only answer questions and click confirm:
 
-- **Sequential dependencies + concurrency**: nodes with no dependency run in parallel.
-- **Conditional branching**: after a node produces a structured result, downstream edges activate by that result — only the matched branch runs; un-taken branches are skipped at zero cost; multiple upstreams can join by "all / any / quorum".
-- **Structured rework loop**: model "fix it until it passes" as a loop node (e.g. `code → test` repeated until the test passes); at the iteration cap it pauses to ask whether to grant more rounds.
-- **Automatic revisit**: when downstream finds an upstream product inadequate, it can send the upstream (and its downstream cone) back for redo, carrying a "why / what was wrong" note; a budget cap prevents infinite loops.
+```
+ ① Grill ──▶ ② Confirm spec ──▶ ③ Compile ──▶ ④ Confirm flow ──▶ ⑤ Run
+  (Q&A)       (Gate-1)           (DAG)         (Gate-2)          (nodes in parallel)
+```
 
-### Intervening mid-run (CLI)
-
-Besides tapping cards, you can drive it by command (`runId` is the key throughout):
-
-| Command | Effect |
-|------|------|
-| `botmux workflow start <runId>` | After approve-dag, hand to the daemon to run (with Feishu approval cards) |
-| `botmux workflow retry <runId> [--node <id>] [--reason <text>]` | Re-run a blocked node; the main bot must give `--reason` in a turn a run event woke |
-| `botmux workflow grant <runId> [--loop <id>]` | Grant one more round to a loop that ran out of iterations |
-| `botmux workflow cancel <runId> [--reason <text>]` | Cancel an in-flight run |
-| `botmux workflow status <runId> [--json]` | Show a running flow's current version, node states and any change awaiting confirmation (used in the run's main topic, normally by the main bot) |
-| `botmux workflow edit <runId> --patch-file <file\|-> --base <version> [--reason <text>]` | Change a running flow: one set of changes that takes effect as a whole or not at all; `--base` is the current version read with `status` (normally used by the main bot, see the next section); the main bot must give `--reason` in a turn a run event woke |
-| `botmux workflow ask-human <runId> --node <id> --reason <text>` | Hand a node to a person: stop its running turn and block it (waiting for a person), with a blocked card in the main topic; only in the initiator's own turn or a turn this run's events woke (normally used by the main bot, see "Hand nodes to bots in the chat") |
-
-Changed your mind: requirement → `botmux workflow revise-spec <runId>` (steps back to re-clarify, old DAG discarded); flow only → `botmux workflow revise-dag <runId>` (re-orchestrate only).
-
-> The three "continue" entry points are not interchangeable: a blocked node uses `retry`, a loop out of iterations uses `grant`; and "revisit budget exhausted" can **only be permitted by tapping the Feishu card — there's no CLI command for it**.
-
-### Changing a flow while it runs
-
-Once a run has started its flow can still change: add or remove nodes, change a node's goal / acceptance / outputs / timeout / approval, change dependencies, move a node to another bot, or redo a finished node. Just tell the main bot in the main topic what to change; it reads the current version and submits the change. Every change makes a new version (version 2, 3, …), and the parts of one change take effect together or not at all. When two people change the flow at the same time the first one wins; the main bot re-reads the latest version and resubmits the other.
-
-**Who can change it, and when a confirmation is needed**
-
-- A change the **initiator** asks for in the main topic takes effect directly. The one exception is adding or changing a node with an external action (host nodes such as sending a Feishu message or creating a scheduled task): that posts a "flow change" card in the main topic for the initiator to approve.
-  - Using a bot this run has not approved also takes effect directly, and the bot becomes part of the run's approved bots — the blocked card's reassign picker offers it from then on.
-  - Removing or relaxing a human approval, raising a loop's maximum rounds, a longer timeout, or more than twice as many nodes as were originally approved all take effect directly.
-- A change asked for by **anyone else** in the chat always becomes a "flow change" card for the initiator to approve or reject; nothing changes until then.
-- A change the **main bot decides on by itself** from how the run is going (including in a turn a scheduled task started) needs the initiator's confirmation if it does any of these, and takes effect directly otherwise:
-  - uses a bot this run has not approved (in a new node or a reassignment) — once approved, the bot is part of the run's approved bots too;
-  - adds or changes a node with an external action;
-  - removes or relaxes a human approval: removing it, changing its options, or changing who may approve (adding one needs no confirmation);
-  - raises a budget: a loop's maximum rounds, a timeout longer than the node had, or more than twice as many nodes as were originally approved.
-
-Whether a change is "the initiator's" depends on who sent the message that started that turn. A turn the main bot started by itself, for a run event or a scheduled task, stays the main bot's decision even if the initiator chimes in meanwhile (the bot may not have read that message yet); anyone else chiming in makes it that person's change. Automatic turns queued after it (a subtask's report, another run event, a scheduled task) are not chiming in. The card lists the nodes added, removed and changed, the new bots, and why it needs confirmation. While it waits, the nodes it touches are not dispatched and everything else keeps running; questions on those nodes cannot be answered and their blocked cards cannot reassign until the card is decided. If another change takes effect directly in the meantime: when both involve the same nodes, or the waiting change would no longer mean the same thing (or no longer apply) on the new version, the waiting card is voided and the main bot says why; when they are unrelated, the waiting change moves on to a new version and keeps waiting — its card updates in place, and tapping the old card still counts.
-
-**What happens to a node that is running or waiting for approval**
-
-- **Running**: the current round is voided (the process or the bot's current turn is stopped, and anything it submits afterwards no longer counts), and the node starts over with the new definition.
-- **Waiting for approval**: that approval card is voided — frozen as "the flow changed, this approval no longer applies" — and the node goes through approval again with the new definition.
-- **Blocked**: a definition-only change leaves it blocked for a later retry; a reassignment re-runs it on the new bot right away. If its approval had already passed, a changed definition needs approval again: a retry or reassignment first posts a new approval card and runs only once it is approved. A question it had asked is voided too: the card keeps only "🔄 Re-run with the new definition (needs approval again)", and nothing starts until someone taps it.
-- **Not started**: scheduled with the new definition.
-- Skipped and cancelled nodes cannot change (add a new node instead); a running loop's body cannot change, but what comes after the loop can.
-
-**A finished node can only be redone**
-
-A finished node cannot be removed or redefined (downstream nodes may already use its products); it can only be redone, or get new nodes after it. Redoing it also re-runs the downstream nodes that used its old products, and spends revisit budget (shared with automatic rework: by default once per node, 8 times per run). When the budget is spent:
-
-- A redo the initiator asks for adds what it needs by itself and takes effect (one more per node redone), recorded as added by the initiator — no card to tap.
-- Otherwise (a redo the main bot decided on, or a change that still waits for confirmation) a "more redo budget" card appears in the main topic: once the initiator taps "➕ Add 1", have the main bot submit the change again. One card is posted per exhaustion; when the budget runs out again a new card is posted, and the old one says it has expired.
-
-**Seeing the version**
-
-- **Progress card**: shows "version N · last change: …"; while a change awaits confirmation it adds "version N awaits the initiator's confirmation; the nodes it touches are paused".
-- **Board (Dashboard v3 view)**: drawn from the version in effect; added, changed and pending nodes are marked, and the "flow versions" panel lists each version's time, author, summary and whether it was confirmed.
-
-**Saving as a Saved Workflow**
-
-`/workflow save last` saves the run's **final version in effect** — the flow that actually ran — and the save confirmation card says how many times the run was changed while running. A run started from a Saved Workflow can be changed while running too; that only affects the run. To update the saved definition, save again.
-
-**Both execution modes**
-
-Changing a running flow works whether nodes run in temporary processes or are handed to bots in the chat (next section). For a node handed to a bot, a changed definition or a reassignment sends a new handoff in the same place, saying the requirements changed.
-
-> ⚠️ **Do not downgrade the daemon under a run whose flow was changed.** An older daemon does not know about versions: it ignores the changes and keeps running version 1 — it may run nodes that were removed, run changed nodes with their old definition, and skip changes still waiting for confirmation. If you must downgrade, cancel those runs first or wait for them to finish. Runs whose version on the board is above 1 are the changed ones.
-
-### Hand nodes to bots in the chat (experimental, off by default)
-
-By default each node runs in a temporary CLI process the daemon starts and discards. The Dashboard's global settings have an experimental switch next to "Enable the workflow feature": **Hand workflow nodes to bots in the chat**. When it is on:
-
-- **Only runs approved afterwards are affected**: the executor is frozen into the run at Gate-2 approval (or Saved Workflow launch); runs already in flight keep theirs.
-- **A node topic (the default)**: the main bot posts a node card as a new topic (no mention), then a handoff card in it that mentions the bot executing the node (the main bot itself when none is assigned). The handoff lists the goal, acceptance, inputs (upstream products arrive as attachments), required outputs, deadline and the exact submit command; the node card is updated in place as the node progresses.
-- **The main topic (small nodes)**: a one-step job (summarize, rewrite, format, look up one number) can be handed off right in the main topic instead: the handoff card is a reply in the main topic mentioning the executing bot, and a status line at its top is updated in place in place of a node card; the bot's progress and report card stay in the main topic too. The bot's existing session in the main topic is reused (a new one opens when it has none); a node of the main bot itself runs in the main session. While that session is busy the handoff waits in its queue — entering the queue counts as accepting it, and the deadline counts from when its own turn really starts; it may wait up to one more node timeout (at least an hour), after which it is blocked with that reason and a suggestion to use a node topic. The session does not become a node session: its skills stay, the "Workflow ›" entry on its signature row appears only while this node's attempt is in progress, and a submission from it is refused while the handoff is still queued or after the attempt ended. One bot's main-topic session carries one node at a time: a main-topic node of another run handed to it meanwhile is blocked, saying it is busy with another node. When the node is stopped (timeout, cancel, reassignment) the running turn is interrupted even if someone's message was folded into it — that message has to be sent again. While the node is in progress, anything said to this bot in the main topic counts as part of the node and is stopped with it; to talk to the bot about something else, wait for the node to finish, or put the node in a node topic.
-- **Who decides the placement**: the Architect places each node and gives a reason; every Gate-2 line says "main topic" or "node topic" with it. Re-place with revise-dag before approval; once running, only a node that has not started may move. Hard rules are checked at approval, on every runtime change and on reassignment, and a violation is refused naming the rule: two main-topic nodes of one bot must be ordered (one depends on the other — the bot has one session in the main topic); the same holds for the main bot's own main-topic nodes, and while one runs, wake-ups for the main bot wait behind it; a main bot that keeps one session for the whole group (its main session is not in a topic) cannot use the main topic. A target daemon too old for main-topic handoffs blocks the node with that reason. The board shows a main-topic node's handoff time and card title so it can be found in the main topic; there is no link to a single message.
-- **Completion is the structured submission**: the bot runs `botmux report --dispatch-root <handoff message id> --status completed --output <key>=<path> --result-file result.json --content-file summary.md`; the node completes only when it validates, otherwise the command lists what is missing and the bot can resubmit in the same turn. `--status blocked "reason"` blocks the node. Files are capped at 4 MiB each and 8 MiB per submission — put branch names or links for bigger products into result.json.
-- **The node's session only does that node**: it is not offered the workflow skills or the skills that pass work on to other bots (`botmux-orchestrate`, `botmux-handoff`), and `botmux skill show` refuses them. Two exceptions: an existing session reused for a handoff in the main topic (it loaded them when it started), and CLIs whose skill injection is set to the global directory (the files live in a directory shared by every session on the host).
-- **Timeouts and cancellation** stop the executing bot's current turn (its session is kept).
-- **Who executes which node**: telling the grill "let the docs bot do this step" records a named bot (`assignee`) on that node, and the architect must use it; every other node gets a bot the architect picks from the bots currently usable in the chat (in the chat, online, supported CLI) with a one-line reason, defaulting to the main bot when unsure. The Gate-2 summary lists "node → bot (CLI): reason" and marks with ⚠️ every named bot that cannot be used (not in the chat, offline, no bot of that name). Change an assignment by revising the spec.
-- **"Reassign" on the blocked card**: when a node is blocked, its blocked card has a "reassign" picker listing the bots approved for this run that are usable now (the ones chosen at approval, plus any a flow revision brought in: made directly by the initiator, or approved by them on a revision card). Only the person who started the workflow can confirm; the node then runs as a new attempt on the new bot. To move it to a bot outside that set, have the main bot submit a flow revision for the initiator to confirm. While a revision touching the node waits for confirmation, decide that card first.
-- **The main bot is woken by run events**: only when a node is blocked or fails, the executing bot reports it cannot do a node, or a node marked as a checkpoint (`checkpoint: true`) completes — not on every completion. The main bot gets a turn in the main topic, looks at what happened, and retries, reassigns (within the bots approved for the run), changes the flow, or hands the node to a person, then says in the topic what it did. While the main session is busy the wake-up waits in the daemon until that turn ends and then starts as a turn of its own — it never mixes into someone else's running turn; with no session in use in the main topic, a new one is opened there (as a message in the topic would), and a closed session is never resumed. Each event wakes it once, across daemon restarts too.
-- **A reason every time**: an automatic retry, reassignment or redo in such a turn must give `--reason`; handing a node to a person is `botmux workflow ask-human <runId> --node <id> --reason <text>`. There is no attempt limit — the main bot judges when to hand over (repeated failures, uncertainty, information or a decision only a person can give). The node card shows the latest "main bot retried / reassigned / redid: reason" or "handed to a person: reason", and the board's node panel lists them all. A handed-over node stops, shows as waiting for a person, and gets a blocked card in the main topic (retry / reassign / cancel) with no extra deadline; once the decision is recorded, a late submission from the bot no longer counts, and an earlier block of that node no longer wakes the main bot.
-- **Checkpoints**: the architect marks `checkpoint: true` on nodes whose result should be looked at before deciding how the rest goes; ask for one to be added or removed before Gate-2, or change it while running with a flow change's `updateNode` (it applies directly and does not void the work in progress). When a checkpoint completes, the nodes that depend on it wait until the main bot has looked at the result and its turn ended (it may change the rest of the flow in that turn). When several checkpoints complete together, the main bot looks at them one at a time, and each is released only when its own turn ends. If the wake-up cannot be delivered, the main bot's session is closed or its CLI stops midway, or an hour passes, the flow goes on as it was, and the node card and the board say so. Checkpoints only apply to runs whose nodes are handed to the bots in the group; once a run has ended nothing is held.
-- Private-chat runs, runs without a topic root, or a disabled multi-topic switch keep temporary processes; the approval says why. Approval is refused (with a per-node reason) when a node's bot is not configured on this host, not in the chat, offline, cannot get the in-chat collaboration grant, or (in a normal group) folds topics into one group session (reply mode chat / shared); nodes with directory outputs are refused too. Bots are never added to chats automatically. A submission made while the main bot is offline is staged and committed when it comes back.
-- **A working directory (`approve-dag --working-dir <dir>`)**: nodes run in the executing bots' own sessions, so the directory must lie within the range each executing bot (the main bot included) is configured for: its default working directory (or the Oncall-mode directory) and its repo directories (`workingDir` / `workingDirs`), each one itself or anything below it. The directory must already exist (it is never created); `~` is expanded, trailing slashes are dropped and symlinks are resolved before comparing, so a link inside the range pointing outside it does not count; when you pass a symlink, the directory it points to is what is used (changing the link later does not affect the run). When a node's bot does not allow the directory (or configures none at all), approval is refused with one "node → bot: reason" line per node. Without the flag every bot uses its own default directory as before.
-  - The directory is frozen into the run at approval; the executing bot checks it again against its configuration **at that moment** before it starts the node session. If its configuration changed after approval and the directory is no longer in range, the node is blocked with the reason (it never silently falls back to the bot's default directory); add the directory to that bot's default working directory or repo directories and retry, or reassign the node.
-  - Bots a flow revision brings in (reassignment, new nodes) are not checked at approval; they are checked the same way when they start the session.
-  - When the node topic already has a session of that bot running in another directory (someone mentioned the bot there first, or used `/cd`), the node is blocked too rather than handed to that session; close that session and retry.
-  - When the executing bot's daemon is older than the main bot's and does not know about the directory, nothing is handed off and the node is blocked saying so; upgrade it and retry, or reassign.
-
-#### Hand the initiator's identity to node bots (experimental, off by default)
-
-A second switch in the same block, **Hand the initiator's identity to node bots**, applies only to runs whose nodes are handed to bots:
-
-- **Off (the default)**: node bots run as themselves, exactly as without the switch.
-- **Runs approved while it is on** freeze the initiator (the person who approved Gate-2 for an ad-hoc run, or who sent `/workflow run` for a Saved Workflow, in their own message in the chat) and the tools that person could use as themselves on the main bot at that time (the main bot's trigger-user-auth tools). Every handoff then carries its own delegation, signed by the main bot from that record; a node bot with trigger-user auth runs those tools as the initiator. The delegation can only be narrower than what the initiator had on the main bot, and is never passed on through a node's report.
-- **Where it is valid**: while this handoff is still going (the run has not ended, the handoff was not cancelled, timed out, retried or reassigned, and the node is not done), in this chat, and only for the run's approved bots (the ones chosen at approval, plus any a flow revision brought in directly by the initiator or with their approval on a revision card, and a bot the initiator reassigned the node to; a revision still waiting for confirmation does not count). When the node submits its result, or the handoff is stopped, the identity its current turn was given is withdrawn at once; the node bot also re-checks on every call of those tools, so a stop that never arrived still refuses. Removing the initiator from the chat does not interrupt a turn already running; it takes effect the next time the identity is published.
-- **An identity is asked for only when it is really needed**: when the initiator cannot go along, the run is still approved and the node still handed off, just without the initiator, and the approval result and the handoff say why. That covers an approval in a scheduled task or another automatic turn, a main bot missing the contact scope or failing the lookup, a main bot without trigger-user auth, an initiator who left the chat or may not talk to that bot, and a bot outside the approved set. A node bot check that cannot run right now is retried automatically for about a minute first. A tool that really needs a person's authorization refuses and asks for it when called (a missing personal authorization uses the usual `botmux auth request` flow); the bot can explain what it needs with `botmux report --status blocked` so the main bot hands it to a person. Nothing ever runs as the bot or its owner instead.
-- **When a node bot passes work on**: with `botmux dispatch` or `botmux send --mention` to a bot of the run's approved set in this chat, the initiator goes along (only narrower) and ends with this node's handoff; to any other bot the work is passed on as usual, without the initiator. A receiving session that keeps identities in files and cannot re-check them on every call is not given a passed-on identity at all; a tool that needs the person refuses there with the reason.
-
-#### The workflow graph in the Feishu sidebar
-
-In this mode the task messages — node cards, handoff cards, and the executing bot's reply and report cards in the node topic; for a main-topic node the handoff card, the report card and the bot's reply cards while that node's attempt is in progress — carry a "Workflow ›" button at the right end of their signature row, and in the main topic the "Web 详情（需登录）" button of the progress card, the flow-revision confirmation card and the rerun-grant card becomes the same entry. It opens the run's live graph in the Feishu sidebar (laid out top to bottom, refreshed every 2 seconds, tap a node for details). Runs executed by temporary processes and ordinary session cards have no such button, and neither does a host whose Dashboard address cannot be determined.
-
-The link carries no credential; what you see depends on who you are:
-
-- **Dashboard admins**: the full view, same as the Dashboard detail page, with terminal and log access.
-- **Current members of the chat**: a reduced view — node names, goals, executing bot, status, duration, where each node landed, and the flow version history once the flow was changed at runtime (for each version that took effect: number, time, who changed it — main bot / initiator / another member —, the change summary, and whether the initiator confirmed it; no edit notes, and changes still waiting for confirmation are not shown); no terminals, logs, product contents, parameter values or error details. Membership is checked live through the main bot; someone who leaves the chat loses access within a minute.
-- **Everyone else**: no access.
-
-Members are identified through the existing Feishu H5 passwordless login, with no extra switch: with H5 login configured (`BOTMUX_DASHBOARD_FEISHU_H5_*`), members outside its allowlist can open the sidebar too, but only get a session limited to the workflow sidebar and cannot reach any other Dashboard page. People on the H5 allowlist cannot see run details in the Dashboard either, so the sidebar gives them the member view too.
-
-**Without H5 login only admins can view it**: the sidebar is a separate browser context that cannot carry your Dashboard login, so the button then opens the run's Dashboard page in the browser instead (like the progress card's former "Web 详情"), where your existing Dashboard login applies.
-
-### Concurrency caps
-
-How many nodes of one run execute at once is bounded by three caps, all applied together (the tightest one wins):
-
-| Cap | Meaning | Default |
+| Step | What happens | What you do |
 |---|---|---|
-| `global` | nodes in flight for the whole run | 4 |
-| `perBot` | nodes in flight on the same bot (Lark app) | 1 |
-| `perCli` | nodes in flight on the same CLI type (claude-code / codex…) | 2 |
+| ① Grill | The bot asks one question at a time, each with a recommended answer | Answer; say "use defaults / stop asking" when it's enough |
+| ② Gate-1: confirm spec | The bot summarizes: the steps, what each produces, acceptance criteria, what is out of scope | Confirm, or point out what to change |
+| ③ Compile | The system turns the spec into a flow graph | Wait |
+| ④ Gate-2: confirm flow | The bot explains the nodes, their order, and which nodes will stop for your approval | Confirm to start |
+| ⑤ Run | Nodes run in dependency order; independent ones run at the same time | Handle cards as they pop up (next section) |
 
-The defaults are conservative: every node spawns a full CLI process, and one CLI type usually shares one subscription account that rate-limits. With the defaults, nodes on the same bot run one after another. The caps are per run: two runs going at once can each use their full caps. If your CLI is backed by a pay-as-you-go API and the host has memory to spare, raise them in `~/.botmux/config.json`:
+Changed your mind?
+
+- The requirement changes → `botmux workflow revise-spec <runId>` goes back to clarification and discards the current flow;
+- Only the flow changes → `botmux workflow revise-dag <runId>` recompiles just the flow.
+
+You can follow runs on the Dashboard **"Workflows"** page; the "Web 详情（需登录）" (Web details, login required) button on Feishu cards jumps straight to the run.
+
+## Cards you may see while it runs
+
+| Card | When | Buttons |
+|---|---|---|
+| Approval card | **Before** a node marked for approval acts (e.g. sending a message out) | "✅ 通过 / ❌ 拒绝" (approve / reject), or custom options; who may approve can be restricted |
+| Mid-run question | A node needs your decision or more information halfway | Click an option, or type into the input box; the step reruns with your answer |
+| Extend a loop | A rework loop used up its rounds without passing | "➕ 追加 1 轮" (add 1 round); if you don't click, it stays blocked |
+| Allow a revisit | The downstream has used up its "send upstream back for rework" budget | "➕ 准许回溯 +1" (allow +1 revisit); if you don't click, it stays blocked |
+| Blocked card | A node is blocked, e.g. its output doesn't meet the contract or a permission is missing | "🔄 重试" (retry) reruns the node as a new attempt |
+| Progress card | Progress summary of the whole run | "Web 详情（需登录）" |
+
+All of these cards are persisted to disk and survive a daemon restart (or are re-sent), so approvals are never lost.
+
+## What a flow can contain
+
+The compiled flow isn't always a straight line. It can include:
+
+- **Parallelism**: nodes that don't depend on each other run at the same time.
+- **Conditional branches**: after a node produces a structured result, only the matching branch runs; the others are skipped at no cost. When several upstreams join, you can require "all done / any done / a quorum".
+- **Rework loops (loop)**: "keep fixing until it passes" becomes one loop node, e.g. `write code → run tests` repeated until tests pass. When it hits the round limit it stops and asks whether to add rounds.
+- **Automatic rework (revisit)**: a downstream node that finds the upstream output wrong can send the upstream (and its downstream) back for rework with "what's wrong and why". There is a limit to prevent endless loops: 1 per node pair and 8 per run by default.
+- **External action nodes (host nodes)**: no model involved, they do one deterministic thing. There are three kinds today: send a message to the chat (`feishu-send`), reply in the topic (`feishu-reply`), and create a scheduled task (`botmux-schedule`). These nodes **always go through an approval card first**, and the card shows the exact content about to be executed; they are never placed inside a loop or a revisit range, so they can't fire twice.
+
+## Save and reuse (Saved Workflow)
+
+Once an ad-hoc workflow finishes, you can save it as a Saved Workflow and run it again later:
+
+| To do this | In Feishu | On the command line |
+|---|---|---|
+| Save the latest run | `/workflow save last [name]` | `botmux workflow save last [name]` |
+| Save a specific run | `/workflow save <runId> [name]` | `botmux workflow save <runId> [name]` |
+| Run | `/workflow run <name> [key=value ...]` | `botmux workflow run <name\|workflowId> [--param key=value ...]` |
+| List saved ones | `/workflow list` | `botmux workflow list [--json]` |
+| Show a definition | `/workflow show <name>` | `botmux workflow show <name\|workflowId>` |
+| Cancel a running run | `/workflow cancel <runId>` | `botmux workflow cancel <runId> [--reason <text>]` |
+
+Things to know:
+
+- **Only runs that have stopped can be saved** (succeeded, failed or blocked). If it is still running (or waiting for approval), you'll be told to save after it finishes.
+- **The final effective version is saved**: if the flow was edited mid-run, what's saved is the version that actually ran, and the confirmation says how many times it was edited.
+- **Where it's saved**: by default it is visible **in this chat only**. To use it in the bot's other chats too, send `/workflow save last <name> --global` yourself in Feishu (you need operate permission on the bot).
+- **Parameters**: saving an ad-hoc run directly makes an exact replica with no parameters. To turn concrete values (a region, a date) into parameters, send `/workflow save last <name> --distill` yourself in Feishu: you first get a parameter summary card and the workflow is saved to this chat only after you confirm the whole set. This is still experimental: it currently supports only Claude Code bots on Linux without a launch wrapper, and can't be combined with `--global` or `--ack-unsafe`.
+- **Passing values**: in Feishu write `key=value`, and quote values with spaces: `key="multi word"`. On the command line, use `--param key=value` for plain values and `--param-json key=<json>` for objects or arrays, e.g. `--param-json tags='["urgent","cn"]'`. Parameters are for **business variables** (chats, switches, thresholds); the task itself belongs in the flow, not in a parameter.
+- **Possibly sensitive content**: if saving detects something that looks like a secret or a local absolute path, it refuses and lists the warnings. Once you've checked it's safe, resend the original command with `--ack-unsafe` at the end. `--global`, `--distill` and `--ack-unsafe` can only be sent by you in Feishu; the bot never adds them for you.
+- To start an ad-hoc goal that begins with the word `run`, write `/workflow new run ...`; otherwise it is treated as running a Saved Workflow.
+- A run started from a Saved Workflow can also be edited mid-run; that only affects this run. To update the saved definition, save again.
+
+## Intervening from the command line
+
+Besides clicking cards, you can use commands. The `runId` identifies a run throughout and is shown on cards and in the Dashboard. The main bot usually calls these for you in the conversation; you can also use them by hand when troubleshooting:
+
+| Command | What it does |
+|------|------|
+| `botmux workflow start <runId>` | Hand the run to the daemon after Gate-2 approval (with Feishu approval cards) |
+| `botmux workflow retry <runId> [--node <id>] [--reason <text>]` | Rerun a blocked node |
+| `botmux workflow grant <runId> [--loop <id>]` | Add one round to a loop that ran out |
+| `botmux workflow cancel <runId> [--reason <text>]` | Cancel an in-flight run |
+| `botmux workflow status <runId> [--json]` | Show the current version, node states and pending edits |
+| `botmux workflow edit <runId> --patch-file <file\|-> --base <version> [--reason <text>]` | Edit the flow mid-run (next section); `--base` is the version read from `status` |
+| `botmux workflow ask-human <runId> --node <id> --reason <text>` | Hand a node to a human: stop its current attempt, mark it blocked and post a blocked card |
+
+Don't mix up the three "continue" paths: a blocked node uses `retry`, an exhausted loop uses `grant`; **an exhausted revisit budget can only be released from the Feishu card**, there is no command for it.
+
+## Editing the flow mid-run
+
+After a run starts, the flow can still change: add or remove nodes; change a node's goal, completion criteria, outputs, timeout, approval or dependencies; reassign the executing bot; or redo a finished node.
+
+**How**: tell the main bot in the main topic what to change. It reads the current version and submits the edit.
+
+- Every edit creates a new version (v2, v3, …);
+- the items in one edit apply all together or not at all;
+- when two people edit at once, the first wins; the main bot reads the latest version and resubmits the later one.
+
+### Whose edits need confirmation
+
+| Who proposed it | Result |
+|---|---|
+| **The initiator** (asking the main bot in the main topic) | Applies directly. One exception: adding or changing an external action node (send a message, create a scheduled task) needs the initiator to click "Agree" on a "flow edit confirmation" card |
+| **Other chat members** | Always becomes a "flow edit confirmation" card; applies only after the initiator clicks "Agree" |
+| **The main bot on its own** (including a turn triggered by a scheduled task) | Needs the initiator's confirmation if any rule below matches; otherwise applies directly |
+
+For the main bot's own edits, confirmation is needed when it:
+
+- uses a bot this run hasn't approved yet (a new node or a reassignment);
+- adds or changes an external action node;
+- removes or loosens a human approval (removes an approval, changes approve options, changes approvers; **adding** an approval needs no confirmation);
+- raises limits: a higher loop maximum, a longer timeout, or more than twice the node count approved at the start.
+
+When the initiator makes these changes they apply directly, and any new bot used joins the run's approved set, so it can be picked when reassigning from a blocked card later.
+
+<details>
+<summary>Fine print: interjections, concurrent edits, waiting for confirmation</summary>
+
+- Whether an edit "came from the initiator" depends on **who sent the message that triggered this turn**. In a turn the main bot started on its own (run event or scheduled task), an interjection by the initiator still counts as the main bot's edit (it may not have seen that message yet); an interjection by another member counts as that member's edit. Automatic turns queued after it (sub-task reports, another event wake-up, a scheduled task) are not interjections.
+- The confirmation card lists added, removed and changed nodes, any new bots, and why confirmation is needed.
+- While waiting, the affected nodes pause dispatch and the rest keep running; question cards on those nodes can't be answered and blocked cards can't reassign until the confirmation card is handled.
+- If another edit applies before confirmation: when both touch the same nodes, or the pending content would change on the new version, the pending card is voided and the main bot explains why; if they're unrelated, the pending edit rolls forward to the new version and keeps waiting, the card updates in place, and clicking the old card still counts.
+
+</details>
+
+### What happens to a node you edit
+
+| Node state | After the edit |
+|---|---|
+| Running | The current attempt is voided (its process or bot turn is stopped and anything it submits later is ignored), and it restarts with the new definition |
+| Waiting for approval | The approval card is voided, showing "the flow changed, this approval is void", and approval starts over with the new definition |
+| Blocked | A definition-only change keeps it blocked until retried; a reassignment reruns it on the new bot right away. If it had been approved before, it needs approval again; its earlier question card is voided and only shows "🔄 按新定义重跑（需重新审批）" (rerun with the new definition, needs re-approval), which you must click |
+| Not started | Scheduled with the new definition |
+| Skipped / cancelled | Can't be edited; add a new node if needed |
+| Loop running | Its body can't be edited; its downstream can |
+
+### Finished nodes can only be redone
+
+A finished node can't be deleted or redefined (its output may already be used downstream). You can only **redo** it, or add nodes after it. A redo reruns the downstream nodes that used its old output, and consumes the revisit budget (shared with automatic rework: 1 per node pair and 8 per run by default). When the budget runs out:
+
+- a redo asked for by the initiator tops the budget up automatically and applies, no card needed;
+- otherwise an "add redo budget" card appears in the main topic; after the initiator clicks "➕ 追加 1 次" (add 1), ask the main bot to resubmit the edit. Old cards say they've expired when clicked.
+
+### Where to see versions
+
+- **Progress card**: shows "第 N 版 · 最近修改：…" (version N · last edit: …), and notes when an edit is waiting for confirmation.
+- **Dashboard Workflows page**: draws the currently effective version and marks new, changed and pending nodes; the "flow versions" panel lists each version's time, actor, summary and whether it was confirmed.
+
+> ⚠️ **Don't downgrade the daemon while edited runs exist.** An older daemon doesn't understand version records: it ignores the edits and continues on version 1, which can run deleted nodes, run edited nodes with their old definitions, and bypass pending edits. If you must downgrade, cancel those runs or wait for them to finish first. Runs showing a version above 1 on the board are the edited ones.
+
+## Hand nodes to bots in the chat (experimental, off by default)
+
+By default each node runs in a temporary CLI process started by the daemon and destroyed when done; the chat doesn't see the work.
+
+Turn on **"Hand workflow nodes to bots in the chat"** under Dashboard "Global settings → Workflow", and nodes are executed by bots in the chat, in their own sessions, visible to everyone:
+
+```
+Main topic (where the run started)
+ ├─ Node topic A: node card + handoff card @DocBot ──▶ DocBot works ──▶ botmux report submits outputs
+ ├─ Node topic B: node card + handoff card @CodeBot ──▶ ...
+ └─ Small jobs in the main topic: handoff card replies in the main topic @SomeBot
+```
+
+- **Only runs approved afterwards are affected**: the execution mode is fixed at approval (Gate-2, or when a Saved Workflow starts); runs already in flight finish the old way.
+- **Temporary processes are still used** for runs started in a private chat, runs without a topic root, or when [multi-topic collaboration](/en/multi-topic) is off on this machine; the approval result says why.
+- If unsure, or if the chat shouldn't get extra node topics and bot conversations, leave it off.
+
+### Who runs which node
+
+- Say "let DocBot do this step" while clarifying, and that node is assigned to it.
+- Unassigned nodes get a bot picked from those currently available in the chat (in the chat, online, CLI supported), with a one-line reason; when unsure, the main bot takes it.
+- The Gate-2 summary lists "node → executing bot (CLI): reason"; an assigned bot that can't be used (not in the chat, offline, not found) is marked ⚠️. Go back to the draft to change it.
+
+### Two placements: node topic / main topic
+
+| Placement | Good for | What it looks like |
+|---|---|---|
+| **Node topic** (default) | Most nodes | The main bot posts a node card as a new topic, then a handoff card in it @-mentioning the executing bot. The handoff card states the task, completion criteria, inputs (upstream outputs attached), outputs to deliver, deadline and the submit command; the node card updates in place as status changes |
+| **Main topic** | Small one-step jobs: summarize, rewrite, format, look up a number | The handoff card replies in the main topic @-mentioning the executing bot, with a status line on top that updates in place; no extra topic |
+
+Compilation assigns each node a placement with a reason, and every line of the Gate-2 summary says "main topic" or "node topic". Before approval you can rearrange with `revise-dag`; after the run starts, only nodes that haven't started can change.
+
+<details>
+<summary>Main-topic placement rules and limits</summary>
+
+- If the executing bot already has a session in the main topic it is reused, otherwise a new one is opened; the main bot's own nodes run in the main session.
+- If that session is busy, the handoff queues; being queued counts as accepted, and the deadline starts when the turn actually begins. It waits at most one more node timeout (at least 1 hour); if it never starts it becomes blocked with the reason, and a node topic is suggested instead.
+- A bot has only one session in the main topic, so two main-topic nodes of the same bot must depend on each other; the same applies to the main bot's own main-topic nodes. If another run hands a main-topic node to that busy bot, the node becomes blocked with the reason.
+- If the main bot uses "one session for the whole chat" mode in this chat, main-topic placement can't be used. If the executing bot's daemon is too old to support main-topic handoff, the node becomes blocked with the reason.
+- While the node runs, whatever you say to that bot in the main topic is part of the node, and stops with it when the node is stopped (timeout, cancel, reassign); a message merged into that turn needs resending. To chat about something else, wait for the node to finish or use a node topic.
+- That session doesn't turn into a node session: its skills don't change, and submissions are only accepted during this execution — not while queued and not after it ends.
+- The Dashboard node details show the handoff time and handoff card title for main-topic nodes, so you can find them in the main topic.
+
+</details>
+
+### How the executing bot delivers
+
+When done, the executing bot runs:
+
+```bash
+botmux report --dispatch-root <handoff message id> --status completed \
+  --output <key>=<path> --result-file result.json --content-file summary.md
+```
+
+- The node completes only when the submission passes its contract; otherwise the missing items are listed, and it can resubmit in the same attempt after fixing them.
+- If it can't do the job, `botmux report ... --status blocked "reason"` marks the node blocked and posts a retry card in the main topic.
+- Each file ≤4 MiB, ≤8 MiB per submission; for bigger outputs, put a branch name or link in `result.json`.
+- If the main bot is offline, submissions still go through: results are held and recorded once the main bot is back.
+- A node session only does that node: it can't see workflow skills or the skills for handing work on (`botmux-orchestrate`, `botmux-handoff`). Exceptions: an existing session reused in the main topic, and CLIs whose skill injection mode is "global directory".
+
+### Timeouts, blocks and reassignment
+
+- **Timeout**: 30 minutes by default, counted from acceptance. On timeout the node becomes blocked and the executing bot's current turn is stopped.
+- **Cancel**: cancelling the workflow stops each node's current turn but doesn't close their sessions.
+- **Reassign**: blocked cards get a "选择接手的 Bot" (pick a bot to take over) dropdown listing bots approved for this run that are still available (chosen at approval, plus those added by mid-run edits). Only the initiator can click "🔀 确认改派" (confirm reassign); the node then reruns on the new bot. For a bot outside that set, have the main bot submit a flow edit for the initiator to confirm.
+
+### When the main bot is woken
+
+The main bot doesn't watch every node. It is woken only when:
+
+1. a node is blocked or fails;
+2. an executing bot reports it can't do the job;
+3. a node marked as a **checkpoint** (`checkpoint: true`) finishes.
+
+The main bot then decides to retry, reassign (within the run's approved bots), edit the flow, or hand it to a human with `botmux workflow ask-human`, and says what it did in the topic. Automatic retries, reassignments and redos must give a reason; the node card shows the latest "main bot auto retry / reassign / redo: reason" or "handed to a human: reason", and the Dashboard node details list every record.
+
+- If the main session is busy, the wake-up waits for that turn to end and then starts its own turn, never mixing into someone else's; if there's no active session in the main topic, a new one is opened.
+- Each event wakes it once, even across daemon restarts.
+- A node handed to a human stops and shows "waiting for a human"; a blocked card (retry / reassign / cancel) appears in the main topic with no timeout. After that, a submission from the executing bot no longer counts.
+
+**Checkpoints** suit nodes where "we need to see the result before deciding what's next". Compilation marks them automatically, and you can ask to add or remove one before Gate-2; changing it mid-run applies directly. When a checkpoint finishes, nodes that depend on it pause until the main bot has looked and its turn ends. If the wake-up can't be delivered, the main bot's session is closed, or it doesn't finish within an hour, the flow continues as planned and the node card and board say so. Checkpoints only work in runs whose nodes are handed to bots in the chat.
+
+### What's checked before approval
+
+Every node's executing bot must be configured on this machine, already in this chat, with its daemon online, and able to set up in-chat collaboration with the main bot; in an ordinary group its reply mode can't be "one session for the whole chat"; and nodes can't declare directory outputs. Otherwise approval is refused with a per-node reason list. botmux **never adds bots to chats automatically**.
+
+<details>
+<summary>Set a working directory: approve-dag --working-dir</summary>
+
+`botmux workflow approve-dag <runId> --working-dir <dir>` makes every node run in the same directory. Since nodes run in each executing bot's own session, the directory must be allowed for **every** executing bot (including the main bot): its default working directory (or Oncall directory), or its repo directories (`workingDir` / `workingDirs`) themselves or anything under them.
+
+- The directory must already exist; it isn't created. Before comparing, `~` is expanded, a trailing `/` removed and symlinks resolved, so a symlink inside the allowed range pointing outside doesn't count.
+- If not allowed, approval is refused with "node → bot: reason" for each one. Without the flag, each bot uses its own default directory.
+- The directory is fixed at approval. Before an executing bot opens a node session it checks again against its configuration **at that time**: if the configuration changed and the directory is no longer allowed, the node becomes blocked (it never silently falls back to the default directory). Add the directory to its configuration and click "Retry", or reassign.
+- New bots brought in by mid-run edits are checked the same way when they open a session.
+- If the node topic already has a session of that bot running in another directory (someone @-mentioned it earlier, or ran `/cd`), the node is blocked too; close that session and retry.
+- If the executing bot's daemon is older than the main bot's and doesn't understand the directory, the node is blocked with "version too old".
+
+</details>
+
+### Hand the initiator's identity to node bots (experimental, off by default)
+
+The other switch in the same section, **"Hand the initiator's identity to node bots"**, only applies to runs whose nodes are handed to bots in the chat.
+
+- **Off (default)**: the executing bot works as itself.
+- **Runs approved after turning it on**: at approval the initiator is recorded (for an ad-hoc run, whoever approved Gate-2; for a Saved Workflow, whoever sent `/workflow run`, in their own message in the chat), along with the tools that person could use as themselves on the main bot (the main bot's "trigger-user auth" tools). On each handoff, an executing bot with "trigger-user auth" enabled calls those tools as the initiator, never with more scope than the initiator had on the main bot.
+
+<details>
+<summary>Where the delegation is valid, and exceptions</summary>
+
+- **Valid only during this handoff**: the run isn't over, the handoff hasn't been cancelled / timed out / replaced by a retry or reassignment, and the node hasn't finished; only in this chat; only for bots in the run's approved set. It is revoked as soon as the node submits or the handoff stops, and checked again on every tool call. Removing the initiator from the chat doesn't interrupt the current turn; it takes effect from the next handoff.
+- **Missing identity never blocks the flow**: approval and handoff proceed without the initiator's identity, and the approval result and handoff say why. Typical causes: approved in a scheduled task or another automatic turn, the main bot lacks contacts scope, the main bot doesn't have "trigger-user auth" on, the initiator left the chat or can't talk to the executing bot, or the executing bot isn't in the approved set.
+- When the executing bot actually needs a tool that requires personal authorization, it is asked to authorize (via `botmux auth request` as usual), or it can `botmux report --status blocked` to say what's needed; **it never falls back to the bot's or owner's identity**.
+- If a bot in a node hands work on with `botmux dispatch` or `botmux send --mention` to a bot in the run's approved set in this chat, the identity follows (only narrower) and expires with this handoff; handing to other bots works as usual but without the identity.
+
+</details>
+
+### Viewing the flow in the Feishu sidebar
+
+In this mode, node cards, handoff cards and the executing bot's reply and report cards have a **"工作流 ›"** (Workflow) button at the right of the signature line; on the main topic's progress card, flow edit confirmation card and "add redo budget" card, the old "Web 详情" button is replaced by it too. Clicking it opens the run's live flow graph in the Feishu sidebar (refreshes every 2 seconds; click a node for details). Runs executed by temporary processes don't have this button.
+
+What you see depends on who you are (the link itself carries no credentials):
+
+| Who | Sees |
+|---|---|
+| Dashboard admin | The full view, same as the Dashboard detail page, including terminal and log entries |
+| Current member of this chat | A compact view: node name, goal, assigned bot, status, duration, placement link, flow version history; no terminal, logs, output contents, parameter values or error details. Access is lost within a minute of leaving the chat |
+| Anyone else | No access |
+
+Chat members are identified through "Feishu H5 login". When H5 login is configured (`BOTMUX_DASHBOARD_FEISHU_H5_*`), members get a "workflow sidebar only" session and can't open other Dashboard pages. **Without H5 login only admins can view it**: the button opens the run's Dashboard detail page in the browser instead, using your existing Dashboard login.
+
+## Concurrency limits
+
+How many nodes of a run run at once is bounded by three limits; the tightest one wins:
+
+| Layer | Meaning | Default |
+|---|---|---|
+| `global` | Nodes running at once across the whole run | 4 |
+| `perBot` | Nodes running at once on the same bot (Feishu app) | 1 |
+| `perCli` | Nodes running at once on the same CLI (claude-code, codex…) | 2 |
+
+The defaults are conservative: every node starts a full CLI process, and nodes on one CLI usually share a subscription account, which hits rate limits easily. With the defaults, nodes on the same bot run one after another. Limits are per run; two runs at once each get their full limits.
+
+If your CLI is billed per use and the machine has enough memory, raise them in `~/.botmux/config.json`:
 
 ```json
 {
@@ -176,55 +334,81 @@ The defaults are conservative: every node spawns a full CLI process, and one CLI
 }
 ```
 
-- ⚠️ All nodes on one bot run in that bot's working directory (`workingDir`). With `perBot` above 1, several nodes read and write the same directory at once. If nodes edit code or files, make sure they touch different files, or give them different bots.
-- Every field is optional; a missing field keeps its default. Values are integers from 1 to 64. Invalid values are ignored on read and dropped the next time the workflow settings are saved from the Dashboard.
-- `perCliById` sets a cap per CLI type; CLIs not listed use `perCli`.
-- The config is re-read every time a run is driven, so a change applies to the next start or resume without restarting the daemon.
-- When nodes are handed to bots in the chat (`nodeExecutor: "bot"`), only `global` and `perBot` apply; `perCli` does not.
+- Every field is optional; missing ones keep the default. Values are integers 1–64; invalid values are ignored.
+- `perCliById` sets a limit per CLI; CLIs not listed use `perCli`.
+- The config is re-read each time a run is driven, so changes apply to the next start or resume without restarting the daemon.
+- When nodes are handed to bots in the chat, only `global` and `perBot` apply; `perCli` doesn't.
+- ⚠️ All nodes on one bot run in that bot's working directory. With `perBot` above 1, several nodes read and write the same directory at once; if nodes change files, make sure they touch different files, or give them different bots.
 
-### Limits
+## Limitations
 
-- An ad-hoc workflow's nodes can currently only use bots on the **claude-code / codex / seed** CLIs; orchestrating to a bot on another CLI errors out at startup.
-- The `host` node (deterministic side-effect nodes like feishu-send that don't route through an LLM) is reserved in the schema but not yet enabled — all products are produced by `goal` (LLM) nodes.
-- `botmux workflow start` is the real run path with Feishu approval cards; `botmux v3 run` is the dev-terminal path (see the last section) without approval cards.
+- Nodes run in temporary processes currently support bots on these CLIs only: **claude-code, codex, seed, traex, relay, minimax**. A flow that uses a bot on another CLI fails at start.
+- External action nodes are limited to `feishu-send`, `feishu-reply` and `botmux-schedule`, and always require approval.
+- For real runs use Feishu `/workflow` or `botmux workflow start` (with approval cards); `botmux v3 run` is for development and debugging only, without approval cards.
 
-### The underlying state machine (advanced)
+## Advanced
 
-Under the hood an ad-hoc workflow is a state machine driven by a series of `botmux workflow` subcommands — usually invoked by the bot, but you can drive them by hand when troubleshooting:
+### The underlying state machine
 
-| Command | State transition |
+Under the hood, an ad-hoc workflow is a state machine driven by `botmux workflow` subcommands. The bot normally calls them; you can drive them by hand when troubleshooting:
+
+| Command | Transition |
 |------|----------|
-| `botmux workflow new "<goal>"` | Create the run, returns `runId` / `specPath` → `grilling` |
-| `botmux workflow spec-finalize <runId>` | Validate spec.md → `spec_ready` |
+| `botmux workflow new "<goal>"` | Create a run, returns `runId` / `specPath` → `grilling` |
+| `botmux workflow spec-finalize <runId>` | Validate the spec → `spec_ready` |
 | `botmux workflow approve-spec <runId>` | Gate-1 passed → `spec_approved` |
-| `botmux workflow architect <runId>` | Orchestrate and validate the DAG → `dag_ready` |
+| `botmux workflow architect <runId>` | Compile and validate the flow → `dag_ready` |
 | `botmux workflow approve-dag <runId>` | Gate-2 passed → `dag_approved` |
-| `botmux workflow start <runId>` | Hand to the daemon to drive execution |
+| `botmux workflow start <runId>` | Hand to the daemon to run |
 
-## Save and reuse (Saved Workflow)
+Run data lives in `~/.botmux/v3-runs`.
 
-Once an ad-hoc workflow works, save it as a Saved Workflow and rerun it with different params:
+### Run one goal headless: `botmux goal run`
 
-| Entry point | What it does |
-|------|------|
-| Feishu `/workflow save last [name]` / CLI `botmux workflow save [last\|runId] [name]` | Save the latest (or a given runId) run as a Saved Workflow |
-| Feishu `/workflow run <name> [key=value ...]` / CLI `botmux workflow run <name\|workflowId> [--param key=value ...]` | Run a Saved Workflow |
-| Feishu `/workflow list` / CLI `botmux workflow list [--json]` | List saved workflows |
-| Feishu `/workflow show <name>` / CLI `botmux workflow show <name\|workflowId>` | Show a definition |
+Skips Feishu, clarification and planning, and has one bot finish one goal in the background. Handy for scripts or other agents:
 
-Params: on the CLI pass scalars with `--param key=value` and objects / arrays with `--param-json key=<json>` (e.g. `--param-json tags='["urgent","cn"]'`). Params are for **business variables** (chat id, mode switches, thresholds); don't pass a whole task instruction through params — a node's task definition belongs in the workflow itself.
+```bash
+botmux goal run "Collect the stale links under docs/ into a list" --run-id docs-links-1 --json
+```
 
-## Legacy v2 templates (retired)
+| Option | Meaning |
+|---|---|
+| `<goal>` | The goal text; or use `--goal-file <file>` or `--stdin` instead. Pick exactly one |
+| `--run-id <id>` | Run ID; generated if omitted. Set it yourself if you want to replay or resume |
+| `--bot <id\|name>` | Which bot (App ID or name); defaults to the first bot in `bots.json` |
+| `--working-dir <dir>` | Where to run; defaults to the bot's default working directory |
+| `--timeout <seconds>` | Overall time limit, at most 14370 seconds; hitting it counts as a cancel. Without it, the default node timeout (30 minutes) applies |
+| `--json` | On exit, print one line of JSON to stdout (`schemaVersion` is `botmux.goal-run-result/v1`) with `state`, `summary`, `artifacts`, `error` |
 
-The v2 template runtime is retired: `/template run`, `botmux workflow ls / tail / resume / validate` and friends now fail with an error. If you still have old `~/.botmux/workflows/*.workflow.json` definitions or historical runs, use the offline tools:
+It is a single node with no approval card and no Feishu messages. It runs the same way as temporary-process nodes, so only the CLIs listed under "Limitations" above are supported. Data also lands in `~/.botmux/v3-runs/<runId>`.
+
+**Read the result from the exit code**:
+
+| Exit code | `state` | Meaning |
+|---|---|---|
+| 0 | `succeeded` | Done |
+| 10 | `failed` | Failed |
+| 11 | `blocked` | Blocked |
+| 12 | `cancelled` | Cancelled: Ctrl-C, SIGTERM or timeout |
+| 13 | `conflict` | Run ID conflict, or another process is driving this run |
+| 14 | `error` | Bad arguments, Workflow off, no bots configured, etc. |
+
+**Running again with the same `--run-id`** requires exactly the same arguments as the first time (goal, `--bot`, `--working-dir`, `--timeout`):
+
+- Finished run: nothing reruns; you get the original result and exit code back, even if `bots.json` has since changed or been removed.
+- Unfinished run (the process crashed, the machine rebooted): it resumes where it stopped, keeping the bot, directory and settings fixed on the first run rather than re-picking from current config. It still needs that bot's credentials in `bots.json`.
+- Another process is driving the same run: you get a conflict (13) and nothing runs twice.
+- Arguments differ from the first run: conflict (13). Use a new run ID for a new goal.
+
+### Legacy v2 templates (retired)
+
+v2 templates are retired: `/template run`, `botmux workflow resume / tail / validate` and similar commands fail right away. If you still have old `~/.botmux/workflows/*.workflow.json` definitions or historical runs, use the offline tools:
 
 | Command | Description |
 |------|------|
-| `botmux template migrate-v3 [workflowId\|path ...] [--all]` | Dry-run by default; `--commit` converts eligible v2 definitions into v3 Saved Workflows |
-| `botmux template archive-runs [--commit] [--verify <archiveId\|path>]` | Scan, archive or verify terminal v2 runs; never executes a v2 workflow and never deletes history directly |
+| `botmux template migrate-v3 [workflowId\|path ...] [--all]` | Preview only by default; add `--commit` to save convertible v2 definitions as v3 Saved Workflows |
+| `botmux template archive-runs [--commit] [--verify <archiveId\|path>]` | Scan, archive or verify finished v2 runs; never runs a v2 workflow and never deletes history directly |
 
-## Dev / self-test: `botmux v3 run`
+### Development self-test: `botmux v3 run`
 
-`botmux v3 run <dag.json> [--max-parallel <n>] [--max-per-bot <n>] [--max-per-cli <n>]` runs a **hand-written** v3 dag.json on a real local ephemeral worker pool, with humanGate over terminal y/N and **no Feishu cards**. It's only for developing / debugging v3 orchestration; for a real ad-hoc workflow run, go through Feishu `/workflow` + `start`. The three flags override the concurrency config for this run only; `--max-per-cli` applies to every CLI and overrides `perCliById`.
-
-> Workflow is an experimental capability and still evolving. For everyday use, `/workflow <goal>` in Feishu is all you need; the rest of this page is for ops / troubleshooting and orchestration development.
+`botmux v3 run <dag.json> [--max-parallel <n>] [--max-per-bot <n>] [--max-per-cli <n>]` runs a **hand-written** v3 dag.json on the real local temporary-process pool; approvals are y/N prompts in the terminal, with **no Feishu cards**. The three flags override the concurrency config above for this run only; `--max-per-cli` applies to every CLI and overrides `perCliById`.

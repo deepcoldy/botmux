@@ -7792,7 +7792,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   execution background-revoke <任务ID> --json
               撤销本会话原执行人启动的后台任务凭据登记
   auth request [--scope "<scope1 scope2,...>"] [--json]
-              为本轮发起人生成飞书授权链接，返回 JSON；由 Agent 将链接发给用户
+              为本轮发起人生成飞书授权链接，返回 JSON；单聊由 Agent 发给用户，群聊由 botmux 私聊发起人
   auth wait --request-id <id> [--json]
               等待当前授权请求就绪，最多 5 分钟；成功后可重试原操作
   mojo-containment list|revoke
