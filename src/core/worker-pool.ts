@@ -1,3 +1,6 @@
+import { controllerForSession, type WorkerContractContext } from './session-controller.js';
+import { sameWorker } from '../services/session-contract.js';
+import { sessionContractPrimary } from './session-contract-primary.js';
 import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
 import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
 import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
@@ -218,7 +221,7 @@ import { outputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, t
 import { OutputDeliveryCoordinator, OutputDeliveryTerminalError, type OutputDeliveryControl } from '../services/output-delivery-coordinator.js';
 import { TurnSendLedger, FinalPublicationUnknownError } from '../services/turn-send-ledger.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
-import { TurnResultStore } from '../services/turn-result-store.js';
+import { PersistentTurnResultStore } from '../services/persistent-turn-result-store.js';
 import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
 import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observeTurnResultTerminal, observeTurnResultDelivery } from './turn-result-session.js';
 
@@ -226,7 +229,25 @@ import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observ
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomBytes(32).toString('base64url');
-const restartCoordinator = new RestartCoordinator();
+const restartCoordinator = new RestartCoordinator({ persistence: {
+  restore: sessionId => {
+    const ds = findActiveBySessionId(sessionId); const controller = ds ? controllerForSession(ds) : undefined;
+    const operation = controller?.operation();
+    return operation?.kind === 'restart' ? { id: operation.operationId, uncertain: operation.phase !== 'planned', planned: operation.phase === 'planned' } : undefined;
+  },
+  record: (sessionId, operationId, phase) => {
+    const ds = findActiveBySessionId(sessionId); const controller = ds ? controllerForSession(ds) : undefined;
+    if (!controller) return;
+    if (phase === 'requested') controller.beginControl('restart', operationId);
+    else if (phase === 'started') return controller.controlStarted(operationId) ? 'started' : 'joined';
+    else {
+      const known = controller.operation(operationId);
+      if (known?.phase !== 'confirmed' && known?.phase !== 'failed_before_effect' && known?.phase !== 'rejected') controller.controlResult(operationId, phase === 'succeeded' ? 'confirmed' : 'uncertain', controller.currentRuntime());
+    }
+    const operation = controller.operation(operationId);
+    return operation?.phase === 'confirmed' || operation?.phase === 'failed_before_effect' || operation?.phase === 'rejected' ? 'terminal' : 'uncertain';
+  },
+} });
 const topicEffortRestartReadiness = new Map<string, { attemptId: string; worker: DaemonSession['worker']; workerGeneration?: number; workerReady: boolean; cliReady: boolean; requested: import('../utils/traex-session-effort.js').TraexTopicEffortRestart }>();
 const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
@@ -1305,7 +1326,7 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
     }
   });
   setTurnResultRuntime(createTurnResultRuntime({
-    store: new TurnResultStore(),
+    store: new PersistentTurnResultStore(config.session.dataDir),
     enabled: turnResultEnabled,
     eligible: binding => {
       const session = [...(activeSessionsRegistry?.values() ?? [])].find(current =>
@@ -7546,6 +7567,9 @@ export function requestSessionRestart(
   } : observer;
   const result = restartCoordinator.request(ds.session.sessionId, restartObserver, attemptId => {
     settingAttempt = attemptId;
+    const execute = (): void => {
+    const controller = controllerForSession(ds);
+    if (controller && controller.operation()?.operationId !== attemptId) return;
     try {
       if (ds.worker && !ds.worker.killed) {
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
@@ -7582,6 +7606,9 @@ export function requestSessionRestart(
       // Rethrow: the coordinator settles this fresh attempt as `failed`.
       throw error;
     }
+    };
+    const controller = controllerForSession(ds);
+    return controller && sessionContractPrimary(ds.larkAppId) ? controller.flushPrimary().then(execute) : execute();
   });
   return start.failure ? { ...result, startFailure: start.failure } : result;
 }
@@ -9612,6 +9639,12 @@ export function __testOnly_setSuspendBackingVerifier(
   suspendBackingVerifier = verifier ?? destroySuspendBackingVerified;
 }
 
+const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
+const primarySuspendApplying = new WeakSet<DaemonSession>();
+export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle'): Promise<boolean> {
+  const result = suspendWorker(ds, reason);
+  return primarySuspendInFlight.get(ds) ?? result;
+}
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
@@ -9632,12 +9665,39 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   }
   if (!isSuspendableBackendType(ds.initConfig?.backendType)) return false;
 
+  const controller = controllerForSession(ds);
+  if (controller && sessionContractPrimary(ds.larkAppId) && !primarySuspendApplying.has(ds)) {
+    if (!primarySuspendInFlight.has(ds)) {
+      let operationId: string;
+      try { operationId = controller.beginControl('suspend').operation.operationId; controller.controlStarted(operationId); }
+      catch { return false; }
+      const pending = controller.flushPrimary().then(async () => {
+        if (controller.operation()?.operationId !== operationId) return false;
+        primarySuspendApplying.add(ds);
+        try { const result = suspendWorker(ds, reason); await controller.flushPrimary(); return result; }
+        finally { primarySuspendApplying.delete(ds); }
+      });
+      primarySuspendInFlight.set(ds, pending);
+      void pending.finally(() => primarySuspendInFlight.delete(ds)).catch(error => logger.warn(`[${tag(ds)}] Primary suspend not confirmed: ${String(error)}`));
+    }
+    return false;
+  }
+  let operationId: string | undefined;
+  if (controller) {
+    try { const value = controller.beginControl('suspend'); operationId = value.operation.operationId; if (value.joined && value.operation.phase !== 'planned' && !primarySuspendApplying.has(ds)) return false; controller.controlStarted(operationId); }
+    catch { return false; }
+  }
+
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
   if (!suspendBackingVerifier(ds)) {
+    if (operationId) controller!.controlResult(operationId, 'uncertain', undefined, 'suspend_backing_not_proven');
     clearLifecycleRetirement(ds, w);
     return false;
   }
+  // The daemon verifier already proved the exact backing absent. IPC cleanup
+  // may be lost; it does not change the confirmed suspend effect.
+  if (operationId) controller!.controlResult(operationId, 'confirmed');
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
@@ -10198,7 +10258,25 @@ export async function closeSessionForBackgroundCleanup(
   return result;
 }
 
-export async function closeSession(
+const contractCloseInFlight = new Map<string, Promise<CloseSessionResult>>();
+export function closeSession(sessionId: string, opts?: Parameters<typeof closeSessionBody>[1]): Promise<CloseSessionResult> {
+  const ds = findActiveBySessionId(sessionId);
+  const controller = ds ? controllerForSession(ds) : undefined;
+  if (!controller || controller.store.read(controller.ref)!.lifecycle === 'closed') return closeSessionBody(sessionId, opts);
+  const key = JSON.stringify(controller.ref);
+  const pending = contractCloseInFlight.get(key); if (pending) return pending;
+  const { operation } = controller.beginControl('close'); controller.controlStarted(operation.operationId);
+  const work = controller.flushPrimary().then(() => closeSessionBody(sessionId, opts)).then(async result => {
+    controller.controlResult(operation.operationId, result.ok ? 'confirmed' : result.retryable ? 'uncertain' : 'rejected', undefined, result.ok ? undefined : result.error);
+    await controller.flushPrimary();
+    return result;
+  }, error => { controller.controlResult(operation.operationId, 'uncertain', undefined, String(error)); throw error; });
+  contractCloseInFlight.set(key, work);
+  void work.finally(() => { if (contractCloseInFlight.get(key) === work) contractCloseInFlight.delete(key); }).catch(() => {});
+  return work;
+}
+
+async function closeSessionBody(
   sessionId: string,
   opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
@@ -11766,7 +11844,12 @@ export function sendWorkerSessionInput(
   } else if (message.type === 'message') {
     cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   }
-  const annotated = withTurnCaller(ds, message);
+  const controller = controllerForSession(ds);
+  if (controller && !controller.allowsInput()) return false;
+  const scoped = controller && message.type === 'message' && message.turnId
+    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
+    : message;
+  const annotated = withTurnCaller(ds, scoped);
   if (bufferTransferInput(ds, annotated)) return true;
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
@@ -11788,8 +11871,8 @@ export function sendPromptCacheKeepalive(ds: DaemonSession, text: string): boole
 }
 
 export type ExactTurnInterruptResult =
-  | { ok: true }
-  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' | 'fork_pending' };
+  | { ok: true; operationId?: string; confirmation?: 'interrupt_delivered' }
+  | { ok: false; operationId?: string; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' | 'fork_pending' };
 
 /** Native settings use their own receipt, without rotating business-turn state. */
 const pendingCodexCliEffort = new WeakSet<DaemonSession>();
@@ -11929,8 +12012,25 @@ export function interruptExactWorkerTurn(
 ): Promise<ExactTurnInterruptResult> {
   const worker = ds.worker;
   if (!worker || worker.killed) return Promise.resolve({ ok: false, reason: 'no_worker' });
+  const controller = controllerForSession(ds);
+  const execution = controller?.store.executions(controller.ref).filter(value => value.ref.turnId === turnId
+    && value.runtime?.runtimeId === controller.currentRuntime()?.runtimeId && !value.terminal)
+    .sort((left, right) => (right.ref.dispatchAttempt ?? -1) - (left.ref.dispatchAttempt ?? -1))[0];
+  if (controller && (!execution || !execution.runtime)) return Promise.resolve({ ok: false, reason: 'stale_turn' });
+  if (execution?.terminal) return Promise.resolve({ ok: false, reason: 'stale_turn' });
+  const previousCancel = controller && execution ? controller.store.latestCancel(controller.ref, execution.ref.executionId) : undefined;
+  if (previousCancel?.phase === 'confirmed') return Promise.resolve({ ok: true, operationId: previousCancel.operationId, confirmation: 'interrupt_delivered' });
+  if (controller?.operation()?.kind === 'cancel') return Promise.resolve({ ok: false, operationId: controller.operation()!.operationId, reason: 'timeout' });
+  let operationId: string | undefined;
+  if (controller && execution) {
+    try {
+      const value = controller.beginControl('cancel', undefined, execution.ref); operationId = value.operation.operationId;
+      if (value.joined) return Promise.resolve({ ok: false, operationId, reason: 'timeout' });
+      controller.controlStarted(operationId);
+    } catch { return Promise.resolve({ ok: false, reason: 'stale_turn' }); }
+  }
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), turnId, true);
-  const requestId = randomUUID();
+  const requestId = operationId ?? randomUUID();
   return new Promise(resolve => {
     let settled = false;
     const finish = (result: ExactTurnInterruptResult): void => {
@@ -11939,18 +12039,26 @@ export function interruptExactWorkerTurn(
       clearTimeout(timer);
       worker.off('message', onMessage);
       worker.off('exit', onExit);
-      resolve(result);
+      if (operationId) controller!.controlResult(operationId, result.ok ? 'confirmed' : ['timeout', 'no_worker', 'delivery_failed'].includes(result.reason) ? 'uncertain' : 'rejected');
+      resolve({ ...result, ...(operationId ? { operationId } : {}), ...(result.ok ? { confirmation: 'interrupt_delivered' as const } : {}) });
     };
     const onMessage = (msg: WorkerToDaemon): void => {
       if (msg.type !== 'turn_interrupt_result' || msg.requestId !== requestId || msg.turnId !== turnId) return;
-      finish(msg.delivered ? { ok: true } : { ok: false, reason: msg.reason ?? 'delivery_failed' });
+      if (controller) {
+        const producer = controller.store.read(controller.ref)?.worker;
+        if (!producer || !msg.sessionContract) return;
+        const admitted = controller.ingest(msg as unknown as import('./session-controller.js').ControlledWorkerMessage, producer);
+        if (admitted.kind === 'reject' || admitted.kind === 'defer') return;
+        void controller.flushPrimary().then(() => finish(msg.delivered ? { ok: true } : { ok: false, reason: msg.reason ?? 'delivery_failed' }), () => finish({ ok: false, reason: 'delivery_failed' }));
+      } else finish(msg.delivered ? { ok: true } : { ok: false, reason: msg.reason ?? 'delivery_failed' });
     };
     const onExit = (): void => finish({ ok: false, reason: 'no_worker' });
     const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), timeoutMs);
     timer.unref?.();
     worker.on('message', onMessage);
     worker.once('exit', onExit);
-    const queued = afterWorkerIpcBootstrap(worker, () => worker.send({ type: 'interrupt_turn', requestId, turnId } satisfies DaemonToWorker));
+    const queued = afterWorkerIpcBootstrap(worker, () => worker.send({ type: 'interrupt_turn', requestId, turnId,
+      ...(controller && execution ? { sessionCommand: { version: 2 as const, runtime: execution.runtime, execution: execution.ref, operationId } } : {}) } satisfies DaemonToWorker));
     if (!queued) finish({ ok: false, reason: 'no_worker' });
   });
 }
@@ -15767,6 +15875,14 @@ export function forkWorker(
       sessionStore.updateSession(ds.session);
     }
   }
+  const runtimeController = controllerForSession(ds, true);
+  if (runtimeController) {
+    const resumeOperationId = runtimeController.prepareResume();
+    const pendingOperation = runtimeController.operation();
+    initMsg.restartAttemptId ??= resumeOperationId ?? (pendingOperation?.kind === 'restart' ? pendingOperation.operationId : undefined);
+    initMsg.sessionContract = runtimeController.bindWorker(workerGeneration);
+    if (initMsg.turnId) initMsg.sessionCommand = { version: 2, execution: runtimeController.admitInput(initMsg.turnId, initMsg.dispatchAttempt) };
+  }
   ds.initConfig = initMsg;
   // New generation ledger. NOT a plain reset: the previous generation's keys are
   // parked until its worker is observed to exit, because the double-fork guard
@@ -16110,6 +16226,24 @@ function setupWorkerHandlers(
     persistStreamCardState(ds);
   }
   ds.pendingActiveRuntimeCardRefresh = undefined;
+  const sessionController = ds.initConfig?.sessionContract ? controllerForSession(ds) : undefined;
+  const contractWorker = sessionController?.bindWorker(workerGeneration).worker;
+  if (sessionController) {
+    const sendUnscoped = worker.send.bind(worker);
+    worker.send = ((message: unknown, ...args: unknown[]) => {
+      const command = message as DaemonToWorker;
+      const scoped = command && typeof command === 'object' && command.type !== 'init'
+        ? { ...command, sessionCommand: sessionController.command(command) } : command;
+      if (sessionContractPrimary(ds.larkAppId)) {
+        void sessionController.flushPrimary().then(() => {
+          if (ds.worker !== worker || worker.killed) return;
+          (sendUnscoped as (...args: unknown[]) => boolean)(scoped, ...args);
+        }).catch(error => logger.warn(`[${t}] Primary command fenced: ${String(error)}`));
+        return true;
+      }
+      return (sendUnscoped as (...args: unknown[]) => boolean)(scoped, ...args);
+    }) as ChildProcess['send'];
+  }
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
@@ -16126,7 +16260,7 @@ function setupWorkerHandlers(
       || activeSessionsRegistry.get(activeSessionKey(ds)) === ds
     );
   const ownsLifecycleMutation = (): boolean =>
-    ownsWorkerSession() && !isSessionTransferring(ds);
+    ownsWorkerSession() && !isSessionTransferring(ds) && (!sessionController || sessionController.currentAuthority());
   // A new worker generation is starting. As a backstop, invalidate any
   // stuck-warning card posted by the previous generation — explicit kill/suspend/
   // exit paths should already have done this, but fork/refork/takeover paths
@@ -16729,7 +16863,7 @@ function setupWorkerHandlers(
         // terminal — no Lark turn, retry button, or kill to clear it), the
         // model is plainly working again. Clear the stale limit so the card /
         // Dashboard「需要你」 don't stay pinned with a dead retry countdown.
-        if (ds.usageLimit) {
+        if (ds.usageLimit && ownsLifecycleMutation()) {
           clearUsageLimitState(ds);
           if (ds.lastScreenStatus === 'limited') {
             ds.lastScreenStatus = 'idle';
@@ -16753,7 +16887,8 @@ function setupWorkerHandlers(
     // classified INSIDE process so they become terminal `rejected`, instead of
     // leaving the row in pending where a permanently-false owns() predicate
     // silently parks it (and the session attention) forever.
-    const authority = (): boolean => ownsLifecycleMutation();
+    const authority = (): boolean => ownsWorkerSession() && !isSessionTransferring(ds)
+      && (!sessionController || !['closing', 'closed'].includes(sessionController.store.read(sessionController.ref)!.lifecycle));
     await coordinator.deliver(record, {
       owns: authority,
       process: async (record, control) => {
@@ -16815,9 +16950,15 @@ function setupWorkerHandlers(
         }
         return receipt;
       },
-      settled: record => {
+      settled: async record => {
+        if (sessionController && record.origin?.scope.execution) {
+          sessionController.store.apply(sessionController.ref, { type: 'execution_output', execution: record.origin.scope.execution,
+            output: { availability: record.output.content ? 'available' : 'empty', content: record.output.content, completeness: record.output.turnFailed ? 'partial' : 'final' },
+            delivery: { outputId: record.id, status: record.receipt?.status === 'delivered' ? 'delivered' : record.receipt?.status === 'suppressed' ? 'suppressed' : 'partial', ...(record.receipt?.messageId ? { messageId: record.receipt.messageId } : {}) } }, `delivery:${record.id}:${record.receipt?.status}`);
+        }
+        await sessionController?.flushPrimary();
         const claim = { type: 'final_output_settled' as const, id: record.id, fingerprint: record.fingerprint, token: ds.initConfig?.finalOutputHandoff?.token ?? '' };
-        if (ownsLifecycleMutation()) { try {
+        if (authority()) { try {
           if (record.output.codexAppSettlement && record.receipt?.owner === 'codex_app_dispatch_persisted') worker.send({ type: 'codex_app_dispatch_persisted', requestId: record.output.codexAppSettlement.requestId, ok: true });
           worker.send(claim);
         } catch { /* worker retains its journal until receipt */ } }
@@ -16852,7 +16993,7 @@ function setupWorkerHandlers(
   };
   if (journal) universalOutputProcessors.set(outputProcessorKey(ds), { worker, run: runOutput });
 
-  worker.on('message', async (msg: WorkerToDaemon) => {
+  const handleLegacyWorkerMessage = async (msg: WorkerToDaemon): Promise<void> => {
     // Every IPC message is scoped to the child generation that emitted it.
     // A replaced worker can drain queued messages after the new child has been
     // installed; never let those stale events mutate the replacement's cards,
@@ -20833,9 +20974,82 @@ function setupWorkerHandlers(
         break;
       }
     }
+  };
+  const handleWorkerMessage = async (msg: WorkerToDaemon): Promise<void> => {
+    if (!sessionController || !contractWorker || msg.type === 'worker_ipc_ready') return handleLegacyWorkerMessage(msg);
+    // V1 recovery authenticates its frozen offer/token in the existing host
+    // store. It cannot acquire executor control from a new worker envelope.
+    if (msg.type === 'final_output_offer') return handleLegacyWorkerMessage(msg);
+    const metadata = msg.sessionContract as WorkerContractContext | undefined;
+    if (msg.type === 'runtime_binding_started' || msg.type === 'runtime_binding') {
+      if (!sessionController.admitsRegistration(msg.type, msg.bindingId, metadata, contractWorker) || ds.worker !== worker) return;
+      try {
+        if (msg.type === 'runtime_binding_started') {
+          sessionController.reserveBinding(msg.bindingId, contractWorker);
+          await sessionController.flushPrimary();
+          const state = sessionController.store.read(sessionController.ref)!;
+          if (ds.worker !== worker || !sameWorker(state.worker, contractWorker)) return;
+          worker.send({ type: 'runtime_contract_reserved', bindingId: msg.bindingId,
+            runtime: sessionController.store.binding(sessionController.ref, msg.bindingId)?.ref,
+            mayStart: !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
+              && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
+        }
+        else {
+          const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId);
+          await sessionController.flushPrimary();
+          if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
+          worker.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
+            executions: sessionController.store.executions(sessionController.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
+            admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
+          for (const pending of sessionController.store.deferredEvents<WorkerToDaemon>(sessionController.ref, msg.bindingId)) await handleWorkerMessage(pending);
+        }
+      } catch (error) { logger.warn(`[${t}] Runtime contract binding not confirmed: ${String(error)}`); }
+      return;
+    }
+    let recoveredOrigin: import('../services/session-contract.js').SessionEventContext | undefined;
+    if (msg.type === 'final_output' && msg.handoff) {
+      try {
+        const snapshot = outputSnapshot(ds.larkAppId, msg);
+        if (!journal || msg.handoff.token !== ds.initConfig?.finalOutputHandoff?.token || msg.handoff.id !== snapshot.id || msg.handoff.fingerprint !== snapshot.fingerprint) return;
+        if (!metadata && !snapshot.origin) { await handleLegacyWorkerMessage(msg); return; }
+        if (snapshot.origin && !sameWorker(snapshot.origin.producer, contractWorker)) {
+          recoveredOrigin = sessionController.outputOrigin(snapshot.origin);
+          if (!recoveredOrigin) return;
+          if (!recoveredOrigin.scope.execution) {
+            await sessionController.run({ kind: 'historical', context: recoveredOrigin }, () => handleLegacyWorkerMessage(msg));
+            return;
+          }
+          const previous = journal.read(snapshot.id);
+          if (previous?.origin && previous.origin.scope.execution?.executionId !== recoveredOrigin.scope.execution?.executionId) return;
+          msg = { ...msg, sessionOutputOrigin: recoveredOrigin };
+        }
+      } catch (error) { logger.warn(`[${t}] Recovered output origin unproven: ${String(error)}`); return; }
+    }
+    let admission = sessionController.ingest(msg as unknown as import('./session-controller.js').ControlledWorkerMessage, contractWorker, recoveredOrigin);
+    if (admission.kind === 'reject') { logger.debug(`[${t}] Scoped event rejected: ${msg.type} ${admission.reason}`); return; }
+    if (admission.kind === 'defer') return;
+    await sessionController.flushPrimary();
+    admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
+    if (admission.kind === 'reject' || admission.kind === 'defer') return;
+    if (msg.type === 'final_output') {
+      if (msg.sessionOutputOrigin?.scope.execution && msg.sessionOutputOrigin.scope.execution.executionId !== admission.context.scope.execution?.executionId) return;
+      if (!recoveredOrigin) msg = { ...msg, sessionOutputOrigin: admission.context };
+    }
+    if (admission.kind === 'historical') {
+      if (msg.type === 'turn_terminal') await cb.onTurnTerminal?.(ds, msg, { workerGeneration: metadata!.producer.generation });
+      if (msg.type === 'final_output') await sessionController.run(admission, () => handleLegacyWorkerMessage(msg));
+    } else {
+      if (msg.type === 'final_output') msg = { ...msg, sessionOutputOrigin: msg.sessionOutputOrigin ?? admission.context };
+      await sessionController.run(admission, () => handleLegacyWorkerMessage(msg));
+    }
+    if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
+  };
+  worker.on('message', msg => {
+    void handleWorkerMessage(msg as WorkerToDaemon).catch(error => logger.warn(`[${t}] Session event not confirmed: ${String(error)}`));
   });
 
   worker.on('exit', (code, signal) => {
+    if (sessionController && contractWorker) { try { sessionController.workerLost(contractWorker); } catch (error) { logger.warn(`[${t}] Worker loss contract not persisted: ${String(error)}`); } }
     clearInterval(cliNoticeTimer);
     if (ownsLifecycleMutation()) {
       cliNoticeExitGeneration = workerGeneration + 1;
@@ -23117,6 +23331,11 @@ export function forkAdoptWorker(
     // way out of date if the user has /clear'd since).
     adoptRestoredFromMetadata: opts?.restoredFromMetadata === true ? true : undefined,
   };
+  const runtimeController = controllerForSession(ds, true);
+  if (runtimeController) {
+    initMsg.restartAttemptId ??= runtimeController.prepareResume();
+    initMsg.sessionContract = runtimeController.bindWorker(workerGeneration);
+  }
   setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
   ds.worker = worker;
   initializeWorkerIpcBootstrap(worker);

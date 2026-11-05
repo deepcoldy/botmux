@@ -125,6 +125,7 @@ export function herdrConfigForChatType(
 }
 
 export interface BackendTurnInput {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   content: string;
   turnId: string;
   replyTurnId?: string;
@@ -136,6 +137,7 @@ export interface BackendTurnInput {
 /** Host-owned state frozen beside a Remote Runner turn. Providers never send
  * or receive this context; it exists only on the backend → worker callbacks. */
 export interface RemoteRunnerTurnHostContext {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   linkRefMode?: 'observe' | 'enabled';
 }
 
@@ -147,6 +149,7 @@ export interface BackendTurnSubmission {
 }
 
 export interface BackendTurnFailure {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   turnId: string;
   code: string;
   message: string;
@@ -285,6 +288,7 @@ export class AmbiguousSubmissionBlockedError extends Error {
 }
 
 export interface SessionBackend {
+  getRuntimeIdentity?(): import('../../services/session-contract.js').RuntimeIdentity | undefined;
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
   /** Returns false only when the backend can prove the write was not accepted.
    * Legacy implementations may return void on success. */
@@ -413,7 +417,7 @@ export interface SessionBackend {
    * executing anything on the host; schedule mutations still cross daemon
    * authorization. */
   onSessionTool?(
-    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+    cb: (operation: RemoteRunnerSessionToolOperation, hostContext?: RemoteRunnerTurnHostContext) => Promise<RemoteRunnerSessionToolResult>,
   ): void;
   /** A provider-owned turn survived the host/worker process and is now being
    * observed without resubmitting its prompt. */

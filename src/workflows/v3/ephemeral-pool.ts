@@ -8,6 +8,10 @@
  */
 
 import { buildBotWorkerEnv } from '../../core/env-policy.js';
+import { SessionController } from '../../core/session-controller.js';
+import { SessionContractStore } from '../../services/session-contract-store.js';
+import { sessionContractsEnabled } from '../../services/session-contract.js';
+import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
 import { getBot } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
@@ -317,6 +321,13 @@ async function runNodeImpl(
     botName: req.node.bot,
     locale: 'zh' as const,
   };
+  const contractStore = sessionContractsEnabled() ? new SessionContractStore(workerDataDir, req.botSnapshot.larkAppId) : undefined;
+  const contractSession = { larkAppId: req.botSnapshot.larkAppId, session: { sessionId, status: 'active' }, cliReadyGeneration: 0 } as DaemonSession;
+  const controller = contractStore ? new SessionController(contractSession, contractStore) : undefined;
+  const generation = (controller?.store.read(controller.ref)?.worker?.generation ?? 0) + 1;
+  const bootstrap = controller?.bindWorker(generation);
+  const execution = controller?.admitInput(req.attemptId, undefined, req.attemptId);
+  const scopedInit = bootstrap ? { ...init, sessionContract: bootstrap, sessionCommand: { version: 2 as const, execution } } : init;
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
@@ -365,7 +376,7 @@ async function runNodeImpl(
       clearTimeout(hardDeadline);
       if (quiesceTimer) clearTimeout(quiesceTimer);
       if (manifestTimer) clearTimeout(manifestTimer);
-      try { worker.send({ type: 'close' }); } catch { /* worker may be gone */ }
+      try { sendClose(); } catch { /* worker may be gone */ }
       sigtermTimer = setTimeout(() => {
         try { worker.kill('SIGTERM'); } catch { /* worker may be gone */ }
       }, 250);
@@ -376,6 +387,11 @@ async function runNodeImpl(
         void appendLine(stderrPath(req), `[v3] worker exit grace expired; escalating to SIGKILL`);
         try { worker.kill('SIGKILL'); } catch { /* worker may be gone */ }
       }, 250 + deps.cancelGraceMs);
+    }
+    function sendClose(): void {
+      const operation = controller?.beginControl('close').operation;
+      if (operation) controller!.controlStarted(operation.operationId);
+      worker.send({ type: 'close', ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), operationId: operation?.operationId } } : {}) });
     }
 
     function finish(status: RunNodeResult['status'], reason: string): void {
@@ -409,7 +425,7 @@ async function runNodeImpl(
         sigkillTimer = undefined;
       }
       void appendLine(stderrPath(req), `[v3] cancel signal received; sending close+SIGINT`);
-      try { worker.send({ type: 'close' }); } catch { /* already gone */ }
+      try { sendClose(); } catch { /* already gone */ }
       try { worker.kill('SIGINT'); } catch { /* already gone */ }
       sigkillTimer = setTimeout(() => {
         void appendLine(stderrPath(req), `[v3] cancel grace expired; escalating to SIGKILL`);
@@ -429,13 +445,15 @@ async function runNodeImpl(
 
     function sendInit(): void {
       if (initSent) return;
-      worker.send(init);
+      worker.send(scopedInit);
       initSent = true;
     }
 
     function sendGoalIfReady(): void {
       if (!initSent || webPort === undefined || goalSent) return;
-      worker.send({ type: 'raw_input', content: buildGoalCommand(req) });
+      if (controller && !controller.ds.cliReady) return;
+      worker.send({ type: 'raw_input', content: buildGoalCommand(req), turnId: req.attemptId,
+        ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), execution } } : {}) });
       goalSent = true;
       startManifestWatch();
     }
@@ -456,7 +474,28 @@ async function runNodeImpl(
       manifestTimer = setTimeout(poll, deps.manifestPollMs);
     }
 
-    worker.on('message', (event: WorkerEvent) => {
+    const handleMessage = (event: WorkerEvent): void => {
+      if (controller && bootstrap && event.type !== 'worker_ipc_ready') {
+        if (event.type === 'runtime_binding_started' || event.type === 'runtime_binding') {
+          if (!controller.admitsRegistration(event.type, event.bindingId, event.sessionContract, bootstrap.worker)) return;
+          if (event.type === 'runtime_binding_started') {
+            controller.reserveBinding(event.bindingId, bootstrap.worker);
+            worker.send({ type: 'runtime_contract_reserved', bindingId: event.bindingId, runtime: controller.store.binding(controller.ref, event.bindingId)?.ref, mayStart: !['closed', 'closing'].includes(controller.store.read(controller.ref)!.lifecycle) });
+          }
+          else {
+            const runtime = controller.bindRuntime(event.bindingId, bootstrap.worker, event.identity, event.operationId);
+            worker.send({ type: 'runtime_contract_assigned', bindingId: event.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
+              executions: controller.store.executions(controller.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
+              admissionStates: controller.store.executions(controller.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) });
+            for (const deferred of controller.store.deferredEvents<WorkerEvent>(controller.ref, event.bindingId)) handleMessage(deferred);
+          }
+          return;
+        }
+        const admission = controller.ingest(event as unknown as import('../../core/session-controller.js').ControlledWorkerMessage, bootstrap.worker);
+        if (admission.kind === 'reject' || admission.kind === 'defer') return;
+        if (event.sessionContract) controller.store.acknowledgeDeferred(controller.ref, event.sessionContract.eventId);
+        if (admission.kind === 'historical' && event.type !== 'final_output') return;
+      }
       if (cancelRequested) {
         // CLI exit is not the outer worker exit.  The worker may still own a
         // PTY, file descriptors, or sandbox cleanup, so no IPC message may
@@ -501,7 +540,8 @@ async function runNodeImpl(
           finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit');
           break;
       }
-    });
+    };
+    worker.on('message', handleMessage);
 
     forwardWorkerError = (err) => {
       if (cancelRequested) return;
@@ -521,6 +561,12 @@ async function runNodeImpl(
       if (quiesceTimer) clearTimeout(quiesceTimer);
       if (manifestTimer) clearTimeout(manifestTimer);
       cancelSignal?.removeEventListener('abort', onAbort);
+      if (controller && bootstrap) {
+        const operation = controller.operation();
+        if (operation?.kind === 'close') controller.controlResult(operation.operationId, 'confirmed');
+        controller.workerLost(bootstrap.worker);
+      }
+      contractStore?.close();
       if (cancelRequested) {
         settled = true;
         void appendLine(stderrPath(req), `[v3] worker closed after cancellation code=${code ?? 'null'}`);

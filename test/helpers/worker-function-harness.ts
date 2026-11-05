@@ -20,6 +20,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { contractTerminalStatus } from '../../src/services/session-contract.js';
 
 let parsed: ts.SourceFile | undefined;
 
@@ -64,7 +65,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
 ): T {
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => (key in target ? target[key as string] : (globalThis as any)[key]),
+    get: (target, key) => (key in target ? target[key as string] : key === 'contractTerminalStatus' ? contractTerminalStatus : (globalThis as any)[key]),
     set: (target, key, value) => {
       target[key as string] = value;
       return true;

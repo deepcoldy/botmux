@@ -24,7 +24,8 @@ export interface RestartObserver {
 interface RestartAttempt {
   id: string;
   observers: RestartObserver[];
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
+  uncertain?: boolean;
 }
 
 export class RestartCoordinator {
@@ -34,6 +35,10 @@ export class RestartCoordinator {
   constructor(private readonly options: {
     timeoutMs?: number;
     createAttemptId?: () => string;
+    persistence?: {
+      restore(sessionId: string): { id: string; uncertain: boolean; planned?: boolean } | undefined;
+      record(sessionId: string, id: string, phase: 'requested' | 'started' | 'succeeded' | 'failed' | 'timed_out'): 'terminal' | 'uncertain' | 'started' | 'joined' | void;
+    };
   } = {}) {}
 
   request(
@@ -41,14 +46,17 @@ export class RestartCoordinator {
     observer: RestartObserver,
     startPhysicalRestart: (attemptId: string) => void | Promise<void>,
   ): { attemptId: string; joined: boolean } {
+    const restored = !this.attempts.has(sessionId) ? this.options.persistence?.restore(sessionId) : undefined;
+    if (restored && !restored.planned) this.attempts.set(sessionId, { id: restored.id, observers: [], uncertain: restored.uncertain });
     const existing = this.attempts.get(sessionId);
     if (existing) {
       existing.observers.push(observer);
-      this.enqueueNotify(observer, 'in_progress');
+      this.enqueueNotify(observer, existing.uncertain ? 'timed_out' : 'in_progress');
       return { attemptId: existing.id, joined: true };
     }
 
-    const attemptId = this.options.createAttemptId?.() ?? randomBytes(12).toString('hex');
+    const attemptId = restored?.planned ? restored.id : this.options.createAttemptId?.() ?? randomBytes(12).toString('hex');
+    if (!restored?.planned) this.options.persistence?.record(sessionId, attemptId, 'requested');
     const timer = setTimeout(
       () => this.resolve(sessionId, attemptId, 'timed_out'),
       this.options.timeoutMs ?? 40_000,
@@ -60,6 +68,8 @@ export class RestartCoordinator {
     // postpone replacing the process.
     this.enqueueNotify(observer, 'in_progress');
     try {
+      const start = this.options.persistence?.record(sessionId, attemptId, 'started');
+      if (start === 'joined') return { attemptId, joined: true };
       const started = startPhysicalRestart(attemptId);
       void Promise.resolve(started).catch(() => {
         this.resolve(sessionId, attemptId, 'failed');
@@ -73,6 +83,14 @@ export class RestartCoordinator {
   resolve(sessionId: string, attemptId: string, status: RestartTerminalStatus): boolean {
     const attempt = this.attempts.get(sessionId);
     if (!attempt || attempt.id !== attemptId) return false;
+    const result = this.options.persistence?.record(sessionId, attemptId, status);
+    if (result === 'uncertain') {
+      attempt.uncertain = true;
+      clearTimeout(attempt.timer);
+      attempt.timer = undefined;
+      for (const observer of attempt.observers) this.enqueueNotify(observer, status);
+      return true;
+    }
     this.attempts.delete(sessionId);
     clearTimeout(attempt.timer);
     for (const observer of attempt.observers) this.enqueueNotify(observer, status);

@@ -1,4 +1,7 @@
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
+import { registerSessionContractPrimary } from './core/session-contract-primary.js';
+import { controllerForSession } from './core/session-controller.js';
+import { sessionContractStore } from './services/session-contract-store.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
@@ -10743,6 +10746,8 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // 有超时兜底，信号丢失不致命，没必要让 hook 客户端报错。
 ipcRoute('POST', '/api/session-ready', async (req, res) => {
   let raw: {
+    runtimeBindingId?: unknown;
+    nativeSessionId?: unknown;
     sessionId?: unknown;
     source?: unknown;
     originCapability?: unknown;
@@ -10789,10 +10794,13 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     }
   }
   if (ds?.worker) {
+    const controller = controllerForSession(ds);
+    const sessionCommand = controller?.nativeSignal(raw.runtimeBindingId, raw.nativeSessionId);
+    if (controller && !sessionCommand) return jsonRes(res, 200, { ok: true, ignored: 'runtime_scope_unproven' });
     const requestId = randomUUID();
     const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
-      ds.worker.send({ type: 'session_ready', source, requestId } as DaemonToWorker);
+      ds.worker.send({ type: 'session_ready', source, requestId, ...(sessionCommand ? { sessionCommand } : {}) } as DaemonToWorker);
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
       cancelSessionReadyAck(requestId);
@@ -10830,6 +10838,8 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
 // 丢一个回合空闲不致命，worker 侧还有既有兜底路径。
 ipcRoute('POST', '/api/turn-idle', async (req, res) => {
   let raw: {
+    runtimeBindingId?: unknown;
+    nativeSessionId?: unknown;
     sessionId?: unknown;
     originCapability?: unknown;
     originTurnId?: unknown;
@@ -10893,9 +10903,14 @@ ipcRoute('POST', '/api/turn-idle', async (req, res) => {
     }
   }
   if (ds?.worker) {
+    const controller = controllerForSession(ds);
+    const sessionCommand = controller?.nativeSignal(raw.runtimeBindingId, raw.nativeSessionId,
+      typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined, positiveInt(raw.originDispatchAttempt));
+    if (controller && !sessionCommand) return jsonRes(res, 200, { ok: true, ignored: 'runtime_scope_unproven' });
     try {
       ds.worker.send({
         type: 'turn_idle',
+        ...(sessionCommand ? { sessionCommand } : {}),
         turnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
         dispatchAttempt: positiveInt(raw.originDispatchAttempt),
         seq: positiveInt(raw.seq),
@@ -33904,6 +33919,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   : `active Session takeover is not ready: ${claimed.kind}`,
               };
             }
+            if (claimed.session.sessionRuntimeContract) sessionContractStore(config.session.dataDir, cfg.larkAppId).restore(claimed.session.sessionRuntimeContract);
             const local = activeSessions.get(stableKey);
             if (local?.session.sessionId === claimed.session.sessionId
                 && local.session.status === 'active') {
@@ -34121,6 +34137,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           durablePrimaryRuntimes.push(primaryRuntime);
           durablePrimaryEventRuntimes.push(eventRuntime);
           durablePrimaryRuntimeByApp.set(cfg.larkAppId, primaryRuntime);
+          registerSessionContractPrimary(cfg.larkAppId, primaryRuntime.session, sessionId => {
+            const ds = [...activeSessions.values()].find(value => value.larkAppId === cfg.larkAppId && value.session.sessionId === sessionId);
+            if (ds) { retireWorkerProcessOnly(ds, 'session_contract_primary_fenced'); if (activeSessions.get(activeSessionKey(ds)) === ds) activeSessions.delete(activeSessionKey(ds)); }
+          });
           eventRuntime.connect();
           void primaryRuntime.ready.then(() => {
             logger.info(`[durable-primary:${cfg.larkAppId}] runtime ready`);

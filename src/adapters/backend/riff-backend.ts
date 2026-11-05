@@ -1096,6 +1096,11 @@ export class RiffBackend implements SessionBackend {
     this.taskIdCb = cb;
     if (this.currentTaskId) cb(this.currentTaskId);
   }
+  getRuntimeIdentity(): import('../../services/session-contract.js').RuntimeIdentity | undefined {
+    if (!this.currentTaskId) return undefined;
+    return { backend: 'riff', physicalId: `${new URL(this.config.baseUrl).origin}:${this.sessionId}`,
+      nativeSessionId: this.sessionId, proof: 'persistent_lineage' };
+  }
 
   /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh
    *  works. Async because a keychain miss may trigger a (non-blocking) CLI

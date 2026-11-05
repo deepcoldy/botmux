@@ -1,0 +1,55 @@
+import type { SessionContractStore } from '../services/session-contract-store.js';
+import { sameRuntime, sameWorker, type ContractSessionRef, type SessionEventContext, type WorkerRef } from '../services/session-contract.js';
+
+export type SessionEventAdmission =
+  | { kind: 'current'; context: SessionEventContext }
+  | { kind: 'historical'; context: SessionEventContext }
+  | { kind: 'worker'; context: SessionEventContext }
+  | { kind: 'defer'; bindingId: string }
+  | { kind: 'reject'; reason: string };
+const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack']);
+/** A trusted channel supplies producer identity. An event cannot self-upgrade
+ * to the current execution instance merely because its IPC worker survived. */
+export class SessionEventGateway {
+  constructor(readonly store: SessionContractStore, readonly session: ContractSessionRef) {}
+  admit(type: string, context: SessionEventContext | undefined, channel: WorkerRef, recoveredOrigin?: SessionEventContext): SessionEventAdmission {
+    if (!context || context.version !== 2) return { kind: 'reject', reason: 'session_event_context_missing' };
+    if (context.session.appId !== this.session.appId || context.session.sessionId !== this.session.sessionId || !sameWorker(context.producer, channel)) return { kind: 'reject', reason: 'session_event_channel_mismatch' };
+    if (!Number.isSafeInteger(context.sequence) || context.sequence < 1 || context.eventId !== `${channel.workerId}:${context.sequence}`) return { kind: 'reject', reason: 'invalid_session_event_sequence' };
+    const state = this.store.read(this.session); if (!state) return { kind: 'reject', reason: 'session_contract_missing' };
+    const runtime = context.scope.runtime;
+    if (!runtime) {
+      if (context.scope.execution) {
+        const execution = this.store.execution(this.session, context.scope.execution.executionId);
+        if (!execution || execution.ref.turnId !== context.scope.execution.turnId || execution.ref.dispatchAttempt !== context.scope.execution.dispatchAttempt) return { kind: 'reject', reason: 'execution_scope_unproven' };
+      }
+      return workerEvents.has(type) && sameWorker(state.worker, channel) ? { kind: 'worker', context } : { kind: 'reject', reason: 'runtime_scope_missing' };
+    }
+    const recovery = type === 'final_output' && recoveredOrigin
+      && recoveredOrigin.session.appId === this.session.appId && recoveredOrigin.session.sessionId === this.session.sessionId
+      && sameRuntime(recoveredOrigin.scope.runtime, runtime)
+      && recoveredOrigin.scope.execution?.executionId === context.scope.execution?.executionId
+      && (this.store.authorizedProducer(this.session, runtime, recoveredOrigin.producer)
+        || (recoveredOrigin.bindingId && this.store.bindingProducer(this.session, recoveredOrigin.bindingId, recoveredOrigin.producer)
+          && sameRuntime(this.store.binding(this.session, recoveredOrigin.bindingId)?.ref, runtime)));
+    if (!this.store.authorizedProducer(this.session, runtime, channel) && !recovery) return { kind: 'reject', reason: 'runtime_producer_unproven' };
+    if (context.scope.execution) {
+      const execution = this.store.execution(this.session, context.scope.execution.executionId);
+      if (!execution || execution.ref.turnId !== context.scope.execution.turnId || execution.ref.dispatchAttempt !== context.scope.execution.dispatchAttempt
+      ) return { kind: 'reject', reason: 'execution_scope_unproven' };
+      // A restored/queued turn can publish and revoke its send identity before
+      // native execution evidence arrives. This does not bind/start the attempt.
+      const unboundCurrent = sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime)
+        && (['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(type)
+          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked'].includes(type)));
+      if (!sameRuntime(execution.runtime, runtime)
+        && !(!execution.runtime && (recovery || workerEvents.has(type) || unboundCurrent))) {
+        return { kind: 'reject', reason: 'execution_scope_unproven' };
+      }
+    }
+    if (!recovery && sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime) && state.lifecycle !== 'closed' && state.lifecycle !== 'closing') return { kind: 'current', context };
+    if (immutableFacts.has(type)) return { kind: 'historical', context };
+    return { kind: 'reject', reason: 'stale_runtime_scope' };
+  }
+}
