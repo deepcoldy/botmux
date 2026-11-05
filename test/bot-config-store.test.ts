@@ -234,6 +234,16 @@ describe('bot-config store', () => {
     expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('high');
   });
 
+  it('does not treat a compatible effort as validation of a retained model when leaving MiniMax', async () => {
+    const model = 'minimax/MiniMax-M3.1-Flash';
+    const { registry, store } = await loaded({ cliId: 'minimax', model, reasoningEffort: 'high' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('cli')!, 'codex')).ok).toBe(true);
+    // CLI switching retains the old model. Codex's unknown-model effort
+    // fallback permits high; it does not establish that Codex can run this model.
+    expect(readConfig()).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+  });
+
   it.each([undefined, 'minimax/MiniMax-M3', 'other/MiniMax-M3.1-Flash'])('rejects MiniMax effort for an unverified model %s without persisting it', async model => {
     const { store } = await loaded({ cliId: 'minimax', model });
     expect(await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'xhigh'))

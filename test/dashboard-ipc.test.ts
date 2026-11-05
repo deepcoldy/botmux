@@ -6947,6 +6947,8 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
       expect(ignored.reasoningEffort).toBeUndefined();
       expect(ignored.warnings).toHaveLength(1);
 
+      expect((await patch({ reasoningEffort: clear })).status).toBe(400);
+      expect(scheduleStore.getTask(task.id, APP)).toEqual(before);
       expect((await patch({ model: clear, reasoningEffort: clear })).status).toBe(200);
       const after = scheduleStore.getTask(task.id, APP)!;
       expect(after.model).toBeUndefined();

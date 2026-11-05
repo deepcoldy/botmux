@@ -99,7 +99,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
 import { allowlistSandboxVerifiedClis, sharedBotSandboxAdvice } from '../../core/shared-bot-sandbox-advice.js';
@@ -148,9 +148,9 @@ function selectedAgentCliId(cliKey: string): string {
 
 function reasoningCatalogKey(cliKey: string): string | undefined {
   const cliId = selectedAgentCliId(cliKey);
-  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code' || cliId === 'kimi') return cliId;
-  if (cliId === 'codex' || cliId === 'codex-app') return 'codex';
-  return undefined;
+  // Share the write handler's capability gate: a second CLI list can hide the
+  // control and turn an otherwise unchanged save into an explicit clear.
+  return isConfigurableReasoningCliId(cliId) ? cliId : undefined;
 }
 
 function cliSupportsReasoningEffort(cliKey: string): boolean {
