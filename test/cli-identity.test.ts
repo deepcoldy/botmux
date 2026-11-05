@@ -654,6 +654,8 @@ describe('renderIdentityWrapper', () => {
     const { status, stderr } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
     expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
     expect(stderr).toContain('/login');
+    // Nothing published is not an authorization verdict: say which it is.
+    expect(stderr).toContain('[reason=identity_not_published]');
   });
 
   it('refuses outside a botmux session, where no identity can be published', () => {

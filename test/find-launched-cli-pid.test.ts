@@ -3,17 +3,29 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { cliIdForComm, findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { cliIdForComm, findLaunchedCliPid, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS } from '../src/utils/codex-app-control.js';
 import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from '../src/core/traex-leaf-pid.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
 function makeScheduler() {
-  const queue: Array<() => void> = [];
+  let now = 0;
+  const queue: Array<{ fn: () => void; at: number }> = [];
   return {
-    schedule: (fn: () => void) => { queue.push(fn); },
-    runAll: (max = 100) => { let n = 0; while (queue.length && n++ < max) queue.shift()!(); },
+    now: () => now,
+    schedule: (fn: () => void, ms = 0) => { queue.push({ fn, at: now + ms }); },
+    runAll: (max = 1_000) => {
+      let n = 0;
+      while (queue.length && n++ < max) {
+        queue.sort((a, b) => a.at - b.at);
+        const next = queue.shift()!;
+        now = next.at;
+        next.fn();
+      }
+    },
     pending: () => queue.length,
   };
 }
@@ -46,6 +58,9 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
   runInNewContext(leafFnsSource, {
     ...sandbox,
     readComm: deps.readComm,
+    readCmdline: () => [],
+    isNonInteractiveCodexArgv,
+    isZombieProcess: () => false,
     cliIdForComm,
     findLaunchedCliPid: deps.findReal,
   });
@@ -58,6 +73,8 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
 function runWorkerWiring(late: boolean, options: {
   cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean;
   launchedCliPid?: number | null;
+  launchedCliAfterMs?: number;
+  beforeTimers?: (scope: Record<string, any>) => void;
   // comm of the pane/getChildPid process: 'node' models the npm launcher (a
   // codex descendant must be discovered), 'codex' a direct native install (no
   // descendant scan may run).
@@ -86,11 +103,18 @@ function runWorkerWiring(late: boolean, options: {
   scopePayloadAfterProbe?: number;
   /** Children of pids other than the pane (100); a synthetic launch chain. */
   children?: Record<number, number[]>;
+  /** Herdr/ZMX shape: getChildPid() reports the MUTABLE cliPid, which gets
+   *  rewired to the discovered leaf, rather than the stable pane/launcher pid. */
+  aliasedChildPid?: boolean;
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
-  const backend = { cliPid: 100, getChildPid: () => 100 };
+  const backend: { cliPid: number; getChildPid: () => number } = {
+    cliPid: 100,
+    getChildPid: () => (options.aliasedChildPid ? backend.cliPid : 100),
+  };
   const findLaunchedCliPidMock = vi.fn(function (this: unknown, ..._args: unknown[]) {
+    if (scheduler.now() < (options.launchedCliAfterMs ?? 0)) return null;
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
   });
   // The pane process's comm: 'node' models the npm launcher (descendant must be
@@ -111,6 +135,9 @@ function runWorkerWiring(late: boolean, options: {
     scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
+    lastSpawnCodexLauncherPid: undefined,
+    codexOwnershipAttestationPending: false,
+    FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
@@ -139,7 +166,7 @@ function runWorkerWiring(late: boolean, options: {
     programStatusRelayLaunched: options.relayLaunched ?? false,
     effectiveBackendType: options.backendType ?? 'tmux',
     actuallyReattachedPersistent: options.reattached ?? false,
-    publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(), observeZcodeCliSessionId: vi.fn(),
+    publishLocalProcessAttestation: vi.fn(() => true), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(), observeZcodeCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
   // The REAL layer walk and TRAE leaf resolver, probing the same synthetic
@@ -163,9 +190,10 @@ function runWorkerWiring(late: boolean, options: {
     }),
   });
   runInNewContext(workerWiring, context);
+  options.beforeTimers?.(context);
   scheduler.runAll();
   expect(scheduler.pending()).toBe(0);
-  return context;
+  return { ...context, elapsedMs: scheduler.now() };
 }
 
 describe('worker wrapper PID wiring', () => {
@@ -376,13 +404,78 @@ describe('worker wrapper PID wiring', () => {
     expect(result.resolveCodexOwnershipPid).toHaveBeenCalledWith(100, true, undefined);
     expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex', 6, expect.any(Object), undefined);
     expect(result.backend.cliPid).toBe(200);
-    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.bridgeCliPid).toBe(200);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it('publishes a synchronously bound native root even when ready beats the first retry tick', () => {
+    runWorkerWiring(false, {
+      wrapperCli: '',
+      beforeTimers: scope => {
+        expect(scope.backend.cliPid).toBe(200);
+        expect(scope.publishLocalProcessAttestation).not.toHaveBeenCalled();
+        // Model the already-bound native leaf; execute the real fast path.
+        scope.codexProcessIsNativeLeaf = (pid: number) => pid === 200;
+        const current = loadWorkerFunction<() => number>('currentCodexObservedPid', scope);
+        expect(current()).toBe(200);
+        expect(scope.publishLocalProcessAttestation).toHaveBeenCalledWith(200);
+        expect(scope.codexOwnershipAttestationPending).toBe(false);
+      },
+    });
+  });
+
+  it('retries publication after the timer finds a native root but capability publication fails', () => {
+    const result = runWorkerWiring(false, {
+      wrapperCli: '', launchedCliAfterMs: 12_000,
+      beforeTimers: scope => {
+        scope.isZombieProcess = () => false;
+        const current = loadWorkerFunction<() => number>('currentCodexObservedPid', scope);
+        expect(current()).toBe(100);
+        expect(scope.codexOwnershipAttestationPending).toBe(false);
+        // The wrapper was already published successfully. Only the later
+        // timer's native-root publication fails; initial pending cannot mask it.
+        scope.publishLocalProcessAttestation.mockReturnValueOnce(false);
+      },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.codexOwnershipAttestationPending).toBe(true);
+    const scope = { ...result, codexProcessIsNativeLeaf: (pid: number) => pid === 200 };
+    expect(loadWorkerFunction<() => number>('currentCodexObservedPid', scope)()).toBe(200);
+    expect(scope.codexOwnershipAttestationPending).toBe(false);
+    expect(result.publishLocalProcessAttestation.mock.calls).toEqual([[100], [200], [200]]);
+  });
+
+  it.each([false, true])('attests a slow wrapper child before any rollout exists (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { launchedCliAfterMs: 12_000 });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+    expect(result.codexOwnershipAttestationPending).toBe(false);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(12_000);
+    expect(result.elapsedMs).toBeLessThan(CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS);
+  });
+
+  it.each([false, true])('keeps the Codex retry loop alive when getChildPid aliases the mutable cliPid (Herdr/ZMX) (late PID=%s)', late => {
+    // Herdr/ZMX report the rewired ownership pid from getChildPid(). The
+    // synchronous resolve already moves cliPid from the launcher (100) to the
+    // discovered leaf (200), so asking backend.getChildPid() on the first retry
+    // tick returns 200 — launcherRetryStillValid's same-pid gate would abort the
+    // whole loop before the scheduled apply ever runs. The codex resolver must
+    // hand the gate the STABLE launcher pid captured at spawn instead.
+    const result = runWorkerWiring(late, { wrapperCli: '', aliasedChildPid: true });
+    expect(result.log).toHaveBeenCalledWith(
+      expect.stringContaining('Codex launcher: resolved real codex leaf pid 200 under launcher 100'),
+    );
+    // Rooted at the stable launcher twice: the synchronous resolve and the one
+    // successful retry tick (never from the aliased 200).
+    const rootedCalls = result.findLaunchedCliPid.mock.calls.filter((call: unknown[]) =>
+      call.length === 5 && call[0] === 100 && call[1] === 'codex');
+    expect(rootedCalls.length).toBe(2);
   });
 
   it.each([false, true])('forwards the configured custom codex executable to BOTH resolve sites (late PID=%s)', late => {
     // Renamed Codex-compatible runtime: the child never forks, so every
-    // descendant probe — the synchronous resolve (1) plus 30 retry ticks —
+    // descendant probe — the synchronous resolve and the full startup window —
     // must carry the exact configured executable name. No call may fall back
     // to the static 'codex' map.
     const result = runWorkerWiring(late, {
@@ -390,7 +483,8 @@ describe('worker wrapper PID wiring', () => {
       cliRuntime: { source: 'configured', executable: '/opt/foo/my-codex' },
     });
     expect(result.resolveCodexOwnershipPid).toHaveBeenCalledWith(100, true, '/opt/foo/my-codex');
-    expect(result.findLaunchedCliPid).toHaveBeenCalledTimes(31);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS);
+    expect(result.elapsedMs).toBeLessThan(CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS + 200);
     expect(result.findLaunchedCliPid.mock.calls.every(call => call[4] === '/opt/foo/my-codex')).toBe(true);
     expect(result.backend.cliPid).toBe(100);
   });
@@ -449,7 +543,7 @@ describe('worker wrapper PID wiring', () => {
     // launcher resolver is unconditional and must still rewire cliPid.
     const result = runWorkerWiring(late, { wrapperCli: '  ' });
     expect(result.backend.cliPid).toBe(200);
-    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.bridgeCliPid).toBe(200);
   });
 
   it.each([
@@ -464,10 +558,10 @@ describe('worker wrapper PID wiring', () => {
 
   // Sandbox ignores wrapperCli, so the #1745 wrapper bridge resolver must stay
   // off (bridgeCliPid never rewired). Sandboxed Codex instead has its OWN bwrap
-  // resolver (#1755): it rewires backend.cliPid but never the bridge pid.
+  // resolver also keeps backend.cliPid and bridgeCliPid in step.
   it.each([false, true])('keeps the wrapper bridge resolver off under sandbox while the codex bwrap resolver runs (late=%s)', late => {
     const result = runWorkerWiring(late, { sandboxRequested: true });
-    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.bridgeCliPid).toBe(200);
     // The production resolver supplies optional BFS probe/filter arguments;
     // this boundary cares that every probe starts at the launcher and targets
     // Codex, not about the internal optional-argument representation.

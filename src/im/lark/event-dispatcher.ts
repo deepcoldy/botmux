@@ -118,6 +118,7 @@ import {
   durableLarkSessionControlPartition,
 } from '../../services/durable-lark-session-control.js';
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
+import { shouldPersistTriggeredMessage } from '../../services/durable-primary-turn-admission.js';
 import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
 
 function vcMeetingEventPayloadForLog(data: any): string {
@@ -1099,6 +1100,10 @@ const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
   'close',
   'restart',
   'resume',
+  // The display mode is worker-local. In primary multi-replica deployments it
+  // must enter the same owner-routed control lane instead of being applied on
+  // whichever Lark WebSocket happened to receive the click.
+  'toggle_display',
 ]);
 
 function cardActionType(data: any): string | undefined {
@@ -2807,7 +2812,12 @@ export interface RoutingContext {
    *  （`{ ...ctx, scope, anchor }`），box 引用随拷贝共享，接纳发生在拷贝之后
    *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
-  ingressAdmission?: { admitted: boolean; retryReason?: string };
+  ingressAdmission?: {
+    admitted: boolean;
+    retryReason?: string;
+    /** See DurableInboxPrimaryDispatchResult.progressToken. */
+    retryProgressToken?: string;
+  };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
   /** Preserve confirmed command state while its task remains in the Inbox. */
@@ -3446,7 +3456,11 @@ async function dispatchHumanMessageViaHandlers(
   } finally {
     // A pre-admission failure can be retried by a later edit. Once admitted,
     // even a subsequent presentation error must not allow the task to run again.
-    if (messageId && (completed || payload.ctx.ingressAdmission?.admitted)) {
+    if (messageId && shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: !!payload.ctx.durablePrimaryDispatch,
+      handlerCompleted: completed,
+      admitted: payload.ctx.ingressAdmission?.admitted === true,
+    })) {
       markMessageTriggered(appId, messageId);
     }
     if (key) pendingMessageTriggers.delete(key);
@@ -4584,7 +4598,10 @@ async function processCommentEvent(
 
   // 2) 拉评论 thread 取权威正文 / 作者 / @ 列表（事件 payload 不保证带全），
   //    同时用最新一条回复作为"触发回复"。
-  const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
+  let commentReadError: string | undefined;
+  const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId, {
+    onError: message => { commentReadError = message; },
+  });
   if (!comment || comment.replies.length === 0) {
     logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
     // ⚠️ 这个丢弃点在 mention-only 闸（下面第 4 步）**之前** —— 而 mention-only
@@ -4605,7 +4622,7 @@ async function processCommentEvent(
     } else {
       rollbackAutoSub();
     }
-    noteOutcome('no-comment');
+    noteOutcome('no-comment', commentReadError ?? '评论正文为空或不可用，未投递给会话');
     return;
   }
   const trigger = parsed.replyId
@@ -4962,7 +4979,10 @@ export function createLarkEventDispatcherRuntime(
     primary: PrimaryProcessContext,
   ): DurableLarkCanonicalHandlerResult => {
     const retryReason = ctx.ingressAdmission?.retryReason?.trim();
-    if (retryReason) return { kind: 'retry', reason: retryReason };
+    if (retryReason) {
+      const progressToken = ctx.ingressAdmission?.retryProgressToken;
+      return { kind: 'retry', reason: retryReason, ...(progressToken ? { progressToken } : {}) };
+    }
     if (!ctx.ingressAdmission?.admitted) {
       return { kind: 'ignored', reason: 'canonical handler completed without task admission' };
     }
@@ -6549,11 +6569,14 @@ export function createLarkEventDispatcherRuntime(
         runtimeOptions.enqueuePrimary
         && actionType
         && PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS.has(actionType)
+        && (actionType !== 'toggle_display'
+          || (data?.action?.value?.visibility !== 'private'
+            && getBot(larkAppId).config.privateCard !== true))
       ) {
         let authorizedControl = false;
         if (
           runtimeOptions.enqueuePrimaryControl
-          && (actionType === 'close' || actionType === 'resume')
+          && (actionType === 'close' || actionType === 'resume' || actionType === 'toggle_display')
           && data?.action?.value?.visibility !== 'private'
           && getBot(larkAppId).config.privateCard !== true
         ) {
@@ -6569,7 +6592,7 @@ export function createLarkEventDispatcherRuntime(
         if (
           runtimeOptions.enqueuePrimaryControl
           && authorizedControl
-          && (actionType === 'close' || actionType === 'resume')
+          && (actionType === 'close' || actionType === 'resume' || actionType === 'toggle_display')
           && data?.action?.value?.visibility !== 'private'
           && getBot(larkAppId).config.privateCard !== true
         ) {
@@ -6635,7 +6658,11 @@ export function createLarkEventDispatcherRuntime(
           toast: {
             type: 'warning',
             content: t(
-              'card.action.primary_lifecycle_unavailable',
+              // #2062 F6: a refused display toggle is an old card or a viewer
+              // without operate rights, not an unsupported lifecycle action.
+              actionType === 'toggle_display'
+                ? 'card.action.primary_display_unavailable'
+                : 'card.action.primary_lifecycle_unavailable',
               undefined,
               localeForBot(larkAppId),
             ),

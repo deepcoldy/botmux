@@ -81,7 +81,7 @@ const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', c
 // Run the actual worker screen-ready gate against a real transcript queue.
 // Stop at its release boundary: the remainder only schedules UI/input work.
 const workerSource = ts.createSourceFile('worker.ts', readFileSync('src/worker.ts', 'utf8'), ts.ScriptTarget.Latest, true);
-const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirstPromptViewportRejects', 'markPromptReady'].map(name => {
+const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirstPromptViewportRejects', 'nativeSessionForkPending', 'holdForNativeSessionFork', 'markPromptReady'].map(name => {
   const node = workerSource.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
   if (!node) throw new Error(`missing worker function ${name}`);
   return node.getText(workerSource);
@@ -98,12 +98,19 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
     stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,
+    // This fixture exercises lifecycle/delegation, not a live process tree.
+    // Root refresh and publication are covered by worker-codex-execution-root.
+    currentCodexObservedPid: vi.fn(),
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
     structuredRejectedReadyEvidenceGeneration: undefined, log: vi.fn(),
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
+    // These cases all run AFTER the first prompt was admitted
+    // (awaitingFirstPrompt:false below), so the cold-resume stale-turn release
+    // is inert by its first guard; stub it like the other module boundaries.
+    releaseInterruptedStructuredBridgeOnFirstPrompt: vi.fn(),
     durableTurnInFlight: false, preserveActiveTurnAuthorityForReady: false,
     releaseActiveTurnAuthority: release,
     queuedTurnAdvanceConsumedForPrompt: undefined, queuedTypeAheadTurns: [],
@@ -500,5 +507,37 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     } });
     expect((await h.run()).status).toBe(200);
     expect((await read())?.authority.openId).toBe('ou_original');
+  });
+  describe('from a workflow node session (交接带发起人身份, design §10.3)', () => {
+    const workflowRef = { runId: 'r1', nodeId: 'write', attemptId: 'write#001/attempts/001', revision: 1, nonce: `wfh_${'n'.repeat(24)}` };
+    function nodeTurn(passedOn: { inherit: true; workflow: unknown } | { inherit: false }, personAllowed = true) {
+      const h = harness(); h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+      h.scope.dispatchUserForTurn = async () => ({
+        authority: { appId: 'cli_main', openId: 'ou_original', unionId: 'on_original', tools: ['bytedcli'] },
+        workflow: workflowRef,
+      });
+      h.scope.targetUserForDelegation = vi.fn(async () => (personAllowed ? 'ou_alice_target' : undefined));
+      h.scope.inheritWorkflowDelegation = vi.fn(async (input: any) => {
+        // The decision gets this bot's own dispatch check of the person.
+        expect(await input.targetUserAllowed(input.inherited.authority)).toBe(personAllowed);
+        return passedOn;
+      });
+      h.scope.v3DefaultBaseDir = () => '/runs';
+      return h;
+    }
+    it('passes the initiator on as a record tied to the node attempt when its run allows it', async () => {
+      const h = nodeTurn({ inherit: true, workflow: { ...workflowRef, hop: 1 } });
+      expect((await h.run()).status).toBe(200);
+      expect(h.scope.inheritWorkflowDelegation).toHaveBeenCalledWith(expect.objectContaining({
+        targetAppIds: ['cli_target'], chatId: 'oc_target', baseDir: '/runs',
+      }));
+      expect(await read()).toMatchObject({ domain: 'botmux.dispatch-user.workflow.v1', workflow: { hop: 1 }, authority: { openId: 'ou_original' } });
+    });
+    it.each([true, false])('otherwise dispatches without the initiator, never refused (person passes: %s)', async (allowed) => {
+      const h = nodeTurn({ inherit: false }, allowed);
+      expect((await h.run()).status).toBe(200);
+      expect(h.send).toHaveBeenCalledTimes(1);
+      expect(await read()).toBeUndefined();
+    });
   });
 });

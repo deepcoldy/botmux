@@ -528,6 +528,93 @@ describe('webhook token mode', () => {
     expect(captured[0].envelope.instruction).toBeUndefined();
   });
 
+  describe('promptEnvelope.trustPayload', () => {
+    async function dispatchOnce(input: {
+      trustPayload?: boolean;
+      query?: string;
+    }): Promise<any[]> {
+      const captured: any[] = [];
+      const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+        captured.push(JSON.parse(String(init.body)));
+        return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fixed' } }) };
+      }) as any;
+      await startWebhookServer({ proxyToDaemon });
+      const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+      const { upsertConnector } = await import('../src/services/connector-store.js');
+      const secret = createWebhookSecret('tok_plain_value');
+      upsertConnector({
+        id: 'conn_trust',
+        name: 'Agent dispatch',
+        enabled: true,
+        verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_fixed' },
+        promptEnvelope: {
+          sourceName: 'agent-platform', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024,
+          ...(input.trustPayload === undefined ? {} : { trustPayload: input.trustPayload }),
+        },
+        loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+        lifecycleExtractors: null,
+        createdAt: '2026-06-06T00:00:00.000Z',
+        updatedAt: '2026-06-06T00:00:00.000Z',
+      });
+      const res = await fetch(`${baseUrl}/webhook/conn_trust/tok_plain_value${input.query ?? ''}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ task: 'run the remote job' }),
+      });
+      expect(res.status).toBe(200);
+      return captured;
+    }
+
+    it('an older connector without the field dispatches without payloadTrusted', async () => {
+      const captured = await dispatchOnce({});
+      expect(captured).toHaveLength(1);
+      expect('payloadTrusted' in captured[0]).toBe(false);
+      expect(captured[0].envelope.trusted).toBe(false);
+    });
+
+    it('an explicit false dispatches without payloadTrusted', async () => {
+      const captured = await dispatchOnce({ trustPayload: false });
+      expect('payloadTrusted' in captured[0]).toBe(false);
+    });
+
+    it('a verified connector that opts in forwards payloadTrusted, keeping envelope.trusted=false', async () => {
+      const captured = await dispatchOnce({ trustPayload: true });
+      expect(captured[0].payloadTrusted).toBe(true);
+      expect(captured[0].envelope.trusted).toBe(false);
+    });
+
+    it('keeps payloadTrusted on wait / async response modes', async () => {
+      const wait = await dispatchOnce({ trustPayload: true, query: '?wait=1' });
+      expect(wait[0].payloadTrusted).toBe(true);
+      expect(wait[0].options.waitForFinalOutput).toBe(true);
+    });
+
+    // A hand-edited store can carry trustPayload without verification. Over HTTP
+    // such a connector is refused before dispatch, so the dispatch-time gate is
+    // exercised through the exported helper.
+    it('re-checks verification at dispatch: no secret or an unknown verify type never trusts', async () => {
+      const { payloadTrustFields } = await import('../src/dashboard/webhook-routes.js');
+      const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+      const ref = createWebhookSecret('x').ref;
+      const base = {
+        id: 'c', name: 'c', enabled: true,
+        verify: { type: 'token', secretRef: ref, signatureHeader: 's', timestampHeader: 't', nonceHeader: 'n', toleranceSeconds: 300 },
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc' },
+        promptEnvelope: { sourceName: 'c', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1, trustPayload: true },
+        loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 1 },
+        lifecycleExtractors: null, createdAt: '', updatedAt: '',
+      } as unknown as ConnectorDefinition;
+      expect(payloadTrustFields(base)).toEqual({ payloadTrusted: true });
+      expect(payloadTrustFields({ ...base, verify: { ...base.verify, type: 'hmac-sha256' } })).toEqual({ payloadTrusted: true });
+      expect(payloadTrustFields({ ...base, verify: { ...base.verify, type: 'none' as any } })).toEqual({});
+      expect(payloadTrustFields({ ...base, verify: { ...base.verify, secretRef: 'missing_ref' } })).toEqual({});
+      expect(payloadTrustFields({ ...base, verify: { ...base.verify, secretRef: '' } })).toEqual({});
+      expect(payloadTrustFields({ ...base, target: { ...base.target, kind: 'workflow', workflowId: 'w' } })).toEqual({});
+      expect(payloadTrustFields({ ...base, promptEnvelope: { ...base.promptEnvelope, trustPayload: false } })).toEqual({});
+    });
+  });
+
   it('wait mode does not require a dynamic chatId and forwards wait options', async () => {
     const captured: any[] = [];
     const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {

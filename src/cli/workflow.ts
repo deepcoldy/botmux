@@ -113,7 +113,7 @@ v2 资产离线处理: botmux template <migrate-v3|archive-runs>
 `);
     return;
   }
-  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant> [...]
+  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant|status|edit|ask-human> [...]
 
 Saved Workflow:
   save [last|runId] [名称] [--workflow-id <chat-scope-id>]
@@ -124,6 +124,13 @@ Saved Workflow:
 即兴 Workflow:
   new / spec-finalize / approve-spec / architect / approve-dag / start
   cancel <runId> [--reason <text>] [--bot <larkAppId>]
+
+运行中修改（仅 run 主会话）:
+  status <runId> [--json]
+  edit <runId> --patch-file <文件|-> --base <版本> [--reason <理由>] [--json]
+  retry <runId> [--node <id>] [--reason <理由>]
+  ask-human <runId> --node <id> --reason <理由>
+  （事件唤醒的回合里 retry / edit / ask-human 都必须带 --reason）
 
 v2 资产离线处理: botmux template <migrate-v3|archive-runs>
 `);

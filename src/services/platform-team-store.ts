@@ -140,6 +140,12 @@ export function getPlatformTeamSyncRev(dataDir: string): string {
   return readFile(dataDir)?.rev ?? '';
 }
 
+/** Last applied team-sync's teams, or null when no sync has been received —
+ *  distinguishes "not synced yet" from "the owner has no teams". */
+export function readPlatformTeamSync(dataDir: string): PlatformTeamSyncTeam[] | null {
+  return readFile(dataDir)?.teams ?? null;
+}
+
 /** All platform teams this machine belongs to (last applied sync). */
 export function listPlatformTeams(dataDir: string): PlatformTeamSyncTeam[] {
   return readFile(dataDir)?.teams ?? [];

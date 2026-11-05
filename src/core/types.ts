@@ -549,6 +549,16 @@ export interface DaemonSession {
    *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
    *  turn or busy edge that is not a keep-alive. */
   promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
+  /** Idle auto-compact topic notice waiting for the next sweep tick: posted
+   *  only once the compact's own busy→idle edge (or the worker's refusal) is
+   *  seen, so the topic never claims a compact that did not run
+   *  (core/idle-auto-compact.ts). In-memory only. */
+  idleAutoCompactPendingNotice?: import('./idle-auto-compact.js').IdleAutoCompactPendingNotice;
+  /** TurnId of the idle auto-compact this process itself dispatched. In-memory
+   *  ONLY (never persisted): a marker inherited from a restarted daemon folded
+   *  as handled must not be announced as a successful compact, because this
+   *  process never saw it run. Cleared on the finishing edge / terminal. */
+  idleAutoCompactDispatchedTurnId?: string;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -741,6 +751,8 @@ export interface DaemonSession {
   usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };

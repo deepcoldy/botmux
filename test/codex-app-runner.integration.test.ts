@@ -25,7 +25,7 @@ import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
-import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from '../src/services/codex-async-user-input.js';
+import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from '../src/services/codex-async-user-input.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
@@ -1530,7 +1530,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('steers a follow-up into a start turn proven by an exact turn/started BEFORE the start response returns (B1 start-response-last)', async () => {
+  it.each(['om_sr_root', 'codex-async-answer-legacy'])('steers a human follow-up into %s before the start response returns', async rootTurnId => {
     // B1: the app-server may publish an exact-client `turn/started` before it
     // replies to `turn/start`. That exact match proves the canonical native id,
     // so a follow-up must be able to steer into the SAME turn during the pending
@@ -1554,7 +1554,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         `legacy:${text}`,
         { text, clientUserMessageId: replyTurnId },
         replyTurnId,
-        true,
+        replyTurnId === rootTurnId && rootTurnId.startsWith('codex-async-answer-')
+          ? codexAsyncAnswerSteerable({ answerer: 'ou_owner', originalAnswerer: 'ou_owner',
+            human: true, managedLark: true, cleanInputAccepted: true }) : true,
       );
       harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
     };
@@ -1564,7 +1566,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // Root: turn/started (exact clientId) arrives ~immediately; the start
       // response is delayed 120ms. Wait until the runner logged the turn/start
       // request so the follow-up races the pending response.
-      send('root', 'om_sr_root');
+      send('root', rootTurnId);
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
       // Follow-up arrives while the root start response is STILL pending.
       send('follow', 'om_sr_follow');
@@ -1583,7 +1585,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         clientUserMessageId: 'om_sr_follow',
       });
       expect(control.finals).toEqual([
-        expect.objectContaining({ turnId: 'om_sr_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: rootTurnId, content: '', disposition: 'steer_superseded' }),
         expect.objectContaining({ turnId: 'om_sr_follow', content: 'fake answer 1' }),
       ]);
       // steer lifecycle emitted for the follow-up.
@@ -3487,6 +3489,64 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(results[2].contentItems[0].text).toContain('Browser is not available: 1');
       expect(JSON.parse(results[6].contentItems[0].text).snapshot).toEqual({ connected: '2', setupCount: 1 });
       expect(readRequests(logPath).filter(r => r.method === 'turn/start')).toHaveLength(1);
+    } finally { await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])('loads bot origin delegation through the real runner argv: %s', async automatic => {
+    const dir = mkdtempSync(join(tmpdir(), 'site-policy-runner-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const plugin = join(dir, 'plugin'); mkdirSync(join(plugin, 'scripts'), { recursive: true });
+    writeFileSync(join(plugin, 'scripts', 'browser-service.mjs'), 'export async function handleRpc(){return {}}');
+    writeFileSync(join(plugin, 'scripts', 'browser-client.mjs'), `
+      export async function setupBrowserRuntime(){return {browsers:{get:async()=>({
+        browserId:'test',nameSession:async()=>{},user:{openTabs:async()=>{
+          const answer=await globalThis.nodeRepl.createElicitation({meta:{codex_approval_kind:'mcp_tool_call',
+            connector_id:'browser-use',tool_name:'access_browser_origin',origin:'https://example.test',persist:'always'}});
+          return [{id:answer.action,title:answer.meta?.persist??'none'}];
+        }}
+      })}}}
+    `);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+      const fs=require('node:fs'),readline=require('node:readline');
+      if(process.argv.includes('--version')){console.log('codex 0.162.1');process.exit(0)}
+      const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+      const notify=(method,params)=>send({method,params});
+      readline.createInterface({input:process.stdin}).on('line',line=>{
+        const q=JSON.parse(line);fs.appendFileSync(process.env.FAKE_CODEX_LOG,JSON.stringify(q)+'\\n');
+        if(q.id===9009){
+          const item={type:'agentMessage',id:'answer',text:JSON.stringify(q.result)};
+          notify('item/completed',{threadId:'thread-site',turnId:'turn-site',item});
+          notify('turn/completed',{threadId:'thread-site',turn:{id:'turn-site',status:'completed',items:[item]}});return;
+        }
+        if(q.id===undefined)return;
+        let result={};
+        if(q.method==='initialize')result={userAgent:'fake-codex'};
+        if(q.method==='thread/start')result={thread:{id:'thread-site',turns:[]}};
+        if(q.method==='turn/start')result={turn:{id:'turn-site'}};
+        send({id:q.id,result});
+        if(q.method==='turn/start'){
+          notify('turn/started',{threadId:'thread-site',turn:{id:'turn-site'}});
+          send({id:9009,method:'item/tool/call',params:{threadId:'thread-site',turnId:'turn-site',
+            callId:'site-call',tool:'botmux_browser',arguments:{operation:'list_tabs'}}});
+        }
+      });
+    `); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'site-policy', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome', '--browser-plugin-root', plugin,
+        ...(automatic ? ['--browser-auto-approve-origins'] : [])],
+      // The default path must cancel before any real Ask transport can run.
+      env: { BOTMUX_SESSION_ID: '', BOTMUX_CHAT_ID: '', BOTMUX_LARK_APP_ID: '', BOTMUX_ROOT_MESSAGE_ID: '' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('check site', { text: 'check site' })}\r`);
+      await waitFor(harness, () => control.finals.length === 1);
+      const answer = readRequests(logPath).find(r => r.id === 9009 && r.result)?.result;
+      expect(answer?.success).toBe(true);
+      const text = answer.contentItems.find((item: any) => item.type === 'inputText').text;
+      expect(JSON.parse(text).tabs).toEqual([{ id: automatic ? 'accept' : 'cancel', title: automatic ? 'session' : 'none' }]);
     } finally { await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 

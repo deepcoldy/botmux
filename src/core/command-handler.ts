@@ -1,3 +1,5 @@
+import { forkManualTurn } from './manual-turn-dispatch.js';
+import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -5,7 +7,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -14,7 +16,8 @@ import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
-import { isLarkToolBound } from './lark-tool-binding.js';
+import { sessionLarkToolBound } from './lark-tool-binding.js';
+import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
@@ -46,11 +49,12 @@ import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { botsInfoObjectEntries, isBotsInfoNameEntry } from '../services/bots-info-shape.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -104,6 +108,7 @@ import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-sto
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
 import { canOperate, isKnownPeerBot } from '../im/lark/event-dispatcher.js';
+import { IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS, applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled, parseIdleAutoCompactCommand } from './idle-auto-compact.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
@@ -136,7 +141,7 @@ import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
-import { rehomeReplyTargetState } from './reply-target.js';
+import { rehomeReplyTargetState, inheritTurnReplyRouting } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
@@ -151,7 +156,8 @@ import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../serv
 import { readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
-import { isPlatformTeamBot } from '../services/platform-team-store.js';
+import { isPlatformTeamBot, readPlatformTeamSync } from '../services/platform-team-store.js';
+import { platformMachineOwner } from '../platform/binding.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
@@ -548,7 +554,7 @@ function botDisplayName(larkAppId: string): string {
     try {
       const p = join(config.session.dataDir, 'bots-info.json');
       if (existsSync(p)) {
-        const entries: Array<{ larkAppId?: string; botName?: string | null; cliId?: string | null }> = JSON.parse(readFileSync(p, 'utf-8'));
+        const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(p, 'utf-8')));
         const found = entries.find(e => e.larkAppId === larkAppId);
         return found?.botName || found?.cliId || larkAppId;
       }
@@ -597,6 +603,8 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface CommandHandlerDeps {
+  /** Source entry, independent of a shared session or newly created topic. */
+  invocationContext?: 'new-topic' | 'thread';
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
@@ -1510,7 +1518,7 @@ export async function handleCardCommand(
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
   const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
-    && ['claude-code', 'codex', 'grok'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
+    && supportsUnifiedReplyCardCli(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
@@ -1868,6 +1876,20 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/models': {
+        const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
+        if (atTopLevel && larkAppId) {
+          await showDefaultModelPicker(larkAppId, rootId, message.senderId, sessionReply, loc);
+          break;
+        }
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        await showSessionModelPicker(ds, rootId, message.senderId, message.senderUnionId, sessionReply, loc);
+        break;
+      }
+
       case '/queue': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2926,6 +2948,10 @@ export async function handleCommand(
           break;
         }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (ds.session.pendingForkSession && effectiveCliId === 'antigravity') {
+          await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
+          break;
+        }
         if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
@@ -3185,8 +3211,8 @@ export async function handleCommand(
                 codexAppInputGateFrozen: true,
               };
             }
-            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput);
-            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput);
+            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput, current.pendingRawTurnId ?? current.pendingTurnId ?? current.session.pendingRepoSetup?.turnId);
+            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput, current.pendingTurnId ?? current.session.pendingRepoSetup?.turnId);
 
             // forkWorker performs the synchronous pre-accept/write-ahead work.
             // Keep the opening reservation and every buffered field intact if
@@ -3372,6 +3398,7 @@ export async function handleCommand(
                 current.session = session;
                 current.lastUserPrompt = undefined;
                 current.lastCliInput = undefined;
+                current.lastCliInputTurnId = undefined;
                 current.workingDir = selectedPath;
                 session.workingDir = selectedPath;
                 session.larkAppId = current.larkAppId;
@@ -3712,28 +3739,80 @@ export async function handleCommand(
           content: failedTurn.cliInput,
           ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
         };
+        const retryTurnId = `retry-${randomUUID()}`;
+        const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
         let accepted = false;
         try {
           if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput);
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId);
           } else {
-            forkWorker(ds, retryInput, ds.hasHistory);
-            accepted = true;
+            accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (!accepted) {
+          rollbackReplyRouting();
+          sessionStore.updateSession(ds.session);
           await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
           break;
         }
         // Update retry state + record the input as the session's last CLI turn
         // (same post-acceptance pattern as the daemon's live-worker path).
         markRetryAttempt(ds.session);
-        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        break;
+      }
+
+      case '/idlecompact': {
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
+          break;
+        }
+        if (!sessionSupportsIdleAutoCompact(ds)) {
+          await sessionReply(rootId, t('card.idle_compact.unsupported', undefined, loc));
+          break;
+        }
+        const parsed = parseIdleAutoCompactCommand(message.content.trim().replace(/^\/idlecompact\b/i, ''));
+        const minK = String(Math.round(IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS / 1000));
+        if (parsed.kind === 'invalid') {
+          await sessionReply(rootId, t('cmd.idlecompact.usage', undefined, loc));
+          break;
+        }
+        if (parsed.kind === 'status') {
+          const setting = ds.session.idleAutoCompact;
+          await sessionReply(rootId, t(
+            isIdleAutoCompactEnabled(ds.session) ? 'cmd.idlecompact.status_on' : 'cmd.idlecompact.status_off',
+            { minutes: idleAutoCompactMinutes(setting), min: minK },
+            loc,
+          ));
+          break;
+        }
+        const previous = ds.session.idleAutoCompact ? { ...ds.session.idleAutoCompact } : undefined;
+        const setting = applyIdleAutoCompactSetting(ds.session, parsed.kind === 'on'
+          ? { enabled: true, ...(parsed.minutes !== undefined ? { minutes: parsed.minutes } : {}) }
+          : { enabled: false });
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          if (previous) ds.session.idleAutoCompact = previous;
+          else delete ds.session.idleAutoCompact;
+          logger.warn(`[${logTag}] /idlecompact save failed: ${err instanceof Error ? err.message : String(err)}`);
+          await sessionReply(rootId, t('card.idle_compact.save_failed', undefined, loc));
+          break;
+        }
+        // Refresh the live card's toggle label; best-effort.
+        try { scheduleActiveRuntimePatch(ds); } catch { /* card refresh is cosmetic */ }
+        await sessionReply(rootId, setting.enabled
+          ? t('card.idle_compact.enabled', { minutes: idleAutoCompactMinutes(setting) }, loc)
+          : t('card.idle_compact.disabled', undefined, loc));
         break;
       }
 
@@ -3931,16 +4010,19 @@ export async function handleCommand(
               const savedReplay = {
                 lastUserPrompt: current.session.lastUserPrompt,
                 lastCliInput: current.session.lastCliInput,
+                lastCliInputTurnId: current.session.lastCliInputTurnId,
                 lastFailedTurn: current.session.lastFailedTurn,
               };
               current.session.lastUserPrompt = undefined;
               current.session.lastCliInput = undefined;
+              current.session.lastCliInputTurnId = undefined;
               current.session.lastFailedTurn = undefined;
               try {
                 sessionStore.updateSession(current.session);
               } catch (err) {
                 current.session.lastUserPrompt = savedReplay.lastUserPrompt;
                 current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
                 current.session.lastFailedTurn = savedReplay.lastFailedTurn;
                 return asError(err, 'could not persist rewind state');
               }
@@ -3952,6 +4034,7 @@ export async function handleCommand(
                 // attempt leaves the session as it was.
                 current.session.lastUserPrompt = savedReplay.lastUserPrompt;
                 current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
                 current.session.lastFailedTurn = savedReplay.lastFailedTurn;
                 try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
                 return asError(err);
@@ -4288,15 +4371,33 @@ export async function handleCommand(
         // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
         // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
         const loginOpenId = message.senderId;
-        // Only sessions created with the new entry use the receiving app here.
-        // Existing sessions keep the original login flow below.
-        if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)
-          && (subCmd === '' || subCmd === 'lark')) {
-          const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
-            normalizeBrand(botCfg2.brand), [], loginOpenId);
-          await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
-          break;
-        }
+        // Sessions on the managed lark-cli binding authorize the receiving app;
+        // legacy sessions keep the original login flow below. Decided from
+        // configuration, so a new topic's first /login (no worker yet) gets the
+        // same answer it will get after the CLI starts.
+        const larkBound = !!ds && sessionLarkToolBound({
+          botConfig: botCfg2,
+          dataDir: config.session.dataDir,
+          sessionId: ds.session.sessionId,
+          workerLive: !!ds.worker && !ds.worker.killed,
+          spawnFacts: {
+            sessionId: ds.session.sessionId,
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            apiOnly: botCfg2.apiOnly,
+            adoptMode: !!ds.session.adoptedFrom,
+            existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
+            backendType: ds.session.backendType ?? botCfg2.backendType ?? config.daemon.backendType,
+            larkToolBinding: botCfg2.larkToolBinding,
+          },
+          workflow: process.env.BOTMUX_WORKFLOW === '1',
+        });
+        // credentialSource = platform: a bound session's `lark-cli --as user` takes
+        // the sender's token from the platform only, so a bot-app authorization
+        // would be useless there. The platform branch below already answers the
+        // bare and explicit forms; status/done must not report one either.
+        const larkPlatformOnly = credentialSourceOf(botCfg2.triggerUserAuth) === 'platform'
+          && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
         // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
         // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
         // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
@@ -4313,6 +4414,32 @@ export async function handleCommand(
           break;
         }
         if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
+          // The platform only issues to the machine owner or a teammate of theirs.
+          // Someone outside every team would authorize there and still get nothing
+          // here, so tell them that up front and offer what does work.
+          const senderUnionId = message.senderUnionId
+            ?? (loginOpenId ? (await resolveUserUnionId(botCfg2.larkAppId, loginOpenId)).unionId : undefined);
+          const owner = platformMachineOwner();
+          const teammate = platformTeammateVerdict({
+            senderUnionId,
+            ownerUnionId: owner.unionId,
+            teams: readPlatformTeamSync(config.session.dataDir),
+          });
+          if (teammate === 'not_teammate') {
+            const localCommands = [larkGoverned ? '/login lark' : '', bytedcliGoverned ? '/login bytedcli' : '']
+              .filter(Boolean).join(t('cmd.login.platform_not_teammate_or', undefined, loc));
+            await sessionReply(rootId, [
+              t('cmd.login.platform_not_teammate_title', undefined, loc), '',
+              t('cmd.login.platform_not_teammate_body', {
+                owner: owner.name ?? t('cmd.login.platform_not_teammate_owner_fallback', undefined, loc),
+              }, loc), '',
+              credSource === 'auto'
+                ? t('cmd.login.platform_not_teammate_local', { commands: localCommands }, loc)
+                : t('cmd.login.platform_not_teammate_platform_only', undefined, loc),
+              t('cmd.login.platform_not_teammate_join', { url: platformCredsUrl }, loc),
+            ].join('\n'));
+            break;
+          }
           const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
             : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
           const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
@@ -4332,6 +4459,15 @@ export async function handleCommand(
           break;
         }
 
+        // After the platform branch: on a platform-bound machine the bare /login
+        // always points at the platform page, whatever state the session is in.
+        if (larkBound && (subCmd === '' || subCmd === 'lark')) {
+          const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand), [], loginOpenId);
+          await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
+          break;
+        }
+
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
@@ -4341,7 +4477,12 @@ export async function handleCommand(
               url: platformCredsUrl,
             }, loc));
           }
-          if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)) {
+          if (larkPlatformOnly) {
+            // The platform is the only source of this person's lark-cli identity:
+            // the platform line above is the answer. Neither the bot-app token nor
+            // a machine-local device login would ever be used here.
+            if (!platformCredsUrl) lines.push(t('cmd.login.platform_unbound', undefined, loc));
+          } else if (larkBound) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
@@ -4371,9 +4512,12 @@ export async function handleCommand(
         // matching side suppressing the other.
         if (subCmd === 'done' || subCmd === '完成') {
           const doneLines: string[] = [];
-          const boundLark = !!ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId);
-          const larkPending = boundLark ? null : pendingLarkCliChallenge(loginOpenId);
-          if (boundLark) {
+          const boundLark = larkBound && !larkPlatformOnly;
+          // platform-only: no machine-local lark-cli login is ever consulted.
+          const larkPending = boundLark || larkPlatformOnly ? null : pendingLarkCliChallenge(loginOpenId);
+          if (larkPlatformOnly) {
+            // nothing to finish or report for lark-cli on this machine
+          } else if (boundLark) {
             doneLines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (larkPending) {
             const { state, detail } = await completeLarkCliLogin(loginOpenId);
@@ -5544,7 +5688,7 @@ export async function handleCommand(
             let bots: Parameters<typeof resolveGroupCreationAgents>[2] = [];
             try {
               const cached: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
-              if (Array.isArray(cached)) bots = cached.filter(b => b && typeof b === 'object');
+              bots = normalizeBotsInfoRouteEntries(cached);
             } catch { /* Names can be unavailable; app IDs still resolve against config. */ }
             configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, configs, bots);
           }
@@ -6710,8 +6854,10 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.models', undefined, loc),
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
+          t('help.idlecompact', undefined, loc),
           t('help.queue', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),

@@ -987,7 +987,7 @@ describe('claude-code writeInput submission confirmation', () => {
         wroteNewTranscript = true;
         writeFileSync(
           newPath,
-          JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello from the moved session' } }) + '\n',
+          JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'hello from the moved session' } }) + '\n',
         );
       }),
     };
@@ -1015,6 +1015,7 @@ describe('claude-code writeInput submission confirmation', () => {
           JSON.stringify({
             type: 'queue-operation',
             operation: 'enqueue',
+            timestamp: new Date().toISOString(),
             content: 'queued prompt after session switch',
           }) + '\n',
         );
@@ -1204,7 +1205,7 @@ describe('claude-code writeInput submission confirmation', () => {
         writeClaudePidFile(9999, { sessionId: rotatedSessionId, cwd });
         appendFileSync(
           rotatedPath,
-          JSON.stringify({ type: 'user', message: { role: 'user', content: 'sent during rotation' } }) + '\n',
+          JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'sent during rotation' } }) + '\n',
         );
       }),
     };
@@ -1253,7 +1254,7 @@ describe('claude-code writeInput submission confirmation', () => {
           setTimeout(() => {
             appendFileSync(
               rotatedPath,
-              JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
+              JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
             );
           }, 850 * TIME_SCALE);
         }),
@@ -1286,7 +1287,7 @@ describe('claude-code writeInput submission confirmation', () => {
         wroteNewTranscript = true;
         writeFileSync(
           newPath,
-          JSON.stringify({ type: 'user', message: { role: 'user', content: 'fallback by fingerprint' } }) + '\n',
+          JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'fallback by fingerprint' } }) + '\n',
         );
       }),
     };
@@ -1326,7 +1327,7 @@ describe('claude-code writeInput submission confirmation', () => {
     // Hook eventually lets the user line land in the pinned path.
     appendFileSync(
       pinnedPath,
-      JSON.stringify({ type: 'user', message: { role: 'user', content: 'slow hook still running' } }) + '\n',
+      JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'slow hook still running' } }) + '\n',
     );
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
   });
@@ -1398,6 +1399,19 @@ Fix the test suite failure on CI
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeLessThan(100);
     expect(res).toContain('safe content');
+  });
+
+  it('extractMessageContentForFingerprint strips the follow-up <botmux_formatting> block without an envelope', () => {
+    // #2716: bare transcript / hook fallback shapes carry no <user_message>;
+    // the new follow-up-only block must be isolated from the user payload just
+    // like <botmux_reminder>, instead of taking over the 30-char fingerprint of
+    // a short message.
+    const bare = '继续\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    expect(extractMessageContentForFingerprint(bare)).toBe('继续');
+    expect(makeSubmitFingerprint(bare, 30)).toBe('继续');
+
+    const ledByFormatting = '<botmux_formatting>短进度优先纯文本。</botmux_formatting>\n\n<user_message>\n继续看一下\n</user_message>';
+    expect(extractMessageContentForFingerprint(ledByFormatting)).toBe('继续看一下');
   });
 
   it('stripBotmuxEnvelopeBlocks stays linear and preserves later blocks on malformed tag soup', () => {

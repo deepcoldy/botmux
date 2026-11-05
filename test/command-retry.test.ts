@@ -129,7 +129,7 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 // created with vi.hoisted to be referenceable inside the factories.
 const { sendWorkerInput, forkWorker, rememberLastCliInput } = vi.hoisted(() => ({
   sendWorkerInput: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
-  forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
+  forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any, options?: any) => boolean>(),
   rememberLastCliInput: vi.fn<(ds: any, userPrompt: string, cliInput: any, opts?: any) => void>(),
 }));
 
@@ -274,7 +274,9 @@ vi.mock('../src/core/session-title.js', () => ({ updateSessionTitle: vi.fn() }))
 vi.mock('../src/core/session-rename.js', () => ({ requestAgentSessionRename: vi.fn() }));
 vi.mock('../src/core/session-mutation-guard.js', () => ({ hasProtectedSessionMutationOwnership: vi.fn(() => false) }));
 vi.mock('../src/core/bot-turn-mutation-gate.js', () => ({ withBotTurnMutation: vi.fn(async (_id: string, action: () => any) => action()) }));
-vi.mock('../src/core/reply-target.js', () => ({ rehomeReplyTargetState: vi.fn() }));
+vi.mock('../src/core/reply-target.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/core/reply-target.js')>(), rehomeReplyTargetState: vi.fn(),
+}));
 vi.mock('../src/core/cli-runtime-display.js', () => ({
   configuredRuntimeDisplayName: vi.fn(() => undefined),
   sessionConfiguredRuntimeDisplayName: vi.fn(() => undefined),
@@ -371,6 +373,7 @@ function aliveWorker(): { killed: boolean } {
 beforeEach(() => {
   vi.clearAllMocks();
   sendWorkerInput.mockReturnValue(true);
+  forkWorker.mockImplementation((_ds, _input, _resume, options) => { options?.onAdmission?.('accepted'); return true; });
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -400,7 +403,7 @@ describe('/retry command', () => {
     await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), deps, LARK_APP_ID);
 
     expect(sendWorkerInput).toHaveBeenCalledTimes(1);
-    const [sentDs, payload] = sendWorkerInput.mock.calls[0];
+    const [sentDs, payload, turnId] = sendWorkerInput.mock.calls[0];
     expect(sentDs).toBe(ds);
     expect(payload).toMatchObject({ content: '<user-prompt>fix the flaky test</user-prompt>' });
     expect(forkWorker).not.toHaveBeenCalled();
@@ -410,9 +413,25 @@ describe('/retry command', () => {
     // The re-injected input becomes the session's last CLI turn.
     expect(rememberLastCliInput).toHaveBeenCalledWith(ds, 'fix the flaky test', expect.objectContaining({
       content: '<user-prompt>fix the flaky test</user-prompt>',
-    }));
+    }), turnId);
+    expect(turnId).toEqual(expect.any(String));
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('routes a new retry turn to the failed topic even after another topic becomes current', async () => {
+    const failed = makeFailedTurn();
+    const ds = makeDaemonSession({ worker: aliveWorker() as any, scope: 'chat',
+      session: makeSession({ lastFailedTurn: failed, replyTargets: {
+        [failed.turnId]: { rootMessageId: 'om_failed_topic', senderOpenId: 'ou_original', updatedAt: failed.failedAt },
+      } }), currentReplyTarget: { rootMessageId: 'om_other_topic', turnId: 'om_other', updatedAt: failed.failedAt } });
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
+    const id = sendWorkerInput.mock.calls[0][2]!;
+    const { frozenReplyContextForTurn, resolveSessionReplyTarget } = await import('../src/core/reply-target.js');
+    expect(frozenReplyContextForTurn(ds, id).target).toEqual({ mode: 'thread', rootMessageId: 'om_failed_topic' });
+    expect(resolveSessionReplyTarget(ds, id)).toEqual({ mode: 'thread', rootMessageId: 'om_failed_topic' });
+    expect(ds.session.replyTargets?.[id].senderOpenId).toBeUndefined();
+    expect(rememberLastCliInput.mock.calls[0][3]).toBe(id);
   });
 
   it('forks a fresh worker when the current one is dead', async () => {
@@ -428,7 +447,8 @@ describe('/retry command', () => {
     const [forkedDs, payload, hasHistory] = forkWorker.mock.calls[0];
     expect(forkedDs).toBe(ds);
     expect(payload).toMatchObject({ content: '<user-prompt>fix the flaky test</user-prompt>' });
-    expect(hasHistory).toBe(true);
+    expect(hasHistory).toMatchObject({ resume: true, turnId: expect.any(String) });
+    expect(rememberLastCliInput.mock.calls[0][3]).toBe((hasHistory as { turnId: string }).turnId);
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'msg_001');
   });
 
@@ -493,5 +513,43 @@ describe('/retry command', () => {
     await handleCommand('/help', ROOT_ID, makeLarkMessage('/help'), deps, LARK_APP_ID);
     const helpText = deps.sessionReply.mock.calls[0][1] as string;
     expect(helpText).toContain('/retry');
+  });
+});
+
+
+describe('/retry rejected admission routing transaction', () => {
+  it.each(['ipc', 'false', 'handled-rejected', 'partial-write-throw'] as const)(
+    'restores full indexes and persists rollback after repeated %s', async mode => {
+      const { fillRetryRouting, routingSnapshot } = await import('./helpers/retry-routing.js');
+      const ds = makeDaemonSession({ worker: mode === 'ipc' ? aliveWorker() as any : null,
+        session: makeSession({ lastFailedTurn: makeFailedTurn() }) });
+      const before = fillRetryRouting(ds, ds.session.lastFailedTurn!.turnId);
+      let persisted: unknown;
+      vi.mocked(sessionStore.updateSession).mockImplementation(row => {
+        persisted = structuredClone(row);
+        Object.assign(row, structuredClone(row));
+      });
+      sendWorkerInput.mockReturnValue(false);
+      forkWorker.mockImplementation((target, _input, _resume, opts) => {
+        sessionStore.updateSession(target.session);
+        if (mode === 'partial-write-throw') throw new Error('spawn failed');
+        opts.onAdmission('rejected');
+        return mode === 'handled-rejected';
+      });
+      for (let i = 0; i < 3; i++) {
+        await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
+        expect(routingSnapshot(ds)).toEqual(before);
+        expect(persisted).toMatchObject(before);
+        expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+        expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined();
+        expect(rememberLastCliInput).not.toHaveBeenCalled();
+      }
+    });
+  it('keeps an already queued deferred input and starts its cooldown', async () => {
+    const ds = makeDaemonSession({ session: makeSession({ lastFailedTurn: makeFailedTurn() }) });
+    forkWorker.mockImplementation((_ds, _input, _resume, opts) => { opts.onAdmission('deferred'); return true; });
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+    expect(rememberLastCliInput).toHaveBeenCalledTimes(1);
   });
 });

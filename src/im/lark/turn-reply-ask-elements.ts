@@ -1,16 +1,20 @@
 import { hasAskForm } from '../../core/ask-form.js';
 import { buildAskFormElements } from './ask-form-elements.js';
 import type { ReplyCardAsk } from '../../services/turn-reply-card.js';
+import { stripCardMarkdownImages } from './md-card.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot } from './ask-option-layout.js';
+import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
+import { buildAskCustomForm } from './ask-custom-form.js';
 
-const safe = (text: string) => text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
+const safe = (text: string) => stripCardMarkdownImages(text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]'))
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0. */
 export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 'zh'): Array<Record<string, any>> {
   const { ask } = entry;
   if (hasAskForm(ask.questions)) return buildAskFormElements(ask, locale, entry.result);
+  if (supportsAskCustomInput(ask)) return [buildAskCustomForm(ask, locale, entry.confirmEmptyArmed, safe)];
   const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
   const submit = textReplyRequired || ask.questions.length > 1 || ask.questions.some(q => q.multiSelect || q.defaultSelectedKeys !== undefined);
   const elements: Array<Record<string, any>> = [];
@@ -64,13 +68,12 @@ export function turnReplyAskSummary(entry: ReplyCardAsk, locale: Locale = 'zh'):
   const { ask, result } = entry;
   const lines = ask.questions.map((q, i) => {
     const labels = result?.kind === 'answered'
-      ? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
-    const input = result?.kind === 'answered' ? result.inputs?.[i] : null;
-    return `🙋 ${safe(q.prompt)}${labels || input ? `\n✓ ${safe(input ?? labels)}` : ''}`;
+      ? result.customAnswers?.[i] ?? result.inputs?.[i] ?? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
+    return `🙋 ${safe(q.prompt)}${labels ? `\n✓ ${safe(labels)}` : ''}`;
   });
   if (result?.kind === 'answered') {
     if (result.comment) lines.push(`💬 ${safe(result.comment)}`);
-    else if (result.answers.every(keys => keys.length === 0) && !result.inputs?.some(Boolean)) lines.push(locale === 'en' ? '✓ No options selected' : '✓ 未选择任何选项');
+    else if (!result.inputs?.some(Boolean) && !result.customAnswers?.some(Boolean) && result.answers.every(keys => keys.length === 0)) lines.push(locale === 'en' ? '✓ No options selected' : '✓ 未选择任何选项');
   } else {
     lines.push(result?.kind === 'timedOut' ? t('card.ask.timed_out', undefined, locale)
       : result?.kind === 'invalidated' ? t('card.ask.invalidated', undefined, locale)

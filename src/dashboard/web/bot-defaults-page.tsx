@@ -1,3 +1,4 @@
+import { SessionGroupNamingRow } from './session-group-naming-row.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
@@ -108,7 +109,7 @@ import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings, type Trae
 import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
 import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
-  strongestTraexModelSettings, type TraexAutoModelDraft,
+  strongestTraexModelSettings, strongestTraexPreflightModelSettings, type TraexAutoModelDraft,
 } from './traex-auto-model-preferences.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
@@ -641,6 +642,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
     codexBrowser: body.codexBrowser,
+    codexBrowserAutoApproveOrigins: body.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
@@ -2412,6 +2414,11 @@ export function BotAgentSection(props: {
   const [autoModelEnabled, setAutoModelEnabled] = useState(autoDraftRef.current.enabled);
   const [autoReselectPerTurn, setAutoReselectPerTurn] = useState(autoDraftRef.current.reselectPerTurn);
   const [autoTrigger, setAutoTrigger] = useState(autoDraftRef.current.trigger ?? 'capacity');
+  const [autoPreflightLoadCheck, setAutoPreflightLoadCheck] = useState(autoDraftRef.current.preflightLoadCheck === true);
+  const [autoOverloadThresholdPercent, setAutoOverloadThresholdPercent] = useState(autoDraftRef.current.overloadThresholdPercent ?? '100');
+  const [autoPreflightTimeoutSeconds, setAutoPreflightTimeoutSeconds] = useState(autoDraftRef.current.preflightTimeoutSeconds ?? '8');
+  const [autoUnknownLoadPolicy, setAutoUnknownLoadPolicy] = useState<'skip'>(autoDraftRef.current.unknownLoadPolicy ?? 'skip');
+  const [autoAllOverloadedPolicy, setAutoAllOverloadedPolicy] = useState<'lowest_load'>(autoDraftRef.current.allOverloadedPolicy ?? 'lowest_load');
   const [autoModelTouched, setAutoModelTouched] = useState(!!initialAutoDraft.current);
   const [autoModels, setAutoModels] = useState(autoDraftRef.current.models);
   const [autoModelSettings, setAutoModelSettings] = useState(autoDraftRef.current.modelSettings);
@@ -2430,6 +2437,11 @@ export function BotAgentSection(props: {
     setAutoModelEnabled(draft.enabled);
     setAutoReselectPerTurn(draft.reselectPerTurn);
     setAutoTrigger(draft.trigger ?? 'capacity');
+    setAutoPreflightLoadCheck(draft.preflightLoadCheck === true);
+    setAutoOverloadThresholdPercent(draft.overloadThresholdPercent ?? '100');
+    setAutoPreflightTimeoutSeconds(draft.preflightTimeoutSeconds ?? '8');
+    setAutoUnknownLoadPolicy(draft.unknownLoadPolicy ?? 'skip');
+    setAutoAllOverloadedPolicy(draft.allOverloadedPolicy ?? 'lowest_load');
     setAutoModels(draft.models);
     setAutoModelSettings(draft.modelSettings);
     setAutoTimeoutSeconds(draft.timeoutSeconds);
@@ -2716,16 +2728,38 @@ export function BotAgentSection(props: {
     }
     const trimmedNativeModel = nativeModel.trim();
     const saveCliId = selectedAgentCliId(cliKey);
+    const overloadThresholdPercent = autoOverloadThresholdPercent.trim() === ''
+      ? 100 : Number(autoOverloadThresholdPercent);
+    const preflightTimeoutSeconds = autoPreflightTimeoutSeconds.trim() === ''
+      ? 8 : Number(autoPreflightTimeoutSeconds);
+    const preflightTimeoutMs = Math.round(preflightTimeoutSeconds * 1_000);
+    if (autoModelEnabled && autoPreflightLoadCheck
+      && (!Number.isInteger(overloadThresholdPercent) || overloadThresholdPercent < 0
+        || overloadThresholdPercent > 65_535 || !Number.isFinite(preflightTimeoutSeconds)
+        || preflightTimeoutSeconds < 0.1 || preflightTimeoutSeconds > 30)) {
+      setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
+      return;
+    }
     const autoConfig = normalizeTraexAutoModelConfig(autoModelEnabled ? {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
       trigger: autoTrigger,
+      preflightLoadCheck: autoPreflightLoadCheck,
+      overloadThresholdPercent,
+      preflightTimeoutMs,
+      unknownLoadPolicy: autoUnknownLoadPolicy,
+      allOverloadedPolicy: autoAllOverloadedPolicy,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
       previousSettings: previousAutoSettings.current,
-      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => [model,
-        resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
-          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined }),
-      ])),
+      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => {
+        const configured = resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
+          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined });
+        const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
+        const requiredEffort = strongestTraexPreflightModelSettings(model, capability).reasoningEffort;
+        return [model, autoPreflightLoadCheck && requiredEffort
+          ? { ...configured, reasoningEffort: requiredEffort }
+          : configured];
+      })),
     } : null);
     if (saveCliId === 'traex' && autoConfig.error) {
       setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
@@ -3280,7 +3314,18 @@ export function BotAgentSection(props: {
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}
           trigger={autoTrigger}
-          onTrigger={trigger => editAutoDraft({ trigger })}
+          preflightLoadCheck={autoPreflightLoadCheck}
+          overloadThresholdPercent={autoOverloadThresholdPercent}
+          preflightTimeoutSeconds={autoPreflightTimeoutSeconds}
+          unknownLoadPolicy={autoUnknownLoadPolicy}
+          allOverloadedPolicy={autoAllOverloadedPolicy}
+          onTrigger={trigger => editAutoDraft({ trigger,
+            ...(trigger === 'quota' ? { preflightLoadCheck: false } : {}) })}
+          onPreflightLoadCheck={enabled => editAutoDraft({ preflightLoadCheck: enabled })}
+          onOverloadThresholdPercent={value => editAutoDraft({ overloadThresholdPercent: value })}
+          onPreflightTimeoutSeconds={value => editAutoDraft({ preflightTimeoutSeconds: value })}
+          onUnknownLoadPolicy={value => editAutoDraft({ unknownLoadPolicy: value })}
+          onAllOverloadedPolicy={value => editAutoDraft({ allOverloadedPolicy: value })}
           onReselectPerTurn={enabled => editAutoDraft({ reselectPerTurn: enabled })}
           modelSettings={autoModelSettings} capabilities={detectedModels?.modelCapabilities}
           timeoutSeconds={autoTimeoutSeconds} cooldownSeconds={autoCooldownSeconds}
@@ -5639,9 +5684,10 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
   const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
+  const [autoApproveOrigins, setAutoApproveOrigins] = useState(props.bot.codexBrowserAutoApproveOrigins === true);
   const [cliNudge, setCliNudge] = useState(props.bot.noProgressNotify?.cliEnabled === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'no-progress' | null>(null);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'browser-approval' | 'no-progress' | null>(null);
   // 无进展提醒（#1162）：null 配置 = 默认（开启，90s）。UI 状态与 bot 配置同步，
   // 两个控件独立保存但总是提交完整对象，避免 toggle 顺手丢掉已配置的阈值。
   const noProgress = props.bot.noProgressNotify ?? null;
@@ -5658,6 +5704,7 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
   useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
+  useEffect(() => setAutoApproveOrigins(props.bot.codexBrowserAutoApproveOrigins === true), [props.bot.codexBrowserAutoApproveOrigins]);
   useEffect(() => setCliNudge(props.bot.noProgressNotify?.cliEnabled === true), [props.bot.noProgressNotify]);
 
   async function saveCleanInput(checked: boolean): Promise<void> {
@@ -5683,6 +5730,19 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       setBusy: on => setBusy(on ? 'browser' : null),
       saved: tr('botDefaults.cardPrefSaved'),
       rollback: () => setBrowserEnabled(previous),
+    });
+  }
+
+  async function saveBrowserApproval(checked: boolean): Promise<void> {
+    const previous = autoApproveOrigins;
+    setAutoApproveOrigins(checked);
+    await saveBotField({
+      request: () => props.putCardPref({ codexBrowserAutoApproveOrigins: checked }),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? 'browser-approval' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      rollback: () => setAutoApproveOrigins(previous),
     });
   }
 
@@ -5737,6 +5797,15 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
           description={tr('botDefaults.codexBrowserDescription')}
           help={tr('botDefaults.codexBrowserHelp')}
           onChange={checked => void saveBrowser(checked)}
+        />
+        <ToggleRow
+          checked={browserEnabled && autoApproveOrigins}
+          disabled={busy !== null || !browserEnabled}
+          dataAction="toggle-codex-browser-auto-approve-origins"
+          title={tr('botDefaults.codexBrowserAutoApproveOrigins')}
+          description={tr('botDefaults.codexBrowserAutoApproveOriginsDescription')}
+          help={tr('botDefaults.codexBrowserAutoApproveOriginsHelp')}
+          onChange={checked => void saveBrowserApproval(checked)}
         />
         <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
         <ToggleRow
@@ -6401,6 +6470,7 @@ function SessionModeSection(props: {
         <div className="bd-mode-group-side"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
         {p2p === 'group' ? (
           <>
+            <SessionGroupNamingRow key={props.bot.larkAppId} appId={props.bot.larkAppId} cliId={props.bot.cliId} />
             <SessionGroupTagRow bot={props.bot} />
             <p className="bd-section-note" data-session-group-lifecycle>{tr('botDefaults.sgLifecycleHint')}</p>
           </>

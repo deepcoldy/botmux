@@ -429,3 +429,38 @@ describe('session reasoning selector', () => {
     expect(JSON.stringify(card)).not.toContain('set_reasoning_effort');
   });
 });
+
+describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', () => {
+  const usageWith = (enabled: boolean) => ({ context: null, tokens: null, idleAutoCompact: { enabled, minutes: 55 } });
+
+  it('renders in the main control row next to compact, showing the current state', () => {
+    const off = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })), 'toggle_idle_compact');
+    expect(off.text.content).toContain('关');
+    expect(off.value.desired).toBe('on');
+    expect(off.value.session_id).toBe(SID);
+    const on = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true) })), 'toggle_idle_compact');
+    expect(on.text.content).toContain('开');
+    expect(on.value.desired).toBe('off');
+    const actions = headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })).map((a: any) => a.value?.action);
+    expect(actions.indexOf('toggle_idle_compact')).toBe(actions.indexOf('compact_session') + 1);
+  });
+
+  it('localises the label', () => {
+    const btn = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true), locale: 'en' })), 'toggle_idle_compact');
+    expect(btn.text.content).toMatch(/idle/i);
+  });
+
+  it('is not rendered when the snapshot carries no toggle state (unsupported CLI/backend)', () => {
+    const card = build({ status: 'idle', cliId: 'gemini', usage: { context: null, tokens: null } });
+    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
+  });
+
+  it('follows the compact button\'s hidden-button setting', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
+    ));
+    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
+  });
+});

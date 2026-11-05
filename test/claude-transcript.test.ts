@@ -1069,6 +1069,66 @@ describe('fingerprint fallback: /clear rotation + short fingerprint guard', () =
   });
 });
 
+describe('time floor: records without a timestamp cannot pass it', () => {
+  const floorMs = Date.parse('2026-10-29T10:35:00.000Z');
+  // Shape Claude Code writes next to a prompt: role:user content, no timestamp, no uuid.
+  const blob = (text: string) => JSON.stringify({
+    type: 'api-request-blob',
+    hash: 'abc',
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  }) + '\n';
+  const stalePrompt = (text: string) => JSON.stringify({
+    type: 'user',
+    timestamp: '2026-10-29T10:08:04.933Z',
+    message: { role: 'user', content: text },
+  }) + '\n';
+
+  it('a stale prompt and its blob copy in another session do not match a new turn', () => {
+    const closed = join(dir, 'closed-session.jsonl');
+    appendFileSync(closed, stalePrompt('run the daily report') + blob('run the daily report'), 'utf8');
+    const options = { minEventTimestampMs: floorMs, includeQueueOperations: true };
+    expect(findJsonlsContainingExactContent(dir, 'run the daily report', options)).toEqual([]);
+    expect(findJsonlContainingFingerprint(dir, 'run the daily', options)).toBeNull();
+    expect(jsonlContainsFingerprint(closed, 'run the daily', options)).toBe(false);
+  });
+
+  it('a record with an unparseable timestamp does not pass either', () => {
+    const path = join(dir, 'bad-ts.jsonl');
+    appendFileSync(path, JSON.stringify({
+      type: 'user',
+      timestamp: 'not-a-date',
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily', { minEventTimestampMs: floorMs })).toBe(false);
+  });
+
+  it('a fresh prompt still matches when the file also holds blob copies', () => {
+    const live = join(dir, 'live-session.jsonl');
+    appendFileSync(live, blob('run the daily report') + JSON.stringify({
+      type: 'user',
+      timestamp: '2026-10-29T10:35:43.733Z',
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(findJsonlsContainingExactContent(dir, 'run the daily report', { minEventTimestampMs: floorMs })).toEqual([live]);
+  });
+
+  it('a record exactly at the floor passes (the floor is inclusive)', () => {
+    const path = join(dir, 'at-floor.jsonl');
+    appendFileSync(path, JSON.stringify({
+      type: 'user',
+      timestamp: new Date(floorMs).toISOString(),
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily', { minEventTimestampMs: floorMs })).toBe(true);
+  });
+
+  it('without a floor, the blob copy still counts (behaviour unchanged)', () => {
+    const path = join(dir, 'no-floor.jsonl');
+    appendFileSync(path, blob('run the daily report'), 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily')).toBe(true);
+  });
+});
+
 // ─── isMeaningfulUserEvent / extractLastAssistantTurn ──────────────────────
 //
 // Powers the /adopt preamble: when /adopt fires, the bridge baselines the

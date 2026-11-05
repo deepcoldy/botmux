@@ -95,6 +95,27 @@ export function hasInterruptedWork(work: InterruptedWork | undefined): work is I
   return !!work && (work.turnOpen || work.tasks.length > 0);
 }
 
+/** Whether journal-replayed activity may substitute for a missed tail scan:
+ *  the 16MB restart-interruption scan can see no open turn when the dead
+ *  turn's boundary lies outside its window, while the durable journal proves
+ *  the previous process started one. Synthesis is allowed only for a spawn
+ *  the scan itself was eligible for — a TraeX auto-model rotation
+ *  intentionally keeps the native turn running, and adopt / Codex App /
+ *  remote / shared-app-server sessions own recovery elsewhere — and only
+ *  when the scan did not already produce interruption work. `hasStaleTurn`
+ *  is the caller's check that the replay produced a started restored mark. */
+export function shouldSynthesizeJournalInterruption(input: {
+  scanEligible: boolean;
+  existingAppServerEndpoint: boolean;
+  pendingWork: InterruptedWork | undefined;
+  hasStaleTurn: boolean;
+}): boolean {
+  return input.scanEligible
+    && !input.existingAppServerEndpoint
+    && input.pendingWork === undefined
+    && input.hasStaleTurn;
+}
+
 function eventTimeMs(ev: TranscriptEvent): number | undefined {
   const ms = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
   return Number.isFinite(ms) ? ms : undefined;

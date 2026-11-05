@@ -66,7 +66,10 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue', terminalDelayMs = 0,
   delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false, holdPreferredSuccessor = false,
   quota?: { code: string; exhaustLast?: boolean; initial?: boolean; blocked?: boolean },
-  delayedHistoryReceipt?: { submission: number; ms: number }) {
+  delayedHistoryReceipt?: { submission: number; ms: number },
+  preflight?: { enabled: boolean; initialPrompt?: string; dispatchAttempt?: number;
+    probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number },
+  restoreInterruptedStructuredTurn = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -104,11 +107,13 @@ if (process.argv[2] === 'app-server') {
       const request = JSON.parse(pending.slice(0, end)); pending = pending.slice(end + 1);
       fs.appendFileSync(${JSON.stringify(rpcRequests)}, JSON.stringify({ method: request.method }) + '\\n');
       if (request.method === 'initialize') process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n');
+      if (request.method === 'model/list' && ${JSON.stringify(preflight?.probe)} === 'timeout') continue;
+      if (request.method === 'model/list' && ${JSON.stringify(preflight?.probe)} === 'failure') process.exit(1);
       if (request.method === 'model/list') process.stdout.write(JSON.stringify({ id: request.id, result: {
         data: ${JSON.stringify(loadData ? [
-          { id: 'core', businessMetadata: { load: { load_percent: 180 } } },
-          { id: 'backup', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 100 : 160 } } },
-          { id: 'last', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 50 : 120 } } },
+          { id: 'core', businessMetadata: { load: { load_percent: 180 } }, supportedReasoningEfforts: [{ reasoningEffort: 'xhigh' }, { reasoningEffort: 'max' }] },
+          { id: 'backup', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 100 : 160 } }, supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'xhigh' }] },
+          { id: 'last', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 50 : 120 } }, supportedReasoningEfforts: [{ reasoningEffort: 'xhigh' }, { reasoningEffort: 'max' }] },
           { id: 'outside', businessMetadata: { load: { load_percent: 0 } } },
         ] : [])}, nextCursor: null } }) + '\\n');
     }
@@ -234,6 +239,28 @@ setInterval(() => {
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
   const sessionId = randomUUID();
+  if (restoreInterruptedStructuredTurn) {
+    const markTimeMs = Date.now() - 1_000;
+    const timestamp = new Date(markTimeMs).toISOString();
+    const interruptedPrompt = 'interrupted cold resume ask';
+    writeFileSync(rolloutPath, [
+      { type: 'session_meta', payload: { id: nativeId, cwd: dataDir } },
+      { timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: 'native_interrupted' } },
+      { timestamp, type: 'event_msg', payload: { type: 'user_message', message: interruptedPrompt, turn_id: 'native_interrupted' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const marksDir = join(dataDir, 'turn-marks');
+    mkdirSync(marksDir, { recursive: true });
+    writeFileSync(join(marksDir, `${sessionId}.json.structured`), `${JSON.stringify({
+      version: 1,
+      pending: [{
+        turnId: 'om_interrupted',
+        markTimeMs,
+        fingerprint: interruptedPrompt,
+        jsonlPath: rolloutPath,
+        offsetAtMark: 0,
+      }],
+    })}\n`);
+  }
   const binary = process.env.BOTMUX_TEST_WORKER_BINARY;
   const backendType = binary || process.env.BOTMUX_TEST_WORKER_BACKEND === 'tmux' ? 'tmux' : 'pty';
   if (backendType === 'tmux') panes.push(`bmx-${sessionId.slice(0, 8)}`);
@@ -309,8 +336,11 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
   }
   const init = { type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId: 'traex', cliPathOverride: fake, cliSessionId: freshStart ? undefined : nativeId,
-    resume: !freshStart, model: 'core', backendType, prompt: quota?.initial ? 'initial quota task' : '',
-    ...(quota?.initial ? { turnId: 'om_initial_quota' } : {}),
+    resume: !freshStart, model: 'core', backendType,
+    prompt: preflight?.initialPrompt ?? (quota?.initial ? 'initial quota task' : ''),
+    ...((preflight?.initialPrompt || quota?.initial) ? { turnId: preflight?.initialPrompt ? 'om_initial_preflight' : 'om_initial_quota' } : {}),
+    ...(preflight?.initialPrompt && preflight.dispatchAttempt !== undefined
+      ? { dispatchAttempt: preflight.dispatchAttempt } : {}),
     ...(quota?.blocked ? { traexAutoModelRuntime: {
       model: 'last', nativeSessionId: nativeId, waitingOnFinalModel: false,
       policyKey: traexAutoModelPolicyKey({ enabled: true, trigger: 'quota', models: ['core', 'backup', 'last'],
@@ -320,6 +350,13 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
     ...(rpcPolicy ? { codexRpcInput: resolveCodexRpcInput('traex', rpcPolicy.override, rpcPolicy.global) } : {}),
     ...(enabled ? { traexAutoModel: { enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000, switchCooldownMs: 5_000,
       ...(quota ? { trigger: 'quota' as const } : {}),
+      ...(preflight?.enabled ? {
+        preflightLoadCheck: true,
+        overloadThresholdPercent: 100,
+        preflightTimeoutMs: preflight.timeoutMs ?? 1_000,
+        unknownLoadPolicy: 'skip' as const,
+        allOverloadedPolicy: 'lowest_load' as const,
+      } : {}),
       reselectPerTurn,
       ...(loadData ? { modelSettings: {
         core: { reasoningEffort: 'high', modelBackendVariant: 'standard' },
@@ -335,6 +372,69 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('releases a cold-restored interrupted structured turn before accepting new input', async () => {
+    const f = await fixture(false, false, false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, true);
+    await f.wait(() => f.logs.join('').includes('Cleared 1 stale structured turn(s)'), 'stale structured turn cleared');
+    expect(interruptionNotices(f.messages)).toHaveLength(1);
+    expect(f.logs.join('')).not.toContain('Ignoring prompt-ready heuristic while a structured turn is unfinished');
+
+    f.child.send({ type: 'message', content: 'new request after cold recovery', turnId: 'om_after_recovery' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'new request submitted after recovery');
+    expect(rows(f.submissions)[0]).toMatchObject({ model: 'core' });
+    expect(rows(f.submissions)[0].text).toMatch(/^new request after cold recovery(?:\r|\n|$)/);
+    expect(rows(f.submissions)[0].text).not.toContain('interrupted cold resume ask');
+  }, 45_000);
+
+  it('preflights a cold first turn before the only spawn and submits the original prompt once', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined,
+      { enabled: true, initialPrompt: 'cold preflight task' });
+    await f.wait(() => rows(f.submissions).length === 1, 'cold prompt submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['backup']);
+    expect(rows(f.launches)[0].args).toContain('model_reasoning_effort="xhigh"');
+    expect(rows(f.submissions)).toEqual([expect.objectContaining({ model: 'backup', text: 'cold preflight task' })]);
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(1);
+  }, 45_000);
+
+  it.each(['failure', 'timeout'] as const)('fails open on a preflight probe %s without duplicating the first prompt', async probe => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined,
+      { enabled: true, initialPrompt: `${probe} task`, probe, timeoutMs: 100 });
+    await f.wait(() => rows(f.submissions).length === 1, `${probe} prompt submitted`);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+    expect(rows(f.submissions)).toEqual([expect.objectContaining({ model: 'core', text: `${probe} task` })]);
+  }, 45_000);
+
+  it('preflights an idle warm turn with exact resume, then keeps busy type-ahead on that model', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      'working', 0, 0, false, false, undefined, undefined, { enabled: true });
+    f.child.send({ type: 'message', content: 'warm independent task', turnId: 'om_warm' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'warm task submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
+    expect(rows(f.launches)[1].args).toContain(f.nativeId);
+    expect(rows(f.submissions)[0]).toMatchObject({ model: 'backup' });
+    expect(rows(f.submissions)[0].text).toMatch(/^warm independent task(?:\r|\n|$)/);
+    const loadReads = rows(f.rpcRequests).filter(row => row.method === 'model/list').length;
+
+    f.child.send({ type: 'message', content: 'busy correction', turnId: 'om_correction' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 2, 'busy correction submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
+    expect(rows(f.submissions)[1]).toMatchObject({ model: 'backup', text: 'busy correction' });
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(loadReads);
+  }, 45_000);
+
+  it('routes a durable dispatch through the same idle Worker admission before writing', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      'working', 0, 0, false, false, undefined, undefined, { enabled: true });
+    f.child.send({ type: 'message', content: 'dispatch task', turnId: 'dispatch-turn', dispatchAttempt: 1 } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'dispatch submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
+    expect(rows(f.submissions)).toHaveLength(1);
+    expect(rows(f.submissions)[0]).toMatchObject({ model: 'backup' });
+    expect(rows(f.submissions)[0].text).toMatch(/^dispatch task(?:\r|\n|$)/);
+  }, 45_000);
+
   it('quota initial prompts use admission instead of bypassing persisted blocks', async () => {
     const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
       { code: 'usage_limit_exceeded', initial: true, blocked: true });

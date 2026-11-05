@@ -3,7 +3,7 @@ import type { FailedTurnRecord, TrustedCaller, CliTurnPayload, Session } from '.
 import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
-import { buildFailedTurnRecord, shouldRecordFailedTurn } from '../services/failed-turn-retry.js';
+import { buildFailedTurnRecord } from '../services/failed-turn-retry.js';
 import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
@@ -69,8 +69,7 @@ export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCall
 /** Some structured quota failures have no turn_terminal. Record their input
  * once at the native limited edge, while the authenticated turn still exists. */
 export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | undefined): void {
-  if (!turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId
-      || !shouldRecordFailedTurn({ turnId, status: 'failed' }, ds.currentReplyTarget?.turnId)) return;
+  if (!turnId || ds.lastCliInputTurnId !== turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId) return;
   const caller = failedTurnCaller(ds, turnId);
   if (!caller) return;
   const record = buildFailedTurnRecord({ turnId, status: 'failed', errorCode: `${ds.usageLimit.kind}_limited` }, {
@@ -111,7 +110,7 @@ export function recordFailedTurnTerminal(
   // state, not a failed human turn. Recording it would reuse ds.lastCliInput
   // from the previous human turn and make /retry replay already-completed work.
   if (isAutoCompactSafeComposerRefusal(terminal)) return;
-  if (!shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)
+  if (ds.lastCliInputTurnId !== terminal.turnId
       || ds.session.lastFailedTurn?.turnId === terminal.turnId && ds.session.lastFailedTurn.recovery) return;
   const record = buildFailedTurnRecord({ ...terminal, status: terminal.status }, {
     userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
@@ -137,7 +136,7 @@ function newerInput(ds: DaemonSession, record: FailedTurnRecord): boolean {
     || hasProtectedSessionMutationOwnership(ds)
     || !!ds.pendingPrompt || !!ds.pendingFollowUps?.length || !!ds.pendingFollowUpTurnIds?.length
     || !!ds.activeInteractiveTurn && ds.activeInteractiveTurn.turnId !== record.turnId
-    || !!ds.currentReplyTarget?.turnId && ds.currentReplyTarget.turnId !== record.turnId
+    || !!ds.lastCliInputTurnId && ds.lastCliInputTurnId !== record.turnId
     || ds.lastMessageAt > Date.parse(record.failedAt)
     || ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing';
 }
@@ -253,9 +252,15 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           [turnId]: { ...priorReply, rootMessageId: priorReply?.rootMessageId ?? ds.session.rootMessageId,
             senderOpenId: caller.requestUserOpenId, participants: priorReply?.participants ?? [{ openId: caller.requestUserOpenId, isBot: false }], updatedAt: new Date().toISOString() } };
         target.activeInteractiveTurn = { turnId, caller: recoveredCaller, userPrompt: record.userPrompt };
-        target.currentReplyTarget = { rootMessageId: priorReply?.rootMessageId ?? ds.session.rootMessageId,
-          turnId, updatedAt: new Date().toISOString() };
-        target.session.currentReplyTarget = { ...target.currentReplyTarget };
+        // The mutable reply cursor belongs only to chat-scope routing. Thread
+        // ingress updates replyTargets but never advances this cursor; recovery
+        // must not manufacture chat routing state for a thread session.
+        target.currentReplyTarget = target.scope === 'chat'
+          ? { rootMessageId: priorReply?.rootMessageId ?? ds.session.rootMessageId,
+            turnId, updatedAt: new Date().toISOString() }
+          : undefined;
+        target.session.currentReplyTarget = target.currentReplyTarget
+          ? { ...target.currentReplyTarget } : undefined;
         const codexAppInput = record.codexAppInput
           ? (({ clientUserMessageId: _oldId, ...input }) => input)(record.codexAppInput) : undefined;
         const input: CliTurnPayload = request.mode === 'fresh'
@@ -283,7 +288,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
             onAdmission: admission => { rejected = admission === 'rejected'; },
           });
         if (!accepted || rejected) return setState('dispatch_unknown');
-        rememberLastCliInput(target, record.userPrompt, input);
+        rememberLastCliInput(target, record.userPrompt, input, turnId);
         store.updateSession(target.session);
         return setState('accepted');
       } catch {

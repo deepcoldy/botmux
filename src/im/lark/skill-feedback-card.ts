@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { normalizeCardActionData } from './card-action-data.js';
 import { resolveCardOperatorUnionId } from './card-handler.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
-import type { SkillFeedbackStore } from '../../services/skill-feedback-store.js';
+import type { CompatibleFeedbackStore } from '../../services/feedback-storage-types.js';
 import { buildOncallGroupColumn } from './oncall-group.js';
 import { logger } from '../../utils/logger.js';
 
@@ -278,7 +278,7 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
 function callbackKey(input: Record<string, unknown>): string { return createHash('sha256').update(JSON.stringify(input)).digest('hex'); }
 
 export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: string, deps: {
-  store: SkillFeedbackStore;
+  store: CompatibleFeedbackStore;
   loadBaseCard?: (platformMessageId: string) => Promise<Record<string, unknown> | undefined>;
 }): Promise<any> {
   const data = normalizeCardActionData(input);
@@ -287,7 +287,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
   const operatorOpenId = verifiedOperator.openId?.startsWith('ou_') ? verifiedOperator.openId : undefined;
   const action = data.action?.value?.action;
   if (!platformMessageId || !action) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
-  const delivery = deps.store.findDeliveryByPlatformMessage('lark', larkAppId, platformMessageId);
+  const delivery = await deps.store.findDeliveryByPlatformMessage('lark', larkAppId, platformMessageId);
   if (!delivery?.policy || !delivery.baseCard) return { toast: { type: 'error', content: '反馈目标不存在或已失效' } };
   let baseCard = delivery.baseCard;
   try { baseCard = await deps.loadBaseCard?.(platformMessageId) ?? baseCard; }
@@ -322,7 +322,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
     if (delivery.requesterSubjectId && delivery.requesterSubjectId !== operatorSubjectId && delivery.requesterSubjectId !== operatorOpenId) return { toast: { type: 'error', content: '仅本次提问者可反馈' } };
   }
 
-  const previous = deps.store.getLatestFeedback(delivery.deliveryId, operatorSubjectId);
+  const previous = await deps.store.getLatestFeedback(delivery.deliveryId, operatorSubjectId);
   if (previous && !delivery.policy.allowReselect && action === 'feedback_submit') {
     return { card: { type: 'raw', data: renderFeedbackCard(baseCard, delivery.policy, previous) } };
   }
@@ -360,9 +360,9 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
   if (expectedFeedbackId !== undefined && (typeof expectedFeedbackId !== 'string' || !expectedFeedbackId)) {
     return { toast: { type: 'error', content: '反馈状态无效，请刷新后重试' } };
   }
-  let recorded: ReturnType<SkillFeedbackStore['recordFeedback']>;
+  let recorded: Awaited<ReturnType<CompatibleFeedbackStore['recordFeedback']>>;
   try {
-    recorded = deps.store.recordFeedback({
+    recorded = await deps.store.recordFeedback({
       platform: 'lark', platformAppId: larkAppId, platformMessageId, operatorSubjectId, result, semantic: selectedButton?.semantic, reasonKey, comment,
       expectedFeedbackId,
       callbackKey: callbackKey({

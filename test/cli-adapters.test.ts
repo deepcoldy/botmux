@@ -1293,11 +1293,13 @@ describe('codex-app buildArgs', () => {
         enabled: true,
         family: 'edge',
         pluginRoot: '/opt/codex/chrome-plugin',
+        autoApproveOrigins: true,
       },
     });
     expect(enabled).toEqual(expect.arrayContaining([
       '--browser-family', 'edge',
       '--browser-plugin-root', '/opt/codex/chrome-plugin',
+      '--browser-auto-approve-origins',
     ]));
   });
 });
@@ -2992,14 +2994,20 @@ describe('hermes buildArgs', () => {
 describe('antigravity buildArgs', () => {
   const adapter = createAntigravityAdapter('/usr/local/bin/agy');
 
-  it('fresh session passes --dangerously-skip-permissions only', () => {
+  it('fresh sessions keep permission bypass and use separate native identity logs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
-    expect(args).toEqual(['--dangerously-skip-permissions']);
+    const other = adapter.buildArgs({ sessionId: 'sess-8', resume: false });
+    expect(args).toContain('--dangerously-skip-permissions');
+    expect(args).toContain('--log-file');
+    expect(other).toContain('--log-file');
+    expect(args[args.indexOf('--log-file') + 1]).not.toBe(other[other.indexOf('--log-file') + 1]);
+    expect(args).not.toContain('--conversation');
   });
 
   it('omits dangerous permission flag when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true });
-    expect(args).toEqual([]);
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).toContain('--log-file');
   });
 
   it('does NOT inject initialPrompt via -i (agy -i does not auto-submit)', () => {

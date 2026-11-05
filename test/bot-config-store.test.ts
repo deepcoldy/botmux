@@ -87,6 +87,106 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange, sessionGroups };
   }
 
+  it('checks a picker model snapshot inside the file lock before writing effort', async () => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce();
+      await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].model = 'sonnet';
+      writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus' });
+    release();
+    await holder;
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ model: 'sonnet' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('checks a picker CLI snapshot inside the file lock before writing a model', async () => {
+    const { store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].cliId = 'codex'; writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('model')!, 'sonnet', { selectionKey: 'claude-code' });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ cliId: 'codex', model: 'opus' });
+  });
+
+  it('refuses a picker write when the backend loses launch-model support while waiting for the lock', async () => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].backendType = 'riff'; writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus', requireLaunchModelSupport: true });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ backendType: 'riff', model: 'opus' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it.each([false, true])('rechecks picker admin authorization under the lock (registry updated: %s)', async updateRegistry => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].allowedUsers = []; writeFileSync(configPath, JSON.stringify(raw));
+      if (updateRegistry) {
+        registry.getBot('app_default').config.allowedUsers = [];
+        registry.getBot('app_default').resolvedAllowedUsers = [];
+      }
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus', actorOpenId: 'ou_owner' });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('accepts and clears effort for the CLI default model with an exact picker snapshot', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('reasoningEffort')!;
+    const precondition = { selectionKey: 'claude-code', model: null };
+    expect((await store.applyConfigField('app_default', spec, 'high', precondition)).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('high');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('high');
+    expect((await store.applyConfigField('app_default', spec, null, precondition)).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
     const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
     const spec = store.findConfigField('envPolicy')!;
@@ -1668,6 +1768,100 @@ describe('bot-config store', () => {
     expect(readConfig().sandbox).toBeUndefined();
     // 内存态可能由配置归一化填默认 false（盘上缺省才是契约）；关键是不能落成 scratch。
     expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+  });
+
+  it('rejects replyDelivery=transcript for doubao under scratch sandbox (#2828: .sessions tree lands in the merged overlay the host bridge cannot read)', async () => {
+    const { store } = await loaded({ cliId: 'doubao', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('accepts replyDelivery=transcript for doubao under oncall (authPaths directory bind keeps the host path readable)', async () => {
+    const { store } = await loaded({ cliId: 'doubao', sandbox: 'oncall' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+  });
+
+  it('#2828 P2: legacy entry with persisted transcript on a non-capture CLI (no scratch) is not locked — editing an unrelated field succeeds', async () => {
+    // 可达形状：claude-code+transcript 切 cliId 到 opencode（invariant master 历来放行，
+    // 运行时回落 send）。窄化前的判据会把该 bot 的任何字段编辑锁死在
+    // reply_delivery_unsupported；现在改 model/name 等无关字段必须成功。
+    const { store } = await loaded({ cliId: 'opencode', replyDelivery: 'transcript', model: 'old' });
+    const r = await store.applyConfigField('app_default', store.findConfigField('model')!, 'new-model');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', replyDelivery: 'transcript', model: 'new-model' });
+
+    // 直接写 transcript 到不支持的 CLI 仍被写入门禁拒绝（master 既有行为，不在本次放宽面）。
+    const reject = await store.applyConfigField('app_default', store.findConfigField('replyDelivery')!, 'transcript');
+    expect(reject).toMatchObject({ ok: false, reason: 'reply_delivery_unsupported' });
+
+    // 该 entry 切 scratch 也不锁：opencode「从来没有」转写采集，scratch 下显式
+    // transcript 只是运行时回落 send（不静默）。锁它会误伤存量 bots.json。
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const sr = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(sr.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('#2828 P3: codex+scratch+transcript switching cliId to a never-capture CLI stays allowed (master-reachable legacy shape), to doubao/cursor stays rejected', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const cli = store.findConfigField('cli')!;
+    const toOpencode = await store.applyConfigField('app_default', cli, 'opencode');
+    expect(toOpencode.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', sandbox: 'scratch', replyDelivery: 'transcript' });
+    // 该存量 entry 的无关编辑不再被锁
+    const modelEdit = await store.applyConfigField('app_default', store.findConfigField('model')!, 'm');
+    expect(modelEdit.ok).toBe(true);
+
+    // 回到 codex 后切 doubao（真静默边）仍被 rmw 拦
+    expect((await store.applyConfigField('app_default', cli, 'codex')).ok).toBe(true);
+    const blocked = await store.applyConfigField('app_default', cli, 'doubao');
+    expect(blocked).toMatchObject({ ok: false, reason: 'reply_delivery_unsupported' });
+    expect(readConfig().cliId).toBe('codex');
+  });
+
+  it('doubao default (no explicit replyDelivery) may switch to scratch — the default resolves at runtime, the rmw invariant only rejects persisted transcript', async () => {
+    await loaded({ cliId: 'doubao' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'doubao', sandbox: 'scratch' });
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('invariant backstop: switching cliId codex→doubao while scratch+transcript persist is rejected', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'doubao');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('invariant backstop: updateBotSandboxMode rejects switching a doubao+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
+    const { registry } = await loaded({ cliId: 'doubao', replyDelivery: 'transcript' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+  });
+
+  it('doubao enables zero injection oncall but rejects it under scratch (#2828 bypass: none forces transcript past the delivery gate)', async () => {
+    const oncall = await loaded({ cliId: 'doubao', sandbox: 'oncall' });
+    const noneSpec = oncall.store.findConfigField('promptInjection')!;
+    expect((await oncall.store.applyConfigField('app_default', noneSpec, 'none')).ok).toBe(true);
+
+    const scratch = await loaded({ cliId: 'doubao', sandbox: 'scratch' });
+    const r = await scratch.store.applyConfigField('app_default', scratch.store.findConfigField('promptInjection')!, 'none');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('zero_prompt_unsupported');
+    expect(readConfig().promptInjection).toBeUndefined();
   });
 
   it('updateBotSandboxPaths refuses `/` / HOME / botmux home and relative entries as readWrite and leaves bots.json untouched', async () => {

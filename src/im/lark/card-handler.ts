@@ -1,3 +1,8 @@
+import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
+import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
+import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
+import { randomUUID } from 'node:crypto';
+import { MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -79,6 +84,7 @@ import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled } from '../../core/idle-auto-compact.js';
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
@@ -87,17 +93,14 @@ import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js'
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { staticModelChoices, detectModels, mergeModelChoices } from '../../services/model-catalog.js';
-import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.js';
-import { selectionKeyForBot } from '../../setup/cli-selection.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
-import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
+import { fallbackTurnId, rehomeReplyTargetState, inheritTurnReplyRouting } from '../../core/reply-target.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
@@ -151,6 +154,8 @@ export interface CardHandlerDeps {
   v3LoopGrantDeps?: V3LoopGrantCardHandlerDeps;
   /** v3 回溯预算准许卡点击处理（同一个 runner 的 driveRun）. */
   v3RevisitGrantDeps?: V3RevisitGrantCardHandlerDeps;
+  /** v3 运行中「流程修改确认」卡的同意 / 拒绝（只有发起人能点）。 */
+  v3RevisionDeps?: import('./v3-revision-card-handler.js').V3RevisionCardHandlerDeps;
   /** v3 成功终态卡的「保存复用」动作。 */
   v3RunSaveDeps?: V3RunSaveCardHandlerDeps;
   /** v3 参数蒸馏提案的接受/拒绝动作。 */
@@ -179,8 +184,10 @@ export interface CardHandlerDeps {
       senderIsBot: boolean;
       messageId: string;
       replyRootId?: string;
+      turnId?: string;
+      onDelivered?: () => void;
     },
-  ) => void;
+  ) => boolean | void;
   /** Signed single-use button. The handler admits the clicker and returns a
    *  continuation that starts the turn after the card callback is acked. */
   cardClickTurn?: (input: {
@@ -807,8 +814,8 @@ export async function commitRepoSelection(
           codexAppInputGateFrozen: true,
         };
       }
-      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput);
-      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput);
+      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput, ds.pendingRawTurnId ?? ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
+      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput, ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
       // Keep the reservation and every buffered opening field intact through
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
@@ -987,6 +994,7 @@ export async function commitRepoSelection(
         current.session = session;
         current.lastUserPrompt = undefined;
         current.lastCliInput = undefined;
+        current.lastCliInputTurnId = undefined;
         current.workingDir = dirPath;
         session.workingDir = dirPath;
         session.larkAppId = current.larkAppId;
@@ -1192,6 +1200,7 @@ export async function runAutoWorktreeCommit(deps: {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
         // Never reached under suppressConfirmReply for a pendingRepo session.
         sessionReply: async () => '',
+        prepareTurn,
       },
       targetDir,
       pathBasename(targetDir),
@@ -1357,49 +1366,6 @@ async function cardReplyOptions(
 
 // ── Reply-card overflow action menu (reply_card_menu) helpers ──────────────
 
-const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
-
-/**
- * Resolve the model-catalogue selection for THIS session's frozen CLI shape.
- * The catalogue functions take a "selection key" (cliId + wrapperCli +
- * launchMode), not a bare cliId — probing a `ttadk codex` session with the
- * bare 'codex' key returns the native codex list instead of the gateway's.
- * Probe inputs (custom executable, injected env, runtime cache identity) are
- * derived through the same helper as the dashboard endpoint so the menu sees
- * exactly the runtime the session is running.
- */
-function resolveReplyMenuModelCatalogue(ds: DaemonSession): {
-  key: string;
-  staticChoices: readonly string[];
-  detect: () => Promise<readonly string[] | null>;
-} {
-  const cliId = sessionCliId(ds);
-  const key = selectionKeyForBot(cliId, ds.session.wrapperCli, ds.session.cliLaunchMode);
-  const probe = modelCatalogProbeContext(key, getBot(ds.larkAppId).config, process.env);
-  return {
-    key,
-    staticChoices: staticModelChoices(key),
-    detect: () => detectModels(key, {
-      runtimeContext: probe.runtimeContext,
-      probeEnv: probe.probeEnv,
-      runtimeExecutable: probe.runtimeExecutable,
-      adapterFactory: requestedCliId => createCliAdapterSync(
-        requestedCliId,
-        requestedCliId === probe.cliId ? probe.runtimeExecutable : undefined,
-      ),
-    }),
-  };
-}
-
-/** One accept rule shared by the picker render and the submission whitelist:
- * live non-empty wins, otherwise the curated static list. Building both from
- * this keeps the offered options and the inject whitelist on identical terms. */
-async function replyMenuModelChoices(ds: DaemonSession): Promise<readonly string[]> {
-  const catalogue = resolveReplyMenuModelCatalogue(ds);
-  const live = await catalogue.detect().catch(() => null);
-  return mergeModelChoices(catalogue.staticChoices, live).models;
-}
-
 type SessionReplyFn = (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
 
 function replyMenuBinding(ds: DaemonSession, rootId: string): Record<string, string> {
@@ -1526,41 +1492,6 @@ function buildMenuCloseConfirmCard(ds: DaemonSession, rootId: string, loc: Local
   });
 }
 
-function buildMenuModelPickerCard(
-  ds: DaemonSession,
-  rootId: string,
-  models: readonly string[],
-  currentModel: string | undefined,
-  loc: Locale,
-): string {
-  // Only render slugs the inject path would accept: a live-detected catalogue
-  // entry with exotic characters must not render into a dead option.
-  const safeModels = models.filter(model => MODEL_SLUG_PATTERN.test(model));
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    elements: [
-      { tag: 'markdown', content: `**${t('card.reply_actions.model_title', undefined, loc)}**` },
-      {
-        tag: 'action',
-        actions: [{
-          tag: 'select_static',
-          placeholder: { tag: 'plain_text', content: currentModel || t('card.reply_actions.model', undefined, loc) },
-          ...(currentModel && safeModels.includes(currentModel) ? { initial_option: currentModel } : {}),
-          options: safeModels.slice(0, 50).map(model => ({
-            text: {
-              tag: 'plain_text',
-              content: model === currentModel
-                ? `${model} ${t('card.reply_actions.model_current', undefined, loc)}`
-                : model,
-            },
-            value: model,
-          })),
-          value: { action: 'reply_model_pick', ...replyMenuBinding(ds, rootId) },
-        }],
-      },
-    ],
-  });
-}
 
 function cardClickTurnToastKey(reason: string): string {
   switch (reason) {
@@ -2436,16 +2367,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     let accepted = false;
     try {
       if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
-      // Cold session: fork a worker with the transcript as its opening input,
-      // matching how retry_last_task revives a dead worker. `forkWorker` throws
-      // on refusal rather than returning a flag, so acceptance is claimed only
-      // after it returns — the earlier `accepted = true` before the call would
-      // have reported success for a fork that never happened, with the
-      // one-shot follow-up token already consumed and no retry affordance.
-      else {
-        forkWorker(ds, cliInput, ds.hasHistory);
-        accepted = true;
-      }
+      else accepted = forkManualTurn(ds, cliInput, turnId, forkWorker);
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2464,7 +2386,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // only ever driven through /quote would keep that flag forever — final text
     // answers still arrive, but its streaming card is permanently dead with no
     // visible cause and no way for the user to revive it.
-    rememberLastCliInput(ds, transcript.text, cliInput);
+    rememberLastCliInput(ds, transcript.text, cliInput, turnId);
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
@@ -2501,7 +2423,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──
   const CONFIG_CARD_ACTIONS = [
-    'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+    'config_toggle', 'config_set', 'models_default_pick', 'models_default_effort_pick', 'config_quota', 'config_quota_open',
     'config_quota_save', 'config_text_open', 'config_text_save',
   ];
   if (value?.action && larkAppId && CONFIG_CARD_ACTIONS.includes(value.action)) {
@@ -2515,6 +2437,20 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     if (admins.length === 0 || !operatorOpenId || !admins.includes(operatorOpenId)) {
       return { toast: { type: 'error', content: t('cmd.config.not_admin', undefined, loc) } };
     }
+    const effortPicker = value.action === 'models_default_effort_pick';
+    const defaultPicker = value.action === 'models_default_pick' || effortPicker;
+    if (defaultPicker && value.lark_app_id !== larkAppId) {
+      return { toast: { type: 'error', content: t('cmd.config.no_bot', undefined, loc) } };
+    }
+    if (defaultPicker && !botAcceptsLaunchModel(cbot.config)) {
+      return { toast: { type: 'warning', content: t('card.models.default_unsupported', undefined, loc) } };
+    }
+    if (defaultPicker && value.selection_key !== defaultModelSelectionKey(larkAppId)) {
+      return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
+    }
+    if (effortPicker && value.expected_model !== (cbot.config.model?.trim() || '')) {
+      return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
+    }
     // ttadk 网关 bot 用 ttadk 网关模型候选（glm-5.1…），非底层适配器的 opus/gpt-5
     // （否则被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
     const modelChoices = (() => {
@@ -2522,7 +2458,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (ttadkChoices !== null) return ttadkChoices;
       try { return createCliAdapterSync(cbot.config.cliId, cbot.config.cliPathOverride).modelChoices ?? []; } catch { return []; }
     })();
-    const reRender = () => {
+    const reRender = async () => {
+      if (defaultPicker) {
+        const refreshKey = defaultModelSelectionKey(larkAppId);
+        const { models, load } = await defaultModelPickerData(larkAppId);
+        const current = getBot(larkAppId);
+        if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
+          || !current.resolvedAllowedUsers.includes(operatorOpenId)) return {};
+        return { card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, models, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }, load)) } };
+      }
       const d = getConfigCardData(larkAppId, modelChoices);
       return d ? { card: { type: 'raw' as const, data: JSON.parse(buildConfigCard(d, loc)) } } : {};
     };
@@ -2609,7 +2553,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const raw = (action as any)?.option ?? '';
       // legacy 是只读初始项，用来让历史 >1000 额度仍能生成合法下拉卡。
       if (raw === 'legacy') {
-        return { toast: { type: 'info', content: t('card.config.quota_legacy_unchanged', undefined, loc) }, ...reRender() };
+        return { toast: { type: 'info', content: t('card.config.quota_legacy_unchanged', undefined, loc) }, ...(await reRender()) };
       }
       let limit: number | null = null;
       if (raw !== 'off') {
@@ -2621,15 +2565,23 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
       const qr = await updateBotGrantPrefs(larkAppId, { messageQuotaDefaultLimit: limit });
       if (!qr.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: qr.reason }, loc) } };
-      return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...reRender() };
+      return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...(await reRender()) };
     }
 
-    const field = value.field as string | undefined;
+    const field = defaultPicker ? (effortPicker ? 'reasoningEffort' : 'model') : value.field as string | undefined;
     const spec = field ? findConfigField(field) : undefined;
     if (!spec || spec.kind === 'allowedUsers') {
       return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: field ?? '?', fields: '' }, loc) } };
     }
 
+    const commitValue = (fieldValue: unknown) => defaultPicker
+      ? applyConfigField(larkAppId, spec, fieldValue, {
+          selectionKey: String(value.selection_key),
+          requireLaunchModelSupport: true,
+          actorOpenId: operatorOpenId,
+          ...(effortPicker ? { model: typeof value.expected_model === 'string' && value.expected_model ? value.expected_model : null } : {}),
+        })
+      : applyConfigField(larkAppId, spec, fieldValue);
     let r;
     if (value.action === 'config_toggle') {
       if (spec.kind !== 'boolean') return { toast: { type: 'error', content: t('cmd.config.invalid_bool', { field: spec.key, value: '' }, loc) } };
@@ -2637,17 +2589,39 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';
+      if (defaultPicker && raw !== CONFIG_UNSET && (effortPicker ? !isCodexReasoningEffort(raw) : !MODEL_SLUG_PATTERN.test(raw))) {
+        return { toast: { type: 'error', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.reply_actions.model_unsupported', undefined, loc) } };
+      }
       if (raw === CONFIG_UNSET) {
-        if (!spec.clearable) return { toast: { type: 'error', content: t('cmd.config.not_clearable', { field: spec.key }, loc) }, ...reRender() };
-        r = await applyConfigField(larkAppId, spec, null);
+        if (!spec.clearable) return { toast: { type: 'error', content: t('cmd.config.not_clearable', { field: spec.key }, loc) }, ...(await reRender()) };
+        r = await commitValue(null);
       } else {
         const coerced = coerceConfigValue(spec, raw);
-        if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) }, ...reRender() };
-        r = await applyConfigField(larkAppId, spec, coerced.value);
+        if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) }, ...(await reRender()) };
+        r = await commitValue(coerced.value);
       }
     }
-    if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
-    return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...reRender() };
+    if (!r.ok) {
+      if (defaultPicker && r.reason === 'config_selection_changed') {
+        return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
+      }
+      if (defaultPicker && r.reason === 'reasoning_effort_not_supported_by_model') {
+        return { toast: { type: 'warning', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.models.effort_incompatible', undefined, loc) }, ...(await reRender()) };
+      }
+      return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+    }
+    if (defaultPicker) {
+      const refreshKey = defaultModelSelectionKey(larkAppId);
+      const { models: choices, load } = await defaultModelPickerData(larkAppId);
+      const current = getBot(larkAppId);
+      if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
+        || !current.resolvedAllowedUsers.includes(operatorOpenId)) {
+        return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText} · ${t('card.models.changed', undefined, loc)}` } };
+      }
+      return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` },
+        card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }, load)) } };
+    }
+    return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...(await reRender()) };
   }
 
   // ─── /relay picker: confirm transfer (stage 2 → done) ──────────────────
@@ -3344,6 +3318,82 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
     }
 
+    // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in（core/idle-auto-compact.ts）。按钮值带目标
+    // 状态 desired，旧卡片重复点击幂等；设置落在会话行上，daemon 重启后仍生效。
+    if (actionType === 'toggle_idle_compact') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+      }
+      // canOperate is enforced by the sensitive-action gate (card-action-routes.ts).
+      if (!sessionSupportsIdleAutoCompact(ds)) {
+        return { toast: { type: 'warning', content: t('card.idle_compact.unsupported', undefined, loc) } };
+      }
+      const enabled = value?.desired === 'on'
+        ? true
+        : value?.desired === 'off' ? false : !isIdleAutoCompactEnabled(ds.session);
+      const previous = ds.session.idleAutoCompact ? { ...ds.session.idleAutoCompact } : undefined;
+      const setting = applyIdleAutoCompactSetting(ds.session, { enabled });
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        if (previous) ds.session.idleAutoCompact = previous;
+        else delete ds.session.idleAutoCompact;
+        logger.warn(`[${tag(ds)}] toggle_idle_compact save failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { toast: { type: 'warning', content: t('card.idle_compact.save_failed', undefined, loc) } };
+      }
+      logger.info(`[${tag(ds)}] idle auto-compact ${enabled ? 'on' : 'off'} via card by ${operatorOpenId ?? '?'}`);
+      return {
+        toast: {
+          type: 'success',
+          content: enabled
+            ? t('card.idle_compact.enabled', { minutes: idleAutoCompactMinutes(setting) }, loc)
+            : t('card.idle_compact.disabled', undefined, loc),
+        },
+        ...(cardMessageId && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      };
+    }
+
+    if (actionType === 'session_effort_pick' || actionType === 'session_effort_apply') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      const warning = (key: string) => ({ toast: { type: 'warning', content: t(key, undefined, loc) } });
+      if (!ds || !operatorOpenId) return warning('card.reply_actions.session_gone');
+      let requested = false;
+      const mutation = await tryWithBotTurnMutation(ds.larkAppId, 1000, () => {
+        const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
+        const control = topicReasoningControl(ds);
+        if (current !== ds || ds.session.status !== 'active' || value.lark_app_id !== ds.larkAppId
+          || value.chat_id !== ds.chatId || rootId !== sessionAnchorId(ds)
+          || value.worker_generation !== String(ds.workerGeneration ?? 0) || value.cli_generation !== String(ds.cliReadyGeneration ?? 0)
+          || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId) || !control
+          || value.expected_model !== control.model
+          || value.expected_effort !== (ds.session.topicReasoningEffort?.effort ?? '')
+          || value.expected_effort_model !== (ds.session.topicReasoningEffort?.model ?? '')) return 'stale' as const;
+        if (actionType === 'session_effort_pick') return setTopicReasoningEffort(ds, action?.option);
+        const selected = ds.session.topicReasoningEffort;
+        if (!selected || value.effort !== selected.effort || !control.choices.includes(selected.effort)) return 'invalid' as const;
+        if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds)) return 'busy' as const;
+        if (!ds.session.cliSessionId) return 'unsupported' as const;
+        const result = requestSessionRestart(ds, {
+          source: 'card',
+          notify: async status => { await sessionReply(rootId, t(`card.topic_effort.restart_${status}`, undefined, loc)); },
+        }, { topicEffort: { model: control.model, effort: selected.effort, nativeSessionId: ds.session.cliSessionId } });
+        requested = !!result && !result.startFailure && !result.joined;
+        return requested ? 'saved' as const : 'busy' as const;
+      });
+      if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value !== 'saved') return warning(mutation.value === 'stale' ? 'card.topic_effort.stale' : `card.effort.${mutation.value}`);
+      if (requested) return { toast: { type: 'info', content: t('card.topic_effort.restart_in_progress', undefined, loc) } };
+      const { models, load } = await sessionModelPickerData(ds);
+      if (getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) !== ds
+        || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) return warning('card.topic_effort.stale');
+      return { toast: { type: 'success', content: t('card.topic_effort.saved', undefined, loc) },
+        card: { type: 'raw' as const, data: JSON.parse(buildSessionModelPickerCard(ds, rootId, models,
+          ds.activeModel ?? ds.session.model, loc, 'session_model_pick', load)) } };
+    }
+
     if (actionType === 'set_reasoning_effort') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       const warning = (key: string) => ({
@@ -3362,9 +3412,43 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           || !cardMessageId || cardMessageId !== ds.streamCardId
           || value.card_nonce !== ds.streamCardNonce
           || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
-        return setSessionReasoningEffort(ds, data.action?.option);
+        const control = sessionReasoningControl(ds);
+        if (!control) return 'unsupported' as const;
+        const effort = control.choices.find(choice => choice === data.action?.option);
+        if (!effort) return 'invalid' as const;
+        // Keep the verified cold-start path for suspended sessions and wrappers.
+        // A live Codex uses the same native, receipt-confirmed menu as /effort.
+        const worker = ds.worker;
+        if (!worker || worker.killed || (ds.initConfig ?? ds.session).wrapperCli) {
+          return setSessionReasoningEffort(ds, effort);
+        }
+        const generation = ds.workerGeneration;
+        const sessionGeneration = ds.session.workerGeneration;
+        const nativeId = ds.session.cliSessionId;
+        const stillCurrent = () => getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) === ds
+          && ds.worker === worker && ds.workerGeneration === generation
+          && ds.session.workerGeneration === sessionGeneration
+          && ds.session.cliSessionId === nativeId && ds.session.status === 'active';
+        const notify = async (result: import('../../types.js').CodexAppEffortResult) => {
+          if (!stillCurrent()) return;
+          scheduleCardPatch(ds, buildStreamingCardJson(ds), undefined, { userInitiated: true });
+          const key = result.reason ? `cmd.effort.${result.reason}`
+            : result.status === 'invalid' && !result.choices?.length
+              ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
+          const text = t(key, { effort, choices: result.choices?.join(', ') ?? '' }, loc);
+          await deliverEphemeralOrReply(ds, operatorOpenId, text, 'text', () => sessionReply(rootId, text));
+        };
+        // Native menu navigation may take seconds. Acknowledge the card callback
+        // and release the bot mutation gate before waiting for the CLI receipt.
+        void updateCodexCliEffort(ds, effort).then(notify).catch(error => {
+          logger.warn(`[${tag(ds)}] Card effort update failed: ${String(error)}`);
+        });
+        return 'updating' as const;
       });
       if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value === 'updating') return {
+        toast: { type: 'info', content: t('card.effort.updating', undefined, loc) },
+      };
       if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
       return {
         toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },
@@ -3787,12 +3871,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -3801,9 +3886,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      rememberLastCliInput(ds, ds.lastUserPrompt ?? cliInput, retryInput, retryTurnId);
       // Only now consume the one-shot retry state and advertise working: live
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
@@ -3861,6 +3949,35 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     //     failed-turn-retry.test 有用例钉住），因为一次重试也可能再失败。
     // 两道都 fail-closed：宁可让用户多发一条消息，也不重复提交可能带外部副作用
     // 的任务。
+    // 自动恢复失败卡的「重试」：重新投递那一轮的原消息。刻意不在
+    // SENSITIVE_CARD_ACTIONS 里——通用 canOperate 门会把原发起人（oncall 群里常是
+    // talk-only 成员）挡在外面；权限门在 handleOrdinaryRecoveryRetryClick 里：
+    // 原发起人（仍能和 bot 对话）或 bot 管理员，其余人一律拒绝。
+    if (actionType === 'retry_recovery_turn') {
+      if (!ds) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.retry_recovery_missing', undefined, localeForBot(larkAppId)),
+          },
+        };
+      }
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
+      const { handleOrdinaryRecoveryRetryClick } = await import('../../core/ordinary-recovery-retry.js');
+      return handleOrdinaryRecoveryRetryClick(ds, {
+        logicalTurnId: typeof value?.logical_turn_id === 'string' ? value.logical_turn_id : undefined,
+        operatorOpenId,
+        ...(data?.operator?.union_id ? { operatorUnionId: data.operator.union_id } : {}),
+      });
+    }
+
     if (actionType === 'retry_turn' && ds) {
       const locDs = localeForBot(ds.larkAppId);
       if (isSessionTransferring(ds)) {
@@ -3920,12 +4037,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -3934,12 +4052,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       // Start the cooldown only after acceptance: a rejected click must not
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4315,8 +4435,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         value?.stream_card_version !== STREAMING_CARD_PATCH_VERSION;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 
+      const requestedDisplayMode: DisplayMode | undefined =
+        value?.target_display_mode === 'hidden' || value?.target_display_mode === 'screenshot'
+          ? value.target_display_mode
+          : undefined;
       const nextMode = (current: DisplayMode): DisplayMode =>
-        current === 'hidden' ? 'screenshot' : 'hidden';
+        requestedDisplayMode ?? (current === 'hidden' ? 'screenshot' : 'hidden');
 
       if (needsPatchContractMigration) {
         const legacyMessageId = cardMessageId
@@ -4668,6 +4792,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
+      if (ds.session.pendingForkSession && sessionCliId(ds) === 'antigravity') {
+        return { toast: { type: 'warning', content: t('cmd.stop.fork_pending', undefined, locDs) } };
+      }
       if (isSessionTransferring(ds)) {
         return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
       }
@@ -4818,17 +4945,24 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           return {};
         }
         const pickerDs = ds;
+        const pickerWorker = ds.worker;
+        const pickerGeneration = ds.workerGeneration;
         return {
           toast: { type: 'info', content: t('card.reply_actions.model_loading', undefined, loc) },
           afterAck: async () => {
-            const models = await replyMenuModelChoices(pickerDs);
+            const { models, load } = await sessionModelPickerData(pickerDs);
+            if (!canOperate(pickerDs.larkAppId, pickerDs.chatId, operatorOpenId)
+              || pickerDs.worker !== pickerWorker || pickerDs.workerGeneration !== pickerGeneration
+              || pickerDs.worker?.killed || isSessionTransferring(pickerDs)) return;
             const cardJson = models.length > 0
-              ? buildMenuModelPickerCard(
+              ? buildSessionModelPickerCard(
                 pickerDs,
                 rootId,
                 models,
                 pickerDs.activeModel?.trim() || pickerDs.session.model?.trim() || undefined,
                 loc,
+                'reply_model_pick',
+                load,
               )
               : menuNoticeCard(t('card.reply_actions.model_empty', undefined, loc));
             await deliverEphemeralOrReply(pickerDs, operatorOpenId, cardJson, 'interactive',
@@ -4842,12 +4976,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // Model pick from the reply-card menu. Passthrough `/model <slug>` into the
     // live session, gated like compact_session plus an idle boundary and a
     // strict slug whitelist (PTY injection must never carry free text).
-    if (actionType === 'reply_model_pick') {
+    if (actionType === 'reply_model_pick' || actionType === 'session_model_pick') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.reply_actions.session_gone', undefined, loc) } };
       }
-      if (getBot(ds.larkAppId).config.replyCardActions !== true) {
+      if (actionType === 'reply_model_pick' && getBot(ds.larkAppId).config.replyCardActions !== true) {
         return { toast: { type: 'warning', content: t('card.reply_actions.disabled', undefined, loc) } };
       }
       if (isSessionTransferring(ds)) {
@@ -4870,17 +5004,57 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Same catalogue terms the picker offered (same selection key + live
       // wins/static fallback); a slug not in the current list is refused even
       // if the 10-minute probe cache flipped since the picker rendered.
-      const allowed = new Set<string>(await replyMenuModelChoices(ds));
+      const worker = ds.worker;
+      const workerGeneration = ds.workerGeneration;
+      const sessionWorkerGeneration = ds.session.workerGeneration;
+      const cliId = sessionCliId(ds);
+      const allowed = new Set<string>(await sessionModelChoices(ds));
       if (!allowed.has(slug)) {
         return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
       }
-      deps.deliverPassthroughCommand(ds, `/model ${slug}`, {
-        anchor: sessionAnchorId(ds),
-        senderOpenId: operatorOpenId,
-        senderIsBot: false,
-        messageId: cardMessageId ?? `reply-model-${Date.now()}`,
-        replyRootId: rootId,
-      });
+      // Model discovery can yield to a business turn, permission revocation or
+      // session replacement. Revalidate immediately before the synchronous send.
+      if (getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) !== ds
+        || ds.session.status !== 'active' || ds.worker !== worker
+        || ds.workerGeneration !== workerGeneration || ds.session.workerGeneration !== sessionWorkerGeneration
+        || !ds.worker || ds.worker.killed
+        || !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions)) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.session_gone', undefined, loc) } };
+      }
+      if (!operatorOpenId || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+        return { toast: { type: 'warning', content: t('daemon.cmd_allowed_users_only', { cmd: '/models' }, loc) } };
+      }
+      if (actionType === 'reply_model_pick' && getBot(ds.larkAppId).config.replyCardActions !== true) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.disabled', undefined, loc) } };
+      }
+      if (isSessionTransferring(ds) || !sessionAcceptsDirectCommand(ds)) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_busy', undefined, loc) } };
+      }
+      if (sessionCliId(ds) !== cliId
+        || cliHasNoRawPassthroughSurface(cliId, { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
+      }
+      let delivered = false;
+      try {
+        const accepted = deps.deliverPassthroughCommand(ds, `/model ${slug}`, {
+          anchor: sessionAnchorId(ds),
+          senderOpenId: operatorOpenId,
+          senderIsBot: false,
+          messageId: cardMessageId ?? `reply-model-${Date.now()}`,
+          // Each click is a distinct command, even when reusing a picker card.
+          turnId: `${cardMessageId ?? 'model'}#model-${randomUUID()}`,
+          // A chat-scope anchor is a chat id, not a replyable message id.
+          replyRootId: ds.scope === 'chat' ? undefined : rootId,
+          onDelivered: () => { delivered = true; },
+        });
+        // Legacy injected dependencies return void; the daemon returns a boolean.
+        delivered ||= accepted !== false;
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] model command delivery failed: ${String(err)}`);
+      }
+      if (!delivered) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_failed', undefined, loc) } };
+      }
       logger.info(`[${tag(ds)}] reply-card menu: /model ${slug} passthrough sent`);
       return { toast: { type: 'success', content: t('card.reply_actions.model_sent', { model: slug }, loc) } };
     }
@@ -4889,6 +5063,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.
     if (actionType === 'term_action' && ds) {
+      if (ds.session.pendingForkSession && sessionCliId(ds) === 'antigravity') {
+        return { toast: { type: 'warning', content: t('cmd.stop.fork_pending', undefined, localeForBot(ds.larkAppId)) } };
+      }
       if (isSessionTransferring(ds)) {
         return {
           toast: {

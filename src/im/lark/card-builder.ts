@@ -18,6 +18,7 @@ import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegmen
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import {
   clampGrantQuotaForCard,
   DEFAULT_GRANT_DURATION_MS,
@@ -1142,7 +1143,17 @@ export function buildStreamingCard(
     headerActions.push(callbackButton(
       t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
       'default',
-      { action: 'toggle_display', ...actionBase },
+      coordinationModeIsPrimary()
+        ? {
+            action: 'toggle_display',
+            // #2062: in primary multi-replica mode the click travels through the
+            // durable control lane, which may retry it after an owner failover.
+            // Carry the visible intent so a retry applies the same mode instead
+            // of toggling back. Single-replica cards keep the pre-#2062 payload.
+            target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
+            ...actionBase,
+          }
+        : { action: 'toggle_display', ...actionBase },
     ));
     if (displayMode !== 'hidden') {
       headerActions.push(callbackButton(
@@ -1196,6 +1207,18 @@ export function buildStreamingCard(
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
   if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
     headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
+  }
+  // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in 的闲置自动 /compact（core/idle-auto-compact.ts）。
+  // 状态随 usage 快照到卡（与 modelFallback 同理，所有调用点都已转发），快照里没有 ⇒ 该
+  // CLI/后端不支持，不渲染。跟随「压缩」按钮的隐藏配置：隐藏压缩即一并隐藏。按钮值带目标
+  // 状态 desired（而非「翻转」），旧卡片重复点击是幂等的。
+  const idleCompact = !adoptMode && !hidden.has('compact') ? usage?.idleAutoCompact : undefined;
+  if (idleCompact) {
+    headerActions.push(callbackButton(
+      t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
+      'default',
+      { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
   }
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
   // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
@@ -2139,6 +2162,128 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   return JSON.stringify(wideCard({
     header: cardHeader(t(titleKey, { cliName: plainTitle(o.cliName) }, locale), 'red'),
+    elements,
+  }));
+}
+
+export interface RecoveryFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** Logical turn the notice is about; pins the retry button to it. */
+  logicalTurnId: string;
+  /** Original sender, @-mentioned first (never a bot). */
+  mentionOpenId?: string;
+  /** i18n key of the human-readable cause (see recoveryCauseI18nKey). */
+  causeKey: string;
+  /** i18n key of how far automatic recovery got (see recoveryOutcomeI18nKey). */
+  outcomeKey: string;
+  continuations: number;
+  /** Closed-set error codes, shown de-emphasised for whoever debugs it. */
+  errorCodes: string[];
+  task?: string;
+  failedAt?: Date;
+  /** `available` renders the retry button; `retried` replaces it with who
+   *  retried and when; `none` explains why there is nothing to re-deliver. */
+  retry:
+    | { kind: 'available' }
+    | { kind: 'retried'; byOpenId: string; at: Date }
+    /** No re-delivery material, but the session's `lastFailedTurn` is this
+     *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
+     *  continue mode) that recovery cards used to carry. */
+    | { kind: 'continue_legacy'; turnId: string }
+    | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 自动恢复失败卡：一轮普通消息的自动续跑最终失败（重试用尽 / 续跑结果无法确认 /
+ *  交接被打断……）时发到原群（原话题）的唯一一张卡。
+ *
+ *  与 {@link buildTurnFailedCard} 的区别：
+ *  1. 原因按错误码归类成一句人话（`causeKey`），错误码只作为次要信息附在后面——
+ *     从不出现 provider 原文、堆栈或内部地址；
+ *  2. 「重试」按钮重新投递**这条消息本身**（logical turn 的原始输入，按原发起人身份），
+ *     按钮钉在 logical turn 上，而不是会被后续失败覆盖的 `lastFailedTurn`；
+ *  3. 发起人与管理员都能点（handler 校验），点过后卡片原地换成「已由谁重试」。 */
+export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
+  const { locale } = o;
+  const lines: string[] = [];
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
+  if (o.task) {
+    lines.push(t('card.recovery_failed.field_task', { task: escapeMd(o.task) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.recovery_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  lines.push(t('card.recovery_failed.field_recovery', {
+    outcome: t(o.outcomeKey, { count: String(o.continuations) }, locale),
+  }, locale));
+  const codes = [...new Set(o.errorCodes.filter(Boolean))]
+    .map(code => `\`${code.replace(/[`<>]/g, '')}\``);
+  if (codes.length > 0) {
+    lines.push(t('card.recovery_failed.field_codes', { codes: codes.join(' · ') }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+  const advice = o.retry.kind === 'available'
+    ? t('card.recovery_failed.retry_hint', undefined, locale)
+    : o.retry.kind === 'continue_legacy'
+      ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'retried'
+      ? t('card.recovery_failed.retried', {
+        who: `<at id=${o.retry.byOpenId}></at>`,
+        when: o.retry.at.toLocaleTimeString(locale === 'en' ? 'en-US' : 'zh-CN', {
+          hour12: false, hour: '2-digit', minute: '2-digit',
+        }),
+      }, locale)
+      : t(`card.recovery_failed.no_retry_${o.retry.reason}`, undefined, locale);
+  elements.push({ tag: 'markdown', content: advice });
+
+  const actions: any[] = [];
+  if (o.retry.kind === 'available') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.retry_recovery_turn', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'retry_recovery_turn',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+        logical_turn_id: o.logicalTurnId,
+      },
+    });
+  }
+  if (o.retry.kind === 'continue_legacy') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.continue_turn', undefined, locale) },
+      type: 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retry.turnId,
+        mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.recovery_failed.title', { cliName: plainTitle(o.cliName) }, locale), 'red'),
     elements,
   }));
 }

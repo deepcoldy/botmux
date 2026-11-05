@@ -88,6 +88,11 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // /models opens the existing session's model picker; it is no longer model text.
+  (input, legacy, next) => legacy.kind === 'forward'
+    && legacy.reason === 'unknown_slash'
+    && next.kind === 'daemon' && next.cmd === '/models'
+    && next.sessionPolicy === 'sessionless',
   // Valid Codex effort headers may include a literal task body on later lines.
   (input, legacy, next) => ['codex', 'codex-app'].includes(input.cliId ?? '')
     && /^\s*\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(input.text)
@@ -106,6 +111,12 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
   (input, legacy, next) => legacy.kind === 'forward'
     && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
     && next.kind === 'daemon' && next.cmd === '/rewind'
+    && next.sessionPolicy === 'existing_only',
+  // /idlecompact is a new existing-session daemon command (per-session idle
+  // auto-compact toggle); the frozen oracle treats it as unknown.
+  (input, legacy, next) => legacy.kind === 'forward'
+    && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
+    && next.kind === 'daemon' && next.cmd === '/idlecompact'
     && next.sessionPolicy === 'existing_only',
   // Codex App 的 /effort 由原生控制接口处理；其它 CLI 保留冻结的透传行为。
   (input, legacy, next) =>

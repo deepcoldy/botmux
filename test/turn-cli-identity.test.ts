@@ -54,7 +54,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
 }));
 
-const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
@@ -182,6 +182,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).not.toContain('tok-alice');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('https://example.com/lark-device');
+    expect(body).toContain('[reason=not_authorized]');
   });
 
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
@@ -193,6 +194,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const outcomes = await publish(botConfig(), undefined);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(identityBody('lark-cli')).not.toContain('tok-alice');
+    expect(identityBody('lark-cli')).toContain('[reason=no_sender]');
   });
 
   it('reports needs-authorization instead of degrading under fallback: none', async () => {
@@ -541,7 +543,7 @@ describe('target daemon consumes signed message authority', () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
         return options.member === false ? [] : ['ou_alice_target'];
       },
-      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',
@@ -999,5 +1001,6 @@ it('does not begin another login when the bytedcli provider fails', async () => 
   expect(provider.beginBytedcliLogin).not.toHaveBeenCalled();
   const written = identityBody('bytedcli', 'turn-unavailable');
   expect(written).toContain('停止自动重试');
+  expect(written).toContain('[reason=provider_unavailable]');
   expect(written).not.toContain('old-sender-credential');
 });

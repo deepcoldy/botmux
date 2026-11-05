@@ -466,12 +466,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Unguessable pane/profile authority channel. It selects an exact read carve
   // but is not sufficient without the daemon-rotated capability inside it.
   'BOTMUX_ORIGIN_CHANNEL_ID',
+  // Workflow node session marker: `botmux skill show` inside a tmux / zellij
+  // pane must see it like a PTY child does; being listed also means a stale
+  // value in a shared server's global env is unset for ordinary panes.
+  'BOTMUX_WORKFLOW_NODE_SESSION',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   // Host-resolved multi-topic orchestration switch. Managed panes must not
   // inherit a stale value from a co-tenant tmux server.
   'BOTMUX_MULTI_TOPIC_ENABLED',
+  // Same for the dispatch task-tree card switch: a file-sandboxed CLI cannot
+  // read ~/.botmux/config.json, so the daemon must project the resolved value.
+  'BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED',
   'BOTMUX_READY_COMMAND',
   // Structured end-of-turn idle report command, injected per session for
   // adapters that opt in (dsh-tui). Not a credential and not fatal when absent.
@@ -607,6 +614,11 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   // cjadk wrapper-branch knob, set/deleted per spawn by the worker.
   'CJADK_INTERACTIVE',
+  // Workflow node session marker (workflows/session-kind.ts), set per
+  // session by the worker. An inherited copy (e.g. `botmux restart` issued
+  // from a node session) would silently strip the workflow hint and skills
+  // from every ordinary session the daemon then starts.
+  'BOTMUX_WORKFLOW_NODE_SESSION',
 ] as const;
 
 /** Delete inherited session-only identity/capabilities from `env` in place. */

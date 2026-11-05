@@ -61,7 +61,9 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.dshProfileTitle', 'botDefaults.dshRuntimeTitle', 'botDefaults.sectionRiff',
       'botDefaults.riffModel', 'botDefaults.riffReasoningEffort',
       'botDefaults.riffSandboxCluster', 'botDefaults.riffJwtEnv',
-      'botDefaults.autoModelTitle', 'botDefaults.autoModelReselectPerTurn',
+      'botDefaults.autoModelTitle', 'botDefaults.autoModelPreflightLoadCheck',
+      'botDefaults.autoModelOverloadThreshold', 'botDefaults.autoModelPreflightTimeout',
+      'botDefaults.autoModelReselectPerTurn',
       'botDefaults.agentCli', 'botDefaults.runtimeDisplayName', 'botDefaults.runtimeLegacyPath',
       'botDefaults.runtimeUpdateProvider', 'botDefaults.nativeSubagentModel', 'botDefaults.nativeSubagentCustomModel',
       'botDefaults.nativeSubagentReasoningEffort', 'botDefaults.nativeSubagentCustomReasoningEffort',
@@ -195,7 +197,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'codex-app-display',
     tab: 'advanced',
     titleKey: 'botDefaults.sectionCodexAppDisplay',
-    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify', 'botDefaults.noProgressNotifyTimeoutLabel'],
+    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.codexBrowserAutoApproveOrigins', 'botDefaults.noProgressNotify', 'botDefaults.noProgressNotifyTimeoutLabel'],
   },
   {
     id: 'codex-runtime',
@@ -442,6 +444,7 @@ export type BotDefaultsRow = {
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
   codexBrowser?: boolean;
+  codexBrowserAutoApproveOrigins?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
@@ -484,7 +487,7 @@ export type BotDefaultsRow = {
   topicUnavailablePolicy?: 'legacy' | 'stop';
   replyDelivery?: 'send' | 'transcript' | null;
   promptInjection?: 'default' | 'none';
-  /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
+  /** 当前 cliId 的缺省投递方式（doubao 缺省 transcript，其余 CLI 缺省 send）。 */
   replyDeliveryDefault?: 'send' | 'transcript';
   /** 当前 cliId 是否有转写采集通道（claude-code / 结构化转写白名单）；false 时开关禁用。 */
   replyDeliverySupported?: boolean;

@@ -44,6 +44,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 - **自包含单文件二进制**：运行时与 PTY 已内嵌，**安装和运行都不依赖本机 Node**。支持 Linux / macOS（x64 / arm64，macOS 正式版提供稳定 Apple Developer ID 签名），Windows 用户请在 WSL2 中使用。
 - **平滑升级**：执行 `botmux upgrade` 或重跑上述 curl 命令即可原地安全更新。
+- **源码安装更新**：Dashboard「版本与更新」支持普通更新，以及预览、确认并备份后强制覆盖本地改动；恢复方法见[本地源码更新](docs/local-source-update.md)。
 - **完整指南**：包含 Lark 国际版、手动配置权限与排查，见 [5 分钟快速接入文档](https://deepcoldy.github.io/botmux/quickstart)。
 
 <details>
@@ -88,15 +89,30 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 
-`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) · `doubao` ([Doubao CLI 安装与使用](docs/doubao.md)) …
 
-- **Gemini CLI 已下线**：`gemini` 适配器已移除，替代品是 `antigravity`。仍写 `cliId: "gemini"` 的 bot 会拒绝启动并提示改用 Antigravity，其它 bot 不受影响；Gemini 专属的 `cliPathOverride` / `wrapperCli` / `model` / `GEMINI_CLI_HOME` 不会沿用，详见 [迁移说明](https://deepcoldy.github.io/botmux/adapters#gemini-cli-已下线)。
 - **会话级 CLI 切换**：会话尚未启动前，可通过 `/cli <cliId>` 为当前会话临时指定已注册的 CLI。
 - **Codex 多账号与实例池**：同一 Bot 支持通过 [会话级 Codex 实例](docs/codex-instances.md) 配置多登录目录与分配策略。
 - **兼容发行版**：Codex 衍生版和 Kimi TUI 衍生版可直接保留原 `cliId` 并通过 `cliRuntime` 声明独立身份，详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。
 - **共享记忆（可选）**：通过 [OpenViking 共享记忆示例](examples/openviking-memory/README.md) 让多个本地 Agent 共享用户与项目级长期记忆。
 
 完整 `cliId` 列表与网关 / wrapper 详细配置见 [多 CLI 适配器文档](https://deepcoldy.github.io/botmux/adapters)。
+
+### Doubao CLI 快速接入
+
+需要包含 `doubao` 适配器的 Botmux 版本。先安装 Doubao CLI 并在运行 Botmux 的同一系统用户下完成原生登录，再配置 Bot：
+
+```bash
+npm install -g '@bytedance/doubao-cli' --registry=https://registry.npmjs.org
+doubao --version
+doubao                      # 完成登录并确认输入框可用，再 /exit
+botmux setup                # CLI 选 Doubao，选择实际项目目录
+botmux start
+```
+
+已有 Bot 可在 Dashboard 选择 Doubao，或在原 `bots.json` 条目中设置 `"cliId": "doubao"` 和实际 `workingDir`，保留应用凭证与其他配置；保存后重启并新建会话。`model` 可省略，指定时使用原生 `/model` 的当前账号显示名。
+
+多行任务一次提交，Web 终端按 **Esc** 打断；最终回答自动从原生日志回收，重启按原生数字 ID 精确续聊，不猜“最近会话”。默认传 `--permission-mode always_allow`，应限制为可信用户/项目；**Botmux 二进制不依赖 Node，但 Doubao 的 npm 安装与 launcher 需要 Node/npm**。内网安装、本机 HTTP 试用、权限说明和当前限制见 [Doubao 使用指南](docs/doubao.md)。Linux 原生运行/文件沙箱与既有终端 `/adopt` 专用桥接未完成实机验收，勿将普通对话支持等同于全部能力支持。
 
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper
 
@@ -112,11 +128,6 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 | 多 CLI / Agent | 20+ 适配器一键切换 | 取决于 SDK 覆盖面 |
 | 多机器人 | 同群多 bot @mention 路由 | 取决于实现 |
 | 终端直连 | 本地 CLI 可 `tmux attach` 进真进程 | 取决于实现 |
-
-## 进阶集成
-
-- **[可信建群服务的默认免 @](docs/signed-chat-defaults.md)** — 自助建群服务可通过签名绑定为普通群声明默认 `ambient` 免 @ 模式，在保持权限隔离的同时简化群交互。
-- **[模型透明代理模式](docs/model-proxy.md)** — 外部系统（如 [OpenCodeReview](https://github.com/alibaba/open-code-review)）可通过有鉴权的本地 Chat Completions 入口直接复用 CLI 的模型能力，结合 [受约束执行接口](docs/constrained-invocations.md) 实现任务幂等与状态查询。
 
 ## 文档 · 社区 · 贡献
 
@@ -134,5 +145,3 @@ botmux 或许是目前专为飞书（Feishu/Lark）打造的开源项目中贡�
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
 </a>
-
-<p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>

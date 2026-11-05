@@ -1606,6 +1606,11 @@ setInterval(() => {}, 1_000);
       turnId: 'om_turn',
     } satisfies DaemonToWorker);
 
+    // Transpiling and booting the worker is host-load dependent; it must not
+    // consume the 10s behaviour window that proves the fake CLI publishes the
+    // expected working -> limited transition. Keep the post-spawn budget
+    // strict so a real status-pipeline regression still fails quickly.
+    await waitForLog(child, logs, 'Spawning fresh CLI:', WORKER_BOOT_TIMEOUT_MS);
     const updates = await waitForScreenUpdates(child, messages, 2, logs);
     expect(updates.slice(0, 2).map(message => message.status)).toEqual([
       'working',
@@ -1613,5 +1618,5 @@ setInterval(() => {}, 1_000);
     ]);
     expect(updates[0]?.usageLimit).toBeUndefined();
     expect(updates[1]?.usageLimit?.limited).toBe(true);
-  }, 15_000);
+  }, WORKER_BOOT_TIMEOUT_MS + 15_000);
 });

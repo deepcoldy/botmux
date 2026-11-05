@@ -11,12 +11,12 @@
  * worker has already settled the submit without a proven session.
  */
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { resolveNodeExecutable, spawnNodeTsScript } from './helpers/ts-runner.js';
 import { killProcessTree } from './helpers/process-tree.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -32,7 +32,7 @@ afterEach(async () => {
 
 async function startWorker(
   historySid: string,
-  opts: { openAfterGivingUp?: boolean; historyDelayMs?: number } = {},
+  opts: { openAfterGivingUp?: boolean; historyDelayMs?: number; startupProbe?: boolean; startupDelayMs?: number } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'bmx-codex-lazy-rollout-'));
   const dataDir = join(root, 'data');
@@ -42,10 +42,15 @@ async function startWorker(
   const openRollout = join(root, 'open-rollout');
   const rolloutOpened = join(root, 'rollout-opened');
   const cliPidFile = join(root, 'cli-pid');
+  const probePidFile = join(root, 'probe-pid');
+  const launcherPidFile = join(root, 'launcher-pid');
+  const attestationFile = join(root, 'attestation');
+  const firstSubmitAttestationFile = join(root, 'first-submit-attestation');
   const fakeCli = join(root, 'fake-codex');
   writeFileSync(fakeCli, `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
+if (${!!opts.startupProbe || !!opts.startupDelayMs}) process.title = 'codex';
 // Same data root the worker watches: it may redirect CODEX_HOME per bot.
 const codexHome = process.env.CODEX_HOME || path.join(require('node:os').homedir(), '.codex');
 const rolloutPath = (home, sid) => path.join(home, 'sessions', '2026', '10', '27', 'rollout-2026-10-27T00-00-00-' + sid + '.jsonl');
@@ -76,6 +81,10 @@ setInterval(() => {
   if (!match) return;
   input = input.slice(input.indexOf(match[0]) + match[0].length);
   submits += 1;
+  if (submits === 1) {
+    fs.writeFileSync(${JSON.stringify(firstSubmitAttestationFile)},
+      fs.existsSync(${JSON.stringify(attestationFile)}) ? fs.readFileSync(${JSON.stringify(attestationFile)}) : 'null');
+  }
   if (submits > 1) {
     // Later submits: the rollout is already open, as in a live session.
     fs.writeSync(rolloutFd, rolloutLines(${JSON.stringify(OWN_SID)}, match[1], 'OWN ROLLOUT REPLY ' + submits, 'turn-' + submits));
@@ -107,6 +116,42 @@ setInterval(() => {}, 1000);
 `);
   chmodSync(fakeCli, 0o755);
 
+  let cliPath = fakeCli;
+  if (opts.startupProbe) {
+    // An unrecognised startup probe still looks like Codex to the comm-only
+    // resolver. A renamed sleep keeps its real argv and OS comm without a C
+    // compiler; explicit debug/version filtering is covered separately.
+    const probe = join(root, 'codex');
+    copyFileSync('/bin/sleep', probe);
+    cliPath = join(root, 'launcher');
+    writeFileSync(cliPath, `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+fs.writeFileSync(${JSON.stringify(launcherPidFile)}, String(process.pid));
+const probe = spawn(${JSON.stringify(probe)}, ['30'], { stdio: 'ignore' });
+fs.writeFileSync(${JSON.stringify(probePidFile)}, String(probe.pid));
+probe.on('exit', () => {
+  const cli = spawn(${JSON.stringify(resolveNodeExecutable())}, [${JSON.stringify(fakeCli)}, ...process.argv.slice(2)], { stdio: 'inherit' });
+  cli.on('exit', code => process.exit(code ?? 0));
+});
+`);
+    chmodSync(cliPath, 0o755);
+  }
+
+  if (opts.startupDelayMs) {
+    cliPath = join(root, 'slow-launcher');
+    writeFileSync(cliPath, `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+fs.writeFileSync(${JSON.stringify(launcherPidFile)}, String(process.pid));
+setTimeout(() => {
+  const cli = spawn(${JSON.stringify(resolveNodeExecutable())}, [${JSON.stringify(fakeCli)}, ...process.argv.slice(2)], { stdio: 'inherit' });
+  cli.on('exit', code => process.exit(code ?? 0));
+}, ${opts.startupDelayMs});
+`);
+    chmodSync(cliPath, 0o755);
+  }
+
   const sessionId = randomUUID();
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
@@ -123,7 +168,17 @@ setInterval(() => {}, 1000);
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
-  child.on('message', m => messages.push(m as WorkerToDaemon));
+  let attestedPid: number | undefined;
+  child.on('message', m => {
+    const msg = m as WorkerToDaemon;
+    messages.push(msg);
+    if (msg.type === 'local_process_attestation') attestedPid = msg.cliPid;
+    if (msg.type === 'managed_turn_origin') {
+      // Model the daemon's ordered IPC publication; the fake CLI samples it
+      // immediately on its first submit, before creating history or a rollout.
+      writeFileSync(attestationFile, JSON.stringify({ cliPid: attestedPid, turnId: msg.turnId }));
+    }
+  });
   child.stdout?.on('data', b => logs.push(b.toString()));
   child.stderr?.on('data', b => logs.push(b.toString()));
   cleanups.push(async () => {
@@ -131,6 +186,11 @@ setInterval(() => {}, 1000);
     // The CLI may live in its own session scope, outside the worker's tree.
     if (existsSync(cliPidFile)) {
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
+    }
+    for (const pidFile of [probePidFile, launcherPidFile]) {
+      if (existsSync(pidFile)) {
+        try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
+      }
     }
     rmSync(root, { recursive: true, force: true });
   });
@@ -147,10 +207,18 @@ setInterval(() => {}, 1000);
 
   child.send({
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
-    workingDir: dataDir, cliId: 'codex', cliPathOverride: fakeCli, backendType: 'pty',
+    workingDir: dataDir, cliId: 'codex', cliPathOverride: cliPath, backendType: 'pty',
     promptInjection: 'none',
     prompt: PROMPT, turnId: 'om_lazy', larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
+  if (opts.startupProbe) {
+    await waitFor('the startup probe', () => existsSync(probePidFile) && !!readFileSync(probePidFile, 'utf8'));
+    const probePid = Number(readFileSync(probePidFile, 'utf8'));
+    // Ensure the production resolver really selected this process before it
+    // exits. Without that barrier the regression can pass by missing the race.
+    await waitFor('the probe ownership binding', () => logs.some(l => l.includes(`resolved real codex leaf pid ${probePid}`)));
+    process.kill(probePid, 'SIGTERM');
+  }
   await waitFor('fake Codex startup', () => existsSync(loaded));
   writeFileSync(releaseStartup, 'loaded');
   // Barrier: the submit has already been settled without a proven session,
@@ -172,10 +240,35 @@ setInterval(() => {}, 1000);
     (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output');
   const consumed = () => messages.filter(
     (m): m is Extract<WorkerToDaemon, { type: 'native_input_consumed' }> => m.type === 'native_input_consumed');
-  return { child, messages, logs, waitFor, finals, consumed };
+  return { child, messages, logs, waitFor, finals, consumed, cliPid: Number(readFileSync(cliPidFile, 'utf8')),
+    firstSubmitAttestation: JSON.parse(readFileSync(firstSubmitAttestationFile, 'utf8')) };
 }
 
 describe('Codex history match that lands before the lazily-created rollout', () => {
+  it.skipIf(process.platform !== 'linux')('attests a slow launcher child before the first input is handed to Codex', async () => {
+    const run = await startWorker(OWN_SID, { startupDelayMs: 8_000 });
+    expect(run.firstSubmitAttestation).toEqual({ cliPid: run.cliPid, turnId: 'om_lazy' });
+    await run.waitFor('the slow-launch reply', () => run.finals().some(m => m.turnId === 'om_lazy'));
+    expect(run.finals().filter(m => m.turnId === 'om_lazy')).toEqual([
+      expect.objectContaining({ content: 'OWN ROLLOUT REPLY' }),
+    ]);
+  }, 40_000);
+
+  it.skipIf(process.platform !== 'linux')('recovers a retired startup probe and collects both turns exactly once', async () => {
+    const run = await startWorker(OWN_SID, { startupProbe: true });
+    await run.waitFor('the turn reply', () => run.finals().some(m => m.turnId === 'om_lazy'));
+    expect(run.finals().filter(m => m.turnId === 'om_lazy')).toEqual([
+      expect.objectContaining({ content: 'OWN ROLLOUT REPLY' }),
+    ]);
+    expect(run.messages).toContainEqual(expect.objectContaining({ type: 'cli_session_id', cliSessionId: OWN_SID }));
+    run.child.send({ type: 'message', turnId: 'om_next', content: 'next-task' } satisfies DaemonToWorker);
+    await run.waitFor('the next turn reply', () => run.finals().some(m => m.turnId === 'om_next'));
+    expect(run.finals().filter(m => m.turnId === 'om_next')).toEqual([
+      expect.objectContaining({ content: 'OWN ROLLOUT REPLY 2' }),
+    ]);
+    expect(run.messages.filter(m => m.type === 'user_notify')).toEqual([]);
+  }, 40_000);
+
   it('collects the turn once the Codex process holds the matched rollout', async () => {
     const run = await startWorker(OWN_SID);
     await run.waitFor('the turn reply', () => run.finals().some(m => m.turnId === 'om_lazy'));

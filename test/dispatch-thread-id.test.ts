@@ -19,7 +19,10 @@ function extract(path: string, names: string[]): string {
   }).join('\n');
 }
 
-const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'freezeDispatchOriginClaim', 'cmdDispatch']);
+const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'freezeDispatchOriginClaim', 'cmdDispatch',
+  // Real (not stubbed) task-tree sync so the default-off gate and its IPC
+  // behaviour are exercised; only the HTTP layer (postCurrentSessionDaemonRoute) is a mock.
+  'syncDispatchTaskTreeAfterDispatch', 'trySyncDispatchTaskTree']);
 // larkGet / larkRequestDeadline live in lark-get.ts (re-exported by client.ts).
 const clientCode = extract('src/im/lark/lark-get.ts', ['larkRequestDeadline', 'larkGet'])
   + '\n' + extract('src/im/lark/client.ts', ['getMessageDetail', 'getMessageThreadId']);
@@ -31,6 +34,7 @@ function harness(mode: Mode, options: {
   threadId?: unknown;
   failure?: 'permission' | 'network' | 'timeout' | 'send';
   acceptance?: 'accepted' | 'timed_out';
+  taskTreeCardEnabled?: boolean;
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
   const stdout: string[] = [];
@@ -97,6 +101,11 @@ function harness(mode: Mode, options: {
     // own refusal path is covered by multi-topic-feature-gate.test.ts, so this
     // receipt/thread-id harness keeps the default-enabled behavior.
     isMultiTopicOrchestrationEnabled: () => true,
+    // Extracted cmdDispatch calls the machine-wide task-tree card gate;
+    // default-OFF in this harness so the receipt/thread-id tests keep the
+    // pre-card shape (no attemptAt, no /dispatch-tree IPC). An explicit
+    // taskTreeCardEnabled:true exercises the on path.
+    isDispatchTaskTreeCardEnabled: () => options.taskTreeCardEnabled === true,
     loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     requireSessionById: async (sid: string) => ({
       sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',
@@ -166,6 +175,12 @@ for (const chatMode of ['normal', 'topic'] as const) {
         expect(oldFields).toEqual(oldReceipt(mode));
         expect(h.steps).toEqual(mode === 'into' ? ['reply', 'lookup'] : ['seed', 'reply', 'lookup']);
         expect(h.postCurrentSessionDaemonRoute).toHaveBeenCalledTimes(mode === 'dispatch' ? 2 : 1);
+        // Card OFF (harness default): no /dispatch-tree call and the dispatch
+        // entry gains no attemptAt — exactly the pre-card dispatch shape.
+        expect(h.postCurrentSessionDaemonRoute.mock.calls.map(c => c[0]!.path))
+          .not.toContain(expect.stringContaining('dispatch-tree'));
+        expect((h.persistDispatchLifecycle.mock.calls[0]![0] as Record<string, unknown>).attemptStartedAt)
+          .toBeUndefined();
         expect(h.request).toHaveBeenCalledExactlyOnceWith({
           method: 'GET', url: '/open-apis/im/v1/messages/' + h.root,
           params: { with_sender_name: 'true' }, timeout: 2_000, signal: h.timeoutSignals[0].signal,
@@ -173,6 +188,31 @@ for (const chatMode of ['normal', 'topic'] as const) {
         expect(h.state.process.exitCode).toBe(0);
       });
     }
+  });
+}
+
+for (const mode of ['dispatch', 'standby', 'into'] as const) {
+  describe(mode + ' task-tree card gate', () => {
+    it('OFF: persists no attemptStartedAt and makes no /dispatch-tree IPC (pre-card shape)', async () => {
+      const h = harness(mode, { taskTreeCardEnabled: false });
+      await h.run();
+      expect(h.persistDispatchLifecycle).toHaveBeenCalledTimes(1);
+      for (const call of h.persistDispatchLifecycle.mock.calls) {
+        expect((call[0] as Record<string, unknown>).attemptStartedAt).toBeUndefined();
+      }
+      expect(h.postCurrentSessionDaemonRoute.mock.calls.map(c => c[0]!.path))
+        .not.toContain(expect.stringContaining('dispatch-tree'));
+    });
+
+    it('ON: persists attemptStartedAt and calls the dispatch-tree IPC once', async () => {
+      const h = harness(mode, { taskTreeCardEnabled: true });
+      await h.run();
+      expect((h.persistDispatchLifecycle.mock.calls[0]![0] as Record<string, unknown>).attemptStartedAt)
+        .toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/));
+      const treeCalls = h.postCurrentSessionDaemonRoute.mock.calls
+        .filter(c => c[0]!.path.includes('dispatch-tree'));
+      expect(treeCalls).toHaveLength(1);
+    });
   });
 }
 

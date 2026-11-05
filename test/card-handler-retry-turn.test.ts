@@ -32,6 +32,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendUserMessage: vi.fn(),
   sendEphemeralCard: vi.fn(async () => 'om_eph'),
   getMessageDetail: vi.fn(),
+  listThreadMessages: vi.fn(async () => []),
+  listMessagesByThreadId: vi.fn(async () => [{ message_id: 'om_transcript', message_type: 'text',
+    body: { content: JSON.stringify({ text: 'quoted fixture' }) }, sender: { id: 'ou_original', sender_type: 'user' } }]),
   isHumanOpenId: vi.fn(() => true),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {},
 }));
@@ -111,8 +114,10 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 const rememberLastCliInputMock = vi.fn();
 vi.mock('../src/core/session-manager.js', () => ({
+  xmlEscape: (text: string) => text,
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   buildNewTopicCliInput: vi.fn(() => ({ content: 'mock-prompt' })),
+  buildFollowUpCliInput: vi.fn((text: string) => ({ content: text })),
   getAvailableBots: vi.fn(async () => []),
   persistStreamCardState: vi.fn(),
   resumeSession: vi.fn(),
@@ -127,6 +132,7 @@ vi.mock('../src/core/session-mutation-guard.js', () => ({
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   canOperate: vi.fn(() => true),
   canTalk: vi.fn(() => true),
+  canRunDaemonCommand: vi.fn(() => true),
 }));
 
 vi.mock('../src/core/session-activity.js', () => ({
@@ -152,6 +158,11 @@ vi.mock('../src/services/local-cli-opener.js', () => ({
 
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
+}));
+
+const recoveryRetryClickMock = vi.fn(async (..._a: any[]) => ({ toast: { type: 'success', content: 'ok' } }));
+vi.mock('../src/core/ordinary-recovery-retry.js', () => ({
+  handleOrdinaryRecoveryRetryClick: (...a: any[]) => recoveryRetryClickMock(...a),
 }));
 
 // ─── Imports (after mocks) ────────────────────────────────────────────────
@@ -250,6 +261,7 @@ beforeEach(() => {
   sendWorkerInputMock.mockReset();
   sendWorkerInputMock.mockReturnValue(true);
   forkWorkerMock.mockReset();
+  forkWorkerMock.mockImplementation((_ds, _input, _resume, options) => { options?.onAdmission?.('accepted'); return true; });
   updateSessionMock.mockReset();
   rememberLastCliInputMock.mockReset();
   isSessionTransferringMock.mockReset();
@@ -453,5 +465,102 @@ describe('retry_turn — permission gate', () => {
     await handleCardAction(actionData(), depsWith(ds), LARK_APP_ID);
     expect(sendWorkerInputMock).not.toHaveBeenCalled();
     expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('retry_recovery_turn — routing', () => {
+  function recoveryClick(operator: string): any {
+    return {
+      operator: { open_id: operator, union_id: 'on_operator' },
+      action: {
+        value: { action: 'retry_recovery_turn', root_id: ROOT, session_id: SID, logical_turn_id: 'om_A' },
+      },
+      context: { open_message_id: 'om_card' },
+    };
+  }
+
+  it('reaches its own sender-or-admin gate even when the generic operator gate would deny the clicker', async () => {
+    // The original sender is usually a talk-only member of an oncall group:
+    // the generic canOperate card gate must not swallow their click.
+    recoveryRetryClickMock.mockClear();
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = makeDs();
+    const res = await handleCardAction(recoveryClick('ou_asker'), depsWith(ds), LARK_APP_ID);
+    expect(recoveryRetryClickMock).toHaveBeenCalledTimes(1);
+    expect(recoveryRetryClickMock).toHaveBeenCalledWith(ds, {
+      logicalTurnId: 'om_A', operatorOpenId: 'ou_asker', operatorUnionId: 'on_operator',
+    });
+    expect(res?.toast?.type).toBe('success');
+    // And it never takes the lastFailedTurn-based retry_turn path.
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+  });
+
+  it('answers a click on a card whose session is gone without dispatching anything', async () => {
+    recoveryRetryClickMock.mockClear();
+    const res = await handleCardAction(recoveryClick('ou_asker'), depsWith(undefined), LARK_APP_ID);
+    expect(res?.toast?.type).toBe('warning');
+    expect(recoveryRetryClickMock).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('manual card retries rejected admission routing transaction', () => {
+  it.each(['retry_turn', 'retry_last_task'] as const)('%s preserves full routing and retry eligibility', async action => {
+    const { fillRetryRouting, routingSnapshot } = await import('./helpers/retry-routing.js');
+    for (const mode of ['ipc', 'false', 'handled-rejected', 'partial-write-throw']) {
+      const ds = makeDs({ worker: mode === 'ipc' ? { killed: false } as any : null,
+        lastCliInput: 'wrapped original', lastUserPrompt: 'original', lastCliInputTurnId: TURN,
+        usageLimit: { limited: true, kind: 'usage', retryAtMs: 0, retryReady: true, retryLabel: '' } });
+      const before = fillRetryRouting(ds, TURN);
+      let persisted: unknown;
+      updateSessionMock.mockImplementation(row => { persisted = structuredClone(row); Object.assign(row, structuredClone(row)); });
+      sendWorkerInputMock.mockReturnValue(false);
+      forkWorkerMock.mockImplementation((target, _input, _resume, opts) => {
+        updateSessionMock(target.session);
+        if (mode === 'partial-write-throw') throw new Error('spawn failed');
+        opts.onAdmission('rejected');
+        return mode === 'handled-rejected';
+      });
+      for (let i = 0; i < 3; i++) {
+        const event = actionData(); event.action.value.action = action;
+        await handleCardAction(event, depsWith(ds), LARK_APP_ID);
+        expect(routingSnapshot(ds)).toEqual(before);
+        expect(persisted).toMatchObject(before);
+        expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+        expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined();
+        expect(ds.usageLimit?.retryReady).toBe(true);
+        expect(rememberLastCliInputMock).not.toHaveBeenCalled();
+        expect(ds.streamCardPending).not.toBe(true);
+      }
+    }
+  });
+});
+
+
+describe('/quote cold admission', () => {
+  const event = () => ({ operator: { open_id: OWNER },
+    context: { open_message_id: 'om_quote_click' }, action: { value: {
+      action: 'quote_confirm', chat_id: 'oc_chat', root_id: ROOT,
+      container_id: 'omt_quoted', container_kind: 'thread', title: 'quoted', invoker_open_id: OWNER,
+    } } });
+  it('dispatches and remembers the exact same quote turn', async () => {
+    const ds = makeDs({ worker: null });
+    await handleCardAction(event(), depsWith(ds), LARK_APP_ID);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [target, input, options] = forkWorkerMock.mock.calls[0];
+    expect(target).toBe(ds);
+    expect(options).toEqual({ resume: true, turnId: 'om_quote_click' });
+    expect(rememberLastCliInputMock).toHaveBeenCalledWith(ds, expect.any(String), input, options.turnId);
+    expect(ds.currentTurnId).toBe(options.turnId);
+  });
+  it.each([false, true])('does not commit a refused cold quote even if fork returns %s', async handled => {
+    const ds = makeDs({ worker: null });
+    forkWorkerMock.mockImplementation((_ds, _input, _resume, opts) => { opts.onAdmission('rejected'); return handled; });
+    const result = await handleCardAction(event(), depsWith(ds), LARK_APP_ID);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    expect(result?.toast?.type).toBe('error');
+    expect(rememberLastCliInputMock).not.toHaveBeenCalled();
+    expect(ds.currentTurnId).toBeUndefined();
+    expect(ds.streamCardPending).not.toBe(true);
   });
 });

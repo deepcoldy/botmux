@@ -3,6 +3,7 @@ import {
   botsInfoObjectEntries,
   isBotsInfoNameEntry,
   isBotsInfoRouteEntry,
+  normalizeBotsInfoRouteEntries,
 } from '../src/services/bots-info-shape.js';
 
 describe('bots-info runtime shapes', () => {
@@ -35,6 +36,42 @@ describe('bots-info runtime shapes', () => {
       { larkAppId: 'cli_missing_name' },
       { larkAppId: 'cli_null_name', botName: null },
       { larkAppId: 'cli_named', botName: 'Named' },
+    ]);
+  });
+
+  it('normalizes optional route fields without dropping later valid rows', () => {
+    expect(normalizeBotsInfoRouteEntries([
+      null,
+      { larkAppId: 'cli_bad_name', botName: 42, botOpenId: 'ou_bad' },
+      {
+        larkAppId: 'cli_valid',
+        botOpenId: 7,
+        botName: 'Valid',
+        botAvatarUrl: {},
+        cliId: ['codex'],
+      },
+      {
+        larkAppId: 'cli_complete',
+        botOpenId: 'ou_complete',
+        botName: null,
+        botAvatarUrl: 'https://example.com/avatar.png',
+        cliId: 'codex',
+      },
+    ])).toEqual([
+      {
+        larkAppId: 'cli_valid',
+        botOpenId: null,
+        botName: 'Valid',
+        botAvatarUrl: null,
+        cliId: null,
+      },
+      {
+        larkAppId: 'cli_complete',
+        botOpenId: 'ou_complete',
+        botName: null,
+        botAvatarUrl: 'https://example.com/avatar.png',
+        cliId: 'codex',
+      },
     ]);
   });
 });

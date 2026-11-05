@@ -133,20 +133,62 @@ export interface WorkflowFeatureGlobalConfig {
   /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== true`
    *  keeps the feature OFF (disabled by default). Set true to turn the whole
    *  workflow feature on for this host: the `/workflow` grill + Saved-Workflow
-   *  run/save entries are accepted, the `botmux-workflow` family of skills is
-   *  advertised/installed, and the CLI authoring/run subcommands work.
+   *  run/save entries are accepted, the `botmux-workflow` family of skills can
+   *  be read on demand (`botmux skill show`; never resident in session prompts),
+   *  and the CLI authoring/run subcommands work.
    *  In-flight run management (cancel / retry / grant) stays available so a run
    *  started before a flip can still be wound down. The multi-bot
    *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a
    *  separate long-running-orchestration capability, not a v3 workflow. */
   enabled?: boolean;
+  /** Experimental (design 2026-11-03 §15.5): who executes goal nodes of runs
+   *  authorized from now on. Absent = `ephemeral` (today's temporary CLI
+   *  workers). `bot` hands each node to a bot's own session in the run's chat.
+   *  Frozen into `run.json` at authorization, so flipping it never changes a
+   *  run that already started. Only the non-default value is ever stored. */
+  nodeExecutor?: 'bot';
+  /** Experimental (design 2026-11-03 §10, §15.5, D5): a bot-executed run
+   *  authorized from now on freezes its initiator's identity, and every
+   *  handoff of that run carries a delegation signed from it, so the node bot
+   *  runs its `triggerUserAuth` tools as the initiator. Absent = off (the node
+   *  bot runs as itself). Frozen into `run.json` at authorization; only `true`
+   *  is ever stored. */
+  handoffIdentity?: true;
+  /** v3 runtime concurrency caps, per run (design 2026-06-01 Q5/R3:
+   *  "conservative defaults, configurable"). Every field is optional; a
+   *  missing field keeps the code default (V3_DEFAULT_CONCURRENCY). Read
+   *  when a run is driven, so a change applies to the next drive. Invalid
+   *  values are dropped on read, so a later Dashboard write of the workflow
+   *  block does not keep them. */
+  concurrency?: WorkflowConcurrencyConfig;
 }
+
+export interface WorkflowConcurrencyConfig {
+  /** Max nodes (goal, gate and host) in flight for one run. */
+  global?: number;
+  /** Max nodes in flight on the same bot (Lark app). */
+  perBot?: number;
+  /** Max nodes in flight on the same CLI type, for any CLI not listed in
+   *  `perCliById`. */
+  perCli?: number;
+  /** Per-CLI override keyed by cliId (e.g. `{ "claude-code": 8 }`) — an
+   *  API-billed CLI can run wide while a subscription CLI stays at 2. */
+  perCliById?: Record<string, number>;
+}
+
+export type WorkflowNodeExecutorMode = 'ephemeral' | 'bot';
 
 export interface MultiTopicGlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing means enabled for
    *  backwards compatibility. When disabled, botmux-orchestrate is hidden and
    *  `botmux dispatch` may only append to an existing topic via `--into`. */
   enabled?: boolean;
+  /** Dispatch task-tree card. Default OFF (missing !== true): the first
+   *  dispatch posts no card, no dispatch-task-tree-cards.json is written, and
+   *  reports record nothing — exactly the pre-card behaviour. Opt in from
+   *  Dashboard 全局设置 → 多话题编排 → 任务树卡片. Read live, so turning it
+   *  off stops new card posts/updates immediately (a kill switch). */
+  taskTreeCard?: boolean;
 }
 
 export interface WorkerConfig {
@@ -858,6 +900,41 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   const v = raw as Record<string, unknown>;
   const out: WorkflowFeatureGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (v.nodeExecutor === 'bot') out.nodeExecutor = 'bot';
+  if (v.handoffIdentity === true) out.handoffIdentity = true;
+  const concurrency = readWorkflowConcurrency(v.concurrency);
+  if (concurrency) out.concurrency = concurrency;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Upper bound for any single concurrency cap: a typo like 1000 must not fork
+ *  a thousand CLI workers. */
+export const WORKFLOW_CONCURRENCY_MAX = 64;
+
+function readConcurrencyCap(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 && raw <= WORKFLOW_CONCURRENCY_MAX
+    ? raw
+    : undefined;
+}
+
+function readWorkflowConcurrency(raw: unknown): WorkflowConcurrencyConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: WorkflowConcurrencyConfig = {};
+  const global = readConcurrencyCap(v.global);
+  if (global !== undefined) out.global = global;
+  const perBot = readConcurrencyCap(v.perBot);
+  if (perBot !== undefined) out.perBot = perBot;
+  const perCli = readConcurrencyCap(v.perCli);
+  if (perCli !== undefined) out.perCli = perCli;
+  if (v.perCliById && typeof v.perCliById === 'object' && !Array.isArray(v.perCliById)) {
+    const byId: Record<string, number> = {};
+    for (const [cliId, cap] of Object.entries(v.perCliById as Record<string, unknown>)) {
+      const n = readConcurrencyCap(cap);
+      if (cliId && n !== undefined) byId[cliId] = n;
+    }
+    if (Object.keys(byId).length > 0) out.perCliById = byId;
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -866,6 +943,7 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
   const v = raw as Record<string, unknown>;
   const out: MultiTopicGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (typeof v.taskTreeCard === 'boolean') out.taskTreeCard = v.taskTreeCard;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1126,6 +1204,28 @@ export function isCrossPrincipalInterruptionEnabled(
   return readGlobalConfig().dashboard?.crossPrincipalInterruption === true;
 }
 
+/** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):
+ *  who executes goal nodes of runs authorized from now on. Read live like the
+ *  other dashboard toggles; the value only matters at authorization, where it
+ *  is frozen into `run.json`. */
+export function workflowNodeExecutorMode(): WorkflowNodeExecutorMode {
+  return readGlobalConfig().workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral';
+}
+
+/** Configured v3 concurrency caps (`workflow.concurrency`), or undefined when
+ *  none are set — callers then keep the runtime's code defaults. */
+export function workflowConcurrencyConfig(): WorkflowConcurrencyConfig | undefined {
+  return readGlobalConfig().workflow?.concurrency;
+}
+
+/** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):
+ *  whether bot-executed runs authorized from now on hand their initiator's
+ *  identity to the node bots. Read live; only consulted at authorization,
+ *  where the outcome is frozen into `run.json`. */
+export function workflowHandoffIdentityEnabled(): boolean {
+  return readGlobalConfig().workflow?.handoffIdentity === true;
+}
+
 /** Machine-wide multi-topic orchestration switch. Defaults ON for backwards
  * compatibility. The env override is also injected into managed CLI sessions
  * so sandboxed commands agree with the host daemon. */
@@ -1136,6 +1236,45 @@ export function isMultiTopicOrchestrationEnabled(env: NodeJS.ProcessEnv = proces
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().multiTopic?.enabled !== false;
+}
+
+/** Machine-wide dispatch task-tree card switch. Defaults OFF: a fresh install
+ *  sends no task-tree card (3.2(c) — a feature that adds a message must be
+ *  opted in). `BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED` wins when set, otherwise
+ *  the Dashboard toggle `multiTopic.taskTreeCard`. The DAEMON side (card post /
+ *  patch, report recording) reads it live from the short-TTL (~2s) global-config
+ *  cache, each daemon expiring its own (a Dashboard write invalidates only its
+ *  own process), so card behaviour follows the toggle within ~2s without a
+ *  restart. A CLI inside a sandboxed/file-isolated pane cannot read the config
+ *  file; the worker projects the value into spawn-time env, so the in-pane
+ *  `attemptAt` decision for an already-running session follows the NEXT session
+ *  (new spawn), while new dispatch-time card gating on the daemon is live. */
+export function isDispatchTaskTreeCardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().multiTopic?.taskTreeCard === true;
+}
+
+/**
+ * Host-resolved machine-wide on/off switches the daemon projects into spawned
+ * panes as `'true'`/`'false'` strings. This is the single step that turns the
+ * daemon-side config value into the env a file-sandboxed CLI reads (the child-env
+ * allowlist alone only forwards whatever stale value is already present). Pass
+ * the resolved env explicitly so tests can stub it instead of process.env.
+ * Covers the workflow feature, multi-topic orchestration and dispatch
+ * task-tree card switches (the latter two default the opposite way: multiTopic
+ * is on unless false, the card is off unless true — the readers already encode
+ * that, so this only stringifies their result).
+ */
+export function paneSwitchEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  return {
+    BOTMUX_WORKFLOW_ENABLED: isWorkflowFeatureEnabled(env) ? 'true' : 'false',
+    BOTMUX_MULTI_TOPIC_ENABLED: isMultiTopicOrchestrationEnabled(env) ? 'true' : 'false',
+    BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: isDispatchTaskTreeCardEnabled(env) ? 'true' : 'false',
+  };
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

@@ -2,7 +2,7 @@
  * talks to the real daemon IPC route (authorization, journal, sessionReply).
  * Only the Lark provider and the orchestrator daemon transport are replaced. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -39,6 +39,7 @@ import { loadOrCreateDashboardSecret } from '../src/dashboard/auth.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { UNDELIVERED_REPORT_RELAY_REASON_TEXT } from '../src/core/report-session-relay.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const APP = 'cli_report_fallback';
@@ -141,6 +142,40 @@ async function runReport(args: string[]) {
 }
 
 describe('botmux report relay fallback, CLI to daemon (#2262)', () => {
+  const registryEntry = () => {
+    const all = JSON.parse(readFileSync(join(data, 'orchestrate-dispatch.json'), 'utf8')) as Record<string, any>;
+    return all[ROOT] as Record<string, unknown>;
+  };
+  const refreshCalls = () => mocks.fetch.mock.calls.filter(call => call[1] === '/api/dispatch-tree/refresh');
+
+  afterEach(() => {
+    delete process.env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
+    invalidateGlobalConfigCache();
+  });
+
+  it('task-tree card default-OFF: a healthy relay records no lastReport and never refreshes a card', async () => {
+    delete process.env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
+    invalidateGlobalConfigCache();
+    const result = await runReport(['--dispatch-root', ROOT, 'Done']);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({ delivery: 'orchestrator-session', reportedTo: 'lead' });
+    // The relay trigger still happens; the card refresh does not.
+    expect(mocks.fetch.mock.calls.filter(call => call[1] === '/api/trigger')).toHaveLength(1);
+    expect(refreshCalls()).toHaveLength(0);
+    expect(registryEntry().lastReport).toBeUndefined();
+  });
+
+  it('task-tree card ON: a healthy relay records lastReport and asks the orchestrator to refresh', async () => {
+    process.env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED = 'true';
+    invalidateGlobalConfigCache();
+    const result = await runReport(['--status', 'completed', '--dispatch-root', ROOT, 'Done']);
+    expect(result.status, result.stderr).toBe(0);
+    expect(refreshCalls()).toHaveLength(1);
+    expect(refreshCalls()[0]![0]).toBe(19999);
+    expect(refreshCalls()[0]![2]).toMatchObject({ method: 'POST' });
+    expect(registryEntry().lastReport).toMatchObject({ status: 'completed' });
+  });
+
   it('keeps a healthy relay exactly as before: orchestrator session, nothing visible', async () => {
     const result = await runReport(['--dispatch-root', ROOT, 'Done']);
     expect(result.status, result.stderr).toBe(0);

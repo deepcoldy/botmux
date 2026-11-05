@@ -46,6 +46,7 @@ botmux start                 # start the daemon (botmux autostart enable for aut
 
 - **Self-contained single-file binary**: Runtime and PTY are embedded — **no Node required on the host to install or run**. Supports Linux / macOS (x64 / arm64, stable Apple Developer ID signature for official macOS builds); on Windows, run inside WSL2.
 - **Seamless upgrade**: Run `botmux upgrade` or re-run the curl command above for safe in-place upgrades.
+- **Source installs**: Dashboard version settings offer normal updates and a confirmed force update that backs up local changes before replacing them. See [source updates and recovery](docs/local-source-update.md).
 - **Full Guide**: Lark international edition, manual permission configuration, and troubleshooting are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 
 <details>
@@ -90,15 +91,30 @@ Designed for multi-agent dispatch pipelines (lead-bot delegating tasks to sub-bo
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents:
 
-`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) · `doubao` ([Doubao CLI setup and usage](docs/doubao.en.md)) …
 
-- **Gemini CLI removed**: the `gemini` adapter is gone; use `antigravity` instead. A bot still set to `cliId: "gemini"` refuses to start with a hint to switch to Antigravity, and other bots are unaffected; Gemini-specific `cliPathOverride` / `wrapperCli` / `model` / `GEMINI_CLI_HOME` do not carry over. See the [migration notes](https://deepcoldy.github.io/botmux/en/adapters#gemini-cli-has-been-removed).
 - **Session-level CLI Selection**: Select a registered CLI for an upcoming session with `/cli <cliId>`.
 - **Codex Multi-Account & Instances**: Configure multiple login homes and distribution strategies via [Session-level Codex Instances](docs/codex-instances.md).
 - **Compatible Distributions**: Codex-compatible and Kimi-compatible distributions can declare independent identities via `cliRuntime`, see [Codex-compatible Distributions](https://deepcoldy.github.io/botmux/en/adapters#codex-compatible-distributions).
 - **Shared Memory (Optional)**: Enable cross-agent persistent memory with [OpenViking Shared Memory](examples/openviking-memory/README.md).
 
 Authoritative `cliId` list and wrapper setups are documented in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+
+### Doubao CLI quickstart
+
+Use a Botmux build containing the `doubao` adapter. Install Doubao and finish native login as the same OS user that will run Botmux, then configure the Bot:
+
+```bash
+npm install -g '@bytedance/doubao-cli' --registry=https://registry.npmjs.org
+doubao --version
+doubao                      # finish login, verify the composer, then /exit
+botmux setup                # select Doubao and the actual project directory
+botmux start
+```
+
+For an existing Bot, select Doubao in Dashboard or merge `"cliId": "doubao"` and the actual `workingDir` into its existing `bots.json` entry, preserving credentials and other settings. Restart after saving and create a new session. Omit `model` for the default, or use a display name available to the account in native `/model`.
+
+Multiline tasks are submitted once; **Esc** interrupts through the Web terminal. Final answers are collected automatically from native logs, and restart resumes by the exact native decimal ID, never the “latest” conversation. Default permissions pass `--permission-mode always_allow`; restrict access to trusted users/projects. **The Botmux binary needs no Node; Doubao's npm installation and launcher still need Node/npm.** See the [Doubao guide](docs/doubao.en.md) for enterprise installation, local HTTP trials, permissions, and limits. Native Linux execution/sandbox and the existing-terminal `/adopt` bridge are not acceptance-tested; ordinary chat support does not imply every capability is supported.
 
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 
@@ -114,11 +130,6 @@ The table below compares only **verifiable integration boundaries** — it does 
 | Multi-CLI / agent | 20+ adapters, switch in one line | Depends on SDK coverage |
 | Multi-bot | Multi-bot @mention routing in one group | Depends on the implementation |
 | Direct terminal | Local CLIs can `tmux attach` into the real process | Depends on the implementation |
-
-## Advanced Integrations
-
-- **[Signed Chat Defaults](docs/signed-chat-defaults.md)** — Automated chat provisioning services can declare default `ambient` (mention-free) modes for standard groups via signed bindings.
-- **[Model Proxy Mode](docs/model-proxy.md)** — External applications (such as [OpenCodeReview](https://github.com/alibaba/open-code-review)) can access CLI model capabilities through an authenticated local Chat Completions endpoint, backed by [constrained invocation interfaces](docs/constrained-invocations.md).
 
 ## Docs · Community · Contributing
 
@@ -136,5 +147,3 @@ botmux may well be the most-contributed-to open-source project built specificall
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
 </a>
-
-<p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
