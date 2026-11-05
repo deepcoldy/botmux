@@ -89,13 +89,14 @@ export function contentAuditSensitiveTypes(err: unknown): ContentAuditSensitiveT
  * 就不再是邮箱，能过审；域名还能看出是 GitHub noreply 还是个人邮箱，阅读影响小。
  *
  * 防误伤：
- * - local part 前面不能紧贴邮箱字符或 `@`/`/`（`@scope/pkg@1.2.3` 的 `pkg` 前是 `/`）；
+ * - local part 前面不能紧贴邮箱字符、`@` 或单个 `/`（`@scope/pkg@1.2.3` 的 `pkg` 前是 `/`）；
+ *   `ssh://git@host` 的 `://` 和截断写法 `<...abc@host>` 的 `.` 不在此列，照常打码；
  * - 顶级域必须是 2 位以上字母，排除 `bun@1.4.3`、`pkg@^2.0.0` 等版本号；
  * - 域名字符不含 `{`，排除 `HEAD@{1}`、`stash@{0}` 等 reflog 写法；
  * - 装饰器 `@Component`、包名 `@types/node` 没有 local part，天然不匹配；
  * - 顶级域是常见源码扩展名（`.ts`/`.js`/`.py`…）时不算邮箱。
  */
-const EMAIL_RE = /(?<![A-Za-z0-9._%+\-@/])([A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*)@((?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+([A-Za-z]{2,24}))(?![A-Za-z0-9\-]|\.[A-Za-z0-9])/g;
+const EMAIL_RE = /(?<![A-Za-z0-9_%+\-@])(?<!(?:^|[^/])\/)([A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*)@((?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+([A-Za-z]{2,24}))(?![A-Za-z0-9\-]|\.[A-Za-z0-9])/g;
 const CODE_EXTENSION_TLDS = new Set([
   'ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs', 'json', 'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift',
   'cpp', 'hpp', 'cc', 'md', 'mdx', 'yml', 'yaml', 'toml', 'lock', 'sh', 'txt', 'css', 'scss', 'html', 'vue', 'svelte',

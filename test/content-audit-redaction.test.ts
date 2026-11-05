@@ -81,6 +81,8 @@ describe('redactSensitiveText', () => {
     ['GitHub noreply in a code span', '`12345678+bob@users.noreply.github.com`', '`*************users.noreply.github.com`'],
     ['co-author trailer', 'Co-Authored-By: Claude <noreply@anthropic.com>', 'Co-Authored-By: Claude <********anthropic.com>'],
     ['SSH remote (Lark flags it as an email)', 'remote git@github.com:owner/repo.git', 'remote ****github.com:owner/repo.git'],
+    ['ssh:// URL', 'clone "ssh://git@ssh.example.com/owner/repo"', 'clone "ssh://****ssh.example.com/owner/repo"'],
+    ['truncated with a leading ellipsis', 'Author <...7f3a@example.com>', 'Author <...*****example.com>'],
     ['adjacent CJK and full-width punctuation', '邮箱zhangsan@example.net，', '邮箱*********example.net，'],
     ['subdomain + sentence period', 'x@sub.mail.example.org.', '**sub.mail.example.org.'],
     ['uppercase, multi-label TLD', 'A.B-C_d%e@Foo-Bar.CO.UK', '**********Foo-Bar.CO.UK'],
