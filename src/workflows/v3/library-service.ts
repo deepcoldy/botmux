@@ -1063,15 +1063,27 @@ export async function loadDashboardAppendTarget(input: {
   return { metadata, latest: current.revision, comparisons };
 }
 
-/** What a retried append must match: the definition, not the moment it was
- *  confirmed (a draft save re-stamps `confirmedAt` on every request). */
-function comparableAppendDraft(payload: Pick<SavedWorkflowRevisionDraft, 'sourceRunId' | 'inputs' | 'contextRefs' | 'specTemplate' | 'specStatus' | 'dagTemplate' | 'safety' | 'provenance'>): unknown {
+/**
+ * What a retried Dashboard save (new template or append) must match to be
+ * answered with what it already wrote: the definition and where it came from
+ * — not the moment of confirming (a draft save re-stamps `confirmedAt` on
+ * every request) nor the request id. Anything else differing is another save.
+ */
+function comparableDashboardSave(payload: Pick<SavedWorkflowRevisionDraft, 'sourceRunId' | 'inputs' | 'contextRefs' | 'specTemplate' | 'specStatus' | 'dagTemplate' | 'safety' | 'provenance'>): unknown {
   const provenance = payload.provenance;
   return {
     ...(comparableRevisionDraft(payload as SavedWorkflowWriteResult['revision']['payload']) as Record<string, unknown>),
     ...(provenance?.kind === 'dashboard_draft'
-      ? { provenance: { kind: provenance.kind, draftRunId: provenance.draftRunId, flowSummarySha256: provenance.confirmation.flowSummarySha256, confirmedBy: provenance.confirmation.confirmedByOpenId, flowConfirmedAt: provenance.confirmation.flowConfirmedAt } }
-      : provenance ? { provenance: { ...provenance, requestId: undefined } } : {}),
+      ? { provenance: {
+          kind: provenance.kind,
+          draftRunId: provenance.draftRunId,
+          flowSummarySha256: provenance.confirmation.flowSummarySha256,
+          confirmedByOpenId: provenance.confirmation.confirmedByOpenId,
+          flowConfirmedAt: provenance.confirmation.flowConfirmedAt,
+        } }
+      : provenance?.kind === 'dashboard_run'
+        ? { provenance: { kind: provenance.kind, runId: provenance.runId, runtimeRevisions: provenance.runtimeRevisions, botChanges: provenance.botChanges } }
+        : {}),
   };
 }
 
@@ -1126,7 +1138,7 @@ export async function commitDashboardSave(input: CommitDashboardSaveInput): Prom
           if (existing.payload.provenance?.requestId === requestId && sameOwner(existing.payload.createdBy, actor)) {
             // Same request, same content — a retry. The same key with other
             // content is a different save, never silently answered with the old.
-            if (canonicalJsonStringify(comparableAppendDraft(existing.payload)) !== canonicalJsonStringify(comparableAppendDraft(revision))) {
+            if (canonicalJsonStringify(comparableDashboardSave(existing.payload)) !== canonicalJsonStringify(comparableDashboardSave(revision))) {
               throw new SavedWorkflowConflictError(`Saved workflow '${workflowId}' already has a version from this request with different content`);
             }
             return { metadata: await readSavedWorkflowMetadata(input.dataDir, workflowId), revision: existing, created: false, replayed: true };
@@ -1160,7 +1172,7 @@ export async function commitDashboardSave(input: CommitDashboardSaveInput): Prom
   const root = workflowLibraryRoot(input.dataDir);
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   return withFileLock(join(root, `.dashboard-save-${workflowId}`), async () => {
-    const existing = await loadExistingDashboardSave(input.dataDir, workflowId, actor, input.plan.revision);
+    const existing = await loadExistingDashboardSave(input.dataDir, workflowId, actor, input.plan.revision, input.displayName ?? input.plan.displayName);
     if (existing) return { ...existing, created: false };
     const dir = savedWorkflowDir(input.dataDir, workflowId);
     // Same remnant rule as the card save: our deterministic lock owns it.
@@ -1174,6 +1186,7 @@ async function loadExistingDashboardSave(
   workflowId: string,
   actor: SavedWorkflowOwner,
   revision: SavedWorkflowRevisionDraft,
+  displayName: string,
 ): Promise<SavedWorkflowWriteResult | undefined> {
   let current: SavedWorkflowWriteResult;
   try {
@@ -1182,8 +1195,11 @@ async function loadExistingDashboardSave(
     if (err instanceof SavedWorkflowNotFoundError) return undefined;
     throw err;
   }
+  // Same request key, same save — or a conflict: never answer a changed
+  // confirmation, source or name with what an earlier request wrote.
   if (!sameOwner(current.metadata.owner, actor) || current.revision.payload.humanVersion !== 1
-    || canonicalJsonStringify(comparableRevisionDraft(current.revision.payload)) !== canonicalJsonStringify(comparableRevisionDraft({ ...revision } as SavedWorkflowWriteResult['revision']['payload']))) {
+    || current.metadata.displayName !== displayName.trim().normalize('NFC')
+    || canonicalJsonStringify(comparableDashboardSave(current.revision.payload)) !== canonicalJsonStringify(comparableDashboardSave(revision))) {
     throw new SavedWorkflowConflictError(`Saved workflow '${workflowId}' already exists with different content`);
   }
   return current;
