@@ -169,5 +169,21 @@ describe('Dashboard session stop HTTP integration', () => {
       body: '{"publicReadOnly":true}' })).status).toBe(200);
     for (const route of [suspendPath, interruptPath]) expect((await post(route, false)).status).toBe(401);
     expect(writes.length).toBe(beforeRejected);
+
+    // 跨站 Origin（含同站不同端口、Origin: null）带着合法 cookie 也到不了 owner daemon。
+    await request(`${base}/api/settings`, { method: 'PUT', headers: auth, body: '{"publicReadOnly":false}' });
+    for (const origin of ['https://evil.example', 'http://127.0.0.1:1', 'null']) {
+      for (const route of [suspendPath, interruptPath, '/api/sessions/cleanup-idle', '/api/sessions/create']) {
+        const res = await request(base + route, { method: 'POST', headers: { ...auth, origin }, body: '{}' });
+        expect(res.status).toBe(403);
+        expect(res.body).toEqual({ ok: false, error: 'control_origin_forbidden' });
+      }
+    }
+    expect(writes.length).toBe(beforeRejected);
+    suspendReply = { status: 200, body: { ok: true, sessionId, suspended: true } };
+    // 同源仍可达 owner；无来源信号的非浏览器调用保持原行为。
+    expect((await request(base + suspendPath, { method: 'POST', headers: { ...auth, origin: base }, body: '{}' })).status).toBe(200);
+    expect((await post(suspendPath)).status).toBe(200);
+    expect(writes.length).toBe(beforeRejected + 2);
   }, 25_000);
 });
