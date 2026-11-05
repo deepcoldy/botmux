@@ -132,3 +132,58 @@ it('ignores the screen after the dialog was answered and is gone', () => {
     ' ╰──────────────────────────────────────────────╯',
   ].join('\n'))).toBeUndefined();
 });
+
+it('projects a dialog whose question wrapped onto a second terminal row', () => {
+  const prompt = claudeActionPrompt([
+    ' Edit file',
+    ' │ const x = 1;',
+    '',
+    ' Do you want to make this edit to a-very-long-component-file-name-for-the-',
+    ' settings-panel-of-account.tsx?',
+    ' ❯ 1. Yes',
+    '   2. No',
+    '',
+    ' Esc to cancel',
+  ].join('\n'));
+  expect(prompt).toContain('「Edit file」');
+  expect(prompt).toContain('1. Yes');
+  expect(prompt).toContain('2. No');
+  expect(prompt).not.toContain('const x');
+});
+
+const wrapped = (rows: string[]) => [' Edit file', ' │ const x = 1;', '', ...rows, ' ❯ 1. Yes', '   2. No', '', ' Esc to cancel'].join('\n');
+
+it('detects a dialog whose very long path wrapped over 3 rows (>156 chars joined)', () => {
+  const prompt = claudeActionPrompt(wrapped([
+    ' Do you want to make this edit to /home/tiger/work/botmux/src/services/a-really-long-component-name-for-the-settings-',
+    ' panel-of-account-and-billing-notifications-screen-with-extra-segments/',
+    ' final-file.tsx?',
+  ]));
+  expect(prompt).toContain('Do you want to make this edit to /home/tiger');
+  expect(prompt).toContain('2. No');
+});
+
+it('does not join across a blank row', () => {
+  expect(claudeActionPrompt(wrapped([
+    ' Do you want to make this edit to',
+    '',
+    ' src/component.tsx?',
+  ]))).toBeUndefined();
+});
+
+it('does not join a non-question head row into the real question below it', () => {
+  const prompt = claudeActionPrompt(wrapped([
+    ' Do you want to proceed with the cleanup',
+    ' Do you want to proceed?',
+  ]));
+  expect(prompt).toContain('：Do you want to proceed?');
+  expect(prompt).not.toContain('cleanup');
+});
+
+it('does not turn trailing chat text into a dialog without choices', () => {
+  expect(claudeActionPrompt([
+    ' Do you want to know more',
+    ' about something?',
+    ' Esc to cancel',
+  ].join('\n'))).toBeUndefined();
+});
