@@ -251,6 +251,20 @@ describe('protected HTTP egress route decisions', () => {
   });
 
   it.each([
+    '/v1/items/Update',
+    '/V1/ITEMS/UPDATE?cursor=%aa%2f',
+  ])('denies case variants of a registered write path: %s', path => {
+    expect(decide('POST', path)).toBe('deny');
+    expect(decide('GET', path)).toBe('allow');
+  });
+
+  it('preserves case-sensitive read paths and unrelated routes', () => {
+    expect(normalizeProtectedHttpPath('/v1/Items/List?cursor=%aa%2f'))
+      .toBe('/v1/Items/List?cursor=%aa%2f');
+    expect(decide('POST', '/v1/Items/List')).toBe('allow');
+  });
+
+  it.each([
     ['/v1/items/%75pdate', 'encoded unreserved character'],
     ['/v1/items/../items/update', 'dot segment'],
     ['/v1/items/./update', 'single-dot segment'],
@@ -268,13 +282,24 @@ describe('protected HTTP egress route decisions', () => {
     ['/v1/items/%0aupdate', 'encoded control character'],
     ['/v1/items/update\u0000', 'literal control character'],
     ['/v1/items/update#fragment', 'fragment'],
+    ['/v1/items/update;jsessionid=abc', 'matrix suffix'],
+    ['/v1;version=1/items/update', 'matrix parameter in an ancestor'],
+    ['/v1/items/update ', 'literal trailing space'],
+    ['/v1/items/up date', 'literal embedded space'],
+    ['/v1/items/update\u00a0', 'Unicode trailing whitespace'],
+    ['/v1/items/update%20', 'encoded trailing whitespace'],
+    ['/v1/items/update%c2%a0', 'encoded Unicode whitespace'],
+    ['/v1/items/update%3bjsessionid=abc', 'encoded matrix separator'],
+    ['/v1/items/update%3fignored', 'encoded query separator'],
+    ['/v1/items/update%23ignored', 'encoded fragment separator'],
+    ['/v1/items/update%3aignored', 'encoded reserved character'],
   ])('rejects ambiguous or unsafe path spelling: %s (%s)', (path) => {
     expect(() => decide('POST', path)).toThrow('invalid_protected_http_path');
   });
 
-  it('preserves query semantics while canonicalizing percent hex case', () => {
-    expect(normalizeProtectedHttpPath('/v1/items/list?cursor=%aa%2f&view=all'))
-      .toBe('/v1/items/list?cursor=%AA%2F&view=all');
+  it('preserves tracker query text including escape spelling and matrix-like values', () => {
+    expect(normalizeProtectedHttpPath('/v1/items/list?cursor=%aa%2f%25&view=all;next=%20&view=More'))
+      .toBe('/v1/items/list?cursor=%aa%2f%25&view=all;next=%20&view=More');
   });
 
   it('fails closed on a policy identifier mismatch or malformed method', () => {

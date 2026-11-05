@@ -1,7 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { chmodSync, lstatSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, rmSync } from 'node:fs';
 import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
@@ -15,6 +15,7 @@ import type { ProtectedHttpEgressWorkerPolicy } from './protected-http-egress.js
 
 const PROTECTED_MCP_CAPABILITY_ID = /^[a-z][a-z0-9._:-]{0,127}$/;
 const ENVIRONMENT_VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_PROTECTED_SECRET_BYTES = 64 * 1024;
 
 export const PROTECTED_MCP_CONTAINMENT_PROFILE = 'local-stdio-secret-v1' as const;
 export const PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE = 'local-stdio-secret-egress-guard-v1' as const;
@@ -28,8 +29,8 @@ export interface ProtectedMcpCapabilityConfig {
   enabled: boolean;
   allowedPluginIds: string[];
   secret: {
-    source: 'env';
-    name: string;
+    source: 'file';
+    path: string;
   };
   principal?: 'verified-human-email';
   containmentProfile: ProtectedMcpContainmentProfile;
@@ -43,7 +44,6 @@ export type ProtectedMcpCapabilityConfigMap = Record<string, ProtectedMcpCapabil
 
 export interface ProtectedMcpIsolationPolicy {
   protectedHomePaths: string[];
-  secretEnvNames: string[];
   redactEnv: string[];
 }
 
@@ -78,11 +78,6 @@ export interface ProtectedMcpWorkerProvisioning {
   secrets: Map<string, string>;
 }
 
-type ProtectedMcpSecretEnvironment = NodeJS.ProcessEnv | ReadonlyMap<string, string>;
-
-let daemonProtectedSecretEnv = new Map<string, string>();
-let daemonProtectedEnvKeys: string[] = [];
-
 export function isValidProtectedMcpCapabilityId(value: unknown): value is string {
   return typeof value === 'string' && PROTECTED_MCP_CAPABILITY_ID.test(value);
 }
@@ -113,6 +108,7 @@ function uniqueValidatedStrings(
 
 function isProtectedHomeRelativePath(value: unknown): value is string {
   if (typeof value !== 'string' || !value || value !== value.trim()) return false;
+  if (value.includes('\0')) return false;
   if (value.includes('\\') || value.startsWith('/') || /^[A-Za-z]:/.test(value)) return false;
   const parts = value.split('/');
   return parts.every(part => part.length > 0 && part !== '.' && part !== '..');
@@ -125,8 +121,8 @@ function normalizeCapabilityConfig(raw: unknown): ProtectedMcpCapabilityConfig |
   if (!allowedPluginIds?.length) return undefined;
 
   if (!isRecord(raw.secret)
-    || raw.secret.source !== 'env'
-    || !isValidEnvironmentVariableName(raw.secret.name)) return undefined;
+    || raw.secret.source !== 'file'
+    || !isProtectedHomeRelativePath(raw.secret.path)) return undefined;
   if (raw.principal !== undefined && raw.principal !== 'verified-human-email') return undefined;
   if (raw.containmentProfile !== PROTECTED_MCP_CONTAINMENT_PROFILE
     && raw.containmentProfile !== PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE) return undefined;
@@ -153,7 +149,7 @@ function normalizeCapabilityConfig(raw: unknown): ProtectedMcpCapabilityConfig |
   return {
     enabled: raw.enabled === true,
     allowedPluginIds,
-    secret: { source: 'env', name: raw.secret.name },
+    secret: { source: 'file', path: raw.secret.path },
     ...(raw.principal === 'verified-human-email' ? { principal: raw.principal } : {}),
     containmentProfile: raw.containmentProfile,
     ...(isolation ? { isolation } : {}),
@@ -197,17 +193,17 @@ export function protectedMcpIsolationPolicy(
 ): ProtectedMcpIsolationPolicy {
   const enabledPlugins = new Set(pluginIds ?? []);
   const protectedHomePaths = new Set<string>();
-  const secretEnvNames = new Set<string>();
   const redactEnv = new Set<string>();
   for (const capability of Object.values(config ?? {})) {
+    // Every child must be denied the operator credential, including bots
+    // without the plugin and capabilities whose writes are disabled.
+    if (isProtectedHomeRelativePath(capability.secret.path)) protectedHomePaths.add(capability.secret.path);
     if (!capability.allowedPluginIds.some(pluginId => enabledPlugins.has(pluginId))) continue;
-    secretEnvNames.add(capability.secret.name);
     for (const path of capability.isolation?.protectedHomePaths ?? []) protectedHomePaths.add(path);
     for (const name of capability.isolation?.redactEnv ?? []) redactEnv.add(name);
   }
   return {
     protectedHomePaths: [...protectedHomePaths],
-    secretEnvNames: [...secretEnvNames],
     redactEnv: [...redactEnv],
   };
 }
@@ -218,52 +214,75 @@ export function protectedMcpGlobalRedactedEnvKeys(
 ): string[] {
   const keys = new Set<string>();
   for (const capability of Object.values(config ?? {})) {
-    keys.add(capability.secret.name);
     for (const name of capability.isolation?.redactEnv ?? []) keys.add(name);
   }
   return [...keys];
 }
 
-/**
- * Capture configured daemon-only secret sources before removing every
- * protected name from the daemon environment inherited by arbitrary children.
- */
-export function captureProtectedMcpDaemonEnvironment(
+/** Combine the current typed config and recognizable names from rejected records. */
+export function protectedMcpCurrentRedactedEnvKeys(
   config: ProtectedMcpCapabilityConfigMap | undefined,
-  env: NodeJS.ProcessEnv,
-  configuredEnvKeys: readonly string[] = protectedMcpGlobalRedactedEnvKeys(config),
-): ReadonlyMap<string, string> {
-  const captured = new Map<string, string>();
-  for (const capability of Object.values(config ?? {})) {
-    const value = env[capability.secret.name]?.trim();
-    if (value) captured.set(capability.secret.name, value);
-  }
-  for (const key of configuredEnvKeys) delete env[key];
-  delete env[PROTECTED_MCP_SECRET_FD_ENV];
-  daemonProtectedSecretEnv = captured;
-  daemonProtectedEnvKeys = [...new Set(configuredEnvKeys.filter(isValidEnvironmentVariableName))];
-  return new Map(captured);
+  configuredEnvKeys: readonly string[],
+): string[] {
+  return [...new Set([
+    PROTECTED_MCP_SECRET_FD_ENV,
+    ...protectedMcpGlobalRedactedEnvKeys(config),
+    ...configuredEnvKeys.filter(isValidEnvironmentVariableName),
+  ])];
 }
 
-/** Snapshot of secret source values retained only by the daemon process. */
-export function protectedMcpDaemonSecretEnvironment(): ReadonlyMap<string, string> {
-  return new Map(daemonProtectedSecretEnv);
-}
-
-/** Machine-wide protected env names captured at daemon boot, including safe names from rejected records. */
-export function protectedMcpDaemonRedactedEnvKeys(): string[] {
-  return [...daemonProtectedEnvKeys];
-}
-
-function protectedSecretValue(
-  source: ProtectedMcpSecretEnvironment,
-  name: string,
+/**
+ * Pin each directory fd before opening its next component. Linux procfs fd
+ * paths provide openat-style traversal without a native dependency: a rename
+ * or symlink swap cannot redirect a later open into a different directory.
+ * All failures leave the capability read-only; never repair the source file.
+ */
+function protectedSecretFileValue(
+  home: string,
+  secret: ProtectedMcpCapabilityConfig['secret'],
 ): string | undefined {
-  const raw = typeof (source as ReadonlyMap<string, string>).get === 'function'
-    ? (source as ReadonlyMap<string, string>).get(name)
-    : (source as NodeJS.ProcessEnv)[name];
-  const value = raw?.trim();
-  return value || undefined;
+  if (process.platform !== 'linux' || typeof process.getuid !== 'function'
+    || secret.source !== 'file' || !isProtectedHomeRelativePath(secret.path)) return undefined;
+  const fds: number[] = [];
+  let bytes: Buffer | undefined;
+  try {
+    const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+    let parent = openSync('/', directoryFlags);
+    fds.push(parent);
+    // The account Home is trusted. Resolve its alias once, then anchor the
+    // entire canonical root and the secret's complete intermediate path.
+    const rootParts = realpathSync(home).split('/').filter(Boolean);
+    const parts = [...rootParts, ...secret.path.split('/')];
+    for (const part of parts.slice(0, -1)) {
+      parent = openSync(`/proc/self/fd/${parent}/${part}`, directoryFlags);
+      fds.push(parent);
+    }
+    const fd = openSync(`/proc/self/fd/${parent}/${parts.at(-1)}`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    fds.push(fd);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o7777) !== 0o600
+      || stat.size <= 0 || stat.size > MAX_PROTECTED_SECRET_BYTES) return undefined;
+    // Read one byte beyond the limit rather than trusting an earlier size:
+    // the file can grow after fstat, but that must never allocate unboundedly.
+    bytes = Buffer.alloc(MAX_PROTECTED_SECRET_BYTES + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = readSync(fd, bytes, length, bytes.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    const after = fstatSync(fd);
+    if (length > MAX_PROTECTED_SECRET_BYTES || after.uid !== process.getuid()
+      || (after.mode & 0o7777) !== 0o600 || after.size !== stat.size
+      || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) return undefined;
+    const value = bytes.subarray(0, length).toString('utf8').trim();
+    return value || undefined;
+  } catch {
+    return undefined;
+  } finally {
+    bytes?.fill(0);
+    for (const fd of fds.reverse()) closeSync(fd);
+  }
 }
 
 /** Environment names that must stay daemon-only for this worker generation. */
@@ -330,7 +349,7 @@ export function protectedMcpHomeDenyPaths(
 
 export function prepareProtectedMcpWorkerProvisioning(
   pluginIds: readonly string[] | undefined,
-  env: ProtectedMcpSecretEnvironment,
+  trustedHome: string,
   config: ProtectedMcpCapabilityConfigMap | undefined,
   containmentConfigured: boolean,
   protectedHttpEgressPolicy?: ProtectedHttpEgressWorkerPolicy,
@@ -339,10 +358,7 @@ export function prepareProtectedMcpWorkerProvisioning(
   const workerPolicy: ProtectedMcpWorkerPolicy = {
     capabilities: [],
     protectedHomePaths: isolation.protectedHomePaths,
-    redactEnv: [...new Set([
-      ...protectedMcpGlobalRedactedEnvKeys(config),
-      ...protectedMcpDaemonRedactedEnvKeys(),
-    ])],
+    redactEnv: protectedMcpGlobalRedactedEnvKeys(config),
   };
   const secrets = new Map<string, string>();
   const enabledPlugins = new Set(pluginIds ?? []);
@@ -359,7 +375,7 @@ export function prepareProtectedMcpWorkerProvisioning(
     } else if (capability.containmentProfile !== PROTECTED_MCP_CONTAINMENT_PROFILE) {
       continue;
     }
-    const secret = protectedSecretValue(env, capability.secret.name);
+    const secret = protectedSecretFileValue(trustedHome, capability.secret);
     if (!secret) continue;
     workerPolicy.capabilities.push({
       id,
@@ -405,7 +421,6 @@ export function protectedMcpContainmentActive(input: {
   sandboxEngaged: boolean;
   mcpSocketMounted: boolean;
   egressSocketMounted?: boolean;
-  directTargetDenyRulesInstalled?: boolean;
   guardLive?: boolean;
   expectedPolicyDigest?: string;
   guardPolicyDigest?: string;
@@ -420,7 +435,6 @@ export function protectedMcpContainmentActive(input: {
   if (!common) return false;
   if (input.containmentProfile === PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE) {
     return input.egressSocketMounted === true
-      && input.directTargetDenyRulesInstalled === true
       && input.guardLive === true
       && !!input.expectedPolicyDigest
       && input.guardPolicyDigest === input.expectedPolicyDigest;

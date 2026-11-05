@@ -129,6 +129,7 @@ describe('managed lark-cli binding', () => {
     const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: dir };
     const first = prepareLarkToolEnv({ env, dataDir: dir, sessionId: 'session-a', appId: defaults.appId, brand: 'lark' });
     const second = prepareLarkToolEnv({ env, dataDir: dir, sessionId: 'session-a', appId: defaults.appId, brand: 'lark' });
+    expect(env.BOTMUX_WRAPPER_BIN).toBe(join(dir, '.botmux', 'bin'));
     expect(second.accessKey).toBe(first.accessKey);
     expect(second.realBinary).toBe(real);
     expect(readLarkToolBinding(larkToolBindingPath(dir, 'session-a')).appId).toBe(defaults.appId);

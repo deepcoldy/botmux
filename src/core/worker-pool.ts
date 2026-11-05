@@ -47,7 +47,7 @@ import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
-import { readGlobalConfig } from '../global-config.js';
+import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
@@ -109,8 +109,7 @@ import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
 import {
   PROTECTED_MCP_SECRET_FD_ENV,
   prepareProtectedMcpWorkerProvisioning,
-  protectedMcpDaemonRedactedEnvKeys,
-  protectedMcpDaemonSecretEnvironment,
+  protectedMcpCurrentRedactedEnvKeys,
   protectedMcpContainmentConfigured,
   serveProtectedMcpSecrets,
 } from './protected-mcp-capabilities.js';
@@ -120,7 +119,6 @@ import {
   type ProtectedHttpEgressWorkerPolicy,
 } from './protected-http-egress.js';
 import {
-  PROTECTED_HTTP_EGRESS_REQUIRED_ENV,
   PROTECTED_HTTP_EGRESS_SOCKET_ENV,
 } from './protected-http-egress-host.js';
 import { resolveSessionEnv, type ResolvedSessionEnv } from './session-env-resolve.js';
@@ -998,7 +996,7 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_HTTP_EGRESS_SOCKET_ENV, PROTECTED_HTTP_EGRESS_REQUIRED_ENV, PROTECTED_MCP_SECRET_FD_ENV] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_HTTP_EGRESS_SOCKET_ENV, PROTECTED_MCP_SECRET_FD_ENV] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv, protectedEnvKeys: readonly string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -7172,10 +7170,10 @@ export function resolveSessionEnvForSession(
         || ds.session?.existingAppServerEndpoint !== undefined,
     },
   });
-  const protectedKeys = new Set([
-    PROTECTED_MCP_SECRET_FD_ENV,
-    ...protectedMcpDaemonRedactedEnvKeys(),
-  ]);
+  const protectedKeys = new Set(protectedMcpCurrentRedactedEnvKeys(
+    readGlobalConfig().protectedMcpCapabilities,
+    configuredProtectedMcpEnvKeys(),
+  ));
   const set = Object.fromEntries(
     Object.entries(resolved.composed.set).filter(([key]) => !protectedKeys.has(key)),
   );
@@ -14650,6 +14648,18 @@ export function forkWorker(
     );
   }
   if (protectedHttpEgressForkIsResume(resumeOrTurnId)) {
+    // A resume shares an opening that is still freezing its DNS targets. Only
+    // a legacy session without a pending opening may freeze policy absence;
+    // re-reading live plugin config here would replace the opening's snapshot.
+    if (pending) {
+      return queueBehindPendingProtectedHttpEgressFork(
+        pending,
+        ds,
+        promptInput,
+        resumeOrTurnId,
+        opts,
+      );
+    }
     return forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, undefined, bot);
   }
 
@@ -14659,6 +14669,7 @@ export function forkWorker(
   );
   if (collected.length > 1) throw new Error('multiple_protected_http_egress_policies');
   if (collected.length === 0) {
+    if (pending) throw new Error('protected_http_egress_policy_changed_during_freeze');
     return forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, undefined, bot);
   }
 
@@ -14772,22 +14783,26 @@ export function forkWorker(
           const promoteAfterOpeningInit = () => {
             if (activePendingSettled) return;
             activePendingSettled = true;
+            const waiters = [...activePending.waiters];
+            // Admission callbacks may synchronously admit another turn. It
+            // belongs to the live worker's ordinary FIFO, not this already
+            // settled DNS opening or its one-time promotion decision.
+            clearActivePending();
             try {
-              const promoted = activePending.waiters.length === 0
+              const promoted = !waiters.some(waiter => waiter.queuedActivationTailId)
                 || promoteQueuedActivationTail(ds);
-              for (const waiter of activePending.waiters) {
-                waiter.opts.onAdmission?.(promoted ? 'accepted' : 'rejected');
+              for (const waiter of waiters) {
+                waiter.opts.onAdmission?.(!waiter.queuedActivationTailId || promoted
+                  ? 'accepted' : 'rejected');
               }
             } catch (error) {
               logger.error(
                 `[${tag(ds)}] Failed to promote protected egress DNS waiters after opening init: `
                 + `${error instanceof Error ? error.message : String(error)}`,
               );
-              for (const waiter of activePending.waiters) {
-                waiter.opts.onAdmission?.('rejected');
+              for (const waiter of waiters) {
+                waiter.opts.onAdmission?.(waiter.queuedActivationTailId ? 'rejected' : 'accepted');
               }
-            } finally {
-              clearActivePending();
             }
           };
           if (!worker || !afterWorkerIpcBootstrap(
@@ -15532,7 +15547,7 @@ function forkWorkerPrepared(
   const globalConfig = readGlobalConfig();
   const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
     resolveEffectivePluginIds(botCfg, globalConfig),
-    protectedMcpDaemonSecretEnvironment(),
+    homedir(),
     globalConfig.protectedMcpCapabilities,
     protectedMcpContainmentConfigured({
       platform: process.platform,
@@ -15543,6 +15558,12 @@ function forkWorkerPrepared(
       adopt: false,
     }),
     protectedHttpEgressPolicy,
+  );
+  // Rejected legacy env-source records grant no capability, but their safe
+  // names must also reach fork inheritance and the worker's child-env policy.
+  protectedMcpProvisioning.workerPolicy.redactEnv = protectedMcpCurrentRedactedEnvKeys(
+    globalConfig.protectedMcpCapabilities,
+    configuredProtectedMcpEnvKeys(),
   );
   const forkEnv = workerForkEnv(
     buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),
@@ -22966,9 +22987,13 @@ export function forkAdoptWorker(
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
   const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
     effectivePluginIds,
-    protectedMcpDaemonSecretEnvironment(),
+    homedir(),
     globalConfig.protectedMcpCapabilities,
     false,
+  );
+  protectedMcpProvisioning.workerPolicy.redactEnv = protectedMcpCurrentRedactedEnvKeys(
+    globalConfig.protectedMcpCapabilities,
+    configuredProtectedMcpEnvKeys(),
   );
   const forkEnv = workerForkEnv(
     buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),

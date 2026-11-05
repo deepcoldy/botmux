@@ -15,6 +15,9 @@ export interface NetworkLaunchPlan {
   command: string;
   args: string[];
   protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
+  /** Start of the CLI's own arguments within args, after trusted launchers
+   * and its executable. Absent means an unwrapped command (offset zero). */
+  protectedHttpBridgeArgsOffset?: number;
   localServiceBridges?: ProtectedLocalServiceLoopbackPlan[];
 }
 
@@ -45,6 +48,7 @@ export function sandboxNetworkLaunch(
   args: string[],
   protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan,
   localServiceBridges?: ProtectedLocalServiceLoopbackPlan[],
+  protectedHttpBridgeArgsOffset?: number,
 ): { bin: string; args: string[] } {
   if (process.platform !== 'linux') throw new Error('sandboxNetworkPolicy requires Linux');
   parseSandboxNetworkPolicy(policy);
@@ -69,6 +73,7 @@ export function sandboxNetworkLaunch(
     command,
     args,
     ...(protectedHttpBridge ? { protectedHttpBridge } : {}),
+    ...(protectedHttpBridgeArgsOffset !== undefined ? { protectedHttpBridgeArgsOffset } : {}),
     ...(localServiceBridges?.length ? { localServiceBridges } : {}),
   });
   const encoded = Buffer.from(JSON.stringify(plan)).toString('base64');

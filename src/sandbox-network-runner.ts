@@ -256,6 +256,7 @@ async function main() {
         plan.args,
         plan.protectedHttpBridge.placeholderOrigin,
         protectedHttpBridge.origin,
+        plan.protectedHttpBridgeArgsOffset,
       );
     }
     // Feed an immutable anonymous pipe; no mutable host filter file exists.

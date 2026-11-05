@@ -9,6 +9,7 @@ import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
 import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir, sessionVisiblePath } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import type { ProtectedLoopbackService } from './protected-http-egress-host.js';
 
@@ -232,6 +233,7 @@ export function prepareLarkToolEnv(input: {
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');
   input.env.BOTMUX_IDENTITY_BIN = binDir;
+  input.env.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(input.env);
   input.env.ZDOTDIR = zdotdir;
   input.env.BASH_ENV = bashEnv;
   input.env.SESSION_DATA_DIR = rootDir;

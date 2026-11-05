@@ -4,10 +4,10 @@
  *   BOTMUX_PROTECTED_LOOPBACK_INTEGRATION=1 bun run test test/protected-provider-loopback-linux.test.ts
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import {
@@ -16,6 +16,9 @@ import {
 import { verifyProtectedLoopbackProxyAttestation } from '../src/core/protected-loopback-attestation.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import type { SandboxNetworkPolicy } from '../src/core/sandbox-network-policy.js';
+import { protectedHttpEgressAuthTokenPath } from '../src/core/protected-http-egress-host.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 const enabled = process.platform === 'linux'
   && process.env.BOTMUX_PROTECTED_LOOPBACK_INTEGRATION === '1'
@@ -31,7 +34,9 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
     root = mkdtempSync(join(tmpdir(), 'botmux-provider-loopback-linux-'));
     chmodSync(root, 0o700);
     socketPath = join(root, 'e.sock');
-    writeFileSync(join(root, 'egress-auth'), 'namespace-auth-fixture\n', { mode: 0o600 });
+    const tokenPath = protectedHttpEgressAuthTokenPath(socketPath);
+    mkdirSync(dirname(tokenPath), { mode: 0o700 });
+    writeFileSync(tokenPath, 'namespace-auth-fixture\n', { mode: 0o600 });
     guard = createServer((request, response) => {
       const service = request.headers['x-botmux-loopback-service'] as string | undefined;
       const session = request.headers['x-botmux-lark-session'] as string | undefined;
@@ -64,7 +69,8 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
     observed.length = 0;
     const script = join(root, 'probe.mjs');
     writeFileSync(script, [
-      'const response = await fetch(process.argv[2], { method: "POST", body: "{}" });',
+      'const baseUrl = process.argv[3].slice("model_providers.fixture.base_url=".length);',
+      'const response = await fetch(baseUrl, { method: "POST", body: "{}" });',
       'const body = await response.text();',
       'console.log(JSON.stringify({ status: response.status, body }));',
     ].join('\n'));
@@ -77,7 +83,7 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
     const launch = sandboxNetworkLaunch(
       policy,
       process.execPath,
-      [script, `${PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN}/model/responses`],
+      [script, '-c', `model_providers.fixture.base_url=${PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN}/model/responses`],
       {
         socketPath,
         policyId: 'fixture.items.write.v1',
@@ -108,6 +114,71 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
       policy: 'fixture.items.write.v1',
       target: '0',
     }]);
+  });
+
+  it.each(['node', 'bun'] as const)('starts the production file-sandbox launch and routes the model through the protected bridge (%s)', async runtime => {
+    observed.length = 0;
+    const script = join(root, 'sandbox-provider-probe.mjs');
+    const prompt = 'Do not rewrite http://127.0.0.1:0 in this prompt';
+    writeFileSync(script, [
+      'import { existsSync } from "node:fs";',
+      'const baseUrl = JSON.parse(process.argv[3].slice("model_providers.fixture.base_url=".length));',
+      'const response = await fetch(baseUrl, { method: "POST", body: "{}", signal: AbortSignal.timeout(5000) });',
+      'const body = await response.text();',
+      `const authPaths = ${JSON.stringify([protectedHttpEgressAuthTokenPath(socketPath), protectedHttpEgressAuthTokenPath('/run/botmux-mcp/e.sock')])};`,
+      'console.log(JSON.stringify({ status: response.status, body, prompt: process.argv[4], authReadable: authPaths.map(existsSync) }));',
+    ].join('\n'));
+    const gateway = createServer((_request, response) => response.end('fixture'));
+    const gatewayPath = join(root, 'g.sock');
+    const { prepareDirectSandbox } = await import('../dist/adapters/backend/sandbox.js');
+    const paths = ['/usr', '/etc', dirname(realpathSync(process.execPath)),
+      ...(process.env.LD_LIBRARY_PATH ?? '').split(':').filter(path => path.startsWith('/')), root];
+    let sandbox: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      await new Promise<void>((resolve, reject) => { gateway.once('error', reject); gateway.listen(gatewayPath, resolve); });
+      sandbox = prepareDirectSandbox({
+        sessionId: 'production-provider-argv', dataDir: root,
+        policy: { net: true, writeRegexes: [], rules: [...new Set(paths)].map(path => ({
+          path, access: path === root ? 'readWrite' : 'readOnly', source: 'baseline',
+        })) },
+        networkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
+        chdir: root, home: root, cliBin: process.execPath,
+        cliArgs: [script, '-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/model/responses"', prompt],
+        mcpGatewaySocketPath: gatewayPath, protectedEgressSocketPath: socketPath,
+        protectedHttpBridge: {
+          socketPath, policyId: 'fixture.items.write.v1', targetIndex: 0,
+          placeholderOrigin: PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+        },
+      });
+      expect(sandbox).not.toBeNull();
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+        const child = runtime === 'bun'
+          ? spawn(spawnSync('/bin/sh', ['-c', 'command -v bun'], { encoding: 'utf8' }).stdout.trim(), sandbox!.args, {
+            env: { ...process.env, ...sandbox!.env }, stdio: ['ignore', 'pipe', 'pipe'],
+          })
+          : spawnNodeTsScript(sandbox!.args[0]!, sandbox!.args.slice(1), {
+            env: { ...process.env, ...sandbox!.env }, stdio: ['ignore', 'pipe', 'pipe'],
+          });
+        let stdout = ''; let stderr = '';
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('sandbox provider probe timed out')); }, 15000);
+        child.stdout!.on('data', chunk => stdout += chunk); child.stderr!.on('data', chunk => stderr += chunk);
+        child.once('error', error => { clearTimeout(timer); reject(error); });
+        child.once('exit', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toEqual({
+        status: 200, body: 'data: namespace-first\n\ndata: namespace-second\n\n', prompt,
+        authReadable: [false, false],
+      });
+      expect(observed).toEqual([{
+        method: 'POST', url: '/model/responses', auth: 'namespace-auth-fixture',
+        policy: 'fixture.items.write.v1', target: '0',
+      }]);
+    } finally {
+      sandbox?.cleanup();
+      await new Promise<void>(resolve => gateway.close(() => resolve()));
+      rmSandboxScratch(join(root, 'sandboxes'));
+    }
   });
 
   it('re-exposes only the declared daemon route on private loopback', async () => {

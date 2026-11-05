@@ -8,7 +8,8 @@
  */
 
 import { buildBotWorkerEnv } from '../../core/env-policy.js';
-import { protectedMcpDaemonRedactedEnvKeys } from '../../core/protected-mcp-capabilities.js';
+import { protectedMcpCurrentRedactedEnvKeys, protectedMcpIsolationPolicy } from '../../core/protected-mcp-capabilities.js';
+import { configuredProtectedMcpEnvKeys, readGlobalConfig } from '../../global-config.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
 import { getBot } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
@@ -172,7 +173,8 @@ async function runNodeImpl(
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
-  const protectedEnvKeys = protectedMcpDaemonRedactedEnvKeys();
+  const global = readGlobalConfig();
+  const protectedEnvKeys = protectedMcpCurrentRedactedEnvKeys(global.protectedMcpCapabilities, configuredProtectedMcpEnvKeys());
   const workerEnv: Record<string, string | undefined> = {
     // v3 ephemeral workers fork straight from the daemon here (not via
     // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
@@ -299,6 +301,13 @@ async function runNodeImpl(
     model: req.botSnapshot.model,
     envPolicy: req.botSnapshot.envPolicy,
     ...workerSessionEnv,
+    // Workflow nodes receive no write capability or secret channel, but must
+    // still deny every machine-configured secret file in their sandbox.
+    protectedMcpPolicy: {
+      capabilities: [],
+      protectedHomePaths: protectedMcpIsolationPolicy([], global.protectedMcpCapabilities).protectedHomePaths,
+      redactEnv: protectedEnvKeys,
+    },
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,

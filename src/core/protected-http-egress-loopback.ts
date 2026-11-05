@@ -17,6 +17,7 @@ export const PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN = 'http://127.0.0.1:0';
 
 const MAX_CODEX_CONFIG_BYTES = 1024 * 1024;
 const ROUTING_HEADERS = new Set([
+  'x-botmux-egress-client',
   'x-botmux-egress-auth',
   'x-botmux-egress-policy',
   'x-botmux-egress-target',
@@ -403,17 +404,82 @@ export async function startProtectedLocalServiceLoopbackBridge(
   };
 }
 
+function codexProviderBaseUrlArg(raw: string): {
+  providerId: string;
+  value: string;
+  valueOffset: number;
+} | undefined {
+  const match = /^([ \t]*model_providers\.([A-Za-z0-9_-]{1,128})\.base_url[ \t]*=[ \t]*)(.*?)[ \t]*$/.exec(raw);
+  if (!match) return undefined;
+  const rawValue = match[3]!;
+  const quote = rawValue[0];
+  let value: unknown;
+  if (quote === '"' || quote === "'") {
+    try { value = parse(`value=${rawValue}`).value; } catch { return undefined; }
+  } else {
+    // Codex accepts an unquoted CLI value as a string when TOML parsing fails.
+    value = rawValue;
+  }
+  if (typeof value !== 'string') return undefined;
+  return {
+    providerId: match[2]!,
+    value,
+    valueOffset: match[1]!.length + (quote === '"' || quote === "'" ? 1 : 0),
+  };
+}
+
+/** Replace the origin only in one provider base_url passed through -c in the
+ * launcher-declared CLI argument slice, never in shell or bwrap arguments.
+ * Text in prompts, unrelated settings and the URL suffix is not routing input.
+ * A second assignment to that provider is ambiguous even if it uses another
+ * origin: Codex's override ordering must not silently undo the bridge. */
 export function materializeProtectedHttpLoopbackArgs(
   args: readonly string[],
   placeholderOrigin: string,
   actualOrigin: string,
+  cliArgsOffset = 0,
 ): string[] {
-  let count = 0;
-  const materialized = args.map(arg => {
-    if (!arg.includes(placeholderOrigin)) return arg;
-    count += arg.split(placeholderOrigin).length - 1;
-    return arg.split(placeholderOrigin).join(actualOrigin);
-  });
-  if (count !== 1) throw new Error('protected_http_loopback_placeholder_count');
+  if (!Number.isSafeInteger(cliArgsOffset) || cliArgsOffset < 0 || cliArgsOffset > args.length) {
+    throw new Error('protected_http_loopback_args_offset');
+  }
+  const materialized = [...args];
+  const providers = new Map<string, number>();
+  let providerTableAssignments = 0;
+  const targets: Array<{ index: number; providerId: string; valueOffset: number }> = [];
+  for (let index = cliArgsOffset; index < args.length; index += 1) {
+    const flag = args[index]!;
+    if (flag === '--') break;
+    const canonical = flag === '-c';
+    let raw: string | undefined;
+    if (canonical || flag === '--config') raw = args[++index];
+    else if (flag.startsWith('--config=')) raw = flag.slice('--config='.length);
+    else if (flag.startsWith('-c') && flag.length > 2) raw = flag.slice(flag[2] === '=' ? 3 : 2);
+    if (raw === undefined) continue;
+    // Codex splits CLI override keys on dots; do not treat quoted keys as
+    // equivalent TOML paths. Count route writes even if their value cannot be
+    // materialized, including replacement of the containing provider table.
+    const equals = raw.indexOf('=');
+    const assignment = equals < 0 ? undefined
+      : /^model_providers(?:\.([A-Za-z0-9_-]{1,128})(?:\.base_url)?)?$/.exec(raw.slice(0, equals).trim());
+    if (assignment) {
+      const providerId = assignment[1];
+      if (providerId) providers.set(providerId, (providers.get(providerId) ?? 0) + 1);
+      else providerTableAssignments += 1;
+    }
+    const override = codexProviderBaseUrlArg(raw);
+    if (!canonical || !override) continue;
+    if (!override.value.startsWith(placeholderOrigin)
+      || !/^(?:[/?#]|$)/.test(override.value.slice(placeholderOrigin.length))
+      || raw.slice(override.valueOffset, override.valueOffset + placeholderOrigin.length) !== placeholderOrigin) {
+      continue;
+    }
+    targets.push({ index, providerId: override.providerId, valueOffset: override.valueOffset });
+  }
+  const target = targets[0];
+  if (targets.length !== 1 || !target || providers.get(target.providerId) !== 1 || providerTableAssignments !== 0) {
+    throw new Error('protected_http_loopback_placeholder_count');
+  }
+  const raw = args[target.index]!;
+  materialized[target.index] = `${raw.slice(0, target.valueOffset)}${actualOrigin}${raw.slice(target.valueOffset + placeholderOrigin.length)}`;
   return materialized;
 }

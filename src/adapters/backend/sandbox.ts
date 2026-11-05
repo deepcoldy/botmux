@@ -39,9 +39,12 @@ import {
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
 import {
-  PROTECTED_HTTP_EGRESS_REQUIRED_ENV,
   PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+  PROTECTED_HTTP_EGRESS_PROTOCOL_ENV,
+  PROTECTED_HTTP_SHARED_READ_PROTOCOL,
+  protectedHttpEgressAuthTokenPath,
 } from '../../core/protected-http-egress-host.js';
+import { ensurePrivateGatewayDir } from '../../core/plugins/mcp/socket-dir.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
 import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
@@ -1188,8 +1191,6 @@ export function prepareDirectSandbox(opts: {
   mcpGatewaySocketPath?: string;
   /** Worker-owned protected HTTP egress guard socket beside the MCP socket. */
   protectedEgressSocketPath?: string;
-  /** A policy exists even if guard startup failed; protected origins must not fall back direct. */
-  protectedEgressRequired?: boolean;
   /** Optional loopback bridge for a process control-plane origin that overlaps
    *  a protected target. It is started by the network-namespace runner. */
   protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
@@ -1448,6 +1449,14 @@ export function prepareDirectSandbox(opts: {
       const hostDir = realpathSync(dirname(mcpSocketPath));
       const sandboxDir = '/run/botmux-mcp';
       args.push('--dir', sandboxDir, '--ro-bind', hostDir, sandboxDir);
+      // Keep the rotating MCP socket directory live, but never expose the
+      // egress bridge's authentication to task processes. Mask BOTH aliases:
+      // another file-policy ancestor grant may also admit the canonical path.
+      // The outer network runner reads the real directory outside bwrap.
+      const egressAuthDir = dirname(protectedHttpEgressAuthTokenPath(join(hostDir, 'e.sock')));
+      ensurePrivateGatewayDir(egressAuthDir);
+      args.push('--tmpfs', join(sandboxDir, basename(egressAuthDir)),
+        '--dir', hostDir, '--tmpfs', egressAuthDir);
       sandboxMcpGatewaySocketPath = join(sandboxDir, basename(mcpSocketPath));
       if (opts.protectedEgressSocketPath) {
         const egressSocketPath = resolve(opts.protectedEgressSocketPath);
@@ -1517,9 +1526,7 @@ export function prepareDirectSandbox(opts: {
   }
   if (sandboxProtectedEgressSocketPath) {
     env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] = sandboxProtectedEgressSocketPath;
-  }
-  if (opts.protectedEgressRequired) {
-    env[PROTECTED_HTTP_EGRESS_REQUIRED_ENV] = '1';
+    env[PROTECTED_HTTP_EGRESS_PROTOCOL_ENV] = PROTECTED_HTTP_SHARED_READ_PROTOCOL;
   }
   for (const k of PROXY_ENV_KEYS) {
     const v = process.env[k];
@@ -1569,6 +1576,9 @@ export function prepareDirectSandbox(opts: {
     rollbackSandboxSetup(sessionRoot, createdMasks);
     throw error;
   }
+  // Carry the CLI boundary explicitly: the network runner receives shell +
+  // bwrap arguments, whose -c and -- have different meanings from Codex's.
+  const protectedHttpBridgeArgsOffset = launch.args.length + args.length + 2;
   if (!compactLaunch) args.push('--', ...command);
 
   let networkLaunch: ReturnType<typeof sandboxNetworkLaunch> | undefined;
@@ -1580,6 +1590,7 @@ export function prepareDirectSandbox(opts: {
         [...launch.args, ...args],
         opts.protectedHttpBridge,
         opts.localServiceBridges,
+        opts.protectedHttpBridge ? protectedHttpBridgeArgsOffset : undefined,
       )
       : undefined;
   } catch (error) {

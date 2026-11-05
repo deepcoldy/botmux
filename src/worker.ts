@@ -3,7 +3,8 @@ import { deploymentContinuationTemplate } from './services/deployment-continuati
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
-import { FROZEN_NETWORK_POLICY_HINT, hostDnsServers, mergeProtectedHttpEgressNetworkPolicy, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import { FROZEN_NETWORK_POLICY_HINT, hostDnsServers, mergeProtectedHttpEgressNetworkPolicy, networkPolicySupportError, protectedHttpEgressCliSupportError } from './core/sandbox-network-policy.js';
+import { networkProxyLaunchError } from './core/sandbox-network-proxy.js';
 import {
   protectedMcpContainmentActive,
   protectedMcpHomeDenyPaths,
@@ -11,8 +12,8 @@ import {
   protectedMcpRedactedEnvKeys,
 } from './core/protected-mcp-capabilities.js';
 import {
-  PROTECTED_HTTP_EGRESS_REQUIRED_ENV,
   PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+  PROTECTED_HTTP_EGRESS_PROTOCOL_ENV,
   startSessionProtectedHttpEgressHost,
   type SessionProtectedHttpEgressHost,
 } from './core/protected-http-egress-host.js';
@@ -2412,6 +2413,7 @@ async function prepareCliPluginGenerationAndGateway(
         dataDir: config.session.dataDir,
         policy: cfg.protectedHttpEgressPolicy.policy,
         policyDigest: cfg.protectedHttpEgressPolicy.policyDigest,
+        sharedRead: true,
         frozenAddresses: cfg.protectedHttpEgressPolicy.frozenAddresses,
         loopbackServices,
         ...(cfg.protectedLoopbackProxyAttestation ? {
@@ -2429,6 +2431,8 @@ async function prepareCliPluginGenerationAndGateway(
             },
           },
         } : {}),
+        log: entry => log(`[protected-egress] request ${JSON.stringify(entry)}`),
+        warn: warning => log(`[protected-egress] warning ${JSON.stringify(warning)}`),
         onError: error => log(`[protected-egress] host error: ${error.message}`),
       });
       log(`[protected-egress] guard listening for ${cfg.protectedHttpEgressPolicy.pluginId}`);
@@ -21069,6 +21073,8 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   followBotTraeHome(cfg);
+  const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
+  if (protectedCliError) throw new Error(protectedCliError + FROZEN_NETWORK_POLICY_HINT);
   const protectedMcpEnvKeys = protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy);
   // Freeze protected-target denies before ANY support/proxy/sandbox decision.
   // The exact worker-init addresses also feed the egress host, so DNS cannot
@@ -21116,7 +21122,9 @@ async function spawnCli(
   });
   // cfg.sandboxNetworkPolicy is the session's creation-time snapshot.
   if (networkError) throw new Error(networkError + FROZEN_NETWORK_POLICY_HINT);
-  const proxyError = networkProxyError(effectiveSandboxNetworkPolicy, { ...process.env, ...cfg.env });
+  const proxyError = await networkProxyLaunchError(effectiveSandboxNetworkPolicy, { ...process.env, ...cfg.env }, {
+    protectedHttpEgress: !!cfg.protectedHttpEgressPolicy,
+  });
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
   localProtectedMcpContainmentActiveCapabilityIds = [];
@@ -23712,7 +23720,10 @@ async function spawnCli(
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy);
   delete childEnv[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
-  delete childEnv[PROTECTED_HTTP_EGRESS_REQUIRED_ENV];
+  delete childEnv[PROTECTED_HTTP_EGRESS_PROTOCOL_ENV];
+  // Older callers interpret this retired flag as a required socket contract.
+  // Never let a stale daemon environment poison an unprotected CLI launch.
+  delete childEnv.BOTMUX_PROTECTED_EGRESS_REQUIRED;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
   // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
   // The worker pin above is the single source for CLI and worker scratch.
@@ -24882,7 +24893,6 @@ async function spawnCli(
         protectedEgressSocketPath: sessionMcpGatewayHost
           ? sessionProtectedHttpEgressHost?.socketPath
           : undefined,
-        protectedEgressRequired: !!cfg.protectedHttpEgressPolicy,
         protectedHttpBridge: codexProtectedProviderBridge?.bridge,
         localServiceBridges: sessionProtectedHttpEgressHost?.loopbackServices.map(service => ({
             socketPath: sessionProtectedHttpEgressHost!.socketPath,
@@ -24921,7 +24931,6 @@ async function spawnCli(
           mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
           egressSocketMounted: !!sessionMcpGatewayHost?.socketPath
             && !!sessionProtectedHttpEgressHost?.socketPath,
-          directTargetDenyRulesInstalled: !!cfg.protectedHttpEgressPolicy,
           guardLive: !!sessionProtectedHttpEgressHost,
           expectedPolicyDigest: cfg.protectedHttpEgressPolicy?.policyDigest,
           guardPolicyDigest: sessionProtectedHttpEgressHost?.policyDigest,

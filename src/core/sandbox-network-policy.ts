@@ -183,7 +183,9 @@ export function mergeProtectedHttpEgressNetworkPolicy(
     throw new Error('protected_http_egress_target_not_frozen');
   }
   const merged: SandboxNetworkPolicy = structuredClone(parsed);
-  if (merged.proxyMode === 'trusted-egress') merged.proxyMode = 'reject';
+  if (merged.proxyMode === 'trusted-egress') {
+    throw new Error('protected_http_egress_proxy_policy_conflict：受保护 HTTP 出站不能与通用代理委托策略共用；请移除任务代理变量并清除 proxyMode 的通用代理委托配置，模型连接请使用受保护模型桥');
+  }
   workerPolicy.policy.targets.forEach((target, targetIndex) => {
     const addresses = workerPolicy.frozenAddresses[targetIndex];
     if (!addresses?.length) throw new Error('protected_http_egress_target_not_frozen');
@@ -226,6 +228,16 @@ function sandboxModeLabel(sandbox: unknown): string {
   return '关闭';
 }
 
+/** Other CLIs do not yet have a protected model connection bridge. Reject
+ * before spawning rather than letting destination denies break model access. */
+export function protectedHttpEgressCliSupportError(
+  cliId: string,
+  policy: ProtectedHttpEgressWorkerPolicy | undefined,
+): string | undefined {
+  if (!policy || cliId === 'codex') return;
+  return `受保护 HTTP 出站目前只支持 codex CLI，当前 CLI 是 ${cliId}；该 CLI 尚未接入受保护模型桥，会话不会启动。请使用 codex CLI`;
+}
+
 /** Why this launch cannot enforce the policy, naming what the launch actually
  * is. Callers holding a session's frozen policy append
  * {@link FROZEN_NETWORK_POLICY_HINT}. */
@@ -250,10 +262,11 @@ const PROXY_KEYS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'htt
 /** Default to rejecting proxy configuration for restricted policies. An
  * explicit trusted-egress mode delegates business destination control to that
  * exit, while namespace rules continue to filter its actual endpoint IP. */
-export function networkProxyError(policy: SandboxNetworkPolicy | undefined, env: Record<string, string | undefined>): string | undefined {
+export function networkProxyError(policy: SandboxNetworkPolicy | undefined, env: Record<string, string | undefined>, protectedHttpEgress = false): string | undefined {
+  const keys = PROXY_KEYS.filter(key => !!env[key]);
+  if (protectedHttpEgress && keys.length) return `环境里设置了任务代理变量（${keys.join('、')}），通用代理可绕过受保护 HTTP 出站的目标限制，会话不会启动。请移除这些任务代理变量；模型连接请使用受保护模型桥`;
   if (!policy || policy.proxyMode === 'trusted-egress') return;
   if (policy.proxyMode === undefined && policy.public.mode === 'allow' && policy.private.mode === 'allow') return;
-  const keys = PROXY_KEYS.filter(key => !!env[key]);
   if (keys.length) return `环境里设置了代理变量（${keys.join('、')}），受限的目标 IP 网络策略约束不了代理转发后的目标地址，会话不会启动。请在策略里加上 "proxyMode": "trusted-egress"（把业务目标的控制交给这个代理出口，内核规则仍只放行到代理本身的地址），或去掉这些代理变量`;
 }
 

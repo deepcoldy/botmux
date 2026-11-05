@@ -489,12 +489,14 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Trigger-user CLI identity. The pane inherits PATH from the user's rcfile,
   // NOT from childEnv, so the worker's PATH prepend never reaches it — these
-  // three are how the wrapper dir gets back in front, via the login-shell shim
-  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN after path_helper.
+  // these are how the wrapper dirs get back in front, via the login-shell shim
+  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN and
+  // BOTMUX_WRAPPER_BIN after path_helper.
   // Without them on this allowlist the whole feature is inert in a tmux pane:
   // every governed call silently resolves the real tool and runs as the machine
   // account.
   'BOTMUX_IDENTITY_BIN',
+  'BOTMUX_WRAPPER_BIN',
   'BOTMUX_LARK_TOOL_BINDING',
   'ZDOTDIR',
   'BASH_ENV',

@@ -27,14 +27,13 @@ import { botOneShotEnv, type SessionEnvBotInput } from '../core/session-env-reso
 import { resolveEffectivePluginIds } from '../core/plugins/effective.js';
 import {
   protectedMcpHomePaths,
-  protectedMcpDaemonRedactedEnvKeys,
-  protectedMcpGlobalRedactedEnvKeys,
+  protectedMcpCurrentRedactedEnvKeys,
   protectedMcpIsolationPolicy,
   protectedMcpRedactedEnvKeys,
   type ProtectedMcpWorkerPolicy,
 } from '../core/protected-mcp-capabilities.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
-import { readGlobalConfig } from '../global-config.js';
+import { configuredProtectedMcpEnvKeys, readGlobalConfig } from '../global-config.js';
 import { renameChat } from './groups-store.js';
 import {
   getSessionGroup,
@@ -125,10 +124,7 @@ function matchingProtectedMcpPolicy(plugins?: string[]): ProtectedMcpWorkerPolic
   return {
     capabilities: [],
     protectedHomePaths: isolation.protectedHomePaths,
-    redactEnv: [...new Set([
-      ...protectedMcpGlobalRedactedEnvKeys(global.protectedMcpCapabilities),
-      ...protectedMcpDaemonRedactedEnvKeys(),
-    ])],
+    redactEnv: protectedMcpCurrentRedactedEnvKeys(global.protectedMcpCapabilities, configuredProtectedMcpEnvKeys()),
   };
 }
 
@@ -287,10 +283,19 @@ export async function generateOneShotTitle(opts: {
     logger.info(`[${logTag}] no one-shot template for cliId=${cfg.cliId}; keeping placeholder title`);
     return null;
   }
+  // Both title schedulers share this host-process boundary. A caller-side
+  // check alone cannot protect every path that reaches this function.
+  if (!oneShotTitleAllowed(cfg)) return null;
   const { argv, env: wrapperEnv } = resolveOneShotCommand(cfg, template);
   const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
-  const runOnce = () => new Promise<string>((resolve, reject) => {
+  const runOnce = () => new Promise<string | null>((resolve, reject) => {
+    // Re-read before each exec, including the retry after its wait: operator
+    // changes during the first call must not open a second bare-host process.
+    if (!oneShotTitleAllowed(getBot(larkAppId).config)) {
+      resolve(null);
+      return;
+    }
     const env = { ...buildOneShotEnv(cfg), ...wrapperEnv, ...oneShotProfileEnv(cfg) };
     const child = execFile(argv[0], [...argv.slice(1), prompt], {
       timeout: TITLE_TIMEOUT_MS,
@@ -316,7 +321,7 @@ export async function generateOneShotTitle(opts: {
   });
   // One-shot CLI calls fail transiently (API hiccups, cold start races) —
   // a single spaced retry recovers most of them without delaying much.
-  let stdout: string;
+  let stdout: string | null;
   try {
     stdout = await runOnce();
   } catch (firstErr) {
@@ -324,6 +329,7 @@ export async function generateOneShotTitle(opts: {
     await new Promise(r => setTimeout(r, 3000));
     stdout = await runOnce();
   }
+  if (stdout === null) return null;
 
   const title = sanitizeTitleOutput(stdout, maxLen);
   if (!title) {

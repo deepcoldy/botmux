@@ -481,12 +481,12 @@ describe('plugin MCP Gateway', () => {
     installFixturePlugin('plugin-readonly', 'secret-fd', undefined, 'fixture.secret.v1');
     const provisioning = prepareProtectedMcpWorkerProvisioning(
       ['plugin-readonly'],
-      { FIXTURE_SECRET: 'fd-only-secret' },
+      home,
       {
         'fixture.secret.v1': {
           enabled,
           allowedPluginIds: ['plugin-readonly'],
-          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
           principal: 'verified-human-email',
           containmentProfile: 'local-stdio-secret-v1',
           isolation: { redactEnv: ['FIXTURE_SECRET'] },

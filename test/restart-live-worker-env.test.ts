@@ -37,7 +37,7 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
 }));
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -45,7 +45,7 @@ import {
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
-import { captureProtectedMcpDaemonEnvironment } from '../src/core/protected-mcp-capabilities.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 let sessionCounter = 0;
 
@@ -91,7 +91,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  captureProtectedMcpDaemonEnvironment(undefined, {});
+  vi.unstubAllEnvs();
+  invalidateGlobalConfigCache();
   __testOnly_resetRestartCoordinator();
 });
 
@@ -164,10 +165,11 @@ describe('latestSessionEnvForRestart (daemon-side env snapshot carrier)', () => 
 
 describe('requestSessionRestart live-worker branch carries env (behavioral)', () => {
   it('removes daemon-protected values from the restart payload after live bot reinjection', () => {
-    captureProtectedMcpDaemonEnvironment(undefined, {}, [
-      'FIXTURE_PROTECTED_SECRET',
-      'FIXTURE_PROTECTED_REDACTED',
-    ]);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(quarantineDir, 'global.json'));
+    writeFileSync(join(quarantineDir, 'global.json'), JSON.stringify({ protectedMcpCapabilities: {
+      legacy: { secret: { source: 'env', name: 'FIXTURE_PROTECTED_SECRET' }, isolation: { redactEnv: ['FIXTURE_PROTECTED_REDACTED'] } },
+    } }));
+    invalidateGlobalConfigCache();
     getBotMock.mockReturnValue({ config: { env: {
       FIXTURE_PROTECTED_SECRET: 'restart-secret',
       FIXTURE_PROTECTED_REDACTED: 'restart-token',

@@ -81,14 +81,14 @@ async function main() {
   // the process default when a bot has no per-bot `lang` set.
   {
     const { configuredProtectedMcpEnvKeys, readGlobalConfig } = await import('./global-config.js');
-    const { captureProtectedMcpDaemonEnvironment } = await import('./core/protected-mcp-capabilities.js');
+    const { protectedMcpCurrentRedactedEnvKeys } = await import('./core/protected-mcp-capabilities.js');
     const { setDefaultLocale } = await import('./i18n/index.js');
     const cfg = readGlobalConfig();
-    captureProtectedMcpDaemonEnvironment(
-      cfg.protectedMcpCapabilities,
-      process.env,
-      configuredProtectedMcpEnvKeys(),
-    );
+    // Legacy env sources are rejected but their recognizable names must not
+    // leak into arbitrary daemon children. No secret values are captured.
+    for (const key of protectedMcpCurrentRedactedEnvKeys(cfg.protectedMcpCapabilities, configuredProtectedMcpEnvKeys())) {
+      delete process.env[key];
+    }
     if (cfg.lang) setDefaultLocale(cfg.lang);
     // Wire user prompt-key overrides into t() before any prompt is built.
     const { registerPromptOverrideResolver } = await import('./skills/effective-builtins.js');

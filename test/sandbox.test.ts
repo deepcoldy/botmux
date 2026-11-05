@@ -18,7 +18,9 @@ import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
 import { protectedMcpHomeDenyPaths, protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
-import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../src/core/protected-http-egress-host.js';
+import { PROTECTED_HTTP_EGRESS_SOCKET_ENV, protectedHttpEgressAuthTokenPath } from '../src/core/protected-http-egress-host.js';
+import { materializeProtectedHttpLoopbackArgs } from '../src/core/protected-http-egress-loopback.js';
+import type { NetworkLaunchPlan } from '../src/core/sandbox-network-launch.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -55,6 +57,51 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     return server;
   }
 
+  it('carries the actual Codex argument boundary through the shell and bwrap launch plan', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-provider-argv-'));
+    const socketDir = join(root, 'sockets');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const gatewayPath = join(socketDir, 'g.sock');
+    const egressPath = join(socketDir, 'e.sock');
+    const gateway = await listen(gatewayPath);
+    const egress = await listen(egressPath);
+    const prompt = 'Keep http://127.0.0.1:0 in this prompt unchanged';
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'provider-argv', dataDir,
+        policy: { rules: [], net: true, writeRegexes: [] },
+        networkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
+        chdir: root, home: root, cliBin: '/bin/true',
+        cliArgs: ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"', '--', prompt],
+        mcpGatewaySocketPath: gatewayPath,
+        protectedEgressSocketPath: egressPath,
+        protectedHttpBridge: {
+          socketPath: egressPath, policyId: 'fixture.write.v1', targetIndex: 0,
+          placeholderOrigin: 'http://127.0.0.1:0',
+        },
+      });
+      expect(plan).not.toBeNull();
+      const launch = JSON.parse(Buffer.from(plan!.args.at(-1)!, 'base64').toString('utf8')) as NetworkLaunchPlan;
+      const result = materializeProtectedHttpLoopbackArgs(
+        launch.args, 'http://127.0.0.1:0', 'http://127.0.0.1:43123', launch.protectedHttpBridgeArgsOffset,
+      );
+      const offset = launch.protectedHttpBridgeArgsOffset!;
+      expect(result.slice(offset)).toEqual([
+        '-c', 'model_providers.fixture.base_url="http://127.0.0.1:43123/relay"', '--', prompt,
+      ]);
+      expect(result[offset - 1]).toBe(realpathSync('/bin/true'));
+      expect(result.slice(0, offset)).toEqual(launch.args.slice(0, offset));
+    } finally {
+      plan?.cleanup();
+      await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => egress.close(() => resolve()))]);
+      rmSandboxScratch(root);
+    }
+  });
+
   it('mounts the shared private socket directory once and exposes only sandbox socket paths', async () => {
     if (process.platform !== 'linux') return;
     const root = mkdtempSync(join(tmpdir(), 'sbx-protected-egress-'));
@@ -66,7 +113,8 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     const egressPath = join(socketDir, 'e.sock');
     const gateway = await listen(gatewayPath);
     const egress = await listen(egressPath);
-    writeFileSync(join(socketDir, 'egress-auth'), 'host-auth-token-fixture\n', { mode: 0o600 });
+    mkdirSync(dirname(protectedHttpEgressAuthTokenPath(egressPath)), { mode: 0o700 });
+    writeFileSync(protectedHttpEgressAuthTokenPath(egressPath), 'host-auth-token-fixture\n', { mode: 0o600 });
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
       plan = prepareDirectSandbox({
@@ -88,6 +136,7 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
       expect(mounts).toHaveLength(1);
       expect(plan!.env.BOTMUX_MCP_GATEWAY_SOCKET).toBe('/run/botmux-mcp/g.sock');
       expect(plan!.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV]).toBe('/run/botmux-mcp/e.sock');
+      expect(plan!.env.BOTMUX_PROTECTED_EGRESS_PROTOCOL).toBe('shared-read-v1');
       const childArgv = args.slice(args.lastIndexOf('--') + 1);
       expect(JSON.stringify({ childArgv, env: plan!.env })).not.toContain(socketDir);
       expect(JSON.stringify({ args, env: plan!.env })).not.toContain('host-auth-token-fixture');
@@ -107,7 +156,8 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     mkdirSync(dataDir);
     const egressPath = join(socketDir, 'e.sock');
     const egress = await listen(egressPath);
-    writeFileSync(join(socketDir, 'egress-auth'), 'host-auth-token-fixture\n', { mode: 0o600 });
+    mkdirSync(dirname(protectedHttpEgressAuthTokenPath(egressPath)), { mode: 0o700 });
+    writeFileSync(protectedHttpEgressAuthTokenPath(egressPath), 'host-auth-token-fixture\n', { mode: 0o600 });
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
       plan = prepareDirectSandbox({
@@ -180,38 +230,6 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     }
   });
 
-  it('marks protected egress as required even when the guard socket is unavailable', async () => {
-    if (process.platform !== 'linux') return;
-    const root = mkdtempSync(join(tmpdir(), 'sbx-protected-egress-required-'));
-    const socketDir = join(root, 'sockets');
-    const dataDir = join(root, 'data');
-    mkdirSync(socketDir, { mode: 0o700 });
-    mkdirSync(dataDir);
-    const gatewayPath = join(socketDir, 'g.sock');
-    const gateway = await listen(gatewayPath);
-    let plan: ReturnType<typeof prepareDirectSandbox> = null;
-    try {
-      plan = prepareDirectSandbox({
-        sessionId: 'protected-egress-required',
-        dataDir,
-        policy: { rules: [], net: true, writeRegexes: [] },
-        chdir: root,
-        home: root,
-        cliBin: '/bin/true',
-        cliArgs: [],
-        mcpGatewaySocketPath: gatewayPath,
-        protectedEgressRequired: true,
-      });
-      expect(plan).not.toBeNull();
-      expect(plan!.env.BOTMUX_PROTECTED_EGRESS_REQUIRED).toBe('1');
-      expect(plan!.env.BOTMUX_PROTECTED_EGRESS_SOCKET).toBeUndefined();
-      expect(JSON.stringify(plan!.env)).not.toContain(socketDir);
-    } finally {
-      plan?.cleanup();
-      await new Promise<void>(resolve => gateway.close(() => resolve()));
-      rmSandboxScratch(root);
-    }
-  });
 });
 
 describe('credential-only managed-origin carve-out', () => {

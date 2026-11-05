@@ -54,7 +54,7 @@ vi.mock('node:https', async () => {
   };
 });
 
-import { startSessionProtectedHttpEgressHost } from '../src/core/protected-http-egress-host.js';
+import { protectedHttpEgressAuthTokenPath, startSessionProtectedHttpEgressHost } from '../src/core/protected-http-egress-host.js';
 import {
   normalizeProtectedHttpEgressPolicy,
   protectedHttpEgressPolicyDigest,
@@ -90,7 +90,7 @@ describe('protected HTTP egress pinned DNS lookup', () => {
       await host.close();
       rmSync(socketDir, { recursive: true, force: true });
     });
-    const auth = readFileSync(join(socketDir, 'egress-auth'), 'utf8').trim();
+    const auth = readFileSync(protectedHttpEgressAuthTokenPath(host.socketPath), 'utf8').trim();
 
     const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
       const request = httpRequest({

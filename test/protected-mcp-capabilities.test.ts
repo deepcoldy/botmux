@@ -1,10 +1,15 @@
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  captureProtectedMcpDaemonEnvironment,
+  normalizeProtectedMcpCapabilities,
   prepareProtectedMcpWorkerProvisioning,
+  protectedMcpConfiguredEnvKeys,
+  protectedMcpGlobalRedactedEnvKeys,
   protectedMcpContainmentActive,
   protectedMcpContainmentConfigured,
   serveProtectedMcpSecrets,
@@ -13,12 +18,19 @@ import {
 import { parseSandboxNetworkPolicy } from '../src/core/sandbox-network-policy.js';
 import type { ProtectedHttpEgressWorkerPolicy } from '../src/core/protected-http-egress.js';
 
+// Keep all real filesystem effects; intercept only the open boundary to
+// deterministically replace an intermediate directory while its fd is live.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, openSync: vi.fn(actual.openSync) };
+});
+
 const fixtureCapability = (
   overrides: Partial<ProtectedMcpCapabilityConfig> = {},
 ): ProtectedMcpCapabilityConfig => ({
   enabled: false,
   allowedPluginIds: ['fixture-plugin'],
-  secret: { source: 'env', name: 'FIXTURE_SECRET' },
+  secret: { source: 'file', path: '.secrets/mcp-secret' },
   principal: 'verified-human-email',
   containmentProfile: 'local-stdio-secret-v1',
   isolation: {
@@ -51,49 +63,118 @@ const frozenEgress: ProtectedHttpEgressWorkerPolicy = {
   frozenAddresses: [['10.20.30.40']],
 };
 
-describe('protected MCP worker provisioning', () => {
-  it('captures configured secrets once and removes every protected env name from the daemon', () => {
-    const env: NodeJS.ProcessEnv = {
-      FIXTURE_SECRET: ' daemon-secret ',
-      FIXTURE_TOKEN: 'daemon-token',
-      BOTMUX_PROTECTED_SECRET_FD: '3',
-      UNRELATED: 'visible',
-    };
-    const captured = captureProtectedMcpDaemonEnvironment(
-      { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
-      env,
-    );
-
-    expect(captured.get('FIXTURE_SECRET')).toBe('daemon-secret');
-    for (const key of ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD']) {
-      expect(env[key], key).toBeUndefined();
-    }
-    expect(env.UNRELATED).toBe('visible');
-
-    const provisioning = prepareProtectedMcpWorkerProvisioning(
-      ['fixture-plugin'],
-      captured,
-      { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
-      true,
-    );
-    expect(provisioning.secrets.get('fixture.secret.v1')).toBe('daemon-secret');
+describe.skipIf(process.platform !== 'linux')('protected MCP worker provisioning', () => {
+  let home: string;
+  let secretPath: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'protected-mcp-file-'));
+    mkdirSync(join(home, '.secrets'));
+    secretPath = join(home, '.secrets', 'mcp-secret');
+    writeFileSync(secretPath, ' fixture-value\n', { mode: 0o600 });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(home, { recursive: true, force: true });
   });
 
-  it('globally redacts configured secret env names without widening Home paths for unmatched plugins', () => {
+  const provision = (home: string) => prepareProtectedMcpWorkerProvisioning(
+    ['fixture-plugin'], home, { 'fixture.secret.v1': fixtureCapability({ enabled: true }) }, true,
+  );
+
+  it('reads the current file on each worker generation after atomic rotation', () => {
+    const first = provision(home);
+    writeFileSync(join(home, '.secrets', 'replacement'), 'rotated-secret\n', { mode: 0o600 });
+    renameSync(join(home, '.secrets', 'replacement'), secretPath);
+    const next = provision(home);
+    expect(first.secrets.get('fixture.secret.v1')).toBe('fixture-value');
+    expect(next.secrets.get('fixture.secret.v1')).toBe('rotated-secret');
+    expect(JSON.stringify(next.workerPolicy)).not.toContain('rotated-secret');
+  });
+
+  it.each([0o400, 0o640, 0o644, 0o700, 0o1600])('rejects a secret whose exact mode is %s without repairing it', mode => {
+    chmodSync(secretPath, mode);
+    expect(provision(home).secrets.size).toBe(0);
+    expect(lstatSync(secretPath).mode & 0o7777).toBe(mode);
+  });
+
+  it.each(['', ' \n\t ', 'x'.repeat(64 * 1024 + 1)])('rejects empty or oversized secret files (%#)', value => {
+    writeFileSync(secretPath, value);
+    expect(provision(home).workerPolicy.capabilities).toEqual([]);
+  });
+
+  it('rejects a leaf symlink and a directory rather than reading their targets', () => {
+    renameSync(secretPath, join(home, '.secrets', 'original'));
+    symlinkSync(join(home, '.secrets', 'original'), secretPath);
+    expect(provision(home).secrets.size).toBe(0);
+    rmSync(secretPath);
+    mkdirSync(secretPath, { mode: 0o600 });
+    expect(provision(home).secrets.size).toBe(0);
+  });
+
+  it('rejects an intermediate symlink even when it points back inside Home', () => {
+    renameSync(join(home, '.secrets'), join(home, 'original'));
+    symlinkSync(join(home, 'original'), join(home, '.secrets'));
+    expect(provision(home).secrets.size).toBe(0);
+  });
+
+  it('keeps reads anchored to the opened directory during an intermediate replacement race', () => {
+    const realOpen = vi.mocked(fs.openSync).getMockImplementation()!;
+    const outside = mkdtempSync(join(tmpdir(), 'protected-mcp-outside-'));
+    writeFileSync(join(outside, 'mcp-secret'), 'attacker-secret', { mode: 0o600 });
+    let swapped = false;
+    vi.spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
+      const fd = realOpen(path, flags, mode);
+      if (!swapped && String(path).endsWith('/.secrets')) {
+        swapped = true;
+        renameSync(join(home, '.secrets'), join(home, 'pinned'));
+        symlinkSync(outside, join(home, '.secrets'));
+      }
+      return fd;
+    });
+    try {
+      const provisioning = provision(home);
+      expect(swapped).toBe(true);
+      expect(provisioning.secrets.get('fixture.secret.v1')).not.toBe('attacker-secret');
+      expect(['fixture-value', undefined]).toContain(provisioning.secrets.get('fixture.secret.v1'));
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a file owned by a different uid', () => {
+    const actualUid = process.getuid!();
+    vi.spyOn(process, 'getuid').mockReturnValue(actualUid + 1);
+    expect(provision(home).secrets.size).toBe(0);
+  });
+
+  it('accepts only validated Home-relative file sources while keeping old env names redacted', () => {
+    expect(normalizeProtectedMcpCapabilities({ good: fixtureCapability({ enabled: true }) })).toEqual({ good: fixtureCapability({ enabled: true }) });
+    for (const secret of [
+      { source: 'env', name: 'OLD_SECRET' }, { source: 'file', path: '/tmp/secret' },
+      { source: 'file', path: '../secret' }, { source: 'file', path: '.secrets/../secret' },
+      { source: 'file', path: '.secrets/./secret' }, { source: 'file', path: 'bad\u0000path' },
+    ]) {
+      const raw = { invalid: { ...fixtureCapability({ enabled: true }), secret } };
+      expect(normalizeProtectedMcpCapabilities(raw)).toBeUndefined();
+    }
+    expect(protectedMcpConfiguredEnvKeys({ old: {
+      secret: { source: 'env', name: 'OLD_SECRET' }, isolation: { redactEnv: ['EXTRA_SECRET', 'bad-key'] },
+    } })).toEqual(['OLD_SECRET', 'EXTRA_SECRET']);
+    expect(protectedMcpGlobalRedactedEnvKeys({ good: fixtureCapability() })).toEqual(['FIXTURE_TOKEN']);
+  });
+
+  it('globally redacts env names and denies secret files while scoping extra Home paths to matching plugins', () => {
     const provisioning = prepareProtectedMcpWorkerProvisioning(
       [],
-      {
-        FIXTURE_SECRET: 'must-stay-daemon-only',
-        FIXTURE_TOKEN: 'must-also-stay-daemon-only',
-      },
+      home,
       { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
       true,
     );
 
     expect(provisioning.workerPolicy).toEqual({
       capabilities: [],
-      protectedHomePaths: [],
-      redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+      protectedHomePaths: ['.secrets/mcp-secret'],
+      redactEnv: ['FIXTURE_TOKEN'],
     });
     expect(provisioning.secrets.size).toBe(0);
   });
@@ -101,15 +182,15 @@ describe('protected MCP worker provisioning', () => {
   it('keeps capabilities default-off while retaining matching isolation', () => {
     const provisioning = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
-      { FIXTURE_SECRET: 'fixture-value' },
+      home,
       { 'fixture.secret.v1': fixtureCapability() },
       true,
     );
 
     expect(provisioning.workerPolicy).toEqual({
       capabilities: [],
-      protectedHomePaths: ['.fixture-credential'],
-      redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+      protectedHomePaths: ['.secrets/mcp-secret', '.fixture-credential'],
+      redactEnv: ['FIXTURE_TOKEN'],
     });
     expect(provisioning.secrets.size).toBe(0);
   });
@@ -117,7 +198,7 @@ describe('protected MCP worker provisioning', () => {
   it('provisions only an enabled, allowed, non-empty secret under static containment', () => {
     const enabled = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
-      { FIXTURE_SECRET: ' fixture-value ' },
+      home,
       { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
       true,
     );
@@ -133,19 +214,19 @@ describe('protected MCP worker provisioning', () => {
     for (const provisioning of [
       prepareProtectedMcpWorkerProvisioning(
         ['other-plugin'],
-        { FIXTURE_SECRET: 'fixture-value' },
+        home,
         { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
         true,
       ),
       prepareProtectedMcpWorkerProvisioning(
         ['fixture-plugin'],
-        {},
-        { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
+        home,
+        { 'fixture.secret.v1': fixtureCapability({ enabled: true, secret: { source: 'file', path: '.secrets/missing' } }) },
         true,
       ),
       prepareProtectedMcpWorkerProvisioning(
         ['fixture-plugin'],
-        { FIXTURE_SECRET: 'fixture-value' },
+        home,
         { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
         false,
       ),
@@ -191,7 +272,7 @@ describe('protected MCP worker provisioning', () => {
 
     const enabled = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
-      { FIXTURE_SECRET: 'fixture-value' },
+      home,
       {
         'fixture.actor-write.v1': fixtureCapability({
           enabled: true,
@@ -216,7 +297,7 @@ describe('protected MCP worker provisioning', () => {
 
     const disabled = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
-      { FIXTURE_SECRET: 'fixture-value' },
+      home,
       { 'fixture.actor-write.v1': fixtureCapability({
         enabled: false,
         containmentProfile: 'local-stdio-secret-egress-guard-v1',
@@ -231,7 +312,7 @@ describe('protected MCP worker provisioning', () => {
   it('requires the egress containment profile only for the descriptor-bound capability', () => {
     const oldProfile = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
-      { FIXTURE_SECRET: 'fixture-value' },
+      home,
       { 'fixture.actor-write.v1': fixtureCapability({ enabled: true }) },
       true,
       frozenEgress,
@@ -241,7 +322,7 @@ describe('protected MCP worker provisioning', () => {
 
     const egressProfileWithoutDescriptor = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
-      { FIXTURE_SECRET: 'fixture-value' },
+      home,
       { 'fixture.other.v1': fixtureCapability({
         enabled: true,
         containmentProfile: 'local-stdio-secret-egress-guard-v1',
@@ -260,7 +341,6 @@ describe('protected MCP worker provisioning', () => {
       sandboxEngaged: true,
       mcpSocketMounted: true,
       egressSocketMounted: true,
-      directTargetDenyRulesInstalled: true,
       guardLive: true,
       expectedPolicyDigest: frozenEgress.policyDigest,
       guardPolicyDigest: frozenEgress.policyDigest,
@@ -272,7 +352,6 @@ describe('protected MCP worker provisioning', () => {
       { ...complete, sandboxEngaged: false },
       { ...complete, mcpSocketMounted: false },
       { ...complete, egressSocketMounted: false },
-      { ...complete, directTargetDenyRulesInstalled: false },
       { ...complete, guardLive: false },
       { ...complete, guardPolicyDigest: 'c'.repeat(64) },
       { ...complete, pidNamespaceRetained: false },

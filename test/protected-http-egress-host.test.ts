@@ -1,13 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { request } from 'node:http';
-import { createConnection } from 'node:net';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { request, Server as HttpServer } from 'node:http';
+import { createConnection, createServer as createNetServer } from 'node:net';
 import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   MAX_PROTECTED_HTTP_BODY_BYTES,
   PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+  protectedHttpEgressAuthTokenPath,
   startSessionProtectedHttpEgressHost,
   type ProtectedHttpEgressForwardRequest,
   type ProtectedHttpEgressLogEntry,
@@ -103,7 +104,7 @@ describe('session protected HTTP egress host', () => {
       await host.close();
       rmSync(socketDir, { recursive: true, force: true });
     });
-    const auth = readFileSync(join(socketDir, 'egress-auth'), 'utf8').trim();
+    const auth = readFileSync(protectedHttpEgressAuthTokenPath(host.socketPath), 'utf8').trim();
     return { host, socketDir, auth, forwarded, logs, warnings };
   }
 
@@ -115,11 +116,187 @@ describe('session protected HTTP egress host', () => {
     };
   }
 
+  function sharedReadHeaders(): Record<string, string> {
+    return {
+      'x-botmux-egress-client': 'shared-read-v1',
+      'x-botmux-egress-policy': policy.id,
+      'x-botmux-egress-target': '0',
+    };
+  }
+
+  it.each(['GET', 'POST'])('allows shared reads without a guard token and preserves the local MIX identity (%s)', async method => {
+    const { host, forwarded } = await start({ sharedRead: true });
+    const result = await unixHttpRequest(host.socketPath, method, '/v1/items/query?keyword=activity', {
+      ...sharedReadHeaders(), authorization: 'Bearer local-user-fixture',
+      'x-jwt-token': 'local-jwt-fixture', 'x-botmux-trusted-principal': 'forged-principal',
+    }, method === 'POST' ? Buffer.from('{"keyword":"activity"}') : undefined);
+    expect(result.status).toBe(200);
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]).toMatchObject({
+      targetIndex: 0, method, path: '/v1/items/query?keyword=activity',
+      headers: { authorization: 'Bearer local-user-fixture', 'x-jwt-token': 'local-jwt-fixture' },
+    });
+    expect(Object.keys(forwarded[0]!.headers).some(name => name.startsWith('x-botmux-'))).toBe(false);
+  });
+
+  it('does not enable shared reads on an unconfigured guard', async () => {
+    const { host, forwarded } = await start();
+    expect((await unixHttpRequest(host.socketPath, 'GET', '/v1/items/query', sharedReadHeaders())).status).toBe(403);
+    expect(forwarded).toHaveLength(0);
+  });
+
+  it('blocks registered writes from the tokenless shared-read client', async () => {
+    const { host, forwarded, logs } = await start({ sharedRead: true });
+    const result = await unixHttpRequest(host.socketPath, 'POST', '/v1/items/update', sharedReadHeaders(), Buffer.from('{}'));
+    expect(result.status).toBe(403);
+    expect(JSON.parse(result.body.toString())).toMatchObject({ code: 'botmux_protected_write_required' });
+    expect(forwarded).toHaveLength(0);
+    expect(logs).toContainEqual(expect.objectContaining({ decision: 'deny', path: '/v1/items/update' }));
+  });
+
+  it.each([
+    { 'x-botmux-egress-auth': 'not-a-host-token' },
+    { 'x-botmux-egress-client': 'unknown-protocol' },
+    { 'x-botmux-egress-policy': 'different-policy' },
+    { 'x-botmux-egress-target': '9' },
+    { 'x-botmux-loopback-service': 'lark-tool-identity' },
+    { 'x-botmux-loopback-peer-pid': '1234' },
+    { 'x-botmux-loopback-peer-start': '1234' },
+    { 'x-botmux-loopback-attestation': 'forged-attestation' },
+  ])('rejects shared-read authority or routing overrides %#', async extraHeaders => {
+    const forwardedLoopback: unknown[] = [];
+    const { host, forwarded } = await start({ sharedRead: true,
+      loopbackServices: [{ id: 'lark-tool-identity', method: 'GET', path: '/v1/items/query',
+        listenPort: 17950, upstreamPort: 7950, forwardHeaders: [] }],
+      forwardLoopbackService: async (_service, incoming) => {
+        forwardedLoopback.push(incoming);
+        return { status: 200, headers: {}, body: Buffer.from('{}') };
+      },
+    });
+    const result = await unixHttpRequest(host.socketPath, 'GET', '/v1/items/query', {
+      ...sharedReadHeaders(), ...extraHeaders,
+    });
+    expect(result.status).toBeGreaterThanOrEqual(400);
+    expect(forwarded).toHaveLength(0);
+    expect(forwardedLoopback).toHaveLength(0);
+  });
+
+  it('rejects duplicate shared-read protocol headers', async () => {
+    const { host, forwarded } = await start({ sharedRead: true });
+    const raw = await rawUnixHttpRequest(host.socketPath,
+      `GET /v1/items/query HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nx-botmux-egress-client: shared-read-v1\r\nx-botmux-egress-client: shared-read-v1\r\nx-botmux-egress-policy: ${policy.id}\r\nx-botmux-egress-target: 0\r\n\r\n`);
+    expect(raw).toContain('403');
+    expect(forwarded).toHaveLength(0);
+  });
+
+  it('rejects a shared-read client selecting an internal service without business routing headers', async () => {
+    const forwardedLoopback: unknown[] = [];
+    const { host, forwarded } = await start({ sharedRead: true,
+      loopbackServices: [{ id: 'identity', method: 'POST', path: '/internal/identity',
+        listenPort: 17950, upstreamPort: 7950, forwardHeaders: [] }],
+      forwardLoopbackService: async (_service, incoming) => {
+        forwardedLoopback.push(incoming);
+        return { status: 200, headers: {}, body: Buffer.from('{}') };
+      },
+    });
+    const result = await unixHttpRequest(host.socketPath, 'POST', '/internal/identity', {
+      'x-botmux-egress-client': 'shared-read-v1', 'x-botmux-loopback-service': 'identity',
+    });
+    expect(result.status).toBe(403);
+    expect(JSON.parse(result.body.toString())).toMatchObject({ code: 'botmux_protected_egress_forbidden' });
+    expect(forwarded).toHaveLength(0);
+    expect(forwardedLoopback).toHaveLength(0);
+  });
+
+  it('keeps egress authentication in a private subtree separate from the socket mount', async () => {
+    const { host, socketDir } = await start();
+    expect(existsSync(join(socketDir, 'egress-auth'))).toBe(false);
+    expect(readFileSync(join(socketDir, 'egress-private', 'egress-auth'), 'utf8').trim()).not.toBe('');
+    expect(statSync(join(socketDir, 'egress-private')).mode & 0o777).toBe(0o700);
+    expect(host.socketPath).toBe(join(socketDir, 'e.sock'));
+  });
+
+  it('removes its authentication file when closed', async () => {
+    const { host } = await start();
+    const authPath = protectedHttpEgressAuthTokenPath(host.socketPath);
+    expect(existsSync(authPath)).toBe(true);
+    await host.close();
+    expect(existsSync(authPath)).toBe(false);
+  });
+
+  it('preserves authentication already rotated by a successor', async () => {
+    const { host } = await start();
+    const authPath = protectedHttpEgressAuthTokenPath(host.socketPath);
+    writeFileSync(authPath, 'successor-token-fixture\n', { mode: 0o600 });
+    await host.close();
+    expect(readFileSync(authPath, 'utf8')).toBe('successor-token-fixture\n');
+  });
+
+  it('does not unlink the socket of a replacement guard when a prior guard closes late', async () => {
+    const { host, socketDir } = await start();
+    const replacement = await startSessionProtectedHttpEgressHost({
+      socketDir, policy, policyDigest: protectedHttpEgressPolicyDigest(policy),
+      forward: async () => ({ status: 200, headers: {}, body: Buffer.from('replacement') }),
+    });
+    cleanups.push(() => replacement.close());
+    const auth = readFileSync(protectedHttpEgressAuthTokenPath(replacement.socketPath), 'utf8').trim();
+    await host.close();
+    expect(await unixHttpRequest(replacement.socketPath, 'GET', '/v1/items/query', routingHeaders(auth)))
+      .toMatchObject({ status: 200, body: Buffer.from('replacement') });
+  });
+
+  it('closes the socket even when the authentication path cannot be cleaned', async () => {
+    const errors: Error[] = [];
+    const { host, socketDir } = await start({ onError: error => errors.push(error) });
+    const privateDir = dirname(protectedHttpEgressAuthTokenPath(host.socketPath));
+    const savedDir = `${privateDir}.saved`;
+    renameSync(privateDir, savedDir);
+    writeFileSync(privateDir, 'not-a-directory', { mode: 0o600 });
+    try {
+      await expect(host.close()).resolves.toBeUndefined();
+      expect(errors).toHaveLength(1);
+      expect(existsSync(host.socketPath)).toBe(false);
+      await expect(unixHttpRequest(host.socketPath, 'GET', '/', {})).rejects.toThrow();
+    } finally {
+      rmSync(privateDir, { force: true });
+      renameSync(savedDir, privateDir);
+      cleanups.push(() => rmSync(socketDir, { recursive: true, force: true }));
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('cleans authentication when the Unix socket cannot listen', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'egress-listen-failure-'));
+    const socketDir = join(root, 'guard');
+    const occupiedPath = join(root, 'occupied.sock');
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const occupied = createNetServer();
+    await new Promise<void>((resolve, reject) => {
+      occupied.once('error', reject); occupied.listen(occupiedPath, resolve);
+    });
+    // Keep the real bind/error/cleanup path. Only substitute the bind address:
+    // oversized Unix paths fail on Node but are truncated by Bun, so they are
+    // not a portable failure fixture. This address really is already in use.
+    const originalListen = HttpServer.prototype.listen;
+    const bindAddress = vi.spyOn(HttpServer.prototype, 'listen').mockImplementation(function (...args) {
+      return Reflect.apply(originalListen, this, [occupiedPath, ...args.slice(1)]);
+    });
+    try {
+      await expect(startSessionProtectedHttpEgressHost({
+        socketDir, policy, policyDigest: protectedHttpEgressPolicyDigest(policy),
+        forward: async () => ({ status: 200, headers: {}, body: Buffer.alloc(0) }),
+      })).rejects.toThrow();
+      expect(existsSync(protectedHttpEgressAuthTokenPath(join(socketDir, 'e.sock')))).toBe(false);
+    } finally {
+      bindAddress.mockRestore();
+      await new Promise<void>(resolve => occupied.close(() => resolve()));
+    }
+  });
+
   it('exports only the socket locator name and creates sibling 0600 authentication material', async () => {
     const { host, socketDir } = await start();
     expect(PROTECTED_HTTP_EGRESS_SOCKET_ENV).toBe('BOTMUX_PROTECTED_EGRESS_SOCKET');
     expect(host.socketPath).toBe(join(socketDir, 'e.sock'));
-    expect(statSync(join(socketDir, 'egress-auth')).mode & 0o777).toBe(0o600);
+    expect(statSync(protectedHttpEgressAuthTokenPath(host.socketPath)).mode & 0o777).toBe(0o600);
   });
 
   it.each([
@@ -294,7 +471,7 @@ describe('session protected HTTP egress host', () => {
       targetIndex: 0,
       target: policy.targets[0],
       method: 'POST',
-      path: '/v1/items/search?cursor=%AA%2F',
+      path: '/v1/items/search?cursor=%aa%2f',
       headers: {
         authorization: 'Bearer machine-jwt-fixture',
         'content-type': 'application/json',
@@ -589,7 +766,7 @@ describe('session protected HTTP egress host', () => {
       await host.close();
       rmSync(socketDir, { recursive: true, force: true });
     });
-    const auth = readFileSync(join(socketDir, 'egress-auth'), 'utf8').trim();
+    const auth = readFileSync(protectedHttpEgressAuthTokenPath(host.socketPath), 'utf8').trim();
     mutablePolicy.targets[0].host = 'mutated.invalid';
     mutablePolicy.targets[0].denyRoutes[0].path = '/v1/other';
 

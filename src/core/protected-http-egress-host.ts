@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { isIP, type Socket } from 'node:net';
@@ -23,14 +23,17 @@ import type { ProcessIdentity } from './current-actor-attestation.js';
 import { ensurePrivateGatewayDir, sessionMcpGatewaySocketDir } from './plugins/mcp/socket-dir.js';
 
 export const PROTECTED_HTTP_EGRESS_SOCKET_ENV = 'BOTMUX_PROTECTED_EGRESS_SOCKET';
-export const PROTECTED_HTTP_EGRESS_REQUIRED_ENV = 'BOTMUX_PROTECTED_EGRESS_REQUIRED';
+export const PROTECTED_HTTP_EGRESS_PROTOCOL_ENV = 'BOTMUX_PROTECTED_EGRESS_PROTOCOL';
+export const PROTECTED_HTTP_SHARED_READ_PROTOCOL = 'shared-read-v1';
 export const PROTECTED_HTTP_EGRESS_AUTH_FILENAME = 'egress-auth';
+export const PROTECTED_HTTP_EGRESS_AUTH_DIRNAME = 'egress-private';
 export const MAX_PROTECTED_HTTP_BODY_BYTES = 16 * 1024 * 1024;
 
 const PROTECTED_HTTP_EGRESS_SOCKET_FILENAME = 'e.sock';
 const UPSTREAM_TIMEOUT_MS = 30_000;
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Z]+$/;
 const ROUTING_HEADERS = new Set([
+  'x-botmux-egress-client',
   'x-botmux-egress-auth',
   'x-botmux-egress-policy',
   'x-botmux-egress-target',
@@ -122,6 +125,9 @@ export interface SessionProtectedHttpEgressHost {
 export interface StartSessionProtectedHttpEgressHostOptions {
   policy: ProtectedHttpEgressPolicy;
   policyDigest: string;
+  /** Allow task clients to use the write-filtered business exit without host
+   * authentication. This never admits the privileged loopback service exit. */
+  sharedRead?: boolean;
   /** An already-resolved session MCP directory; primarily useful to tests. */
   socketDir?: string;
   sessionId?: string;
@@ -149,7 +155,7 @@ class BodyLimitError extends Error {}
 class InvalidRequestError extends Error {}
 
 export function protectedHttpEgressAuthTokenPath(socketPath: string): string {
-  return join(dirname(socketPath), PROTECTED_HTTP_EGRESS_AUTH_FILENAME);
+  return join(dirname(socketPath), PROTECTED_HTTP_EGRESS_AUTH_DIRNAME, PROTECTED_HTTP_EGRESS_AUTH_FILENAME);
 }
 
 function normalizedMethod(raw: string | undefined): string {
@@ -420,6 +426,7 @@ function logPath(path: string): string {
 function rotateEgressAuthToken(socketPath: string): string {
   const token = randomBytes(32).toString('base64url');
   const finalPath = protectedHttpEgressAuthTokenPath(socketPath);
+  ensurePrivateGatewayDir(dirname(finalPath));
   const tmpPath = `${finalPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   try {
     writeFileSync(tmpPath, `${token}\n`, { mode: 0o600, flag: 'wx' });
@@ -430,6 +437,17 @@ function rotateEgressAuthToken(socketPath: string): string {
     throw error;
   }
   return token;
+}
+
+/** A late close must not remove authentication already rotated by a successor. */
+function removeOwnedEgressAuthToken(socketPath: string, token: string): void {
+  const path = protectedHttpEgressAuthTokenPath(socketPath);
+  try {
+    if (!lstatSync(path).isFile() || readFileSync(path, 'utf8').trim() !== token) return;
+    rmSync(path, { force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
 }
 
 function defaultForwarder(
@@ -581,6 +599,10 @@ export async function startSessionProtectedHttpEgressHost(
   }
   const socketDir = resolvedSocketDir(opts);
   const socketPath = join(socketDir, PROTECTED_HTTP_EGRESS_SOCKET_FILENAME);
+  // libuv unlinks its original Unix listen pathname on close. Give each
+  // generation a unique bind name, then publish at the stable session path;
+  // a late old close must not unlink a replacement guard's socket.
+  const listenPath = join(socketDir, `e.${randomBytes(4).toString('hex')}.sock`);
   const frozenAddresses = opts.forward
     ? opts.frozenAddresses?.map(addresses => [...addresses])
     : snapshotFrozenAddresses(policy, opts.frozenAddresses);
@@ -603,11 +625,25 @@ export async function startSessionProtectedHttpEgressHost(
   const sockets = new Set<Socket>();
   const sensitiveBuffers = new Set<Buffer>();
   let closing: Promise<void> | undefined;
+  let ownedSocket: { dev: number; ino: number } | undefined;
 
   const reportError = (_error: unknown): void => {
     try {
       opts.onError?.(new Error('protected_http_egress_error'));
     } catch { /* error reporting must not affect the guard */ }
+  };
+  const cleanupPaths = (): void => {
+    // Filesystem cleanup failure must not keep connections or the listener
+    // alive, and must not replace the original listen/startup error.
+    try { removeOwnedEgressAuthToken(socketPath, authToken); } catch (error) { reportError(error); }
+    try {
+      const current = lstatSync(socketPath);
+      if (ownedSocket && current.dev === ownedSocket.dev && current.ino === ownedSocket.ino) {
+        rmSync(socketPath, { force: true });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') reportError(error);
+    }
   };
 
   const server = createServer((request, response) => {
@@ -617,7 +653,17 @@ export async function startSessionProtectedHttpEgressHost(
       let path: string;
       try {
         const presentedAuthValues = rawHeaderValues(request, 'x-botmux-egress-auth');
-        if (presentedAuthValues.length !== 1 || !tokenMatches(presentedAuthValues[0], authToken)) {
+        const clientValues = rawHeaderValues(request, 'x-botmux-egress-client');
+        const sharedRead = clientValues.length > 0;
+        const authorized = sharedRead
+          ? opts.sharedRead === true
+            && clientValues.length === 1
+            && clientValues[0] === PROTECTED_HTTP_SHARED_READ_PROTOCOL
+            && presentedAuthValues.length === 0
+            && !request.rawHeaders.some((name, index) => index % 2 === 0
+              && name.toLowerCase().startsWith('x-botmux-loopback-'))
+          : presentedAuthValues.length === 1 && tokenMatches(presentedAuthValues[0], authToken);
+        if (!authorized) {
           request.resume();
           sendJson(response, 403, 'botmux_protected_egress_forbidden');
           return;
@@ -844,13 +890,19 @@ export async function startSessionProtectedHttpEgressHost(
     };
     const onListening = () => {
       server.off('error', onInitialError);
-      resolve();
+      try {
+        const stat = lstatSync(listenPath);
+        renameSync(listenPath, socketPath);
+        ownedSocket = { dev: stat.dev, ino: stat.ino };
+        resolve();
+      } catch (error) { reject(error); }
     };
     server.once('error', onInitialError);
     server.once('listening', onListening);
-    server.listen(socketPath);
+    server.listen(listenPath);
   }).catch(error => {
-    rmSync(socketPath, { force: true });
+    cleanupPaths();
+    if (server.listening) server.close();
     throw error;
   });
   server.on('error', reportError);
@@ -858,7 +910,7 @@ export async function startSessionProtectedHttpEgressHost(
     chmodSync(socketPath, 0o600);
   } catch (error) {
     server.close();
-    rmSync(socketPath, { force: true });
+    cleanupPaths();
     throw error;
   }
 
@@ -870,7 +922,7 @@ export async function startSessionProtectedHttpEgressHost(
     loopbackServices,
     close(): Promise<void> {
       closing ??= (async () => {
-        rmSync(socketPath, { force: true });
+        cleanupPaths();
         for (const socket of sockets) socket.destroy();
         for (const buffer of sensitiveBuffers) buffer.fill(0);
         sensitiveBuffers.clear();

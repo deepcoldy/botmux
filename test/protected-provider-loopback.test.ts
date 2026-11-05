@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { type Server } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
   materializeProtectedHttpLoopbackArgs,
@@ -17,7 +17,8 @@ import {
   normalizeProtectedHttpEgressPolicy,
   protectedHttpEgressPolicyDigest,
 } from '../src/core/protected-http-egress.js';
-import { startSessionProtectedHttpEgressHost } from '../src/core/protected-http-egress-host.js';
+import { protectedHttpEgressAuthTokenPath, startSessionProtectedHttpEgressHost } from '../src/core/protected-http-egress-host.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 const roots: string[] = [];
 const servers: Server[] = [];
@@ -120,7 +121,9 @@ describe('protected HTTP loopback bridge', () => {
     chmodSync(root, 0o700);
     const socketPath = join(root, 'e.sock');
     const auth = 'guard-auth-token-fixture';
-    writeFileSync(join(root, 'egress-auth'), `${auth}\n`, { mode: 0o600 });
+    const authPath = protectedHttpEgressAuthTokenPath(socketPath);
+    mkdirSync(dirname(authPath), { recursive: true, mode: 0o700 });
+    writeFileSync(authPath, `${auth}\n`, { mode: 0o600 });
     let observed = '';
     const unix = createHttpServer((request, response) => {
       const body: Buffer[] = [];
@@ -200,6 +203,159 @@ describe('protected HTTP loopback bridge', () => {
     )).toThrow('protected_http_loopback_placeholder_count');
   });
 
+  it('materializes the actual Codex adapter override and leaves prompt and unrelated arguments unchanged', () => {
+    const adapterArgs = createCodexAdapter('/usr/bin/codex').buildArgs({
+      sessionId: 'sid',
+      resume: false,
+      modelProviderBaseUrlOverride: {
+        providerId: 'fixture',
+        baseUrl: `${PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN}/relay`,
+      },
+    });
+    const prompt = `Explain ${PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN} without changing it`;
+    const args = [...adapterArgs, '-c', `notice.text="${PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN}"`, prompt];
+    const result = materializeProtectedHttpLoopbackArgs(
+      args,
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+    );
+
+    expect(result).toEqual([
+      ...adapterArgs.map(arg => arg === 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"'
+        ? 'model_providers.fixture.base_url="http://127.0.0.1:43123/relay"'
+        : arg),
+      '-c', 'notice.text="http://127.0.0.1:0"', prompt,
+    ]);
+    expect(args.at(-1)).toBe(prompt);
+  });
+
+  it('materializes only the explicitly bounded CLI arguments after shell and bwrap wrappers', () => {
+    const wrapper = [
+      '-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/wrapper"',
+      'botmux-isolation', '/usr/bin/bwrap', '--ro-bind', '/', '/', '--', '/usr/bin/codex',
+    ];
+    const prompt = 'Explain http://127.0.0.1:0 without rewriting the prompt';
+    const args = [...wrapper, '-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"',
+      '--', prompt];
+    expect(materializeProtectedHttpLoopbackArgs(
+      args,
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+      wrapper.length,
+    )).toEqual([...wrapper, '-c', 'model_providers.fixture.base_url="http://127.0.0.1:43123/relay"',
+      '--', prompt]);
+  });
+
+  it.each([-1, 0.5, NaN, Infinity, 4])('refuses an invalid CLI argument offset (%s)', offset => {
+    expect(() => materializeProtectedHttpLoopbackArgs(
+      ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"'],
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+      offset,
+    )).toThrow('protected_http_loopback_args_offset');
+  });
+
+  it('still refuses conflicting provider overrides inside the bounded CLI arguments', () => {
+    const wrapper = ['--', '/usr/bin/codex'];
+    expect(() => materializeProtectedHttpLoopbackArgs(
+      [...wrapper, '-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"',
+        '--config=model_providers.fixture.base_url="https://other.example/relay"'],
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+      wrapper.length,
+    )).toThrow('protected_http_loopback_placeholder_count');
+  });
+
+  it.each([
+    ['model_providers.fixture.base_url=http://127.0.0.1:0/relay', 'model_providers.fixture.base_url=http://127.0.0.1:43123/relay'],
+    [" model_providers.fixture.base_url \t= 'http://127.0.0.1:0/relay'  ", " model_providers.fixture.base_url \t= 'http://127.0.0.1:43123/relay'  "],
+    ['model_providers.fixture.base_url="http://127.0.0.1:0/relay?text=\\"quoted\\"&next=http://127.0.0.1:0"', 'model_providers.fixture.base_url="http://127.0.0.1:43123/relay?text=\\"quoted\\"&next=http://127.0.0.1:0"'],
+  ])('replaces only the origin in a valid config value: %s', (override, expected) => {
+    expect(materializeProtectedHttpLoopbackArgs(
+      ['-c', override, 'resume', 'sid'],
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+    )).toEqual(['-c', expected, 'resume', 'sid']);
+  });
+
+  it.each([
+    ['prompt', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"'],
+    ['-c', 'notice.text="http://127.0.0.1:0/relay"'],
+    ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:01234/relay"'],
+    ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0.evil/relay"'],
+    ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0@evil.example/relay"'],
+    ['-c', 'model_providers.fixture.base_url="https://other.example/http://127.0.0.1:0"'],
+    ['-c', 'model_providers.fixture.base_url=" http://127.0.0.1:0/relay"'],
+    ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay" trailing'],
+  ])('fails when no valid provider override contains the placeholder origin: %s %s', (...args) => {
+    expect(() => materializeProtectedHttpLoopbackArgs(
+      args,
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+    )).toThrow('protected_http_loopback_placeholder_count');
+  });
+
+  it.each([
+    ['model_providers.fixture.base_url="http://127.0.0.1:0/other"'],
+    ['model_providers.other.base_url="http://127.0.0.1:0/other"'],
+    ['model_providers.fixture.base_url="https://other.example/relay"'],
+  ])('fails when another override makes the selected target non-unique: %s', secondOverride => {
+    expect(() => materializeProtectedHttpLoopbackArgs(
+      ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"', '-c', secondOverride],
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+    )).toThrow('protected_http_loopback_placeholder_count');
+  });
+
+  it.each([
+    { flags: ['--config', 'model_providers.fixture.base_url="https://other.example/relay"'] },
+    { flags: ['--config=model_providers.fixture.base_url="https://other.example/relay"'] },
+    { flags: ['-cmodel_providers.fixture.base_url="https://other.example/relay"'] },
+    { flags: ['-c=model_providers.fixture.base_url="https://other.example/relay"'] },
+    { flags: ['--config', 'model_providers.fixture.base_url=noncanonical-value'] },
+    { flags: ['--config=model_providers.fixture={base_url="https://other.example/relay"}'] },
+    { flags: ['-cmodel_providers={fixture={base_url="https://other.example/relay"}}'] },
+  ])('rejects a provider override in every accepted Codex config flag form %#', ({ flags }) => {
+    const bridge = ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"'];
+    for (const args of [[...bridge, ...flags], [...flags, ...bridge]]) {
+      expect(() => materializeProtectedHttpLoopbackArgs(
+        args,
+        PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+        'http://127.0.0.1:43123',
+      )).toThrow('protected_http_loopback_placeholder_count');
+    }
+  });
+
+  it.each([
+    { flags: ['--config', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"'] },
+    { flags: ['--config=model_providers.fixture.base_url="http://127.0.0.1:0/relay"'] },
+    { flags: ['-cmodel_providers.fixture.base_url="http://127.0.0.1:0/relay"'] },
+    { flags: ['-c=model_providers.fixture.base_url="http://127.0.0.1:0/relay"'] },
+  ])('requires a standalone canonical -c value for bridge materialization %#', ({ flags }) => {
+    expect(() => materializeProtectedHttpLoopbackArgs(
+      flags,
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+    )).toThrow('protected_http_loopback_placeholder_count');
+  });
+
+  it('preserves unrelated aliased config values and prompt text after the option terminator', () => {
+    const args = [
+      '-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"',
+      '--config', 'model_providers.other.base_url="https://other.example/relay"',
+      '--config=notice.text="http://127.0.0.1:0/relay"',
+      '--', '--config', 'model_providers.fixture.base_url="https://prompt.example/relay"',
+    ];
+    expect(materializeProtectedHttpLoopbackArgs(
+      args,
+      PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
+      'http://127.0.0.1:43123',
+    )).toEqual([
+      '-c', 'model_providers.fixture.base_url="http://127.0.0.1:43123/relay"',
+      ...args.slice(2),
+    ]);
+  });
+
   it('preserves the existing guard decision: reads pass and registered writes are rejected', async () => {
     const root = tempRoot();
     chmodSync(root, 0o700);
@@ -267,7 +423,9 @@ describe('protected HTTP loopback bridge', () => {
     chmodSync(root, 0o700);
     const socketPath = join(root, 'e.sock');
     const auth = 'guard-auth-token-fixture';
-    writeFileSync(join(root, 'egress-auth'), `${auth}\n`, { mode: 0o600 });
+    const authPath = protectedHttpEgressAuthTokenPath(socketPath);
+    mkdirSync(dirname(authPath), { recursive: true, mode: 0o700 });
+    writeFileSync(authPath, `${auth}\n`, { mode: 0o600 });
     const observed: Array<Record<string, string | undefined>> = [];
     const unix = createHttpServer((request, response) => {
       observed.push({

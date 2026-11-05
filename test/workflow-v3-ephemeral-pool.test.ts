@@ -12,7 +12,7 @@ import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, typ
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
 import type { BotConfig } from '../src/bot-registry.js';
-import { captureProtectedMcpDaemonEnvironment } from '../src/core/protected-mcp-capabilities.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 // The default factory delegates to self-spawn's spawnWorker, which is the only
 // path that gets the compiled-binary case right. Mock node:child_process so we
@@ -188,19 +188,23 @@ describe('v3 ephemeral pool', () => {
     vi.stubEnv('FIXTURE_SECRET', 'machine-secret');
     vi.stubEnv('FIXTURE_TOKEN', 'machine-token');
     vi.stubEnv('INVALID_RECORD_SECRET', 'invalid-record-machine-secret');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(dir, 'current-global.json'));
+    vi.stubEnv('BOTMUX_PROTECTED_SECRET_FD', '3');
     try {
-      captureProtectedMcpDaemonEnvironment({
+      writeFileSync(join(dir, 'current-global.json'), JSON.stringify({ protectedMcpCapabilities: {
         'fixture.secret.v1': {
           enabled: true,
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
           containmentProfile: 'local-stdio-secret-v1',
           isolation: {
             protectedHomePaths: ['.fixture-credential'],
-            redactEnv: ['FIXTURE_TOKEN'],
+            redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
           },
         },
-      }, process.env, ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'INVALID_RECORD_SECRET']);
+        legacy: { secret: { source: 'env', name: 'INVALID_RECORD_SECRET' } },
+      } }));
+      invalidateGlobalConfigCache();
       const worker = new ScriptedWorker();
       const factory = factoryFor(worker);
       const pool = createEphemeralPool({
@@ -218,17 +222,26 @@ describe('v3 ephemeral pool', () => {
       });
       const running = pool.runNode(request());
       await worker.waitForInit();
-      expect(factory.lastOpts!.env.FIXTURE_SECRET).toBeUndefined();
-      expect(factory.lastOpts!.env.FIXTURE_TOKEN).toBeUndefined();
-      expect(factory.lastOpts!.env.INVALID_RECORD_SECRET).toBeUndefined();
-      expect(worker.init.env.FIXTURE_SECRET).toBeUndefined();
-      expect(worker.init.env.FIXTURE_TOKEN).toBeUndefined();
-      expect(worker.init.env.INVALID_RECORD_SECRET).toBeUndefined();
-      expect(worker.init.protectedMcpPolicy).toBeUndefined();
-      worker.emitExit(0);
-      await running;
+      try {
+        expect(factory.lastOpts!.env.FIXTURE_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(factory.lastOpts!.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.BOTMUX_PROTECTED_SECRET_FD).toBeUndefined();
+        expect(worker.init.env.FIXTURE_SECRET).toBeUndefined();
+        expect(worker.init.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(worker.init.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(worker.init.protectedMcpPolicy).toEqual({
+          capabilities: [],
+          protectedHomePaths: ['.secrets/mcp-secret'],
+          redactEnv: ['BOTMUX_PROTECTED_SECRET_FD', 'FIXTURE_SECRET', 'FIXTURE_TOKEN', 'INVALID_RECORD_SECRET'],
+        });
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
     } finally {
       vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
     }
   });
 

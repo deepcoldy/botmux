@@ -279,8 +279,8 @@ Streamable HTTP MCP 服务不能申请 `protectedCapability`，同时声明两�
       "enabled": false,
       "allowedPluginIds": ["fixture-plugin"],
       "secret": {
-        "source": "env",
-        "name": "FIXTURE_PROTECTED_SECRET"
+        "source": "file",
+        "path": ".botmux/secrets/fixture-protected-secret"
       },
       "principal": "verified-human-email",
       "containmentProfile": "local-stdio-secret-v1",
@@ -293,11 +293,17 @@ Streamable HTTP MCP 服务不能申请 `protectedCapability`，同时声明两�
 }
 ```
 
-省略 `enabled` 时默认关闭，JSON 布尔值 `true` 启用绑定，布尔值 `false` 关闭绑定。字符串 `"true"`、数字 `1` 等任何非布尔值都会使整条能力记录被拒绝，不会被强制转换成关闭状态。密钥值只存在于 daemon 启动环境，配置中只写环境变量名。无论当前 Bot 是否启用匹配插件，Botmux 都会从全部 daemon 子进程、worker、模型进程和插件通用环境删除所有已配置的 secret source 与 `redactEnv` 变量；能力授权与受保护 Home 路径仍按插件范围生效。受保护密钥及其清理名单在 daemon 启动时捕获；新增、轮转或更名密钥环境变量后必须重启 daemon 才能完整生效。热加载期间会保持安全方向：旧进程不会获得新密钥，新进程也不会绕过已有清理规则。
+省略 `enabled` 时默认关闭，JSON 布尔值 `true` 启用绑定，布尔值 `false` 关闭绑定。字符串 `"true"`、数字 `1` 等非布尔值会使整条能力记录被拒绝。secret 只支持 `{ "source": "file", "path": "<Home 相对路径>" }`；路径以 daemon 账户的可信 Home 为根，不接受绝对路径、`.`、`..` 或软链。运维人员预先创建当前用户拥有、精确权限为 `0600` 的非空普通文件，文件大小最多 64 KiB。Botmux 不会修复不安全文件，也不会在 daemon 启动时捕获或缓存密钥；每次新 worker fork 前现读文件，并逐级固定目录 fd 后以 no-follow 打开，拒绝中间路径或叶子的软链及替换竞态重定向。
+
+密钥只经一次性 fd 通道提供给获准 MCP，不进入 argv、通用环境或日志。文件轮换对下一次 worker fork 生效，已运行 MCP 保留本次启动获得的密钥，需重建该会话才能更新。每个有效配置的 secret 文件自动加入所有相关会话的沙箱 deny，即使 Bot 未启用匹配插件或能力关闭；额外 `protectedHomePaths` 仍按匹配插件生效。`redactEnv` 以及无效旧 `source: "env"` 记录中可辨识的合法变量名会按当前配置从 worker、模型和插件通用环境清除；旧环境来源不会授权写能力。修改机器配置沿用全局配置的短缓存刷新规则。
 
 MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allowedPluginIds` 中、配置的隔离前提不满足，或 daemon 无法提供一次性通道，Botmux 会改用不带受保护密钥文件描述符的普通 stdio transport 启动服务。服务仍可启动并提供只读工具；该连接上的 `tools/call` 不会收到 `botmuxTrustedPrincipal` 或 `botmuxGrantedCapabilities`，插件必须对受保护写入失败关闭。
 
 `principal` 是每次 `tools/call` 的授权条件，不是 MCP 进程启动条件。如果全局绑定、插件 allowlist、隔离前提和 daemon 通道在启动时均已成功，长驻 MCP 进程可能已持有一次性密钥，即使后续某次调用缺少所需的已验证真人主体或其它调用级授权条件。Botmux 会在该次调用中省略 `botmuxTrustedPrincipal` 和 `botmuxGrantedCapabilities`，插件必须拒绝受保护写入。插件必须在**每一次**受保护写操作中重新校验 `botmuxTrustedPrincipal` 以及 `botmuxGrantedCapabilities` 是否包含当前能力 ID，不得把上一轮主体、能力或授权结果缓存到进程级状态后复用；任一字段缺失、不匹配或过期都必须失败关闭。只要匹配的插件已启用，即使能力本身关闭，配置的隔离路径和环境变量清理仍然生效。
+
+迁移旧环境密钥时，先把密钥写入上述安全文件并将配置改为 `source: "file"`，再从 daemon 启动源移除旧变量并重启 daemon；仅 `delete process.env` 不能擦除旧进程的 `/proc/<pid>/environ`。新增或改变密钥文件路径前，须先结束并重建旧 CLI 会话，使新的文件 deny 生效；不要仅靠热更新撤回旧进程访问。建议固定路径后以安全文件原子替换轮换。存在受保护文件或其它需隔离的身份配置时，裸宿主 one-shot 自动标题生成会跳过并保留占位标题，不影响会话正文的读取能力。
+
+同一个 stdio MCP 子进程重启后，一次性密钥通道目前不会再次交付，受保护工具会退回只读；需重建会话恢复。不同出站策略收集入口的用户错误提示尚待统一。
 
 ## 卡片与终端
 
@@ -633,6 +639,8 @@ per-user 对话授权不放在 `bots.json`，而是存在 `<数据目录>/grants
 | `proxyMode` 缺省且任一区域为 `block`、`allowlist` 或 `denylist` | 非空代理值会被明确拒绝启动，包括继承和本 bot 的 `env` |
 | `proxyMode: "reject"` | 即使两区均 `allow`，非空代理值也会拒绝启动 |
 | `proxyMode: "trusted-egress"` | 可保留显式获准的代理值；网络规则必须允许客户端实际连接的代理 IP / 端口；最终模型目标、代理端 DNS、CONNECT/HTTP 规则由部署层代理 ACL 控制 |
+
+上表的通用代理委托只适用于普通会话。插件已冻结受保护 HTTP 出站策略时，`trusted-egress` 与任务代理变量均会明确拒绝，不能反复添加该配置消除报错；模型连接使用受保护模型桥，目前仅支持 Codex。详见[网络沙盒文档](sandbox.md)。
 
 `trusted-egress` 不创建代理、不自动授权环境变量、不保证 CLI 会使用代理；允许代理出口不等于限制代理后的业务目标。若模型依赖代理，不能只删掉 `inherit` 中的代理名称来让配置通过：应显式选择可信出口并配置出口规则与部署层 ACL，或先准备可直连的模型认证、获准目标 CIDR / 端口和 DNS，再移除代理授权。网络策略仍要求 Linux、新建本地 PTY 及 `sandbox: true` / `"oncall"`；tmux 等持久后端、adopt 和外部 App Server 的拒绝门禁不会因 `trusted-egress` 或 `envPolicy` 放开。详见[网络沙箱说明](sandbox.md)。
 

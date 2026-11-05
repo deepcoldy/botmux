@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys, privateBrokerContainmentEnabled, mergeProtectedHttpEgressNetworkPolicy } from '../src/core/sandbox-network-policy.js';
+import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys, privateBrokerContainmentEnabled, mergeProtectedHttpEgressNetworkPolicy, protectedHttpEgressCliSupportError } from '../src/core/sandbox-network-policy.js';
 import { networkSocketFilter } from '../src/core/sandbox-network-launch.js';
 import { workflowSandboxInitFields } from '../src/workflows/shared/sandbox-policy.js';
 import type { ProtectedHttpEgressWorkerPolicy } from '../src/core/protected-http-egress.js';
@@ -20,6 +20,19 @@ const frozenEgress: ProtectedHttpEgressWorkerPolicy = {
   frozenAddresses: [['10.20.30.40', '2606:4700::40', '10.20.30.40']],
 };
 describe('network policy', () => {
+  it.each(['claude', 'grok', 'antigravity', 'pi', 'unknown'])('refuses protected egress for unsupported %s before CLI launch', cliId => {
+    const error = protectedHttpEgressCliSupportError(cliId, frozenEgress);
+    expect(error).toBeTruthy();
+    expect(error).toContain(cliId);
+    expect(error).toContain('codex');
+    expect(error).toMatch(/模型.*桥|桥.*模型/);
+  });
+  it('admits codex and preserves ordinary sessions of every CLI', () => {
+    expect(protectedHttpEgressCliSupportError('codex', frozenEgress)).toBeUndefined();
+    for (const cliId of ['codex', 'claude', 'grok', 'antigravity', 'pi', 'unknown']) {
+      expect(protectedHttpEgressCliSupportError(cliId, undefined)).toBeUndefined();
+    }
+  });
   it.each(['10.0.0.1','127.0.0.1','169.254.0.1','100.64.0.1','192.168.1.1','198.18.0.1','224.0.0.1','0.0.0.0','255.255.255.255','::1','::','fe80::1','fc00::1','ff02::1','2001:db8::1','2002::1','64:ff9b::a00:1','::ffff:127.0.0.1','3fff::1'])('special/private %s', ip => expect(networkZone(ip)).toBe('private'));
   it.each(['8.8.8.8','1.1.1.1','2606:4700:4700::1111','::ffff:8.8.8.8'])('public %s', ip => expect(networkZone(ip)).toBe('public'));
   it('normalizes CIDR and IPv4 mappings', () => {
@@ -196,15 +209,28 @@ describe('network policy', () => {
     expect(nft.indexOf('ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport { 443 } drop'))
       .toBeLessThan(nft.indexOf('ip daddr 10.0.0.0/8 accept'));
   });
-  it('revokes delegated proxy egress because a proxy could bypass destination-IP denies', () => {
-    const merged = mergeProtectedHttpEgressNetworkPolicy(parseSandboxNetworkPolicy({
+  it('rejects delegated proxy policy conflicts instead of silently changing the operator configuration', () => {
+    const operator = parseSandboxNetworkPolicy({
       version: 1,
       public: { mode: 'allow' },
       private: { mode: 'allow' },
       proxyMode: 'trusted-egress',
-    }), frozenEgress, []);
-    expect(merged.proxyMode).toBe('reject');
-    expect(networkProxyError(merged, { HTTPS_PROXY: 'http://proxy.internal:8080' })).toBeTruthy();
+    });
+    expect(() => mergeProtectedHttpEgressNetworkPolicy(operator, frozenEgress, []))
+      .toThrow('protected_http_egress_proxy_policy_conflict');
+    expect(operator.proxyMode).toBe('trusted-egress');
+  });
+  it('offers protected model bridge guidance without recommending a conflicting proxy policy', () => {
+    const merged = mergeProtectedHttpEgressNetworkPolicy(undefined, frozenEgress, []);
+    const message = networkProxyError(merged, {
+      HTTPS_PROXY: 'http://user:secret@proxy.internal:8080',
+    }, true)!;
+    expect(message).toBeTruthy();
+    expect(message).toContain('HTTPS_PROXY');
+    expect(message).toMatch(/移除|去掉/);
+    expect(message).toMatch(/模型.*桥|桥.*模型/);
+    expect(message).not.toContain('trusted-egress');
+    expect(message).not.toContain('secret');
   });
   it('proxy re-resolution configurations fail closed without changing environment', () => {
     const p = parseSandboxNetworkPolicy(base); const env = { HTTPS_PROXY: 'http://example.org:8080', NO_PROXY: '*' };

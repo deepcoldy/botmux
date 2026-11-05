@@ -45,8 +45,6 @@ export type ProtectedHttpEgressLookup = (
 
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Z]+$/;
 const HTTP_PATH_CONTROL = /[\u0000-\u001f\u007f]/;
-const HTTP_PATH_PERCENT = /%([0-9a-fA-F]{2})/g;
-const HTTP_UNRESERVED_BYTE = /[A-Za-z0-9\-._~]/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -219,9 +217,11 @@ function normalizeProtectedHttpMethod(raw: string): string {
 }
 
 /**
- * Canonicalize a worker-supplied origin-form request target without ever
- * accepting an alternate spelling of a protected path. Query ordering and
- * contents are preserved; deny-route matching uses only the pathname.
+ * Validate a worker-supplied origin-form target, preserving query text and
+ * pathname case. Reject encodings, matrix parameters and whitespace instead
+ * of guessing how an upstream router decodes or strips them. This is a
+ * conservative accepted grammar, not a complete model of server routing:
+ * policies still need to enumerate other aliases recognized by the target.
  */
 export function normalizeProtectedHttpPath(raw: string): string {
   if (typeof raw !== 'string'
@@ -243,34 +243,20 @@ export function normalizeProtectedHttpPath(raw: string): string {
 
   const queryAt = raw.indexOf('?');
   const pathname = queryAt < 0 ? raw : raw.slice(0, queryAt);
-  const query = queryAt < 0 ? '' : raw.slice(queryAt);
-  if ((pathname.length > 1 && pathname.endsWith('/')) || pathname.includes('//')) {
+  // No encoded pathname byte is currently proven unambiguous across target
+  // routers, so there is deliberately no percent-encoding allowlist.
+  if ((pathname.length > 1 && pathname.endsWith('/'))
+    || pathname.includes('//')
+    || pathname.includes('%')
+    || pathname.includes(';')
+    || /\s/u.test(pathname)) {
     throw new Error('invalid_protected_http_path');
-  }
-  try {
-    decodeURIComponent(pathname);
-  } catch {
-    throw new Error('invalid_protected_http_path');
-  }
-  for (const match of pathname.matchAll(HTTP_PATH_PERCENT)) {
-    const byte = Number.parseInt(match[1], 16);
-    const character = String.fromCharCode(byte);
-    if (byte === 0x25
-      || byte === 0x2f
-      || byte === 0x5c
-      || byte <= 0x1f
-      || byte === 0x7f
-      || HTTP_UNRESERVED_BYTE.test(character)) {
-      throw new Error('invalid_protected_http_path');
-    }
   }
   if (pathname.split('/').some(segment => segment === '.' || segment === '..')) {
     throw new Error('invalid_protected_http_path');
   }
 
-  return `${pathname.replace(HTTP_PATH_PERCENT, (_escape, hex: string) => `%${hex.toUpperCase()}`)}${
-    query.replace(HTTP_PATH_PERCENT, (_escape, hex: string) => `%${hex.toUpperCase()}`)
-  }`;
+  return raw;
 }
 
 export function protectedHttpEgressDecision(
@@ -290,7 +276,10 @@ export function protectedHttpEgressDecision(
   const requestPathname = normalizedPath.split('?', 1)[0];
   for (const route of target.denyRoutes) {
     const routePath = normalizeProtectedHttpPath(route.path).split('?', 1)[0];
-    if (route.methods.includes(normalizedMethod) && routePath === requestPathname) return 'deny';
+    // Treat case-only write aliases as protected even on case-insensitive
+    // upstream routers, without changing the case of forwarded read paths.
+    if (route.methods.includes(normalizedMethod)
+      && routePath.toLowerCase() === requestPathname.toLowerCase()) return 'deny';
   }
   return 'allow';
 }

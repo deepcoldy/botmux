@@ -46,6 +46,7 @@ import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 import { ensureBackgroundJobHome } from '../services/bytedcli-home.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
 export type { IdentityStorageModel };
 
@@ -1429,8 +1430,14 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
   const reprepend = [
     '# botmux trigger-user identity — generated, do not edit.',
     '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
+    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ]; then',
+    '  case "$PATH:" in',
+    '    "$BOTMUX_WRAPPER_BIN":*) ;;',
+    '    *) PATH="$BOTMUX_WRAPPER_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '  esac',
+    'fi',
     'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
-    '  case ":$PATH:" in',
+    '  case "$PATH:" in',
     '    "$BOTMUX_IDENTITY_BIN":*) ;;',
     '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
     '  esac',
@@ -1842,6 +1849,7 @@ export function prepareTriggerUserCliEnv(
     try {
       const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
       childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+      childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
       childEnv.ZDOTDIR = zdotdir;
       childEnv.BASH_ENV = bashEnv;
     } catch (e) {

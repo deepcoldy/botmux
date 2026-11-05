@@ -128,7 +128,7 @@ describe('global dashboard config', () => {
       protectedMcpCapabilities: {
         'fixture.secret.v1': {
           allowedPluginIds: ['fixture-plugin', 'fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
           principal: 'verified-human-email',
           containmentProfile: 'local-stdio-secret-v1',
           isolation: {
@@ -144,7 +144,7 @@ describe('global dashboard config', () => {
       'fixture.secret.v1': {
         enabled: false,
         allowedPluginIds: ['fixture-plugin'],
-        secret: { source: 'env', name: 'FIXTURE_SECRET' },
+        secret: { source: 'file', path: '.secrets/mcp-secret' },
         principal: 'verified-human-email',
         containmentProfile: 'local-stdio-secret-v1',
         isolation: {
@@ -161,7 +161,7 @@ describe('global dashboard config', () => {
         'fixture.actor-write.v1': {
           enabled: false,
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
           principal: 'verified-human-email',
           containmentProfile: 'local-stdio-secret-egress-guard-v1',
         },
@@ -173,7 +173,7 @@ describe('global dashboard config', () => {
       'fixture.actor-write.v1': {
         enabled: false,
         allowedPluginIds: ['fixture-plugin'],
-        secret: { source: 'env', name: 'FIXTURE_SECRET' },
+        secret: { source: 'file', path: '.secrets/mcp-secret' },
         principal: 'verified-human-email',
         containmentProfile: 'local-stdio-secret-egress-guard-v1',
       },
@@ -186,13 +186,13 @@ describe('global dashboard config', () => {
         '../escape': {
           enabled: true,
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
           containmentProfile: 'local-stdio-secret-v1',
         },
         'fixture.absolute-path.v1': {
           enabled: true,
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
           containmentProfile: 'local-stdio-secret-v1',
           isolation: { protectedHomePaths: ['/tmp/credential'] },
         },
@@ -205,7 +205,7 @@ describe('global dashboard config', () => {
         'fixture.unknown-profile.v1': {
           enabled: true,
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
           containmentProfile: 'operator-composed-profile',
         },
       },
@@ -221,19 +221,22 @@ describe('global dashboard config', () => {
         'fixture.string-enabled.v1': {
           enabled: 'true',
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_STRING_SECRET' },
+          secret: { source: 'file', path: '.secrets/string-secret' },
+          isolation: { redactEnv: ['FIXTURE_STRING_SECRET'] },
           containmentProfile: 'local-stdio-secret-v1',
         },
         'fixture.numeric-enabled.v1': {
           enabled: 1,
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_NUMERIC_SECRET' },
+          secret: { source: 'file', path: '.secrets/numeric-secret' },
+          isolation: { redactEnv: ['FIXTURE_NUMERIC_SECRET'] },
           containmentProfile: 'local-stdio-secret-v1',
         },
         'fixture.boolean-enabled.v1': {
           enabled: false,
           allowedPluginIds: ['fixture-plugin'],
-          secret: { source: 'env', name: 'FIXTURE_BOOLEAN_SECRET' },
+          secret: { source: 'file', path: '.secrets/boolean-secret' },
+          isolation: { redactEnv: ['FIXTURE_BOOLEAN_SECRET'] },
           containmentProfile: 'local-stdio-secret-v1',
         },
       },
@@ -244,7 +247,8 @@ describe('global dashboard config', () => {
       'fixture.boolean-enabled.v1': {
         enabled: false,
         allowedPluginIds: ['fixture-plugin'],
-        secret: { source: 'env', name: 'FIXTURE_BOOLEAN_SECRET' },
+        secret: { source: 'file', path: '.secrets/boolean-secret' },
+        isolation: { redactEnv: ['FIXTURE_BOOLEAN_SECRET'] },
         containmentProfile: 'local-stdio-secret-v1',
       },
     });
@@ -260,7 +264,7 @@ describe('global dashboard config', () => {
       'fixture.secret.v1': {
         enabled: false,
         allowedPluginIds: ['fixture-plugin'],
-        secret: { source: 'env' as const, name: 'FIXTURE_SECRET' },
+        secret: { source: 'file' as const, path: '.secrets/mcp-secret' },
         containmentProfile: 'local-stdio-secret-v1' as const,
         isolation: {
           protectedHomePaths: ['.fixture-credential'],
@@ -270,13 +274,11 @@ describe('global dashboard config', () => {
     };
 
     expect(protectedMcpIsolationPolicy(['fixture-plugin'], config)).toEqual({
-      protectedHomePaths: ['.fixture-credential'],
-      secretEnvNames: ['FIXTURE_SECRET'],
+      protectedHomePaths: ['.secrets/mcp-secret', '.fixture-credential'],
       redactEnv: ['FIXTURE_TOKEN'],
     });
     expect(protectedMcpIsolationPolicy(['other-plugin'], config)).toEqual({
-      protectedHomePaths: [],
-      secretEnvNames: [],
+      protectedHomePaths: ['.secrets/mcp-secret'],
       redactEnv: [],
     });
   });
