@@ -1,5 +1,8 @@
 # Web Terminal (interactive)
 
+<video src="../img/video-v2-daily.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 Every session has a browser-based terminal: open it to watch the CLI live, and if you have permission, type into it directly. It works on desktop, tablet, and phone.
 
 The one exception is the ZMX backend, which has no Web Terminal. Run `botmux list` or `zmx attach` on the host instead; see [ZMX backend](/en/zmx).

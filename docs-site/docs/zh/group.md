@@ -1,5 +1,7 @@
 # 一键新建会话群
 
+<video src="img/video-v4-multibot.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 想给一个项目或任务单独开一个干净的群？发 `/group <群名>`（简写 `/g`）就行。机器人会帮你：
 
 1. 新建一个飞书群，把你拉进去；

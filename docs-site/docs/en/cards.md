@@ -1,5 +1,8 @@
 # Streaming Cards
 
+<video src="../img/video-v2-daily.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 Botmux uses Lark cards to show what the CLI is doing, and lets you control it right from your phone. This page goes from most common to advanced: first what shows up during a turn, then the status card, dynamic single cards and the switches, and finally the features for scripts and integrators.
 
 ## What shows up in the chat during a turn

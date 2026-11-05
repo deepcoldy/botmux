@@ -1,5 +1,8 @@
 # Dashboard Control Panel
 
+<video src="../img/video-v7-dashboard.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 The Dashboard is botmux's built-in web admin console. One page lets you manage sessions, groups, scheduled tasks, workflows, and configuration for **every bot** on this machine, without typing commands into each Lark group.
 
 ## Open the Dashboard

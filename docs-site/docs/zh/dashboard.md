@@ -1,5 +1,7 @@
 # Dashboard 管控面
 
+<video src="img/video-v7-dashboard.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Dashboard 是 botmux 自带的网页管理后台。一个页面就能管这台机器上**所有机器人**的会话、群、定时任务、工作流和配置，不用逐个进飞书群敲命令。
 
 ## 打开 Dashboard

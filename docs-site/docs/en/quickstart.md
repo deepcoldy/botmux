@@ -1,5 +1,8 @@
 # 5-minute quick setup
 
+<video src="../img/video-v1-quickstart.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 Four steps and you're chatting with an AI coding CLI from Lark:
 
 | Step | Command / action | What it does |

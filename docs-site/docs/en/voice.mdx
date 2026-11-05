@@ -1,3 +1,5 @@
+import video_v6_oncall_voice from '../../static/img/video-v6-oncall-voice.mp4';
+
 # Voice Summary and Speech Recognition
 
 botmux voice works in two directions. Turn on either one, or both:
@@ -11,7 +13,8 @@ Both are optional advanced features, off by default. Run `botmux restart` after 
 
 ## Voice summary: turn a reply into audio with one tap
 
-<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421547656_voice-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+<video src={video_v6_oncall_voice} controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+<p style={{fontSize:'13px',opacity:.7,marginTop:'-8px'}}>Video narration is in Chinese.</p>
 
 Once a voice engine is configured, the bot's reply cards get a "🔊 语音总结" (Voice Summary) button at the bottom. Tap it and:
 

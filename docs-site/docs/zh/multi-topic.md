@@ -1,5 +1,7 @@
 # 多话题协作模式
 
+<video src="img/video-v4-multibot.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 把一个大任务交给主 bot，它会：
 
 - 把任务拆成几个子项目；

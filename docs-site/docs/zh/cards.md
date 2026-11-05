@@ -1,5 +1,7 @@
 # 实时流式卡片
 
+<video src="img/video-v2-daily.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Botmux 在飞书里用卡片告诉你 CLI 正在干什么，也让你在手机上就能操控它。这一页按「最常用 → 进阶」的顺序介绍：先看一轮对话会出现哪些东西，再讲状态卡、动态单卡、各种开关，最后是给脚本和集成方用的高级能力。
 
 ## 一轮对话，群里会出现什么

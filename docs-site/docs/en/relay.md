@@ -1,5 +1,8 @@
 # Session Relay
 
+<video src="../img/video-v3-adopt-relay.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 `/relay` moves a **running AI session** to another group, another topic, or a DM, so you can keep going there.
 
 - What moves is **the same CLI process and the same AI memory**, not a fresh copy.

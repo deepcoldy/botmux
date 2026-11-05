@@ -1,5 +1,7 @@
 # Web 终端（可交互）
 
+<video src="img/video-v2-daily.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 每个会话都有一个网页版终端：在浏览器里就能看到 CLI 的实时画面，有权限的话还能直接敲键盘操作。电脑、平板、手机都能用。
 
 唯一的例外是 ZMX 后端，它不提供 Web 终端，请在本机运行 `botmux list` 或 `zmx attach` 进入，见 [ZMX 后端](/zmx)。

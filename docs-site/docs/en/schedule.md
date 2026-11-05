@@ -1,5 +1,8 @@
 # Scheduled Tasks
 
+<video src="../img/video-v5-automation.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 Let a bot do work on a schedule: a daily morning report, a service check every 30 minutes, cleaning up a branch once a PR merges. When a task is due, the bot hands your prompt to its AI CLI and posts the result back to Feishu/Lark.
 
 ## Quick start

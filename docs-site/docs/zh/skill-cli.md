@@ -1,5 +1,7 @@
 # Skill + CLI 交互
 
+<video src="img/video-v8-skills.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 在 botmux 会话里，AI 想跟飞书打交道（发消息、看历史、建定时任务……），靠的是两样东西：
 
 - **`botmux` 命令**：会话启动时自动放进 CLI 的 PATH，AI 在终端里直接执行即可。

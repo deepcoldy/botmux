@@ -1,5 +1,8 @@
 # Multi-Topic Orchestration Mode
 
+<video src="../img/video-v4-multibot.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 Hand a big task to a main bot and it will:
 
 - split the task into a few sub-projects;

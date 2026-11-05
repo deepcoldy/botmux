@@ -1,5 +1,8 @@
 # Agent Workbench
 
+<video src="../img/video-v7-dashboard.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 The Workbench (shown as 驾驶舱, "Cockpit", in the Dashboard) is the part of the [Dashboard](/en/dashboard) built for **keeping an eye on many AI sessions at once**: the left side lists every session on this machine, the right side shows the terminal of the one you pick. You can see at a glance which session just finished and which one is stuck waiting for you.
 
 The "Open Workbench" button on the Lark `/dashboard` card and the `工作台: …` link printed by `botmux dashboard` both open it.

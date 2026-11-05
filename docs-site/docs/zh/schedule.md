@@ -1,5 +1,7 @@
 # 定时任务
 
+<video src="img/video-v5-automation.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 让 Bot 到点自动干活：每天早上出日报、每 30 分钟巡检一次服务、PR 合入后再去清理分支……到点时，Bot 会把你写好的提示词（prompt）交给 AI CLI 执行，结果发回飞书群。
 
 ## 一分钟上手

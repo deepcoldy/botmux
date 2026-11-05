@@ -1,10 +1,13 @@
 # botmux
 
+<video src="../img/video-v0-overview.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+
 <p class="lead">Remote-control your AI coding CLI from Lark. One message starts a session, and every session gets its own CLI process.</p>
 
 botmux is a bridge. It runs a background service (the **daemon**) on your dev machine that listens to Lark messages:
 
-- Each new topic gets its own AI coding CLI (20+ supported, including Claude Code, Codex, Cursor, OpenCode, and Antigravity)
+- Each new topic gets its own AI coding CLI (30+ supported, including Claude Code, Codex, Cursor, OpenCode, and Antigravity)
 - Every turn of CLI output is streamed live into a Lark **streaming card**
 - When you want to take over, a card button opens the **Web Terminal**, so you can drive the same CLI from a browser or phone
 
@@ -71,7 +74,7 @@ Compared with approaches "rebuilt on top of an Agent SDK", the difference is mai
 | What gets bridged | The full CLI process, with its own hooks / memory / plan mode / MCP / `/` commands | Whatever the SDK exposes |
 | CLI upgrades | Most capabilities benefit directly | Depends on the SDK version and your integration |
 | Memory / context | Uses the CLI's built-in memory | Depends on the SDK or your own build |
-| Multiple CLIs | 20+ adapters, switch with one config change | Depends on SDK coverage |
+| Multiple CLIs | 30+ adapters, switch with one config change | Depends on SDK coverage |
 | Multiple bots | Several bots in one group, dispatched by @ | Depends on implementation |
 | Direct terminal access | With the tmux backend, `tmux attach` into the real CLI process | Depends on implementation |
 
