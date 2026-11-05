@@ -36,7 +36,7 @@
  * without one there is nothing to seed from and login reports "not configured".
  */
 import { spawn } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -328,58 +328,87 @@ function ensureBootstrapped(openId: string): boolean {
 
   const secretFile = join(dataDir, `appsecret_${machine.appId}.enc`);
   const masterKey = join(dataDir, 'master.key');
+  const sourceSecret = join(machine.dataDir, `appsecret_${machine.appId}.enc`);
+  const sourceMasterKey = join(machine.dataDir, 'master.key');
+  // Check the issuer's material BEFORE touching this HOME: a profile without
+  // its secret file must leave the person's existing state (and any device
+  // code still valid on the server) exactly as it was.
+  if (!existsSync(sourceSecret) || !existsSync(sourceMasterKey)) {
+    logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: issuer ${machine.appId} has no secret or master key`);
+    return false;
+  }
   // The issuer is read fresh on every login, but this HOME was seeded once:
   // after the operator switches profile (or a personal issuer appears) the
   // person kept minting codes for the old app. Re-seed when the app changed.
   const seededApp = seededAppId(home);
   const reseed = seededApp !== undefined && seededApp !== machine.appId;
-  if (reseed) {
-    logger.info(`[lark-cli-auth] issuer app changed for ${openId}: ${seededApp} -> ${machine.appId}; re-seeding`);
-    clearChallenge(openId);
-  }
+  // Everything is staged next to its target first and only then renamed into
+  // place, config last: a copy or write that fails leaves the HOME exactly as
+  // it was (never a new key under the old app's config, which lark-cli can no
+  // longer decrypt and no later login would repair).
+  const staged: Array<[string, string]> = [];
+  const stage = (target: string, write: (tmp: string) => void) => {
+    const tmp = `${target}.botmux-seed`;
+    write(tmp);
+    staged.push([tmp, target]);
+  };
   try {
-    if (reseed || !existsSync(secretFile)) {
-      copyFileSync(join(machine.dataDir, `appsecret_${machine.appId}.enc`), secretFile);
-    }
-    if (reseed || !existsSync(masterKey)) {
-      copyFileSync(join(machine.dataDir, 'master.key'), masterKey);
-    }
-  } catch (e) {
-    logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: ${e instanceof Error ? e.message : String(e)}`);
-    return false;
-  }
+    if (reseed || !existsSync(secretFile)) stage(secretFile, tmp => copyFileSync(sourceSecret, tmp));
+    if (reseed || !existsSync(masterKey)) stage(masterKey, tmp => copyFileSync(sourceMasterKey, tmp));
 
-  // Minimal app entry: the secret is referenced from the encrypted file lark-cli
-  // itself wrote (source "keychain"), and there are no users until someone
-  // actually scans. Built from the operator's config shape, not hand-invented.
-  if (reseed || !existsSync(larkCliConfigPath(home))) {
-    let appEntry: unknown = null;
-    try {
-      const cfg = JSON.parse(readFileSync(machine.config, 'utf8')) as
-        { apps?: Array<Record<string, unknown>> };
-      const src = cfg.apps?.find(a => a.appId === machine.appId);
-      if (src) {
+    // Minimal app entry: the secret is referenced from the encrypted file lark-cli
+    // itself wrote (source "keychain"), and there are no users until someone
+    // actually scans. Built from the operator's config shape, not hand-invented.
+    if (reseed || !existsSync(larkCliConfigPath(home))) {
+      let appEntry: unknown = null;
+      try {
+        const cfg = JSON.parse(readFileSync(machine.config, 'utf8')) as
+          { apps?: Array<Record<string, unknown>> };
+        const src = cfg.apps?.find(a => a.appId === machine.appId);
+        if (src) {
+          appEntry = {
+            appId: src.appId,
+            appSecret: src.appSecret,
+            brand: src.brand ?? 'feishu',
+            lang: src.lang ?? 'zh',
+            users: [],
+          };
+        }
+      } catch { /* fall through to the minimal literal */ }
+      if (!appEntry) {
         appEntry = {
-          appId: src.appId,
-          appSecret: src.appSecret,
-          brand: src.brand ?? 'feishu',
-          lang: src.lang ?? 'zh',
+          appId: machine.appId,
+          brand: 'feishu',
+          lang: 'zh',
+          // Without a reference to the encrypted-secret pointer, the CLI treats
+          // this as not configured. The encrypted files were copied above; a
+          // machine lacking a readable source config never reaches this path.
           users: [],
         };
       }
-    } catch { /* fall through to the minimal literal */ }
-    if (!appEntry) {
-      appEntry = {
-        appId: machine.appId,
-        brand: 'feishu',
-        lang: 'zh',
-        // Without a reference to the encrypted-secret pointer, the CLI treats
-        // this as not configured. The encrypted files were copied above; a
-        // machine lacking a readable source config never reaches this path.
-        users: [],
-      };
+      const body = JSON.stringify({ apps: [appEntry] }, null, 2);
+      stage(larkCliConfigPath(home), tmp => writeFileSync(tmp, body, { mode: 0o600 }));
     }
-    atomicWriteFileSync(larkCliConfigPath(home), JSON.stringify({ apps: [appEntry] }, null, 2), { mode: 0o600 });
+    for (const [tmp, target] of staged) renameSync(tmp, target);
+  } catch (e) {
+    for (const [tmp] of staged) { try { rmSync(tmp, { force: true }); } catch { /* best effort */ } }
+    logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+  if (reseed) {
+    // Only now that the new material is fully in place: the old app's code and
+    // tokens can no longer be used with it. Leaving the token would make
+    // hasLarkCliHome() report "authorized" for a login the CLI cannot read.
+    logger.info(`[lark-cli-auth] issuer changed for ${openId}: ${seededApp} -> ${machine.appId}; re-seeded`);
+    clearChallenge(openId);
+    for (const f of listUserTokenFiles(home)) {
+      if (!f.startsWith(`${machine.appId}_`) || seededApp === machine.appId) {
+        try { rmSync(join(dataDir, f), { force: true }); } catch { /* best effort */ }
+      }
+    }
+    if (seededApp !== machine.appId) {
+      try { rmSync(join(dataDir, `appsecret_${seededApp}.enc`), { force: true }); } catch { /* best effort */ }
+    }
   }
   return true;
 }
@@ -427,6 +456,14 @@ function saveChallenge(openId: string, deviceCode: string, authUrl: string): voi
   } catch (e) {
     logger.debug(`[lark-cli-auth] could not persist the login challenge: ${e instanceof Error ? e.message : String(e)}`);
   }
+}
+
+function clearChallengeIfCurrent(openId: string, deviceCode: string): void {
+  try {
+    const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as { deviceCode?: unknown };
+    if (raw.deviceCode !== deviceCode) return;
+  } catch { return; }
+  clearChallenge(openId);
 }
 
 function clearChallenge(openId: string): void {
@@ -530,7 +567,9 @@ export async function completeLarkCliLogin(
   const invalidCode = /device[_ ]code.*(?:invalid|unknown)|invalid.*device[_ ]code/i.test(raw);
   const expired = /expired[_ ]token|(?:device[_ ]code|authorization).*expired/i.test(raw);
   if (denied || invalidCode || expired) {
-    clearChallenge(openId);
+    // Only the challenge this poll was about: a newer one (issued meanwhile,
+    // e.g. after the issuer changed) must survive the old code's verdict.
+    clearChallengeIfCurrent(openId, code);
   } else {
     deferAutomaticPoll(openId, code);
   }
