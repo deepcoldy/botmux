@@ -65,22 +65,43 @@ const RUNNER_PPID = 987_655;
 
 let dataDir: string;
 let prevDataDir: string | undefined;
+// Saved descriptors so the real process.pid/ppid can be restored exactly. Bun's
+// ppid is an accessor while Node's pid is a non-writable data property, so the
+// descriptors differ per runtime and plain assignment is not enough.
+let realPidDescriptor: PropertyDescriptor | undefined;
+let realPpidDescriptor: PropertyDescriptor | undefined;
 
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'mojo-containment-wiring-'));
   prevDataDir = process.env.SESSION_DATA_DIR;
   process.env.SESSION_DATA_DIR = dataDir;
-  vi.spyOn(process, 'pid', 'get').mockReturnValue(RUNNER_PID);
-  vi.spyOn(process, 'ppid', 'get').mockReturnValue(RUNNER_PPID);
+  pinRunnerIdentity();
 });
+
+/**
+ * Pin the runner identity off the fixture set by installing getters directly.
+ * `vi.spyOn(process, 'pid', 'get')` only works under vitest: Bun's spyOn rejects
+ * accessor targets ("does not support accessor properties yet"), which made the
+ * whole file red on the bun:test leg. On Node the native ppid is a special data
+ * property that silently ignores a value-form redefinition, so both properties
+ * are pinned as getters (the one form both runtimes honour).
+ */
+function pinRunnerIdentity(): void {
+  realPidDescriptor = Object.getOwnPropertyDescriptor(process, 'pid');
+  realPpidDescriptor = Object.getOwnPropertyDescriptor(process, 'ppid');
+  Object.defineProperty(process, 'pid', { get: () => RUNNER_PID, configurable: true, enumerable: true });
+  Object.defineProperty(process, 'ppid', { get: () => RUNNER_PPID, configurable: true, enumerable: true });
+}
 
 /** Restore the real runner identity for cases that build handles from live /proc. */
 function useRealProcessIdentity(): void {
-  vi.restoreAllMocks();
+  if (realPidDescriptor) Object.defineProperty(process, 'pid', realPidDescriptor);
+  if (realPpidDescriptor) Object.defineProperty(process, 'ppid', realPpidDescriptor);
 }
 
 afterEach(() => {
   vi.restoreAllMocks();
+  useRealProcessIdentity();
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
   else process.env.SESSION_DATA_DIR = prevDataDir;
   rmSync(dataDir, { recursive: true, force: true });
