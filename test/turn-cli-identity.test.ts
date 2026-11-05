@@ -182,6 +182,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).not.toContain('tok-alice');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('https://example.com/lark-device');
+    expect(body).toContain('[reason=not_authorized]');
   });
 
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
@@ -193,6 +194,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const outcomes = await publish(botConfig(), undefined);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(identityBody('lark-cli')).not.toContain('tok-alice');
+    expect(identityBody('lark-cli')).toContain('[reason=no_sender]');
   });
 
   it('reports needs-authorization instead of degrading under fallback: none', async () => {
@@ -999,5 +1001,6 @@ it('does not begin another login when the bytedcli provider fails', async () => 
   expect(provider.beginBytedcliLogin).not.toHaveBeenCalled();
   const written = identityBody('bytedcli', 'turn-unavailable');
   expect(written).toContain('停止自动重试');
+  expect(written).toContain('[reason=provider_unavailable]');
   expect(written).not.toContain('old-sender-credential');
 });

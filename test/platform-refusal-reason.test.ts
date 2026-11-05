@@ -10,6 +10,8 @@ describe('platformRefusalReason', () => {
     [{ state: 'denied', reason: 'forbidden', detail: 'forbidden (403 x)' }, 'platform_forbidden'],
     [{ state: 'unavailable', detail: 'sender union_id unresolved' }, 'union_id_unresolved'],
     [{ state: 'unavailable', detail: 'network: 连接超时（5000ms） (after retry)' }, 'platform_timeout'],
+    [{ state: 'unavailable', detail: 'network: connect ETIMEDOUT 10.0.0.1:443' }, 'platform_timeout'],
+    [{ state: 'unavailable', detail: 'platform unavailable (504 gateway timeout)' }, 'platform_timeout'],
     [{ state: 'unavailable', detail: 'network: ECONNREFUSED' }, 'platform_unreachable'],
     [{ state: 'unavailable', detail: 'rate limited (429)' }, 'platform_rate_limited'],
     [{ state: 'unavailable', detail: 'platform unavailable (503 store_unavailable)' }, 'platform_unavailable'],

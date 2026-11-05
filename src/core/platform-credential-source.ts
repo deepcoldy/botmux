@@ -244,7 +244,9 @@ export function platformRefusalReason(resolution: Exclude<PlatformIdentityResolu
     case 'unavailable': {
       const d = String(resolution.detail ?? '').toLowerCase();
       if (d.includes('union_id unresolved')) return 'union_id_unresolved';
-      if (d.includes('超时') || d.includes('timed out') || d.includes('timeout')) return 'platform_timeout';
+      if (d.includes('超时') || d.includes('timed out') || d.includes('timeout') || d.includes('etimedout') || /\b504\b/.test(d)) {
+        return 'platform_timeout';
+      }
       if (d.startsWith('network')) return 'platform_unreachable';
       if (d.startsWith('rate limited')) return 'platform_rate_limited';
       return 'platform_unavailable';
