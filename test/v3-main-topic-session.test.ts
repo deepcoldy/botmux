@@ -39,6 +39,9 @@ import { workflowNodeSessionEntry } from '../src/im/lark/workflow-sidebar-entry.
 // registry fire-and-forget, then tells the main bot. Teardown waits until
 // every refusal of the test has reached the main bot — its registry write is
 // done by then — instead of racing the write when removing the run dirs.
+// Only a refusal sent over IPC can be observed here: one whose main bot is
+// this very daemon settles in-process (no postDaemon), so the wrapper refuses
+// to count it rather than letting teardown fail with a bare count mismatch.
 let refusalsStarted = 0;
 let refusalsDelivered = 0;
 function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): WorkflowNodeDaemon {
@@ -53,7 +56,13 @@ function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): WorkflowNodeDae
   const admitInbound = daemon.admitInbound;
   daemon.admitInbound = (...args) => {
     const admission = admitInbound(...args);
-    if (!admission.start) refusalsStarted += 1;
+    if (!admission.start) {
+      if (args[0].sourceLarkAppId === deps.selfLarkAppId()) {
+        throw new Error('v3-main-topic-session: a refusal whose main bot is this daemon settles in-process; '
+          + 'teardown only waits for refusals sent over IPC. Wait for its nodeBlocked in the test and extend this wrapper.');
+      }
+      refusalsStarted += 1;
+    }
     return admission;
   };
   return daemon;
