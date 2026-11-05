@@ -10,14 +10,14 @@
  */
 import { join } from 'node:path';
 
-import type { DraftLaunchDeps, LaunchRootCardView, LaunchSummaryView } from '../../src/workflows/v3/draft-launch.js';
+import { joinLaunchInitiator, type DraftLaunchDeps, type LaunchRootCardView, type LaunchSummaryView } from '../../src/workflows/v3/draft-launch.js';
 import type { V3BotEligibilityProbe } from '../../src/workflows/v3/node-executor-mode.js';
 import { preflightV3RunStart } from '../../src/workflows/v3/daemon-run.js';
 import { persistV3StartIntent } from '../../src/workflows/v3/start-intent.js';
 import { MAIN } from './workflow-draft-fakes.js';
 
 export type LaunchOp =
-  | 'resolveEmails' | 'createGroup' | 'joinInitiator' | 'listChats' | 'findRootCards' | 'addBots' | 'postRootCard' | 'updateRootCard'
+  | 'resolveEmails' | 'createGroup' | 'joinInitiator' | 'joinOwnerCheck' | 'joinMemberCheck' | 'joinInvite' | 'joinTransfer' | 'listChats' | 'findRootCards' | 'addBots' | 'postRootCard' | 'updateRootCard'
   | 'postSummary' | 'bindSession' | 'grant' | 'revoke' | 'resolveSubject' | 'startRun';
 
 export interface FakeChat {
@@ -51,6 +51,15 @@ export function fakeLaunch(baseDir: string) {
   const refusedPeople = new Set<string>();
   /** People who can join but not become owner. */
   const noOwner = new Set<string>();
+  /** Feishu behaviours of the join step. */
+  const switches = {
+    /** A repeated invite of a member answers "not added" (as Feishu does). */
+    duplicateInviteFails: true,
+    /** An invite that did add the person still lists them as not added. */
+    inviteReportsInvalid: false,
+    /** The member list cannot be read. */
+    memberCheckFails: false,
+  };
   /** Run just before `grant` answers (tamper hooks). */
   let beforeGrantReturn: (() => void) | undefined;
   let n = 0;
@@ -111,12 +120,35 @@ export function fakeLaunch(baseDir: string) {
       await enter('joinInitiator', [chatId, owner]);
       const chat = chats.get(chatId)!;
       const ownerId = owner.channel === 'open_id' ? owner.openId : owner.unionId;
-      if (refusedPeople.has(ownerId)) return { joined: false, error: 'invitee_rejected' };
-      const list = owner.channel === 'open_id' ? chat.users : chat.unionUsers;
-      if (!list.includes(ownerId)) list.push(ownerId);
-      if (noOwner.has(ownerId)) return { joined: true, ownerTransferError: 'transfer_failed' };
-      chat.owner = { channel: owner.channel, id: ownerId };
-      return { joined: true };
+      const list = () => (owner.channel === 'open_id' ? chat.users : chat.unionUsers);
+      // The production decision over fake Feishu reads / writes.
+      return joinLaunchInitiator(ownerId, {
+        owner: async () => {
+          calls.push({ op: 'joinOwnerCheck', args: [chatId] });
+          // No person owns it yet: the bot does (not the initiator).
+          if (!chat.owner) return MAIN;
+          return chat.owner.channel === owner.channel ? chat.owner.id : undefined;
+        },
+        isMember: async () => {
+          calls.push({ op: 'joinMemberCheck', args: [chatId] });
+          if (switches.memberCheckFails) throw new Error('members api down');
+          return list().includes(ownerId);
+        },
+        invite: async () => {
+          calls.push({ op: 'joinInvite', args: [chatId, ownerId] });
+          if (refusedPeople.has(ownerId)) return { invalid: true };
+          // Feishu answers a repeated invite as "not added".
+          if (list().includes(ownerId)) return { invalid: switches.duplicateInviteFails };
+          list().push(ownerId);
+          return { invalid: switches.inviteReportsInvalid };
+        },
+        transferOwner: async () => {
+          calls.push({ op: 'joinTransfer', args: [chatId, ownerId] });
+          if (noOwner.has(ownerId)) return { error: 'transfer_failed' };
+          chat.owner = { channel: owner.channel, id: ownerId };
+          return {};
+        },
+      });
     },
     async listChats() {
       await enter('listChats', []);
@@ -232,6 +264,7 @@ export function fakeLaunch(baseDir: string) {
     uninvitable,
     refusedPeople,
     noOwner,
+    switches,
     set beforeGrantReturn(fn: (() => void) | undefined) { beforeGrantReturn = fn; },
     granted: (chatId: string, receiver: string) => [...(grants.get(`${chatId}|${receiver}`) ?? [])].sort(),
     onlyChat(): FakeChat {

@@ -58,12 +58,12 @@ import type { WorkflowDraftInitiator } from '../workflows/v3/draft-store.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { DaemonSession } from './types.js';
 import { initiatorFailureBody, type WorkflowInitiatorResolution } from './workflow-initiator.js';
-import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
+import { joinLaunchInitiator, type DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { createLiveV3BotEligibilityProbe } from '../im/lark/v3-bot-eligibility.js';
 import { buildV3LaunchRootCard, buildV3LaunchSummaryText, isLaunchRootCardOf } from '../im/lark/v3-launch-card.js';
 import { getMessageDetail, listChatMessagesUntil, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from '../im/lark/client.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
-import { addBotToChat, addUsersToChatByOpenId, addUsersToChatByUnionId, listChats } from '../services/groups-store.js';
+import { addBotToChat, addUsersToChatByOpenId, addUsersToChatByUnionId, getChatOwner, listChatMemberDisplays, listChats } from '../services/groups-store.js';
 import { requestExactChatGrant } from '../cli/exact-chat-grant-client.js';
 import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
@@ -303,17 +303,34 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
       };
     },
     async joinInitiator(chatId, owner) {
-      const added = owner.channel === 'open_id'
-        ? await addUsersToChatByOpenId(appId, chatId, [owner.openId])
-        : await addUsersToChatByUnionId(appId, chatId, [owner.unionId]);
-      if (added.invalidUserIds.length > 0) return { joined: false, error: 'invitee_rejected' };
-      const transferred = await transferGroupOwner({
-        creatorLarkAppId: appId,
-        chatId,
-        ownerId: owner.channel === 'open_id' ? owner.openId : owner.unionId,
-        ownerIdType: owner.channel,
+      const id = owner.channel === 'open_id' ? owner.openId : owner.unionId;
+      // The member list is read by open_id in the main bot's own app; a
+      // union_id is turned into that app's open_id there first (no open_id
+      // ever comes from another app).
+      const memberOpenId = async (): Promise<string> => {
+        if (owner.channel === 'open_id') return owner.openId;
+        const resolved = await resolveAllowedUsersWithMap(appId, [owner.unionId]);
+        const openId = resolved.map.get(owner.unionId);
+        if (!openId?.startsWith('ou_')) throw new Error('发起人的 union_id 在编排 Bot 的应用里换算不出 open_id');
+        return openId;
+      };
+      return joinLaunchInitiator(id, {
+        owner: () => getChatOwner(appId, chatId, owner.channel),
+        isMember: async () => {
+          const openId = await memberOpenId();
+          return (await listChatMemberDisplays(appId, chatId)).some((member) => member.openId === openId);
+        },
+        invite: async () => {
+          const added = owner.channel === 'open_id'
+            ? await addUsersToChatByOpenId(appId, chatId, [owner.openId])
+            : await addUsersToChatByUnionId(appId, chatId, [owner.unionId]);
+          return { invalid: added.invalidUserIds.length > 0 };
+        },
+        transferOwner: async () => {
+          const transferred = await transferGroupOwner({ creatorLarkAppId: appId, chatId, ownerId: id, ownerIdType: owner.channel });
+          return transferred.transferError ? { error: transferred.transferError } : {};
+        },
       });
-      return { joined: true, ...(transferred.transferError ? { ownerTransferError: transferred.transferError } : {}) };
     },
     listChats: async () => (await listChats(appId)).map((chat) => ({
       chatId: chat.chatId,
