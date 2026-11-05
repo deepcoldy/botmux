@@ -19,6 +19,7 @@ import {
 } from '../src/core/decision-board/hints.js';
 import { createPrStateLookup, OPEN_RECHECK_MS } from '../src/core/decision-board/github-pr-state.js';
 import { parseBoardArgs } from '../src/cli/board-command.js';
+import { riffHostFileArguments } from '../src/services/riff-host-tools.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { DecisionBoardStore, decisionBoardDbPath } from '../src/services/decision-board-store.js';
 
@@ -263,17 +264,93 @@ describe('巡检提示', () => {
     expect(hintEvents(seq)).toHaveLength(1);
   });
 
-  it('送进 worker 后异步失败的回执：撤销已通知，下一轮重发；批次的失败回执路径不受影响', async () => {
+  it('送进 worker 后的失败回执：入队前被拒才重发；结果未知（收据超时）不重发', async () => {
     await add('修登录', { links: ['pr=o/r#1'] });
     prStates.set('o/r#1', 'merged');
     await service.sweepHints(Date.now());
     expect(delivered).toHaveLength(1);
-    service.noteDeliveryFailure(delivered[0]!.turnId, 'receipt_timeout');
+    service.noteDeliveryFailure(delivered[0]!.turnId, 'receipt_timeout', 'worker.input_delivery_failed');
+    await service.sweepHints(Date.now());
+    await service.sweepHints(Date.now());
+    expect(delivered).toHaveLength(1);
+
+    await add('另一个', { links: ['pr=o/r#2'] });
+    prStates.set('o/r#2', 'merged');
     await service.sweepHints(Date.now());
     expect(delivered).toHaveLength(2);
-    expect(delivered[1]!.turnId).not.toBe(delivered[0]!.turnId);
+    service.noteDeliveryFailure(delivered[1]!.turnId, 'worker_rejected:busy', 'worker.input_rejected_before_admission');
+    await service.sweepHints(Date.now());
+    expect(delivered).toHaveLength(3);
+    expect(delivered[2]!.turnId).not.toBe(delivered[1]!.turnId);
+    expect(delivered[2]!.prompt).toContain('另一个');
+    expect(delivered[2]!.prompt).not.toContain('修登录');
     // 提示回合 id 不会被当成批次号解析。
     expect(parseBoardTurnId(delivered[0]!.turnId)).toBeNull();
+  });
+
+  it('投递一直抛错（可能已发出横幅）：同一条提示最多自动投 3 次', async () => {
+    await add('修登录', { links: ['pr=o/r#1'] });
+    prStates.set('o/r#1', 'merged');
+    let attempts = 0;
+    deliverImpl = async () => { attempts++; throw new Error('banner posted, then session gone'); };
+    for (let i = 0; i < 6; i++) await service.sweepHints(Date.now());
+    expect(attempts).toBe(3);
+  });
+
+  it('投递卡住不返回：之后的巡检照常给看板标提示，只是不叠发通知', async () => {
+    await add('A', { links: ['pr=o/r#1'] });
+    prStates.set('o/r#1', 'merged');
+    let release!: () => void;
+    deliverImpl = input => { delivered.push(input); return new Promise(resolve => { release = () => resolve({ sessionId: 's' }); }); };
+    const first = service.sweepHints(Date.now());
+    for (let i = 0; i < 100 && !delivered.length; i++) await new Promise(r => setTimeout(r, 5));
+    expect(delivered).toHaveLength(1);
+    const b = await add('B', { links: ['pr=o/r#2'] });
+    prStates.set('o/r#2', 'merged');
+    await service.sweepHints(Date.now());
+    expect(item(b).hint).toMatchObject({ kind: 'close' });
+    expect(delivered).toHaveLength(1);
+    release();
+    await first;
+    deliverImpl = async input => { delivered.push(input); return { sessionId: 's' }; };
+    await service.sweepHints(Date.now());
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]!.prompt).toContain('#2 B');
+  });
+
+  it('PR 查不到时只保留靠 PR 得出的提示：依赖重开了照样清掉', async () => {
+    const dep = await add('前置');
+    const seq = await add('后续', { dependsOn: String(dep), links: ['pr=corp/internal#7'] });
+    await set(dep, { fields: { state: 'done' } });
+    await service.sweepHints(Date.now());
+    expect(item(seq).hint).toMatchObject({ kind: 'advance', key: `advance:deps:${dep}` });
+    await set(dep, { fields: { state: 'active' } });
+    await service.sweepHints(Date.now());
+    expect(item(seq).hint).toBeUndefined();
+  });
+
+  it('改关闭条件 / 依赖：原来的提示立刻清掉（不算收起），按新条件重算', async () => {
+    const seq = await add('修登录', { links: ['pr=o/r#1'] });
+    prStates.set('o/r#1', 'merged');
+    await service.sweepHints(Date.now());
+    const res = await set(seq, { closeWhen: 'pr:o/r#2 merged' });
+    expect(res.item).not.toHaveProperty('hint');
+    prStates.set('o/r#2', 'open');
+    await service.sweepHints(Date.now());
+    expect(item(seq).hint).toBeUndefined();
+    // 换回原来的条件：原提示没被收起，照样回来。
+    await set(seq, { closeWhen: 'auto' });
+    await service.sweepHints(Date.now());
+    expect(item(seq).hint).toMatchObject({ key: 'close:pr:o/r#1' });
+  });
+
+  it('PR 超过一轮的查询上限：轮转着查，排在后面的 PR 合入后几轮内也出提示', async () => {
+    const seqs: number[] = [];
+    for (let i = 1; i <= 45; i++) seqs.push(await add(`事项 ${i}`, { links: [`pr=o/r#${i}`] }));
+    for (let i = 1; i <= 45; i++) prStates.set(`o/r#${i}`, 'open');
+    prStates.set('o/r#45', 'merged');
+    for (let round = 0; round < 3 && !item(seqs[44]!).hint; round++) await service.sweepHints(Date.now());
+    expect(item(seqs[44]!).hint).toMatchObject({ kind: 'close', key: 'close:pr:o/r#45' });
   });
 
   it('开关关着 / 管家没选群：不跑；关掉后已有的提示不往外带', async () => {
@@ -381,6 +458,9 @@ describe('解析', () => {
     expect(parseNextCheckSpec('+1w', 0)).toBe(7 * 24 * HOUR);
     expect(parseNextCheckSpec('none', 0)).toBeNull();
     expect(parseNextCheckSpec('2026-11-10T09:30Z', 0)).toBe(Date.parse('2026-11-10T09:30Z'));
+    // 已经过去的时间写进去永远不会触发，拒掉。
+    expect(parseNextCheckSpec('2026-11-10T09:30Z', Date.parse('2026-11-11T00:00Z'))).toHaveProperty('error');
+    expect(parseDependsOnSpec('0')).toHaveProperty('error');
     // 不带时区的时间不收：daemon 和管家可能不在同一时区。
     expect(parseNextCheckSpec('2026-11-10T09:30', 0)).toHaveProperty('error');
     expect(parseNextCheckSpec('2026-11-10', 0)).toHaveProperty('error');
@@ -393,6 +473,8 @@ describe('解析', () => {
     expect(parseBoardArgs(['set', '5', '--next-check', 'none'])).toMatchObject({ ok: true });
     expect(parseBoardArgs(['add', 't', '--no-chat', 'x', '--dismiss-hint'])).toMatchObject({ ok: false });
     expect(parseBoardArgs(['list', '--dismiss-hint'])).toMatchObject({ ok: false });
+    // Riff 沙箱里的管家走宿主工具网关：新参数（通知里叫它跑的 --dismiss-hint）要放行。
+    expect(() => riffHostFileArguments(['board', 'set', '5', '--dismiss-hint', '--close-when', 'manual', '--depends-on', '1,2', '--next-check', '+2d'])).not.toThrow();
   });
 
   it('evaluateHints：已结束的项不给提示；依赖里有不存在的编号不下结论', () => {
@@ -462,6 +544,42 @@ describe('PR 状态查询', () => {
     expect(calls).toHaveLength(3);
     expect(await lookup('o/r#404')).toBeUndefined();
     expect(await lookup('not a ref')).toBeUndefined();
+  });
+
+  it('关掉的 PR 不是终态：重开再合入后照样查到；查不到的隔一阵再试', async () => {
+    let now = 0;
+    const { impl, calls } = fakeFetch([
+      { status: 200, body: { state: 'closed', merged: false } },
+      { status: 200, body: { state: 'open', merged: false } },
+      { status: 200, body: { state: 'closed', merged: true } },
+      { status: 404 },
+      { status: 200, body: { state: 'open' } },
+    ]);
+    const lookup = createPrStateLookup({ fetchImpl: impl, now: () => now, authHeaders: () => ({ Authorization: 'Bearer t' }) });
+    expect(await lookup('o/r#9')).toBe('closed');
+    now += OPEN_RECHECK_MS;
+    expect(await lookup('o/r#9')).toBe('open');
+    now += OPEN_RECHECK_MS;
+    expect(await lookup('o/r#9')).toBe('merged');
+    expect(await lookup('o/r#404')).toBeUndefined();
+    expect(await lookup('o/r#404')).toBeUndefined();
+    expect(calls).toHaveLength(4);
+    now += OPEN_RECHECK_MS;
+    expect(await lookup('o/r#404')).toBe('open');
+  });
+
+  it('二级频控（403 + retry-after）也暂停请求', async () => {
+    let now = 5_000_000;
+    const { impl, calls } = fakeFetch([
+      { status: 403, headers: { 'x-ratelimit-remaining': '4000', 'retry-after': '60' } },
+      { status: 200, body: { state: 'open' } },
+    ]);
+    const lookup = createPrStateLookup({ fetchImpl: impl, now: () => now, authHeaders: () => ({ Authorization: 'Bearer t' }) });
+    expect(await lookup('o/r#1')).toBeUndefined();
+    expect(await lookup('o/r#2')).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    now += 61_000;
+    expect(await lookup('o/r#2')).toBe('open');
   });
 
   it('没有环境 token 时用 gh 的 token；频控后到重置时间前不再请求', async () => {

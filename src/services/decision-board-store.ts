@@ -40,6 +40,7 @@ import {
 import {
   appendKey,
   closePrRefs,
+  hintRestsOnPrs,
   closeWhenFromJson,
   dependsOnFromJson,
   evaluateHints,
@@ -741,10 +742,12 @@ export class DecisionBoardStore {
       // 关闭条件 / 依赖 / 复查时间：不算待拍板内容（不升 rev），改了记一句历史。
       this.checkItemRefs(appId, seq, patch);
       const trackEdits: string[] = [];
+      let conditionChanged = false;
       if (patch.closeWhen !== undefined) {
         const value = patch.closeWhen ? JSON.stringify(patch.closeWhen) : null;
         if (value !== (row.close_when ?? null)) {
           set('close_when', value);
+          conditionChanged = true;
           trackEdits.push(`关闭条件：${patch.closeWhen ? formatCloseWhen(patch.closeWhen) : '默认（挂的 PR 全部合入）'}`);
         }
       }
@@ -752,6 +755,7 @@ export class DecisionBoardStore {
         const value = patch.dependsOn.length ? JSON.stringify(patch.dependsOn) : null;
         if (value !== (row.depends_on ?? null)) {
           set('depends_on', value);
+          conditionChanged = true;
           trackEdits.push(`依赖：${patch.dependsOn.length ? patch.dependsOn.map(n => `#${n}`).join('、') : '无'}`);
         }
       }
@@ -786,6 +790,9 @@ export class DecisionBoardStore {
         if (dismissed && patch.dismissHint) {
           this.insertEvent(appId, seq, now, 'steward', actorRef, 'hint', `收起提示：${hintEventText(dismissed, locale)}`);
         }
+      } else if (conditionChanged) {
+        // 条件换了，原来的提示不再作数：清掉（不算收起），下一轮巡检按新条件重算。
+        this.stmt('UPDATE board_items SET hint_json = NULL WHERE app_id = ? AND seq = ?').run(appId, seq);
       } else if (sets.length || trackEdits.length) {
         this.clearStaleHint(appId, seq);
       }
@@ -860,8 +867,11 @@ export class DecisionBoardStore {
         if (isEndedState(item.state)) {
           next = undefined;
         } else {
-          const evaluation = evaluateHints(item, this.links(appId, item.seq), full);
-          if (!(evaluation.unknown && current)) {
+          const links = this.links(appId, item.seq);
+          const evaluation = evaluateHints(item, links, full);
+          // PR 这轮查不到：只保留靠这些 PR 得出的现有提示；其余照常重算（依赖重开了、条件改了就清掉）。
+          const keep = evaluation.unknown && !!current && hintRestsOnPrs(current.key, closePrRefs(item, links));
+          if (!keep) {
             const pick = pickHint(evaluation, keyListFromJson(row.hint_dismissed));
             if (!pick) next = undefined;
             else if (current?.key !== pick.key) next = { ...pick, at: now };

@@ -32774,7 +32774,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onBoardTurnDeliveryFailed(ds, context) {
       if (ds.larkAppId !== cfg.larkAppId) return;
       try {
-        decisionBoard.noteDeliveryFailure(context.turnId, context.reason);
+        decisionBoard.noteDeliveryFailure(context.turnId, context.reason, context.messageKey);
       } catch (err) {
         logger.warn(`[decision-board] noteDeliveryFailure failed: ${err instanceof Error ? err.message : String(err)}`);
       }

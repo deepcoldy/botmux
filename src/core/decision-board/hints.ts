@@ -62,7 +62,8 @@ export function parseDependsOnSpec(raw: string): number[] | { error: string } {
     const m = /^#?(\d{1,9})$/.exec(part);
     if (!m) return { error: `--depends-on 要写事项编号（如 66,70），不认识：${part}` };
     const seq = Number(m[1]);
-    if (seq > 0 && !out.includes(seq)) out.push(seq);
+    if (seq <= 0) return { error: `--depends-on 的编号从 1 开始：${part}` };
+    if (!out.includes(seq)) out.push(seq);
   }
   if (out.length > 32) return { error: '--depends-on 最多 32 项' };
   return out;
@@ -95,7 +96,8 @@ export function parseNextCheckSpec(raw: string, now: number): number | null | { 
   }
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i.test(value)) {
     const at = Date.parse(value);
-    if (Number.isFinite(at)) return at;
+    // 已经过去的时间写进去永远不会触发（写入本身就把 updated_at 推到了它后面），当成写错拒掉。
+    if (Number.isFinite(at)) return at > now ? at : { error: `--next-check 要晚于现在：${raw}` };
   }
   return { error: `--next-check 写相对时间（+2h、+3d）或带时区的时间（2026-11-10T09:30+08:00），none 清空：${raw}` };
 }
@@ -212,6 +214,16 @@ export function evaluateHints(
   }
 
   return { candidates: [...close, ...advance, ...stale], unknown };
+}
+
+/**
+ * 这条提示是不是只靠 PR 状态得出的、且用到的 PR 仍是这一项现在判断关闭要看的那些。PR 这轮查不到时，
+ * 只有这类提示可以原样保留；靠依赖、事项条件、复查时间得出的，或 PR 已经换掉的，照常重算。
+ */
+export function hintRestsOnPrs(key: string, refs: readonly string[]): boolean {
+  const m = /^(?:close:pr|advance:pr-closed):(.+)$/.exec(key);
+  if (!m) return false;
+  return m[1]!.split(',').every(ref => refs.includes(ref));
 }
 
 /** 跳过管家收起过的提示，取优先级最高的那个。 */
