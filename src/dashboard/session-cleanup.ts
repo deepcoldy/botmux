@@ -11,9 +11,11 @@ export function idleCleanupHoursLabel(hours: IdleCleanupHours): string {
 export interface IdleCleanupSessionRow {
   sessionId: string;
   status?: string;
-  /** Backlog-pool row: its prompt is parked in queuedPrompt and no CLI has ever
+  /** Parked backlog row: its prompt sits in queuedPrompt and no CLI has ever
    *  started for it. Dashboard rows project these as status 'idle', so the
-   *  queue flag is the only signal that keeps a parked draft out of sweeps. */
+   *  queue flag is what keeps a parked draft out of sweeps. A queued activation
+   *  already in flight (queued cleared, queuedActivationPending set) is not
+   *  signalled here — narrow known boundary, see docs/manual-idle-cleanup.md. */
   queued?: unknown;
   lastMessageAt?: unknown;
   pendingRepo?: unknown;
@@ -54,9 +56,12 @@ export function isIdleCleanupCandidate(
 ): boolean {
   if (!row.sessionId) return false;
   if (row.status !== 'idle') return false;
-  // Backlog drafts are projected as 'idle' by dashboard-rows; they carry an
-  // unstarted queuedPrompt, so never let any threshold (including 0 = no age
-  // filter) sweep them.
+  // Parked (never-activated) backlog drafts are projected as 'idle' by
+  // dashboard-rows: their queuedPrompt is still parked, so every threshold
+  // (including 0 = no age filter) skips rows still carrying the queued flag.
+  // Rows whose queued activation is already in flight (queued cleared,
+  // queuedActivationPending set) are not signalled here — narrow known
+  // boundary, see docs/manual-idle-cleanup.md.
   if (row.queued) return false;
   if (row.locked) return false;
   if (row.pendingRepo || row.tuiPromptActive || row.agentAttention) return false;

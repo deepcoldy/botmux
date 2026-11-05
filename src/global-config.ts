@@ -803,9 +803,11 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
 
 /** Parse `sessionCleanup` from config. Whitelist known keys; drop invalid
  *  values so a hand-edited config degrades to defaults rather than crashing.
- *  `olderThanHours` accepts only the three supported thresholds (same set as the
- *  manual button); `intervalMinutes` is clamped to a 5-minute floor. The tick
- *  (dashboard/auto-cleanup.ts) layers defaults over whatever survives here. */
+ *  `olderThanHours` accepts only the three scheduled-sweep thresholds
+ *  24 / 72 / 168 — deliberately NOT the manual button's full set (which also
+ *  offers 1 and 0 = all); `intervalMinutes` is clamped to a 5-minute floor. The
+ *  tick (dashboard/auto-cleanup.ts) layers defaults over whatever survives
+ *  here. */
 function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const value = raw as Record<string, unknown>;
