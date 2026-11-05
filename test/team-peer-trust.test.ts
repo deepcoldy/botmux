@@ -1,5 +1,5 @@
 /**
- * Team-peer trust: isTeamGroupChat (trust root) + isTrustedTeamBotSender (the
+ * Team-peer trust: isLegacyTeamGroupChat (trust root) + isTrustedTeamBotSender (the
  * foreign-bot gate predicate that lets teammates collaborate without /grant).
  * Run: pnpm vitest run test/team-peer-trust.test.ts
  */
@@ -13,20 +13,21 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   return { Client: FakeClient };
 });
 
-import { recordTeamGroup, isTeamGroupChat } from '../src/services/team-groups-store.js';
+import { recordTeamGroup } from '../src/services/team-groups-store.js';
+import { isLegacyTeamGroupChat } from '../src/services/platform-team-store.js';
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 import { isTrustedTeamBotSender } from '../src/im/lark/event-dispatcher.js';
 
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-teampeer-')); });
 
-describe('isTeamGroupChat', () => {
+describe('isLegacyTeamGroupChat', () => {
   it('recognises a recorded 拉群 group of any team', () => {
-    expect(isTeamGroupChat(dataDir, 'oc_team')).toBe(false);
+    expect(isLegacyTeamGroupChat(dataDir, 'oc_team')).toBe(false);
     recordTeamGroup(dataDir, 'team1', 'oc_team');
-    expect(isTeamGroupChat(dataDir, 'oc_team')).toBe(true);
-    expect(isTeamGroupChat(dataDir, 'oc_other')).toBe(false);
-    expect(isTeamGroupChat(dataDir, undefined)).toBe(false);
+    expect(isLegacyTeamGroupChat(dataDir, 'oc_team')).toBe(true);
+    expect(isLegacyTeamGroupChat(dataDir, 'oc_other')).toBe(false);
+    expect(isLegacyTeamGroupChat(dataDir, undefined)).toBe(false);
   });
 });
 

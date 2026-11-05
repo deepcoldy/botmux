@@ -1623,7 +1623,8 @@ function isConfiguredOnThisMachine(appId: string): boolean {
 
 /**
  * 平台团队 bot 信任（talk + operate 的平台 roster 腿）：发送方 union_id 在平台 roster 里，
- * 且与接收 bot `larkAppId` 同属一个团队，或发送方就配置在本机（同机不同团队照样免授权）。
+ * 且与接收 bot `larkAppId` 同属一个团队，或发送方就配置在本机 bots.json（同机不同团队照样免授权；
+ * 同机腿不校验 owner、不看 trustSameOwnerBots，与收窄前一致——按 owner 区分的是兄弟 bot 腿）。
  * 只认飞书盖章的 bot 发送方 union（调用方契约同 teamBot 腿）。
  */
 export function isPlatformTeamBotTrustedForReceiver(

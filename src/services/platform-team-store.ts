@@ -194,7 +194,9 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
  *     (same anchor as {@link isPlatformTeamMember} for people).
  *  2. SAME MACHINE — the sender's roster `appId` is configured on this machine
  *     (`isLocalApp`, i.e. in this deployment's bots.json), whatever its team.
- *     Bots one owner runs side by side keep collaborating grant-free.
+ *     No owner check and `trustSameOwnerBots` does not apply here (unchanged
+ *     from before this leg was narrowed): any bot in this bots.json counts.
+ *     The owner-scoped sibling leg is isTrustedSameOwnerSiblingBot.
  *
  * What it no longer accepts: a bot on ANOTHER machine whose only link is that
  * this machine's owner is also in the sender's team. The roster is pushed per

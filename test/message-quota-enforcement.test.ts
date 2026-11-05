@@ -93,7 +93,6 @@ vi.mock('../src/services/team-groups-store.js', async () => {
   return {
     ...actual,
     listTeamGroups: (_dataDir: string, teamId?: string) => bindings.filter(b => teamId === undefined || b.teamId === teamId),
-    isTeamGroupChat: (_dataDir: string, chatId?: string) => chatId === 'oc_team_group',
   };
 });
 
