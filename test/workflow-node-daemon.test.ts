@@ -19,6 +19,11 @@ import type { WorkflowNodeSessionMarker } from '../src/types.js';
 import { readDispatchRegistryLoose, revokeWorkflowHandoff } from '../src/core/workflow-handoff-binding.js';
 import { authorizeRun } from './helpers/workflow-identity-world.js';
 
+/** Background work (notices behind a file lock, retries) finishes when it
+ *  finishes on a loaded runner: wait for what a test expects to happen
+ *  instead of sleeping a fixed time. */
+const eventually = (assertion: () => void) => vi.waitFor(assertion, { timeout: 10_000, interval: 10 });
+
 afterEach(() => cleanupBotRuns());
 
 const BINDING = { larkAppId: MAIN, chatId: CHAT, chatType: 'group' as const, rootMessageId: 'om_main' };
@@ -232,7 +237,6 @@ describe('workflow node daemon wiring', () => {
 });
 
 describe('workflow node daemon wiring — second review pass', () => {
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
   it('P2-a: after accepted → stalled → active, the next turn ending without a submission stalls again', async () => {
     const { run, world, marker } = await handedOff('wd2-stall-again');
@@ -242,8 +246,7 @@ describe('workflow node daemon wiring — second review pass', () => {
     target.wiring.onTurnSettled(ds, { turnId: marker.handoffMessageId, at: 2 }); // asked a human
     target.wiring.onInputCommitted(ds, { turnId: 'om_human_answer', committedAt: 3 }); // the answer
     target.wiring.onTurnSettled(ds, { turnId: 'om_human_answer', at: 4 }); // forgot to submit
-    await settle();
-    expect(target.posted.map((post) => post.body.kind)).toEqual(['accepted', 'stalled', 'active', 'stalled']);
+    await eventually(() => expect(target.posted.map((post) => post.body.kind)).toEqual(['accepted', 'stalled', 'active', 'stalled']));
   });
 
   it('P3-b: a handoff revoked before its session registered it is never accepted and its turn is stopped', async () => {
@@ -254,9 +257,8 @@ describe('workflow node daemon wiring — second review pass', () => {
     expect(target.wiring.isRevoked(marker.nonce)).toBe(true);
     target.wiring.onRegistered('sess-a', marker);
     target.wiring.onInputCommitted(target.sessions[0]!, { turnId: marker.handoffMessageId, committedAt: 1 });
-    await settle();
+    await eventually(() => expect(target.interrupted).toEqual(['sess-a:force', 'sess-a:force']));
     expect(target.posted).toEqual([]);
-    expect(target.interrupted).toEqual(['sess-a:force', 'sess-a:force']);
   });
 
   it('P3-b: the main bot answering "handoff_revoked" to the acceptance stops the turn', async () => {
@@ -266,8 +268,7 @@ describe('workflow node daemon wiring — second review pass', () => {
     });
     target.sessions.push(fakeSession('sess-a', marker));
     target.wiring.onRegistered('sess-a', marker);
-    await settle();
-    expect(target.interrupted).toEqual(['sess-a:force']);
+    await eventually(() => expect(target.interrupted).toEqual(['sess-a:force']));
   });
 
   it('M5: the target\'s stop route accepts the (always revoked) binding of a remote stop', async () => {
@@ -296,8 +297,7 @@ describe('workflow node daemon wiring — second review pass', () => {
     );
     expect(staged.status).toBe(202);
     online = true; // the main bot was only missed for a moment
-    await settle();
-    expect(target.posted.map((post) => [post.path, post.body.kind])).toEqual([['/api/workflow/handoff-event', 'wake']]);
+    await eventually(() => expect(target.posted.map((post) => [post.path, post.body.kind])).toEqual([['/api/workflow/handoff-event', 'wake']]));
   });
 
   it('P3-c: before its id is linked, a handoff counts only when the sender is proven to be the main bot', async () => {
@@ -407,13 +407,12 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({ workingDirs: [d.lab] }) });
     const decision = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
     if (decision.start) throw new Error('expected a refusal');
-    // The refusal notice is sent by the fire-and-forget refuse chain (registry
-    // write behind a file lock first); wait for the post, not a fixed sleep.
-    await vi.waitFor(() => expect(target.posted).toEqual([{
+    await eventually(() => expect(target.posted).toHaveLength(1));
+    expect(target.posted).toEqual([{
       port: 4100,
       path: '/api/workflow/handoff-event',
       body: { kind: 'refused', nonce: nonceOf(attempt), dispatchRoot: attempt.handoffMessageId, reason: decision.reason },
-    }]), { timeout: 5_000, interval: 5 });
+    }]);
     const drives: string[] = [];
     const main = daemon(MAIN, world.dataDir, run.base, run, { drive: (runId) => { drives.push(runId); } });
     expect(await main.wiring.eventRoute(target.posted[0]!.body)).toMatchObject({ status: 200, body: { outcome: 'blocked' } });
@@ -437,10 +436,8 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
       },
     });
     expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toMatchObject({ start: false });
-    // Two notices (first fails, then the retry after the timer) are driven by
-    // the fire-and-forget refuse chain; wait for the second call, not a sleep.
-    await vi.waitFor(() => expect(calls).toBe(2), { timeout: 5_000, interval: 5 });
-    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
+    await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
+    expect(calls).toBe(2);
   });
 
   it('when the notice never arrives the node still blocks at the acceptance deadline, keeping the directory reason', async () => {
@@ -454,13 +451,9 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     });
     const decision = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
     if (decision.start) throw new Error('expected a refusal');
-    // The warning is emitted by the fire-and-forget refusal chain (registry
-    // write behind a file lock, then two failed IPC notices separated by a
-    // retry timer). A fixed 20 ms sleep races a slow CI filesystem; wait for
-    // the observable outcome instead.
-    await vi.waitFor(() => expect(warnings.join('\n')).toContain(decision.reason), { timeout: 5_000, interval: 5 });
+    // Both sends fail (the second after the retry delay), then it gives up.
+    await eventually(() => expect(warnings.join('\n')).toContain(decision.reason));
     expect(run.of('nodeBlocked')).toEqual([]);
-    expect(warnings.join('\n')).toContain(decision.reason);
     run.clock.t = run.openAttempt('write').acceptDeadlineAt! + 1;
     await run.drive(world.executor, { opts: { chatBinding: BINDING } });
     const [blocked] = run.of('nodeBlocked');
@@ -482,8 +475,7 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     const other = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a', d.lab);
     expect(other).toMatchObject({ start: false });
     expect((other as { reason: string }).reason).toContain('节点话题里已有会话，工作目录与指定的不一致');
-    // The refusal notice is fire-and-forget; wait for the post, not a sleep.
-    await vi.waitFor(() => expect(target.posted.map((post) => post.body.kind)).toEqual(['refused']), { timeout: 5_000, interval: 5 });
+    await eventually(() => expect(target.posted.map((post) => post.body.kind)).toEqual(['refused']));
     // Without a pinned directory an existing session is used as before.
     const plainRun = await handedOffPinned('wdd-existing-plain', undefined);
     const plain = daemon('cli_a', plainRun.world.dataDir, plainRun.run.base, plainRun.run);
@@ -522,16 +514,15 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
         deliverSelfTurn: async (input) => { delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) }); return { sessionId: 'self-session' }; },
       });
       await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
-      await settle();
       if (expectStarted) {
-        expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]);
+        await eventually(() => expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]));
         expect(posted).toEqual(['node card', 'handoff card']);
         expect(run.of('nodeBlocked')).toEqual([]);
       } else {
+        await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
         expect(delivered).toEqual([]);
         // Decided before the cards: no task card is left in the topic.
         expect(posted).toEqual([]);
-        expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
       }
     }
   });
@@ -594,15 +585,14 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
         },
       });
       await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
-      await settle();
       if (expectBlocked) {
-        expect(delivered).toEqual([]);
-        expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
+        await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
           errorCode: 'WORKING_DIR_REFUSED',
           message: expect.stringContaining('节点话题里已有会话'),
-        })]);
+        })]));
+        expect(delivered).toEqual([]);
       } else {
-        expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]);
+        await eventually(() => expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]));
         expect(run.of('nodeBlocked')).toEqual([]);
       }
     }
@@ -627,9 +617,8 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
       },
     });
     await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
-    await settle();
+    await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
     expect(delivered).toEqual([]);
-    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
   });
 
   it('the main bot\'s own node: a principal-lane session stored under a virtual anchor is not reused by the turn and must not be blocked (its rootMessageId happens to be the node card)', async () => {
@@ -657,8 +646,7 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
       },
     });
     await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
-    await settle();
-    expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]);
+    await eventually(() => expect(delivered).toEqual([{ workingDir: realpathSync(d.project) }]));
     expect(run.of('nodeBlocked')).toEqual([]);
   });
 
@@ -689,11 +677,10 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
       },
     });
     await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
-    await settle();
-    expect(delivered).toEqual([]);
-    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
+    await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
       errorCode: 'WORKING_DIR_REFUSED',
       message: expect.stringContaining('节点话题里已有会话'),
-    })]);
+    })]));
+    expect(delivered).toEqual([]);
   });
 });
