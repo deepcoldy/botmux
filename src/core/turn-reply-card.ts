@@ -9,7 +9,9 @@ import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
-import { localeForBot } from '../i18n/index.js';
+import { localeForBot, t as tr } from '../i18n/index.js';
+import { isLarkContentAuditError } from '../im/lark/content-audit.js';
+import { sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { logger } from '../utils/logger.js';
 import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
 import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '../im/lark/client.js';
@@ -158,8 +160,14 @@ export async function updateTurnReplyCard(
       return messageId;
     },
     patch: async (messageId, card) => {
-      await patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, card, sessionAnchorId(ds),
-        groupContextAuthorOrigin, beforeEffect);
+      // 统一卡片的最终回复是 PATCH 进已有卡片：被内容安全审计拒收时同样打码重发一次。
+      await sendWithContentAuditRedaction({
+        content: card, msgType: 'interactive',
+        send: body => patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, body, sessionAnchorId(ds),
+          groupContextAuthorOrigin, beforeEffect),
+        note: tr('worker.final_output_content_audit_redacted_note', undefined, localeForBot(ds.larkAppId)),
+        log: line => logger.warn(`[reply-card] ${event.kind} patch ${line} (turn ${turnId.substring(0, 8)})`),
+      });
       acknowledged.set(messageId, 'primary');
     },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
@@ -212,7 +220,9 @@ export async function updateTurnReplyCard(
     catch (error) {
       publication({ status: 'unavailable', reason: 'delivery_unknown' },
         acknowledged.size ? 'partial' : 'unknown', 'delivery_unknown');
-      if (attempt >= 2 || error instanceof MessageWithdrawnError || store.read(key)?.withdrawn) throw error;
+      // 内容安全审计拒收是确定性的（打码重发已在 transport 里做过一次），原样重试无用。
+      if (attempt >= 2 || error instanceof MessageWithdrawnError || isLarkContentAuditError(error)
+        || store.read(key)?.withdrawn) throw error;
       await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 800 : 2000));
       beforeEffect();
     }
