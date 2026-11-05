@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const { dataDir } = vi.hoisted(() => {
@@ -25,6 +25,17 @@ describe('group secretary store without a registration file', () => {
     expect(store.isGroupSecretaryChat('cli_a', 'oc_1')).toBe(false);
     vi.setSystemTime(1_002_000);
     expect(store.isGroupSecretaryChat('cli_a', 'oc_1')).toBe(true);
+  });
+
+  it('a write re-reads the disk, so a file another daemon just created is not clobbered', () => {
+    vi.useFakeTimers({ now: 3_000_000 });
+    const path = join(dataDir, 'group-secretary.json');
+    rmSync(path, { force: true });
+    store.resetGroupSecretaryStoreCache();
+    expect(store.isGroupSecretaryChat('cli_a', 'oc_1')).toBe(false); // caches "absent"
+    writeFileSync(path, JSON.stringify({ version: 2, chats: { oc_other: { larkAppId: 'cli_b', enabledBy: 'ou_x', enabledAt: 1 } } }));
+    expect(store.setGroupSecretaryChat('oc_1', { larkAppId: 'cli_a', enabledBy: 'ou_x', enabledAt: 2 })).toEqual({ ok: true });
+    expect(Object.keys(JSON.parse(readFileSync(path, 'utf-8')).chats).sort()).toEqual(['oc_1', 'oc_other']);
   });
 
   it('a write by this process is visible immediately', () => {

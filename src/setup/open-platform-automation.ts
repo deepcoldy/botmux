@@ -2381,8 +2381,6 @@ async function defaultAppIcon(): Promise<Uint8Array> {
   }
 }
 
-/** The custom/test icon override, read off disk. Fails with the path in the message
- *  so a caller that passed a bad path can see which one. */
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 /** 上传时按 image/png 提交：不是 PNG 的文件在本地就拒绝，别等开放平台接口报一个看不懂的错。 */
@@ -2393,6 +2391,8 @@ export function assertPngIcon(data: Buffer, iconFilePath: string): Buffer {
   return data;
 }
 
+/** The custom/test icon override, read off disk. Fails with the path in the message
+ *  so a caller that passed a bad path can see which one. */
 function readIconFile(iconFilePath: string) {
   if (!existsSync(iconFilePath)) throw new Error(`找不到指定的应用图标: ${iconFilePath}`);
   return assertPngIcon(readFileSync(iconFilePath), iconFilePath);

@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, isHeldPendingMark, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -2103,6 +2103,14 @@ describe('input held in Claude\'s own queue', () => {
     q.ingest([{ type: 'system', subtype: 'turn_duration', uuid: 'd-running' } as TranscriptEvent]);
     expect(q.pruneExpired(TTL, markAt + 300_000 + TTL)).toEqual([]);
     expect(q.pruneExpired(TTL, markAt + 300_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('a busy-held mark uses the rare fallback-scan cadence', () => {
+    const q = busyWith();
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    expect(isHeldPendingMark(q.peek().find(t => t.turnId === 't1')!)).toBe(false);
+    q.pruneExpired(TTL, markAt + 1_000);
+    expect(isHeldPendingMark(q.peek().find(t => t.turnId === 't1')!)).toBe(true);
   });
 
   it('bounds the busy hold, so a lost input cannot stay pending for good', () => {

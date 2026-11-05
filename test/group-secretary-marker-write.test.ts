@@ -18,7 +18,7 @@ describe('writeSecretaryMarker conditional write', () => {
 
   it('does not overwrite a marker another machine wrote in the meantime', async () => {
     description = '项目群\n[botmux:secretary=cli_remote]';
-    expect(await writeSecretaryMarker('cli_me', 'oc_1', 'cli_me', { expect: null })).toEqual({ ok: false, reason: 'marker_changed' });
+    expect(await writeSecretaryMarker('cli_me', 'oc_1', 'cli_me', { expect: null })).toEqual({ ok: false, reason: 'marker_changed', previous: 'cli_remote' });
     expect(update).not.toHaveBeenCalled();
     expect(description).toBe('项目群\n[botmux:secretary=cli_remote]');
   });

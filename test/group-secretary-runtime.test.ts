@@ -333,15 +333,20 @@ describe('group secretary runtime — group marker and federation', () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     let marker: string | undefined;
     // The remote takeover lands between our read and our conditional write.
-    const writeMarker = vi.fn(async () => { marker = 'cli_remote'; return { ok: false, reason: 'marker_changed' }; });
+    const writeMarker = vi.fn(async () => { marker = 'cli_remote'; return { ok: false, reason: 'marker_changed', previous: 'cli_remote' }; });
+    const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       readMarker: async () => marker, writeMarker: writeMarker as any,
-      deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
+      deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
     });
+    rt.observeMessageEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_tk', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '有人吗' }), mentions: [] } });
+    clock += 30_000;
     await rt.tick();
     expect(writeMarker).toHaveBeenCalledWith(CHAT, APP, { expect: null });
     expect(getGroupSecretaryChat(APP, CHAT)?.markerConfirmedAt).toBeUndefined();
+    expect(deliver).not.toHaveBeenCalled(); // the takeover is honoured in the same tick
     await rt.tick(); // re-read right away, not a full refresh interval later
     expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
     expect(writeMarker).toHaveBeenCalledTimes(1);

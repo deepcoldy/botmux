@@ -126,6 +126,9 @@ export function setGroupSecretaryChat(
   chatId: string,
   entry: GroupSecretaryChatEntry | null,
 ): { ok: true } | { ok: false; reason: string } {
+  // 写之前必须真的回读一次磁盘：「文件不存在」的短缓存期间别的 daemon 可能刚建了文件，
+  // 拿缓存的空登记写回会把对方的群抹掉。
+  cache = undefined;
   const current = load();
   const next: GroupSecretaryFile = { version: 2, chats: { ...current.chats } };
   if (entry) next.chats[chatId] = entry;

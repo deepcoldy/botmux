@@ -21,7 +21,7 @@ export interface GroupSecretaryRuntimeDeps {
   readMarker?: (chatId: string) => Promise<string | undefined>;
   /** appId 为 null 表示清除标记。 */
   /** `expect`：条件写，写前回读到的标记必须仍是这个值（null = 没有标记），否则不写，返回 marker_changed。 */
-  writeMarker?: (chatId: string, appId: string | null, opts?: { expect?: string | null }) => Promise<{ ok: boolean; reason?: string }>;
+  writeMarker?: (chatId: string, appId: string | null, opts?: { expect?: string | null }) => Promise<{ ok: boolean; reason?: string; previous?: string }>;
   /** 读 / 写标记的单次超时（飞书接口挂住时不拖死整个秘书循环）。 */
   markerTimeoutMs?: number;
   markerRefreshMs?: number;
@@ -219,7 +219,9 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
             setGroupSecretaryChat(chatId, { ...current!, markerConfirmedAt: now() });
             deps.log('info', `[group-secretary] wrote marker for legacy registration chat=${chatId.slice(0, 12)}`);
           } else if (wrote.reason === 'marker_changed') {
-            // 补写前别的 bot 已写入标记：不覆盖，下次刷新按新标记处理（指向别人就停手）。
+            // 补写前别的 bot 已写入标记：不覆盖。本拍就按新标记处理（指向别人立即停止投递），
+            // 下一拍重读后清掉本机登记。
+            markers.set(chatId, wrote.previous);
             markerReadAt.delete(chatId);
             deps.log('info', `[group-secretary] marker appeared during migration chat=${chatId.slice(0, 12)}; not overwritten`);
           } else {

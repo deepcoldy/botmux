@@ -40,7 +40,7 @@ export async function readSecretaryMarker(app: string, chat: string): Promise<st
   return parseSecretaryMarker(await readChatDescription(app, chat)).appId;
 }
 
-export type MarkerWriteResult = { ok: true; previous?: string } | { ok: false; reason: string };
+export type MarkerWriteResult = { ok: true; previous?: string } | { ok: false; reason: string; previous?: string };
 
 /** 把群秘书标记设为 appId（null = 清除）。
  *  传 `expect` 时是条件写：写前回读到的标记必须仍是调用方之前读到的那个（null = 没有标记），
@@ -53,7 +53,7 @@ export async function writeSecretaryMarker(
     const current = await readChatDescription(app, chat);
     const previous = parseSecretaryMarker(current).appId;
     if (opts && 'expect' in opts && (previous ?? null) !== (opts.expect ?? null)) {
-      return { ok: false, reason: 'marker_changed' };
+      return { ok: false, reason: 'marker_changed', ...(previous ? { previous } : {}) };
     }
     const next = buildSecretaryDescription(current, appId);
     if (next === current) return { ok: true, ...(previous ? { previous } : {}) };
