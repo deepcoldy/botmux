@@ -786,6 +786,41 @@ describe('inherited signalling is gated by what each fact licenses', () => {
       spy.mockRestore();
     }
   });
+
+  it('never signals a claimed member whose pid equals the pinned runner identity', () => {
+    // The identity pin that makes this file deterministic also disconnected the
+    // only observable check that signalInheritedTree feeds selfPids() into the
+    // scan's excludePids: with that wiring removed, a nonce-bearing member wearing
+    // the runner's own pid would be claimed and SIGKilled — the self-signal the
+    // exclusion exists to prevent. Members wear BOTH pinned values, so dropping
+    // either one from selfPids() must fail.
+    const sessionId = 'sess-self-pids-excluded';
+    const proc = isolatedSyntheticProc('proc-self-pids-excluded');
+    const nonceEnv = 'PATH=/bin\0BOTMUX_MOJO_TREE_NONCE=nonce-self-pids\0';
+    proc.addProcess({ pid: RUNNER_PID, state: 'S', startTime: 301, environ: nonceEnv });
+    proc.addProcess({ pid: RUNNER_PPID, state: 'S', startTime: 302, environ: nonceEnv });
+    const handle = {
+      kind: 'tree-identity', sessionId, generation: 0,
+      // Recorded root absent from /proc, so env-nonce claiming is the ONLY path
+      // that can reach the two members; exclusion is the single thing protecting
+      // them (no PGID claim can happen for a root that cannot be verified).
+      rootPid: 9000, bootId: proc.bootId, startTime: 300, nonce: 'nonce-self-pids',
+    } as const;
+
+    const sent: number[] = [];
+    const spy = vi.mocked(process.kill).mockImplementation(pid => { sent.push(pid); return true; });
+    try {
+      class FakeProc extends MojoBackend {
+        protected get procRoot(): string { return proc.path; }
+      }
+      const backend = new FakeProc({ model: 'default' } as never, sessionId);
+      backend['signalInheritedTree'](handle, false);
+      // Nothing must be signalled: the only claimed members ARE the runner pair.
+      expect(sent).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 // ── helpers ──────────────────────────────────────────────────────────────────
