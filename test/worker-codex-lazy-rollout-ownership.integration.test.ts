@@ -24,6 +24,9 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 const OWN_SID = '01a17500-0000-7000-8000-00000000a363';
 const FOREIGN_SID = '01a17500-0000-7000-8000-00000000f363';
 const PROMPT = 'lazy-rollout-task';
+/** Slack for one load-dependent step; deterministic sleeps are added on top. */
+const WAIT_MS = 15_000;
+const SLOW_LAUNCH_MS = 8_000;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -44,6 +47,7 @@ async function startWorker(
   const cliPidFile = join(root, 'cli-pid');
   const probePidFile = join(root, 'probe-pid');
   const launcherPidFile = join(root, 'launcher-pid');
+  const launcherStartedFile = join(root, 'launcher-started-at');
   const attestationFile = join(root, 'attestation');
   const firstSubmitAttestationFile = join(root, 'first-submit-attestation');
   const fakeCli = join(root, 'fake-codex');
@@ -144,6 +148,8 @@ probe.on('exit', () => {
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 fs.writeFileSync(${JSON.stringify(launcherPidFile)}, String(process.pid));
+// Written after the pid so a reader never sees the clock without the pid.
+fs.writeFileSync(${JSON.stringify(launcherStartedFile)}, String(Date.now()));
 setTimeout(() => {
   const cli = spawn(${JSON.stringify(resolveNodeExecutable())}, [${JSON.stringify(fakeCli)}, ...process.argv.slice(2)], { stdio: 'inherit' });
   cli.on('exit', code => process.exit(code ?? 0));
@@ -195,7 +201,7 @@ setTimeout(() => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  const waitFor = async (what: string, condition: () => boolean, timeoutMs = 15_000) => {
+  const waitFor = async (what: string, condition: () => boolean, timeoutMs = WAIT_MS) => {
     const deadline = Date.now() + timeoutMs;
     while (!condition()) {
       if (Date.now() >= deadline || child.exitCode != null) {
@@ -219,7 +225,22 @@ setTimeout(() => {
     await waitFor('the probe ownership binding', () => logs.some(l => l.includes(`resolved real codex leaf pid ${probePid}`)));
     process.kill(probePid, 'SIGTERM');
   }
-  await waitFor('fake Codex startup', () => existsSync(loaded));
+  if (opts.startupDelayMs) {
+    // The launcher's delay is deterministic and only starts once the worker has
+    // booted and spawned it; worker cold start is not (3.7–14.7s measured with
+    // 8 files on 4 oversubscribed CPUs, against ~0.4s idle). One window from
+    // spawn charged both to the same 15s, leaving cold start ~7s where every
+    // other case gets the full window (#2793/#2808/#2809). Give cold start its
+    // own window, then measure the delay from the launcher's own clock.
+    // writeFileSync creates the file before writing it: an empty read is "not yet".
+    const readLauncherStart = () => existsSync(launcherStartedFile) ? Number(readFileSync(launcherStartedFile, 'utf8')) || 0 : 0;
+    await waitFor('the slow launcher', () => readLauncherStart() > 0);
+    const launcherStartedAt = readLauncherStart();
+    await waitFor('fake Codex startup', () => existsSync(loaded),
+      launcherStartedAt + opts.startupDelayMs + WAIT_MS - Date.now());
+  } else {
+    await waitFor('fake Codex startup', () => existsSync(loaded));
+  }
   writeFileSync(releaseStartup, 'loaded');
   // Barrier: the submit has already been settled without a proven session,
   // before any rollout exists, so the proof cannot have come from the match.
@@ -246,13 +267,16 @@ setTimeout(() => {
 
 describe('Codex history match that lands before the lazily-created rollout', () => {
   it.skipIf(process.platform !== 'linux')('attests a slow launcher child before the first input is handed to Codex', async () => {
-    const run = await startWorker(OWN_SID, { startupDelayMs: 8_000 });
+    const run = await startWorker(OWN_SID, { startupDelayMs: SLOW_LAUNCH_MS });
     expect(run.firstSubmitAttestation).toEqual({ cliPid: run.cliPid, turnId: 'om_lazy' });
     await run.waitFor('the slow-launch reply', () => run.finals().some(m => m.turnId === 'om_lazy'));
     expect(run.finals().filter(m => m.turnId === 'om_lazy')).toEqual([
       expect.objectContaining({ content: 'OWN ROLLOUT REPLY' }),
     ]);
-  }, 40_000);
+    // Cold start, the launcher's delay plus its slack, the history match and the
+    // reply each get their own window; the case must outlast all of them, or the
+    // runner's timeout fires first and hides which step was slow.
+  }, 4 * WAIT_MS + SLOW_LAUNCH_MS);
 
   it.skipIf(process.platform !== 'linux')('recovers a retired startup probe and collects both turns exactly once', async () => {
     const run = await startWorker(OWN_SID, { startupProbe: true });
