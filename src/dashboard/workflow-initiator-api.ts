@@ -56,7 +56,8 @@ export function workflowInitiatorPreGateDenial(
   identity: DashboardRequestIdentity | null,
   canManageHost: boolean,
 ): boolean {
-  if (!isWorkflowInitiatorPath(pathname) || canManageHost || identity?.kind !== 'feishu-h5') return false;
+  // The whole orchestration surface (initiator + drafts, D2) answers H5 alike.
+  if (!pathname.startsWith('/api/v3/orchestration/') || canManageHost || identity?.kind !== 'feishu-h5') return false;
   jsonRes(res, 403, { ok: false, error: 'h5_login_unsupported', retryable: false });
   return true;
 }

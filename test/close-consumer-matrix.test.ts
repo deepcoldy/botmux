@@ -187,6 +187,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'handoff is re-sent with the same keys or blocks for a human.',
     count: 2,
   },
+  'core/dashboard-ipc-server.ts::closeSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'A Dashboard workflow draft that is abandoned or deleted closes its clarify '
+      + 'headless session; nobody is waiting on that session, the wrapper logs refusal '
+      + 'and residual, and the draft is already marked so no turn can reach it again.',
+  },
   'core/failed-turn-recovery.ts::recoverFailedTurn::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Host recovery uses the native background wrapper to log refusal and '
