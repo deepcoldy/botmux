@@ -347,7 +347,8 @@ import {
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
-import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
+import { generateAuthUrl, handleCallbackUrl, isCallbackUrl, callbackOrigin } from './utils/user-token.js';
+import { renderOAuthLoopbackPage, type OAuthLoopbackOutcome } from './utils/oauth-loopback-page.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
@@ -8251,18 +8252,27 @@ const oauthCallbackServer = createServer(async (req, res) => {
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     return res.end('Not found');
   }
-  let ok = false;
-  try {
-    const message = await handleCallbackUrl(url.toString());
-    ok = typeof message === 'string' && message.startsWith('✅');
-  } catch (error) {
-    logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`);
+  // A callback whose login this process never started belongs to another
+  // BotMux (the issuing daemon). Do not consume it here; tell the person where
+  // to send it.
+  let outcome: OAuthLoopbackOutcome = 'failed';
+  const origin = callbackOrigin(url.toString());
+  if (origin === 'unknown') {
+    outcome = 'foreign';
+  } else if (origin === 'own') {
+    try {
+      const message = await handleCallbackUrl(url.toString());
+      if (typeof message === 'string' && message.startsWith('✅')) outcome = 'ok';
+    } catch (error) {
+      logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`);
+    }
   }
-  res.writeHead(ok ? 200 : 400, {
+  const page = renderOAuthLoopbackPage(outcome, url.toString());
+  res.writeHead(page.status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
   });
-  return res.end(`<!doctype html><meta charset="utf-8"><title>${ok ? '授权成功' : '授权失败'}</title><style>body{font-family:system-ui,sans-serif;max-width:560px;margin:80px auto;padding:24px;color:#111827}h1{font-size:28px}</style><h1>${ok ? '授权成功' : '授权失败'}</h1><p>${ok ? 'BotMux 已完成授权。你可以关闭此页面并返回 Dashboard。' : '授权链接无效或已过期。请返回 Dashboard 后重新发起授权。'}</p>`);
+  return res.end(page.html);
 });
 
 oauthCallbackServer.on('error', error => {

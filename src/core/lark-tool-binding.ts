@@ -159,6 +159,33 @@ export function isLarkToolBound(
   return botConfig?.larkToolBinding !== false && hasLarkToolBinding(dataDir, sessionId);
 }
 
+/**
+ * Which lark-cli identity a session's `/login` should authorize.
+ *
+ * The binding file is written when the worker spawns, but `/login` is often the
+ * very first message of a new topic — no worker yet. Keying on the file alone
+ * sent that first `/login` down the legacy device-code flow (an issuer app the
+ * person may not even be allowed to use), and the same command answered with
+ * the bot-app OAuth a message later. Before the first spawn, decide from the
+ * same session facts the worker will use (usesLarkToolBinding). A live worker
+ * without the file is a session that runs the legacy wrapper: keep it there.
+ */
+export function sessionLarkToolBound(input: {
+  botConfig: { larkToolBinding?: boolean } | undefined;
+  dataDir: string;
+  sessionId: string;
+  /** A worker process is running for this session right now. */
+  workerLive: boolean;
+  /** The facts the worker's own usesLarkToolBinding decision reads. */
+  spawnFacts: Parameters<typeof usesLarkToolBinding>[0];
+  workflow?: boolean;
+}): boolean {
+  if (input.botConfig?.larkToolBinding === false) return false;
+  if (hasLarkToolBinding(input.dataDir, input.sessionId)) return true;
+  if (input.workerLive) return false;
+  return usesLarkToolBinding(input.spawnFacts, input.dataDir, input.workflow ?? false);
+}
+
 /** Bind only this session's tool. No global profile, account or user token is read. */
 export function prepareLarkToolEnv(input: {
   env: NodeJS.ProcessEnv;
