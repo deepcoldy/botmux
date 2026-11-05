@@ -45,6 +45,25 @@ describe('tmuxEnv()', () => {
     expect(stripped.LANG).toBe('en_US.UTF-8');
   });
 
+  it('strips only Trae git-attribution injection before contacting tmux', () => {
+    const stripped = tmuxEnv({
+      PATH: '/usr/bin',
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a',
+      GIT_CONFIG_KEY_1: 'core.hooksPath',
+      GIT_CONFIG_VALUE_1: '.githooks',
+      TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+    });
+    // The Trae entry is filtered first; tmuxEnv then applies its pre-existing
+    // rule that no per-turn GIT_CONFIG slots may seed a shared tmux server.
+    expect(stripped.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(stripped.GIT_CONFIG_KEY_0).toBeUndefined();
+    expect(stripped.GIT_CONFIG_VALUE_0).toBeUndefined();
+    expect(stripped.GIT_CONFIG_KEY_1).toBeUndefined();
+    expect(stripped.TRAE_GIT_ATTRIBUTION_HELPER).toBeUndefined();
+  });
+
   it('leaves TMUX_TMPDIR alone (user override, not tmux-injected)', () => {
     const stripped = tmuxEnv({
       TMUX: '/tmp/tmux-99999/missing,12345,0',
@@ -325,6 +344,14 @@ describe('tmux subcommand with stale $TMUX', () => {
         // transcripts (CLAUDE_CODE_CHILD_SESSION → nested-child mode).
         CLAUDE_CODE_CHILD_SESSION: '1',
         CLAUDE_CODE_SESSION_ID: 'stale-claude-session',
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'user.name',
+        GIT_CONFIG_VALUE_0: 'Example User',
+        GIT_CONFIG_KEY_1: 'core.hooksPath',
+        GIT_CONFIG_VALUE_1: '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a',
+        GIT_CONFIG_PARAMETERS:
+          "'user.email=dev@example.com' 'core.hookspath=/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a'",
+        TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
         HOME: '/safe/home',
       };
       delete pollutedEnv.TMUX;
@@ -348,6 +375,12 @@ describe('tmux subcommand with stale $TMUX', () => {
         ]));
         expect(scrub.removed).not.toContain('GITHUB_TOKEN');
         expect(scrub.removed).not.toContain('GH_TOKEN');
+        expect(scrub.removed).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1', 'TRAE_GIT_ATTRIBUTION_HELPER',
+        ]));
+        expect(scrub.updated).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+        ]));
 
         const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
           env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
@@ -356,6 +389,12 @@ describe('tmux subcommand with stale $TMUX', () => {
         expect(globalEnv.stdout).toContain('HOME=/safe/home');
         expect(globalEnv.stdout).toContain('GITHUB_TOKEN=ghp_server_global');
         expect(globalEnv.stdout).toContain('GH_TOKEN=ghs_server_global');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_COUNT=1');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_KEY_0=user.name');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_VALUE_0=Example User');
+        expect(globalEnv.stdout).toContain("GIT_CONFIG_PARAMETERS='user.email=dev@example.com'");
+        expect(globalEnv.stdout).not.toContain('commit-attribution');
+        expect(globalEnv.stdout).not.toContain('TRAE_GIT_ATTRIBUTION_HELPER');
         for (const key of [
           'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID',
           'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',

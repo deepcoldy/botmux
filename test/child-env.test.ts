@@ -18,6 +18,7 @@ import {
   scrubInvokerTerminalEnv,
   scrubSessionCliHomeEnv,
   scrubSessionTurnMarkerEnv,
+  scrubTraeGitAttributionEnv,
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
   SESSION_TURN_MARKER_ENV_KEYS,
@@ -624,6 +625,119 @@ describe('scrubSessionTurnMarkerEnv()', () => {
     for (const key of Object.keys(env)) {
       expect.fail(`expected every key deleted, found ${key}`);
     }
+  });
+});
+
+describe('scrubTraeGitAttributionEnv()', () => {
+  const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/0.213.1/profile-a';
+
+  it('removes only Trae hook slots and preserves/reindexes ordinary Git config', () => {
+    const env: NodeJS.ProcessEnv = {
+      GIT_CONFIG_COUNT: '3',
+      GIT_CONFIG_KEY_0: 'user.name',
+      GIT_CONFIG_VALUE_0: 'Example User',
+      GIT_CONFIG_KEY_1: 'core.hooksPath',
+      GIT_CONFIG_VALUE_1: traeHooks,
+      GIT_CONFIG_KEY_2: 'core.hookspath',
+      GIT_CONFIG_VALUE_2: '.githooks',
+      GIT_CONFIG_KEY_7: 'stale.slot',
+      GIT_CONFIG_VALUE_7: 'must-go',
+      GIT_CONFIG_PARAMETERS:
+        `'user.email=dev@example.com' 'core.hookspath'='${traeHooks}' 'core.hooksPath=.husky'`,
+      TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+      TRAE_GIT_ATTRIBUTION_MANAGED_HOOK: '1',
+      KEEP: 'yes',
+    };
+
+    const result = scrubTraeGitAttributionEnv(env, () => {});
+
+    expect(result.warnings).toEqual([]);
+    expect(env).toMatchObject({
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'user.name',
+      GIT_CONFIG_VALUE_0: 'Example User',
+      GIT_CONFIG_KEY_1: 'core.hookspath',
+      GIT_CONFIG_VALUE_1: '.githooks',
+      GIT_CONFIG_PARAMETERS: `'user.email=dev@example.com' 'core.hooksPath=.husky'`,
+      KEEP: 'yes',
+    });
+    expect(env.GIT_CONFIG_KEY_2).toBeUndefined();
+    expect(env.GIT_CONFIG_VALUE_2).toBeUndefined();
+    expect(env.GIT_CONFIG_KEY_7).toBeUndefined();
+    expect(env.GIT_CONFIG_VALUE_7).toBeUndefined();
+    expect(env.TRAE_GIT_ATTRIBUTION_HELPER).toBeUndefined();
+    expect(env.TRAE_GIT_ATTRIBUTION_MANAGED_HOOK).toBeUndefined();
+  });
+
+  it('preserves user hooks and ordinary GIT_CONFIG_PARAMETERS byte-for-byte', () => {
+    const env: NodeJS.ProcessEnv = {
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: '.husky',
+      GIT_CONFIG_KEY_1: 'credential.helper',
+      GIT_CONFIG_VALUE_1: 'osxkeychain',
+      GIT_CONFIG_PARAMETERS: "'core.hookspath=.githooks'   'user.name=Example User'",
+    };
+    const before = { ...env };
+
+    const result = scrubTraeGitAttributionEnv(env, () => {});
+
+    expect(result.changedKeys).toEqual([]);
+    expect(result.warnings).toEqual([]);
+    expect(env).toEqual(before);
+  });
+
+  it('does not guess malformed or discontinuous numbered config', () => {
+    const malformed: NodeJS.ProcessEnv = {
+      GIT_CONFIG_COUNT: 'not-a-number',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: traeHooks,
+      TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+    };
+    const discontinuous: NodeJS.ProcessEnv = {
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: traeHooks,
+      TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+    };
+    const malformedBefore = { ...malformed };
+    const discontinuousBefore = { ...discontinuous };
+
+    const malformedResult = scrubTraeGitAttributionEnv(malformed, () => {});
+    const discontinuousResult = scrubTraeGitAttributionEnv(discontinuous, () => {});
+
+    expect(malformed).toEqual(malformedBefore);
+    expect(discontinuous).toEqual(discontinuousBefore);
+    expect(malformedResult.warnings).toHaveLength(1);
+    expect(discontinuousResult.warnings).toHaveLength(1);
+  });
+
+  it('keeps the helper contract whole when malformed parameters retain the Trae hook', () => {
+    const env: NodeJS.ProcessEnv = {
+      GIT_CONFIG_PARAMETERS:
+        `'core.hookspath=/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a`,
+      TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+      TRAE_GIT_ATTRIBUTION_MANAGED_HOOK: '1',
+    };
+
+    const result = scrubTraeGitAttributionEnv(env, () => {});
+
+    expect(result.warnings).toHaveLength(1);
+    expect(env.TRAE_GIT_ATTRIBUTION_HELPER).toBe('/old/traex');
+    expect(env.TRAE_GIT_ATTRIBUTION_MANAGED_HOOK).toBe('1');
+  });
+
+  it('redacts the leaked hook contract from direct CLI children', () => {
+    const child = redactChildEnv({
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: traeHooks,
+      TRAE_GIT_ATTRIBUTION_CONFIG_SLOT: '0',
+    });
+    expect(child.GIT_CONFIG_COUNT).toBe('0');
+    expect(child.GIT_CONFIG_KEY_0).toBeUndefined();
+    expect(child.GIT_CONFIG_VALUE_0).toBeUndefined();
+    expect(child.TRAE_GIT_ATTRIBUTION_CONFIG_SLOT).toBeUndefined();
   });
 });
 

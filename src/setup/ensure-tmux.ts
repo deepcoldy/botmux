@@ -27,6 +27,7 @@ import { detectPlatform, type PackageManager, type PlatformInfo } from './detect
 import {
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
+  scrubTraeGitAttributionEnv,
 } from '../utils/child-env.js';
 
 export interface TmuxResult {
@@ -238,8 +239,13 @@ function withTmuxSearchPath(pathValue: string | undefined): string {
 }
 
 export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const cleaned = { ...env };
+  // A tmux server snapshots its first client's environment globally. Keep a
+  // Trae-started Botmux from seeding the broken attribution hook into every
+  // later pane while preserving unrelated user Git config slots.
+  scrubTraeGitAttributionEnv(cleaned, () => {});
   const rest: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(env)) {
+  for (const [key, value] of Object.entries(cleaned)) {
     // TMUX/TMUX_PANE would re-target a dead parent server; botmux-managed keys
     // would seed the server's shared global env and leak to co-tenant sessions.
     if (key === 'TMUX' || key === 'TMUX_PANE') continue;
@@ -256,6 +262,8 @@ export interface TmuxGlobalEnvScrubResult {
   /** False means no tmux server answered (or tmux was temporarily unavailable). */
   serverFound: boolean;
   removed: string[];
+  /** Existing keys rewritten to preserve non-Trae config after filtering. */
+  updated: string[];
   failed: string[];
 }
 
@@ -280,35 +288,71 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
       env: tmuxEnv(),
     });
   } catch {
-    return { serverFound: false, removed: [], failed: [] };
+    return { serverFound: false, removed: [], updated: [], failed: [] };
   }
   if (typeof output !== 'string') {
-    return { serverFound: false, removed: [], failed: [] };
+    return { serverFound: false, removed: [], updated: [], failed: [] };
   }
 
-  const names = output.split('\n')
+  const lines = output.split('\n');
+  const names = lines
     // `show-environment -g` prints `NAME=value`, or `-NAME` for an explicitly
     // removed entry. Take the name in both shapes.
     .map(line => (line.startsWith('-') ? line.slice(1) : line.split('=', 1)[0]).trim())
     .filter(name => name.length > 0 && isBotmuxManagedTmuxServerGlobalEnvKey(name));
 
+  // Dynamic Git config cannot be classified by key alone: GIT_CONFIG_COUNT
+  // and numbered slots are legitimate user channels. Reconstruct the server
+  // table, filter only Trae's commit-attribution entry, then apply the exact
+  // key-level delta (unset removed slots, rewrite retained/reindexed slots).
+  const serverEnv: NodeJS.ProcessEnv = {};
+  for (const line of lines) {
+    if (!line || line.startsWith('-')) continue;
+    const separator = line.indexOf('=');
+    if (separator <= 0) continue;
+    serverEnv[line.slice(0, separator)] = line.slice(separator + 1);
+  }
+  const cleanedServerEnv = { ...serverEnv };
+  const gitScrub = scrubTraeGitAttributionEnv(cleanedServerEnv, () => {});
+  const gitChanges = new Map(gitScrub.changedKeys.map(key => [key, cleanedServerEnv[key]]));
+  if (gitScrub.changedKeys.length > 0) {
+    // GIT_CONFIG_{COUNT,KEY_n,VALUE_n} also belong to Botmux's per-turn
+    // identity channel, so the generic server scrub normally removes them all.
+    // Once the Trae filter has deliberately preserved/reindexed ordinary slots,
+    // promote the complete cleaned structure into the delta; otherwise an
+    // unchanged retained slot would be removed by the generic pass while its
+    // rewritten COUNT survived, leaving a discontinuous Git config contract.
+    for (const key of new Set([...Object.keys(serverEnv), ...Object.keys(cleanedServerEnv)])) {
+      if (/^GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+)$/.test(key)
+        || key.startsWith('TRAE_GIT_ATTRIBUTION_')) {
+        gitChanges.set(key, cleanedServerEnv[key]);
+      }
+    }
+  }
+
   const removed: string[] = [];
+  const updated: string[] = [];
   const failed: string[] = [];
-  for (const name of new Set(names)) {
+  for (const name of new Set([...names, ...gitChanges.keys()])) {
     try {
-      execFileSync('tmux', [...socketArgs, 'set-environment', '-g', '-u', name], {
+      const replacement = gitChanges.get(name);
+      const args = replacement === undefined
+        ? [...socketArgs, 'set-environment', '-g', '-u', name]
+        : [...socketArgs, 'set-environment', '-g', name, replacement];
+      execFileSync('tmux', args, {
         stdio: 'ignore',
         timeout: 2000,
         env: tmuxEnv(),
       });
-      removed.push(name);
+      if (replacement === undefined) removed.push(name);
+      else updated.push(name);
     } catch {
       // Keep the exact failed key observable to callers without exposing its
       // (potentially sensitive) old value in logs.
       failed.push(name);
     }
   }
-  return { serverFound: true, removed, failed };
+  return { serverFound: true, removed, updated, failed };
 }
 
 function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = process.env): void {
