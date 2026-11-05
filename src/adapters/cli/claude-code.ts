@@ -33,6 +33,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { ensureLeadOnlyPluginDir } from '../../skills/lead-only-guard.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -1311,8 +1312,16 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       const leadOnlyActive = leadOnly === true && variant.id === 'claude-code';
       // Lead-only chat manager: no self-service reading/research either. The plugin
       // PreToolUse guard additionally limits Bash to `botmux ...` and blocks MCP tools.
-      if (leadOnlyActive) disallowedTools.push('Edit', 'Write', 'NotebookEdit', 'MultiEdit', 'Read', 'Grep', 'Glob', 'Agent', 'Task', 'WebFetch', 'WebSearch');
+      let leadOnlyPluginDir: string | undefined;
+      if (leadOnlyActive) {
+        disallowedTools.push('Edit', 'Write', 'NotebookEdit', 'MultiEdit', 'Read', 'Grep', 'Glob', 'Agent', 'Task', 'WebFetch', 'WebSearch');
+        leadOnlyPluginDir = ensureLeadOnlyPluginDir(CLAUDE_PLUGIN_DIR);
+        // Guard plugin unavailable: fail closed rather than leave Bash unrestricted.
+        if (!leadOnlyPluginDir) disallowedTools.push('Bash');
+      }
       args.push('--disallowed-tools', disallowedTools.join(','));
+      // Enforcement is orthogonal to promptInjection: mount the guard plugin before the early return below.
+      if (leadOnlyPluginDir) args.push('--plugin-dir', leadOnlyPluginDir);
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.

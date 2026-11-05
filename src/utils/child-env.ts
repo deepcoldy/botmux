@@ -396,9 +396,6 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
-  // Lead-only chat manager marker: arms the plugin's lead-only PreToolUse guard.
-  // Must reach the pane or the guard stays inert (tmux allowlist drops it otherwise).
-  'BOTMUX_LEAD_ONLY',
   'BOTMUX_LARK_APP_ID',
   // The EXACT bots.json the daemon loaded (getLoadedConfigPath, frozen host-side
   // and pinned by spawnCli). Injected so a CLI child reads the SAME registry even
@@ -570,8 +567,6 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_DISPATCH_ATTEMPT',
   // thread|chat scope, computed per session from rootMessageId (worker.ts).
   'BOTMUX_SESSION_SCOPE',
-  // Lead-only manager guard marker (worker-computed per session).
-  'BOTMUX_LEAD_ONLY',
   // Daemon-authenticated session owner, both channels (applySessionOwnerEnv).
   'BOTMUX_OWNER_OPEN_ID',
   '__OWNER_OPEN_ID',

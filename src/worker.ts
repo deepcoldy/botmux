@@ -24178,9 +24178,6 @@ async function spawnCli(
   else delete childEnv.BOTMUX_API_ONLY;
   // Scope and topic identity come from this Worker, after configurable envs.
   childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
-  // Lead-only chat manager: arms the plugin's PreToolUse guard. Never inherited from the daemon env.
-  if (cfg.leadOnly === true && cfg.cliId === 'claude-code') childEnv.BOTMUX_LEAD_ONLY = '1';
-  else delete childEnv.BOTMUX_LEAD_ONLY;
   // Ask/browser approval require this anchor for both thread and chat sessions.
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);

@@ -20530,6 +20530,11 @@ switch (command) {
   case 'hook': {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';
+    if (cliId === 'lead-only-guard') {
+      // Hidden: PreToolUse guard of the dedicated lead-only plugin dir (never listed in help).
+      const { runLeadOnlyGuardHook } = await import('./skills/lead-only-guard.js');
+      runLeadOnlyGuardHook();
+    }
     await cmdHook(cliId);
     break;
   }

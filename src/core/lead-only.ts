@@ -31,3 +31,20 @@ export function isLeadOnlySession(
   if (!isLeadOnlyManagerClaim(larkAppId, chatId)) return false;
   return !isExecutorRoleSession(session);
 }
+
+export type ChatManagerMutationPlan =
+  | { ok: true; action: 'set' | 'clear' | 'lead-only'; authAction: 'set' | 'clear' | 'lead-only-on' | 'lead-only-off'; leadOnly?: boolean }
+  | { ok: false; status: 400 | 409; error: 'invalid_action' | 'chat_manager_disabled' };
+
+/**
+ * Validation + gating for POST /api/sessions/:id/chat-manager mutations (status is handled before this).
+ * `set` and `lead-only` require the per-bot manager switch; `clear` (teardown) is intentionally ungated.
+ */
+export function planChatManagerMutation(body: { action?: unknown; leadOnly?: unknown }, chatManagerEnabled: boolean): ChatManagerMutationPlan {
+  const { action } = body;
+  if (action !== 'set' && action !== 'clear' && action !== 'lead-only') return { ok: false, status: 400, error: 'invalid_action' };
+  if (action === 'lead-only' && typeof body.leadOnly !== 'boolean') return { ok: false, status: 400, error: 'invalid_action' };
+  if ((action === 'set' || action === 'lead-only') && !chatManagerEnabled) return { ok: false, status: 409, error: 'chat_manager_disabled' };
+  if (action === 'lead-only') return { ok: true, action, authAction: body.leadOnly ? 'lead-only-on' : 'lead-only-off', leadOnly: body.leadOnly as boolean };
+  return { ok: true, action, authAction: action };
+}

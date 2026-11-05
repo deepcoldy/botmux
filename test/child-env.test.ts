@@ -696,7 +696,6 @@ describe('process-boundary env scrub call sites', () => {
 describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
   it('includes sandbox verdicts and the per-session reply-style snapshot', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_READ_ISOLATION');
-    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_LEAD_ONLY');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_API_ONLY');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');

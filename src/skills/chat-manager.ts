@@ -21,6 +21,7 @@ botmux manager lead-only off
 可选的 lead-only（默认关闭）：本机器人是负责人时，可让它在本群的非执行者会话里只能执行 botmux 命令，
 读写文件、搜索、联网、子 agent、MCP 以及非 botmux 的 Bash 都会被拦截，具体工作须用 botmux dispatch 派给执行 bot。
 由 botmux dispatch 派出的会话和 workflow 节点会话（执行者）不受限；私聊不生效；仅对 claude-code 生效，其他 CLI 忽略该开关。
+接管（adopt）的会话补不上启动期参数，不会生效。
 仅当前负责人可开关，取消负责人时一并关闭；对已运行的会话不生效，下次会话（重新）启动时才生效。status 输出含 leadOnly。
 
 set/clear/lead-only 必须来自当前轮真人管理员的明确指令，不能沿用会话 owner、其他机器人或定时任务的身份。

@@ -37,10 +37,18 @@ describe('claude-code buildArgs: lead-only', () => {
     }
   });
 
-  it('promptInjection=none: tools still disallowed, no prompt/plugin', () => {
+  it('promptInjection=none: enforcement stays (tools disallowed + guard plugin dir), no prompt', () => {
     const { args, disallowed } = build({ leadOnly: true, promptInjection: 'none' });
     expect(disallowed).toContain('Edit');
     expect(args).not.toContain('--append-system-prompt');
-    expect(args).not.toContain('--plugin-dir');
+    const dirs = args.flatMap((a, i) => (a === '--plugin-dir' ? [args[i + 1]] : []));
+    expect(dirs).toHaveLength(1);
+    expect(dirs[0]).toMatch(/claude-plugin-lead-only$/);
+  });
+
+  it('lead-only mounts the guard dir; ordinary sessions never do', () => {
+    const lead = build({ leadOnly: true }).args;
+    expect(lead.filter(a => a.endsWith('claude-plugin-lead-only'))).toHaveLength(1);
+    expect(build({}).args.some(a => a.endsWith('-lead-only'))).toBe(false);
   });
 });

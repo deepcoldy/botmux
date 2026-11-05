@@ -266,7 +266,7 @@ export interface CliAdapter {
      *  'send'. */
     solo?: boolean;
     /** Lead-only chat manager session (claude-code only; ignored by other CLIs): block
-     *  file/web/agent tools, export BOTMUX_LEAD_ONLY=1 for the plugin guard, append the lead-only prompt. */
+     *  file/web/agent tools, mount the dedicated lead-only guard plugin dir, append the lead-only prompt. */
     leadOnly?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
