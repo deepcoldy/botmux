@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request, type Server } from 'node:http';
-import { createServer as createNetServer } from 'node:net';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -35,14 +35,6 @@ const SECRET = 'wf-drafts-host-key';
 const OWNER_OPEN = 'ou_owner';
 const ALICE = { open: 'ou_alice', union: 'on_alice' };
 const OWNER_UNION = 'on_owner';
-
-async function freePort(): Promise<number> {
-  const probe = createNetServer();
-  await new Promise<void>(resolve => probe.listen(0, '127.0.0.1', () => resolve()));
-  const port = (probe.address() as { port: number }).port;
-  await new Promise<void>(resolve => probe.close(() => resolve()));
-  return port;
-}
 
 describe('Dashboard → daemon workflow drafts', () => {
   let dir: string;
@@ -134,12 +126,16 @@ describe('Dashboard → daemon workflow drafts', () => {
     body: unknown = method === 'POST' ? {} : null,
     opts: { viaTunnel?: boolean; actor?: string; rawBody?: string } = {},
   ): Promise<{ status: number; body: any }> {
-    const localPort = await freePort();
-    if (opts.viaTunnel) forgetBridges.push(registerPlatformTunnelBridge(localPort));
+    // Connect first (the OS picks the client port), register that port as a
+    // tunnel bridge, then speak HTTP over the same socket. Probing a free port
+    // and binding it later raced under parallel load (EADDRINUSE).
+    const socket = connect(dashboardPort, '127.0.0.1');
+    await new Promise<void>((resolve, reject) => { socket.once('connect', () => resolve()); socket.once('error', reject); });
+    if (opts.viaTunnel) forgetBridges.push(registerPlatformTunnelBridge(socket.localPort!));
     const payload = opts.rawBody ?? (body === null ? undefined : JSON.stringify(body));
     return new Promise((resolve, reject) => {
       const req = request({
-        host: '127.0.0.1', port: dashboardPort, localPort, agent: false, method, path,
+        host: '127.0.0.1', port: dashboardPort, createConnection: () => socket, method, path,
         headers: {
           ...(opts.actor ? { 'x-botmux-actor': opts.actor } : {}),
           ...(payload !== undefined ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}),
