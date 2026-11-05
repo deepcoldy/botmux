@@ -345,6 +345,7 @@ describe('botmux ask — CLI boundary', () => {
 
     const server = createServer((req, res) => {
       req.resume();
+      if (!isAskPost(req)) { res.writeHead(404).end(); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         kind: 'answered',
@@ -385,6 +386,7 @@ describe('botmux ask — CLI boundary', () => {
 
     const server = createServer((req, res) => {
       req.resume();
+      if (!isAskPost(req)) { res.writeHead(404).end(); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         kind: 'answered',
@@ -485,7 +487,7 @@ describe('botmux ask — atomic input form CLI', () => {
     const requests: any[] = [];
     const strayPosts: string[] = [];
     const server = createServer(async (req, res) => {
-      if (req.url !== '/api/asks/form-v1') { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
+      if (!(req.method === 'POST' && req.url === '/api/asks/form-v1')) { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
       requests.push(await readRequestBodyJson(req, { strict: true }));
       res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(response));
     });
@@ -509,7 +511,7 @@ describe('botmux ask — atomic input form CLI', () => {
     let calls = 0;
     const strayPosts: string[] = [];
     const server = createServer(async (req, res) => {
-      if (req.url !== '/api/asks/form-v1') { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
+      if (!(req.method === 'POST' && req.url === '/api/asks/form-v1')) { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
       await readRequestBodyJson(req, { strict: true }); calls++;
       res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' }));
     });
