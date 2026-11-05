@@ -940,7 +940,7 @@ function setupBotState(opts?: {
 	  cardActionAckTimeoutMs?: number;
 	  substituteMode?: {
 	    enabled: boolean;
-	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
+	    targets: Array<{ appId?: string; openId?: string; userId?: string; unionId?: string; name?: string }>;
 	    disclosure?: 'prefix' | 'none';
 	    chats?: string[];
 	    excludedChats?: string[];
@@ -6782,6 +6782,81 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  for (const senderType of ['user', 'app', 'bot']) {
+    for (const chatMode of ['group', 'topic'] as const) {
+      it(`App ID substitute: ${senderType} mentions a third-party bot in ${chatMode}`, async () => {
+        setupBotState({
+          allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID],
+          substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] },
+        });
+        mockGetChatMode.mockResolvedValue(chatMode);
+        handlers.isSessionOwner.mockReturnValue(false);
+        const opts = {
+          senderOpenId: senderType === 'user' ? USER_OPEN_ID : OTHER_BOT_OPEN_ID,
+          content: JSON.stringify({ text: '@_user_1 help' }),
+          messageId: `om_app_${senderType}_${chatMode}`, chatId: 'oc_app',
+          rootId: `om_app_${senderType}_${chatMode}`,
+          threadId: null,
+          mentions: [{ key: '@_user_1', name: 'External', id: { open_id: 'ou_external' } }],
+        };
+        const event = senderType === 'user' ? makeUserMessageEvent(opts) : makeBotMessageEvent({ ...opts, senderType });
+        mockGetMessageDetail.mockImplementation(async (_app, _id, options) => ({ items: [{
+          message_id: event.message.message_id, chat_id: event.message.chat_id, msg_type: 'text',
+          body: { content: event.message.content },
+          mentions: options?.userIdType
+            ? [{ key: '@_user_1', name: 'External', id: 'cli_external', id_type: 'app_id' }]
+            : event.message.mentions,
+        }] }));
+        await capturedHandlers['im.message.receive_v1'](event);
+        await flushEventWork();
+        const calls = [...handlers.handleNewTopic.mock.calls, ...handlers.handleThreadReply.mock.calls];
+        expect(calls).toHaveLength(1);
+        expect(calls[0][1]).toMatchObject({ substituteTrigger: { target: { appId: 'cli_external' } } });
+        expect(mockApplyDelegatedGrants).not.toHaveBeenCalled();
+      });
+    }
+  }
+
+  for (const senderType of ['user', 'bot']) {
+    it.each(['outside-allowlist', 'excluded', 'chat-off'])
+      (`App ID lookup skips %s for a ${senderType} sender`, async policy => {
+        setupBotState({
+          allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID],
+          substituteMode: {
+            enabled: true, targets: [{ appId: 'cli_external' }],
+            chats: policy === 'outside-allowlist' ? ['oc_other'] : ['oc_app'],
+            excludedChats: policy === 'excluded' ? ['oc_app'] : undefined,
+          },
+        });
+        mockGetChatMode.mockResolvedValue('topic');
+        mockIsSubstituteEnabledForChat.mockReturnValue(policy !== 'chat-off');
+        const options = {
+          senderOpenId: senderType === 'user' ? USER_OPEN_ID : OTHER_BOT_OPEN_ID,
+          messageId: 'om_app_scope', chatId: 'oc_app', rootId: 'om_app_scope',
+          threadId: null,
+          content: JSON.stringify({ text: '@_user_1 help' }),
+          mentions: [{ key: '@_user_1', name: 'External', id: { open_id: 'ou_external' } }],
+        };
+        const event = senderType === 'user' ? makeUserMessageEvent(options) : makeBotMessageEvent(options);
+        await capturedHandlers['im.message.receive_v1'](event);
+        await flushEventWork();
+        expect(mockGetMessageDetail).not.toHaveBeenCalled();
+        expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+        expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      });
+  }
+
+  it('App ID substitute never substitutes an unrelated same-name bot', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] } });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, messageId: 'om_unrelated', chatId: 'oc_app', content: JSON.stringify({ text: '@_user_1 help' }), mentions: [{ key: '@_user_1', name: 'External', id: { open_id: 'ou_other' } }] });
+    mockGetMessageDetail.mockImplementation(async (_app, _id, options) => ({ items: [{ message_id: event.message.message_id, chat_id: event.message.chat_id, msg_type: 'text', body: { content: event.message.content }, mentions: options?.userIdType ? [{ key: '@_user_1', name: 'External', id: 'cli_other', id_type: 'app_id' }] : event.message.mentions }] }));
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('substituteMode: @substitute in a regular group routes to the group chat session without @bot', async () => {

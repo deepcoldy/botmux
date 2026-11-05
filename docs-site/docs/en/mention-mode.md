@@ -67,3 +67,9 @@ Explicit message listeners, no-@ commands, substitute triggers and auto-start on
 Except for the message listener (clause 3), every clause still requires the sender to **have talk access**. In multi-bot groups where you want the bots not to talk over each other, prefer `ambient`: whoever is named answers.
 
 > Related: whether a reply lands in a new topic or the current session is controlled by `/reply-mode`; see [Slash Commands](/en/slash-commands).
+
+### Bot substitute targets by App ID
+
+Select **App ID** and enter `cli_...`. Existing chat allow/block lists still apply; no Open ID, extra chat ID, or manual bot binding is required. Only the App ID is stored. Text/rich-text mentions are matched against stable App IDs returned for that exact message, including authorized bot senders. Display names are never identity evidence.
+
+If the original message cannot be verified or has changed, App ID substitution fails closed. Saving checks ID format; it does not verify app existence or chat membership and does not request application-management scopes for name lookup.

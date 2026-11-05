@@ -1279,6 +1279,7 @@ export interface BotDefaultOncall {
 }
 
 export interface SubstituteTarget {
+  appId?: string;
   /** App-scoped open_id. Directly comparable with Lark mention payloads. */
   openId?: string;
   /** Tenant user_id. Preferred for hand-authored config when available. */

@@ -1553,6 +1553,7 @@ export interface ChatContext {
 }
 
 export interface SubstituteTriggerIdentity {
+  appId?: string;
   name?: string;
   openId?: string;
   userId?: string;

@@ -557,7 +557,7 @@ function nonNegativeInteger(raw: string, fallback: number): number | null {
   return Number(value);
 }
 
-type SubstituteTargetIdField = 'email' | 'openId' | 'userId' | 'unionId';
+type SubstituteTargetIdField = 'appId' | 'email' | 'openId' | 'userId' | 'unionId';
 
 type SubstituteTargetDraft = {
   key: number;
@@ -575,7 +575,7 @@ type SubstituteTargetDraft = {
   };
 };
 
-const substituteTargetIdFields: SubstituteTargetIdField[] = ['email', 'openId', 'userId', 'unionId'];
+const substituteTargetIdFields: SubstituteTargetIdField[] = ['appId', 'email', 'openId', 'userId', 'unionId'];
 
 function parseSubstituteChats(text: string): string[] {
   const values = text.split(/[\r\n,，;；]+/).map(s => s.trim()).filter(Boolean);
@@ -602,6 +602,7 @@ export function buildSubstituteTarget(
 ): BotSubstituteTarget | null {
   const idValue = row.idValue.trim();
   if (!idValue) return null;
+  if (row.idField === 'appId') return { appId: idValue };
   const target: BotSubstituteTarget = { ...row.persisted };
   const idEdited = row.persisted[row.idField] !== idValue
     || (row.originalIdField != null && row.originalIdField !== row.idField);
@@ -7077,7 +7078,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       name: target?.name ?? '',
       persisted: target ? { ...target } : {},
       originalIdField: target ? idField : undefined,
-      resolution: target?.name || target?.avatarUrl
+      resolution: target?.appId ? { ok: true, name: target.name } : target?.name || target?.avatarUrl
         ? { ok: true, name: target.name, avatarUrl: target.avatarUrl }
         : undefined,
     };
@@ -7106,12 +7107,13 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       const res = await resolveSubstituteTarget(props.bot.larkAppId, target);
       if (!isCurrent()) return;
       setTargetRows(rows => rows.map(r => {
-        if (r.key !== key) return r;
+        if (r.key !== key || r.idField !== row.idField || r.idValue.trim() !== idValue) return r;
         if (!res.ok) return { ...r, resolving: false, resolution: { ok: false } };
         const entry = res.resolution;
         if (entry?.ok === true) {
           // userId passthrough: nothing was verified (no openId / profile) —
           // keep the editable name input instead of showing a fake chip.
+          if (entry.appId) return { ...r, persisted: { appId: entry.appId }, resolving: false, resolution: { ok: true } };
           if (!entry.openId) return { ...r, resolving: false, resolution: undefined };
           const persisted: BotSubstituteTarget = { ...r.persisted };
           persisted.openId = entry.openId;
@@ -7369,8 +7371,9 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                   label: tr(`botDefaults.substituteTarget${value[0].toUpperCase()}${value.slice(1)}`),
                 }))}
                 onChange={idField => {
+                  resolveEpochs.current.set(target.key, (resolveEpochs.current.get(target.key) ?? 0) + 1);
                   setTargetRows(rows => rows.map(row => row.key === target.key
-                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolution: undefined }
+                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolving: false, resolution: undefined }
                     : row));
                 }}
               />
@@ -7384,14 +7387,17 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                 disabled={busy}
                 onChange={event => {
                   const idValue = event.currentTarget.value;
-                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolution: undefined } : row));
+                  resolveEpochs.current.set(target.key, (resolveEpochs.current.get(target.key) ?? 0) + 1);
+                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolving: false, resolution: undefined } : row));
                 }}
                 onBlur={() => {
                   if (target.idValue.trim()) void resolveTargetRow(target.key);
                 }}
               />
               <div className="bd-substitute-target-name">
-                {target.resolving ? (
+                {target.idField === 'appId' ? (
+                  <span className={target.resolution?.ok === false ? "bd-substitute-target-resolution-badge" : "bd-substitute-target-name-chip"}>{target.resolution?.ok === false ? substituteReasonText(target.resolution.reason) : tr('botDefaults.substituteTargetAppIdHint')}</span>
+                ) : target.resolving ? (
                   <span className="bd-substitute-target-resolving">{tr('botDefaults.substituteResolving')}</span>
                 ) : target.resolution?.ok === true && (target.name || target.resolution.avatarUrl) ? (
                   <>

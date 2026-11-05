@@ -121,3 +121,14 @@ describe('normalizeSubstituteMode', () => {
     expect(cfg).toMatchObject({ enabled: true, disableControlCard: true });
   });
 });
+
+describe('App ID configuration reload', () => {
+  it('retains the App ID alone and never carries a stale Open ID or bot chat scope', () => {
+    const cfg = normalizeSubstituteMode({ enabled: true, targets: [{ appId: ' cli_external ', openId: 'ou_stale', botChatId: 'oc_old', userId: 'u_old' }] });
+    expect(cfg?.targets).toEqual([{ appId: 'cli_external' }]);
+    expect(normalizeSubstituteMode(JSON.parse(JSON.stringify(cfg)))).toEqual(cfg);
+  });
+  it('does not fall back to a person when the App ID is malformed', () => {
+    expect(normalizeSubstituteMode({ enabled: true, targets: [{ appId: 'bad', openId: 'ou_stale' }] })).toBeUndefined();
+  });
+});

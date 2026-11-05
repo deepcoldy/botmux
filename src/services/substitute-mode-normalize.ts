@@ -30,6 +30,13 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
         if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
         const src = item as Record<string, unknown>;
         const target: SubstituteTarget = {};
+        if (src.appId !== undefined) {
+          if (typeof src.appId !== 'string' || !/^cli_[a-z0-9]+$/i.test(src.appId.trim())) return [];
+          // App ID is the sole matching identity; never retain a stale resolved person/bot id.
+          target.appId = src.appId.trim();
+          if (typeof src.name === 'string' && src.name.trim()) target.name = src.name.trim();
+          return [target];
+        }
         if (typeof src.openId === 'string' && src.openId.trim()) target.openId = src.openId.trim();
         if (typeof src.userId === 'string' && src.userId.trim()) target.userId = src.userId.trim();
         if (typeof src.unionId === 'string' && src.unionId.trim()) target.unionId = src.unionId.trim();
@@ -41,7 +48,7 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
     : [];
   if (targets.length === 0) return undefined;
   const enabled = rec.enabled === true;
-  const hasMatchableTarget = targets.some(t => t.openId || t.userId || t.unionId);
+  const hasMatchableTarget = targets.some(t => t.appId || t.openId || t.userId || t.unionId);
   // Enabling with no matchable id is a dead ON state — reject (undefined).
   if (enabled && !hasMatchableTarget) return undefined;
   const chats = Array.isArray(rec.chats)

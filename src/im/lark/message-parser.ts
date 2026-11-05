@@ -267,7 +267,8 @@ export function extractMentionIdentities(message: {
           // target and pollute the userId leg with an open_id value.
           out.push({
             name: node.user_name,
-            openId: node.user_id,
+            ...(typeof node.user_id === 'string' && node.user_id.startsWith('cli_')
+              ? { appId: node.user_id } : { openId: node.user_id }),
           });
         }
       }

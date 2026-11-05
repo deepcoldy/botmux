@@ -1499,7 +1499,7 @@ export async function patchCardStreamElement(
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
-  options: { userCardContent?: boolean } & LarkRequestOptions = {},
+  options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
   const c = getBotClient(larkAppId);
   // card_msg_content_type=user_card_content returns the original card JSON
@@ -1516,6 +1516,8 @@ export async function getMessageDetail(
     // user AND bot senders); without it the server omits them. Matters here for
     // merge_forward sub-messages, whose senders appear nowhere else.
     with_sender_name: 'true',
+    // Explicit ID type makes Feishu return app_id for bot mentions.
+    ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
   }, options);
   if (res.code !== 0) {
     throw larkApiError('get message', res);

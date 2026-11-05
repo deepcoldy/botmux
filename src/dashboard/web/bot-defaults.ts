@@ -289,6 +289,7 @@ export type NativeSubagentRuntimePolicy = {
 };
 
 export type BotSubstituteTarget = {
+  appId?: string;
   openId?: string;
   userId?: string;
   unionId?: string;
@@ -795,6 +796,7 @@ export async function fetchBotDefaults(): Promise<LoadBotsResult> {
 export type SubstituteTargetResolution = {
   input?: string;
   ok?: boolean;
+  appId?: string;
   openId?: string;
   name?: string;
   avatarUrl?: string;
