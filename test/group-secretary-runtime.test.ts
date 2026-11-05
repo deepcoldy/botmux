@@ -411,3 +411,96 @@ describe('group secretary runtime — busy detection', () => {
   });
 });
 
+describe('group secretary runtime — registration re-checked after awaits', () => {
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+  function migratingRuntime(writeMarker: (chatId: string, appId: string | null) => Promise<{ ok: boolean; reason?: string }>) {
+    return createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      readMarker: async () => undefined, writeMarker,
+      deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
+    });
+  }
+
+  it('legacy migration does not resurrect a registration turned off while the marker write was in flight', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const write = deferred<{ ok: boolean }>();
+    const writeMarker = vi.fn().mockReturnValueOnce(write.promise).mockResolvedValue({ ok: true });
+    const rt = migratingRuntime(writeMarker as any);
+    const pending = rt.tick();
+    await vi.waitFor(() => expect(writeMarker).toHaveBeenCalledTimes(1));
+    setGroupSecretaryChat(CHAT, null); // /secretary off 落盘
+    write.resolve({ ok: true });
+    await pending;
+    expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
+    // 迟到的迁移写把标记写回了自己：撤回，群里不留没人当的秘书标记。
+    expect(writeMarker).toHaveBeenLastCalledWith(CHAT, null);
+    rt.stop();
+  });
+
+  it('legacy migration does not overwrite a local takeover that landed while the marker write was in flight', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const write = deferred<{ ok: boolean }>();
+    const writeMarker = vi.fn().mockReturnValueOnce(write.promise).mockResolvedValue({ ok: true });
+    const rt = migratingRuntime(writeMarker as any);
+    const pending = rt.tick();
+    await vi.waitFor(() => expect(writeMarker).toHaveBeenCalledTimes(1));
+    setGroupSecretaryChat(CHAT, { larkAppId: 'cli_other', enabledBy: 'ou_owner', enabledAt: 2, markerConfirmedAt: 2 });
+    write.resolve({ ok: true });
+    await pending;
+    resetGroupSecretaryStoreCache();
+    expect(getGroupSecretaryChat('cli_other', CHAT)?.enabledAt).toBe(2);
+    expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
+    expect(writeMarker).toHaveBeenLastCalledWith(CHAT, 'cli_other');
+    rt.stop();
+  });
+
+  for (const [label, change] of [
+    ['turned off', () => setGroupSecretaryChat(CHAT, null)],
+    ['taken over', () => setGroupSecretaryChat(CHAT, { larkAppId: 'cli_other', enabledBy: 'ou_owner', enabledAt: 2 })],
+  ] as const) {
+    it(`does not deliver a digest for a chat ${label} while its transcript was being fetched`, async () => {
+      setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+      const lines = deferred<Array<{ role: string; text: string }>>();
+      const fetchTranscript = vi.fn(() => lines.promise);
+      const deliver = vi.fn(async () => undefined);
+      const snaps = [snapshot('working'), snapshot('idle')];
+      const rt = createGroupSecretaryRuntime({
+        larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => snaps.shift() ?? snapshot('idle'),
+        fetchTranscript: fetchTranscript as any, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
+      });
+      await rt.tick(); clock += 10_000; await rt.tick(); clock += 5_000;
+      const pending = rt.tick();
+      await vi.waitFor(() => expect(fetchTranscript).toHaveBeenCalledTimes(1));
+      change();
+      lines.resolve([{ role: 'agent', text: '做完了' }]);
+      await pending;
+      expect(deliver).not.toHaveBeenCalled();
+      rt.stop();
+    });
+  }
+
+  it('off then on again during the transcript fetch drops the digest from before the reopen', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const lines = deferred<Array<{ role: string; text: string }>>();
+    const fetchTranscript = vi.fn(() => lines.promise);
+    const deliver = vi.fn(async () => undefined);
+    const snaps = [snapshot('working'), snapshot('idle')];
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => snaps.shift() ?? snapshot('idle'),
+      fetchTranscript: fetchTranscript as any, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
+    });
+    await rt.tick(); clock += 10_000; await rt.tick(); clock += 5_000;
+    const pending = rt.tick();
+    await vi.waitFor(() => expect(fetchTranscript).toHaveBeenCalledTimes(1));
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_new', enabledAt: 2 });
+    lines.resolve([]);
+    await pending;
+    // 关了又开（新的一次开启）：关之前的旧事件不该投递。
+    expect(deliver).not.toHaveBeenCalled();
+    rt.stop();
+  });
+});

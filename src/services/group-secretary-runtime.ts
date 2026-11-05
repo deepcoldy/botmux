@@ -8,7 +8,7 @@
 import { createHash } from 'node:crypto';
 import { GroupSecretaryEngine, type SecretaryDigest, type SecretaryManualWatch, type SecretarySessionView } from './group-secretary-engine.js';
 import { renderGroupSecretaryPrompt } from './group-secretary-prompt.js';
-import { getGroupSecretaryChat, isGroupSecretaryChat, listGroupSecretaryChats, setGroupSecretaryChat } from './group-secretary-store.js';
+import { getGroupSecretaryChat, getGroupSecretaryOwner, isGroupSecretaryChat, listGroupSecretaryChats, setGroupSecretaryChat, type GroupSecretaryChatEntry } from './group-secretary-store.js';
 import { extractListenerMessageText, listenerSenderType } from './message-listener.js';
 import type { ObserveSnapshot } from './session-observe.js';
 
@@ -19,7 +19,8 @@ export interface GroupSecretaryRuntimeDeps {
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
   /** 读 / 写群描述里的秘书标记（全群唯一登记）。不提供时只按本机登记判断。 */
   readMarker?: (chatId: string) => Promise<string | undefined>;
-  writeMarker?: (chatId: string, appId: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** appId 为 null 表示清除标记。 */
+  writeMarker?: (chatId: string, appId: string | null) => Promise<{ ok: boolean; reason?: string }>;
   /** 读 / 写标记的单次超时（飞书接口挂住时不拖死整个秘书循环）。 */
   markerTimeoutMs?: number;
   markerRefreshMs?: number;
@@ -167,6 +168,9 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     } finally { if (timer) clearTimeout(timer); }
   };
   /** 本机登记是自己，且群描述标记没有指向别的 bot（读不到时按本机登记继续，不因网络抖动停手）。 */
+  /** 同一次开启：await 前后读到的是不是同一份登记（关闭、接管、关了又开都算换了）。 */
+  const sameRegistration = (a: GroupSecretaryChatEntry | undefined, b: GroupSecretaryChatEntry): boolean =>
+    !!a && a.larkAppId === b.larkAppId && a.enabledAt === b.enabledAt && a.enabledBy === b.enabledBy;
   const isActiveChat = (chatId: string | undefined): boolean => {
     if (!isGroupSecretaryChat(deps.larkAppId, chatId)) return false;
     if (!deps.readMarker || !markers.has(chatId!)) return true;
@@ -191,8 +195,25 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
           if (!deps.writeMarker) continue;
           const wrote = await withTimeout(deps.writeMarker(chatId, deps.larkAppId));
           if (wrote.ok) {
+            const current = getGroupSecretaryChat(deps.larkAppId, chatId);
+            if (!sameRegistration(current, entry)) {
+              // 写标记期间登记变了（/secretary off、本机别的 bot 接管、关了又开）：不拿旧登记写回。
+              // 登记已不归自己时，迟到的这次写把标记盖成了自己，按本机现任秘书还回去（没有就清空）。
+              if (!current) {
+                const owner = getGroupSecretaryOwner(chatId)?.larkAppId ?? null;
+                try {
+                  const undo = await withTimeout(deps.writeMarker(chatId, owner));
+                  if (!undo.ok) deps.log('warn', `[group-secretary] marker rollback failed chat=${chatId.slice(0, 12)}: ${undo.reason ?? 'unknown'}`);
+                } catch (err) {
+                  deps.log('warn', `[group-secretary] marker rollback failed chat=${chatId.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+                }
+                markers.set(chatId, owner ?? undefined);
+              }
+              deps.log('info', `[group-secretary] registration changed during marker migration chat=${chatId.slice(0, 12)}; skipped`);
+              continue;
+            }
             markers.set(chatId, deps.larkAppId);
-            setGroupSecretaryChat(chatId, { ...entry, markerConfirmedAt: now() });
+            setGroupSecretaryChat(chatId, { ...current!, markerConfirmedAt: now() });
             deps.log('info', `[group-secretary] wrote marker for legacy registration chat=${chatId.slice(0, 12)}`);
           } else {
             deps.log('warn', `[group-secretary] marker migration failed chat=${chatId.slice(0, 12)}: ${wrote.reason ?? 'unknown'}; will retry`);
@@ -267,6 +288,11 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
           }
         } catch { /* 无证据照常投递 */ }
       }));
+      // 取证据期间可能已被关闭 / 接管 / 关了又开：这批事件属于旧的那次开启，丢弃。
+      if (!sameRegistration(getGroupSecretaryChat(deps.larkAppId, digest.chatId), entry) || !isActiveChat(digest.chatId)) {
+        deps.log('info', `[group-secretary] registration changed while gathering evidence chat=${digest.chatId.slice(0, 12)}; dropped ${digest.events.length} event(s)`);
+        return;
+      }
     }
     const prompt = renderGroupSecretaryPrompt(digest, {
       enabledByOpenId: entry.enabledBy,
