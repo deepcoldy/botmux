@@ -194,9 +194,8 @@ export function publishTurnCliIdentity(
 async function publishTurnCliIdentityNow(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
-  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel } = args;
+  const { sessionDataDir, sessionId, turnId } = args;
   const privateChat = args.privateChat === true;
-  const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
   // Record before the new-entry shortcut (and before first worker spawn).
   // The daemon has already verified the signed dispatch and target access.
@@ -206,45 +205,60 @@ async function publishTurnCliIdentityNow(
   // and cannot serve as that anchor.
   if (turnId) registerActiveIdentityTurn(sessionDataDir, sessionId, turnId);
 
-  for (const tool of TRIGGER_USER_AUTH_TOOLS) {
-    if (tool === 'lark-cli' && isLarkToolBound(botConfig, sessionDataDir, sessionId)) {
-      outcomes.push({ tool, state: 'off' }); // the new session entry resolves this itself
-      continue;
-    }
-    if (!triggerUserAuthApplies(policy, tool)) {
-      outcomes.push({ tool, state: 'off' });
-      continue;
-    }
-    try {
-      outcomes.push(args.delegatedIdentity
-        ? await publishDelegated(tool, args, args.delegatedIdentity)
-        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat));
-    } catch (e) {
-      // Fail closed through the SAME policy as an ordinary missing token, so a
-      // credential-store outage and "this person never authorized" cannot end
-      // up with different identities in force.
-      logger.warn(
-        `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
-        + `${e instanceof Error ? e.message : String(e)}`,
-      );
-      if (tool === 'bytedcli') {
-        try {
-          writeSessionIdentity(sessionDataDir, sessionId, {
-            tool, mode: 'denied', ...(turnId ? { turnId } : {}),
-            message: locale === 'en'
-              ? `botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.\n${reasonTag('provider_unavailable')}`
-              : `botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。\n${reasonTag('provider_unavailable')}`,
-          }, storageModel);
-        } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel); }
-        outcomes.push({ tool, state: 'unavailable' });
-        continue;
-      }
-      outcomes.push(args.delegatedIdentity
-        ? denyDelegated(tool, args, args.delegatedIdentity)
-        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat));
-    }
+  // The tools are prepared side by side: they share no credential state (each
+  // has its own provider queue and its own identity file / proven entry), and a
+  // bytedcli mint is several CLI runs that must not hold back lark-cli. The
+  // outcomes keep the TRIGGER_USER_AUTH_TOOLS order, each tool still fails
+  // closed on its own, and this settles only after every tool has settled, so
+  // a turn is never released with one identity still being written.
+  const settled = await Promise.allSettled(TRIGGER_USER_AUTH_TOOLS.map(tool => publishToolIdentity(tool, args, privateChat)));
+  for (const result of settled) {
+    if (result.status === 'rejected') throw result.reason;
+    outcomes.push(result.value);
   }
   return outcomes;
+}
+
+async function publishToolIdentity(
+  tool: TriggerUserAuthTool,
+  args: PublishTurnIdentityArgs,
+  privateChat: boolean,
+): Promise<ToolIdentityOutcome> {
+  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel } = args;
+  const policy = botConfig.triggerUserAuth;
+  if (tool === 'lark-cli' && isLarkToolBound(botConfig, sessionDataDir, sessionId)) {
+    return { tool, state: 'off' }; // the new session entry resolves this itself
+  }
+  if (!triggerUserAuthApplies(policy, tool)) {
+    return { tool, state: 'off' };
+  }
+  try {
+    return args.delegatedIdentity
+      ? await publishDelegated(tool, args, args.delegatedIdentity)
+      : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
+  } catch (e) {
+    // Fail closed through the SAME policy as an ordinary missing token, so a
+    // credential-store outage and "this person never authorized" cannot end
+    // up with different identities in force.
+    logger.warn(
+      `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
+      + `${e instanceof Error ? e.message : String(e)}`,
+    );
+    if (tool === 'bytedcli') {
+      try {
+        writeSessionIdentity(sessionDataDir, sessionId, {
+          tool, mode: 'denied', ...(turnId ? { turnId } : {}),
+          message: locale === 'en'
+            ? `botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.\n${reasonTag('provider_unavailable')}`
+            : `botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。\n${reasonTag('provider_unavailable')}`,
+        }, storageModel);
+      } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel); }
+      return { tool, state: 'unavailable' };
+    }
+    return args.delegatedIdentity
+      ? denyDelegated(tool, args, args.delegatedIdentity)
+      : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
+  }
 }
 
 function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
