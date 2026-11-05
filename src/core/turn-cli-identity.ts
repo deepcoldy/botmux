@@ -33,6 +33,8 @@ import type { IdentityStorageModel } from './lark-tool-binding.js';
 import {
   resolvePlatformIdentity,
   platformAuthorizeUrl,
+  platformRefusalReason,
+  reasonTag,
   type PlatformIdentityResolution,
 } from './platform-credential-source.js';
 import {
@@ -137,7 +139,59 @@ export interface PublishTurnIdentityArgs {
  * The worst case is a withheld identity, which the tool reports as an auth error
  * and the agent can act on.
  */
-export async function publishTurnCliIdentity(
+// ─── Publications in flight: a call that arrives mid-publication waits ───────
+//
+// A turn's identity is published asynchronously (a platform grant can take its
+// whole budget). The opening turn of a new session is published again once the
+// worker reports its identity model, and the CLI's first tool call can land in
+// that window: it found nothing yet and was refused as if the person had no
+// credentials, while the next message — published in time — worked.
+
+/** Longest an identity fetch waits on a publication that is still running. */
+export const PUBLICATION_WAIT_CAP_MS = 10_000;
+const publicationsInFlight = new Map<string, Set<Promise<unknown>>>();
+const publicationKey = (sessionDataDir: string, sessionId: string) => JSON.stringify([sessionDataDir, sessionId]);
+
+/** Resolves when no publication for this session is running, or after `capMs`. Never throws. */
+export async function awaitTurnIdentityPublication(
+  sessionDataDir: string,
+  sessionId: string,
+  capMs = PUBLICATION_WAIT_CAP_MS,
+): Promise<void> {
+  const pending = publicationsInFlight.get(publicationKey(sessionDataDir, sessionId));
+  if (!pending?.size) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.allSettled([...pending]),
+    new Promise<void>(resolve => { timer = setTimeout(resolve, capMs); }),
+  ]);
+  clearTimeout(timer);
+}
+
+/** Mark `work` as a publication for this session until it settles. Callers
+ *  whose publication starts after other async steps (the model-flip replay
+ *  resolves the turn's sender first) register the whole chain up front. */
+export function trackTurnIdentityPublication<T>(sessionDataDir: string, sessionId: string, work: Promise<T>): Promise<T> {
+  const key = publicationKey(sessionDataDir, sessionId);
+  let set = publicationsInFlight.get(key);
+  if (!set) publicationsInFlight.set(key, set = new Set());
+  set.add(work);
+  const settle = () => {
+    const current = publicationsInFlight.get(key);
+    current?.delete(work);
+    if (current && !current.size) publicationsInFlight.delete(key);
+  };
+  work.then(settle, settle);
+  return work;
+}
+
+export function publishTurnCliIdentity(
+  args: PublishTurnIdentityArgs,
+): Promise<ToolIdentityOutcome[]> {
+  return trackTurnIdentityPublication(args.sessionDataDir, args.sessionId, publishTurnCliIdentityNow(args));
+}
+
+async function publishTurnCliIdentityNow(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
   const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel } = args;
@@ -178,8 +232,8 @@ export async function publishTurnCliIdentity(
           writeSessionIdentity(sessionDataDir, sessionId, {
             tool, mode: 'denied', ...(turnId ? { turnId } : {}),
             message: locale === 'en'
-              ? 'botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.'
-              : 'botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。',
+              ? `botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.\n${reasonTag('provider_unavailable')}`
+              : `botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。\n${reasonTag('provider_unavailable')}`,
           }, storageModel);
         } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel); }
         outcomes.push({ tool, state: 'unavailable' });
@@ -587,7 +641,8 @@ function refuseViaPlatform(
       state = 'unavailable';
       break;
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, undefined, tail);
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, undefined, tail,
+    platformRefusalReason(platform));
   return { tool, state };
 }
 
@@ -641,7 +696,8 @@ async function withholdIdentity(
       );
     }
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, authUrl);
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, authUrl,
+    undefined, senderOpenId ? 'not_authorized' : 'no_sender');
   return { tool, state: 'needs-authorization' };
 }
 
@@ -670,6 +726,8 @@ function writeDenial(
   /** Replaces the local-login tail (auto-link or /login how-to) when the
    *  authorization lives elsewhere — e.g. on the central platform. */
   tailOverride?: string[],
+  /** Machine-readable cause, printed as the last line (`[reason=…]`). */
+  reason?: string,
 ): void {
   try {
     const name = senderOpenId && botConfig.larkAppId
@@ -715,6 +773,7 @@ function writeDenial(
               locale,
             ),
             t('trigger_user_auth.denied_howto_status', undefined, locale)]),
+        ...(reason ? [reasonTag(reason)] : []),
       ].join('\n'),
     }, storageModel);
   } catch (e) {

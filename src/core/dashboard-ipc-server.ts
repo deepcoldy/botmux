@@ -539,7 +539,7 @@ import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
-import { publishDelegationRefusal, retryTransientTurnIdentity } from './turn-cli-identity.js';
+import { publishDelegationRefusal, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1590,7 +1590,14 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       // treats a throwing reader as a refusal to publish.
       currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
     });
-    const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    let env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    if (!env) {
+      // The turn's identity may still be on its way (a new session's opening
+      // turn is republished after the worker reports its model). Wait for that
+      // publication instead of refusing as if nothing would ever come.
+      await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
+      env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    }
     if (env) {
       return jsonRes(res, 200, {
         schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
