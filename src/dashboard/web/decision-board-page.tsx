@@ -191,15 +191,15 @@ function UnverifiedTag() {
   return <span className="dboard-chat-tag is-warn" title={tr('decisionBoard.chatUnverifiedTitle')}>{tr('decisionBoard.chatUnverified')}</span>;
 }
 
-/** 巡检提示的小标签（汇总行）；悬停看原因。 */
+/** 汇总行里的巡检提示：标签 + 原因（触屏上没有悬停，原因直接写出来）。 */
 function HintChip(props: { hint: BoardHint | undefined }) {
   const tr = useT();
   const hint = knownHint(props.hint);
   if (!hint) return null;
-  const label = tr(BOARD_HINT_LABEL_KEYS[hint.kind]);
   return (
-    <span className={`dboard-hint-chip is-${hint.kind}`} title={hint.reason} data-hint={hint.kind}>
-      💡 {label}
+    <span className="dboard-hint-row" data-hint={hint.kind}>
+      <span className={`dboard-hint-chip is-${hint.kind}`}>💡 {tr(BOARD_HINT_LABEL_KEYS[hint.kind])}</span>
+      <span className="dboard-hint-reason">{hint.reason}</span>
     </span>
   );
 }

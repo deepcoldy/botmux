@@ -91,7 +91,7 @@ Three views: **Needs you** (including "needs review") / **In progress** / **All*
 | Open chat | Opens the item's main chat in Feishu; "+N more" under the title when there are several |
 | No chat: (reason) | There really is no chat; the steward gave a reason |
 | ⚠ No chat linked | Neither a chat nor a reason |
-| 💡 Suggest closing / Suggest moving on / Check in | A hint from the board check (see "Finding items that are ready to close"); hover for the reason |
+| 💡 Suggest closing / Suggest moving on / Check in | A hint from the board check (see "Finding items that are ready to close"), followed by the reason |
 
 ### Item page
 
