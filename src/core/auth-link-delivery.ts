@@ -39,12 +39,18 @@ export async function deliverAuthLink(input: AuthLinkDeliveryInput): Promise<Aut
     return 'inline';
   }
   if (input.openId) {
+    let delivered = false;
     try {
       await input.sendDirect(input.openId, input.text);
-      await input.replyInPlace(t('auth_link.sent_privately', undefined, input.locale));
-      return 'dm';
+      delivered = true;
     } catch {
       // Fall through: say how to get the link without ever posting it here.
+    }
+    if (delivered) {
+      // The link reached the person; failing to say so in the group must not
+      // turn into "I could not message you".
+      await input.replyInPlace(t('auth_link.sent_privately', undefined, input.locale)).catch(() => undefined);
+      return 'dm';
     }
   }
   await input.replyInPlace(t('auth_link.dm_failed', { command: input.privateCommand ?? '/login' }, input.locale));

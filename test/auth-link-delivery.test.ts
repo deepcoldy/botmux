@@ -38,6 +38,19 @@ describe('deliverAuthLink', () => {
     expect(h.inPlace.join('')).not.toContain(LINK);
   });
 
+  it('group, DM delivered but the group notice fails: still reported as delivered, no "could not message you"', async () => {
+    const direct: string[] = [];
+    const inPlace: string[] = [];
+    const outcome = await deliverAuthLink({
+      privateChat: false, openId: 'ou_a', text: LINK, locale: 'zh',
+      sendDirect: async (_o, text) => { direct.push(text); },
+      replyInPlace: async text => { inPlace.push(text); throw new Error('group send failed'); },
+    });
+    expect(outcome).toBe('dm');
+    expect(direct).toEqual([LINK]);
+    expect(inPlace).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
+  });
+
   it('group without a usable initiator: no DM to anyone, no link in the group', async () => {
     const h = harness();
     expect(await deliverAuthLink({ privateChat: false, openId: undefined, text: LINK, ...h, locale: 'zh' })).toBe('dm_failed');

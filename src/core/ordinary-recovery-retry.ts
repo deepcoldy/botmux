@@ -144,7 +144,7 @@ export async function retryOrdinaryRecoveryNotice(
         onAdmission: admission => { rejected = admission === 'rejected'; },
       });
     if (!accepted || rejected) throw new Error('worker refused the re-delivery');
-    rememberLastCliInput(ds, userPrompt, { content });
+    rememberLastCliInput(ds, userPrompt, { content }, turnId);
     const settled = updateOrdinaryRecoveryNotice(ds, logicalTurnId, entry => {
       if (entry.retried?.turnId === turnId) entry.retried.state = 'accepted';
     }) ?? findOrdinaryRecoveryNotice(ds, logicalTurnId) ?? record;

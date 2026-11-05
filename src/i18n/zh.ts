@@ -638,7 +638,14 @@ export const messages: Record<string, string> = {
   'cmd.login.lark_status_yes': 'lark-cli（你的飞书身份）：已授权',
   'cmd.login.lark_status_no': 'lark-cli（你的飞书身份）：未授权 —— 发 /login lark 点链接完成授权',
   // 中心化平台来源：本机已绑定且 credentialSource ≠ local 时，/login 指向平台凭据页。
-  'cmd.login.platform_title': '🔐 在中心化平台授权（一次授权，所有绑定平台的机器通用）',
+  'cmd.login.platform_title': '🔐 在中心化平台授权（授权一次，与本机所有者同团队的已绑定机器都能复用）',
+  'cmd.login.platform_not_teammate_title': '🔐 中心化平台的授权在这台机器上用不了',
+  'cmd.login.platform_not_teammate_body': '这台机器绑定在 {owner} 的平台账号下，你和对方没有共同的平台团队。平台只把授权发给机器所有者本人或同团队成员，所以在平台授权页授权后，这里仍然拿不到。',
+  'cmd.login.platform_not_teammate_owner_fallback': '本机所有者',
+  'cmd.login.platform_not_teammate_or': ' 或 ',
+  'cmd.login.platform_not_teammate_local': '可以改用只在这台机器上有效的授权：发 {commands}。',
+  'cmd.login.platform_not_teammate_platform_only': '本 Bot 只接受平台凭据（credentialSource = platform），不能改用本机授权；需要的话请 Bot 管理员把凭据来源改为 auto。',
+  'cmd.login.platform_not_teammate_join': '想跨机器复用平台授权：请机器所有者把你加入他的任一平台团队，再在 {url} 授权时允许该团队。刚加入团队的，稍等一分钟再发 /login。',
   'cmd.login.platform_step1': '打开平台凭据页，按页面提示完成 {provider} 授权：',
   'cmd.login.platform_step2': '授权完成后直接在本话题重试刚才的操作即可，不用再发命令。',
   'cmd.login.platform_note': '说明：本机已绑定中心化平台，{tool} 的授权统一由平台保管与续期，撤销也在那里。授权时请把本机所在的团队勾上，否则这台机器拿不到。',
@@ -1204,7 +1211,7 @@ export const messages: Record<string, string> = {
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
   'ai.credentials.on_auth_failure': '遇到飞书鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`：返回 authUrl 时（只在和发起人的单聊里）用 `botmux send` 发给本轮用户；返回 delivery=dm 时链接已由 botmux 私聊给发起人，只在当前会话告诉用户去私聊里打开。授权链接只发给发起人本人，绝不贴到群里。之后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。凭证沿用本轮注入的用户身份。',
   'ai.credentials.on_bytedcli_auth_failure': '遇到 ByteCloud / Codebase 鉴权失败（bytedcli 或 codebase 命令）：原样说明失败。stderr 已附授权链接时按「stderr 附链接」流程处理；未附链接时提示用户发 /login bytedcli。凭证沿用本轮注入的用户身份。',
-  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify、ByteCloud/cloud.bytedance 或中心化平台凭据页链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（这种链接只会出现在和发起人的单聊里；任何授权链接都不得贴到群里；链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
+  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify、ByteCloud/cloud.bytedance 或中心化平台凭据页链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（设备码、OAuth 这类授权链接只会出现在和发起人的单聊里，不得贴到群里；中心化平台凭据页是每个人管理自己授权的固定页面，可以照常转发；链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
   // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑普通授权，
   // 那只会拿到同样的权限再失败一次。补授权按已确定的任务步骤汇总，不逐个报错逐次申请。
   'ai.credentials.on_missing_scope': '遇到 missing_scope 时不要重跑普通 /login。依据当前任务已确定的操作和工具文档，一次合并所需权限；同一操作的候选权限只选一个，不逐项发链接，不申请无关或未经核实的权限。运行 `botmux auth request --scope "<所需权限>" --json`，说明用途；返回 authUrl 时（单聊）用 `botmux send` 发送，返回 delivery=dm 时链接已私聊给发起人，不要在群里贴任何授权链接；再运行 `botmux auth wait --request-id <requestId> --json`，仅在 ready 后以本轮用户身份重试。仍失败时按实际错误处理，不循环登录。',

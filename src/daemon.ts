@@ -6553,7 +6553,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       mode: 'live',
       turnId,
     });
-    rememberLastCliInput(ds, promptContent, cliInput);
+    rememberLastCliInput(ds, promptContent, cliInput, turnId);
     sessionStore.updateSession(ds.session);
     if (!sendWorkerInput(ds, cliInput, turnId)) {
       throw new Error('doc-watch warmup worker input was not accepted');
@@ -6572,9 +6572,9 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       mode: 'refork',
       turnId,
     });
-    rememberLastCliInput(ds, promptContent, wrappedInput);
+    rememberLastCliInput(ds, promptContent, wrappedInput, turnId);
     sessionStore.updateSession(ds.session);
-    if (!forkWorker(ds, wrappedInput, ds.hasHistory)) {
+    if (!forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId })) {
       throw new Error('doc-watch warmup worker fork was not accepted');
     }
     beginNewTurn(ds, title, turnId);
@@ -6657,7 +6657,7 @@ async function submitQueuedMessage(
   })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
   beginNewTurn(ds, text, message.messageId);
-  rememberLastCliInput(ds, text, input);
+  rememberLastCliInput(ds, text, input, message.messageId);
   markSessionActivity(ds, Date.now(), { human: senderIsBot === false });
   sessionStore.updateSession(ds.session);
   return true;
@@ -10598,7 +10598,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
           trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
-        rememberLastCliInput(askSession, text, input);
+        rememberLastCliInput(askSession, text, input, turnId);
         markSessionActivity(askSession);
         sessionStore.updateSession(askSession.session);
         logger.info(`[${boundAsk.sessionId.slice(0, 8)}] async question ${asyncInput.itemId} answer admitted as ${turnId}`);
@@ -21766,7 +21766,7 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     || ds.worker.killed;
   if (!promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {})) return false;
   try {
-    rememberLastCliInput(ds, head.userPrompt, head.cliInput, {
+    rememberLastCliInput(ds, head.userPrompt, head.cliInput, head.turnId, {
       codexAppInputAccepted: !!head.cliInput.codexAppInput,
     });
   } catch (err) {
@@ -22057,7 +22057,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
   clearPrincipalLaneDispatchRetry(ds, head.turnId);
   beginNewTurn(ds, head.title, head.turnId);
   setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
-  rememberLastCliInput(ds, head.userPrompt, head.cliInput);
+  rememberLastCliInput(ds, head.userPrompt, head.cliInput, head.turnId);
   logger.info(
     `[${tag(ds)}] Dispatched principal-lane FIFO head turn=${head.turnId.slice(0, 12)} `
     + `remaining=${ds.session.principalLaneQueuedTurns?.length ?? 0}`,
@@ -22839,7 +22839,7 @@ async function driveNextXpiSharedCwdTurn(
     // the same turn again after the lease is later released.
     setActiveInteractiveTurn(ds, next.record.turnId, next.record.caller);
     beginNewTurn(ds, next.record.userPrompt, next.record.turnId);
-    rememberLastCliInput(ds, next.record.userPrompt, next.record.cliInput);
+    rememberLastCliInput(ds, next.record.userPrompt, next.record.cliInput, next.record.turnId);
     return true;
   } catch (error) {
     if (!accepted) rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
@@ -22965,7 +22965,7 @@ function forkReservedInitialSession(
     clearInitialStartBuffers(ds);
     return false;
   }
-  rememberLastCliInput(ds, userPrompt, input);
+  rememberLastCliInput(ds, userPrompt, input, turnId);
   if (turnId && trustedCaller) {
     setActiveInteractiveTurn(ds, turnId, trustedCaller);
   }
@@ -23861,7 +23861,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   }
   setActiveInteractiveTurn(ds, turnId, record.owner, ownerTask);
   beginNewTurn(ds, ownerTask, turnId);
-  rememberLastCliInput(ds, prompt, cliInput);
+  rememberLastCliInput(ds, prompt, cliInput, turnId);
   removeCrossPrincipalRecord(ds, record.id);
   await notifyApprovedCrossPrincipalDispatch(ds, record, 'started');
   return true;
@@ -24701,7 +24701,7 @@ async function confirmNextCrossPrincipalSuggestion(ds: DaemonSession): Promise<v
   ds.pendingCrossPrincipalSuggestions?.shift();
   setActiveInteractiveTurn(ds, suggestion.turnId, suggestion.owner, suggestion.text);
   beginNewTurn(ds, suggestion.text, suggestion.turnId);
-  rememberLastCliInput(ds, suggestion.userPrompt, approvedInput);
+  rememberLastCliInput(ds, suggestion.userPrompt, approvedInput, suggestion.turnId);
   sessionStore.updateSession(ds.session);
   logger.info(`[${tag(ds)}] Owner-approved cross-principal suggestion dispatched turn=${suggestion.turnId.slice(0, 12)}`);
 }
@@ -24768,7 +24768,7 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
     };
   }
   const rawInput = ds.pendingRawInput ?? '';
-  rememberLastCliInput(ds, rawInput, rawInput);
+  rememberLastCliInput(ds, rawInput, rawInput, ds.pendingRawTurnId ?? ds.pendingTurnId);
   // A non-owner turn can reserve/admit a durable successor while this literal
   // raw opening is still preparing. Arm the same tokened activation journal
   // used by pending-repo raw starts so that successor is released only after
@@ -29931,7 +29931,7 @@ async function handleThreadReplyAdmitted(
             stripCrossPrincipalAsToken(parsed.content).text,
           );
         }
-        rememberLastCliInput(ds, promptContent, cliInput);
+        rememberLastCliInput(ds, promptContent, cliInput, parsed.messageId);
         if (ctx.durablePrimaryDispatch) {
           try {
             await waitForDurablePrimaryInputCommit(
@@ -30288,6 +30288,9 @@ async function handleThreadReplyAdmitted(
       if (openingTurn) releaseInitialUserTurn(ds);
       return;
     }
+    const reforkTurnId = queuedHasDurableTail
+      ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
+      : parsed.messageId;
     let reforkAccepted = true;
     let xpiAdmission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
     let xpiAdmissionAcquired = false;
@@ -30369,9 +30372,7 @@ async function handleThreadReplyAdmitted(
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.
           resume: openingResume,
-          turnId: queuedHasDurableTail
-            ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
-            : parsed.messageId,
+          turnId: reforkTurnId,
           ...(!queuedHasDurableTail && ctx.durablePrimaryDispatch
             ? {
                 dispatchAttempt: ctx.durablePrimaryDispatch.attempt,
@@ -30463,7 +30464,7 @@ async function handleThreadReplyAdmitted(
     // that poison as `hadPriorCliInput` and wrongly `--resume`d a CLI that never
     // took a real turn — breaking the empty-start invariant. forkWorker itself
     // persists the session (clearing queued); this records last* + reply state.
-    rememberLastCliInput(ds, queuedHasDurableTail ? ds.session.queuedPrompt! : promptContent, wrappedInput);
+    rememberLastCliInput(ds, queuedHasDurableTail ? ds.session.queuedPrompt! : promptContent, wrappedInput, reforkTurnId);
     sessionStore.updateSession(ds.session);
     if (ownsInitialStartClaim()) {
       if (initialStartClaimWaitsForQueuedAck) {
@@ -31435,7 +31436,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
-        rememberLastCliInput(ds, promptContent, cliInput);
+        rememberLastCliInput(ds, promptContent, cliInput, turnId);
         await noteTurnReceived(ds, commentId, text, sender, turnId);
         ensureCurrentRoutingGeneration(generation, 'comment:live-note');
         sub = currentDocSubscriptionForDelivery(larkAppId, sub);
@@ -31495,7 +31496,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         turnId,
       });
       (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
-      rememberLastCliInput(ds, promptContent, wrappedInput);
+      rememberLastCliInput(ds, promptContent, wrappedInput, turnId);
       await noteTurnReceived(ds, commentId, text, sender, turnId);
       ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
       sub = currentDocSubscriptionForDelivery(larkAppId, sub);
@@ -32931,7 +32932,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       // Record the failed/interrupted turn for /retry. Best-effort: a persist
       // failure must not crash the worker IPC handler (same contract as the
-      // turn-completion enqueue above). The reply-target guard skips type-ahead
+      // turn-completion enqueue above). Exact input ownership skips type-ahead
       // scenarios where a newer turn already owns the captured prompt.
       try {
         recordFailedTurnTerminal(ds, terminal, { workerGeneration: context.workerGeneration,
