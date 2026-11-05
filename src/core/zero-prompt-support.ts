@@ -102,3 +102,35 @@ export function zeroPromptInjectionUnsupportedReason(
 export function supportsZeroPromptInjection(cliId: string | undefined, opts?: ZeroPromptSupportOpts): boolean {
   return zeroPromptInjectionUnsupportedReason(cliId, opts) === null;
 }
+
+/** Per-bot options that can make transcript delivery unusable even when the
+ *  CLI itself harvests transcripts. Lives in this leaf module (no
+ *  bot-registry/config-store deps) so config-write invariants can reuse the
+ *  exact same predicate without closing an import cycle back through
+ *  core/reply-delivery → bot-registry (a cycle bun rejects at module link
+ *  time: "Export named 'resolveReplyDelivery' not found"). */
+export interface TranscriptDeliveryCapabilityOpts {
+  sandbox?: ZeroPromptSandboxValue;
+}
+
+/** Whether `replyDelivery: transcript` works for this CLI under its sandbox
+ *  configuration.
+ *
+ *  Full-root COW scratch: cursor's agent-transcript mirror and doubao's
+ *  `agent_mode/<uid>/workspace/.sessions` tree both live in the merged
+ *  overlay, which the host-side bridge cannot read (doubao has no scratch
+ *  path mapping — only codex/trae get an env redirect and claude a data-dir
+ *  remap — and neither writeInput's first-turn id capture nor
+ *  locate.bySessionId resolve the merged tree). Enabling the transcript
+ *  envelope there would strip the `botmux send` instructions while harvest
+ *  produced nothing — a fully silent turn. The deny-by-default oncall bwrap
+ *  is fine for both: their adapters declare the data directories as
+ *  authPaths, directory-bind mounted from the real host fs. */
+export function supportsTranscriptReplyDeliveryForBot(
+  cliId: string | undefined,
+  opts?: TranscriptDeliveryCapabilityOpts,
+): boolean {
+  if (!supportsTranscriptReplyDelivery(cliId)) return false;
+  if ((cliId === 'cursor' || cliId === 'doubao') && isScratchSandbox(opts)) return false;
+  return true;
+}

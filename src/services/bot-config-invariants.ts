@@ -1,5 +1,11 @@
 import { parseSandboxNetworkPolicy } from '../core/sandbox-network-policy.js';
-import { supportsTranscriptReplyDelivery, supportsTranscriptReplyDeliveryForBot } from '../core/reply-delivery.js';
+// 直接依赖叶子模块，勿改从 core/reply-delivery 取：reply-delivery import
+// bot-registry，而 bot-registry 经 turn-reply-card → card-handler →
+// bot-config-store → config-store 回到本文件，取道 reply-delivery 会闭合环，
+// bun 在模块链接期报 "Export named 'resolveReplyDelivery' not found"
+// （CI bun-test test/summary-command-window.test.ts 实测）。
+import { supportsTranscriptReplyDeliveryForBot } from '../core/zero-prompt-support.js';
+import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 export type BotConfigInvariantError =
   | 'codex_browser_requires_codex_app'
   | 'codex_browser_config_conflict'

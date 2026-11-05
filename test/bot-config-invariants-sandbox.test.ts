@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { botConfigInvariantError } from '../src/services/bot-config-invariants.js';
 
 describe('botConfigInvariantError — sandbox tri-state', () => {
@@ -137,5 +139,24 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
     expect(botConfigInvariantError({
       cliId: 'doubao', sandbox: 'scratch',
     })).toBeUndefined();
+  });
+
+  // 源码结构护栏(K1)：invariants 处在 config-store→invariants→…→bot-registry 环的一边，
+  // 从 core/reply-delivery 导入能力判据会把环闭成 bun 模块链接期错误（CI bun-test
+  // summary-command-window 实测），vitest 对环宽容、行为测试测不出来，只能钉 import 边。
+  it('K2 结构护栏：invariants 不得经 core/reply-delivery 取能力判据（会闭合 bun 链接期环）', () => {
+    // bot-registry → turn-reply-card → card-handler → bot-config-store →
+    // config-store → invariants 已在环的一边；reply-delivery 又直接 import
+    // bot-registry。invariants 从 reply-delivery 导入会让 bun 在模块链接期报
+    // "Export named 'resolveReplyDelivery' not found"（CI bun-test
+    // summary-command-window 实测，vitest 对环宽容测不出来，只能守依赖边）。
+    // 能力判据在 core/zero-prompt-support（叶子模块），从那里或
+    // structured-bridge-clis 取。
+    const source = readFileSync(
+      fileURLToPath(new URL('../src/services/bot-config-invariants.ts', import.meta.url)),
+      'utf8',
+    );
+    expect(source).not.toMatch(/from\s+['"][^'"]*core\/reply-delivery(\.js)?['"]/);
+    expect(source).toMatch(/from\s+['"][^'"]*core\/zero-prompt-support(\.js)?['"]/);
   });
 });

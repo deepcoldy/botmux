@@ -16,17 +16,18 @@
  */
 import { getBot, getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 import { logger } from '../utils/logger.js';
 import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { isScratchSandbox, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
+import { supportsTranscriptReplyDeliveryForBot, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
 
-/** claude-code 走 `claudeDataDir` 转写桥（worker.ts bridge fallback），其余按
- *  结构化转写白名单（codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor）。
- *  antigravity 只有零注入转写，不算；codex-app 天然是转写模式，不需要本开关。 */
-export { supportsTranscriptReplyDelivery };
+/** 能力判据在 zero-prompt-support（无 bot-registry 依赖的叶子模块）实现，这里原样
+ *  转出：daemon / worker-pool / dashboard / 测试的既有导入路径不变，且 config 写盘
+ *  不变量可以直接用叶子模块而不必经本文件绕回 bot-registry 形成 import 环。 */
+export { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
+export { supportsTranscriptReplyDeliveryForBot } from './zero-prompt-support.js';
+export type { TranscriptDeliveryCapabilityOpts } from './zero-prompt-support.js';
 
 /**
  * 未显式配置时的缺省投递方式：除 doubao 外**一律 `send`**，与上游行为逐字节一致——
@@ -50,40 +51,6 @@ export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDeliver
   // 系统提示也不再教 `botmux send`，绕开这条串号路径。显式写 `send` 仍可退回。
   if (cliId === 'doubao') return 'transcript';
   return 'send';
-}
-
-/** Per-bot options that can make transcript delivery unusable even when the
- *  CLI itself harvests transcripts. */
-export interface TranscriptDeliveryCapabilityOpts {
-  sandbox?: ZeroPromptSandboxValue;
-}
-
-/** Whether `replyDelivery: transcript` works for this bot's CLI under its
- *  sandbox configuration. The plain `supportsTranscriptReplyDelivery` predicate
- *  is CLI-only; callers that know the bot config (config write validation,
- *  dashboard switch gating, the runtime envelope decision) must go through
- *  this so an unusable combination is rejected at write time rather than
- *  accepted and silently degraded at runtime.
- *
- *  Full-root COW scratch: cursor's agent-transcript mirror and doubao's
- *  `agent_mode/<uid>/workspace/.sessions` tree both live in the merged
- *  overlay, which the host-side bridge cannot read (doubao has no scratch
- *  path mapping — only codex/trae get an env redirect and claude a data-dir
- *  remap — and neither writeInput's first-turn id capture nor
- *  locate.bySessionId resolve the merged tree). Enabling the transcript
- *  envelope there would strip the `botmux send` instructions from the prompt
- *  while harvest produced nothing — a fully silent turn, the exact shape the
- *  fallback exists to prevent. Reject it (same scratch boundary zero-injection
- *  already enforces). The deny-by-default oncall bwrap is fine for both:
- *  their adapters declare the data directories as authPaths, which are
- *  directory-bind mounted from the real host fs. */
-export function supportsTranscriptReplyDeliveryForBot(
-  cliId: string | undefined,
-  opts?: TranscriptDeliveryCapabilityOpts,
-): boolean {
-  if (!supportsTranscriptReplyDelivery(cliId)) return false;
-  if ((cliId === 'cursor' || cliId === 'doubao') && isScratchSandbox(opts)) return false;
-  return true;
 }
 
 const warnedUnsupported = new Set<string>();
