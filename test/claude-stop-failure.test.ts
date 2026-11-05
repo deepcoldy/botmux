@@ -13,7 +13,9 @@ import { join } from 'node:path';
 import {
   claudeStopFailureBelongsToOwner,
   classifyClaudeStopFailure,
+  CLAUDE_STOP_FAILURE_COMPACT_RECORD_MAX_LEAD_MS,
   CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS,
+  CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS,
   CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS,
   CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS,
   ClaudeStopFailureTranscriptEvidence,
@@ -481,6 +483,86 @@ describe('handleClaudeStopFailureReport', () => {
     handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
     runAll(timers);
     expect(notices).toEqual([['provider_server_error', 'om_failed']]);
+  });
+
+  it('leaves the next real failure\'s record to that failure\'s own report', () => {
+    // A background report on a completed turn; a few seconds later the next
+    // queued turn really fails and the transcript does not settle it.
+    const { ctx, timers, emitted, notices, record } = harness({ settled: 'completed', record: false });
+    handleClaudeStopFailureReport(backgroundFailure, { turnId: 'om_failed' }, ctx);
+    ctx.advance(3_000);
+    ctx.activeTurn = { turnId: 'om_next', dispatchAttempt: undefined };
+    ctx.advance(2_000);
+    timers[0].run();
+    ctx.advance(4_000);
+    record({ error: 'unknown' }, ctx.now() - 300);
+    ctx.advance(2_000);
+    handleClaudeStopFailureReport({ ...backgroundFailure }, { turnId: 'om_next' }, ctx);
+    ctx.advance(CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS - 4_000);
+    timers[1].run();
+    expect(notices).toEqual([]);
+    ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+    timers[2].run();
+    expect(emitted).toEqual([['om_next', 'ambiguous', 'provider_unknown_error', undefined, false]]);
+    expect(notices).toEqual([]);
+  });
+
+  it('does not let an old record whose own report got lost back a later one', () => {
+    const { ctx, timers, notices, record } = harness({ settled: 'completed', record: false });
+    record({}, ctx.now() - CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS - 5_000);
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    runAll(timers);
+    expect(notices).toEqual([]);
+  });
+
+  it('gives a prompt-too-long terminal the time Claude spent trying to compact', () => {
+    const { ctx, timers, notices, record } = harness({ settled: 'completed', record: false });
+    const leadMs = CLAUDE_STOP_FAILURE_COMPACT_RECORD_MAX_LEAD_MS - 60_000;
+    expect(leadMs).toBeGreaterThan(CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS);
+    record({ error: 'invalid_request', apiError: 'prompt_too_long' } as Partial<TranscriptEvent>, ctx.now() - leadMs);
+    handleClaudeStopFailureReport({ ...fromDrivenCli, error: 'invalid_request', lastAssistantMessage: 'Prompt is too long' }, { turnId: 'om_failed' }, ctx);
+    runAll(timers);
+    expect(notices).toEqual([['provider_invalid_request', 'om_failed']]);
+  });
+
+  it('counts a record read twice (same file on two bridge paths) once', () => {
+    const evidence = new ClaudeStopFailureTranscriptEvidence();
+    const at = Date.parse('2026-11-06T00:42:00.000Z');
+    const ev = { ...transcriptRecord, uuid: 'rec-1', timestamp: new Date(at).toISOString() };
+    evidence.observe([ev], TRANSCRIPT);
+    evidence.observe([ev], TRANSCRIPT);
+    expect(evidence.take(fromDrivenCli, at + 500)).toBe(true);
+    expect(evidence.take(fromDrivenCli, at + 500)).toBe(false);
+  });
+
+  it('keeps the newest records when it has to drop some', () => {
+    const evidence = new ClaudeStopFailureTranscriptEvidence();
+    const at = Date.parse('2026-11-06T00:42:00.000Z');
+    evidence.observe([{ ...transcriptRecord, uuid: 'new', timestamp: new Date(at).toISOString() }], TRANSCRIPT);
+    // A batch of older history read afterwards.
+    evidence.observe(Array.from({ length: 40 }, (_, i) => ({
+      ...transcriptRecord, uuid: `old-${i}`, timestamp: new Date(at - 3_600_000 + i).toISOString(),
+    })), TRANSCRIPT);
+    expect(evidence.take(fromDrivenCli, at + 500)).toBe(true);
+  });
+
+  it('claims the record closest to the report, leaving an earlier one to its own report', () => {
+    // Two failures 20s apart; the later report is matched first.
+    const evidence = new ClaudeStopFailureTranscriptEvidence();
+    const at = Date.parse('2026-11-06T00:42:00.000Z');
+    evidence.observe([
+      { ...transcriptRecord, uuid: 'first', timestamp: new Date(at - 20_000).toISOString() },
+      { ...transcriptRecord, uuid: 'second', timestamp: new Date(at - 400).toISOString() },
+    ], TRANSCRIPT);
+    expect(evidence.take(fromDrivenCli, at)).toBe(true);
+    expect(evidence.take(fromDrivenCli, at - 19_500)).toBe(true);
+  });
+
+  it('matches a record only up to a few seconds after the report', () => {
+    const evidence = new ClaudeStopFailureTranscriptEvidence();
+    const at = Date.parse('2026-11-06T00:42:00.000Z');
+    evidence.observe([{ ...transcriptRecord, timestamp: new Date(at + CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS + 1_000).toISOString() }], TRANSCRIPT);
+    expect(evidence.take(fromDrivenCli, at)).toBe(false);
   });
 
   it('lets one record back one report only', () => {

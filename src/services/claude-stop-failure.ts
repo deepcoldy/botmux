@@ -215,13 +215,21 @@ export function claudeStopFailureBelongsToOwner(
 // transcript the bridge reads, the report only counts once the bridge has read
 // a matching non-sidechain record.
 
-/** How far a record's own timestamp may precede the report. A prompt-too-long
- *  surfaces the record created before Claude tried, and failed, to compact,
- *  which can take minutes. */
-export const CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS = 5 * 60_000;
-/** How far it may follow it (clock granularity; the record is created before
- *  the hook is started). */
-export const CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS = 60_000;
+/** How far a record's own timestamp may precede the report. Claude creates
+ *  the record, writes it and only then starts the hook, so a real report
+ *  normally lands within a second of its record (measured on this fleet:
+ *  0.4–0.7s). The bound leaves room for a slow hook start, and stays short so
+ *  a record whose own hook got lost cannot back a later background failure. */
+export const CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS = 30_000;
+/** Same, for `invalid_request`: a prompt-too-long / autocompact terminal can
+ *  surface after Claude tried, and failed, to compact, and an image error
+ *  surfaces the record of the request that failed before that attempt. */
+export const CLAUDE_STOP_FAILURE_COMPACT_RECORD_MAX_LEAD_MS = 5 * 60_000;
+/** How far a record's timestamp may follow the report's arrival. The record is
+ *  created before the hook starts; this only absorbs timestamp rounding and
+ *  the worker's view of arrival. Kept short so the next real failure's record
+ *  is not claimed by a background report that came just before it. */
+export const CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS = 3_000;
 /** Extra time, after the grace period, for a transcript write that lost the
  *  race against the hook to reach the bridge. */
 export const CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS = 10_000;
@@ -230,6 +238,7 @@ const DIAGNOSTIC_FIELD_MAX = 200;
 
 interface ObservedTerminalRecord {
   path: string;
+  uuid?: string;
   error: string;
   atMs: number;
   used: boolean;
@@ -248,19 +257,34 @@ export class ClaudeStopFailureTranscriptEvidence {
       if (role !== 'assistant') continue;
       const atMs = eventTimeMs(ev);
       if (atMs === undefined) continue;
+      // The same file can be read twice (a path that is primary again while
+      // still listed as a retired secondary path).
+      const uuid = typeof ev.uuid === 'string' && ev.uuid ? ev.uuid : undefined;
+      if (uuid && this.records.some(r => r.uuid === uuid && r.path === path)) continue;
       const error = (typeof ev.error === 'string' && ev.error.trim() ? ev.error.trim() : 'unknown').slice(0, MAX_ERROR_LENGTH);
-      this.records.push({ path, error, atMs, used: false });
+      this.records.push({ path, ...(uuid ? { uuid } : {}), error, atMs, used: false });
     }
-    if (this.records.length > MAX_OBSERVED_RECORDS) this.records.splice(0, this.records.length - MAX_OBSERVED_RECORDS);
+    if (this.records.length > MAX_OBSERVED_RECORDS) {
+      // Keep the newest unused records: used ones back nothing any more.
+      this.records.sort((a, b) => (Number(b.used) - Number(a.used)) || (a.atMs - b.atMs));
+      this.records.splice(0, this.records.length - MAX_OBSERVED_RECORDS);
+    }
   }
 
-  /** Claim the record a report that arrived at `arrivedAtMs` stands for. */
+  /** Claim the record a report that arrived at `arrivedAtMs` stands for: the
+   *  unused one of the same error and transcript closest to the arrival. */
   take(report: ClaudeStopFailureReport, arrivedAtMs: number): boolean {
     const path = report.transcriptPath;
     if (!path) return false;
-    const found = this.records.find(r => !r.used && r.path === path && r.error === report.error
-      && r.atMs >= arrivedAtMs - CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS
-      && r.atMs <= arrivedAtMs + CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS);
+    const maxLeadMs = report.error === 'invalid_request'
+      ? CLAUDE_STOP_FAILURE_COMPACT_RECORD_MAX_LEAD_MS
+      : CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS;
+    let found: ObservedTerminalRecord | undefined;
+    for (const r of this.records) {
+      if (r.used || r.path !== path || r.error !== report.error) continue;
+      if (r.atMs < arrivedAtMs - maxLeadMs || r.atMs > arrivedAtMs + CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS) continue;
+      if (!found || Math.abs(r.atMs - arrivedAtMs) < Math.abs(found.atMs - arrivedAtMs)) found = r;
+    }
     if (!found) return false;
     found.used = true;
     return true;
