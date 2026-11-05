@@ -692,6 +692,12 @@ describe('淘汰与 retentionGap', () => {
     const pruned = pruneGroupContext(APP, CHAT, { now });
     expect(pruned.prunedCount).toBe(1);
     expect(listGroupContextMessages(APP, CHAT).messages.map(m => m.messageId)).toEqual(['om_new']);
+    // Age-based eviction must publish the same gap metadata as the row-cap path,
+    // otherwise a reader paging from the start silently treats a pruned window as
+    // "no messages yet" instead of reporting the hole.
+    expect(listGroupContextMessages(APP, CHAT).retentionGap)
+      .toEqual({ prunedThroughSeq: pruned.prunedThroughSeq, prunedCount: 1 });
+    expect(getGroupContextHead(APP, CHAT).prunedCount).toBe(1);
   });
 
   it('upsert 会按阈值自动触发淘汰（默认 10000 条/群），写入方不必手动 prune', () => {
