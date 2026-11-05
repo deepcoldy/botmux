@@ -295,11 +295,12 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
           }
         } catch { /* 无证据照常投递 */ }
       }));
-      // 取证据期间可能已被关闭 / 接管 / 关了又开：这批事件属于旧的那次开启，丢弃。
-      if (!sameRegistration(getGroupSecretaryChat(deps.larkAppId, digest.chatId), entry) || !isActiveChat(digest.chatId)) {
-        deps.log('info', `[group-secretary] registration changed while gathering evidence chat=${digest.chatId.slice(0, 12)}; dropped ${digest.events.length} event(s)`);
-        return;
-      }
+    }
+    // 投递前最后一次复核：取证据（或将来在这之前加的任何 await）期间可能已被关闭 / 接管 /
+    // 关了又开，这批事件属于旧的那次开启，丢弃。不挂在取证据分支里，免得以后改投递流程时漏掉。
+    if (!sameRegistration(getGroupSecretaryChat(deps.larkAppId, digest.chatId), entry) || !isActiveChat(digest.chatId)) {
+      deps.log('info', `[group-secretary] registration changed before delivery chat=${digest.chatId.slice(0, 12)}; dropped ${digest.events.length} event(s)`);
+      return;
     }
     const prompt = renderGroupSecretaryPrompt(digest, {
       enabledByOpenId: entry.enabledBy,

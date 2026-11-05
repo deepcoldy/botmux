@@ -39,9 +39,9 @@ function attr(name: string, value: string | undefined): string {
   return value ? ` ${name}="${escapeXml(value)}"` : '';
 }
 
-let renderOpts = { includeMessages: true };
+interface RenderOptions { includeMessages: boolean }
 
-function renderEvent(event: SecretaryEvent): string {
+function renderEvent(event: SecretaryEvent, renderOpts: RenderOptions): string {
   const s = event.session;
   const m = event.message;
   const head = `<event kind="${event.kind}" label="${EVENT_LABEL[event.kind]}" at="${iso(event.at)}"`
@@ -95,7 +95,7 @@ export function renderGroupSecretaryPrompt(
   options: { enabledByOpenId: string; groupContextInjected?: boolean },
 ): string {
   const owner = options.enabledByOpenId;
-  renderOpts = { includeMessages: !options.groupContextInjected };
+  const renderOpts: RenderOptions = { includeMessages: !options.groupContextInjected };
   return [
     '<group_secretary>',
     '  <instruction>',
@@ -139,7 +139,7 @@ export function renderGroupSecretaryPrompt(
     '12. 每条消息简短，一两句话。',
     '  </instruction>',
     '  <events>',
-    ...digest.events.map(renderEvent),
+    ...digest.events.map(event => renderEvent(event, renderOpts)),
     '  </events>',
     ...(digest.activeSessions?.length ? ['  <active_sessions>', ...digest.activeSessions.map(v => `    ${renderSession(v)}`), '  </active_sessions>'] : []),
     ...(digest.ownRecent?.length ? ['  <own_recent>', ...digest.ownRecent.map(renderMessage), '  </own_recent>'] : []),

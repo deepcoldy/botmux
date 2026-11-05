@@ -12814,7 +12814,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       const { appendFileSync, mkdirSync: mk } = await import('node:fs');
       const dir = resolveDataDir();
       mk(dir, { recursive: true });
-      appendFileSync(join(dir, `group-secretary-actions-${s.larkAppId}.jsonl`), JSON.stringify({
+      const auditPath = join(dir, `group-secretary-actions-${s.larkAppId}.jsonl`);
+      // 审计日志只追加：超过 5 MiB 时滚成 .1（只留一份历史），不让它无限长大。
+      const { rotateLogIfNeeded } = await import('./utils/log-rotate.js');
+      rotateLogIfNeeded(auditPath, 5 * 1024 * 1024);
+      appendFileSync(auditPath, JSON.stringify({
         at: new Date().toISOString(), chatId: s.chatId, turnId: currentTurnId,
         action: secretaryGate.action, reason: argValue(rest, '--secretary-reason')?.slice(0, 300),
         text: content.slice(0, 300),
