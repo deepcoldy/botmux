@@ -100,7 +100,9 @@ describe('Codex CLI effort menu', () => {
 
   it('does not select Enter when an older CLI lacks session-scoped selection', async () => {
     const { io, keys } = fixture({ session: false });
+    io.unavailable = vi.fn();
     expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'high')).toMatchObject({ status: 'unavailable' });
+    expect(io.unavailable).toHaveBeenCalledWith('session_selection_unavailable');
     expect(keys).toEqual(['Enter', 'Escape']);
   });
 
@@ -113,8 +115,20 @@ describe('Codex CLI effort menu', () => {
 
   it.each(['› important unsent draft', '› /other-command', 'unknown layout'])('leaves %s untouched', async screen => {
     const { io, keys } = fixture();
+    io.unavailable = vi.fn();
     io.screen = async () => screen;
     expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max')).toMatchObject({ status: 'unavailable' });
+    expect(io.unavailable).toHaveBeenCalledWith('composer_not_empty');
+    expect(io.command).not.toHaveBeenCalled();
+    expect(keys).toEqual([]);
+  });
+
+  it('identifies an already open picker without logging its contents or pressing keys', async () => {
+    const { io, keys } = fixture();
+    io.unavailable = vi.fn();
+    io.screen = async () => picker('Advanced Reasoning', ['Max', 'Ultra'], 0);
+    expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max')).toMatchObject({ status: 'unavailable' });
+    expect(io.unavailable).toHaveBeenCalledExactlyOnceWith('menu_already_open');
     expect(io.command).not.toHaveBeenCalled();
     expect(keys).toEqual([]);
   });

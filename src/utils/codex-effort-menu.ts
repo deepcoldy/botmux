@@ -78,6 +78,8 @@ export interface CodexEffortMenuIO {
   isCurrent(): boolean;
   signal: AbortSignal;
   deadline: number;
+  /** Fixed reason codes only: never include composer text or a raw screen. */
+  unavailable?(reason: 'inactive' | 'composer_not_empty' | 'menu_already_open' | 'session_selection_unavailable'): void;
   now?: () => number;
   delay?: (ms: number) => Promise<void>;
 }
@@ -102,7 +104,11 @@ export async function applyCodexEffortMenu(
   const alive = () => io.isCurrent() && !io.signal.aborted && now() < io.deadline;
   try {
     const initial = await io.screen();
-    if (!alive() || !hasEmptyCodexComposer(initial) || parseCodexEffortMenu(initial)) {
+    const unavailable = !alive() ? 'inactive'
+      : parseCodexEffortMenu(initial) ? 'menu_already_open'
+        : !hasEmptyCodexComposer(initial) ? 'composer_not_empty' : undefined;
+    if (unavailable) {
+      io.unavailable?.(unavailable);
       return { status: 'unavailable', reason: 'cli_menu_unavailable' };
     }
     await io.command();
@@ -156,6 +162,7 @@ export async function applyCodexEffortMenu(
           else if (menu.kind === 'model' || /^More reasoning/.test(menu.rows[target]!.label)) io.key('Enter');
           else {
             if (!/enter (?:default|apply)\s*·\s*s session\s*·\s*esc back/i.test(screen)) {
+              io.unavailable?.('session_selection_unavailable');
               return { status: 'unavailable', reason: 'cli_menu_unavailable' };
             }
             io.key('s'); // Use the session-scoped key for both default and apply menus.
