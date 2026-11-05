@@ -634,6 +634,29 @@ describe('authorization loop regressions', () => {
     expect(calls).toEqual([]);
   });
 
+  // Seen live while bytedcli upgraded itself mid-call: stdout carried a notice
+  // (or a stack trace) next to the token. Injecting that as the JWT makes every
+  // call in the turn read "not logged in", so the mint must fail as transient.
+  it.each([
+    '✓ bytedcli global package auto-upgraded: 0.185.0 -> 0.186.0.\ncloud.jwt.value\n',
+    'cloud.jwt.value\nReload bytedcli-related agent skills in existing sessions.\n',
+    'cloud.jwt value\n',
+  ])('refuses a ByteCloud JWT mixed with other output: %j', async stdout => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    replies = [{ code: 0, stdout }, { code: 0, stdout: 'code.jwt.value\n' }];
+    await expect(mod.mintBytedcliJwts(ALICE)).rejects.toThrow('service unavailable');
+  });
+
+  it('drops a Codebase JWT mixed with other output but keeps the ByteCloud identity', async () => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    replies = [
+      { code: 0, stdout: 'cloud.jwt.value\n' },
+      { code: 0, stdout: 'Update available\ncode.jwt.value\n' },
+      { code: 1 }, { code: 1 }, { code: 1 },
+    ];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt.value' });
+  });
+
   it('reports a failed JWT mint as unavailable instead of asking for another login', async () => {
     const mod = await fresh(); authorize(mod, ALICE);
     replies = [{ code: 1, stderr: 'network down' }];

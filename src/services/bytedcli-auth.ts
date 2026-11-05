@@ -632,14 +632,18 @@ async function mintJwts(openId: string, epoch: number, durableEpoch: number): Pr
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
   if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const cloudJwt = cloud.stdout.trim();
-  if (!cloud.ok || !cloudJwt) {
+  // A JWT never contains whitespace. Anything else on stdout (an auto-upgrade
+  // notice, a half-installed package's stack trace) would otherwise be injected
+  // verbatim as the person's token and every call would read "not logged in".
+  if (!cloud.ok || !cloudJwt || /\s/.test(cloudJwt)) {
     throw new BytedcliAuthUnavailableError('mint personal JWT');
   }
   // The Codebase JWT is optional: without it lark/bytedcli calls still work and
   // only git attribution degrades, so a failure here must not deny the turn.
   const code = await runAsUser(openId, ['auth', 'get-codebase-jwt-token']);
   if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
-  const codeJwt = code.ok ? code.stdout.trim() : '';
+  const mintedCodeJwt = code.ok ? code.stdout.trim() : '';
+  const codeJwt = /\s/.test(mintedCodeJwt) ? '' : mintedCodeJwt;
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
   }
