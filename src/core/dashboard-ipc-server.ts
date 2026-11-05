@@ -8437,7 +8437,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
-  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则缺省 send）
+  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则按 CLI 缺省，
+  // doubao 缺省 transcript、其余 send）
   // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
   let replyDelivery: 'send' | 'transcript' = 'send';
   let replyDeliveryDefault: 'send' | 'transcript' = 'send';
@@ -10243,7 +10244,7 @@ botConfigPutRoute('/api/bot-topic-unavailable-policy', 'topicUnavailablePolicy',
 //     模型不再被要求 botmux send；仅 claude-code 与结构化转写白名单 CLI 支持，其它
 //     CLI 由 store 拒绝（400 reply_delivery_unsupported）。落盘 'transcript'
 //   • 'send' → 模型必须自己 botmux send。落盘 'send'
-//   • ''/其它 → 删 key，回到缺省 send
+//   • ''/其它 → 删 key，回到该 CLI 的缺省（doubao 缺省 transcript，其余缺省 send）
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
 // 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
 botConfigPutRoute<{ promptInjection?: unknown }>('/api/bot-prompt-injection', 'promptInjection', {

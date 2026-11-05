@@ -304,23 +304,25 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 | `promptInjection` | `"none"` 或 `"default"`（默认）。设置为 `"none"` 时开启**零注入模式**：跳过系统提示词、逐轮提醒、身份信封、角色与技能注入，仅传递纯净任务与附件，并由底层转写自动采集回传最终回答。详见 [零注入模式](#零注入模式-promptinjection-none) |
 | `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
 | `senderTagHideEmail` | 布尔，默认 `false`（关）。开启后仅在新构造的 `<sender>` 中省略 `email` 属性，保留姓名、ID 和类型。与 `senderTag` 独立保存；不修改身份缓存、鉴权或 `--mention-back`，不清理已排队输入、历史或正文中的邮箱。可用 `/botconfig set senderTagHideEmail on\|off` 热更新 |
-| `replyDelivery` | `"transcript"` 或 `"send"`，**所有 CLI 缺省都是 `send`**（与上游行为一致），`transcript` 需显式开启。最终回复怎么送到飞书：`transcript` = daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，系统提示不再提及 `botmux send`；`send` = 模型必须自己 `botmux send`（历史行为）。显式写 `"send"` 才让 claude-code 退回旧行为；`send` / `transcript` 都会写盘，`unset` 回各 CLI 默认 |
+| `replyDelivery` | `"transcript"` 或 `"send"`，**缺省按 CLI：`doubao` 缺省 `transcript`，其余 CLI（含 `claude-code`）缺省 `send`**。最终回复怎么送到飞书：`transcript` = daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，系统提示不再提及 `botmux send`；`send` = 模型必须自己 `botmux send`（历史行为）。`send` / `transcript` 都会写盘，`unset` 回各 CLI 默认 |
 
 ### `replyDelivery: "transcript"`
 
-`claude-code` 缺省即 `transcript`；其它支持的 CLI 需显式设置。生效后对该 bot 的会话有三条效果：
+`doubao` 缺省即 `transcript`（其工具命令跑在账号级常驻 `doubao --type=service` 进程，模型自己 `botmux send` 会按首个拉起终端的进程树误归属，详见 [Doubao CLI](/doubao)）；其余 CLI 需显式设置。生效后对该 bot 的会话有三条效果：
 
 1. **系统提示不再提及 `botmux send`**：开场改为「最终 assistant message 由 botmux 自动转发回飞书，直接作答即可」，heredoc / @ 决策 / 附件用法、`<identity>` 里「协作必须 `botmux send --mention`」的规则一并去掉，只保留 `botmux history` / `botmux bots list` 与 `BOTMUX_NOTHING_TO_SEND` 沉默哨兵。附件、跨 bot @ 等确实需要 `botmux send` 的场景，模型可通过内置 skill（`--plugin-dir` 里的 `botmux-send`）按需自行发现；
 2. **不再逐轮注入 `<botmux_reminder>`**（每轮 prompt 少一段提醒）；
 3. **solo 会话去壳**：私聊、或只有 owner 和本 bot 两个参与者的 1v1 普通群，每轮消息去掉 `<user_message>` 壳与 `<sender/>` 标签，模型看到的就是裸文本。话题群、多人群、非 owner 发言的一律不算 solo，壳与标签照旧。
 
-支持的 CLI 白名单：`claude-code`，以及走结构化转写桥的 `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`。其它 CLI（如 `cursor`、`antigravity`）没有转写采集通道，`/botconfig set` 与 dashboard 都会拒绝（`reply_delivery_unsupported`）；已写盘后再把 `cli` 切到不支持的 CLI，运行时自动回落 `send`（日志 warn 一次），不会丢回复。
+支持的 CLI 白名单：`claude-code`（自带数据目录转写桥），以及走结构化转写桥的 `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok` / `cursor` / `doubao`。`antigravity` 没有普通转写通道，只在零注入（`promptInjection: "none"`）下采集，显式写 `transcript` 会被 `/botconfig set` 与 dashboard 拒绝（`reply_delivery_unsupported`）；已写盘后再把 `cli` 切到不支持的 CLI，运行时自动回落 `send`（日志 warn 一次），不会丢回复。
+
+沙箱限制：`cursor` 与 `doubao` 在全根 COW 的 `sandbox: "scratch"` 下不支持 transcript（CLI 写在 merged overlay 里的转写宿主侧桥读不到）——写盘被拒、缺省值运行时回落 `send`；oncall 沙箱（`true` / `"oncall"`，含 legacy readIsolation）不受影响，数据目录以目录级 bind 挂真实宿主路径。
 
 可由 owner / `allowedUsers` 通过 `/botconfig` 热更新：
 
 ```text
-/botconfig set replyDelivery transcript   # 其它支持的 CLI 显式开启
-/botconfig set replyDelivery send         # claude-code 退回旧行为（模型自己 botmux send）
+/botconfig set replyDelivery transcript   # 显式开启（doubao 本来就是缺省）
+/botconfig set replyDelivery send         # 显式钉住 send，如 doubao 不建议地改回旧行为
 /botconfig unset replyDelivery            # 回各 CLI 默认
 ```
 

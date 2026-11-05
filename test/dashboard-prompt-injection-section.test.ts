@@ -66,6 +66,10 @@ it('follows the row’s current CLI / backend / sandbox instead of a load-time s
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandboxMode: 'scratch' })).toBe(false);
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandboxMode: 'off' })).toBe(true);
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandbox: true })).toBe(true);
+  // #2828：doubao 的 .sessions 在 scratch merged 树里，零注入与 transcript 同样被锁
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandboxMode: 'scratch' })).toBe(false);
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandboxMode: 'off' })).toBe(true);
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandbox: true })).toBe(true);
   // A local CLI never spawns on a remote backend (paired back to a local one), so
   // a stale riff override does not block it; antigravity on zmx is unsupported.
   expect(zeroPromptSupportedFor({ cliId: 'claude-code', backendType: 'riff' })).toBe(true);
