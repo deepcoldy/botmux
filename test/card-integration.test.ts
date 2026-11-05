@@ -2094,6 +2094,7 @@ describe('Card integration: full event flow', () => {
         },
         lastUserPrompt: '继续',
         lastCliInput: '<user_message>继续</user_message>',
+        lastCliInputTurnId: 'om_limited_turn',
         currentImageKey: 'img_old',
       });
       const sessions = new Map<string, DaemonSession>();
@@ -2102,9 +2103,19 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRetryLastTaskEvent(ROOT_ID), deps, APP_ID);
 
+      const { rememberLastCliInput } = await import('../src/core/session-manager.js');
+      const retryTurnId = vi.mocked(rememberLastCliInput).mock.calls.at(-1)?.[3];
+      expect(retryTurnId).toEqual(expect.any(String));
+      expect(retryTurnId).not.toBe('');
+      expect(retryTurnId).not.toBe('om_limited_turn');
+      expect(rememberLastCliInput).toHaveBeenCalledWith(
+        ds, '继续', { content: '<user_message>继续</user_message>' }, retryTurnId,
+      );
+      expect((ds.worker as any).send).toHaveBeenCalledTimes(1);
       expect((ds.worker as any).send).toHaveBeenCalledWith({
         type: 'message',
         content: '<user_message>继续</user_message>',
+        turnId: retryTurnId,
       });
       expect(ds.usageLimit).toBeUndefined();
       expect(ds.usageLimitRetryTimer).toBeUndefined();
