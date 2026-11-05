@@ -4440,7 +4440,12 @@ export async function handleCommand(
               url: platformCredsUrl,
             }, loc));
           }
-          if (larkBound && !larkPlatformOnly) {
+          if (larkPlatformOnly) {
+            // The platform is the only source of this person's lark-cli identity:
+            // the platform line above is the answer. Neither the bot-app token nor
+            // a machine-local device login would ever be used here.
+            if (!platformCredsUrl) lines.push(t('cmd.login.platform_unbound', undefined, loc));
+          } else if (larkBound) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
@@ -4471,8 +4476,11 @@ export async function handleCommand(
         if (subCmd === 'done' || subCmd === '完成') {
           const doneLines: string[] = [];
           const boundLark = larkBound && !larkPlatformOnly;
-          const larkPending = boundLark ? null : pendingLarkCliChallenge(loginOpenId);
-          if (boundLark) {
+          // platform-only: no machine-local lark-cli login is ever consulted.
+          const larkPending = boundLark || larkPlatformOnly ? null : pendingLarkCliChallenge(loginOpenId);
+          if (larkPlatformOnly) {
+            // nothing to finish or report for lark-cli on this machine
+          } else if (boundLark) {
             doneLines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (larkPending) {
             const { state, detail } = await completeLarkCliLogin(loginOpenId);

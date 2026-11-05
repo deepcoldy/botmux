@@ -85,3 +85,27 @@ function findPendingDir(root: string, state: string): string {
   }
   throw new Error('pending file not found');
 }
+
+describe('answerOAuthLoopbackCallback', () => {
+  const url = 'http://127.0.0.1:9768/callback?code=c&state=s';
+  it('never consumes a callback this machine did not start', async () => {
+    const { answerOAuthLoopbackCallback } = await import('../src/utils/oauth-loopback-page.js');
+    const consume = vi.fn(async () => '✅');
+    for (const origin of ['unknown', 'expired'] as const) {
+      const page = await answerOAuthLoopbackCallback(url, { origin: () => origin, consume });
+      expect(page.status).toBe(origin === 'unknown' ? 409 : 400);
+    }
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it('consumes its own login and reports the result', async () => {
+    const { answerOAuthLoopbackCallback } = await import('../src/utils/oauth-loopback-page.js');
+    expect((await answerOAuthLoopbackCallback(url, { origin: () => 'own', consume: async () => '✅ done' })).status).toBe(200);
+    expect((await answerOAuthLoopbackCallback(url, { origin: () => 'own', consume: async () => '❌ no' })).status).toBe(400);
+    const onError = vi.fn();
+    expect((await answerOAuthLoopbackCallback(url, {
+      origin: () => 'own', consume: async () => { throw new Error('boom'); }, onError,
+    })).status).toBe(400);
+    expect(onError).toHaveBeenCalled();
+  });
+});

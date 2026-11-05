@@ -348,7 +348,7 @@ import {
 } from './services/quota-fallback.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl, callbackOrigin } from './utils/user-token.js';
-import { renderOAuthLoopbackPage, type OAuthLoopbackOutcome } from './utils/oauth-loopback-page.js';
+import { answerOAuthLoopbackCallback } from './utils/oauth-loopback-page.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
@@ -8255,19 +8255,11 @@ const oauthCallbackServer = createServer(async (req, res) => {
   // A callback whose login this process never started belongs to another
   // BotMux (the issuing daemon). Do not consume it here; tell the person where
   // to send it.
-  let outcome: OAuthLoopbackOutcome = 'failed';
-  const origin = callbackOrigin(url.toString());
-  if (origin === 'unknown') {
-    outcome = 'foreign';
-  } else if (origin === 'own') {
-    try {
-      const message = await handleCallbackUrl(url.toString());
-      if (typeof message === 'string' && message.startsWith('✅')) outcome = 'ok';
-    } catch (error) {
-      logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`);
-    }
-  }
-  const page = renderOAuthLoopbackPage(outcome, url.toString());
+  const page = await answerOAuthLoopbackCallback(url.toString(), {
+    origin: callbackOrigin,
+    consume: handleCallbackUrl,
+    onError: error => logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`),
+  });
   res.writeHead(page.status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',

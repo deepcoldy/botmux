@@ -27,3 +27,31 @@ export function renderOAuthLoopbackPage(outcome: OAuthLoopbackOutcome, callbackU
     html: `<!doctype html><meta charset="utf-8"><title>${title}</title><style>body{font-family:system-ui,sans-serif;max-width:560px;margin:80px auto;padding:24px;color:#111827}h1{font-size:28px}</style><h1>${title}</h1>${body}`,
   };
 }
+
+/**
+ * The loopback listener's whole decision: which page to show and whether this
+ * process may consume the callback at all. Only a login this process (or a
+ * sibling process on this machine) started is handed to `consume`.
+ */
+export async function answerOAuthLoopbackCallback(
+  callbackUrl: string,
+  deps: {
+    origin: (url: string) => 'own' | 'expired' | 'unknown';
+    consume: (url: string) => Promise<string | null>;
+    onError?: (error: unknown) => void;
+  },
+): Promise<{ status: number; html: string }> {
+  let outcome: OAuthLoopbackOutcome = 'failed';
+  const origin = deps.origin(callbackUrl);
+  if (origin === 'unknown') {
+    outcome = 'foreign';
+  } else if (origin === 'own') {
+    try {
+      const message = await deps.consume(callbackUrl);
+      if (typeof message === 'string' && message.startsWith('✅')) outcome = 'ok';
+    } catch (error) {
+      deps.onError?.(error);
+    }
+  }
+  return renderOAuthLoopbackPage(outcome, callbackUrl);
+}

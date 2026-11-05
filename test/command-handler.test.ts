@@ -7134,6 +7134,22 @@ describe('handleCommand', () => {
         expect(reply(deps)).toContain(PAGE);
       });
 
+      it('platform-only: /login status and /login done report no machine-local lark-cli login either', async () => {
+        const deps = withPolicy({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, true);
+        (deps as any).activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID)).worker = null;
+        vi.mocked(hasLarkCliHome).mockClear();
+        vi.mocked(pendingLarkCliChallenge).mockClear();
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+        const status = reply(deps);
+        expect(status).toContain(PAGE);
+        expect(status).not.toContain(t('cmd.login.lark_status_no', undefined, 'zh'));
+        expect(status).not.toContain(t('cmd.login.lark_status_yes', undefined, 'zh'));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
+        expect(pendingLarkCliChallenge).not.toHaveBeenCalled();
+        expect(hasLarkCliHome).not.toHaveBeenCalled();
+        expect(completeLarkCliLogin).not.toHaveBeenCalled();
+      });
+
       it('platform-only + unbound machine: refuses, offers neither bot app OAuth nor device code', async () => {
         const deps = withPolicy({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, false);
         (deps as any).activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID)).worker = null;
