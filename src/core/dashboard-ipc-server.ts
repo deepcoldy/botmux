@@ -109,7 +109,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
-import { resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { envSandboxMode, resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
@@ -8647,6 +8647,11 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     askOptionLayout,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
+    // Machine-wide BOTMUX_SANDBOX force the worker applies over this bot's own
+    // selection (null = none). Lets the page say why "关闭" is not what runs.
+    sandboxEnvForce: (() => {
+      try { const m = envSandboxMode(process.env.BOTMUX_SANDBOX); return m === 'off' ? null : m; } catch { return null; }
+    })(),
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),

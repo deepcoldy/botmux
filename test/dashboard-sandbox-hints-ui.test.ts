@@ -59,6 +59,36 @@ function mount(element: React.ReactElement): TestRenderer.ReactTestRenderer {
 const bot = (over: Partial<BotDefaultsRow>): BotDefaultsRow => ({ larkAppId: 'app_a', ...over } as BotDefaultsRow);
 const sandboxPuts = () => calls.filter(c => c.method === 'PUT' && c.url === '/api/bots/app_a/sandbox');
 
+describe('SandboxSection — says when the selection is not what new sessions run', () => {
+  const overrideNote = (view: TestRenderer.ReactTestRenderer) =>
+    view.root.findAll(n => typeof n.type === 'string' && n.props['data-sandbox-override'] !== undefined);
+
+  it('legacy readIsolation keeps "off" confined: the page says so and offers to clear it', async () => {
+    const patchBot = vi.fn();
+    responder = () => ({ body: { ok: true, readIsolation: false } });
+    const view = mount(React.createElement(SandboxSection, { bot: bot({ sandboxMode: 'off', readIsolation: true }), patchBot }));
+    expect(overrideNote(view).map(n => n.props['data-sandbox-override'])).toEqual(['readIsolation']);
+    await act(async () => { await view.root.findByProps({ 'data-action': 'clear-legacy-read-isolation' }).props.onClick(); });
+    expect(calls.filter(c => c.method === 'PUT').map(c => [c.url, c.body])).toEqual([
+      ['/api/bots/app_a/read-isolation', JSON.stringify({ enabled: false })],
+    ]);
+    expect(patchBot).toHaveBeenCalledWith('app_a', { readIsolation: false });
+  });
+
+  it('a daemon-wide BOTMUX_SANDBOX force is named; no note when it matches the selection', () => {
+    const forced = mount(React.createElement(SandboxSection, { bot: bot({ sandboxMode: 'off', sandboxEnvForce: 'oncall' }), patchBot: vi.fn() }));
+    expect(overrideNote(forced).map(n => n.props['data-sandbox-override'])).toEqual(['env']);
+    const same = mount(React.createElement(SandboxSection, { bot: bot({ sandboxMode: 'oncall', sandboxEnvForce: 'oncall' }), patchBot: vi.fn() }));
+    expect(overrideNote(same)).toEqual([]);
+  });
+
+  it('no note for a plain off/oncall bot, nor for oncall + readIsolation (same effect)', () => {
+    for (const row of [bot({ sandboxMode: 'off' }), bot({ sandboxMode: 'oncall', readIsolation: true })]) {
+      expect(overrideNote(mount(React.createElement(SandboxSection, { bot: row, patchBot: vi.fn() })))).toEqual([]);
+    }
+  });
+});
+
 describe('SandboxSection — confirm before switching the sandbox on', () => {
   async function click(view: TestRenderer.ReactTestRenderer, action: string): Promise<void> {
     await act(async () => { await view.root.findByProps({ 'data-action': action }).props.onClick(); });

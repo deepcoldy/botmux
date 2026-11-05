@@ -37,6 +37,31 @@ export function frozenSessionSandboxMode(raw: unknown): SandboxMode {
   try { return normalizeSandboxMode(raw); } catch { return 'off'; }
 }
 
+/**
+ * Sandbox mode the session card should show. The frozen session decision is
+ * not the whole truth: the worker also honours the machine-wide BOTMUX_SANDBOX
+ * force (never materialised into the session), so a session frozen "off" on a
+ * forced daemon still runs inside a sandbox and must not render as unsandboxed.
+ * When the current worker has already reported whether a local sandbox wraps
+ * the CLI (`engaged`, e.g. a remote backend bypasses it), that fact wins.
+ * Display only — never feeds a spawn decision. A typo'd env value (which makes
+ * the worker refuse to start) falls back to the frozen mode.
+ */
+export function sessionCardSandboxMode(
+  frozen: unknown,
+  engaged?: boolean,
+  envValue: string | undefined = process.env.BOTMUX_SANDBOX,
+): SandboxMode {
+  if (engaged === false) return 'off';
+  const recorded = frozenSessionSandboxMode(frozen);
+  let forced: SandboxMode = 'off';
+  try { forced = envSandboxMode(envValue); } catch { /* worker refuses to start; show what was frozen */ }
+  if (forced !== 'off') return forced;
+  if (recorded !== 'off') return recorded;
+  // Engaged without a frozen or env mode: legacy readIsolation applied at spawn.
+  return engaged === true ? 'oncall' : 'off';
+}
+
 /** The mode a NEW session of this bot would freeze right now — the same rule
  *  as `freezeSessionSandboxDecision` (legacy readIsolation implies oncall). */
 export function botConfigSandboxMode(botCfg: { sandbox?: unknown; readIsolation?: boolean }): SandboxMode {

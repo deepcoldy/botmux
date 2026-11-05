@@ -4447,6 +4447,24 @@ export function CodexIsolatedConfigInfo(props: { bot: BotDefaultsRow }) {
   );
 }
 
+/**
+ * Why the mode a new session actually runs under differs from the selected one
+ * (null = it does not). The worker folds two inputs the selector does not own:
+ * the machine-wide BOTMUX_SANDBOX force (wins over every bot), then the legacy
+ * `readIsolation` flag (implies the whitelist sandbox). Without this note
+ * "关闭" reads as off while every new session is still confined.
+ */
+export function sandboxSelectionOverride(
+  bot: Pick<BotDefaultsRow, 'readIsolation' | 'sandboxEnvForce'>,
+  selected: SandboxMode,
+): { cause: 'env'; mode: 'oncall' | 'scratch' } | { cause: 'readIsolation' } | null {
+  const forced = bot.sandboxEnvForce;
+  if (forced === 'oncall' || forced === 'scratch') return forced === selected ? null : { cause: 'env', mode: forced };
+  // oncall: readIsolation adds nothing; scratch: the worker refuses the combination.
+  if (bot.readIsolation === true && selected !== 'oncall') return { cause: 'readIsolation' };
+  return null;
+}
+
 export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const { bot, patchBot } = props;
@@ -4495,6 +4513,18 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     await save(next, next === 'scratch' ? storage : 'tmpfs');
   }
 
+  async function clearLegacyReadIsolation(): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/read-isolation`, { enabled: false }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.sandboxSaved'),
+      errorText: res => configErrorText(res, tr),
+      onSaved: () => patchBot(bot.larkAppId, { readIsolation: false }),
+    });
+  }
+
+  const override = sandboxSelectionOverride(bot, selected);
   const readIsoSupported = bot.readIsolationSupported === true;
   const scratchSupported = bot.scratchSupported !== false;
   const capNote = selected === 'scratch' ? scratchCapabilityNote(bot.scratchCapability, storage, tr) : null;
@@ -4509,6 +4539,20 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
         scratchSupported={scratchSupported}
         onSelect={m => void selectMode(m)}
       />
+      {override ? (
+        <div className="bd-section-note bd-warn" role="note" data-sandbox-override={override.cause}>
+          <p>
+            {override.cause === 'env'
+              ? tr('botDefaults.sandboxOverrideEnv', { mode: tr(override.mode === 'scratch' ? 'botDefaults.sandboxModeScratch' : 'botDefaults.sandboxModeOncall') })
+              : tr('botDefaults.sandboxOverrideReadIsolation')}
+          </p>
+          {override.cause === 'readIsolation' ? (
+            <button type="button" className="btn" data-action="clear-legacy-read-isolation" disabled={busy} onClick={() => void clearLegacyReadIsolation()}>
+              {tr('botDefaults.sandboxOverrideReadIsolationClear')}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       {selected === 'oncall' ? (
         <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
           {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
