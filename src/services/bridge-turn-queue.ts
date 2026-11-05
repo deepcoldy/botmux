@@ -158,6 +158,13 @@ export interface BridgePendingTurn {
    *  being observable. The record that binds the mark follows right behind, so
    *  the normal TTL runs again from here. */
   cliQueueReleasedAtMs?: number;
+  /** Last prune at which an earlier turn was still running when this mark was
+   *  pending. Claude Code persists the queue records of type-ahead input only
+   *  when the running turn next writes to its transcript (observed: enqueue
+   *  lines first appearing 3m40s late, together with the dequeue), so a busy
+   *  CLI is itself proof the input cannot have been consumed yet. The normal
+   *  TTL runs again from the moment the CLI stopped being busy. */
+  heldWhileBusyAtMs?: number;
   /** Set when this mark was re-created from the durable turn journal after a
    *  worker/daemon restart interrupted the turn. The emit path prefixes the
    *  delivered fallback with an "interrupted by restart" notice so the user
@@ -507,14 +514,18 @@ export class BridgeTurnQueue {
    *  never expired here: once Claude actually wrote the user line, the
    *  turn is collecting assistant text and we want to wait however long
    *  the model takes. The same goes for a mark whose input Claude holds in its
-   *  own queue, up to {@link CLI_QUEUE_HOLD_MAX_MS}. */
+   *  own queue, or that was written while an earlier turn is still running,
+   *  up to {@link CLI_QUEUE_HOLD_MAX_MS}. */
   pruneExpired(maxAgeMs: number, now: number = Date.now()): BridgePendingTurn[] {
     const dropped: BridgePendingTurn[] = [];
+    // An earlier turn is still running: type-ahead input waits behind it.
+    const busy = !!this.collecting && !this.collecting.terminalObserved;
     this.queue = this.queue.filter(t => {
       if (t.started) return true;
       if (t.markTimeMs === undefined) return true;
       if (isHeldInCliQueue(t) && now - t.cliQueuedAtMs! <= CLI_QUEUE_HOLD_MAX_MS) return true;
-      if (now - Math.max(t.markTimeMs, t.cliQueueReleasedAtMs ?? 0) <= maxAgeMs) return true;
+      if (busy && now - t.markTimeMs <= CLI_QUEUE_HOLD_MAX_MS) { t.heldWhileBusyAtMs = now; return true; }
+      if (now - Math.max(t.markTimeMs, t.cliQueueReleasedAtMs ?? 0, t.heldWhileBusyAtMs ?? 0) <= maxAgeMs) return true;
       dropped.push(t);
       return false;
     });
