@@ -2343,4 +2343,88 @@ describe('Claude background-task wake turns', () => {
     expect(ready[0].assistantUuids).toEqual(['wake-a-final']);
     expect(ready.some(turn => turn.isBackgroundWake)).toBe(false);
   });
+
+  /** A second Lark turn (`turnId`) that launches background task `taskId`, then
+   *  ends — placed just before the fixture's wake notification. */
+  function secondLarkLaunch(q: BridgeTurnQueue, events: TranscriptEvent[], turnId: string, taskId: string): TranscriptEvent[] {
+    const prompt = '<user_message>另一个话题：跑下压测</user_message>';
+    const wakeAt = Date.parse(events.find(ev => ev.uuid === 'wake-user')!.timestamp!);
+    const iso = (offsetMs: number) => new Date(wakeAt - 30_000 + offsetMs).toISOString();
+    q.mark(turnId, makeFingerprint(prompt), wakeAt - 31_000, normaliseForFingerprint(prompt));
+    return [
+      { type: 'user', uuid: `${turnId}-u`, timestamp: iso(0), message: { role: 'user', content: prompt } },
+      { type: 'assistant', uuid: `${turnId}-launch`, timestamp: iso(10), message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: `call_${taskId}`, name: 'Bash', input: { command: 'run-load', run_in_background: true } }] } },
+      { type: 'user', uuid: `${turnId}-ack`, timestamp: iso(20), toolUseResult: { backgroundTaskId: taskId }, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `call_${taskId}`, content: `Command running in background with ID: ${taskId}.` }] } },
+      { type: 'assistant', uuid: `${turnId}-final`, timestamp: iso(30), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: '压测已后台启动' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: `${turnId}-duration`, timestamp: iso(40) },
+    ] as TranscriptEvent[];
+  }
+  function notification(uuid: string, taskId: string, atMs: number): TranscriptEvent {
+    return { type: 'user', uuid, timestamp: new Date(atMs).toISOString(), isSidechain: false,
+      message: { role: 'user', content: `<task-notification>\n<task-id>${taskId}</task-id>\n<status>completed</status>\n</task-notification>` } } as TranscriptEvent;
+  }
+  /** Ingest the fixture with `extra` notifications delivered right after (or,
+   *  with `before`, right before) its own wake notification. */
+  function wakeWithSiblings(q: BridgeTurnQueue, events: TranscriptEvent[], prelude: TranscriptEvent[], extra: (wakeAtMs: number) => TranscriptEvent[], before = false) {
+    const wakeAt = events.findIndex(ev => ev.uuid === 'wake-user');
+    q.ingest(events.slice(0, wakeAt));
+    q.ingest(prelude);
+    const siblings = extra(Date.parse(events[wakeAt].timestamp!));
+    q.ingest(before ? [...siblings, ...events.slice(wakeAt)] : [events[wakeAt], ...siblings, ...events.slice(wakeAt + 1)]);
+    return readyWake(q).ready.find(turn => turn.assistantUuids.includes('wake-a-final'));
+  }
+
+  it('notifications from tasks of two different Lark turns answered together fail closed', async () => {
+    const q = new BridgeTurnQueue();
+    markLark(q, 'om_topicA');
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const wake = wakeWithSiblings(q, events, secondLarkLaunch(q, events, 'om_topicB', 'taskB'),
+      at => [notification('wake-b', 'taskB', at + 20)]);
+    expect(wake?.turnId).toBe('local-headless-wake-a-final');
+    expect(wake?.isBackgroundWake).toBeFalsy();
+    expect(await suppressed(wake, events, 'transcript')).toBe(true);
+  });
+
+  it('notifications of two tasks launched by the same Lark turn still forward to it', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const wakeAt = Date.parse(events.find(ev => ev.uuid === 'wake-user')!.timestamp!);
+    // Re-launch under the same anchor: the fixture's Lark turn also acks taskB.
+    const launchB = { ...events.find(ev => ev.uuid === 'lark-ack')!, uuid: 'lark-ack-b',
+      toolUseResult: { backgroundTaskId: 'taskB' } } as TranscriptEvent;
+    const withB = events.flatMap(ev => ev.uuid === 'lark-ack' ? [ev, launchB] : [ev]);
+    const wake = wakeWithSiblings(q, withB, [], () => [notification('wake-b', 'taskB', wakeAt + 20)]);
+    expect(wake).toMatchObject({ isBackgroundWake: true, replyAnchorTurnId: 'lark-t1' });
+  });
+
+  for (const before of [false, true]) {
+    it(`an anchored notification answered together with an unanchored one fails closed (unanchored ${before ? 'first' : 'second'})`, () => {
+      const q = new BridgeTurnQueue();
+      markLark(q);
+      const events = fixtureEvents({ liveAfterMs: Date.now() });
+      // taskZ was launched from the terminal (or before this worker): no anchor.
+      const wake = wakeWithSiblings(q, events, [],
+        at => [notification('wake-z', 'taskZ', before ? at - 20 : at + 20)], before);
+      expect(wake?.turnId).toBe('local-headless-wake-a-final');
+      expect(wake?.isBackgroundWake).toBeFalsy();
+    });
+  }
+
+  it('a notification folded into a running Lark turn arms nothing even if that turn settles before the duration marker', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const byId = (id: string) => events.find(ev => ev.uuid === id)!;
+    // The notice lands while the Lark turn is still collecting; the Lark
+    // turn's final then settles it (released before its duration marker), so
+    // the wake's answer arrives with nothing collecting and is synthesised.
+    q.ingest(['lark-user-1', 'lark-a-launch', 'lark-ack', 'wake-user', 'lark-a-final'].map(byId));
+    const first = q.drainEmittable({ explicitTerminalOnly: true, releaseHeldTerminals: true });
+    expect(first.map(turn => turn.turnId)).toEqual(['lark-t1']);
+    q.ingest(['wake-a-thinking', 'wake-a-final', 'wake-duration'].map(byId));
+    const wake = readyWake(q).ready.find(turn => turn.assistantUuids.includes('wake-a-final'));
+    expect(wake?.turnId).toBe('local-headless-wake-a-final');
+    expect(wake?.isBackgroundWake).toBeFalsy();
+  });
 });

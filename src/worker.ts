@@ -10619,6 +10619,9 @@ function emitReadyTurns(opts: {
     // keeps it an ordinary headless local turn.
     const forwardBackgroundWake = turn.isBackgroundWake === true && !adoptMode
       && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript';
+    if (turn.backgroundWakeUnrouted === true && !adoptMode && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript') {
+      log(`Background wake ${turn.turnId.substring(0, 8)} not forwarded: its task notifications resolve to no single launching Lark turn`);
+    }
     if (!turn.isScheduled && !forwardBackgroundWake && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (local-typed)`);
       continue;

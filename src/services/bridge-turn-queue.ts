@@ -118,6 +118,12 @@ export interface BridgePendingTurn {
    *  failure-notice anchoring); only the worker's transcript-delivery path
    *  forwards its final, to {@link replyAnchorTurnId}. Claude queue only. */
   isBackgroundWake?: boolean;
+  /** Set instead of {@link isBackgroundWake} when the notices that opened this
+   *  headless turn resolve to no single launching Lark turn (different topics,
+   *  or one task without an anchor). The turn stays an ordinary local turn;
+   *  the flag only lets the worker log why a transcript-mode wake was not
+   *  forwarded. */
+  backgroundWakeUnrouted?: boolean;
   /** Lark turn id this scheduled turn's final should anchor to (chat-scope
    *  topic routing). Captured as the latest marked Lark turn at fire time.
    *  Unused in thread scope, where the session root is the anchor. For a
@@ -331,9 +337,13 @@ export class BridgeTurnQueue {
    *  Tasks launched from terminal-typed turns, or before this queue existed,
    *  have no entry: their wake stays an ordinary local turn. */
   private backgroundTaskAnchors = new Map<string, string>();
-  /** Anchor of a live `<task-notification>` that opened a new turn and has not
-   *  yet produced the visible text that synthesises its headless turn. */
-  private pendingBackgroundWake: string | undefined;
+  /** Background wake armed by the `<task-notification>`s that opened the next
+   *  turn and have not yet produced the visible text that synthesises its
+   *  headless turn. Claude may answer several notices in one turn, so this
+   *  accumulates: the shared anchor while every notice resolves to the same
+   *  launching Lark turn, `null` (ambiguous — fail closed, stay local) once
+   *  two differ or any one has no anchor, `undefined` when nothing pending. */
+  private pendingBackgroundWake: string | null | undefined;
   /** Records written before this queue existed were written while no worker
    *  of this process was watching: replaying them (journal restore, rotation)
    *  must never open a background-wake delivery. */
@@ -731,7 +741,8 @@ export class BridgeTurnQueue {
             turnId: `local-headless-${uuid}`,
             started: true,
             isLocal: true,
-            ...(wakeAnchor !== undefined ? { isBackgroundWake: true, replyAnchorTurnId: wakeAnchor } : {}),
+            ...(typeof wakeAnchor === 'string' ? { isBackgroundWake: true, replyAnchorTurnId: wakeAnchor } : {}),
+            ...(wakeAnchor === null ? { backgroundWakeUnrouted: true } : {}),
             userUuid: undefined,
             replyContextTurnId: this.lastLocalTurnId,
             precedingLarkTurnId: this.lastLarkTurnId,
@@ -830,16 +841,23 @@ export class BridgeTurnQueue {
    *  turn (nothing collecting, or the last turn closed by its duration marker)
    *  for a task with a known launch anchor arms a background wake for the
    *  headless turn its reply synthesises. A notice folded into a running turn,
-   *  a sidechain one, or one written before this queue existed arms nothing. */
+   *  a sidechain one, one written before this queue existed, or one for a task
+   *  without an anchor arms nothing — and, since Claude may answer every notice
+   *  that piled up in one turn, also disarms any wake already pending: a mixed
+   *  or cross-topic answer has no single safe destination. */
   private notePendingBackgroundWake(ev: TranscriptEvent): void {
     if (ev.isSidechain === true || ev.type !== 'user') return;
     const notice = parseTaskNotification(ev);
     if (!notice) return;
     const opensTurn = !this.collecting || this.collecting.closedByDurationMarker === true;
     const atMs = eventTimeMs(ev);
-    this.pendingBackgroundWake = opensTurn && atMs !== undefined && atMs >= this.liveSinceMs
+    const anchor = opensTurn && atMs !== undefined && atMs >= this.liveSinceMs
       ? this.backgroundTaskAnchors.get(notice.taskId)
       : undefined;
+    const pending = this.pendingBackgroundWake;
+    this.pendingBackgroundWake = anchor !== undefined && (pending === undefined || pending === anchor)
+      ? anchor
+      : null;
   }
 
   /** Restore task→anchor pairs from the worker's durable store after a
