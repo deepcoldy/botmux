@@ -5065,7 +5065,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(body).not.toContain(SECRET_EMAIL);
       expect(body).not.toContain(NOREPLY_EMAIL);
       expect(body).toContain(`${'*'.repeat('alice.liu@'.length)}example.com`);
-      expect(body).toContain(`${'*'.repeat('12345678+bob@'.length)}users.noreply.github.com`);
+      // Outside code spans the mask is escaped so markdown keeps it as literal stars.
+      expect(body).toContain(`${'\\*'.repeat('12345678+bob@'.length)}users.noreply.github.com`);
       // Only the reported type is masked: the phone stays, and so do the
       // email-like code tokens.
       expect(body).toContain(PHONE);
@@ -5097,7 +5098,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       const body = cardText(sessionReply.mock.calls[1][1]);
       expect(body).not.toContain(SECRET_EMAIL);
       expect(body).not.toContain(PHONE);
-      expect(body).toContain('*'.repeat(PHONE.length));
+      expect(body).toContain('\\*'.repeat(PHONE.length));
       expect(body).toContain('7704631496199457811');
       await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(true, 'om_redacted'));
       expect(logged.some(line => /types=unknown .*hits=email:2,phone:1 result=delivered/.test(line))).toBe(true);

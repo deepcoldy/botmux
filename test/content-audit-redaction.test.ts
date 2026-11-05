@@ -83,6 +83,7 @@ describe('redactSensitiveText', () => {
     ['SSH remote (Lark flags it as an email)', 'remote git@github.com:owner/repo.git', 'remote ****github.com:owner/repo.git'],
     ['ssh:// URL', 'clone "ssh://git@ssh.example.com/owner/repo"', 'clone "ssh://****ssh.example.com/owner/repo"'],
     ['truncated with a leading ellipsis', 'Author <...7f3a@example.com>', 'Author <...*****example.com>'],
+    ['fediverse handle', 'follow @alice@social.example.org', 'follow @******social.example.org'],
     ['adjacent CJK and full-width punctuation', '邮箱zhangsan@example.net，', '邮箱*********example.net，'],
     ['subdomain + sentence period', 'x@sub.mail.example.org.', '**sub.mail.example.org.'],
     ['uppercase, multi-label TLD', 'A.B-C_d%e@Foo-Bar.CO.UK', '**********Foo-Bar.CO.UK'],
@@ -99,6 +100,22 @@ describe('redactSensitiveText', () => {
     const out = redactSensitiveText(input, ['phone']);
     expect(out.text).toBe('手机 ***********、+** *** **** ****、****-***********、***-****-****，座机 ***-********');
     expect(out.hits.phone).toBe(5);
+  });
+
+  it('masks numbers written right after a colon or hash label', () => {
+    const input = `手机:13812345678 Phone:13812345678 Tel:+86-13812345678 #13812345678 身份证:${ID_CARD} 卡号:${UNIONPAY_19}`;
+    const out = redactSensitiveText(input, ALL_SENSITIVE_CATEGORIES);
+    expect(out.text).toBe(`手机:*********** Phone:*********** Tel:+**-*********** #*********** 身份证:${'*'.repeat(18)} 卡号:${'*'.repeat(19)}`);
+    expect(out.hits).toMatchObject({ phone: 4, idCard: 1, bankCard: 1 });
+  });
+
+  it('escapes masks in markdown outside code so they render as literal stars, not emphasis', () => {
+    const input = 'a@example.com and b@example.org, `c@example.net`\n```\nd@example.com\n```';
+    const out = redactSensitiveText(input, ['email'], undefined, { markdown: true });
+    expect(out.text).toBe('\\*\\*example.com and \\*\\*example.org, `**example.net`\n```\n**example.com\n```');
+    expect(out.hits.email).toBe(4);
+    // Plain text (text messages, plain_text nodes) keeps the bare stars.
+    expect(redactSensitiveText('a@example.com', ['email']).text).toBe('**example.com');
   });
 
   it('masks resident ID numbers (checksum-valid) and bank cards (prefix + Luhn)', () => {
@@ -119,6 +136,8 @@ describe('redactSensitiveText', () => {
     ['digits inside URLs', 'https://github.com/o/r/actions/runs/13812345678 https://x.com/u/622202123456789012'],
     ['line ranges and decimals', '文件:6448-6728 1.13812345678 13812345678.5'],
     ['code-file "domains"', 'x@y.ts import x from "a@b.js" foo@bar.md'],
+    ['retina asset names', 'added icon@2x.png and logo@3x.webp'],
+    ['Kotlin labels', 'val root = this@MainActivity.window; super@Outer.run()'],
     ['checksum-invalid 18-digit and non-Luhn 19-digit', `110105194912310021 ${UNIONPAY_19.slice(0, -1)}${(Number(UNIONPAY_19.slice(-1)) + 1) % 10}`],
   ])('leaves %s untouched', (_name, input) => {
     const out = redactSensitiveText(input, ALL_SENSITIVE_CATEGORIES);
@@ -162,7 +181,7 @@ describe('redactLarkMessageContent', () => {
     const els = parsed.body.elements;
     expect(els[0]).toEqual({ tag: 'markdown', element_id: 'answer', content: 'Author `X <**example.org>` <at id=ou_owner></at>' });
     expect(els[1].columns[0]).toEqual({ name: 'c0', display_name: '******example.net', data_type: 'lark_md' });
-    expect(els[1].rows[0].c0).toBe('**example.org');
+    expect(els[1].rows[0].c0).toBe('\\*\\*example.org');
     // Callback payloads are not text: changing them would break the button.
     expect(els[2].behaviors).toEqual(card.body.elements[2].behaviors);
     expect(els[3].href).toBe('mailto:**example.org');
@@ -177,7 +196,7 @@ describe('redactLarkMessageContent', () => {
   it('appends a note element to a legacy (schema 1.0) card', () => {
     const card = { config: { wide_screen_mode: true }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: 'mail a@example.com' } }] };
     const parsed = JSON.parse(redactLarkMessageContent(JSON.stringify(card), 'interactive', ['email'], NOTE)!.content);
-    expect(parsed.elements[0].text).toEqual({ tag: 'lark_md', content: 'mail **example.com' });
+    expect(parsed.elements[0].text).toEqual({ tag: 'lark_md', content: 'mail \\*\\*example.com' });
     expect(parsed.elements[1]).toEqual({ tag: 'note', elements: [{ tag: 'plain_text', content: NOTE }] });
   });
 
@@ -203,6 +222,17 @@ describe('redactLarkMessageContent', () => {
     expect(post.content[0][2]).toEqual(body.content[0][2]);
     expect(post.content[0][3].text).toBe('git log --format="%an <%ae>"  # ***example.org');
     expect(post.content[1]).toEqual([{ tag: 'text', text: NOTE }]);
+  });
+
+  it('escapes masks only in markdown-rendered nodes (post md, lark_md table columns)', () => {
+    const post = { zh_cn: { title: 't', content: [[{ tag: 'md', text: 'x a@example.com' }, { tag: 'text', text: 'y a@example.com' }]] } };
+    const outPost = JSON.parse(redactLarkMessageContent(JSON.stringify(post), 'post', ['email'])!.content);
+    expect(outPost.zh_cn.content[0]).toEqual([{ tag: 'md', text: 'x \\*\\*example.com' }, { tag: 'text', text: 'y **example.com' }]);
+    const card = { schema: '2.0', body: { elements: [{ tag: 'table',
+      columns: [{ name: 'md', data_type: 'lark_md' }, { name: 'plain', data_type: 'text' }],
+      rows: [{ md: 'a@example.com', plain: 'a@example.com' }] }] } };
+    const outCard = JSON.parse(redactLarkMessageContent(JSON.stringify(card), 'interactive', ['email'])!.content);
+    expect(outCard.body.elements[0].rows[0]).toEqual({ md: '\\*\\*example.com', plain: '**example.com' });
   });
 
   it('treats text messages as plain text and appends the note on its own line', () => {

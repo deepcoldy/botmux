@@ -89,40 +89,71 @@ export function contentAuditSensitiveTypes(err: unknown): ContentAuditSensitiveT
  * 就不再是邮箱，能过审；域名还能看出是 GitHub noreply 还是个人邮箱，阅读影响小。
  *
  * 防误伤：
- * - local part 前面不能紧贴邮箱字符、`@` 或单个 `/`（`@scope/pkg@1.2.3` 的 `pkg` 前是 `/`）；
+ * - local part 前面不能紧贴邮箱字符或单个 `/`（`@scope/pkg@1.2.3` 的 `pkg` 前是 `/`）；
  *   `ssh://git@host` 的 `://` 和截断写法 `<...abc@host>` 的 `.` 不在此列，照常打码；
  * - 顶级域必须是 2 位以上字母，排除 `bun@1.4.3`、`pkg@^2.0.0` 等版本号；
  * - 域名字符不含 `{`，排除 `HEAD@{1}`、`stash@{0}` 等 reflog 写法；
  * - 装饰器 `@Component`、包名 `@types/node` 没有 local part，天然不匹配；
- * - 顶级域是常见源码扩展名（`.ts`/`.js`/`.py`…）时不算邮箱。
+ * - 顶级域是常见源码 / 资源扩展名（`.ts`/`.py`/`.png`…，如 `icon@2x.png`）时不算邮箱；
+ * - Kotlin 标签写法 `this@MainActivity.x` / `super@Foo.bar` 不算邮箱。
  */
-const EMAIL_RE = /(?<![A-Za-z0-9_%+\-@])(?<!(?:^|[^/])\/)([A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*)@((?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+([A-Za-z]{2,24}))(?![A-Za-z0-9\-]|\.[A-Za-z0-9])/g;
+const EMAIL_RE = /(?<![A-Za-z0-9_%+\-])(?<!(?:^|[^/])\/)([A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*)@((?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+([A-Za-z]{2,24}))(?![A-Za-z0-9\-]|\.[A-Za-z0-9])/g;
 const CODE_EXTENSION_TLDS = new Set([
   'ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs', 'json', 'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift',
   'cpp', 'hpp', 'cc', 'md', 'mdx', 'yml', 'yaml', 'toml', 'lock', 'sh', 'txt', 'css', 'scss', 'html', 'vue', 'svelte',
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'avif', 'bmp', 'ico', 'pdf',
 ]);
+const CODE_LABEL_LOCALS = new Set(['this', 'super']);
 
-/** 中国大陆手机号（可带 +86 / 86 前缀，允许 3-4-4 的空格或连字符分组）与带区号的座机号。 */
-const MOBILE_RE = /(?<![\w.+\-/:#])(?:(?:\+|00)?86[\s\-]?)?1[3-9]\d(?:\d{8}|[\s\-]\d{4}[\s\-]\d{4})(?![\w\-]|\.\d)/g;
-const LANDLINE_RE = /(?<![\w.+\-/:#])0\d{2,3}-\d{7,8}(?![\w\-]|\.\d)/g;
+/**
+ * 中国大陆手机号（可带 +86 / 86 前缀，允许 3-4-4 的空格或连字符分组）与带区号的座机号。
+ * 数字类规则的前缀只排除字母数字、`.`、`+`、`-`、`/`（路径里的数字基本是 ID）；
+ * `手机:138…`、`Tel:+86…`、`#138…` 这类紧跟冒号 / 井号的写法照常打码。
+ */
+const MOBILE_RE = /(?<![\w.+\-/])(?:(?:\+|00)?86[\s\-]?)?1[3-9]\d(?:\d{8}|[\s\-]\d{4}[\s\-]\d{4})(?![\w\-]|\.\d)/g;
+const LANDLINE_RE = /(?<![\w.+\-/])0\d{2,3}-\d{7,8}(?![\w\-]|\.\d)/g;
 /** 18 位居民身份证号（含出生日期段 + GB 11643 校验位）。 */
-const ID_CARD_RE = /(?<![\w.+\-/:#])[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![\w\-]|\.\d)/g;
+const ID_CARD_RE = /(?<![\w.+\-/])[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![\w\-]|\.\d)/g;
 /**
  * 银行卡号：常见卡组织前缀（银联 62、Visa 4、Mastercard 51-55/2221-2720、
  * Amex 34/37）+ Luhn 校验，可 4 位一组。飞书消息 / 话题 ID 是 7 开头的 19 位
  * 雪花数，不在这些前缀里，避免把长数字 ID 当卡号。
  */
-const BANK_CARD_RE = /(?<![\w.+\-/:#])(?:\d{4}[\s\-]){3,4}\d{1,7}(?![\w\-]|\.\d)|(?<![\w.+\-/:#])\d{15,19}(?![\w\-]|\.\d)/g;
+const BANK_CARD_RE = /(?<![\w.+\-/])(?:\d{4}[\s\-]){3,4}\d{1,7}(?![\w\-]|\.\d)|(?<![\w.+\-/])\d{15,19}(?![\w\-]|\.\d)/g;
 
 /** 特殊片段：mention 标记（整体保留）与 URL（只打邮箱，不碰数字）。 */
 const PROTECTED_RE = /<at\b[^>]*>[\s\S]*?<\/at>|<at\b[^>]*\/?>|\bhttps?:\/\/[^\s<>()"'`\]]+/gi;
 
+/**
+ * 打码时先写占位符，最后按所在位置换成 `*`：Markdown 正文里连续的 `*` 会被当成
+ * 粗体 / 斜体 / 分隔线吞掉，所以代码区以外写成转义的 `\*`（渲染出来仍是等长的 `*`），
+ * 代码区与纯文本里直接写 `*`。
+ */
+const MASK = '\uE000';
+const MASK_RE = /\uE000/g;
+
 function stars(length: number): string {
-  return '*'.repeat(length);
+  return MASK.repeat(length);
 }
 
 function maskDigits(value: string): string {
-  return value.replace(/\d/g, '*');
+  return value.replace(/\d/g, MASK);
+}
+
+/** Markdown 代码区：围栏代码块与行内代码（反引号内 `*` 不会被解析）。 */
+const MARKDOWN_CODE_RE = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g;
+
+function finalizeMask(text: string, markdown: boolean): string {
+  if (!text.includes(MASK)) return text;
+  if (!markdown) return text.replace(MASK_RE, '*');
+  let out = '';
+  let last = 0;
+  for (const match of text.matchAll(MARKDOWN_CODE_RE)) {
+    const start = match.index ?? 0;
+    out += text.slice(last, start).replace(MASK_RE, '\\*') + match[0].replace(MASK_RE, '*');
+    last = start + match[0].length;
+  }
+  return out + text.slice(last).replace(MASK_RE, '\\*');
 }
 
 function luhnValid(digits: string): boolean {
@@ -160,7 +191,7 @@ function redactSegment(text: string, categories: ReadonlySet<SensitiveCategory>,
   let out = text;
   if (categories.has('email')) {
     out = out.replace(EMAIL_RE, (match, local: string, _domain: string, tld: string) => {
-      if (CODE_EXTENSION_TLDS.has(tld.toLowerCase())) return match;
+      if (CODE_EXTENSION_TLDS.has(tld.toLowerCase()) || CODE_LABEL_LOCALS.has(local)) return match;
       hits.email++;
       return stars(local.length + 1) + match.slice(local.length + 1);
     });
@@ -188,11 +219,15 @@ function redactSegment(text: string, categories: ReadonlySet<SensitiveCategory>,
   return out;
 }
 
-/** 对一段纯文本按类别打码；mention 标记原样保留，URL 只打邮箱。替换等长，不改变其余字符位置。 */
+/**
+ * 对一段文本按类别打码；mention 标记原样保留，URL 只打邮箱。纯文本里是等长替换；
+ * `markdown: true` 时代码区以外的打码写成 `\*`，渲染后同样是等长的 `*`。
+ */
 export function redactSensitiveText(
   text: string,
   categories: readonly SensitiveCategory[] = ALL_SENSITIVE_CATEGORIES,
   hits: RedactionHits = emptyHits(),
+  options: { markdown?: boolean } = {},
 ): { text: string; hits: RedactionHits } {
   const wanted = new Set(categories);
   if (wanted.size === 0 || !text) return { text, hits };
@@ -207,7 +242,7 @@ export function redactSensitiveText(
     last = start + match[0].length;
   }
   out += redactSegment(text.slice(last), wanted, hits);
-  return { text: out, hits };
+  return { text: finalizeMask(out, options.markdown === true), hits };
 }
 
 // ─── 消息体打码（只改文本节点） ───────────────────────────────────────────────
@@ -225,7 +260,13 @@ const SKIPPED_SUBTREES = new Set(['value', 'behaviors', 'config', 'confirm_value
 /** 链接字段：只处理 mailto: 邮箱，不碰数字（URL 里的数字基本都是 ID）。 */
 const LINK_KEYS = new Set(['href', 'url', 'pc_url', 'android_url', 'ios_url', 'default_url']);
 
-function redactNode(node: unknown, key: string | undefined, categories: readonly SensitiveCategory[], hits: RedactionHits): unknown {
+/** 承载 Markdown 的节点：卡片 markdown / lark_md、post 的 md。 */
+const MARKDOWN_TAGS = new Set(['markdown', 'lark_md', 'md']);
+
+function redactNode(
+  node: unknown, key: string | undefined, categories: readonly SensitiveCategory[], hits: RedactionHits,
+  markdown = false,
+): unknown {
   if (typeof node === 'string') {
     if (key && STRUCTURAL_KEYS.has(key)) return node;
     if (key && LINK_KEYS.has(key)) {
@@ -233,13 +274,30 @@ function redactNode(node: unknown, key: string | undefined, categories: readonly
       const target = node.slice('mailto:'.length);
       return 'mailto:' + redactSensitiveText(target, ['email'], hits).text;
     }
-    return redactSensitiveText(node, categories, hits).text;
+    return redactSensitiveText(node, categories, hits, { markdown }).text;
   }
-  if (Array.isArray(node)) return node.map(item => redactNode(item, key, categories, hits));
+  if (Array.isArray(node)) return node.map(item => redactNode(item, key, categories, hits, markdown));
   if (node && typeof node === 'object') {
+    const record = node as Record<string, unknown>;
+    const isMarkdownNode = typeof record.tag === 'string' && MARKDOWN_TAGS.has(record.tag);
+    // 表格单元格按列的 data_type 决定是否按 Markdown 渲染。
+    const markdownColumns = record.tag === 'table' && Array.isArray(record.columns)
+      ? new Set((record.columns as Array<Record<string, unknown>>)
+        .filter(column => column?.data_type === 'lark_md' || column?.data_type === 'markdown')
+        .map(column => String(column.name)))
+      : undefined;
     const out: Record<string, unknown> = {};
-    for (const [childKey, child] of Object.entries(node as Record<string, unknown>)) {
-      out[childKey] = SKIPPED_SUBTREES.has(childKey) ? child : redactNode(child, childKey, categories, hits);
+    for (const [childKey, child] of Object.entries(record)) {
+      if (SKIPPED_SUBTREES.has(childKey)) { out[childKey] = child; continue; }
+      if (markdownColumns && childKey === 'rows' && Array.isArray(child)) {
+        out[childKey] = child.map(row => row && typeof row === 'object' && !Array.isArray(row)
+          ? Object.fromEntries(Object.entries(row as Record<string, unknown>).map(([cell, value]) =>
+            [cell, redactNode(value, undefined, categories, hits, markdownColumns.has(cell))]))
+          : redactNode(row, childKey, categories, hits));
+        continue;
+      }
+      const childMarkdown = isMarkdownNode && (childKey === 'content' || childKey === 'text');
+      out[childKey] = redactNode(child, childKey, categories, hits, childMarkdown);
     }
     return out;
   }

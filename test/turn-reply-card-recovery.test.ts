@@ -50,6 +50,25 @@ describe('reply-card recovery under partial writes and overlapping writers', () 
   await expect(store.update(key,{kind:'terminal',phase:'completed',durationMs:1234},io)).rejects.toThrow('PATCH unavailable');
   io.patch=real; vi.setSystemTime(2_000_000);
  }
+ it('masks a content-audit-rejected recovery PATCH instead of leaving the card unsettled',async()=>{
+  // The final (with an email) is already in the card; the terminal PATCH is left
+  // pending, and recovery re-renders the whole card including that final.
+  const email='alice.liu@example.com';
+  await store.update(key,{kind:'final',text:`作者 <${email}>`,source:'explicit',card:JSON.stringify({schema:'2.0',body:{elements:[{tag:'markdown',content:`作者 <${email}>`}]}})},io);
+  await pending();
+  const audit={isAxiosError:true,name:'AxiosError',message:'Request failed with status code 400',
+    response:{status:400,data:{code:230028,msg:'contain sensitive data: EMAIL_ADDRESS'}}};
+  const bodies:string[]=[];
+  vi.mocked(updateMessage).mockImplementation(async (_app,_id,card)=>{bodies.push(card);if(card.includes(email))throw audit;patches++;remote=card;});
+  await sweepInterruptedReplyCards(key.larkAppId);
+  expect(bodies).toHaveLength(2);
+  expect(bodies[0]).toContain(email);
+  expect(remote).not.toContain(email);
+  expect(remote).toContain('example.com');
+  expect(remote).toContain('worker.final_output_content_audit_redacted_note');
+  expect(store.read(key)?.pendingPatch).toBeUndefined();
+  expect(store.read(key)?.phase).toBe('completed');
+ });
  it('rebuilds a terminal update after its pending payload journal write fails',async()=>{
   const oldRemote=remote; const write=(store as any).write.bind(store);
   const fail=vi.spyOn(store as any,'write').mockImplementation((k:any,r:any)=>{
