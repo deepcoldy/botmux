@@ -4927,7 +4927,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
       const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
-      if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
+      if (olderThanHours === null) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
 
       // WYSIWYG: the UI scopes cleanup to the rows currently visible under the
       // page filters and sends their sessionIds, so the closed set matches the

@@ -25,7 +25,7 @@ import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/pr
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
-  IDLE_CLEANUP_HOUR_OPTIONS,
+  AUTO_CLEANUP_HOUR_OPTIONS as IDLE_CLEANUP_HOUR_OPTIONS,
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
@@ -1800,7 +1800,7 @@ function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleCompo
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
 
-/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+/** 定时自动清理空闲会话：开关 + 空闲阈值（自动清理仅 24H/72H/7d；手动清理另有 1H 与全部）+ 检查频率。 */
 function SessionCleanupRow(props: {
   value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   disabled: boolean;
