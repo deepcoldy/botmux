@@ -24,13 +24,13 @@
  */
 
 import { readFileSync, rmSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import type { BotConfig } from '../../bot-registry.js';
 import { isStewardBot } from '../../core/decision-board/model.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { birthRun, readGrillState, transition, type GrillState } from './grill-state.js';
+import { birthRun, readGrillState, transition, writeGrillState, type GrillState } from './grill-state.js';
 import {
   HostGuardError,
   adHocFlowSummary,
@@ -47,15 +47,46 @@ import {
   type ArchitectDeps,
 } from './host.js';
 import { loadDag as realLoadDag } from './dag-loader.js';
-import type { V3Dag } from './dag.js';
+import type { V3Dag, V3Node } from './dag.js';
 import { validateSpec } from './spec.js';
 import { freezeDagBotSnapshots } from './bot-resolve.js';
-import { V3_RUN_ENVELOPE_FILE, readRunEnvelope, type V3RunInitiator } from './run-envelope.js';
+import { V3_RUN_ENVELOPE_FILE, artifactRef, readRunEnvelope, type V3RunInitiator } from './run-envelope.js';
+import { ParamCoerceFailure, type RawParamInput } from '../shared/params.js';
+import {
+  SavedWorkflowConflictError,
+  SavedWorkflowNotFoundError,
+  SavedWorkflowPermissionError,
+  listSavedWorkflowCatalog,
+  readSavedWorkflowRevision,
+  readSavedWorkflowMetadata,
+} from './library-store.js';
+import { SavedWorkflowSchemaError, type SavedWorkflowGateComparison } from './library-schema.js';
+import {
+  SavedWorkflowServiceError,
+  commitDashboardSave,
+  dashboardSavedWorkflowId,
+  loadDashboardAppendTarget,
+  planDashboardRunSave,
+  prepareDashboardSavedWorkflowRun,
+  withDashboardParamEdits,
+  type DashboardSavePlan,
+} from './library-service.js';
+import {
+  SavedWorkflowUnsafeLiteralError,
+  buildSavedWorkflowRevisionFromFlow,
+  commitSavedWorkflowRunInPlace,
+  savedWorkflowRunFlow,
+} from './library-materialize.js';
+import {
+  SavedWorkflowParamEditError,
+  parseSavedWorkflowParamEdits,
+} from './library-params.js';
 import type { RunChatBinding } from './grill-state.js';
-import { v3FlowSummarySha256, type V3FlowSummary } from './flow-summary.js';
+import { buildV3FlowSummary, v3FlowSummarySha256, type V3FlowSummary } from './flow-summary.js';
 import {
   buildV3BotRoster,
   planV3SketchAssignees,
+  projectV3Gate2BotPlan,
   v3BotStaticExclusion,
   v3RosterSelectorProblems,
   type V3BotRoster,
@@ -93,9 +124,13 @@ import {
   type WorkflowDraftPhase,
   type WorkflowDraftRecord,
   type WorkflowDraftReservationHolder,
+  type WorkflowDraftTemplateRun,
   type WorkflowDraftTurn,
+  WORKFLOW_TEMPLATE_RUN_MAX_PARAM_CHARS,
+  workflowTemplateRunNeedsConfirmation,
 } from './draft-store.js';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../../utils/process-identity.js';
+import { withFileLockSync } from '../../utils/file-lock.js';
 import { pidIsSignalable } from '../../utils/process-alive.js';
 import {
   buildDraftClarifyKickoff,
@@ -175,6 +210,26 @@ export type WorkflowDraftErrorCode =
   | 'root_update_failed'
   /** D4: a message the initiator asked to resend did not go out. */
   | 'post_failed'
+  /** D5: no such finished run on this bot. */
+  | 'unknown_run'
+  /** D5: a template run is not clarified or re-orchestrated (复制 is D6). */
+  | 'template_run'
+  /** D5: no such template visible to this bot. */
+  | 'template_not_found'
+  /** D5: a chat-scoped template runs / is appended to only in its chat (I9). */
+  | 'template_scope'
+  /** D5: the template has no published revision. */
+  | 'template_not_published'
+  /** D5: parameters missing / of the wrong type, or a 「设为参数」 refused. */
+  | 'bad_params'
+  /** D5: the result breaks a template rule. */
+  | 'template_invalid'
+  /** D5: only the owner saves or appends (I9). */
+  | 'not_owner'
+  /** D5: the template changed since the dialog compared with it. */
+  | 'save_conflict'
+  /** D5: literals that need an explicit acknowledgement. */
+  | 'unsafe_literals'
   | 'bad_request';
 
 const STATUS: Record<WorkflowDraftErrorCode, number> = {
@@ -205,6 +260,16 @@ const STATUS: Record<WorkflowDraftErrorCode, number> = {
   run_committed: 409,
   root_update_failed: 503,
   post_failed: 502,
+  unknown_run: 404,
+  template_run: 409,
+  template_not_found: 404,
+  template_scope: 409,
+  template_not_published: 409,
+  bad_params: 422,
+  template_invalid: 422,
+  not_owner: 403,
+  save_conflict: 409,
+  unsafe_literals: 409,
   bad_request: 400,
 };
 
@@ -277,6 +342,9 @@ export interface WorkflowDraftServiceDeps {
   randomSuffix?: () => string;
   /** 拉群开始 (§4.5, D4). Absent: launch calls answer launch_unavailable. */
   launch?: DraftLaunchDeps;
+  /** The Saved Workflow library's dataDir (D5); default: baseDir's parent,
+   *  where `/workflow save` keeps it (~/.botmux). */
+  libraryDataDir?: string;
   log?: (message: string) => void;
   /** Whether a reservation's holder process is still running (default: pid
    *  + process start identity, as the file locks check their holders). */
@@ -330,6 +398,27 @@ export interface WorkflowDraftView {
   flowError?: string;
   flowConfirmation?: NonNullable<WorkflowDraftRecord['flowConfirmation']> & { valid: boolean };
   launch?: WorkflowDraftLaunchView;
+  /** 运行模板 (D5). `needsConfirmation`: I13 or a swapped bot; `swapped`:
+   *  no longer the template as is (commits as an ad-hoc run). */
+  template?: WorkflowDraftTemplateRun & { needsConfirmation: boolean; swapped: boolean };
+}
+
+/** 存为模板 (§5.1): what the confirm dialog shows before anything is written. */
+export interface WorkflowDraftTemplateSavePreview {
+  displayName: string;
+  flowSummary: V3FlowSummary;
+  flowSummarySha256: string;
+  inputs: DashboardSavePlan['revision']['inputs'];
+  nodeCount: number;
+  gateCount: number;
+  lintWarnings: string[];
+  /** Append only. */
+  target?: { workflowId: string; displayName: string; latestRevision: string; humanVersion: number; gates: SavedWorkflowGateComparison };
+  /** The template's nodes with the edits so far (where 「设为参数」 selects
+   *  next: edits apply in order, each to the text the previous ones left). */
+  dagNodes: V3Node[];
+  /** The caller's own global templates of this bot (I9: appendable). */
+  appendCandidates: Array<{ workflowId: string; displayName: string; latestRevision: string }>;
 }
 
 /** 拉群记录 as the page shows it (§4.5): where it is, what it did. */
@@ -502,6 +591,47 @@ function findGoalNode(dag: Record<string, unknown>, nodeId: string): Record<stri
     if (hit) return hit;
   }
   return undefined;
+}
+
+function countGates(nodes: readonly V3Node[]): number {
+  let count = 0;
+  for (const node of nodes) {
+    if (node.humanGate) count += 1;
+    if (node.type === 'loop' && node.body) count += countGates(node.body.nodes);
+  }
+  return count;
+}
+
+function parseOptionalWorkflowId(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^wf_[0-9a-f]{32}$/.test(value)) throw err('bad_request', 'workflowId 不合法');
+  return value;
+}
+
+/** The save target fields shared by 「存为模板」 from a draft and from a run. */
+export function parseSaveTarget(
+  input: { expectedLatestRevision?: unknown; displayName?: unknown; requestKey?: unknown },
+  workflowId: string | undefined,
+): { expectedLatestRevision?: string; displayName?: string; requestKey: string } {
+  let expectedLatestRevision: string | undefined;
+  if (input.expectedLatestRevision !== undefined) {
+    if (typeof input.expectedLatestRevision !== 'string' || !/^rev_[0-9a-f]{64}$/.test(input.expectedLatestRevision)) {
+      throw err('bad_request', 'expectedLatestRevision 不合法');
+    }
+    expectedLatestRevision = input.expectedLatestRevision;
+  }
+  if (workflowId && !expectedLatestRevision) throw err('bad_request', '追加版本要带上保存框比较过的最新版本 expectedLatestRevision');
+  let displayName: string | undefined;
+  if (input.displayName !== undefined) {
+    if (typeof input.displayName !== 'string' || !input.displayName.trim() || Array.from(input.displayName.trim()).length > 128) {
+      throw err('bad_request', '模板名称必须是 1–128 个字符');
+    }
+    if (workflowId) throw err('bad_request', '追加版本不改模板名称');
+    displayName = input.displayName.trim();
+  }
+  const requestKey = typeof input.requestKey === 'string' ? input.requestKey : '';
+  if (!workflowId && !/^[A-Za-z0-9_-]{8,64}$/.test(requestKey)) throw err('bad_request', '新建模板要带 requestKey（8–64 位字母数字）');
+  return { ...(expectedLatestRevision ? { expectedLatestRevision } : {}), ...(displayName ? { displayName } : {}), requestKey };
 }
 
 // ─── Service ──────────────────────────────────────────────────────────────
@@ -700,6 +830,48 @@ export class WorkflowDraftService {
    *  or the launch abandoned. */
   private assertNoLaunch(draft: WorkflowDraftRecord, what: string): void {
     if (draft.launch) throw err('state_conflict', `已经开始拉群，不能再${what}；可以换执行 Bot 或放弃`);
+  }
+
+  /** A template run (D5) has no requirement stage: no clarify, no Architect. */
+  private assertNotTemplateRun(draft: WorkflowDraftRecord, what: string): void {
+    if (draft.template) throw err('template_run', `从模板运行的草稿不能${what}；要改需求或流程请先「复制为新工作流」`);
+  }
+
+  /** Whether the flow may go to 拉群开始: confirmed (all four pins) — or, for
+   *  a template run that needs no confirmation (I13), still exactly the
+   *  prepared revision's flow. */
+  private flowReady(draft: WorkflowDraftRecord, flow: { dagSha256: string; specSha256: string; flowSummarySha256: string }): boolean {
+    if (draft.template && !workflowTemplateRunNeedsConfirmation(draft)) {
+      return flow.dagSha256 === draft.template.dagSha256 && flow.specSha256 === draft.template.specSha256;
+    }
+    return !!draft.flowConfirmation && this.confirmationValid(draft, flow);
+  }
+
+  private libraryDir(): string {
+    return this.deps.libraryDataDir ?? dirname(this.deps.baseDir);
+  }
+
+  /** Library / parameter failures → the draft error vocabulary. */
+  private mapLibraryError(error: unknown): unknown {
+    if (error instanceof WorkflowDraftError) return error;
+    if (error instanceof SavedWorkflowServiceError) {
+      switch (error.code) {
+        case 'not_found': return err('template_not_found', '没有这个模板，或它不属于这个编排 Bot');
+        case 'scope_mismatch': return err('template_scope', '这是群范围的模板，只能在原群里用 /workflow run');
+        case 'not_published': return err('template_not_published', '这个模板还没有发布的版本');
+        case 'source_not_owned': return err('not_owner', '只能保存自己发起的运行');
+        default: return err('template_invalid', error.message);
+      }
+    }
+    if (error instanceof SavedWorkflowPermissionError) return err('not_owner', '只能给自己的模板追加版本');
+    if (error instanceof SavedWorkflowNotFoundError) return err('template_not_found', '没有这个模板');
+    if (error instanceof SavedWorkflowConflictError) return err('save_conflict', error.message);
+    if (error instanceof ParamCoerceFailure) return err('bad_params', error.message, { issues: error.issues });
+    if (error instanceof SavedWorkflowParamEditError) return err('bad_params', error.message, error.index !== undefined ? { index: error.index } : {});
+    if (error instanceof SavedWorkflowUnsafeLiteralError) return err('unsafe_literals', error.message, { warnings: [...error.warnings] });
+    if (error instanceof SavedWorkflowSchemaError) return err('template_invalid', '保存的内容不符合模板规则', { problems: error.problems });
+    if (error instanceof Error && /sensitive parameters are not executable/.test(error.message)) return err('bad_params', error.message);
+    return this.mapError(error);
   }
 
   private assertNotArchitecting(runId: string, draft: WorkflowDraftRecord, grill: GrillState): void {
@@ -1042,6 +1214,388 @@ export class WorkflowDraftService {
     return this.view(runId);
   }
 
+  /**
+   * 运行模板 (§5.3): a draft from the published revision of one of this bot's
+   * global templates, with the parameters checked and converted by the
+   * `/workflow run` rules — no clarify, no Architect: it stands at 待确认流程
+   * (draft-born revision, I13) or 已确认流程 (from a finished run), and 拉群开始
+   * runs as for any draft. `expectedRevisionId`: the revision the form was
+   * built from (a newer publish is refused, not run silently).
+   */
+  async createFromTemplate(
+    initiator: WorkflowDraftInitiator,
+    input: { workflowId: unknown; params?: unknown; expectedRevisionId?: unknown },
+  ): Promise<WorkflowDraftView> {
+    const workflowId = typeof input.workflowId === 'string' ? input.workflowId : '';
+    if (!/^wf_[0-9a-f]{32}$/.test(workflowId)) throw err('bad_request', 'workflowId 不合法');
+    if (input.expectedRevisionId !== undefined && (typeof input.expectedRevisionId !== 'string' || !/^rev_[0-9a-f]{64}$/.test(input.expectedRevisionId))) {
+      throw err('bad_request', 'expectedRevisionId 不合法');
+    }
+    const params: Record<string, string> = {};
+    if (input.params !== undefined) {
+      if (!input.params || typeof input.params !== 'object' || Array.isArray(input.params)) throw err('bad_request', 'params 必须是对象');
+      for (const [name, value] of Object.entries(input.params as Record<string, unknown>)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) throw err('bad_params', `参数名不合法：${name}`);
+        if (typeof value !== 'string') throw err('bad_params', `参数 ${name} 的值要填文字`);
+        if (value.length > WORKFLOW_TEMPLATE_RUN_MAX_PARAM_CHARS) throw err('bad_params', `参数 ${name} 最多 ${WORKFLOW_TEMPLATE_RUN_MAX_PARAM_CHARS} 个字符`);
+        params[name] = value;
+      }
+    }
+    const bots = this.deps.loadBots();
+    const bot = bots.find((candidate) => candidate.larkAppId === this.deps.appId);
+    if (!bot) throw err('orchestrator_ineligible', '编排 Bot 不在本机 bots.json 里');
+    const why = v3BotStaticExclusion(bot);
+    if (why) throw err('orchestrator_ineligible', `这个 Bot 不能编排工作流：${why}`);
+    if (isStewardBot(bot.steward)) throw err('orchestrator_ineligible', '管家 Bot 不能当编排 Bot');
+
+    const rawParams = Object.create(null) as Record<string, RawParamInput>;
+    for (const [name, value] of Object.entries(params)) rawParams[name] = { kind: 'string', value };
+    let prepared: Awaited<ReturnType<typeof prepareDashboardSavedWorkflowRun>>;
+    try {
+      prepared = await prepareDashboardSavedWorkflowRun({
+        dataDir: this.libraryDir(),
+        workflowId,
+        actor: { openId: initiator.openId, larkAppId: this.deps.appId },
+        rawParams,
+      });
+    } catch (error) {
+      throw this.mapLibraryError(error);
+    }
+    if (input.expectedRevisionId !== undefined && prepared.revision.revisionId !== input.expectedRevisionId) {
+      throw err('save_conflict', '模板已经发布了新版本，请刷新后再运行', { revisionId: prepared.revision.revisionId });
+    }
+    const now = this.now();
+    const displayName = prepared.metadata.displayName;
+    const { runId, runDir, state } = birthRun({
+      goal: displayName,
+      baseDir: this.deps.baseDir,
+      now,
+      ...(this.deps.randomSuffix ? { randomSuffix: this.deps.randomSuffix() } : {}),
+    });
+    let record: WorkflowDraftRecord;
+    try {
+      const { dag, spec } = savedWorkflowRunFlow(prepared.revision, runId);
+      // Every node's bot must still be configured here (checked again live
+      // at 拉群开始): fail now, not at the end of a launch.
+      freezeDagBotSnapshots(dag, bots, { defaultSelector: this.deps.appId });
+      const dagPath = join(runDir, 'dag.json');
+      atomicWriteFileSync(dagPath, `${JSON.stringify(dag, null, 2)}\n`, { mode: 0o600 });
+      atomicWriteFileSync(state.specJsonPath, `${JSON.stringify(spec, null, 2)}\n`, { mode: 0o600 });
+      // The flow is the template's: the grill starts where a confirmed
+      // Architect run ends (no clarify, no Architect, §5.3).
+      writeGrillState(runDir, { ...state, status: 'dag_ready', dagPath, updatedAt: now.toISOString() });
+      const at = now.toISOString();
+      record = {
+        schemaVersion: WORKFLOW_DRAFT_SCHEMA_VERSION,
+        runId,
+        orchestratorAppId: this.deps.appId,
+        initiator,
+        goal: displayName,
+        createdAt: at,
+        updatedAt: at,
+        version: 1,
+        clarify: { state: 'closed', turns: [] },
+        flowRevision: 0,
+        template: {
+          workflowId,
+          revisionId: prepared.revision.revisionId,
+          contentHash: prepared.revision.contentHash,
+          humanVersion: prepared.revision.payload.humanVersion,
+          displayName,
+          ownerOpenId: prepared.metadata.owner.openId,
+          params,
+          confirmationRequired: prepared.confirmationRequired,
+          hasInputs: Object.keys(prepared.revision.payload.inputs).length > 0,
+          dagSha256: artifactRef(runDir, 'dag.json').sha256,
+          specSha256: artifactRef(runDir, 'spec.json').sha256,
+          preparedAt: at,
+        },
+      };
+      // draft.json last: until it exists the directory is not a draft.
+      withWorkflowDraftLock(runDir, runId, () => writeWorkflowDraft(runDir, record));
+    } catch (error) {
+      rmSync(runDir, { recursive: true, force: true });
+      if (error instanceof WorkflowDraftError) throw error;
+      throw err('template_invalid', `模板不能在这里运行：${errorText(error)}`);
+    }
+    this.log(`[workflow-draft] template run ${runId} of ${workflowId} v${record.template!.humanVersion} by ${initiator.openId} (${initiator.source})`);
+    return this.view(runId);
+  }
+
+  /**
+   * 存为模板 (§5.1) from a draft: only once its second confirmation holds
+   * for the flow as it is now; the save re-shows that flow summary and the
+   * template version records who confirmed it, when, and the summary.
+   * Synchronous under the draft lock; nothing is written.
+   */
+  private planDraftTemplateSave(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: { flowSummarySha256?: string; paramEdits: ReturnType<typeof parseSavedWorkflowParamEdits> },
+  ): { plan: DashboardSavePlan; flowSummary: V3FlowSummary; flowSummarySha256: string } {
+    const bots = this.deps.loadBots();
+    const nameOf = this.deps.nameOf();
+    const actor = { openId: initiator.openId, larkAppId: this.deps.appId };
+    return this.mutate(runId, initiator, {}, ({ draft, grill, runDir }) => {
+      this.assertNotTemplateRun(draft, '另存为模板');
+      this.assertNotArchitecting(runId, draft, grill);
+      this.assertStatus(grill, ['dag_ready'], '存为模板');
+      let flow: ReturnType<WorkflowDraftService['currentFlow']>;
+      try {
+        flow = this.currentFlow(runDir, grill, bots, nameOf);
+      } catch (error) {
+        throw err('dag_invalid', `流程读不出来：${errorText(error)}`);
+      }
+      const confirmation = draft.flowConfirmation;
+      if (!confirmation || !this.confirmationValid(draft, flow)) {
+        throw err('flow_changed', '先「确认流程」：只有通过第二道确认的草稿才能存为模板', { flowSummarySha256: flow.flowSummarySha256 });
+      }
+      if (input.flowSummarySha256 !== undefined && input.flowSummarySha256 !== flow.flowSummarySha256) {
+        throw err('flow_changed', '流程在你确认前变了，请看最新的流程摘要再保存', { flowSummarySha256: flow.flowSummarySha256 });
+      }
+      const spec = validateSpec(JSON.parse(readFileSync(grill.specJsonPath, 'utf-8')) as unknown);
+      const snapshots = freezeDagBotSnapshots(flow.dag, bots, { defaultSelector: this.deps.appId });
+      let plan: DashboardSavePlan;
+      try {
+        const built = buildSavedWorkflowRevisionFromFlow({ dag: flow.dag, spec, snapshots });
+        plan = withDashboardParamEdits({
+          displayName: built.displayName,
+          revision: {
+            ...built.revision,
+            provenance: {
+              kind: 'dashboard_draft',
+              draftRunId: runId,
+              confirmation: {
+                confirmedByOpenId: initiator.openId,
+                confirmedAt: this.now().toISOString(),
+                flowConfirmedAt: confirmation.confirmedAt,
+                flowSummary: flow.flowSummary,
+                flowSummarySha256: flow.flowSummarySha256,
+              },
+            },
+          },
+          publish: true,
+          lintWarnings: built.lintWarnings,
+        }, actor, input.paramEdits);
+      } catch (error) {
+        throw this.mapLibraryError(error);
+      }
+      return { changed: false, result: { plan, flowSummary: flow.flowSummary, flowSummarySha256: flow.flowSummarySha256 } };
+    });
+  }
+
+  private async templateSavePreview(
+    plan: DashboardSavePlan,
+    actor: { openId: string; larkAppId: string },
+    workflowId: string | undefined,
+    flow: { flowSummary: V3FlowSummary; flowSummarySha256: string },
+  ): Promise<WorkflowDraftTemplateSavePreview> {
+    let target: WorkflowDraftTemplateSavePreview['target'];
+    if (workflowId) {
+      try {
+        const found = await loadDashboardAppendTarget({ dataDir: this.libraryDir(), workflowId, actor, revision: plan.revision });
+        target = {
+          workflowId,
+          displayName: found.metadata.displayName,
+          latestRevision: found.metadata.latestRevision,
+          humanVersion: found.latest.payload.humanVersion,
+          gates: found.gates,
+        };
+      } catch (error) {
+        throw this.mapLibraryError(error);
+      }
+    }
+    const nodes = plan.revision.dagTemplate.nodes;
+    const catalog = await listSavedWorkflowCatalog(this.libraryDir());
+    const appendCandidates = catalog.entries
+      .filter((entry) => entry.owner.larkAppId === actor.larkAppId && entry.owner.openId === actor.openId && entry.scope.kind === 'global')
+      .map((entry) => ({ workflowId: entry.workflowId, displayName: entry.displayName, latestRevision: entry.latestRevision }));
+    return {
+      appendCandidates,
+      dagNodes: nodes,
+      displayName: plan.displayName,
+      flowSummary: flow.flowSummary,
+      flowSummarySha256: flow.flowSummarySha256,
+      inputs: plan.revision.inputs,
+      nodeCount: nodes.reduce((count, node) => count + 1 + (node.type === 'loop' && node.body ? node.body.nodes.length : 0), 0),
+      gateCount: countGates(plan.revision.dagTemplate.nodes),
+      lintWarnings: plan.lintWarnings,
+      ...(target ? { target } : {}),
+    };
+  }
+
+  /** The confirm dialog of 「存为模板」: the flow summary again, gates vs the
+   *  version appended to (I10), lint warnings. Writes nothing. */
+  async previewTemplateSave(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: { workflowId?: unknown; paramEdits?: unknown },
+  ): Promise<WorkflowDraftTemplateSavePreview> {
+    const workflowId = parseOptionalWorkflowId(input.workflowId);
+    let paramEdits: ReturnType<typeof parseSavedWorkflowParamEdits>;
+    try { paramEdits = parseSavedWorkflowParamEdits(input.paramEdits); } catch (error) { throw this.mapLibraryError(error); }
+    const planned = this.planDraftTemplateSave(runId, initiator, { paramEdits });
+    return this.templateSavePreview(planned.plan, { openId: initiator.openId, larkAppId: this.deps.appId }, workflowId, planned);
+  }
+
+  /** 「存为模板」: a new global template (owner = the initiator, I9) or a new
+   *  version of the initiator's own template. */
+  async saveAsTemplate(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: {
+      flowSummarySha256: unknown;
+      workflowId?: unknown;
+      expectedLatestRevision?: unknown;
+      displayName?: unknown;
+      paramEdits?: unknown;
+      requestKey?: unknown;
+      acknowledgeUnsafeLiterals?: unknown;
+    },
+  ): Promise<{ workflowId: string; revisionId: string; humanVersion: number; created: boolean }> {
+    const shown = typeof input.flowSummarySha256 === 'string' ? input.flowSummarySha256 : '';
+    if (!/^sha256:[0-9a-f]{64}$/.test(shown)) throw err('bad_request', 'flowSummarySha256 必须是保存框里显示的流程摘要哈希');
+    const workflowId = parseOptionalWorkflowId(input.workflowId);
+    const save = parseSaveTarget(input, workflowId);
+    let paramEdits: ReturnType<typeof parseSavedWorkflowParamEdits>;
+    try { paramEdits = parseSavedWorkflowParamEdits(input.paramEdits); } catch (error) { throw this.mapLibraryError(error); }
+    const actor = { openId: initiator.openId, larkAppId: this.deps.appId };
+    const planned = this.planDraftTemplateSave(runId, initiator, { flowSummarySha256: shown, paramEdits });
+    if (planned.plan.lintWarnings.length > 0 && input.acknowledgeUnsafeLiterals !== true) {
+      throw err('unsafe_literals', '保存的内容里有需要你确认的文字（疑似密钥 / 本机路径 / 群内发消息）', { warnings: planned.plan.lintWarnings });
+    }
+    try {
+      const written = await commitDashboardSave({
+        dataDir: this.libraryDir(),
+        actor,
+        plan: planned.plan,
+        ...(workflowId ? { workflowId, ...(save.expectedLatestRevision ? { expectedLatestRevision: save.expectedLatestRevision } : {}) } : {}),
+        ...(save.displayName ? { displayName: save.displayName } : {}),
+        ...(!workflowId ? { newWorkflowId: dashboardSavedWorkflowId({ sourceKind: 'draft', sourceId: runId, actor, requestKey: save.requestKey }) } : {}),
+        now: this.now(),
+      });
+      this.log(`[workflow-draft] saved ${runId} as template ${written.metadata.workflowId} v${written.revision.payload.humanVersion} by ${initiator.openId}`);
+      return {
+        workflowId: written.metadata.workflowId,
+        revisionId: written.revision.revisionId,
+        humanVersion: written.revision.payload.humanVersion,
+        created: written.created,
+      };
+    } catch (error) {
+      throw this.mapLibraryError(error);
+    }
+  }
+
+  // ── 存为模板 from a finished run (§5.1, E10) ──
+
+  /** The run's own directory, or unknown_run. Runs of this bot only: the
+   *  ownership check (planDashboardRunSave) needs the binding anyway. */
+  private finishedRunDir(runId: string): string {
+    const runDir = workflowDraftRunDir(this.deps.baseDir, runId);
+    if (!runDir || !existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) throw err('unknown_run', `没有这个运行：${runId}`);
+    return runDir;
+  }
+
+  private planRunSave(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: { allowDraft?: unknown; paramEdits?: unknown },
+  ): DashboardSavePlan {
+    const runDir = this.finishedRunDir(runId);
+    const actor = { openId: initiator.openId, larkAppId: this.deps.appId };
+    try {
+      const edits = parseSavedWorkflowParamEdits(input.paramEdits);
+      return withDashboardParamEdits(planDashboardRunSave({ runDir, actor, allowDraft: input.allowDraft === true }), actor, edits);
+    } catch (error) {
+      if (error instanceof SavedWorkflowServiceError && error.code === 'source_not_terminal') {
+        throw err('state_conflict', '这次运行还没结束，结束后再保存');
+      }
+      if (error instanceof Error && /cannot publish workflow from a (failed|blocked) run/.test(error.message)) {
+        throw err('state_conflict', '这次运行没有成功，只能存成未发布的版本', { needsDraft: true });
+      }
+      throw this.mapLibraryError(error);
+    }
+  }
+
+  /** The confirm dialog of 「保存为模板」 on a run: the bots that differ from
+   *  the approved flow, gates vs the version appended to (I10), lint. */
+  async previewRunSave(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: { workflowId?: unknown; allowDraft?: unknown; paramEdits?: unknown },
+  ): Promise<WorkflowDraftTemplateSavePreview & Pick<DashboardSavePlan, 'botChanges' | 'runtimeRevisions' | 'sourceStatus' | 'publish'>> {
+    const workflowId = parseOptionalWorkflowId(input.workflowId);
+    const plan = this.planRunSave(runId, initiator, input);
+    const bots = this.deps.loadBots();
+    const nameOf = this.deps.nameOf();
+    // The summary of what would be saved, on the same terms as a draft's.
+    const dag = { runId: 'saved-template', nodes: plan.revision.dagTemplate.nodes } as V3Dag;
+    let flowSummary: V3FlowSummary;
+    try {
+      const targets = v3BotExecutorTargets(dag, freezeDagBotSnapshots(dag, bots, { defaultSelector: this.deps.appId }));
+      flowSummary = buildV3FlowSummary({
+        dagNodes: dag.nodes,
+        plan: projectV3Gate2BotPlan({ targets, orchestratorAppId: this.deps.appId, nameOf, cliOf: (appId) => bots.find((bot) => bot.larkAppId === appId)?.cliId, reasons: new Map(), assignees: [] }),
+      });
+    } catch (error) {
+      throw err('template_invalid', `模板里的 Bot 在本机找不到：${errorText(error)}`);
+    }
+    const preview = await this.templateSavePreview(plan, { openId: initiator.openId, larkAppId: this.deps.appId }, workflowId, {
+      flowSummary, flowSummarySha256: v3FlowSummarySha256(flowSummary),
+    });
+    return {
+      ...preview,
+      ...(plan.botChanges ? { botChanges: plan.botChanges } : {}),
+      ...(plan.runtimeRevisions !== undefined ? { runtimeRevisions: plan.runtimeRevisions } : {}),
+      ...(plan.sourceStatus ? { sourceStatus: plan.sourceStatus } : {}),
+      publish: plan.publish,
+    };
+  }
+
+  /** 「保存为模板」 on a finished run: only the initiator's own run (I9). */
+  async saveRunAsTemplate(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: {
+      workflowId?: unknown;
+      expectedLatestRevision?: unknown;
+      displayName?: unknown;
+      paramEdits?: unknown;
+      requestKey?: unknown;
+      allowDraft?: unknown;
+      acknowledgeUnsafeLiterals?: unknown;
+    },
+  ): Promise<{ workflowId: string; revisionId: string; humanVersion: number; created: boolean; published: boolean }> {
+    const workflowId = parseOptionalWorkflowId(input.workflowId);
+    const save = parseSaveTarget(input, workflowId);
+    const plan = this.planRunSave(runId, initiator, input);
+    if (plan.lintWarnings.length > 0 && input.acknowledgeUnsafeLiterals !== true) {
+      throw err('unsafe_literals', '保存的内容里有需要你确认的文字（疑似密钥 / 本机路径 / 群内发消息）', { warnings: plan.lintWarnings });
+    }
+    const actor = { openId: initiator.openId, larkAppId: this.deps.appId };
+    try {
+      const written = await commitDashboardSave({
+        dataDir: this.libraryDir(),
+        actor,
+        plan,
+        ...(workflowId ? { workflowId, ...(save.expectedLatestRevision ? { expectedLatestRevision: save.expectedLatestRevision } : {}) } : {}),
+        ...(save.displayName ? { displayName: save.displayName } : {}),
+        ...(!workflowId ? { newWorkflowId: dashboardSavedWorkflowId({ sourceKind: 'run', sourceId: runId, actor, requestKey: save.requestKey }) } : {}),
+        now: this.now(),
+      });
+      this.log(`[workflow-draft] saved run ${runId} as template ${written.metadata.workflowId} v${written.revision.payload.humanVersion} by ${initiator.openId}`);
+      return {
+        workflowId: written.metadata.workflowId,
+        revisionId: written.revision.revisionId,
+        humanVersion: written.revision.payload.humanVersion,
+        created: written.created,
+        published: written.metadata.publishedRevision === written.revision.revisionId,
+      };
+    } catch (error) {
+      throw this.mapLibraryError(error);
+    }
+  }
+
   /** One message from the initiator into the clarify session. */
   async sendMessage(runId: string, initiator: WorkflowDraftInitiator, input: { text: unknown; baseVersion?: number }): Promise<WorkflowDraftView> {
     const text = typeof input.text === 'string' ? input.text.trim() : '';
@@ -1173,6 +1727,7 @@ export class WorkflowDraftService {
     const note = typeof input.note === 'string' && input.note.trim() ? input.note.trim() : undefined;
     const runDir = this.runDirOf(runId);
     this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
+      this.assertNotTemplateRun(draft, '重新编排');
       this.assertNoLaunch(draft, '重新编排');
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['spec_approved', 'dag_ready'], '编排');
@@ -1342,6 +1897,11 @@ export class WorkflowDraftService {
     const stale = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['dag_ready'], '换执行 Bot');
+      // A swapped bot makes a template run an ad-hoc one (复制后启动, §5.3):
+      // its `${params.…}` markers would have nothing to resolve them.
+      if (draft.template?.hasInputs) {
+        throw err('template_run', '这个模板带参数，不能直接换执行 Bot；请先「复制为新工作流」再改');
+      }
       const dagPath = grill.dagPath;
       if (!dagPath) throw err('state_conflict', '还没有流程图');
       withHostMutationLockSync(runDir, () => {
@@ -1481,6 +2041,7 @@ export class WorkflowDraftService {
    *  and the DAG are void. */
   async reviseSpec(runId: string, initiator: WorkflowDraftInitiator, input: { baseVersion?: number } = {}): Promise<WorkflowDraftView> {
     this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
+      this.assertNotTemplateRun(draft, '退回改需求');
       this.assertNoLaunch(draft, '退回改需求');
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['spec_ready', 'spec_approved', 'dag_ready'], '退回改需求');
@@ -1652,7 +2213,7 @@ export class WorkflowDraftService {
     } catch (error) {
       throw err('dag_invalid', `流程读不出来：${errorText(error)}`);
     }
-    if (!draft.flowConfirmation || !this.confirmationValid(draft, flow)) {
+    if (!this.flowReady(draft, flow)) {
       throw err('flow_changed', '流程还没确认，或确认后又改过：请先「确认流程」', { flowSummarySha256: flow.flowSummarySha256 });
     }
     return flow;
@@ -2195,14 +2756,14 @@ export class WorkflowDraftService {
       }
       return {
         changed,
-        result: { chatId: launch.chat!.chatId, rootMessageId: launch.root!.messageId, session, title: this.titleOf(draft, grill) },
+        result: { chatId: launch.chat!.chatId, rootMessageId: launch.root!.messageId, session, title: this.titleOf(draft, grill), template: !!draft.template },
       };
     });
     if (!snap.held) return false;
     const { chatId, rootMessageId, session, title } = snap.result;
     let bound: Awaited<ReturnType<DraftLaunchDeps['bindSession']>>;
     if (!session) {
-      bound = { ok: false, error: '澄清会话已断开', unavailable: true };
+      bound = { ok: false, error: snap.result.template ? '从模板运行，没有澄清会话' : '澄清会话已断开', unavailable: true };
     } else {
       try {
         bound = await deps.bindSession({ ...session, chatId, rootMessageId, title });
@@ -2594,6 +3155,10 @@ export class WorkflowDraftService {
    * recorded.
    */
   private async launchCommitStep(runId: string, token: string): Promise<boolean> {
+    // 运行模板 as is (§5.3): run.json is the template's (saved_definition).
+    // A swapped bot made it 复制后启动: the ad-hoc commit below.
+    const peek = readWorkflowDraft(this.runDirOf(runId, { launched: true }));
+    if (peek?.template && Object.keys(peek.nodeBots ?? {}).length === 0) return this.launchTemplateCommitStep(runId, token, peek.template);
     const bots = this.deps.loadBots();
     const nameOf = this.deps.nameOf();
     const out = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => {
@@ -2617,6 +3182,7 @@ export class WorkflowDraftService {
           return { changed: false, result: 'again' as const };
         }
       }
+      if (draft.template && Object.keys(draft.nodeBots ?? {}).length === 0) return { changed: false, result: 'again' as const };
       const confirmation = draft.flowConfirmation;
       const binding: RunChatBinding = {
         larkAppId: this.deps.appId,
@@ -2680,6 +3246,113 @@ export class WorkflowDraftService {
       return false;
     }
     if (out.result === 'committed') this.log(`[workflow-draft] launch ${runId}: run.json written`);
+    return true;
+  }
+
+  /**
+   * Step 7 of a template run (§5.3): the revision pinned when the run was
+   * prepared, committed in place as `source: saved_definition` with the
+   * group, the main topic and the initiator (D1: the binding's owner is the
+   * initiator). Its flow must still be the prepared one; a draft-born
+   * revision's run also needs its 「确认流程」 to hold (I13).
+   */
+  private async launchTemplateCommitStep(runId: string, token: string, pinned: WorkflowDraftTemplateRun): Promise<boolean> {
+    let library: { metadata: Awaited<ReturnType<typeof readSavedWorkflowMetadata>>; revision: Awaited<ReturnType<typeof readSavedWorkflowRevision>> } | undefined;
+    let libraryError: string | undefined;
+    try {
+      const metadata = await readSavedWorkflowMetadata(this.libraryDir(), pinned.workflowId);
+      const revision = await readSavedWorkflowRevision(this.libraryDir(), pinned.workflowId, pinned.revisionId);
+      if (revision.contentHash !== pinned.contentHash) libraryError = '模板版本的内容和准备运行时不一样';
+      else if (metadata.status === 'archived') libraryError = '模板已归档，不能再运行';
+      else if (metadata.scope.kind !== 'global' || metadata.owner.larkAppId !== this.deps.appId) libraryError = '模板的范围或所属 Bot 变了，不能在这里运行';
+      else library = { metadata, revision };
+    } catch (error) {
+      libraryError = `模板读不出来：${errorText(error)}`;
+    }
+    if (!library) {
+      this.stopLaunch(runId, token, { step: 'commit', code: 'template_unavailable', retryable: true, message: libraryError ?? '模板读不出来' });
+      return false;
+    }
+    const bots = this.deps.loadBots();
+    const nameOf = this.deps.nameOf();
+    const out = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => {
+      const template = draft.template;
+      if (!template || template.revisionId !== pinned.revisionId || Object.keys(draft.nodeBots ?? {}).length > 0) {
+        return { changed: false, result: 'again' as const };
+      }
+      const chatId = launch.chat!.chatId;
+      const rootMessageId = launch.root!.messageId;
+      const envelopePath = join(runDir, V3_RUN_ENVELOPE_FILE);
+      let flow: ReturnType<WorkflowDraftService['currentFlow']>;
+      try {
+        flow = this.currentFlow(runDir, grill, bots, nameOf);
+      } catch (error) {
+        throw err('dag_invalid', `流程读不出来：${errorText(error)}`);
+      }
+      if (!existsSync(envelopePath)) {
+        if (grill.status !== 'dag_ready' || !this.flowReady(draft, flow)) {
+          delete draft.flowConfirmation;
+          return { changed: true, result: 'stop' as const };
+        }
+        if (nextLaunchStep(launch, { flowRevision: draft.flowRevision ?? 0, targets: [...new Set(flow.targets.map((t) => t.larkAppId).filter((appId) => appId !== this.deps.appId))] }) !== 'commit') {
+          return { changed: false, result: 'again' as const };
+        }
+      }
+      const binding: RunChatBinding = {
+        larkAppId: this.deps.appId,
+        chatId,
+        chatType: 'group',
+        rootMessageId,
+        ...(launch.migrate?.status === 'bound' && launch.migrate.sessionId ? { sessionId: launch.migrate.sessionId } : {}),
+        ownerOpenId: draft.initiator.openId,
+      };
+      const initiator: V3RunInitiator = {
+        openId: draft.initiator.openId,
+        ...(draft.initiator.source === 'dashboard-platform' && draft.initiator.unionId ? { unionId: draft.initiator.unionId } : {}),
+        source: draft.initiator.source,
+      };
+      const rawParams = Object.create(null) as Record<string, RawParamInput>;
+      for (const [name, value] of Object.entries(template.params)) rawParams[name] = { kind: 'string', value };
+      // Lock order: draft (held) → grill/host → run.json.
+      const envelope = withHostMutationLockSync(runDir, () => withFileLockSync(envelopePath, () => {
+        const committed = commitSavedWorkflowRunInPlace({
+          runDir,
+          metadata: library!.metadata,
+          revision: library!.revision,
+          rawParams,
+          chatBinding: binding,
+          initiator,
+          expected: { dagSha256: template.dagSha256, specSha256: template.specSha256 },
+          bots,
+          now: this.now(),
+        });
+        // The grill is this draft's bookkeeping only: past run.json it reads
+        // as approved, like an ad-hoc launch's.
+        const current = readGrillState(runDir);
+        if (current?.status === 'dag_ready') transition(runDir, 'dag_approved', {}, this.now());
+        return committed;
+      }));
+      launch.commit = {
+        at: this.now().toISOString(),
+        chatId,
+        rootMessageId,
+        runJsonSha256: fileSha256(envelopePath)!,
+        flowSummarySha256: flow.flowSummarySha256 as `sha256:${string}`,
+        dagSha256: envelope.artifacts.dag.sha256,
+        specSha256: envelope.artifacts.spec.sha256,
+        flowRevision: draft.flowRevision ?? 0,
+      };
+      return { changed: true, result: 'committed' as const };
+    });
+    if (!out.held) return false;
+    if (out.result === 'stop') {
+      this.stopLaunch(runId, token, {
+        step: 'commit', code: 'flow_changed', retryable: false,
+        message: '流程和准备运行（或确认）时的不一致：请看最新的流程，确认后点「继续」',
+      });
+      return false;
+    }
+    if (out.result === 'committed') this.log(`[workflow-draft] launch ${runId}: template run.json written (${pinned.workflowId} v${pinned.humanVersion})`);
     return true;
   }
 
@@ -2797,6 +3470,7 @@ export class WorkflowDraftService {
     let flow: WorkflowDraftFlowView | undefined;
     let flowError: string | undefined;
     let confirmationValid = false;
+    let phaseReady = false;
     if (grill.status === 'dag_ready' && grill.dagPath) {
       try {
         const bots = this.deps.loadBots();
@@ -2817,6 +3491,7 @@ export class WorkflowDraftService {
           })),
         };
         confirmationValid = this.confirmationValid(draft, current);
+        phaseReady = this.flowReady(draft, current);
       } catch (error) {
         flowError = errorText(error);
       }
@@ -2836,7 +3511,7 @@ export class WorkflowDraftService {
       initiator: draft.initiator,
       goal: draft.goal,
       title,
-      phase: workflowDraftPhase(grill, draft, confirmationValid),
+      phase: workflowDraftPhase(grill, draft, phaseReady),
       grillStatus: grill.status,
       ...(grill.problems?.length ? { problems: grill.problems } : {}),
       createdAt: draft.createdAt,
@@ -2870,6 +3545,11 @@ export class WorkflowDraftService {
       ...(flowError ? { flowError } : {}),
       ...(draft.flowConfirmation ? { flowConfirmation: { ...draft.flowConfirmation, valid: confirmationValid } } : {}),
       ...(draft.launch ? { launch: this.launchView(draft, flowTargetsOf(flow), snapshot.launchRunning) } : {}),
+      ...(draft.template ? { template: {
+        ...draft.template,
+        needsConfirmation: workflowTemplateRunNeedsConfirmation(draft),
+        swapped: Object.keys(draft.nodeBots ?? {}).length > 0,
+      } } : {}),
     };
   }
 

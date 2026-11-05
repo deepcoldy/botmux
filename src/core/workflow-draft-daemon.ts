@@ -24,6 +24,15 @@
  *   POST /drafts/:runId/launch/abandon                                  放弃（群保留）
  *   POST /drafts/:runId/launch/resend-root      {confirmedAbsent: true} 人工确认群里没有根卡片后重发
  *   POST /drafts/:runId/launch/resend-summary   {confirmedAbsent: true} 人工确认群里没有摘要后重发
+ *   POST /drafts/:runId/template/preview        {workflowId?, paramEdits?}   存为模板的确认框（D5）
+ *   POST /drafts/:runId/template/save           {flowSummarySha256, …}       存为模板（D5）
+ *
+ * Templates (D5, under {@link WORKFLOW_LIBRARY_PATH}; reads are the
+ * Dashboard's own, from disk):
+ *
+ *   POST /library/runs/:runId/save/preview      {workflowId?, paramEdits?, allowDraft?}  保存为模板的确认框
+ *   POST /library/runs/:runId/save              {workflowId?, expectedLatestRevision?, displayName?, paramEdits?, requestKey?, …}
+ *   POST /library/:workflowId/run               {params, expectedRevisionId?}  运行模板 → 草稿
  *
  * The launch record is part of GET /drafts/:runId (`launch`).
  *
@@ -70,6 +79,7 @@ import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { getBotBrand, getBotOpenId } from '../bot-registry.js';
 
 export const WORKFLOW_DRAFTS_PATH = '/api/v3/orchestration/drafts';
+export const WORKFLOW_LIBRARY_PATH = '/api/v3/orchestration/library';
 
 /** How far back (messages) / how many candidates are read in full when
  *  looking for a root card past Feishu's uuid window. */
@@ -236,6 +246,38 @@ export function registerWorkflowDraftIpcRoutes(
     ({ draft: await service.resendRoot(runId, initiator, { confirmedAbsent: body.confirmedAbsent, baseVersion }) }));
   write(draftPath('launch/resend-summary'), async ({ service, initiator, body, runId }) =>
     ({ draft: await service.resendSummary(runId, initiator, { confirmedAbsent: body.confirmedAbsent }) }));
+
+  // ── 模板（D5）──
+  write(draftPath('template/preview'), async ({ service, initiator, body, runId }) =>
+    ({ preview: await service.previewTemplateSave(runId, initiator, { workflowId: body.workflowId, paramEdits: body.paramEdits }) }));
+  write(draftPath('template/save'), async ({ service, initiator, body, runId }) =>
+    ({ saved: await service.saveAsTemplate(runId, initiator, {
+      flowSummarySha256: body.flowSummarySha256,
+      workflowId: body.workflowId,
+      expectedLatestRevision: body.expectedLatestRevision,
+      displayName: body.displayName,
+      paramEdits: body.paramEdits,
+      requestKey: body.requestKey,
+      acknowledgeUnsafeLiterals: body.acknowledgeUnsafeLiterals,
+    }) }));
+  write(`${WORKFLOW_LIBRARY_PATH}/runs/:runId/save/preview`, async ({ service, initiator, body, runId }) =>
+    ({ preview: await service.previewRunSave(runId, initiator, { workflowId: body.workflowId, allowDraft: body.allowDraft, paramEdits: body.paramEdits }) }));
+  write(`${WORKFLOW_LIBRARY_PATH}/runs/:runId/save`, async ({ service, initiator, body, runId }) =>
+    ({ saved: await service.saveRunAsTemplate(runId, initiator, {
+      workflowId: body.workflowId,
+      expectedLatestRevision: body.expectedLatestRevision,
+      displayName: body.displayName,
+      paramEdits: body.paramEdits,
+      requestKey: body.requestKey,
+      allowDraft: body.allowDraft,
+      acknowledgeUnsafeLiterals: body.acknowledgeUnsafeLiterals,
+    }) }));
+  write(`${WORKFLOW_LIBRARY_PATH}/:workflowId/run`, async ({ service, initiator, body, params }) =>
+    ({ draft: await service.createFromTemplate(initiator, {
+      workflowId: decodeParam(params.workflowId),
+      params: body.params,
+      expectedRevisionId: body.expectedRevisionId,
+    }) }));
 }
 
 // ─── 拉群开始 collaborators (D4) ──────────────────────────────────────────

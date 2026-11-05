@@ -152,6 +152,39 @@ const nodeOverrideSchema = z.object({
   at: iso,
 }).strict();
 
+/** Raw parameter values as entered on the Dashboard (text; converted by the
+ *  `/workflow run` rules when the run is prepared and again at commit). */
+export const WORKFLOW_TEMPLATE_RUN_MAX_PARAM_CHARS = 16_000;
+
+/**
+ * 运行模板 (design 2026-11-03 workflow-dashboard-orchestration §5.3, D5): a
+ * draft born from a published Saved Workflow revision instead of a clarify
+ * session. Its dag.json / spec.json are that revision's flow under this run id
+ * (pinned by digest); 拉群开始 commits it as `source: saved_definition`.
+ * Swapping a node's bot makes it no longer "the template as is": it then needs
+ * 「确认流程」 and commits as an ad-hoc run (复制后启动, §6).
+ */
+const templateRunSchema = z.object({
+  workflowId: z.string().regex(/^wf_[0-9a-f]{32}$/),
+  revisionId: z.string().regex(/^rev_[0-9a-f]{64}$/),
+  contentHash: sha,
+  humanVersion: z.number().int().min(1),
+  displayName: z.string().min(1).max(256),
+  /** The template's owner (who saves versions) — not the run's initiator. */
+  ownerOpenId: openId,
+  params: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/), z.string().max(WORKFLOW_TEMPLATE_RUN_MAX_PARAM_CHARS)),
+  /** I13: a draft-born revision is confirmed again before it runs. */
+  confirmationRequired: z.boolean(),
+  /** The revision declares inputs: its flow carries `${params.…}` markers,
+   *  which an ad-hoc run (a swapped bot) could not resolve. */
+  hasInputs: z.boolean(),
+  dagSha256: sha,
+  specSha256: sha,
+  preparedAt: iso,
+}).strict();
+
+export type WorkflowDraftTemplateRun = z.infer<typeof templateRunSchema>;
+
 const chatIdSchema = z.string().regex(/^oc_[A-Za-z0-9_-]{1,128}$/);
 const messageIdSchema = z.string().regex(/^om_[A-Za-z0-9_-]{1,128}$/);
 const appIdSchema = z.string().min(1).max(128);
@@ -317,6 +350,8 @@ export const WorkflowDraftRecordSchema = z.object({
   deletedAt: iso.optional(),
   /** 拉群开始 (§4.5, D4). */
   launch: launchSchema.optional(),
+  /** 运行模板 (§5.3, D5): born from a Saved Workflow revision. */
+  template: templateRunSchema.optional(),
   orphanSessions: z.array(z.object({
     sessionId: z.string().min(1).max(256),
     headlessId: z.string().min(1).max(256).optional(),
@@ -446,9 +481,26 @@ export type WorkflowDraftPhase =
   /** 拉群开始 finished: the run is started. */
   | 'started';
 
+/**
+ * A template run needs 「确认流程」 when its revision was born from a draft
+ * (I13) or a node's bot was swapped (no longer the template as is, §5.3).
+ */
+export function workflowTemplateRunNeedsConfirmation(draft: Pick<WorkflowDraftRecord, 'template' | 'nodeBots'>): boolean {
+  if (!draft.template) return true;
+  return draft.template.confirmationRequired || Object.keys(draft.nodeBots ?? {}).length > 0;
+}
+
+/** A template run's flow files are still the prepared revision's. */
+export function templateRunFlowIntact(grill: GrillState, draft: WorkflowDraftRecord): boolean {
+  const template = draft.template;
+  return !!template
+    && fileSha256(grill.dagPath) === template.dagSha256
+    && fileSha256(grill.specJsonPath) === template.specSha256;
+}
+
 export function workflowDraftPhase(
   grill: Pick<GrillState, 'status'>,
-  draft: Pick<WorkflowDraftRecord, 'abandonedAt' | 'architect' | 'flowConfirmation' | 'launch'>,
+  draft: Pick<WorkflowDraftRecord, 'abandonedAt' | 'architect' | 'flowConfirmation' | 'launch'> & Partial<Pick<WorkflowDraftRecord, 'template' | 'nodeBots'>>,
   flowConfirmationValid?: boolean,
 ): WorkflowDraftPhase {
   if (draft.abandonedAt) return 'abandoned';
@@ -464,7 +516,10 @@ export function workflowDraftPhase(
     dag_approved: 'committed',
   };
   const phase = byStatus[grill.status];
-  if (phase === 'dag_ready' && draft.flowConfirmation && flowConfirmationValid !== false) {
+  // A template run that needs no confirmation (I13) stands where a confirmed
+  // flow does; `flowConfirmationValid` then says its files are intact.
+  const confirmed = draft.template && !workflowTemplateRunNeedsConfirmation(draft) ? true : !!draft.flowConfirmation;
+  if (phase === 'dag_ready' && confirmed && flowConfirmationValid !== false) {
     return draft.launch ? 'launching' : 'flow_confirmed';
   }
   return phase;
@@ -482,6 +537,8 @@ export interface WorkflowDraftSummary {
   updatedAt: string;
   /** §4.6: 30 days without activity — greyed out, deletable. */
   stale: boolean;
+  /** 运行模板 (D5): the template this run comes from. */
+  template?: { workflowId: string; humanVersion: number; displayName: string };
 }
 
 function specTitle(grill: GrillState): string | undefined {
@@ -496,6 +553,7 @@ function specTitle(grill: GrillState): string | undefined {
 /** The second confirmation still matches the dag and spec bytes on disk (the
  *  flow summary itself needs bots.json, so only the daemon compares it). */
 export function flowConfirmationMatchesFiles(grill: GrillState, draft: WorkflowDraftRecord): boolean {
+  if (draft.template && !workflowTemplateRunNeedsConfirmation(draft)) return templateRunFlowIntact(grill, draft);
   const confirmation = draft.flowConfirmation;
   if (!confirmation) return false;
   return confirmation.flowRevision === (draft.flowRevision ?? 0)
@@ -520,6 +578,7 @@ export function summarizeWorkflowDraft(runDir: string, now: Date = new Date()): 
     createdAt: draft.createdAt,
     updatedAt,
     stale: now.getTime() - Date.parse(updatedAt) >= WORKFLOW_DRAFT_STALE_MS,
+    ...(draft.template ? { template: { workflowId: draft.template.workflowId, humanVersion: draft.template.humanVersion, displayName: draft.template.displayName } } : {}),
   };
 }
 

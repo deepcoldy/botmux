@@ -18,13 +18,33 @@ import { DagValidationError, isGoalNode, isLoopNode, validateDag } from './dag.j
 import type { Spec } from './contract.js';
 import { SpecValidationError, validateSpec } from './spec.js';
 import { assertSavedWorkflowTemplateBindings } from './template-bindings.js';
+import { V3FlowSummarySchema, v3FlowSummarySha256, type V3FlowSummary } from './flow-summary.js';
 
 // Compatibility export for callers that historically imported the encoder
 // from the Saved Workflow schema module.
 export { canonicalJsonStringify } from '../../utils/canonical-json.js';
 
 export const SAVED_WORKFLOW_METADATA_SCHEMA_VERSION = 1 as const;
-export const SAVED_WORKFLOW_REVISION_SCHEMA_VERSION = 2 as const;
+/**
+ * The newest revision schema this reader understands (design 2026-11-03
+ * workflow-dashboard-orchestration §5.1, D5).
+ *
+ *   v1  legacy selector-based templates (read-migrated to v2, bytes kept);
+ *   v2  stable outputs; every Feishu `/workflow save` / distillation write;
+ *   v3  v2 + `provenance`: where a Dashboard save came from — the run it was
+ *       saved from (with the nodes whose bot differs from the approved flow),
+ *       or the draft whose second confirmation it carries (who, when, the
+ *       flow summary). Not derivable from the DAG, so never in `gateDigest`.
+ *
+ * A revision is written at the lowest schema that can hold it
+ * ({@link savedWorkflowRevisionSchemaVersionFor}): without provenance it is
+ * byte-identical v2, so the Feishu entries and older daemons are untouched;
+ * with provenance it is v3, which an older daemon refuses to read ("newer than
+ * supported") instead of silently dropping the confirmation.
+ */
+export const SAVED_WORKFLOW_REVISION_SCHEMA_VERSION = 3 as const;
+/** Lowest schema new revisions are written at (v1 is read-only). */
+export const SAVED_WORKFLOW_REVISION_MIN_WRITE_SCHEMA_VERSION = 2 as const;
 
 export const SAVED_WORKFLOW_ID_RE = /^wf_[0-9a-f]{32}$/;
 export const SAVED_WORKFLOW_REVISION_ID_RE = /^rev_[0-9a-f]{64}$/;
@@ -107,6 +127,43 @@ export interface SavedWorkflowChatSideEffectProblem {
   guidance: string;
 }
 
+/** A node whose executing bot in the saved definition differs from the flow
+ *  the source run was approved with (E10). `reassigned`: 受阻卡改派;
+ *  `revised`: an applied runtime revision changed it; `added` / `removed`: the
+ *  node exists on one side only. */
+export interface SavedWorkflowBotChange {
+  nodeId: string;
+  approvedLarkAppId?: string;
+  savedLarkAppId?: string;
+  cause: 'reassigned' | 'revised' | 'added' | 'removed';
+}
+
+/** The second confirmation a draft-born revision carries (§5.1): the person
+ *  who confirmed the flow summary shown when saving, when, and that summary
+ *  (normalized content + sha256, flow-summary.ts). */
+export interface SavedWorkflowDraftConfirmation {
+  confirmedByOpenId: string;
+  confirmedAt: string;
+  /** The draft's own 「确认流程」 that this save re-confirmed. */
+  flowConfirmedAt: string;
+  flowSummary: V3FlowSummary;
+  flowSummarySha256: string;
+}
+
+export type SavedWorkflowRevisionProvenance =
+  | {
+      kind: 'dashboard_run';
+      runId: string;
+      /** Applied runtime revisions of the source run (§13.8). */
+      runtimeRevisions: number;
+      botChanges: SavedWorkflowBotChange[];
+    }
+  | {
+      kind: 'dashboard_draft';
+      draftRunId: string;
+      confirmation: SavedWorkflowDraftConfirmation;
+    };
+
 export interface SavedWorkflowRevisionPayloadV1 {
   workflowId: string;
   humanVersion: number;
@@ -120,6 +177,8 @@ export interface SavedWorkflowRevisionPayloadV1 {
   specStatus: 'current' | 'stale';
   dagTemplate: V3DagTemplate;
   safety: SavedWorkflowSafety;
+  /** v3 only (absent in every v1/v2 revision). */
+  provenance?: SavedWorkflowRevisionProvenance;
 }
 
 /** Fields supplied by a save compiler; identity/version/provenance are allocated by the store. */
@@ -139,7 +198,9 @@ export interface LoadedSavedWorkflowRevision {
   revisionId: string;
   contentHash: string;
   storedSchemaVersion: number;
-  schemaVersion: typeof SAVED_WORKFLOW_REVISION_SCHEMA_VERSION;
+  /** The schema the payload is read at: v1 is migrated to 2; v2 and v3 are
+   *  read as stored. */
+  schemaVersion: 2 | 3;
   payload: SavedWorkflowRevisionPayloadV1;
   migrated: boolean;
 }
@@ -471,6 +532,45 @@ function gateProjection(nodes: V3Node[], prefix = ''): unknown[] {
   return out;
 }
 
+/** One human gate of a template: its position (`<node>` or `<loop>.<body>`)
+ *  and its approval rule — the facts `gateDigest` is taken over. */
+export interface SavedWorkflowGatePosition {
+  nodeId: string;
+  humanGate: unknown;
+}
+
+export function savedWorkflowGatePositions(dagTemplate: V3DagTemplate): SavedWorkflowGatePosition[] {
+  return (gateProjection(dagTemplate.nodes) as Array<{ id: string; humanGate: unknown }>)
+    .map((gate) => ({ nodeId: gate.id, humanGate: gate.humanGate }));
+}
+
+/**
+ * Human gates of a revision against the previous one (I10): how many, and
+ * where. `removed` are positions the previous revision gated and this one
+ * does not — what 「比上一版少了 N 道人工确认」 counts (N = removed.length); a
+ * gate that moved is one removed plus one added. `changed`: the same position
+ * with a different approval rule.
+ */
+export interface SavedWorkflowGateComparison {
+  previousCount: number;
+  currentCount: number;
+  removed: string[];
+  added: string[];
+  changed: string[];
+}
+
+export function compareSavedWorkflowGates(previous: V3DagTemplate, current: V3DagTemplate): SavedWorkflowGateComparison {
+  const before = new Map(savedWorkflowGatePositions(previous).map((gate) => [gate.nodeId, canonicalJsonStringify(gate.humanGate)]));
+  const after = new Map(savedWorkflowGatePositions(current).map((gate) => [gate.nodeId, canonicalJsonStringify(gate.humanGate)]));
+  return {
+    previousCount: before.size,
+    currentCount: after.size,
+    removed: [...before.keys()].filter((id) => !after.has(id)),
+    added: [...after.keys()].filter((id) => !before.has(id)),
+    changed: [...after.keys()].filter((id) => before.has(id) && before.get(id) !== after.get(id)),
+  };
+}
+
 const CHAT_SIDE_EFFECT_PATTERNS: Array<{ kind: string; re: RegExp }> = [
   { kind: 'botmux-send', re: /\bbotmux\s+(?:send|reply)\b/i },
   { kind: 'bytedcli-feishu', re: /\bbytedcli\s+feishu\b.*?\b(?:send|reply|message|im|chat)\b(?:[ \t]+(?:send|reply|message|im|chat)\b)*/i },
@@ -662,6 +762,152 @@ function normalizeSafety(value: unknown, dagTemplate: V3DagTemplate, problems: s
   return { gateDigest, sideEffects: normalizedSideEffects };
 }
 
+const BOT_CHANGE_CAUSES: ReadonlyArray<SavedWorkflowBotChange['cause']> = ['reassigned', 'revised', 'added', 'removed'];
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[], where: string, problems: string[]): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) problems.push(`${where}.${key} is not supported`);
+  }
+}
+
+/** The executing bot each goal node (incl. loop bodies, `<loop>.<body>`)
+ *  names, as the flow summary's node rows key them. */
+export function savedWorkflowGoalNodeBots(nodes: readonly V3Node[], prefix = '', inherited?: string): Map<string, string | undefined> {
+  const out = new Map<string, string | undefined>();
+  for (const node of nodes) {
+    const id = prefix ? `${prefix}.${node.id}` : node.id;
+    const bot = typeof node.bot === 'string' && node.bot.trim() ? node.bot.trim() : inherited;
+    if (isGoalNode(node)) out.set(id, bot);
+    if (isLoopNode(node) && node.body) {
+      for (const [childId, childBot] of savedWorkflowGoalNodeBots(node.body.nodes, id, bot)) out.set(childId, childBot);
+    }
+  }
+  return out;
+}
+
+function normalizeProvenance(
+  value: unknown,
+  ctx: { createdBy: SavedWorkflowOwner; sourceRunId?: string; dagTemplate?: V3DagTemplate },
+  problems: string[],
+): SavedWorkflowRevisionProvenance | undefined {
+  if (!isRecord(value)) {
+    problems.push('provenance must be an object');
+    return undefined;
+  }
+  if (value.kind === 'dashboard_run') {
+    exactKeys(value, ['kind', 'runId', 'runtimeRevisions', 'botChanges'], 'provenance', problems);
+    const runId = nonEmptyString(value.runId, 'provenance.runId', problems);
+    if (runId && ctx.sourceRunId !== runId) problems.push('provenance.runId must equal sourceRunId');
+    const runtimeRevisions = value.runtimeRevisions;
+    if (!Number.isInteger(runtimeRevisions) || (runtimeRevisions as number) < 0) {
+      problems.push('provenance.runtimeRevisions must be a non-negative integer');
+    }
+    const botChanges: SavedWorkflowBotChange[] = [];
+    if (!Array.isArray(value.botChanges)) {
+      problems.push('provenance.botChanges must be an array');
+    } else {
+      const seen = new Set<string>();
+      value.botChanges.forEach((item, index) => {
+        const where = `provenance.botChanges[${index}]`;
+        if (!isRecord(item)) {
+          problems.push(`${where} must be an object`);
+          return;
+        }
+        exactKeys(item, ['nodeId', 'approvedLarkAppId', 'savedLarkAppId', 'cause'], where, problems);
+        const nodeId = nonEmptyString(item.nodeId, `${where}.nodeId`, problems);
+        if (nodeId && seen.has(nodeId)) problems.push(`${where}.nodeId duplicates ${nodeId}`);
+        seen.add(nodeId);
+        if (!BOT_CHANGE_CAUSES.includes(item.cause as SavedWorkflowBotChange['cause'])) {
+          problems.push(`${where}.cause must be ${BOT_CHANGE_CAUSES.join(', ')}`);
+        }
+        const approved = item.approvedLarkAppId === undefined ? undefined : nonEmptyString(item.approvedLarkAppId, `${where}.approvedLarkAppId`, problems);
+        const saved = item.savedLarkAppId === undefined ? undefined : nonEmptyString(item.savedLarkAppId, `${where}.savedLarkAppId`, problems);
+        if (!approved && !saved) problems.push(`${where} must name the approved or the saved bot`);
+        if (approved && saved && approved === saved) problems.push(`${where} names the same bot on both sides`);
+        botChanges.push({
+          nodeId,
+          ...(approved ? { approvedLarkAppId: approved } : {}),
+          ...(saved ? { savedLarkAppId: saved } : {}),
+          cause: item.cause as SavedWorkflowBotChange['cause'],
+        });
+      });
+    }
+    if (ctx.dagTemplate) {
+      const bots = savedWorkflowGoalNodeBots(ctx.dagTemplate.nodes);
+      for (const change of botChanges) {
+        if (change.savedLarkAppId !== undefined && bots.get(change.nodeId) !== change.savedLarkAppId) {
+          problems.push(`provenance.botChanges ${change.nodeId}: savedLarkAppId does not match dagTemplate`);
+        }
+      }
+    }
+    return {
+      kind: 'dashboard_run',
+      runId,
+      runtimeRevisions: runtimeRevisions as number,
+      botChanges: botChanges.sort((a, b) => (a.nodeId < b.nodeId ? -1 : a.nodeId > b.nodeId ? 1 : 0)),
+    };
+  }
+  if (value.kind === 'dashboard_draft') {
+    exactKeys(value, ['kind', 'draftRunId', 'confirmation'], 'provenance', problems);
+    const draftRunId = nonEmptyString(value.draftRunId, 'provenance.draftRunId', problems);
+    if (ctx.sourceRunId !== undefined) problems.push('a draft-born revision has no sourceRunId');
+    const confirmation = value.confirmation;
+    if (!isRecord(confirmation)) {
+      problems.push('provenance.confirmation must be an object');
+      return undefined;
+    }
+    exactKeys(confirmation, ['confirmedByOpenId', 'confirmedAt', 'flowConfirmedAt', 'flowSummary', 'flowSummarySha256'], 'provenance.confirmation', problems);
+    const confirmedByOpenId = nonEmptyString(confirmation.confirmedByOpenId, 'provenance.confirmation.confirmedByOpenId', problems);
+    // Only the owner saves (I9): the person who re-confirmed is the creator.
+    if (confirmedByOpenId && confirmedByOpenId !== ctx.createdBy.openId) {
+      problems.push('provenance.confirmation.confirmedByOpenId must be the revision creator');
+    }
+    const confirmedAt = validIso(confirmation.confirmedAt, 'provenance.confirmation.confirmedAt', problems);
+    const flowConfirmedAt = validIso(confirmation.flowConfirmedAt, 'provenance.confirmation.flowConfirmedAt', problems);
+    const parsed = V3FlowSummarySchema.safeParse(confirmation.flowSummary);
+    if (!parsed.success) {
+      problems.push(`provenance.confirmation.flowSummary is invalid: ${parsed.error.issues.map((issue) => issue.message).join('; ')}`);
+      return undefined;
+    }
+    const flowSummary = parsed.data;
+    const sha = typeof confirmation.flowSummarySha256 === 'string' ? confirmation.flowSummarySha256 : '';
+    if (sha !== v3FlowSummarySha256(flowSummary)) problems.push('provenance.confirmation.flowSummarySha256 does not match flowSummary');
+    // The summary is what a person confirmed; it must describe THIS template:
+    // the same gates, outward actions and node → bot rows.
+    if (ctx.dagTemplate) {
+      if (flowSummary.gateDigest !== computeSavedWorkflowGateDigest(ctx.dagTemplate)) {
+        problems.push('provenance.confirmation.flowSummary gates do not match dagTemplate');
+      }
+      if (canonicalJsonStringify(flowSummary.sideEffects) !== canonicalJsonStringify(computeSavedWorkflowSideEffects(ctx.dagTemplate))) {
+        problems.push('provenance.confirmation.flowSummary outward actions do not match dagTemplate');
+      }
+      const bots = savedWorkflowGoalNodeBots(ctx.dagTemplate.nodes);
+      const rows = new Map(flowSummary.nodes.map((row) => [row.nodeId, row.larkAppId]));
+      if (rows.size !== bots.size || [...bots].some(([nodeId, bot]) => rows.get(nodeId) !== bot)) {
+        problems.push('provenance.confirmation.flowSummary node bots do not match dagTemplate');
+      }
+    }
+    return {
+      kind: 'dashboard_draft',
+      draftRunId,
+      confirmation: { confirmedByOpenId, confirmedAt, flowConfirmedAt, flowSummary, flowSummarySha256: sha },
+    };
+  }
+  problems.push('provenance.kind must be dashboard_run or dashboard_draft');
+  return undefined;
+}
+
+/** The schema a payload is written at: the lowest that holds it. */
+export function savedWorkflowRevisionSchemaVersionFor(payload: Pick<SavedWorkflowRevisionPayloadV1, 'provenance'>): 2 | 3 {
+  return payload.provenance ? 3 : SAVED_WORKFLOW_REVISION_MIN_WRITE_SCHEMA_VERSION;
+}
+
+/** Revisions this writer produces (and whose canonical bytes it can rebuild). */
+export function isWrittenSavedWorkflowRevisionSchema(schemaVersion: number): boolean {
+  return schemaVersion >= SAVED_WORKFLOW_REVISION_MIN_WRITE_SCHEMA_VERSION
+    && schemaVersion <= SAVED_WORKFLOW_REVISION_SCHEMA_VERSION;
+}
+
 export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflowRevisionPayloadV1 {
   const problems: string[] = [];
   if (!isRecord(raw)) throw new SavedWorkflowSchemaError(['revision payload must be an object']);
@@ -709,6 +955,9 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
     }
   }
   const safety = normalizeSafety(raw.safety, safeDag, problems);
+  const provenance = raw.provenance === undefined
+    ? undefined
+    : normalizeProvenance(raw.provenance, { createdBy, ...(sourceRunId ? { sourceRunId } : {}), ...(dagTemplate ? { dagTemplate } : {}) }, problems);
 
   if (problems.length > 0 || !specTemplate || !dagTemplate) throw new SavedWorkflowSchemaError(problems);
   return {
@@ -723,6 +972,7 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
     specStatus,
     dagTemplate,
     safety,
+    ...(provenance ? { provenance } : {}),
   };
 }
 
@@ -735,7 +985,7 @@ export function validateSavedWorkflowRevisionDraft(raw: unknown): SavedWorkflowR
   if (!isRecord(raw)) throw new SavedWorkflowSchemaError(['revision draft must be an object']);
   const allowed = new Set([
     'sourceRunId', 'inputs', 'contextRefs', 'specTemplate', 'specStatus',
-    'dagTemplate', 'safety',
+    'dagTemplate', 'safety', 'provenance',
   ]);
   const extra = Object.keys(raw).filter((key) => !allowed.has(key));
   if (extra.length > 0) {
@@ -776,12 +1026,12 @@ export function computeSavedWorkflowRevisionContentHash(schemaVersion: number, p
 
 export function buildSavedWorkflowRevision(payload: unknown): StoredSavedWorkflowRevision {
   const normalized = validateSavedWorkflowRevisionPayload(payload);
-  const contentHash = computeSavedWorkflowRevisionContentHash(
-    SAVED_WORKFLOW_REVISION_SCHEMA_VERSION,
-    normalized,
-  );
+  // The lowest schema that holds it: a payload without provenance stays the
+  // exact v2 bytes (and id) it always was.
+  const schemaVersion = savedWorkflowRevisionSchemaVersionFor(normalized);
+  const contentHash = computeSavedWorkflowRevisionContentHash(schemaVersion, normalized);
   return {
-    schemaVersion: SAVED_WORKFLOW_REVISION_SCHEMA_VERSION,
+    schemaVersion,
     revisionId: `rev_${contentHash.slice('sha256:'.length)}`,
     contentHash,
     payload: normalized,
@@ -798,6 +1048,9 @@ const REVISION_MIGRATIONS: Readonly<Partial<Record<number, RevisionMigration>>> 
   // v2 changes the authoring boundary, not historical bytes. Old revisions
   // remain selector-based and executable; no output contracts are invented.
   1: (payload) => payload,
+  // v3 only adds optional `provenance`: a v2 payload is a v3 payload without
+  // it. Read-only — the stored bytes and the revision id stay as they are.
+  2: (payload) => payload,
 });
 
 export function migrateSavedWorkflowRevisionPayload(
@@ -852,6 +1105,11 @@ export function loadSavedWorkflowRevision(
   // Verify the immutable stored bytes before transforming them. The original
   // revisionId remains the identity after a read migration.
   const migrated = migrateSavedWorkflowRevisionPayload(storedSchemaVersion as number, raw.payload);
+  // Provenance did not exist before v3: an older revision carrying the key
+  // was not written by any botmux and is not silently promoted.
+  if ((storedSchemaVersion as number) < 3 && isRecord(raw.payload) && Object.prototype.hasOwnProperty.call(raw.payload, 'provenance')) {
+    throw new SavedWorkflowSchemaError([`revision schema ${storedSchemaVersion as number} cannot carry provenance`]);
+  }
   const payload = validateSavedWorkflowRevisionPayload(migrated.payload);
   if (expected.workflowId && payload.workflowId !== expected.workflowId) {
     throw new SavedWorkflowSchemaError([
@@ -862,8 +1120,10 @@ export function loadSavedWorkflowRevision(
     revisionId,
     contentHash,
     storedSchemaVersion: storedSchemaVersion as number,
-    schemaVersion: SAVED_WORKFLOW_REVISION_SCHEMA_VERSION,
+    // v1 reads as v2 (as before); v2 and v3 as stored. A v2 revision
+    // materializes with the same definition snapshot bytes it always did.
+    schemaVersion: (storedSchemaVersion as number) >= 3 ? 3 : 2,
     payload,
-    migrated: migrated.migrated,
+    migrated: (storedSchemaVersion as number) < 2,
   };
 }
