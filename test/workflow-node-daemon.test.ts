@@ -237,7 +237,6 @@ describe('workflow node daemon wiring', () => {
 });
 
 describe('workflow node daemon wiring — second review pass', () => {
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
   it('P2-a: after accepted → stalled → active, the next turn ending without a submission stalls again', async () => {
     const { run, world, marker } = await handedOff('wd2-stall-again');
