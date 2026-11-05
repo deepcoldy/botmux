@@ -183,6 +183,61 @@ const templateRunSchema = z.object({
 
 export type WorkflowDraftTemplateRun = z.infer<typeof templateRunSchema>;
 
+/**
+ * 基于历史创建 (design 2026-11-03 workflow-dashboard-orchestration §6, D6):
+ * a draft copied from a run or a template version. Its spec and flow were
+ * prefilled; it stands at 待确认需求 with no clarify session. Both
+ * confirmations are still needed (the content may have been edited); 「确认需求」
+ * puts the prefilled flow (`copy.dag.json`, pinned by digest) in place
+ * instead of running the Architect. A copy commits as an ordinary ad-hoc run.
+ */
+export const WORKFLOW_COPY_DAG_FILE = 'copy.dag.json';
+
+const copyParamSchema = z.object({
+  type: z.enum(['string', 'number', 'boolean', 'object', 'array']),
+  required: z.boolean().optional(),
+  default: z.unknown().optional(),
+  description: z.string().max(4000).optional(),
+  sensitive: z.boolean().optional(),
+}).strict();
+
+const copySourceSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('run'),
+    runId: z.string().min(1).max(256),
+    runStatus: z.string().min(1).max(32),
+    /** Not finished when copied: the copy is the flow as it stood then. */
+    unfinished: z.boolean(),
+    runtimeRevisions: z.number().int().min(0),
+    orchestratorAppId: z.string().min(1).max(128).optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal('template'),
+    workflowId: z.string().regex(/^wf_[0-9a-f]{32}$/),
+    revisionId: z.string().regex(/^rev_[0-9a-f]{64}$/),
+    humanVersion: z.number().int().min(1),
+    displayName: z.string().min(1).max(256),
+    ownerOpenId: openId,
+    orchestratorAppId: z.string().min(1).max(128),
+    scope: z.enum(['global', 'chat']),
+  }).strict(),
+]);
+
+const copySchema = z.object({
+  source: copySourceSchema,
+  copiedAt: iso,
+  /** The prefilled flow, used by 「确认需求」 instead of the Architect. Gone
+   *  once the requirement is sent back (退回改需求) or re-orchestrated. */
+  prefill: z.object({ dagSha256: sha }).strict().optional(),
+  /** Parameters kept from a template (§6: 参数保留为参数); 存为模板 declares
+   *  them again, 拉群开始 refuses a flow that still has their markers. */
+  inputs: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/), copyParamSchema).optional(),
+  /** The goal was edited with 「只改文字」 (the flow kept). */
+  goalEditedAt: iso.optional(),
+}).strict();
+
+export type WorkflowDraftCopy = z.infer<typeof copySchema>;
+
 const chatIdSchema = z.string().regex(/^oc_[A-Za-z0-9_-]{1,128}$/);
 const messageIdSchema = z.string().regex(/^om_[A-Za-z0-9_-]{1,128}$/);
 const appIdSchema = z.string().min(1).max(128);
@@ -352,6 +407,8 @@ export const WorkflowDraftRecordSchema = z.object({
   launch: launchSchema.optional(),
   /** 运行模板 (§5.3, D5): born from a Saved Workflow revision. */
   template: templateRunSchema.optional(),
+  /** 基于历史创建 (§6, D6): copied from a run or a template version. */
+  copy: copySchema.optional(),
   orphanSessions: z.array(z.object({
     sessionId: z.string().min(1).max(256),
     headlessId: z.string().min(1).max(256).optional(),
@@ -541,6 +598,8 @@ export interface WorkflowDraftSummary {
   stale: boolean;
   /** 运行模板 (D5): the template this run comes from. */
   template?: { workflowId: string; humanVersion: number; displayName: string };
+  /** 基于历史创建 (D6): where it was copied from. */
+  copiedFrom?: { kind: 'run'; runId: string; unfinished: boolean } | { kind: 'template'; workflowId: string; humanVersion: number; displayName: string };
 }
 
 function specTitle(grill: GrillState): string | undefined {
@@ -581,7 +640,14 @@ export function summarizeWorkflowDraft(runDir: string, now: Date = new Date()): 
     updatedAt,
     stale: now.getTime() - Date.parse(updatedAt) >= WORKFLOW_DRAFT_STALE_MS,
     ...(draft.template ? { template: { workflowId: draft.template.workflowId, humanVersion: draft.template.humanVersion, displayName: draft.template.displayName } } : {}),
+    ...(draft.copy ? { copiedFrom: copiedFromOf(draft.copy) } : {}),
   };
+}
+
+export function copiedFromOf(copy: WorkflowDraftCopy): NonNullable<WorkflowDraftSummary['copiedFrom']> {
+  return copy.source.kind === 'run'
+    ? { kind: 'run', runId: copy.source.runId, unfinished: copy.source.unfinished }
+    : { kind: 'template', workflowId: copy.source.workflowId, humanVersion: copy.source.humanVersion, displayName: copy.source.displayName };
 }
 
 /** Run dirs under `baseDir` that are drafts (any bot, any state); with

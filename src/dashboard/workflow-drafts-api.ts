@@ -6,6 +6,8 @@
  *   POST /api/v3/orchestration/drafts            {larkAppId, goal} → 该 Bot 的 daemon
  *   GET  /api/v3/orchestration/drafts/:runId     → 草稿属主 daemon
  *   POST /api/v3/orchestration/drafts/:runId/…   → 草稿属主 daemon（写）
+ *   POST /api/v3/orchestration/drafts/from-source {source, larkAppId?} 复制为新工作流（D6）
+ *        → larkAppId 的 daemon；不填 = 来源的编排 Bot（run.json 绑定的主 Bot / 模板所属 Bot，读盘）
  *   GET  /api/v3/orchestration/bots              编排 Bot 下拉框（D3，只读）
  *
  * The Dashboard only classifies the login (D1 `classifyDashboardInitiator`)
@@ -25,6 +27,12 @@ import {
   initiatorFailureBody,
 } from '../core/workflow-initiator.js';
 import { listWorkflowDrafts, workflowDraftOwner } from '../workflows/v3/draft-store.js';
+import {
+  WorkflowCopySourceError,
+  parseWorkflowCopySource,
+  runCopyDefaultOrchestrator,
+  templateCopyDefaultOrchestrator,
+} from '../workflows/v3/draft-copy.js';
 import { logger } from '../utils/logger.js';
 import type { BotConfig } from '../bot-registry.js';
 import { v3BotStaticExclusion } from '../workflows/v3/bot-assignment.js';
@@ -32,6 +40,8 @@ import { isV3SupportedCli } from '../workflows/v3/contract.js';
 import { isStewardBot } from '../core/decision-board/model.js';
 
 export const WORKFLOW_DRAFTS_API_PATH = '/api/v3/orchestration/drafts';
+/** 复制为新工作流 (D6). Not a run id: minted ids always end in 8 hex digits. */
+export const WORKFLOW_DRAFTS_FROM_SOURCE_TAIL = '/from-source';
 const MAX_BODY_BYTES = 1024 * 1024;
 
 export interface WorkflowDraftsApiDeps {
@@ -40,6 +50,8 @@ export interface WorkflowDraftsApiDeps {
   platformBound: boolean;
   featureEnabled: () => boolean;
   runsDir: string;
+  /** ~/.botmux: the template library (D6 copies from it). */
+  libraryDataDir?: string;
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
   now?: () => Date;
 }
@@ -140,7 +152,39 @@ export async function handleWorkflowDraftsApi(
     }
   }
   let larkAppId: string | undefined;
-  if (tail === '') {
+  if (tail === WORKFLOW_DRAFTS_FROM_SOURCE_TAIL) {
+    if (method !== 'POST') {
+      jsonRes(res, 405, { ok: false, error: 'method_not_allowed', retryable: false });
+      return true;
+    }
+    // The orchestrator: the one the page chose, else the source's own —
+    // read from disk, never taken from the request.
+    const body = parsed as { source?: unknown; larkAppId?: unknown };
+    let source: ReturnType<typeof parseWorkflowCopySource>;
+    try { source = parseWorkflowCopySource(body.source); } catch (error) {
+      jsonRes(res, 400, { ok: false, error: 'bad_request', message: error instanceof WorkflowCopySourceError ? error.message : 'source 不合法', retryable: false });
+      return true;
+    }
+    if (body.larkAppId !== undefined) {
+      larkAppId = typeof body.larkAppId === 'string' && body.larkAppId.trim() ? body.larkAppId.trim() : undefined;
+      if (!larkAppId) {
+        jsonRes(res, 400, { ok: false, error: 'larkAppId_required', retryable: false });
+        return true;
+      }
+    } else if (source.kind === 'run') {
+      larkAppId = runCopyDefaultOrchestrator(deps.runsDir, source.runId);
+      if (!larkAppId) {
+        jsonRes(res, 404, { ok: false, error: 'unknown_run', message: '没有这个运行，或它没有绑定编排 Bot（请指定编排 Bot）', retryable: false });
+        return true;
+      }
+    } else {
+      larkAppId = deps.libraryDataDir ? await templateCopyDefaultOrchestrator(deps.libraryDataDir, source.workflowId) : undefined;
+      if (!larkAppId) {
+        jsonRes(res, 404, { ok: false, error: 'template_not_found', retryable: false });
+        return true;
+      }
+    }
+  } else if (tail === '') {
     const named = (parsed as { larkAppId?: unknown } | null)?.larkAppId;
     larkAppId = typeof named === 'string' && named.trim() ? named.trim() : undefined;
     if (!larkAppId) {

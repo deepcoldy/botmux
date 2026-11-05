@@ -315,6 +315,50 @@ function findTemplateGoalNode(nodes: V3Node[], nodeId: string): V3Node | undefin
 }
 
 /**
+ * A run's final effective flow and the bots that ran it (design 2026-11-03
+ * §5.1 E10, §6): the authorized DAG plus every applied runtime revision
+ * (digest-verified; a pending proposal is not part of it), with each goal
+ * node's bot replaced by the one a recorded reassignment moved it to. Works
+ * on a run that has not finished (or not started: no journal yet). Read
+ * only: nothing in the run dir is written.
+ */
+export function readV3RunFinalFlow(
+  runDir: string,
+  loaded: LoadedAuthorizedV3Run,
+  events: ReturnType<typeof readJournal>,
+  snap: ReturnType<typeof materialize> = materialize(events),
+): {
+  frozen: Map<string, BotSnapshot>;
+  effective: ReturnType<typeof loadEffectiveV3Dag>;
+  nodes: V3Node[];
+  scope: Map<string, BotSnapshot>;
+  reassigned: Set<string>;
+  spec: Spec;
+} {
+  if (loaded.botSnapshots === undefined || !loaded.spec) {
+    throw new Error('cannot save workflow: source run has no pinned bots.snapshot.json / spec.json');
+  }
+  const frozen = parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
+  const effective = loadEffectiveV3Dag(runDir, loaded.dag, events);
+  const scope = v3ApprovedBotScope(frozen, effective.botAdditions);
+
+  // The bots that ran: every recorded reassignment wins over the definition.
+  const nodes = cloneNodes(effective.dag.nodes);
+  const reassigned = new Set<string>();
+  for (const [nodeId, larkAppId] of snap.assignments) {
+    const node = findTemplateGoalNode(nodes, nodeId);
+    if (!node) continue;
+    if (!snapshotForSelector(scope, larkAppId)) {
+      throw new Error(`cannot save workflow: node ${nodeId} was reassigned to ${larkAppId}, which is outside the run's approved bots`);
+    }
+    if (!scope.has(larkAppId)) scope.set(larkAppId, snapshotForSelector(scope, larkAppId)!);
+    node.bot = larkAppId;
+    reassigned.add(nodeId);
+  }
+  return { frozen, effective, nodes, scope, reassigned, spec: loaded.spec };
+}
+
+/**
  * Like {@link compileSavedWorkflowFromRun}, plus what the Dashboard save
  * promises (E10): the final effective flow AND the bots that actually ran
  * it — a node reassigned on its blocked card (`nodeReassigned`) is saved
@@ -340,29 +384,10 @@ export function compileDashboardSavedWorkflowFromRun(
   if (status !== 'succeeded' && opts.allowDraft !== true) {
     throw new Error(`cannot publish workflow from a ${status} run; pass allowDraft to save it as draft`);
   }
-  if (loaded.botSnapshots === undefined || !loaded.spec) {
-    throw new Error('cannot save workflow: source run has no pinned bots.snapshot.json / spec.json');
-  }
-  const frozen = parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
-  const effective = loadEffectiveV3Dag(runDir, loaded.dag, events);
-  const scope = v3ApprovedBotScope(frozen, effective.botAdditions);
-
-  // The bots that ran: every recorded reassignment wins over the definition.
-  const nodes = cloneNodes(effective.dag.nodes);
-  const reassigned = new Set<string>();
-  for (const [nodeId, larkAppId] of snap.assignments) {
-    const node = findTemplateGoalNode(nodes, nodeId);
-    if (!node) continue;
-    if (!snapshotForSelector(scope, larkAppId)) {
-      throw new Error(`cannot save workflow: node ${nodeId} was reassigned to ${larkAppId}, which is outside the run's approved bots`);
-    }
-    if (!scope.has(larkAppId)) scope.set(larkAppId, snapshotForSelector(scope, larkAppId)!);
-    node.bot = larkAppId;
-    reassigned.add(nodeId);
-  }
+  const { frozen, effective, nodes, scope, reassigned, spec } = readV3RunFinalFlow(runDir, loaded, events, snap);
   const built = buildSavedWorkflowRevisionFromFlow({
     dag: { ...effective.dag, nodes },
-    spec: loaded.spec,
+    spec,
     snapshots: scope,
     sourceRunId: loaded.envelope.runId,
   }, opts);

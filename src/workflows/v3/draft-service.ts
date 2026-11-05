@@ -47,7 +47,7 @@ import {
   type ArchitectDeps,
 } from './host.js';
 import { loadDag as realLoadDag } from './dag-loader.js';
-import type { V3Dag, V3Node } from './dag.js';
+import { DagValidationError, validateDag, type V3Dag, type V3Node } from './dag.js';
 import { validateSpec } from './spec.js';
 import { freezeDagBotSnapshots } from './bot-resolve.js';
 import { V3_RUN_ENVELOPE_FILE, artifactRef, readRunEnvelope, type V3RunInitiator } from './run-envelope.js';
@@ -61,7 +61,8 @@ import {
   readSavedWorkflowMetadata,
   readSavedWorkflowMetadataSync,
 } from './library-store.js';
-import { SavedWorkflowSchemaError, type SavedWorkflowGateComparisonAgainst } from './library-schema.js';
+import { SavedWorkflowSchemaError, type SavedWorkflowGateComparisonAgainst, type SavedWorkflowParamDef } from './library-schema.js';
+import { collectSavedWorkflowTemplateBindings } from './template-bindings.js';
 import {
   SavedWorkflowServiceError,
   commitDashboardSave,
@@ -130,13 +131,24 @@ import {
   type WorkflowDraftTemplateRun,
   type WorkflowDraftTurn,
   WORKFLOW_TEMPLATE_RUN_MAX_PARAM_CHARS,
+  WORKFLOW_COPY_DAG_FILE,
   workflowTemplateRunNeedsConfirmation,
+  type WorkflowDraftCopy,
 } from './draft-store.js';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../../utils/process-identity.js';
 import { withFileLockSync } from '../../utils/file-lock.js';
 import { pidIsSignalable } from '../../utils/process-alive.js';
 import {
+  WorkflowCopySourceError,
+  parseWorkflowCopySource,
+  readRunCopyMaterial,
+  readTemplateCopyMaterial,
+  unresolvedFlowMarkers,
+  type WorkflowCopyMaterial,
+} from './draft-copy.js';
+import {
   buildDraftClarifyKickoff,
+  buildDraftCopyClarifyKickoff,
   buildDraftClarifyResume,
   buildDraftSpecProblemsTurn,
   parseDraftClarifyOutput,
@@ -234,6 +246,12 @@ export type WorkflowDraftErrorCode =
   | 'save_conflict'
   /** D5: literals that need an explicit acknowledgement. */
   | 'unsafe_literals'
+  /** D6: the run / template to copy could not be read. */
+  | 'source_unreadable'
+  /** D6: the flow still has `${params.…}` / `${context.…}` markers an ad-hoc run cannot resolve. */
+  | 'unresolved_params'
+  /** D6: only a draft copied from a run / template does this. */
+  | 'not_a_copy'
   | 'bad_request';
 
 const STATUS: Record<WorkflowDraftErrorCode, number> = {
@@ -274,6 +292,9 @@ const STATUS: Record<WorkflowDraftErrorCode, number> = {
   not_owner: 403,
   save_conflict: 409,
   unsafe_literals: 409,
+  source_unreadable: 422,
+  unresolved_params: 409,
+  not_a_copy: 409,
   bad_request: 400,
 };
 
@@ -411,7 +432,24 @@ export interface WorkflowDraftView {
      *  still runs the prepared one (shown, not blocking). */
     newerPublished?: { humanVersion: number; revisionId: string };
   };
+  /** 基于历史创建 (D6). `prefilled`: 「确认需求」 uses the copied flow
+   *  (`prefillDag`, shown read only) instead of the Architect. `unresolved`:
+   *  markers left in the current flow (拉群开始 refuses them). */
+  copy?: {
+    source: WorkflowDraftCopy['source'];
+    copiedAt: string;
+    prefilled: boolean;
+    prefillDag?: V3Dag;
+    inputs?: WorkflowDraftCopy['inputs'];
+    goalEditedAt?: string;
+    unresolved?: { params: string[]; context: string[] };
+  };
 }
+
+/** 「改目标」 on a copied draft (§6): keep the flow and only change the text,
+ *  or re-orchestrate for the new goal — straight to the Architect (the
+ *  requirement text changed) or back to clarifying first. */
+export type WorkflowCopyGoalMode = 'text_only' | 'rearchitect' | 'reclarify';
 
 /** 存为模板 (§5.1): what the confirm dialog shows before anything is written. */
 export interface WorkflowDraftTemplateSavePreview {
@@ -618,6 +656,28 @@ function countGates(nodes: readonly V3Node[]): number {
     if (node.type === 'loop' && node.body) count += countGates(node.body.nodes);
   }
   return count;
+}
+
+/** spec.md of a copied spec: the title, the requirement, and the one
+ *  canonical json block hostSpecFinalize reads. */
+function renderCopySpecMarkdown(spec: { title: string; requirement: string }): string {
+  return `# ${spec.title}\n\n## 需求\n\n${spec.requirement}\n\n\`\`\`json\n${JSON.stringify(spec, null, 2)}\n\`\`\`\n`;
+}
+
+/** The parameters a flow (and its spec) still refers to, of those declared. */
+function referencedInputs(
+  inputs: Record<string, SavedWorkflowParamDef> | undefined,
+  dag: V3Dag,
+  spec: unknown,
+): Record<string, SavedWorkflowParamDef> {
+  if (!inputs) return {};
+  const used = new Set(collectSavedWorkflowTemplateBindings({ schemaVersion: 2, nodes: dag.nodes }).params);
+  const specText = JSON.stringify(spec);
+  const out: Record<string, SavedWorkflowParamDef> = {};
+  for (const [name, def] of Object.entries(inputs)) {
+    if (used.has(name) || specText.includes(`\${params.${name}}`)) out[name] = def as SavedWorkflowParamDef;
+  }
+  return out;
 }
 
 function parseOptionalWorkflowId(value: unknown): string | undefined {
@@ -1346,6 +1406,303 @@ export class WorkflowDraftService {
   }
 
   /**
+   * 基于历史创建 (§6, D6): a new draft from a run (finished or not) or one
+   * version of a template, with its spec and flow prefilled, at 待确认需求 —
+   * the person who copies is its initiator (§7.2: anyone's source may be
+   * copied). Checked like an Architect result (spec, DAG, the planned-group
+   * roster) before anything is written; a refusal lists the problems. No
+   * clarify session, no run record, no artefacts are copied; the source is
+   * only read.
+   *
+   * `larkAppId`: the orchestrating bot chosen on the page; absent, it is the
+   * source's (the Dashboard routes there) and must be this daemon's.
+   */
+  async createFromSource(
+    initiator: WorkflowDraftInitiator,
+    input: { source: unknown; larkAppId?: unknown },
+  ): Promise<WorkflowDraftView> {
+    if (input.larkAppId !== undefined && input.larkAppId !== this.deps.appId) {
+      throw err('bot_mismatch', '请求的编排 Bot 不是这个 daemon 的 Bot');
+    }
+    let material: WorkflowCopyMaterial;
+    try {
+      const ref = parseWorkflowCopySource(input.source);
+      material = ref.kind === 'run'
+        ? readRunCopyMaterial(this.deps.baseDir, ref.runId)
+        : await readTemplateCopyMaterial(this.libraryDir(), ref.workflowId, ref.revisionId);
+    } catch (error) {
+      if (error instanceof WorkflowCopySourceError) {
+        throw err(error.code === 'source_unreadable' ? 'source_unreadable' : error.code, error.message);
+      }
+      throw error;
+    }
+    if (input.larkAppId === undefined && material.source.orchestratorAppId !== this.deps.appId) {
+      throw err('bot_mismatch', '来源的编排 Bot 不是这个 daemon 的 Bot，请指定编排 Bot');
+    }
+    const bots = this.deps.loadBots();
+    const bot = bots.find((candidate) => candidate.larkAppId === this.deps.appId);
+    if (!bot) throw err('orchestrator_ineligible', '编排 Bot 不在本机 bots.json 里');
+    const why = v3BotStaticExclusion(bot);
+    if (why) throw err('orchestrator_ineligible', `这个 Bot 不能编排工作流：${why}`);
+    if (isStewardBot(bot.steward)) throw err('orchestrator_ineligible', '管家 Bot 不能当编排 Bot');
+    const roster = await this.plannedRoster(bots, this.deps.nameOf());
+
+    const title = material.spec.title;
+    const now = this.now();
+    const { runId, runDir, state } = birthRun({
+      goal: title,
+      baseDir: this.deps.baseDir,
+      now,
+      ...(this.deps.randomSuffix ? { randomSuffix: this.deps.randomSuffix() } : {}),
+    });
+    const at = now.toISOString();
+    try {
+      let spec: ReturnType<typeof validateSpec>;
+      let dag: V3Dag;
+      try {
+        spec = validateSpec({ ...material.spec, runId });
+      } catch (error) {
+        throw err('dag_invalid', '复制来的需求没有通过校验', { problems: (error as { problems?: string[] }).problems ?? [errorText(error)] });
+      }
+      try {
+        dag = validateDag({ ...(material.schemaVersion !== undefined ? { schemaVersion: material.schemaVersion } : {}), runId, nodes: material.nodes });
+      } catch (error) {
+        throw err('dag_invalid', '复制来的流程没有通过校验', { problems: error instanceof DagValidationError ? error.problems : [errorText(error)] });
+      }
+      // The planned group's roster, as for an Architect result (§4.4).
+      const problems = v3RosterSelectorProblems(dag, roster);
+      try {
+        freezeDagBotSnapshots(dag, bots, { defaultSelector: this.deps.appId });
+      } catch (error) {
+        problems.push(errorText(error));
+      }
+      if (problems.length > 0) throw err('dag_invalid', '复制来的流程没有通过校验', { problems });
+      const copyPath = join(runDir, WORKFLOW_COPY_DAG_FILE);
+      atomicWriteFileSync(copyPath, `${JSON.stringify(dag, null, 2)}\n`, { mode: 0o600 });
+      atomicWriteFileSync(state.specPath, renderCopySpecMarkdown(spec), { mode: 0o600 });
+      atomicWriteFileSync(state.specJsonPath, `${JSON.stringify(spec, null, 2)}\n`, { mode: 0o600 });
+      // The requirement is written: the grill starts at 待确认需求 (§6).
+      writeGrillState(runDir, { ...state, status: 'spec_ready', updatedAt: at });
+      const dagSha256 = fileSha256(copyPath);
+      if (!dagSha256) throw new Error('copy.dag.json 写入后读不到');
+      const source = material.source;
+      const what = source.kind === 'run'
+        ? `运行 ${source.runId}${source.unfinished ? '（尚未结束，复制的是复制时的版本）' : ''}`
+        : `模板「${source.displayName}」v${source.humanVersion}`;
+      const inputs = Object.keys(material.inputs).length > 0 ? material.inputs : undefined;
+      const record: WorkflowDraftRecord = {
+        schemaVersion: WORKFLOW_DRAFT_SCHEMA_VERSION,
+        runId,
+        orchestratorAppId: this.deps.appId,
+        initiator,
+        goal: clip(spec.requirement, MAX_GOAL_CHARS),
+        createdAt: at,
+        updatedAt: at,
+        version: 1,
+        // No clarify session is copied; 「按新目标重新编排」 starts one.
+        clarify: { state: 'disconnected', turns: [{ role: 'system', text: `复制自${what}`, at }] },
+        flowRevision: 0,
+        copy: {
+          source,
+          copiedAt: at,
+          prefill: { dagSha256 },
+          ...(inputs ? { inputs: inputs as WorkflowDraftCopy['inputs'] } : {}),
+        },
+      };
+      // draft.json last: until it exists the directory is not a draft.
+      withWorkflowDraftLock(runDir, runId, () => writeWorkflowDraft(runDir, record));
+    } catch (error) {
+      rmSync(runDir, { recursive: true, force: true });
+      if (error instanceof WorkflowDraftError) throw error;
+      throw err('dag_invalid', `复制失败：${errorText(error)}`, { problems: [errorText(error)] });
+    }
+    const source = material.source;
+    this.log(`[workflow-draft] copy ${runId} from ${source.kind === 'run' ? `run ${source.runId}` : `template ${source.workflowId}@${source.revisionId}`} by ${initiator.openId} (${initiator.source})`);
+    return this.view(runId);
+  }
+
+  /** A copied draft (§6), or not_a_copy. */
+  private assertCopy(draft: WorkflowDraftRecord, what: string): WorkflowDraftCopy {
+    if (!draft.copy) throw err('not_a_copy', `只有「复制为新工作流」得到的草稿能${what}`);
+    return draft.copy;
+  }
+
+  /**
+   * 「确认需求」 of a copy with its prefilled flow: the copied DAG (checked
+   * against its digest and validated again) becomes the draft's flow and the
+   * grill goes to 待确认流程 in one write — no Architect (§6). Caller holds
+   * the draft lock.
+   */
+  private applyCopyPrefill(runDir: string, copy: WorkflowDraftCopy): void {
+    const prefill = copy.prefill!;
+    withHostMutationLockSync(runDir, () => {
+      const cur = readGrillState(runDir);
+      if (!cur) throw err('state_conflict', 'grill.state.json 不存在');
+      if (existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) throw err('state_conflict', 'run 已开始，流程定义不可再改');
+      this.assertStatus(cur, ['spec_ready'], '确认需求');
+      const copyPath = join(runDir, WORKFLOW_COPY_DAG_FILE);
+      if (fileSha256(copyPath) !== prefill.dagSha256) throw err('dag_invalid', '复制来的流程文件被改动过，请退回改需求后重新编排');
+      try {
+        this.loadDag(copyPath);
+      } catch (error) {
+        throw err('dag_invalid', '复制来的流程没有通过校验', { problems: (error as { problems?: string[] }).problems ?? [errorText(error)] });
+      }
+      const dagPath = join(runDir, 'dag.json');
+      atomicWriteFileSync(dagPath, readFileSync(copyPath), { mode: 0o600 });
+      writeGrillState(runDir, { ...cur, status: 'dag_ready', dagPath, problems: undefined, updatedAt: this.now().toISOString() });
+    });
+  }
+
+  /**
+   * 改目标 on a copy at 待确认需求 (§6):
+   *   - text_only: the requirement text changes, the copied flow is kept;
+   *   - rearchitect: the requirement text changes and the copied flow is
+   *     dropped — 「确认需求」 then runs the Architect;
+   *   - reclarify: back to clarifying with a new session for the new goal
+   *     (the copied spec as a starting point); the flow is dropped.
+   * Both confirmations are void either way.
+   */
+  async editCopyGoal(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: { goal: unknown; mode: unknown; baseVersion?: number },
+  ): Promise<WorkflowDraftView> {
+    const goal = typeof input.goal === 'string' ? input.goal.trim() : '';
+    if (!goal) throw err('bad_request', '目标不能为空');
+    if (goal.length > MAX_GOAL_CHARS) throw err('bad_request', `目标最多 ${MAX_GOAL_CHARS} 个字符`);
+    const mode = input.mode;
+    if (mode !== 'text_only' && mode !== 'rearchitect' && mode !== 'reclarify') {
+      throw err('bad_request', 'mode 只能是 text_only / rearchitect / reclarify');
+    }
+    const reservation = mode === 'reclarify' ? this.reserve() : undefined;
+    let kickoff: { prompt: string; title: string } | undefined;
+    try {
+      kickoff = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
+        const copy = this.assertCopy(draft, '改目标');
+        this.assertNoLaunch(draft, '改目标');
+        this.assertNotArchitecting(runId, draft, grill);
+        this.assertStatus(grill, ['spec_ready'], '改目标');
+        const at = this.now().toISOString();
+        if (mode === 'reclarify') {
+          if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
+          const copiedSpecMarkdown = readTextOrUndefined(grill.specPath);
+          // The copied flow goes first (its own write): a requirement sent
+          // back must never come round to 「确认需求」 with it still attached.
+          delete copy.prefill;
+          this.persist(runDir, draft);
+          hostReviseSpec(runDir, this.now());
+          delete draft.specConfirmation;
+          this.flowChanged(draft, { nodeBots: true });
+          draft.goal = goal;
+          pushTurn(draft, { role: 'user', text: goal, at });
+          draft.clarify.pending = this.reservationEntry(reservation!);
+          return {
+            changed: true,
+            result: {
+              prompt: buildDraftCopyClarifyKickoff({ runId, goal, ...(copiedSpecMarkdown ? { copiedSpecMarkdown } : {}) }),
+              title: clip(goal.replace(/\s+/g, ' '), 80),
+            },
+          };
+        }
+        let spec: Record<string, unknown>;
+        try {
+          spec = JSON.parse(readFileSync(grill.specJsonPath, 'utf-8')) as Record<string, unknown>;
+        } catch (error) {
+          throw err('no_spec', `spec.json 读不出来：${errorText(error)}`);
+        }
+        try {
+          validateSpec({ ...spec, requirement: goal });
+        } catch (error) {
+          throw err('dag_invalid', '改完的需求没有通过校验', { problems: (error as { problems?: string[] }).problems ?? [errorText(error)] });
+        }
+        if (mode === 'rearchitect') {
+          // As above: dropped before the requirement changes.
+          delete copy.prefill;
+          this.persist(runDir, draft);
+        }
+        const previous = readTextOrUndefined(grill.specPath);
+        atomicWriteFileSync(grill.specPath, renderCopySpecMarkdown({ ...spec, requirement: goal } as { title: string; requirement: string }), { mode: 0o600 });
+        const finalized = hostSpecFinalize(runDir, this.now());
+        if (!finalized.ok) {
+          if (previous === undefined) rmSync(grill.specPath, { force: true });
+          else atomicWriteFileSync(grill.specPath, previous, { mode: 0o600 });
+          throw err('dag_invalid', '改完的需求没有通过校验', { problems: finalized.problems ?? [] });
+        }
+        this.flowChanged(draft, { nodeBots: true });
+        delete draft.specConfirmation;
+        draft.goal = goal;
+        if (mode === 'text_only') {
+          copy.goalEditedAt = at;
+          pushTurn(draft, { role: 'system', text: `目标改为：${clip(goal, 200)}（只改文字，保留复制来的流程）`, at });
+        } else {
+          pushTurn(draft, { role: 'system', text: `目标改为：${clip(goal, 200)}（确认需求后按新目标重新编排）`, at });
+        }
+        return { changed: true, result: undefined };
+      });
+    } catch (error) {
+      if (reservation) this.inflight.delete(reservation);
+      throw error;
+    }
+    if (kickoff && reservation) await this.startSession(runId, kickoff.prompt, kickoff.title, reservation);
+    return this.view(runId);
+  }
+
+  /**
+   * 改节点目标 / 完成标准 on a copy at 待确认流程 (§6): a goal node's goal
+   * text and its node-specific instructions (`override.systemPromptAppend`,
+   * shown as 完成标准与补充要求; empty removes it). Re-validated; the second
+   * confirmation is void. Adding or removing nodes and changing dependencies
+   * go through 退回改需求 → 重新编排.
+   */
+  async setNodeText(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    nodeId: string,
+    input: { goal?: unknown; completion?: unknown; baseVersion?: number },
+  ): Promise<WorkflowDraftView> {
+    if (input.goal === undefined && input.completion === undefined) throw err('bad_request', '要改 goal 或 completion');
+    if (input.goal !== undefined && (typeof input.goal !== 'string' || !input.goal.trim() || input.goal.length > MAX_GOAL_CHARS)) {
+      throw err('bad_request', `goal 必须是 1–${MAX_GOAL_CHARS} 个字符`);
+    }
+    if (input.completion !== undefined && (typeof input.completion !== 'string' || Buffer.byteLength(input.completion, 'utf-8') > 8000)) {
+      throw err('bad_request', 'completion 必须是不超过 8000 字节的文字');
+    }
+    this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
+      this.assertCopy(draft, '直接改节点文字');
+      this.assertNoLaunch(draft, '改节点');
+      this.assertNotArchitecting(runId, draft, grill);
+      this.assertStatus(grill, ['dag_ready'], '改节点');
+      const dagPath = grill.dagPath;
+      if (!dagPath) throw err('state_conflict', '还没有流程图');
+      withHostMutationLockSync(runDir, () => {
+        if (existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) throw err('state_conflict', 'run 已开始，流程定义不可再改');
+        const before = readFileSync(dagPath, 'utf-8');
+        const raw = JSON.parse(before) as Record<string, unknown>;
+        const node = findGoalNode(raw, nodeId);
+        if (!node) throw err('unknown_node', `没有这个任务节点：${nodeId}`);
+        if (typeof input.goal === 'string') node.goal = input.goal.trim();
+        if (typeof input.completion === 'string') {
+          const override = { ...((node.override as Record<string, unknown> | undefined) ?? {}) };
+          if (input.completion.trim()) override.systemPromptAppend = input.completion.trim();
+          else delete override.systemPromptAppend;
+          if (Object.keys(override).length > 0) node.override = override;
+          else delete node.override;
+        }
+        atomicWriteFileSync(dagPath, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
+        try {
+          this.loadDag(dagPath);
+        } catch (error) {
+          atomicWriteFileSync(dagPath, before, { mode: 0o600 });
+          throw err('dag_invalid', '改完的流程没有通过校验', { problems: (error as { problems?: string[] }).problems ?? [errorText(error)] });
+        }
+      });
+      this.flowChanged(draft, { nodeBots: false });
+      return { changed: true, result: undefined };
+    });
+    return this.view(runId);
+  }
+
+  /**
    * 存为模板 (§5.1) from a draft: only once its second confirmation holds
    * for the flow as it is now; the save re-shows that flow summary and the
    * template version records who confirmed it, when, and the summary.
@@ -1380,7 +1737,9 @@ export class WorkflowDraftService {
       const snapshots = freezeDagBotSnapshots(flow.dag, bots, { defaultSelector: this.deps.appId });
       let plan: DashboardSavePlan;
       try {
-        const built = buildSavedWorkflowRevisionFromFlow({ dag: flow.dag, spec, snapshots });
+        // A copy of a template keeps its parameters (§6): declared again.
+        const inputs = referencedInputs(draft.copy?.inputs as Record<string, SavedWorkflowParamDef> | undefined, flow.dag, spec);
+        const built = buildSavedWorkflowRevisionFromFlow({ dag: flow.dag, spec, snapshots }, Object.keys(inputs).length ? { inputs } : {});
         plan = withDashboardParamEdits({
           displayName: built.displayName,
           revision: {
@@ -1691,6 +2050,10 @@ export class WorkflowDraftService {
       }
       this.flowChanged(draft, { nodeBots: true });
       delete draft.specConfirmation;
+      // A spec written in clarifying is a new requirement: a copy's prefilled
+      // flow belongs to the one it was copied with (an edit at 待确认需求
+      // keeps it — 「只改文字」).
+      if (grill.status === 'grilling' && draft.copy) delete draft.copy.prefill;
       return { changed: true, result: { ok: true, problems: [] } };
     });
     if (!outcome.ok && input.relayProblems === true && outcome.problems.length > 0) {
@@ -1728,12 +2091,19 @@ export class WorkflowDraftService {
         specSha256,
       };
       this.persist(runDir, draft);
+      // A copy with its prefilled flow goes straight to 待确认流程 (§6).
+      const prefilled = !!draft.copy?.prefill;
       try {
-        hostApproveSpec(runDir, this.now());
+        if (prefilled) this.applyCopyPrefill(runDir, draft.copy!);
+        else hostApproveSpec(runDir, this.now());
       } catch (error) {
         delete draft.specConfirmation;
         this.persist(runDir, draft);
         throw error;
+      }
+      if (prefilled) {
+        this.flowChanged(draft, { nodeBots: true });
+        return { changed: true, result: undefined };
       }
       return { changed: false, result: undefined };
     });
@@ -2070,6 +2440,14 @@ export class WorkflowDraftService {
       this.assertNoLaunch(draft, '退回改需求');
       this.assertNotArchitecting(runId, draft, grill);
       this.assertStatus(grill, ['spec_ready', 'spec_approved', 'dag_ready'], '退回改需求');
+      // A copy's prefilled flow is for the requirement it was copied with: a
+      // revised requirement is orchestrated anew (§6). Dropped in its own
+      // write first, so a crash after the grill moved cannot leave it
+      // attached to the next 「确认需求」.
+      if (draft.copy?.prefill) {
+        delete draft.copy.prefill;
+        this.persist(runDir, draft);
+      }
       hostReviseSpec(runDir, this.now());
       delete draft.specConfirmation;
       this.flowChanged(draft, { nodeBots: true });
@@ -2273,7 +2651,15 @@ export class WorkflowDraftService {
         // move into the main topic would race it.
         if (draft.clarify.sessionId && this.suspending.has(draft.clarify.sessionId)) throw err('busy', '会话正在释放空闲进程，请稍后重试');
         this.assertNotArchitecting(runId, draft, grill);
-        this.assertFlowConfirmed(runDir, draft, grill, bots, nameOf);
+        const confirmed = this.assertFlowConfirmed(runDir, draft, grill, bots, nameOf);
+        if (draft.copy) {
+          // A copy commits as an ad-hoc run: nothing resolves a template's
+          // parameters there (§6: 参数保留为参数).
+          const left = unresolvedFlowMarkers(confirmed.dag.nodes);
+          if (left.params.length || left.context.length) {
+            throw err('unresolved_params', '流程里还有参数没换成具体内容：先「存为模板」再带参数运行，或把这些参数改成具体文字', left);
+          }
+        }
         const marker = launchMarker(runId);
         if (!marker) throw err('state_conflict', `runId ${runId} 没有随机段，无法给群名加标记`);
         // I7: the platform login joins by union_id, a local login as the bot
@@ -3660,6 +4046,24 @@ export class WorkflowDraftService {
         }
       } catch { /* unreadable library: nothing to say */ }
     }
+    let copyView: WorkflowDraftView['copy'];
+    if (draft.copy) {
+      const prefilled = !!draft.copy.prefill && grill.status === 'spec_ready';
+      let prefillDag: V3Dag | undefined;
+      if (prefilled) {
+        try { prefillDag = this.loadDag(join(runDir, WORKFLOW_COPY_DAG_FILE)) as V3Dag; } catch { prefillDag = undefined; }
+      }
+      const markers = flow ? unresolvedFlowMarkers(flow.dag.nodes) : prefillDag ? unresolvedFlowMarkers(prefillDag.nodes) : undefined;
+      copyView = {
+        source: draft.copy.source,
+        copiedAt: draft.copy.copiedAt,
+        prefilled,
+        ...(prefillDag ? { prefillDag } : {}),
+        ...(draft.copy.inputs ? { inputs: draft.copy.inputs } : {}),
+        ...(draft.copy.goalEditedAt ? { goalEditedAt: draft.copy.goalEditedAt } : {}),
+        ...(markers && (markers.params.length || markers.context.length) ? { unresolved: markers } : {}),
+      };
+    }
     const specMarkdown = readTextOrUndefined(grill.specPath);
     const specJsonText = grill.status === 'grilling' ? undefined : readTextOrUndefined(grill.specJsonPath);
     let specJson: unknown;
@@ -3715,6 +4119,7 @@ export class WorkflowDraftService {
         swapped: Object.keys(draft.nodeBots ?? {}).length > 0,
         ...(newerPublished ? { newerPublished } : {}),
       } } : {}),
+      ...(copyView ? { copy: copyView } : {}),
     };
   }
 

@@ -6875,6 +6875,7 @@ const server = createServer(async (req, res) => {
       platformBound: !!readPlatformBinding(),
       featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
       runsDir: v3RunsDir(),
+      libraryDataDir: dirname(v3RunsDir()),
       proxyToDaemon,
     })) {
       return;

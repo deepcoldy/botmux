@@ -26,6 +26,9 @@
  *   POST /drafts/:runId/launch/resend-summary   {confirmedAbsent: true} 人工确认群里没有摘要后重发
  *   POST /drafts/:runId/template/preview        {workflowId?, paramEdits?}   存为模板的确认框（D5）
  *   POST /drafts/:runId/template/save           {flowSummarySha256, …}       存为模板（D5）
+ *   POST /drafts/from-source                    {source, larkAppId?}    复制为新工作流（D6）
+ *   POST /drafts/:runId/copy/goal               {goal, mode}            复制的草稿改目标（D6）
+ *   POST /drafts/:runId/nodes/:nodeId/text      {goal?, completion?}    复制的草稿改节点文字（D6）
  *
  * Templates (D5, under {@link WORKFLOW_LIBRARY_PATH}; reads are the
  * Dashboard's own, from disk):
@@ -197,6 +200,10 @@ export function registerWorkflowDraftIpcRoutes(
     return { draft: await service.create(initiator, { goal: body.goal }) };
   });
 
+  // 复制为新工作流（D6）: the copier is the new draft's initiator.
+  write(`${WORKFLOW_DRAFTS_PATH}/from-source`, async ({ service, initiator, body }) =>
+    ({ draft: await service.createFromSource(initiator, { source: body.source, ...(body.larkAppId !== undefined ? { larkAppId: body.larkAppId } : {}) }) }));
+
   route('GET', `${WORKFLOW_DRAFTS_PATH}/:runId`, async (req, res, params) => {
     const service = gate(req, res);
     if (!service) return;
@@ -226,6 +233,13 @@ export function registerWorkflowDraftIpcRoutes(
     if (!nodeId) throw new WorkflowDraftError('bad_request', 'nodeId 不合法');
     return { draft: await service.setNodeBot(runId, initiator, nodeId, { larkAppId: body.larkAppId, baseVersion }) };
   });
+  write(draftPath('nodes/:nodeId/text'), async ({ service, initiator, body, baseVersion, runId, params }) => {
+    const nodeId = decodeParam(params.nodeId);
+    if (!nodeId) throw new WorkflowDraftError('bad_request', 'nodeId 不合法');
+    return { draft: await service.setNodeText(runId, initiator, nodeId, { goal: body.goal, completion: body.completion, baseVersion }) };
+  });
+  write(draftPath('copy/goal'), async ({ service, initiator, body, baseVersion, runId }) =>
+    ({ draft: await service.editCopyGoal(runId, initiator, { goal: body.goal, mode: body.mode, baseVersion }) }));
   write(draftPath('approve-flow'), async ({ service, initiator, body, baseVersion, runId }) =>
     ({ draft: await service.approveFlow(runId, initiator, { flowSummarySha256: body.flowSummarySha256, baseVersion }) }));
   write(draftPath('revise-spec'), async ({ service, initiator, baseVersion, runId }) =>
