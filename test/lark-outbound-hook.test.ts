@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,7 +35,7 @@ vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: mocks.emitHookEvent,
 }));
 
-import { replyMessage, sendMessage, urgentMessage } from '../src/im/lark/client.js';
+import { replyMessage, sendMessage, sendUserMessage, urgentMessage } from '../src/im/lark/client.js';
 
 describe('Lark outbound hook provider replay suppression', () => {
   it.each(['create', 'reply'] as const)('preserves the provider rejection code from %s for report recovery', async method => {
@@ -295,5 +295,87 @@ describe('Lark outbound hook provider replay suppression', () => {
         data: { user_id_list: ['ou_user'] },
       });
     }
+  });
+});
+
+describe('Lark send gate retry keeps one dedupe uuid', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mocks.create.mockReset();
+    mocks.reply.mockReset();
+    mocks.emitHookEvent.mockReset();
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const transient502 = () => Object.assign(new Error('Request failed with status code 502'), {
+    isAxiosError: true, response: { status: 502, data: {} },
+  });
+
+  it.each(['create', 'reply'] as const)('%s retried after a lost response reuses the same uuid', async method => {
+    mocks[method]
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_ok' } });
+    const action = method === 'create'
+      ? sendMessage('app-retry-uuid', 'oc_chat', 'body')
+      : replyMessage('app-retry-uuid', 'om_root', 'body');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_ok');
+
+    expect(mocks[method]).toHaveBeenCalledTimes(2);
+    const uuids = mocks[method].mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[0]).not.toBe('');
+    expect(uuids[1]).toBe(uuids[0]);
+    expect(uuids[0]).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+  });
+
+  it('separate sends without a caller uuid do not share one', async () => {
+    mocks.create.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    await sendMessage('app-retry-uuid', 'oc_chat', 'a');
+    await sendMessage('app-retry-uuid', 'oc_chat', 'a');
+    const [a, b] = mocks.create.mock.calls.map(c => c[0].data.uuid);
+    expect(a).not.toBe(b);
+  });
+
+  it('does not leak the generated uuid into the outbound hook', async () => {
+    mocks.create.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    await sendMessage('app-retry-uuid', 'oc_chat', 'a', 'text', undefined, { sessionId: 's' });
+    expect(mocks.emitHookEvent).toHaveBeenCalledOnce();
+    expect(mocks.emitHookEvent.mock.calls[0][1].uuid).toBeUndefined();
+  });
+
+  it('a caller-supplied uuid is sent unchanged on every gate retry', async () => {
+    mocks.create
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_ok' } });
+    const action = sendMessage('app-retry-uuid', 'oc_chat', 'body', 'text', 'caller-uuid');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_ok');
+    expect(mocks.create.mock.calls.map(c => c[0].data.uuid)).toEqual(['caller-uuid', 'caller-uuid']);
+  });
+
+  it('thread reply keeps reply_in_thread and the uuid across a retry', async () => {
+    mocks.reply
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_ok' } });
+    const action = replyMessage('app-retry-uuid', 'om_root', 'body', 'text', true);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await action;
+    const [first, second] = mocks.reply.mock.calls.map(c => c[0].data);
+    expect(first.reply_in_thread).toBe(true);
+    expect(second.reply_in_thread).toBe(true);
+    expect(second.uuid).toBe(first.uuid);
+  });
+
+  it('sendUserMessage retry reuses one uuid', async () => {
+    mocks.create
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_dm' } });
+    const action = sendUserMessage('app-retry-uuid', 'ou_user', 'hi');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_dm');
+    const uuids = mocks.create.mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[1]).toBe(uuids[0]);
   });
 });
