@@ -1787,6 +1787,26 @@ describe('bot-config store', () => {
     expect(readConfig().replyDelivery).toBe('transcript');
   });
 
+  it('#2828 P2: legacy entry with persisted transcript on a non-capture CLI (no scratch) is not locked — editing an unrelated field succeeds', async () => {
+    // 可达形状：claude-code+transcript 切 cliId 到 opencode（invariant master 历来放行，
+    // 运行时回落 send）。窄化前的判据会把该 bot 的任何字段编辑锁死在
+    // reply_delivery_unsupported；现在改 model/name 等无关字段必须成功。
+    const { store } = await loaded({ cliId: 'opencode', replyDelivery: 'transcript', model: 'old' });
+    const r = await store.applyConfigField('app_default', store.findConfigField('model')!, 'new-model');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', replyDelivery: 'transcript', model: 'new-model' });
+
+    // 直接写 transcript 到不支持的 CLI 仍被写入门禁拒绝（master 既有行为，不在本次放宽面）。
+    const reject = await store.applyConfigField('app_default', store.findConfigField('replyDelivery')!, 'transcript');
+    expect(reject).toMatchObject({ ok: false, reason: 'reply_delivery_unsupported' });
+
+    // scratch 下该存量形状仍被 rmw 不变量拦（切换 sandbox 不能落静默组合）。
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const sr = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(sr.ok).toBe(false);
+    if (!sr.ok) expect(sr.reason).toBe('reply_delivery_unsupported');
+  });
+
   it('doubao default (no explicit replyDelivery) may switch to scratch — the default resolves at runtime, the rmw invariant only rejects persisted transcript', async () => {
     await loaded({ cliId: 'doubao' });
     const sandboxStore = await import('../src/services/sandbox-store.js');

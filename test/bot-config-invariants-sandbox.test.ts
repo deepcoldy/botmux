@@ -88,4 +88,36 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
       cliId: 'doubao', sandbox: 'oncall', replyDelivery: 'transcript',
     })).toBeUndefined();
   });
+
+  it('does NOT reject persisted transcript on non-transcript CLIs outside scratch (runtime falls back to send; never lock unrelated edits)', () => {
+    // #2828 复审 P2：把判据泛化成「任何无转写能力 CLI × 显式 transcript」会锁死存量
+    // entry（从 claude-code 切 cliId 到达的形状，master 历来放行，运行时回落 send）。
+    // 不变量只拦 scratch：非 scratch（含 oncall）下这些 entry 必须继续放行。
+    for (const cliId of ['opencode', 'codex-app', 'antigravity']) {
+      expect(botConfigInvariantError({
+        cliId, replyDelivery: 'transcript', model: 'old',
+      })).toBeUndefined();
+      expect(botConfigInvariantError({
+        cliId, replyDelivery: 'transcript', sandbox: 'oncall',
+      })).toBeUndefined();
+    }
+  });
+
+  it('rejects persisted transcript for any non-capture CLI under scratch while the repair exits stay open', () => {
+    // 窄化后的判据在 scratch 下对任何无采集 CLI 都成立：{unsupported cli, scratch,
+    // transcript} 无法经 cliId/sandbox 切换落成；切回支持的 CLI、显式 send、关掉
+    // scratch 三个修复出口仍可走。
+    expect(botConfigInvariantError({
+      cliId: 'opencode', replyDelivery: 'transcript', sandbox: 'scratch',
+    })).toBe('reply_delivery_unsupported');
+    expect(botConfigInvariantError({
+      cliId: 'antigravity', replyDelivery: 'transcript', sandbox: 'scratch',
+    })).toBe('reply_delivery_unsupported');
+    expect(botConfigInvariantError({
+      cliId: 'opencode', replyDelivery: 'send', sandbox: 'scratch',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'opencode', sandbox: 'scratch',
+    })).toBeUndefined();
+  });
 });
