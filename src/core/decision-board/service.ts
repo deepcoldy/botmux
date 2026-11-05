@@ -96,7 +96,8 @@ export interface DecisionBoardServiceDeps {
    * 管家群里的拍板卡片（见 card.ts）。不接线时不发卡，其余行为不变。
    */
   cards?: {
-    sendCard(chatId: string, cardJson: string): Promise<string>;
+    /** uuid：飞书发送去重键（补发同一张卡时不变，上次其实已发出时不会出第二张）。 */
+    sendCard(chatId: string, cardJson: string, uuid: string): Promise<string>;
     updateCard(messageId: string, cardJson: string): Promise<void>;
     isCardGone(error: unknown): boolean;
   };
@@ -127,6 +128,7 @@ const CARD_TOASTS = {
     notDeciding: '这一项已经不在待拍板了，卡片已刷新',
     stale: '选项刚改过，卡片已刷新，请按最新选项再点',
     noteRequired: '先在说明框里写点什么',
+    replaced: '这张卡片已过期，请用管家群里这一项最新的卡片，或去看板上处理',
     duplicate: '这个决定已经交给管家了',
     accepted: (label: string) => `已选 ${label}，正在交给管家`,
     acceptedNote: '已提交说明，正在交给管家',
@@ -139,6 +141,7 @@ const CARD_TOASTS = {
     notDeciding: 'This item no longer awaits a decision; card refreshed',
     stale: 'The options just changed; card refreshed, please pick again',
     noteRequired: 'Write something in the note box first',
+    replaced: 'This card is outdated; use the latest card for this item in the steward chat, or the board',
     duplicate: 'This decision was already sent to the steward',
     accepted: (label: string) => `Picked ${label}; sending to the steward`,
     acceptedNote: 'Note submitted; sending to the steward',
@@ -193,6 +196,8 @@ export class DecisionBoardService {
   private storeRef?: DecisionBoardStore;
   private readonly delivering = new Map<number, Promise<BoardBatch>>();
   readonly cards?: DecisionCards;
+  /** 批次按编号顺序逐个投递：较早的一批先进管家会话，覆盖标记在投递那一刻读，先后才对得上。 */
+  private deliveryChain: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: DecisionBoardServiceDeps) {
     const sink = deps.cards;
@@ -203,7 +208,7 @@ export class DecisionBoardService {
         locale: () => this.deps.locale(),
         steward: () => this.deps.steward(),
         links: seq => this.itemLinks(seq),
-        sendCard: (chatId, card) => sink.sendCard(chatId, card),
+        sendCard: (chatId, card, uuid) => sink.sendCard(chatId, card, uuid),
         updateCard: (messageId, card) => sink.updateCard(messageId, card),
         isCardGone: error => sink.isCardGone(error),
         log: (level, message) => this.deps.log(level, message),
@@ -222,6 +227,12 @@ export class DecisionBoardService {
     await this.cards?.idle();
   }
 
+  /** daemon 起来后对一遍卡片：补发上次没发出去的、刷新内容过期的（含批次在重启前后变了状态）。 */
+  async reconcileCards(): Promise<void> {
+    if (!this.cards || !this.isSteward()) return;
+    await this.cards.reconcile();
+  }
+
   private get appId(): string { return this.deps.larkAppId(); }
 
   store(): DecisionBoardStore {
@@ -236,6 +247,7 @@ export class DecisionBoardService {
   }
 
   close(): void {
+    this.cards?.stop();
     this.storeRef?.close();
     this.storeRef = undefined;
   }
@@ -648,6 +660,7 @@ export class DecisionBoardService {
     const turnId = batch.turnId ?? formatBoardTurnId(this.appId, batch.id);
     store.markBatchFailed(this.appId, batch.id, 'delivery_interrupted');
     this.deps.log('warn', `[decision-board] batch #${batch.id} (turn ${turnId}) was interrupted mid-delivery; marked failed for manual re-delivery`);
+    this.syncBatchCards(batch.id);
     return store.getBatch(this.appId, batch.id)!;
   }
 
@@ -699,6 +712,14 @@ export class DecisionBoardService {
     this.syncBatchCards(parsed.batchId);
   }
 
+  /** 没送达的一批再投一次：上一轮进程死在投递途中的先收敛成 failed（与 redeliver 同口径），再按同一个回合 id 投。 */
+  private async retryStuckBatch(batchId: number): Promise<void> {
+    const batch = this.store().getBatch(this.appId, batchId);
+    if (!batch || batch.delivery === 'delivered' || this.delivering.has(batchId)) return;
+    if (batch.delivery === 'dispatched') this.settleInterruptedBatch(this.store(), batch);
+    await this.deliverBatch(batchId);
+  }
+
   /** 批次投递状态变了：这一批里每一项的卡片跟着刷新（已选 X → 已交给管家 / 投递失败）。 */
   private syncBatchCards(batchId: number): void {
     if (!this.cards) return;
@@ -720,7 +741,6 @@ export class DecisionBoardService {
     const cards = this.cards;
     const v = click.value;
     if (!cards || v.app !== this.appId) return { toast: { type: 'warning', content: T.unavailable } };
-    if (!cards.enabled()) return { toast: { type: 'warning', content: T.disabled } };
     const owner = this.deps.ownerOpenId();
     if (!owner || !click.operatorOpenId || click.operatorOpenId !== owner) {
       this.deps.log('info', `[decision-board] card click by non-owner ${click.operatorOpenId ?? '?'} rejected`);
@@ -735,6 +755,14 @@ export class DecisionBoardService {
       if (r && click.messageId) cards.noteRendered(seq, click.messageId, r.hash);
       return { toast: { type, content }, ...(r ? { card: r.card } : {}) };
     };
+    // 关了开关：不写入，把这张卡收成只有链接的版本。
+    if (!cards.enabled()) return refreshed(T.disabled);
+    // 点的是被顶替的旧卡（卡片失效后另发过、或管家群换过）：不写入，也不把它换回能点的卡片，
+    // 免得一项有两张能点的卡。
+    if (click.messageId && !cards.isCurrentCard(seq, click.messageId)) {
+      const r = cards.render(seq, 'replaced');
+      return { toast: { type: 'warning', content: T.replaced }, ...(r ? { card: r.card } : {}) };
+    }
     const choice = v.action === DECISION_CARD_ACTION_PICK && typeof v.key === 'string' && v.key ? v.key : undefined;
     if (v.action !== DECISION_CARD_ACTION_PICK && v.action !== DECISION_CARD_ACTION_NOTE) return { toast: { type: 'warning', content: T.unavailable } };
     if (v.action === DECISION_CARD_ACTION_PICK && !choice) return { toast: { type: 'warning', content: T.unavailable } };
@@ -744,14 +772,17 @@ export class DecisionBoardService {
     if (v.ask !== decisionAskKey(item) || (choice && !item.options.some(o => o.key === choice))) return refreshed(T.stale);
     // 连点、或飞书没收到应答后的重试：最近一条还没被处理 / 覆盖的决定就是同一个选择和说明时不再建批次。
     // 那一批投递失败时顺带重投一次（同一个回合 id，管家那边不会重复执行）。
+    // 只有在同一份选项下（指纹相同）才算重复：选项改过之后同一个选项键可能换了意思，那是新决定。
     const latest = store.latestDecision(this.appId, seq);
     const latestBatch = latest ? store.getBatch(this.appId, latest.batchId) : undefined;
     if (latest && latestBatch && !latest.handledAt && latest.supersededBy === undefined
-      && latestBatch.createdAt >= item.stateAt && (latest.choice ?? undefined) === choice && latest.text.trim() === text) {
+      && latestBatch.createdAt >= item.stateAt && (latest.askKey ?? v.ask) === v.ask
+      && (latest.choice ?? undefined) === choice && latest.text.trim() === text) {
       const res = refreshed(T.duplicate, 'info');
-      return latestBatch.delivery === 'failed'
-        ? { ...res, deliver: async () => { await this.deliverBatch(latestBatch.id); } }
-        : res;
+      // 那一批没送达（失败，或上一轮进程死在投递途中）：顺带重投一次，同一个回合 id。
+      const stuck = latestBatch.delivery === 'failed'
+        || (latestBatch.delivery === 'dispatched' && !this.delivering.has(latestBatch.id));
+      return stuck ? { ...res, deliver: () => this.retryStuckBatch(latestBatch.id) } : res;
     }
     let submitted: ReturnType<DecisionBoardStore['submitCard']>;
     try {
@@ -784,11 +815,12 @@ export class DecisionBoardService {
   deliverBatch(batchId: number): Promise<BoardBatch> {
     const inflight = this.delivering.get(batchId);
     if (inflight) return inflight;
-    const run = this.deliverBatchOnce(batchId).finally(() => {
+    const run = this.deliveryChain.catch(() => undefined).then(() => this.deliverBatchOnce(batchId)).finally(() => {
       this.delivering.delete(batchId);
       this.syncBatchCards(batchId);
     });
     this.delivering.set(batchId, run);
+    this.deliveryChain = run;
     return run;
   }
 
@@ -808,6 +840,9 @@ export class DecisionBoardService {
       store.markBatchFailed(app, batchId, 'steward_chat_missing');
       return store.getBatch(app, batchId)!;
     }
+    // 提交人名字要查通讯录（可能要等）：放在落 dispatched、读覆盖标记之前，读完到交给 deliver 之间不再等别的。
+    const ownerOpenId = this.deps.ownerOpenId();
+    const ownerName = batch.authorName || await this.deps.ownerName().catch(() => undefined);
     store.markBatchAttempt(app, batchId);
     // 稳定回合 id + dispatched 在【调用 deliver 之前】落盘：deliver() 内部要发横幅、走
     // 会话锁、把输入交给 worker，其中任何一步后进程死亡，重启都只能看到「结果未知」的
@@ -844,15 +879,18 @@ export class DecisionBoardService {
         ...(option ? { choiceLabel: option.label } : {}),
         recommended: !!d.choice && item?.recommend === d.choice,
         ...(batch.source === 'card' ? { source: 'card' as const } : {}),
-        ...(() => { const ids = store.supersededBy(app, batchId, d.seq); return ids.length ? { supersedes: ids } : {}; })(),
+        ...(() => {
+          const detail = store.supersededDetail(app, batchId, d.seq);
+          const settled = detail.filter(x => x.settled).map(x => x.batchId);
+          const open = detail.filter(x => !x.settled).map(x => x.batchId);
+          return { ...(settled.length ? { supersedes: settled } : {}), ...(open.length ? { supersedesPending: open } : {}) };
+        })(),
         ...(d.supersededBy !== undefined ? { supersededBy: d.supersededBy } : {}),
         text: d.text,
         fileCount: d.fileIds.length,
         ...(chat?.url ? { primaryChat: { text: chat.text, url: chat.url } } : {}),
       };
     });
-    const ownerOpenId = this.deps.ownerOpenId();
-    const ownerName = batch.authorName || await this.deps.ownerName().catch(() => undefined);
     const prompt = formatBatchMessage({
       batchId,
       authorName: ownerName || 'owner',

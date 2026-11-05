@@ -21,6 +21,9 @@ import {
   type BoardItem,
   type StewardConfig,
 } from './model.js';
+import { decisionAskKey } from './ask-key.js';
+
+export { decisionAskKey };
 
 export const DECISION_CARD_ACTION_PREFIX = 'board_card_';
 /** 点选项（说明框里的内容一起提交）。 */
@@ -35,19 +38,10 @@ const QUESTION_CHARS = 600;
 const SUMMARY_CHARS = 200;
 const OPTION_TEXT_CHARS = 200;
 const BUTTON_LABEL_CHARS = 36;
-const NOTE_MAX_CHARS = 4_000;
+/** 说明框上限：飞书 input 的 max_length 只到 1000。 */
+const NOTE_MAX_CHARS = 1_000;
 /** 飞书卡片请求体上限 30KB；超过这个预算就降级成只给链接的卡片。 */
 export const DECISION_CARD_MAX_BYTES = 24_000;
-
-/**
- * 待拍板内容的指纹（问题 + 选项 + 推荐）：按钮上带着它，点的时候和当前内容对不上就是旧卡片。
- * 只看拍板相关字段，管家改进展、改阶段不会让 owner 手上的卡片失效。
- */
-export function decisionAskKey(item: Pick<BoardItem, 'question' | 'options' | 'recommend'>): string {
-  return createHash('sha256')
-    .update(JSON.stringify({ q: item.question ?? '', o: item.options.map(o => [o.key, o.label, o.effect ?? '']), r: item.recommend ?? '' }))
-    .digest('hex').slice(0, 12);
-}
 
 /** 卡片上展示的「这一项最近一次决定」。 */
 export interface CardDecisionStatus {
@@ -58,6 +52,8 @@ export interface CardDecisionStatus {
   supersedes: Array<{ id: number; source: 'web' | 'card' }>;
   /** 这次决定后来被哪个批次覆盖（以及来源）。 */
   supersededBy?: { id: number; source: 'web' | 'card' };
+  /** 决定之后选项改过（同一个选项键可能换了意思）：不显示现在的选项原文。 */
+  optionsChanged?: boolean;
 }
 
 export interface DecisionCardInput {
@@ -67,6 +63,11 @@ export interface DecisionCardInput {
   links: { url?: string; appLink?: string };
   /** 当前状态下（进入待拍板之后）最近的一次决定；没有就不显示。 */
   status?: CardDecisionStatus;
+  /**
+   * 卡片不再是入口时只给链接：'disabled' = 关了「飞书卡片拍板」或管家；'moved' = 管家群换了，
+   * 新卡片在新群；'replaced' = 这张已被同一项更新的卡片顶替。
+   */
+  retired?: 'disabled' | 'moved' | 'replaced';
 }
 
 type Mode = 'open' | 'too_many' | 'not_deciding' | 'ended';
@@ -92,10 +93,14 @@ const TEXT = {
     delivering: (id: number) => `正在交给管家…（批次 #${id}）`,
     failed: (id: number, why: string) => `交给管家失败（批次 #${id}）：${why}。去看板「最近提交」里重新投递。`,
     handled: (id: number) => `管家已处理（批次 #${id}）`,
-    supersedes: (ids: string) => `覆盖了${ids}的决定，以这次为准。`,
+    supersedes: (ids: string) => `覆盖了${ids} 的决定，以这次为准。`,
     supersededBy: (id: number, web: boolean) => `${web ? '网页上' : '卡片上'}随后又提交了批次 #${id}，以后提交的为准。`,
     batchRef: (id: number, web: boolean) => `${web ? '网页' : '卡片'}批次 #${id}`,
     sep: '、',
+    optionsChanged: '（之后选项改过）',
+    disabled: '这个管家已关闭「飞书卡片拍板」，去看板上处理。',
+    moved: '管家群换了，这一项的拍板卡片在新的管家群里。',
+    replaced: '这张卡片已过期，这一项的最新卡片在管家群里。',
   },
   en: {
     decide: 'Decision needed',
@@ -121,6 +126,10 @@ const TEXT = {
     supersededBy: (id: number, web: boolean) => `Batch #${id} was submitted later ${web ? 'on the web' : 'from the card'}; the later one wins.`,
     batchRef: (id: number, web: boolean) => `${web ? 'web' : 'card'} batch #${id}`,
     sep: ', ',
+    optionsChanged: ' (options changed since)',
+    disabled: 'Decision cards are off for this steward; use the board.',
+    moved: 'The steward chat changed; this item\'s decision card is in the new steward chat.',
+    replaced: 'This card is outdated; the latest card for this item is in the steward chat.',
   },
 } as const;
 
@@ -154,8 +163,11 @@ function statusLine(status: CardDecisionStatus, locale: Locale): string {
   const L = TEXT[locale === 'en' ? 'en' : 'zh'];
   const { decision, batch } = status;
   const web = batch.source !== 'card';
+  // 选项后来改过时只写选项键：现在的原文可能已经不是 owner 当时选的意思。
   const head = decision.choice
-    ? L.chose(md(oneLine(`${decision.choice}${status.choiceLabel ? ` ${clip(status.choiceLabel, 60)}` : ''}`)), web)
+    ? status.optionsChanged
+      ? `${L.chose(md(decision.choice), web)}${L.optionsChanged}`
+      : L.chose(md(oneLine(`${decision.choice}${status.choiceLabel ? ` ${clip(status.choiceLabel, 60)}` : ''}`)), web)
     : L.noteSubmitted(web);
   const state = decision.handledAt
     ? L.handled(batch.id)
@@ -206,7 +218,8 @@ function linkOnlyCard(input: DecisionCardInput, template: string, notice: string
   const elements: unknown[] = [{ tag: 'markdown', content: body.join('\n') }];
   const btn = linkButton(input.links, input.locale);
   if (btn) elements.push(btn);
-  return shell(`#${item.seq} ${clip(oneLine(item.title), 80)}（${label}）`, template, elements);
+  const suffix = input.locale === 'en' ? ` (${label})` : `（${label}）`;
+  return shell(`#${item.seq} ${clip(oneLine(item.title), 80)}${suffix}`, template, elements);
 }
 
 function openCard(input: DecisionCardInput): Record<string, unknown> {
@@ -269,6 +282,7 @@ function openCard(input: DecisionCardInput): Record<string, unknown> {
 /** 由看板数据渲染一项的拍板卡片（纯函数）。 */
 export function buildDecisionCard(input: DecisionCardInput): Record<string, unknown> {
   const L = TEXT[input.locale === 'en' ? 'en' : 'zh'];
+  if (input.retired) return linkOnlyCard(input, 'grey', L[input.retired]);
   const mode = cardMode(input.item);
   const stateLabel = BOARD_STATE_LABELS[input.locale === 'en' ? 'en' : 'zh'][input.item.state];
   if (mode === 'ended') return linkOnlyCard(input, 'grey', L.notDeciding(stateLabel));
@@ -292,16 +306,22 @@ export interface DecisionCardDeps {
   locale(): Locale;
   steward(): StewardConfig | undefined;
   links(seq: number): { url?: string; appLink?: string };
-  /** 发到管家群，返回消息 id。 */
-  sendCard(chatId: string, cardJson: string): Promise<string>;
+  /** 发到管家群，返回消息 id。uuid 是飞书的发送去重键（1 小时内同一个只发一条）。 */
+  sendCard(chatId: string, cardJson: string, uuid: string): Promise<string>;
   updateCard(messageId: string, cardJson: string): Promise<void>;
   /** 卡片已经改不了（撤回、超过编辑期限）：这时才另发一张新卡顶替。 */
   isCardGone(error: unknown): boolean;
   log(level: 'info' | 'warn', message: string): void;
+  /** 测试用：失败后重试的等待（毫秒）。 */
+  retryDelays?: readonly number[];
 }
+
+/** 发卡 / 更新失败（且卡片没失效）后的重试间隔；用完就等下次写入或 daemon 重启时的对账。 */
+const RETRY_DELAYS_MS = [30_000, 120_000, 600_000];
 
 export class DecisionCards {
   private readonly chains = new Map<number, Promise<void>>();
+  private readonly retries = new Map<number, { attempt: number; timer: ReturnType<typeof setTimeout> }>();
 
   constructor(private readonly deps: DecisionCardDeps) {}
 
@@ -309,14 +329,16 @@ export class DecisionCards {
     return stewardDecisionCardsOn(this.deps.steward());
   }
 
-  /** 这一项此刻该显示的卡片；事项不存在返回 undefined。 */
-  render(seq: number): { card: Record<string, unknown>; hash: string } | undefined {
+  /** 这一项此刻该显示的卡片；事项不存在返回 undefined。开关关着时给只有链接的版本。 */
+  render(seq: number, retired?: DecisionCardInput['retired']): { card: Record<string, unknown>; hash: string } | undefined {
     const store = this.deps.store();
     const app = this.deps.appId();
     const item = store.getItem(app, seq);
     if (!item) return undefined;
+    const effectiveRetired = retired ?? (this.enabled() ? undefined : 'disabled' as const);
     const card = buildDecisionCard({
       appId: app, locale: this.deps.locale(), item, links: this.deps.links(seq), status: this.status(item),
+      ...(effectiveRetired ? { retired: effectiveRetired } : {}),
     });
     return { card, hash: decisionCardHash(card) };
   }
@@ -335,10 +357,13 @@ export class DecisionCards {
     if (item.state === 'decide' && batch.createdAt < item.stateAt) return undefined;
     const sourceOf = (id: number): 'web' | 'card' => (store.getBatch(app, id)?.source === 'card' ? 'card' : 'web');
     const option = item.options.find(o => o.key === decision.choice);
+    // 没记指纹的旧决定按「没改过」处理（与之前的显示一致）。
+    const optionsChanged = !!decision.askKey && decision.askKey !== decisionAskKey(item);
     return {
       decision,
       batch,
-      ...(option ? { choiceLabel: option.label } : {}),
+      ...(option && !optionsChanged ? { choiceLabel: option.label } : {}),
+      ...(optionsChanged ? { optionsChanged: true } : {}),
       supersedes: store.supersededBy(app, decision.batchId, item.seq).map(id => ({ id, source: sourceOf(id) })),
       ...(decision.supersededBy !== undefined ? { supersededBy: { id: decision.supersededBy, source: sourceOf(decision.supersededBy) } } : {}),
     };
@@ -350,16 +375,58 @@ export class DecisionCards {
     if (rec && rec.messageId === messageId) this.deps.store().putCard(this.deps.appId(), { ...rec, hash });
   }
 
+  /** 这张卡片是不是这一项当前那张（不是被顶替的旧卡、也不是别的群里的那张）。 */
+  isCurrentCard(seq: number, messageId: string): boolean {
+    const rec = this.deps.store().getCard(this.deps.appId(), seq);
+    return !rec || !rec.messageId || rec.messageId === messageId;
+  }
+
+  /** daemon 起来后对一遍：补发上次没发出去的卡，刷新内容过期的卡。 */
+  async reconcile(): Promise<void> {
+    let records: BoardCardRecord[];
+    try {
+      records = this.deps.store().listCards(this.deps.appId());
+    } catch (error) {
+      this.deps.log('warn', `[decision-board] card reconcile skipped: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    for (const rec of records) await this.sync(rec.seq, { create: false });
+  }
+
+  /** 停掉还没到点的重试（关停 / 测试用）。 */
+  stop(): void {
+    for (const r of this.retries.values()) clearTimeout(r.timer);
+    this.retries.clear();
+  }
+
+  private scheduleRetry(seq: number): void {
+    const delays = this.deps.retryDelays ?? RETRY_DELAYS_MS;
+    const prev = this.retries.get(seq);
+    const attempt = prev ? prev.attempt + 1 : 0;
+    if (prev) clearTimeout(prev.timer);
+    if (attempt >= delays.length) { this.retries.delete(seq); return; }
+    const timer = setTimeout(() => { void this.sync(seq, { create: false }, attempt); }, delays[attempt]);
+    (timer as { unref?: () => void }).unref?.();
+    this.retries.set(seq, { attempt, timer });
+  }
+
   /**
    * 把这一项的卡片对齐到当前数据。同一项串行执行（连续 set 不会发出两张卡）。
    *   - 还没有卡：只在 create=true（刚进入待拍板 / 改了选项）且事项在待拍板时发新卡；
    *   - 已有卡：内容变了就原地更新；卡已失效（撤回 / 过期）且仍在待拍板时另发一张顶替。
    * 发卡失败只记日志：看板写入不因为卡片失败而失败。
    */
-  sync(seq: number, opts: { create: boolean }): Promise<void> {
+  sync(seq: number, opts: { create: boolean }, retryAttempt?: number): Promise<void> {
     const prev = this.chains.get(seq) ?? Promise.resolve();
-    const run = prev.then(() => this.syncOnce(seq, opts)).catch(error => {
+    const run = prev.then(async () => {
+      // 新的一次同步接管：之前排着的重试作废（重试本身进来时保留计数）。
+      const pending = this.retries.get(seq);
+      if (pending && pending.attempt !== retryAttempt) { clearTimeout(pending.timer); this.retries.delete(seq); }
+      await this.syncOnce(seq, opts);
+      if (this.retries.get(seq)?.attempt === retryAttempt) this.retries.delete(seq);
+    }).catch(error => {
       this.deps.log('warn', `[decision-board] card sync for #${seq} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.scheduleRetry(seq);
     });
     this.chains.set(seq, run);
     void run.finally(() => { if (this.chains.get(seq) === run) this.chains.delete(seq); });
@@ -373,24 +440,39 @@ export class DecisionCards {
 
   private async syncOnce(seq: number, opts: { create: boolean }): Promise<void> {
     const steward = this.deps.steward();
-    if (!stewardDecisionCardsOn(steward)) return;
     const store = this.deps.store();
     const app = this.deps.appId();
     const item = store.getItem(app, seq);
     if (!item) return;
     const rec = store.getCard(app, seq);
+    const on = stewardDecisionCardsOn(steward);
+    if (!on) {
+      // 关了开关（或管家）：不发新卡；已经发出去的卡改成只有链接，免得留着点不动的按钮。
+      if (rec?.messageId) await this.patch(rec, this.render(seq, 'disabled'));
+      return;
+    }
     const wantsNew = opts.create && item.state === 'decide';
-    // 管家群换过：旧群里那张卡不再是入口，重新进入待拍板时在新群发。
-    if (!rec || (rec.chatId !== steward.chatId && wantsNew)) {
+    if (!rec) {
+      if (wantsNew) await this.post(seq, steward.chatId);
+      return;
+    }
+    // 发卡前落的占位：上次没发出去（失败 / 进程死在中间），仍在待拍板就补发，否则丢掉。
+    if (!rec.messageId) {
+      if (item.state === 'decide') await this.post(seq, steward.chatId, rec);
+      else store.deleteCard(app, seq);
+      return;
+    }
+    // 管家群换过：重新进入待拍板时在新群发，旧群那张收成「已移到新群」。
+    if (rec.chatId !== steward.chatId) {
       if (!wantsNew) return;
+      await this.patch(rec, this.render(seq, 'moved')).catch(() => undefined);
       await this.post(seq, steward.chatId);
       return;
     }
     const rendered = this.render(seq);
     if (!rendered || rendered.hash === rec.hash) return;
     try {
-      await this.deps.updateCard(rec.messageId, JSON.stringify(rendered.card));
-      store.putCard(app, { ...rec, hash: rendered.hash });
+      await this.patch(rec, rendered);
     } catch (error) {
       if (!this.deps.isCardGone(error)) throw error;
       if (item.state !== 'decide') return;
@@ -399,14 +481,30 @@ export class DecisionCards {
     }
   }
 
-  private async post(seq: number, chatId: string): Promise<BoardCardRecord | undefined> {
-    const rendered = this.render(seq);
-    if (!rendered) return undefined;
-    const messageId = await this.deps.sendCard(chatId, JSON.stringify(rendered.card));
+  private async patch(rec: BoardCardRecord, rendered: { card: Record<string, unknown>; hash: string } | undefined): Promise<void> {
+    if (!rendered || rendered.hash === rec.hash) return;
+    await this.deps.updateCard(rec.messageId, JSON.stringify(rendered.card));
+    this.deps.store().putCard(this.deps.appId(), { ...rec, hash: rendered.hash });
+  }
+
+  /**
+   * 发新卡：先落一行占位（messageId 为空）再发，发成功再写上消息 id。进程死在中间或发送失败时，
+   * 占位留着，下次同步 / 启动对账补发；补发沿用同一个飞书去重键，上次其实已经发出去时不会出第二张。
+   */
+  private async post(seq: number, chatId: string, placeholder?: BoardCardRecord): Promise<void> {
     const store = this.deps.store();
-    store.putCard(this.deps.appId(), { seq, chatId, messageId, hash: rendered.hash });
+    const app = this.deps.appId();
+    const rendered = this.render(seq);
+    if (!rendered) return;
+    let slot = placeholder;
+    if (!slot || slot.chatId !== chatId) {
+      store.putCard(app, { seq, chatId, messageId: '', hash: '' });
+      slot = store.getCard(app, seq)!;
+    }
+    const uuid = createHash('sha256').update(`${app}:${seq}:${chatId}:${slot.createdAt}`).digest('hex').slice(0, 40);
+    const messageId = await this.deps.sendCard(chatId, JSON.stringify(rendered.card), uuid);
+    store.putCard(app, { seq, chatId, messageId, hash: rendered.hash });
     this.deps.log('info', `[decision-board] posted decision card for #${seq} in ${chatId} (${messageId})`);
-    return store.getCard(this.deps.appId(), seq);
   }
 }
 

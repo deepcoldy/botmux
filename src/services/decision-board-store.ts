@@ -16,6 +16,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { dirname, join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike, type StatementLike } from './sqlite-compat.js';
 import type { Locale } from '../i18n/types.js';
+import { decisionAskKey } from '../core/decision-board/ask-key.js';
 import {
   BOARD_LIMITS,
   BOARD_STATE_LABELS,
@@ -239,8 +240,9 @@ function migrateChatColumns(db: DatabaseSyncLike): void {
  * 再挂回来会悄悄复位成主群）；已经有群的事项清掉无群原因（否则群删光后显示的是过期原因而不是缺群）。
  */
 /**
- * 拍板卡片的两列：board_batches.source（'card' = 管家群卡片上点的，NULL = 网页）、
- * board_decisions.superseded_by（同一项后来又提交了决定时，覆盖它的批次号）。照 migrateChatColumns
+ * 拍板卡片的三列：board_batches.source（'card' = 管家群卡片上点的，NULL = 网页）、
+ * board_decisions.superseded_by（同一项后来又提交了决定时，覆盖它的批次号）、
+ * board_decisions.ask_key（决定时待拍板内容的指纹，见 ask-key.ts）。照 migrateChatColumns
  * 按列在不在补，幂等；都可空，旧构建的 SELECT * 与显式列 INSERT 照常工作，不升版本号。
  * 卡片记录是单独的 board_cards 表（CREATE IF NOT EXISTS），旧构建不读它。
  */
@@ -252,6 +254,7 @@ function migrateCardColumns(db: DatabaseSyncLike): void {
   };
   addMissing('board_batches', 'source', 'TEXT');
   addMissing('board_decisions', 'superseded_by', 'INTEGER');
+  addMissing('board_decisions', 'ask_key', 'TEXT');
 }
 
 function healChatFields(db: DatabaseSyncLike): void {
@@ -399,6 +402,8 @@ export class DecisionBoardStore {
           handled_at INTEGER,
           -- 同一项后来又提交了决定（卡片与网页之间以后提交的为准）：覆盖它的批次号；被覆盖的不再算待执行。
           superseded_by INTEGER,
+          -- 决定时「问题 + 选项 + 推荐」的指纹：之后选项改过就对不上（同一个选项键可能换了意思）。
+          ask_key TEXT,
           PRIMARY KEY (app_id, batch_id, seq)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS board_cards (
@@ -724,9 +729,9 @@ export class DecisionBoardStore {
       let handled = 0;
       if (opts.handled) {
         handled = Number(this.stmt(`UPDATE board_decisions SET handled_at = ?
-          WHERE app_id = ? AND seq = ? AND handled_at IS NULL AND superseded_by IS NULL
+          WHERE app_id = ? AND seq = ? AND handled_at IS NULL
             AND batch_id = (SELECT MIN(batch_id) FROM board_decisions
-              WHERE app_id = ? AND seq = ? AND handled_at IS NULL AND superseded_by IS NULL)`)
+              WHERE app_id = ? AND seq = ? AND handled_at IS NULL)`)
           .run(now, appId, seq, appId, seq).changes);
       }
       this.stmt('UPDATE board_items SET updated_at = ? WHERE app_id = ? AND seq = ?').run(now, appId, seq);
@@ -764,7 +769,7 @@ export class DecisionBoardStore {
     const drafts = new Set(opts.author
       ? (this.stmt('SELECT seq FROM board_drafts WHERE app_id = ? AND author = ?').all(appId, opts.author) as Array<{ seq: number }>).map(r => r.seq)
       : []);
-    const pending = new Map((this.stmt('SELECT seq, COUNT(*) AS n FROM board_decisions WHERE app_id = ? AND handled_at IS NULL AND superseded_by IS NULL GROUP BY seq')
+    const pending = new Map((this.stmt('SELECT seq, COUNT(*) AS n FROM board_decisions WHERE app_id = ? AND handled_at IS NULL GROUP BY seq')
       .all(appId) as Array<{ seq: number; n: number }>).map(r => [r.seq, r.n]));
     const q = opts.query?.trim().toLowerCase();
     const out: ItemSummary[] = [];
@@ -954,18 +959,22 @@ export class DecisionBoardStore {
         VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)`).run(appId, id, input.submitter ?? input.author, input.authorName ?? null, input.nonce, now);
       const decisions: BoardDecision[] = [];
       for (const { draft, item } of drafts) {
-        this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev)
-          VALUES (?, ?, ?, ?, ?, ?, ?)`).run(appId, id, item.seq, draft.choice ?? null, draft.text,
-          JSON.stringify(draft.fileIds), item.rev);
+        this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev, ask_key)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, id, item.seq, draft.choice ?? null, draft.text,
+          JSON.stringify(draft.fileIds), item.rev, decisionAskKey(item));
         for (const fid of draft.fileIds) {
           this.stmt('UPDATE board_files SET seq = ? WHERE app_id = ? AND id = ? AND seq IS NULL').run(item.seq, appId, fid);
         }
         const summary = [draft.choice ? `选 ${draft.choice}` : '', draft.text.trim()].filter(Boolean).join('：') || '（附图）';
         this.insertEvent(appId, item.seq, now, 'owner', input.submitter ?? input.author, 'decision', summary, draft.fileIds, id);
-        this.supersedeEarlier(appId, item.seq, id, 'web', now);
+        // 网页草稿可能写在选项改动之前：选的选项已经不在、或事项已不在待拍板时，这份草稿不算「以后提交的
+        // 决定」，不去覆盖卡片上的决定（照旧作为普通的一批送达，由管家按 guide 核对）。
+        if (item.state === 'decide' && (!draft.choice || item.options.some(o => o.key === draft.choice))) {
+          this.supersedeEarlier(appId, item.seq, id, 'web', now);
+        }
         this.clearDraft(appId, item.seq, input.author);
         decisions.push({ batchId: id, seq: item.seq, ...(draft.choice ? { choice: draft.choice } : {}), text: draft.text,
-          fileIds: draft.fileIds, itemRev: item.rev });
+          fileIds: draft.fileIds, itemRev: item.rev, askKey: decisionAskKey(item) });
       }
       return { batch: this.getBatch(appId, id)!, decisions, duplicate: false };
     });
@@ -994,41 +1003,57 @@ export class DecisionBoardStore {
       const id = ((this.stmt('SELECT MAX(id) AS m FROM board_batches WHERE app_id = ?').get(appId) as { m: number | null }).m ?? 0) + 1;
       this.stmt(`INSERT INTO board_batches (app_id, id, author, author_name, nonce, created_at, delivery, attempts, source)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, 'card')`).run(appId, id, input.submitter, input.authorName ?? null, input.nonce, now);
-      this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev)
-        VALUES (?, ?, ?, ?, ?, '[]', ?)`).run(appId, id, item.seq, choice ?? null, text, item.rev);
+      const askKey = decisionAskKey(item);
+      this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev, ask_key)
+        VALUES (?, ?, ?, ?, ?, '[]', ?, ?)`).run(appId, id, item.seq, choice ?? null, text, item.rev, askKey);
       const summary = [choice ? `选 ${choice}` : '', text.trim()].filter(Boolean).join('：');
       this.insertEvent(appId, item.seq, now, 'owner', input.submitter, 'decision', `${summary}（飞书卡片）`, [], id);
       const supersedes = this.supersedeEarlier(appId, item.seq, id, 'card', now);
-      const decision: BoardDecision = { batchId: id, seq: item.seq, ...(choice ? { choice } : {}), text, fileIds: [], itemRev: item.rev };
+      const decision: BoardDecision = { batchId: id, seq: item.seq, ...(choice ? { choice } : {}), text, fileIds: [], itemRev: item.rev, askKey };
       return { batch: this.getBatch(appId, id)!, decision, duplicate: false, supersedes };
     });
   }
 
   /**
-   * 同一项又有了新决定时，较早的、还没执行的决定作废（以后提交的为准）。只在卡片参与时生效
+   * 同一项又有了新决定时，较早的、还没执行的决定以新的为准（以后提交的为准）。只在卡片参与时生效
    *（新决定来自卡片，或较早的那条来自卡片）：网页上连续提交的几批仍按原来的规则逐批执行。
+   *
+   *   - 较早那批还没送到管家（pending / failed）：直接作废——记 superseded_by，同时记 handled_at，
+   *     它不再算待执行，`--handled` 也不会落到它头上；之后真被投递时消息里写明「不用执行」。
+   *   - 已经送到或正在送（dispatched / delivered）：管家可能已经在做，不能替它作废。只记 superseded_by，
+   *     仍按批次顺序待执行：管家按 guide 先把那条按实际情况 `--handled`（做了什么，或「已被覆盖，未执行」），
+   *     再执行新的一条。`--handled` 永远落在最早的未执行决定上，所以账本与管家实际做的事一致。
+   *
    * 在调用方的事务里执行；返回被覆盖的批次号。
    */
   private supersedeEarlier(appId: string, seq: number, batchId: number, source: BatchSource, now: number): number[] {
-    const rows = this.stmt(`SELECT d.batch_id AS batch_id, b.source AS source FROM board_decisions d
+    const rows = this.stmt(`SELECT d.batch_id AS batch_id, b.source AS source, b.delivery AS delivery FROM board_decisions d
       JOIN board_batches b ON b.app_id = d.app_id AND b.id = d.batch_id
       WHERE d.app_id = ? AND d.seq = ? AND d.batch_id < ? AND d.handled_at IS NULL AND d.superseded_by IS NULL
-      ORDER BY d.batch_id`).all(appId, seq, batchId) as Array<{ batch_id: number; source: string | null }>;
-    const ids = rows.filter(r => source === 'card' || r.source === 'card').map(r => r.batch_id);
-    for (const old of ids) {
-      this.stmt('UPDATE board_decisions SET superseded_by = ? WHERE app_id = ? AND batch_id = ? AND seq = ?').run(batchId, appId, old, seq);
+      ORDER BY d.batch_id`).all(appId, seq, batchId) as Array<{ batch_id: number; source: string | null; delivery: string }>;
+    const hit = rows.filter(r => source === 'card' || r.source === 'card');
+    for (const old of hit) {
+      const voided = old.delivery === 'pending' || old.delivery === 'failed';
+      this.stmt(`UPDATE board_decisions SET superseded_by = ?, handled_at = CASE WHEN ? THEN ? ELSE handled_at END
+        WHERE app_id = ? AND batch_id = ? AND seq = ?`).run(batchId, voided ? 1 : 0, now, appId, old.batch_id, seq);
     }
-    if (ids.length) {
+    if (hit.length) {
       this.insertEvent(appId, seq, now, 'system', undefined, 'note',
-        `批次 ${ids.map(i => `#${i}`).join('、')} 里的决定被批次 #${batchId} 覆盖（以后提交的为准）`, [], batchId);
+        `批次 #${batchId} 覆盖了批次 ${hit.map(r => `#${r.batch_id}`).join('、')} 里对这一项的决定（以后提交的为准）`, [], batchId);
     }
-    return ids;
+    return hit.map(r => r.batch_id);
   }
 
   /** 这个批次里对 seq 的决定覆盖了哪些较早批次。 */
   supersededBy(appId: string, batchId: number, seq: number): number[] {
-    return (this.stmt('SELECT batch_id FROM board_decisions WHERE app_id = ? AND seq = ? AND superseded_by = ? ORDER BY batch_id')
-      .all(appId, seq, batchId) as Array<{ batch_id: number }>).map(r => r.batch_id);
+    return this.supersededDetail(appId, batchId, seq).map(r => r.batchId);
+  }
+
+  /** 同上，带上那条现在是否已不用执行（作废，或管家已经 --handled）。 */
+  supersededDetail(appId: string, batchId: number, seq: number): Array<{ batchId: number; settled: boolean }> {
+    return (this.stmt('SELECT batch_id, handled_at FROM board_decisions WHERE app_id = ? AND seq = ? AND superseded_by = ? ORDER BY batch_id')
+      .all(appId, seq, batchId) as Array<{ batch_id: number; handled_at: number | null }>)
+      .map(r => ({ batchId: r.batch_id, settled: r.handled_at !== null }));
   }
 
   /** 这一项最近的一条决定（含已执行 / 被覆盖的），卡片据此显示「已选 X」。 */
@@ -1045,18 +1070,23 @@ export class DecisionBoardStore {
     return r ? { seq: r.seq, chatId: r.chat_id, messageId: r.message_id, hash: r.hash, createdAt: r.created_at, updatedAt: r.updated_at } : undefined;
   }
 
-  /** 按卡片消息找事项（点击回调核对卡片确实是这一项当前那张）。 */
-  cardByMessage(appId: string, messageId: string): BoardCardRecord | undefined {
-    const r = this.stmt('SELECT seq FROM board_cards WHERE app_id = ? AND message_id = ?').get(appId, messageId) as { seq: number } | undefined;
-    return r ? this.getCard(appId, r.seq) : undefined;
+  /** 全部卡片记录（启动时对一遍：补发没发出去的、刷新内容过期的）。 */
+  listCards(appId: string): BoardCardRecord[] {
+    return (this.stmt('SELECT seq FROM board_cards WHERE app_id = ? ORDER BY seq').all(appId) as Array<{ seq: number }>)
+      .map(r => this.getCard(appId, r.seq)!).filter(Boolean);
   }
 
+  /** 卡片记录。messageId 为空串 = 要发、还没确认发出（发卡前先落这一行，发失败或进程死了之后据此重发）。 */
   putCard(appId: string, rec: { seq: number; chatId: string; messageId: string; hash: string }, now = Date.now()): void {
     this.stmt(`INSERT INTO board_cards (app_id, seq, chat_id, message_id, hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(app_id, seq) DO UPDATE SET
         created_at = CASE WHEN board_cards.message_id = excluded.message_id THEN board_cards.created_at ELSE excluded.created_at END,
         chat_id = excluded.chat_id, message_id = excluded.message_id, hash = excluded.hash, updated_at = excluded.updated_at`)
       .run(appId, rec.seq, rec.chatId, rec.messageId, rec.hash, now, now);
+  }
+
+  deleteCard(appId: string, seq: number): void {
+    this.stmt('DELETE FROM board_cards WHERE app_id = ? AND seq = ?').run(appId, seq);
   }
 
   getBatch(appId: string, id: number): BoardBatch | undefined {
@@ -1079,13 +1109,13 @@ export class DecisionBoardStore {
 
   decisionsFor(appId: string, seq: number, onlyPending: boolean): BoardDecision[] {
     const sql = onlyPending
-      ? 'SELECT * FROM board_decisions WHERE app_id = ? AND seq = ? AND handled_at IS NULL AND superseded_by IS NULL ORDER BY batch_id'
+      ? 'SELECT * FROM board_decisions WHERE app_id = ? AND seq = ? AND handled_at IS NULL ORDER BY batch_id'
       : 'SELECT * FROM board_decisions WHERE app_id = ? AND seq = ? ORDER BY batch_id';
     return (this.stmt(sql).all(appId, seq) as DecisionRow[]).map(rowToDecision);
   }
 
   pendingDecisions(appId: string): BoardDecision[] {
-    return (this.stmt('SELECT * FROM board_decisions WHERE app_id = ? AND handled_at IS NULL AND superseded_by IS NULL ORDER BY batch_id, seq').all(appId) as DecisionRow[]).map(rowToDecision);
+    return (this.stmt('SELECT * FROM board_decisions WHERE app_id = ? AND handled_at IS NULL ORDER BY batch_id, seq').all(appId) as DecisionRow[]).map(rowToDecision);
   }
 
   markBatchAttempt(appId: string, id: number): void {
@@ -1151,9 +1181,10 @@ function rowToBatch(r: BatchRow): BoardBatch {
 interface DecisionRow {
   batch_id: number; seq: number; choice: string | null; text: string; file_ids_json: string; item_rev: number; handled_at: number | null;
   superseded_by?: number | null;
+  ask_key?: string | null;
 }
 function rowToDecision(r: DecisionRow): BoardDecision {
   return { batchId: r.batch_id, seq: r.seq, ...(r.choice ? { choice: r.choice } : {}), text: r.text, fileIds: parseIds(r.file_ids_json),
     itemRev: r.item_rev, ...(r.handled_at ? { handledAt: r.handled_at } : {}),
-    ...(r.superseded_by ? { supersededBy: r.superseded_by } : {}) };
+    ...(r.superseded_by ? { supersededBy: r.superseded_by } : {}), ...(r.ask_key ? { askKey: r.ask_key } : {}) };
 }

@@ -16,7 +16,7 @@ import {
 import { handleDecisionCardAction, setDecisionCardService } from '../src/core/decision-board/card-action.js';
 import { DECISION_CARD_MAX_OPTIONS, normalizeStewardConfig, type StewardConfig } from '../src/core/decision-board/model.js';
 import { isBotmuxCardAction } from '../src/core/card-action-namespace.js';
-import { DecisionBoardStore } from '../src/services/decision-board-store.js';
+import { BoardError, DecisionBoardStore } from '../src/services/decision-board-store.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 
 const APP = 'cli_steward';
@@ -28,7 +28,8 @@ let dir: string;
 let steward: StewardConfig | undefined;
 let delivered: Array<Parameters<DecisionBoardServiceDeps['deliver']>[0]>;
 let deliverImpl: DecisionBoardServiceDeps['deliver'];
-let sent: Array<{ chatId: string; card: any; messageId: string }>;
+let sent: Array<{ chatId: string; card: any; messageId: string; uuid: string }>;
+let sendImpl: () => Promise<void>;
 let updated: Array<{ messageId: string; card: any }>;
 let updateImpl: (messageId: string) => Promise<void>;
 let service: DecisionBoardService;
@@ -50,9 +51,10 @@ function makeService(): DecisionBoardService {
     log: () => {},
     lookupChat: async chatId => ({ ok: true, chatId, appId: APP, name: '群' }),
     cards: {
-      sendCard: async (chatId, card) => {
+      sendCard: async (chatId, card, uuid) => {
+        await sendImpl();
         const messageId = `om_card_${sent.length + 1}`;
-        sent.push({ chatId, card: JSON.parse(card), messageId });
+        sent.push({ chatId, card: JSON.parse(card), messageId, uuid });
         return messageId;
       },
       updateCard: async (messageId, card) => {
@@ -72,6 +74,7 @@ beforeEach(() => {
   sent = [];
   updated = [];
   updateImpl = async () => {};
+  sendImpl = async () => {};
   service = makeService();
 });
 afterEach(() => { setDecisionCardService(undefined); service.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -108,7 +111,7 @@ function currentCard(): any {
   return updated.length ? updated[updated.length - 1]!.card : sent[sent.length - 1]!.card;
 }
 
-function click(card: any, opts: { operator?: string; key?: string; note?: string; action?: string } = {}) {
+function click(card: any, opts: { operator?: string; key?: string; note?: string; action?: string; messageId?: string } = {}) {
   const btn = opts.action === DECISION_CARD_ACTION_NOTE
     ? callbackButtons(card).find(b => b.behaviors[0].value.action === DECISION_CARD_ACTION_NOTE)
     : pickButtons(card).find(b => b.behaviors[0].value.key === (opts.key ?? 'A'));
@@ -117,7 +120,7 @@ function click(card: any, opts: { operator?: string; key?: string; note?: string
     operatorUnionId: 'on_owner',
     value: btn.behaviors[0].value,
     formValue: opts.note !== undefined ? { [DECISION_CARD_NOTE_FIELD]: opts.note } : {},
-    messageId: sent[0]?.messageId,
+    messageId: opts.messageId ?? service.store().getCard(APP, Number(btn.behaviors[0].value.seq))?.messageId,
   });
 }
 
@@ -388,48 +391,65 @@ describe('点击', () => {
 });
 
 describe('和网页提交冲突：以后提交的为准', () => {
-  it('先卡片后网页：网页那一批覆盖卡片的决定，pending 只剩网页的，卡片提示被覆盖', async () => {
-    const seq = await addDecide();
-    const res = click(sent[0]!.card, { key: 'A' });
-    await res.deliver!();
-    await webSubmit(seq, 'B', '还是再等一轮', 'web-1');
-
-    expect(delivered).toHaveLength(2);
-    expect(delivered[1]!.prompt).toContain('覆盖：批次 #1 里对这一项的决定作废，以本次为准');
-    const pending = await service.cli({ action: 'pending' }, { sessionId: 's' }) as any;
-    expect(pending.decisions.map((d: any) => [d.batchId, d.choice])).toEqual([[2, 'B']]);
-    const text = cardText(currentCard());
-    expect(text).toContain('网页上已选 **B 不合**');
-    expect(text).toContain('覆盖了卡片批次 #1的决定');
-    expect(service.detail(seq, 'owner').events.some((e: any) => e.text.includes('被批次 #2 覆盖'))).toBe(true);
-  });
-
-  it('先网页后卡片：卡片那一批覆盖网页的决定；--handled 只标未被覆盖的那条', async () => {
-    const seq = await addDecide();
-    await webSubmit(seq, 'B', '', 'web-1');
-    const res = click(sent[0]!.card, { key: 'A', note: '改主意了' });
-    expect(cardText(res.card)).toContain('覆盖了网页批次 #1的决定');
-    await res.deliver!();
-    expect(delivered[1]!.prompt).toContain('覆盖：批次 #1');
-    const h = await service.cli({ action: 'history', ref: String(seq), text: '按 A 合了', handled: true }, { sessionId: 's' }) as any;
-    expect(h.handledDecisions).toBe(1);
-    expect(service.store().decisionsFor(APP, seq, false).map(d => [d.batchId, !!d.handledAt, d.supersededBy])).toEqual([
-      [1, false, 2], [2, true, undefined],
-    ]);
-    await service.cardsIdle();
-    expect(cardText(currentCard())).toContain('管家已处理（批次 #2）');
-  });
-
-  it('被覆盖的那批还没送达时才投递：批次消息里标明「已被覆盖，不用执行」', async () => {
+  it('卡片那批还没送到时网页又提交：卡片那条作废（不再待执行），网页那批写「作废」，迟到的卡片批次写「不用执行」', async () => {
     const seq = await addDecide();
     deliverImpl = async () => { throw new Error('down'); };
     const res = click(sent[0]!.card, { key: 'A' });
     await res.deliver!();
     deliverImpl = async input => { delivered.push(input); return { sessionId: 's' }; };
-    await webSubmit(seq, 'B', '', 'web-1');
+    await webSubmit(seq, 'B', '还是再等一轮', 'web-1');
+
+    expect(delivered.map(d => d.turnId)).toEqual([`board:${APP}:2`]);
+    expect(delivered[0]!.prompt).toContain('覆盖：批次 #1 里对这一项的决定作废，以本次为准');
+    const pending = await service.cli({ action: 'pending' }, { sessionId: 's' }) as any;
+    expect(pending.decisions.map((d: any) => [d.batchId, d.choice])).toEqual([[2, 'B']]);
+    const text = cardText(currentCard());
+    expect(text).toContain('网页上已选 **B 不合**');
+    expect(text).toContain('覆盖了卡片批次 #1 的决定');
+    expect(service.detail(seq, 'owner').events.some((e: any) => e.text.includes('批次 #2 覆盖了批次 #1'))).toBe(true);
+
     await service.redeliver(1);
     const late = delivered.find(d => d.turnId === `board:${APP}:1`)!;
     expect(late.prompt).toContain('已被覆盖：这一项后来在批次 #2 改了决定');
+  });
+
+  it('网页那批已送到管家（可能在执行）时卡片改选：旧的仍待执行，--handled 落在实际执行的那批上，新的不丢', async () => {
+    const seq = await addDecide();
+    await webSubmit(seq, 'A', '', 'web-1');
+    const res = click(sent[0]!.card, { key: 'B', note: '改主意了' });
+    expect(cardText(res.card)).toContain('覆盖了网页批次 #1 的决定');
+    await res.deliver!();
+    expect(delivered[1]!.prompt).toContain('覆盖：批次 #1 里对这一项的决定已送到你这里、还没标执行');
+    let pending = await service.cli({ action: 'pending' }, { sessionId: 's' }) as any;
+    expect(pending.decisions.map((d: any) => d.batchId)).toEqual([1, 2]);
+
+    const h = await service.cli({ action: 'history', ref: String(seq), text: '按 A 合了', handled: true }, { sessionId: 's' }) as any;
+    expect(h.handledDecisions).toBe(1);
+    expect(service.store().decisionsFor(APP, seq, false).map(d => [d.batchId, !!d.handledAt, d.supersededBy])).toEqual([
+      [1, true, 2], [2, false, undefined],
+    ]);
+    pending = await service.cli({ action: 'pending' }, { sessionId: 's' }) as any;
+    expect(pending.decisions.map((d: any) => [d.batchId, d.choice])).toEqual([[2, 'B']]);
+    await service.cardsIdle();
+    expect(cardText(currentCard())).toContain('已选 **B 不合**，已交给管家（批次 #2）');
+    expect(cardText(currentCard())).not.toContain('管家已处理');
+
+    await service.cli({ action: 'history', ref: String(seq), text: '按 B 处理', handled: true }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(cardText(currentCard())).toContain('管家已处理（批次 #2）');
+  });
+
+  it('网页上那份草稿写在选项改动之前（选的选项已不在）：照常送达，但不覆盖卡片上的决定', async () => {
+    const seq = await addDecide();
+    const item = service.store().getItem(APP, seq)!;
+    const draft = service.putDraft(seq, 'owner', { choice: 'B', text: '', baseRev: item.rev }).draft!;
+    await service.cli({ action: 'set', ref: String(seq), options: ['A=合', 'C=拆开'] }, { sessionId: 's' });
+    await service.cardsIdle();
+    deliverImpl = async () => { throw new Error('down'); };
+    await click(currentCard(), { key: 'A' }).deliver!();
+    deliverImpl = async input => { delivered.push(input); return { sessionId: 's' }; };
+    await service.submit({ author: 'owner', submitter: 'local', nonce: 'web-old', items: [{ seq, draftUpdatedAt: draft.updatedAt }] });
+    expect(service.store().decisionsFor(APP, seq, false).map(d => [d.batchId, d.supersededBy])).toEqual([[1, undefined], [2, undefined]]);
   });
 
   it('网页上连续两次提交（不涉及卡片）照旧逐批执行，不互相覆盖', async () => {
@@ -439,6 +459,209 @@ describe('和网页提交冲突：以后提交的为准', () => {
     const pending = await service.cli({ action: 'pending' }, { sessionId: 's' }) as any;
     expect(pending.decisions.map((d: any) => d.batchId)).toEqual([1, 2]);
     expect(delivered[1]!.prompt).not.toContain('覆盖');
+  });
+
+  it('网页那批还在投递时卡片又提交：按批次编号先后送进管家会话，后一批写明覆盖关系', async () => {
+    const seq = await addDecide();
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    deliverImpl = async input => { if (input.turnId.endsWith(':1')) await gate; delivered.push(input); return { sessionId: 's' }; };
+    const item = service.store().getItem(APP, seq)!;
+    const draft = service.putDraft(seq, 'owner', { choice: 'A', text: '', baseRev: item.rev }).draft!;
+    const web = service.submit({ author: 'owner', submitter: 'local', nonce: 'web-1', items: [{ seq, draftUpdatedAt: draft.updatedAt }] });
+    await new Promise(r => setTimeout(r, 0));
+    const res = click(sent[0]!.card, { key: 'B' });
+    const card = res.deliver!();
+    await new Promise(r => setTimeout(r, 0));
+    expect(delivered).toHaveLength(0);
+    release();
+    await Promise.all([web, card]);
+    expect(delivered.map(d => d.turnId)).toEqual([`board:${APP}:1`, `board:${APP}:2`]);
+    expect(delivered[1]!.prompt).toContain('已送到你这里');
+  });
+});
+
+describe('点击：选项改过之后', () => {
+  it('同一个选项键换了意思：卡片不再把旧决定写成新选项原文，再点同一个键是新决定', async () => {
+    const seq = await addDecide();
+    await click(sent[0]!.card, { key: 'A' }).deliver!();
+    await service.cli({ action: 'set', ref: String(seq), options: ['A=拆成两个 PR 再合', 'B=不合'] }, { sessionId: 's' });
+    await service.cardsIdle();
+    const text = cardText(currentCard());
+    expect(text).toContain('已选 **A**（之后选项改过）');
+    expect(text).not.toContain('已选 **A 拆成两个 PR');
+    const again = click(currentCard(), { key: 'A' });
+    expect(again.toast!.type).toBe('success');
+    await again.deliver!();
+    expect(service.store().listBatches(APP)).toHaveLength(2);
+  });
+
+  it('旧卡片上与待执行决定相同的选择：按过期处理，不当成重复', async () => {
+    const seq = await addDecide();
+    const oldCard = sent[0]!.card;
+    expect(click(oldCard, { key: 'A' }).toast!.type).toBe('success');
+    await service.cli({ action: 'set', ref: String(seq), options: ['A=合但先拆 PR', 'B=不合'] }, { sessionId: 's' });
+    await service.cardsIdle();
+    const again = click(oldCard, { key: 'A' });
+    expect(again.toast!.content).toContain('选项刚改过');
+    expect(again.deliver).toBeUndefined();
+  });
+
+  it('submitCard：写锁里的 verify 抛错时整笔回滚，不建批次、不写决定', async () => {
+    const seq = await addDecide();
+    const store = service.store();
+    expect(() => store.submitCard(APP, { seq, choice: 'A', text: '', submitter: 'owner', nonce: 'card:probe',
+      verify: () => { throw new BoardError('card_stale'); } })).toThrow(/card_stale/);
+    expect(store.listBatches(APP)).toHaveLength(0);
+    expect(store.latestDecision(APP, seq)).toBeUndefined();
+  });
+});
+
+describe('半途失败与恢复', () => {
+  it('发卡失败：留下待发记录，之后任意一次同步（只改进展）补发；补发沿用同一个飞书去重键', async () => {
+    const attempts: string[] = [];
+    let fail = true;
+    service.close();
+    const base = makeService();
+    const deps = (base as any).deps;
+    base.close();
+    service = new DecisionBoardService({ ...deps, cards: { ...deps.cards, sendCard: async (chatId: string, card: string, uuid: string) => {
+      attempts.push(uuid);
+      if (fail) throw new Error('timeout');
+      return deps.cards.sendCard(chatId, card, uuid);
+    } } });
+    const seq = await addDecide();
+    expect(sent).toHaveLength(0);
+    expect(service.store().getCard(APP, seq)?.messageId).toBe('');
+    fail = false;
+    await service.cli({ action: 'set', ref: String(seq), fields: { progress: '又跑了一轮' } }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(sent).toHaveLength(1);
+    expect(service.store().getCard(APP, seq)?.messageId).toBe(sent[0]!.messageId);
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]).toBe(attempts[0]);
+    service.cards!.stop();
+  });
+
+  it('启动对账：补发上次没发出去的卡；已经发出去的不再发', async () => {
+    sendImpl = async () => { throw new Error('timeout'); };
+    await addDecide();
+    service.cards!.stop();
+    sendImpl = async () => {};
+    service.close();
+    service = makeService();
+    await service.reconcileCards();
+    await service.reconcileCards();
+    expect(sent).toHaveLength(1);
+  });
+
+  it('daemon 死在投递途中：重启补投把批次收敛成失败时，卡片跟着显示失败', async () => {
+    await addDecide();
+    deliverImpl = () => new Promise(() => {});
+    const res = click(sent[0]!.card, { key: 'A' });
+    void res.deliver!();
+    await new Promise(r => setTimeout(r, 0));
+    expect(service.store().getBatch(APP, 1)!.delivery).toBe('dispatched');
+    service.close();
+    service = makeService();
+    await service.redeliverUndelivered();
+    await service.cardsIdle();
+    expect(service.store().getBatch(APP, 1)!.delivery).toBe('failed');
+    expect(cardText(currentCard())).toContain('交给管家失败（批次 #1）');
+  });
+
+  it('上一轮死在投递途中、补投前就再点同一个选择：收敛后按同一个回合 id 重投', async () => {
+    await addDecide();
+    deliverImpl = () => new Promise(() => {});
+    void click(sent[0]!.card, { key: 'A' }).deliver!();
+    await new Promise(r => setTimeout(r, 0));
+    service.close();
+    deliverImpl = async input => { delivered.push(input); return { sessionId: 's' }; };
+    service = makeService();
+    const again = click(sent[0]!.card, { key: 'A' });
+    expect(again.deliver).toBeDefined();
+    await again.deliver!();
+    expect(delivered.map(d => d.turnId)).toEqual([`board:${APP}:1`]);
+    expect(service.store().getBatch(APP, 1)!.delivery).toBe('delivered');
+  });
+
+  it('更新失败（不是失效）：按退避重试，成功后卡片对上', async () => {
+    service.close();
+    service = new DecisionBoardService({ ...(service as any).deps, cards: { ...(service as any).deps.cards } });
+    (service.cards as any).deps.retryDelays = [5, 5];
+    const seq = await addDecide();
+    let failures = 1;
+    updateImpl = async () => { if (failures-- > 0) throw new Error('rate limited'); };
+    await service.cli({ action: 'set', ref: String(seq), options: ['A=合', 'B=再等'] }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(updated).toHaveLength(0);
+    await new Promise(r => setTimeout(r, 30));
+    await service.cardsIdle();
+    expect(updated).toHaveLength(1);
+    expect(pickButtons(updated[0]!.card).map(b => b.text.content).join()).toContain('再等');
+    service.cards!.stop();
+  });
+
+  it('回调里出了意外错误：给 owner 一个看得见的失败提示，而不是没反应', async () => {
+    await addDecide();
+    setDecisionCardService(service);
+    const btn = pickButtons(sent[0]!.card)[0];
+    const store = service.store();
+    const orig = store.submitCard.bind(store);
+    store.submitCard = () => { throw new Error('database is locked'); };
+    const out = await handleDecisionCardAction({ operator: { open_id: OWNER }, action: { value: btn.behaviors[0].value },
+      context: { open_message_id: sent[0]!.messageId } } as any, APP);
+    store.submitCard = orig;
+    expect(out.toast.type).toBe('error');
+  });
+});
+
+describe('开关与管家群变化', () => {
+  it('关掉开关后：已发的卡收成只有链接，点了不写入；打开后下次变化恢复成能点的卡', async () => {
+    const seq = await addDecide();
+    steward = { enabled: true, chatId: 'oc_steward', decisionCards: false };
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'closed' } }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(callbackButtons(currentCard())).toHaveLength(0);
+    const res = click(sent[0]!.card, { key: 'A' });
+    expect(res.toast!.content).toContain('没开');
+    expect(callbackButtons(res.card)).toHaveLength(0);
+    expect(service.store().listBatches(APP)).toHaveLength(0);
+    steward = { enabled: true, chatId: 'oc_steward' };
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'decide' } }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(pickButtons(currentCard())).toHaveLength(2);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('关着开关进入待拍板，打开后只改进展不发卡，改选项才发', async () => {
+    steward = { enabled: true, chatId: 'oc_steward', decisionCards: false };
+    const seq = await addDecide();
+    expect(sent).toHaveLength(0);
+    steward = { enabled: true, chatId: 'oc_steward' };
+    await service.cli({ action: 'set', ref: String(seq), fields: { progress: '又跑了一轮' } }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(sent).toHaveLength(0);
+    await service.cli({ action: 'set', ref: String(seq), options: ['A=合', 'B=不合', 'C=拆'] }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(sent).toHaveLength(1);
+  });
+
+  it('管家群换了：重新待拍板时在新群发卡，旧群那张收成只有链接；点旧卡不写入、也不变回能点的卡', async () => {
+    const seq = await addDecide();
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'active' } }, { sessionId: 's' });
+    await service.cardsIdle();
+    steward = { enabled: true, chatId: 'oc_new' };
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'decide' } }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(sent.map(x => x.chatId)).toEqual(['oc_steward', 'oc_new']);
+    const old = updated.filter(u => u.messageId === 'om_card_1').at(-1)!.card;
+    expect(cardText(old)).toContain('管家群换了');
+    expect(callbackButtons(old)).toHaveLength(0);
+    const res = click(sent[1]!.card, { key: 'A', messageId: 'om_card_1' });
+    expect(res.toast!.content).toContain('过期');
+    expect(callbackButtons(res.card)).toHaveLength(0);
+    expect(service.store().listBatches(APP)).toHaveLength(0);
   });
 });
 

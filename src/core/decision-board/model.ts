@@ -151,8 +151,13 @@ export interface BoardDecision {
   fileIds: string[];
   itemRev: number;
   handledAt?: number;
-  /** 同一项后来又提交了决定（卡片与网页之间以后提交的为准）：覆盖它的批次号。被覆盖的不再算待执行。 */
+  /**
+   * 同一项后来又提交了决定（卡片与网页之间以后提交的为准）：覆盖它的批次号。还没送到管家时同时记
+   * handledAt（作废）；已送到的仍待执行，由管家按实际情况 --handled。
+   */
   supersededBy?: number;
+  /** 决定时待拍板内容（问题 + 选项 + 推荐）的指纹；旧数据没有。 */
+  askKey?: string;
 }
 
 // ─── 字段上限 ───────────────────────────────────────────────────────────────
@@ -526,7 +531,7 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 - 逐项处理：先 \`botmux board show <编号>\` 看最新内容，再按决定执行。
 - 每项做完：\`botmux board history <编号> --handled "做了什么、结果"\`，需要时改状态。
 - 决定看不懂，或者和现状冲突：不要猜，写 \`--handled "要你再确认：…"\`，并把状态设回 decide。
-- 同一项在卡片和网页上先后都提交过时以后提交的为准：标着「覆盖：批次 #N …」的只执行本次（#N 里那条已作废，不用再 --handled）；标着「已被覆盖」的跳过，等后来那个批次。
+- 同一项在卡片和网页上先后都提交过时以后提交的为准，按批次消息里的标记做：「覆盖：批次 #N … 作废」——#N 那条已作废，不用执行也不用 --handled，只执行本次；「覆盖：批次 #N … 已送到你这里」——先给 #N 那条按实际情况 --handled（做了写做了什么，没做写「已被覆盖，未执行」），再执行本次；「已被覆盖」——这一项跳过，等后来那个批次。
 - 最后回一条汇总。
 
 ## 定时巡检（收到「决策看板 · 巡检」消息时）
@@ -576,7 +581,7 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 - Item by item: \`botmux board show <n>\` for the latest state, then act on the decision.
 - After each one: \`botmux board history <n> --handled "what you did and the result"\`, and update the state if needed.
 - If a decision is unclear or conflicts with reality, do not guess: \`--handled "Please confirm: …"\` and set the state back to decide.
-- When an item was submitted from both the card and the web page, the later one wins: an entry marked "Supersedes: batch #N" is the one to execute (the older one is void; no --handled needed for it); skip an entry marked "Superseded" and wait for the later batch.
+- When an item was submitted from both the card and the web page, the later one wins; follow the marks in the batch message: "Supersedes … is void": batch #N's decision is void, neither execute nor --handled it, just execute this one; "Supersedes … already reached you": first --handled #N's decision as it actually went (what you did, or "superseded, not executed"), then execute this one; "Superseded": skip this item and wait for the later batch.
 - Finish with one summary reply.
 
 ## Scheduled patrol (when a "Decision board · patrol" message arrives)
@@ -658,8 +663,13 @@ export interface BatchMessageEntry {
   primaryChat?: { text: string; url: string };
   /** 在管家群的拍板卡片上点的（缺省 = 网页看板）。 */
   source?: BatchSource;
-  /** 这次决定作废了这些较早批次里对同一项的决定（以后提交的为准）。 */
+  /** 这次决定作废了这些较早批次里对同一项的决定（以后提交的为准；它们还没送到管家，不用执行）。 */
   supersedes?: number[];
+  /**
+   * 这次决定覆盖的较早决定里，已经送到管家、还没标执行的那些批次：管家可能已经在做，
+   * 要先按实际情况 --handled 那一条，再执行本次。
+   */
+  supersedesPending?: number[];
   /** 投递前同一项已有更新的决定：这一条以那个批次为准，不用执行。 */
   supersededBy?: number;
 }
@@ -713,11 +723,16 @@ export function formatBatchEntries(
     }
     // 来源与覆盖关系紧跟「选」：放在多行说明后面会像说明的一部分。
     if (e.source === 'card') lines.push(zh ? '来源：管家群的拍板卡片' : 'Source: decision card in the steward chat');
+    const ids = (list: number[]) => list.map(id => `#${id}`).join(zh ? '、' : ', ');
     if (e.supersedes?.length) {
-      const ids = e.supersedes.map(id => `#${id}`).join(zh ? '、' : ', ');
       lines.push(zh
-        ? `覆盖：批次 ${ids} 里对这一项的决定作废，以本次为准`
-        : `Supersedes: the decision on this item in batch ${ids} is void; follow this one`);
+        ? `覆盖：批次 ${ids(e.supersedes)} 里对这一项的决定作废，以本次为准`
+        : `Supersedes: the decision on this item in batch ${ids(e.supersedes)} is void; follow this one`);
+    }
+    if (e.supersedesPending?.length) {
+      lines.push(zh
+        ? `覆盖：批次 ${ids(e.supersedesPending)} 里对这一项的决定已送到你这里、还没标执行，以本次为准。先按实际情况给那一条 --handled（做了写做了什么，没做写「已被覆盖，未执行」），再执行本次`
+        : `Supersedes: batch ${ids(e.supersedesPending)} already reached you and is not marked handled; this one wins. First --handled that one as it actually went (what you did, or "superseded, not executed"), then execute this one`);
     }
     if (e.supersededBy !== undefined) {
       lines.push(zh
