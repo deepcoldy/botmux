@@ -15102,7 +15102,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --bot <spec>          兼容外部/旧链路；spec = open_id[:名字[:角色]]，不保证本机双向授权
   --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
-  --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay
+  --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay|reply（原话题直回）
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --delegate schedule:create
                         请求把当前真人回合的 schedule 创建权限委托给目标 Bot 当前派发 turn（需宿主策略开启）
@@ -15258,8 +15258,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('缺少简报。用 --brief 或 --brief-file 指定（仅 --standby 模式可省略）。');
     process.exit(1);
   }
-  if (!['relay', 'publish', 'publish-and-relay'].includes(resultDelivery)) {
-    console.error('--result-delivery 必须是 relay|publish|publish-and-relay。');
+  if (!['relay', 'publish', 'publish-and-relay', 'reply'].includes(resultDelivery)) {
+    console.error('--result-delivery 必须是 relay|publish|publish-and-relay|reply。');
     process.exit(1);
   }
   if (dispatchArgs.kind !== undefined && !['task', 'review'].includes(dispatchArgs.kind)) {
@@ -15401,6 +15401,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('公开结果投递需要使用 --bot-app 派发实际任务，目标须启用默认提示注入；零注入模式使用自动回传。');
     process.exit(1);
   }
+  if (resultDelivery === 'reply' && (intoRoot || repo || hasLaunchOverride || parsedBotApps.length !== 1
+    || (s.scope ?? 'thread') !== 'thread')) {
+    console.error('reply 仅支持从真人话题新建单个项目 Bot 的委托；已有派单继续使用原投递方式。');
+    process.exit(1);
+  }
 
   let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
@@ -15474,7 +15479,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     dispatchRootId,
     exactReportRootEnabled,
     sameTopicSendEnabled,
-    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay',
+    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay' | 'reply',
   });
   let built;
   try {
@@ -15716,6 +15721,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       originClaim: dispatchOriginClaim,
       body: {
         seedText: built.seedText,
+        ...(resultDelivery === 'reply' ? { resultDelivery: 'reply' } : {}),
         targetChatId,
         targetAppIds: parsedBotApps.map(item => item.appId),
         acceptanceRequested: !standby && parsedBotApps.length > 0,
@@ -16479,6 +16485,21 @@ async function cmdReport(rest: string[]): Promise<void> {
       process.exit(1);
     } else {
       const target = triggerBody.reportTarget;
+      if (triggerBody.delivery === 'reply') {
+        if (typeof triggerBody.publishedMessageId !== 'string' || !triggerBody.publicationTarget?.rootMessageId) {
+          console.error(JSON.stringify({ success: false, error: 'report_reply_receipt_incomplete' }));
+          process.exit(1);
+        }
+        recordSuccessfulReportMarker({ messageId: triggerBody.publishedMessageId,
+          targetChatId: triggerBody.publicationTarget.chatId,
+          targetRootMessageId: triggerBody.publicationTarget.rootMessageId,
+          dispatchRootId: dispatchRootCandidate });
+        console.log(JSON.stringify({ success: true, delivery: 'lark-message', viaRegistry: true,
+          reportedTo: triggerBody.publishedMessageId, deliveryMode: 'reply',
+          publishedMessageId: triggerBody.publishedMessageId, publicationTarget: triggerBody.publicationTarget,
+          messageTarget: triggerBody.publicationTarget, relayDelivered: false }));
+        return;
+      }
       recordSuccessfulReportMarker({
         ...(typeof triggerBody.publishedMessageId === 'string'
           ? { messageId: triggerBody.publishedMessageId }
