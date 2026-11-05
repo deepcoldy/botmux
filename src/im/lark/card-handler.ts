@@ -94,7 +94,7 @@ import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -3419,9 +3419,43 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           || !cardMessageId || cardMessageId !== ds.streamCardId
           || value.card_nonce !== ds.streamCardNonce
           || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
-        return setSessionReasoningEffort(ds, data.action?.option);
+        const control = sessionReasoningControl(ds);
+        if (!control) return 'unsupported' as const;
+        const effort = control.choices.find(choice => choice === data.action?.option);
+        if (!effort) return 'invalid' as const;
+        // Keep the verified cold-start path for suspended sessions and wrappers.
+        // A live Codex uses the same native, receipt-confirmed menu as /effort.
+        const worker = ds.worker;
+        if (!worker || worker.killed || (ds.initConfig ?? ds.session).wrapperCli) {
+          return setSessionReasoningEffort(ds, effort);
+        }
+        const generation = ds.workerGeneration;
+        const sessionGeneration = ds.session.workerGeneration;
+        const nativeId = ds.session.cliSessionId;
+        const stillCurrent = () => getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) === ds
+          && ds.worker === worker && ds.workerGeneration === generation
+          && ds.session.workerGeneration === sessionGeneration
+          && ds.session.cliSessionId === nativeId && ds.session.status === 'active';
+        const notify = async (result: import('../../types.js').CodexAppEffortResult) => {
+          if (!stillCurrent()) return;
+          scheduleCardPatch(ds, buildStreamingCardJson(ds), undefined, { userInitiated: true });
+          const key = result.reason ? `cmd.effort.${result.reason}`
+            : result.status === 'invalid' && !result.choices?.length
+              ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
+          const text = t(key, { effort, choices: result.choices?.join(', ') ?? '' }, loc);
+          await deliverEphemeralOrReply(ds, operatorOpenId, text, 'text', () => sessionReply(rootId, text));
+        };
+        // Native menu navigation may take seconds. Acknowledge the card callback
+        // and release the bot mutation gate before waiting for the CLI receipt.
+        void updateCodexCliEffort(ds, effort).then(notify).catch(error => {
+          logger.warn(`[${tag(ds)}] Card effort update failed: ${String(error)}`);
+        });
+        return 'updating' as const;
       });
       if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value === 'updating') return {
+        toast: { type: 'info', content: t('card.effort.updating', undefined, loc) },
+      };
       if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
       return {
         toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },

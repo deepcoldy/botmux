@@ -532,7 +532,7 @@ describe('platform-issued user credentials in a bound session', () => {
     });
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ ok: false, error: 'platform_authorization_required',
-      authUrl: 'https://platform.example.test/credentials' });
+      authUrl: 'https://platform.example.test/credentials?scope=search%3Adocs%3Aread' });
     expect(deviceFlow).not.toHaveBeenCalled();
   });
   it('auth request does not start a bot-app device flow for a turn that moved on during the platform check', async () => {

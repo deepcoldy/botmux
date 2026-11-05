@@ -18,6 +18,13 @@
  * without a mention — Lark never delivers a bot's own message back to it —
  * and the turn is started in-process in the node topic (§6.5).
  *
+ * Main-topic placement (§5.4, §5.5, P2, P3; PR 5b-2): no node card. The
+ * handoff card is replied into the run's main topic and carries the node's
+ * status line itself (patched in place by the card sync, from the card input
+ * saved next to the attempt); the binding is keyed by the handoff message id
+ * exactly as in a node topic, its publish root being the main topic's root.
+ * The main bot's own main-topic node runs in the main session.
+ *
  * Everything that touches Lark, daemons or sessions is injected.
  */
 
@@ -59,6 +66,7 @@ import {
   buildV3NodeCard,
   planV3HandoffCard,
   v3HandoffBodyText,
+  v3HandoffCardStatus,
   type V3HandoffCardInput,
 } from './v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
@@ -111,6 +119,15 @@ export interface V3HandoffIdentityDeps {
 
 export interface V3BotHandoffExecutorDeps {
   selfLarkAppId: string;
+  /** §5.5: whether that bot's running daemon handles a main-topic handoff
+   *  (advertised in its descriptor). An older one would keep the node marker
+   *  on its ordinary session for good and fold the turn into a running one,
+   *  so it gets no main-topic handoff at all. Absent = every daemon does. */
+  daemonHandlesMainPlacement?(larkAppId: string): boolean;
+  /** §5.5: the Lark topic id (`omt_…`) of the run's main topic, when known —
+   *  recorded with the handoff so the board's「打开」goes to the main topic
+   *  (there is no stable AppLink to a single message). */
+  mainTopicThreadId?(binding: { chatId: string; rootMessageId: string; sessionId?: string }): string | undefined;
   dataDir: string;
   transport: V3BotHandoffTransport;
   resolveTargetInChat(chatId: string, targetLarkAppId: string): Promise<V3TargetInChat>;
@@ -261,6 +278,26 @@ export function v3NodeTopicKey(attempt: { nodeId: string; loop?: { loopId: strin
   return attempt.loop ? `${attempt.loop.loopId}/${attempt.loop.bodyNodeId}` : attempt.nodeId;
 }
 
+/** Main-topic placement: the handoff card's input, next to the attempt, so
+ *  its status line can be patched in place (P2). Display only. */
+export const V3_HANDOFF_CARD_INPUT_FILE = 'handoff-card.json';
+
+function writeV3HandoffCardInput(attemptDir: string, input: V3HandoffCardInput): void {
+  const path = join(attemptDir, V3_HANDOFF_CARD_INPUT_FILE);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(input)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
+export function readV3HandoffCardInput(attemptDir: string): V3HandoffCardInput | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(join(attemptDir, V3_HANDOFF_CARD_INPUT_FILE), 'utf-8')) as V3HandoffCardInput;
+    return raw && typeof raw === 'object' && typeof raw.handoffRef === 'string' && typeof raw.nonce === 'string' ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Node cards this run has posted, by topic key — written the moment a card
  *  is sent, so a node whose handoff never got a Sent record (e.g. it ended
  *  HANDOFF_UNCERTAIN) still keeps a single topic and an up-to-date card. */
@@ -349,9 +386,9 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
     const target = request.targetLarkAppId;
     const selfExecuted = target === deps.selfLarkAppId;
     const nodeCardUuid = request.idempotency.nodeCard;
-    if (request.placement !== 'topic' || !nodeCardUuid) {
-      // Main-topic placement is a later change; nothing is sent for it here.
-      return { kind: 'rejected', code: 'COLLABORATION_DENIED', message: `placement "${request.placement}" is not supported yet` };
+    const mainTopic = request.placement === 'main';
+    if (!mainTopic && (request.placement !== 'topic' || !nodeCardUuid)) {
+      return { kind: 'rejected', code: 'COLLABORATION_DENIED', message: `placement "${request.placement}" is not supported` };
     }
     const secret = deps.bindingSecret();
     const nonce = workflowHandoffNonce(secret, request.idempotency.handoff);
@@ -362,6 +399,13 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
     // §6.3: re-check the target right before sending anything.
     if (!selfExecuted && !deps.isDaemonOnline(target)) {
       return { kind: 'rejected', code: 'BOT_OFFLINE', message: `${deps.botName(target)} 的 daemon 不在线` };
+    }
+    if (mainTopic && !selfExecuted && deps.daemonHandlesMainPlacement && !deps.daemonHandlesMainPlacement(target)) {
+      return {
+        kind: 'rejected',
+        code: 'COLLABORATION_DENIED',
+        message: `${deps.botName(target)} 的 daemon 版本过旧，不支持在主话题里交接；把它升级到与主 Bot 相同的版本后重试，或改派，或把节点改成节点话题`,
+      };
     }
     const dirRefusal = deps.workingDirPreflight?.(request);
     if (dirRefusal) return { kind: 'rejected', code: 'WORKING_DIR_REFUSED', message: dirRefusal };
@@ -377,7 +421,7 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
         return {
           kind: 'rejected',
           code: 'COLLABORATION_DENIED',
-          message: `${deps.botName(target)} 在本群是「整群一个会话」模式，节点话题里的交接无法单独执行`,
+          message: `${deps.botName(target)} 在本群是「整群一个会话」模式，${mainTopic ? '主话题' : '节点话题'}里的交接无法单独执行`,
         };
       }
       if (topics !== 'yes') throw new Error(`target topic sessions unknown: ${topics.unknown}`);
@@ -413,6 +457,15 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       ...identityNote,
       ...(entry ? { entry } : {}),
     });
+    if (mainTopic) {
+      return dispatchInMainTopic({
+        request,
+        binding: { chatId, rootMessageId: binding.rootMessageId, ...(binding.sessionId ? { sessionId: binding.sessionId } : {}) },
+        target, selfExecuted, nonce, secret,
+        identity, content, title: context.title, sketchId,
+      });
+    }
+
     const nodeIndex = context.goalNodeIds.indexOf(request.loop ? request.loop.loopId : request.nodeId);
     const nodeCard = buildV3NodeCard({
       runTitle: context.title,
@@ -437,7 +490,7 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       nodeCardMessageId = existingTopic;
       await deps.transport.patchCard(nodeCardMessageId, nodeCard).catch(() => undefined);
     } else {
-      nodeCardMessageId = await deps.transport.sendCard(chatId, nodeCard, nodeCardUuid);
+      nodeCardMessageId = await deps.transport.sendCard(chatId, nodeCard, nodeCardUuid!);
       recordV3HandoffTopic(request.runDir, topicKey, nodeCardMessageId);
     }
     request.signal.throwIfAborted();
@@ -527,6 +580,121 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       });
     }
     return { kind: 'sent', handoffMessageId, nodeCardMessageId };
+  }
+
+  /**
+   * §5.4 / §5.5 main-topic placement: the handoff card is replied straight
+   * into the main topic (no node card) and shows the node's status itself;
+   * a node of the main bot runs in the main session. Same binding, same
+   * pending-before-send order and the same idempotency key as a node topic.
+   */
+  async function dispatchInMainTopic(input: {
+    request: V3ExternalDispatchRequest;
+    binding: { chatId: string; rootMessageId: string; sessionId?: string };
+    target: string;
+    selfExecuted: boolean;
+    nonce: string;
+    secret: string;
+    identity: WorkflowHandoffIdentityPlan;
+    content: (handoffRef: string) => V3HandoffCardInput;
+    title: string;
+    sketchId: string;
+  }): Promise<V3ExternalDispatchOutcome> {
+    const { request, target, selfExecuted, nonce, secret, identity } = input;
+    const content = (handoffRef: string): V3HandoffCardInput => ({ ...input.content(handoffRef), mainTopic: true });
+    const chatId = input.binding.chatId;
+    const publishRoot = input.binding.rootMessageId;
+    const handingOff = { status: v3HandoffCardStatus({ kind: 'handing_off' }, request.attemptNumber) };
+    let threadId: string | undefined;
+    try {
+      threadId = deps.mainTopicThreadId?.(input.binding);
+    } catch { /* display only */ }
+    const sent = (handoffMessageId: string): V3ExternalDispatchOutcome => ({
+      kind: 'sent',
+      handoffMessageId,
+      ...(threadId ? { threadId } : {}),
+    });
+    const signed = createWorkflowHandoffBinding(secret, {
+      nonce,
+      publishRoot,
+      targetLarkAppId: target,
+      targetChatId: chatId,
+      sourceLarkAppId: deps.selfLarkAppId,
+      workflow: {
+        runId: request.runId,
+        nodeId: request.nodeId,
+        ...(request.instanceId ? { instanceId: request.instanceId } : {}),
+        attemptId: request.attemptId,
+        revision: request.revision,
+      },
+      issuedAt: new Date(now()).toISOString(),
+      placement: 'main',
+    });
+    const recorded = await recordWorkflowHandoffBinding(deps.dataDir, secret, signed);
+    if (recorded.revoked) {
+      return { kind: 'rejected', code: 'COLLABORATION_DENIED', message: 'the handoff was revoked before it was sent' };
+    }
+    const planned = planV3HandoffCard({ ...content(WORKFLOW_HANDOFF_ID_PLACEHOLDER), ...handingOff }, WORKFLOW_HANDOFF_TASK_FILE);
+    if (planned.overflowTask !== undefined) {
+      writeFileSync(join(request.attemptDir, WORKFLOW_HANDOFF_TASK_FILE), planned.overflowTask, { mode: 0o600 });
+    }
+    const overflow = planned.overflowTask !== undefined ? { overflowAttachment: WORKFLOW_HANDOFF_TASK_FILE } : {};
+    const sendHandoff = () => deps.transport.replyCard(publishRoot, planned.card, request.idempotency.handoff);
+    const handoffMessageId = identity.kind === 'sign'
+      ? await deps.handoffIdentity!.deliver({
+          authority: identity.authority,
+          targetLarkAppId: target,
+          chatId,
+          rootId: publishRoot,
+          workflow: {
+            runId: request.runId,
+            nodeId: request.nodeId,
+            ...(request.instanceId ? { instanceId: request.instanceId } : {}),
+            attemptId: request.attemptId,
+            revision: request.revision,
+            nonce,
+          },
+          send: sendHandoff,
+        })
+      : await sendHandoff();
+    await linkWorkflowHandoffMessage(deps.dataDir, secret, nonce, handoffMessageId);
+    // The card's input, kept so the sync can patch its status line in place
+    // (P2: the handoff card stands in for the node card).
+    const cardInput: V3HandoffCardInput = { ...content(handoffMessageId), ...overflow };
+    writeV3HandoffCardInput(request.attemptDir, cardInput);
+    await deps.transport.patchCard(handoffMessageId, buildV3HandoffCard({ ...cardInput, ...handingOff }))
+      .catch(() => undefined);
+
+    if (selfExecuted) {
+      request.signal.throwIfAborted();
+      if (lookupWorkflowHandoffByNonceRevoked(nonce)) return sent(handoffMessageId);
+      const current = classifyExternalAttempt(readJournal(join(request.runDir, 'journal.ndjson')), request.attemptId);
+      if (!current.ok) return sent(handoffMessageId);
+      const body = v3HandoffBodyText(cardInput);
+      await deps.startSelfTurn({
+        chatId,
+        publishRoot,
+        handoffMessageId,
+        marker: {
+          runId: request.runId,
+          nodeId: request.nodeId,
+          ...(request.instanceId ? { instanceId: request.instanceId } : {}),
+          attemptId: request.attemptId,
+          handoffMessageId,
+          nonce,
+          publishRoot,
+          orchestratorAppId: deps.selfLarkAppId,
+          registeredAt: new Date(now()).toISOString(),
+          placement: 'main',
+        },
+        prompt: `【工作流任务】${input.title} · ${input.sketchId}（第 ${request.attemptNumber} 次）\n\n${body}`,
+        sessionTitle: `工作流 ${input.title}`,
+        inputs: request.inputs,
+        runDir: request.runDir,
+        ...(identity.kind === 'sign' ? { identityDelegated: true as const } : {}),
+      });
+    }
+    return sent(handoffMessageId);
   }
 
   /** A revocation can precede the binding (stop before the send finished). */

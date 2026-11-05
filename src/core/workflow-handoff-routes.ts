@@ -98,7 +98,9 @@ interface EventKey {
 }
 
 export type WorkflowHandoffEvent =
-  | (EventKey & { kind: 'accepted'; acceptedAt?: number })
+  /** `startedAt`: the handoff's own turn reached the CLI (input commit) —
+   *  for a main-topic handoff the node timeout counts from it (§5.5). */
+  | (EventKey & { kind: 'accepted'; acceptedAt?: number; startedAt?: number })
   /** The handoff's own turn ended without an accepted submission. */
   | (EventKey & { kind: 'stalled'; at?: number })
   /** A later turn started in the node session (clears "stopped"). */
@@ -106,7 +108,9 @@ export type WorkflowHandoffEvent =
   | (EventKey & { kind: 'blocked'; reason: string })
   /** The executing bot's daemon refused to start the node session in the
    *  run's Gate-2 working dir (design §15.4); no session exists for it. */
-  | (Omit<EventKey, 'sessionId'> & { kind: 'refused'; reason: string })
+  /** `errorCode`: `MAIN_TOPIC_BUSY` when the bot's main-topic session is
+   *  executing another node (§5.5); absent = the working-dir refusal. */
+  | (Omit<EventKey, 'sessionId'> & { kind: 'refused'; reason: string; errorCode?: 'MAIN_TOPIC_BUSY' })
   | (EventKey & { kind: 'progress' })
   /** A submission was staged while this daemon looked offline: drive once
    *  so the staged install is committed now rather than at the next wake. */
@@ -182,7 +186,9 @@ export async function handleWorkflowHandoffEvent(raw: unknown, deps: WorkflowHan
       attemptId: binding.workflow.attemptId,
       ...(binding.workflow.instanceId ? { instanceId: binding.workflow.instanceId } : {}),
       reason,
-      errorCode: V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED,
+      errorCode: raw.errorCode === V3_EXTERNAL_ERROR_CODES.MAIN_TOPIC_BUSY
+        ? V3_EXTERNAL_ERROR_CODES.MAIN_TOPIC_BUSY
+        : V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED,
     });
     if (!outcome.ok) return rejection(outcome.reason);
     deps.drive(runId);
@@ -201,7 +207,12 @@ export async function handleWorkflowHandoffEvent(raw: unknown, deps: WorkflowHan
   switch (raw.kind) {
     case 'accepted': {
       const acceptedAt = typeof raw.acceptedAt === 'number' && Number.isFinite(raw.acceptedAt) ? raw.acceptedAt : undefined;
-      const outcome = recordExternalAccepted(runDir, { ...identity, ...(acceptedAt !== undefined ? { acceptedAt } : {}) }, ctx);
+      const startedAt = typeof raw.startedAt === 'number' && Number.isFinite(raw.startedAt) ? raw.startedAt : undefined;
+      const outcome = recordExternalAccepted(runDir, {
+        ...identity,
+        ...(acceptedAt !== undefined ? { acceptedAt } : {}),
+        ...(startedAt !== undefined ? { startedAt } : {}),
+      }, ctx);
       if (!outcome.ok) return rejection(outcome.reason);
       if (!outcome.alreadyAccepted) deps.drive(runId);
       return { status: 200, body: { ok: true, deadlineAt: outcome.deadlineAt } };
@@ -295,8 +306,10 @@ export interface WorkflowNodeReportSession {
   chatId: string;
   scope?: 'thread' | 'chat';
   rootMessageId?: string;
-  /** The session's verified handoff marker, if any. */
-  workflowNode?: { handoffMessageId: string; nonce: string };
+  /** The session's verified handoff marker, if any. For a main-topic
+   *  handoff (§5.5) also whether its own turn has started and whether the
+   *  attempt is still in progress in this session. */
+  workflowNode?: { handoffMessageId: string; nonce: string; placement?: 'main'; started?: boolean; active?: boolean };
 }
 
 export interface WorkflowNodeReportDeps {
@@ -311,6 +324,9 @@ export interface WorkflowNodeReportDeps {
   /** Deliver an event to the main bot's daemon. A rejected promise (network)
    *  or a 503 `orchestrator_offline` means it did not process the event. */
   forward(binding: WorkflowHandoffBindingPayload, event: WorkflowHandoffEvent): Promise<RouteResult>;
+  /** Main topic (§5.5): the bot reported the node blocked and the run took
+   *  it — its attempt ended without a submission. */
+  markClosed?(sessionId: string, nonce: string): void;
   /** §7.2 step 3: the main bot is offline — leave the validated submission
    *  in the attempt's staging area for it to commit on its next drive. */
   stageSubmission(binding: WorkflowHandoffBindingPayload, input: {
@@ -399,6 +415,19 @@ export async function handleWorkflowNodeReport(raw: unknown, deps: WorkflowNodeR
     || session.rootMessageId !== binding.publishRoot) {
     return { status: 403, body: { ok: false, error: 'handoff_route_mismatch', message: '请在交接消息所在的节点话题里提交' } };
   }
+  // §5.5: the main-topic session is shared with the topic's other
+  // conversation. A report for the node counts only from the session that
+  // holds this handoff, after its own turn started, while the attempt is in
+  // progress — not from a turn that ran before it (queued) or after it ended.
+  if (binding.placement === 'main') {
+    const marker = session.workflowNode;
+    if (!marker || marker.nonce !== binding.nonce || marker.active !== true) {
+      return { status: 409, body: { ok: false, error: 'handoff_not_active', message: '这个工作流节点在本会话里的这次执行已经结束（或不是交给本会话的），不能再提交' } };
+    }
+    if (marker.started !== true) {
+      return { status: 409, body: { ok: false, error: 'handoff_not_started', message: '这个工作流节点的交接还在排队，它这一轮开始后才能提交' } };
+    }
+  }
 
   const key = {
     nonce: binding.nonce,
@@ -407,7 +436,10 @@ export async function handleWorkflowNodeReport(raw: unknown, deps: WorkflowNodeR
   };
   const content = typeof raw.content === 'string' ? raw.content : '';
   if (status === 'blocked' || status === 'failed') {
-    return deps.forward(binding, { ...key, kind: 'blocked', reason: content }).catch(() => OFFLINE);
+    const blocked = await deps.forward(binding, { ...key, kind: 'blocked', reason: content }).catch(() => OFFLINE);
+    // The attempt is over: a main-topic session is an ordinary one again.
+    if (blocked.status === 200 && blocked.body.ok === true) deps.markClosed?.(session.sessionId, binding.nonce);
+    return blocked;
   }
   if (status !== 'completed') {
     return deps.forward(binding, { ...key, kind: 'progress' }).catch(() => OFFLINE);

@@ -82,6 +82,8 @@ vi.mock('../src/core/worker-pool.js', async () => {
     vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
   }),
   setSessionReasoningEffort: vi.fn(() => 'saved'),
+  sessionReasoningControl: vi.fn(() => ({ choices: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] })),
+  updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
   sendWorkerSessionInput: (...args: any[]) => sendWorkerSessionInputMock(...args),
@@ -462,25 +464,79 @@ describe('stop_turn / compact_session permission gate (table lock)', () => {
 
 describe('reasoning selector card callback', () => {
   function setup() {
-    const ds = makeDs({ streamCardId: 'om_clicked', streamCardNonce: 'nonce', sessionOverrides: { reasoningEffort: 'ultra' } });
+    const ds = makeDs({ streamCardId: 'om_clicked', streamCardNonce: 'nonce', lastScreenStatus: 'working',
+      sessionOverrides: { cliId: 'codex', reasoningEffort: 'ultra' } });
     const data = actionData('set_reasoning_effort');
     Object.assign(data.action.value, { card_nonce: 'nonce', expected_effort: 'ultra' });
     data.action.option = 'high';
     return { ds, data };
   }
 
-  it('dispatches a verified current-card selection and returns updated card data', async () => {
+  beforeEach(async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.updateCodexCliEffort).mockReset();
+    vi.mocked(pool.updateCodexCliEffort).mockResolvedValue({ status: 'future_only', reason: 'cli_next_turn' });
+    vi.mocked(pool.setSessionReasoningEffort).mockClear();
+    vi.mocked(pool.deliverEphemeralOrReply).mockClear();
+    vi.mocked(pool.scheduleCardPatch).mockClear();
+  });
+
+  it('keeps the cold-start preference path for suspended sessions', async () => {
     const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
     vi.mocked(setSessionReasoningEffort).mockClear();
     const { ds, data } = setup();
+    ds.worker = null;
+    ds.session.suspendedColdResume = true;
     const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
     expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high');
     expect(result).toMatchObject({ toast: { type: 'success' }, card: { type: 'raw' } });
     expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
   });
 
+  it('acknowledges a running-session selection before the native receipt, releasing the mutation gate', async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    const { withBotTurnAdmission } = await import('../src/core/bot-turn-mutation-gate.js');
+    let confirm!: (result: import('../src/types.js').CodexAppEffortResult) => void;
+    vi.mocked(pool.updateCodexCliEffort).mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+    const { ds, data } = setup();
+    const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('info');
+    expect(pool.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
+    expect(pool.deliverEphemeralOrReply).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(await withBotTurnAdmission(LARK_APP_ID, () => 'admitted')).toBe('admitted');
+    confirm({ status: 'future_only', reason: 'cli_next_turn' });
+    await vi.waitFor(() => expect(pool.deliverEphemeralOrReply).toHaveBeenCalledOnce());
+    expect(pool.scheduleCardPatch).toHaveBeenCalledWith(ds, expect.any(String), undefined, { userInitiated: true });
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['unavailable', 'error', 'invalid'] as const)('reports native %s without falling back to a saved preference', async status => {
+    const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.updateCodexCliEffort).mockResolvedValueOnce({ status });
+    const { ds, data } = setup();
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    await vi.waitFor(() => expect(pool.deliverEphemeralOrReply).toHaveBeenCalledOnce());
+    expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
+  });
+
+  it('does not publish a delayed receipt onto a replacement worker', async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    let confirm!: (result: import('../src/types.js').CodexAppEffortResult) => void;
+    vi.mocked(pool.updateCodexCliEffort).mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+    const { ds, data } = setup();
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    ds.worker = { killed: false } as any;
+    confirm({ status: 'future_only', reason: 'cli_next_turn' });
+    await Promise.resolve();
+    expect(pool.deliverEphemeralOrReply).not.toHaveBeenCalled();
+    expect(pool.scheduleCardPatch).not.toHaveBeenCalled();
+  });
+
   it.each(['nonce', 'session', 'message', 'selection', 'operator'])('rejects stale or unauthorized %s without mutation', async field => {
-    const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
+    const { setSessionReasoningEffort, updateCodexCliEffort } = await import('../src/core/worker-pool.js');
     vi.mocked(setSessionReasoningEffort).mockClear();
     const { ds, data } = setup();
     if (field === 'nonce') data.action.value.card_nonce = 'old';
@@ -490,6 +546,7 @@ describe('reasoning selector card callback', () => {
     if (field === 'operator') vi.mocked(canOperate).mockReturnValue(false);
     await handleCardAction(data, depsWith(ds), LARK_APP_ID);
     expect(setSessionReasoningEffort).not.toHaveBeenCalled();
+    expect(updateCodexCliEffort).not.toHaveBeenCalled();
   });
 });
 

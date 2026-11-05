@@ -118,10 +118,25 @@ function platformRefusal(resolution: PlatformIdentityResolution, delegated: bool
 }
 
 /**
+ * The platform credentials page asking for `scopes` on top of what the person
+ * already granted (`/credentials?scope=a+b`). The page shows exactly which
+ * scopes are being added and requests those plus the existing grant, so one
+ * click fills the gap instead of re-requesting the same default list. A
+ * platform that predates the parameter ignores it and shows the plain page.
+ */
+export function platformIncrementalAuthorizeUrl(page: string, scopes: readonly string[]): string {
+  const wanted = [...new Set(scopes.filter(Boolean))];
+  if (!wanted.length) return page;
+  const url = new URL(page);
+  url.searchParams.set('scope', wanted.join(' '));
+  return url.toString();
+}
+
+/**
  * `botmux auth request` for a person who has no grant to the bot's application:
  * a device-code link for the bot app would only show them "no permission to use
- * <bot>". Point at the platform instead. Returns null when the bot-app flow
- * should proceed as before.
+ * <bot>". Point at the platform instead, carrying the scopes this request is
+ * missing. Returns null when the bot-app flow should proceed as before.
  */
 export async function platformAuthRequestRedirect(input: {
   bot: BotConfig;
@@ -129,25 +144,33 @@ export async function platformAuthRequestRedirect(input: {
   openId: string;
   delegated: boolean;
   botAppToken: (openId: string) => Promise<string | null>;
+  /** The scopes `botmux auth request --scope` asked for. */
+  scopes?: readonly string[];
 }): Promise<{ error: string; authorizeUrl?: string } | null> {
   const policy = boundLarkPlatformPolicy(input.bot);
   if (policy === 'off') return null;
-  const url = platformAuthorizeUrl();
-  if (!url) {
+  const page = platformAuthorizeUrl();
+  if (!page) {
     if (policy === 'prefer-bot-app') return null;
     return { error: 'This bot takes lark-cli user credentials only from the botmux platform, but this machine is not bound to it. Ask the operator to run botmux bind on the host.' };
   }
   if (policy === 'prefer-bot-app' && await input.botAppToken(input.openId)) return null;
+  const url = platformIncrementalAuthorizeUrl(page, input.scopes ?? []);
   const who = input.delegated ? 'The original user' : 'This user';
+  const scoped = url !== page;
   return {
     error: `${who}'s lark-cli authorization comes from the botmux platform, not from application ${input.bot.larkAppId}. `
       // The platform application cannot hold every scope (some need tenant-wide
       // approval), but the bot's own identity often covers the same data.
       + 'For a READ of data in a chat or document this bot can access (for example messages of a group the bot is in), '
       + 'retry that read with --as bot first; it needs no user authorization. Never switch a write to --as bot. '
-      + `If the read also fails as bot, or the action must be done as this user, send them the platform page at ${url} `
-      + 'to authorize (or re-authorize). If a scope is still missing afterwards, '
-      + 'the platform application itself must enable it first; tell the user which scope is needed instead of retrying.',
+      + (scoped
+        ? `If the read also fails as bot, or the action must be done as this user, send them this platform link: ${url} . `
+          + 'It lists the missing scopes and adds just those to their existing platform authorization with one click ("补充授权"); retry with --as user after they confirm. '
+          + 'If the page says the platform application has not enabled a scope, only the platform administrator can fix that: tell the user which scope is needed instead of retrying.'
+        : `If the read also fails as bot, or the action must be done as this user, send them the platform page at ${url} `
+          + 'to authorize (or re-authorize). If a scope is still missing afterwards, '
+          + 'the platform application itself must enable it first; tell the user which scope is needed instead of retrying.'),
     authorizeUrl: url,
   };
 }

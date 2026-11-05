@@ -28,6 +28,10 @@ export interface OnlineDaemonInfo {
   /** Applies a workflow run's Gate-2 working dir to its node sessions
    *  (design 2026-11-03 §15.4). Absent = an older daemon that ignores it. */
   workflowNodeWorkingDir?: 'v1';
+  /** Handles a workflow handoff in the run's main topic (design 2026-11-03
+   *  §5.5: queued as its own turn, attempt-scoped session marker). Absent =
+   *  an older daemon, which gets node-topic handoffs only. */
+  workflowMainPlacement?: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
   sessionStoreProtocol?: string;
   /** Running binary version. Copy only; never compared by size. */
@@ -104,6 +108,7 @@ export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } =
           ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
           : {}),
         ...(d.workflowNodeWorkingDir === 'v1' ? { workflowNodeWorkingDir: d.workflowNodeWorkingDir } : {}),
+        ...(d.workflowMainPlacement === 'v1' ? { workflowMainPlacement: d.workflowMainPlacement } : {}),
         ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
           ? { sessionStoreProtocol: d.sessionStoreProtocol }
           : {}),
