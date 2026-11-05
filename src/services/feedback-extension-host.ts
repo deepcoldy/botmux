@@ -108,6 +108,12 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
       } catch {}
     }
     const currentConfig = await readFeedbackExtensionConfig(dataDir);
+    // The bot-config presentation is functionally equivalent to one stored in
+    // the extension file (it was already overlaid on `config` for surface
+    // reconciliation above): the hook authorization fence must read the same
+    // merged view, otherwise a card sent from a bot-config rule renders and
+    // accepts clicks while every hook job is settled `blocked`.
+    if (!currentConfig.presentations[appId] && botPresentation) currentConfig.presentations[appId] = botPresentation;
     const maximumTimeout = Math.max(1000, ...currentConfig.hooks.map(hook => hook.timeoutMs)) + 10000;
     const job = extensions.claim('hook', Date.now(), maximumTimeout, appId,
       Object.fromEntries(currentConfig.hooks.map(hook => [hook.id, hook.concurrency])));

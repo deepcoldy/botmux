@@ -3,7 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const mock = vi.hoisted(() => ({ source: undefined as any, reply: vi.fn(), mode: vi.fn(), detail: vi.fn() }));
+const mock = vi.hoisted(() => ({
+  source: undefined as any, reply: vi.fn(), mode: vi.fn(), detail: vi.fn(),
+  botConfig: { feedback: { enabled: true, audience: 'everyone' } } as Record<string, unknown>,
+}));
 vi.mock('../src/services/skill-feedback-store.js', async original => ({
   ...await original<any>(), getSkillFeedbackStore: async () => mock.source,
 }));
@@ -12,18 +15,22 @@ vi.mock('../src/im/lark/client.js', async original => ({
   getChatModeStrict: mock.mode, getMessageDetail: mock.detail,
 }));
 vi.mock('../src/bot-registry.js', async original => ({
-  ...await original<any>(), getBot: () => ({ config: { feedback: { enabled: true, audience: 'everyone' } } }),
+  ...await original<any>(), getBot: () => ({ config: mock.botConfig }),
 }));
 
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src/services/feedback-extension-config.js';
-import { handleFeedbackExtensionCard, sendFeedbackSurface, pendingFeedbackHookAuthorized } from '../src/services/feedback-extension-host.js';
+import { handleFeedbackExtensionCard, sendFeedbackSurface, pendingFeedbackHookAuthorized, tickFeedbackExtensions } from '../src/services/feedback-extension-host.js';
+import { createHash } from 'node:crypto';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackSurface, defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 
 const dispose: Array<() => void> = [];
-afterEach(() => { for (const close of dispose.splice(0)) close(); });
+afterEach(() => {
+  for (const close of dispose.splice(0)) close();
+  mock.botConfig = { feedback: { enabled: true, audience: 'everyone' } };
+});
 
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'feedback-host-'));
@@ -120,5 +127,19 @@ describe('feedback extension host callback', () => {
     expect(data.extensions.claim('hook', Date.now(), 10000)?.id).toBe(job.id);
     await handleFeedbackExtensionCard(data.callback(retry.action, retry), 'app', data.directory);
     expect(data.extensions.claim('hook', Date.now(), 10000)).toBeUndefined();
+  });
+  it('authorizes a hook click when the presentation rule lives in bot config, not only the extension file', async () => {
+    const data = await fixture();
+    mock.botConfig = { feedback: { enabled: true, audience: 'everyone' },
+      feedbackPresentation: { default: { enabled: true, rounds: [1], mode: 'separate', actionIds: ['help'] }, rules: [] } };
+    const current = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, current.version, { ...current, hooks: [{
+      ...current.hooks[0], version: 2, command: [process.execPath, '-e',
+        "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const i=JSON.parse(d);process.stdout.write(JSON.stringify({schemaVersion:1,executionId:i.executionId,outcome:'succeeded',publicMessage:'ok',receiptRefs:['file:x']}));});"],
+    }] }, 'test-admin');
+    await handleFeedbackExtensionCard(data.callback('feedback_custom_action', { action_id: 'help' }), 'app', data.directory);
+    await tickFeedbackExtensions(data.directory, 'app');
+    const jobId = createHash('sha256').update(JSON.stringify(['app', 'chat', 'question', 'help'])).digest('hex');
+    expect(data.extensions.job(jobId)).toMatchObject({ status: 'succeeded' });
   });
 });
