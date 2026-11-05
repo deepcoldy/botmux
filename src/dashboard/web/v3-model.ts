@@ -149,6 +149,19 @@ export function nodeBotLine(node: RunNodeView): string {
   return bot.cliId ? `${who} · ${bot.cliId}` : who;
 }
 
+/** §5.1: whether a bot run hands this node off in the main topic. */
+export function nodeInMainTopic(node: RunNodeView): boolean {
+  return node.handoff ? node.handoff.placement === 'main' : node.placement === 'main';
+}
+
+/** Graph box second row: the bot, plus「主话题」for a main-topic node (a
+ *  node topic is the default and is not marked). */
+export function nodeBoxBotLine(node: RunNodeView): string {
+  const line = nodeBotLine(node);
+  if (!line || !nodeInMainTopic(node)) return line;
+  return node.handoff?.queued ? `${line} · 主话题 · 排队中` : `${line} · 主话题`;
+}
+
 export const V3_DECISION_LABEL: Record<string, string> = {
   exit: '✓ 通过',
   continue: '↻ 继续返工',

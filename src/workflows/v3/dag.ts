@@ -279,6 +279,15 @@ export interface V3Node {
    *  node that never had the field, so existing DAGs and saved templates keep
    *  their bytes. */
   checkpoint?: true;
+  /** Top-level goal nodes only (design 2026-11-03 §5.1, D2): where a
+   *  bot-executed run hands this node off. `'main'` = in the run's main topic
+   *  (no node card, no topic of its own); absent = `'topic'`, a node topic.
+   *  Only `'main'` is kept — an authored `'topic'` serializes exactly as a
+   *  node that never had the field, so existing DAGs and saved templates keep
+   *  their bytes. Loop body nodes and host / loop nodes always use a node
+   *  topic (a body re-runs every round and can be revisited; host / loop
+   *  nodes are never handed to a bot). Ignored by runs on temporary workers. */
+  placement?: 'main';
 
   // ── host-only fields (type === 'host') ──
   /** Deterministic executor invoked by the host runtime (never an LLM). */
@@ -483,6 +492,9 @@ export function validateDag(raw: unknown): V3Dag {
       if (n.checkpoint !== undefined) {
         problems.push(`host node "${id}".checkpoint is not supported — only goal nodes can be checkpoints`);
       }
+      if (n.placement !== undefined) {
+        problems.push(`host node "${id}".placement is not supported — host nodes are executed by the main bot, never handed off`);
+      }
       if (n.resultSchema !== undefined) {
         problems.push(`host node "${id}".resultSchema is not supported — host output uses the trusted executor result contract`);
       }
@@ -575,6 +587,7 @@ export function validateDag(raw: unknown): V3Dag {
 
     const revisitTo = normRevisitTo(n.revisitTo, id, problems);
     const checkpoint = normCheckpoint(n.checkpoint, `goal node "${id}"`, problems);
+    const placement = normPlacement(n.placement, `goal node "${id}"`, problems);
     if (schemaVersion !== 2 && n.outputs !== undefined) {
       problems.push(`goal node "${id}".outputs requires schemaVersion 2`);
     }
@@ -597,6 +610,7 @@ export function validateDag(raw: unknown): V3Dag {
       resultSchema,
       ...(revisitTo ? { revisitTo } : {}),
       ...(checkpoint ? { checkpoint } : {}),
+      ...(placement ? { placement } : {}),
     });
   }
 
@@ -1073,6 +1087,14 @@ function normTimeoutSec(v: unknown, where: string, problems: string[]): number |
 /** Normalize `revisitTo`: an optional array of non-empty path-safe node ids.
  *  Shape only here; the ancestor / existence cross-checks run once all ids are
  *  collected (validateDag's cross-node pass). */
+/** `placement` is `'topic'` (the default, dropped) or `'main'` (§5.1). */
+function normPlacement(v: unknown, where: string, problems: string[]): 'main' | undefined {
+  if (v === undefined || v === 'topic') return undefined;
+  if (v === 'main') return 'main';
+  problems.push(`${where}.placement must be "topic" or "main"`);
+  return undefined;
+}
+
 /** `checkpoint` is an optional boolean; only `true` survives normalization. */
 function normCheckpoint(v: unknown, where: string, problems: string[]): true | undefined {
   if (v === undefined || v === false) return undefined;
@@ -1175,6 +1197,9 @@ function normLoopFields(
   if (n.checkpoint !== undefined) {
     problems.push(`${where}.checkpoint is not supported — mark a goal node outside the loop instead`);
   }
+  if (n.placement !== undefined) {
+    problems.push(`${where}.placement is not supported — a loop's body nodes always run in node topics`);
+  }
 
   let maxIterations: number | undefined;
   if (typeof n.maxIterations !== 'number' || !Number.isInteger(n.maxIterations) || n.maxIterations < 1) {
@@ -1226,6 +1251,11 @@ function normLoopFields(
     }
     if (b.checkpoint !== undefined) {
       problems.push(`${where}.body node "${bid}".checkpoint is not supported inside a loop body (first cut)`);
+    }
+    if (b.placement !== undefined) {
+      // A body re-runs every round (and may be revisited): its rounds belong
+      // in one node topic, never in the main topic (design §5.2).
+      problems.push(`${where}.body node "${bid}".placement is not supported — loop body nodes always run in node topics`);
     }
     // No whenSink: conditional edges are rejected inside a body (first cut).
     const bdepends = normDepends(b.depends, `${where}.body node "${bid}"`, problems);

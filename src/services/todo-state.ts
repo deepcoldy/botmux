@@ -250,7 +250,13 @@ function extractCreatedTaskId(content: unknown): string | null {
 //   · ino 变/被截断/首次→冷读全量；冷读遇 >32MiB 直接 fail-closed 返 null，
 //     绝不返旧 cache 冒充当前（否则越界前的旧 pending 会被永久当成当前状态）。
 const MAX_TODO_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
-const TODO_CACHE_MAX_ENTRIES = 512;
+// 必须盖住一个 daemon 的全部会话：/api/sessions 每次按顺序把所有 runtime 会话扫一遍，
+// 条目数一旦小于会话数，按插入序淘汰就会在每一轮把下一轮要用的条目先挤掉——每次请求
+// 都退化成全量冷读。实测 1200 个 Claude 会话、上限 512 时一次请求冷读约 760 份共 2.2GB
+// 的 transcript，主线程阻塞约 7s；外部每 10s 轮询一次就让 daemon 七成时间卡死，连带取凭据
+// 等所有网络请求超时。一个条目只存游标和折叠后的任务态（无 todo 的会话几乎为空），
+// 4096 条的内存可以忽略。
+const TODO_CACHE_MAX_ENTRIES = 4096;
 
 interface TodoCacheEntry {
   dev: number;

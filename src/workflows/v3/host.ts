@@ -72,6 +72,7 @@ import {
   checkV3Assignees,
   formatV3Gate2BotPlan,
   parseV3AssignmentReasons,
+  parseV3PlacementReasons,
   projectV3Gate2BotPlan,
   planV3SketchAssignees,
   v3AssigneeProblems,
@@ -79,15 +80,18 @@ import {
   type V3ArchitectBotAssignment,
   type V3BotRoster,
 } from './bot-assignment.js';
-import type { V3Dag } from './dag.js';
+import { isGoalNode, type V3Dag } from './dag.js';
+import { v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
 import {
   checkV3BotExecutorEligibility,
   decideV3NodeExecutor,
   describeV3EphemeralFallback,
   describeV3NodeWorkingDir,
   formatV3BotEligibilityRefusal,
+  formatV3PlacementRefusal,
   resolveV3HandoffIdentity,
   v3BotExecutorTargets,
+  v3TargetPlacementProblems,
   type V3BotEligibilityProbe,
   type V3HandoffIdentityPolicy,
   type V3BotEligibilityProblem,
@@ -457,9 +461,20 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
         throw new DagValidationError(['architect dag.json must use schemaVersion 2']);
       }
       if (deps.botAssignment) {
+        const mainApp = deps.botAssignment.roster.mainLarkAppId;
         const problems = [
           ...v3RosterSelectorProblems(dag as V3Dag, deps.botAssignment.roster),
           ...v3AssigneeProblems(dag as V3Dag, deps.botAssignment),
+          // §5.2 hard rules: sent back to the Architect to re-place.
+          ...v3PlacementProblems({
+            dag: dag as V3Dag,
+            mainLarkAppId: mainApp,
+            executorOf: (nodeId) => {
+              const node = (dag as V3Dag).nodes.find((candidate) => candidate.id === nodeId);
+              return (node && isGoalNode(node) ? node.bot : undefined) ?? mainApp;
+            },
+            mainTopic: deps.botAssignment.mainTopic ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+          }).map((problem) => problem.message),
         ];
         if (problems.length > 0) throw new DagValidationError(problems);
       }
@@ -658,13 +673,18 @@ export interface AdHocNodeExecutorPlanInput {
   workingDirOverride?: string;
   /** Live §6.1 probe for the run's chat; only built for a `bot` decision. */
   probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
+  /** §5.2 rule 3, read only when some node is placed in the main topic
+   *  (absent = unknown: such a dag is refused). */
+  mainTopic?: (binding: RunChatBinding) => V3MainTopicAvailability;
 }
 
 export type AdHocNodeExecutorPlan =
   | { kind: 'ephemeral'; decision: Extract<V3NodeExecutorDecision, { mode: 'ephemeral' }> }
   /** `workingDir`: the absolute Gate-2 directory, when one was asked for. */
   | { kind: 'bot'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; workingDir?: string }
-  | { kind: 'refused'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; problems: V3BotEligibilityProblem[]; workingDir?: string };
+  | { kind: 'refused'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; problems: V3BotEligibilityProblem[]; workingDir?: string }
+  /** The placements break a §5.2 hard rule (messages name the rule). */
+  | { kind: 'placementRefused'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; problems: string[] };
 
 /**
  * Gate-2 executor decision for a not-yet-authorized ad-hoc run (design §6.3):
@@ -706,6 +726,14 @@ export async function planAdHocNodeExecutor(
     workingDirOverride: workingDir,
   });
   const targets = v3BotExecutorTargets(dag, snapshots);
+  if (targets.some((target) => target.placement === 'main')) {
+    const placement = v3TargetPlacementProblems({
+      targets,
+      orchestratorAppId: binding.larkAppId,
+      mainTopic: input.mainTopic?.(binding) ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+    });
+    if (placement.length > 0) return { kind: 'placementRefused', binding, targets, problems: placement };
+  }
   const withDir = workingDir !== undefined ? { workingDir } : {};
   if (workingDir !== undefined) {
     const dirProblems = v3WorkingDirProblems(targets, bots, workingDir);
@@ -760,6 +788,8 @@ export async function planArchitectBotAssignment(
     nameOf: (larkAppId: string) => string;
     /** Capability labels; only built for a bot run. */
     roleOf?: () => ((larkAppId: string) => string | undefined) | Promise<(larkAppId: string) => string | undefined>;
+    /** §5.2 rule 3: whether nodes may be placed in the main topic. */
+    mainTopic?: (binding: RunChatBinding) => V3MainTopicAvailability;
   },
 ): Promise<V3ArchitectBotAssignment | undefined> {
   const cur = mustRead(runDir);
@@ -778,7 +808,11 @@ export async function planArchitectBotAssignment(
     ...(input.roleOf ? { roleOf: await input.roleOf() } : {}),
   });
   const spec = validateSpec(JSON.parse(readFileSync(cur.specJsonPath, 'utf-8')) as unknown);
-  return { roster, assignees: planV3SketchAssignees(spec, roster, bots, input.nameOf) };
+  return {
+    roster,
+    assignees: planV3SketchAssignees(spec, roster, bots, input.nameOf),
+    mainTopic: input.mainTopic?.(binding) ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+  };
 }
 
 /**
@@ -809,8 +843,13 @@ function adHocBotPlanInput(
 ): Parameters<typeof formatV3Gate2BotPlan>[0] {
   const cur = readGrillState(runDir);
   let reasons = new Map<string, { bot: string; reason: string }>();
+  let placementReasons = new Map<string, { placement: string; reason: string }>();
   try {
-    if (cur?.notesPath) reasons = parseV3AssignmentReasons(readFileSync(cur.notesPath, 'utf-8'));
+    if (cur?.notesPath) {
+      const notes = readFileSync(cur.notesPath, 'utf-8');
+      reasons = parseV3AssignmentReasons(notes);
+      placementReasons = parseV3PlacementReasons(notes);
+    }
   } catch { /* no reasons */ }
   let assignees: ReturnType<typeof checkV3Assignees> = [];
   try {
@@ -827,6 +866,7 @@ function adHocBotPlanInput(
     cliOf: (appId) => bots.find((bot) => bot.larkAppId === appId)?.cliId,
     reasons,
     assignees,
+    placementReasons,
   };
 }
 
@@ -1008,6 +1048,8 @@ export interface WorkflowHostCommandDeps {
   resolveCurrentTurnConfirmer?: () => string | undefined;
   /** Capability labels for the Architect roster (default: bot profiles). */
   botRole?: () => (larkAppId: string) => string | undefined;
+  /** §5.2 rule 3 (default: the run's persisted main session). */
+  mainTopicAvailability?: (binding: RunChatBinding) => V3MainTopicAvailability | Promise<V3MainTopicAvailability>;
   /** Test seam for the architect worker (default: the real ephemeral pool). */
   runArchitect?: ArchitectDeps['runArchitect'];
 }
@@ -1047,6 +1089,28 @@ const PREVIEW_PROBE: V3BotEligibilityProbe = {
   opensTopicSessions: async () => 'yes',
   ensureGrant: async () => {},
 };
+
+async function liveMainTopicAvailability(binding: RunChatBinding): Promise<V3MainTopicAvailability> {
+  const { liveV3MainTopicAvailability } = await import('../../im/lark/v3-bot-eligibility.js');
+  return liveV3MainTopicAvailability(binding);
+}
+
+/** §5.2 rule 3 for the run in `runDir`, resolved once per command (only a
+ *  bot run with a chat binding reads the main session). */
+async function resolveMainTopic(
+  runDir: string,
+  deps: WorkflowHostCommandDeps,
+): Promise<((binding: RunChatBinding) => V3MainTopicAvailability) | undefined> {
+  const binding = readGrillState(runDir)?.chatBinding;
+  if (!binding) return undefined;
+  let availability: V3MainTopicAvailability;
+  try {
+    availability = await (deps.mainTopicAvailability ?? liveMainTopicAvailability)(binding);
+  } catch (err) {
+    availability = { available: false, why: `读不到主会话（${err instanceof Error ? err.message : String(err)}）` };
+  }
+  return () => availability;
+}
 
 async function liveBotDisplayName(): Promise<(larkAppId: string) => string> {
   const { v3BotDisplayNameResolver } = await import('../../im/lark/v3-bot-eligibility.js');
@@ -1143,6 +1207,7 @@ export async function cmdWorkflowHost(
       // a single probe.
       let botAssignment: V3ArchitectBotAssignment | undefined;
       let nameOf: ((larkAppId: string) => string) | undefined;
+      const mainTopic = switchMode === 'bot' ? await resolveMainTopic(runDir, deps) : undefined;
       if (switchMode === 'bot') {
         nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
         try {
@@ -1152,6 +1217,7 @@ export async function cmdWorkflowHost(
             probe: (binding) => (deps.botEligibilityProbe ?? liveBotEligibilityProbe)(binding, bots),
             nameOf,
             roleOf: deps.botRole ?? liveBotRole,
+            ...(mainTopic ? { mainTopic } : {}),
           });
         } catch (err) {
           // Without a roster every node stays on the main bot (the default
@@ -1165,6 +1231,7 @@ export async function cmdWorkflowHost(
                 excluded: [],
               },
               assignees: [],
+              ...(mainTopic ? { mainTopic: mainTopic(binding) } : {}),
             };
           }
           console.error(`（没能取到群里可用的 Bot 名单，本次节点都交给主 Bot：${err instanceof Error ? err.message : String(err)}）`);
@@ -1195,10 +1262,13 @@ export async function cmdWorkflowHost(
             multiTopicEnabled: multiTopicEnabled(),
             workingDirOverride: argValue(rest, '--working-dir'),
             probe: () => PREVIEW_PROBE,
+            ...(mainTopic ? { mainTopic } : {}),
           });
           if (preview.kind === 'ephemeral') {
             const fallback = describeV3EphemeralFallback(preview.decision);
             if (fallback) console.log(`\n${fallback}`);
+          } else if (preview.kind === 'placementRefused') {
+            console.log(`\n${formatV3PlacementRefusal(preview.problems)}`);
           } else {
             console.log(`\n${describeAdHocBotPlan(runDir, preview.targets, preview.binding.larkAppId, bots, nameOf!, botAssignment?.roster)}`);
             console.log('（批准时会再检查每个执行 Bot 是否在本群、daemon 是否在线）');
@@ -1236,12 +1306,16 @@ export async function cmdWorkflowHost(
       if (before.kind === 'missing') {
         const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
         if (switchMode === 'bot') {
+          const mainTopic = await resolveMainTopic(runDir, deps);
           const plan = await planAdHocNodeExecutor(runDir, bots, {
             switchMode,
             multiTopicEnabled: (deps.multiTopicEnabled ?? (() => isMultiTopicOrchestrationEnabled()))(),
             workingDirOverride,
             probe: (binding) => (deps.botEligibilityProbe ?? liveBotEligibilityProbe)(binding, bots),
+            ...(mainTopic ? { mainTopic } : {}),
           });
+          // §5.2: a hard-rule violation refuses the approval, naming the rule.
+          if (plan.kind === 'placementRefused') throw new HostGuardError(formatV3PlacementRefusal(plan.problems));
           if (plan.kind === 'ephemeral') {
             const fallback = describeV3EphemeralFallback(plan.decision);
             if (fallback) summary.push(fallback);

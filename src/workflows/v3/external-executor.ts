@@ -35,6 +35,10 @@ export const V3_EXTERNAL_ERROR_CODES = {
   /** The executing bot's daemon would not start the node session in the
    *  run's Gate-2 working dir: not inside its configured range (design §15.4). */
   WORKING_DIR_REFUSED: 'WORKING_DIR_REFUSED',
+  /** Main-topic placement (design §5.5): the executing bot's session in the
+   *  main topic is executing another workflow node right now (another run in
+   *  the same topic); one session cannot carry two nodes at once. */
+  MAIN_TOPIC_BUSY: 'MAIN_TOPIC_BUSY',
   NODE_TIMEOUT: 'NODE_TIMEOUT',
   /** The main bot (or the initiator) handed the node to a human (§13.6). */
   HANDED_TO_HUMAN: 'HANDED_TO_HUMAN',
@@ -67,6 +71,20 @@ export const V3_HANDOFF_IDEMPOTENCY_WINDOW_MS = 50 * 60 * 1000;
  *  call that does not settle in time is treated as an unknown outcome, so a
  *  hung transport can never freeze the run or its cancellation. */
 export const V3_EXTERNAL_CALL_TIMEOUT_MS = 30_000;
+
+/**
+ * Main-topic placement (§5.5): a handoff accepted into the target session's
+ * queue has not started; until it does, its backstop deadline is acceptance
+ * + the node timeout + this grace — the turn ahead of it may itself be long
+ * (coding CLIs' turns of tens of minutes are ordinary). The grace is the
+ * node's own timeout, at least an hour: it scales with the node, and a short
+ * node does not time out behind one ordinary long turn.
+ */
+export const V3_MAIN_TOPIC_QUEUE_GRACE_MIN_MS = 60 * 60 * 1000;
+
+export function v3MainTopicQueueGraceMs(nodeTimeoutMs: number): number {
+  return Math.max(nodeTimeoutMs, V3_MAIN_TOPIC_QUEUE_GRACE_MIN_MS);
+}
 
 /** Default acceptance window (mirrors `botmux dispatch`). */
 export const V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS = 15_000;

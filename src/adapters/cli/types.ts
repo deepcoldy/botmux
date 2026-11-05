@@ -996,6 +996,16 @@ export interface CliAdapter {
    *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
   sandboxReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
 
+  /** Single FILES (never directories) the CLI must be able to open read-write
+   *  inside the oncall file sandbox even though their parent dir stays hidden
+   *  or read-only — e.g. TRAE's `<TRAE_HOME>/installation_id`, which the
+   *  embedded app server opens O_RDWR|O_CREAT on every cold start and aborts
+   *  on EROFS. Bound readWrite like `authPaths`, but the worker pre-creates a
+   *  missing one as an EMPTY regular file (authPaths' pre-create would mkdir a
+   *  directory in its place) and binds only regular files. Not consulted when
+   *  the sandbox is off or in scratch mode. Missing/empty → nothing extra. */
+  sandboxWritableFiles?(env?: NodeJS.ProcessEnv): readonly string[];
+
   /** Credential files a trusted service CLI must read inside the sandbox.
    *  This is deliberately separate from ordinary readonlyRoots so adapters
    *  cannot expose secrets accidentally. The worker validates exact regular

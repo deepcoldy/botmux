@@ -28,6 +28,8 @@ import {
 import { foldV3NodeInterventions } from './interventions.js';
 import { v3CheckpointMarkedSince, v3CheckpointSuccesses } from './checkpoint-hold.js';
 import { loadDag } from './dag-loader.js';
+import { foldV3ExternalAttempts } from './external-attempt-ledger.js';
+import { attemptNumber } from './attempt-numbering.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
  *  caller-supplied runId, so it can't escape runsDir via traversal. */
@@ -148,6 +150,13 @@ export interface RunNodeView {
   checkpoint?: 'holding' | 'reviewed' | 'notReviewed';
   /** Checkpoint nodes this not-yet-started node waits behind. */
   waitingOnCheckpoint?: string[];
+  /** Design §5.1: set only for a top-level goal node of the effective flow
+   *  placed in the main topic (absent = a node topic, or not a goal node). */
+  placement?: 'main';
+  /** Bot-executed runs (§5.5): the node's latest handoff — where it went, when,
+   *  and for the main topic the handoff card's title to find it there by (no
+   *  stable AppLink to a single message exists). Absent before a handoff. */
+  handoff?: { placement: 'topic' | 'main'; at?: number; title?: string; queued?: true };
 }
 
 export interface RunNodeInterventionView {
@@ -243,6 +252,8 @@ interface DagNodeLite {
   executor?: string;
   /** Authored bot selector (goal / loop nodes). */
   bot?: string;
+  /** Goal nodes placed in the main topic (§5.1). */
+  placement?: 'main';
   maxIterations?: number;
   /** Loop nodes only: body template — body-INTERNAL depends + goal per body
    *  node id.  Used to give body instances their real intra-round edges (the
@@ -277,7 +288,7 @@ function readDagNodesFrom(p: string, expectedSha256?: string): DagNodeLite[] {
     return dag.nodes.map((raw): DagNodeLite => {
       const n = raw as {
         id?: unknown; depends?: unknown; goal?: unknown; type?: unknown; maxIterations?: unknown;
-        body?: unknown; bot?: unknown; executor?: unknown;
+        body?: unknown; bot?: unknown; executor?: unknown; placement?: unknown;
       };
       let body: DagNodeLite['body'];
       const bodyNodes = (n.body as { nodes?: unknown } | undefined)?.nodes;
@@ -304,6 +315,7 @@ function readDagNodesFrom(p: string, expectedSha256?: string): DagNodeLite[] {
         isLoop: n.type === 'loop' || undefined,
         executor: n.type === 'host' && typeof n.executor === 'string' ? n.executor : undefined,
         bot: typeof n.bot === 'string' ? n.bot : undefined,
+        ...(n.type === 'goal' && n.placement === 'main' ? { placement: 'main' as const } : {}),
         maxIterations: typeof n.maxIterations === 'number' ? n.maxIterations : undefined,
         body,
       };
@@ -376,6 +388,7 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
   const revisions = projectRevisions(runDir, events, approvedNodes, botSnapshots);
   const interventions = foldV3NodeInterventions(events, readInitiatorOpenId(runDir));
   const checkpoints = projectCheckpoints(runDir, events);
+  const handoffs = projectHandoffs(runDir, events);
   const dagNodes = revisions?.effectiveNodes ?? approvedNodes;
 
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
@@ -635,6 +648,9 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     if (checkpoint) view.checkpoint = checkpoint;
     const waitingOn = checkpoints?.waiting.get(id);
     if (waitingOn?.length && status === 'pending') view.waitingOnCheckpoint = waitingOn;
+    if (authored?.placement === 'main' && !inst) view.placement = 'main';
+    const handoff = handoffs?.get(id);
+    if (handoff) view.handoff = handoff;
     return view;
   });
 
@@ -655,6 +671,50 @@ interface ProjectedRevisions {
   pendingNodes?: DagNodeLite[];
   marks: Map<string, 'added' | 'changed'>;
   pendingChanges: Map<string, 'add' | 'remove' | 'change'>;
+}
+
+/** The latest handoff of every node of a bot-executed run (§5.5; display
+ *  only; degrades to none). Keyed like RunView nodes (dispatch nodeId). */
+function projectHandoffs(
+  runDir: string,
+  events: ReturnType<typeof readJournal>,
+): Map<string, NonNullable<RunNodeView['handoff']>> | undefined {
+  if (!events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot')) return undefined;
+  let attempts: ReturnType<typeof foldV3ExternalAttempts>;
+  try {
+    attempts = foldV3ExternalAttempts(events);
+  } catch {
+    return undefined;
+  }
+  let runTitle: string | undefined;
+  const out = new Map<string, NonNullable<RunNodeView['handoff']>>();
+  for (const attempt of attempts.values()) {
+    if (attempt.phase === 'dispatched' || !attempt.placement) continue;
+    const placement = attempt.placement === 'main' ? 'main' : 'topic';
+    let title: string | undefined;
+    if (placement === 'main' && attempt.handoffMessageId) {
+      runTitle ??= readRunTitle(runDir);
+      // The handoff card's own title (v3-node-card buildV3HandoffCard).
+      title = `【工作流任务】${runTitle} · ${attempt.nodeId}（第 ${attemptNumber(attempt.attemptId) ?? 1} 次）`;
+    }
+    out.set(attempt.nodeId, {
+      placement,
+      ...(attempt.sentAt !== undefined ? { at: attempt.sentAt } : {}),
+      ...(title ? { title } : {}),
+      // Accepted into a busy main-topic session's queue, not started (§5.5).
+      ...(attempt.startPending && !attempt.closed ? { queued: true as const } : {}),
+    });
+  }
+  return out;
+}
+
+/** spec.json `title`, else the run id (as the handoff cards name the run). */
+function readRunTitle(runDir: string): string {
+  try {
+    const spec = JSON.parse(readFileSync(join(runDir, 'spec.json'), 'utf-8')) as { title?: unknown };
+    if (typeof spec.title === 'string' && spec.title.trim()) return spec.title.trim();
+  } catch { /* fall through */ }
+  return runDir.split(sep).pop() ?? '';
 }
 
 /** Checkpoint holds of a bot-executed run (display only; degrades to none). */

@@ -219,6 +219,7 @@ const REJECTION_TEXT: Record<Extract<V3ReassignOutcome, { kind: 'rejected' }>['r
   'revise-workflow-required': '产物契约与 Workflow 定义不一致，改派也无法完成；请修订并发布新版本',
   'not-bot-run': '这个 run 的节点不是交给群里的 Bot 执行的，不能改派',
   'revision-pending': '这个节点有待确认的流程修改，请先处理修改确认卡',
+  'placement-conflict': '改派后会违反主话题落点的硬规则（同一个 Bot 在主话题里的两个节点可能同时运行）；换一个 Bot，或先用 workflow edit 把节点改成节点话题',
 };
 
 type V3ClickState =
