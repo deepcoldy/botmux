@@ -1250,6 +1250,8 @@ interface ResolvedDashboardSettings {
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
   cardBrandLabel: boolean;
+  /** Turn initiator may press the safe keys on stuck cards. Default ON. */
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1923,6 +1925,8 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     // default ON — machine-wide footer brand signature switch; only an explicit
     // stored false suppresses brand rendering for every bot (matches bot-registry).
     cardBrandLabel: dashboard.cardBrandLabel !== false,
+    // default ON — only an explicit stored false disables (matches config.ts getter)
+    stuckCardInitiatorKeys: dashboard.stuckCardInitiatorKeys !== false,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,

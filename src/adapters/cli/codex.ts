@@ -265,6 +265,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'codex',
     bridgeSpec: codexBridgeSpec,
+    // codex_core renders the hook-review flow classifyStuckPage recognises.
+    stuckPageFamily: 'codex-family',
     mcpGateway: {
       get configPath(): string { return join(codexHome(), 'config.toml'); },
       format: 'codex-toml',
