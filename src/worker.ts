@@ -365,6 +365,7 @@ import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERRO
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
+import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexModelLaunchObservation } from './services/codex-model-selection.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { traexRejectedArgument } from './adapters/cli/traex-version.js';
@@ -26206,30 +26207,51 @@ async function spawnCli(
         log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
       }
     }
-    backend.spawn(spawnBin, spawnArgs, {
-      cwd: spawnCwd,
-      cols: PTY_COLS,
-      rows: PTY_ROWS,
-      env: childEnv as Record<string, string>,
-      injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
-      gitConfigPairs,
-      // Already removed from childEnv; shell-wrapped backends also `env -u`
-      // them after the pane's rcfile / terminal-server env (session env overlay).
-      unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
-      launchShell: lastInitConfig?.launchShell,
-      // tmux reads the pane's launch argv from a private file here instead of
-      // its ~16 KB command line (pane-launch.ts).
-      paneLaunchDir: paneLaunchDir(config.session.dataDir, cfg.sessionId),
-      strictEnv: cfg.envPolicy?.mode === 'strict',
-      strictEnvReattach: willReattachPersistent,
-      remoteResumeMode: cfg.remoteResumeMode,
-      // spawnBin may now be a launch wrapper (session scope / wrapperCli /
-      // credential sandbox); the Herdr facade still needs the real CLI name.
-      cliBin: cliAdapter.resolvedBin,
-      cliId: cfg.cliId,
-      model: cfg.model,
-      modelBackendVariant: cfg.modelBackendVariant,
-      reasoningEffort: cfg.reasoningEffort,
+    let nativeModelLaunch: CodexModelLaunchObservation | undefined;
+    if (cfg.cliId === 'codex' && !cfg.adoptMode && !cfg.existingAppServerEndpoint
+      && !willReattachPersistent && ['pty', 'tmux'].includes(effectiveBackendType)) {
+      nativeModelLaunch = { model: cfg.model ?? null, startedAtMs: Date.now(), nativeSessionId: cfg.cliSessionId };
+      if (cfg.cliSessionId) {
+        try {
+          const path = findCodexRolloutBySessionId(cfg.cliSessionId, { codexHome: childEnv.CODEX_HOME });
+          if (path) nativeModelLaunch.settingsCursor = readCodexModelSettingsCursor(path)?.cursor;
+        } catch { /* The timestamp boundary remains usable when no rollout is readable yet. */ }
+      }
+    }
+    const spawnBackend = backend;
+    const spawnCliBin = cliAdapter.resolvedBin;
+    spawnWithCodexModelLaunch({
+      dataDir: config.session.dataDir, sessionId: cfg.sessionId, launch: nativeModelLaunch,
+      reattached: () => 'isReattach' in spawnBackend && spawnBackend.isReattach === true,
+      publish: send,
+      spawn: () => {
+        const backend = spawnBackend;
+        backend.spawn(spawnBin, spawnArgs, {
+          cwd: spawnCwd,
+          cols: PTY_COLS,
+          rows: PTY_ROWS,
+          env: childEnv as Record<string, string>,
+          injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+          gitConfigPairs,
+          // Already removed from childEnv; shell-wrapped backends also `env -u`
+          // them after the pane's rcfile / terminal-server env (session env overlay).
+          unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
+          launchShell: lastInitConfig?.launchShell,
+          // tmux reads the pane's launch argv from a private file here instead of
+          // its ~16 KB command line (pane-launch.ts).
+          paneLaunchDir: paneLaunchDir(config.session.dataDir, cfg.sessionId),
+          strictEnv: cfg.envPolicy?.mode === 'strict',
+          strictEnvReattach: willReattachPersistent,
+          remoteResumeMode: cfg.remoteResumeMode,
+          // spawnBin may now be a launch wrapper (session scope / wrapperCli /
+          // credential sandbox); the Herdr facade still needs the real CLI name.
+          cliBin: spawnCliBin,
+          cliId: cfg.cliId,
+          model: cfg.model,
+          modelBackendVariant: cfg.modelBackendVariant,
+          reasoningEffort: cfg.reasoningEffort,
+        });
+      },
     });
     if (!willReattachPersistent) {
       writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
