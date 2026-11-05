@@ -695,11 +695,19 @@ describe('淘汰与 retentionGap', () => {
   });
 
   it('upsert 会按阈值自动触发淘汰（默认 10000 条/群），写入方不必手动 prune', () => {
-    for (let i = 1; i <= 30; i++) upsertGroupContextMessage(APP, msg({ messageId: `om_${i}`, createTime: 1000 + i }), { maxRows: 20 });
+    // 时间全部落在 maxAgeMs 窗口内并注入 now，确保只有条数分支参与淘汰
+    const now = 10_000_000_000;
+    for (let i = 1; i <= 30; i++) {
+      upsertGroupContextMessage(APP, msg({ messageId: `om_${i}`, createTime: now - i * 1000 }), { maxRows: 20, now });
+    }
     const h = getGroupContextHead(APP, CHAT);
-    expect(h.count).toBeLessThanOrEqual(20);
-    expect(h.prunedCount).toBeGreaterThan(0);
-    expect(listGroupContextMessages(APP, CHAT).retentionGap).toBeDefined();
+    expect(h.count).toBe(20);
+    expect(h.prunedCount).toBe(10);
+    const list = listGroupContextMessages(APP, CHAT);
+    expect(list.messages.map(m => m.messageId).sort()).toEqual(
+      Array.from({ length: 20 }, (_, i) => `om_${i + 1}`).sort(),
+    );
+    expect(list.retentionGap).toBeDefined();
   });
 
   it('淘汰按 chat 隔离：另一个群不受影响', () => {

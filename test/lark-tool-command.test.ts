@@ -25,6 +25,91 @@ describe('lark-cli argv metadata', () => {
     }
   });
 
+  it.each([
+    ['--signature-id', 'mail +signature'],
+    ['--writes', '{sheet_name|sheet_id, range, cells}'],
+    ['--border-styles', '{ top|bottom|left|right }'],
+    ['--properties', '+cond-format-create --properties'],
+    ['--sort-keys', '[{"column":"<col letter>","order":"asc"}]'],
+    // A compact JSON-array placeholder without spaces used to look like the
+    // old no-value "[mnemonic]" form.
+    ['--values', '[["alice",95]]'],
+  ])('reads %s when its help type contains spaces', (flag, type) => {
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch'
+        ? help.replace('      --dry-run', `      ${flag} ${type}   Value with a structured type\n      --dry-run`)
+        : help;
+    };
+    const args = ['docs', '+fetch', flag, 'structured-value', '--as=user', '--dry-run'];
+    const invocation = parseLarkToolInvocation(args, binding, readHelp);
+    expect(invocation.mode).toBe('user');
+    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', flag, 'structured-value', '--dry-run', '--as', 'user']);
+  });
+
+  it('keeps a bracketed mnemonic placeholder an optional value (bare flag, =value only)', () => {
+    // lark-cli renders pflag NoOptDefVal flags (e.g. sheets +csv-get
+    // --include-row-prefix [row=N]) like this: the bare flag is accepted and
+    // the value is only passed with --flag=value, so the parser must not eat
+    // the following argv token.
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch'
+        ? help.replace('      --dry-run', '      --include-row-prefix [row=N]   Whether to prefix rows (default true)\n      --dry-run')
+        : help;
+    };
+    const bare = parseLarkToolInvocation(['docs', '+fetch', '--include-row-prefix'], binding, readHelp);
+    expect(larkToolExecutionArgs(bare)).toEqual(['docs', '+fetch', '--include-row-prefix', '--as', 'bot']);
+    const trailing = parseLarkToolInvocation(
+      ['docs', '+fetch', '--include-row-prefix', '--as=user', '--dry-run'], binding, readHelp,
+    );
+    expect(trailing.mode).toBe('user');
+    expect(larkToolExecutionArgs(trailing)).toEqual(['docs', '+fetch', '--include-row-prefix', '--dry-run', '--as', 'user']);
+    const inline = parseLarkToolInvocation(
+      ['docs', '+fetch', '--include-row-prefix=false', '--dry-run'], binding, readHelp,
+    );
+    expect(larkToolExecutionArgs(inline)).toEqual(['docs', '+fetch', '--include-row-prefix=false', '--dry-run', '--as', 'bot']);
+  });
+
+  it('distinguishes a required compact JSON-array placeholder from an optional mnemonic one', () => {
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch'
+        ? help.replace('      --dry-run', '      --values [["alice",95]]   Initial data as a 2D JSON array\n      --dry-run')
+        : help;
+    };
+    // Required value: omitting it fails before the command is executed.
+    expect(() => parseLarkToolInvocation(['docs', '+fetch', '--values'], binding, readHelp)).toThrow('requires a value');
+    // With the value supplied, parsing and identity insertion stay intact.
+    expect(larkToolExecutionArgs(parseLarkToolInvocation(
+      ['docs', '+fetch', '--values', '[["alice",95]]', '--dry-run'], binding, readHelp,
+    ))).toEqual(['docs', '+fetch', '--values', '[["alice",95]]', '--dry-run', '--as', 'bot']);
+  });
+
+  it.each([
+    // Every branch of the JSON-array probe gets its own case, including the
+    // quoteless-array and false-first forms that no other case covers.
+    ['--strs', '["A1:B2", "C2:D10"]'],
+    ['--quoted', "['a', 'b']"],
+    ['--nums', '[1, 2, 3]'],
+    ['--neg', '[-1.5, 0]'],
+    ['--bools', '[true, false]'],
+    ['--false-first', '[false, true]'],
+    ['--nulls', '[null]'],
+    ['--objs', '[{"k": "v"}]'],
+  ])('treats a %s JSON-array example as a required value', (flag, type) => {
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch'
+        ? help.replace('      --dry-run', `      ${flag} ${type}   JSON array value\n      --dry-run`)
+        : help;
+    };
+    expect(() => parseLarkToolInvocation(['docs', '+fetch', flag], binding, readHelp)).toThrow('requires a value');
+    expect(larkToolExecutionArgs(parseLarkToolInvocation(
+      ['docs', '+fetch', flag, type, '--dry-run'], binding, readHelp,
+    ))).toEqual(['docs', '+fetch', flag, type, '--dry-run', '--as', 'bot']);
+  });
+
   it('resolves a lone subcommand listed with Cobra single-space padding', () => {
     const readHelp = (cmd: readonly string[]) => {
       const key = cmd.join(' ');
