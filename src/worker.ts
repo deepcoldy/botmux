@@ -87,7 +87,7 @@ import { skillStoreDir } from './core/skills/registry-paths.js';
 import { pluginsHome } from './core/plugins/paths.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
-import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
+import { finalizeRawCommandDelivery, typeRawCommandLine, writeRawCommandLine } from './core/raw-command-writer.js';
 import {
   decodeTerminalWriteFrameSource,
   terminalWriteFrame,
@@ -184,6 +184,7 @@ import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogS
 import { CodexModelMigrationDialogGuard, codexModelMigrationSafeKeys, isCodexModelMigrationScreen } from './utils/codex-model-migration-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { applyCodexEffortMenu, hasEmptyCodexComposer, parseCodexEffortMenu } from './utils/codex-effort-menu.js';
+import { detectCodexChoiceModal } from './utils/codex-choice-modal.js';
 import { sandboxBoolValue, resolveSpawnNetworkShape } from './adapters/cli/sandbox-mode.js';
 import {
   ClaudeBtwCaptureGuard,
@@ -3859,7 +3860,11 @@ const STARTUP_CMD_CAP_MS = 4_000;
  *  registers the match before submit) → a separate Enter, or fall back to a
  *  single write + CR. Shared by the `raw_input` IPC handler and
  *  runStartupCommands so both stay in lockstep. */
-async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
+async function sendRawCommandLine(
+  be: NonNullable<typeof backend>,
+  content: string,
+  opts: { submit?: boolean } = {},
+): Promise<void> {
   // Long-lived framed runners (minimax, …) must receive even raw passthrough
   // lines through their frame protocol's full submit transaction. The generic
   // literal writer has no pre-flush/chunk-retry/ambiguity semantics: a dropped
@@ -3894,15 +3899,115 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   // recovery-fence transaction detects a failed submission by a thrown error, so
   // bridge the two: turn an explicit `false` into the same throw the inline
   // implementation used, letting runAmbiguousSubmissionTransaction cancel the WAL.
-  const accepted = await writeRawCommandLine(
-    be,
-    content,
-    rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
-  );
+  const writeOptions = rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId);
+  // `submit: false` types the line and leaves it in the composer; the caller
+  // presses Enter itself. Used by the Codex effort controller, whose Enter must
+  // come after a screen re-check (see typeRawCommandLine).
+  const accepted = opts.submit === false
+    ? await typeRawCommandLine(be, content, writeOptions)
+    : await writeRawCommandLine(be, content, writeOptions);
   if (accepted === false) {
     throw new Error('backend rejected command text or submit key input');
   }
 }
+
+/**
+ * Structural "no Codex selection surface owns Enter right now" check.
+ *
+ * The controller calls this as its pre-Enter gate, so the PTY and tmux backends
+ * cannot drift.
+ *
+ * Order matters and is the whole guard: drain the renderer FIRST (the existing
+ * `settleCodexModelMigrationRenderer` primitive — flush an empty write, wait for
+ * the screen revision to stop moving), re-validate the CLI generation, and only
+ * then read the viewport. Without the drain we could inspect a frame painted
+ * before the popup appeared.
+ *
+ * Fail-closed by construction: a generation change, a throwing capture, a blank
+ * screen, or no screen source all return false. "No evidence" is never "clear".
+ */
+async function codexChoiceSurfaceClear(target: SessionBackend, current: () => boolean): Promise<boolean> {
+  if (!current()) return false;
+  if (!await settleCodexModelMigrationRenderer()) return false;
+  if (!current()) return false;
+  let screen: string | undefined;
+  try {
+    screen = isObserveBackend(target)
+      ? (await snapshotToText(target, renderCols, renderRows, { filter: false }))?.content
+      : renderer?.rawSnapshot();
+  } catch { return false; }
+  if (!screen || !stripAnsiScreenText(screen).trim()) return false;
+  const modal = detectCodexChoiceModal(screen);
+  if (!modal) return true;
+  log(`Codex CLI effort submit withheld: ${modal.kind} owns the keyboard (composer behind: ${modal.composerBehind})`);
+  return false;
+}
+
+/**
+ * Type the `/model` command for the effort controller WITHOUT submitting it.
+ *
+ * Split out (rather than passing a flag at the call site) so the "this path must
+ * never press Enter" property is a named, testable unit: the controller presses
+ * Enter itself only after its pre-submit screen re-check.
+ */
+async function typeCodexEffortModelCommand(be: NonNullable<typeof backend>): Promise<void> {
+  await sendRawCommandLine(be, '/model', { submit: false });
+}
+
+/**
+ * Remove the `/model` text that `typeCodexEffortModelCommand` typed, after a
+ * refused submit guard.
+ *
+ * Why: the controller types the line first and only then asks the guard, so a
+ * refusal leaves the literal text in the composer. Left there, the next queued
+ * user message is appended onto it (`/model` + `fix the bug` → `modelfix the
+ * bug`) and the turn is lost as a malformed slash command — verified against a
+ * real 0.164 PTY.
+ *
+ * Safety: Ctrl-U is a composer-only binding in Codex (`kill_line_start`). It is
+ * sent ONLY when the post-guard screen is a plain composer whose row still holds
+ * our exact literal, and never while a selection surface owns the keyboard:
+ * there the key would be consumed as menu input, and the draft is irrelevant
+ * because the popup covers the composer anyway.
+ */
+async function discardTypedCodexEffortCommand(
+  target: SessionBackend,
+  current: () => boolean,
+): Promise<void> {
+  if (!current()) return;
+  let screen: string | undefined;
+  try {
+    screen = isObserveBackend(target)
+      ? (await snapshotToText(target, renderCols, renderRows, { filter: false }))?.content
+      : renderer?.rawSnapshot();
+  } catch { return; }
+  if (!screen) return;
+  // A selection surface owns the keyboard (do not inject a clear key into it), or
+  // the composer holds something that is not our untouched literal.
+  if (!codexEffortOrphanedLiteral(screen)) return;
+  if (!current()) return;
+  try { target.write('\x15'); } catch { /* draft stays; the hold below keeps input out */ }
+}
+
+/**
+ * Composer holds our exact, unsubmitted `/model` literal and no selection
+ * surface owns the keyboard — the only case where a clear key is safe.
+ *
+ * Shared by the post-refusal discard and the recovery hold's self-heal, so the
+ * two cannot disagree about when Ctrl-U may be sent.
+ */
+function codexEffortOrphanedLiteral(screen: string): boolean {
+  if (detectCodexChoiceModal(screen)) return false;
+  const text = stripAnsiScreenText(screen);
+  // Only our own untouched literal. Any other composer content (a user draft
+  // that arrived meanwhile) is not ours to clear.
+  const promptRow = text.split(/\r?\n/).reverse().find(line => /^\s*[›»]/.test(line));
+  return !!promptRow && promptRow.trim().replace(/^[›»]\s*/, '') === '/model';
+}
+
+/** One-shot latch: the recovery hold clears a leftover `/model` at most once per
+ *  hold, so a CLI that ignores the key cannot turn this into a keystroke loop. */
+let codexEffortRecoveryClearAttempted = false;
 
 /** Serialize one complete raw command-line transaction (fence -> text -> Enter
  * -> commit/cancel). raw_input deliberately keeps its legacy "send while busy"
@@ -3919,15 +4024,32 @@ function codexCliEffortNeedsRecovery(): boolean {
   if (!hold) return false;
   if (hold.backend !== backend || hold.lifetime !== cliLifetimeNonce) {
     codexCliEffortRecovery = undefined;
+    codexEffortRecoveryClearAttempted = false;
     return false;
   }
   try {
     // Observe backends return ANSI full history for web seeding. Input admission
     // must instead inspect the current viewport's text, never old picker rows.
-    const screen = stripAnsiScreenText(captureBackendScreen(hold.backend));
+    const raw = captureBackendScreen(hold.backend);
+    const screen = stripAnsiScreenText(raw);
     if (hasEmptyCodexComposer(screen) && !parseCodexEffortMenu(screen)) {
       codexCliEffortRecovery = undefined;
+      codexEffortRecoveryClearAttempted = false;
       return false;
+    }
+    // The refusal path could not clear its typed `/model` because a popup owned
+    // the keyboard (clearing there would be consumed as menu input). Once that
+    // popup is gone the literal is merely an orphan draft — and leaving it would
+    // hold queued input forever, with no user-visible reason (the operator has
+    // already dismissed the popup and expects the session to work again).
+    // Self-heal exactly once per hold, on the recovery frame, then let the next
+    // frame confirm the composer is empty before releasing.
+    if (!codexEffortRecoveryClearAttempted && codexEffortOrphanedLiteral(raw)) {
+      codexEffortRecoveryClearAttempted = true;
+      try {
+        hold.backend.write('\x15');
+        log('Codex effort recovery: cleared an orphaned /model draft so queued input can resume');
+      } catch { /* Missing evidence keeps queued input held. */ }
     }
   } catch { /* Missing screen evidence keeps queued input held. */ }
   return true;
@@ -31592,6 +31714,21 @@ process.on('message', async (raw: unknown) => {
         || cliRestartInProgress || pendingMessages.length || pendingRawInputs.length
         || bareShellCheckInProgress || bareShellLaunchBlocked || tuiPromptBlocking
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)) {
+        log(`Codex CLI effort unavailable at worker admission: ${JSON.stringify({
+          cli: lastInitConfig?.cliId, backend: lastInitConfig?.backendType,
+          hasBackend: !!target, hasRollout: !!path, hasModel: !!model,
+          wrapped: !!lastInitConfig?.wrapperCli, rpc: !!codexRpcEngine,
+          adopted: !!lastInitConfig?.adoptMode,
+          sandbox: sandboxBoolValue(lastInitConfig?.sandbox) || sandboxEnabled(),
+          isolated: !!lastInitConfig?.readIsolation,
+          rename: sessionRenamePhase, menuActive: !!codexCliEffortOperation,
+          menuRecovery: !!codexCliEffortRecovery, flushing: isFlushing,
+          injecting: injectionFlushing, commandWrites: commandLineWritesPending,
+          restarting: cliRestartInProgress, queuedMessages: pendingMessages.length,
+          queuedRawInput: pendingRawInputs.length,
+          shellProbe: bareShellCheckInProgress, shellBlocked: bareShellLaunchBlocked,
+          tuiPrompt: tuiPromptBlocking, runnerHeld: shouldHoldCodexRunnerInput(codexRunnerFreshness),
+        })}`);
         send({ type: 'codex_cli_effort_result', requestId: msg.requestId,
           status: 'unavailable', reason: 'cli_menu_unavailable' });
         break;
@@ -31613,6 +31750,7 @@ process.on('message', async (raw: unknown) => {
       try {
         const result = await applyCodexEffortMenu({
           signal: abort.signal, deadline: msg.deadline, isCurrent: current,
+          unavailable: reason => log(`Codex CLI effort unavailable at native menu: ${reason}`),
           screen: async () => {
             if (!current()) return '';
             if (isObserveBackend(target)) return (await snapshotToText(target, renderCols, renderRows, { filter: false }))?.content ?? '';
@@ -31621,8 +31759,17 @@ process.on('message', async (raw: unknown) => {
           },
           command: () => {
             codexCliEffortRecovery = { backend: target, lifetime };
-            return sendRawCommandLine(target, '/model');
+            codexEffortRecoveryClearAttempted = false;
+            // Type only: the submitting Enter is deferred until submitGuard below
+            // has re-read the screen. `command()` used to submit, which left the
+            // 200ms beat between text and Enter with no modal check at all.
+            return typeCodexEffortModelCommand(target);
           },
+          // The controller's pre-Enter re-check (drain + structural modal
+          // detection). Both backends go through one contract, so the guard
+          // cannot drift between PTY and tmux.
+          submitGuard: () => codexChoiceSurfaceClear(target, current),
+          discardTypedCommand: () => discardTypedCodexEffortCommand(target, current),
           key: key => {
             if (!current()) throw new Error('CLI generation changed');
             const bytes = { Up: '\x1b[A', Down: '\x1b[B', Enter: '\r', Escape: '\x1b', s: 's' }[key];
