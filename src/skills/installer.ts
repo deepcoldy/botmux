@@ -1,4 +1,5 @@
 import { mkdirSync, existsSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { ensureLeadOnlyGuard } from './lead-only-guard.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -48,6 +49,7 @@ export function ensurePluginSkills(cliId: string, pluginDir: string | undefined)
   } catch (err: any) {
     logger.warn(`[skills] Failed to write plugin manifest for ${cliId}: ${err.message}`);
   }
+  if (cliId === 'claude-code') ensureLeadOnlyGuard(root);
   ensureSkills(cliId, join(root, 'skills'));
 }
 

@@ -589,7 +589,7 @@ import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
-import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
+import { changeChatManager, getChatManagerStatus, setChatManagerLeadOnly } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
@@ -3790,25 +3790,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, param
     return jsonRes(res, 400, { ok: false, error: 'regular_group_only' });
   }
   if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
-  if (body.action !== 'set' && body.action !== 'clear') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+  if (body.action !== 'set' && body.action !== 'clear' && body.action !== 'lead-only') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+  if (body.action === 'lead-only' && typeof body.leadOnly !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
   // `set` requires the per-bot manager switch. `clear` (teardown) and status are
   // intentionally left ungated so an admin can always remove the manager / inspect
   // state even after turning the switch off — the switch gates activation, not removal.
-  if (body.action === 'set' && getBot(ds.larkAppId).config.chatManagerEnabled !== true) {
+  if ((body.action === 'set' || body.action === 'lead-only') && getBot(ds.larkAppId).config.chatManagerEnabled !== true) {
     return jsonRes(res, 409, { ok: false, error: 'chat_manager_disabled' });
   }
   const { getMessageDetail } = await import('../im/lark/client.js');
   const { effectiveBotDisplayName } = await import('../bot-registry.js');
   const human = await authorizeHumanManager({
     sessionId: ds.session.sessionId, appId: ds.larkAppId, chatId: ds.chatId,
-    action: body.action, claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
+    action: body.action === 'lead-only' ? (body.leadOnly ? 'lead-only-on' : 'lead-only-off') : body.action,
+    claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
     liveOrigin: () => findActiveBySessionId(params.sessionId)?.managedTurnOrigin,
     readMessage: getMessageDetail,
     canOperate: (app, chat, sender) => getBot(app).resolvedAllowedUsers.includes(sender) && canOperate(app, chat, sender),
   });
   if (!human.ok) return jsonRes(res, 403, human);
-  const result = await changeChatManager(ds.larkAppId, ds.chatId, body.action,
-    effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
+  const result = body.action === 'lead-only'
+    ? await setChatManagerLeadOnly(ds.larkAppId, ds.chatId, body.leadOnly as boolean, human.stillCurrent)
+    : await changeChatManager(ds.larkAppId, ds.chatId, body.action,
+      effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
   return jsonRes(res, result.ok ? 200 : 409, result);
 });
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
