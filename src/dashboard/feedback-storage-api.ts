@@ -1,14 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { jsonRes } from './http.js';
 import { feedbackStorageStatus, feedbackStorageView, configureFeedbackStorageCandidate, testFeedbackStorageConnection, initializeFeedbackStorage } from '../services/feedback-storage-management.js';
-import { getFeedbackMigration, prepareFeedbackMigration, resumeFeedbackMigration, cancelFeedbackMigration } from '../services/feedback-migration.js';
+// Migration runner pulls in `pg`; this API module is statically imported by the
+// dashboard, so migration functions are loaded lazily per request.
 import { inspectFeedbackRecovery, acknowledgeFeedbackRecovery } from '../services/feedback-recovery.js';
 
 const running = new Map<string, Promise<unknown>>();
 function execute(dataDir: string, migrationId: string): void {
   const key = `${dataDir}:${migrationId}`;
   if (running.has(key)) return;
-  const work = resumeFeedbackMigration(dataDir, migrationId).finally(() => running.delete(key));
+  const work = import('../services/feedback-migration.js')
+    .then(({ resumeFeedbackMigration }) => resumeFeedbackMigration(dataDir, migrationId))
+    .finally(() => running.delete(key));
   running.set(key, work);
   void work.catch(() => {});
 }
@@ -19,12 +22,13 @@ export async function handleFeedbackStorageApi(req: IncomingMessage, res: Server
   if (!deps.isHostAdmin) { jsonRes(res, 403, { error: 'feedback_storage_admin_required' }); return true; }
   if (req.method !== 'GET' && !deps.csrfValid) { jsonRes(res, 403, { error: 'control_csrf_invalid' }); return true; }
   try {
+    const migrationModule = async () => import('../services/feedback-migration.js');
     const migration = url.pathname.match(/^\/api\/feedback\/storage\/migrations\/([a-zA-Z0-9_-]+)(\/resume|\/cancel)?$/);
     if (req.method === 'GET') {
       if (url.pathname === '/api/feedback/storage') jsonRes(res, 200, await feedbackStorageStatus(deps.dataDir));
       else if (url.pathname === '/api/feedback/storage/recovery') jsonRes(res, 200, { items: await inspectFeedbackRecovery(deps.dataDir) });
       else if (migration && !migration[2]) {
-        const job = await getFeedbackMigration(deps.dataDir, migration[1]);
+        const job = await (await migrationModule()).getFeedbackMigration(deps.dataDir, migration[1]);
         jsonRes(res, 200, { migrationId: job.migrationId, phase: job.phase, blockers: job.blockers });
       } else jsonRes(res, 404, { error: 'not_found' });
       return true;
@@ -48,16 +52,16 @@ export async function handleFeedbackStorageApi(req: IncomingMessage, res: Server
         if (body.confirmed !== true) throw new Error('feedback_storage_confirmation_required');
         jsonRes(res, 200, feedbackStorageView(await initializeFeedbackStorage(deps.dataDir, body.expectedGeneration))); break;
       case '/api/feedback/storage/migrate': {
-        const job = await prepareFeedbackMigration(deps.dataDir, body);
+        const job = await (await migrationModule()).prepareFeedbackMigration(deps.dataDir, body);
         execute(deps.dataDir, job.migrationId);
         jsonRes(res, 202, { migrationId: job.migrationId, phase: job.phase, blockers: job.blockers }); break;
       }
       default:
         if (migration?.[2] === '/cancel') {
-          const job = await cancelFeedbackMigration(deps.dataDir, migration[1], { ...body, actor: 'dashboard:host-admin' });
+          const job = await (await migrationModule()).cancelFeedbackMigration(deps.dataDir, migration[1], { ...body, actor: 'dashboard:host-admin' });
           jsonRes(res, 200, { migrationId: job.migrationId, phase: job.phase, blockers: job.blockers });
         } else if (migration?.[2] === '/resume') {
-          const job = await getFeedbackMigration(deps.dataDir, migration[1]);
+          const job = await (await migrationModule()).getFeedbackMigration(deps.dataDir, migration[1]);
           execute(deps.dataDir, job.migrationId);
           jsonRes(res, 202, { migrationId: job.migrationId, phase: job.phase });
         } else jsonRes(res, 404, { error: 'not_found' });

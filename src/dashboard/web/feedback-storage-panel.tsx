@@ -5,7 +5,8 @@ import { controlCsrfHeaders } from './control-csrf.js';
 type Target = {
   backend: 'sqlite' | 'postgresql';
   postgres?: { host: string; port: number; database: string; user: string; schema: string;
-    connectTimeoutMs: number; tls: { mode: 'verify-full' | 'disable'; hasCa?: boolean }; hasPassword?: boolean };
+    connectTimeoutMs: number; tls: { mode: 'verify-full' | 'disable'; hasCa?: boolean }; hasPassword?: boolean;
+    bytepg?: { computeId: string; hasToken?: boolean; doas?: { psm: string; environment: string } } };
 };
 type StorageStatus = { generation: number; active: Target; candidate?: Target; migrations: Array<{ migrationId: string; phase: string; blockers: string[] }> };
 type RecoveryItem = { kind: 'webhook' | 'send'; id: string; fingerprint: string; status: string; live: boolean; acknowledged: boolean; eventId?: string; destinationId?: string; marker?: string };
@@ -19,6 +20,12 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
   const [backend, setBackend] = useState<Target['backend']>('sqlite');
   const [postgres, setPostgres] = useState(defaults);
   const [password, setPassword] = useState('');
+  const [authentication, setAuthentication] = useState<'password' | 'bytepg'>('password');
+  const [computeId, setComputeId] = useState('');
+  const [token, setToken] = useState('');
+  const [tokenSource, setTokenSource] = useState<'reference' | 'doas'>('reference');
+  const [doasPsm, setDoasPsm] = useState('');
+  const [doasEnvironment, setDoasEnvironment] = useState('boe');
   const [ca, setCa] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -39,8 +46,13 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
       const selected = body.candidate ?? body.active;
       setBackend(selected.backend);
       if (selected.postgres) {
-        const { hasPassword: _password, tls, ...values } = selected.postgres;
-        setPostgres({ ...values, tls: { mode: tls.mode } });
+        const { hasPassword: _password, bytepg, tls, ...values } = selected.postgres;
+        setAuthentication(bytepg ? 'bytepg' : 'password');
+        setComputeId(bytepg?.computeId ?? '');
+        setTokenSource(bytepg?.doas ? 'doas' : 'reference');
+        setDoasPsm(bytepg?.doas?.psm ?? '');
+        setDoasEnvironment(bytepg?.doas?.environment ?? 'boe');
+        setPostgres({ ...values, user: values.user ?? '', tls: { mode: tls.mode } });
       }
     }
   }
@@ -60,7 +72,7 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error ?? 'feedback_storage_operation_failed');
       setMessage(t('feedback.storage.success'));
-      if (path === 'configure') { setPassword(''); setCa(''); setRequestId(undefined); }
+      if (path === 'configure') { setPassword(''); setToken(''); setCa(''); setRequestId(undefined); }
       // A cancelled job is terminal: the panel must mint a fresh requestId for
       // the next migration attempt, or prepareFeedbackMigration would keep
       // returning the old cancelled job (its resume is a permanent no-op).
@@ -90,12 +102,35 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
         </select>
       </label>
       {backend === 'postgresql' && <>
+        <label>{t('feedback.storage.authentication')}
+          <select id="feedback-storage-authentication" value={authentication} disabled={busy || !!migrating}
+            onChange={event => { setAuthentication(event.target.value as 'password' | 'bytepg'); setPassword(''); setToken(''); }}>
+            <option value="password">{t('feedback.storage.passwordAuth')}</option>
+            <option value="bytepg">{t('feedback.storage.bytepgAuth')}</option>
+          </select>
+        </label>
         {(['host', 'port', 'database', 'user', 'schema'] as const).map(field => <label key={field}>
           {t(`feedback.storage.${field}`)}
           <input value={postgres[field]} type={field === 'port' ? 'number' : 'text'} disabled={busy || !!migrating}
             onChange={event => setPostgres(current => ({ ...current, [field]: field === 'port' ? Number(event.target.value) : event.target.value }))} />
         </label>)}
-        <label>{t('feedback.storage.password')}<input type="password" autoComplete="new-password" value={password} onChange={event => setPassword(event.target.value)} placeholder={t('feedback.storage.keepPassword')} /></label>
+        {authentication === 'password'
+          ? <label>{t('feedback.storage.password')}<input type="password" autoComplete="new-password" value={password} onChange={event => setPassword(event.target.value)} placeholder={t('feedback.storage.keepPassword')} /></label>
+          : <>
+            <label>{t('feedback.storage.computeId')}<input id="feedback-storage-compute-id" value={computeId} onChange={event => setComputeId(event.target.value)} /></label>
+            <label>{t('feedback.storage.tokenSource')}<select id="feedback-storage-token-source" value={tokenSource} onChange={event => { setTokenSource(event.target.value as 'reference' | 'doas'); setToken(''); }}>
+              <option value="reference">{t('feedback.storage.staticToken')}</option><option value="doas">{t('feedback.storage.doasToken')}</option>
+            </select></label>
+            {tokenSource === 'reference'
+              ? <label>{t('feedback.storage.token')}<input id="feedback-storage-token" type="password" autoComplete="new-password" value={token} onChange={event => setToken(event.target.value)} placeholder={t('feedback.storage.keepToken')} /></label>
+              : <>
+                <label>PSM<input id="feedback-storage-doas-psm" value={doasPsm} onChange={event => setDoasPsm(event.target.value)} /></label>
+                <label>{t('feedback.storage.doasEnvironment')}<select value={doasEnvironment} onChange={event => setDoasEnvironment(event.target.value)}>
+                  {['boe', 'cn', 'row', 'nontt', 'euttp', 'usttp'].map(value => <option key={value} value={value}>{value}</option>)}
+                </select></label>
+                <p>{t('feedback.storage.doasHelp')}</p>
+              </>}
+          </>}
         <label>TLS<select value={postgres.tls.mode} onChange={event => setPostgres(current => ({ ...current, tls: { mode: event.target.value as 'verify-full' | 'disable' } }))}>
           <option value="verify-full">{t('feedback.storage.verifyTls')}</option><option value="disable">{t('feedback.storage.disableTls')}</option>
         </select></label>
@@ -104,8 +139,13 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
     </div>
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
       <button id="feedback-storage-save" disabled={busy || !!migrating} onClick={() => {
-        const candidate = backend === 'sqlite' ? { backend } : { backend, postgres };
-        void action('configure', { expectedGeneration: status.generation, candidate, ...(password ? { password } : {}), ...(ca ? { ca } : {}) });
+        const candidate = backend === 'sqlite' ? { backend } : { backend, postgres: {
+          ...postgres, ...(authentication === 'bytepg' ? { user: postgres.user || undefined, bytepg: { computeId,
+            ...(tokenSource === 'doas' ? { doas: { psm: doasPsm, environment: doasEnvironment } } : { tokenRef: '' }) } } : {}),
+        } };
+        void action('configure', { expectedGeneration: status.generation, candidate,
+          ...(authentication === 'password' && password ? { password } : {}),
+          ...(authentication === 'bytepg' && tokenSource === 'reference' && token ? { token } : {}), ...(ca ? { ca } : {}) });
       }}>{t('feedback.storage.save')}</button>
       <button disabled={busy} onClick={() => void action('test')}>{t('feedback.storage.test')}</button>
     </div>

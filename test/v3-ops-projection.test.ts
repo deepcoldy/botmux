@@ -112,6 +112,81 @@ describe('v3 ops-projection — projectRun', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  /** A bot-executed run whose checkpoint node `survey` succeeded while its
+   *  dependant `build` has not started. */
+  function buildCheckpointRun(runId: string, opts: { botRun?: boolean; released?: 'wakeTurnEnded' | 'holdTimeout' } = {}): string {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-cp-'));
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+      schemaVersion: 2,
+      runId,
+      nodes: [
+        { id: 'survey', type: 'goal', goal: 'survey', bot: 'cli_a', checkpoint: true, depends: [], inputs: [] },
+        { id: 'build', type: 'goal', goal: 'build', bot: 'cli_b', depends: ['survey'], inputs: [{ from: 'survey' }] },
+      ],
+    }));
+    const jp = join(runDir, 'journal.ndjson');
+    appendEvent(jp, { type: 'runStarted', runId, ...(opts.botRun === false ? {} : { nodeExecutor: 'bot' }) });
+    appendEvent(jp, { type: 'nodeDispatched', nodeId: 'survey', attemptId: 'survey/attempts/001', nodeExecutor: 'bot' });
+    appendEvent(jp, { type: 'nodeSucceeded', nodeId: 'survey', attemptId: 'survey/attempts/001', manifestPath: join(runDir, 'survey/attempts/001/manifest.json') });
+    if (opts.released) {
+      appendEvent(jp, {
+        type: 'checkpointReleased', nodeId: 'survey', attemptId: 'survey/attempts/001', eventSeq: 3,
+        reason: opts.released,
+      });
+    }
+    return runDir;
+  }
+
+  it('检查点：未放行时检查点节点 holding、未开始的依赖节点 waitingOnCheckpoint', () => {
+    const runId = 'cp-hold-260602-0001';
+    const runDir = buildCheckpointRun(runId);
+    try {
+      const view = projectRun(runId, runDir);
+      const survey = view.nodes.find((n) => n.id === 'survey')!;
+      const build = view.nodes.find((n) => n.id === 'build')!;
+      expect(survey.checkpoint).toBe('holding');
+      expect(build.checkpoint).toBeUndefined();
+      expect(build.waitingOnCheckpoint).toEqual(['survey']);
+    } finally {
+      rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  it('检查点：wakeTurnEnded 放行后 reviewed 且依赖节点不再等待；超时放行归为 notReviewed', () => {
+    const reviewedId = 'cp-review-260602-0001';
+    const reviewedDir = buildCheckpointRun(reviewedId, { released: 'wakeTurnEnded' });
+    try {
+      const view = projectRun(reviewedId, reviewedDir);
+      expect(view.nodes.find((n) => n.id === 'survey')!.checkpoint).toBe('reviewed');
+      expect(view.nodes.find((n) => n.id === 'build')!.waitingOnCheckpoint).toBeUndefined();
+    } finally {
+      rmSync(reviewedDir, { recursive: true, force: true });
+    }
+
+    const timeoutId = 'cp-timeout-260602-0001';
+    const timeoutDir = buildCheckpointRun(timeoutId, { released: 'holdTimeout' });
+    try {
+      const view = projectRun(timeoutId, timeoutDir);
+      expect(view.nodes.find((n) => n.id === 'survey')!.checkpoint).toBe('notReviewed');
+    } finally {
+      rmSync(timeoutDir, { recursive: true, force: true });
+    }
+  });
+
+  it('检查点：旧模式 run（runStarted 无 nodeExecutor）不投影检查点', () => {
+    const runId = 'cp-oldmode-260602-0001';
+    const runDir = buildCheckpointRun(runId, { botRun: false });
+    try {
+      const view = projectRun(runId, runDir);
+      expect(view.nodes.find((n) => n.id === 'survey')!.checkpoint).toBeUndefined();
+      expect(view.nodes.find((n) => n.id === 'build')!.waitingOnCheckpoint).toBeUndefined();
+    } finally {
+      rmSync(runDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('v3 ops-projection — projectRunById 安全 + listRuns', () => {

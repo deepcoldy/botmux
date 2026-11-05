@@ -404,6 +404,9 @@ export interface V3RuntimeDeps {
   ) => void;
 }
 
+/** Code defaults for the three concurrency caps (codex's three-layer cap). */
+export const V3_DEFAULT_CONCURRENCY = Object.freeze({ global: 4, perBot: 1, perCli: 2 });
+
 export interface V3RuntimeOptions {
   /** The run lives in `${baseDir}/${dag.runId}`. */
   baseDir: string;
@@ -415,6 +418,8 @@ export interface V3RuntimeOptions {
   globalConcurrency?: number; // default 4
   perBotConcurrency?: number; // default 1
   perCliConcurrency?: number; // default 2
+  /** Per-CLI override of `perCliConcurrency`, keyed by cliId. */
+  perCliConcurrencyById?: Readonly<Record<string, number>>;
   cancelSignal?: AbortSignal;
   /** Bot identities already pinned by an immutable run envelope. When set,
    *  the runtime must use these exact snapshots instead of live bots.json. */
@@ -592,9 +597,12 @@ export async function runWorkflow(
   const journalPath = join(runDir, 'journal.ndjson');
   const statePath = join(runDir, 'STATE');
 
-  const globalCap = opts.globalConcurrency ?? 4;
-  const perBotCap = opts.perBotConcurrency ?? 1;
-  const perCliCap = opts.perCliConcurrency ?? 2;
+  const globalCap = opts.globalConcurrency ?? V3_DEFAULT_CONCURRENCY.global;
+  const perBotCap = opts.perBotConcurrency ?? V3_DEFAULT_CONCURRENCY.perBot;
+  const perCliDefaultCap = opts.perCliConcurrency ?? V3_DEFAULT_CONCURRENCY.perCli;
+  const perCliById = opts.perCliConcurrencyById ?? {};
+  const perCliCap = (cliId: string): number =>
+    Object.prototype.hasOwnProperty.call(perCliById, cliId) ? perCliById[cliId]! : perCliDefaultCap;
   const gateMode = opts.gateMode ?? 'blocking';
   const hostResponseWaitMs = opts.hostResponseWaitMs ?? 15_000;
   const executionContext = opts.executionContext ?? opts.resolvedWorkflowData;
@@ -1193,7 +1201,7 @@ export async function runWorkflow(
           // selectors resolving to the same bot share its slot.
           const botKey = botSnap.larkAppId;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
-          if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
+          if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap(botSnap.cliId)) continue;
           if (startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId)) {
             startedThisTick++;
           }
