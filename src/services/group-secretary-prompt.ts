@@ -198,6 +198,9 @@ export function renderMainSecretaryPrompt(
     '3. 有人要你盯某件事（「盯着他做完告诉我」）：用 botmux secretary watch <thread_root> --every 10m --note "<要盯什么>" 登记，巡查会按时去看；不用盯了用 botmux secretary unwatch <thread_root>。',
     '4. leader 问各任务进展：按 <ledger> 回答（状态 + 一句话），不用去话题里翻。台账没有的话题如实说没有记录。',
     '',
+    '【check_in / turn_ended / stuck / attention / stopped：主群里 bot 的会话（scope="chat"）】',
+    '5a. 话题里的会话不会出现在这里（由巡查处理），这里只有 bot 在主群顶层的会话。正常推进或做完：静默。没进展、做一半停了：nudge，--quote 它在主群最近的那条消息并 --mention 它；own_messages_since_human ≥2 时改为 alert leader。要真人处理的（权限、额度、确认）直接 alert。',
+    '',
     '【escalation：话题巡查上报】',
     '5. 这是巡查判断「leader 需要在主群知道」的事（卡点、要拍板、要他提供东西、他要盯的任务完成了）。同一批里多条上报合并成一条 alert（--mention ' + owner + '），每个话题一行：哪个话题、卡在哪、需要谁做什么。',
     '6. 与 own_recent 里你已经报过的同一件事重复的，不再报。',
@@ -239,7 +242,7 @@ export function renderPatrolPrompt(
     '【怎么巡查】',
     '1. 读 events、话题消息（context）、执行 bot 的最近对话（recent_transcript），再对照 <previous> 里这个话题上次的台账，判断：正常推进 / 原地打转 / 卡住等人 / 做完了。',
     '2. 正常推进、对方已经接住、或你问过的事真人还没回：静默。',
-    '3. 没进展、在重复报同一个错、做一半停了：nudge —— 在本话题 botmux send --mention <那个 bot 的 open_id>，要求它先核对已完成部分再从断点继续。own_messages_since_human ≥2 时不许再催，改为上报。',
+    '3. 没进展、在重复报同一个错、做一半停了：nudge —— botmux dispatch --into ' + root + ' --bot-app <它的 bot_app_id> --brief "<先核对已完成部分，再从断点继续：…>"（只能 --into 本话题）。own_messages_since_human ≥2 时不许再催，改为上报。',
     '4. 需要真人拍板 / 提供信息 / 处理权限额度：如果 leader 一直在这个话题里跟，直接在本话题 ask（--mention ' + owner + '）；否则写台账时用 --escalate 上报，由总管在主群告诉他。',
     options.watched
       ? '5. 这是 leader 要你盯的话题：做完了就在本话题 deliver 简报结果（--mention ' + owner + '），并在台账 --escalate 一句「已完成：…」。'
