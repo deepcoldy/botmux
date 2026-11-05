@@ -1517,7 +1517,7 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   // Opt-in, so a CLI with the original strict key check never sees new keys.
   const fields = (body as Record<string, unknown>).fields;
   const includeOrigin = Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_ORIGIN_FIELD);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1555,7 +1555,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
   if (!sessionId || !tool) return jsonRes(res, 400, blocked);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1642,7 +1642,7 @@ for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
       || (route === BACKGROUND_REVOKE_ROUTE && (typeof body.jobId !== 'string' || body.jobId.length > 128))) {
       return jsonRes(res, 400, { error: 'invalid_background_request' });
     }
-    const peer = resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
+    const peer = await resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
       remotePort: req.socket.remotePort, localPort: req.socket.localPort });
     if (!peer.ok) return jsonRes(res, 403, { error: 'current_execution_unverified' });
     const input = { sessionDataDir: config.session.dataDir, sessionId: body.sessionId, peer: peer.peer };
@@ -1679,7 +1679,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     && body.expectedScheduledTurnId.length <= 256
     ? body.expectedScheduledTurnId
     : undefined;
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
     localPort: req.socket.localPort,
@@ -3317,7 +3317,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   try { body = await readBoundedJsonBody(req, 4096, 1000); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
   const ds = findActiveBySessionId(params.sessionId);
-  const peer = process.platform === 'linux' ? resolveLoopbackPeerProcesses({
+  const peer = process.platform === 'linux' ? await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   }) : undefined;
   const backgroundInput = peer?.ok ? { sessionDataDir: config.session.dataDir,
@@ -3512,7 +3512,7 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
     } else if (!boundTool) {
-      const peer = resolveLoopbackPeerProcesses({
+      const peer = await resolveLoopbackPeerProcesses({
         remoteAddress: req.socket.remoteAddress,
         remotePort: req.socket.remotePort,
         localPort: req.socket.localPort,
