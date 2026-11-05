@@ -65,10 +65,26 @@ bun run test test/bot-config-store.test.ts test/feedback-presentation.test.ts te
 6. 连点、多用户点击及测试实例重启，核对没有重复 Hook 副作用；超时返回未知，证据核对后才可恢复。
 7. 关闭该测试规则及 Hook，核对尚未执行的请求被阻止，已经保存的评价与回执保留。
 
-这些步骤是待执行验收，不是已有真实客户端结果。离线测试、浏览器 fixture 和 GitHub CI 不能代替它们。
+上述完整矩阵尚未全部完成；下节区分已经执行的真实交互与仍待验证项。离线测试、浏览器 fixture 和 GitHub CI 不能代替它们。
+
+### 有界原生交互验证
+
+在明确授权的测试应用/话题内，暂时停止该应用原接收进程，使用隔离 HOME、配置和数据库加载本 PR 的发卡、反馈及 Hook 模块。测试结束已恢复原应用进程，其他机器人与 Dashboard 的 PID 未变化。没有切换共享安装、迁移生产库或执行真实业务转接。
+
+观察结果：
+
+- 三条固定答复产生三条原 delivery；只在第1、3轮产生两张独立反馈卡。
+- 真实用户的正向、负向及补充说明已持久化；未观察到 progress 选项的回调，不能标记该项已通过。
+- 同一动作收到四次真人点击回调，只有一个 Hook job 和一条实际脚本回执；后续点击没有重新执行脚本。
+- 负向点击后两次立即 PATCH 返回平台 `230099 / 11310: card action is lock`。定位为临时接收器在回调 ACK 前等待 PATCH，未遵循产品 `deferredCard` 协议；不是根据现象推断反馈写入失败。
+- 正式 `event-dispatcher` 已先返回空 ACK，再安排 deferred PATCH。针对快速 deferred 更新、保留 toast 和 deferred 失败的三个现有回归本次全部通过。临时接收器已改为相同顺序，但修正后的真实客户端复测尚未执行。
+
+这是“真实 transport + PR 组件”的有界验证，不是完整 daemon/CLI 自动轮次流程验收。移动/桌面双端布局、未授权用户、progress 按钮和修正后的 deferred PATCH 仍需补充。不要以一次回调返回或 job 状态代替实际副作用回执。
 
 真实临时 PostgreSQL 提交顺序测试及带流正常迁移的既有验证保留。本轮未更改其数据库算法。
 
 全量 unit 尝试：42916 passed、158 failed、171 skipped。部分失败涉及宿主文件监听资源耗尽；`schedule-store-dashboard-watch.test.ts` 在干净上游基线同样因 EMFILE 失败。其余失败尚未逐项归因，不宣称全量通过。
 
 GitHub 上前一提交的失败定位到 `group-context-canonical-revision.test.ts` 的4项断言；本地当前分支及干净上游均为4失败/22通过。该夹具的固定创建时间已超过30天保留窗口，观察历史后会被清理。本PR未修改这套无关的业务保留逻辑。
+
+后续核对 `bc7e565c5bedbcc8dc063a9db1ed3963bea4afb1` 的 GitHub 检查全部成功：Node 四分片及汇总、Bun、build、三种 binary、PostgreSQL15/17、network-boundary。该远端结论只绑定此 SHA，不替代以上原生验收缺口或抹除本地全量失败记录。
