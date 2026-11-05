@@ -6,6 +6,26 @@ import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src
 import { defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 
 describe('feedback extension configuration', () => {
+  it('validates inherited action and template combinations before saving a rule', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'feedback-inherited-'));
+    try {
+      const initial = await readFeedbackExtensionConfig(directory);
+      const ratings = defaultFeedbackTemplate();
+      ratings.id = 'ratings-only';
+      ratings.elements = ratings.elements.filter(element => element.slot !== 'actionButtons');
+      const input = {
+        ...initial, templates: [defaultFeedbackTemplate(), ratings],
+        hooks: [{ id: 'hook', version: 1, protocolVersion: 1, hostId: initial.hostId, command: ['/bin/true'],
+          cwd: '/tmp', allowedBotAppIds: ['app'], allowedChatIds: ['chat'], allowedActionIds: ['help'],
+          timeoutMs: 1000, concurrency: 1, envRefs: {}, enabled: false }],
+        actions: [{ id: 'help', label: 'Help', hookId: 'hook' }],
+        presentations: { app: { default: { enabled: true, actionIds: ['help'], templateId: 'default' },
+          rules: [{ id: 'ratings', match: { chatId: 'chat' }, templateId: 'ratings-only' }] } },
+      };
+      await expect(saveFeedbackExtensionConfig(directory, 0, input, 'admin')).rejects.toThrow('feedback_template_action_slot_missing');
+      expect((await readFeedbackExtensionConfig(directory)).version).toBe(0);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it('does not replace the saved configuration with a template that cannot fit in a card', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'feedback-config-'));
     try {

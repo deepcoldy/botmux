@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
-import { normalizeFeedbackPresentation } from './feedback-presentation.js';
+import { normalizeFeedbackPresentation, resolveFeedbackPresentation } from './feedback-presentation.js';
 import { normalizeFeedbackHook } from './feedback-hook-config.js';
 import { defaultFeedbackTemplate, validateFeedbackTemplate, type FeedbackTemplate } from './feedback-template.js';
 import { feedbackExtensionId } from './feedback-extension-id.js';
@@ -62,6 +62,22 @@ function normalize(input: unknown): FeedbackExtensionConfig {
       if (layer.actionIds?.length && layer.templateId) {
         const template = templates.find(item => item.id === layer.templateId);
         if (!template?.elements.some(element => element.slot === 'actionButtons')) throw new Error('feedback_template_action_slot_missing');
+      }
+    }
+    const scopes = [{ chatId: '', sourceMessageId: '' },
+      ...normalized.rules.map(rule => ({ chatId: rule.match.chatId, sourceMessageId: rule.match.sourceMessageId ?? '' }))];
+    for (const scope of scopes) {
+      const effective = resolveFeedbackPresentation(normalized, { botAppId: appId, ...scope, round: 1 });
+      const template = templates.find(item => item.id === effective.templateId);
+      if (effective.enabled && !template) throw new Error('feedback_template_not_found');
+      if (effective.actionIds.length && !template?.elements.some(element => element.slot === 'actionButtons')) {
+        throw new Error('feedback_template_action_slot_missing');
+      }
+      for (const id of effective.actionIds) {
+        const hookId = actions.find(action => action.id === id)?.hookId;
+        const hook = hooks.find(item => item.id === hookId);
+        if (!hook || !hook.allowedBotAppIds.includes(appId)
+          || (scope.chatId && !hook.allowedChatIds.includes(scope.chatId))) throw new Error('feedback_action_not_authorized');
       }
     }
     presentations[appId] = normalized;

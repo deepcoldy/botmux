@@ -3,25 +3,52 @@ import { Readable } from 'node:stream';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+const receiptMock = vi.hoisted(() => ({ message: {} as any }));
 vi.mock('../src/bot-registry.js', async original => ({
   ...await original<any>(), loadBotConfigs: () => [{ larkAppId: 'app', feedback: { enabled: true },
-    feedbackPresentation: { default: { enabled: true, rounds: [1] }, rules: [] } }],
+    feedbackPresentation: { default: { enabled: true, rounds: [1] }, rules: [] } }], getBotOpenId: () => 'ou_bot',
 }));
+vi.mock('../src/im/lark/client.js', async original => ({ ...await original<any>(), getMessageDetail: async () => receiptMock.message }));
 import { authorizeFeedbackExtensionChange, handleFeedbackExtensionApi } from '../src/dashboard/feedback-extension-api.js';
 import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src/services/feedback-extension-config.js';
+import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
+import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 
-async function call(dataDir: string, path: string, body: unknown) {
+async function call(dataDir: string, path: string, body: unknown, hostAdmin = false) {
   const request = Readable.from([JSON.stringify(body)]) as any;
   request.method = 'POST';
   let status = 0;
   let result: any;
   await handleFeedbackExtensionApi(request, { writeHead: (code: number) => { status = code; },
     end: (value: string) => { result = JSON.parse(value); } } as any, new URL(`http://fixture/api/feedback/extensions/${path}`),
-  { dataDir, hostAdmin: false, manager: true, csrf: true });
+  { dataDir, hostAdmin, manager: true, csrf: true });
   return { status, result };
 }
 
 describe('feedback extension API permissions', () => {
+  it('only reconciles a surface after verifying sender, scope and stamped card content', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'feedback-receipt-api-'));
+    const store = await FeedbackExtensionStore.open(directory);
+    try {
+      const card = { schema: '2.0', body: { elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'Help' },
+        behaviors: [{ type: 'callback', value: { action: 'feedback_custom_action', action_id: 'help' } }] }] } };
+      store.ingest('source', 0, [{ sequence: 1, eventId: 'event', jobs: [{
+        id: 'job', kind: 'surface', payload: { appId: 'app', chatId: 'chat', subjectId: 'question', card, mode: 'both' },
+      }] }]);
+      store.claim('surface', 1, 10);
+      store.expire(12);
+      const body = { jobId: 'job', messageId: 'om_surface', evidence: 'provider receipt', confirmed: true };
+      receiptMock.message = { items: [{ sender: { id: 'ou_wrong' }, chat_id: 'chat', parent_id: 'question',
+        body: { content: stampBotmuxCallbackMarkers(JSON.stringify(card)) } }] };
+      expect((await call(directory, 'reconcile-surface', body, true)).status).toBe(400);
+      expect(store.job('job')?.status).toBe('unknown');
+      receiptMock.message.items[0].sender.id = 'ou_bot';
+      expect((await call(directory, 'reconcile-surface', body)).status).toBe(403);
+      expect((await call(directory, 'reconcile-surface', body, true)).status).toBe(200);
+      expect(store.surface('app', 'om_surface')).toMatchObject({ subjectId: 'question' });
+      expect((await call(directory, 'reconcile-surface', body, true)).status).toBe(409);
+    } finally { store.close(); await rm(directory, { recursive: true, force: true }); }
+  });
   it('previews a bot-config presentation even when no extension override has been saved', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'feedback-api-'));
     try {
