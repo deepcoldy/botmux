@@ -20,8 +20,11 @@
  *
  * Group chats are additionally mirrored into [[team-groups-store]] under the
  * `platform:<teamId>` teamId prefix (replace-by-prefix, never touching legacy
- * federation entries) so every existing isTeamGroupChat consumer — the
- * first-contact trust leg AND the recordTeamBot learning gate — works unchanged.
+ * federation entries). Auth consumers do NOT treat that mirror as a chat-wide
+ * trust root: first contact in a platform group only counts for bots on THAT
+ * team ({@link isTeamGroupChatFor}), and teammate learning into the
+ * machine-wide team-bots.json is limited to legacy groups
+ * ({@link isLegacyTeamGroupChat}) — platform bot identity comes from the roster.
  *
  * Storage: `{dataDir}/platform-team-sync.json`.
  */

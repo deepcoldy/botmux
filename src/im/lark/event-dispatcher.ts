@@ -5215,11 +5215,13 @@ export function createLarkEventDispatcherRuntime(
             .catch(err => logger.error(`Error handling message event: ${err}`));
           return;
         }
-        // Learn teammate identity from team-assembled groups (the trust root):
-        // any bot talking in a 拉群 group is a vouched teammate, so capture its
+        // Learn teammate identity from LEGACY federation 拉群 groups (the trust
+        // root there): a bot talking in one is a vouched teammate, so capture its
         // tenant-stable union_id — we then honour it as a teammate in ANY chat
-        // (see team-bots-store). Done BEFORE the @mention gate so even a non-@
-        // message in a team group teaches us the teammate. Cheap + idempotent.
+        // (see team-bots-store). Platform team groups are excluded: platform bot
+        // identity comes from the roster (see learnTeamBotFromGroupMessage).
+        // Done BEFORE the @mention gate so even a non-@ message teaches us the
+        // teammate. Cheap + idempotent.
         const senderUnionId = sender.sender_id?.union_id as string | undefined;
         learnTeamBotFromGroupMessage(config.session.dataDir, chatId, senderUnionId);
         // 机器人大厅：bot 消息只用于身份登记（上面已学 sender union / mentions
