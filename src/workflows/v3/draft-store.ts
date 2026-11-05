@@ -594,9 +594,12 @@ export function workflowDraftPhase(
   // §5.2 refused the flow at the commit step (nothing written): the launch is
   // paused for editing, not underway. Show 待确认流程 so the bot swap / node
   // edits are reachable; for a no-confirmation template run a swap is the
-  // recovery (it then confirms as an ad-hoc flow).
+  // recovery (it then confirms as an ad-hoc flow). Once the flow is
+  // re-confirmed (flowConfirmation back), stop falling back: the launch is
+  // underway again and 「继续」 must be available.
   const placementRefused = draft.launch?.error?.code === 'placement_refused'
-    && !draft.launch.commit && !draft.launch.start && grill.status === 'dag_ready';
+    && !draft.launch.commit && !draft.launch.start && grill.status === 'dag_ready'
+    && !draft.flowConfirmation;
   if (phase === 'dag_ready' && confirmed && flowConfirmationValid !== false && !placementRefused) {
     return draft.launch ? 'launching' : 'flow_confirmed';
   }

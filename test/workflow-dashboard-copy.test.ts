@@ -734,7 +734,11 @@ describe('§5.2 落点闸拒绝后的恢复路径', () => {
 
     // Fix it: put b on a different bot, re-confirm, then 继续.
     const fixed = await hh.service.setNodeBot(draft.runId, OWNER, 'b', { larkAppId: REVIEW });
-    await hh.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: fixed.flow!.flowSummarySha256 });
+    const reconfirmed = await hh.service.approveFlow(draft.runId, OWNER, { flowSummarySha256: fixed.flow!.flowSummarySha256 });
+    // Re-confirmation puts the launch back underway — the 「继续」 entry must
+    // exist (phase launching), otherwise the user is stuck at dag_ready with
+    // the fixed flow and no resume button.
+    expect(reconfirmed.phase).toBe('launching');
     await hh.service.continueLaunch(draft.runId, OWNER, {});
     const done = await settled(hh.service, draft.runId);
     expect(done.phase).toBe('started');
@@ -805,7 +809,8 @@ describe('§5.2 落点闸拒绝后的恢复路径', () => {
     // re-confirm, and 「继续」 the same (already built) group.
     const fixed = await hh.service.setNodeBot(tRun.runId, OWNER, 'b', { larkAppId: REVIEW });
     expect(fixed.phase).toBe('dag_ready');
-    await hh.service.approveFlow(tRun.runId, OWNER, { flowSummarySha256: fixed.flow!.flowSummarySha256 });
+    const reconfirmed = await hh.service.approveFlow(tRun.runId, OWNER, { flowSummarySha256: fixed.flow!.flowSummarySha256 });
+    expect(reconfirmed.phase).toBe('launching');
     await hh.service.continueLaunch(tRun.runId, OWNER, {});
     const done = await settled(hh.service, tRun.runId);
     expect(done.phase).toBe('started');
