@@ -241,13 +241,19 @@ export type MessageListenerContentPolicy = NonNullable<MessageListenerConfig['co
  * feeds evaluateMessageListener (realtime delivery, polled backfill, dashboard
  * preview) so they can never diverge on content matching.
  *
- * - Absent policy, or one with no keywords → match everything (legacy
- *   behavior: every non-mention text message woke the Agent).
- * - Keywords: case-insensitive substring match (Chinese-friendly; both sides
- *   lowercased, plain `includes`). Substring search is linear-time, so an
+ * - Absent policy, or one with neither text keywords nor identity terms →
+ *   match everything (legacy behavior: every non-mention text message woke the
+ *   Agent).
+ * - Text keywords: case-insensitive substring match (Chinese-friendly; both
+ *   sides lowercased, plain `includes`). Substring search is linear-time, so an
  *   attacker-controlled group message cannot stall the daemon main loop.
- * - matchMode 'any' (default): at least one keyword hits.
- * - matchMode 'all': every keyword must hit.
+ * - Identity terms (`includeMentionedOpenIds`) match a real @mention of the
+ *   configured open_id in a native text/post message only; a present but
+ *   empty/invalid identity list fails closed (never matches), even when a text
+ *   keyword would hit under matchMode 'any'.
+ * - Text keywords and identity terms share one matchMode:
+ *   'any' (default): at least one term hits.
+ *   'all': every keyword and every identity term must hit.
  *
  * V1 deliberately has NO regex support: a JS regex with catastrophic
  * backtracking (e.g. the 6-char `(a+)+$`) runs on the daemon's main event

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -69,6 +69,21 @@ function runCli(args: string[], env: Record<string, string | undefined>): { code
   }
 }
 
+// Like runCli but pipes a real stdin body. send's preflight reads stdin BEFORE
+// cmdSend's transport gate, so a non-empty stdin send is the shape that proves
+// the gate still refuses a *valid* send (an empty/ignored stdin would die in
+// the preflight's empty-body check and prove nothing about the gate).
+function runCliWithInput(args: string[], env: Record<string, string | undefined>, input: string): { code: number; out: string } {
+  const base: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!k.startsWith('BOTMUX_') && v !== undefined) base[k] = v;
+  }
+  base.SESSION_DATA_DIR = DATA_DIR;
+  for (const [k, v] of Object.entries(env)) { if (v === undefined) delete base[k]; else base[k] = v; }
+  const r = spawnSync('node', [CLI, ...args], { env: base, encoding: 'utf8', input, timeout: 15_000 });
+  return { code: r.status ?? 1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+}
+
 const distReady = existsSync(CLI);
 const d = distReady ? describe : describe.skip;
 
@@ -91,7 +106,10 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
 
   it('managed virtual turn (honest env): every Lark-facing command exits 2', () => {
     for (const cmd of LARK_FACING) {
-      const { code, out } = runCli([cmd], {
+      // `send` needs valid argv so the transport gate — not the body preflight
+      // — is the first refusal this test proves.
+      const args = cmd === 'send' ? ['send', 'hello'] : [cmd];
+      const { code, out } = runCli(args, {
         BOTMUX_SESSION_ID: VIRTUAL_SID, BOTMUX_CHAT_ID: 'http_async_behaviorzero', BOTMUX_LARK_APP_ID: 'cli_test_bot',
       });
       expect(code, `${cmd} honest exit`).toBe(2);
@@ -99,10 +117,24 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
     }
   });
 
+  it('managed virtual turn with a non-empty stdin body is still refused by the transport gate', () => {
+    // send's preflight reads stdin before cmdSend's workflow/transport gates.
+    // This pins the ordering trade-off: a VALID implicit-stdin send must still
+    // die at the transport gate — if preflight swallowed it (empty-body error)
+    // or the gate ever moved ahead of stdin, the assertion loses its meaning.
+    const { code, out } = runCliWithInput(['send', '--no-mention'], {
+      BOTMUX_SESSION_ID: VIRTUAL_SID, BOTMUX_CHAT_ID: 'http_async_behaviorzero', BOTMUX_LARK_APP_ID: 'cli_test_bot',
+    }, 'real body from stdin\n');
+    expect(code, out).toBe(2);
+    expect(out).toMatch(/unavailable|no Feishu|HTTP control-API/);
+    expect(out).not.toContain('正文为空');
+  });
+
   it('managed headless turn: every Lark-facing command exits 2', () => {
     writeAncestryMarker(HEADLESS_SID);
     for (const cmd of LARK_FACING) {
-      const { code, out } = runCli([cmd], {
+      const args = cmd === 'send' ? ['send', 'hello'] : [cmd];
+      const { code, out } = runCli(args, {
         BOTMUX_SESSION_ID: HEADLESS_SID, BOTMUX_CHAT_ID: 'headless_hl_behaviorzero', BOTMUX_LARK_APP_ID: 'cli_test_bot',
       });
       expect(code, `${cmd} headless exit`).toBe(2);

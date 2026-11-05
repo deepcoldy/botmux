@@ -214,6 +214,45 @@ describe('event-woken turn of THIS run', () => {
     expect(relay(RUN, 'trg_9f2b1caa-0000-4000-8000-000000000000')).toMatchObject({ ok: false, error: 'turn_provenance_stale' });
   });
 
+  it('the relay decides who made a retry / ask-human from its own session record; a caller in the body is dropped', () => {
+    seedRun();
+    const wake = issueWake(RUN, 2);
+    const capability = 'c'.repeat(64);
+    const relay = (mutation: 'retry' | 'ask-human', liveTurnId: string, raw: Record<string, unknown>, session: Record<string, unknown> = {}) =>
+      authorizeV3SessionRunMutationRequest({
+        runId: RUN,
+        mutation,
+        raw: { sessionId: 'sess-main', originCapability: capability, ...raw },
+        trustedHost: false,
+        session: {
+          receiver: false,
+          liveOrigin: { capability, turnId: liveTurnId, dispatchAttempt: 1 },
+          callerOpenId: 'ou_last_human',
+          chatId: BINDING.chatId,
+          larkAppId: BINDING.larkAppId,
+          quoteTargetId: 'om_last_human_msg',
+          rootMessageId: BINDING.rootMessageId,
+          ...session,
+        },
+        selfLarkAppId: BINDING.larkAppId,
+        baseDir,
+      });
+    const forged = { origin: 'human', openId: 'ou_initiator' };
+    expect(relay('retry', wake, { nodeId: 'a', reason: 'flaky', caller: forged })).toMatchObject({
+      ok: true,
+      body: { nodeId: 'a', reason: 'flaky', caller: { origin: 'runEvent', openId: 'ou_initiator', wakeTurn: true, turnId: wake } },
+    });
+    expect(relay('ask-human', wake, { nodeId: 'a', reason: 'needs a person' })).toMatchObject({
+      ok: true, body: { caller: { origin: 'runEvent', wakeTurn: true } },
+    });
+    // The initiator's own message: their own turn, no reason needed.
+    expect(relay('retry', 'om_initiator_says', { nodeId: 'a' }, {
+      callerOpenId: 'ou_initiator', quoteTargetId: 'om_initiator_says',
+    })).toMatchObject({ ok: true, body: { caller: { origin: 'human', openId: 'ou_initiator' } } });
+    const humanBody = relay('retry', 'om_initiator_says', { nodeId: 'a' }, { callerOpenId: 'ou_initiator', quoteTargetId: 'om_initiator_says' });
+    expect(humanBody.ok && (humanBody.body.caller as { wakeTurn?: boolean }).wakeTurn).toBeFalsy();
+  });
+
   it('a human turn in the main session is a human edit, whoever the human is', () => {
     seedRun();
     writeSession();
@@ -230,8 +269,9 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
   const MEMBER = 'ou_member';
   const capability = 'c'.repeat(64);
   const patch = [{ op: 'updateNode', nodeId: 'a', set: { goal: 'as discussed in the topic' } }];
-  const apply = (caller: { openId: string; origin: 'human' | 'runEvent' }) => applyV3RunEdit({
-    baseDir, runId: RUN, patch, baseRevision: 1, caller,
+  // A wake turn must say why (design §13.6); every case here gives a reason.
+  const apply = (caller: { openId: string; origin: 'human' | 'runEvent'; wakeTurn?: boolean }) => applyV3RunEdit({
+    baseDir, runId: RUN, patch, baseRevision: 1, caller, reason: 'as discussed in the topic',
     resolveNewBotSnapshot: () => { throw new Error('no new bots'); },
   });
   /** The session after a message from `sender` landed in the main topic. */
@@ -244,7 +284,10 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
     writeSession(messageFrom(sender, messageId));
     writeMarker(markerTurnId);
     const authority = editAs();
-    return { authority, outcome: apply({ openId: authority.callerOpenId, origin: authority.origin }) };
+    return {
+      authority,
+      outcome: apply({ openId: authority.callerOpenId, origin: authority.origin, ...(authority.wakeTurn ? { wakeTurn: true } : {}) }),
+    };
   };
   const relayEdit = (sender: string, messageId: string, liveTurnId: string) => {
     const decision = authorizeV3SessionRunEditRequest({
@@ -346,8 +389,10 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
     writeSession({ quoteTargetId: 'om_unattributed', lastCallerOpenId: undefined });
     writeMarker(wake);
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
+    // Another wake turn queued behind this one is no interjection (design
+    // §13.1, PR 5b-1): the wake turn keeps acting as the main bot.
     writeSession({ quoteTargetId: mintWorkflowEventTurnId(RUN, 3) });
-    expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
+    expect(editAs()).toMatchObject({ origin: 'runEvent', callerOpenId: INITIATOR, wakeTurn: true });
     // Relay: the session's fields must name one human generation.
     const relayStatus = (session: { callerOpenId?: string; quoteTargetId?: string; currentReplyTargetTurnId?: string }) =>
       authorizeV3SessionRunEditRequest({
@@ -367,9 +412,10 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
         baseDir,
       });
     expect(relayStatus({ callerOpenId: MEMBER, quoteTargetId: 'om_member_says' })).toMatchObject({ ok: true });
+    // A queued wake turn is no interjection: still this wake turn.
+    expect(relayStatus({ callerOpenId: MEMBER, quoteTargetId: mintWorkflowEventTurnId(RUN, 3) })).toMatchObject({ ok: true });
     for (const session of [
       { quoteTargetId: 'om_member_says' },
-      { callerOpenId: MEMBER, quoteTargetId: mintWorkflowEventTurnId(RUN, 3) },
       { callerOpenId: MEMBER, quoteTargetId: 'om_member_says', currentReplyTargetTurnId: 'om_someone_else' },
     ]) {
       expect(relayStatus(session)).toMatchObject({ ok: false, error: 'turn_provenance_stale' });
@@ -432,9 +478,11 @@ describe('who decided the edit: an overtaken wake turn or a scheduled turn is th
   const RERUN_SPENT = [{ op: 'rerunNode', nodeId: 'd' }];
   const BENIGN = [{ op: 'updateNode', nodeId: 'g', set: { goal: 'g, as discussed' } }];
 
-  function applyEdit(patch: unknown, caller: { openId: string; origin: 'human' | 'runEvent' }, base = 2) {
+  function applyEdit(patch: unknown, caller: { openId: string; origin: 'human' | 'runEvent'; wakeTurn?: boolean }, base = 2) {
     return applyV3RunEdit({
       baseDir, runId: RUN, patch, baseRevision: base, caller,
+      // A wake turn must say why (design §13.6).
+      ...(caller.wakeTurn ? { reason: 'the run needs it' } : {}),
       resolveNewBotSnapshot: (selector) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never,
     });
   }
@@ -442,7 +490,7 @@ describe('who decided the edit: an overtaken wake turn or a scheduled turn is th
 
   /** The three things only the initiator's own turn may do directly.
    *  `prepare` seeds a fresh run (and whatever the turn needs on it). */
-  function expectMainBotGrade(caller: () => { openId: string; origin: 'human' | 'runEvent' }, prepare: () => void): void {
+  function expectMainBotGrade(caller: () => { openId: string; origin: 'human' | 'runEvent'; wakeTurn?: boolean }, prepare: () => void): void {
     prepare();
     expect(applyEdit(RISKY, caller())).toMatchObject({ kind: 'proposed', reasons: expect.arrayContaining(['newBot', 'gateRelaxed']) });
     rmSync(join(baseDir, RUN), { recursive: true, force: true });
@@ -481,10 +529,10 @@ describe('who decided the edit: an overtaken wake turn or a scheduled turn is th
     writeMarker(mintWorkflowEventTurnId(RUN, 2));
     const caller = () => {
       const authority = editAs();
-      return { openId: authority.callerOpenId, origin: authority.origin };
+      return { openId: authority.callerOpenId, origin: authority.origin, ...(authority.wakeTurn ? { wakeTurn: true } : {}) };
     };
     prepareWake();
-    expect(caller()).toEqual({ openId: INITIATOR, origin: 'runEvent' });
+    expect(caller()).toEqual({ openId: INITIATOR, origin: 'runEvent', wakeTurn: true });
     rmSync(join(baseDir, RUN), { recursive: true, force: true });
     expectMainBotGrade(caller, prepareWake);
   });
@@ -494,7 +542,7 @@ describe('who decided the edit: an overtaken wake turn or a scheduled turn is th
       callerOpenId: INITIATOR, quoteTargetId: 'om_initiator_ack', currentReplyTargetTurnId: 'om_initiator_ack',
     });
     prepareWake();
-    expect(caller()).toEqual({ openId: INITIATOR, origin: 'runEvent' });
+    expect(caller()).toEqual({ openId: INITIATOR, origin: 'runEvent', wakeTurn: true });
     rmSync(join(baseDir, RUN), { recursive: true, force: true });
     expectMainBotGrade(caller, prepareWake);
   });

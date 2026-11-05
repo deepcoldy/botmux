@@ -3,8 +3,13 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, un
 import { basename, dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { FileLockTimeoutError, withFileLock } from '../utils/file-lock.js';
+import { PROVIDER_TTL_MS } from '../workflows/shared/provider-reconciler.js';
 
 export type TurnSendKind = 'progress' | 'final' | 'auxiliary';
+
+export class FinalPublicationUnknownError extends Error {
+  constructor() { super('final_publication_ambiguous: an earlier attempt has no delivery receipt'); }
+}
 
 export interface TurnSendLedgerKey {
   larkAppId: string;
@@ -15,6 +20,9 @@ export interface TurnSendLedgerKey {
 
 export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
   version: 1;
+  /** A provider call may have committed before its response/receipt was saved.
+   * Shared by explicit sends and the opted-in ordinary bridge publisher. */
+  publication?: { fingerprint: string; providerUuid: string; startedAtMs: number };
   nonIdempotentSequence?: {
     fingerprint: string;
     target: string;
@@ -108,6 +116,25 @@ export class TurnSendLedger {
     return join(this.sessionDirectory(key.sessionId), `${this.id(key)}.json`);
   }
 
+  /** Host marks the exact admitted turn before its CLI can publish. This lets
+   * matching CLI builds fence explicit finals even if launcher env is scrubbed. */
+  enableHandoffFence(key: TurnSendLedgerKey): void {
+    this.ensureSessionDirectory(key);
+    atomicWriteFileSync(this.handoffFencePath(key), 'v1\n', { mode: 0o600, durable: true, followTargetSymlink: false });
+  }
+
+  private handoffFencePath(key: TurnSendLedgerKey): string {
+    return join(this.sessionDirectory(key.sessionId), `.final-handoff-${this.id(key)}`);
+  }
+
+  handoffFenced(key: TurnSendLedgerKey): boolean {
+    const path = this.handoffFencePath(key);
+    if (!existsSync(path)) return false;
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Unsafe final handoff fence');
+    return true;
+  }
+
   /** Pre-session-directory layout (flat under the root). Read-only fallback so
    *  records written before the upgrade keep fencing, and stay inspectable and
    *  prunable; every new write goes to {@link recordPath}. */
@@ -137,6 +164,11 @@ export class TurnSendLedger {
       throw new Error('Invalid turn-send final record');
     }
     const sequence = record.nonIdempotentSequence;
+    if (record.publication && (!/^[a-f0-9]{64}$/.test(record.publication.fingerprint)
+      || !/^[A-Za-z0-9_-]{1,50}$/.test(record.publication.providerUuid)
+      || !Number.isFinite(record.publication.startedAtMs))) {
+      throw new Error('Invalid turn-send publication record');
+    }
     if (sequence && (
       !sequence.fingerprint
       || !sequence.target
@@ -235,6 +267,10 @@ export class TurnSendLedger {
       };
     }
     const sequence = record.nonIdempotentSequence;
+    if (!sequence && record.publication) return {
+      ...identity, state: 'in_flight', target: record.publication.providerUuid,
+      stepCount: 1, completedSteps: 0, inFlightStep: 1,
+    };
     if (!sequence) throw new Error('Invalid empty turn-send ledger record');
     return {
       ...identity,
@@ -309,6 +345,7 @@ export class TurnSendLedger {
           const record = this.readPath(path);
           if (record.final && record.final.deliveredAtMs <= cutoffMs) {
             unlinkSync(path);
+            rmSync(this.handoffFencePath(record), { force: true });
             removed++;
           } else {
             retained++;
@@ -382,7 +419,14 @@ export class TurnSendLedger {
   ): Promise<TurnSendLedgerResult | undefined> {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
-      const final = this.read(key)?.final;
+      const record = this.read(key);
+      const final = record?.final;
+      if (!final && record?.publication && kind !== 'auxiliary') {
+        if (kind === 'progress' || record.publication.fingerprint !== this.fingerprint(renderedContent)) {
+          throw new Error('本轮 final 投递结果未知，不能发布另一份正文或 progress；请先核对 turn-send-ledger');
+        }
+        this.assertPublicationRetry(record.publication);
+      }
       if (!final || kind === 'auxiliary') return undefined;
       if (kind === 'progress') {
         throw new Error('本轮 final 已完成，不能再发送 progress；如需补充消息，请使用 --response-kind auxiliary');
@@ -399,6 +443,7 @@ export class TurnSendLedger {
     kind: TurnSendKind,
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
+    options: { fenced?: boolean; providerUuid?: string; reuseExistingFinal?: boolean; beforeDispatch?: () => void; noSideEffect?: (error: unknown) => boolean } = {},
   ): Promise<TurnSendLedgerResult> {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
@@ -414,16 +459,43 @@ export class TurnSendLedger {
         if (kind === 'progress') {
           throw new Error('本轮 final 已完成，不能再发送 progress；如需补充消息，请使用 --response-kind auxiliary');
         }
-        if (record.final.fingerprint !== this.fingerprint(renderedContent)) {
+        if (!options.reuseExistingFinal && record.final.fingerprint !== this.fingerprint(renderedContent)) {
           throw new Error('本轮 final 已投递，但本次请求的目标、提及或附件与已投递请求不同；如需补充消息，请使用 --response-kind auxiliary');
         }
         return { messageId: record.final.messageId, replayed: true };
       }
 
+      const fingerprint = this.fingerprint(renderedContent);
+      const publication = record.publication;
+      if (publication && kind !== 'auxiliary') {
+        if (kind !== 'final' || publication.fingerprint !== fingerprint) {
+          throw new Error('本轮 final 投递结果未知，不能发布另一份正文或 progress；请先核对 turn-send-ledger');
+        }
+        this.assertPublicationRetry(publication);
+      }
       const providerUuid = kind === 'final'
-        ? `bts_${createHash('sha256').update(`${this.id(key)}:${this.fingerprint(renderedContent)}`).digest('hex').slice(0, 32)}`
+        ? publication?.providerUuid ?? options.providerUuid ??
+          `bts_${createHash('sha256').update(`${this.id(key)}:${fingerprint}`).digest('hex').slice(0, 32)}`
         : undefined;
-      const messageId = await dispatch(providerUuid);
+      options.beforeDispatch?.();
+      if (kind === 'final' && (publication || options.fenced || this.handoffFenced(key))) {
+        if (!providerUuid || !/^[A-Za-z0-9_-]{1,50}$/.test(providerUuid)) throw new Error('Invalid final provider UUID');
+        record.publication ??= { fingerprint, providerUuid, startedAtMs: Date.now() };
+        this.write(key, record);
+      }
+      let messageId: string;
+      try { messageId = await dispatch(providerUuid); }
+      catch (error) {
+        if (record.publication && options.noSideEffect?.(error)) {
+          // A rejection proves this call had no effect, not that an earlier
+          // timed-out call was rejected. Preserve the earlier uncertainty.
+          if (publication) throw new FinalPublicationUnknownError();
+          delete record.publication;
+          if (!record.final && !record.nonIdempotentSequence) rmSync(this.recordPath(key), { force: true });
+          else this.write(key, record);
+        }
+        throw error;
+      }
       if (!messageId && kind === 'final') throw new Error('Missing primary message ID');
       if (kind === 'final') {
         record.final = {
@@ -431,10 +503,18 @@ export class TurnSendLedger {
           messageId,
           deliveredAtMs: Date.now(),
         };
+        delete record.publication;
         this.write(key, record);
       }
       return { messageId, replayed: false };
     }, { maxWaitMs: 60_000 });
+  }
+
+  private assertPublicationRetry(publication: NonNullable<TurnSendLedgerRecord['publication']>): void {
+    const age = Date.now() - publication.startedAtMs;
+    if (age < 0 || age >= PROVIDER_TTL_MS['feishu-im'] - 60_000) {
+      throw new Error('final_publication_ambiguous: provider UUID 去重窗口已过期，请人工核对；不会自动重发');
+    }
   }
 
   /**
@@ -458,6 +538,7 @@ export class TurnSendLedger {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
       const record = this.read(key) ?? { ...key, version: 1 as const };
+      if (!record.final && record.publication) throw new Error('本轮已有结果未知的 final 投递，请先核对 turn-send-ledger');
       const fingerprint = this.fingerprint(renderedContent);
       if (record.final) {
         if (record.final.fingerprint !== fingerprint) {

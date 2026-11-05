@@ -147,6 +147,7 @@ import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/fi
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
+import { defaultStatFile, parseSendInvocation, validateClientSendInvocation, type ClientSendPlan } from './cli/send-invocation.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { safeRequirementUrl } from './core/dispatch-task-tree.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
@@ -440,6 +441,7 @@ import {
   authorizeV3DaemonCommand,
   authorizeV3RunEditCommand,
 } from './workflows/v3/cli-daemon-command-authority.js';
+import { v3ReasonRequiredProblem } from './workflows/v3/action-provenance.js';
 import {
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
@@ -4144,7 +4146,7 @@ interface SessionData {
   cliSessionId?: string;
   /** Workflow node marker (Session.workflowNode): this session executes a
    *  handed-off node of a bot-executed run. Only the run / main bot are read. */
-  workflowNode?: Pick<import('./types.js').WorkflowNodeSessionMarker, 'runId' | 'orchestratorAppId'>;
+  workflowNode?: Pick<import('./types.js').WorkflowNodeSessionMarker, 'runId' | 'orchestratorAppId' | 'placement' | 'submittedAt' | 'closedAt'>;
   /** Frozen file-sandbox decision from the persisted session (tri-state). */
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   dispatchLaunchSpec?: import('./types.js').Session['dispatchLaunchSpec'];
@@ -7255,7 +7257,11 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
     process.exit(1);
   }
   // Isolated main session → session relay (the daemon derives the caller).
-  const relayed = await tryWorkflowSessionRelayMutation(runId, 'edit', { patch, base: parsed.base });
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'edit', {
+    patch,
+    base: parsed.base,
+    ...(parsed.reason ? { reason: parsed.reason } : {}),
+  });
   if (relayed) {
     response = relayed;
   } else try {
@@ -7264,6 +7270,11 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
       dataDir: resolveDataDir(),
       envSessionId: process.env.BOTMUX_SESSION_ID,
     });
+    const missingReason = v3ReasonRequiredProblem(authority.wakeTurn ? { origin: authority.origin, wakeTurn: true } : undefined, parsed.reason);
+    if (missingReason) {
+      console.error(`❌ ${missingReason}`);
+      process.exit(1);
+    }
     const daemon = findDaemon(authority.larkAppId);
     if (!daemon) {
       console.error('❌ 没有在线 daemon；运行中修改需要拥有该 run 的 daemon 执行。');
@@ -7276,7 +7287,8 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
       body: {
         patch,
         base: parsed.base,
-        caller: { openId: authority.callerOpenId, origin: authority.origin },
+        caller: { openId: authority.callerOpenId, origin: authority.origin, ...(authority.wakeTurn ? { wakeTurn: true } : {}) },
+        ...(parsed.reason ? { reason: parsed.reason } : {}),
       },
     });
   } catch (err) {
@@ -7297,15 +7309,39 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
  *  走 daemon 的 retry IPC（journal 写入留在 daemon 进程内，单写者），daemon append
  *  `nodeRetryRequested` 后以新 attempt 重驱动；已退休的 v2 `resume` 不再参与分发。 */
 async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Promise<void> {
+  const { V3_RUN_RETRY_USAGE } = await import('./cli/v3-run-actions.js');
+  const { parseV3ReasonFlag } = await import('./cli/v3-run-edit.js');
   if (!runId) {
-    console.error('用法: botmux workflow retry <runId> [--node <nodeId>] [--bot <larkAppId>]');
+    console.error(V3_RUN_RETRY_USAGE);
     process.exit(1);
   }
   const nodeId = argValue(rest, '--node');
-  let response = await tryWorkflowSessionRelayMutation(runId, 'retry', nodeId ? { nodeId } : {});
+  const parsedReason = parseV3ReasonFlag(rest);
+  if (!parsedReason.ok) {
+    console.error(`❌ ${parsedReason.error}`);
+    console.error(V3_RUN_RETRY_USAGE);
+    process.exit(1);
+  }
+  const reason = parsedReason.reason;
+  // Isolated session: the daemon derives who decided (and refuses a wake
+  // turn without a reason) from its own live session record.
+  let response = await tryWorkflowSessionRelayMutation(runId, 'retry', {
+    ...(nodeId ? { nodeId } : {}),
+    ...(reason ? { reason } : {}),
+  });
   if (!response) {
-    const larkAppId = authorizeWorkflowDaemonCommand(runId, rest);
-    const daemon = findDaemon(larkAppId);
+    const authority = authorizeV3DaemonCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+      requestedLarkAppId: argValue(rest, '--bot'),
+    });
+    const missingReason = v3ReasonRequiredProblem(authority.caller, reason);
+    if (missingReason) {
+      console.error(`❌ ${missingReason}`);
+      process.exit(1);
+    }
+    const daemon = findDaemon(authority.larkAppId);
     if (!daemon) {
       console.error('❌ 没有在线 daemon；blocked 重试需要 daemon 驱动。');
       process.exit(1);
@@ -7315,7 +7351,14 @@ async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Prom
         daemon,
         runId,
         mutation: 'retry',
-        body: nodeId ? { nodeId } : {},
+        // A human retry without a reason sends exactly the old body (an older
+        // daemon still accepts it); who decided is sent only when it changes
+        // what the daemon records.
+        body: {
+          ...(nodeId ? { nodeId } : {}),
+          ...(reason ? { reason } : {}),
+          ...(authority.caller && (reason || authority.caller.origin === 'runEvent') ? { caller: authority.caller } : {}),
+        },
       });
     } catch (err: any) {
       console.error(`❌ ${err?.message ?? err}`);
@@ -7323,7 +7366,9 @@ async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Prom
     }
   }
   if (!response.ok) {
-    if (response.bodyRaw.includes('loop_node_use_grant')) {
+    if (response.bodyRaw.includes('reason_required')) {
+      console.error(`❌ ${v3ReasonRequiredProblem({ origin: 'runEvent', wakeTurn: true }, undefined)}`);
+    } else if (response.bodyRaw.includes('loop_node_use_grant')) {
       console.error(`❌ 该受阻的是一个 loop（轮数耗尽），不是节点 attempt——用 \`botmux workflow grant ${runId}\` 追加一轮。`);
     } else {
       console.error(`❌ retry 失败 (HTTP ${response.status}): ${response.bodyRaw}`);
@@ -7331,6 +7376,66 @@ async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Prom
     process.exit(1);
   }
   console.log(`🔄 v3 run "${runId}" 重试已受理，节点将以新 attempt 重跑。`);
+}
+
+/** `botmux workflow ask-human <runId> --node <id> --reason "…"` — hand a node
+ *  to a human (design §13.6). Same strict caller check as `retry`: only the
+ *  initiator's own turn or a turn this run's events woke. The owning daemon
+ *  stops the node's running attempt and blocks it as HANDED_TO_HUMAN (or
+ *  records the hand-over on a node already blocked). */
+async function cmdWorkflowAskHuman(runId: string | undefined, rest: string[]): Promise<void> {
+  const {
+    V3_RUN_ASK_HUMAN_USAGE,
+    formatV3AskHumanResponse,
+    parseV3AskHumanCliOptions,
+  } = await import('./cli/v3-run-actions.js');
+  if (!runId) {
+    console.error(V3_RUN_ASK_HUMAN_USAGE);
+    process.exit(1);
+  }
+  const parsed = parseV3AskHumanCliOptions(rest);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    console.error(V3_RUN_ASK_HUMAN_USAGE);
+    process.exit(1);
+  }
+  let response = await tryWorkflowSessionRelayMutation(runId, 'ask-human', { nodeId: parsed.nodeId, reason: parsed.reason });
+  if (!response) {
+    let authority;
+    try {
+      authority = authorizeV3DaemonCommand({
+        runId,
+        dataDir: resolveDataDir(),
+        envSessionId: process.env.BOTMUX_SESSION_ID,
+      });
+    } catch (err) {
+      console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    if (authority.mode !== 'chat' || !authority.caller) {
+      console.error('❌ ask-human 只能在 run 主会话的当前 botmux 回合里使用（发起人本人的回合，或本 run 的事件唤醒的回合）');
+      process.exit(1);
+    }
+    const daemon = findDaemon(authority.larkAppId);
+    if (!daemon) {
+      console.error('❌ 没有在线 daemon；交给人需要拥有该 run 的 daemon 执行。');
+      process.exit(1);
+    }
+    try {
+      response = await postWorkflowDaemonMutation({
+        daemon,
+        runId,
+        mutation: 'ask-human',
+        body: { nodeId: parsed.nodeId, reason: parsed.reason, caller: authority.caller },
+      });
+    } catch (err: any) {
+      console.error(`❌ ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  }
+  const out = formatV3AskHumanResponse(runId, parsed.nodeId, response);
+  (out.exitCode === 0 ? console.log : console.error)(out.text);
+  if (out.exitCode !== 0) process.exit(out.exitCode);
 }
 
 /** `botmux workflow grant <runId> [--loop <id>]` — 耗尽 loop 追加一轮入口（CLI 侧）。
@@ -7835,8 +7940,10 @@ ${SEND_HELP_BODY}
                                        持久化取消 v3 run 并中断活动节点
   workflow retry|grant [...]           处理受阻节点 / loop
   workflow status <runId> [--json]     查看运行中流程的当前版本、节点状态和待确认修改
-  workflow edit <runId> --patch-file <文件|-> --base <版本>
+  workflow edit <runId> --patch-file <文件|-> --base <版本> [--reason <理由>]
                                        运行中按版本修改流程（越界修改转发起人确认）
+  workflow ask-human <runId> --node <id> --reason <理由>
+                                       把节点交给人决定（停下正在跑的尝试，转受阻卡）
   template migrate-v3 [id|path ...] [--all] [--commit ...]
                                        v2 定义迁移：默认 dry-run，写入需显式 owner/app/scope
   template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]
@@ -9787,7 +9894,20 @@ async function relaySend(
   rest: string[],
   relayDir: string,
   replyLayout?: ReplyLayout,
+  preflightPlan?: ClientSendPlan,
 ): Promise<void> {
+  const resolved = preflightPlan
+    ? { kind: 'plan' as const, plan: preflightPlan }
+    : await preflightSendInvocation(rest);
+  if (resolved.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    return;
+  }
+  if (resolved.kind === 'error') {
+    console.error(resolved.message);
+    process.exit(2);
+  }
+  const plan = resolved.plan;
   if (flagPresentButValueMissing(rest, '--completion-proposal-file')) {
     console.error('relay: --completion-proposal-file 需要路径参数');
     process.exit(2);
@@ -9856,22 +9976,16 @@ async function relaySend(
     cardContent = readFileSync(cardFile, 'utf-8');
   }
   // Resolve content with the same precedence as cmdSend (content-file > positional > stdin)
-  const contentFile = argValue(rest, '--content-file');
+  const contentFile = plan.contentFile;
   let content = '';
   if (cardJsonArg !== undefined || cardFile !== undefined) {
     content = '';
   } else if (contentFile) {
     content = existsSync(contentFile) ? readFileSync(contentFile, 'utf-8') : '';
+  } else if (plan.invocation.bodySource === 'stdin') {
+    content = plan.stdinContent ?? await readStdin();
   } else {
-    // NOTE: `--attention` is deliberately NOT excluded here. The relay flag
-    // allowlist (below) doesn't forward it, so sandbox `--attention` can't raise
-    // the dashboard hand anyway; excluding it would silently send the reason as a
-    // bare message instead of the original loud "no content" failure. Plumbing
-    // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent', '--schedule-remove-self']);
-    content = pos.length > 0
-      ? normalizePositionalSendContent(pos.join(' '))
-      : await readStdin();
+    content = normalizePositionalSendContent(plan.invocation.positionals.join(' '));
   }
   content = stripTrailingOaiMemoryCitation(content);
   if (diffInput) {
@@ -9939,19 +10053,19 @@ async function relaySend(
     try { writeFileSync(join(relayDir, base), readFileSync(p)); out.push(base); } catch { /* skip unreadable */ }
   };
   const images: string[] = [];
-  for (const p of argValues(rest, '--image', '--images')) {
+  for (const p of plan.attachments.images) {
     copyOutboxAttachment(p, images);
   }
   const attachments: string[] = [];
-  for (const p of argValues(rest, '--file', '--files')) {
+  for (const p of plan.attachments.files) {
     copyOutboxAttachment(p, attachments);
   }
   const videos: string[] = [];
-  for (const p of argValues(rest, '--video', '--videos')) {
+  for (const p of plan.attachments.videos) {
     copyOutboxAttachment(p, videos);
   }
   const videoCovers: string[] = [];
-  for (const p of argValues(rest, '--video-cover', '--video-covers')) {
+  for (const p of plan.attachments.videoCovers) {
     copyOutboxAttachment(p, videoCovers);
   }
 
@@ -10527,7 +10641,82 @@ function buildSendDiffCard(input: SendDiffInput, summary: string): DiffCardResul
   }
 }
 
-async function sendDryRun(rest: string[]): Promise<void> {
+type SendPreflight =
+  | { kind: 'help' }
+  | { kind: 'error'; message: string }
+  | { kind: 'plan'; plan: ClientSendPlan };
+
+/** Earliest send gate. Runs before Riff dispatch and before any session,
+ *  relay, marker or transport resolution so a rejected argv cannot mutate
+ *  state. The order is part of the contract:
+ *  provider guard → pure parse → raw exact `--` → free help → client validation. */
+async function preflightSendInvocation(rest: string[]): Promise<SendPreflight> {
+  if (rest.includes('--remote-runner-outbound')
+    && argValues(rest, '--mention').some(isCliFlagShapedRemoteRunnerValue)) {
+    return { kind: 'error', message: 'botmux send refused: --remote-runner-outbound mention values must not look like CLI flags' };
+  }
+  const invocation = parseSendInvocation(rest);
+  if (invocation.rawDoubleDashToken) {
+    return { kind: 'error', message: "botmux send: '--' 分隔符尚未支持；正文以 -- 开头请用 --content-file 或 heredoc。" };
+  }
+  if (invocation.freeHelpRequested) return { kind: 'help' };
+  const validated = validateClientSendInvocation(invocation, {
+    cwd: process.cwd(),
+    statFile: defaultStatFile,
+  });
+  if (!validated.ok) return { kind: 'error', message: validated.message };
+  const plan = validated.plan;
+  if (plan.invocation.bodySource !== 'stdin') return { kind: 'plan', plan };
+
+  // `--as independent|suggestion` is pure argv derivation, in the same class as
+  // the image-mode/response-kind checks above, and cmdSend later synthesizes
+  // its whole body via crossPrincipalAsKeyword (like --diff's rendered card).
+  // Validate it BEFORE reading stdin: a bad value must report the usage error
+  // even when stdin is a non-TTY pipe that never reaches EOF, rather than
+  // blocking on the read.
+  const asChoice = parseCrossPrincipalAsFlag(plan.invocation.flags['--as']?.[0]);
+  if (Object.hasOwn(plan.invocation.flags, '--as') && !asChoice) {
+    return { kind: 'error', message: t('xpi.send.as_usage') };
+  }
+
+  // Read stdin before session/ledger/marker resolution. This is the same read
+  // the command used to perform later, but doing it here keeps a rejected body
+  // from advancing a queued turn or copying an open socket into a transport.
+  // Trade-off: this read also precedes the workflow/transport/capability gates
+  // inside cmdSend, so a non-TTY stdin that never reaches EOF blocks before
+  // those gates can refuse. That fd shape is not reachable in production (the
+  // worker hands the CLI a TTY; remote-runner uses --content-file with
+  // stdio:'ignore'), and the queued-turn ordering win is worth it.
+  const stdinContent = await readStdin();
+  const loneDash = plan.invocation.positionals.length === 1 && plan.invocation.positionals[0] === '-';
+  if (loneDash && !stdinContent.trim()) {
+    return {
+      kind: 'error',
+      message: "botmux send: 位置参数 '-' 表示从 stdin 读正文，但 stdin 没有内容；多行正文请直接用 botmux send <<'EOF' … EOF。",
+    };
+  }
+  const hasAttachments = plan.attachments.images.length + plan.attachments.files.length
+    + plan.attachments.videos.length + plan.attachments.videoCovers.length > 0;
+  if (!loneDash && !stdinContent.trim() && !hasAttachments
+    && !Object.hasOwn(plan.invocation.flags, '--diff') && !asChoice) {
+    return { kind: 'error', message: 'botmux send: 正文为空（stdin 没有内容）。' };
+  }
+  return { kind: 'plan', plan: { ...plan, stdinContent } };
+}
+
+async function sendDryRun(rest: string[], preflightPlan?: ClientSendPlan): Promise<void> {
+  const resolved = preflightPlan
+    ? { kind: 'plan' as const, plan: preflightPlan }
+    : await preflightSendInvocation(rest);
+  if (resolved.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    return;
+  }
+  if (resolved.kind === 'error') {
+    console.error(resolved.message);
+    process.exit(2);
+  }
+  const plan = resolved.plan;
   const diff = parseDiffFlag(rest);
   if (diff.error) { console.error(`botmux send: ${diff.error}`); process.exit(2); }
   const diffError = diffUsageError({
@@ -10545,16 +10734,15 @@ async function sendDryRun(rest: string[]): Promise<void> {
   for (const flag of ['--images', '--files', '--videos', '--voice']) {
     if (rest.includes(flag)) console.error(`botmux send --dry-run: 已忽略 ${flag}（dry-run 只渲染正文）`);
   }
-  const contentFile = argValue(rest, '--content-file');
+  const contentFile = plan.contentFile;
   let content: string;
   if (contentFile) {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
+  } else if (plan.invocation.bodySource === 'stdin') {
+    content = plan.stdinContent ?? await readStdin();
   } else {
-    const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--schedule-remove-self']);
-    content = pos.length > 0
-      ? normalizePositionalSendContent(pos.join(' '))
-      : await readStdin();
+    content = normalizePositionalSendContent(plan.invocation.positionals.join(' '));
   }
   content = extractCardText(stripTrailingOaiMemoryCitation(content));
   if (!content.trim() && !diffInput) {
@@ -10575,35 +10763,29 @@ async function sendDryRun(rest: string[]): Promise<void> {
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, ...(rendered ? { diff: { stats: rendered.stats, statsScope: rendered.statsScope, preview: rendered.preview } } : {}), card }, null, 2));
 }
 
-async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promise<void> {
+async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
+  const resolved = preflight ?? await preflightSendInvocation(rest);
+  if (resolved.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    return;
+  }
+  if (resolved.kind === 'error') {
+    console.error(resolved.message);
+    process.exit(2);
+  }
+  const sendPlan = resolved.plan;
   const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
-  // Provider values are opaque argv tokens, but flag-shaped mention values can
-  // otherwise trigger the help/dry-run early exits below before the outbound
-  // policy guard runs. Reject them at the final CLI boundary as well as in the
-  // Remote Runner protocol parser so direct/replayed outbound mention values
-  // fail closed.
+  // Defense in depth for direct callers that pass a plan; the earliest gate
+  // already enforces this before help/dry-run.
   if (remoteRunnerOutbound
     && argValues(rest, '--mention').some(isCliFlagShapedRemoteRunnerValue)) {
     console.error('botmux send refused: --remote-runner-outbound mention values must not look like CLI flags');
     process.exit(2);
   }
-  // `--help` wins over every ordinary flag and over all content resolution.
-  // It must stay the first generic early exit after the narrow provider-value
-  // shape check above: content resolution below
-  // falls through to readStdin() when there is no positional/--content-file,
-  // and positionals() filters `--help` out as a flag, so anything placed
-  // after it turns `botmux send --help` into a stdin wait instead of help —
-  // and stdin that never reaches EOF (an open socket) hangs the process
-  // indefinitely, taking the calling shell with it. Printing help is a
-  // success, so this exits 0 rather than falling into the usage error.
-  if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(SEND_HELP_BODY);
-    return;
-  }
   // `--dry-run` renders locally and exits before any session, relay or
   // transport resolution: it must never be able to deliver anything.
   if (rest.includes('--dry-run')) {
-    await sendDryRun(rest);
+    await sendDryRun(rest, sendPlan);
     return;
   }
   const ancestorCtx = findAncestorSessionContext();
@@ -10753,7 +10935,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promis
         replyLayout = undefined;
       }
     }
-    await relaySend(rest, relayDir, replyLayout);
+    await relaySend(rest, relayDir, replyLayout, sendPlan);
     return;
   }
   if (relayDir && (linuxKernelIsolationDetected || !liveMarkerCtx?.sessionId)) {
@@ -11038,10 +11220,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promis
     console.error('botmux send: --image-mode 仅支持 fit_horizontal|medium|small|tiny');
     process.exit(2);
   }
-  const images = argValues(rest, '--image', '--images');
-  const files = argValues(rest, '--file', '--files');
-  const videos = argValues(rest, '--video', '--videos');
-  const videoCovers = argValues(rest, '--video-cover', '--video-covers');
+  const { images, files, videos, videoCovers } = sendPlan.attachments;
   const diffError = diffUsageError({
     requested: diff.requested,
     customCardRequested: cardJsonArg !== undefined || cardFile !== undefined,
@@ -11074,7 +11253,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promis
     process.exit(1);
   }
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
-  const contentFile = argValue(rest, '--content-file');
+  const contentFile = sendPlan.contentFile;
   if (customCardRequested && !diff.requested && contentFile) {
     console.error('botmux send: --card-file/--card-json 不能与 --content-file 混用');
     process.exit(2);
@@ -11707,7 +11886,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promis
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested && !diff.requested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound', '--schedule-remove-self']);
+    const unexpectedText = sendPlan.invocation.positionals;
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -11784,13 +11963,10 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promis
   } else if (contentFile) {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
+  } else if (sendPlan.invocation.bodySource === 'stdin') {
+    content = sendPlan.stdinContent ?? await readStdin();
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound', '--schedule-remove-self']);
-    if (pos.length > 0) {
-      content = normalizePositionalSendContent(pos.join(' '));
-    } else {
-      content = await readStdin();
-    }
+    content = normalizePositionalSendContent(sendPlan.invocation.positionals.join(' '));
   }
   if (diffInput) {
     customCard = { ...buildSendDiffCard(diffInput, extractCardText(stripTrailingOaiMemoryCitation(content))).card };
@@ -18879,14 +19055,29 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+let sendPreflight: SendPreflight | undefined;
+if (command === 'send') {
+  sendPreflight = await preflightSendInvocation(process.argv.slice(3));
+  if (sendPreflight.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    process.exit(0);
+  }
+  if (sendPreflight.kind === 'error') {
+    console.error(sendPreflight.message);
+    process.exit(2);
+  }
+}
+
 // Riff runs on a different machine. Dispatch its stateful helpers on the owning
 // host before any command can accidentally read/write sandbox-local stores.
 if (process.env.BOTMUX_SESSION_ID && !command?.startsWith('__')
   && (command === 'riff-host-bind' || process.env.BOTMUX_RIFF_HOST_TOOLS === '1'
     || process.env.BOTMUX_RIFF_HOST_BINDING || process.env.BOTMUX_LARK_APP_SECRET)) {
   try {
-    const { maybeRunRiffHostTool } = await import('./cli/riff-host-tools.js');
-    if (await maybeRunRiffHostTool(process.argv.slice(2), readStdin)) process.exit(process.exitCode ?? 0);
+    const { makeRiffStdinReader, maybeRunRiffHostTool } = await import('./cli/riff-host-tools.js');
+    const cachedStdin = sendPreflight?.kind === 'plan' ? sendPreflight.plan.stdinContent : undefined;
+    const riffStdin = makeRiffStdinReader(cachedStdin, readStdin);
+    if (await maybeRunRiffHostTool(process.argv.slice(2), riffStdin)) process.exit(process.exitCode ?? 0);
   } catch (error) {
     console.error(`botmux Riff host: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
@@ -19166,6 +19357,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'grant',
     'cancel',
     'edit',
+    'ask-human',
   ]);
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
@@ -20469,6 +20661,11 @@ switch (command) {
       await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
       break;
     }
+    if (wfSub === 'ask-human') {
+      // v3: the main bot hands a node to a human (design §13.6).
+      await cmdWorkflowAskHuman(process.argv[4], process.argv.slice(5));
+      break;
+    }
     const { cmdWorkflow } = await import('./cli/workflow.js');
     await cmdWorkflow(wfSub, process.argv.slice(4));
     break;
@@ -20524,7 +20721,7 @@ switch (command) {
     try {
       await cmdSend(process.argv.slice(3), () => {
         releaseFeedbackEffect ??= acquireFeedbackSendLease(resolveDataDir());
-      });
+      }, sendPreflight);
       releaseFeedbackEffect?.();
     }
     catch (error) {

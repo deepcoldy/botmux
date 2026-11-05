@@ -1159,6 +1159,11 @@ export class CodexBridgeQueue {
     return out;
   }
 
+  restoreDrained(turns: readonly CodexPendingTurn[]): void {
+    const retained = new Set(this.queue);
+    this.queue.unshift(...turns.filter(turn => !retained.has(turn)));
+  }
+
   size(): number {
     return this.queue.length;
   }

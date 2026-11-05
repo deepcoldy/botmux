@@ -30,7 +30,7 @@ export interface DurableLarkPostAdmissionOutput {
 export type DurableLarkCanonicalHandlerResult =
   | { kind: 'admitted'; session: Session }
   | { kind: 'ignored'; reason: string }
-  | { kind: 'retry'; reason: string };
+  | { kind: 'retry'; reason: string; progressToken?: string };
 
 export interface DurableLarkCanonicalHandlerContext extends DurableInboxPrimaryDispatchContext {
   /** Raw event data after the durable envelope identity has been validated. */
@@ -180,7 +180,13 @@ export function createDurableLarkCanonicalDispatch(
       if (!reason || reason.length > 512) {
         throw new Error('durable canonical retry result requires a bounded reason');
       }
-      return { kind: 'retry', reason };
+      return {
+        kind: 'retry',
+        reason,
+        ...(typeof result.progressToken === 'string' && result.progressToken
+          ? { progressToken: result.progressToken.slice(0, 256) }
+          : {}),
+      };
     }
     if (result.kind === 'ignored') {
       if (outputs.length > 0 || controls.length > 0) {

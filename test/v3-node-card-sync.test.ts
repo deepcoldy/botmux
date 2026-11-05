@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { BotRun, cleanupBotRuns, expectTerminal, reportDag, reportFiles } from './helpers/v3-external-harness.js';
 import { CHAT, MAIN, handoffWorld } from './helpers/workflow-handoff-harness.js';
-import { createV3NodeCardSync, v3NodeCardStatusFor } from '../src/im/lark/v3-node-card-sync.js';
+import { checkpointLine, createV3NodeCardSync, v3NodeCardStatusFor } from '../src/im/lark/v3-node-card-sync.js';
 import { buildV3NodeCard, v3NodeStalled } from '../src/im/lark/v3-node-card.js';
 import { foldV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
 import { recordExternalStalled, reportExternalBlocked } from '../src/workflows/v3/external-control.js';
@@ -169,5 +169,37 @@ describe('node card follows the journal', () => {
     });
     await sync('card-plain');
     expect(patches).toEqual([]);
+  });
+});
+
+describe('checkpoint line (M21): the four texts a completed checkpoint card can show', () => {
+  // Mutation coverage for checkpointLine: every release reason has its own
+  // wording — a delivery failure, a closed session and the timeout must not
+  // be presented as "the main bot reviewed it".
+  const success = (released?: { reason: 'wakeTurnEnded' | 'wakeNotDelivered' | 'wakeSessionEnded' | 'holdTimeout'; at: number }) => ({
+    nodeId: 'survey',
+    attemptId: 'survey/attempts/001',
+    eventSeq: 7,
+    at: 1000,
+    ...(released ? { released } : {}),
+  });
+
+  it('no record: no line; still holding: the wait line', () => {
+    expect(checkpointLine(undefined)).toBeUndefined();
+    expect(checkpointLine(success())).toBe('检查点：等主 Bot 看完结果，后续节点暂停');
+  });
+
+  it('a turn that ended: the reviewed line (the only "happy" wording)', () => {
+    expect(checkpointLine(success({ reason: 'wakeTurnEnded', at: 2000 })))
+      .toBe('检查点：主 Bot 已看过结果，后续节点继续');
+  });
+
+  it('each fallback reason keeps its own, distinguishable text', () => {
+    expect(checkpointLine(success({ reason: 'holdTimeout', at: 2000 })))
+      .toBe('检查点：等主 Bot 看结果超时，已按原流程继续');
+    expect(checkpointLine(success({ reason: 'wakeSessionEnded', at: 2000 })))
+      .toBe('检查点：主 Bot 的会话中途结束，已按原流程继续');
+    expect(checkpointLine(success({ reason: 'wakeNotDelivered', at: 2000 })))
+      .toBe('检查点：没能唤醒主 Bot 看结果，已按原流程继续');
   });
 });

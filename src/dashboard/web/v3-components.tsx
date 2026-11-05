@@ -23,6 +23,8 @@ import {
   loopInstances,
   loopRounds,
   nodeBotLine,
+  nodeBoxBotLine,
+  nodeInMainTopic,
   nodeElapsedMs,
   nodeStatusLine,
   nodeWaitingMs,
@@ -34,6 +36,9 @@ import {
   V3_NODE_HEADING,
   V3_REVISION_ROLE_LABEL,
   V3_REVISION_STATE_LABEL,
+  V3_INTERVENTION_LABEL,
+  V3_INTERVENTION_ROLE_LABEL,
+  V3_CHECKPOINT_LABEL,
 } from './v3-model.js';
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
@@ -427,7 +432,7 @@ export function DagNode(props: {
   if (node.isLoop) {
     return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} />;
   }
-  const botLine = nodeBotLine(node);
+  const botLine = nodeBoxBotLine(node);
   const fit = boxTextFit(box.width);
   const heading = nodeBoxHeading(node, box.width, fit(22));
   return (
@@ -561,6 +566,21 @@ function NodePanel(props: {
         ) : null}
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
         <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
+        {nodeInMainTopic(node) ? (
+          // §5.5: no stable link to a single message — say when and what to
+          // look for in the main topic.
+          <p className="v3r-exec-row">
+            <span>落点</span>主话题
+            {node.handoff?.at !== undefined ? ` · ${formatClock(node.handoff.at)} 交接` : '（还没交接）'}
+            {node.handoff?.queued ? ' · 排队中：等执行 Bot 在主话题里的当前一轮结束' : ''}
+            {node.handoff?.title ? ` · 在主话题里找「${node.handoff.title}」` : ''}
+          </p>
+        ) : null}
+        {node.checkpoint ? <p className="v3r-checkpoint">{V3_CHECKPOINT_LABEL[node.checkpoint]}</p> : null}
+        {node.waitingOnCheckpoint?.length ? (
+          <p className="v3r-checkpoint">等检查点 {node.waitingOnCheckpoint.join('、')} 由主 Bot 看完结果后再开始</p>
+        ) : null}
+        <NodeInterventions node={node} />
         {node.depends.length ? (
           <p className="v3r-deps">
             <span>依赖</span>
@@ -634,6 +654,7 @@ export function NodeExecution(props: { node: RunNodeView; generatedAt: number | 
       {botLine ? (
         <p className="v3r-exec-row"><span>执行</span>{botLine}{node.bot?.model ? ` · ${node.bot.model}` : ''}</p>
       ) : null}
+
       {elapsed !== undefined ? (
         <p className="v3r-exec-row">
           <span>耗时</span>{formatV3Duration(elapsed)}{node.status === 'running' ? '（进行中）' : ''}
@@ -662,6 +683,30 @@ export function NodeExecution(props: { node: RunNodeView; generatedAt: number | 
           })}
         </ol>
       ) : null}
+    </div>
+  );
+}
+
+/** Every automatic handling by the main bot and every hand-over to a
+ *  person, with the reason as given (design §13.6). */
+export function NodeInterventions(props: { node: RunNodeView }): React.JSX.Element | null {
+  const items = props.node.interventions ?? [];
+  if (items.length === 0) return null;
+  return (
+    <div className="v3r-interventions">
+      <p className="v3r-interventions-title">自动处理与交给人</p>
+      <ol className="v3r-interventions-list">
+        {items.map((item, index) => (
+          <li key={`${item.at}-${index}`} className={`v3r-intervention kind-${item.kind}`}>
+            <span className="t">{formatClock(item.at)}</span>
+            <span className="k">{V3_INTERVENTION_LABEL[item.kind]}</span>
+            {item.kind === 'handedToHuman' && item.by !== 'mainBot' ? (
+              <span className="b">（{V3_INTERVENTION_ROLE_LABEL[item.by]}）</span>
+            ) : null}
+            {item.reason ? <span className="r">{item.reason}</span> : null}
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }

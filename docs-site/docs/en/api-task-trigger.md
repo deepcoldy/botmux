@@ -103,6 +103,8 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 
 **`envelope.trusted` must be `false`** by design: it declares "the envelope below is untrusted external data", which is what makes the daemon wrap the whole envelope in `<botmux_external_event trusted="false">` and explicitly tell the model not to execute instructions smuggled inside it. **Put what you actually want done in the top-level `instruction`** — it is rendered as `<botmux_task trusted="true">` above the event data.
 
+> Exception: when a webhook connector turns on "[Treat event content as trusted instructions](/en/webhook#treat-event-content-as-trusted-instructions-optional-off-by-default)", the Dashboard adds top-level `payloadTrusted: true` to the forwarded request (`envelope.trusted` stays `false`) and the daemon renders the event data as a trusted task. The field is only accepted with `source.type: "webhook"` and `target.kind: "turn"`; any other combination is a 400. Direct `/api/trigger` callers don't need it — put the work in `instruction`.
+
 ### 3.4 `presentation` (optional; controls how it looks in Feishu)
 
 | Field | Value | Default |

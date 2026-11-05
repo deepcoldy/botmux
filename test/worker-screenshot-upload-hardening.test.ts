@@ -509,6 +509,10 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const usageLimitTracker = { beginTurn: () => 1 }, currentUsageLimitSnapshot = () => undefined;
       const claudeBridgeActive = false, codexBridgeActive = false;
       const lastInitConfig = { cliId: 'dsh-tui' }, cliAdapter = { reliableTurnTerminal: false };
+      // Durable output handoff is negotiated per worker init; this queue-only
+      // harness runs without one, so the fence write stays inert (the guard
+      // short-circuits before TurnSendLedger is touched).
+      const universalOutputHandoff = undefined;
       const stampMojoTurnMark = () => {}, markTurnExecutionStart = () => {};
       const logicalMsg = 'queued input', msg = logicalMsg;
       let submissionPreparationFailed = false;

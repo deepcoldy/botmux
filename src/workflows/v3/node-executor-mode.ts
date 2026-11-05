@@ -15,6 +15,7 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
+import { v3OrderedAncestorSets, v3OrderingBreak, v3ReachableAncestorSets, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
 import type { V3HandoffIdentityRecord, V3HandoffIdentityTool, V3HandoffIdentityUnavailableReason } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
@@ -65,6 +66,30 @@ export function describeV3EphemeralFallback(decision: V3NodeExecutorDecision): s
   return `「节点交给群里的 Bot 执行」已开启，但本次仍用临时进程执行节点：${EPHEMERAL_REASON_TEXT[decision.reason]}。`;
 }
 
+/**
+ * §5.2 hard rule 3: can this run's main topic host `main` nodes? Only when
+ * the run is anchored at a topic root AND its main session is that topic's
+ * own session. A normal group whose main bot keeps one chat-wide session
+ * (P4) has a root to reply under, but its main session is not in it: every
+ * node there gets a node topic. `mainSession` is the persisted row of
+ * `binding.sessionId` (undefined = not found / unreadable).
+ */
+export function v3MainTopicAvailability(
+  binding: RunChatBinding | undefined,
+  mainSession: { scope?: 'thread' | 'chat'; rootMessageId?: string | null } | undefined,
+): V3MainTopicAvailability {
+  if (!binding?.chatId || !binding.rootMessageId) return { available: false, why: '这个 run 没有主话题根' };
+  if (binding.chatType !== 'group') return { available: false, why: '这个 run 不在群聊里' };
+  if (!binding.sessionId || !mainSession) return { available: false, why: '查不到主会话，无法确认它在不在话题里' };
+  if ((mainSession.scope ?? 'thread') !== 'thread') {
+    return { available: false, why: '主 Bot 在本群是「整群一个会话」，主会话不在话题里' };
+  }
+  if (mainSession.rootMessageId !== binding.rootMessageId) {
+    return { available: false, why: '主会话不在这个 run 的主话题里' };
+  }
+  return { available: true };
+}
+
 export interface V3NodeExecutorTarget {
   /** Authored goal node id, or `<loopId>.<bodyNodeId>` for a loop body. */
   nodeId: string;
@@ -76,6 +101,14 @@ export interface V3NodeExecutorTarget {
    *  (`botmux report --output` carries files), so such a node can never
    *  complete when handed to a bot. */
   directoryOutputs?: string[];
+  /** §5.1: set only for a top-level goal node handed off in the main topic. */
+  placement?: 'main';
+  /** With `placement`: why a `depends` ancestor is NOT among `ancestors`
+   *  (a one_success / quorum join lets the node start before it ends). */
+  unorderedAncestors?: Array<{ nodeId: string; joinId: string; rule: string }>;
+  /** With `placement`: the node's transitive `depends` ancestors (top-level
+   *  ids), so the §5.2 hard rules can be checked from the targets alone. */
+  ancestors?: string[];
 }
 
 function directoryOutputsOf(outputs: Record<string, { kind: string }> | undefined): string[] | undefined {
@@ -102,8 +135,35 @@ export function v3BotExecutorTargets(
     const directoryOutputs = directoryOutputsOf(outputs);
     return directoryOutputs ? { ...target, directoryOutputs } : target;
   };
+  // §5.2: only ancestors guaranteed to finish first (all_success joins on
+  // the whole path) order two main-topic nodes; the same rule as placement.ts.
+  const ordered = v3OrderedAncestorSets(dag);
+  const main = dag.nodes.filter((node) => isGoalNode(node) && node.placement === 'main');
+  // The explanation is only needed for a pair that conflicts (same executor,
+  // linked by `depends` yet unordered); computed once per DAG, not per pair.
+  const executorOfMain = new Map(main.map((node) => [node.id, isGoalNode(node) ? targetOf(node.bot, node.id) : undefined]));
+  let reach: Map<string, Set<string>> | undefined;
   for (const node of dag.nodes) {
-    if (isGoalNode(node)) out.push(withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs));
+    if (isGoalNode(node)) {
+      const target = withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs);
+      if (node.placement !== 'main') {
+        out.push(target);
+        continue;
+      }
+      const unorderedAncestors = main.flatMap(({ id: other }) => {
+        if (other === node.id || ordered.get(node.id)?.has(other)) return [];
+        if (executorOfMain.get(other) !== executorOfMain.get(node.id)) return [];
+        reach ??= v3ReachableAncestorSets(dag);
+        const why = v3OrderingBreak(dag, other, node.id, reach);
+        return why ? [{ nodeId: other, ...why }] : [];
+      });
+      out.push({
+        ...target,
+        placement: 'main',
+        ancestors: [...(ordered.get(node.id) ?? [])].sort(),
+        ...(unorderedAncestors.length > 0 ? { unorderedAncestors } : {}),
+      });
+    }
     if (isLoopNode(node)) {
       for (const body of node.body.nodes) {
         const nodeId = `${node.id}.${body.id}`;
@@ -116,6 +176,57 @@ export function v3BotExecutorTargets(
     }
   }
   return out;
+}
+
+/**
+ * §5.2 hard rules over the frozen targets (who executes each node is already
+ * resolved): rules 1–2 from the `ancestors` the main targets carry, rule 3
+ * against `mainTopic`. Messages say which rule; empty = fine.
+ */
+export function v3TargetPlacementProblems(input: {
+  targets: readonly V3NodeExecutorTarget[];
+  orchestratorAppId: string;
+  mainTopic: V3MainTopicAvailability;
+  nameOf?: (larkAppId: string) => string;
+}): string[] {
+  const main = input.targets.filter((target) => target.placement === 'main' && !target.loop);
+  if (main.length === 0) return [];
+  const executor = new Map(main.map((target) => [target.nodeId, target.larkAppId]));
+  return v3PlacementProblems({
+    dag: {
+      runId: 'placement-check',
+      nodes: main.map((target) => ({
+        id: target.nodeId,
+        type: 'goal' as const,
+        goal: target.nodeId,
+        placement: 'main' as const,
+        // Ancestors are already transitive: direct edges to them suffice.
+        depends: (target.ancestors ?? []).map((from) => ({ from })),
+        inputs: [],
+      })),
+    },
+    mainLarkAppId: input.orchestratorAppId,
+    executorOf: (nodeId) => executor.get(nodeId) ?? input.orchestratorAppId,
+    explainUnordered: (a, b) => {
+      const find = (later: string, first: string) =>
+        main.find((target) => target.nodeId === later)?.unorderedAncestors?.find((entry) => entry.nodeId === first);
+      const ab = find(b, a);
+      if (ab) return { joinId: ab.joinId, rule: ab.rule, first: a };
+      const ba = find(a, b);
+      return ba ? { joinId: ba.joinId, rule: ba.rule, first: b } : undefined;
+    },
+    mainTopic: input.mainTopic,
+    ...(input.nameOf ? { nameOf: input.nameOf } : {}),
+  }).map((problem) => problem.message);
+}
+
+/** The refusal text when placements break the §5.2 hard rules. */
+export function formatV3PlacementRefusal(problems: readonly string[]): string {
+  return [
+    '节点落点不满足硬规则，已拒绝批准：',
+    ...problems.map((problem) => `- ${problem}`),
+    '把相关节点改成节点话题或调整依赖后重试（即兴 run 可用 revise-dag 让 Architect 重排）。',
+  ].join('\n');
 }
 
 export type V3BotEligibilityCode =
@@ -280,6 +391,19 @@ export function describeV3NodeWorkingDir(workingDir: string): string {
     + '到时不在它的目录范围内，该节点会受阻并写明原因，不会改用它的默认目录）';
 }
 
+/** The summary heading of a bot run: unchanged while every node gets its own
+ *  topic; a run that also hands nodes off in the main topic says so. */
+export function v3BotExecutorPlanHeading(targets: readonly Pick<V3NodeExecutorTarget, 'placement'>[]): string {
+  return targets.some((target) => target.placement === 'main')
+    ? '执行方式：节点交给群里的 Bot 执行（按节点在主话题交接或开节点话题，见每行括号）'
+    : '执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）';
+}
+
+/** 「主话题」/「节点话题」for one target. */
+export function v3PlacementLabel(target: Pick<V3NodeExecutorTarget, 'placement'>): string {
+  return target.placement === 'main' ? '主话题' : '节点话题';
+}
+
 /** "Node → executing bot" lines for the Gate-2 summary of a bot run. */
 export function formatV3BotExecutorPlan(
   targets: readonly V3NodeExecutorTarget[],
@@ -287,10 +411,15 @@ export function formatV3BotExecutorPlan(
   nameOf: (larkAppId: string) => string,
 ): string {
   return [
-    '执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）',
-    ...targets.map((target) =>
-      `- ${target.nodeId} → ${nameOf(target.larkAppId)}` +
-      (target.larkAppId === orchestratorAppId ? '（主 Bot 自己）' : '')),
+    v3BotExecutorPlanHeading(targets),
+    ...targets.map((target) => {
+      const detail = [
+        target.larkAppId === orchestratorAppId ? '主 Bot 自己' : undefined,
+        // Named only when some node goes to the main topic (lines unchanged otherwise).
+        targets.some((other) => other.placement === 'main') ? v3PlacementLabel(target) : undefined,
+      ].filter(Boolean).join('，');
+      return `- ${target.nodeId} → ${nameOf(target.larkAppId)}${detail ? `（${detail}）` : ''}`;
+    }),
   ].join('\n');
 }
 
@@ -387,6 +516,9 @@ export interface V3NodeExecutorPolicy {
   nameOf: (larkAppId: string) => string;
   /** 交接带发起人身份 switch: present only while it is on. */
   handoffIdentity?: V3HandoffIdentityPolicy;
+  /** §5.2 rule 3 (read only when some node is placed in the main topic):
+   *  absent = unknown, and such a run is refused rather than guessed. */
+  mainTopic?: (binding: RunChatBinding) => V3MainTopicAvailability;
 }
 
 export type V3NodeExecutorResolution =
@@ -421,6 +553,16 @@ export async function resolveV3NodeExecutor(input: {
   }
   const binding = input.binding!;
   const targets = input.targetsFor(binding);
+  // §5.2 hard rules first: pure, and a refusal needs no live probe.
+  if (targets.some((target) => target.placement === 'main')) {
+    const placement = v3TargetPlacementProblems({
+      targets,
+      orchestratorAppId: binding.larkAppId,
+      mainTopic: input.policy.mainTopic?.(binding) ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+      nameOf: input.policy.nameOf,
+    });
+    if (placement.length > 0) return { kind: 'refused', problems: [], message: formatV3PlacementRefusal(placement) };
+  }
   const checked = await checkV3BotExecutorEligibility({
     orchestratorAppId: binding.larkAppId,
     targets,

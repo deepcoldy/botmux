@@ -1,4 +1,5 @@
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -73,6 +74,67 @@ describe('feedback storage configuration', () => {
     const path = await directory();
     await writeFile(join(path, 'feedback-storage.json'), '{"password":"never-log-this",');
     await expect(readFeedbackStorageConfig(path)).rejects.toThrow('feedback_storage_config_invalid');
+  });
+  it.each([
+    { passwordRef: 'env:P', bytepg: { computeId: 'cp', tokenRef: 'env:T' }, user: 'botmux' },
+    { user: 'botmux' },
+    { passwordRef: 'env:P' },
+  ])('rejects persisted postgres targets with contradictory or missing auth fields', async auth => {
+    const path = await directory();
+    const persisted = {
+      version: 1, generation: 1, instanceId: randomUUID(),
+      active: { backend: 'postgresql', postgres: {
+        host: 'localhost', port: 5432, database: 'feedback', schema: 'feedback_test',
+        tls: { mode: 'disable' }, connectTimeoutMs: 5000, ...auth,
+      } },
+    };
+    await writeFile(join(path, 'feedback-storage.json'), JSON.stringify(persisted), 'utf8');
+    await expect(readFeedbackStorageConfig(path)).rejects.toThrow('feedback_storage_config_invalid');
+  });
+  it('accepts a persisted BytePG target without password reference or explicit user', async () => {
+    const path = await directory();
+    const persisted = {
+      version: 1, generation: 1, instanceId: randomUUID(),
+      active: { backend: 'postgresql', postgres: {
+        host: 'localhost', port: 5432, database: 'feedback', schema: 'feedback_test',
+        bytepg: { computeId: 'cp', tokenRef: 'env:BOTMUX_TEST_PG_TOKEN' },
+        tls: { mode: 'verify-full' }, connectTimeoutMs: 5000,
+      } },
+    };
+    await writeFile(join(path, 'feedback-storage.json'), JSON.stringify(persisted), 'utf8');
+    const reread = await readFeedbackStorageConfig(path);
+    expect(reread.active.backend).toBe('postgresql');
+  });
+  it.each([
+    { bytepg: { computeId: 'cp', tokenRef: 'env:BOTMUX_TEST_PG_TOKEN', doas: { psm: 'p.s', environment: 'boe' } } },
+    { bytepg: { computeId: 'cp' } },
+  ])('rejects a persisted BytePG target carrying both or neither credential source', async auth => {
+    const path = await directory();
+    const persisted = {
+      version: 1, generation: 1, instanceId: randomUUID(),
+      active: { backend: 'postgresql', postgres: {
+        host: 'localhost', port: 5432, database: 'feedback', schema: 'feedback_test',
+        tls: { mode: 'disable' }, connectTimeoutMs: 5000, ...auth,
+      } },
+    };
+    await writeFile(join(path, 'feedback-storage.json'), JSON.stringify(persisted), 'utf8');
+    await expect(readFeedbackStorageConfig(path)).rejects.toThrow('feedback_storage_config_invalid');
+  });
+  it('accepts a persisted doas-only BytePG target without any token reference', async () => {
+    const path = await directory();
+    const persisted = {
+      version: 1, generation: 1, instanceId: randomUUID(),
+      active: { backend: 'postgresql', postgres: {
+        host: 'localhost', port: 5432, database: 'feedback', schema: 'feedback_test',
+        bytepg: { computeId: 'cp', doas: { psm: 'data.example.service', environment: 'boe' } },
+        tls: { mode: 'verify-full' }, connectTimeoutMs: 5000,
+      } },
+    };
+    await writeFile(join(path, 'feedback-storage.json'), JSON.stringify(persisted), 'utf8');
+    const reread = await readFeedbackStorageConfig(path);
+    if (reread.active.backend !== 'postgresql') throw new Error();
+    expect(reread.active.postgres.bytepg?.doas).toEqual({ psm: 'data.example.service', environment: 'boe' });
+    expect(reread.active.postgres.bytepg?.tokenRef).toBeUndefined();
   });
   it.each([
     { ...target, postgres: { ...target.postgres, schema: 'x;DROP SCHEMA public' } },

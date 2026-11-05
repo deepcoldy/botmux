@@ -226,6 +226,33 @@ describe('message-listener page', () => {
     await act(async () => { renderer.unmount(); });
   });
 
+  it('offers only real users as identity keywords and rejects bot or out-of-roster values', async () => {
+    const requests = mockApi({
+      members: () => response({ members: [
+        { openId: 'ou_alice', name: 'Alice', memberType: 'user' },
+        { openId: 'ou_bot_member', name: 'Bot member', memberType: 'bot' },
+      ] }),
+    });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    const editor = () => editorOf(root, 'global');
+    const select = () => byClass(editor(), 'roles-listener-content-policy')[0]!.findAllByType('select')[0]!;
+    const optionValues = () => select().findAllByType('option').map((node: any) => node.props.value);
+    expect(optionValues()).toContain('ou_alice');
+    expect(optionValues()).not.toContain('ou_bot_member');
+    // A synthesized event must not add a bot or an id outside the roster even
+    // if the option filter were bypassed — the onChange handler re-checks.
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_bot_member' } }));
+    expect(editor().props.listener.contentPolicy?.includeMentionedOpenIds).toBeUndefined();
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_stranger' } }));
+    expect(editor().props.listener.contentPolicy?.includeMentionedOpenIds).toBeUndefined();
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_alice' } }));
+    expect(editor().props.listener.contentPolicy?.includeMentionedOpenIds).toEqual(['ou_alice']);
+    await click(globalSave(root));
+    expect(puts(requests, GLOBAL_URL).at(-1)?.body.contentPolicy.includeMentionedOpenIds).toEqual(['ou_alice']);
+    await act(async () => { renderer.unmount(); });
+  });
+
   it('keeps "close session after completion" through saves of the global rule and a custom group', async () => {
     const requests = mockApi({ global: savedGlobal({ autoCloseAfterCompletion: true }) });
     const renderer = await renderPage();

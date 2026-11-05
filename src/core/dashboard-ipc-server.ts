@@ -14,6 +14,16 @@ import {
   dashboardCreatorFromRequest,
   resolveDashboardScheduleCreator,
 } from './dashboard-schedule-creator.js';
+import {
+  DASHBOARD_INITIATOR_SOURCE_HEADER,
+  DASHBOARD_INITIATOR_UNION_HEADER,
+  WORKFLOW_INITIATOR_PATH,
+  initiatorFailureBody,
+  resolveDashboardWorkflowInitiator,
+  type WorkflowInitiatorResolution,
+} from './workflow-initiator.js';
+import { createProductionDraftClarifier, registerWorkflowDraftIpcRoutes, workflowDraftService } from './workflow-draft-daemon.js';
+import type { DraftClarifier } from '../workflows/v3/draft-service.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -211,7 +221,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig, isDispatchTaskTreeCardEnabled } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -231,7 +241,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -328,6 +338,7 @@ import {
   listHeadlessSessions,
   readHeadlessSession,
   updateHeadlessSession,
+  deleteHeadlessSession,
   type HeadlessSessionRecord,
 } from '../services/headless-session-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
@@ -345,6 +356,7 @@ import {
   sessionWakeAcquireTimeoutMs,
 } from './session-wake-deadline.js';
 import {
+  hasProtectedSessionMutationOwnership,
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
@@ -527,7 +539,7 @@ import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
-import { publishDelegationRefusal } from './turn-cli-identity.js';
+import { publishDelegationRefusal, retryTransientTurnIdentity } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1562,6 +1574,22 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
         tool: tool === 'codebase' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
       });
     }
+    // A refusal published because the platform was unreachable when the turn
+    // was prepared gets another chance on this call (rate-limited, CAS-guarded).
+    // The Codebase companion is published together with bytedcli.
+    //
+    // The policy is passed as a READER, not a config: a Dashboard edit replaces
+    // the whole bot config object, so anything captured here would be a stale
+    // snapshot that cannot see a change made while the re-ask is in flight —
+    // exactly the window in which the answer gets written to disk.
+    const liveAppId = ds.larkAppId;
+    await retryTransientTurnIdentity({
+      sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
+      tool: tool === 'codebase' ? 'bytedcli' : tool,
+      // A bot that no longer exists is "no longer governed": policyStillWants
+      // treats a throwing reader as a refusal to publish.
+      currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
+    });
     const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
     if (env) {
       return jsonRes(res, 200, {
@@ -3637,7 +3665,7 @@ for (const action of ['auth-request', 'auth-status']) {
     // (the app's availability range excludes them); their lark-cli identity
     // comes from the platform, so send them there instead of a dead link.
     const platformRedirect = await platformAuthRequestRedirect({
-      bot: cfg, openId: callerOpenId, delegated: !!delegated,
+      bot: cfg, openId: callerOpenId, delegated: !!delegated, scopes,
       botAppToken: openId => resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), openId),
     });
     if (platformRedirect) {
@@ -6483,6 +6511,87 @@ async function dashboardScheduleCreator(
   }
   logger.info(`[schedule-creator] dashboard feishu login recorded as creator ${subject} open=${creator.openId}`);
   return { openId: creator.openId, unionId: creator.unionId };
+}
+
+/**
+ * The verified initiator of a Dashboard workflow request on THIS daemon's bot
+ * (design 2026-11-03 workflow-dashboard-orchestration §7.1, I1–I5; see
+ * core/workflow-initiator). Every Dashboard workflow write that names an
+ * initiator goes through this one function. Only this bot's own app resolves
+ * the person; a refusal never falls back to the bot owner.
+ */
+async function dashboardWorkflowInitiator(req: IncomingMessage): Promise<WorkflowInitiatorResolution> {
+  const result = await resolveDashboardWorkflowInitiator(
+    {
+      source: req.headers[DASHBOARD_INITIATOR_SOURCE_HEADER],
+      unionId: req.headers[DASHBOARD_INITIATOR_UNION_HEADER],
+    },
+    {
+      appId: cachedLarkAppId,
+      featureEnabled: isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      trustedHost: isTrustedHostIpcRequest(req),
+      ownerOpenId: getOwnerOpenId,
+      resolveOpenId: resolveTargetAppOpenId,
+      canOperate: (app, openId, union) => canOperate(app, undefined, openId, union),
+    },
+  );
+  const source = req.headers[DASHBOARD_INITIATOR_SOURCE_HEADER];
+  if (result.ok) {
+    logger.info(`[workflow-initiator] app=${cachedLarkAppId} source=${result.initiator.source} open=${result.initiator.openId}`);
+  } else if (result.error !== 'feature_disabled') {
+    logger.warn(`[workflow-initiator] refused (${result.error}) app=${cachedLarkAppId} source=${typeof source === 'string' ? source : '?'}`);
+  }
+  return result;
+}
+
+// Who the Dashboard login initiates a workflow as on this bot, or why nobody.
+// Body `{ larkAppId }` is the bot the Dashboard routed to; answering for
+// another one would let a mis-routed request pass the gate under the wrong
+// app. POST with a body for the platform-routing reason in
+// core/workflow-initiator.
+ipcRoute('POST', WORKFLOW_INITIATOR_PATH, requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson(req, res);
+  if (body === BAD_JSON) return;
+  const asked = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as Record<string, unknown>).larkAppId
+    : undefined;
+  if (asked !== cachedLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'bot_mismatch', retryable: false });
+  }
+  const result = await dashboardWorkflowInitiator(req);
+  if (!result.ok) return jsonRes(res, result.status, initiatorFailureBody(result));
+  return jsonRes(res, 200, { ok: true, initiator: result.initiator });
+}, NOT_BOUND_BODY.okFalse));
+
+// Dashboard workflow drafts (design 2026-11-03 workflow-dashboard-orchestration
+// D2): routes and service live in core/workflow-draft-daemon; every write
+// resolves the initiator through dashboardWorkflowInitiator above.
+registerWorkflowDraftIpcRoutes(ipcRoute, {
+  appId: () => cachedLarkAppId,
+  featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+  trustedHost: isTrustedHostIpcRequest,
+  resolveInitiator: dashboardWorkflowInitiator,
+  service: workflowDraftService,
+  readJsonBody: (req) => readJsonBody(req, 1024 * 1024),
+  jsonRes,
+});
+
+/** The drafts' clarify sessions over this daemon's headless sessions. */
+export function productionWorkflowDraftClarifier(): DraftClarifier {
+  return createProductionDraftClarifier({
+    activeSessions: getActiveSessionsRegistry,
+    createHeadlessSession: (active, args) => withBotTurnAdmission(args.larkAppId, () => createHeadlessSession(active, undefined, args)),
+    triggerSessionTurn,
+    lookupTriggerResult: buildAsyncTriggerLookupResponse,
+    sessionStatus: (sessionId) => (findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId))?.status,
+    suspendWorker,
+    isSuspendable: (ds) => isSuspendableBackendType(ds.initConfig?.backendType),
+    canRetireWorker: (ds) => !isRemoteBackendSession(ds) && !isSessionTransferring(ds) && !hasProtectedSessionMutationOwnership(ds),
+    killWorker: (ds) => killWorker(ds),
+    lifecycleInFlight: isSessionLifecycleInFlight,
+    closeSession: (sessionId) => closeSessionForBackgroundCleanup(sessionId, 'workflow draft clarify session'),
+    deleteHeadlessRecord: (headlessId) => { deleteHeadlessSession(headlessId); },
+  });
 }
 
 ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {

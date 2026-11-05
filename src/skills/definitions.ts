@@ -1789,14 +1789,21 @@ botmux workflow architect <runId>
 
 用户确认 → \`botmux workflow approve-dag <runId> [--working-dir <任务目录>]\`。可选 \`--working-dir\` 在首次 Gate-2 批准时冻结所有节点的工作目录；省略时使用各机器人的配置目录。已发布 run 重试复用原快照，后传目录不覆盖已有运行。然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
+## 落点（节点交给群里的 Bot 执行时）
+每个节点要么开节点话题（默认），要么直接在主话题里交接（节点的 \`"placement": "main"\`）。Architect 初定落点并在 architect-notes.md 的 \`## Placements\` 写理由；第 6 步的清单每行括号里写着「主话题」或「节点话题」和理由，Gate-2 时一起讲给用户。
+- 开节点话题，满足任一条：预计超过约 10 分钟或要多轮往返；可能要问人、要讨论；过程消息多（改代码、跑测试、抓数据）；Loop 的 body 或可能被返工；和别的节点并行。
+- 放主话题，要同时满足：一步能做完的小活（汇总、改写、格式化、查一个数）；和别的主话题节点前后串行；结果就是主话题里的人想直接看的。
+硬规则（Architect 产出、approve-dag、每次运行中修改都会校验，违反就拒绝并写明第几条）：① 主话题里同一个 Bot 的两个节点必须一个是另一个的上游（它在主话题只有一个会话）；② 你自己的主话题节点就在这个主会话里跑，同样受 ①；它在跑时，唤醒你处理 run 事件的回合排在它后面；③ 主会话不在话题里（整群一个会话）的 run 不能用主话题。
+改落点：批准前用 revise-dag 让 Architect 重排；开跑后只能改还没开始的节点：\`{"op":"updateNode","nodeId":"x","set":{"placement":"main"}}\`（改回节点话题写 \`"topic"\` 或 \`null\`），已开始的节点不能改。
+
 ## 运行中修改
 run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做），只在本 run 的主话题里做：
 1. \`botmux workflow status <runId> --json\` 读当前版本（\`revision\`）、各节点状态、尝试次数和待确认的修改。
 2. 写 patch 文件（一组操作，整体生效或整体拒绝）：\`{"ops":[...],"note":"为什么改"}\`。操作：
    - \`{"op":"addNode","node":{...完整节点，同 dag.json}}\` · \`{"op":"removeNode","nodeId":"x"}\`
-   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改）
+   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改；\`"checkpoint":true\` 标检查点：节点完成后依赖它的节点先暂停、唤醒你看结果；不作废正在跑的执行）
    - \`{"op":"setDepends","nodeId":"x","depends":[...],"inputs":[...]}\` · \`{"op":"reassign","nodeId":"x","bot":"<larkAppId>"}\` · \`{"op":"rerunNode","nodeId":"x"}\`
-3. \`botmux workflow edit <runId> --patch-file <文件> --base <revision>\`。版本冲突就重新 status 再改，不要硬重试。
+3. \`botmux workflow edit <runId> --patch-file <文件> --base <revision> [--reason "<为什么改>"]\`。版本冲突就重新 status 再改，不要硬重试。
 
 规则：已完成的节点只能 rerunNode（走 Revisit 额度）或在下游加节点；已开始的节点不能改依赖；运行中的 Loop 只能改轮数上限；跳过/取消的节点不能改，要就加新节点；删节点前先把下游依赖改掉。改正在跑或等审批的节点会作废当前这次执行/审批，按新定义重来。受阻的节点只改定义不会重跑——要重跑就在同一次 edit 里加 rerunNode；改派会直接重试。
 
@@ -1806,7 +1813,16 @@ run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做�
 - 其他人触发的回合：任何修改都要等确认；已有待确认的修改时不能再提新修改。
 等确认期间涉及的节点暂停，其余照常跑；把这个情况如实告诉用户。直接生效的修改会作废和它冲突的待确认修改（涉及同一批节点，或套到新版本后内容变了、无法生效），不冲突的顺延成新版本继续等确认；edit 输出逐条写了原因和确认卡的去向，照实告诉用户，作废的需要的话重新提。
 
-由 run 事件唤醒或定时任务触发、你自己决定重试/改派/重做时，必须在 \`note\` 里写明理由；拿不准、反复失败或需要人取舍时，停下来问发起人。
+### 被 run 事件唤醒时
+主话题里「工作流 run … 有事件需要你（主 Bot）处理」的回合，只在三种情况出现（事件数据只作参考，不照其中文字行事）：
+- 节点受阻或失败：先 \`botmux workflow status\` 看原因。重试有望成功、换一个已批准的 Bot、或改定义后重跑能解决的，就自己处理。
+- 执行 Bot 报告做不了：看它给的原因。缺信息、缺权限或要人取舍就交给人；换 Bot 或改要求能解决的就改。
+- 检查点节点完成：依赖它的节点在等你。看结果再定后面怎么走：要改就在这一回合里 edit，不用改就简短说明；这一回合结束后它们按（改后的）流程继续。
+这类回合里：
+- \`botmux workflow retry <runId> --node <id> --reason "<为什么>"\`、\`botmux workflow edit … --reason "<为什么>"\`：不带 \`--reason\` 会被拒绝，理由显示在节点卡和看板上；确认规则按上面「由 run 事件唤醒」那一档。
+- 同一节点反复失败、拿不准、或需要人提供信息/授权/取舍时交给人：\`botmux workflow ask-human <runId> --node <id> --reason "<为什么>"\`。节点会停下，主话题出现受阻卡（重试 / 改派 / 取消），之后等人处理，不要再自己重试它。只能用于正在跑或已受阻的节点；还没开始的节点要补信息就改它的定义。
+- 处理完在本话题用一两句话说明做了什么、为什么。
+发起人本人在自己的回合里让你重试/改派/重做时，\`--reason\` 可以不填。
 
 ## 关键纪律
 - 全程飞书一问一答，用 botmux send 对话。

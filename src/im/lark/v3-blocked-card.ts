@@ -202,6 +202,11 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   } else if (input.retryForbidden === 'revise-workflow-required') {
     title = `需要修订 Workflow：${input.nodeId}`;
     template = 'red';
+  } else if (input.errorCode === 'HANDED_TO_HUMAN') {
+    // The main bot stopped and asked a person (design §13.6); the message is
+    // its reason, shown as is under 原因.
+    title = `交给人决定：节点 ${input.nodeId}`;
+    template = 'blue';
   } else { title = `节点受阻：${input.nodeId}`; template = 'orange'; }
 
   const attemptNNN = input.attemptId.slice(input.attemptId.lastIndexOf('/') + 1);

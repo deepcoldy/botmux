@@ -118,6 +118,7 @@ Architect（主 Bot 的 daemon 后台跑，按「计划中的群」给节点分�
 - 入口：工作流页面标题区的「新建工作流」按钮，路由 `#/workflows/new`；草稿页 `#/workflows/drafts/<runId>`。现在 `#/workflows/<任意段>` 都会被当成 runId，所以 `new`、`drafts`、`library` 三个段要在路由表里排在运行详情之前，并在解析 runId 时排除。
 - 编排 Bot 下拉框列出本机配置的 Bot，每个标出能不能用：
   - CLI 不支持工作流节点的（例如 pi、cursor、opencode），关了 CLI bypass 的，配了 Codex profile 的：不能选，写明原因；
+  - 管家 Bot（decision-board 管家开关打开即算，不要求选了管家群，`isStewardBot`）：不能选；daemon 的建草稿接口在 `birthRun` 之前直接拒绝（`orchestrator_ineligible`），不建 run 目录、不起澄清会话；
   - daemon 不在线：不能选；
   - 发起人不能操作这个 Bot（第 11 节 I1）：不能选。
 - 目标：一个多行输入框。
@@ -153,6 +154,7 @@ Architect（主 Bot 的 daemon 后台跑，按「计划中的群」给节点分�
   - 话题群里所有 Bot 都能开话题会话，这一项直接通过；
   - 「是否在群」「协作授权」留到拉群时实测（4.5）。
   - 管家 Bot 不进名单。飞书入口（#2728）的名单现在没有排除管家，D2 改成两个入口共用同一条排除规则，避免两条入口分到的 Bot 不一样。这对飞书入口是一处小的行为变化，只影响打开了「节点交给群里的 Bot 执行」开关的部署（默认关），管家本来就不该执行节点。
+- 编排 Bot 本身也不能是管家：D2 的建草稿接口（`WorkflowDraftService.create`）按与名单同一个 `isStewardBot` 判定在创建前拒绝。这条拒绝只作用于 Dashboard 草稿入口；飞书 `/workflow new` 入口 D2 刻意不改——管家 Bot 仍可作为主 Bot 在飞书发起 run，其节点按默认选择器落在它自己身上，「管家不执行节点」在飞书入口只体现在上面那条节点名单排除。若以后要让飞书入口也禁止管家当主 Bot，作为独立改动评估。
 - **流程图**：复用运行详情页的流程图组件（要导出），每个节点显示执行 Bot 和 Architect 写的理由。点节点可以：
   - 换执行 Bot：下拉框只列名单里能用的 Bot，不能用的标出原因（例如「pi：CLI 不支持工作流节点」）；
   - 看节点要素。
@@ -385,7 +387,7 @@ Architect（主 Bot 的 daemon 后台跑，按「计划中的群」给节点分�
 |---|---|---|---|
 | D0 | `docs(design): Dashboard 编排工作流设计` | 本文档；更正群内 Bot 接力设计 §11.3 的平台前提 | 无 |
 | D1 | `feat(dashboard): 工作流发起人身份` | 7.1 的身份来源（本地 token → owner、平台隧道 union_id、H5 拒绝）；主 Bot daemon 的 union_id → open_id 换算接口；I1 的入口闸（校验不过硬拒，不回退 owner）；`run.json` 新授权字段（7.3） | D0 确认 I1–I5、I11 |
-| D2 | `feat(workflow): 无群草稿与 daemon 侧编排接口` | 草稿创建（无绑定）、spec 定稿 / 第一道确认 / Architect 后台任务（计划中的 Bot 名单，排除管家，两个入口共用）/ 改节点 Bot / 第二道确认记录 / 退回，全部作为主 Bot daemon 接口；每个写接口在 daemon 侧校验发起人（Dashboard 经宿主签名转发）；澄清会话生命周期（4.2）；Dashboard 代理路由；草稿列表接口 | D1；I6 |
+| D2 | `feat(workflow): 无群草稿与 daemon 侧编排接口` | 草稿创建（无绑定；管家 Bot 不能当编排 Bot，创建前拒绝，4.1）、spec 定稿 / 第一道确认 / Architect 后台任务（计划中的 Bot 名单，排除管家，两个入口共用）/ 改节点 Bot / 第二道确认记录 / 退回，全部作为主 Bot daemon 接口；每个写接口在 daemon 侧校验发起人（Dashboard 经宿主签名转发）；澄清会话生命周期（4.2）；Dashboard 代理路由；草稿列表接口 | D1；I6 |
 | D3 | `feat(dashboard): 工作流编排页面（澄清、spec、流程图）` | 4.1–4.4、4.6 的页面；对话面板（headless 会话 + Dashboard 版澄清提示）；流程图组件导出与节点 Bot 下拉框 | D2 |
 | D4 | `feat(workflow): Dashboard 拉群开始` | 4.5：Dashboard 建群接口可选参数（话题群、协作授权）；建群意图 + 群名标记 + 不发 kickoff（照搬）+ 按标记认回的对账（新写，`listChats` 遍历主 Bot 所在群）；检查通过后才写协作授权，换 Bot 时撤销旧 Bot 授权；群主两条通道；卡片开主话题；澄清会话迁入；实时检查；写 `run.json`；启动；拉群记录与断点续做 | D2（页面按钮在 D3）；I7 |
 | D5 | `feat(dashboard): 工作流模板列表与带参数运行` | 前置：模板版本格式升 v3（确认人与确认时摘要，只读迁移老版本）；含 Saved Workflow 服务层「无群上下文」的调用形态扩展（保存、追加、列表、运行四个入口现在都要求群上下文）。5.1–5.3：从 run / 草稿保存、手工参数、版本间人工确认比较、模板列表与详情、带参数运行（复用 D4 的拉群开始） | D4；I9、I10、I13 |

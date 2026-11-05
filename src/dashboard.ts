@@ -198,7 +198,7 @@ import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { applyGlobalSessionEnvOps, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, isWorkflowFeatureEnabled, workflowNodeExecutorMode, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -210,6 +210,11 @@ import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  createDurableTerminalRoutePublisher,
+  createDurableTerminalRouteRegistry,
+  durableTerminalRoutePort,
+} from './services/durable-terminal-route.js';
 import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
@@ -377,6 +382,8 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
+import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
+import { handleWorkflowDraftsApi } from './dashboard/workflow-drafts-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -913,10 +920,39 @@ const previewGuardPage = createPreviewGuardPage({
   // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
+// Primary replicas need one shared route registry for Pod-local worker
+// terminals. Initialize it before the `/s/*` front proxy so a request landing
+// on a non-owner backend can resolve the current owner Dashboard NodePort.
+const dashboardCoordinationRuntime = coordinationModeIsPrimary()
+  ? await initializeDurableCoordinationRuntime({
+      ...process.env,
+      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
+      // narrow config/route provider must not race those reporters on one path.
+      BOTMUX_COORDINATION_HEALTH_FILE: '',
+    }, { allowPrimary: true })
+  : undefined;
+const terminalRouteInstanceId = (process.env.MY_POD_NAME || process.env.HOSTNAME || `dashboard-${process.pid}`).trim();
+const terminalRouteRegistry = dashboardCoordinationRuntime?.mode === 'primary'
+  ? createDurableTerminalRouteRegistry({
+      store: dashboardCoordinationRuntime.store,
+      ownerId: `terminal-route-dashboard:${terminalRouteInstanceId}:${process.pid}`,
+    })
+  : undefined;
 const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => (
     aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)
   ),
+  // #2062: cross-replica routing exists only when primary coordination is on.
+  // Single-replica Dashboards install neither hook and keep the local-only path.
+  ...(terminalRouteRegistry
+    ? {
+        resolveRemoteTarget: async (sessionId: string) => {
+          const route = await terminalRouteRegistry.resolveSession(sessionId, terminalRouteInstanceId);
+          return route ? { host: route.host, port: route.port } : undefined;
+        },
+        isLocalTerminalLive: (sessionId: string) => aggregator.hasLiveTerminalWorker(sessionId),
+      }
+    : {}),
   resolveActor: dashboardRequestIdentity,
   control: terminalControl,
   // P1-5: bound `?viewToken=` capabilities are refused once the auth session
@@ -933,6 +969,40 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // #2004: lets the daemon proxy wake a suspended session for a signed-in viewer.
   wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
 });
+
+// #2062: advertise this replica's live terminals so a request landing on a
+// peer Dashboard can be forwarded here. Primary-only; a single-replica
+// Dashboard installs no listener and no timer.
+const terminalRouteHost = process.env.BOTMUX_TERMINAL_ROUTE_HOST?.trim();
+const terminalRoutePort = durableTerminalRoutePort(process.env);
+if (terminalRouteRegistry && terminalRouteHost && terminalRoutePort !== undefined) {
+  const terminalRoutePublisher = createDurableTerminalRoutePublisher({
+    registry: terminalRouteRegistry,
+    listRows: () => aggregator.getSessions(),
+    ownerInstanceId: terminalRouteInstanceId,
+    host: terminalRouteHost,
+    port: terminalRoutePort,
+    onWarn: message => logger.warn(`[terminal-route] ${message}`),
+  });
+  let terminalRoutePublishInFlight: Promise<void> | undefined;
+  const scheduleTerminalRoutePublish = (): void => {
+    if (terminalRoutePublishInFlight) return;
+    terminalRoutePublishInFlight = terminalRoutePublisher.publishDue()
+      .catch(error => logger.warn(`[terminal-route] publish failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { terminalRoutePublishInFlight = undefined; });
+  };
+  aggregator.on(ev => {
+    if (ev.type === 'session.spawned' || ev.type === 'session.update') {
+      scheduleTerminalRoutePublish();
+    }
+  });
+  const terminalRouteHeartbeat = setInterval(scheduleTerminalRoutePublish, 10_000);
+  terminalRouteHeartbeat.unref?.();
+} else if (terminalRouteRegistry) {
+  logger.warn('[terminal-route] primary coordination is on but BOTMUX_TERMINAL_ROUTE_HOST / '
+    + 'BOTMUX_TERMINAL_ROUTE_PORT (or BOTMUX_DASHBOARD_PORT) is unset or invalid; '
+    + 'terminals on this replica are not reachable from peer replicas');
+}
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {
     const daemon = registry.getByAppId(appId);
@@ -1924,14 +1994,6 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // Single shared deps object for `applySettingsWrite` — both the browser
 // `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
 // route call through this so error codes / merge semantics stay identical.
-const dashboardCoordinationRuntime = coordinationModeIsPrimary()
-  ? await initializeDurableCoordinationRuntime({
-      ...process.env,
-      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
-      // narrow config-CAS provider must not race those reporters on one path.
-      BOTMUX_COORDINATION_HEALTH_FILE: '',
-    }, { allowPrimary: true })
-  : undefined;
 const dashboardConfigCoordinator = dashboardCoordinationRuntime?.mode === 'primary'
   ? createDurableConfigCoordinator({
       store: dashboardCoordinationRuntime.store,
@@ -4458,6 +4520,10 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Workflow orchestration refuses Feishu H5 免登 with its own code (design
+    // 2026-11-03 workflow-dashboard-orchestration I5) instead of the generic 401.
+    if (workflowInitiatorPreGateDenial(res, url.pathname, requestIdentity, canManageHost)) return;
+
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
@@ -6785,6 +6851,33 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Workflow initiator (design 2026-11-03 workflow-dashboard-orchestration
+    // §7.1): classify the login here, resolve the person and gate on the
+    // orchestrating bot's own daemon.
+    if (await handleWorkflowInitiatorApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // Workflow drafts (design 2026-11-03 workflow-dashboard-orchestration D2):
+    // the list reads disk; everything else goes to the draft's orchestrating
+    // bot's daemon, which checks the initiator on every write.
+    if (await handleWorkflowDraftsApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      runsDir: v3RunsDir(),
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
     // v3 workflow runs. Reads project directly from disk; cancel resolves the
     // immutable run owner and proxies to that daemon (the dashboard never
     // writes the v3 journal itself).
@@ -8281,6 +8374,14 @@ listenWithProbe({
     logger.warn(`[dashboard] Failed to record H5 login availability: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  // #2062 F5: the advertised route port defaults to BOTMUX_DASHBOARD_PORT, but
+  // the listener may have probed past a busy port. An explicit
+  // BOTMUX_TERMINAL_ROUTE_PORT (e.g. a NodePort mapping) is trusted as-is.
+  if (terminalRouteRegistry && !process.env.BOTMUX_TERMINAL_ROUTE_PORT?.trim()
+      && terminalRoutePort !== undefined && terminalRoutePort !== port) {
+    logger.warn(`[terminal-route] advertised port ${terminalRoutePort} differs from the listening port ${port}; `
+      + 'peer replicas will fail to reach terminals here — set BOTMUX_TERMINAL_ROUTE_PORT explicitly');
+  }
   // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
   // (crash/restart mid-delete). Best-effort and fire-and-forget.
   sweepStoreTrash();
