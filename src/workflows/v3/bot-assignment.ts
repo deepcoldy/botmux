@@ -9,6 +9,7 @@
  */
 
 import type { BotConfig } from '../../bot-registry.js';
+import { isStewardBot } from '../../core/decision-board/model.js';
 import { isV3SupportedCli, type Spec } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { V3MainTopicAvailability } from './placement.js';
@@ -58,12 +59,14 @@ function oneLine(text: string, max: number): string {
 
 /** Why a bot can never execute a workflow node, from its config alone (the
  *  same rules the Gate-2 snapshot freeze enforces). */
-function staticExclusion(bot: BotConfig): string | undefined {
+export function v3BotStaticExclusion(bot: BotConfig): string | undefined {
   if (!isV3SupportedCli(bot.cliId)) return `CLI ${bot.cliId} 不能执行工作流节点`;
   if (bot.disableCliBypass === true) return '关闭了 CLI bypass，不能执行工作流节点';
   if (bot.codexProfile) return '配置了 Codex profile，不能执行工作流节点';
   return undefined;
 }
+
+const STEWARD_EXCLUSION = '是管家 Bot，不执行工作流节点';
 
 async function mapLimited<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out = new Array<R>(items.length);
@@ -103,9 +106,14 @@ export async function buildV3BotRoster(input: {
     ...unique.filter((bot) => bot.larkAppId !== input.orchestratorAppId),
   ];
   const verdicts = await mapLimited(ordered, ROSTER_PROBE_CONCURRENCY, async (bot): Promise<string | undefined> => {
-    const fixed = staticExclusion(bot);
+    const fixed = v3BotStaticExclusion(bot);
     if (fixed) return fixed;
     if (bot.larkAppId === input.orchestratorAppId) return undefined;
+    // The steward (decision board) never executes workflow nodes; one rule for
+    // the Dashboard draft and the Feishu /workflow entry (design 2026-11-03
+    // workflow-dashboard-orchestration §4.4). The orchestrator itself is kept:
+    // its nodes default to it whatever the roster says.
+    if (isStewardBot(bot.steward)) return STEWARD_EXCLUSION;
     const problem = await judgeV3BotEligibility(bot.larkAppId, input.probe, { grant: false });
     return problem
       ? describeV3BotEligibilityCode(problem.code) + (problem.detail ? `（${problem.detail}）` : '')

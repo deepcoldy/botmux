@@ -383,6 +383,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
+import { handleWorkflowDraftsApi } from './dashboard/workflow-drafts-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -6858,6 +6859,20 @@ const server = createServer(async (req, res) => {
       canManageHost: authed,
       platformBound: !!readPlatformBinding(),
       featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // Workflow drafts (design 2026-11-03 workflow-dashboard-orchestration D2):
+    // the list reads disk; everything else goes to the draft's orchestrating
+    // bot's daemon, which checks the initiator on every write.
+    if (await handleWorkflowDraftsApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      runsDir: v3RunsDir(),
       proxyToDaemon,
     })) {
       return;
