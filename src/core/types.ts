@@ -150,6 +150,12 @@ export interface DaemonSession {
     engineProcStart?: string;
     workerGeneration?: number;
   };
+  /** Per-worker-generation HMAC key for the protected local-service proxy.
+   * It exists only in daemon/worker memory and crosses only their private IPC. */
+  protectedLoopbackProxyAttestation?: {
+    secret: string;
+    workerGeneration: number;
+  };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;

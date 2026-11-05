@@ -6812,6 +6812,7 @@ export function killWorker(
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
   // daemon-side copy synchronously; the worker may never get a chance to send
@@ -6896,6 +6897,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
@@ -6924,6 +6926,7 @@ function clearTransferWorkerState(
   // readiness with its own prompt_ready.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
@@ -9485,6 +9488,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
@@ -15304,6 +15308,7 @@ function forkWorkerPrepared(
   let agentCfg!: ReturnType<typeof sessionAgentConfig>;
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   try {
   // Per-turn authority is never inferred from mutable session state. Human
   // message routes pass their accepted Lark message id explicitly; restore,
@@ -15394,6 +15399,9 @@ function forkWorkerPrepared(
   // existing worker. A failed reservation leaves the old worker untouched;
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
+  const protectedLoopbackProxyAttestation = protectedHttpEgressPolicy
+    ? { secret: randomBytes(32).toString('hex'), workerGeneration }
+    : undefined;
   bindPreparedGroupContextWorker(ds, initAttributionTurnId, workerGeneration);
   onWorkerGenerationReserved?.(workerGeneration);
   if (initAttributionTurnId?.startsWith('om_')) {
@@ -16079,6 +16087,7 @@ function forkWorkerPrepared(
     pluginBindings: botCfg.plugins,
     protectedMcpPolicy: protectedMcpProvisioning.workerPolicy,
     protectedHttpEgressPolicy,
+    protectedLoopbackProxyAttestation,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
       ? { runnerBuildId: runtimeIdentity.id }
@@ -16137,6 +16146,7 @@ function forkWorkerPrepared(
   // refork, restore, cold resume, queued activation — clears it exactly once.
   ds.cliReady = false;
   ds.worker = worker;
+  ds.protectedLoopbackProxyAttestation = protectedLoopbackProxyAttestation;
   initializeWorkerIpcBootstrap(worker);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   {

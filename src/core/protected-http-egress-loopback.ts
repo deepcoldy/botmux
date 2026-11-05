@@ -5,7 +5,13 @@ import { parse } from 'smol-toml';
 import {
   protectedHttpEgressAuthTokenPath,
 } from './protected-http-egress-host.js';
-import type { ProtectedHttpEgressPolicy } from './protected-http-egress.js';
+import { normalizeProtectedHttpPath, type ProtectedHttpEgressPolicy } from './protected-http-egress.js';
+import { resolveLoopbackPeerProcesses, type ProcessIdentity } from './current-actor-attestation.js';
+import {
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+  PROTECTED_LOOPBACK_PEER_PID_HEADER,
+  PROTECTED_LOOPBACK_PEER_START_HEADER,
+} from './protected-loopback-attestation.js';
 
 export const PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN = 'http://127.0.0.1:0';
 
@@ -14,6 +20,10 @@ const ROUTING_HEADERS = new Set([
   'x-botmux-egress-auth',
   'x-botmux-egress-policy',
   'x-botmux-egress-target',
+  'x-botmux-loopback-service',
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+  PROTECTED_LOOPBACK_PEER_PID_HEADER,
+  PROTECTED_LOOPBACK_PEER_START_HEADER,
 ]);
 
 export interface ProtectedHttpEgressLoopbackPlan {
@@ -27,6 +37,20 @@ export interface ProtectedHttpEgressLoopbackBridge {
   origin: string;
   close(): Promise<void>;
 }
+
+export interface ProtectedLocalServiceLoopbackPlan {
+  socketPath: string;
+  serviceId: string;
+  listenPort: number;
+  method: string;
+  path: string;
+  forwardHeaders: string[];
+  attestProcessPeer?: boolean;
+}
+
+export type ProtectedLocalServicePeerResolver = (
+  peer: ProcessIdentity,
+) => Promise<ProcessIdentity | null>;
 
 export interface CodexProtectedProviderBridgeSelection {
   providerId: string;
@@ -148,6 +172,56 @@ function bridgeUnavailable(response: ServerResponse): void {
   response.end(body);
 }
 
+function bridgeForbidden(response: ServerResponse): void {
+  const body = Buffer.from('{"code":"botmux_protected_loopback_forbidden"}');
+  response.writeHead(403, {
+    'content-type': 'application/json',
+    'content-length': String(body.length),
+    connection: 'close',
+  });
+  response.end(body);
+}
+
+async function localServiceHeaders(
+  request: IncomingMessage,
+  authToken: string,
+  plan: ProtectedLocalServiceLoopbackPlan,
+  resolveProcessPeer: ProtectedLocalServicePeerResolver,
+): Promise<Record<string, string> | undefined> {
+  const allowed = new Set(['host', 'connection', 'content-length', ...plan.forwardHeaders]);
+  const valuesByName = new Map<string, string[]>();
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    const name = request.rawHeaders[index]!.toLowerCase();
+    if (!allowed.has(name)) return undefined;
+    const values = valuesByName.get(name) ?? [];
+    values.push(request.rawHeaders[index + 1]!);
+    valuesByName.set(name, values);
+  }
+  if ([...valuesByName.values()].some(values => values.length !== 1)) return undefined;
+  const headers: Record<string, string> = {};
+  for (const name of plan.forwardHeaders) {
+    const values = valuesByName.get(name) ?? [];
+    if (values.length === 1) headers[name] = values[0]!;
+  }
+  const contentLength = valuesByName.get('content-length')?.[0];
+  if (contentLength !== undefined) headers['content-length'] = contentLength;
+  if (plan.attestProcessPeer) {
+    const peer = resolveLoopbackPeerProcesses({
+      remoteAddress: request.socket.remoteAddress,
+      remotePort: request.socket.remotePort,
+      localPort: request.socket.localPort,
+    });
+    if (!peer.ok) return undefined;
+    const resolvedPeer = await resolveProcessPeer(peer.peer);
+    if (!resolvedPeer) return undefined;
+    headers[PROTECTED_LOOPBACK_PEER_PID_HEADER] = String(resolvedPeer.pid);
+    headers[PROTECTED_LOOPBACK_PEER_START_HEADER] = resolvedPeer.procStart;
+  }
+  headers['x-botmux-egress-auth'] = authToken;
+  headers['x-botmux-loopback-service'] = plan.serviceId;
+  return headers;
+}
+
 /** Bind inside the session network namespace. The task sees only an ordinary
  * loopback HTTP origin; the Unix socket authentication material remains owned
  * by this runner process and is injected at the trusted boundary. */
@@ -200,6 +274,120 @@ export async function startProtectedHttpEgressLoopbackBridge(
   if (!address || typeof address === 'string') {
     server.close();
     throw new Error('protected_http_loopback_bind_failed');
+  }
+  let closing: Promise<void> | undefined;
+  return {
+    origin: `http://127.0.0.1:${address.port}`,
+    close(): Promise<void> {
+      closing ??= new Promise<void>(resolve => {
+        for (const socket of sockets) socket.destroy();
+        if (!server.listening) resolve();
+        else server.close(() => resolve());
+      });
+      return closing;
+    },
+  };
+}
+
+export async function startProtectedLocalServiceLoopbackBridge(
+  plan: ProtectedLocalServiceLoopbackPlan,
+  resolveProcessPeer: ProtectedLocalServicePeerResolver = async peer => peer,
+): Promise<ProtectedHttpEgressLoopbackBridge> {
+  if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(plan.serviceId)
+    || !Number.isSafeInteger(plan.listenPort) || plan.listenPort < 0 || plan.listenPort > 65535
+    || !/^[!#$%&'*+\-.^_`|~0-9A-Z]+$/.test(plan.method)
+    || plan.method !== plan.method.toUpperCase()
+    || normalizeProtectedHttpPath(plan.path) !== plan.path
+    || plan.path.includes('?')
+    || (plan.attestProcessPeer !== undefined && plan.attestProcessPeer !== true)) {
+    throw new Error('protected_local_service_loopback_plan_invalid');
+  }
+  const forwardHeaders: string[] = [];
+  const seen = new Set<string>();
+  for (const header of plan.forwardHeaders) {
+    if (header !== header.toLowerCase() || !/^[!#$%&'*+\-.^_`|~0-9a-z]+$/.test(header)
+      || ROUTING_HEADERS.has(header) || header === 'host' || header === 'content-length'
+      || seen.has(header)) {
+      throw new Error('protected_local_service_loopback_plan_invalid');
+    }
+    seen.add(header);
+    forwardHeaders.push(header);
+  }
+  const normalizedPlan = { ...plan, forwardHeaders };
+  const authToken = readFileSync(protectedHttpEgressAuthTokenPath(plan.socketPath), 'utf8').trim();
+  if (!authToken || authToken.length > 4096 || /[\r\n]/.test(authToken)) {
+    throw new Error('protected_http_loopback_auth_invalid');
+  }
+  const sockets = new Set<Socket>();
+  const server = createServer((incoming, outgoing) => {
+    void (async () => {
+      let path: string;
+      try { path = normalizeProtectedHttpPath(incoming.url ?? ''); } catch {
+        incoming.resume();
+        bridgeForbidden(outgoing);
+        return;
+      }
+      if ((incoming.method ?? '').toUpperCase() !== normalizedPlan.method || path !== normalizedPlan.path) {
+        incoming.resume();
+        bridgeForbidden(outgoing);
+        return;
+      }
+      const headers = await localServiceHeaders(
+        incoming,
+        authToken,
+        normalizedPlan,
+        resolveProcessPeer,
+      );
+      if (!headers) {
+        incoming.resume();
+        bridgeForbidden(outgoing);
+        return;
+      }
+      const upstream = httpRequest({
+        socketPath: normalizedPlan.socketPath,
+        method: normalizedPlan.method,
+        path: normalizedPlan.path,
+        headers,
+        agent: false,
+      }, response => {
+        outgoing.writeHead(response.statusCode ?? 502, response.statusMessage, response.headers);
+        response.pipe(outgoing);
+      });
+      upstream.once('error', () => bridgeUnavailable(outgoing));
+      incoming.once('aborted', () => upstream.destroy());
+      outgoing.once('close', () => {
+        if (!outgoing.writableEnded) upstream.destroy();
+      });
+      incoming.pipe(upstream);
+    })().catch(() => {
+      incoming.resume();
+      if (!outgoing.headersSent) bridgeForbidden(outgoing);
+      else if (!outgoing.writableEnded) outgoing.destroy();
+    });
+  });
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+  server.on('connect', (_request, socket) => socket.destroy());
+  server.on('upgrade', (_request, socket) => socket.destroy());
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(normalizedPlan.listenPort, '127.0.0.1');
+  });
+  const address = server.address() as AddressInfo | null;
+  if (!address || typeof address === 'string') {
+    server.close();
+    throw new Error('protected_local_service_loopback_bind_failed');
   }
   let closing: Promise<void> | undefined;
   return {

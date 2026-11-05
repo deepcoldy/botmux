@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { request } from 'node:http';
 import { createConnection } from 'node:net';
 import { Readable } from 'node:stream';
@@ -162,6 +162,103 @@ describe('session protected HTTP egress host', () => {
       path: '/v1/items/update',
       decision: 'deny',
       status: 403,
+    });
+  });
+
+  it('forwards only the configured local service route and its declared headers', async () => {
+    const forwarded: Array<Record<string, unknown>> = [];
+    const { host, auth } = await start({
+      loopbackServices: [{
+        id: 'lark-tool-identity',
+        listenPort: 7950,
+        upstreamPort: 7950,
+        method: 'POST',
+        path: '/api/sessions/session-a/lark-tool-identity',
+        forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+        attestProcessPeer: true,
+      }],
+      forwardLoopbackService: async (service, request) => {
+        forwarded.push({ service, incoming: { ...request, body: Buffer.from(request.body) } });
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from('{"ok":true}'),
+        };
+      },
+    });
+    const body = Buffer.from('{"mode":"bot"}');
+    const headers = {
+      'x-botmux-egress-auth': auth,
+      'x-botmux-loopback-service': 'lark-tool-identity',
+      'x-botmux-lark-session': 'session-access-key',
+      'content-type': 'application/json',
+      'x-botmux-loopback-peer-pid': String(process.pid),
+      'x-botmux-loopback-peer-start': '12345',
+    };
+
+    const allowed = await unixHttpRequest(
+      host.socketPath,
+      'POST',
+      '/api/sessions/session-a/lark-tool-identity',
+      headers,
+      body,
+    );
+    const wrongMethod = await unixHttpRequest(
+      host.socketPath,
+      'GET',
+      '/api/sessions/session-a/lark-tool-identity',
+      headers,
+    );
+    const wrongSession = await unixHttpRequest(
+      host.socketPath,
+      'POST',
+      '/api/sessions/session-b/lark-tool-identity',
+      headers,
+      body,
+    );
+    const undeclaredHeader = await unixHttpRequest(
+      host.socketPath,
+      'POST',
+      '/api/sessions/session-a/lark-tool-identity',
+      { ...headers, 'x-not-declared': 'must-reject' },
+      body,
+    );
+    const mixedRouting = await unixHttpRequest(
+      host.socketPath,
+      'POST',
+      '/api/sessions/session-a/lark-tool-identity',
+      { ...headers, 'x-botmux-egress-policy': 'attacker-policy' },
+      body,
+    );
+
+    expect(allowed.status).toBe(200);
+    expect(allowed.body.toString('utf8')).toBe('{"ok":true}');
+    expect(wrongMethod.status).toBe(403);
+    expect(wrongSession.status).toBe(403);
+    expect(undeclaredHeader.status).toBe(403);
+    expect(mixedRouting.status).toBe(403);
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]).toEqual({
+      service: {
+        id: 'lark-tool-identity',
+        listenPort: 7950,
+        upstreamPort: 7950,
+        method: 'POST',
+        path: '/api/sessions/session-a/lark-tool-identity',
+        forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+        attestProcessPeer: true,
+      },
+      incoming: {
+        method: 'POST',
+        path: '/api/sessions/session-a/lark-tool-identity',
+        headers: {
+          'content-length': String(body.length),
+          'content-type': 'application/json',
+          'x-botmux-lark-session': 'session-access-key',
+        },
+        body,
+        peer: { pid: process.pid, procStart: '12345' },
+      },
     });
   });
 
@@ -439,6 +536,31 @@ describe('session protected HTTP egress host', () => {
         frozenAddresses,
       })).rejects.toThrow('protected_http_egress_target_not_frozen');
     }
+  });
+
+  it('validates process-attested loopback configuration before creating authentication material', async () => {
+    const socketDir = mkdtempSync(join(tmpdir(), 'botmux-egress-host-invalid-loopback-'));
+    chmodSync(socketDir, 0o700);
+    cleanups.push(() => rmSync(socketDir, { recursive: true, force: true }));
+
+    await expect(startSessionProtectedHttpEgressHost({
+      socketDir,
+      policy,
+      policyDigest: protectedHttpEgressPolicyDigest(policy),
+      forward: async () => ({ status: 204, headers: {}, body: Buffer.alloc(0) }),
+      loopbackServices: [{
+        id: 'lark-tool-identity',
+        listenPort: 7950,
+        upstreamPort: 7950,
+        method: 'POST',
+        path: '/api/sessions/session-a/lark-tool-identity',
+        forwardHeaders: ['content-type'],
+        attestProcessPeer: true,
+      }],
+    })).rejects.toThrow('invalid_protected_loopback_proxy_attestation');
+
+    expect(existsSync(join(socketDir, 'egress-auth'))).toBe(false);
+    expect(existsSync(join(socketDir, 'e.sock'))).toBe(false);
   });
 
   it('snapshots the digest-bound policy before serving requests', async () => {

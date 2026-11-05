@@ -471,6 +471,12 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
       policyDigest: 'd'.repeat(64),
       frozenAddresses: [['10.20.30.40', '2001:db8::40']],
     });
+    expect(init.protectedLoopbackProxyAttestation).toEqual({
+      secret: expect.stringMatching(/^[a-f0-9]{64}$/),
+      workerGeneration: ds.workerGeneration,
+    });
+    expect(ds.protectedLoopbackProxyAttestation).toEqual(init.protectedLoopbackProxyAttestation);
+    expect(JSON.stringify(init.env ?? {})).not.toContain(init.protectedLoopbackProxyAttestation.secret);
     expect(init.protectedMcpPolicy.capabilities).toEqual([]);
   });
 

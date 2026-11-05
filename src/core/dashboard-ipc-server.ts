@@ -143,6 +143,10 @@ import {
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
+import {
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+  verifyProtectedLoopbackProxyAttestation,
+} from './protected-loopback-attestation.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -961,13 +965,21 @@ async function readBoundedJsonBody<T = unknown>(
   maxBytes: number,
   timeoutMs: number,
 ): Promise<T> {
+  return (await readBoundedJsonBodyWithRaw<T>(req, maxBytes, timeoutMs)).body;
+}
+
+async function readBoundedJsonBodyWithRaw<T = unknown>(
+  req: IncomingMessage,
+  maxBytes: number,
+  timeoutMs: number,
+): Promise<{ body: T; raw: Buffer }> {
   const contentLength = req.headers['content-length'];
   if (typeof contentLength === 'string') {
     if (!/^\d+$/.test(contentLength) || Number(contentLength) > maxBytes) {
       throw new IpcBodyTooLargeError('request body too large');
     }
   }
-  return await new Promise<T>((resolve, reject) => {
+  return await new Promise<{ body: T; raw: Buffer }>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
@@ -999,9 +1011,11 @@ async function readBoundedJsonBody<T = unknown>(
       settled = true;
       cleanup();
       try {
-        resolve(chunks.length === 0
-          ? {} as T
-          : JSON.parse(Buffer.concat(chunks, total).toString('utf8')) as T);
+        const raw = Buffer.concat(chunks, total);
+        resolve({
+          body: raw.length === 0 ? {} as T : JSON.parse(raw.toString('utf8')) as T,
+          raw,
+        });
       } catch (err) {
         reject(err);
       }
@@ -3269,12 +3283,54 @@ function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: s
 
 ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
   let body: Record<string, unknown>;
-  try { body = await readBoundedJsonBody(req, 4096, 1000); }
+  let rawBody: Buffer;
+  try {
+    const parsed = await readBoundedJsonBodyWithRaw<Record<string, unknown>>(req, 4096, 1000);
+    body = parsed.body;
+    rawBody = parsed.raw;
+  }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
   const ds = findActiveBySessionId(params.sessionId);
-  const peer = process.platform === 'linux' ? resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
-  }) : undefined;
+  const proxyToken = req.headers[PROTECTED_LOOPBACK_ATTESTATION_HEADER];
+  let proxyPeer: ReturnType<typeof verifyProtectedLoopbackProxyAttestation> = null;
+  if (proxyToken !== undefined) {
+    const proxyKey = ds?.protectedLoopbackProxyAttestation;
+    const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    const contentType = req.headers['content-type'];
+    const sessionAccessKey = req.headers['x-botmux-lark-session'];
+    proxyPeer = typeof proxyToken === 'string' && proxyKey
+      && typeof contentType === 'string' && typeof sessionAccessKey === 'string'
+      && ds?.workerGeneration === proxyKey.workerGeneration
+      ? verifyProtectedLoopbackProxyAttestation(proxyKey.secret, proxyToken, {
+          sessionId: params.sessionId,
+          serviceId: 'lark-tool-identity',
+          workerGeneration: proxyKey.workerGeneration,
+          ...(ds.managedTurnOrigin?.turnId ? { turnId: ds.managedTurnOrigin.turnId } : {}),
+          ...(ds.managedTurnOrigin?.dispatchAttempt !== undefined
+            ? { dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt }
+            : {}),
+          method: 'POST',
+          path,
+          headers: {
+            'content-type': contentType,
+            'x-botmux-lark-session': sessionAccessKey,
+          },
+          body: rawBody,
+        })
+      : null;
+    if (!proxyPeer) {
+      return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
+    }
+  }
+  const peer = process.platform === 'linux'
+    ? (proxyPeer
+      ? { ok: true as const, peer: proxyPeer }
+      : resolveLoopbackPeerProcesses({
+          remoteAddress: req.socket.remoteAddress,
+          remotePort: req.socket.remotePort,
+          localPort: req.socket.localPort,
+        }))
+    : undefined;
   const backgroundInput = peer?.ok ? { sessionDataDir: config.session.dataDir,
     sessionId: params.sessionId, peer: peer.peer } : undefined;
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;

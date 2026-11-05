@@ -9,6 +9,7 @@ import {
   materializeProtectedHttpLoopbackArgs,
   readCodexProtectedProviderBridge,
   selectCodexProtectedProviderBridge,
+  startProtectedLocalServiceLoopbackBridge,
   startProtectedHttpEgressLoopbackBridge,
 } from '../src/core/protected-http-egress-loopback.js';
 import { buildNetworkLaunchPlan } from '../src/core/sandbox-network-launch.js';
@@ -259,5 +260,117 @@ describe('protected HTTP loopback bridge', () => {
 
     expect(plan.protectedHttpBridge).toEqual(bridge);
     expect(plan.args).toEqual(['--', '/usr/bin/codex']);
+  });
+
+  it('exposes a configured local service on loopback without exposing guard routing controls', async () => {
+    const root = tempRoot();
+    chmodSync(root, 0o700);
+    const socketPath = join(root, 'e.sock');
+    const auth = 'guard-auth-token-fixture';
+    writeFileSync(join(root, 'egress-auth'), `${auth}\n`, { mode: 0o600 });
+    const observed: Array<Record<string, string | undefined>> = [];
+    const unix = createHttpServer((request, response) => {
+      observed.push({
+        method: request.method,
+        path: request.url,
+        auth: request.headers['x-botmux-egress-auth'] as string | undefined,
+        service: request.headers['x-botmux-loopback-service'] as string | undefined,
+        session: request.headers['x-botmux-lark-session'] as string | undefined,
+        attackerPolicy: request.headers['x-botmux-egress-policy'] as string | undefined,
+      });
+      request.resume();
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{"ok":true}');
+    });
+    servers.push(unix);
+    await new Promise<void>((resolve, reject) => {
+      unix.once('error', reject);
+      unix.listen(socketPath, resolve);
+    });
+
+    const bridge = await startProtectedLocalServiceLoopbackBridge({
+      socketPath,
+      serviceId: 'lark-tool-identity',
+      listenPort: 0,
+      method: 'POST',
+      path: '/api/sessions/session-a/lark-tool-identity',
+      forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+      attestProcessPeer: true,
+    });
+    cleanups.push(() => bridge.close());
+
+    const call = (method: string, path: string, extraHeaders: Record<string, string> = {}) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = httpRequest(`${bridge.origin}${path}`, {
+        method,
+        headers: {
+          'content-type': 'application/json',
+          'x-botmux-lark-session': 'session-access-key',
+          ...extraHeaders,
+        },
+      }, response => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', chunk => { body += chunk; });
+        response.once('end', () => resolve({ status: response.statusCode ?? 0, body }));
+      });
+      req.once('error', reject);
+      req.end('{"mode":"bot"}');
+    });
+
+    await expect(call('POST', '/api/sessions/session-a/lark-tool-identity')).resolves.toEqual({
+      status: 200,
+      body: '{"ok":true}',
+    });
+    await expect(call('GET', '/api/sessions/session-a/lark-tool-identity')).resolves.toMatchObject({ status: 403 });
+    await expect(call('POST', '/api/sessions/session-b/lark-tool-identity')).resolves.toMatchObject({ status: 403 });
+    await expect(call('POST', '/api/sessions/session-a/lark-tool-identity', {
+      'x-not-declared': 'must-reject',
+    })).resolves.toMatchObject({ status: 403 });
+    await expect(call('POST', '/api/sessions/session-a/lark-tool-identity', {
+      'x-botmux-egress-auth': 'attacker-auth',
+      'x-botmux-egress-policy': 'attacker-policy',
+      'x-botmux-loopback-service': 'attacker-service',
+    })).resolves.toMatchObject({ status: 403 });
+    expect(observed).toEqual([{
+      method: 'POST',
+      path: '/api/sessions/session-a/lark-tool-identity',
+      auth,
+      service: 'lark-tool-identity',
+      session: 'session-access-key',
+      attackerPolicy: undefined,
+    }]);
+  });
+
+  it('deep-copies local service bridge declarations in the immutable network launch plan', () => {
+    const service = {
+      socketPath: '/run/private/e.sock',
+      serviceId: 'lark-tool-identity',
+      listenPort: 7950,
+      method: 'POST',
+      path: '/api/sessions/session-a/lark-tool-identity',
+      forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+      attestProcessPeer: true,
+    };
+    const plan = buildNetworkLaunchPlan({
+      nft: '/usr/sbin/nft',
+      ip: '/usr/sbin/ip',
+      unshare: '/usr/bin/unshare',
+      slirp: '/usr/bin/slirp4netns',
+      nftRules: 'table inet fixture {}',
+      command: '/usr/bin/bwrap',
+      args: ['--', '/usr/bin/codex'],
+      localServiceBridges: [service],
+    } as Parameters<typeof buildNetworkLaunchPlan>[0] & { localServiceBridges: typeof service[] });
+
+    service.forwardHeaders.push('authorization');
+    expect((plan as unknown as { localServiceBridges: typeof service[] }).localServiceBridges).toEqual([{
+      socketPath: '/run/private/e.sock',
+      serviceId: 'lark-tool-identity',
+      listenPort: 7950,
+      method: 'POST',
+      path: '/api/sessions/session-a/lark-tool-identity',
+      forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+      attestProcessPeer: true,
+    }]);
   });
 });

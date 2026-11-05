@@ -20,7 +20,7 @@
  */
 import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
-import type { ProtectedHttpEgressLoopbackPlan } from '../../core/protected-http-egress-loopback.js';
+import type { ProtectedHttpEgressLoopbackPlan, ProtectedLocalServiceLoopbackPlan } from '../../core/protected-http-egress-loopback.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
 import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
@@ -731,15 +731,32 @@ export function __testOnly_resetPidNamespaceProbe(): void {
  *      --unshare-pid MUST stay — hence this gate never fires there.
  *   2. The host actually can't unshare-pid (nested sandbox) — otherwise keep
  *      full isolation; there's no reason to weaken it when it works.
+ * A credential-bearing host channel (MCP socket or protected local-service
+ * bridge) independently forbids the degrade: sharing the runner's PID namespace
+ * would make its private broker descriptors reachable through `/proc/1/fd`.
  * The on-disk credential seal (fs-policy deny masks) is UNCHANGED regardless;
  * only the pid-namespace defense-in-depth is dropped, and only where it both
  * (a) can't work and (b) protects nothing.
  */
+export function coreOnlyPidNamespaceDegradeDecision(input: {
+  coreOnly: boolean;
+  canUnsharePid: boolean;
+  credentialBearingHostChannel: boolean;
+}): boolean {
+  return !input.credentialBearingHostChannel && input.coreOnly && !input.canUnsharePid;
+}
+
 export function coreOnlyPidNamespaceDegrade(
-  opts: { credentialBearingMcp?: boolean } = {},
+  opts: { credentialBearingHostChannel?: boolean } = {},
 ): boolean {
-  if (opts.credentialBearingMcp) return false;
-  return process.env.BOTMUX_CORE_ONLY === '1' && !bwrapCanUnsharePid();
+  if (opts.credentialBearingHostChannel) return false;
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  if (!coreOnly) return false;
+  return coreOnlyPidNamespaceDegradeDecision({
+    coreOnly,
+    canUnsharePid: bwrapCanUnsharePid(),
+    credentialBearingHostChannel: false,
+  });
 }
 
 /**
@@ -1176,6 +1193,9 @@ export function prepareDirectSandbox(opts: {
   /** Optional loopback bridge for a process control-plane origin that overlaps
    *  a protected target. It is started by the network-namespace runner. */
   protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
+  /** Exact localhost services re-exposed inside an isolated network namespace.
+   *  Each declaration is route- and header-scoped at the trusted Unix guard. */
+  localServiceBridges?: ProtectedLocalServiceLoopbackPlan[];
   /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
    *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
    *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
@@ -1202,6 +1222,9 @@ export function prepareDirectSandbox(opts: {
     || !opts.protectedEgressSocketPath
     || resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath))) {
     throw new Error('protected HTTP loopback bridge requires the matching guarded network sandbox');
+  }
+  if (opts.localServiceBridges?.length && !opts.networkPolicy) {
+    throw new Error('protected local service bridge requires a guarded network sandbox');
   }
   const proxyError = networkProxyError(opts.networkPolicy, process.env);
   if (proxyError) throw new Error(proxyError);
@@ -1290,7 +1313,7 @@ export function prepareDirectSandbox(opts: {
     filePaths,
     chdir: opts.chdir,
     skipPidNamespace: coreOnlyPidNamespaceDegrade({
-      credentialBearingMcp: !!opts.mcpGatewaySocketPath,
+      credentialBearingHostChannel: !!opts.mcpGatewaySocketPath || !!opts.localServiceBridges?.length,
     }),
   });
   if (minimaxAlias) {
@@ -1551,7 +1574,13 @@ export function prepareDirectSandbox(opts: {
   let networkLaunch: ReturnType<typeof sandboxNetworkLaunch> | undefined;
   try {
     networkLaunch = opts.networkPolicy
-      ? sandboxNetworkLaunch(opts.networkPolicy, launch.bin, [...launch.args, ...args], opts.protectedHttpBridge)
+      ? sandboxNetworkLaunch(
+        opts.networkPolicy,
+        launch.bin,
+        [...launch.args, ...args],
+        opts.protectedHttpBridge,
+        opts.localServiceBridges,
+      )
       : undefined;
   } catch (error) {
     rollbackSandboxSetup(sessionRoot, createdMasks);

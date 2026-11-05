@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, lstatSync, chmodSync, utimesSync } from 'node:fs';
 import { createServer, type Server } from 'node:net';
 import { once } from 'node:events';
-import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, coreOnlyPidNamespaceDegradeDecision, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
@@ -94,6 +94,58 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     } finally {
       plan?.cleanup();
       await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => egress.close(() => resolve()))]);
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('carries a route-scoped local-service bridge in the network runner without mounting an MCP socket', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-local-service-bridge-'));
+    const socketDir = join(root, 'sockets');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const egressPath = join(socketDir, 'e.sock');
+    const egress = await listen(egressPath);
+    writeFileSync(join(socketDir, 'egress-auth'), 'host-auth-token-fixture\n', { mode: 0o600 });
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'local-service-bridge',
+        dataDir,
+        policy: { rules: [], net: true, writeRegexes: [] },
+        networkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
+        chdir: root,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: [],
+        localServiceBridges: [{
+          socketPath: egressPath,
+          serviceId: 'lark-tool-identity',
+          listenPort: 7950,
+          method: 'POST',
+          path: '/api/sessions/session-a/lark-tool-identity',
+          forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+          attestProcessPeer: true,
+        }],
+      });
+      expect(plan).not.toBeNull();
+      const encoded = plan!.args.at(-1)!;
+      const launch = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      expect(launch.localServiceBridges).toEqual([{
+        socketPath: egressPath,
+        serviceId: 'lark-tool-identity',
+        listenPort: 7950,
+        method: 'POST',
+        path: '/api/sessions/session-a/lark-tool-identity',
+        forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+        attestProcessPeer: true,
+      }]);
+      expect(plan!.env.BOTMUX_MCP_GATEWAY_SOCKET).toBeUndefined();
+      expect(plan!.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV]).toBeUndefined();
+    } finally {
+      plan?.cleanup();
+      await new Promise<void>(resolve => egress.close(() => resolve()));
       rmSandboxScratch(root);
     }
   });
@@ -338,12 +390,17 @@ describe('coreOnlyPidNamespaceDegrade gate (credential-safety)', () => {
     }
   });
 
-  it('never drops the PID namespace when a host MCP credential broker is exposed', () => {
+  it('never drops the PID namespace when any credential-bearing host channel is exposed', () => {
+    expect(coreOnlyPidNamespaceDegradeDecision({
+      coreOnly: true,
+      canUnsharePid: false,
+      credentialBearingHostChannel: true,
+    })).toBe(false);
     const prev = process.env.BOTMUX_CORE_ONLY;
     process.env.BOTMUX_CORE_ONLY = '1';
     __testOnly_resetPidNamespaceProbe();
     try {
-      expect(coreOnlyPidNamespaceDegrade({ credentialBearingMcp: true })).toBe(false);
+      expect(coreOnlyPidNamespaceDegrade({ credentialBearingHostChannel: true })).toBe(false);
     } finally {
       if (prev === undefined) delete process.env.BOTMUX_CORE_ONLY;
       else process.env.BOTMUX_CORE_ONLY = prev;

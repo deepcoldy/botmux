@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { bwrapExecutable } from './system-bwrap.js';
 import { compileNetworkNft, parseSandboxNetworkPolicy, type SandboxNetworkPolicy } from './sandbox-network-policy.js';
-import type { ProtectedHttpEgressLoopbackPlan } from './protected-http-egress-loopback.js';
+import type { ProtectedHttpEgressLoopbackPlan, ProtectedLocalServiceLoopbackPlan } from './protected-http-egress-loopback.js';
 
 export interface NetworkLaunchPlan {
   nft: string;
@@ -15,6 +15,7 @@ export interface NetworkLaunchPlan {
   command: string;
   args: string[];
   protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
+  localServiceBridges?: ProtectedLocalServiceLoopbackPlan[];
 }
 
 export function buildNetworkLaunchPlan(plan: NetworkLaunchPlan): NetworkLaunchPlan {
@@ -23,6 +24,12 @@ export function buildNetworkLaunchPlan(plan: NetworkLaunchPlan): NetworkLaunchPl
     args: [...plan.args],
     ...(plan.protectedHttpBridge ? {
       protectedHttpBridge: { ...plan.protectedHttpBridge },
+    } : {}),
+    ...(plan.localServiceBridges ? {
+      localServiceBridges: plan.localServiceBridges.map(bridge => ({
+        ...bridge,
+        forwardHeaders: [...bridge.forwardHeaders],
+      })),
     } : {}),
   };
 }
@@ -37,6 +44,7 @@ export function sandboxNetworkLaunch(
   command: string,
   args: string[],
   protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan,
+  localServiceBridges?: ProtectedLocalServiceLoopbackPlan[],
 ): { bin: string; args: string[] } {
   if (process.platform !== 'linux') throw new Error('sandboxNetworkPolicy requires Linux');
   parseSandboxNetworkPolicy(policy);
@@ -61,6 +69,7 @@ export function sandboxNetworkLaunch(
     command,
     args,
     ...(protectedHttpBridge ? { protectedHttpBridge } : {}),
+    ...(localServiceBridges?.length ? { localServiceBridges } : {}),
   });
   const encoded = Buffer.from(JSON.stringify(plan)).toString('base64');
   if (Buffer.byteLength(encoded) > 98304) throw new Error('sandboxNetworkPolicy launch plan exceeds the supported 96 KiB limit');

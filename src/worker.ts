@@ -50,7 +50,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
-import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -2401,12 +2401,34 @@ async function prepareCliPluginGenerationAndGateway(
   stopSessionMcpGatewayHost();
   if (cfg.protectedHttpEgressPolicy) {
     try {
+      const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
+      const loopbackServices = daemonIpcPort && usesLarkToolBinding(
+        cfg,
+        process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+        isWorkflowWorker(),
+      ) ? [larkToolLoopbackService(cfg.sessionId, daemonIpcPort)] : [];
       sessionProtectedHttpEgressHost = await startSessionProtectedHttpEgressHost({
         sessionId: cfg.sessionId,
         dataDir: config.session.dataDir,
         policy: cfg.protectedHttpEgressPolicy.policy,
         policyDigest: cfg.protectedHttpEgressPolicy.policyDigest,
         frozenAddresses: cfg.protectedHttpEgressPolicy.frozenAddresses,
+        loopbackServices,
+        ...(cfg.protectedLoopbackProxyAttestation ? {
+          loopbackProxyAttestation: {
+            ...cfg.protectedLoopbackProxyAttestation,
+            sessionId: cfg.sessionId,
+            currentTurn: () => {
+              const active = activeTurnAuthority.identity();
+              const turnId = active.turnId ?? currentBotmuxTurnId;
+              const dispatchAttempt = active.dispatchAttempt ?? currentBotmuxDispatchAttempt;
+              return {
+                ...(turnId ? { turnId } : {}),
+                ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+              };
+            },
+          },
+        } : {}),
         onError: error => log(`[protected-egress] host error: ${error.message}`),
       });
       log(`[protected-egress] guard listening for ${cfg.protectedHttpEgressPolicy.pluginId}`);
@@ -24862,6 +24884,15 @@ async function spawnCli(
           : undefined,
         protectedEgressRequired: !!cfg.protectedHttpEgressPolicy,
         protectedHttpBridge: codexProtectedProviderBridge?.bridge,
+        localServiceBridges: sessionProtectedHttpEgressHost?.loopbackServices.map(service => ({
+            socketPath: sessionProtectedHttpEgressHost!.socketPath,
+            serviceId: service.id,
+            listenPort: service.listenPort,
+            method: service.method,
+            path: service.path,
+            forwardHeaders: [...service.forwardHeaders],
+            ...(service.attestProcessPeer ? { attestProcessPeer: true } : {}),
+          })),
         larkCliDataDir: childLarkDataRoot,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
@@ -24895,7 +24926,8 @@ async function spawnCli(
           expectedPolicyDigest: cfg.protectedHttpEgressPolicy?.policyDigest,
           guardPolicyDigest: sessionProtectedHttpEgressHost?.policyDigest,
           pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
-            credentialBearingMcp: !!sessionMcpGatewayHost?.socketPath,
+            credentialBearingHostChannel: !!sessionMcpGatewayHost?.socketPath
+              || !!sessionProtectedHttpEgressHost?.loopbackServices.length,
           }),
           networkPolicy: effectiveSandboxNetworkPolicy,
         }))

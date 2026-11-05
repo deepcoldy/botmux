@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmodSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { isIP, type Socket } from 'node:net';
 import { dirname, join } from 'node:path';
@@ -13,6 +13,13 @@ import {
   type ProtectedHttpEgressPolicy,
   type ProtectedHttpEgressTarget,
 } from './protected-http-egress.js';
+import {
+  createProtectedLoopbackProxyAttestation,
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+  PROTECTED_LOOPBACK_PEER_PID_HEADER,
+  PROTECTED_LOOPBACK_PEER_START_HEADER,
+} from './protected-loopback-attestation.js';
+import type { ProcessIdentity } from './current-actor-attestation.js';
 import { ensurePrivateGatewayDir, sessionMcpGatewaySocketDir } from './plugins/mcp/socket-dir.js';
 
 export const PROTECTED_HTTP_EGRESS_SOCKET_ENV = 'BOTMUX_PROTECTED_EGRESS_SOCKET';
@@ -27,6 +34,10 @@ const ROUTING_HEADERS = new Set([
   'x-botmux-egress-auth',
   'x-botmux-egress-policy',
   'x-botmux-egress-target',
+  'x-botmux-loopback-service',
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+  PROTECTED_LOOPBACK_PEER_PID_HEADER,
+  PROTECTED_LOOPBACK_PEER_START_HEADER,
 ]);
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -62,6 +73,24 @@ export interface ProtectedHttpEgressForwardResponse {
   body: Buffer | Readable;
 }
 
+export interface ProtectedLoopbackService {
+  id: string;
+  listenPort: number;
+  upstreamPort: number;
+  method: string;
+  path: string;
+  forwardHeaders: string[];
+  attestProcessPeer?: boolean;
+}
+
+export interface ProtectedLoopbackForwardRequest {
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: Buffer;
+  peer?: ProcessIdentity;
+}
+
 export interface ProtectedHttpEgressLogEntry {
   policyId: string;
   method: string;
@@ -86,6 +115,7 @@ export interface SessionProtectedHttpEgressHost {
   socketDir: string;
   policyId: string;
   policyDigest: string;
+  loopbackServices: readonly ProtectedLoopbackService[];
   close(): Promise<void>;
 }
 
@@ -99,6 +129,17 @@ export interface StartSessionProtectedHttpEgressHostOptions {
   /** Frozen A/AAAA results by policy target index. Required by the default forwarder. */
   frozenAddresses?: readonly (readonly string[])[];
   forward?: (request: ProtectedHttpEgressForwardRequest) => Promise<ProtectedHttpEgressForwardResponse>;
+  loopbackServices?: readonly ProtectedLoopbackService[];
+  forwardLoopbackService?: (
+    service: ProtectedLoopbackService,
+    request: ProtectedLoopbackForwardRequest,
+  ) => Promise<ProtectedHttpEgressForwardResponse>;
+  loopbackProxyAttestation?: {
+    secret: string;
+    workerGeneration: number;
+    sessionId: string;
+    currentTurn: () => { turnId?: string; dispatchAttempt?: number };
+  };
   log?: (entry: ProtectedHttpEgressLogEntry) => void;
   warn?: (warning: ProtectedHttpEgressWarning) => void;
   onError?: (error: Error) => void;
@@ -115,6 +156,40 @@ function normalizedMethod(raw: string | undefined): string {
   const method = (raw ?? '').toUpperCase();
   if (!HTTP_TOKEN.test(method)) throw new InvalidRequestError('invalid_protected_http_method');
   return method;
+}
+
+function normalizeLoopbackServices(raw: readonly ProtectedLoopbackService[] | undefined): ProtectedLoopbackService[] {
+  const ids = new Set<string>();
+  const listenPorts = new Set<number>();
+  return (raw ?? []).map(service => {
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(service.id)
+      || !Number.isSafeInteger(service.listenPort) || service.listenPort < 1 || service.listenPort > 65535
+      || !Number.isSafeInteger(service.upstreamPort) || service.upstreamPort < 1 || service.upstreamPort > 65535
+      || ids.has(service.id) || listenPorts.has(service.listenPort)) {
+      throw new Error('invalid_protected_loopback_service');
+    }
+    ids.add(service.id);
+    listenPorts.add(service.listenPort);
+    const method = normalizedMethod(service.method);
+    const path = normalizeProtectedHttpPath(service.path);
+    if (path.includes('?')) throw new Error('invalid_protected_loopback_service');
+    const forwardHeaders: string[] = [];
+    const seenHeaders = new Set<string>();
+    for (const rawHeader of service.forwardHeaders) {
+      const header = rawHeader.toLowerCase();
+      if (!HTTP_TOKEN.test(header.toUpperCase()) || header !== rawHeader
+        || HOP_BY_HOP_HEADERS.has(header) || ROUTING_HEADERS.has(header)
+        || header === 'content-length' || isProxyHeader(header) || seenHeaders.has(header)) {
+        throw new Error('invalid_protected_loopback_service');
+      }
+      seenHeaders.add(header);
+      forwardHeaders.push(header);
+    }
+    if (service.attestProcessPeer !== undefined && service.attestProcessPeer !== true) {
+      throw new Error('invalid_protected_loopback_service');
+    }
+    return { ...service, method, path, forwardHeaders };
+  });
 }
 
 function tokenMatches(presented: string, expected: string): boolean {
@@ -184,6 +259,48 @@ function sanitizedRequestHeaders(request: IncomingMessage): Record<string, strin
     headers[name] = Array.isArray(value) ? value.join(', ') : value;
   }
   return headers;
+}
+
+function loopbackRequestHeaders(
+  request: IncomingMessage,
+  service: ProtectedLoopbackService,
+): { headers: Record<string, string>; peer?: ProcessIdentity } {
+  if (request.headers.upgrade !== undefined || request.headers.expect !== undefined) {
+    throw new InvalidRequestError('unsafe_request_header');
+  }
+  const allowed = new Set([
+    'host', 'connection', 'content-length',
+    'x-botmux-egress-auth', 'x-botmux-loopback-service',
+    ...(service.attestProcessPeer
+      ? [PROTECTED_LOOPBACK_PEER_PID_HEADER, PROTECTED_LOOPBACK_PEER_START_HEADER]
+      : []),
+    ...service.forwardHeaders,
+  ]);
+  const valuesByName = new Map<string, string[]>();
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    const name = request.rawHeaders[index]!.toLowerCase();
+    if (!allowed.has(name)) throw new InvalidRequestError('undeclared_request_header');
+    const values = valuesByName.get(name) ?? [];
+    values.push(request.rawHeaders[index + 1]!);
+    valuesByName.set(name, values);
+  }
+  if ([...valuesByName.values()].some(values => values.length !== 1)) {
+    throw new InvalidRequestError('duplicate_forward_header');
+  }
+  const headers: Record<string, string> = {};
+  for (const name of service.forwardHeaders) {
+    const values = valuesByName.get(name) ?? [];
+    if (values.length === 1) headers[name] = values[0]!;
+  }
+  if (!service.attestProcessPeer) return { headers };
+  const pidText = valuesByName.get(PROTECTED_LOOPBACK_PEER_PID_HEADER)?.[0];
+  const procStart = valuesByName.get(PROTECTED_LOOPBACK_PEER_START_HEADER)?.[0];
+  const pid = Number(pidText);
+  if (!/^\d+$/.test(pidText ?? '') || !Number.isSafeInteger(pid) || pid <= 1
+    || !/^\d{1,64}$/.test(procStart ?? '')) {
+    throw new InvalidRequestError('invalid_loopback_peer');
+  }
+  return { headers, peer: { pid, procStart: procStart! } };
 }
 
 function zeroBuffers(buffers: readonly Buffer[]): void {
@@ -357,6 +474,57 @@ function defaultForwarder(
   };
 }
 
+function defaultLoopbackForwarder(
+  proxy: StartSessionProtectedHttpEgressHostOptions['loopbackProxyAttestation'],
+  service: ProtectedLoopbackService,
+  request: ProtectedLoopbackForwardRequest,
+): Promise<ProtectedHttpEgressForwardResponse> {
+  return new Promise((resolve, reject) => {
+    const headers = { ...request.headers };
+    if (service.attestProcessPeer) {
+      if (!proxy || !request.peer) {
+        reject(new Error('protected_loopback_attestation_unavailable'));
+        return;
+      }
+      const currentTurn = proxy.currentTurn();
+      const signedHeaders = Object.fromEntries(
+        service.forwardHeaders.flatMap(name => request.headers[name] === undefined
+          ? [] : [[name, request.headers[name]!]]),
+      );
+      headers[PROTECTED_LOOPBACK_ATTESTATION_HEADER] = createProtectedLoopbackProxyAttestation(
+        proxy.secret,
+        {
+          sessionId: proxy.sessionId,
+          serviceId: service.id,
+          workerGeneration: proxy.workerGeneration,
+          ...currentTurn,
+          peer: request.peer,
+          method: request.method,
+          path: request.path,
+          headers: signedHeaders,
+          body: request.body,
+        },
+      );
+    }
+    const upstream = httpRequest({
+      host: '127.0.0.1',
+      port: service.upstreamPort,
+      method: request.method,
+      path: request.path,
+      headers,
+      agent: false,
+      timeout: UPSTREAM_TIMEOUT_MS,
+    }, response => resolve({
+      status: response.statusCode ?? 502,
+      headers: response.headers,
+      body: response,
+    }));
+    upstream.once('timeout', () => upstream.destroy(new Error('protected_loopback_service_timeout')));
+    upstream.once('error', reject);
+    upstream.end(request.body);
+  });
+}
+
 async function streamCappedResponseBody(source: Readable, response: ServerResponse): Promise<void> {
   let length = 0;
   try {
@@ -416,10 +584,22 @@ export async function startSessionProtectedHttpEgressHost(
   const frozenAddresses = opts.forward
     ? opts.frozenAddresses?.map(addresses => [...addresses])
     : snapshotFrozenAddresses(policy, opts.frozenAddresses);
+  const loopbackServices = normalizeLoopbackServices(opts.loopbackServices);
+  if (!opts.forwardLoopbackService && loopbackServices.some(service => service.attestProcessPeer)
+    && (!opts.loopbackProxyAttestation
+      || !/^[a-f0-9]{64}$/.test(opts.loopbackProxyAttestation.secret)
+      || !Number.isSafeInteger(opts.loopbackProxyAttestation.workerGeneration)
+      || opts.loopbackProxyAttestation.workerGeneration <= 0
+      || !/^[A-Za-z0-9._-]{1,200}$/.test(opts.loopbackProxyAttestation.sessionId))) {
+    throw new Error('invalid_protected_loopback_proxy_attestation');
+  }
   ensurePrivateGatewayDir(socketDir);
   rmSync(socketPath, { force: true });
   const authToken = rotateEgressAuthToken(socketPath);
   const forward = opts.forward ?? defaultForwarder(frozenAddresses!);
+  const loopbackServicesById = new Map(loopbackServices.map(service => [service.id, service]));
+  const forwardLoopbackService = opts.forwardLoopbackService
+    ?? ((service, request) => defaultLoopbackForwarder(opts.loopbackProxyAttestation, service, request));
   const sockets = new Set<Socket>();
   const sensitiveBuffers = new Set<Buffer>();
   let closing: Promise<void> | undefined;
@@ -440,6 +620,85 @@ export async function startSessionProtectedHttpEgressHost(
         if (presentedAuthValues.length !== 1 || !tokenMatches(presentedAuthValues[0], authToken)) {
           request.resume();
           sendJson(response, 403, 'botmux_protected_egress_forbidden');
+          return;
+        }
+        const loopbackServiceValues = rawHeaderValues(request, 'x-botmux-loopback-service');
+        if (loopbackServiceValues.length > 0) {
+          if (loopbackServiceValues.length !== 1
+            || rawHeaderValues(request, 'x-botmux-egress-policy').length > 0
+            || rawHeaderValues(request, 'x-botmux-egress-target').length > 0) {
+            request.resume();
+            sendJson(response, 403, 'botmux_protected_loopback_forbidden');
+            return;
+          }
+          const service = loopbackServicesById.get(loopbackServiceValues[0]);
+          method = normalizedMethod(request.method);
+          path = normalizeProtectedHttpPath(request.url ?? '');
+          if (!service || method !== service.method || path !== service.path) {
+            request.resume();
+            sendJson(response, 403, 'botmux_protected_loopback_forbidden');
+            return;
+          }
+          const declaredLength = requestContentLength(request);
+          let loopbackRequest: ReturnType<typeof loopbackRequestHeaders>;
+          try {
+            loopbackRequest = loopbackRequestHeaders(request, service);
+          } catch (error) {
+            if (!(error instanceof InvalidRequestError)) throw error;
+            request.resume();
+            sendJson(response, 403, 'botmux_protected_loopback_forbidden');
+            return;
+          }
+          const headers = loopbackRequest.headers;
+          const body = await readCappedBody(request, declaredLength);
+          sensitiveBuffers.add(body);
+          if (body.length > 0) headers['content-length'] = String(body.length);
+          let pendingUpstreamBody: Buffer | undefined;
+          try {
+            const upstream = await forwardLoopbackService(service, {
+              method, path, headers, body,
+              ...(loopbackRequest.peer ? { peer: loopbackRequest.peer } : {}),
+            });
+            if (!Number.isInteger(upstream.status) || upstream.status < 100 || upstream.status > 599) {
+              throw new Error('invalid_protected_loopback_status');
+            }
+            if (!Buffer.isBuffer(upstream.body) && !(upstream.body instanceof Readable)) {
+              throw new Error('invalid_protected_loopback_body');
+            }
+            if (Buffer.isBuffer(upstream.body)) {
+              pendingUpstreamBody = upstream.body;
+              sensitiveBuffers.add(upstream.body);
+              if (upstream.body.length > MAX_PROTECTED_HTTP_BODY_BYTES) {
+                sendJson(response, 502, 'botmux_protected_loopback_response_too_large');
+                upstream.body.fill(0);
+                sensitiveBuffers.delete(upstream.body);
+                pendingUpstreamBody = undefined;
+              } else {
+                response.writeHead(upstream.status, sanitizedResponseHeaders(upstream.headers));
+                const responseBody = upstream.body;
+                const clearResponseBody = () => {
+                  responseBody.fill(0);
+                  sensitiveBuffers.delete(responseBody);
+                };
+                response.once('finish', clearResponseBody);
+                response.once('close', clearResponseBody);
+                response.end(responseBody);
+                pendingUpstreamBody = undefined;
+              }
+            } else {
+              response.writeHead(upstream.status, sanitizedResponseHeaders(upstream.headers));
+              await streamCappedResponseBody(upstream.body, response);
+            }
+          } catch (error) {
+            pendingUpstreamBody?.fill(0);
+            if (pendingUpstreamBody) sensitiveBuffers.delete(pendingUpstreamBody);
+            if (!response.headersSent) sendJson(response, 502, 'botmux_protected_loopback_unavailable');
+            else if (!response.writableEnded) response.destroy();
+            reportError(error);
+          } finally {
+            body.fill(0);
+            sensitiveBuffers.delete(body);
+          }
           return;
         }
         const policyId = requiredSingleHeader(request, 'x-botmux-egress-policy');
@@ -608,6 +867,7 @@ export async function startSessionProtectedHttpEgressHost(
     socketDir,
     policyId: policy.id,
     policyDigest: actualDigest,
+    loopbackServices,
     close(): Promise<void> {
       closing ??= (async () => {
         rmSync(socketPath, { force: true });

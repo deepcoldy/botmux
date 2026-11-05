@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, larkToolLoopbackService } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
@@ -17,6 +17,18 @@ const parseLarkToolInvocation = (args: string[], binding: { appId: string; defau
 };
 
 describe('managed lark-cli binding', () => {
+  it('declares one exact authenticated loopback route for the current session identity', () => {
+    expect(larkToolLoopbackService('session-a', 7950)).toEqual({
+      id: 'lark-tool-identity',
+      listenPort: 7950,
+      upstreamPort: 7950,
+      method: 'POST',
+      path: '/api/sessions/session-a/lark-tool-identity',
+      forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+      attestProcessPeer: true,
+    });
+  });
+
   it('is default ON unless explicitly disabled (larkToolBinding: false); leaves adopt/remote/workflow alone', () => {
     const config = { sessionId: 'session-a', larkAppId: 'cli_current', chatId: 'oc_chat', backendType: 'pty' as const };
     // Default on

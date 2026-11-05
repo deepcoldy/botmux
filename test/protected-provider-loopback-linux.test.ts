@@ -4,7 +4,7 @@
  *   BOTMUX_PROTECTED_LOOPBACK_INTEGRATION=1 bun run test test/protected-provider-loopback-linux.test.ts
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +12,8 @@ import { spawn } from 'node:child_process';
 import {
   PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
 } from '../src/core/protected-http-egress-loopback.js';
+import { verifyProtectedLoopbackProxyAttestation } from '../src/core/protected-loopback-attestation.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import type { SandboxNetworkPolicy } from '../src/core/sandbox-network-policy.js';
 
 const enabled = process.platform === 'linux'
@@ -22,7 +24,7 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
   let root: string;
   let socketPath: string;
   let guard: ReturnType<typeof createServer>;
-  const observed: Array<{ method?: string; url?: string; auth?: string; policy?: string; target?: string }> = [];
+  const observed: Array<{ method?: string; url?: string; auth?: string; policy?: string; target?: string; service?: string; session?: string }> = [];
 
   beforeAll(async () => {
     root = mkdtempSync(join(tmpdir(), 'botmux-provider-loopback-linux-'));
@@ -30,12 +32,16 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
     socketPath = join(root, 'e.sock');
     writeFileSync(join(root, 'egress-auth'), 'namespace-auth-fixture\n', { mode: 0o600 });
     guard = createServer((request, response) => {
+      const service = request.headers['x-botmux-loopback-service'] as string | undefined;
+      const session = request.headers['x-botmux-lark-session'] as string | undefined;
       observed.push({
         method: request.method,
         url: request.url,
         auth: request.headers['x-botmux-egress-auth'] as string | undefined,
         policy: request.headers['x-botmux-egress-policy'] as string | undefined,
         target: request.headers['x-botmux-egress-target'] as string | undefined,
+        ...(service ? { service } : {}),
+        ...(session ? { session } : {}),
       });
       request.resume();
       response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -54,6 +60,7 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
   });
 
   it('materializes the dynamic origin and reaches the Unix guard with trusted routing', async () => {
+    observed.length = 0;
     const script = join(root, 'probe.mjs');
     writeFileSync(script, [
       'const response = await fetch(process.argv[2], { method: "POST", body: "{}" });',
@@ -100,5 +107,217 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
       policy: 'fixture.items.write.v1',
       target: '0',
     }]);
+  });
+
+  it('re-exposes only the declared daemon route on private loopback', async () => {
+    observed.length = 0;
+    const script = join(root, 'local-service-probe.mjs');
+    writeFileSync(script, [
+      'import { request } from "node:http";',
+      'const target = new URL(process.argv[2]);',
+      'const payload = JSON.stringify({ mode: "bot" });',
+      'const result = await new Promise((resolve, reject) => {',
+      '  const req = request({ hostname: target.hostname, port: target.port, path: target.pathname, method: "POST",',
+      '    headers: { "content-type": "application/json", "x-botmux-lark-session": "session-access-key", "content-length": String(Buffer.byteLength(payload)) } }, response => {',
+      '    let body = ""; response.setEncoding("utf8"); response.on("data", chunk => body += chunk);',
+      '    response.once("end", () => resolve({ status: response.statusCode, body }));',
+      '  });',
+      '  req.once("error", reject); req.end(payload);',
+      '});',
+      'console.log(JSON.stringify(result));',
+    ].join('\n'));
+    const policy: SandboxNetworkPolicy = {
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'allow' },
+    };
+    const { sandboxNetworkLaunch } = await import('../dist/core/sandbox-network-launch.js');
+    const path = '/api/sessions/session-a/lark-tool-identity';
+    const launch = sandboxNetworkLaunch(
+      policy,
+      process.execPath,
+      [script, `http://127.0.0.1:17950${path}`],
+      undefined,
+      [{
+        socketPath,
+        serviceId: 'lark-tool-identity',
+        listenPort: 17950,
+        method: 'POST',
+        path,
+        forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+        attestProcessPeer: true,
+      }],
+    );
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(launch.bin, launch.args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += chunk; });
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('exit', code => resolve({ code, stdout, stderr }));
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain('[sandbox-network]');
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      status: 200,
+      body: 'data: namespace-first\n\ndata: namespace-second\n\n',
+    });
+    expect(observed).toEqual([{
+      method: 'POST',
+      url: path,
+      auth: 'namespace-auth-fixture',
+      policy: undefined,
+      target: undefined,
+      service: 'lark-tool-identity',
+      session: 'session-access-key',
+    }]);
+  });
+
+  it('forwards the isolated lark identity route to the real host loopback port', async () => {
+    const path = '/api/sessions/session-a/lark-tool-identity';
+    const secret = 'cd'.repeat(32);
+    const daemonRequests: Array<{
+      method?: string;
+      url?: string;
+      session?: string;
+      attestation?: string;
+      body: string;
+      hostPeerVerified: boolean;
+    }> = [];
+    const daemon = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      request.once('end', () => {
+        const body = Buffer.concat(chunks);
+        const attestation = request.headers['x-botmux-loopback-attestation'] as string | undefined;
+        const peer = attestation ? verifyProtectedLoopbackProxyAttestation(secret, attestation, {
+          sessionId: 'session-a', serviceId: 'lark-tool-identity', workerGeneration: 7,
+          turnId: 'turn-fixture', method: 'POST', path,
+          headers: {
+            'content-type': 'application/json',
+            'x-botmux-lark-session': 'session-access-key',
+          },
+          body,
+        }) : null;
+        daemonRequests.push({
+          method: request.method,
+          url: request.url,
+          session: request.headers['x-botmux-lark-session'] as string | undefined,
+          attestation,
+          body: body.toString('utf8'),
+          hostPeerVerified: !!peer && readProcessStartIdentity(peer.pid) === peer.procStart,
+        });
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end('{"ok":true,"credential":"fixture"}');
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      daemon.once('error', reject);
+      daemon.listen(0, '127.0.0.1', resolve);
+    });
+    const daemonAddress = daemon.address();
+    if (!daemonAddress || typeof daemonAddress === 'string') throw new Error('fixture daemon did not bind TCP');
+    const socketDir = join(root, 'full-chain');
+    mkdirSync(socketDir, { mode: 0o700 });
+    const { normalizeProtectedHttpEgressPolicy, protectedHttpEgressPolicyDigest } = await import('../dist/core/protected-http-egress.js');
+    const { startSessionProtectedHttpEgressHost } = await import('../dist/core/protected-http-egress-host.js');
+    const fixturePolicy = normalizeProtectedHttpEgressPolicy({
+      id: 'fixture.items.write.v1',
+      targets: [{
+        scheme: 'https',
+        host: 'fixture.internal.example',
+        port: 443,
+        denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+      }],
+    })!;
+    const host = await startSessionProtectedHttpEgressHost({
+      socketDir,
+      policy: fixturePolicy,
+      policyDigest: protectedHttpEgressPolicyDigest(fixturePolicy),
+      forward: async () => ({ status: 502, headers: {}, body: Buffer.alloc(0) }),
+      loopbackServices: [{
+        id: 'lark-tool-identity',
+        listenPort: daemonAddress.port,
+        upstreamPort: daemonAddress.port,
+        method: 'POST',
+        path,
+        forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+        attestProcessPeer: true,
+      }],
+      loopbackProxyAttestation: {
+        secret,
+        workerGeneration: 7,
+        sessionId: 'session-a',
+        currentTurn: () => ({ turnId: 'turn-fixture' }),
+      },
+    });
+    try {
+      const script = join(root, 'full-chain-probe.mjs');
+      writeFileSync(script, [
+        'import { request } from "node:http";',
+        'const target = new URL(process.argv[2]);',
+        'const payload = JSON.stringify({ mode: "bot" });',
+        'const result = await new Promise((resolve, reject) => {',
+        '  const req = request({ hostname: target.hostname, port: target.port, path: target.pathname, method: "POST",',
+        '    headers: { "content-type": "application/json", "x-botmux-lark-session": "session-access-key", "content-length": String(Buffer.byteLength(payload)) } }, response => {',
+        '    let body = ""; response.setEncoding("utf8"); response.on("data", chunk => body += chunk);',
+        '    response.once("end", () => resolve({ status: response.statusCode, body }));',
+        '  });',
+        '  req.once("error", reject); req.end(payload);',
+        '});',
+        'console.log(JSON.stringify(result));',
+      ].join('\n'));
+      const { sandboxNetworkLaunch } = await import('../dist/core/sandbox-network-launch.js');
+      const launch = sandboxNetworkLaunch(
+        { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
+        '/bin/sh',
+        [
+          '-c',
+          'if test -e /proc/self/fd/7 || test -e /proc/self/fd/8; then exit 91; fi; exec "$@"',
+          'botmux-broker-fd-probe',
+          process.execPath,
+          script,
+          `http://127.0.0.1:${daemonAddress.port}${path}`,
+        ],
+        undefined,
+        host.loopbackServices.map(service => ({
+          socketPath: host.socketPath,
+          serviceId: service.id,
+          listenPort: service.listenPort,
+          method: service.method,
+          path: service.path,
+          forwardHeaders: [...service.forwardHeaders],
+          ...(service.attestProcessPeer ? { attestProcessPeer: true } : {}),
+        })),
+      );
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+        const child = spawn(launch.bin, launch.args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', chunk => { stdout += chunk; });
+        child.stderr.on('data', chunk => { stderr += chunk; });
+        child.once('error', reject);
+        child.once('exit', code => resolve({ code, stdout, stderr }));
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).not.toContain('[sandbox-network]');
+      expect(JSON.parse(result.stdout.trim())).toEqual({
+        status: 200,
+        body: '{"ok":true,"credential":"fixture"}',
+      });
+      expect(daemonRequests).toEqual([{
+        method: 'POST',
+        url: path,
+        session: 'session-access-key',
+        attestation: expect.stringMatching(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/),
+        body: '{"mode":"bot"}',
+        hostPeerVerified: true,
+      }]);
+    } finally {
+      await host.close();
+      await new Promise<void>(resolve => daemon.close(() => resolve()));
+    }
   });
 });
