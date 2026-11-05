@@ -25,6 +25,9 @@ export interface OnlineDaemonInfo {
   workflowIpcProtocol?: string;
   /** Internal target-authoritative dispatch launch protocol. */
   dispatchLaunchIpcProtocol?: 'v1';
+  /** Applies a workflow run's Gate-2 working dir to its node sessions
+   *  (design 2026-11-03 §15.4). Absent = an older daemon that ignores it. */
+  workflowNodeWorkingDir?: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
   sessionStoreProtocol?: string;
   /** Running binary version. Copy only; never compared by size. */
@@ -100,6 +103,7 @@ export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } =
         ...(d.dispatchLaunchIpcProtocol === 'v1'
           ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
           : {}),
+        ...(d.workflowNodeWorkingDir === 'v1' ? { workflowNodeWorkingDir: d.workflowNodeWorkingDir } : {}),
         ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
           ? { sessionStoreProtocol: d.sessionStoreProtocol }
           : {}),

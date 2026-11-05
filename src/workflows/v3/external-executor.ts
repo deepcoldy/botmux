@@ -32,7 +32,12 @@ export const V3_EXTERNAL_ERROR_CODES = {
   HANDOFF_NOT_ACCEPTED: 'HANDOFF_NOT_ACCEPTED',
   HANDOFF_UNCERTAIN: 'HANDOFF_UNCERTAIN',
   BOT_REPORTED_BLOCKED: 'BOT_REPORTED_BLOCKED',
+  /** The executing bot's daemon would not start the node session in the
+   *  run's Gate-2 working dir: not inside its configured range (design §15.4). */
+  WORKING_DIR_REFUSED: 'WORKING_DIR_REFUSED',
   NODE_TIMEOUT: 'NODE_TIMEOUT',
+  /** The main bot (or the initiator) handed the node to a human (§13.6). */
+  HANDED_TO_HUMAN: 'HANDED_TO_HUMAN',
 } as const;
 
 export type V3ExternalErrorCode =
@@ -43,7 +48,10 @@ export type V3HandoffRejectionCode =
   | 'BOT_NOT_IN_CHAT'
   | 'BOT_OFFLINE'
   | 'COLLABORATION_DENIED'
-  | 'IDENTITY_UNAVAILABLE';
+  | 'IDENTITY_UNAVAILABLE'
+  /** The run's Gate-2 working dir cannot be honoured by the target (design
+   *  §15.4): the main bot's own range, or a target daemon too old to apply it. */
+  | 'WORKING_DIR_REFUSED';
 
 /**
  * How long a prepared-but-unconfirmed handoff may be re-sent with the same
@@ -120,7 +128,9 @@ export type V3ExternalDispatchOutcome =
 
 export type V3ExternalAcceptanceProbe =
   | { status: 'accepted'; sessionId: string; acceptedAt?: number }
-  | { status: 'notAccepted' };
+  /** `detail`: why the target did not take it, when the transport knows
+   *  (kept in the HANDOFF_NOT_ACCEPTED message). */
+  | { status: 'notAccepted'; detail?: string };
 
 export type V3ExternalStopReason =
   | 'runCancelled'
@@ -129,7 +139,8 @@ export type V3ExternalStopReason =
   | 'uncertain'
   | 'reassigned'
   | 'obsolete'
-  | 'runBoundary';
+  | 'runBoundary'
+  | 'handedToHuman';
 
 export interface V3ExternalStopRequest extends V3ExternalAttemptRef {
   reason: V3ExternalStopReason;

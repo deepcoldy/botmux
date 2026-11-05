@@ -272,6 +272,13 @@ export interface V3Node {
    *  validateDag enforces every entry is an ANCESTOR (transitive `depends`),
    *  so a revisit can never create a forward jump or a cycle in the run. */
   revisitTo?: string[];
+  /** Goal nodes only (design 2026-11-03 §13.6, M6): "look at the result
+   *  before deciding how the rest goes". In a run whose goal nodes are
+   *  handed to bots, the main bot is woken when this node completes. Only
+   *  `true` is kept — absent (and an authored `false`) serialize exactly as a
+   *  node that never had the field, so existing DAGs and saved templates keep
+   *  their bytes. */
+  checkpoint?: true;
 
   // ── host-only fields (type === 'host') ──
   /** Deterministic executor invoked by the host runtime (never an LLM). */
@@ -473,6 +480,9 @@ export function validateDag(raw: unknown): V3Dag {
       if (n.bot !== undefined) problems.push(`host node "${id}".bot is not supported — host nodes do not spawn a CLI`);
       if (n.override !== undefined) problems.push(`host node "${id}".override is not supported`);
       if (n.revisitTo !== undefined) problems.push(`host node "${id}".revisitTo is not supported`);
+      if (n.checkpoint !== undefined) {
+        problems.push(`host node "${id}".checkpoint is not supported — only goal nodes can be checkpoints`);
+      }
       if (n.resultSchema !== undefined) {
         problems.push(`host node "${id}".resultSchema is not supported — host output uses the trusted executor result contract`);
       }
@@ -564,6 +574,7 @@ export function validateDag(raw: unknown): V3Dag {
     const override = normOverride(n.override, `node "${id}"`, problems);
 
     const revisitTo = normRevisitTo(n.revisitTo, id, problems);
+    const checkpoint = normCheckpoint(n.checkpoint, `goal node "${id}"`, problems);
     if (schemaVersion !== 2 && n.outputs !== undefined) {
       problems.push(`goal node "${id}".outputs requires schemaVersion 2`);
     }
@@ -585,6 +596,7 @@ export function validateDag(raw: unknown): V3Dag {
       humanGate,
       resultSchema,
       ...(revisitTo ? { revisitTo } : {}),
+      ...(checkpoint ? { checkpoint } : {}),
     });
   }
 
@@ -1061,6 +1073,14 @@ function normTimeoutSec(v: unknown, where: string, problems: string[]): number |
 /** Normalize `revisitTo`: an optional array of non-empty path-safe node ids.
  *  Shape only here; the ancestor / existence cross-checks run once all ids are
  *  collected (validateDag's cross-node pass). */
+/** `checkpoint` is an optional boolean; only `true` survives normalization. */
+function normCheckpoint(v: unknown, where: string, problems: string[]): true | undefined {
+  if (v === undefined || v === false) return undefined;
+  if (v === true) return true;
+  problems.push(`${where}.checkpoint must be a boolean`);
+  return undefined;
+}
+
 function normRevisitTo(v: unknown, id: string, problems: string[]): string[] | undefined {
   if (v === undefined) return undefined;
   if (!Array.isArray(v)) {
@@ -1152,6 +1172,9 @@ function normLoopFields(
   if (n.override !== undefined) {
     problems.push(`${where}.override is not supported — a loop composite never spawns a worker; set override on body nodes instead`);
   }
+  if (n.checkpoint !== undefined) {
+    problems.push(`${where}.checkpoint is not supported — mark a goal node outside the loop instead`);
+  }
 
   let maxIterations: number | undefined;
   if (typeof n.maxIterations !== 'number' || !Number.isInteger(n.maxIterations) || n.maxIterations < 1) {
@@ -1200,6 +1223,9 @@ function normLoopFields(
     }
     if (b.triggerRule !== undefined) {
       problems.push(`${where}.body node "${bid}".triggerRule is not supported inside a loop body (first cut)`);
+    }
+    if (b.checkpoint !== undefined) {
+      problems.push(`${where}.body node "${bid}".checkpoint is not supported inside a loop body (first cut)`);
     }
     // No whenSink: conditional edges are rejected inside a body (first cut).
     const bdepends = normDepends(b.depends, `${where}.body node "${bid}"`, problems);

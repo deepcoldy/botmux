@@ -2,9 +2,10 @@ export interface PostgresTarget {
   host: string;
   port: number;
   database: string;
-  user: string;
+  user?: string;
   schema: string;
-  passwordRef: string;
+  passwordRef?: string;
+  bytepg?: { computeId: string; tokenRef?: string; doas?: import('./feedback-doas-token.js').DoasTokenConfig };
   tls: { mode: 'verify-full' | 'disable'; caRef?: string };
   connectTimeoutMs: number;
 }

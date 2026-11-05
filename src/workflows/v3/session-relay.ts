@@ -21,6 +21,7 @@ import type { ScheduledTask } from '../../types.js';
 import {
   authorizeV3RunEditForCurrentTuple,
   authorizeV3RunMutationForCurrentTuple,
+  v3ActionCallerFor,
   V3DaemonCommandAuthorityError,
   workflowEventTurnVerifierFor,
 } from './cli-daemon-command-authority.js';
@@ -34,7 +35,7 @@ import {
 
 export const V3_SESSION_RUN_MUTATION_ROUTE_PREFIX = '/api/v3/session-runs';
 
-export const V3_SESSION_RUN_MUTATIONS = ['start', 'cancel', 'retry', 'grant'] as const;
+export const V3_SESSION_RUN_MUTATIONS = ['start', 'cancel', 'retry', 'grant', 'ask-human'] as const;
 export type V3SessionRunMutation = typeof V3_SESSION_RUN_MUTATIONS[number];
 
 export function isV3SessionRunMutation(value: string): value is V3SessionRunMutation {
@@ -124,9 +125,14 @@ function nonEmpty(value: unknown): value is string {
 const MUTATION_BODY_KEYS: Record<V3SessionRunMutation, readonly string[]> = {
   start: [],
   cancel: ['reason'],
-  retry: ['nodeId'],
+  retry: ['nodeId', 'reason'],
   grant: ['loopId'],
+  'ask-human': ['nodeId', 'reason'],
 };
+
+/** Mutations that record who decided them: the daemon adds the caller it
+ *  derived from its own session record (never one from the body). */
+const CALLER_RECORDING_MUTATIONS: ReadonlySet<V3SessionRunMutation> = new Set(['retry', 'ask-human']);
 
 /**
  * Authorize one relayed mutation request. Deliberately pure: the daemon route
@@ -175,6 +181,8 @@ type RelayAuthenticated = {
   overtakenWakeRunId?: string;
   /** A scheduled turn of a task `callerOpenId` created. */
   scheduledTurn: boolean;
+  /** The live capability's turn (audit only). */
+  turnId?: string;
 };
 
 /** Capability → live session → current-turn caller, shared by every relay
@@ -343,6 +351,18 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
     workflowEvent: !!workflowEvent && !overtakenWakeTurn,
     ...(overtakenWakeTurn && workflowEvent ? { overtakenWakeRunId: workflowEvent.runId } : {}),
     scheduledTurn,
+    ...(liveTurnId ? { turnId: liveTurnId } : {}),
+  };
+}
+
+/** The turn shape `v3ActionCallerFor` / the edit check grade, from a relay
+ *  authentication. */
+function relayTurnFacts(authenticated: RelayAuthenticated, runId: string) {
+  return {
+    callerOpenId: authenticated.callerOpenId,
+    ...(authenticated.workflowEvent ? { workflowRunEvent: { runId } } : {}),
+    ...(authenticated.overtakenWakeRunId ? { overtakenWorkflowRunEvent: { runId: authenticated.overtakenWakeRunId } } : {}),
+    ...(authenticated.scheduledTurn ? { scheduledTurn: true } : {}),
   };
 }
 
@@ -385,6 +405,13 @@ export function authorizeV3SessionRunMutationRequest(input: V3SessionRelayAuthIn
   const subset: Record<string, unknown> = {};
   for (const key of MUTATION_BODY_KEYS[input.mutation as V3SessionRunMutation]) {
     if (body[key] !== undefined) subset[key] = body[key];
+  }
+  if (CALLER_RECORDING_MUTATIONS.has(input.mutation as V3SessionRunMutation)) {
+    subset.caller = v3ActionCallerFor({
+      runId: input.runId,
+      baseDir: input.baseDir,
+      current: { ...relayTurnFacts(authenticated, input.runId), ...(authenticated.turnId ? { turnId: authenticated.turnId } : {}) },
+    });
   }
   const parsed = parseWorkflowDaemonMutationBody(input.mutation as V3SessionRunMutation, JSON.stringify(subset));
   if (!parsed.ok) return { ok: false, status: 400, error: parsed.error };
@@ -429,14 +456,12 @@ export function authorizeV3SessionRunEditRequest(
       runId: input.runId,
       baseDir: input.baseDir,
       current: {
+        ...relayTurnFacts(authenticated, input.runId),
         callerOpenId,
         chatId: current.chatId,
         larkAppId: current.larkAppId,
         sessionId,
         ...(current.rootMessageId ? { rootMessageId: current.rootMessageId } : {}),
-        ...(authenticated.workflowEvent ? { workflowRunEvent: { runId: input.runId } } : {}),
-        ...(authenticated.overtakenWakeRunId ? { overtakenWorkflowRunEvent: { runId: authenticated.overtakenWakeRunId } } : {}),
-        ...(authenticated.scheduledTurn ? { scheduledTurn: true } : {}),
       },
     });
   } catch (err) {
@@ -452,7 +477,8 @@ export function authorizeV3SessionRunEditRequest(
   const parsed = parseWorkflowDaemonMutationBody('edit', JSON.stringify({
     patch: body.patch,
     base: body.base,
-    caller: { openId: authority.callerOpenId, origin: authority.origin },
+    caller: { openId: authority.callerOpenId, origin: authority.origin, ...(authority.wakeTurn ? { wakeTurn: true } : {}) },
+    ...(body.reason !== undefined ? { reason: body.reason } : {}),
   }));
   if (!parsed.ok || parsed.body.mutation !== 'edit') {
     return { ok: false, status: 400, error: parsed.ok ? 'bad_edit' : parsed.error };

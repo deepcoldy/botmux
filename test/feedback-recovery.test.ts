@@ -170,9 +170,9 @@ describe('manual feedback recovery', () => {
     const { directory, job } = await fixture();
     await beginFeedbackMaintenance(directory, job.migrationId);
     await mkdir(join(directory, 'feedback-send-leases'), { recursive: true });
-    await writeFile(join(directory, 'feedback-send-leases', '1234-uuid.json.99.ab.tmp'), 'partial', { mode: 0o600 });
+    await writeFile(join(directory, 'feedback-send-leases', '1234-uuid.json.99.deadbeef.tmp'), 'partial', { mode: 0o600 });
     await mkdir(join(directory, 'feedback-participants'), { recursive: true });
-    await writeFile(join(directory, 'feedback-participants', '5678.json.99.cd.tmp'), '{partial', { mode: 0o600 });
+    await writeFile(join(directory, 'feedback-participants', '5678.json.99.cafef00d.tmp'), '{partial', { mode: 0o600 });
     expect((await inspectFeedbackRecovery(directory)).filter(item => item.kind === 'send')).toEqual([]);
     expect((await inspectFeedbackMaintenance(directory, job.migrationId)).blockers).not.toContainEqual(expect.stringContaining('feedback_send_lease_invalid'));
   });

@@ -1,20 +1,20 @@
 import { hasAskForm } from '../../core/ask-form.js';
 import { buildAskFormElements } from './ask-form-elements.js';
 import type { ReplyCardAsk } from '../../services/turn-reply-card.js';
+import { stripCardMarkdownImages } from './md-card.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot } from './ask-option-layout.js';
-
 import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
 import { buildAskCustomForm } from './ask-custom-form.js';
 
-const safe = (text: string) => text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
+const safe = (text: string) => stripCardMarkdownImages(text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]'))
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0. */
 export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 'zh'): Array<Record<string, any>> {
   const { ask } = entry;
   if (hasAskForm(ask.questions)) return buildAskFormElements(ask, locale, entry.result);
-  if (supportsAskCustomInput(ask)) return [buildAskCustomForm(ask, locale, entry.confirmEmptyArmed)];
+  if (supportsAskCustomInput(ask)) return [buildAskCustomForm(ask, locale, entry.confirmEmptyArmed, safe)];
   const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
   const submit = textReplyRequired || ask.questions.length > 1 || ask.questions.some(q => q.multiSelect || q.defaultSelectedKeys !== undefined);
   const elements: Array<Record<string, any>> = [];

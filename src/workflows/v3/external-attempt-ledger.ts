@@ -44,6 +44,10 @@ export interface V3ExternalAttempt {
   acceptedAt?: number;
   deadlineAt?: number;
   stalledAt?: number;
+  /** A `nodeHandedToHuman` was recorded while the attempt was still open:
+   *  its closing `nodeBlocked(HANDED_TO_HUMAN)` is owed (crash between the
+   *  two writes) and the runtime writes it with this reason. */
+  handedToHuman?: { reason: string };
   closed?: V3ExternalAttemptClosure;
 }
 
@@ -146,6 +150,9 @@ export function foldV3ExternalAttempts(
         break;
       case 'nodeStalled':
         attempt.stalledAt = event.at;
+        break;
+      case 'nodeHandedToHuman':
+        attempt.handedToHuman = { reason: event.reason };
         break;
       default: {
         const closure = closureOf(event);

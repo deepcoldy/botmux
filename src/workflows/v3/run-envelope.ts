@@ -27,7 +27,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 
 import {
@@ -38,6 +38,7 @@ import { validateDag, type V3Dag } from './dag.js';
 import { validateSpec } from './spec.js';
 import type { Spec } from './contract.js';
 import type { RunChatBinding } from './grill-state.js';
+import { V3FlowSummarySchema, v3FlowSummarySha256 } from './flow-summary.js';
 
 export const V3_RUN_ENVELOPE_FILE = 'run.json';
 export const V3_RUN_ENVELOPE_SCHEMA_VERSION = 1 as const;
@@ -101,6 +102,19 @@ const baseShape = {
  */
 const nodeExecutorSchema = z.literal('bot').optional();
 
+/**
+ * Gate-2 `approve-dag --working-dir` for a bot-executed ad-hoc run (design
+ * §15.4): the absolute directory every goal node's session starts in. It is
+ * frozen into each bot snapshot's `workingDir` exactly as an ephemeral run
+ * freezes it; this key additionally marks it as an explicit choice that the
+ * executing bot's daemon checks against its configured directory range — and
+ * applies — when it starts the node session (in a bot run the snapshots'
+ * `workingDir` is otherwise display-only, the bot's own default applies).
+ * Only with `nodeExecutor: "bot"`; older readers reject the key (`.strict()`).
+ */
+const nodeWorkingDirSchema = z.string().min(1).max(4096)
+  .refine((path) => isAbsolute(path) && !path.includes('\0'), 'must be an absolute path');
+
 /** Tools the initiator could run as themselves on the main bot (mirrors
  *  `TRIGGER_USER_AUTH_TOOLS`; kept literal so this module stays host-neutral). */
 export const V3_HANDOFF_IDENTITY_TOOLS = ['lark-cli', 'bytedcli'] as const;
@@ -149,9 +163,63 @@ export type V3HandoffIdentityFreeze = z.infer<typeof handoffIdentityFreezeSchema
  *  there is none. */
 export type V3HandoffIdentityRecord = z.infer<typeof handoffIdentitySchema>;
 
+/** Where a run's initiator came from (design 2026-11-03
+ *  workflow-dashboard-orchestration §7.3, I11). Kept literal so this module
+ *  stays host-neutral; core/workflow-initiator re-exports it. */
+export const V3_RUN_INITIATOR_SOURCES = ['dashboard-local', 'dashboard-platform', 'feishu'] as const;
+export type V3RunInitiatorSource = typeof V3_RUN_INITIATOR_SOURCES[number];
+
+const openIdSchema = z.string().regex(/^ou_[A-Za-z0-9_-]{1,128}$/, 'must be an open_id (ou_…)');
+const unionIdSchema = z.string().regex(/^on_[A-Za-z0-9_-]{1,128}$/, 'must be a union_id (on_…)');
+
+/**
+ * The run's initiator (§7.3): the main bot app's open_id, the tenant-stable
+ * union_id when the login carried one, and which entry established them.
+ * Only on a bot-executed run; older readers reject the key (`.strict()`), so
+ * an older daemon never drives such a run (§10).
+ */
+const runInitiatorSchema = z.object({
+  openId: openIdSchema,
+  unionId: unionIdSchema.optional(),
+  source: z.enum(V3_RUN_INITIATOR_SOURCES),
+}).strict();
+
+/**
+ * The second gate ("确认流程") as it happened (§4.4 / §7.3): who confirmed —
+ * absent when the confirming turn's person is not known — when, and the flow
+ * summary they confirmed (normalized content + its sha256, flow-summary.ts).
+ * Gate-2 only; requires `nodeExecutor: "bot"`.
+ */
+const flowConfirmationSchema = z.object({
+  confirmedByOpenId: openIdSchema.optional(),
+  confirmedAt: timestampSchema,
+  flowSummary: V3FlowSummarySchema,
+  flowSummarySha256: sha256Schema,
+}).strict();
+
+export type V3RunInitiator = z.infer<typeof runInitiatorSchema>;
+
+/** A Feishu-born run's initiator: the authenticated caller frozen on its chat
+ *  binding (Gate-2: the grill's caller; Saved Workflow: the `/workflow run`
+ *  sender), with the union_id only when 交接带发起人身份 already resolved it —
+ *  no extra lookup. Undefined when the binding names no open_id. */
+export function feishuRunInitiator(
+  ownerOpenId: string | undefined,
+  handoffIdentity: V3HandoffIdentityRecord | undefined,
+): V3RunInitiator | undefined {
+  if (!ownerOpenId || !openIdSchema.safeParse(ownerOpenId).success) return undefined;
+  return {
+    openId: ownerOpenId,
+    ...(handoffIdentity && 'unionId' in handoffIdentity ? { unionId: handoffIdentity.unionId } : {}),
+    source: 'feishu',
+  };
+}
+export type V3FlowConfirmation = z.infer<typeof flowConfirmationSchema>;
+
 const adHocEnvelopeSchema = z.object({
   ...baseShape,
   nodeExecutor: nodeExecutorSchema,
+  nodeWorkingDir: nodeWorkingDirSchema.optional(),
   source: z.object({
     kind: z.literal('ad_hoc'),
     grillStatePath: z.literal('grill.state.json'),
@@ -168,6 +236,8 @@ const adHocEnvelopeSchema = z.object({
     dagSha256: sha256Schema,
     specSha256: sha256Schema,
     handoffIdentity: handoffIdentitySchema.optional(),
+    initiator: runInitiatorSchema.optional(),
+    flowConfirmation: flowConfirmationSchema.optional(),
   }).strict(),
 }).strict();
 
@@ -196,6 +266,7 @@ const savedDefinitionEnvelopeSchema = z.object({
     dagSha256: sha256Schema,
     specSha256: sha256Schema,
     handoffIdentity: handoffIdentitySchema.optional(),
+    initiator: runInitiatorSchema.optional(),
   }).strict(),
 }).strict();
 
@@ -270,6 +341,75 @@ export const V3RunEnvelopeSchema = z.union([
         message: 'requires the authenticated initiator (authorizedByOpenId / chatBinding.ownerOpenId)',
       });
     }
+  }
+
+  // Initiator and flow confirmation (§7.3) belong to bot-executed runs only,
+  // like handoffIdentity, and must agree with the identities already on the run.
+  const authorization = envelope.authorization as { initiator?: V3RunInitiator; flowConfirmation?: V3FlowConfirmation; handoffIdentity?: V3HandoffIdentityRecord };
+  const botExecuted = 'nodeExecutor' in envelope && envelope.nodeExecutor === 'bot';
+  for (const key of ['initiator', 'flowConfirmation'] as const) {
+    if (authorization[key] !== undefined && !botExecuted) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['authorization', key], message: 'requires nodeExecutor "bot"' });
+    }
+  }
+  if (authorization.initiator) {
+    // The authenticated anchor must exist and name the same person: an
+    // initiator is never recorded on a run that authenticated nobody.
+    const authenticated = initiatorOpenIdOf(envelope);
+    if (authenticated !== authorization.initiator.openId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'initiator', 'openId'],
+        message: 'must match the authenticated initiator (authorizedByOpenId / chatBinding.ownerOpenId)',
+      });
+    }
+    if (authorization.initiator.source === 'dashboard-local' && authorization.initiator.unionId !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'initiator', 'unionId'],
+        message: 'must be absent for a dashboard-local initiator (a local token login names no person)',
+      });
+    }
+    const frozen = authorization.handoffIdentity;
+    if (frozen && 'unionId' in frozen && authorization.initiator.unionId !== undefined
+      && frozen.unionId !== authorization.initiator.unionId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'initiator', 'unionId'],
+        message: 'must match authorization.handoffIdentity.unionId',
+      });
+    }
+  }
+  if (authorization.flowConfirmation && !authorization.initiator) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['authorization', 'flowConfirmation'],
+      message: 'requires authorization.initiator',
+    });
+  }
+  const confirmer = authorization.flowConfirmation?.confirmedByOpenId;
+  if (confirmer !== undefined && confirmer !== authorization.initiator?.openId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['authorization', 'flowConfirmation', 'confirmedByOpenId'],
+      message: 'must match authorization.initiator.openId (only the initiator confirms the flow)',
+    });
+  }
+  if (authorization.flowConfirmation
+    && v3FlowSummarySha256(authorization.flowConfirmation.flowSummary) !== authorization.flowConfirmation.flowSummarySha256) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['authorization', 'flowConfirmation', 'flowSummarySha256'],
+      message: 'must be the sha256 of the canonical flowSummary',
+    });
+  }
+
+  if ('nodeWorkingDir' in envelope && envelope.nodeWorkingDir !== undefined && envelope.nodeExecutor !== 'bot') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['nodeWorkingDir'],
+      message: 'requires nodeExecutor "bot"',
+    });
   }
 
   if (envelope.authorization.kind === 'gate2') {
@@ -377,6 +517,13 @@ export function frozenHandoffIdentity(envelope: V3RunEnvelope): V3FrozenHandoffI
   const openId = initiatorOpenIdOf(envelope);
   if (!frozen || !('unionId' in frozen) || !openId) return undefined;
   return { openId, unionId: frozen.unionId, tools: [...frozen.tools] };
+}
+
+/** The Gate-2 working dir of a bot-executed run (design §15.4), or
+ *  undefined: then every node runs in its executing bot's own default. */
+export function frozenNodeWorkingDir(envelope: V3RunEnvelope): string | undefined {
+  if (!('nodeWorkingDir' in envelope) || envelope.nodeExecutor !== 'bot') return undefined;
+  return envelope.nodeWorkingDir;
 }
 
 /** The run's 交接带发起人身份 record (frozen or why not), or undefined when
@@ -920,7 +1067,10 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
   authorizedByOpenId?: string;
   artifacts: V3AdHocRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
+  nodeWorkingDir?: string;
   handoffIdentity?: V3HandoffIdentityRecord;
+  initiator?: V3RunInitiator;
+  flowConfirmation?: V3FlowConfirmation;
 }): V3AdHocRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -929,6 +1079,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
     createdAt: input.createdAt,
     ...(input.chatBinding ? { chatBinding: input.chatBinding } : {}),
     ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
+    ...(input.nodeWorkingDir !== undefined ? { nodeWorkingDir: input.nodeWorkingDir } : {}),
     source: { kind: 'ad_hoc', grillStatePath: 'grill.state.json' },
     artifacts: input.artifacts,
     authorization: {
@@ -938,6 +1089,8 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
       dagSha256: input.artifacts.dag.sha256,
       specSha256: input.artifacts.spec.sha256,
       ...(input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
+      ...(input.initiator ? { initiator: input.initiator } : {}),
+      ...(input.flowConfirmation ? { flowConfirmation: input.flowConfirmation } : {}),
     },
   }) as V3AdHocRunEnvelope;
 }
@@ -950,6 +1103,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
   artifacts: V3SavedDefinitionRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
   handoffIdentity?: V3HandoffIdentityRecord;
+  initiator?: V3RunInitiator;
 }): V3SavedDefinitionRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -974,6 +1128,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
       dagSha256: input.artifacts.dag.sha256,
       specSha256: input.artifacts.spec.sha256,
       ...(input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
+      ...(input.initiator ? { initiator: input.initiator } : {}),
     },
   }) as V3SavedDefinitionRunEnvelope;
 }

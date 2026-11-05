@@ -53,6 +53,7 @@ import {
 import {
   artifactRef,
   loadAuthorizedV3Run,
+  feishuRunInitiator,
   makeSavedDefinitionRunEnvelope,
   publishRunEnvelopeOnce,
   type LoadedAuthorizedV3Run,
@@ -399,6 +400,7 @@ export function materializeSavedWorkflowRun(
   // Reserve the final run id across cooperating CLI/daemon processes. A plain
   // exists+rename sequence can replace an empty directory on POSIX when two
   // callers race with the same explicit runId.
+  const initiator = feishuRunInitiator(input.context?.chatBinding?.ownerOpenId, input.handoffIdentity);
   return withFileLockSync(runDir, () => {
     if (existsSync(runDir)) throw new Error(`v3 run already exists: ${runId}`);
 
@@ -446,6 +448,9 @@ export function materializeSavedWorkflowRun(
         ...(input.context?.chatBinding ? { chatBinding: input.context.chatBinding } : {}),
         ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
         ...(input.nodeExecutor && input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
+        // The run's initiator (design 2026-11-03 workflow-dashboard-orchestration
+        // §7.3): the `/workflow run` sender, bot runs only.
+        ...(input.nodeExecutor === 'bot' && initiator ? { initiator } : {}),
         artifacts,
       });
       publishRunEnvelopeOnce(stagedRunDir, envelope);
