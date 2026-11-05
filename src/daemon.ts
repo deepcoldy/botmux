@@ -4519,6 +4519,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 }
 
@@ -4616,6 +4617,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
   return true;
 }
@@ -4701,6 +4703,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 
   // NO chat notice here.
@@ -7023,6 +7026,7 @@ async function withdrawWorkflowHandoffIdentity(ds: DaemonSession, turnId: string
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 }
 

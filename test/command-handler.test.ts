@@ -2974,7 +2974,7 @@ describe('handleCommand', () => {
     it('/subscribe-lark-doc still prompts document OAuth for a runtime-expired user token', async () => {
       vi.mocked(resolveUserToken).mockResolvedValue('uat-doc');
       vi.mocked(subscribeDocFile).mockRejectedValueOnce(new UserTokenMissingError('User Token 已失效'));
-      const deps = makeDeps(makeDaemonSession());
+      const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
 
       await handleCommand(
         '/subscribe-lark-doc',
@@ -7034,7 +7034,7 @@ describe('handleCommand', () => {
           triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) ?? undefined,
         },
       })) as any);
-      return makeDeps(makeDaemonSession());
+      return makeDeps(makeDaemonSession({ chatType: 'p2p' }));
     }
     const reply = (deps: any) => (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     afterEach(() => { vi.mocked(platformCredentialsUrl).mockReturnValue(null); });
@@ -7142,8 +7142,56 @@ describe('handleCommand', () => {
   });
 
   describe('/login', () => {
+    // Authorization links reach only the sender: anyone in a group who opens a
+    // device/OAuth link authorizes as THEMSELVES.
+    describe('auth links in a group go to the sender privately', () => {
+      const replies = (deps: any) => (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string);
+      beforeEach(() => { vi.mocked(sendUserMessage).mockClear(); });
+
+      it('bare /login: DMs the OAuth link, the group only hears that it was sent', async () => {
+        const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+        expect(sendUserMessage).toHaveBeenCalledTimes(1);
+        const [appId, openId, dmText] = vi.mocked(sendUserMessage).mock.calls[0]!;
+        expect(appId).toBe('app-1');
+        expect(openId).toBe('ou_sender');
+        expect(dmText).toContain('https://open.feishu.cn/auth/v1/test');
+        expect(replies(deps)).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
+      });
+
+      it('/login bytedcli: the ByteCloud link is DMed too', async () => {
+        const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+        expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).toContain('https://cloud.example.com/auth?state=x');
+        expect(replies(deps).join('\n')).not.toContain('https://');
+      });
+
+      it('DM fails: tells the sender to message the bot privately, never posts the link', async () => {
+        vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
+        const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+        const text = replies(deps).join('\n');
+        expect(text).toBe(t('auth_link.dm_failed', { command: '/login bytedcli' }, 'zh'));
+        expect(text).not.toContain('https://');
+      });
+
+      it('no session yet in a p2p chat: replies inline', async () => {
+        const deps = makeDeps();
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login', { chatType: 'p2p' }), deps, LARK_APP_ID);
+        expect(sendUserMessage).not.toHaveBeenCalled();
+        expect(replies(deps)[0]).toContain('https://open.feishu.cn/auth/v1/test');
+      });
+
+      it('no session and unknown chat type: treated as a group', async () => {
+        const deps = makeDeps();
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+        expect(sendUserMessage).toHaveBeenCalledTimes(1);
+        expect(replies(deps).join('\n')).not.toContain('https://');
+      });
+    });
+
     it('should return OAuth URL', async () => {
-      const ds = makeDaemonSession();
+      const ds = makeDaemonSession({ chatType: 'p2p' });
       const deps = makeDeps(ds);
 
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
@@ -7162,7 +7210,7 @@ describe('handleCommand', () => {
     // 完成兑换，这时候还教人「复制地址栏、看 F12」只会把人劝退——而被劝退的人
     // 恰恰是点了授权链接、却不知道下一步该干什么的那批人。
     it('tells the manual paste steps when no oauthRedirectBase is configured', async () => {
-      const ds = makeDaemonSession();
+      const ds = makeDaemonSession({ chatType: 'p2p' });
       const deps = makeDeps(ds);
       vi.mocked(resolveOAuthRedirectUri).mockReturnValue('http://127.0.0.1:9768/callback');
 
@@ -7175,7 +7223,7 @@ describe('handleCommand', () => {
     });
 
     it('tells the auto-callback steps when oauthRedirectBase is configured', async () => {
-      const ds = makeDaemonSession();
+      const ds = makeDaemonSession({ chatType: 'p2p' });
       const deps = makeDeps(ds);
       vi.mocked(resolveOAuthRedirectUri).mockReturnValue('https://botmux.example.com/oauth/callback');
 
@@ -7198,7 +7246,7 @@ describe('handleCommand', () => {
     // that makes every person approve permissions they will never use.
     describe('/login --scope', () => {
       it('passes an explicit document scope and the requesting user to OAuth', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:readonly'), deps, LARK_APP_ID);
         expect(generateAuthUrl).toHaveBeenCalledWith(
           'app-1', 'secret-1', 'feishu', ['docx:document:readonly'], 'ou_sender',
@@ -7206,7 +7254,7 @@ describe('handleCommand', () => {
       });
 
       it('builds an authorization URL carrying the requested scopes', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:write_only'), deps, LARK_APP_ID);
 
         expect(generateAuthUrl).toHaveBeenCalledWith(
@@ -7216,7 +7264,7 @@ describe('handleCommand', () => {
       });
 
       it('accepts several scopes at once', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand(
           '/login', ROOT_ID,
           makeLarkMessage('/login --scope docx:document:write_only drive:file:upload'), deps, LARK_APP_ID,
@@ -7230,7 +7278,7 @@ describe('handleCommand', () => {
       // 20043 and the person is handed a link that just fails to open, with no
       // hint which word was wrong. Catch it here where we can name it.
       it('refuses a scope name that does not exist', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand(
           '/login', ROOT_ID, makeLarkMessage('/login --scope docx:documnet'), deps, LARK_APP_ID,
         );
@@ -7247,14 +7295,14 @@ describe('handleCommand', () => {
       });
 
       it('explains itself when no scope is given', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope'), deps, LARK_APP_ID);
         expect(generateAuthUrl).not.toHaveBeenCalled();
         expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login --scope');
       });
 
       it('allows an uncataloged but syntactically valid scope when --force is specified', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand(
           '/login', ROOT_ID, makeLarkMessage('/login --force --scope uncataloged:custom:scope'), deps, LARK_APP_ID,
         );
@@ -7264,7 +7312,7 @@ describe('handleCommand', () => {
       });
 
       it('handles multiple adjacent --force flags without leaving leftover tokens', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand(
           '/login', ROOT_ID, makeLarkMessage('/login --force --force --scope uncataloged:custom:scope'), deps, LARK_APP_ID,
         );
@@ -7274,7 +7322,7 @@ describe('handleCommand', () => {
       });
 
       it('handles mixed --scope and --force order with multiple --scope tokens', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand(
           '/login', ROOT_ID,
           makeLarkMessage('/login --scope docx:document:readonly --force --scope uncataloged:custom:scope'),
@@ -7286,14 +7334,14 @@ describe('handleCommand', () => {
       });
 
       it('explains itself when --force is provided without any scopes', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --force'), deps, LARK_APP_ID);
         expect(generateAuthUrl).not.toHaveBeenCalled();
         expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login --scope');
       });
 
       it('accepts new Base v3 block and appmode scopes without --force', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand(
           '/login', ROOT_ID, makeLarkMessage('/login --scope base:appmode:read base:block:read'), deps, LARK_APP_ID,
         );
@@ -7307,7 +7355,7 @@ describe('handleCommand', () => {
       it.each(['/login bytedcli done', '/login done'])('retains authorization on provider outage: %s', async command => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValueOnce({ state: 'unavailable' });
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
         const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
         expect(text).toContain('授权服务暂时不可用');
@@ -7322,7 +7370,7 @@ describe('handleCommand', () => {
         }) as any);
         vi.mocked(hasBytedcliHome).mockRejectedValueOnce(new Error('provider unavailable'));
         try {
-          const deps = makeDeps(makeDaemonSession());
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
           const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
           expect(text).toContain('授权服务暂时不可用');
@@ -7331,7 +7379,7 @@ describe('handleCommand', () => {
       });
 
       it('returns the ByteCloud link and says it is separate from Feishu', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
 
         const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
@@ -7357,7 +7405,7 @@ describe('handleCommand', () => {
           config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig(policy) ?? undefined },
         } as any);
         for (const command of ['/login bytedcli done', '/login done']) {
-          const deps = makeDeps(makeDaemonSession());
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
 
           expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
@@ -7380,7 +7428,7 @@ describe('handleCommand', () => {
       it('says pending, not failed, when the person has not authorized yet', async () => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'pending' });
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
 
         const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
@@ -7389,7 +7437,7 @@ describe('handleCommand', () => {
 
       it('tells them to start one when done arrives with no challenge', async () => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
 
         expect(completeBytedcliLogin).not.toHaveBeenCalled();
@@ -7400,7 +7448,7 @@ describe('handleCommand', () => {
       // `done` can never complete somebody else's login.
       it('resumes the challenge belonging to the sender', async () => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
 
         expect(pendingBytedcliChallenge).toHaveBeenCalledWith('ou_sender');
@@ -7416,7 +7464,7 @@ describe('handleCommand', () => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
         try {
-          const deps = makeDeps(makeDaemonSession());
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
 
           expect(completeLarkCliLogin).not.toHaveBeenCalled();
@@ -7438,7 +7486,7 @@ describe('handleCommand', () => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
         try {
-          const deps = makeDeps(makeDaemonSession());
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
 
           expect(completeLarkCliLogin).toHaveBeenCalledWith('ou_sender');
@@ -7458,7 +7506,7 @@ describe('handleCommand', () => {
         vi.mocked(hasLarkCliHome).mockReturnValue(true);
         vi.mocked(hasBytedcliHome).mockResolvedValue(true);
         try {
-          const deps = makeDeps(makeDaemonSession());
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
 
           expect(completeLarkCliLogin).not.toHaveBeenCalled();
@@ -7473,7 +7521,7 @@ describe('handleCommand', () => {
       });
 
       it('points at the begin commands when neither side has anything pending', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
 
         const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
@@ -7486,7 +7534,7 @@ describe('handleCommand', () => {
       // path now completing pending logins, retrying just works — say so, and
       // still mention /login done as an explicit confirmation path.
       it('includes the post-authorization step after the link', async () => {
-        const deps = makeDeps(makeDaemonSession());
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
 
         const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
@@ -7506,7 +7554,7 @@ describe('handleCommand', () => {
           },
         })) as any);
         try {
-          const deps = makeDeps(makeDaemonSession());
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
 
           const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
@@ -7519,7 +7567,7 @@ describe('handleCommand', () => {
     });
 
     it('should show token status with "status" subcommand', async () => {
-      const ds = makeDaemonSession();
+      const ds = makeDaemonSession({ chatType: 'p2p' });
       const deps = makeDeps(ds);
 
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);

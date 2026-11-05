@@ -84,7 +84,7 @@ function botConfig(triggerUserAuth: unknown) {
   } as any;
 }
 const publish = (config: any, sender: string | undefined, turnId = 'om_t1') =>
-  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId });
+  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId, privateChat: true });
 const read = (tool: 'lark-cli' | 'bytedcli') => readFileSync(sessionIdentityPath(dir, SESSION, tool), 'utf8');
 const granted = (tool: 'lark-cli' | 'bytedcli') => ({
   ok: true,

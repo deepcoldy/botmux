@@ -27,7 +27,7 @@ beforeEach(async () => {
   binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
   session = {
     session: { sessionId: 'tool-session', status: 'active', replyTargets: { om_turn: { senderOpenId: 'ou_sender' } } },
-    larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { pid: process.pid, killed: false }, workerGeneration: 1,
+    larkAppId: 'cli_bound', chatId: 'oc_chat', chatType: 'p2p', worker: { pid: process.pid, killed: false }, workerGeneration: 1,
     localProcessAttestation: { backendType: 'pty', workerGeneration: 1,
       cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
     managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender',

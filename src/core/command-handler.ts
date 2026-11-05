@@ -16,6 +16,7 @@ import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
+import { deliverAuthLink } from './auth-link-delivery.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
@@ -4360,13 +4361,24 @@ export async function handleCommand(
         // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
         // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
         const loginOpenId = message.senderId;
+        // Any reply carrying an authorization link reaches only the sender: a
+        // group member opening someone else's link would authorize as THEMSELVES.
+        const authLinkReply = (text: string, privateCommand = '/login') => deliverAuthLink({
+          privateChat: (ds?.chatType ?? message.chatType) === 'p2p',
+          openId: isUsableOpenId(loginOpenId) ? loginOpenId : undefined,
+          text,
+          replyInPlace: content => sessionReply(rootId, content),
+          sendDirect: (openId, content) => sendUserMessage(botCfg2.larkAppId, openId, content),
+          locale: loc,
+          privateCommand,
+        });
         // Only sessions created with the new entry use the receiving app here.
         // Existing sessions keep the original login flow below.
         if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)
           && (subCmd === '' || subCmd === 'lark')) {
           const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
             normalizeBrand(botCfg2.brand), [], loginOpenId);
-          await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
+          await authLinkReply(loginPromptLines(authUrl, loc).join('\n'));
           break;
         }
         // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
@@ -4400,7 +4412,7 @@ export async function handleCommand(
           if (credSource === 'auto' && subCmd === '') {
             lines.push('', t('cmd.login.platform_local_hint', { command: larkGoverned ? 'lark' : 'bytedcli' }, loc));
           }
-          await sessionReply(rootId, lines.join('\n'));
+          await authLinkReply(lines.join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
           break;
         }
 
@@ -4486,7 +4498,7 @@ export async function handleCommand(
               await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'lark-cli has no provisioned issuer app on the server' }, loc));
               break;
             }
-            await sessionReply(rootId, [
+            await authLinkReply([
               t('cmd.login.lark_title', undefined, loc),
               '',
               t('cmd.login.lark_step1', undefined, loc),
@@ -4512,7 +4524,7 @@ export async function handleCommand(
               await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'no provisioned issuer app' }, loc));
               break;
             }
-            await sessionReply(rootId, [
+            await authLinkReply([
               t('cmd.login.lark_title', undefined, loc), '',
               t('cmd.login.lark_step1', undefined, loc),
               started.authUrl, '',
@@ -4554,7 +4566,7 @@ export async function handleCommand(
             requested,
             loginOpenId,
           );
-          await sessionReply(rootId, [
+          await authLinkReply([
             ...loginPromptLines(scopedUrl, loc, 'cmd.login.scope_title'),
             '',
             t('cmd.login.scope_footer', { scopes: requested.join(' ') }, loc),
@@ -4591,7 +4603,7 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: 'bytedcli auth login --begin' }, loc));
             break;
           }
-          await sessionReply(rootId, [
+          await authLinkReply([
             t('cmd.login.bytedcli_title', undefined, loc),
             '',
             t('cmd.login.bytedcli_step1', undefined, loc),
@@ -4600,7 +4612,7 @@ export async function handleCommand(
             t('cmd.login.bytedcli_step2', undefined, loc),
             '',
             t('cmd.login.bytedcli_note', undefined, loc),
-          ].join('\n'));
+          ].join('\n'), '/login bytedcli');
           break;
         }
         // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
@@ -4614,7 +4626,7 @@ export async function handleCommand(
             FEED_GROUP_OAUTH_SCOPES,
             loginOpenId,
           );
-          await sessionReply(rootId, [
+          await authLinkReply([
             ...loginPromptLines(tagAuthUrl, loc, 'cmd.login.tags_title'),
             '',
             t('cmd.login.tags_footer', undefined, loc),
@@ -4628,7 +4640,7 @@ export async function handleCommand(
           [],
           loginOpenId,
         );
-        await sessionReply(rootId, [
+        await authLinkReply([
           ...loginPromptLines(authUrl, loc),
           '',
           t('cmd.login.footer', undefined, loc),
@@ -4682,10 +4694,15 @@ export async function handleCommand(
             // 读写就按他的权限走。
             message.senderId,
           );
-          await sessionReply(
-            rootId,
-            loginPromptLines(authUrl, loc, 'cmd.subdoc.need_login').join('\n'),
-          );
+          await deliverAuthLink({
+            privateChat: (ds.chatType ?? message.chatType) === 'p2p',
+            openId: isUsableOpenId(message.senderId) ? message.senderId : undefined,
+            text: loginPromptLines(authUrl, loc, 'cmd.subdoc.need_login').join('\n'),
+            replyInPlace: content => sessionReply(rootId, content),
+            sendDirect: (openId, content) => sendUserMessage(subCfg.larkAppId, openId, content),
+            locale: loc,
+            privateCommand: '/subscribe-lark-doc',
+          });
         };
         // Keyed by the sender: the authorize link this command hands out is
         // generated for `message.senderId`, so the token it produces lands in

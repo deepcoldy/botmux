@@ -58,6 +58,7 @@ const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.j
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
+const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -84,7 +85,8 @@ function botConfig(triggerUserAuth: unknown = { enabled: true, tools: ['lark-cli
   } as any;
 }
 
-function publish(config: any, senderOpenId: string | undefined, turnId = 'turn-default') {
+// Default: a 1:1 chat, the only place a refusal may carry an auth link.
+function publish(config: any, senderOpenId: string | undefined, turnId = 'turn-default', privateChat = true) {
   return publishTurnCliIdentity({
     botConfig: config,
     turnId,
@@ -92,6 +94,7 @@ function publish(config: any, senderOpenId: string | undefined, turnId = 'turn-d
     sessionDataDir: dir,
     sessionId: SESSION,
     senderOpenId,
+    privateChat,
   });
 }
 
@@ -182,6 +185,20 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).not.toContain('tok-alice');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('https://example.com/lark-device');
+  });
+
+  // A group member opening someone else's device link authorizes as
+  // THEMSELVES; the agent relays whatever the refusal carries into the chat.
+  it('in a group: denies without any link and never starts a device login', async () => {
+    const begins = vi.mocked(beginLarkCliLogin).mock.calls.length;
+    const outcomes = await publish(botConfig(), BOB, 'turn-group', false);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = identityBody('lark-cli', 'turn-group');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toContain('https://example.com/lark-device');
+    expect(body).not.toMatch(/https?:\/\//);
+    expect(body).toContain('/login');
+    expect(vi.mocked(beginLarkCliLogin).mock.calls.length).toBe(begins);
   });
 
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
