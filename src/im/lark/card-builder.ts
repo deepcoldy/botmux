@@ -28,6 +28,7 @@ import {
 } from '../../services/grant-policy.js';
 import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import type { SubstituteCardControl } from './substitute-card-control.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
@@ -1109,6 +1110,8 @@ export function buildStreamingCard(
   /** Screenshot mode with no image: render "no screenshot available" instead
    *  of "waiting for first screenshot". Ignored when `imageKey` is present. */
   screenshotUnavailable = false,
+  /** Per-chat substitute toggle. Omitted ⇒ no button (fail-closed). */
+  substituteControl?: SubstituteCardControl,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1218,6 +1221,15 @@ export function buildStreamingCard(
       t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
       'default',
       { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
+  }
+  // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关（不是会话设置）。
+  // 按钮值携带明确的目标 desired，处理侧按目标写入而不是翻转，旧卡重复点击幂等。
+  if (!hidden.has('substitute') && substituteControl) {
+    headerActions.push(callbackButton(
+      t(substituteControl.enabled ? 'card.btn.substitute_off' : 'card.btn.substitute_on', undefined, locale),
+      'default',
+      { action: 'toggle_substitute', desired: substituteControl.enabled ? 'off' : 'on', ...actionBase },
     ));
   }
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
