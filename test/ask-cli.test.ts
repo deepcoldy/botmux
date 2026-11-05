@@ -469,8 +469,9 @@ describe('botmux ask — atomic input form CLI', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-form-cli-')); tempDirs.push(dataDir);
     const file = join(dataDir, 'form.json'); writeFileSync(file, JSON.stringify(questions));
     const requests: any[] = [];
+    const strayPosts: string[] = [];
     const server = createServer(async (req, res) => {
-      expect(req.url).toBe('/api/asks/form-v1');
+      if (req.url !== '/api/asks/form-v1') { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
       requests.push(await readRequestBodyJson(req, { strict: true }));
       res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(response));
     });
@@ -481,6 +482,7 @@ describe('botmux ask — atomic input form CLI', () => {
       const result = await runAsk(dataDir, ['ask', 'buttons', '--questions-file', file, '--answerer=ou_actual', '--json']);
       expect(result.status).toBe(status);
       expect(JSON.parse(result.stdout)).toMatchObject({ inputs, answers: response.kind === 'answered' ? response.answers : null, selected: null, comment: response.comment });
+      expect(strayPosts).toEqual([]);
       expect(requests).toHaveLength(2);
       expect(requests[0]).toMatchObject({ originKind: 'explicit', answererOpenId: 'ou_actual', questions: [questions[0], { ...questions[1], input: { ...questions[1].input, required: true, maxLength: 1000 } }, { ...questions[2], input: { ...questions[2].input, maxLength: 1000 } }] });
       expect(requests[1]).toEqual({ ...requests[0], acknowledge: true });
@@ -491,9 +493,10 @@ describe('botmux ask — atomic input form CLI', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-old-cli-')); tempDirs.push(dataDir);
     const file = join(dataDir, 'form.json'); writeFileSync(file, JSON.stringify(questions));
     let calls = 0;
+    const strayPosts: string[] = [];
     const server = createServer(async (req, res) => {
+      if (req.url !== '/api/asks/form-v1') { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
       await readRequestBodyJson(req, { strict: true }); calls++;
-      expect(req.url).toBe('/api/asks/form-v1');
       res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' }));
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -501,7 +504,7 @@ describe('botmux ask — atomic input form CLI', () => {
       const registry = join(dataDir, 'dashboard-daemons'); mkdirSync(registry);
       writeFileSync(join(registry, 'cli_test.json'), JSON.stringify({ larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now() }));
       const result = await runAsk(dataDir, ['ask', 'buttons', ...(form ? ['--questions-file', file] : ['--options', 'yes,no', 'Decide']), '--answerer', 'ou_actual']);
-      expect(result.status).not.toBe(0); expect(result.stdout).toBe(''); expect(calls).toBe(1);
+      expect(result.status).not.toBe(0); expect(result.stdout).toBe(''); expect(calls).toBe(1); expect(strayPosts).toEqual([]);
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   });
 
