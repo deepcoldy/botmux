@@ -87,10 +87,9 @@ export function templateSaveRequest(source: TemplateSaveSource, tail: 'preview' 
   if (source.kind === 'run' && input.allowDraft) body.allowDraft = true;
   if (tail === 'save') {
     if (input.workflowId && input.expectedLatestRevision) body.expectedLatestRevision = input.expectedLatestRevision;
-    if (!input.workflowId) {
-      if (input.displayName) body.displayName = input.displayName;
-      if (input.requestKey) body.requestKey = input.requestKey;
-    }
+    if (!input.workflowId && input.displayName) body.displayName = input.displayName;
+    // New template and append alike: a retried request finds what it wrote.
+    if (input.requestKey) body.requestKey = input.requestKey;
     if (source.kind === 'draft' && input.flowSummarySha256) body.flowSummarySha256 = input.flowSummarySha256;
     if (input.acknowledgeUnsafeLiterals) body.acknowledgeUnsafeLiterals = true;
   }

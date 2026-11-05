@@ -34,10 +34,19 @@ export function templateRunState(entry: Pick<SavedWorkflowCatalogEntry, 'scope' 
 // ─── 人工确认的变化（I10）───────────────────────────────────────────────
 
 /** 与上一版比：少了几道（位置上没了）、多了几道、规则变了几道。 */
-export function gateChangeSummary(gates: SavedWorkflowGateComparison | undefined): { fewer: number; more: number; changed: number } | undefined {
+export function gateChangeSummary(gates: SavedWorkflowGateComparison | undefined): { fewer: number; loosened: number; more: number; changed: number } | undefined {
   if (!gates) return undefined;
-  const summary = { fewer: gates.removed.length, more: gates.added.length, changed: gates.changed.length };
-  return summary.fewer || summary.more || summary.changed ? summary : undefined;
+  const summary = { fewer: gates.removed.length, loosened: gates.loosened?.length ?? 0, more: gates.added.length, changed: gates.changed.length };
+  return summary.fewer || summary.loosened || summary.more || summary.changed ? summary : undefined;
+}
+
+/** One line per loosened gate: where, and whose approval is gone. */
+export function loosenedGateLines(gates: SavedWorkflowGateComparison | undefined): Array<{ nodeId: string; cleared: boolean; approvers: string }> {
+  return (gates?.loosened ?? []).map((item) => ({
+    nodeId: item.nodeId,
+    cleared: item.reason === 'approvers_cleared',
+    approvers: item.removedApprovers.join('、'),
+  }));
 }
 
 /** 版本历史一行的来源标签键。 */

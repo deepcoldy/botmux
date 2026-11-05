@@ -33,6 +33,7 @@ import {
   collectTemplateRunParams,
   filterTemplates,
   gateChangeSummary,
+  loosenedGateLines,
   newTemplateRequestKey,
   paramEditTargets,
   templateParamFields,
@@ -148,7 +149,7 @@ export function WorkflowLibraryPage(): React.JSX.Element {
                     <tr key={entry.workflowId}>
                       <td>
                         <a href={workflowTemplateHref(entry.workflowId)}>{entry.displayName}</a>
-                        {entry.confirmationRequired ? <small className="wfd-tag">{tr('workflow.library.needsConfirmTag')}</small> : null}
+                        {entry.savedFromDraft ? <small className="wfd-tag">{tr('workflow.library.savedFromDraftTag')}</small> : null}
                       </td>
                       <td>{nameOf(entry.orchestratorAppId)}</td>
                       <td><time dateTime={entry.latestAt}>{formatDraftTime(entry.latestAt)}</time> <small className="muted">v{entry.latestHumanVersion}</small></td>
@@ -305,6 +306,9 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
                   <small className="muted">{tr('workflow.library.savedBy', { who: shortId(version.createdByOpenId) })}</small>
                 </div>
                 {change?.fewer ? <p className="wfd-warning" role="note">⚠️ {tr('workflow.library.fewerGates', { count: change.fewer })}（{version.gates!.removed.join('、')}）</p> : null}
+                {loosenedGateLines(version.gates).map((line) => (
+                  <p key={line.nodeId} className="wfd-warning" role="note">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversRemoved', { node: line.nodeId, approvers: line.approvers })}</p>
+                ))}
                 {change?.more ? <p className="muted">{tr('workflow.library.moreGates', { count: change.more })}</p> : null}
                 {change?.changed ? <p className="muted">{tr('workflow.library.changedGates', { count: change.changed })}</p> : null}
                 {version.botChanges?.length ? (
@@ -334,6 +338,17 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Set<string>>(() => new Set());
+  // Editing a field clears its own error (and the form-level notice).
+  const setValue = (name: string, value: string) => {
+    setValues((current) => ({ ...current, [name]: value }));
+    setFieldErrors((current) => {
+      if (!current.has(name)) return current;
+      const next = new Set(current);
+      next.delete(name);
+      return next;
+    });
+    setNotice(null);
+  };
   const runState = templateRunState(entry);
   if (runState !== 'runnable') {
     return (
@@ -389,7 +404,7 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
         <h2 id="wfl-run-title">{tr('workflow.library.runTitle')}</h2>
         <span className="sect-head-hint">{tr('workflow.library.runHint', { version: current.humanVersion })}</span>
       </div>
-      {entry.confirmationRequired ? <p className="wfd-warning" role="note">{tr('workflow.library.runNeedsConfirm')}</p> : <p className="muted">{tr('workflow.library.runNoConfirm')}</p>}
+      <p className="muted">{entry.savedFromDraft ? tr('workflow.library.runFromDraftVersion') : tr('workflow.library.runNoConfirm')}</p>
       <div className="wfd-form wfl-param-form">
         {fields.map((field) => {
           const id = `wfl-param-${field.name}`;
@@ -402,7 +417,7 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
               </label>
               {field.type === 'boolean' ? (
                 <select id={id} value={values[field.name] ?? ''} aria-invalid={invalid} disabled={busy}
-                  onChange={(event) => setValues({ ...values, [field.name]: event.target.value })}>
+                  onChange={(event) => setValue(field.name, event.target.value)}>
                   <option value="">{field.defaultText !== undefined ? tr('workflow.library.useDefault', { value: field.defaultText }) : '—'}</option>
                   <option value="true">{tr('workflow.library.yes')}</option>
                   <option value="false">{tr('workflow.library.no')}</option>
@@ -412,7 +427,7 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
                   value={values[field.name] ?? ''} disabled={busy || field.unsupported} aria-invalid={invalid} required={field.required}
                   aria-describedby={field.description ? `${id}-help` : undefined}
                   placeholder={field.defaultText !== undefined ? tr('workflow.library.useDefault', { value: field.defaultText }) : ''}
-                  onChange={(event) => setValues({ ...values, [field.name]: event.target.value })} />
+                  onChange={(event) => setValue(field.name, event.target.value)} />
               )}
               {field.description ? <p id={`${id}-help`} className="wfd-help">{field.description}</p> : null}
               {invalid ? <p className="wfd-error" role="alert">{field.type === 'number' ? tr('workflow.library.needNumber') : tr('workflow.library.needValue')}</p> : null}
@@ -434,7 +449,7 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
       {notice ? <p className={`wfd-notice${notice.error ? ' wfd-error' : ''}`} role={notice.error ? 'alert' : 'status'}>{notice.text}</p> : null}
       <div className="wfd-actions">
         <button type="button" className="primary" disabled={busy} onClick={() => { void start(); }}>
-          {entry.confirmationRequired ? tr('workflow.library.nextConfirm') : tr('workflow.draft.startGroup')}
+          {tr('workflow.draft.startGroup')}
         </button>
       </div>
     </section>
@@ -520,7 +535,8 @@ export function SaveTemplateDialog(props: {
     if (!preview) return;
     setBusy(true);
     const result = await saveTemplate(props.source, {
-      ...(target ? { workflowId: target, expectedLatestRevision: preview.target?.latestRevision } : { displayName: name.trim() || preview.displayName, requestKey }),
+      ...(target ? { workflowId: target, expectedLatestRevision: preview.target?.latestRevision } : { displayName: name.trim() || preview.displayName }),
+      requestKey,
       paramEdits: edits,
       flowSummarySha256: preview.flowSummarySha256,
       allowDraft,
@@ -568,7 +584,16 @@ export function SaveTemplateDialog(props: {
               </label>
             ) : null}
           </fieldset>
-          {change?.fewer ? <p className="wfd-warning wfl-fewer" role="alert">⚠️ {tr('workflow.library.fewerGates', { count: change.fewer })}（{preview.target!.gates.removed.join('、')}）</p> : null}
+          {change?.fewer ? (
+            <p className="wfd-warning wfl-fewer" role="alert">
+              ⚠️ {preview.target!.gatesBase.kind === 'published'
+                ? tr('workflow.library.fewerGatesThanPublished', { count: change.fewer, version: preview.target!.gatesBase.humanVersion })
+                : tr('workflow.library.fewerGates', { count: change.fewer })}（{preview.target!.gates.removed.join('、')}）
+            </p>
+          ) : null}
+          {loosenedGateLines(preview.target?.gates).map((line) => (
+            <p key={line.nodeId} className="wfd-warning wfl-fewer" role="alert">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversRemoved', { node: line.nodeId, approvers: line.approvers })}</p>
+          ))}
           {change?.more ? <p className="muted">{tr('workflow.library.moreGates', { count: change.more })}</p> : null}
           {change?.changed ? <p className="muted">{tr('workflow.library.changedGates', { count: change.changed })}</p> : null}
 
@@ -677,9 +702,11 @@ export function TemplateRunInfo(props: {
       {params.length ? (
         <ul className="wfd-summary-list">{params.map(([key, value]) => <li key={key}><code>{key}</code> = {value}</li>)}</ul>
       ) : <p className="muted">{tr('workflow.library.noParamsFilled')}</p>}
+      {template.newerPublished ? (
+        <p className="wfd-warning" role="note">{tr('workflow.library.newerPublished', { newer: template.newerPublished.humanVersion, version: template.humanVersion })}</p>
+      ) : null}
       {template.swapped ? <p className="wfd-warning" role="note">{tr('workflow.library.swappedNote')}</p>
-        : template.needsConfirmation ? <p className="wfd-warning" role="note">{tr('workflow.library.runNeedsConfirm')}</p>
-          : <p className="muted">{tr('workflow.library.runNoConfirm')}</p>}
+        : <p className="muted">{tr('workflow.library.runNoConfirm')}</p>}
     </section>
   );
 }

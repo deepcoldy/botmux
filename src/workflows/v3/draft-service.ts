@@ -59,6 +59,7 @@ import {
   listSavedWorkflowCatalog,
   readSavedWorkflowRevision,
   readSavedWorkflowMetadata,
+  readSavedWorkflowMetadataSync,
 } from './library-store.js';
 import { SavedWorkflowSchemaError, type SavedWorkflowGateComparison } from './library-schema.js';
 import {
@@ -75,6 +76,7 @@ import {
   SavedWorkflowUnsafeLiteralError,
   buildSavedWorkflowRevisionFromFlow,
   commitSavedWorkflowRunInPlace,
+  replaySavedWorkflowRunCommit,
   savedWorkflowRunFlow,
 } from './library-materialize.js';
 import {
@@ -401,7 +403,13 @@ export interface WorkflowDraftView {
   launch?: WorkflowDraftLaunchView;
   /** 运行模板 (D5). `needsConfirmation`: I13 or a swapped bot; `swapped`:
    *  no longer the template as is (commits as an ad-hoc run). */
-  template?: WorkflowDraftTemplateRun & { needsConfirmation: boolean; swapped: boolean };
+  template?: WorkflowDraftTemplateRun & {
+    needsConfirmation: boolean;
+    swapped: boolean;
+    /** The owner published another version since this run was prepared: it
+     *  still runs the prepared one (shown, not blocking). */
+    newerPublished?: { humanVersion: number; revisionId: string };
+  };
 }
 
 /** 存为模板 (§5.1): what the confirm dialog shows before anything is written. */
@@ -414,7 +422,15 @@ export interface WorkflowDraftTemplateSavePreview {
   gateCount: number;
   lintWarnings: string[];
   /** Append only. */
-  target?: { workflowId: string; displayName: string; latestRevision: string; humanVersion: number; gates: SavedWorkflowGateComparison };
+  target?: {
+    workflowId: string;
+    displayName: string;
+    latestRevision: string;
+    humanVersion: number;
+    /** The stricter of: vs the latest, vs the published version (I10). */
+    gates: SavedWorkflowGateComparison;
+    gatesBase: { kind: 'latest' | 'published'; humanVersion: number };
+  };
   /** The template's nodes with the edits so far (where 「设为参数」 selects
    *  next: edits apply in order, each to the text the previous ones left). */
   dagNodes: V3Node[];
@@ -631,7 +647,8 @@ export function parseSaveTarget(
     displayName = input.displayName.trim();
   }
   const requestKey = typeof input.requestKey === 'string' ? input.requestKey : '';
-  if (!workflowId && !/^[A-Za-z0-9_-]{8,64}$/.test(requestKey)) throw err('bad_request', '新建模板要带 requestKey（8–64 位字母数字）');
+  if (requestKey && !/^[A-Za-z0-9_-]{8,64}$/.test(requestKey)) throw err('bad_request', 'requestKey 必须是 8–64 位字母数字');
+  if (!workflowId && !requestKey) throw err('bad_request', '新建模板要带 requestKey（8–64 位字母数字）');
   return { ...(expectedLatestRevision ? { expectedLatestRevision } : {}), ...(displayName ? { displayName } : {}), requestKey };
 }
 
@@ -872,6 +889,11 @@ export class WorkflowDraftService {
     if (error instanceof SavedWorkflowUnsafeLiteralError) return err('unsafe_literals', error.message, { warnings: [...error.warnings] });
     if (error instanceof SavedWorkflowSchemaError) return err('template_invalid', '保存的内容不符合模板规则', { problems: error.problems });
     if (error instanceof Error && /sensitive parameters are not executable/.test(error.message)) return err('bad_params', error.message);
+    // The template rules (template-bindings, the exact compiler) throw plain
+    // errors: a flow that breaks them is the request's problem, not a fault.
+    if (error instanceof Error && /^(?:Saved Workflow (?:template|has malformed|host|spec)|cannot save workflow:)/.test(error.message)) {
+      return err('template_invalid', error.message);
+    }
     return this.mapError(error);
   }
 
@@ -1305,7 +1327,6 @@ export class WorkflowDraftService {
           displayName,
           ownerOpenId: prepared.metadata.owner.openId,
           params,
-          confirmationRequired: prepared.confirmationRequired,
           hasInputs: Object.keys(prepared.revision.payload.inputs).length > 0,
           dagSha256: artifactRef(runDir, 'dag.json').sha256,
           specSha256: artifactRef(runDir, 'spec.json').sha256,
@@ -1401,6 +1422,7 @@ export class WorkflowDraftService {
           latestRevision: found.metadata.latestRevision,
           humanVersion: found.latest.payload.humanVersion,
           gates: found.gates,
+          gatesBase: { kind: found.base.kind, humanVersion: found.base.humanVersion },
         };
       } catch (error) {
         throw this.mapLibraryError(error);
@@ -1473,6 +1495,7 @@ export class WorkflowDraftService {
         ...(workflowId ? { workflowId, ...(save.expectedLatestRevision ? { expectedLatestRevision: save.expectedLatestRevision } : {}) } : {}),
         ...(save.displayName ? { displayName: save.displayName } : {}),
         ...(!workflowId ? { newWorkflowId: dashboardSavedWorkflowId({ sourceKind: 'draft', sourceId: runId, actor, requestKey: save.requestKey }) } : {}),
+        ...(workflowId && save.requestKey ? { appendRequest: { sourceKind: 'draft' as const, sourceId: runId, requestKey: save.requestKey } } : {}),
         now: this.now(),
       });
       this.log(`[workflow-draft] saved ${runId} as template ${written.metadata.workflowId} v${written.revision.payload.humanVersion} by ${initiator.openId}`);
@@ -1582,6 +1605,7 @@ export class WorkflowDraftService {
         ...(workflowId ? { workflowId, ...(save.expectedLatestRevision ? { expectedLatestRevision: save.expectedLatestRevision } : {}) } : {}),
         ...(save.displayName ? { displayName: save.displayName } : {}),
         ...(!workflowId ? { newWorkflowId: dashboardSavedWorkflowId({ sourceKind: 'run', sourceId: runId, actor, requestKey: save.requestKey }) } : {}),
+        ...(workflowId && save.requestKey ? { appendRequest: { sourceKind: 'run' as const, sourceId: runId, requestKey: save.requestKey } } : {}),
         now: this.now(),
       });
       this.log(`[workflow-draft] saved run ${runId} as template ${written.metadata.workflowId} v${written.revision.payload.humanVersion} by ${initiator.openId}`);
@@ -3328,25 +3352,30 @@ export class WorkflowDraftService {
    * revision's run also needs its 「确认流程」 to hold (I13).
    */
   private async launchTemplateCommitStep(runId: string, token: string, pinned: WorkflowDraftTemplateRun): Promise<boolean> {
+    // run.json already written (its record lost): replay it from the run
+    // directory alone — the library may have moved on (archived, deleted)
+    // and must not wedge a committed run.
+    const committed = existsSync(join(this.runDirOf(runId, { launched: true }), V3_RUN_ENVELOPE_FILE));
     let library: { metadata: Awaited<ReturnType<typeof readSavedWorkflowMetadata>>; revision: Awaited<ReturnType<typeof readSavedWorkflowRevision>> } | undefined;
-    let libraryError: string | undefined;
-    try {
-      const metadata = await readSavedWorkflowMetadata(this.libraryDir(), pinned.workflowId);
-      const revision = await readSavedWorkflowRevision(this.libraryDir(), pinned.workflowId, pinned.revisionId);
-      if (revision.contentHash !== pinned.contentHash) libraryError = '模板版本的内容和准备运行时不一样';
-      else if (metadata.status === 'archived') libraryError = '模板已归档，不能再运行';
-      else if (metadata.scope.kind !== 'global' || metadata.owner.larkAppId !== this.deps.appId) libraryError = '模板的范围或所属 Bot 变了，不能在这里运行';
-      else library = { metadata, revision };
-    } catch (error) {
-      libraryError = `模板读不出来：${errorText(error)}`;
-    }
-    if (!library) {
-      this.stopLaunch(runId, token, { step: 'commit', code: 'template_unavailable', retryable: true, message: libraryError ?? '模板读不出来' });
-      return false;
+    if (!committed) {
+      let libraryError: string | undefined;
+      try {
+        const metadata = await readSavedWorkflowMetadata(this.libraryDir(), pinned.workflowId);
+        const revision = await readSavedWorkflowRevision(this.libraryDir(), pinned.workflowId, pinned.revisionId);
+        libraryError = revision.contentHash !== pinned.contentHash ? '模板版本的内容和准备运行时不一样' : this.templateRunnableHere(metadata);
+        if (!libraryError) library = { metadata, revision };
+      } catch (error) {
+        libraryError = `模板读不出来：${errorText(error)}`;
+      }
+      if (!library) {
+        this.stopLaunch(runId, token, { step: 'commit', code: 'template_unavailable', retryable: true, message: libraryError ?? '模板读不出来' });
+        return false;
+      }
     }
     const bots = this.deps.loadBots();
     const nameOf = this.deps.nameOf();
-    const out = this.launchTx(runId, token, ({ runDir, draft, launch, grill }) => {
+    type Outcome = 'again' | 'stop' | 'committed' | { unavailable: string };
+    const out = this.launchTx<Outcome>(runId, token, ({ runDir, draft, launch, grill }) => {
       const template = draft.template;
       if (!template || template.revisionId !== pinned.revisionId || Object.keys(draft.nodeBots ?? {}).length > 0) {
         return { changed: false, result: 'again' as const };
@@ -3354,13 +3383,25 @@ export class WorkflowDraftService {
       const chatId = launch.chat!.chatId;
       const rootMessageId = launch.root!.messageId;
       const envelopePath = join(runDir, V3_RUN_ENVELOPE_FILE);
-      let flow: ReturnType<WorkflowDraftService['currentFlow']>;
-      try {
-        flow = this.currentFlow(runDir, grill, bots, nameOf);
-      } catch (error) {
-        throw err('dag_invalid', `流程读不出来：${errorText(error)}`);
-      }
-      if (!existsSync(envelopePath)) {
+      let summarySha: string;
+      const exists = existsSync(envelopePath);
+      if (!exists) {
+        if (!library) return { changed: false, result: 'again' as const };
+        // The archive / scope check of the template, again inside the lock:
+        // closes the window between the read above and this commit.
+        let why: string | undefined;
+        try {
+          why = this.templateRunnableHere(readSavedWorkflowMetadataSync(this.libraryDir(), pinned.workflowId));
+        } catch (error) {
+          why = `模板读不出来：${errorText(error)}`;
+        }
+        if (why) return { changed: false, result: { unavailable: why } };
+        let flow: ReturnType<WorkflowDraftService['currentFlow']>;
+        try {
+          flow = this.currentFlow(runDir, grill, bots, nameOf);
+        } catch (error) {
+          throw err('dag_invalid', `流程读不出来：${errorText(error)}`);
+        }
         if (grill.status !== 'dag_ready' || !this.flowReady(draft, flow)) {
           delete draft.flowConfirmation;
           return { changed: true, result: 'stop' as const };
@@ -3368,6 +3409,13 @@ export class WorkflowDraftService {
         if (nextLaunchStep(launch, { flowRevision: draft.flowRevision ?? 0, targets: [...new Set(flow.targets.map((t) => t.larkAppId).filter((appId) => appId !== this.deps.appId))] }) !== 'commit') {
           return { changed: false, result: 'again' as const };
         }
+        summarySha = flow.flowSummarySha256;
+      } else {
+        // The record of a replayed commit: the summary of the flow on disk
+        // (bots.json may have moved; the committed run.json is what counts).
+        let replayed: string | undefined;
+        try { replayed = this.currentFlow(runDir, grill, bots, nameOf).flowSummarySha256; } catch { replayed = undefined; }
+        summarySha = replayed ?? template.dagSha256;
       }
       const binding: RunChatBinding = {
         larkAppId: this.deps.appId,
@@ -3386,29 +3434,37 @@ export class WorkflowDraftService {
       for (const [name, value] of Object.entries(template.params)) rawParams[name] = { kind: 'string', value };
       // Lock order: draft (held) → grill/host → run.json.
       const envelope = withHostMutationLockSync(runDir, () => withFileLockSync(envelopePath, () => {
-        const committed = commitSavedWorkflowRunInPlace({
-          runDir,
-          metadata: library!.metadata,
-          revision: library!.revision,
-          rawParams,
-          chatBinding: binding,
-          initiator,
-          expected: { dagSha256: template.dagSha256, specSha256: template.specSha256 },
-          bots,
-          now: this.now(),
-        });
+        const written = existsSync(envelopePath)
+          ? replaySavedWorkflowRunCommit(runDir, {
+              workflowId: pinned.workflowId,
+              revisionId: pinned.revisionId,
+              contentHash: pinned.contentHash,
+              chatBinding: binding,
+              initiatorOpenId: initiator.openId,
+            })
+          : commitSavedWorkflowRunInPlace({
+              runDir,
+              metadata: library!.metadata,
+              revision: library!.revision,
+              rawParams,
+              chatBinding: binding,
+              initiator,
+              expected: { dagSha256: template.dagSha256, specSha256: template.specSha256 },
+              bots,
+              now: this.now(),
+            });
         // The grill is this draft's bookkeeping only: past run.json it reads
         // as approved, like an ad-hoc launch's.
         const current = readGrillState(runDir);
         if (current?.status === 'dag_ready') transition(runDir, 'dag_approved', {}, this.now());
-        return committed;
+        return written;
       }));
       launch.commit = {
         at: this.now().toISOString(),
         chatId,
         rootMessageId,
         runJsonSha256: fileSha256(envelopePath)!,
-        flowSummarySha256: flow.flowSummarySha256 as `sha256:${string}`,
+        flowSummarySha256: summarySha as `sha256:${string}`,
         dagSha256: envelope.artifacts.dag.sha256,
         specSha256: envelope.artifacts.spec.sha256,
         flowRevision: draft.flowRevision ?? 0,
@@ -3423,8 +3479,19 @@ export class WorkflowDraftService {
       });
       return false;
     }
-    if (out.result === 'committed') this.log(`[workflow-draft] launch ${runId}: template run.json written (${pinned.workflowId} v${pinned.humanVersion})`);
+    if (typeof out.result === 'object') {
+      this.stopLaunch(runId, token, { step: 'commit', code: 'template_unavailable', retryable: true, message: out.result.unavailable });
+      return false;
+    }
+    if (out.result === 'committed') this.log(`[workflow-draft] launch ${runId}: template run.json ${committed ? 're-recorded' : 'written'} (${pinned.workflowId} v${pinned.humanVersion})`);
     return true;
+  }
+
+  /** Why this bot cannot run the template now (archived, chat scope, another bot). */
+  private templateRunnableHere(metadata: Awaited<ReturnType<typeof readSavedWorkflowMetadata>>): string | undefined {
+    if (metadata.status === 'archived') return '模板已归档，不能再运行';
+    if (metadata.scope.kind !== 'global' || metadata.owner.larkAppId !== this.deps.appId) return '模板的范围或所属 Bot 变了，不能在这里运行';
+    return undefined;
   }
 
   /** Step 8: the same start path as `botmux workflow start` (idempotent). */
@@ -3567,6 +3634,16 @@ export class WorkflowDraftService {
         flowError = errorText(error);
       }
     }
+    let newerPublished: { humanVersion: number; revisionId: string } | undefined;
+    if (draft.template) {
+      try {
+        const metadata = await readSavedWorkflowMetadata(this.libraryDir(), draft.template.workflowId);
+        if (metadata.publishedRevision && metadata.publishedRevision !== draft.template.revisionId) {
+          const published = await readSavedWorkflowRevision(this.libraryDir(), draft.template.workflowId, metadata.publishedRevision);
+          newerPublished = { humanVersion: published.payload.humanVersion, revisionId: published.revisionId };
+        }
+      } catch { /* unreadable library: nothing to say */ }
+    }
     const specMarkdown = readTextOrUndefined(grill.specPath);
     const specJsonText = grill.status === 'grilling' ? undefined : readTextOrUndefined(grill.specJsonPath);
     let specJson: unknown;
@@ -3620,6 +3697,7 @@ export class WorkflowDraftService {
         ...draft.template,
         needsConfirmation: workflowTemplateRunNeedsConfirmation(draft),
         swapped: Object.keys(draft.nodeBots ?? {}).length > 0,
+        ...(newerPublished ? { newerPublished } : {}),
       } } : {}),
     };
   }

@@ -128,7 +128,7 @@ describe('模板页的纯逻辑', () => {
     expect(templateSaveRequest({ kind: 'draft', runId: 'r1' }, 'save', { flowSummarySha256: 'sha256:x', requestKey: 'k', displayName: 'n' }))
       .toEqual({ path: '/api/v3/orchestration/drafts/r1/template/save', body: { displayName: 'n', requestKey: 'k', flowSummarySha256: 'sha256:x' } });
     expect(templateSaveRequest({ kind: 'run', runId: 'r1' }, 'save', { workflowId: 'wf_1', expectedLatestRevision: 'rev_1', displayName: 'ignored', requestKey: 'k' }))
-      .toEqual({ path: '/api/v3/orchestration/library/runs/r1/save', body: { workflowId: 'wf_1', expectedLatestRevision: 'rev_1' } });
+      .toEqual({ path: '/api/v3/orchestration/library/runs/r1/save', body: { workflowId: 'wf_1', expectedLatestRevision: 'rev_1', requestKey: 'k' } });
     expect(templateSaveRequest({ kind: 'run', runId: 'r1' }, 'preview', { allowDraft: true }))
       .toEqual({ path: '/api/v3/orchestration/library/runs/r1/save/preview', body: { allowDraft: true } });
   });
@@ -181,20 +181,22 @@ describe('页面渲染', () => {
     act(() => { renderer.unmount(); });
   });
 
-  it('运行：必填没填不发请求；来源是草稿的版本建草稿后去确认流程，不直接拉群（I13）', async () => {
+  it('运行：来源是草稿的版本也直接拉群，不经过确认流程（I13，11-05）', async () => {
     const detail = await twoVersions();
-    const created = { runId: 'tmpl-run-1', version: 1, phase: 'dag_ready', title: detail.entry.displayName };
+    const created = { runId: 'tmpl-run-1', version: 1, phase: 'flow_confirmed', title: detail.entry.displayName };
     const { renderer, sent } = await renderPage(`#/workflows/library/${detail.entry.workflowId}`, (url) => {
       if (url.endsWith(`/library/${detail.entry.workflowId}`)) return { ok: true, template: detail };
       if (url.endsWith(`/library/${detail.entry.workflowId}/run`)) return { ok: true, draft: created };
+      if (url.endsWith('/launch')) return { ok: true, draft: { ...created, phase: 'launching' } };
       return undefined;
     });
     // v2 (the published one) has no parameters of its own; it is draft-born.
-    expect(text(renderer.root)).toContain('运行前要再点一次「确认流程」');
-    await act(async () => { buttons(renderer, '下一步：确认流程')[0]!.props.onClick(); });
+    expect(detail.entry.savedFromDraft).toBe(true);
+    expect(text(renderer.root)).not.toContain('确认流程」');
+    await act(async () => { buttons(renderer, '拉群开始')[0]!.props.onClick(); });
     await flush();
     expect(sent.find((call) => call.url.endsWith('/run'))?.body).toEqual({ params: {}, expectedRevisionId: detail.current.revisionId });
-    expect(sent.some((call) => call.url.endsWith('/launch'))).toBe(false);
+    expect(sent.find((call) => call.url.endsWith('/launch'))?.body).toEqual({ baseVersion: 1 });
     expect(location.hash).toBe('#/workflows/drafts/tmpl-run-1');
     act(() => { renderer.unmount(); });
   });
@@ -203,7 +205,7 @@ describe('页面渲染', () => {
     const detail = await twoVersions();
     const fromRun: SavedWorkflowDetailView = {
       ...detail,
-      entry: { ...detail.entry, confirmationRequired: false },
+      entry: { ...detail.entry, savedFromDraft: false },
       current: { ...detail.current, inputs: { focus: { type: 'string', required: true }, depth: { type: 'number', default: 2 } } },
     };
     const created = { runId: 'tmpl-run-2', version: 3, phase: 'flow_confirmed', title: detail.entry.displayName };
@@ -235,7 +237,6 @@ describe('页面渲染', () => {
       url.endsWith(`/library/${detail.entry.workflowId}`) ? { ok: true, template: chat } : undefined);
     expect(text(renderer.root)).toContain('群范围的模板只能在原群里用 /workflow run 运行');
     expect(buttons(renderer, '拉群开始')).toHaveLength(0);
-    expect(buttons(renderer, '下一步：确认流程')).toHaveLength(0);
     act(() => { renderer.unmount(); });
   });
 

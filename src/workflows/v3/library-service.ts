@@ -28,6 +28,7 @@ import {
   canonicalJsonStringify,
   compareSavedWorkflowGates,
   normalizeSavedWorkflowLookupKey,
+  savedWorkflowGateWeakening,
   validateSavedWorkflowRevisionPayload,
   type SavedWorkflowBotChange,
   type SavedWorkflowGateComparison,
@@ -43,7 +44,9 @@ import {
   appendSavedWorkflowRevision,
   createSavedWorkflow,
   listSavedWorkflows,
+  listSavedWorkflowRevisions,
   loadCurrentSavedWorkflow,
+  readSavedWorkflowRevision,
   readSavedWorkflowMetadata,
   savedWorkflowDir,
   workflowLibraryRoot,
@@ -971,11 +974,14 @@ export function withDashboardParamEdits(
   return { ...plan, revision };
 }
 
-/** Gates of the revision being saved against the latest one (I10). */
+/** Gates of the revision being saved against the latest one and the
+ *  published one (I10); `gates` is the stricter of the two, `base` the
+ *  version it compares with. */
 export interface DashboardSaveTarget {
   metadata: SavedWorkflowMetadata;
   latest: SavedWorkflowWriteResult['revision'];
   gates: SavedWorkflowGateComparison;
+  base: { kind: 'latest' | 'published'; revisionId: string; humanVersion: number };
 }
 
 /** A terminal run of `actor` (its bound owner on this bot), compiled the
@@ -1044,11 +1050,30 @@ export async function loadDashboardAppendTarget(input: {
   if (metadata.scope.kind === 'chat') {
     throw new SavedWorkflowServiceError('scope_mismatch', `Saved Workflow '${metadata.workflowId}' is chat-scoped: append to it in its chat`);
   }
-  return {
-    metadata,
-    latest: current.revision,
-    gates: compareSavedWorkflowGates(current.revision.payload.dagTemplate, input.revision.dagTemplate),
-  };
+  const latestGates = compareSavedWorkflowGates(current.revision.payload.dagTemplate, input.revision.dagTemplate);
+  let gates = latestGates;
+  let base: DashboardSaveTarget['base'] = { kind: 'latest', revisionId: current.revision.revisionId, humanVersion: current.revision.payload.humanVersion };
+  // The published version is what runs today: a draft-only latest must not
+  // hide that the new one weakens it.
+  if (metadata.publishedRevision && metadata.publishedRevision !== current.revision.revisionId) {
+    const published = await readSavedWorkflowRevision(input.dataDir, input.workflowId, metadata.publishedRevision);
+    const publishedGates = compareSavedWorkflowGates(published.payload.dagTemplate, input.revision.dagTemplate);
+    const [r1, l1] = savedWorkflowGateWeakening(latestGates);
+    const [r2, l2] = savedWorkflowGateWeakening(publishedGates);
+    if (r2 > r1 || (r2 === r1 && l2 > l1)) {
+      gates = publishedGates;
+      base = { kind: 'published', revisionId: published.revisionId, humanVersion: published.payload.humanVersion };
+    }
+  }
+  return { metadata, latest: current.revision, gates, base };
+}
+
+/** sha256 of one append request (P3-6): the same dialog retried finds the
+ *  version it wrote. */
+export function dashboardAppendRequestId(input: { workflowId: string; actor: SavedWorkflowOwner; sourceKind: 'run' | 'draft'; sourceId: string; requestKey: string }): string {
+  return `sha256:${createHash('sha256')
+    .update(['v3-dashboard-append:v1', input.workflowId, input.actor.larkAppId, input.actor.openId, input.sourceKind, input.sourceId, input.requestKey].join('\0'))
+    .digest('hex')}`;
 }
 
 /** Deterministic id of a new template from one Dashboard save request: a
@@ -1072,23 +1097,41 @@ export interface CommitDashboardSaveInput {
   displayName?: string;
   /** New template only: makes a repeated request idempotent. */
   newWorkflowId?: string;
+  /** Append only: the request this append belongs to (P3-6). */
+  appendRequest?: { sourceKind: 'run' | 'draft'; sourceId: string; requestKey: string };
   now?: Date;
 }
 
-export async function commitDashboardSave(input: CommitDashboardSaveInput): Promise<SavedWorkflowWriteResult & { created: boolean }> {
+export async function commitDashboardSave(input: CommitDashboardSaveInput): Promise<SavedWorkflowWriteResult & { created: boolean; replayed?: boolean }> {
   const actor = requireActorContext({ actor: input.actor }).actor;
   if (input.workflowId !== undefined) {
+    const workflowId = input.workflowId;
     // Re-checked under the store's lock by appendSavedWorkflowRevision (owner,
     // archived, expected latest); scope and app here.
-    await loadDashboardAppendTarget({ dataDir: input.dataDir, workflowId: input.workflowId, actor, revision: input.plan.revision });
-    const written = await appendSavedWorkflowRevision(input.dataDir, input.workflowId, {
-      actor,
-      revision: input.plan.revision,
-      publish: input.plan.publish,
-      ...(input.expectedLatestRevision ? { expectedLatestRevision: input.expectedLatestRevision } : {}),
-      now: input.now,
-    });
-    return { ...written, created: false };
+    await loadDashboardAppendTarget({ dataDir: input.dataDir, workflowId, actor, revision: input.plan.revision });
+    const requestId = input.appendRequest ? dashboardAppendRequestId({ workflowId, actor, ...input.appendRequest }) : undefined;
+    const provenance = input.plan.revision.provenance;
+    const revision = requestId && provenance ? { ...input.plan.revision, provenance: { ...provenance, requestId } } : input.plan.revision;
+    const append = async () => {
+      if (requestId) {
+        // Already written by this very request (a retry, a second tab).
+        for (const existing of await listSavedWorkflowRevisions(input.dataDir, workflowId)) {
+          if (existing.payload.provenance?.requestId === requestId && sameOwner(existing.payload.createdBy, actor)) {
+            return { metadata: await readSavedWorkflowMetadata(input.dataDir, workflowId), revision: existing, created: false, replayed: true };
+          }
+        }
+      }
+      const written = await appendSavedWorkflowRevision(input.dataDir, workflowId, {
+        actor,
+        revision,
+        publish: input.plan.publish,
+        ...(input.expectedLatestRevision ? { expectedLatestRevision: input.expectedLatestRevision } : {}),
+        now: input.now,
+      });
+      return { ...written, created: false };
+    };
+    if (!requestId) return append();
+    return withFileLock(join(workflowLibraryRoot(input.dataDir), `.dashboard-append-${workflowId}`), append);
   }
   const workflowId = input.newWorkflowId;
   const create = () => createSavedWorkflow(input.dataDir, {
@@ -1138,8 +1181,6 @@ export interface DashboardSavedWorkflowRun {
   metadata: SavedWorkflowMetadata;
   revision: SavedWorkflowWriteResult['revision'];
   resolvedParams: Record<string, unknown>;
-  /** I13: a draft-born revision is confirmed again before every run. */
-  confirmationRequired: boolean;
 }
 
 /**
@@ -1187,6 +1228,5 @@ export async function prepareDashboardSavedWorkflowRun(input: {
     metadata: current.metadata,
     revision: current.revision,
     resolvedParams,
-    confirmationRequired: current.revision.payload.provenance?.kind === 'dashboard_draft',
   };
 }

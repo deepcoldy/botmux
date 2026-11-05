@@ -176,7 +176,7 @@ describe('Dashboard → daemon workflow templates', () => {
     const list = await call('GET', LIB);
     expect(list.body.templates).toEqual([expect.objectContaining({
       workflowId: saved.body.saved.workflowId, displayName: '风险报告', orchestratorAppId: MAIN, ownerOpenId: OWNER_OPEN,
-      scope: { kind: 'global' }, paramCount: 0, nodeCount: 2, gateCount: 0, runnable: true, confirmationRequired: false,
+      scope: { kind: 'global' }, paramCount: 0, nodeCount: 2, gateCount: 0, runnable: true, savedFromDraft: false,
     })]);
     const detail = await call('GET', `${LIB}/${saved.body.saved.workflowId}`);
     expect(detail.body.template.versions).toEqual([expect.objectContaining({ humanVersion: 1, source: 'dashboard_run', sourceRunId: RUN_ID, published: true })]);

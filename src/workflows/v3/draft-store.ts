@@ -173,8 +173,6 @@ const templateRunSchema = z.object({
   /** The template's owner (who saves versions) — not the run's initiator. */
   ownerOpenId: openId,
   params: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/), z.string().max(WORKFLOW_TEMPLATE_RUN_MAX_PARAM_CHARS)),
-  /** I13: a draft-born revision is confirmed again before it runs. */
-  confirmationRequired: z.boolean(),
   /** The revision declares inputs: its flow carries `${params.…}` markers,
    *  which an ad-hoc run (a swapped bot) could not resolve. */
   hasInputs: z.boolean(),
@@ -482,12 +480,14 @@ export type WorkflowDraftPhase =
   | 'started';
 
 /**
- * A template run needs 「确认流程」 when its revision was born from a draft
- * (I13) or a node's bot was swapped (no longer the template as is, §5.3).
+ * A template run needs 「确认流程」 only once a node's bot was swapped: it is
+ * then no longer the template as is (§5.3, 复制后启动). A version saved from a
+ * draft runs directly (I13, decided 11-05): its saved confirmation goes into
+ * run.json instead.
  */
 export function workflowTemplateRunNeedsConfirmation(draft: Pick<WorkflowDraftRecord, 'template' | 'nodeBots'>): boolean {
   if (!draft.template) return true;
-  return draft.template.confirmationRequired || Object.keys(draft.nodeBots ?? {}).length > 0;
+  return Object.keys(draft.nodeBots ?? {}).length > 0;
 }
 
 /** A template run's flow files are still the prepared revision's. */

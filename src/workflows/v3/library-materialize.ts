@@ -62,6 +62,7 @@ import {
   readRunEnvelope,
   type LoadedAuthorizedV3Run,
   type V3HandoffIdentityRecord,
+  type V3FlowConfirmation,
   type V3RunInitiator,
   type V3SavedDefinitionRunEnvelope,
 } from './run-envelope.js';
@@ -451,6 +452,61 @@ export interface CommitSavedWorkflowRunInPlaceInput {
 }
 
 /**
+ * What run.json records for a version saved from a Dashboard draft (I13,
+ * 11-05): that version's own second confirmation, as saved — who, when, the
+ * summary. Undefined for every other version (Feishu saves, a finished run).
+ */
+export function savedWorkflowRunFlowConfirmation(revision: LoadedSavedWorkflowRevision): V3FlowConfirmation | undefined {
+  const provenance = revision.payload.provenance;
+  if (provenance?.kind !== 'dashboard_draft') return undefined;
+  const { confirmedByOpenId, confirmedAt, flowSummary, flowSummarySha256 } = provenance.confirmation;
+  return { confirmedByOpenId, confirmedAt, flowSummary, flowSummarySha256: flowSummarySha256 as `sha256:${string}` };
+}
+
+export interface SavedWorkflowRunCommitIdentity {
+  workflowId: string;
+  revisionId: string;
+  /** The revision's content hash pinned when the run was prepared. */
+  contentHash: string;
+  chatBinding: Pick<RunChatBinding, 'larkAppId' | 'chatId' | 'rootMessageId'>;
+  initiatorOpenId: string;
+}
+
+/**
+ * A template run's run.json is already there (written before its record could
+ * be): accept it only as exactly this commit — same revision and pinned
+ * content, chat, topic, initiator, confirmation — verified against the run
+ * directory's own artifacts (definition.snapshot.json is the definition it
+ * ran with), then re-published idempotently (fsync heal). The library is not
+ * read: whatever happened to the template since (archived, deleted, a newer
+ * version) does not change a committed run.
+ */
+export function replaySavedWorkflowRunCommit(runDir: string, expected: SavedWorkflowRunCommitIdentity): V3SavedDefinitionRunEnvelope {
+  const runId = basename(runDir);
+  const existing = readRunEnvelope(runDir, runId);
+  if (existing.kind !== 'ok') {
+    throw new Error(existing.kind === 'invalid' ? `run.json 已存在但无效，拒绝覆盖：${existing.problems.join('; ')}` : 'run.json 不存在');
+  }
+  const envelope = existing.envelope;
+  const authorization = envelope.authorization as { initiator?: V3RunInitiator };
+  if (envelope.source.kind !== 'saved_definition'
+    || envelope.source.workflowId !== expected.workflowId
+    || envelope.source.revisionId !== expected.revisionId
+    || envelope.chatBinding?.chatId !== expected.chatBinding.chatId
+    || envelope.chatBinding.rootMessageId !== expected.chatBinding.rootMessageId
+    || envelope.chatBinding.larkAppId !== expected.chatBinding.larkAppId
+    || authorization.initiator?.openId !== expected.initiatorOpenId) {
+    throw new Error('run.json 已存在，但不是这次模板运行写的；不会覆盖它');
+  }
+  const loaded = loadAuthorizedV3Run(runDir, { expectedRunId: runId, allowedSources: ['saved_definition'] });
+  const snapshot = loaded.definitionSnapshot as { contentHash?: unknown } | undefined;
+  if (snapshot?.contentHash !== expected.contentHash) {
+    throw new Error('run.json 已存在，但它的模板定义不是准备运行时那一版；不会覆盖它');
+  }
+  return publishRunEnvelopeOnce(runDir, envelope).envelope as V3SavedDefinitionRunEnvelope;
+}
+
+/**
  * Commit a template run whose directory already exists (a Dashboard
  * template-run draft, §5.3): dag.json / spec.json were written when it was
  * prepared — they must still be exactly the revision's flow under this runId
@@ -480,20 +536,15 @@ export function commitSavedWorkflowRunInPlace(input: CommitSavedWorkflowRunInPla
   const existing = readRunEnvelope(runDir, runId);
   if (existing.kind === 'invalid') throw new Error(`run.json 已存在但无效，拒绝覆盖：${existing.problems.join('; ')}`);
   if (existing.kind === 'ok') {
-    const envelope = existing.envelope;
-    const authorization = envelope.authorization as { initiator?: V3RunInitiator };
-    if (envelope.source.kind !== 'saved_definition'
-      || envelope.source.workflowId !== input.metadata.workflowId
-      || envelope.source.revisionId !== input.revision.revisionId
-      || envelope.chatBinding?.chatId !== input.chatBinding.chatId
-      || envelope.chatBinding.rootMessageId !== input.chatBinding.rootMessageId
-      || envelope.chatBinding.larkAppId !== input.chatBinding.larkAppId
-      || authorization.initiator?.openId !== input.initiator.openId) {
-      throw new Error('run.json 已存在，但不是这次模板运行写的；不会覆盖它');
-    }
-    loadAuthorizedV3Run(runDir, { expectedRunId: runId, allowedSources: ['saved_definition'] });
-    return publishRunEnvelopeOnce(runDir, envelope).envelope as V3SavedDefinitionRunEnvelope;
+    return replaySavedWorkflowRunCommit(runDir, {
+      workflowId: input.metadata.workflowId,
+      revisionId: input.revision.revisionId,
+      contentHash: input.revision.contentHash,
+      chatBinding: input.chatBinding,
+      initiatorOpenId: input.initiator.openId,
+    });
   }
+  const flowConfirmation = savedWorkflowRunFlowConfirmation(input.revision);
   assertSavedWorkflowTemplateBindings(
     input.revision.payload.dagTemplate,
     input.revision.payload.inputs,
@@ -541,6 +592,7 @@ export function commitSavedWorkflowRunInPlace(input: CommitSavedWorkflowRunInPla
     chatBinding: input.chatBinding,
     nodeExecutor: 'bot',
     initiator: input.initiator,
+    ...(flowConfirmation ? { flowConfirmation } : {}),
     artifacts: {
       dag: artifactRef(runDir, 'dag.json'),
       spec: artifactRef(runDir, 'spec.json'),
@@ -682,6 +734,7 @@ export function materializeSavedWorkflowRun(
   // exists+rename sequence can replace an empty directory on POSIX when two
   // callers race with the same explicit runId.
   const initiator = feishuRunInitiator(input.context?.chatBinding?.ownerOpenId, input.handoffIdentity);
+  const savedConfirmation = savedWorkflowRunFlowConfirmation(input.revision);
   return withFileLockSync(runDir, () => {
     if (existsSync(runDir)) throw new Error(`v3 run already exists: ${runId}`);
 
@@ -732,6 +785,8 @@ export function materializeSavedWorkflowRun(
         // The run's initiator (design 2026-11-03 workflow-dashboard-orchestration
         // §7.3): the `/workflow run` sender, bot runs only.
         ...(input.nodeExecutor === 'bot' && initiator ? { initiator } : {}),
+        // A version saved from a Dashboard draft carries its confirmation (I13).
+        ...(savedConfirmation ? { flowConfirmation: savedConfirmation } : {}),
         artifacts,
       });
       publishRunEnvelopeOnce(stagedRunDir, envelope);

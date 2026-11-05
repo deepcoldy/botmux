@@ -150,9 +150,13 @@ export interface SavedWorkflowDraftConfirmation {
   flowSummarySha256: string;
 }
 
+/** Optional on both kinds: sha256 of the Dashboard save request (owner,
+ *  workflow, request key), so a retried append finds the version it already
+ *  wrote instead of failing on the moved latest pointer. */
 export type SavedWorkflowRevisionProvenance =
   | {
       kind: 'dashboard_run';
+      requestId?: string;
       runId: string;
       /** Applied runtime revisions of the source run (§13.8). */
       runtimeRevisions: number;
@@ -160,6 +164,7 @@ export type SavedWorkflowRevisionProvenance =
     }
   | {
       kind: 'dashboard_draft';
+      requestId?: string;
       draftRunId: string;
       confirmation: SavedWorkflowDraftConfirmation;
     };
@@ -545,30 +550,55 @@ export function savedWorkflowGatePositions(dagTemplate: V3DagTemplate): SavedWor
 }
 
 /**
- * Human gates of a revision against the previous one (I10): how many, and
- * where. `removed` are positions the previous revision gated and this one
- * does not — what 「比上一版少了 N 道人工确认」 counts (N = removed.length); a
- * gate that moved is one removed plus one added. `changed`: the same position
- * with a different approval rule.
+ * Human gates of a revision against an earlier one (I10): how many, where,
+ * and who approves. `removed` are positions the earlier revision gated and
+ * this one does not — what 「比上一版少了 N 道人工确认」 counts (N =
+ * removed.length); a gate that moved is one removed plus one added.
+ * `loosened`: the same position whose named approvers were cleared (empty =
+ * anyone who can operate the bot) or lost someone — warned at the same level
+ * as a removed gate. `changed`: any other change of the approval rule.
  */
 export interface SavedWorkflowGateComparison {
   previousCount: number;
   currentCount: number;
   removed: string[];
   added: string[];
+  loosened: Array<{ nodeId: string; reason: 'approvers_cleared' | 'approvers_removed'; removedApprovers: string[] }>;
   changed: string[];
 }
 
+function gateApprovers(gate: unknown): string[] {
+  const approvers = (gate as { approvers?: unknown } | null)?.approvers;
+  return Array.isArray(approvers) ? approvers.filter((item): item is string => typeof item === 'string') : [];
+}
+
 export function compareSavedWorkflowGates(previous: V3DagTemplate, current: V3DagTemplate): SavedWorkflowGateComparison {
-  const before = new Map(savedWorkflowGatePositions(previous).map((gate) => [gate.nodeId, canonicalJsonStringify(gate.humanGate)]));
-  const after = new Map(savedWorkflowGatePositions(current).map((gate) => [gate.nodeId, canonicalJsonStringify(gate.humanGate)]));
+  const before = new Map(savedWorkflowGatePositions(previous).map((gate) => [gate.nodeId, gate.humanGate]));
+  const after = new Map(savedWorkflowGatePositions(current).map((gate) => [gate.nodeId, gate.humanGate]));
+  const loosened: SavedWorkflowGateComparison['loosened'] = [];
+  const changed: string[] = [];
+  for (const [nodeId, gate] of after) {
+    if (!before.has(nodeId)) continue;
+    const was = gateApprovers(before.get(nodeId));
+    const now = new Set(gateApprovers(gate));
+    const removedApprovers = was.filter((approver) => !now.has(approver));
+    if (was.length > 0 && now.size === 0) loosened.push({ nodeId, reason: 'approvers_cleared', removedApprovers });
+    else if (removedApprovers.length > 0) loosened.push({ nodeId, reason: 'approvers_removed', removedApprovers });
+    else if (canonicalJsonStringify(before.get(nodeId)) !== canonicalJsonStringify(gate)) changed.push(nodeId);
+  }
   return {
     previousCount: before.size,
     currentCount: after.size,
     removed: [...before.keys()].filter((id) => !after.has(id)),
     added: [...after.keys()].filter((id) => !before.has(id)),
-    changed: [...after.keys()].filter((id) => before.has(id) && before.get(id) !== after.get(id)),
+    loosened,
+    changed,
   };
+}
+
+/** How much a comparison weakens human review (removed gates first). */
+export function savedWorkflowGateWeakening(gates: SavedWorkflowGateComparison): [number, number] {
+  return [gates.removed.length, gates.loosened.length];
 }
 
 const CHAT_SIDE_EFFECT_PATTERNS: Array<{ kind: string; re: RegExp }> = [
@@ -785,6 +815,15 @@ export function savedWorkflowGoalNodeBots(nodes: readonly V3Node[], prefix = '',
   return out;
 }
 
+function provenanceRequestId(value: Record<string, unknown>, problems: string[]): string | undefined {
+  if (value.requestId === undefined) return undefined;
+  if (typeof value.requestId !== 'string' || !SAVED_WORKFLOW_CONTENT_HASH_RE.test(value.requestId)) {
+    problems.push('provenance.requestId must match sha256:<64 lowercase hex>');
+    return undefined;
+  }
+  return value.requestId;
+}
+
 function normalizeProvenance(
   value: unknown,
   ctx: { createdBy: SavedWorkflowOwner; sourceRunId?: string; dagTemplate?: V3DagTemplate },
@@ -795,7 +834,8 @@ function normalizeProvenance(
     return undefined;
   }
   if (value.kind === 'dashboard_run') {
-    exactKeys(value, ['kind', 'runId', 'runtimeRevisions', 'botChanges'], 'provenance', problems);
+    exactKeys(value, ['kind', 'requestId', 'runId', 'runtimeRevisions', 'botChanges'], 'provenance', problems);
+    const requestId = provenanceRequestId(value, problems);
     const runId = nonEmptyString(value.runId, 'provenance.runId', problems);
     if (runId && ctx.sourceRunId !== runId) problems.push('provenance.runId must equal sourceRunId');
     const runtimeRevisions = value.runtimeRevisions;
@@ -842,13 +882,15 @@ function normalizeProvenance(
     }
     return {
       kind: 'dashboard_run',
+      ...(requestId ? { requestId } : {}),
       runId,
       runtimeRevisions: runtimeRevisions as number,
       botChanges: botChanges.sort((a, b) => (a.nodeId < b.nodeId ? -1 : a.nodeId > b.nodeId ? 1 : 0)),
     };
   }
   if (value.kind === 'dashboard_draft') {
-    exactKeys(value, ['kind', 'draftRunId', 'confirmation'], 'provenance', problems);
+    exactKeys(value, ['kind', 'requestId', 'draftRunId', 'confirmation'], 'provenance', problems);
+    const requestId = provenanceRequestId(value, problems);
     const draftRunId = nonEmptyString(value.draftRunId, 'provenance.draftRunId', problems);
     if (ctx.sourceRunId !== undefined) problems.push('a draft-born revision has no sourceRunId');
     const confirmation = value.confirmation;
@@ -889,6 +931,7 @@ function normalizeProvenance(
     }
     return {
       kind: 'dashboard_draft',
+      ...(requestId ? { requestId } : {}),
       draftRunId,
       confirmation: { confirmedByOpenId, confirmedAt, flowConfirmedAt, flowSummary, flowSummarySha256: sha },
     };

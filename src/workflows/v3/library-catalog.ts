@@ -49,8 +49,8 @@ export interface SavedWorkflowCatalogEntry {
   gateCount: number;
   /** Global and published: the Dashboard offers 「运行」 (I9). */
   runnable: boolean;
-  /** I13: the version that would run was born from a draft. */
-  confirmationRequired: boolean;
+  /** The version that would run was saved from a draft (never ran yet). */
+  savedFromDraft: boolean;
 }
 
 export interface SavedWorkflowVersionView {
@@ -111,7 +111,7 @@ function entryOf(metadata: SavedWorkflowMetadata, shown: LoadedSavedWorkflowRevi
     nodeCount: nodeCount(shown.payload.dagTemplate),
     gateCount: savedWorkflowGatePositions(shown.payload.dagTemplate).length,
     runnable: metadata.scope.kind === 'global' && metadata.status === 'active' && !!published,
-    confirmationRequired: shown.payload.provenance?.kind === 'dashboard_draft',
+    savedFromDraft: shown.payload.provenance?.kind === 'dashboard_draft',
   };
 }
 

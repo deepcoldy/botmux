@@ -7,7 +7,7 @@
  * are immutable, content-addressed, and installed without replacement.
  */
 
-import { constants as fsConstants, promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -631,6 +631,19 @@ export async function readSavedWorkflowMetadata(
   let raw: string;
   try {
     raw = await fs.readFile(path, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw new SavedWorkflowNotFoundError(workflowId);
+    throw err;
+  }
+  return validateSavedWorkflowMetadata(JSON.parse(raw));
+}
+
+/** Synchronous metadata read, for a re-check inside a synchronous lock. */
+export function readSavedWorkflowMetadataSync(dataDir: string, workflowId: string): SavedWorkflowMetadata {
+  const path = savedWorkflowMetadataPath(dataDir, workflowId);
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf-8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw new SavedWorkflowNotFoundError(workflowId);
     throw err;
