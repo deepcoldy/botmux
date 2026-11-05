@@ -28,7 +28,12 @@ import { setGroupContextSettings } from '../src/services/group-context-settings-
 
 const APP = 'cli_app';
 const CHAT = 'oc_room';
-const CREATE = 1_791_240_348_974;
+// Wall-clock-relative, not a fixed epoch: every write is pruned against the
+// retention window, so a hard-coded date goes stale 30 days later and the
+// fixtures are deleted the instant they are written (#2813). All assertions
+// below use CREATE only through its relative offsets, so the base value is
+// arbitrary as long as it is recent.
+const CREATE = Date.now() - 60_000;
 const ALEX = { key: '@_user_1', name: 'Alex', openId: 'ou_alex' };
 let dataDir: string;
 
@@ -37,9 +42,11 @@ beforeEach(async () => {
   vi.stubEnv('SESSION_DATA_DIR', dataDir);
   _resetGroupContextStoreForTest();
   _resetGroupContextIngestForTest();
-  setGroupContextSettingsResolver(() => ({ enabled: true }));
+  // These cases exercise revision/mention identity, not retention: pin the
+  // window wide so a future epoch change can never make prune eat the fixtures.
+  setGroupContextSettingsResolver(() => ({ enabled: true, retentionDays: 365 }));
   // History observation reads the persisted settings, not the ingest resolver.
-  await setGroupContextSettings(CHAT, { enabled: true }, dataDir);
+  await setGroupContextSettings(CHAT, { enabled: true, retentionDays: 365 }, dataDir);
 });
 afterEach(() => {
   _resetGroupContextStoreForTest();
