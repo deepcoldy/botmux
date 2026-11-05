@@ -19,7 +19,7 @@ let directory: string;
 let oldDataDir: string;
 let ds: any;
 const snap = () => structuredClone({ replyTargets: ds.session.replyTargets, turnReplyContexts: ds.session.turnReplyContexts, replyTargetsPrunedThrough: ds.session.replyTargetsPrunedThrough });
-const reject = (id: string) => { const undo = inheritTurnReplyRouting(ds, 'failed', id); const ok = forkManualTurn(ds, { content: 'original task' }, id); if (!ok) { undo(); store.updateSession(ds.session); } return ok; };
+const reject = (id: string) => { const undo = inheritTurnReplyRouting(ds, 'failed', id); const ok = forkManualTurn(ds, { content: 'original task' }, id, pool.forkWorker); if (!ok) { undo(); store.updateSession(ds.session); } return ok; };
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-05T00:00:00Z'));
   directory = mkdtempSync(join(tmpdir(), 'botmux-manual-admission-'));

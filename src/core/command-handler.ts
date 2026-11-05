@@ -3744,7 +3744,7 @@ export async function handleCommand(
           if (ds.worker && !ds.worker.killed) {
             accepted = sendWorkerInput(ds, retryInput, retryTurnId);
           } else {
-            accepted = forkManualTurn(ds, retryInput, retryTurnId);
+            accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);

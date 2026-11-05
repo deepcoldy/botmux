@@ -2367,7 +2367,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     let accepted = false;
     try {
       if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
-      else accepted = forkManualTurn(ds, cliInput, turnId);
+      else accepted = forkManualTurn(ds, cliInput, turnId, forkWorker);
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -3843,7 +3843,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          accepted = forkManualTurn(ds, retryInput, retryTurnId);
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -4009,7 +4009,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          accepted = forkManualTurn(ds, retryInput, retryTurnId);
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
