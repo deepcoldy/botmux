@@ -286,11 +286,31 @@ function machineLarkCliPaths(openId?: string): {
   if (!existsSync(config) || !existsSync(dataDir)) return null;
   let appId = DEFAULT_LARK_CLI_APP_ID;
   try {
-    const cfg = JSON.parse(readFileSync(config, 'utf8')) as { apps?: Array<{ appId?: string }> };
-    const first = cfg.apps?.find(a => typeof a.appId === 'string' && a.appId.startsWith('cli_'));
-    if (first?.appId) appId = first.appId;
+    const picked = currentIssuerApp(JSON.parse(readFileSync(config, 'utf8')));
+    if (picked) appId = picked;
   } catch { /* fall back to the default app id */ }
   return { config, dataDir, appId };
+}
+
+/**
+ * The application lark-cli itself treats as current in a config: the profile
+ * selected by `lark-cli profile use` (`currentApp`, a profile name or app id),
+ * else the first configured app. Reading only the first app made `/login lark`
+ * mint codes for a different application than `lark-cli auth status` showed
+ * as soon as the operator switched profiles.
+ */
+export function currentIssuerApp(cfg: unknown): string | undefined {
+  if (!cfg || typeof cfg !== 'object') return undefined;
+  const { apps, currentApp } = cfg as { apps?: unknown; currentApp?: unknown };
+  if (!Array.isArray(apps)) return undefined;
+  const usable = apps.filter((a): a is { appId: string; name?: unknown } =>
+    !!a && typeof a === 'object' && typeof (a as { appId?: unknown }).appId === 'string'
+    && (a as { appId: string }).appId.startsWith('cli_'));
+  if (typeof currentApp === 'string' && currentApp) {
+    const selected = usable.find(a => a.name === currentApp) ?? usable.find(a => a.appId === currentApp);
+    if (selected) return selected.appId;
+  }
+  return usable[0]?.appId;
 }
 
 /**
@@ -308,11 +328,20 @@ function ensureBootstrapped(openId: string): boolean {
 
   const secretFile = join(dataDir, `appsecret_${machine.appId}.enc`);
   const masterKey = join(dataDir, 'master.key');
+  // The issuer is read fresh on every login, but this HOME was seeded once:
+  // after the operator switches profile (or a personal issuer appears) the
+  // person kept minting codes for the old app. Re-seed when the app changed.
+  const seededApp = seededAppId(home);
+  const reseed = seededApp !== undefined && seededApp !== machine.appId;
+  if (reseed) {
+    logger.info(`[lark-cli-auth] issuer app changed for ${openId}: ${seededApp} -> ${machine.appId}; re-seeding`);
+    clearChallenge(openId);
+  }
   try {
-    if (!existsSync(secretFile)) {
+    if (reseed || !existsSync(secretFile)) {
       copyFileSync(join(machine.dataDir, `appsecret_${machine.appId}.enc`), secretFile);
     }
-    if (!existsSync(masterKey)) {
+    if (reseed || !existsSync(masterKey)) {
       copyFileSync(join(machine.dataDir, 'master.key'), masterKey);
     }
   } catch (e) {
@@ -323,7 +352,7 @@ function ensureBootstrapped(openId: string): boolean {
   // Minimal app entry: the secret is referenced from the encrypted file lark-cli
   // itself wrote (source "keychain"), and there are no users until someone
   // actually scans. Built from the operator's config shape, not hand-invented.
-  if (!existsSync(larkCliConfigPath(home))) {
+  if (reseed || !existsSync(larkCliConfigPath(home))) {
     let appEntry: unknown = null;
     try {
       const cfg = JSON.parse(readFileSync(machine.config, 'utf8')) as
@@ -353,6 +382,16 @@ function ensureBootstrapped(openId: string): boolean {
     atomicWriteFileSync(larkCliConfigPath(home), JSON.stringify({ apps: [appEntry] }, null, 2), { mode: 0o600 });
   }
   return true;
+}
+
+/** The app this person's HOME was seeded for (undefined: not seeded yet or
+ *  unreadable — the seeding path treats both as "write it"). */
+function seededAppId(home: string): string | undefined {
+  try {
+    const cfg = JSON.parse(readFileSync(larkCliConfigPath(home), 'utf8')) as { apps?: Array<{ appId?: unknown }> };
+    const id = cfg.apps?.[0]?.appId;
+    return typeof id === 'string' ? id : undefined;
+  } catch { return undefined; }
 }
 
 /** Where a started-but-unfinished login's resume token lives — inside that

@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   beginLarkCliLogin,
+  currentIssuerApp,
   completeLarkCliLogin,
   larkCliHomeFor,
   hasLarkCliHome,
@@ -523,5 +524,61 @@ describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
     __setLarkCliRunnerForTest(runner);
     expect(await resolveLarkCliHomeForTurn(undefined)).toBeNull();
     expect(runner).not.toHaveBeenCalled();
+  });
+});
+
+describe('issuer app follows the operator\'s current lark-cli profile', () => {
+  const OTHER = 'cli_other_profile_app1';
+  function writeMachine(apps: unknown[], currentApp?: string) {
+    mkdirSync(join(machineHome, '.lark-cli'), { recursive: true });
+    const data = join(machineHome, '.local', 'share', 'lark-cli');
+    mkdirSync(data, { recursive: true });
+    writeFileSync(join(machineHome, '.lark-cli', 'config.json'), JSON.stringify({ apps, ...(currentApp ? { currentApp } : {}) }));
+    writeFileSync(join(data, `appsecret_${APP_ID}.enc`), 'secret-first');
+    writeFileSync(join(data, `appsecret_${OTHER}.enc`), 'secret-other');
+    if (!existsSync(join(data, 'master.key'))) writeFileSync(join(data, 'master.key'), 'm1');
+  }
+  const app = (appId: string, name?: string) => ({ appId, ...(name ? { name } : {}), appSecret: { source: 'keychain' }, brand: 'feishu', users: [] });
+  const seeded = () => JSON.parse(readFileSync(join(larkCliHomeFor(OPEN), '.lark-cli', 'config.json'), 'utf8')).apps[0].appId;
+
+  it('currentIssuerApp: the selected profile (by name or app id), else the first app', () => {
+    expect(currentIssuerApp({ apps: [app(APP_ID), app(OTHER, 'work')], currentApp: 'work' })).toBe(OTHER);
+    expect(currentIssuerApp({ apps: [app(APP_ID), app(OTHER)], currentApp: OTHER })).toBe(OTHER);
+    expect(currentIssuerApp({ apps: [app(APP_ID), app(OTHER)] })).toBe(APP_ID);
+    expect(currentIssuerApp({ apps: [app(APP_ID), app(OTHER)], currentApp: 'gone' })).toBe(APP_ID);
+    expect(currentIssuerApp({ apps: [] })).toBeUndefined();
+  });
+
+  it('a profile switch re-seeds the person\'s HOME and drops the old app\'s pending code', async () => {
+    let n = 0;
+    __setLarkCliRunnerForTest(async () => {
+      n += 1;
+      return { ok: true, stdout: JSON.stringify({ verification_url: `https://v/${n}`, device_code: `dc-${n}` }), stderr: '' };
+    });
+    writeMachine([app(APP_ID), app(OTHER, 'work')]);
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/1');
+    expect(seeded()).toBe(APP_ID);
+
+    // Operator runs `lark-cli profile use work`.
+    writeMachine([app(APP_ID), app(OTHER, 'work')], 'work');
+    writeFileSync(join(machineHome, '.local', 'share', 'lark-cli', 'master.key'), 'rotated-master');
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/2');
+    expect(seeded()).toBe(OTHER);
+    const data = join(larkCliHomeFor(OPEN), '.local', 'share', 'lark-cli');
+    expect(readFileSync(join(data, `appsecret_${OTHER}.enc`), 'utf8')).toBe('secret-other');
+    expect(readFileSync(join(data, 'master.key'), 'utf8')).toBe('rotated-master');
+  });
+
+  it('unchanged issuer keeps the seeded HOME and the pending code', async () => {
+    let n = 0;
+    __setLarkCliRunnerForTest(async () => {
+      n += 1;
+      return { ok: true, stdout: JSON.stringify({ verification_url: `https://v/${n}`, device_code: `dc-${n}` }), stderr: '' };
+    });
+    writeMachine([app(APP_ID)]);
+    await beginLarkCliLogin(OPEN);
+    writeFileSync(join(machineHome, '.local', 'share', 'lark-cli', 'master.key'), 'm2');
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/1');
+    expect(readFileSync(join(larkCliHomeFor(OPEN), '.local', 'share', 'lark-cli', 'master.key'), 'utf8')).toBe('m1');
   });
 });
