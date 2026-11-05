@@ -286,17 +286,20 @@ async function runAsUser(openId: string, args: string[]): Promise<LarkCliResult>
  */
 function machineLarkCliPaths(openId?: string): {
   config: string; dataDir: string; appId: string;
+  /** False when `appId` is the built-in fallback (config unreadable / no app). */
+  appIdFromConfig: boolean;
 } | null {
   const root = issuerMachineHome(openId);
   const config = join(root, '.lark-cli', 'config.json');
   const dataDir = join(root, '.local', 'share', 'lark-cli');
   if (!existsSync(config) || !existsSync(dataDir)) return null;
   let appId = DEFAULT_LARK_CLI_APP_ID;
+  let appIdFromConfig = false;
   try {
     const picked = currentIssuerApp(JSON.parse(readFileSync(config, 'utf8')));
-    if (picked) appId = picked;
+    if (picked) { appId = picked; appIdFromConfig = true; }
   } catch { /* fall back to the default app id */ }
-  return { config, dataDir, appId };
+  return { config, dataDir, appId, appIdFromConfig };
 }
 
 /**
@@ -347,16 +350,20 @@ function ensureBootstrapped(openId: string): boolean {
   // after the operator switches profile (or a personal issuer appears) the
   // person kept minting codes for the old app. Re-seed when the app changed.
   const seededApp = seededAppId(home);
-  const reseed = seededApp !== undefined && seededApp !== machine.appId;
+  // Only an app the issuer config actually names may replace a seeded HOME: a
+  // config that is unreadable for a moment (or lists no app) yields the
+  // built-in fallback, which must never wipe a working login.
+  const reseed = seededApp !== undefined && seededApp !== machine.appId && machine.appIdFromConfig;
   const needsCopy = reseed || !existsSync(secretFile) || !existsSync(masterKey);
   if (needsCopy && (!existsSync(sourceSecret) || !existsSync(sourceMasterKey))) {
     logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: issuer ${machine.appId} has no secret or master key`);
     return false;
   }
   // Everything is staged next to its target first and only then renamed into
-  // place, config last: a copy or write that fails leaves the HOME exactly as
-  // it was (never a new key under the old app's config, which lark-cli can no
-  // longer decrypt and no later login would repair).
+  // place, config last: a copy or write that fails leaves the HOME as it was
+  // (never a new key under the old app's config, which lark-cli can no longer
+  // decrypt and no later login would repair). Only a failing rename itself —
+  // a disk fault — can stop part way; the next login re-seeds from there.
   const staged: Array<[string, string]> = [];
   const stage = (target: string, write: (tmp: string) => void) => {
     const tmp = `${target}.botmux-seed`;
@@ -413,13 +420,11 @@ function ensureBootstrapped(openId: string): boolean {
     logger.info(`[lark-cli-auth] issuer changed for ${openId}: ${seededApp} -> ${machine.appId}; re-seeded`);
     clearChallenge(openId);
     for (const f of listUserTokenFiles(home)) {
-      if (!f.startsWith(`${machine.appId}_`) || seededApp === machine.appId) {
+      if (!f.startsWith(`${machine.appId}_`)) {
         try { rmSync(join(dataDir, f), { force: true }); } catch { /* best effort */ }
       }
     }
-    if (seededApp !== machine.appId) {
-      try { rmSync(join(dataDir, `appsecret_${seededApp}.enc`), { force: true }); } catch { /* best effort */ }
-    }
+    try { rmSync(join(dataDir, `appsecret_${seededApp}.enc`), { force: true }); } catch { /* best effort */ }
   }
   return true;
 }
@@ -441,10 +446,10 @@ function challengePath(openId: string): string {
 }
 
 /** The resume token + link from an in-progress login if still usable. */
-export function pendingLarkCliChallenge(openId: string): { deviceCode: string; authUrl?: string; createdAt: number; autoPollAfter?: number } | null {
+export function pendingLarkCliChallenge(openId: string): { deviceCode: string; authUrl?: string; createdAt: number; autoPollAfter?: number; appId?: string } | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { deviceCode?: unknown; authUrl?: unknown; createdAt?: unknown; autoPollAfter?: unknown };
+      { deviceCode?: unknown; authUrl?: unknown; createdAt?: unknown; autoPollAfter?: unknown; appId?: unknown };
     if (typeof raw.deviceCode !== 'string' || typeof raw.createdAt !== 'number') return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
     return {
@@ -453,6 +458,7 @@ export function pendingLarkCliChallenge(openId: string): { deviceCode: string; a
       createdAt: raw.createdAt,
       ...(typeof raw.autoPollAfter === 'number' && Number.isFinite(raw.autoPollAfter)
         ? { autoPollAfter: raw.autoPollAfter } : {}),
+      ...(typeof raw.appId === 'string' ? { appId: raw.appId } : {}),
     };
   } catch { return null; }
 }
@@ -461,7 +467,7 @@ function saveChallenge(openId: string, deviceCode: string, authUrl: string): voi
   try {
     atomicWriteFileSync(
       challengePath(openId),
-      JSON.stringify({ deviceCode, authUrl, createdAt: Date.now() }),
+      JSON.stringify({ deviceCode, authUrl, createdAt: Date.now(), appId: seededAppId(larkCliHomeFor(openId)) }),
       { mode: 0o600 },
     );
   } catch (e) {
@@ -519,7 +525,10 @@ export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginCha
   // (and invalidate the link already shown) on every message. A fresh scan
   // clears the challenge, so after they authorize a new code is correctly made.
   const pending = pendingLarkCliChallenge(openId);
-  if (pending?.authUrl && !hasLarkCliHome(openId)) {
+  // A code minted for another app (left behind by an interrupted re-seed) is
+  // not reused: completing it would land a token this HOME no longer reads.
+  if (pending?.authUrl && !hasLarkCliHome(openId)
+    && (pending.appId === undefined || pending.appId === seededAppId(home))) {
     return { authUrl: pending.authUrl };
   }
   const { ok, stdout, stderr } = await runAsUser(openId, [

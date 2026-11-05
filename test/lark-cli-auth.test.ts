@@ -655,6 +655,35 @@ describe('issuer app follows the operator\'s current lark-cli profile', () => {
     expect(await beginLarkCliLogin(OPEN)).not.toBeNull();
   });
 
+  it('an unreadable issuer config never re-seeds a working HOME onto the built-in fallback app', async () => {
+    __setLarkCliRunnerForTest(async () => ({ ok: true, stdout: JSON.stringify({ verification_url: 'https://v/1', device_code: 'dc-1' }), stderr: '' }));
+    writeMachine([app(APP_ID), app(OTHER, 'work')], 'work');
+    await beginLarkCliLogin(OPEN); // seeded for OTHER
+    const data = join(larkCliHomeFor(OPEN), '.local', 'share', 'lark-cli');
+    writeFileSync(join(data, `${OTHER}_${OPEN}.enc`), 'other-user-token');
+    // The operator config is truncated mid-write; the fallback app's secret exists.
+    writeFileSync(join(machineHome, '.lark-cli', 'config.json'), '{"apps": [');
+    await beginLarkCliLogin(OPEN);
+    expect(seeded()).toBe(OTHER);
+    expect(existsSync(join(data, `${OTHER}_${OPEN}.enc`))).toBe(true);
+    expect(hasLarkCliHome(OPEN)).toBe(true);
+  });
+
+  it('a pending code minted for another app is not handed out again', async () => {
+    let n = 0;
+    __setLarkCliRunnerForTest(async () => {
+      n += 1;
+      return { ok: true, stdout: JSON.stringify({ verification_url: `https://v/${n}`, device_code: `dc-${n}` }), stderr: '' };
+    });
+    writeMachine([app(APP_ID), app(OTHER, 'work')]);
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/1');
+    // An interrupted re-seed: the HOME now names OTHER, the challenge is still APP_ID's.
+    const cfgPath = join(larkCliHomeFor(OPEN), '.lark-cli', 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({ apps: [{ appId: OTHER, users: [] }] }));
+    writeMachine([app(APP_ID), app(OTHER, 'work')], 'work');
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/2');
+  });
+
   it('unchanged issuer keeps the seeded HOME and the pending code', async () => {
     let n = 0;
     __setLarkCliRunnerForTest(async () => {
