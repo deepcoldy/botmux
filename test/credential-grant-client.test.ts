@@ -4,7 +4,7 @@
  *
  * Run:  npx vitest run --project unit test/credential-grant-client.test.ts
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import {
@@ -200,16 +200,28 @@ describe('requestCredentialGrant transport failures', () => {
   });
 
   it('caps the whole call, retry included, at the total budget even when the transport never settles', async () => {
-    const calls: number[] = [];
-    const http = { post: (_u: string, _b: unknown, opts: any) => { calls.push(opts.timeoutMs); return new Promise<never>(() => {}); } };
-    const t0 = Date.now();
-    const r = await requestCredentialGrant(REQ, { binding: BINDING, http: http as any, timeoutMs: 200, totalBudgetMs: 1_400 });
-    const elapsed = Date.now() - t0;
-    expect(!r.ok && r.reason).toBe('network');
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toBe(200);
-    expect(calls[0]! + calls[1]!).toBeLessThanOrEqual(1_400);
-    expect(elapsed).toBeLessThan(1_400 + 300);
+    // Fake clock: on a real one a timer can fire a millisecond early by
+    // Date.now(), which hands the retry 1ms more than "budget minus elapsed".
+    vi.useFakeTimers();
+    try {
+      const calls: number[] = [];
+      const http = { post: (_u: string, _b: unknown, opts: any) => { calls.push(opts.timeoutMs); return new Promise<never>(() => {}); } };
+      const t0 = Date.now();
+      let settledAfter: number | undefined;
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http: http as any, timeoutMs: 200, totalBudgetMs: 1_400 })
+        .then(r => { settledAfter = Date.now() - t0; return r; });
+      await vi.advanceTimersByTimeAsync(1_399);
+      expect(settledAfter).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      // Checked before awaiting: a call that ignores the budget would never settle.
+      expect(settledAfter).toBe(1_400);
+      const r = await pending;
+      expect(!r.ok && r.reason).toBe('network');
+      // The retry gets exactly what is left of the budget.
+      expect(calls).toEqual([200, 1_200]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // A transport may throw BEFORE returning its promise: `postJson` parses the
