@@ -2615,6 +2615,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (defaultPicker && r.reason === 'reasoning_effort_not_supported_by_model') {
         return { toast: { type: 'warning', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.models.effort_incompatible', undefined, loc) }, ...(await reRender()) };
       }
+      if (spec.configKey === 'cliId' && r.reason === 'reasoning_effort_not_supported_by_model') {
+        return { toast: { type: 'warning', content: t('cmd.config.cli_effort_incompatible', undefined, loc) } };
+      }
       return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
     }
     if (defaultPicker) {

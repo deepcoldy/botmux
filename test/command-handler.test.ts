@@ -1339,6 +1339,42 @@ describe('/botconfig canTalkDaemonCommands uses the field parser (not the passth
 });
 
 describe('/botconfig reasoningEffort compatibility validation', () => {
+  it('recovers a rejected MiniMax CLI switch through the command suggested in the reply', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-effort-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    const entry = {
+      larkAppId: 'app-1', larkAppSecret: 'fixture', cliId: 'codex',
+      reasoningEffort: 'high', allowedUsers: ['ou_sender'],
+    };
+    writeFileSync(configPath, JSON.stringify([entry]));
+    const before = readFileSync(configPath, 'utf8');
+    const bot = { config: { ...entry }, resolvedAllowedUsers: ['ou_sender'] };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+    const deps = makeDeps();
+    const run = (content: string) => handleCommand('/botconfig', ROOT_ID,
+      makeLarkMessage(content, { senderId: 'ou_sender' }), deps, 'app-1');
+    try {
+      await run('/botconfig set cli minimax');
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect(bot.config).toMatchObject({ cliId: 'codex', reasoningEffort: 'high' });
+      const reply = vi.mocked(deps.sessionReply).mock.calls.at(-1)?.[1] ?? '';
+      const recovery = reply.match(/\/botconfig unset reasoningEffort/)?.[0];
+      expect(recovery).toBeDefined();
+      await run(recovery!);
+      await run('/botconfig set cli minimax');
+      expect(bot.config.cliId).toBe('minimax');
+      expect(bot.config.reasoningEffort).toBeUndefined();
+      const saved = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(saved.cliId).toBe('minimax');
+      expect(saved.reasoningEffort).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+
   it('rejects unsupported TraeX reasoning effort before writing bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-reasoning-'));
     const configPath = join(dir, 'bots.json');

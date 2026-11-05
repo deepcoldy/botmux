@@ -1468,7 +1468,12 @@ async function handleConfigCommand(
     }
 
     const r = await applyConfigField(larkAppId, spec, value);
-    if (!r.ok) { await reply(t('cmd.config.write_failed', { reason: r.reason }, loc)); return; }
+    if (!r.ok) {
+      await reply(spec.configKey === 'cliId' && r.reason === 'reasoning_effort_not_supported_by_model'
+        ? t('cmd.config.cli_effort_incompatible', undefined, loc)
+        : t('cmd.config.write_failed', { reason: r.reason }, loc));
+      return;
+    }
     await reply(t('cmd.config.set_ok', { field: spec.key, old: r.oldText, new: r.newText, effect: configEffectNote(r.effect, loc) }, loc));
     return;
   }

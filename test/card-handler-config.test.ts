@@ -87,6 +87,28 @@ describe('/botconfig usageDisplay enum', () => {
   });
 });
 
+describe('/botconfig CLI change with incompatible effort', () => {
+  it.each(['zh', 'en'])('gives an actionable recovery command without changing config (%s)', async loc => {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config[0].reasoningEffort = 'high';
+    writeFileSync(configPath, JSON.stringify(config));
+    const before = readFileSync(configPath, 'utf8');
+    const { registry, handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: 'config_set', field: 'cli', loc },
+        option: 'minimax',
+      },
+    }, deps, 'app_config');
+    expect(result?.toast?.type).toBe('warning');
+    // The command is a recovery action, not a snapshot of translated prose.
+    expect(result?.toast?.content).toContain('/botconfig unset reasoningEffort');
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(registry.getBot('app_config').config).toMatchObject({ cliId: 'claude-code', reasoningEffort: 'high' });
+  });
+});
+
 describe('/botconfig legacy quota', () => {
   it('keeps the read-only legacy option without rewriting it', async () => {
     const config = JSON.parse(readFileSync(configPath, 'utf8'));

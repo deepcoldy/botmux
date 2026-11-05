@@ -1804,9 +1804,9 @@ export interface ScheduledTask {
    *  session and then keep it. Creation surfaces say so out loud rather than
    *  letting the difference be discovered at fire time.
    *
-   *  Gated at fire time on the bot's CLI actually supporting the override
-   *  (isConfigurableReasoningCliId) — an unsupported pairing is dropped with a
-   *  warning, never a skipped run.
+   *  Gated at fire time by the per-task CLI policy (allowsTaskModelOverride),
+   *  independently of bot-level effort controls. An unsupported pairing is
+   *  dropped with a warning, never a skipped run.
    *
    *  It rides on the in-memory DaemonSession (spawnModelOverride), never on the
    *  session record, so a daemon restart drops it: a `topic` / `top-level` task
