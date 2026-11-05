@@ -932,7 +932,7 @@ async function triggerSessionTurnAdmitted(
     rendered: string | CliTurnPayload,
   ): void => {
     if (internal?.persistInputHistory === false) return;
-    rememberLastCliInput(target, original, rendered);
+    rememberLastCliInput(target, original, rendered, triggerId);
   };
   const recordHeadlessTurn = (target: DaemonSession): void => {
     const headless = target.session.headless;
@@ -2344,7 +2344,7 @@ async function triggerSessionTurnAdmitted(
     releaseInitialReservation();
   }
   else {
-    forkWorker(newDs, promptInput);
+    forkWorker(newDs, promptInput, triggerId);
     releaseInitialReservation();
   }
 

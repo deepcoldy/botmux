@@ -12928,7 +12928,7 @@ async function forkFromSource(
         rememberLastCliInput(
           childDs,
           opts?.forkTaskText ?? (typeof initialPrompt === 'string' ? initialPrompt : initialPrompt.content),
-          initialPrompt,
+          initialPrompt, opts?.turnId,
         );
       }
       fkw(
@@ -17802,7 +17802,7 @@ function setupWorkerHandlers(
           if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
             content: followUp.cliInput,
             ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
-          }, { codexAppInputAccepted: !!followUpCodexAppInput });
+          }, followUp.turnId, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
         invalidateStuckWarning(ds, 'prompt_ready');

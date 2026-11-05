@@ -1068,6 +1068,8 @@ export interface Session {
   modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
