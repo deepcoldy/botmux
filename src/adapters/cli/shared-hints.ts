@@ -104,6 +104,15 @@ function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean,
   return [t(transcript ? 'ai.cursor.background_task_note_transcript' : 'ai.cursor.background_task_note', undefined, locale)];
 }
 
+/** Claude Code-only, transcript delivery only: a background-task wake turn's
+ *  final is forwarded to Lark there (send mode leaves it to `botmux send`), so
+ *  the model needs to know to stay silent on routine task events. Returns []
+ *  for every other CLI and for send mode. */
+function claudeBackgroundTaskNote(cliId: CliId | undefined, locale?: Locale): string[] {
+  if (cliId !== 'claude-code') return [];
+  return [t('ai.claude.background_task_note_transcript', undefined, locale)];
+}
+
 /** ZCode-only interim-report line. ZCode emits nothing of its own mid-turn, so
  *  a long task is indistinguishable from a hang unless the model says
  *  something. The equivalent line used to live in the adapter's `systemHints`
@@ -151,6 +160,7 @@ export function buildBotmuxShellHints(
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       ...cursorBackgroundTaskNote(cliId, true, locale),
+      ...claudeBackgroundTaskNote(cliId, locale),
       ...zcodeProgressReportNote(cliId, locale),
       hiddenContextDefense(locale),
     ]

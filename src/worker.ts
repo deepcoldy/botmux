@@ -10613,7 +10613,13 @@ function emitReadyTurns(opts: {
     // check at the gate below can never run. Scheduled turns are always
     // evaluated AFTER the transcript text is available, where NOTHING_TO_SEND
     // and send-marker dedup (incl. the length comparison) have the final.
-    if (!turn.isScheduled && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+    // A background-task wake in transcript delivery is forwarded like a
+    // scheduled turn (its final is the session's only reply channel), so it
+    // skips this pre-text gate for the same reason. Every other delivery mode
+    // keeps it an ordinary headless local turn.
+    const forwardBackgroundWake = turn.isBackgroundWake === true && !adoptMode
+      && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript';
+    if (!turn.isScheduled && !forwardBackgroundWake && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (local-typed)`);
       continue;
     }
@@ -10665,6 +10671,7 @@ function emitReadyTurns(opts: {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       isScheduled: turn.isScheduled,
+      ...(forwardBackgroundWake ? { isBackgroundWake: true } : {}),
       finalText: assistantText,
       forwardLocalFinal: zeroPromptTerminalSync(),
     }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
@@ -10676,7 +10683,8 @@ function emitReadyTurns(opts: {
       // turn here already means completed. The claude family's limits arrive via
       // maybeEmitStructuredRateLimit → noteStructuredLimit, which revokes this.
       usageLimitTracker.noteTurnCompleted('answered');
-      const reason = turn.isScheduled ? 'scheduled turn already sent / silent' : 'local-typed';
+      const reason = turn.isScheduled ? 'scheduled turn already sent / silent'
+        : forwardBackgroundWake ? 'background wake already sent / silent' : 'local-typed';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
       // Positive silence evidence for the terminal — only a bare nothing-to-send
       // sentinel (no prose, no send), never "already sent" / local-typed.
@@ -10699,7 +10707,7 @@ function emitReadyTurns(opts: {
     const postText = bridgePostText(assistantText, adoptMode);
     if (!adoptMode && postText.trim().length === 0) continue;
 
-    if (turn.isLocal && !turn.isScheduled && !zeroPromptTerminalSync()) {
+    if (turn.isLocal && !turn.isScheduled && !forwardBackgroundWake && !zeroPromptTerminalSync()) {
       if (turn.userUuid) {
         // Local turn (adopt mode only): also surface the user prompt so the
         // Lark thread shows both sides of the exchange. User text comes from
@@ -10774,7 +10782,9 @@ function emitReadyTurns(opts: {
       // durable anchor store after a re-attach). Thread scope ignores this and
       // routes to the session root. Omitted in zero-injection mode —
       // terminalLocal owns routing there.
-      ...(turn.isScheduled && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
+      // A forwarded background wake anchors to the Lark turn that launched
+      // its task (the queue only flags a wake when that anchor is known).
+      ...((turn.isScheduled || forwardBackgroundWake) && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
         ? { replyTurnId: turn.replyAnchorTurnId }
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),

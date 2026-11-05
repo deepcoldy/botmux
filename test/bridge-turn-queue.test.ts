@@ -2203,3 +2203,144 @@ describe('input held in Claude\'s own queue', () => {
       .toEqual([['t1', false], ['t2', false]]);
   });
 });
+
+// Real-shaped transcript (trimmed + sanitised from Claude Code 2.1.318): a Lark
+// turn launches `run_in_background` Bash and ends; the task's
+// `<task-notification>` then wakes the main thread, which answers on its own.
+describe('Claude background-task wake turns', () => {
+  const FIXTURE = new URL('./fixtures/claude-background-wake/wake-after-lark-turn.jsonl', import.meta.url);
+  const LARK_PROMPT = '<user_message>盯一下 PR 的 CI，跑完告诉我结果</user_message>';
+
+  /** Fixture events. `live` re-stamps them after `liveAfterMs` (records
+   *  written while this queue watches); otherwise they keep their original,
+   *  older timestamps (history a restarted worker replays). */
+  function fixtureEvents(opts: { liveAfterMs?: number } = {}): TranscriptEvent[] {
+    const events = readFileSync(FIXTURE, 'utf8').trim().split('\n').map(line => JSON.parse(line) as TranscriptEvent);
+    if (opts.liveAfterMs === undefined) return events;
+    const shift = opts.liveAfterMs + 1_000 - Date.parse(events[0].timestamp!);
+    return events.map(ev => ({ ...ev, timestamp: new Date(Date.parse(ev.timestamp!) + shift).toISOString() }));
+  }
+  function withFinal(events: TranscriptEvent[], text: string): TranscriptEvent[] {
+    return events.map(ev => ev.uuid === 'wake-a-final'
+      ? { ...ev, message: { ...ev.message!, content: [{ type: 'text', text }] } }
+      : ev);
+  }
+  function markLark(q: BridgeTurnQueue, turnId = 'lark-t1', prompt = LARK_PROMPT): void {
+    q.mark(turnId, makeFingerprint(prompt), Date.now() - 60_000, normaliseForFingerprint(prompt));
+  }
+  function readyWake(q: BridgeTurnQueue) {
+    const ready = q.drainEmittable({ explicitTerminalOnly: true, releaseHeldTerminals: true });
+    return { ready, wake: ready.find(turn => turn.isLocal) };
+  }
+  /** The worker's transcript-mode decision for a local turn. */
+  async function suppressed(turn: ReturnType<typeof readyWake>['wake'], events: TranscriptEvent[], replyDelivery: 'send' | 'transcript') {
+    const { trailingAssistantText } = await import('../src/services/claude-transcript.js');
+    return shouldSuppressBridgeEmit({
+      markTimeMs: turn!.markTimeMs,
+      isLocal: turn!.isLocal,
+      isScheduled: turn!.isScheduled,
+      ...(turn!.isBackgroundWake ? { isBackgroundWake: true } : {}),
+      finalText: trailingAssistantText(events, turn!.assistantUuids, {}),
+      forwardLocalFinal: false,
+    }, undefined, [], false, replyDelivery);
+  }
+
+  it('a live wake turn anchors to the launching Lark turn and is forwarded in transcript delivery', async () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    q.ingest(events);
+    const { ready, wake } = readyWake(q);
+    expect(ready.map(turn => turn.turnId)).toEqual(['lark-t1', 'local-headless-wake-a-final']);
+    expect(wake).toMatchObject({ isBackgroundWake: true, replyAnchorTurnId: 'lark-t1', assistantUuids: ['wake-a-final'] });
+    expect(await suppressed(wake, events, 'transcript')).toBe(false);
+  });
+
+  it('send delivery still suppresses the same wake turn', async () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    q.ingest(events);
+    expect(await suppressed(readyWake(q).wake, events, 'send')).toBe(true);
+  });
+
+  it('a NOTHING_TO_SEND wake final stays silent in transcript delivery', async () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = withFinal(fixtureEvents({ liveAfterMs: Date.now() }), 'BOTMUX_NOTHING_TO_SEND');
+    q.ingest(events);
+    const { wake } = readyWake(q);
+    expect(wake?.isBackgroundWake).toBe(true);
+    expect(await suppressed(wake, events, 'transcript')).toBe(true);
+  });
+
+  it('anchors to the launching Lark turn, not a later one that ran in between', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const wakeAt = events.findIndex(ev => ev.uuid === 'wake-user');
+    q.ingest(events.slice(0, wakeAt));
+    q.mark('lark-t2', makeFingerprint('另一个问题'));
+    q.ingest([user('lark-user-2', '另一个问题'), assistant('lark-a2', '答复'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'lark-duration-2' } as TranscriptEvent]);
+    q.ingest(events.slice(wakeAt));
+    expect(readyWake(q).wake).toMatchObject({ isBackgroundWake: true, replyAnchorTurnId: 'lark-t1' });
+  });
+
+  it('a wake replayed from before this queue existed stays an ordinary local turn', async () => {
+    // Journal restore / rotation replays: the records predate the worker.
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents();
+    q.ingest(events);
+    const { wake } = readyWake(q);
+    expect(wake?.isBackgroundWake).toBeFalsy();
+    expect(await suppressed(wake, events, 'transcript')).toBe(true);
+  });
+
+  it('a wake whose notification the baseline absorbed stays an ordinary headless turn', () => {
+    const q = new BridgeTurnQueue();
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const continuationAt = events.findIndex(ev => ev.uuid === 'wake-a-thinking');
+    q.absorb(events.slice(0, continuationAt));
+    q.ingest(events.slice(continuationAt));
+    const { wake } = readyWake(q);
+    expect(wake?.turnId).toBe('local-headless-wake-a-final');
+    expect(wake?.isBackgroundWake).toBeFalsy();
+  });
+
+  it('a task launched from a terminal-typed turn has no anchor: its wake stays local', () => {
+    const q = new BridgeTurnQueue();
+    // An earlier Lark turn exists, but it is not the one that launched the task.
+    q.mark('lark-t0', makeFingerprint('先看一下状态'));
+    q.ingest([user('lark-user-0', '先看一下状态'), assistant('lark-a0', '状态正常'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'lark-duration-0' } as TranscriptEvent]);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    q.ingest(events);  // no Lark mark for this prompt: the launching turn is local
+    const ready = q.drainEmittable({ explicitTerminalOnly: true, releaseHeldTerminals: true });
+    const wake = ready.find(turn => turn.assistantUuids.includes('wake-a-final'));
+    expect(wake?.isBackgroundWake).toBeFalsy();
+  });
+
+  it('a sidechain notification does not open a wake turn', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() })
+      .map(ev => ev.uuid === 'wake-user' ? { ...ev, isSidechain: true } : ev);
+    q.ingest(events);
+    expect(readyWake(q).wake?.isBackgroundWake).toBeFalsy();
+  });
+
+  it('a notification read while the Lark turn is still open neither splits it nor arms a wake', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    // Drop the Lark turn's duration marker: the notification lands inside it.
+    const events = fixtureEvents({ liveAfterMs: Date.now() })
+      .filter(ev => ev.uuid !== 'lark-duration' && ev.uuid !== 'lark-a-final');
+    q.ingest(events);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true, releaseHeldTerminals: true });
+    expect(ready.map(turn => turn.turnId)).toEqual(['lark-t1']);
+    expect(ready[0].assistantUuids).toEqual(['wake-a-final']);
+    expect(ready.some(turn => turn.isBackgroundWake)).toBe(false);
+  });
+});
