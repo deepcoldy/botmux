@@ -177,6 +177,38 @@ describe('多步写入只完成一半', () => {
   });
 });
 
+describe('模板运行的主 Bot 会话（迁入主话题）', () => {
+  it('died while moving it in: the next process binds the same session, never opens a second', async () => {
+    const { h, launch } = setup();
+    const saved = await templateFromRun(h, '0011');
+    const draft = await h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId });
+    launch.hangBefore('bindSession');
+    await h.service.launch(draft.runId, OWNER, {});
+    for (let i = 0; i < 400 && launch.count('bindSession') === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(readWorkflowDraft(join(base, draft.runId))!.launch!.migrate).toMatchObject({ status: 'binding' });
+    const next = new WorkflowDraftService({ ...h.deps });
+    next.recoverInterrupted();
+    await next.continueLaunch(draft.runId, OWNER);
+    expect((await settled(next, draft.runId)).phase).toBe('started');
+    expect(h.clarify.sessions.size).toBe(1);
+    const [sessionId] = [...h.clarify.sessions.keys()];
+    expect(launch.binds.map((b) => b.sessionId)).toEqual([sessionId]);
+    expect(h.clarify.sessions.get(sessionId!)!.closed).toBe(false);
+  });
+
+  it('a bind that failed leaves the session the topic\'s: 「放弃」 keeps it open (D4 rule)', async () => {
+    const { h, launch } = setup();
+    const saved = await templateFromRun(h, '0012');
+    const draft = await h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId });
+    launch.failNext('bindSession', new Error('worker busy'));
+    await h.service.launch(draft.runId, OWNER, {});
+    expect((await settled(h.service, draft.runId)).launch).toMatchObject({ state: 'paused', error: { step: 'migrate', code: 'bind_failed' } });
+    await h.service.abandonLaunch(draft.runId, OWNER);
+    const [sessionId] = [...h.clarify.sessions.keys()];
+    expect(h.clarify.sessions.get(sessionId!)!.closed).toBe(false);
+  });
+});
+
 describe('人工中途干预', () => {
   it('stopped at the live check, a bot swapped on a template run: 确认流程 again, then it starts as an ad-hoc run', async () => {
     const { h, launch } = setup();

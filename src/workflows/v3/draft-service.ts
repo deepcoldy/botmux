@@ -139,6 +139,7 @@ import {
   parseDraftClarifyOutput,
 } from './draft-clarify.js';
 import {
+  buildTemplateRunSessionPrompt,
   groupNameHasMarker,
   launchGroupName,
   launchMarker,
@@ -2740,8 +2741,78 @@ export class WorkflowDraftService {
    *  reconciled here (the bind is idempotent). A session that no longer
    *  exists does not hold the launch up: the topic then gets its session from
    *  its first message. */
+  /**
+   * A template run (D5) has no clarify session: open one for the main bot
+   * here (a headless session with a short context turn, never a workflow
+   * command), recorded on the draft like a clarify session, so the move into
+   * the main topic below is D4's binding → bind → migrated. Its own
+   * reservation keeps a second operation from opening another; a session
+   * whose first turn did not go in is closed and opened again on 「继续」.
+   * True when the move may go on.
+   */
+  private async openTemplateRunSession(runId: string, token: string): Promise<boolean> {
+    const reservation = this.reserve();
+    type Plan = { prompt: string; title: string } | 'ready' | 'busy';
+    let plan: Plan;
+    let stale: { sessionId: string; headlessId?: string } | undefined;
+    try {
+      const out = this.launchTx<Plan>(runId, token, ({ draft, launch }) => {
+        const template = draft.template;
+        if (!template || launch.migrate?.status === 'binding') return { changed: false, result: 'ready' as const };
+        if (draft.clarify.sessionId && draft.clarify.state !== 'disconnected') return { changed: false, result: 'ready' as const };
+        if (draft.clarify.pending) return { changed: false, result: 'busy' as const };
+        if (draft.clarify.sessionId) {
+          // Created, but its first turn did not go in: not relayable as is.
+          stale = { sessionId: draft.clarify.sessionId, ...(draft.clarify.headlessId ? { headlessId: draft.clarify.headlessId } : {}) };
+          delete draft.clarify.sessionId;
+          delete draft.clarify.headlessId;
+        }
+        draft.clarify.state = 'active';
+        draft.clarify.pending = this.reservationEntry(reservation);
+        return {
+          changed: true,
+          result: {
+            prompt: buildTemplateRunSessionPrompt({ runId, displayName: template.displayName, humanVersion: template.humanVersion, params: template.params }),
+            title: clip(template.displayName.replace(/\s+/g, ' '), 80),
+          },
+        };
+      });
+      if (!out.held) {
+        this.inflight.delete(reservation);
+        return false;
+      }
+      plan = out.result;
+    } catch (error) {
+      this.inflight.delete(reservation);
+      throw error;
+    }
+    if (plan === 'ready' || plan === 'busy') {
+      this.inflight.delete(reservation);
+      if (plan === 'busy') {
+        this.stopLaunch(runId, token, { step: 'migrate', code: 'session_busy', retryable: true, message: '主 Bot 的会话正在处理上一步，请稍后点「继续」' });
+        return false;
+      }
+      return true;
+    }
+    if (stale) await this.closeOrRemember(runId, stale);
+    await this.startSession(runId, plan.prompt, plan.title, reservation);
+    const opened = this.launchTx(runId, token, ({ draft }) => ({
+      changed: false,
+      result: draft.clarify.sessionId && draft.clarify.state !== 'disconnected'
+        ? undefined
+        : draft.clarify.error ?? '会话没有开起来',
+    }));
+    if (!opened.held) return false;
+    if (opened.result !== undefined) {
+      this.stopLaunch(runId, token, { step: 'migrate', code: 'session_start_failed', retryable: true, message: `主 Bot 的会话没能开起来：${opened.result}；点「继续」重试` });
+      return false;
+    }
+    return true;
+  }
+
   private async launchMigrateStep(runId: string, token: string): Promise<boolean> {
     const deps = this.deps.launch!;
+    if (!await this.openTemplateRunSession(runId, token)) return false;
     const snap = this.launchTx(runId, token, ({ draft, launch, grill }) => {
       const sessionId = launch.migrate?.status === 'binding' ? launch.migrate.sessionId ?? draft.clarify.sessionId : draft.clarify.sessionId;
       const usable = !!sessionId && (launch.migrate?.status === 'binding'
@@ -2756,14 +2827,14 @@ export class WorkflowDraftService {
       }
       return {
         changed,
-        result: { chatId: launch.chat!.chatId, rootMessageId: launch.root!.messageId, session, title: this.titleOf(draft, grill), template: !!draft.template },
+        result: { chatId: launch.chat!.chatId, rootMessageId: launch.root!.messageId, session, title: this.titleOf(draft, grill) },
       };
     });
     if (!snap.held) return false;
     const { chatId, rootMessageId, session, title } = snap.result;
     let bound: Awaited<ReturnType<DraftLaunchDeps['bindSession']>>;
     if (!session) {
-      bound = { ok: false, error: snap.result.template ? '从模板运行，没有澄清会话' : '澄清会话已断开', unavailable: true };
+      bound = { ok: false, error: '澄清会话已断开', unavailable: true };
     } else {
       try {
         bound = await deps.bindSession({ ...session, chatId, rootMessageId, title });
