@@ -13,7 +13,10 @@ import { join } from 'node:path';
 import {
   claudeStopFailureBelongsToOwner,
   classifyClaudeStopFailure,
+  CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS,
+  CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS,
   CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS,
+  ClaudeStopFailureTranscriptEvidence,
   CLAUDE_STOP_FAILURE_OUTBOX_MAX_AGE_MS,
   CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX,
   decideClaudeStopFailureFallback,
@@ -69,6 +72,14 @@ describe('parseClaudeStopFailureHookInput', () => {
       transcriptPath: TRANSCRIPT,
       claudePid: 782482,
     });
+  });
+
+  it('reads the sub-agent identity Claude puts on hooks a sub-agent runs', () => {
+    const parsed = parseClaudeStopFailureHookInput(JSON.stringify({
+      ...hookPayload, agent_id: 'a1b2c3d4e5f6a7b8c', agent_type: 'general-purpose',
+    }));
+    expect(parsed).toMatchObject({ agentId: 'a1b2c3d4e5f6a7b8c', agentType: 'general-purpose' });
+    expect(normalizeClaudeStopFailureReport(JSON.parse(JSON.stringify(parsed)))).toEqual(parsed);
   });
 
   it('rejects other hook events, payloads without an error type and non-JSON', () => {
@@ -200,10 +211,22 @@ describe('decideClaudeStopFailureFallback', () => {
 });
 
 describe('handleClaudeStopFailureReport', () => {
-  function harness(opts: { settled?: 'completed' | 'failed'; surfacedBy?: 'before' | 'catch-up' } = {}) {
+  function harness(opts: {
+    settled?: 'completed' | 'failed';
+    surfacedBy?: 'before' | 'catch-up';
+    /** The failure's record is in the bridge's transcript (default), or nowhere. */
+    record?: false;
+  } = {}) {
     const timers: Array<{ delayMs: number; run: () => void }> = [];
     const settled = new Map<string, string>(opts.settled ? [['om_failed', opts.settled]] : []);
-    let clock = 1_000_000;
+    let clock = Date.parse('2026-11-06T00:42:00.000Z');
+    const evidence = new ClaudeStopFailureTranscriptEvidence();
+    const record = (over: Partial<TranscriptEvent> = {}, atMs = clock - 300) => evidence.observe(
+      [{ ...transcriptRecord, timestamp: new Date(atMs).toISOString(), ...over }], TRANSCRIPT,
+    );
+    if (opts.record !== false) record();
+    const logs: string[] = [];
+    const noticed = new Set<string>();
     let surfacedAt: number | undefined = opts.surfacedBy === 'before' ? clock - 1_000 : undefined;
     const emitted: unknown[][] = [];
     const notices: unknown[][] = [];
@@ -220,14 +243,16 @@ describe('handleClaudeStopFailureReport', () => {
       cliIdle: () => idle,
       isKnownTurn: (turnId: string) => ['om_failed', 'om_older', 'om_next'].includes(turnId),
       lastFailureSurfacedAtMs: () => surfacedAt,
+      transcriptEvidence: evidence,
+      claimTurnNotice: (turnId: string) => !noticed.has(turnId) && !!noticed.add(turnId),
       now: () => clock,
       advance: (ms: number) => { clock += ms; },
       setIdle: (value: boolean) => { idle = value; },
       emit: (...args: unknown[]) => { emitted.push(args); },
       notify: (...args: unknown[]) => { notices.push(args); },
-      log: () => undefined,
+      log: (line: string) => { logs.push(line); },
     };
-    return { ctx, timers, emitted, notices };
+    return { ctx, timers, emitted, notices, logs, record };
   }
   const fromDrivenCli = parseClaudeStopFailureHookInput(JSON.stringify(hookPayload), '4242')!;
 
@@ -344,6 +369,127 @@ describe('handleClaudeStopFailureReport', () => {
     timers[0].run();
     expect(emitted).toEqual([]);
     expect(notices).toEqual([]);
+  });
+
+  // 2.1.318: a background request Claude forks from the main context after a
+  // turn (memory extraction, prompt suggestion) fails and runs StopFailure
+  // with the main session's ids and transcript; nothing reaches the transcript.
+  const backgroundFailure = parseClaudeStopFailureHookInput(JSON.stringify({
+    ...hookPayload, error: 'unknown', last_assistant_message: 'API Error: Request was aborted.',
+  }), '4242')!;
+  const runAll = (timers: Array<{ run: () => void }>) => { for (let i = 0; i < timers.length; i++) timers[i].run(); };
+
+  it('says nothing for a failure the bridge\'s transcript never recorded on a completed turn', () => {
+    const { ctx, timers, emitted, notices, logs } = harness({ settled: 'completed', record: false });
+    handleClaudeStopFailureReport(backgroundFailure, { turnId: 'om_failed' }, ctx);
+    timers[0].run();
+    // A record that lost the race against the hook still gets its time.
+    expect(timers.map(t => t.delayMs)).toEqual([CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS, CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS]);
+    timers[1].run();
+    expect(emitted).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(logs.at(-1)).toContain('error="unknown"');
+    expect(logs.at(-1)).toContain('last_assistant_message="API Error: Request was aborted."');
+  });
+
+  it('never fails a running turn on a failure the transcript never recorded', () => {
+    const { ctx, timers, emitted, notices } = harness({ record: false });
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    runAll(timers);
+    expect(emitted).toEqual([]);
+    expect(notices).toEqual([]);
+  });
+
+  it('bounds the diagnostic line', () => {
+    const { ctx, timers, logs } = harness({ settled: 'completed', record: false });
+    handleClaudeStopFailureReport(
+      { ...backgroundFailure, errorDetails: 'd'.repeat(2_000), lastAssistantMessage: 'm'.repeat(2_000) },
+      { turnId: 'om_failed' }, ctx,
+    );
+    runAll(timers);
+    expect(logs.at(-1)!.length).toBeLessThan(700);
+  });
+
+  it('reports the failure once its record reaches the bridge after the hook', () => {
+    const { ctx, timers, notices, record } = harness({ settled: 'completed', record: false });
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    timers[0].run();
+    expect(notices).toEqual([]);
+    // Written before the hook started, read by the bridge only now.
+    record({}, ctx.now() - 200);
+    timers[1].run();
+    expect(notices).toEqual([['provider_server_error', 'om_failed']]);
+  });
+
+  it('reports a synthetic main-chain terminal that has no error code of its own', () => {
+    // malformed_tool_use_exhausted / empty_completion: the record has no
+    // `error`, the hook says `unknown`.
+    const { ctx, timers, notices, record } = harness({ settled: 'completed', record: false });
+    record({
+      error: undefined,
+      apiError: 'empty_completion',
+      message: { ...transcriptRecord.message, content: [{ type: 'text', text: 'The model returned an empty response (retry also failed).' }] },
+    } as Partial<TranscriptEvent>);
+    handleClaudeStopFailureReport(backgroundFailure, { turnId: 'om_failed' }, ctx);
+    runAll(timers);
+    expect(notices).toEqual([['provider_unknown_error', 'om_failed']]);
+  });
+
+  it('only takes a non-sidechain record of the same error, near the report', () => {
+    for (const [over, atMsOffset] of [
+      [{ isSidechain: true }, -300],
+      [{ error: 'authentication_failed' }, -300],
+      [{}, -CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS - 1_000],
+    ] as Array<[Partial<TranscriptEvent>, number]>) {
+      const { ctx, timers, notices, record } = harness({ settled: 'completed', record: false });
+      record(over, ctx.now() + atMsOffset);
+      handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+      runAll(timers);
+      expect(notices).toEqual([]);
+    }
+  });
+
+  it('takes a report naming another transcript as it is (the bridge lost the session)', () => {
+    const { ctx, timers, notices } = harness({ settled: 'completed', record: false });
+    handleClaudeStopFailureReport(
+      { ...fromDrivenCli, transcriptPath: `/home/u/.claude/projects/-work/rotated.jsonl` },
+      { turnId: 'om_failed' }, ctx,
+    );
+    timers[0].run();
+    expect(timers).toHaveLength(1);
+    expect(notices).toEqual([['provider_server_error', 'om_failed']]);
+  });
+
+  it('leaves a sub-agent\'s failure to the parent agent', () => {
+    const { ctx, timers, emitted, notices, logs } = harness();
+    handleClaudeStopFailureReport(
+      { ...fromDrivenCli, agentId: 'a1b2c3d4e5f6a7b8c', agentType: 'general-purpose' },
+      { turnId: 'om_failed' }, ctx,
+    );
+    expect(timers).toEqual([]);
+    expect(emitted).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(logs.at(-1)).toContain('agent_id="a1b2c3d4e5f6a7b8c"');
+  });
+
+  it('tells a closed turn about its failures once', () => {
+    const { ctx, timers, notices, record } = harness({ settled: 'completed' });
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    runAll(timers);
+    ctx.advance(60_000);
+    record({}, ctx.now() - 300);
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    runAll(timers);
+    expect(notices).toEqual([['provider_server_error', 'om_failed']]);
+  });
+
+  it('lets one record back one report only', () => {
+    const evidence = new ClaudeStopFailureTranscriptEvidence();
+    const at = Date.parse('2026-11-06T00:42:00.000Z');
+    evidence.observe([{ ...transcriptRecord, timestamp: new Date(at).toISOString() }], TRANSCRIPT);
+    expect(evidence.take(fromDrivenCli, at + 1_000)).toBe(true);
+    expect(evidence.take(fromDrivenCli, at + 1_000)).toBe(false);
+    expect(evidence.take({ ...fromDrivenCli, transcriptPath: undefined }, at + 1_000)).toBe(false);
   });
 });
 

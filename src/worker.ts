@@ -224,7 +224,9 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
-import { drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
+import {
+  ClaudeStopFailureTranscriptEvidence, drainClaudeStopFailureOutbox, handleClaudeStopFailureReport,
+} from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence.js';
 import {
@@ -7501,6 +7503,9 @@ function classifyUsageLimitWithNativeEvidence(
 // Attribution lives in BridgeTurnQueue; this file only manages the
 // fs.watch wakeup, byte-offset bookkeeping, lazy baseline, and IPC emit.
 let bridgeJsonlPath: string | undefined;
+/** Main-chain terminal records the bridge read: a StopFailure report naming
+ *  the bridge's transcript only counts with one of them. */
+const claudeStopFailureEvidence = new ClaudeStopFailureTranscriptEvidence();
 /** Directory enclosing bridgeJsonlPath. We poll this dir for newer jsonl
  *  files so the bridge follows `/clear` / `/resume` in the user's CLI —
  *  those create a brand-new sessionId.jsonl, and a watcher pinned to the
@@ -10123,6 +10128,7 @@ function bridgeIngest(): void {
     cliTranscriptEverExisted = true;
   }
   bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  claudeStopFailureEvidence.observe(result.events, bridgeJsonlPath);
   // Arm (or keep) the no-idle-edge watchdog for a fresh head now waiting on
   // its closing records. No-op while an idle settle owns the wait.
   updateProvisionalExitWatch();
@@ -13472,7 +13478,10 @@ function drainSecondaryPaths(): void {
   for (const [path, offset] of bridgeSecondaryPaths) {
     try {
       const result = drainTranscript(path, offset);
-      if (result.events.length > 0) bridgeQueue.ingest(result.events, path);
+      if (result.events.length > 0) {
+        bridgeQueue.ingest(result.events, path);
+        claudeStopFailureEvidence.observe(result.events, path);
+      }
       // Retired paths belong to a Claude session we already left, so the router
       // drops them; routed anyway so the "every queue-feeding drain goes
       // through one entry" rule has no exception to reason about.
@@ -21231,6 +21240,10 @@ function postTerminalPromptFenceHolds(
   }
 }
 
+/** Turns that already got a StopFailure notice (one each), oldest first. */
+const claudeStopFailureNoticedTurns = new Set<string>();
+const CLAUDE_STOP_FAILURE_NOTICED_TURNS_MAX = 64;
+
 /** Claude ended a turn on an API error (`StopFailure` hook; it does not run
  *  `Stop` hooks there). The transcript normally surfaces that failure on its
  *  own API-error record; when the bridge has lost the turn nothing would, so
@@ -21249,16 +21262,30 @@ function handleClaudeStopFailure(
   for (const sid of [lastSpawnEffectiveCliSessionId, lastInitConfig?.cliSessionId]) {
     if (sid) cliSessionIds.add(sid);
   }
-  const timer = handleClaudeStopFailureReport(msg.report, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }, {
+  handleClaudeStopFailureReport(msg.report, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }, {
     owner: { cliPid: bridgeCliPid, cliSessionIds, transcriptPath: bridgeJsonlPath },
     activeTurn: { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
-    schedule: (delayMs, run) => setTimeout(run, delayMs),
+    schedule: (delayMs, run) => {
+      const handle = setTimeout(run, delayMs);
+      handle.unref?.();
+      return handle;
+    },
     catchUp: () => { if (bridgeJsonlPath) bridgeIngest(); },
     settledStatus: (turnId, dispatchAttempt) => emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt),
     cliIdle: () => isPromptReady,
     isKnownTurn: turnId => turnId === currentBotmuxTurnId || retiredTurnIds.has(turnId)
       || queuedTypeAheadTurns.some(queued => queued.turnId === turnId),
     lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
+    transcriptEvidence: claudeStopFailureEvidence,
+    claimTurnNotice: (turnId, dispatchAttempt) => {
+      const key = `${turnId}\u0000${dispatchAttempt ?? ''}`;
+      if (claudeStopFailureNoticedTurns.has(key)) return false;
+      claudeStopFailureNoticedTurns.add(key);
+      if (claudeStopFailureNoticedTurns.size > CLAUDE_STOP_FAILURE_NOTICED_TURNS_MAX) {
+        claudeStopFailureNoticedTurns.delete(claudeStopFailureNoticedTurns.values().next().value!);
+      }
+      return true;
+    },
     now: Date.now,
     emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
       emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable);
@@ -21273,7 +21300,6 @@ function handleClaudeStopFailure(
     },
     log,
   }, opts);
-  timer?.unref?.();
 }
 
 /** An isolated session's hook client falls back to the relay outbox once the
