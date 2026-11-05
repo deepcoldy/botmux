@@ -5,6 +5,8 @@ import { FeedbackExtensionStore, type ExtensionJobInput } from './feedback-exten
 import { resolveFeedbackPresentation } from './feedback-presentation.js';
 import { buildFeedbackSurface } from './feedback-template.js';
 import { feedbackAnswerGroups } from './feedback-answer-binding.js';
+import { logger } from '../utils/logger.js';
+import { feedbackRefreshBudget, refreshFeedbackMessage, type FeedbackRefreshBudget } from './feedback-refresh.js';
 
 function identity(parts: unknown[]): string { return createHash('sha256').update(JSON.stringify(parts)).digest('hex'); }
 
@@ -14,9 +16,12 @@ export async function reconcileFeedbackSurfaces(input: {
   startedAt?: string;
   send: (subjectId: string, card: Record<string, unknown>, operationId: string, chatId: string, round: number) => Promise<string>;
   answerUrl: (messageId: string, chatId: string) => string | Promise<string>;
-  removeInline: (messageId: string) => Promise<void>;
+  removeInline: (messageId: string, signal?: AbortSignal) => Promise<void>;
+  refreshBudget?: FeedbackRefreshBudget;
 }): Promise<void> {
   const { extensions, source } = input;
+  extensions.expire(input.now());
+  const refreshBudget = input.refreshBudget ?? feedbackRefreshBudget();
   const cursorKey = `${input.sourceKey}:${input.appId}`;
   const cursor = extensions.cursor(cursorKey);
   const events = await source.readFeedbackEventsAfter({ after: cursor, limit: 100 });
@@ -69,6 +74,7 @@ export async function reconcileFeedbackSurfaces(input: {
           return (binding?.sourceMessageId ?? delivery.topicRootId) === subjectId && (!binding || binding.answerKind === 'substantive');
         }));
         for (const group of groups) {
+          try {
           const { delivery, id: answerId, round } = group;
           if (!delivery.policy || !delivery.chatId || !delivery.topicRootId
             || (input.startedAt && delivery.createdAt < input.startedAt)) continue;
@@ -94,6 +100,11 @@ export async function reconcileFeedbackSurfaces(input: {
               mode: rule.mode, templateId: template.id, template, answerUrl,
             } });
           }
+          } catch (error) {
+            const reason = error instanceof Error && /^feedback_[a-z_]+$/.test(error.message) ? error.message : 'feedback_surface_prepare_failed';
+            extensions.audit(`surface:${group.id}`, reason, input.now());
+            logger.warn(`[feedback-extension] skipped answer=${group.id} reason=${reason}`);
+          }
         }
       }
     }
@@ -101,10 +112,8 @@ export async function reconcileFeedbackSurfaces(input: {
   }
   if (entries.length) extensions.ingest(cursorKey, cursor, entries);
   for (const messageId of extensions.inlineCleanups(input.appId)) {
-    try {
-      await input.removeInline(messageId);
-      extensions.clearInlineCleanup(input.appId, messageId);
-    } catch {}
+    await refreshFeedbackMessage({ store: extensions, appId: input.appId, messageId, kind: 'cleanup', budget: refreshBudget,
+      run: signal => input.removeInline(messageId, signal) });
   }
   extensions.expire(input.now());
   const job = extensions.claim('surface', input.now(), 60000, input.appId);
@@ -127,8 +136,8 @@ export async function reconcileFeedbackSurfaces(input: {
     const messageId = await input.send(payload.subjectId, payload.card, job.id.slice(0, 32), String(job.payload.chatId), Number(job.payload.round));
     if (!extensions.completeSurface(job.id, job.token!, messageId, input.now())) return;
     if (payload.mode === 'separate') {
-      await input.removeInline(payload.answerMessageId);
-      extensions.clearInlineCleanup(input.appId, payload.answerMessageId);
+      await refreshFeedbackMessage({ store: extensions, appId: input.appId, messageId: payload.answerMessageId,
+        kind: 'cleanup', budget: refreshBudget, run: signal => input.removeInline(payload.answerMessageId, signal) });
     }
   } catch {
     extensions.settle(job.id, job.token!, 'unknown', { reason: 'surface_delivery_unknown' }, input.now());

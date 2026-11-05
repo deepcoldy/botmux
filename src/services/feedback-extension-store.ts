@@ -31,6 +31,9 @@ export class FeedbackExtensionStore {
       CREATE TABLE IF NOT EXISTS subject_bindings(app_id TEXT NOT NULL,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,
         binding TEXT NOT NULL,PRIMARY KEY(app_id,session_id,turn_id));
       CREATE TABLE IF NOT EXISTS inline_cleanup(app_id TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(app_id,message_id));
+      CREATE TABLE IF NOT EXISTS refresh_state(app_id TEXT NOT NULL,message_id TEXT NOT NULL,kind TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,next_run INTEGER NOT NULL DEFAULT 0,terminal INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(app_id,message_id,kind));
       PRAGMA user_version=1;
     `);
   }
@@ -145,6 +148,39 @@ export class FeedbackExtensionStore {
   }
   clearInlineCleanup(appId: string, messageId: string): void {
     this.database.prepare('DELETE FROM inline_cleanup WHERE app_id=? AND message_id=?').run(appId, messageId);
+    this.database.prepare("DELETE FROM refresh_state WHERE app_id=? AND message_id=? AND kind='cleanup' AND terminal=0").run(appId, messageId);
+  }
+  refreshDue(appId: string, messageId: string, kind: 'dirty' | 'cleanup', now: number): boolean {
+    const row = this.database.prepare('SELECT terminal,next_run FROM refresh_state WHERE app_id=? AND message_id=? AND kind=?')
+      .get(appId, messageId, kind) as { terminal: number; next_run: number } | undefined;
+    return !row || (!row.terminal && row.next_run <= now);
+  }
+  failRefresh(appId: string, messageId: string, kind: 'dirty' | 'cleanup', permanent: boolean, reason: string,
+    now: number, revision?: number): 'retry' | 'abandoned' | 'stale' {
+    return this.transaction(() => {
+      if (kind === 'dirty') {
+        const current = this.database.prepare('SELECT revision FROM dirty_surfaces WHERE app_id=? AND message_id=?')
+          .get(appId, messageId) as { revision: number } | undefined;
+        if (!current || current.revision !== revision) return 'stale';
+      } else if (!this.database.prepare('SELECT message_id FROM inline_cleanup WHERE app_id=? AND message_id=?').get(appId, messageId)) return 'stale';
+      const row = this.database.prepare('SELECT attempts FROM refresh_state WHERE app_id=? AND message_id=? AND kind=?')
+        .get(appId, messageId, kind) as { attempts: number } | undefined;
+      const attempts = (row?.attempts ?? 0) + 1;
+      const terminal = permanent || attempts >= 5;
+      this.database.prepare(`INSERT INTO refresh_state VALUES(?,?,?,?,?,?)
+        ON CONFLICT(app_id,message_id,kind) DO UPDATE SET attempts=excluded.attempts,next_run=excluded.next_run,terminal=excluded.terminal`)
+        .run(appId, messageId, kind, attempts, now + Math.min(300000, 5000 * 2 ** (attempts - 1)), terminal ? 1 : 0);
+      if (terminal) {
+        const table = kind === 'dirty' ? 'dirty_surfaces' : 'inline_cleanup';
+        this.database.prepare(`DELETE FROM ${table} WHERE app_id=? AND message_id=?`).run(appId, messageId);
+        this.audit(`refresh:${appId}:${messageId}:${kind}`, `abandoned:${reason}`, now);
+      }
+      return terminal ? 'abandoned' : 'retry';
+    });
+  }
+  audit(identity: string, outcome: string, now = Date.now()): void {
+    this.database.prepare('INSERT INTO reconciliations(job_id,actor,evidence,outcome,created_at) VALUES(?,?,?,?,?)')
+      .run(identity, 'feedback-runtime', outcome, outcome, new Date(now).toISOString());
   }
   surfacesForDelivery(appId: string, deliveryId: string): Array<{ messageId: string; binding: Record<string, unknown> }> {
     const rows = this.database.prepare("SELECT message_id,binding FROM surfaces WHERE app_id=? AND json_extract(binding,'$.deliveryId')=?")
@@ -158,6 +194,7 @@ export class FeedbackExtensionStore {
     const binding = this.surface(appId, messageId);
     if (binding) this.database.prepare('UPDATE surfaces SET binding=? WHERE app_id=? AND message_id=?')
       .run(JSON.stringify({ ...binding, feedbackState: state }), appId, messageId);
+    if (this.database.prepare("SELECT 1 FROM refresh_state WHERE app_id=? AND message_id=? AND kind='dirty' AND terminal=1").get(appId, messageId)) return;
     this.database.prepare(`INSERT INTO dirty_surfaces(app_id,message_id,state) VALUES(?,?,?)
       ON CONFLICT(app_id,message_id) DO UPDATE SET state=excluded.state,revision=dirty_surfaces.revision+1`)
       .run(appId, messageId, JSON.stringify(state));
@@ -180,7 +217,8 @@ export class FeedbackExtensionStore {
     return rows.map(row => ({ messageId: row.message_id, state: JSON.parse(row.state), revision: row.revision }));
   }
   clearDirtySurface(appId: string, messageId: string, revision: number): void {
-    this.database.prepare('DELETE FROM dirty_surfaces WHERE app_id=? AND message_id=? AND revision=?').run(appId, messageId, revision);
+    const removed = this.database.prepare('DELETE FROM dirty_surfaces WHERE app_id=? AND message_id=? AND revision=?').run(appId, messageId, revision);
+    if (Number(removed.changes)) this.database.prepare("DELETE FROM refresh_state WHERE app_id=? AND message_id=? AND kind='dirty' AND terminal=0").run(appId, messageId);
   }
   private transaction<Result>(operation: () => Result): Result {
     this.database.exec('BEGIN IMMEDIATE');
@@ -207,12 +245,27 @@ export class FeedbackExtensionStore {
       this.database.prepare('INSERT INTO cursors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET sequence=excluded.sequence').run(source, sequence);
     });
   }
-  requestAction(input: { requestId: string; actor: string; job: ExtensionJobInput }): void {
+  requestAction(input: { requestId: string; actor: string; job: ExtensionJobInput; paused?: boolean }): void {
     this.transaction(() => {
       this.insertJob(input.job);
+      const paused = this.job(input.job.id);
+      const sameDefinition = paused?.payload.hookDefinition && input.job.payload.hookDefinition
+        && JSON.stringify(paused.payload.hookDefinition) === JSON.stringify(input.job.payload.hookDefinition);
+      const canResume = paused?.status === 'blocked' && paused.result?.recoverable === true
+        && (!paused.payload.hookDefinition || sameDefinition);
+      if ((canResume || paused?.status === 'pending' && sameDefinition)
+        && paused.payload.appId === input.job.payload.appId && paused.payload.hookId === input.job.payload.hookId) {
+        this.database.prepare("UPDATE jobs SET status='pending',payload=?,result=NULL,token=NULL,deadline=NULL WHERE id=? AND status IN ('blocked','pending')")
+          .run(JSON.stringify(input.job.payload), input.job.id);
+        this.audit(input.job.id, 'resubmitted_after_pause');
+      }
       const previous = this.database.prepare('SELECT actor,job_id FROM action_requests WHERE request_id=?').get(input.requestId) as { actor: string; job_id: string } | undefined;
       if (previous && (previous.actor !== input.actor || previous.job_id !== input.job.id)) throw new Error('feedback_action_request_conflict');
       this.database.prepare('INSERT OR IGNORE INTO action_requests VALUES(?,?,?)').run(input.requestId, input.actor, input.job.id);
+      if (input.paused) {
+        this.database.prepare("UPDATE jobs SET status='blocked',result=?,token=NULL,deadline=NULL WHERE id=? AND kind='hook' AND status='pending'")
+          .run(JSON.stringify({ reason: 'hook_paused', recoverable: true }), input.job.id);
+      }
       const job = this.job(input.job.id);
       if (job) this.markActionState(job, job.status, job.result);
     });

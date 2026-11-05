@@ -5,6 +5,20 @@ import { describe, expect, it } from 'vitest';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 
 describe('feedback extension durability', () => {
+  it('rolls back a paused request together with its callback registration on conflict', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-pause-transaction-'));
+    const store = await FeedbackExtensionStore.open(directory);
+    try {
+      store.requestAction({ requestId: 'request', actor: 'first', job: { id: 'original', kind: 'hook', payload: {} } });
+      expect(() => store.requestAction({ requestId: 'request', actor: 'other', paused: true,
+        job: { id: 'paused', kind: 'hook', payload: { appId: 'app' } } })).toThrow('feedback_action_request_conflict');
+      store.close();
+      const reopened = await FeedbackExtensionStore.open(directory);
+      expect(reopened.job('paused')).toBeUndefined();
+      expect(reopened.job('original')?.status).toBe('pending');
+      reopened.close();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
   it('records a verified unknown surface receipt without sending another card', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-surface-reconcile-'));
     const store = await FeedbackExtensionStore.open(directory);

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 import { reconcileFeedbackSurfaces } from '../src/services/feedback-extension-runtime.js';
@@ -52,6 +52,9 @@ describe('feedback surface event reconciliation', () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-cleanup-'));
     const source = await SkillFeedbackStore.open(directory);
     let extensions = await FeedbackExtensionStore.open(directory);
+    const clock = vi.spyOn(Date, 'now');
+    let now = Date.now();
+    clock.mockImplementation(() => now);
     try {
       const policy = normalizeFeedbackPolicy({ enabled: true });
       source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'turn', platform: 'lark',
@@ -73,10 +76,13 @@ describe('feedback surface event reconciliation', () => {
       extensions.close();
       extensions = await FeedbackExtensionStore.open(directory);
       await reconcileFeedbackSurfaces({ ...dependencies, extensions });
+      expect(cleanupAttempts).toBe(1);
+      now += 6000;
+      await reconcileFeedbackSurfaces({ ...dependencies, extensions });
       expect(sends).toBe(1);
       expect(cleanupAttempts).toBe(2);
       expect(extensions.inlineCleanups('app')).toEqual([]);
-    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+    } finally { clock.mockRestore(); extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
   });
   it('keeps a host-frozen feedback policy for a relayed answer and uses an explicit ordinary-chat question', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-relay-'));

@@ -17,8 +17,14 @@ import { handleSkillFeedbackCardAction, renderFeedbackCard } from '../im/lark/sk
 import { surfaceFeedbackStore, renderFeedbackSurfaceState } from './feedback-surface-delivery.js';
 import { feedbackMaintenanceActive, acquireFeedbackSendLease } from './feedback-maintenance.js';
 import { resolveFeedbackPresentation } from './feedback-presentation.js';
+import { feedbackRefreshBudget, refreshFeedbackMessage } from './feedback-refresh.js';
+import type { FeedbackHookRegistration } from './feedback-extension-types.js';
 
 function configured(dataDir: string): boolean { return existsSync(join(dataDir, 'feedback-extensions.json')); }
+function hookDefinition(hook: FeedbackHookRegistration): Record<string, unknown> {
+  const { enabled, version, ...definition } = hook;
+  return definition;
+}
 export function pendingFeedbackHookAuthorized(config: FeedbackExtensionConfig, hookId: string, event: {
   type: string; bot: { appId: string }; scope: { chatId: string; subjectId?: unknown };
   feedback?: { buttonKey?: string }; action: { id: string } | null; answer?: { round?: number };
@@ -47,17 +53,25 @@ export async function sendFeedbackSurface(appId: string, input: {
 }
 export async function tickFeedbackExtensions(dataDir: string, appId: string): Promise<void> {
   const botPresentation = getBot(appId).config.feedbackPresentation;
-  if (!configured(dataDir) && !botPresentation && !existsSync(join(dataDir, 'feedback-extensions.sqlite'))) return;
+  if (!configured(dataDir) && !botPresentation) {
+    if (existsSync(join(dataDir, 'feedback-extensions.sqlite')) && !feedbackMaintenanceActive(dataDir)) {
+      const extensions = await FeedbackExtensionStore.open(dataDir);
+      try { extensions.expire(Date.now()); } finally { extensions.close(); }
+    }
+    return;
+  }
   if (feedbackMaintenanceActive(dataDir)) return;
   const config = await readFeedbackExtensionConfig(dataDir);
   if (!config.presentations[appId] && botPresentation) config.presentations[appId] = botPresentation;
   const extensions = await FeedbackExtensionStore.open(dataDir);
   try {
+    extensions.expire(Date.now());
+    const refreshBudget = feedbackRefreshBudget();
     const startedAt = extensions.activate(appId, new Date().toISOString());
     const storageConfig = await readFeedbackStorageConfig(dataDir);
     const source = await getSkillFeedbackStore(dataDir);
     await reconcileFeedbackSurfaces({
-      appId, source, extensions, config, now: Date.now, startedAt,
+      appId, source, extensions, config, now: Date.now, startedAt, refreshBudget,
       sourceKey: `${storageConfig.instanceId}:${storageConfig.generation}`,
       send: async (subjectId, card, operationId, chatId, round) => {
         const beforeWrite = async () => {
@@ -75,37 +89,48 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
         const threadId = await getMessageThreadId(appId, messageId);
         return threadId ? threadAppLink(chatId, threadId, getBotBrand(appId)) : chatAppLink(chatId, getBotBrand(appId));
       },
-      removeInline: async messageId => {
-        const detail = await getMessageDetail(appId, messageId);
+      removeInline: async (messageId, signal) => {
+        const detail = await getMessageDetail(appId, messageId, { signal });
         const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
-        if (typeof content !== 'string') throw new Error('feedback_answer_unavailable');
+        if (typeof content !== 'string') throw new Error('feedback_refresh_target_missing');
         const card = JSON.parse(content);
         if (!Array.isArray(card.body?.elements)) throw new Error('feedback_answer_card_invalid');
         card.body.elements = card.body.elements.filter((element: { element_id?: string }) => !element.element_id?.startsWith('botmux_feedback'));
-        await updateMessage(appId, messageId, JSON.stringify(card));
+        await updateMessage(appId, messageId, JSON.stringify(card), { beforeWrite: async () => {
+          signal?.throwIfAborted();
+          if (!configured(dataDir) && !getBot(appId).config.feedbackPresentation) throw new Error('feedback_presentation_disabled');
+        } });
       },
     });
     for (const dirty of extensions.dirtySurfaces(appId)) {
       const binding = extensions.surface(appId, dirty.messageId);
       if (!binding) {
         const original = await source.findDeliveryByPlatformMessage('lark', appId, dirty.messageId);
-        if (!original?.policy) continue;
-        try {
-          const detail = await getMessageDetail(appId, dirty.messageId);
+        await refreshFeedbackMessage({ store: extensions, appId, messageId: dirty.messageId, kind: 'dirty',
+          revision: dirty.revision, budget: refreshBudget, run: async signal => {
+          if (!original?.policy) throw new Error('feedback_refresh_target_missing');
+          const detail = await getMessageDetail(appId, dirty.messageId, { signal });
           const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
-          if (typeof content !== 'string') continue;
+          if (typeof content !== 'string') throw new Error('feedback_refresh_target_missing');
           const card = renderFeedbackCard(JSON.parse(content), original.policy, dirty.state);
-          await updateMessage(appId, dirty.messageId, JSON.stringify(card));
-          extensions.clearDirtySurface(appId, dirty.messageId, dirty.revision);
-        } catch {}
+          await updateMessage(appId, dirty.messageId, JSON.stringify(card), { beforeWrite: async () => {
+            signal.throwIfAborted();
+            if (!configured(dataDir) && !getBot(appId).config.feedbackPresentation) throw new Error('feedback_presentation_disabled');
+          } });
+        } });
         continue;
       }
       const delivery = await source.findDeliveryById(String(binding.deliveryId));
-      if (!delivery?.policy) continue;
-      try {
-        await updateMessage(appId, dirty.messageId, JSON.stringify(renderFeedbackSurfaceState(binding, delivery.policy, dirty.state)));
-        extensions.clearDirtySurface(appId, dirty.messageId, dirty.revision);
-      } catch {}
+      await refreshFeedbackMessage({ store: extensions, appId, messageId: dirty.messageId, kind: 'dirty',
+        revision: dirty.revision, budget: refreshBudget, run: async signal => {
+          if (!delivery?.policy) throw new Error('feedback_refresh_target_missing');
+          await updateMessage(appId, dirty.messageId, JSON.stringify(renderFeedbackSurfaceState(binding, delivery.policy, dirty.state)), {
+            beforeWrite: async () => {
+              signal.throwIfAborted();
+              if (!configured(dataDir) && !getBot(appId).config.feedbackPresentation) throw new Error('feedback_presentation_disabled');
+            },
+          });
+        } });
     }
     const currentConfig = await readFeedbackExtensionConfig(dataDir);
     // The bot-config presentation is functionally equivalent to one stored in
@@ -113,7 +138,8 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
     // reconciliation above): the hook authorization fence must read the same
     // merged view, otherwise a card sent from a bot-config rule renders and
     // accepts clicks while every hook job is settled `blocked`.
-    if (!currentConfig.presentations[appId] && botPresentation) currentConfig.presentations[appId] = botPresentation;
+    const currentBotPresentation = getBot(appId).config.feedbackPresentation;
+    if (!currentConfig.presentations[appId] && currentBotPresentation) currentConfig.presentations[appId] = currentBotPresentation;
     const maximumTimeout = Math.max(1000, ...currentConfig.hooks.map(hook => hook.timeoutMs)) + 10000;
     const job = extensions.claim('hook', Date.now(), maximumTimeout, appId,
       Object.fromEntries(currentConfig.hooks.map(hook => [hook.id, hook.concurrency])));
@@ -123,7 +149,12 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
     const event = job.payload.event as HookEvent;
     if (!hook || job.payload.hookVersion !== hook.version || !hook.enabled
       || !pendingFeedbackHookAuthorized(currentConfig, hook.id, event as Parameters<typeof pendingFeedbackHookAuthorized>[2])) {
-      extensions.settle(job.id, job.token!, 'blocked', { reason: 'hook_disabled_or_changed' });
+      const sameDefinition = !!hook && (job.payload.hookDefinition
+        ? JSON.stringify(job.payload.hookDefinition) === JSON.stringify(hookDefinition(hook))
+        : job.payload.hookVersion === hook.version);
+      const recoverable = !!hook && sameDefinition && !hook.enabled
+        && pendingFeedbackHookAuthorized(currentConfig, hook.id, event as Parameters<typeof pendingFeedbackHookAuthorized>[2]);
+      extensions.settle(job.id, job.token!, 'blocked', { reason: 'hook_disabled_or_changed', recoverable });
       return;
     }
     const env: Record<string, string> = {};
@@ -179,13 +210,17 @@ export async function handleFeedbackExtensionCard(input: unknown, appId: string,
     const action = actions.find(item => item.id === actionId);
     const config = await readFeedbackExtensionConfig(dataDir);
     const hook = config.hooks.find(item => item.id === action?.hookId);
-    if (!action || !hook?.enabled || !hook.allowedBotAppIds.includes(appId)
+    if (!action || !hook || !hook.allowedBotAppIds.includes(appId)
       || !hook.allowedChatIds.includes(String(binding.chatId)) || !hook.allowedActionIds.includes(action.id)) {
       return { toast: { type: 'error', content: '动作未启用或已撤销' } };
     }
     const jobId = createHash('sha256').update(JSON.stringify([appId, binding.chatId, binding.subjectId, action.id])).digest('hex');
     const actor = candidates[0];
     const previous = extensions.job(jobId);
+    if (previous?.status === 'blocked' && (previous.result?.recoverable !== true
+      || previous.payload.hookDefinition && JSON.stringify(previous.payload.hookDefinition) !== JSON.stringify(hookDefinition(hook)))) {
+      return { toast: { type: 'error', content: '动作已撤销，不能重新执行' } };
+    }
     if (previous?.status === 'failed_before_effect') {
       const retryToken = String(previous.result?.retryToken ?? '');
       if (data.action?.value?.retry_token === retryToken && retryToken) {
@@ -207,9 +242,13 @@ export async function handleFeedbackExtensionCard(input: unknown, appId: string,
     };
     extensions.requestAction({
       requestId: createHash('sha256').update(JSON.stringify([jobId, actor, messageId])).digest('hex'),
-      actor, job: { id: jobId, kind: 'hook', payload: { appId, hookId: hook.id, hookVersion: hook.version, event } },
+      paused: !hook.enabled,
+      actor, job: { id: jobId, kind: 'hook', payload: { appId, hookId: hook.id, hookVersion: hook.version, hookDefinition: hookDefinition(hook), event } },
     });
+    if (!hook.enabled) {
+      return { toast: { type: 'error', content: '动作已暂停，重新启用后请再次点击' } };
+    }
     const status = extensions.job(jobId)?.status;
-    return { toast: { type: 'info', content: status === 'succeeded' ? '操作已完成' : status === 'unknown' ? '操作结果待核对，请勿重复执行' : '请求已记录' } };
+    return { toast: { type: status === 'blocked' ? 'error' : 'info', content: status === 'blocked' ? '操作被阻止' : status === 'succeeded' ? '操作已完成' : status === 'unknown' ? '操作结果待核对，请勿重复执行' : '请求已记录' } };
   } finally { extensions.close(); }
 }
