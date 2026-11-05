@@ -30,17 +30,26 @@ export function isScratchSandbox(opts?: {
  *    bridge is part of the ALWAYS set — default mode harvests send-less turns
  *    with the send-marker gate, though it is still suppressed under scratch.)
  *
- * Sandbox: cursor/antigravity are supported under the oncall bwrap sandbox
- * (and read isolation / the BOTMUX_SANDBOX switch) — their adapters declare
- * the whole `~/.cursor` / `~/.gemini` tree as readWrite authPaths, which
- * bind-mount the REAL host directories, so the daemon tails the same files the
- * CLI writes (this also keeps cursor's store.db fcntl locks working).
+ * Sandbox: cursor/antigravity/doubao are supported under the oncall bwrap
+ * sandbox (and read isolation / the BOTMUX_SANDBOX switch) — their adapters
+ * declare the whole `~/.cursor` / `~/.gemini` /
+ * `~/.local/share/doubao_cli` tree as readWrite authPaths, which bind-mount
+ * the REAL host directories, so the daemon tails the same files the CLI
+ * writes (this also keeps cursor's store.db fcntl locks working).
  *
- * The full-root COW `sandbox: 'scratch'` mode is rejected for these two for
+ * The full-root COW `sandbox: 'scratch'` mode is rejected for these three for
  * now: it bind-mounts a merged overlay as / and ignores authPaths, so their
  * transcripts land in the upper tree the host-side structured bridge does not
  * resolve yet (the existing structured bridges codex/grok have the same open
  * gap). Fail loudly here rather than silently dropping every reply.
+ *
+ * doubao is rejected under scratch despite being an ALWAYS-bridge CLI:
+ * #2828 made transcript its DEFAULT reply mode, and its
+ * `agent_mode/<uid>/workspace/.sessions` tree has no scratch host-view
+ * mapping (only codex/trae get an env redirect and claude a data-dir remap),
+ * so under scratch both the first-turn id capture and transcript harvest
+ * resolve nothing — the reply-delivery capability gate rejects the same
+ * combination independently.
  *
  * This capability predicate only sees the CONFIG/session value, so the
  * machine-wide `BOTMUX_SANDBOX=scratch` switch (which is not materialised into
@@ -81,7 +90,7 @@ export function zeroPromptInjectionUnsupportedReason(
     && !ZERO_PROMPT_LOCAL_BACKENDS.includes(opts.backendType as typeof ZERO_PROMPT_LOCAL_BACKENDS[number])) {
     return 'backend_unsupported';
   }
-  if ((cliId === 'cursor' || cliId === 'antigravity') && isScratchSandbox(opts)) {
+  if ((cliId === 'cursor' || cliId === 'antigravity' || cliId === 'doubao') && isScratchSandbox(opts)) {
     return 'scratch_unsupported_for_cli';
   }
   if (cliId === 'antigravity' && opts?.backendType === 'zmx') {

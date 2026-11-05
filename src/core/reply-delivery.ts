@@ -65,18 +65,24 @@ export interface TranscriptDeliveryCapabilityOpts {
  *  this so an unusable combination is rejected at write time rather than
  *  accepted and silently degraded at runtime.
  *
- *  Full-root COW scratch: cursor's agent-transcript mirror lives in the merged
- *  overlay, which the host-side bridge cannot read. Enabling the transcript
+ *  Full-root COW scratch: cursor's agent-transcript mirror and doubao's
+ *  `agent_mode/<uid>/workspace/.sessions` tree both live in the merged
+ *  overlay, which the host-side bridge cannot read (doubao has no scratch
+ *  path mapping — only codex/trae get an env redirect and claude a data-dir
+ *  remap — and neither writeInput's first-turn id capture nor
+ *  locate.bySessionId resolve the merged tree). Enabling the transcript
  *  envelope there would strip the `botmux send` instructions from the prompt
  *  while harvest produced nothing — a fully silent turn, the exact shape the
  *  fallback exists to prevent. Reject it (same scratch boundary zero-injection
- *  already enforces). */
+ *  already enforces). The deny-by-default oncall bwrap is fine for both:
+ *  their adapters declare the data directories as authPaths, which are
+ *  directory-bind mounted from the real host fs. */
 export function supportsTranscriptReplyDeliveryForBot(
   cliId: string | undefined,
   opts?: TranscriptDeliveryCapabilityOpts,
 ): boolean {
   if (!supportsTranscriptReplyDelivery(cliId)) return false;
-  if (cliId === 'cursor' && isScratchSandbox(opts)) return false;
+  if ((cliId === 'cursor' || cliId === 'doubao') && isScratchSandbox(opts)) return false;
   return true;
 }
 

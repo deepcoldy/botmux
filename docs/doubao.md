@@ -92,6 +92,8 @@ Doubao Bot 的 `replyDelivery` 缺省为 `transcript`（其它 CLI 缺省仍是 
 
 首轮的原生 Session ID 在提交后最多等待 20 秒捕获（常驻进程冷启动时，`assignment.md` 要 7～8 秒才写入）。
 
+沙箱组合：oncall（`sandbox: true` 或 `"oncall"`，含 legacy readIsolation）下 Doubao 的 `~/.local/share/doubao_cli` 以目录级 bind 挂到真实宿主路径，转写桥正常工作，缺省 transcript 不受影响。全根 COW 的 `sandbox: "scratch"` 会把整个容器根挂成 merged overlay 且不应用 authPaths，Doubao 写入的会话树宿主侧桥读不到，首轮 ID 捕获与转写回收都会落空——此组合下 `replyDelivery` 自动回落 `send`（Dashboard 显示不支持 transcript，显式写 `transcript` 会被拒绝），即回到模型自己 `botmux send` 的旧行为，因此仍带有上文的共享常驻进程串号风险；多 Bot 共用机器上不建议让 Doubao 跑 scratch。`promptInjection: none`（零注入）在 scratch 下会被直接拒绝（它强制 transcript，没有 send 退路）。
+
 这是依赖原生落盘格式的桥接，不是官方稳定的 transcript API。不要在运行中删除/移动这些日志。Doubao 升级若改变格式，适配器可能需要跟进；中断、异常退出等终态覆盖尚不完整，不能保证每种失败都能返回结构化原因。
 
 ### 权限

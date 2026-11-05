@@ -2866,14 +2866,18 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
 });
 
 describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
-  async function withBot(cliId: string, run: (base: string, configPath: string, appId: string) => Promise<void>): Promise<void> {
+  async function withBot(
+    cliId: string,
+    run: (base: string, configPath: string, appId: string) => Promise<void>,
+    extraConfig: Record<string, unknown> = {},
+  ): Promise<void> {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-delivery-'));
     const configPath = join(dir, 'bots.json');
     const appId = `test-reply-delivery-${cliId}`;
     const prevBotsConfig = process.env.BOTS_CONFIG;
     try {
       process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId }], null, 2));
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId, ...extraConfig }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -2988,6 +2992,22 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
       expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
     });
+  });
+
+  it('doubao + scratch: GET 生效值回落 send、缺省值仍 transcript、开关 unsupported，PUT transcript 4xx（#2828 静默边）', async () => {
+    await withBot('doubao', async (base) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: false });
+
+      const rejected = await put(base, 'transcript');
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'reply_delivery_unsupported' });
+
+      // 显式 send 在 scratch 下仍可写（doubao scratch 回旧行为，不静默）。
+      const send = await put(base, 'send');
+      expect(send.status).toBe(200);
+      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
+    }, { sandbox: 'scratch' });
   });
 
   it('antigravity: 只有零注入转写，PUT transcript 4xx reply_delivery_unsupported 且不落盘，PUT send 落盘', async () => {

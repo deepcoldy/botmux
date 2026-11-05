@@ -297,23 +297,25 @@ Editable visually in Dashboard → Bot Config → Cards → Final Answer Feedbac
 | `promptInjection` | `"none"` or `"default"` (default). Set to `"none"` to enable **Zero Prompt Injection mode**: bypasses botmux system prompts, per-turn reminders, identity envelopes, and skills to pass raw task prompts directly to the CLI, with answers collected via transcript capture. See [Zero Prompt Injection](#zero-prompt-injection-promptinjection-none) |
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
 | `senderTagHideEmail` | Boolean, default `false` (off). Omits only the `email` attribute from newly built `<sender>` tags, retaining name, ID and type. Saved independently of `senderTag`; does not change identity caches, authorization or `--mention-back`, nor scrub queued inputs, history or message text. Hot-update with `/botconfig set senderTagHideEmail on\|off` |
-| `replyDelivery` | `"transcript"` or `"send"`; **every CLI defaults to `send`** (matching upstream behaviour), and `transcript` must be turned on explicitly. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
+| `replyDelivery` | `"transcript"` or `"send"`; **defaults are per CLI: `doubao` defaults to `transcript`, every other CLI (including `claude-code`) defaults to `send`**. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). Both `send` and `transcript` are persisted, `unset` returns to the CLI default |
 
 ### `replyDelivery: "transcript"`
 
-`claude-code` defaults to `transcript`; the other supported CLIs need it set explicitly. Once active it changes three things for that bot's sessions:
+`doubao` defaults to `transcript` (its tool commands run in an account-wide resident `doubao --type=service` process, so a model-run `botmux send` is misattributed through the process tree of whichever terminal first started it — see [Doubao CLI](/doubao)); every other CLI needs it set explicitly. Once active it changes three things for that bot's sessions:
 
 1. **The system prompt never mentions `botmux send`**: the intro becomes "your final assistant message is automatically forwarded back to Lark by botmux — just answer directly"; the heredoc rule, the @ decision gate, the attachment usage and the `<identity>` rule "collaboration requires `botmux send --mention`" are all dropped, leaving only `botmux history` / `botmux bots list` and the `BOTMUX_NOTHING_TO_SEND` silence sentinel. For the cases that genuinely need `botmux send` (attachments, cross-bot @) the model can discover the built-in skill (`botmux-send` under `--plugin-dir`) on its own;
 2. **The per-turn `<botmux_reminder>` is no longer injected** (one less reminder block per prompt);
 3. **Solo sessions are unwrapped**: in a DM, or a plain 1:1 group whose only participants are the owner and this bot, each turn drops the `<user_message>` wrapper and the `<sender/>` tag, so the model sees bare text. Topic groups, multi-member groups, and turns spoken by anyone other than the owner never count as solo; wrapper and tag stay as before.
 
-Supported CLIs: `claude-code`, plus the structured-transcript bridge CLIs `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`. Other CLIs (e.g. `cursor`, `antigravity`) have no transcript capture, so both `/botconfig set` and the dashboard reject the value (`reply_delivery_unsupported`); if the field is already persisted and `cli` is later switched to an unsupported CLI, the runtime falls back to `send` (one warn in the log) rather than losing replies.
+Supported CLIs: `claude-code` (its own data-dir transcript bridge), plus the structured-transcript bridge CLIs `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok` / `cursor` / `doubao`. `antigravity` has no ordinary transcript capture — harvesting exists only under zero injection (`promptInjection: "none"`) — so an explicit `transcript` is rejected by both `/botconfig set` and the dashboard (`reply_delivery_unsupported`); if the field is already persisted and `cli` is later switched to an unsupported CLI, the runtime falls back to `send` (one warn in the log) rather than losing replies.
+
+Sandbox limitation: `cursor` and `doubao` do not support transcript under the full-root COW `sandbox: "scratch"` (their transcripts land in the merged overlay, which the host-side bridge cannot read) — the write is rejected and the default degrades to `send` at runtime; the oncall sandbox (`true` / `"oncall"`, including legacy readIsolation) is unaffected because the data directories are directory-bind mounted from the real host fs.
 
 Hot-updatable by the owner / `allowedUsers` via `/botconfig`:
 
 ```text
-/botconfig set replyDelivery transcript   # enable explicitly on the other supported CLIs
-/botconfig set replyDelivery send         # put claude-code back on the old behavior (model runs botmux send itself)
+/botconfig set replyDelivery transcript   # enable explicitly (doubao already defaults to it)
+/botconfig set replyDelivery send         # pin send explicitly, e.g. switch doubao back to the discouraged legacy behavior
 /botconfig unset replyDelivery            # back to the CLI default
 ```
 

@@ -1770,6 +1770,62 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
   });
 
+  it('rejects replyDelivery=transcript for doubao under scratch sandbox (#2828: .sessions tree lands in the merged overlay the host bridge cannot read)', async () => {
+    const { store } = await loaded({ cliId: 'doubao', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('accepts replyDelivery=transcript for doubao under oncall (authPaths directory bind keeps the host path readable)', async () => {
+    const { store } = await loaded({ cliId: 'doubao', sandbox: 'oncall' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+  });
+
+  it('doubao default (no explicit replyDelivery) may switch to scratch — the default resolves at runtime, the rmw invariant only rejects persisted transcript', async () => {
+    await loaded({ cliId: 'doubao' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'doubao', sandbox: 'scratch' });
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('invariant backstop: switching cliId codex→doubao while scratch+transcript persist is rejected', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'doubao');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('invariant backstop: updateBotSandboxMode rejects switching a doubao+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
+    const { registry } = await loaded({ cliId: 'doubao', replyDelivery: 'transcript' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+  });
+
+  it('doubao enables zero injection oncall but rejects it under scratch (#2828 bypass: none forces transcript past the delivery gate)', async () => {
+    const oncall = await loaded({ cliId: 'doubao', sandbox: 'oncall' });
+    const noneSpec = oncall.store.findConfigField('promptInjection')!;
+    expect((await oncall.store.applyConfigField('app_default', noneSpec, 'none')).ok).toBe(true);
+
+    const scratch = await loaded({ cliId: 'doubao', sandbox: 'scratch' });
+    const r = await scratch.store.applyConfigField('app_default', scratch.store.findConfigField('promptInjection')!, 'none');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('zero_prompt_unsupported');
+    expect(readConfig().promptInjection).toBeUndefined();
+  });
+
   it('updateBotSandboxPaths refuses `/` / HOME / botmux home and relative entries as readWrite and leaves bots.json untouched', async () => {
     const { registry } = await loaded({ sandbox: true, sandboxPaths: { readOnly: ['/opt/ref'] } });
     const sandboxStore = await import('../src/services/sandbox-store.js');

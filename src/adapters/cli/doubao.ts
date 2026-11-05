@@ -186,8 +186,10 @@ export function parseDoubaoAvailableModels(output: string): string[] | null {
  *  shown in the TUI, so the first submit is matched against the native per-turn
  *  log to learn the id that `--resume` needs; without it a restart starts fresh
  *  instead of guessing (there is no "latest" resume that is safe to share). */
-/** Structured transcript bridge: doubao has no `botmux send` channel and no
- *  machine-readable stdout, so the final answer is harvested from its own
+/** Structured transcript bridge: doubao has no CLI-native machine-readable
+ *  reply channel (the generic `botmux send` stays executable, but under the
+ *  account-wide resident service it misattributes — see
+ *  defaultReplyDeliveryFor), so the final answer is harvested from its own
  *  trajectory.jsonl (and the user prompts from assignment.md). */
 export const doubaoBridgeSpec: StructuredBridgeSpec = {
   stateCommit: 'drain',

@@ -71,4 +71,21 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
       cliId: 'cursor', sandbox: 'scratch',
     })).toBeUndefined();
   });
+
+  it('flags doubao transcript delivery under scratch (#2828: .sessions tree lands in the merged overlay; default/unset stays writable)', () => {
+    // doubao 缺省 transcript 但缺省不落盘：未写 replyDelivery 的 entry 必须放行
+    //（运行时回落 send），只有显式 transcript 才拒。
+    expect(botConfigInvariantError({
+      cliId: 'doubao', sandbox: 'scratch', replyDelivery: 'transcript',
+    })).toBe('reply_delivery_unsupported');
+    expect(botConfigInvariantError({
+      cliId: 'doubao', sandbox: 'scratch', replyDelivery: 'send',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'doubao', sandbox: 'scratch',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'doubao', sandbox: 'oncall', replyDelivery: 'transcript',
+    })).toBeUndefined();
+  });
 });

@@ -1,4 +1,5 @@
 import { parseSandboxNetworkPolicy } from '../core/sandbox-network-policy.js';
+import { supportsTranscriptReplyDeliveryForBot } from '../core/reply-delivery.js';
 export type BotConfigInvariantError =
   | 'codex_browser_requires_codex_app'
   | 'codex_browser_config_conflict'
@@ -34,17 +35,19 @@ export function botConfigInvariantError(entry: any): BotConfigInvariantError | u
   if (entry.existingAppServer && (sandboxEngaged(entry) || entry.readIsolation === true)) {
     return 'existing_app_server_sandbox_conflict';
   }
-  // replyDelivery=transcript × cursor × scratch：host 侧转写桥读不到 scratch 全根
-  // COW 的 merged overlay mirror，开 transcript 信封会让模型不调 send 而整轮静默。
-  // 放全局不变量（而非只在 replyDelivery 写入门禁）是因为这条边还能从另外两个写者
-  // 进入：cliId 切换（codex+transcript+scratch 合法 → 切到 cursor）与 sandbox 切换
-  // （cursor+transcript → scratch），两者都经 rmwBotEntry 落盘，在此一处判死。
-  // 注意：这里只能看持久化字段——机器级 BOTMUX_SANDBOX 不 materialize 进 entry，
-  // 那条边由 core/reply-delivery 的运行时回落与 worker spawnCli 的 resolved-mode
-  // 复核负责。
+  // replyDelivery=transcript × 无宿主侧转写采集的 CLI/沙箱组合：scratch 全根 COW 把
+  // CLI 写的转写（cursor 的 agent-transcript mirror、doubao 的 agent_mode 会话树）
+  // 留在 merged overlay，host 侧桥读不到，开 transcript 信封会让模型不调 send 而整轮
+  // 静默。放全局不变量（而非只在 replyDelivery 写入门禁）是因为这条边还能从另外两个
+  // 写者进入：cliId 切换（codex+transcript+scratch 合法 → 切到 cursor/doubao）与
+  // sandbox 切换（cursor/doubao+transcript → scratch），两者都经 rmwBotEntry 落盘，
+  // 在此一处判死。判据直接复用 core/reply-delivery 的能力闸，CLI 名单只有那一份。
+  // 注意：这里只能看持久化字段——未配置的缺省值（如 doubao 缺省 transcript）不在
+  // entry.replyDelivery 里，缺省组合由运行时回落 send 处理，不能在这里拒写；机器级
+  // BOTMUX_SANDBOX 不 materialize 进 entry，那条边由运行时回落与 worker spawnCli 的
+  // resolved-mode 复核负责。
   if (entry.replyDelivery === 'transcript'
-      && entry.cliId === 'cursor'
-      && entry.sandbox === 'scratch') {
+      && !supportsTranscriptReplyDeliveryForBot(entry.cliId, { sandbox: entry.sandbox })) {
     return 'reply_delivery_unsupported';
   }
   return undefined;
