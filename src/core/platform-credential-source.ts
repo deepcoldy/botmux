@@ -229,3 +229,31 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
       return { state: 'unavailable', detail };
   }
 }
+
+/**
+ * Machine-readable reason for a refusal, appended to the text the agent and
+ * the person see (`[reason=…]`). Without it every failure read as "no usable
+ * credentials", and nobody could tell an unauthorized person from a platform
+ * that timed out — the two need opposite next steps (authorize vs. wait).
+ */
+export function platformRefusalReason(resolution: Exclude<PlatformIdentityResolution, { state: 'granted' }>): string {
+  switch (resolution.state) {
+    case 'unbound': return 'platform_unbound';
+    case 'not_authorized': return resolution.consent ? 'platform_consent_missing' : 'platform_not_authorized';
+    case 'denied': return resolution.reason === 'not_teammate' ? 'platform_not_teammate' : 'platform_forbidden';
+    case 'unavailable': {
+      const d = String(resolution.detail ?? '').toLowerCase();
+      if (d.includes('union_id unresolved')) return 'union_id_unresolved';
+      if (d.includes('超时') || d.includes('timed out') || d.includes('timeout') || d.includes('etimedout') || /\b504\b/.test(d)) {
+        return 'platform_timeout';
+      }
+      if (d.startsWith('network')) return 'platform_unreachable';
+      if (d.startsWith('rate limited')) return 'platform_rate_limited';
+      return 'platform_unavailable';
+    }
+  }
+}
+
+export function reasonTag(reason: string): string {
+  return `[reason=${reason}]`;
+}
