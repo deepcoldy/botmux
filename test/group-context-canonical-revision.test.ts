@@ -28,7 +28,10 @@ import { setGroupContextSettings } from '../src/services/group-context-settings-
 
 const APP = 'cli_app';
 const CHAT = 'oc_room';
-const CREATE = 1_791_240_348_974;
+// Wall-clock now, not a fixed epoch: the history path prunes rows past the
+// default 30-day retention on every upsert, so a hardcoded timestamp ages out
+// and the revision assertions below start failing a month after it is written.
+const CREATE = Date.now();
 const ALEX = { key: '@_user_1', name: 'Alex', openId: 'ou_alex' };
 let dataDir: string;
 
