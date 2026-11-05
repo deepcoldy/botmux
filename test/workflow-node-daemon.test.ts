@@ -6,7 +6,7 @@
  * idle / registration notices reach the right daemon.
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -452,7 +452,11 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     });
     const decision = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
     if (decision.start) throw new Error('expected a refusal');
-    await settle();
+    // The warning is emitted by the fire-and-forget refusal chain (registry
+    // write behind a file lock, then two failed IPC notices separated by a
+    // retry timer). A fixed 20 ms sleep races a slow CI filesystem; wait for
+    // the observable outcome instead.
+    await vi.waitFor(() => expect(warnings.join('\n')).toContain(decision.reason), { timeout: 5_000, interval: 5 });
     expect(run.of('nodeBlocked')).toEqual([]);
     expect(warnings.join('\n')).toContain(decision.reason);
     run.clock.t = run.openAttempt('write').acceptDeadlineAt! + 1;
