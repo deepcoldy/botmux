@@ -35085,6 +35085,12 @@ dialog.command-palette-dialog::backdrop {
 .dboard-row-ask,
 .dboard-row-pending { color: var(--fg-2); font-size: var(--fs-12); overflow-wrap: anywhere; }
 .dboard-row-pending { color: var(--info); }
+.dboard-hint-chip { align-self: flex-start; padding: 1px 8px; border-radius: var(--radius-full); font-size: var(--fs-12); background: var(--info-soft); color: var(--info); }
+.dboard-hint-chip.is-close { background: var(--success-soft); color: var(--success); }
+.dboard-hint-chip.is-stale { background: var(--warning-soft); color: var(--warning); }
+.dboard-hint-banner { margin: 8px 0; padding: 8px 12px; border-radius: var(--radius-sm); border-left: 3px solid var(--info); background: var(--info-soft); font-size: var(--fs-12); overflow-wrap: anywhere; }
+.dboard-hint-banner.is-close { border-left-color: var(--success); background: var(--success-soft); }
+.dboard-hint-banner.is-stale { border-left-color: var(--warning); background: var(--warning-soft); }
 .dboard-row-meta {
   display: flex;
   align-items: center;
