@@ -116,13 +116,13 @@ it.skipIf(!executable).each([
     onUserInput: async () => { throw new Error('Unexpected permission request for a read-only fixture'); },
   }, AbortSignal.timeout(30_000));
   const first = await invoke();
-  const diagnostics = JSON.stringify({ mcpMethods, seenTools });
-  expect(first.content, diagnostics).toBe(marker);
+  const diagnostics = () => JSON.stringify({ mcpMethods, seenTools });
+  expect(first.content, diagnostics()).toBe(marker);
   expect(readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([{ name: 'proof', arguments: {} }]);
   // A fresh ACP process must restore this exact native session and reconnect.
   requiredCalls = 2;
   const resumed = await invoke(first.sessionId);
   expect(resumed.sessionId).toBe(first.sessionId);
-  expect(resumed.content, diagnostics).toBe(marker);
+  expect(resumed.content, diagnostics()).toBe(marker);
   expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(2);
 }, 90_000);
