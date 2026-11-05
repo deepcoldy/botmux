@@ -38,7 +38,11 @@ interface GroupSecretaryFile {
   chats: Record<string, GroupSecretaryChatEntry>;
 }
 
-let cache: { path: string; mtimeMs: number; size: number; data: GroupSecretaryFile } | undefined;
+let cache: { path: string; mtimeMs: number; size: number; data: GroupSecretaryFile; absentCheckedAt?: number } | undefined;
+/** 文件不存在（没有任何群开秘书）时，这么久内不再 stat：每条群消息都会查一次登记，
+ *  高消息量主机上省掉一次失败的系统调用。别的 daemon 新开的秘书最多晚这么久被本进程看到；
+ *  本进程自己写入会立刻清掉缓存。 */
+const ABSENT_RECHECK_MS = 2_000;
 
 function filePath(): string {
   return join(config.session.dataDir, 'group-secretary.json');
@@ -70,11 +74,16 @@ function parse(raw: any): GroupSecretaryFile {
 /** 按 mtime/size 判断是否需要重读：别的 daemon 改了登记，本进程下一次查询就能看到。 */
 function load(): GroupSecretaryFile {
   const path = filePath();
+  const nowMs = Date.now();
+  if (cache?.path === path && cache.absentCheckedAt !== undefined
+      && nowMs - cache.absentCheckedAt >= 0 && nowMs - cache.absentCheckedAt < ABSENT_RECHECK_MS) {
+    return cache.data;
+  }
   let st: { mtimeMs: number; size: number };
   try {
     st = statSync(path);
   } catch {
-    cache = { path, mtimeMs: -1, size: -1, data: empty() };
+    cache = { path, mtimeMs: -1, size: -1, data: empty(), absentCheckedAt: nowMs };
     return cache.data;
   }
   if (cache && cache.path === path && cache.mtimeMs === st.mtimeMs && cache.size === st.size) return cache.data;
