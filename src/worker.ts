@@ -493,6 +493,7 @@ import { detectCliStartupBlocker, startupBlockerKey, type CliStartupBlocker } fr
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
+import { prepareSandboxWritableFiles } from './adapters/backend/sandbox-writable-files.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
@@ -24700,6 +24701,14 @@ async function spawnCli(
       if (extname(expanded) !== '') continue;
       try { mkdirSync(canonical(expanded), { recursive: true }); } catch { /* best effort */ }
     }
+    // Adapter-declared single FILES the CLI opens read-write although their
+    // parent stays hidden/read-only (TRAE's <TRAE_HOME>/installation_id: the
+    // embedded app server opens it O_RDWR|O_CREAT on every start and dies with
+    // EROFS when it sits under a read-only bind). Same env view as
+    // sandboxReadonlyPaths so a per-bot TRAE_HOME is honoured.
+    const adapterWritableFiles = prepareSandboxWritableFiles(
+      [...(cliAdapter.sandboxWritableFiles?.({ ...childEnv, ...perBotInjectEnv }) ?? [])].map(expandTildeLexical),
+    );
     // (Schedules moved into each bot's BOT_HOME — the whole dir is already
     // bound readWrite for the owner, so no per-file pre-create is needed.)
 
@@ -25015,7 +25024,7 @@ async function spawnCli(
         rehomedHostRoots: [cliAdapter.claudeDataDir, isolatedCodexHome ? `${lexicalHome}/.codex` : undefined]
           .filter((r): r is string => !!r)
           .map(expandTildeLexical),
-      })),
+      })).concat(keepExisting(adapterWritableFiles)),
       // A sandboxed wrapperCli adds only its own executable file(s) and the
       // botmux-generated launch shim; anything else it needs comes from the
       // bot's explicit sandboxPaths (see sandbox-wrapper-launch.ts).
