@@ -80,6 +80,7 @@ import {
   disableAutostart,
   autostartStatus,
   refreshAutostart,
+  resolveLoginShellPath,
   clearWatchdogStopped,
   markWatchdogStopped,
   watchdogStopRequested,
@@ -2916,7 +2917,17 @@ async function startConfiguredFleet(
   // and `daemon-reload`ing the very unit that is mid-transaction is at best
   // pointless and at worst makes the start fail.
   if (!options.bootHookStart
-      && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+      && refreshAutostart({
+        pkgRoot: PKG_ROOT,
+        configDir: CONFIG_DIR,
+        logDir: LOG_DIR,
+        // The boot hook's PATH must reflect the user's LOGIN shell, not the
+        // environment of whoever happens to run this command — a CLI session's
+        // PATH is narrower than the user's shell and would strip tool dirs
+        // from the unit. Resolved here (not in autostart.ts) so the boot-hook
+        // path stays a pure function of its inputs.
+        loginShellPath: resolveLoginShellPath(),
+      })) {
     console.log(`   autostart 主 unit 已同步到当前启动路径`);
   }
   // NOT UNDER systemd. Nobody reads a dashboard link at boot, and this poll waits
@@ -3114,7 +3125,14 @@ async function cmdRestart(): Promise<void> {
     }, { maxWaitMs: 5_000 });
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
-    if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+    if (refreshAutostart({
+      pkgRoot: PKG_ROOT,
+      configDir: CONFIG_DIR,
+      logDir: LOG_DIR,
+      // Same reason as the start path: the unit's PATH must come from the
+      // user's login shell, not from this process's (possibly narrowed) PATH.
+      loginShellPath: resolveLoginShellPath(),
+    })) {
       console.log(`autostart 主 unit 已同步到当前启动路径`);
     }
     console.log('✅ daemon 已重启');
@@ -20793,7 +20811,15 @@ switch (command) {
       break;
     }
     ensureConfigDir();
-    const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
+    const opts = {
+      pkgRoot: PKG_ROOT,
+      configDir: CONFIG_DIR,
+      logDir: LOG_DIR,
+      // The boot hook must carry the user's LOGIN-shell PATH — the CLI's own
+      // PATH may be narrower (a session), and a narrower PATH would delete
+      // the user's tool dirs from the unit.
+      loginShellPath: resolveLoginShellPath(),
+    };
     if (sub === 'enable' || sub === 'install') enableAutostart(opts);
     else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
     else autostartStatus(opts);

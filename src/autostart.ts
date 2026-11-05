@@ -43,6 +43,12 @@ export interface AutostartOpts {
   execPath?: string;
   /** PATH to persist in the boot hook, for tests. Defaults to `process.env.PATH`. */
   environmentPath?: string;
+  /**
+   * PATH of the user's login shell, for tests. Production leaves this unset
+   * and the caller resolves it with {@link resolveLoginShellPath}; it is the
+   * authoritative "what the user expects to find" tier of {@link bootHookPath}.
+   */
+  loginShellPath?: string;
 }
 
 /** Minimal registration state used by the Dashboard toggle. */
@@ -206,6 +212,121 @@ export function launchCommand(opts: AutostartOpts, sub: string, quote = false): 
   return (quote ? parts.map((p) => `"${p}"`) : parts).join(' ');
 }
 
+/**
+ * Merge two PATH strings: `preferred` keeps its own order, `fallback` only
+ * contributes entries `preferred` does not already contain.
+ *
+ * Used to keep a boot hook's PATH from SHRINKING when the hook is re-rendered
+ * from a narrower environment than the one it was written from — see
+ * {@link bootHookPath}.
+ */
+export function mergePathEntries(preferred: string, fallback: string, separator = ':'): string {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [...preferred.split(separator), ...fallback.split(separator)]) {
+    const entry = raw.trim();
+    if (!entry || seen.has(entry)) continue;
+    seen.add(entry);
+    out.push(entry);
+  }
+  return out.join(separator);
+}
+
+/**
+ * The PATH the boot hook must run with.
+ *
+ * WHY A MERGE AND NOT "THE CALLER'S PATH": the hook was historically rendered
+ * from `process.env.PATH` alone, so re-rendering it from a NARROWER
+ * environment silently deleted every directory the user had there but the
+ * caller did not. Observed in production: a `botmux restart` issued from inside
+ * a botmux CLI session re-rendered the systemd unit with the daemon's sanitized
+ * PATH (no `~/.local/bin`), and from that moment the fleet booted without
+ * `node` on PATH — every Node-based CLI (codex is a `#!/usr/bin/env node`
+ * script) died with `env: 'node': No such file or directory` (exit 127),
+ * while native-binary CLIs kept working. The unit looked fine, so the cause was
+ * invisible from the outside.
+ *
+ * Priority, highest first:
+ *   1. the user's login-shell PATH — what the user actually expects to find;
+ *   2. the PATH already persisted in the boot hook — never shrink it;
+ *   3. the PATH of whoever is writing the hook right now.
+ *
+ * A missing login PATH (no shell, probe failed) simply drops that tier.
+ */
+export function bootHookPath(input: {
+  callerPath?: string;
+  existingPath?: string;
+  loginPath?: string;
+  targetPlatform: NodeJS.Platform;
+}): string {
+  const separator = input.targetPlatform === 'win32' ? ';' : ':';
+  const caller = input.callerPath ?? process.env.PATH ?? '';
+  const merged = mergePathEntries(
+    mergePathEntries(input.loginPath ?? '', input.existingPath ?? '', separator),
+    caller,
+    separator,
+  );
+  return autostartPath(merged, input.targetPlatform);
+}
+
+/** The PATH already persisted in a systemd unit, if the unit has one. */
+export function unitPathFromContent(content: string): string | undefined {
+  const match = content.match(/^\s*Environment=PATH=(.*)$/m);
+  const value = match?.[1]?.trim();
+  return value || undefined;
+}
+
+/** The PATH already persisted in a launchd plist, if the plist has one. */
+export function plistPathFromContent(content: string): string | undefined {
+  const match = content.match(/<key>PATH<\/key>\s*<string>([^<]*)<\/string>/);
+  const value = match?.[1]?.trim();
+  return value || undefined;
+}
+
+const LOGIN_PATH_MARKER = 'BOTMUX_LOGIN_PATH=';
+
+/**
+ * The PATH the user's LOGIN shell produces — the authoritative answer to
+ * "which binaries does this user expect to find". A login shell sources
+ * `~/.profile` / `~/.zprofile`, which is where installers put their tool dirs
+ * (`~/.local/bin`, nvm/fnm shims, …); a botmux CLI session's PATH is NOT that
+ * shell's PATH, so the boot hook must not be rendered from it alone.
+ *
+ * Both the login and the interactive flavour are probed and MERGED: some
+ * installers only add their directory in `~/.bashrc` / `~/.zshrc` (interactive
+ * only), others only in `~/.profile`.
+ *
+ * Best-effort: returns undefined when no shell answers (Windows, a broken
+ * profile, a hung shell), and the caller then keeps whatever PATH it had.
+ * The probe is a plain argv exec (no shell interpolation of user input), with
+ * a timeout and stdin closed so a profile cannot block it.
+ */
+export function resolveLoginShellPath(timeoutMs = 5_000): string | undefined {
+  const shells = ['/bin/sh', '/bin/bash', '/bin/zsh', process.env.SHELL ?? '']
+    .filter((sh, i, all) => sh && all.indexOf(sh) === i);
+  const separator = ':';
+  const collected: string[] = [];
+  for (const sh of shells) {
+    for (const flags of ['-lc', '-ic']) {
+      const result = spawnSync(
+        sh,
+        [flags, `printf '%s%s\\n' '${LOGIN_PATH_MARKER}' "$PATH"`],
+        { encoding: 'utf-8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+      if (result.status !== 0) continue;
+      // rc files may print banners before the marker line; take only the
+      // marked line so a banner can never end up inside the boot PATH.
+      const line = (result.stdout ?? '')
+        .split(/\r?\n/)
+        .find((l) => l.startsWith(LOGIN_PATH_MARKER));
+      const value = line?.slice(LOGIN_PATH_MARKER.length).trim();
+      if (value) collected.push(value);
+    }
+  }
+  if (collected.length === 0) return undefined;
+  return collected.reduce((acc, value) => mergePathEntries(acc, value, separator), '');
+}
+
 export function autostartPath(
   pathValue: string = process.env.PATH || '',
   targetPlatform: NodeJS.Platform = process.platform,
@@ -305,7 +426,17 @@ function enableMac(opts: AutostartOpts): void {
   const path = plistPath();
   mkdirSync(dirname(path), { recursive: true });
   mkdirSync(opts.logDir, { recursive: true });
-  writeFileSync(path, plistContent(opts));
+  // Re-enabling must not shrink the PATH an existing plist already carries.
+  const existing = existsSync(path) ? plistPathFromContent(readFileSync(path, 'utf-8')) : undefined;
+  writeFileSync(path, plistContent({
+    ...opts,
+    environmentPath: bootHookPath({
+      callerPath: opts.environmentPath,
+      existingPath: existing,
+      loginPath: opts.loginShellPath,
+      targetPlatform: 'darwin',
+    }),
+  }));
   console.log(`✅ 已写入 LaunchAgent: ${path}`);
   // We deliberately do NOT bootstrap here — bootstrap on a RunAtLoad=true plist
   // would immediately fire `botmux start`, which surprises users who just
@@ -443,7 +574,17 @@ function enableLinux(opts: AutostartOpts): void {
 
   const path = unitPath();
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, unitContent(opts));
+  // Re-enabling must not shrink the PATH an existing unit already carries.
+  const existing = existsSync(path) ? unitPathFromContent(readFileSync(path, 'utf-8')) : undefined;
+  writeFileSync(path, unitContent({
+    ...opts,
+    environmentPath: bootHookPath({
+      callerPath: opts.environmentPath,
+      existingPath: existing,
+      loginPath: opts.loginShellPath,
+      targetPlatform: 'linux',
+    }),
+  }));
   writeWatchdogUnits(opts);
   console.log(`✅ 已写入 systemd unit: ${path}`);
 
@@ -536,7 +677,21 @@ function watchdogEnabled(): boolean {
 }
 
 function writeWatchdogUnits(opts: AutostartOpts): void {
-  writeFileSync(watchdogServicePath(), watchdogServiceContent(opts));
+  // The watchdog service carries its own PATH; keep the one it already has
+  // (same no-shrink rule as the main unit).
+  const servicePath = watchdogServicePath();
+  const existing = existsSync(servicePath)
+    ? unitPathFromContent(readFileSync(servicePath, 'utf-8'))
+    : undefined;
+  writeFileSync(servicePath, watchdogServiceContent({
+    ...opts,
+    environmentPath: bootHookPath({
+      callerPath: opts.environmentPath,
+      existingPath: existing,
+      loginPath: opts.loginShellPath,
+      targetPlatform: 'linux',
+    }),
+  }));
   writeFileSync(watchdogTimerPath(), watchdogTimerContent());
 }
 
@@ -783,8 +938,16 @@ export function refreshAutostart(opts: AutostartOpts): boolean {
       const path = plistPath();
       if (!existsSync(path)) return false;
       // Only rewrite if content changed, to avoid unnecessary launchctl reload.
-      const next = plistContent(opts);
       const prev = readFileSync(path, 'utf-8');
+      const next = plistContent({
+        ...opts,
+        environmentPath: bootHookPath({
+          callerPath: opts.environmentPath,
+          existingPath: plistPathFromContent(prev),
+          loginPath: opts.loginShellPath,
+          targetPlatform: 'darwin',
+        }),
+      });
       if (prev === next) return false;
       writeFileSync(path, next);
       if (launchctlIsLoaded()) { launchctlBootout(); launchctlBootstrap(path); }
@@ -794,8 +957,20 @@ export function refreshAutostart(opts: AutostartOpts): boolean {
       let changed = false;
       const path = unitPath();
       if (existsSync(path)) {
-        const next = unitContent(opts);
         const prev = readFileSync(path, 'utf-8');
+        // NEVER SHRINK: the unit keeps the PATH it already has, and gains the
+        // login-shell PATH plus whatever the current process sees. Re-rendering
+        // from a narrow environment (a CLI session) used to delete the user's
+        // tool dirs from the boot unit — see {@link bootHookPath}.
+        const next = unitContent({
+          ...opts,
+          environmentPath: bootHookPath({
+            callerPath: opts.environmentPath,
+            existingPath: unitPathFromContent(prev),
+            loginPath: opts.loginShellPath,
+            targetPlatform: 'linux',
+          }),
+        });
         if (prev !== next) {
           writeFileSync(path, next);
           changed = true;
@@ -803,9 +978,17 @@ export function refreshAutostart(opts: AutostartOpts): boolean {
         // Existing users already opted into autostart. Install the watchdog
         // during their next manual start instead of requiring another explicit
         // `autostart enable` after upgrade.
-        const wdService = watchdogServiceContent(opts);
-        const wdTimer = watchdogTimerContent();
         const prevService = existsSync(watchdogServicePath()) ? readFileSync(watchdogServicePath(), 'utf-8') : '';
+        const wdService = watchdogServiceContent({
+          ...opts,
+          environmentPath: bootHookPath({
+            callerPath: opts.environmentPath,
+            existingPath: unitPathFromContent(prevService),
+            loginPath: opts.loginShellPath,
+            targetPlatform: 'linux',
+          }),
+        });
+        const wdTimer = watchdogTimerContent();
         const prevTimer = existsSync(watchdogTimerPath()) ? readFileSync(watchdogTimerPath(), 'utf-8') : '';
         if (prevService !== wdService) {
           writeFileSync(watchdogServicePath(), wdService);
