@@ -19,6 +19,8 @@ import { sidebarAppLink } from '../../core/decision-board/model.js';
 import { workflowSidebarEntryPath } from '../../core/workflow-sidebar-link.js';
 import type { Brand } from './lark-hosts.js';
 import { buildReplyCardChromeRow, REPLY_CARD_ACTIONS_ELEMENT_ID } from './reply-card-actions.js';
+import { workflowNodeMarkerActive } from '../../core/workflow-node-session.js';
+import type { WorkflowNodeSessionMarker } from '../../types.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID,
@@ -62,19 +64,19 @@ export function workflowSidebarEntryLink(input: {
 }
 
 /**
- * 子 Bot 在节点落点的回复卡（§5.5）：只有登记了工作流交接的节点会话（session 上有
+ * 子 Bot 在节点落点的回复卡（§5.5）：只有登记了工作流交接的会话（session 上有
  * `workflowNode` 标记，标记只来自已核验的 bot 执行模式交接）才带入口；普通会话一律没有。
  *
- * ⚠️ 目前只有节点话题落点：节点会话就是那个话题的会话，标记一直留着、一直带入口，正合 §5.5。
- * 主话题落点（设计 PR 5b）会把交接交给子 Bot 在主话题里**复用的已有会话**，现在没有任何地方
- * 在 attempt 结束时清掉标记——5b 必须二选一：attempt 结束（成功 / 受阻 / 取消 / 被替代）时清
- * 掉这个标记，或在这里按 attempt 是否仍在进行判断，否则这个会话之后的所有回复都会一直带入口。
+ * - 节点话题落点：节点会话就是那个话题的会话，标记一直留着、一直带入口。
+ * - 主话题落点：交接交给子 Bot 在主话题里复用的普通会话（也可能是主会话），标记带
+ *   `placement: 'main'`，只在本节点这次 attempt 进行期间算数（`workflowNodeMarkerActive`：
+ *   交上产出、被停止 / 撤销、报告做不了之后就不再算）。attempt 结束后这个会话的回复不带入口。
  */
 export function workflowNodeSessionEntry(
-  marker: { runId: string; orchestratorAppId: string } | undefined,
+  marker: ({ runId: string; orchestratorAppId: string } & Pick<WorkflowNodeSessionMarker, 'placement' | 'submittedAt' | 'closedAt'>) | undefined,
   entryFor: (mainLarkAppId: string, runId: string) => WorkflowSidebarEntryLink | undefined,
 ): WorkflowSidebarEntryLink | undefined {
-  return marker ? entryFor(marker.orchestratorAppId, marker.runId) : undefined;
+  return marker && workflowNodeMarkerActive(marker) ? entryFor(marker.orchestratorAppId, marker.runId) : undefined;
 }
 
 function entryLabel(link: WorkflowSidebarEntryLink): string {

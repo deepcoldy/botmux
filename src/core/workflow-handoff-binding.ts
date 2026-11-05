@@ -61,6 +61,10 @@ export interface WorkflowHandoffBindingPayload {
   sourceLarkAppId: string;
   workflow: WorkflowHandoffRef;
   issuedAt: string;
+  /** Design §5.1: `main` = handed off in the run's main topic (`publishRoot`
+   *  is then the main topic's root). Absent = a node topic; such bindings
+   *  keep their exact bytes and signature. */
+  placement?: 'main';
 }
 
 export interface SignedWorkflowHandoffBinding {
@@ -110,6 +114,7 @@ function canonicalPayload(raw: Record<string, unknown>): WorkflowHandoffBindingP
     throw new Error('invalid revision');
   }
   if (typeof raw.issuedAt !== 'string' || !Number.isFinite(Date.parse(raw.issuedAt))) throw new Error('invalid issue time');
+  if (raw.placement !== undefined && raw.placement !== 'main') throw new Error('invalid placement');
   // Fixed key order: the signature covers exactly these bytes.
   return {
     domain: DOMAIN,
@@ -126,6 +131,7 @@ function canonicalPayload(raw: Record<string, unknown>): WorkflowHandoffBindingP
       revision: workflow.revision,
     },
     issuedAt: raw.issuedAt,
+    ...(raw.placement === 'main' ? { placement: 'main' as const } : {}),
   };
 }
 

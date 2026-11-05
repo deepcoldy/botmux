@@ -511,6 +511,30 @@ export interface WorkflowNodeSessionMarker {
    *  Any of them ending without a submission shows the node as stopped; a
    *  turn already in flight before registration never does. */
   turnIds?: string[];
+  /** Main-topic placement (design §5.5): the handoff went into this bot's
+   *  ordinary session in the run's main topic, which outlives the attempt.
+   *  Such a marker never makes the session a node session (its kind, skills
+   *  and plugin dir stay those of an ordinary session) and counts only while
+   *  its attempt is in progress — see `workflowNodeMarkerActive`. */
+  placement?: 'main';
+  /** Main-topic placement: the attempt ended without this session handing
+   *  in work (stopped, revoked, reported blocked). */
+  closedAt?: string;
+  /** Main-topic placement: the handoff's own turn reached the CLI. Persisted
+   *  so a stop after a restart still knows the node's turn may be running. */
+  handoffStartedAt?: string;
+  /** Main-topic placement: the CLI turn the handoff started in (with any
+   *  messages folded into it) went idle again. */
+  handoffSettledAt?: string;
+  /** Main-topic placement: the worker generation the handoff turn started
+   *  in. Another generation (daemon restart, respawned worker) means that
+   *  CLI turn is over, whatever idle signal was missed. */
+  handoffWorkerGeneration?: number;
+  /** Main-topic placement: the latest turn that started in the session
+   *  while the attempt was in progress, and when the session next went idle
+   *  — persisted so a stop after a restart still finds the node's later
+   *  turn (a CLI kept by a persistent backend may still be running it). */
+  lastTurn?: { turnId: string; settledAt?: string };
 }
 
 export interface Session {

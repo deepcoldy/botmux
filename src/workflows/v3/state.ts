@@ -480,6 +480,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
       case 'nodeHandoffPrepared':
       case 'nodeHandoffSent':
       case 'nodeHandoffAccepted':
+      case 'nodeHandoffStarted':
       case 'nodeStalled':
         // External handoff progress is audit/ledger state only; the attempt
         // is already `running` from its nodeDispatched.

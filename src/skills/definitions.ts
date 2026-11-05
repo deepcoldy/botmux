@@ -1789,6 +1789,13 @@ botmux workflow architect <runId>
 
 用户确认 → \`botmux workflow approve-dag <runId> [--working-dir <任务目录>]\`。可选 \`--working-dir\` 在首次 Gate-2 批准时冻结所有节点的工作目录；省略时使用各机器人的配置目录。已发布 run 重试复用原快照，后传目录不覆盖已有运行。然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
+## 落点（节点交给群里的 Bot 执行时）
+每个节点要么开节点话题（默认），要么直接在主话题里交接（节点的 \`"placement": "main"\`）。Architect 初定落点并在 architect-notes.md 的 \`## Placements\` 写理由；第 6 步的清单每行括号里写着「主话题」或「节点话题」和理由，Gate-2 时一起讲给用户。
+- 开节点话题，满足任一条：预计超过约 10 分钟或要多轮往返；可能要问人、要讨论；过程消息多（改代码、跑测试、抓数据）；Loop 的 body 或可能被返工；和别的节点并行。
+- 放主话题，要同时满足：一步能做完的小活（汇总、改写、格式化、查一个数）；和别的主话题节点前后串行；结果就是主话题里的人想直接看的。
+硬规则（Architect 产出、approve-dag、每次运行中修改都会校验，违反就拒绝并写明第几条）：① 主话题里同一个 Bot 的两个节点必须一个是另一个的上游（它在主话题只有一个会话）；② 你自己的主话题节点就在这个主会话里跑，同样受 ①；它在跑时，唤醒你处理 run 事件的回合排在它后面；③ 主会话不在话题里（整群一个会话）的 run 不能用主话题。
+改落点：批准前用 revise-dag 让 Architect 重排；开跑后只能改还没开始的节点：\`{"op":"updateNode","nodeId":"x","set":{"placement":"main"}}\`（改回节点话题写 \`"topic"\` 或 \`null\`），已开始的节点不能改。
+
 ## 运行中修改
 run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做），只在本 run 的主话题里做：
 1. \`botmux workflow status <runId> --json\` 读当前版本（\`revision\`）、各节点状态、尝试次数和待确认的修改。
