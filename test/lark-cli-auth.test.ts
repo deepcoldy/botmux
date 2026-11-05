@@ -684,6 +684,32 @@ describe('issuer app follows the operator\'s current lark-cli profile', () => {
     expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/2');
   });
 
+  it('a code is labelled with the app it was minted for, even if the HOME is re-seeded while it is minted', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let n = 0;
+    __setLarkCliRunnerForTest(async () => {
+      n += 1;
+      const mine = n;
+      if (mine === 1) await gate; // the first topic's CLI call is slow
+      return { ok: true, stdout: JSON.stringify({ verification_url: `https://v/${mine}`, device_code: `dc-${mine}` }), stderr: '' };
+    });
+    writeMachine([app(APP_ID), app(OTHER, 'work')]);
+    // Seed for APP_ID first, without a pending code in the way.
+    const seedPath = join(larkCliHomeFor(OPEN), '.lark-cli', 'config.json');
+    mkdirSync(join(larkCliHomeFor(OPEN), '.lark-cli'), { recursive: true });
+    const slow = beginLarkCliLogin(OPEN);           // minting for APP_ID, in flight
+    await new Promise(r => setTimeout(r, 10));
+    writeMachine([app(APP_ID), app(OTHER, 'work')], 'work');
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/2'); // re-seeded to OTHER
+    release();
+    expect((await slow)?.authUrl).toBe('https://v/1');
+    expect(JSON.parse(readFileSync(seedPath, 'utf8')).apps[0].appId).toBe(OTHER);
+    // dc-1 won the challenge file, but it is APP_ID's: it must not be handed out again.
+    expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-1');
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/3');
+  });
+
   it('unchanged issuer keeps the seeded HOME and the pending code', async () => {
     let n = 0;
     __setLarkCliRunnerForTest(async () => {

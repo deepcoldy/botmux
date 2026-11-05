@@ -463,11 +463,11 @@ export function pendingLarkCliChallenge(openId: string): { deviceCode: string; a
   } catch { return null; }
 }
 
-function saveChallenge(openId: string, deviceCode: string, authUrl: string): void {
+function saveChallenge(openId: string, deviceCode: string, authUrl: string, appId: string | undefined): void {
   try {
     atomicWriteFileSync(
       challengePath(openId),
-      JSON.stringify({ deviceCode, authUrl, createdAt: Date.now(), appId: seededAppId(larkCliHomeFor(openId)) }),
+      JSON.stringify({ deviceCode, authUrl, createdAt: Date.now(), appId }),
       { mode: 0o600 },
     );
   } catch (e) {
@@ -531,6 +531,9 @@ export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginCha
     && (pending.appId === undefined || pending.appId === seededAppId(home))) {
     return { authUrl: pending.authUrl };
   }
+  // The app this code is minted for, read BEFORE the CLI runs: another topic
+  // may re-seed the HOME while we wait, and the label must stay the issuer's.
+  const mintedForApp = seededAppId(home);
   const { ok, stdout, stderr } = await runAsUser(openId, [
     'auth', 'login', '--no-wait', '--json', '--scope', LARK_CLI_DEVICE_SCOPES.join(' '),
   ]);
@@ -547,7 +550,7 @@ export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginCha
   // alone so that newer login is not deleted.
   if (readCliAuthEpoch(openId) !== epochAtStart) return null;
   stampCliAuthEpoch(openId, home);
-  saveChallenge(openId, deviceCode, authUrl);
+  saveChallenge(openId, deviceCode, authUrl, mintedForApp);
   return { authUrl };
 }
 
