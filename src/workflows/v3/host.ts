@@ -18,7 +18,8 @@
  * dag.ts's `loadDag`.  grill state is a conversation worktable — it does NOT
  * write the runtime journal (codex 2026-06-02).
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { WORKFLOW_DRAFT_FILE } from './draft-store.js';
 import { join, resolve, sep } from 'node:path';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
@@ -212,6 +213,12 @@ export function assertWorkflowHostCaller(
   current: RunChatBinding | undefined,
 ): void {
   const state = mustRead(runDir);
+  // A Dashboard draft (design 2026-11-03 workflow-dashboard-orchestration
+  // §4.2, E2) is advanced only by its orchestrating bot's daemon, for its
+  // recorded initiator; no CLI caller may stand in for that person.
+  if (existsSync(join(runDir, WORKFLOW_DRAFT_FILE))) {
+    throw new HostGuardError(`run ${state.runId} 是 Dashboard 草稿，只能在 Dashboard 上操作`);
+  }
   const target = state.chatBinding;
   if (!target) {
     if (current?.ownerOpenId) {
@@ -277,7 +284,7 @@ function hostBusyError(runDir: string): HostGuardError {
   );
 }
 
-function withHostMutationLockSync<T>(runDir: string, fn: () => T): T {
+export function withHostMutationLockSync<T>(runDir: string, fn: () => T): T {
   try {
     return withFileLockSync(hostMutationLockTarget(runDir), fn, {
       maxWaitMs: HOST_MUTATION_LOCK_WAIT_MS,
@@ -824,6 +831,36 @@ function adHocBotPlanInput(
 }
 
 /**
+ * The Gate-2 bot plan (node → bot, CLI, reason, ⚠️) of a not-yet-authorized
+ * run, structured — what a Dashboard draft shows (design 2026-11-03
+ * workflow-dashboard-orchestration §4.4). Read-only.
+ */
+export function projectAdHocBotPlan(
+  runDir: string,
+  targets: readonly V3NodeExecutorTarget[],
+  orchestratorAppId: string,
+  bots: readonly BotConfig[],
+  nameOf: (larkAppId: string) => string,
+  roster?: V3BotRoster,
+): ReturnType<typeof projectV3Gate2BotPlan> {
+  return projectV3Gate2BotPlan(adHocBotPlanInput(runDir, targets, orchestratorAppId, bots, nameOf, roster));
+}
+
+/** The flow summary (§4.4) of exactly `dag` with these executing bots: the
+ *  one Gate-2 approve-dag records and a Dashboard draft's second gate compares. */
+export function adHocFlowSummary(input: {
+  runDir: string;
+  dag: V3Dag;
+  targets: readonly V3NodeExecutorTarget[];
+  orchestratorAppId: string;
+  bots: readonly BotConfig[];
+  nameOf: (larkAppId: string) => string;
+}): ReturnType<typeof buildV3FlowSummary> {
+  const plan = projectAdHocBotPlan(input.runDir, input.targets, input.orchestratorAppId, input.bots, input.nameOf);
+  return buildV3FlowSummary({ dagNodes: input.dag.nodes, plan });
+}
+
+/**
  * Gate-2's second-confirmation record for a bot run (design 2026-11-03
  * workflow-dashboard-orchestration §4.4 / §7.3): the flow summary of exactly
  * what is being frozen, who confirmed (when known) and when.
@@ -838,10 +875,7 @@ function adHocFlowConfirmation(input: {
   confirmedByOpenId?: string;
   confirmedAt: Date;
 }): V3FlowConfirmation {
-  const plan = projectV3Gate2BotPlan(
-    adHocBotPlanInput(input.runDir, input.targets, input.orchestratorAppId, input.bots, input.nameOf),
-  );
-  const flowSummary = buildV3FlowSummary({ dagNodes: input.dag.nodes, plan });
+  const flowSummary = adHocFlowSummary(input);
   return {
     ...(input.confirmedByOpenId ? { confirmedByOpenId: input.confirmedByOpenId } : {}),
     confirmedAt: input.confirmedAt.toISOString(),

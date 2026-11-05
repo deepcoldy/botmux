@@ -445,6 +445,15 @@ export function normalizeStewardConfig(raw: unknown):
   return { ok: true, value };
 }
 
+/**
+ * 这个 bot 是不是管家（只看总开关，不要求选了管家群）。管家不执行工作流节点：
+ * Dashboard 草稿与飞书 /workflow 两个入口的 Architect 名单都按这一条排除
+ * （design 2026-11-03 workflow-dashboard-orchestration §4.4）。
+ */
+export function isStewardBot(cfg: StewardConfig | undefined): boolean {
+  return cfg?.enabled === true;
+}
+
 /** 管家可用 = 开关开 + 选了管家群。只开开关没选群时，看板可读写，但批次无处投递。 */
 export function stewardReady(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
   return !!cfg?.enabled && !!cfg.chatId;
