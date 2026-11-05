@@ -12466,6 +12466,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     let dir: string | undefined;
     let voiceDurationMs: number | undefined;
     try {
+      // Attribute the send to its start, not a delayed synthesis/provider ACK
+      // that may arrive after another input was folded into the native turn.
+      const sentAtMs = Date.now();
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
@@ -12566,13 +12569,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         return deliveredMessageId;
       });
       const messageId = voiceDelivery.messageId;
-      const sentAtMs = Date.now();
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
-      if ((!sendTopLevel && !overrideChatId && !sendInto)
+      if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput) {
+        || !!deferredTopicRootMessageIdForOutput)) {
         try {
           const markerSessionId = originSessionId ?? sid;
           const markerTurnId = originTurnId ?? currentTurnId;
@@ -12657,6 +12659,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
       const docMessageId = `doc:${exactDocTarget.commentId}`;
+      const sentAtMs = Date.now();
       const docDelivery = turnSendKey
         ? await turnSendLedger.executeNonIdempotentSequence(
             turnSendKey,
@@ -12709,20 +12712,22 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
-      try {
-        recordBridgeReplyMarker({
-          dataDir: resolveDataDir(),
-          sessionId: originSessionId!,
-          sentAtMs: Date.now(),
-          messageId: docDelivery.messageId,
-          deliveryKind: 'current_session_send',
-          content,
-          responseKind: effectiveResponseKind,
-          turnId: originTurnId ?? exactDocTarget.turnId,
-          dispatchAttempt: originDispatchAttempt,
-          targetSessionId: originSessionId,
-        });
-      } catch { /* best-effort：漏记只多一条兜底 */ }
+      if (!docDelivery.replayed) {
+        try {
+          recordBridgeReplyMarker({
+            dataDir: resolveDataDir(),
+            sessionId: originSessionId!,
+            sentAtMs,
+            messageId: docDelivery.messageId,
+            deliveryKind: 'current_session_send',
+            content,
+            responseKind: effectiveResponseKind,
+            turnId: originTurnId ?? exactDocTarget.turnId,
+            dispatchAttempt: originDispatchAttempt,
+            targetSessionId: originSessionId,
+          });
+        } catch { /* best-effort：漏记只多一条兜底 */ }
+      }
       if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
           sendDataDir,
@@ -14004,16 +14009,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
-      if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
-        recordBridgeSendMarker(
-          Date.now(),
-          messageId,
-          text,
-          (customCard && !customFinal) || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
-            ? 'non_patchable'
-            : 'standard_reply_card',
-        );
-      }
+      // Reusing a receipt is not a new send. Preserve the original marker's
+      // time, including when another input arrived while we waited on the lock.
       await removeScheduleSelfAfterFinal();
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
@@ -14190,7 +14187,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     const trailingCarrierMessageId = videoMessageIds.at(-1) ?? attachmentMessageIds.at(-1);
     if (trailingCarrierMessageId
       && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
-      recordBridgeSendMarker(Date.now(), trailingCarrierMessageId, '', 'non_patchable');
+      recordBridgeSendMarker(sentAtMs, trailingCarrierMessageId, '', 'non_patchable');
     }
     for (const f of failedAttachments) {
       console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);
