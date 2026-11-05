@@ -1673,6 +1673,9 @@ export class WorkflowDraftService {
             },
           };
         }
+        // Whether the copied flow still belongs to the requirement being
+        // edited: only then does 「只改文字」 carry it over.
+        const pinned = this.copyPrefillUsable(grill, draft);
         let spec: Record<string, unknown>;
         try {
           spec = JSON.parse(readFileSync(grill.specJsonPath, 'utf-8')) as Record<string, unknown>;
@@ -1698,7 +1701,7 @@ export class WorkflowDraftService {
         // Only now that the new requirement is in place: a refused edit keeps
         // the copied flow. A crash before this write leaves a spec the
         // prefill is not pinned to — 「确认需求」 then orchestrates anew.
-        if (mode === 'rearchitect') dropCopyPrefill(draft);
+        if (mode === 'rearchitect' || !pinned) dropCopyPrefill(draft);
         else if (copy.prefill) {
           const specSha256 = fileSha256(grill.specJsonPath);
           if (specSha256) copy.prefill.specSha256 = specSha256;

@@ -259,6 +259,8 @@ describe('复核修复的页面（D6）', () => {
     const edited = await h.service.finalizeSpec(other.runId, OWNER, { specMarkdown: specMarkdown(SKETCHES, { title: '另一份需求' }) });
     const stale = await render(edited.draft);
     expect(text(stale.root)).toContain('确认需求后将按新需求重新编排');
+    const textOnly = stale.root.findAll((node) => node.type === 'input' && node.props.name === 'wfc-mode')[0]!;
+    expect(textOnly.props.disabled).toBe(true);
     act(() => { stale.unmount(); });
   });
 });

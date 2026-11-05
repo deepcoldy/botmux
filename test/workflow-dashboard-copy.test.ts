@@ -471,6 +471,9 @@ describe('复核修复（D6）', () => {
     const finalized = await h.service.finalizeSpec(draft.runId, OWNER, { specMarkdown: specMarkdown(SKETCHES, { title: '完全不同的周报' }) });
     expect(finalized.ok).toBe(true);
     expect(finalized.draft.copy).toMatchObject({ prefilled: false, prefillStale: true });
+    // 「只改文字」 afterwards does not bring the copied flow back.
+    await h.service.editCopyGoal(draft.runId, OWNER, { goal: '再改一下目标', mode: 'text_only' });
+    expect(draftJson(draft.runId).copy.prefill).toBeUndefined();
     const approved = await h.service.approveSpec(draft.runId, OWNER);
     expect(approved.phase).toBe('awaiting_architect');
     expect(draftJson(draft.runId).copy.prefill).toBeUndefined();

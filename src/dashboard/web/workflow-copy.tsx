@@ -129,6 +129,9 @@ export function CopyInfoPanel(props: {
   const [goal, setGoal] = useState(view.goal);
   const [choice, setChoice] = useState<CopyGoalChoice>({ kind: 'text_only' });
   useEffect(() => { setGoal(view.goal); }, [view.goal]);
+  // The requirement changed since the copy: there is no copied flow left to keep.
+  const stale = !!copy?.prefillStale;
+  useEffect(() => { if (stale) setChoice((current) => (current.kind === 'text_only' ? { kind: 'reorchestrate', reclarify: true } : current)); }, [stale]);
   const nameOf = (appId: string) => props.botNames.get(appId) ?? appId;
   const graph = useMemo(() => copy?.prefillDag
     ? draftGraphView(copy.prefillDag, copyGraphRows(copy.prefillDag, view.orchestratorAppId, (appId) => props.botNames.get(appId) ?? appId))
@@ -183,7 +186,7 @@ export function CopyInfoPanel(props: {
           <textarea id="wfc-goal-text" rows={3} value={goal} onChange={(event) => setGoal(event.target.value)} />
           <div className="wfc-modes" role="radiogroup" aria-label={tr('workflow.copy.goalTitle')}>
             <label className="wfc-mode">
-              <input type="radio" name="wfc-mode" checked={choice.kind === 'text_only'} onChange={() => setChoice({ kind: 'text_only' })} />
+              <input type="radio" name="wfc-mode" checked={choice.kind === 'text_only'} disabled={stale} onChange={() => setChoice({ kind: 'text_only' })} />
               <span><b>{tr('workflow.copy.modeTextOnly')}</b><small className="muted">{tr('workflow.copy.modeTextOnlyHint')}</small></span>
             </label>
             <label className="wfc-mode">
