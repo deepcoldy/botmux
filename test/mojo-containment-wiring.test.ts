@@ -49,17 +49,59 @@ const STORE = 'mojo-containment-handles.json';
 /** Linux-only: needs a real /proc and real process signalling. */
 const describeLinux = describe.runIf(isLinux);
 
+/** Every pid a synthetic /proc fixture creates. */
+const SYNTHETIC_FIXTURE_PIDS = [4242, 4243, 5150, 5151, 7000, 8000, 9000, 9100] as const;
+/**
+ * Fake runner identity for synthetic-/proc cases. `MojoBackend.selfPids()`
+ * excludes `[process.pid, process.ppid]` from every tree scan so cleanup can
+ * never signal the runner itself; on a CI container whose pid namespace hands
+ * the runner a LOW pid, the real value can equal a fixture pid (observed:
+ * worker pid 8000 made `expected [] to include 8000` fail deterministically).
+ * Pin both values off the fixture set. Cases that need the REAL identity
+ * (real-/proc handles) call `useRealProcessIdentity()` first.
+ */
+const RUNNER_PID = 987_654;
+const RUNNER_PPID = 987_655;
+
 let dataDir: string;
 let prevDataDir: string | undefined;
+// Saved descriptors so the real process.pid/ppid can be restored exactly. Bun's
+// ppid is an accessor while Node's pid is a non-writable data property, so the
+// descriptors differ per runtime and plain assignment is not enough.
+let realPidDescriptor: PropertyDescriptor | undefined;
+let realPpidDescriptor: PropertyDescriptor | undefined;
 
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'mojo-containment-wiring-'));
   prevDataDir = process.env.SESSION_DATA_DIR;
   process.env.SESSION_DATA_DIR = dataDir;
+  pinRunnerIdentity();
 });
+
+/**
+ * Pin the runner identity off the fixture set by installing getters directly.
+ * `vi.spyOn(process, 'pid', 'get')` only works under vitest: Bun's spyOn rejects
+ * accessor targets ("does not support accessor properties yet"), which made the
+ * whole file red on the bun:test leg. On Node the native ppid is a special data
+ * property that silently ignores a value-form redefinition, so both properties
+ * are pinned as getters (the one form both runtimes honour).
+ */
+function pinRunnerIdentity(): void {
+  realPidDescriptor = Object.getOwnPropertyDescriptor(process, 'pid');
+  realPpidDescriptor = Object.getOwnPropertyDescriptor(process, 'ppid');
+  Object.defineProperty(process, 'pid', { get: () => RUNNER_PID, configurable: true, enumerable: true });
+  Object.defineProperty(process, 'ppid', { get: () => RUNNER_PPID, configurable: true, enumerable: true });
+}
+
+/** Restore the real runner identity for cases that build handles from live /proc. */
+function useRealProcessIdentity(): void {
+  if (realPidDescriptor) Object.defineProperty(process, 'pid', realPidDescriptor);
+  if (realPpidDescriptor) Object.defineProperty(process, 'ppid', realPpidDescriptor);
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
+  useRealProcessIdentity();
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
   else process.env.SESSION_DATA_DIR = prevDataDir;
   rmSync(dataDir, { recursive: true, force: true });
@@ -106,6 +148,21 @@ function backendFor(sessionId: string): MojoBackend {
   // The config surface only needs to be shaped; no CLI is invoked by these cases.
   return new MojoBackend({ model: 'default' } as never, sessionId);
 }
+
+describe('test harness: pinned runner identity', () => {
+  it('never intersects the synthetic fixture pids', () => {
+    // Future fixtures must not reuse the pinned runner pid/ppid, or selfPids()
+    // would swallow the fixture member again (the CI pid-8000 failure).
+    const collision = [...SYNTHETIC_FIXTURE_PIDS].some(pid => pid === RUNNER_PID || pid === RUNNER_PPID);
+    expect(collision).toBe(false);
+    expect(RUNNER_PID).not.toBe(RUNNER_PPID);
+  });
+
+  it('sees the pinned identity inside a synthetic case', () => {
+    expect(process.pid).toBe(RUNNER_PID);
+    expect(process.ppid).toBe(RUNNER_PPID);
+  });
+});
 
 describe('A2: treeNonce is per-session and inherited', () => {
   it('adopts the nonce of an outstanding handle instead of minting a fresh one', () => {
@@ -350,6 +407,7 @@ describe('A5: a workerless close must prove the local subtree', () => {
   it.runIf(isLinux)('does not read a failed scan as an empty subtree', () => {
     // scanned:false collapsing into pids:[] would read as "nothing alive" and mint
     // a proof we do not have. Point the scan at a /proc that does not exist.
+    useRealProcessIdentity();
     const sessionId = 'sess-workerless-unscannable';
     recordContainmentHandle(liveWeakHandle(sessionId, process.pid, 'nonce-unscannable'));
     const proof = proveWorkerlessLocalSubtree(sessionId, { procRoot: join(dataDir, 'no-proc') });
@@ -428,6 +486,7 @@ describe('A3: a failed scan is not an empty subtree (backend teardown path)', ()
   it.runIf(isLinux)('refuses the close when the inherited tree cannot be scanned at all', async () => {
     // scanned:false collapsing into pids:[] would read as "nothing alive" and
     // release a handle on the strength of a scan that never ran.
+    useRealProcessIdentity();
     const sessionId = 'sess-teardown-unscannable';
     recordContainmentHandle(liveWeakHandle(sessionId, process.pid, 'nonce-teardown'));
     const missingProc = join(dataDir, 'no-proc-here');
@@ -813,6 +872,7 @@ describe('inherited unprovable handle: a replacement generation must not wedge o
     // The counter-case that stops the fix from becoming "never fence again": a weak
     // handle whose scan failed may succeed on retry, so a fence is still correct.
     // Without this, deleting the platform distinction entirely would pass.
+    useRealProcessIdentity();
     const sessionId = 'sess-inherited-weak-unscannable';
     recordContainmentHandle(liveWeakHandle(sessionId, process.pid, 'nonce-inherited-weak'));
     const backend = backendFor(sessionId);
