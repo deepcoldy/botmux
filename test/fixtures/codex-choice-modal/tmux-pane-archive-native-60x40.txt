@@ -9,7 +9,7 @@
 
 
 [0m[39m[49m  [38;5;75m>_ [1m[39mOpenAI Codex[0;2m[39m[49m (v0.164.0)
-[0m[39m[49m     [2m/tmp/pi2847/proj
+[0m[39m[49m     [2m/tmp/botmux/proj
 
 [0m[39m[49m  [1m[38;5;211mTip:[0m[39m[49m Use [1m[38;5;211m/permissions[0m[39m[49m to control when Codex asks for
   confirmation.
