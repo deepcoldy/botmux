@@ -491,6 +491,35 @@ describe('a one_success / quorum join does not order its sources before it (§5.
     expect(problemsOf(GATED)).toEqual([]);
   });
 
+  it('a join that needs every source — one_success over one, quorum equal to the in-degree — orders them like all_success', () => {
+    const single = [
+      goal('a', { bot: 'cli_x', placement: 'main' }),
+      goal('b', { bot: 'cli_x', placement: 'main', depends: ['a'], triggerRule: 'one_success' }),
+    ];
+    expect(problemsOf(single)).toEqual([]);
+    expect(problemsOf(JOIN({ quorum: 2 }))).toEqual([]);
+    for (const nodes of [single, JOIN({ quorum: 2 })]) {
+      expect(v3TargetPlacementProblems({ targets: v3BotExecutorTargets(dagOf(nodes), snapshots), orchestratorAppId: MAIN, mainTopic: { available: true } }))
+        .toEqual([]);
+    }
+    // One short of the in-degree still lets it start while a runs.
+    expect(problemsOf(JOIN({ quorum: 1 }))).toHaveLength(1);
+  });
+
+  it('a long main-topic chain is checked in one pass, not once per pair', () => {
+    const nodes = Array.from({ length: 150 }, (_, i) => goal(`n${i}`, {
+      bot: 'cli_x', placement: 'main', ...(i > 0 ? { depends: [`n${i - 1}`] } : {}),
+    }));
+    // Every pair is ordered. Rebuilding the reachability per pair took ~8.5s
+    // here; one pass takes milliseconds — the bound leaves a wide margin.
+    const startedAt = performance.now();
+    const targets = v3BotExecutorTargets(dagOf(nodes), snapshots);
+    expect(performance.now() - startedAt).toBeLessThan(2_000);
+    expect(targets.every((target) => target.unorderedAncestors === undefined)).toBe(true);
+    expect(targets.at(-1)?.ancestors).toHaveLength(149);
+    expect(v3TargetPlacementProblems({ targets, orchestratorAppId: MAIN, mainTopic: { available: true } })).toEqual([]);
+  });
+
   it('approve-dag / Saved Workflow targets refuse it too (and accept the all_success forms)', async () => {
     const targets = v3BotExecutorTargets(dagOf(JOIN()), snapshots);
     expect(targets.find((t) => t.nodeId === 'b')?.ancestors).toEqual([]);

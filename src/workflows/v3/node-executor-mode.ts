@@ -15,7 +15,7 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
-import { v3OrderedAncestorSets, v3OrderingBreak, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
+import { v3OrderedAncestorSets, v3OrderingBreak, v3ReachableAncestorSets, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
 import type { V3HandoffIdentityRecord, V3HandoffIdentityTool, V3HandoffIdentityUnavailableReason } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
@@ -138,7 +138,11 @@ export function v3BotExecutorTargets(
   // §5.2: only ancestors guaranteed to finish first (all_success joins on
   // the whole path) order two main-topic nodes; the same rule as placement.ts.
   const ordered = v3OrderedAncestorSets(dag);
-  const mainIds = dag.nodes.filter((node) => isGoalNode(node) && node.placement === 'main').map((node) => node.id);
+  const main = dag.nodes.filter((node) => isGoalNode(node) && node.placement === 'main');
+  // The explanation is only needed for a pair that conflicts (same executor,
+  // linked by `depends` yet unordered); computed once per DAG, not per pair.
+  const executorOfMain = new Map(main.map((node) => [node.id, isGoalNode(node) ? targetOf(node.bot, node.id) : undefined]));
+  let reach: Map<string, Set<string>> | undefined;
   for (const node of dag.nodes) {
     if (isGoalNode(node)) {
       const target = withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs);
@@ -146,9 +150,11 @@ export function v3BotExecutorTargets(
         out.push(target);
         continue;
       }
-      const unorderedAncestors = mainIds.flatMap((other) => {
+      const unorderedAncestors = main.flatMap(({ id: other }) => {
         if (other === node.id || ordered.get(node.id)?.has(other)) return [];
-        const why = v3OrderingBreak(dag, other, node.id);
+        if (executorOfMain.get(other) !== executorOfMain.get(node.id)) return [];
+        reach ??= v3ReachableAncestorSets(dag);
+        const why = v3OrderingBreak(dag, other, node.id, reach);
         return why ? [{ nodeId: other, ...why }] : [];
       });
       out.push({

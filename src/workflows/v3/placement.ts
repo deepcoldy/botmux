@@ -43,15 +43,19 @@ export interface V3PlacementProblem {
 }
 
 /** Does `node` start only after EVERY node it depends on has finished?
- *  Only the default join, all_success (a conditional `when` edge included:
- *  it still waits for its source). `one_success` / `{ quorum }` may start as
+ *  Exactly when its join needs all of them (the scheduler's `required` is at
+ *  least the in-degree): all_success (a conditional `when` edge included:
+ *  it still waits for its source), a one_success with a single source, a
+ *  quorum equal to the in-degree. A smaller one_success / quorum may start as
  *  soon as some of its sources are done — the rest may still run. */
-export function v3JoinPreservesOrder(node: Pick<V3Node, 'triggerRule'> | undefined): boolean {
+export function v3JoinPreservesOrder(node: Pick<V3Node, 'triggerRule' | 'depends'> | undefined): boolean {
   const rule = node?.triggerRule;
-  return rule === undefined || rule === 'all_success';
+  if (rule === undefined || rule === 'all_success') return true;
+  const required = rule === 'one_success' ? 1 : rule.quorum;
+  return required >= (node?.depends.length ?? 0);
 }
 
-function describeTriggerRule(node: Pick<V3Node, 'triggerRule'> | undefined): string {
+function describeTriggerRule(node: Pick<V3Node, 'triggerRule' | 'depends'> | undefined): string {
   const rule = node?.triggerRule;
   return typeof rule === 'object' && rule ? `quorum ${rule.quorum}` : String(rule ?? 'all_success');
 }
@@ -87,8 +91,9 @@ export function v3OrderedAncestorSets(dag: Pick<V3Dag, 'nodes'>): Map<string, Se
   return memo;
 }
 
-/** Plain `depends` reachability (whatever the joins). */
-function reachableAncestorSets(dag: Pick<V3Dag, 'nodes'>): Map<string, Set<string>> {
+/** Plain `depends` reachability (whatever the joins). Pass it to
+ *  {@link v3OrderingBreak} when asking about many pairs of one DAG. */
+export function v3ReachableAncestorSets(dag: Pick<V3Dag, 'nodes'>): Map<string, Set<string>> {
   const byId = new Map(dag.nodes.map((node) => [node.id, node]));
   const out = new Map<string, Set<string>>();
   for (const node of dag.nodes) {
@@ -114,9 +119,10 @@ export function v3OrderingBreak(
   dag: Pick<V3Dag, 'nodes'>,
   ancestor: string,
   node: string,
+  reachable?: ReadonlyMap<string, ReadonlySet<string>>,
 ): { joinId: string; rule: string } | undefined {
   const byId = new Map(dag.nodes.map((candidate) => [candidate.id, candidate]));
-  const reach = reachableAncestorSets(dag);
+  const reach = reachable ?? v3ReachableAncestorSets(dag);
   if (!reach.get(node)?.has(ancestor)) return undefined;
   for (const joinId of [node, ...[...(reach.get(node) ?? [])].sort()]) {
     const join = byId.get(joinId);
@@ -168,10 +174,12 @@ export function v3PlacementProblems(input: {
   }
 
   const ancestors = v3OrderedAncestorSets(input.dag);
+  let reach: Map<string, Set<string>> | undefined;
   const explain = input.explainUnordered ?? ((a: string, b: string) => {
-    const ab = v3OrderingBreak(input.dag, a, b);
+    reach ??= v3ReachableAncestorSets(input.dag);
+    const ab = v3OrderingBreak(input.dag, a, b, reach);
     if (ab) return { ...ab, first: a };
-    const ba = v3OrderingBreak(input.dag, b, a);
+    const ba = v3OrderingBreak(input.dag, b, a, reach);
     return ba ? { ...ba, first: b } : undefined;
   });
   const byBot = new Map<string, string[]>();
