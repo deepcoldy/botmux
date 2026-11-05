@@ -481,11 +481,20 @@ export interface SavedWorkflowRunCommitIdentity {
  * read: whatever happened to the template since (archived, deleted, a newer
  * version) does not change a committed run.
  */
+/** A committed template run.json that is not this commit's: shown on the
+ *  page (commit / template_unavailable), never overwritten. */
+export class SavedWorkflowRunReplayError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SavedWorkflowRunReplayError';
+  }
+}
+
 export function replaySavedWorkflowRunCommit(runDir: string, expected: SavedWorkflowRunCommitIdentity): V3SavedDefinitionRunEnvelope {
   const runId = basename(runDir);
   const existing = readRunEnvelope(runDir, runId);
   if (existing.kind !== 'ok') {
-    throw new Error(existing.kind === 'invalid' ? `run.json 已存在但无效，拒绝覆盖：${existing.problems.join('; ')}` : 'run.json 不存在');
+    throw new SavedWorkflowRunReplayError(existing.kind === 'invalid' ? `run.json 已存在但无效，拒绝覆盖：${existing.problems.join('; ')}` : 'run.json 不存在');
   }
   const envelope = existing.envelope;
   const authorization = envelope.authorization as { initiator?: V3RunInitiator };
@@ -496,12 +505,22 @@ export function replaySavedWorkflowRunCommit(runDir: string, expected: SavedWork
     || envelope.chatBinding.rootMessageId !== expected.chatBinding.rootMessageId
     || envelope.chatBinding.larkAppId !== expected.chatBinding.larkAppId
     || authorization.initiator?.openId !== expected.initiatorOpenId) {
-    throw new Error('run.json 已存在，但不是这次模板运行写的；不会覆盖它');
+    throw new SavedWorkflowRunReplayError('run.json 已存在，但不是这次模板运行写的；不会覆盖它');
   }
-  const loaded = loadAuthorizedV3Run(runDir, { expectedRunId: runId, allowedSources: ['saved_definition'] });
+  let loaded: LoadedAuthorizedV3Run;
+  try {
+    loaded = loadAuthorizedV3Run(runDir, { expectedRunId: runId, allowedSources: ['saved_definition'] });
+  } catch (error) {
+    // A pinned artifact's bytes no longer match run.json (digest), or the
+    // recorded confirmation is not the snapshot's.
+    throw new SavedWorkflowRunReplayError(`run.json 已写，但运行目录里的模板定义或产物和它记录的摘要对不上，不能接着启动：${error instanceof Error ? error.message : String(error)}`);
+  }
+  // Redundant with the check above (run.json pins definition.snapshot.json
+  // by sha256, and the snapshot's revisionId is content-derived): kept as a
+  // cheap direct statement of what the replay promises — the prepared version.
   const snapshot = loaded.definitionSnapshot as { contentHash?: unknown } | undefined;
   if (snapshot?.contentHash !== expected.contentHash) {
-    throw new Error('run.json 已存在，但它的模板定义不是准备运行时那一版；不会覆盖它');
+    throw new SavedWorkflowRunReplayError('run.json 已存在，但它的模板定义不是准备运行时那一版；不会覆盖它');
   }
   return publishRunEnvelopeOnce(runDir, envelope).envelope as V3SavedDefinitionRunEnvelope;
 }

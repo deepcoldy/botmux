@@ -32,8 +32,7 @@ import {
   buildParamEdit,
   collectTemplateRunParams,
   filterTemplates,
-  gateChangeSummary,
-  loosenedGateLines,
+  gateWarningLines,
   personLabelKey,
   newTemplateRequestKey,
   paramEditTargets,
@@ -294,7 +293,6 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
         <div className="sect-head overview-panel-head"><h2 id="wfl-versions-title">{tr('workflow.library.versionsTitle')}</h2></div>
         <ol className="wfl-versions">
           {detail.versions.map((version) => {
-            const change = gateChangeSummary(version.gates);
             return (
               <li key={version.revisionId} className="wfl-version">
                 <div className="wfl-version-head">
@@ -304,12 +302,7 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
                   <time dateTime={version.createdAt}>{formatDraftTime(version.createdAt)}</time>
                   <small className="muted">{tr('workflow.library.savedBy', { who: who(version.createdByOpenId) })}</small>
                 </div>
-                {change?.fewer ? <p className="wfd-warning" role="note">⚠️ {tr('workflow.library.fewerGates', { count: change.fewer })}（{version.gates!.removed.join('、')}）</p> : null}
-                {loosenedGateLines(version.gates).map((line) => (
-                  <p key={line.nodeId} className="wfd-warning" role="note">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversAdded', { node: line.nodeId, count: line.count })}</p>
-                ))}
-                {change?.more ? <p className="muted">{tr('workflow.library.moreGates', { count: change.more })}</p> : null}
-                {change?.changed ? <p className="muted">{tr('workflow.library.changedGates', { count: change.changed })}</p> : null}
+                <GateWarnings comparisons={version.gateComparisons} role="note" />
                 {version.botChanges?.length ? (
                   <p className="muted">{tr('workflow.library.botChangesLine', { nodes: version.botChanges.map((c) => c.nodeId).join('、') })}</p>
                 ) : null}
@@ -321,6 +314,23 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
           })}
         </ol>
       </section>
+    </>
+  );
+}
+
+/** The gate changes against each compared version, each line naming it. */
+function GateWarnings(props: { comparisons: Parameters<typeof gateWarningLines>[0]; role: 'note' | 'alert' }): React.JSX.Element | null {
+  const tr = useT();
+  const lines = gateWarningLines(props.comparisons);
+  if (!lines.length) return null;
+  return (
+    <>
+      {lines.map((line) => {
+        const text = `${tr(line.base.kind === 'published' ? 'workflow.library.gate.vsPublished' : 'workflow.library.gate.vsPrevious', { version: line.base.humanVersion })}${tr(line.message.key, line.message.params)}`;
+        return line.severe
+          ? <p key={line.key} className="wfd-warning wfl-fewer" role={props.role}>⚠️ {text}</p>
+          : <p key={line.key} className="muted">{text}</p>;
+      })}
     </>
   );
 }
@@ -546,7 +556,6 @@ export function SaveTemplateDialog(props: {
     else setError(describeError(tr, result));
   };
 
-  const change = gateChangeSummary(preview?.target?.gates);
   const needsAck = (preview?.lintWarnings.length ?? 0) > 0;
   return (
     <section className="overview-block wfd-panel wfl-save" role="dialog" aria-modal="false" aria-labelledby="wfl-save-title">
@@ -583,18 +592,7 @@ export function SaveTemplateDialog(props: {
               </label>
             ) : null}
           </fieldset>
-          {change?.fewer ? (
-            <p className="wfd-warning wfl-fewer" role="alert">
-              ⚠️ {preview.target!.gatesBase.kind === 'published'
-                ? tr('workflow.library.fewerGatesThanPublished', { count: change.fewer, version: preview.target!.gatesBase.humanVersion })
-                : tr('workflow.library.fewerGates', { count: change.fewer })}（{preview.target!.gates.removed.join('、')}）
-            </p>
-          ) : null}
-          {loosenedGateLines(preview.target?.gates).map((line) => (
-            <p key={line.nodeId} className="wfd-warning wfl-fewer" role="alert">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversAdded', { node: line.nodeId, count: line.count })}</p>
-          ))}
-          {change?.more ? <p className="muted">{tr('workflow.library.moreGates', { count: change.more })}</p> : null}
-          {change?.changed ? <p className="muted">{tr('workflow.library.changedGates', { count: change.changed })}</p> : null}
+          <GateWarnings comparisons={preview.target?.gateComparisons} role="alert" />
 
           <h3>{tr('workflow.draft.summaryTitle')}</h3>
           <ul className="wfd-summary-list">

@@ -42,6 +42,7 @@ import {
 import { appendEvent } from '../src/workflows/v3/journal.js';
 import { listSavedWorkflowRevisions, readSavedWorkflowMetadata, savedWorkflowMetadataPath } from '../src/workflows/v3/library-store.js';
 import { compareSavedWorkflowGates } from '../src/workflows/v3/library-schema.js';
+import { loadSavedWorkflowDetailView } from '../src/workflows/v3/library-catalog.js';
 import { canonicalJsonStringify } from '../src/utils/canonical-json.js';
 import { v3FlowSummarySha256 } from '../src/workflows/v3/flow-summary.js';
 import { ALICE, BOTS, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD, architectSettled, goalNode, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
@@ -207,6 +208,57 @@ describe('P2-1 run.json written, its record lost, the template gone', () => {
   });
 });
 
+describe('P3-c / P3-d 重放的记录与产物不一致', () => {
+  async function committedThenLost(h: ReturnType<typeof makeService>, launch: ReturnType<typeof fakeLaunch>, workflowId: string) {
+    const draft = await h.service.createFromTemplate(OWNER, { workflowId });
+    launch.failNext('startRun', new Error('boom'));
+    await h.service.launch(draft.runId, OWNER, {});
+    await settled(h.service, draft.runId);
+    const runDir = join(base, draft.runId);
+    const record = readWorkflowDraft(runDir)!;
+    delete record.launch!.commit;
+    writeWorkflowDraft(runDir, record);
+    writeGrillState(runDir, { ...readGrillState(runDir)!, status: 'dag_ready' });
+    return { runId: draft.runId, runDir };
+  }
+
+  it('the replayed record keeps the confirmation digest run.json carries, and never stands a DAG digest in for a summary', async () => {
+    const { h, launch } = setup();
+    const saved = await saveDraft(h, await draftAtFlow(h, NODES));
+    const { runId, runDir } = await committedThenLost(h, launch, saved.workflowId);
+    const run = (readRunEnvelope(runDir, runId) as any).envelope;
+    // bots.json lost DOC: the flow cannot be summarised any more.
+    fleet = fleet.filter((bot) => bot.larkAppId !== DOC);
+    const next = new WorkflowDraftService({ ...h.deps });
+    await next.continueLaunch(runId, OWNER);
+    expect((await settled(next, runId)).phase).toBe('started');
+    const commit = readWorkflowDraft(runDir)!.launch!.commit!;
+    expect(commit.flowSummarySha256).toBe(run.authorization.flowConfirmation.flowSummarySha256);
+    expect(commit.flowSummarySha256).not.toBe(commit.dagSha256);
+
+    seedFinishedRun('src-261101-080000-000-dddd0008');
+    fleet = [...BOTS, { larkAppId: REVIEW, larkAppSecret: 's-rv', name: 'review', cliId: 'claude-code' }];
+    const fromRun = await h.service.saveRunAsTemplate('src-261101-080000-000-dddd0008', OWNER, { requestKey: 'req-fix-run08' });
+    const plain = await committedThenLost(h, launch, fromRun.workflowId);
+    fleet = fleet.filter((bot) => bot.larkAppId !== DOC);
+    await next.continueLaunch(plain.runId, OWNER);
+    expect((await settled(next, plain.runId)).phase).toBe('started');
+    expect(readWorkflowDraft(plain.runDir)!.launch!.commit!.flowSummarySha256).toBeUndefined();
+  });
+
+  it('an artifact no longer matching run.json stops at commit as template_unavailable, with a reason, nothing started', async () => {
+    const { h, launch } = setup();
+    seedFinishedRun('src-261101-080000-000-dddd0009');
+    const saved = await h.service.saveRunAsTemplate('src-261101-080000-000-dddd0009', OWNER, { requestKey: 'req-fix-run09' });
+    const { runId, runDir } = await committedThenLost(h, launch, saved.workflowId);
+    writeJson(join(runDir, 'params.resolved.json'), { params: { injected: true }, context: {} });
+    await h.service.continueLaunch(runId, OWNER);
+    const stopped = await settled(h.service, runId);
+    expect(stopped.launch).toMatchObject({ state: 'paused', error: { step: 'commit', code: 'template_unavailable', message: expect.stringContaining('对不上') } });
+    expect(launch.starts).toEqual([]);
+  });
+});
+
 describe('I13（11-05）：草稿来源版本直接运行，保存时的确认写进 run.json', () => {
   it('another person runs a draft-born version directly: run.json records the saved confirmation as is; a run-born one records none', async () => {
     const { h } = setup();
@@ -301,14 +353,28 @@ describe('I10 人工确认的放宽与发布版比较', () => {
     const at = (gate: Record<string, unknown>) => ({ schemaVersion: 2 as const, nodes: [goalNode('inspect', MAIN), { ...goalNode('write', DOC), humanGate: gate }] as any });
     const before = at(GATE);
     expect(compareSavedWorkflowGates(before, at({ prompt: GATE.prompt })).loosened)
-      .toEqual([{ nodeId: 'write', reason: 'approvers_cleared', approvers: ['ou_lead', 'ou_sec'] }]);
+      .toEqual([{ nodeId: 'write', reason: 'approvers_cleared', items: ['ou_lead', 'ou_sec'] }]);
     expect(compareSavedWorkflowGates(before, at({ ...GATE, approvers: ['ou_lead', 'ou_sec', 'ou_new'] })).loosened)
-      .toEqual([{ nodeId: 'write', reason: 'approvers_added', approvers: ['ou_new'] }]);
+      .toEqual([{ nodeId: 'write', reason: 'approvers_added', items: ['ou_new'] }]);
     // Removing a named approver narrows who may approve: changed, not loosened.
     expect(compareSavedWorkflowGates(before, at({ ...GATE, approvers: ['ou_lead'] }))).toMatchObject({ loosened: [], changed: ['write'] });
     // Naming approvers where anyone could approve narrows too.
     expect(compareSavedWorkflowGates(at({ prompt: GATE.prompt }), before)).toMatchObject({ loosened: [], changed: ['write'] });
     expect(compareSavedWorkflowGates(before, at({ ...GATE, prompt: '再看看？' }))).toMatchObject({ loosened: [], changed: ['write'] });
+  });
+
+  it('more options that count as approval = loosened; approver / approve-option order is no change', () => {
+    const at = (gate: Record<string, unknown>) => ({ schemaVersion: 2 as const, nodes: [goalNode('inspect', MAIN), { ...goalNode('write', DOC), humanGate: gate }] as any });
+    const options = { prompt: 'ok?', options: ['approve', 'approve_with_notes', 'reject'], approvers: ['ou_lead', 'ou_sec'] };
+    const before = at({ ...options, approveOptions: ['approve'] });
+    expect(compareSavedWorkflowGates(before, at({ ...options, approveOptions: ['approve', 'approve_with_notes'] })).loosened)
+      .toEqual([{ nodeId: 'write', reason: 'approve_options_added', items: ['approve_with_notes'] }]);
+    // Fewer approve options narrows: a change only.
+    expect(compareSavedWorkflowGates(at({ ...options, approveOptions: ['approve', 'approve_with_notes'] }), before)).toMatchObject({ loosened: [], changed: ['write'] });
+    expect(compareSavedWorkflowGates(
+      at({ ...options, approvers: ['ou_sec', 'ou_lead'], approveOptions: ['approve_with_notes', 'approve'] }),
+      at({ ...options, approvers: ['ou_lead', 'ou_sec'], approveOptions: ['approve', 'approve_with_notes'] }),
+    )).toMatchObject({ loosened: [], changed: [] });
   });
 
   it('appending after an unpublished latest compares with the published version too and shows the stricter warning', async () => {
@@ -323,9 +389,23 @@ describe('I10 人工确认的放宽与发布版比较', () => {
     expect(v2.published).toBe(false);
     const ungated = await draftAtFlow(h, NODES);
     const preview = await h.service.previewTemplateSave(ungated, OWNER, { workflowId: first.workflowId });
-    // Against the latest (v2) nothing is removed; against the published v1 the gate is.
-    expect(preview.target!.gatesBase).toEqual({ kind: 'published', humanVersion: 1 });
-    expect(preview.target!.gates.removed).toEqual(['write']);
+    // Both shown: against the latest (v2) nothing is removed; against the published v1 the gate is.
+    expect(preview.target!.gateComparisons.map((c) => [c.base.kind, c.base.humanVersion, c.gates.removed])).toEqual([
+      ['previous', 2, []],
+      ['published', 1, ['write']],
+    ]);
+    // The history of a pending version names the published one too.
+    seedFinishedRun('src-261101-080000-000-dddd0007', { status: 'failed' });
+    const p3 = await h.service.previewRunSave('src-261101-080000-000-dddd0007', OWNER, { workflowId: first.workflowId, allowDraft: true });
+    await h.service.saveRunAsTemplate('src-261101-080000-000-dddd0007', OWNER, {
+      workflowId: first.workflowId, expectedLatestRevision: p3.target!.latestRevision, allowDraft: true, requestKey: 'req-fix-run07',
+    });
+    const detail = await loadSavedWorkflowDetailView(library, first.workflowId);
+    const v3 = detail.versions.find((v) => v.humanVersion === 3)!;
+    expect(v3.gateComparisons.map((c) => [c.base.kind, c.base.humanVersion, c.gates.removed])).toEqual([
+      ['previous', 2, []],
+      ['published', 1, ['write']],
+    ]);
   });
 });
 
@@ -374,6 +454,15 @@ describe('P3-5 / P3-6 / 确认被 bots.json 变化作废', () => {
       flowSummarySha256: preview.flowSummarySha256, workflowId: first.workflowId,
       expectedLatestRevision: preview.target!.latestRevision, requestKey: 'req-append-0002',
     }))).toBe('save_conflict');
+    // The same request key with other content is not answered with the old version.
+    const swapped = await h.service.setNodeBot(other, OWNER, 'inspect', { larkAppId: REVIEW });
+    await h.service.approveFlow(other, OWNER, { flowSummarySha256: swapped.flow!.flowSummarySha256 });
+    const changed = await h.service.previewTemplateSave(other, OWNER, { workflowId: first.workflowId });
+    expect(await code(h.service.saveAsTemplate(other, OWNER, {
+      flowSummarySha256: changed.flowSummarySha256, workflowId: first.workflowId,
+      expectedLatestRevision: changed.target!.latestRevision, requestKey: 'req-append-0001',
+    }))).toBe('save_conflict');
+    expect(await listSavedWorkflowRevisions(library, first.workflowId)).toHaveLength(2);
   });
 
   it('a confirmation voided by a bots.json change: saving with the new summary is refused', async () => {

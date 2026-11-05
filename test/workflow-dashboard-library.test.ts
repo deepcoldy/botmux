@@ -325,11 +325,15 @@ describe('保存（§5.1, I9, E10）', () => {
     const first = await saveDraft(h, gated);
     const ungated = await draftAtFlow(h, { nodes: [goalNode('inspect', MAIN), goalNode('write', DOC)] });
     const preview = await h.service.previewTemplateSave(ungated, OWNER, { workflowId: first.workflowId });
-    expect(preview.target!.gates).toEqual({ previousCount: 1, currentCount: 0, removed: ['write'], added: [], loosened: [], changed: [] });
+    expect(preview.target!.gateComparisons).toEqual([{
+      base: { kind: 'previous', humanVersion: 1, revisionId: preview.target!.latestRevision },
+      gates: { previousCount: 1, currentCount: 0, removed: ['write'], added: [], loosened: [], changed: [] },
+    }]);
     expect(preview.appendCandidates.map((c) => c.workflowId)).toEqual([first.workflowId]);
     await h.service.saveAsTemplate(ungated, OWNER, { flowSummarySha256: preview.flowSummarySha256, workflowId: first.workflowId, expectedLatestRevision: preview.target!.latestRevision });
     const detail = await loadSavedWorkflowDetailView(library, first.workflowId);
-    expect(detail.versions.map((v) => [v.humanVersion, v.gates?.removed ?? null])).toEqual([[2, ['write']], [1, null]]);
+    expect(detail.versions.map((v) => [v.humanVersion, v.gateComparisons.map((c) => [c.base.kind, c.base.humanVersion, c.gates.removed])]))
+      .toEqual([[2, [['previous', 1, ['write']]]], [1, []]]);
     // A stale dialog (compared with v1) cannot append after v2 landed.
     expect(await code(h.service.saveAsTemplate(ungated, OWNER, { flowSummarySha256: preview.flowSummarySha256, workflowId: first.workflowId, expectedLatestRevision: preview.target!.latestRevision }))).toBe('save_conflict');
   });

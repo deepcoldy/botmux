@@ -61,7 +61,7 @@ import {
   readSavedWorkflowMetadata,
   readSavedWorkflowMetadataSync,
 } from './library-store.js';
-import { SavedWorkflowSchemaError, type SavedWorkflowGateComparison } from './library-schema.js';
+import { SavedWorkflowSchemaError, type SavedWorkflowGateComparisonAgainst } from './library-schema.js';
 import {
   SavedWorkflowServiceError,
   commitDashboardSave,
@@ -75,6 +75,7 @@ import {
 import {
   SavedWorkflowUnsafeLiteralError,
   buildSavedWorkflowRevisionFromFlow,
+  SavedWorkflowRunReplayError,
   commitSavedWorkflowRunInPlace,
   replaySavedWorkflowRunCommit,
   savedWorkflowRunFlow,
@@ -427,9 +428,9 @@ export interface WorkflowDraftTemplateSavePreview {
     displayName: string;
     latestRevision: string;
     humanVersion: number;
-    /** The stricter of: vs the latest, vs the published version (I10). */
-    gates: SavedWorkflowGateComparison;
-    gatesBase: { kind: 'latest' | 'published'; humanVersion: number };
+    /** Against the latest version and (when another) the published one —
+     *  both shown, each naming its base (I10). */
+    gateComparisons: SavedWorkflowGateComparisonAgainst[];
   };
   /** The template's nodes with the edits so far (where 「设为参数」 selects
    *  next: edits apply in order, each to the text the previous ones left). */
@@ -1421,8 +1422,7 @@ export class WorkflowDraftService {
           displayName: found.metadata.displayName,
           latestRevision: found.metadata.latestRevision,
           humanVersion: found.latest.payload.humanVersion,
-          gates: found.gates,
-          gatesBase: { kind: found.base.kind, humanVersion: found.base.humanVersion },
+          gateComparisons: found.comparisons,
         };
       } catch (error) {
         throw this.mapLibraryError(error);
@@ -3383,7 +3383,7 @@ export class WorkflowDraftService {
       const chatId = launch.chat!.chatId;
       const rootMessageId = launch.root!.messageId;
       const envelopePath = join(runDir, V3_RUN_ENVELOPE_FILE);
-      let summarySha: string;
+      let summarySha: string | undefined;
       const exists = existsSync(envelopePath);
       if (!exists) {
         if (!library) return { changed: false, result: 'again' as const };
@@ -3411,11 +3411,17 @@ export class WorkflowDraftService {
         }
         summarySha = flow.flowSummarySha256;
       } else {
-        // The record of a replayed commit: the summary of the flow on disk
-        // (bots.json may have moved; the committed run.json is what counts).
+        // The record of a replayed commit: the confirmation run.json carries,
+        // else the summary of the flow on disk; never a different digest.
+        const onRecord = readRunEnvelope(runDir, runId);
+        const recorded = onRecord.kind === 'ok'
+          ? (onRecord.envelope.authorization as { flowConfirmation?: { flowSummarySha256?: string } }).flowConfirmation?.flowSummarySha256
+          : undefined;
         let replayed: string | undefined;
-        try { replayed = this.currentFlow(runDir, grill, bots, nameOf).flowSummarySha256; } catch { replayed = undefined; }
-        summarySha = replayed ?? template.dagSha256;
+        if (!recorded) {
+          try { replayed = this.currentFlow(runDir, grill, bots, nameOf).flowSummarySha256; } catch { replayed = undefined; }
+        }
+        summarySha = recorded ?? replayed;
       }
       const binding: RunChatBinding = {
         larkAppId: this.deps.appId,
@@ -3433,15 +3439,23 @@ export class WorkflowDraftService {
       const rawParams = Object.create(null) as Record<string, RawParamInput>;
       for (const [name, value] of Object.entries(template.params)) rawParams[name] = { kind: 'string', value };
       // Lock order: draft (held) → grill/host → run.json.
-      const envelope = withHostMutationLockSync(runDir, () => withFileLockSync(envelopePath, () => {
-        const written = existsSync(envelopePath)
-          ? replaySavedWorkflowRunCommit(runDir, {
+      const replay = (): ReturnType<typeof replaySavedWorkflowRunCommit> | { unavailable: string } => {
+        try {
+          return replaySavedWorkflowRunCommit(runDir, {
               workflowId: pinned.workflowId,
               revisionId: pinned.revisionId,
               contentHash: pinned.contentHash,
               chatBinding: binding,
               initiatorOpenId: initiator.openId,
-            })
+            });
+        } catch (error) {
+          if (error instanceof SavedWorkflowRunReplayError) return { unavailable: error.message };
+          throw error;
+        }
+      };
+      const envelope = withHostMutationLockSync(runDir, () => withFileLockSync(envelopePath, () => {
+        const written = existsSync(envelopePath)
+          ? replay()
           : commitSavedWorkflowRunInPlace({
               runDir,
               metadata: library!.metadata,
@@ -3455,16 +3469,18 @@ export class WorkflowDraftService {
             });
         // The grill is this draft's bookkeeping only: past run.json it reads
         // as approved, like an ad-hoc launch's.
+        if ('unavailable' in written) return written;
         const current = readGrillState(runDir);
         if (current?.status === 'dag_ready') transition(runDir, 'dag_approved', {}, this.now());
         return written;
       }));
+      if ('unavailable' in envelope) return { changed: false, result: { unavailable: envelope.unavailable } };
       launch.commit = {
         at: this.now().toISOString(),
         chatId,
         rootMessageId,
         runJsonSha256: fileSha256(envelopePath)!,
-        flowSummarySha256: summarySha as `sha256:${string}`,
+        ...(summarySha ? { flowSummarySha256: summarySha as `sha256:${string}` } : {}),
         dagSha256: envelope.artifacts.dag.sha256,
         specSha256: envelope.artifacts.spec.sha256,
         flowRevision: draft.flowRevision ?? 0,

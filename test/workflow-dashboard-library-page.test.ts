@@ -198,7 +198,7 @@ describe('页面渲染', () => {
       url.endsWith(`/library/${detail.entry.workflowId}`) ? { ok: true, template: detail } : undefined);
     const history = renderer.root.find((node) => node.type === 'ol' && node.props.className === 'wfl-versions');
     const rows = history.findAll((node) => node.type === 'li');
-    expect(text(rows[0]!)).toContain('比上一版少了 1 道人工确认（write）');
+    expect(text(rows[0]!)).toContain('比上一版 v1：少了 1 道人工确认（write）');
     expect(text(rows[1]!)).not.toContain('人工确认');
     expect(text(renderer.root)).toContain('每次运行的发起人是点「运行」的人');
     act(() => { renderer.unmount(); });

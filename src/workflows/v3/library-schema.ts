@@ -551,27 +551,42 @@ export function savedWorkflowGatePositions(dagTemplate: V3DagTemplate): SavedWor
 
 /**
  * Human gates of a revision against an earlier one (I10): how many, where,
- * and who approves. `removed` are positions the earlier revision gated and
- * this one does not — what 「比上一版少了 N 道人工确认」 counts (N =
- * removed.length); a gate that moved is one removed plus one added.
- * `loosened`: the same position where more people may approve now — the
- * named approvers were cleared (empty = anyone who can operate the bot), or
- * someone was added to a non-empty list — warned at the same level as a
- * removed gate. Removing a named approver narrows who may approve: not
- * loosened, only `changed`. `changed`: any other change of the gate.
+ * and how loose. `removed` are positions the earlier revision gated and this
+ * one does not — what 「少了 N 道人工确认」 counts (N = removed.length); a
+ * gate that moved is one removed plus one added.
+ * `loosened`: the same position where approval got easier —
+ *   - `approvers_cleared`: named approvers → none (anyone who can operate the
+ *     bot may approve);
+ *   - `approvers_added`: someone added to a non-empty list;
+ *   - `approve_options_added`: more of the card's options count as approval.
+ * Warned at the same level as a removed gate. Removing a named approver, or
+ * naming approvers where anyone could approve, narrows: only `changed`.
+ * Approvers and approve options compare as sets (order is no change, as in
+ * dag-revision). `changed`: any other change of the gate.
  */
 export interface SavedWorkflowGateComparison {
   previousCount: number;
   currentCount: number;
   removed: string[];
   added: string[];
-  loosened: Array<{ nodeId: string; reason: 'approvers_cleared' | 'approvers_added'; approvers: string[] }>;
+  loosened: Array<{ nodeId: string; reason: 'approvers_cleared' | 'approvers_added' | 'approve_options_added'; items: string[] }>;
   changed: string[];
 }
 
-function gateApprovers(gate: unknown): string[] {
-  const approvers = (gate as { approvers?: unknown } | null)?.approvers;
-  return Array.isArray(approvers) ? approvers.filter((item): item is string => typeof item === 'string') : [];
+function gateList(gate: unknown, key: 'approvers' | 'approveOptions'): string[] {
+  const list = (gate as Record<string, unknown> | null)?.[key];
+  return Array.isArray(list) ? [...new Set(list.filter((item): item is string => typeof item === 'string'))].sort() : [];
+}
+
+/** The gate as compared: approver / approve-option order carries no meaning. */
+function comparableGate(gate: unknown): unknown {
+  if (!gate || typeof gate !== 'object') return gate;
+  const record = gate as Record<string, unknown>;
+  return {
+    ...record,
+    ...(Array.isArray(record.approvers) ? { approvers: gateList(gate, 'approvers') } : {}),
+    ...(Array.isArray(record.approveOptions) ? { approveOptions: gateList(gate, 'approveOptions') } : {}),
+  };
 }
 
 export function compareSavedWorkflowGates(previous: V3DagTemplate, current: V3DagTemplate): SavedWorkflowGateComparison {
@@ -581,14 +596,26 @@ export function compareSavedWorkflowGates(previous: V3DagTemplate, current: V3Da
   const changed: string[] = [];
   for (const [nodeId, gate] of after) {
     if (!before.has(nodeId)) continue;
-    const was = gateApprovers(before.get(nodeId));
-    const now = gateApprovers(gate);
-    const wasSet = new Set(was);
-    const added = now.filter((approver) => !wasSet.has(approver));
+    const prior = before.get(nodeId);
+    let looser = false;
     // Empty = anyone who can operate the bot; a list allows only those named.
-    if (was.length > 0 && now.length === 0) loosened.push({ nodeId, reason: 'approvers_cleared', approvers: was });
-    else if (was.length > 0 && added.length > 0) loosened.push({ nodeId, reason: 'approvers_added', approvers: added });
-    else if (canonicalJsonStringify(before.get(nodeId)) !== canonicalJsonStringify(gate)) changed.push(nodeId);
+    const was = gateList(prior, 'approvers');
+    const now = gateList(gate, 'approvers');
+    const addedApprovers = now.filter((approver) => !was.includes(approver));
+    if (was.length > 0 && now.length === 0) {
+      loosened.push({ nodeId, reason: 'approvers_cleared', items: was });
+      looser = true;
+    } else if (was.length > 0 && addedApprovers.length > 0) {
+      loosened.push({ nodeId, reason: 'approvers_added', items: addedApprovers });
+      looser = true;
+    }
+    const wasApprove = gateList(prior, 'approveOptions');
+    const addedApprove = gateList(gate, 'approveOptions').filter((option) => !wasApprove.includes(option));
+    if (addedApprove.length > 0) {
+      loosened.push({ nodeId, reason: 'approve_options_added', items: addedApprove });
+      looser = true;
+    }
+    if (!looser && canonicalJsonStringify(comparableGate(prior)) !== canonicalJsonStringify(comparableGate(gate))) changed.push(nodeId);
   }
   return {
     previousCount: before.size,
@@ -600,9 +627,10 @@ export function compareSavedWorkflowGates(previous: V3DagTemplate, current: V3Da
   };
 }
 
-/** How much a comparison weakens human review (removed gates first). */
-export function savedWorkflowGateWeakening(gates: SavedWorkflowGateComparison): [number, number] {
-  return [gates.removed.length, gates.loosened.length];
+/** A comparison against one earlier version, named (I10: shown together). */
+export interface SavedWorkflowGateComparisonAgainst {
+  base: { kind: 'previous' | 'published'; humanVersion: number; revisionId: string };
+  gates: SavedWorkflowGateComparison;
 }
 
 const CHAT_SIDE_EFFECT_PATTERNS: Array<{ kind: string; re: RegExp }> = [

@@ -310,7 +310,9 @@ const launchSchema = z.object({
     chatId: chatIdSchema,
     rootMessageId: messageIdSchema,
     runJsonSha256: sha,
-    flowSummarySha256: sha,
+    /** Absent only for a replayed template commit whose flow could not be
+     *  summarised (the committed run.json stands on its own). */
+    flowSummarySha256: sha.optional(),
     dagSha256: sha,
     specSha256: sha,
     flowRevision: z.number().int().min(0),

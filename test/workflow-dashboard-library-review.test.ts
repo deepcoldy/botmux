@@ -135,7 +135,7 @@ describe('多步写入只完成一半', () => {
     delete record.launch!.commit;
     writeWorkflowDraft(runDir, record);
     await h.service.continueLaunch(draft.runId, OWNER);
-    expect((await settled(h.service, draft.runId)).launch).toMatchObject({ state: 'paused', error: { step: 'interrupted' } });
+    expect((await settled(h.service, draft.runId)).launch).toMatchObject({ state: 'paused', error: { step: 'commit', code: 'template_unavailable' } });
     expect(launch.starts).toEqual([]);
   });
 
@@ -157,7 +157,7 @@ describe('多步写入只完成一半', () => {
     writeWorkflowDraft(runDir, record);
     await h.service.continueLaunch(draft.runId, OWNER);
     const stopped = await settled(h.service, draft.runId);
-    expect(stopped.launch).toMatchObject({ state: 'paused', error: { step: 'interrupted' } });
+    expect(stopped.launch).toMatchObject({ state: 'paused', error: { step: 'commit', code: 'template_unavailable' } });
     expect(JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf-8')).chatBinding.rootMessageId).toBe('om_other');
     expect(launch.starts).toEqual([]);
   });

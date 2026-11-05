@@ -4,7 +4,7 @@
  * 页面上的判断只是展示：保存 / 运行由 daemon 再按同样的规则校验。
  */
 import type { SavedWorkflowCatalogEntry, SavedWorkflowVersionView } from '../../workflows/v3/library-catalog.js';
-import type { SavedWorkflowGateComparison, SavedWorkflowParamDef } from '../../workflows/v3/library-schema.js';
+import type { SavedWorkflowGateComparisonAgainst, SavedWorkflowParamDef } from '../../workflows/v3/library-schema.js';
 import type { SavedWorkflowParamEdit, SavedWorkflowParamEditField, SavedWorkflowParamEditType } from '../../workflows/v3/library-params.js';
 import type { V3Node } from '../../workflows/v3/dag.js';
 
@@ -33,21 +33,37 @@ export function templateRunState(entry: Pick<SavedWorkflowCatalogEntry, 'scope' 
 
 // ─── 人工确认的变化（I10）───────────────────────────────────────────────
 
-/** 与上一版比：少了几道（位置上没了）、多了几道、规则变了几道。 */
-export function gateChangeSummary(gates: SavedWorkflowGateComparison | undefined): { fewer: number; loosened: number; more: number; changed: number } | undefined {
-  if (!gates) return undefined;
-  const summary = { fewer: gates.removed.length, loosened: gates.loosened?.length ?? 0, more: gates.added.length, changed: gates.changed.length };
-  return summary.fewer || summary.loosened || summary.more || summary.changed ? summary : undefined;
+/**
+ * 一个版本的人工确认相对它比较的各个版本（上一版、当前发布版）的变化，合在一起
+ * 显示，每条都标明相对哪个版本（I10）。`severe`：少了确认或放宽，与「少了 N 道」
+ * 同级警告；其余是普通说明。不列审批人（页面不显示 open_id）。
+ */
+export interface GateWarningLine {
+  key: string;
+  base: { kind: 'previous' | 'published'; humanVersion: number };
+  /** i18n key + params of the message (after the base prefix). */
+  message: { key: string; params: Record<string, string | number> };
+  severe: boolean;
 }
 
-/** One line per loosened gate: where, and how many approvers (never their
- *  open_ids: the page shows no open_id). */
-export function loosenedGateLines(gates: SavedWorkflowGateComparison | undefined): Array<{ nodeId: string; cleared: boolean; count: number }> {
-  return (gates?.loosened ?? []).map((item) => ({
-    nodeId: item.nodeId,
-    cleared: item.reason === 'approvers_cleared',
-    count: item.approvers.length,
-  }));
+export function gateWarningLines(comparisons: readonly SavedWorkflowGateComparisonAgainst[] | undefined): GateWarningLine[] {
+  const out: GateWarningLine[] = [];
+  for (const { base, gates } of comparisons ?? []) {
+    const at = { kind: base.kind, humanVersion: base.humanVersion };
+    const id = `${base.kind}:${base.revisionId}`;
+    if (gates.removed.length) {
+      out.push({ key: `${id}:removed`, base: at, severe: true, message: { key: 'workflow.library.gate.fewer', params: { count: gates.removed.length, nodes: gates.removed.join('、') } } });
+    }
+    for (const item of gates.loosened) {
+      const key = item.reason === 'approvers_cleared' ? 'workflow.library.gate.approversCleared'
+        : item.reason === 'approvers_added' ? 'workflow.library.gate.approversAdded'
+          : 'workflow.library.gate.approveOptionsAdded';
+      out.push({ key: `${id}:${item.nodeId}:${item.reason}`, base: at, severe: true, message: { key, params: { node: item.nodeId, count: item.items.length } } });
+    }
+    if (gates.added.length) out.push({ key: `${id}:added`, base: at, severe: false, message: { key: 'workflow.library.gate.more', params: { count: gates.added.length } } });
+    if (gates.changed.length) out.push({ key: `${id}:changed`, base: at, severe: false, message: { key: 'workflow.library.gate.changed', params: { count: gates.changed.length } } });
+  }
+  return out;
 }
 
 /**

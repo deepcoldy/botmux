@@ -28,10 +28,9 @@ import {
   canonicalJsonStringify,
   compareSavedWorkflowGates,
   normalizeSavedWorkflowLookupKey,
-  savedWorkflowGateWeakening,
   validateSavedWorkflowRevisionPayload,
   type SavedWorkflowBotChange,
-  type SavedWorkflowGateComparison,
+  type SavedWorkflowGateComparisonAgainst,
   type SavedWorkflowRevisionDraft,
   type SavedWorkflowMetadata,
   type SavedWorkflowOwner,
@@ -974,14 +973,12 @@ export function withDashboardParamEdits(
   return { ...plan, revision };
 }
 
-/** Gates of the revision being saved against the latest one and the
- *  published one (I10); `gates` is the stricter of the two, `base` the
- *  version it compares with. */
+/** Gates of the revision being saved against the latest version and, when
+ *  that is another one, the published version (I10) — both shown. */
 export interface DashboardSaveTarget {
   metadata: SavedWorkflowMetadata;
   latest: SavedWorkflowWriteResult['revision'];
-  gates: SavedWorkflowGateComparison;
-  base: { kind: 'latest' | 'published'; revisionId: string; humanVersion: number };
+  comparisons: SavedWorkflowGateComparisonAgainst[];
 }
 
 /** A terminal run of `actor` (its bound owner on this bot), compiled the
@@ -1050,22 +1047,32 @@ export async function loadDashboardAppendTarget(input: {
   if (metadata.scope.kind === 'chat') {
     throw new SavedWorkflowServiceError('scope_mismatch', `Saved Workflow '${metadata.workflowId}' is chat-scoped: append to it in its chat`);
   }
-  const latestGates = compareSavedWorkflowGates(current.revision.payload.dagTemplate, input.revision.dagTemplate);
-  let gates = latestGates;
-  let base: DashboardSaveTarget['base'] = { kind: 'latest', revisionId: current.revision.revisionId, humanVersion: current.revision.payload.humanVersion };
+  const comparisons: SavedWorkflowGateComparisonAgainst[] = [{
+    base: { kind: 'previous', revisionId: current.revision.revisionId, humanVersion: current.revision.payload.humanVersion },
+    gates: compareSavedWorkflowGates(current.revision.payload.dagTemplate, input.revision.dagTemplate),
+  }];
   // The published version is what runs today: a draft-only latest must not
-  // hide that the new one weakens it.
+  // hide that the new one weakens it. Both comparisons are shown.
   if (metadata.publishedRevision && metadata.publishedRevision !== current.revision.revisionId) {
     const published = await readSavedWorkflowRevision(input.dataDir, input.workflowId, metadata.publishedRevision);
-    const publishedGates = compareSavedWorkflowGates(published.payload.dagTemplate, input.revision.dagTemplate);
-    const [r1, l1] = savedWorkflowGateWeakening(latestGates);
-    const [r2, l2] = savedWorkflowGateWeakening(publishedGates);
-    if (r2 > r1 || (r2 === r1 && l2 > l1)) {
-      gates = publishedGates;
-      base = { kind: 'published', revisionId: published.revisionId, humanVersion: published.payload.humanVersion };
-    }
+    comparisons.push({
+      base: { kind: 'published', revisionId: published.revisionId, humanVersion: published.payload.humanVersion },
+      gates: compareSavedWorkflowGates(published.payload.dagTemplate, input.revision.dagTemplate),
+    });
   }
-  return { metadata, latest: current.revision, gates, base };
+  return { metadata, latest: current.revision, comparisons };
+}
+
+/** What a retried append must match: the definition, not the moment it was
+ *  confirmed (a draft save re-stamps `confirmedAt` on every request). */
+function comparableAppendDraft(payload: Pick<SavedWorkflowRevisionDraft, 'sourceRunId' | 'inputs' | 'contextRefs' | 'specTemplate' | 'specStatus' | 'dagTemplate' | 'safety' | 'provenance'>): unknown {
+  const provenance = payload.provenance;
+  return {
+    ...(comparableRevisionDraft(payload as SavedWorkflowWriteResult['revision']['payload']) as Record<string, unknown>),
+    ...(provenance?.kind === 'dashboard_draft'
+      ? { provenance: { kind: provenance.kind, draftRunId: provenance.draftRunId, flowSummarySha256: provenance.confirmation.flowSummarySha256, confirmedBy: provenance.confirmation.confirmedByOpenId, flowConfirmedAt: provenance.confirmation.flowConfirmedAt } }
+      : provenance ? { provenance: { ...provenance, requestId: undefined } } : {}),
+  };
 }
 
 /** sha256 of one append request (P3-6): the same dialog retried finds the
@@ -1117,6 +1124,11 @@ export async function commitDashboardSave(input: CommitDashboardSaveInput): Prom
         // Already written by this very request (a retry, a second tab).
         for (const existing of await listSavedWorkflowRevisions(input.dataDir, workflowId)) {
           if (existing.payload.provenance?.requestId === requestId && sameOwner(existing.payload.createdBy, actor)) {
+            // Same request, same content — a retry. The same key with other
+            // content is a different save, never silently answered with the old.
+            if (canonicalJsonStringify(comparableAppendDraft(existing.payload)) !== canonicalJsonStringify(comparableAppendDraft(revision))) {
+              throw new SavedWorkflowConflictError(`Saved workflow '${workflowId}' already has a version from this request with different content`);
+            }
             return { metadata: await readSavedWorkflowMetadata(input.dataDir, workflowId), revision: existing, created: false, replayed: true };
           }
         }

@@ -15,7 +15,7 @@ import {
   savedWorkflowGatePositions,
   type LoadedSavedWorkflowRevision,
   type SavedWorkflowBotChange,
-  type SavedWorkflowGateComparison,
+  type SavedWorkflowGateComparisonAgainst,
   type SavedWorkflowMetadata,
   type SavedWorkflowParamDef,
   type V3DagTemplate,
@@ -66,8 +66,9 @@ export interface SavedWorkflowVersionView {
   paramCount: number;
   nodeCount: number;
   gateCount: number;
-  /** Against the previous version (absent for the first, I10). */
-  gates?: SavedWorkflowGateComparison;
+  /** Against the previous version, and against the published version when
+   *  this one is newer and the published one is not the previous (I10). */
+  gateComparisons: SavedWorkflowGateComparisonAgainst[];
   botChanges?: SavedWorkflowBotChange[];
   runtimeRevisions?: number;
   confirmation?: { confirmedByOpenId: string; confirmedAt: string; flowSummarySha256: string };
@@ -169,7 +170,16 @@ export async function loadSavedWorkflowDetailView(dataDir: string, workflowId: s
       paramCount: Object.keys(revision.payload.inputs).length,
       nodeCount: nodeCount(revision.payload.dagTemplate),
       gateCount: savedWorkflowGatePositions(revision.payload.dagTemplate).length,
-      ...(previous ? { gates: compareSavedWorkflowGates(previous.payload.dagTemplate, revision.payload.dagTemplate) } : {}),
+      gateComparisons: [
+        ...(previous ? [{
+          base: { kind: 'previous' as const, humanVersion: previous.payload.humanVersion, revisionId: previous.revisionId },
+          gates: compareSavedWorkflowGates(previous.payload.dagTemplate, revision.payload.dagTemplate),
+        }] : []),
+        ...(published && published !== previous && published.payload.humanVersion < revision.payload.humanVersion ? [{
+          base: { kind: 'published' as const, humanVersion: published.payload.humanVersion, revisionId: published.revisionId },
+          gates: compareSavedWorkflowGates(published.payload.dagTemplate, revision.payload.dagTemplate),
+        }] : []),
+      ],
       ...(provenance?.kind === 'dashboard_run' ? { botChanges: provenance.botChanges, runtimeRevisions: provenance.runtimeRevisions } : {}),
       ...(provenance?.kind === 'dashboard_draft' ? { confirmation: {
         confirmedByOpenId: provenance.confirmation.confirmedByOpenId,
