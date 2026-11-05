@@ -504,3 +504,59 @@ describe('group secretary runtime — registration re-checked after awaits', () 
     rt.stop();
   });
 });
+
+describe('group secretary runtime — unaddressed candidates under the real 5s tick', () => {
+  const TICK = 5_000;
+  function humanTopLevel(id: string, createTime: number) {
+    return {
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: id, create_time: String(createTime),
+        message_type: 'text', content: JSON.stringify({ text: '谁帮我查下昨天的报错' }), mentions: [] },
+    };
+  }
+  function botReplyUnder(id: string, rootId: string, createTime: number) {
+    return {
+      sender: { sender_type: 'app', sender_id: { open_id: 'ou_bot_b', app_id: 'cli_b' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: id, root_id: rootId, parent_id: rootId,
+        create_time: String(createTime), message_type: 'text', content: JSON.stringify({ text: '我来查' }), mentions: [] },
+    };
+  }
+  const prompts = (deliver: ReturnType<typeof vi.fn>) => deliver.mock.calls.map(c => (c[0] as any).prompt as string);
+
+  it('an unclaimed message is held out of the ordinary batch and wakes the secretary only once its grace expires', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const { rt, deliver } = runtime([]);
+    const grace = staggeredGraceMs(APP);
+    const sentAt = clock;
+    rt.observeMessageEvent(humanTopLevel('om_q', sentAt));
+    // 按真实 5 秒节拍推进，宽限到期前任何一拍都不能把这条消息投给秘书。
+    while (clock + TICK < sentAt + grace) {
+      clock += TICK; await rt.tick();
+      expect(prompts(deliver).filter(p => p.includes('"om_q"'))).toEqual([]);
+    }
+    for (let i = 0; i < 3; i++) { clock += TICK; await rt.tick(); }
+    const hits = prompts(deliver).filter(p => p.includes('"om_q"'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain('kind="unaddressed_task"');
+    expect(hits[0]).toContain('message_id="om_q"');
+    rt.stop();
+  });
+
+  it('a bot claiming the message during grace cancels the wake-up; the message is still perceived with the reply', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const { rt, deliver } = runtime([]);
+    const sentAt = clock;
+    rt.observeMessageEvent(humanTopLevel('om_q', sentAt));
+    clock += TICK; await rt.tick();
+    clock += TICK; await rt.tick();
+    rt.observeMessageEvent(botReplyUnder('om_r', 'om_q', clock));
+    for (let i = 0; i < 12; i++) { clock += TICK; await rt.tick(); }
+    const all = prompts(deliver);
+    expect(all.some(p => p.includes('kind="unaddressed_task"'))).toBe(false);
+    const batch = all.filter(p => p.includes('"om_r"'));
+    expect(batch).toHaveLength(1);
+    expect(batch[0]).toContain('kind="new_messages"');
+    expect(batch[0]).toContain('id="om_q"');
+    rt.stop();
+  });
+});

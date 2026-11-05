@@ -285,32 +285,46 @@ export class GroupSecretaryEngine {
     if (state.messages.length > this.opts.contextMessagesPerChat) {
       state.messages.splice(0, state.messages.length - this.opts.contextMessagesPerChat);
     }
-    // 感知：除了秘书自己发的和机器噪音，每条新消息都进本批，攒够了叫醒秘书。
-    // @ 秘书的消息走普通对话回合处理，不再进静默批次（否则同一条会被处理两次）。
-    if (!message.fromSelf && !message.mentionsSelf && !isSecretaryNoiseMessage(message)) {
-      state.newMessages.push(message);
-      if (state.newMessages.length > this.opts.contextMessagesPerChat) state.newMessages.shift();
-      state.lastEventAt = this.opts.now();
-      if (!state.firstPendingAt) state.firstPendingAt = state.lastEventAt;
-    }
-    // 有 bot（含秘书自己）在某条消息下接了话：那条就不算无人认领。
+    const now = this.opts.now();
+    // 有 bot（含秘书自己）在某条消息下接了话：那条就不算无人认领，转回普通批次（排在回复之前）。
     if (message.senderType === 'bot' || message.fromSelf) {
       const repliedTo = new Set([message.rootId, message.parentId].filter(Boolean));
       if (repliedTo.size > 0) {
-        state.unaddressed = state.unaddressed.filter(u => !repliedTo.has(u.message.messageId));
+        const claimed = state.unaddressed.filter(u => repliedTo.has(u.message.messageId));
+        if (claimed.length > 0) {
+          state.unaddressed = state.unaddressed.filter(u => !repliedTo.has(u.message.messageId));
+          for (const u of claimed) this.perceive(state, u.message, now);
+        }
       }
+      this.perceive(state, message, now);
       return;
     }
-    if (message.fromSelf || message.mentionsSelf) return;
-    if (message.rootId) return;
-    if (message.mentionCount > 0) return;
-    if (message.text.trim().length < 2) return;
+    // 候选分流：无人认领的候选不进普通批次，只在宽限到期仍没人接时以 unaddressed_task 叫醒。
+    // 否则 5 秒 debounce 会先把它随 new_messages 投出去——秘书在宽限期内就看到它（可能抢先出声），
+    // 而投递后候选被划掉，到期不再唤醒（选择静默观望的那一轮就成了漏响应）。
+    if (this.isUnaddressedCandidate(message, now)) {
+      state.unaddressed.push({ message, dueAt: Math.max(now, message.createTime + this.opts.unaddressedGraceMs) });
+      return;
+    }
+    this.perceive(state, message, now);
+  }
+
+  /** 感知：除了秘书自己发的、@ 秘书的（走普通对话回合，否则同一条会被处理两次）和机器噪音，都进本批。 */
+  private perceive(state: ChatState, message: SecretaryMessage, now: number): void {
+    if (message.fromSelf || message.mentionsSelf || isSecretaryNoiseMessage(message)) return;
+    state.newMessages.push(message);
+    if (state.newMessages.length > this.opts.contextMessagesPerChat) state.newMessages.shift();
+    state.lastEventAt = now;
+    if (!state.firstPendingAt) state.firstPendingAt = now;
+  }
+
+  private isUnaddressedCandidate(message: SecretaryMessage, now: number): boolean {
+    if (message.mentionsSelf || message.rootId || message.mentionCount > 0) return false;
+    if (message.text.trim().length < 2) return false;
     // 重放 / 补拉到的旧消息不当新任务：宽限期按消息自身时间算，早已过期的直接忽略。
-    const now = this.opts.now();
-    if (now - message.createTime > this.opts.unaddressedGraceMs + 60_000) return;
+    if (now - message.createTime > this.opts.unaddressedGraceMs + 60_000) return false;
     // 没有对话权限的人发的消息只当上下文：秘书回合以开启人身份运行，不能替任意群成员派活。
-    if (!this.opts.isTrustedHuman(message.chatId, message.senderOpenId)) return;
-    state.unaddressed.push({ message, dueAt: Math.max(now, message.createTime + this.opts.unaddressedGraceMs) });
+    return this.opts.isTrustedHuman(message.chatId, message.senderOpenId);
   }
 
   /** 传入本次拉到的全部会话（可含其它群、已关闭的）；未出现在快照里的会话会被遗忘。 */
@@ -466,9 +480,6 @@ export class GroupSecretaryEngine {
       const events = state.pending;
       if (state.newMessages.length > 0) {
         events.unshift({ kind: 'new_messages', at: now, messages: state.newMessages });
-        // 已随本批送达的消息不再作为「无人认领」二次叫醒。
-        const delivered = new Set(state.newMessages.map(m => m.messageId));
-        state.unaddressed = state.unaddressed.filter(u => !delivered.has(u.message.messageId));
       }
       const attempts = state.pendingAttempts;
       state.pending = [];

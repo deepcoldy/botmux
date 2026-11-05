@@ -119,6 +119,7 @@ export function renderGroupSecretaryPrompt(
     '',
     '【new_messages：群里有新消息】',
     '1. 通读新消息，判断有没有需要你做的。别人之间的正常对话、bot 已经接住的事、闲聊：静默。',
+    '   没 @ 任何人的顶层消息不在 new_messages 里：宽限期内没有 bot 接，才会单独以 unaddressed_task 叫醒你；在上下文里提前看到它也先别动。',
     '2. 有人布置了任务但没指定谁、或指定的 bot 一直没接：botmux bots list 选人后用 ask 问「要不要让 X 来做」（--quote 原消息，--mention 发消息的人）；对方确认后再 dispatch。',
     '3. 要你把信息转给某个 bot：在 active_sessions 里找到它干活的话题，用 botmux dispatch --into <thread_root> --bot-app <bot_app_id> --brief "<信息>" 发进那个话题；拿不准是哪个话题先 ask。不要在主群顶层 @ 它。',
     '4. 有人要你盯某件事（「盯着他做完告诉我」）：用 botmux secretary watch <thread_root> --every 10m --note "<要盯什么>" 登记，做完 / 不用盯了用 botmux secretary unwatch <thread_root>。',

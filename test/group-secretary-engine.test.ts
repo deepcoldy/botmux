@@ -173,13 +173,17 @@ describe('GroupSecretaryEngine — session transitions', () => {
 });
 
 describe('GroupSecretaryEngine — unaddressed messages', () => {
-  it('a top-level human message with no @ is perceived once in a batch, not again as an unaddressed task', () => {
+  it('a top-level human message with no @ waits out its grace outside the batch, then wakes the secretary exactly once', () => {
     const e = engine({ minFlushIntervalMs: 0 });
     e.observeMessage(msg('om_1'));
-    const first = advance(e, 6_000);
-    expect(only('new_messages', first)[0].messages?.map(m => m.messageId)).toEqual(['om_1']);
-    expect(only('unaddressed_task', advance(e, 60_000))).toEqual([]);
-  });;;
+    expect(advance(e, 6_000)).toEqual([]);
+    expect(advance(e, 14_000)).toEqual([]);
+    // 到期后照常过一次 debounce 再投递。
+    const due = advance(e, 5_000);
+    expect(only('new_messages', due)).toEqual([]);
+    expect(only('unaddressed_task', due).map(ev => ev.message?.messageId)).toEqual(['om_1']);
+    expect(advance(e, 60_000)).toEqual([]);
+  });
 
   it('a bot reply under the message during the grace period cancels the candidate', () => {
     const e = engine();
