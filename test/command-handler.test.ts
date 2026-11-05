@@ -7066,7 +7066,7 @@ describe('handleCommand', () => {
   // starting a machine-local device login; `platform` mode never starts one.
   describe('/login with a platform credential source', () => {
     const PAGE = 'https://platform.example.test/credentials';
-    function withPolicy(triggerUserAuth: unknown, bound: boolean) {
+    function withPolicy(triggerUserAuth: unknown, bound: boolean, chatType: 'group' | 'p2p' = 'p2p') {
       vi.mocked(platformCredentialsUrl).mockReturnValue(bound ? PAGE : null);
       vi.mocked(getBot).mockImplementation((() => ({
         botName: 'Claude',
@@ -7076,7 +7076,7 @@ describe('handleCommand', () => {
           triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) ?? undefined,
         },
       })) as any);
-      return makeDeps(makeLegacyLarkSession({ chatType: 'p2p' }));
+      return makeDeps(makeLegacyLarkSession({ chatType }));
     }
     const reply = (deps: any) => (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     afterEach(() => { vi.mocked(platformCredentialsUrl).mockReturnValue(null); });
@@ -7239,6 +7239,44 @@ describe('handleCommand', () => {
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login', { senderUnionId: sender }), deps, LARK_APP_ID);
         expect(reply(deps)).toContain(t('cmd.login.platform_title', undefined, 'zh'));
         expect(reply(deps)).toContain(PAGE);
+      });
+    });
+
+    // The fixed /credentials page is allowed to be relayed (it is not bound to
+    // a pending authorization flow), but in a group it still goes only to the
+    // requester's DM. These two branches were invisible while withPolicy built
+    // p2p sessions, where an in-place reply and a DM are the same call.
+    describe('platform page in a group is DMed, never posted', () => {
+      const team = (memberUnionIds: string[]) =>
+        ({ teamId: 't1', teamName: 'T', groupChatIds: [], bots: [], memberUnionIds });
+      const groupReplies = (deps: any) =>
+        (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string);
+      beforeEach(() => { vi.mocked(sendUserMessage).mockClear(); });
+      afterEach(() => {
+        vi.mocked(readPlatformTeamSync).mockReturnValue(null);
+        vi.mocked(platformMachineOwner).mockReturnValue({});
+      });
+
+      it('platform card: DMs the /credentials page, the group sees no URL', async () => {
+        const deps = withPolicy({ enabled: true, tools: ['lark-cli'] }, true, 'group');
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+        expect(sendUserMessage).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(sendUserMessage).mock.calls[0]![1]).toBe('ou_sender');
+        expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).toContain(PAGE);
+        expect(groupReplies(deps).join('\n')).not.toContain('https://');
+        expect(groupReplies(deps)).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
+      });
+
+      it('not-a-teammate: DMs the join page, the group sees no URL', async () => {
+        vi.mocked(readPlatformTeamSync).mockReturnValue([team(['on_owner'])]);
+        vi.mocked(platformMachineOwner).mockReturnValue({ unionId: 'on_owner' });
+        const deps = withPolicy({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, true, 'group');
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark', { senderUnionId: 'on_outsider' }), deps, LARK_APP_ID);
+        expect(sendUserMessage).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(sendUserMessage).mock.calls[0]![1]).toBe('ou_sender');
+        expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).toContain(PAGE);
+        expect(groupReplies(deps).join('\n')).not.toContain('https://');
+        expect(groupReplies(deps)).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
       });
     });
 

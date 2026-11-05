@@ -204,6 +204,20 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(vi.mocked(beginLarkCliLogin).mock.calls.length).toBe(begins);
   });
 
+  // A group turn with no human sender takes the same linkless group branch and
+  // must still name no_sender; the p2p no-sender case cannot see this branch.
+  it('in a group with no sender: denies linkless with [reason=no_sender]', async () => {
+    const begins = vi.mocked(beginLarkCliLogin).mock.calls.length;
+    const outcomes = await publish(botConfig(), undefined, 'turn-group-no-sender', false);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = identityBody('lark-cli', 'turn-group-no-sender');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toMatch(/https?:\/\//);
+    expect(body).toContain('[reason=no_sender]');
+    expect(body).not.toContain('[reason=not_authorized]');
+    expect(vi.mocked(beginLarkCliLogin).mock.calls.length).toBe(begins);
+  });
+
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
   // trigger user. Reaching for the session creator's or owner's credentials to
   // fill that gap is exactly the borrowing this feature removes.
