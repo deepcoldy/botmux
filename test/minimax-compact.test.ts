@@ -140,24 +140,23 @@ it.each([false, true])('frames compact into the existing ACP session and accepts
 });
 
 it.each([true, false])('reannounces ready after a proven unsubmitted compact, including queue drain (%s)', async flushing => {
-  vi.useFakeTimers({ toFake: ['setImmediate', 'clearImmediate'] });
-  try {
-    const backend = { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys: vi.fn(() => false) };
-    const worker = rawWorker(createMinimaxAdapter('/not-executed'), backend);
-    worker.scope.isFlushing = flushing;
-    const drainStates: boolean[] = [];
-    worker.scope.flushPending = async () => { drainStates.push(worker.scope.isFlushing); };
-    await worker.deliver({ type: 'raw_input', content: '/compact', turnId: 'compact-rejected' });
-    expect(backend.sendText).not.toHaveBeenCalled();
-    expect(worker.events).toContainEqual({ type: 'turn_terminal', turnId: 'compact-rejected', status: 'ambiguous' });
-    expect(worker.events.filter(event => event.type === 'prompt_ready')).toHaveLength(1);
-    expect(worker.scope.isPromptReady).toBe(true);
-    expect(drainStates).toEqual([]);
-    // The outer flush releases its mutex only after deliverRawInput returns.
-    worker.scope.isFlushing = false;
-    await vi.runOnlyPendingTimersAsync();
-    expect(drainStates).toEqual([false]);
-  } finally { vi.useRealTimers(); }
+  const backend = { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys: vi.fn(() => false) };
+  const worker = rawWorker(createMinimaxAdapter('/not-executed'), backend);
+  worker.scope.isFlushing = flushing;
+  const drainStates: boolean[] = [];
+  worker.scope.flushPending = async () => { drainStates.push(worker.scope.isFlushing); };
+  await worker.deliver({ type: 'raw_input', content: '/compact', turnId: 'compact-rejected' });
+  expect(backend.sendText).not.toHaveBeenCalled();
+  expect(worker.events).toContainEqual({ type: 'turn_terminal', turnId: 'compact-rejected', status: 'ambiguous' });
+  expect(worker.events.filter(event => event.type === 'prompt_ready')).toHaveLength(1);
+  expect(worker.scope.isPromptReady).toBe(true);
+  expect(drainStates).toEqual([]);
+  // The outer flush releases its mutex only after deliverRawInput returns.
+  worker.scope.isFlushing = false;
+  // Queue a marker behind the production setImmediate. This observes the real
+  // event-loop boundary on both Node and Bun without a wall-clock sleep.
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(drainStates).toEqual([false]);
 });
 
 it('keeps the active business final attributable until queued compact actually starts', async () => {
