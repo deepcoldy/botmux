@@ -38,13 +38,15 @@ export type ChatManagerMutationPlan =
 
 /**
  * Validation + gating for POST /api/sessions/:id/chat-manager mutations (status is handled before this).
- * `set` and `lead-only` require the per-bot manager switch; `clear` (teardown) is intentionally ungated.
+ * `set` and `lead-only on` require the per-bot manager switch. `clear` and `lead-only off` (both revocations)
+ * are intentionally ungated: the claim file is read without consulting the bot switch, so a leadOnly claim
+ * must stay removable after the switch is turned off without also dropping the manager (`clear`).
  */
 export function planChatManagerMutation(body: { action?: unknown; leadOnly?: unknown }, chatManagerEnabled: boolean): ChatManagerMutationPlan {
   const { action } = body;
   if (action !== 'set' && action !== 'clear' && action !== 'lead-only') return { ok: false, status: 400, error: 'invalid_action' };
   if (action === 'lead-only' && typeof body.leadOnly !== 'boolean') return { ok: false, status: 400, error: 'invalid_action' };
-  if ((action === 'set' || action === 'lead-only') && !chatManagerEnabled) return { ok: false, status: 409, error: 'chat_manager_disabled' };
+  if ((action === 'set' || (action === 'lead-only' && body.leadOnly === true)) && !chatManagerEnabled) return { ok: false, status: 409, error: 'chat_manager_disabled' };
   if (action === 'lead-only') return { ok: true, action, authAction: body.leadOnly ? 'lead-only-on' : 'lead-only-off', leadOnly: body.leadOnly as boolean };
   return { ok: true, action, authAction: action };
 }

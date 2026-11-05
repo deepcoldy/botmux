@@ -3791,7 +3791,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, param
     return jsonRes(res, 400, { ok: false, error: 'regular_group_only' });
   }
   if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
-  // `set` requires the per-bot manager switch. `clear` (teardown) and status are
+  // `set` and `lead-only on` require the per-bot manager switch. `clear`, `lead-only off` and status are
   // intentionally left ungated so an admin can always remove the manager / inspect
   // state even after turning the switch off — the switch gates activation, not removal.
   const plan = planChatManagerMutation(body, getBot(ds.larkAppId).config.chatManagerEnabled === true);

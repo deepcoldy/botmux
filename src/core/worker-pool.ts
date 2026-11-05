@@ -15705,7 +15705,8 @@ export function forkWorker(
       return ttl ? { promptCacheTtl: ttl } : {};
     })(),
     solo: ds.soloSession === true,
-    // Lead-only chat manager: frozen at spawn, applies to the next (re)start only.
+    // Lead-only chat manager: frozen at spawn. /restart, dashboard restart and crash respawn reuse
+    // lastInitConfig in place and do NOT re-read it; only a reopened topic does (documented in the chat-manager skill).
     ...(isLeadOnlySession(ds.larkAppId, ds.chatId, ds.chatType, ds.session) ? { leadOnly: true as const } : {}),
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.

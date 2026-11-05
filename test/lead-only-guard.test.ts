@@ -1,9 +1,9 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensureLeadOnlyPluginDir, isPlainBotmuxCommand, isLeadOnlyToolCallAllowed, leadOnlyHooksJson } from '../src/skills/lead-only-guard.js';
+import { ensureLeadOnlyPluginDir, isPlainBotmuxCommand, leadOnlyArgvViolation, parsePlainBotmuxArgv, isLeadOnlyToolCallAllowed, leadOnlyHooksJson } from '../src/skills/lead-only-guard.js';
 
 describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
   it.each([
@@ -64,6 +64,80 @@ describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
   ])('denies %j', (cmd) => { expect(isPlainBotmuxCommand(cmd)).toBe(false); });
 });
 
+const DENIED_SUBCOMMANDS = ['mcp serve', 'setup add', 'upgrade', 'restart', 'delete all', 'plugin init', 'schedule update x', 'workflow run', 'hook lead-only-guard', 'ask', 'daemon'];
+const FILE_FLAG_CMDS = [
+  "botmux send --content-file secret.txt",
+  "botmux send --content-file=secret.txt",
+  "botmux send --file /etc/passwd",
+  "botmux send --files a,b hi",
+  "botmux send --images a.png hi",
+  "botmux send --card-file c.json",
+  "botmux send --card-json '{}'",
+  "botmux dispatch --brief-file /etc/shadow",
+  "botmux dispatch --brief-file=/etc/shadow",
+  "botmux send --prompt-file p",
+  "botmux send --'content'-file x",
+  "botmux send '--file=x'",
+];
+const ALLOWED_CMDS = [
+  "botmux dispatch --brief 'goal: a; check: b'",
+  "botmux send '多行\n文本'",
+  'botmux status',
+  'botmux manager status',
+  'botmux manager lead-only off',
+  'botmux history',
+  'botmux --help',
+];
+
+describe('subcommand + flag allowlist', () => {
+  it.each(ALLOWED_CMDS)('allows %j', (cmd) => {
+    const argv = parsePlainBotmuxArgv(cmd);
+    expect(argv).not.toBeNull();
+    expect(leadOnlyArgvViolation(argv!)).toBeUndefined();
+    expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } })).toBe(true);
+  });
+  it.each(DENIED_SUBCOMMANDS)('denies subcommand %j', (rest) => {
+    const cmd = `botmux ${rest}`;
+    expect(isPlainBotmuxCommand(cmd)).toBe(true); // lexically plain, so only the allowlist stops it
+    expect(leadOnlyArgvViolation(parsePlainBotmuxArgv(cmd)!)).toMatch(/not allowed/);
+    expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } })).toBe(false);
+  });
+  it.each(FILE_FLAG_CMDS)('denies file flag %j', (cmd) => {
+    expect(leadOnlyArgvViolation(parsePlainBotmuxArgv(cmd)!)).toMatch(/inline/);
+    expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } })).toBe(false);
+  });
+});
+
+describe('guard + real bash with a dummy botmux (no side effects for bypasses)', () => {
+  const BYPASS = [
+    'botmux x <(touch pwned)',
+    'botmux x > pwned',
+    'botmux send <secret',
+    "botmux x # <<'EOF'\ntouch pwned\nEOF",
+    'botmux x <<EOF\n$\\\n(touch pwned)\nEOF',
+    'botmux x; touch pwned',
+    ...FILE_FLAG_CMDS.map(c => `${c}; touch pwned`),
+    ...DENIED_SUBCOMMANDS.map(c => `botmux ${c} > pwned`),
+    'botmux mcp serve',
+    'botmux setup add',
+    'botmux upgrade',
+    'botmux delete all',
+  ];
+  it.each([...BYPASS, ...ALLOWED_CMDS])('%j', (cmd) => {
+    const dir = mkdtempSync(join(tmpdir(), 'lead-bash-'));
+    const bin = mkdtempSync(join(tmpdir(), 'lead-bin-'));
+    writeFileSync(join(bin, 'botmux'), `#!/bin/sh\necho "$@" >> "${dir}/.calls"\n`);
+    chmodSync(join(bin, 'botmux'), 0o755);
+    writeFileSync(join(dir, 'secret'), 'S3CRET');
+    const allowed = isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } });
+    if (allowed) spawnSync('bash', ['-c', cmd], { cwd: dir, env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, input: '' });
+    const files = readdirSync(dir).filter(f => f !== '.calls' && f !== 'secret');
+    expect(files).toEqual([]);
+    expect(existsSync(join(dir, '.calls'))).toBe(allowed);
+    expect(allowed).toBe(ALLOWED_CMDS.includes(cmd));
+  });
+});
+
 describe('isLeadOnlyToolCallAllowed', () => {
   it.each(['TodoWrite', 'Skill', 'ToolSearch'])('allows bookkeeping tool %s', (t) => {
     expect(isLeadOnlyToolCallAllowed({ tool_name: t })).toBe(true);
@@ -75,7 +149,7 @@ describe('isLeadOnlyToolCallAllowed', () => {
     expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: 'botmux send hi' } })).toBe(true);
     expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: 'ls' } })).toBe(false);
     expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: {} })).toBe(false);
-    expect(isLeadOnlyToolCallAllowed({ tool_input: { command: 'botmux x' } })).toBe(true);
+    expect(isLeadOnlyToolCallAllowed({ tool_input: { command: 'botmux status' } })).toBe(true);
   });
 });
 
@@ -90,6 +164,7 @@ describe('lead-only plugin dir', () => {
     expect(hooks.hooks.PreToolUse[0].matcher).toBe('*');
     const cmd: string = hooks.hooks.PreToolUse[0].hooks[0].command;
     expect(cmd).toMatch(/hook lead-only-guard$/);
+    expect(hooks.hooks.PreToolUse[0].hooks[0].onFailure).toBe('block');
     expect(cmd).not.toContain('lead-only-guard.mjs');
     expect(cmd).toBe(JSON.parse(leadOnlyHooksJson()).hooks.PreToolUse[0].hooks[0].command);
   });
