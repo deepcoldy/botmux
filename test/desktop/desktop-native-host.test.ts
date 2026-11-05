@@ -1,10 +1,10 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRuntimeService, type BundledRuntimeCandidate } from '../../src/desktop/main/runtime-service.js';
 import { ensureBotmuxShim, inspectBotmuxShim, pathProvidesBotmux } from '../../src/desktop/host/cli-shim.js';
-import { interpreterFromCommand, resolveFleetOwner } from '../../src/desktop/host/fleet-owner.js';
+import { classifyFleetOwnership, interpreterFromCommand, resolveFleetOwner } from '../../src/desktop/host/fleet-owner.js';
 import { bundledRuntimeForHost, dispatchHostLine, FRAME_PREFIX, launchPolicy } from '../../src/desktop/host/desktop-host.js';
 import { computeFleetAlignment } from '../../src/desktop/host/alignment.js';
 import { decideUpdateAction, isRestartPending, isShellUpdateAvailable, updatePolicyFromConfig } from '../../src/desktop/host/update-policy.js';
@@ -175,7 +175,9 @@ describe('botmux launcher for agents', () => {
   it('keeps an install.sh binary that sits at the launcher path', () => {
     const binDir = join(dir, 'bin');
     mkdirSync(binDir);
-    writeFileSync(join(binDir, 'botmux'), Buffer.from([0xcf, 0xfa, 0xed, 0xfe]));
+    // A real binary may contain text that looks like a wrapper's exec line; it
+    // must still be recognised by its header, not parsed as a script.
+    writeFileSync(join(binDir, 'botmux'), Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.from(`\nexec "${join(dir, 'gone')}" "$@"\n`)]));
     chmodSync(join(binDir, 'botmux'), 0o755);
     expect(ensureBotmuxShim({ binDir, bundledBinary: appBinary }).wrote).toBe(false);
   });
@@ -194,6 +196,8 @@ describe('botmux launcher for agents', () => {
     symlinkSync(join(dir, 'nowhere'), join(binDir, 'botmux'));
     expect(inspectBotmuxShim(join(binDir, 'botmux'), appBinary).kind).toBe('dangling');
     ensureBotmuxShim({ binDir, bundledBinary: appBinary });
+    expect(lstatSync(join(binDir, 'botmux')).isSymbolicLink()).toBe(false);
+    expect(existsSync(join(dir, 'nowhere'))).toBe(false);
     expect(readFileSync(join(binDir, 'botmux'), 'utf-8')).toContain(appBinary);
   });
 
@@ -275,25 +279,25 @@ describe('launch policy', () => {
 
   it('starts the app runtime when nothing runs', async () => {
     const rt = runtime();
-    expect(await launchPolicy({ ...base, runtime: rt, state: state('stopped'), alignment: async () => ({ kind: 'unknown' }), runtimeReplaced: false, ownedByApp: () => true })).toBe('started');
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('stopped'), alignment: async () => ({ kind: 'unknown' }), runtimeReplaced: false, appLaunch: true, ownedByApp: () => true })).toBe('started');
     expect(rt.start).toHaveBeenCalled();
   });
 
   it('restarts its own fleet only after the runtime binary was replaced', async () => {
     const rt = runtime();
-    expect(await launchPolicy({ ...base, runtime: rt, state: state('running'), alignment: async () => ({ kind: 'aligned' }), runtimeReplaced: false, ownedByApp: () => true })).toBe('none');
-    expect(await launchPolicy({ ...base, runtime: rt, state: state('running'), alignment: async () => ({ kind: 'aligned' }), runtimeReplaced: true, ownedByApp: () => true })).toBe('restarted');
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('running'), alignment: async () => ({ kind: 'aligned' }), runtimeReplaced: false, appLaunch: true, ownedByApp: () => true })).toBe('none');
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('running'), alignment: async () => ({ kind: 'aligned' }), runtimeReplaced: true, appLaunch: true, ownedByApp: () => true })).toBe('restarted');
     expect(rt.restartBundled).toHaveBeenCalledTimes(1);
   });
 
   it('takes over an older packaged install, but leaves a checkout or newer install alone', async () => {
     const rt = runtime();
     const running = state('running', 'global-cli');
-    expect(await launchPolicy({ ...base, runtime: rt, state: running, runtimeReplaced: false, ownedByApp: () => false,
+    expect(await launchPolicy({ ...base, runtime: rt, state: running, runtimeReplaced: false, appLaunch: true, ownedByApp: () => false,
       alignment: async () => ({ kind: 'owner-older', ownerVersion: '3.1.0', appVersion: '3.55.0', auto: true }) })).toBe('aligned');
-    expect(await launchPolicy({ ...base, runtime: rt, state: running, runtimeReplaced: false, ownedByApp: () => false,
+    expect(await launchPolicy({ ...base, runtime: rt, state: running, runtimeReplaced: false, appLaunch: true, ownedByApp: () => false,
       alignment: async () => ({ kind: 'owner-older', ownerVersion: '3.1.0', appVersion: '3.55.0', auto: false }) })).toBe('none');
-    expect(await launchPolicy({ ...base, runtime: rt, state: running, runtimeReplaced: false, ownedByApp: () => false,
+    expect(await launchPolicy({ ...base, runtime: rt, state: running, runtimeReplaced: false, appLaunch: true, ownedByApp: () => false,
       alignment: async () => ({ kind: 'owner-newer', ownerVersion: '3.60.0', appVersion: '3.55.0' }) })).toBe('none');
     expect(rt.takeover).toHaveBeenCalledTimes(1);
   });
@@ -338,5 +342,87 @@ describe('app update policy coexists with the CLI auto-update', () => {
     expect(isShellUpdateAvailable('3.56.0', '3.57.0', false)).toBe(false);
     expect(isShellUpdateAvailable('3.57.0', '3.57.0', true)).toBe(false);
     expect(isShellUpdateAvailable(undefined, '3.57.0', true)).toBe(false);
+  });
+});
+
+describe('fleet ownership is three-way', () => {
+  const live = () => true;
+  function state(entry: string | undefined, command?: string) {
+    return { supervisorPid: 4242, supervisorStartedAt: '', ...(entry ? { supervisorEntry: entry } : {}), ...(command ? { supervisorCommand: command } : {}), procs: [] } as never;
+  }
+
+  it('an owner whose launcher cannot be rebuilt is someone else, never the app', () => {
+    mkdirSync(join(dir, 'dist'));
+    const entry = join(dir, 'dist', 'index-supervisor.js');
+    writeFileSync(entry, '');
+    // cli.js and the interpreter are missing (checkout mid-build, deleted worktree)
+    expect(classifyFleetOwnership({ bundledExecPath: appBinary, readState: () => state(entry, `/nope/bun ${entry}`), pidAlive: live }))
+      .toEqual({ kind: 'unknown-external', entry });
+    expect(classifyFleetOwnership({ bundledExecPath: appBinary, readState: () => state(join(dir, 'gone.js')), pidAlive: live }).kind)
+      .toBe('unknown-external');
+    expect(classifyFleetOwnership({ bundledExecPath: appBinary, readState: () => state(undefined), pidAlive: live }).kind)
+      .toBe('unknown-external');
+  });
+
+  it('is "app" only when the supervisor entry is the app runtime', () => {
+    const binary = join(dir, 'botmux');
+    writeFileSync(binary, '');
+    expect(classifyFleetOwnership({ bundledExecPath: binary, readState: () => state(binary), pidAlive: live }).kind).toBe('app');
+    expect(classifyFleetOwnership({ bundledExecPath: binary, readState: () => state(binary), pidAlive: () => false }).kind).toBe('none');
+  });
+
+  it('drives a `bun src/index-supervisor.ts` dev fleet through src/cli.ts, not by exec-ing the .ts file', () => {
+    mkdirSync(join(dir, 'src'));
+    const entry = join(dir, 'src', 'index-supervisor.ts');
+    writeFileSync(entry, '');
+    writeFileSync(join(dir, 'src', 'cli.ts'), '');
+    const bun = join(dir, 'bun');
+    writeFileSync(bun, '');
+    expect(resolveFleetOwner({ bundledExecPath: appBinary, readState: () => state(entry, `${bun} ${entry}`), pidAlive: live }))
+      .toMatchObject({ interpreterPath: bun, cliPath: join(dir, 'src', 'cli.ts') });
+  });
+
+  it('knows the version of a compiled-binary owner (npm / install.sh), so alignment can act on it', () => {
+    const other = join(dir, 'other-botmux');
+    writeFileSync(other, '');
+    const owner = resolveFleetOwner({ bundledExecPath: appBinary, readState: () => state(other), pidAlive: live, probeVersion: () => '3.40.0' });
+    expect(owner?.version).toBe('3.40.0');
+    expect(computeFleetAlignment({ appVersion: '3.55.0', owner: { version: owner!.version, isCheckout: false }, fleetRunning: true }))
+      .toMatchObject({ kind: 'owner-older', auto: true });
+  });
+});
+
+describe('launch policy edges', () => {
+  const ok = { code: 0, stdout: '', stderr: '' };
+  const base = { log: () => {} };
+  function state(status: DesktopRuntimeState['status'], runtimeSource: DesktopRuntimeState['runtimeSource']): DesktopRuntimeState {
+    return { status, appVersion: '3.55.0', runtimeVersion: null, runtimeSource, runtimeManaged: true, runtimePath: null, botCount: 1, onlineDaemonCount: 0, attentionCount: 0, dashboardUrl: null };
+  }
+
+  it('never auto-takes-over on a background host relaunch (after its own update, a crash, a runtime swap)', async () => {
+    const rt = { start: vi.fn(), takeover: vi.fn().mockResolvedValue(ok), restartBundled: vi.fn() };
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('running', 'global-cli'), runtimeReplaced: false, appLaunch: false, ownedByApp: () => false,
+      alignment: async () => ({ kind: 'owner-older', ownerVersion: '3.1.0', appVersion: '3.55.0', auto: true }) })).toBe('none');
+    expect(rt.takeover).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed restart onto the reseeded runtime so the marker survives for the next launch', async () => {
+    const rt = { start: vi.fn(), takeover: vi.fn(), restartBundled: vi.fn().mockResolvedValue({ code: 1, stdout: '', stderr: 'boom' }) };
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('running', 'bundled'), runtimeReplaced: true, appLaunch: true, ownedByApp: () => true,
+      alignment: async () => ({ kind: 'aligned' }) })).toBe('restart-failed');
+  });
+
+  it('does not auto-start anything but the app runtime', async () => {
+    const rt = { start: vi.fn().mockResolvedValue(ok), takeover: vi.fn(), restartBundled: vi.fn() };
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('stopped', 'global-cli'), runtimeReplaced: false, appLaunch: true, ownedByApp: () => false,
+      alignment: async () => ({ kind: 'unknown' }) })).toBe('none');
+    expect(rt.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('restart-pending boundary', () => {
+  it('ignores mtime jitter right around the supervisor start', () => {
+    const started = '2026-11-05T10:00:00.000Z';
+    expect(isRestartPending({ fleetOwnedByApp: true, fleetRunning: true, supervisorStartedAt: started, runtimeMtimeMs: Date.parse(started) + 500 })).toBe(false);
   });
 });

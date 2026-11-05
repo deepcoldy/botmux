@@ -1,68 +1,106 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { FleetState } from '../../core/fleet-supervisor-policy.js';
 import type { ExternalRuntimeCandidate } from '../main/runtime-service.js';
 
 export interface FleetOwnerDeps {
-  /** Absolute path of the binary bundled in Botmux.app. */
+  /** Absolute path of the binary the app runs the fleet from. */
   bundledExecPath: string;
   readState: () => FleetState | null;
   pidAlive: (pid: number) => boolean;
   exists?: (path: string) => boolean;
   realpath?: (path: string) => string;
   readVersion?: (packageJsonPath: string) => string;
+  /** `<binary> --version` for a compiled-binary owner; '' when unknown. */
+  probeVersion?: (binary: string) => string;
 }
 
 /**
- * Who owns the live fleet, when it is NOT the app's bundled binary.
- *
+ * Who runs the live fleet. Three-way on purpose: "the app" must only ever mean a
+ * supervisor whose entry IS the app runtime. A supervisor we cannot reconstruct a
+ * launcher for (a checkout mid-`bun run build`, a deleted worktree) is still
+ * SOMEONE ELSE'S fleet — treating it as the app's would let launch policy
+ * restart it onto the app runtime and hand its updates to a daemon that is not
+ * running the app runtime at all.
+ */
+export type FleetOwnership =
+  | { kind: 'none' }
+  | { kind: 'app' }
+  | { kind: 'external'; runtime: ExternalRuntimeCandidate }
+  | { kind: 'unknown-external'; entry: string | null };
+
+/**
  * The supervisor records how it was launched (`supervisorEntry` +
  * `supervisorCommand` in fleet-state.json). A compiled binary records its own
- * executable; a Node/Bun install records `<root>/dist/index-supervisor.js` and the
- * full command line, whose prefix before the entry is the interpreter. Driving
- * the fleet through that same launcher is what keeps `botmux restart` from the
- * app identical to typing it in the owner's terminal.
- *
- * Returns null when no supervisor is alive, when the owner IS the bundled binary,
- * or when the launcher cannot be reconstructed (missing files); callers then fall
- * back to the bundled runtime.
+ * executable; a Node/Bun install records `<root>/dist/index-supervisor.js` (or
+ * `src/index-supervisor.ts` for the `supervisor:bun` dev chain) and the full
+ * command line, whose prefix before the entry is the interpreter. Driving the
+ * fleet through that same launcher keeps `botmux restart` from the app identical
+ * to typing it in the owner's terminal.
  */
-export function resolveFleetOwner(deps: FleetOwnerDeps): ExternalRuntimeCandidate | null {
+export function classifyFleetOwnership(deps: FleetOwnerDeps): FleetOwnership {
   const exists = deps.exists ?? existsSync;
   const realpath = deps.realpath ?? safeRealpath;
   const state = deps.readState();
-  if (!state || !Number.isInteger(state.supervisorPid) || !deps.pidAlive(state.supervisorPid)) return null;
+  if (!state || !Number.isInteger(state.supervisorPid) || !deps.pidAlive(state.supervisorPid)) return { kind: 'none' };
   const entry = state.supervisorEntry;
-  if (!entry || !exists(entry)) return null;
-  if (realpath(entry) === realpath(deps.bundledExecPath)) return null;
+  if (!entry) return { kind: 'unknown-external', entry: null };
+  if (realpath(entry) === realpath(deps.bundledExecPath)) return { kind: 'app' };
+  if (!exists(entry)) return { kind: 'unknown-external', entry };
 
-  if (!entry.endsWith('.js')) {
+  const script = /\.(?:[cm]?js|ts)$/.exec(entry);
+  if (!script) {
     // Another compiled binary (install.sh / npm platform package).
+    const probe = deps.probeVersion ?? probeVersionCached;
     return {
       kind: 'external',
-      root: dirname(entry),
-      cliPath: entry,
-      binPath: entry,
-      version: '',
-      runtimeSource: 'global-cli',
+      runtime: { kind: 'external', root: dirname(entry), cliPath: entry, binPath: entry, version: probe(entry), runtimeSource: 'global-cli' },
     };
   }
 
-  const cliPath = join(dirname(entry), 'cli.js');
+  // Same directory and extension as the entry: dist/cli.js, src/cli.ts.
+  const cliPath = join(dirname(entry), `cli${script[0]}`);
   const interpreterPath = interpreterFromCommand(state.supervisorCommand, entry);
-  if (!interpreterPath || !exists(interpreterPath) || !exists(cliPath)) return null;
+  if (!interpreterPath || !exists(interpreterPath) || !exists(cliPath)) return { kind: 'unknown-external', entry };
   const root = dirname(dirname(entry));
   const readVersion = deps.readVersion ?? readPackageVersion;
   return {
     kind: 'external',
-    root,
-    cliPath,
-    binPath: cliPath,
-    interpreterPath,
-    version: readVersion(join(root, 'package.json')),
-    runtimeSource: 'global-cli',
+    runtime: {
+      kind: 'external',
+      root,
+      cliPath,
+      binPath: cliPath,
+      interpreterPath,
+      version: readVersion(join(root, 'package.json')),
+      runtimeSource: 'global-cli',
+    },
   };
+}
+
+/** The external runtime to drive, when one can be driven; else null. */
+export function resolveFleetOwner(deps: FleetOwnerDeps): ExternalRuntimeCandidate | null {
+  const ownership = classifyFleetOwnership(deps);
+  return ownership.kind === 'external' ? ownership.runtime : null;
+}
+
+const binaryVersionCache = new Map<string, string>();
+
+function probeVersionCached(binary: string): string {
+  let key = binary;
+  try { key = `${binary}@${statSync(binary).mtimeMs}`; } catch { /* probe uncached */ }
+  const cached = binaryVersionCache.get(key);
+  if (cached !== undefined) return cached;
+  const result = spawnSync(binary, ['--version'], {
+    encoding: 'utf-8',
+    timeout: 15_000,
+    env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+  });
+  const out = result.status === 0 ? result.stdout.trim() : '';
+  const version = /^\d+\.\d+\.\d+/.test(out) ? out : '';
+  binaryVersionCache.set(key, version);
+  return version;
 }
 
 /**

@@ -360,7 +360,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
               onlineDaemonCount,
               attentionCount: 1,
               dashboardUrl: null,
-              message: '检测到由外置 botmux 启动的运行时，Desktop 正在切换到内置运行时。',
+              message: '检测到由其他 botmux 安装启动的运行时，无法定位它的启动方式。',
             };
           }
           return {

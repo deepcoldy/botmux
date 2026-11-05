@@ -15,7 +15,7 @@
  * but never stops the fleet — the daemon outlives the app by design.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -62,7 +62,7 @@ function safeMaintenanceConfig(): MaintenanceConfig | undefined {
   }
 }
 import { ensureBotmuxShim, pathProvidesBotmux } from './cli-shim.js';
-import { resolveFleetOwner } from './fleet-owner.js';
+import { classifyFleetOwnership } from './fleet-owner.js';
 
 export const FRAME_PREFIX = '\u001eBOTMUX ';
 
@@ -199,7 +199,18 @@ export async function runDesktopHost(): Promise<void> {
 
   const fleetStatePath = join(botmuxHome, 'fleet-state.json');
   const readState = () => (existsSync(fleetStatePath) ? readFleetState(fleetStatePath) : null);
-  const fleetOwner = () => resolveFleetOwner({ bundledExecPath: bundled.cliPath, readState, pidAlive });
+  const ownership = () => classifyFleetOwnership({ bundledExecPath: bundled.cliPath, readState, pidAlive });
+  const fleetOwner = () => {
+    const owned = ownership();
+    return owned.kind === 'external' ? owned.runtime : null;
+  };
+  /** Only a supervisor whose entry IS the app runtime counts as the app's fleet. */
+  const ownedByApp = () => ownership().kind === 'app';
+  const runtimeDir = dirname(bundled.cliPath);
+  // Persisted (not a one-shot env): survives host crashes/relaunches until the
+  // restart onto the reseeded runtime actually succeeds.
+  const restartMarker = join(runtimeDir, '.restart-needed');
+  const pathMarker = join(runtimeDir, '.path-entry-written');
   const runtime = createRuntimeService({
     paths,
     appVersion: version,
@@ -233,7 +244,7 @@ export async function runDesktopHost(): Promise<void> {
     const fleetRunning = state.status === 'running' || state.status === 'degraded';
     readPolicy();
     update.restartPending = bundled.selfDispatching === true && isRestartPending({
-      fleetOwnedByApp: !owner,
+      fleetOwnedByApp: ownedByApp(),
       fleetRunning,
       supervisorStartedAt: readState()?.supervisorStartedAt,
       runtimeMtimeMs: runtimeMtime(),
@@ -280,10 +291,9 @@ export async function runDesktopHost(): Promise<void> {
     update.checkedAt = Date.now();
     publish();
 
-    const owner = fleetOwner();
     const fleetRunning = Boolean(lastState && (lastState.status === 'running' || lastState.status === 'degraded'));
     readPolicy();
-    const action = decideUpdateAction({ available: update.available, policy: update.policy, fleetOwnedByApp: !owner, fleetRunning });
+    const action = decideUpdateAction({ available: update.available, policy: update.policy, fleetOwnedByApp: ownedByApp(), fleetRunning });
     if (action === 'auto-apply') {
       log(`auto-updating app runtime ${version} → ${update.latest} (maintenance.autoUpdate is on; fleet not run by the app runtime)`);
       void applyUpdate({ restartFleet: false }).then(
@@ -331,7 +341,7 @@ export async function runDesktopHost(): Promise<void> {
       // The binary at our own path was replaced. If the fleet runs from it,
       // restart so it picks the new build up; a fleet owned by another install
       // is aligned separately (see alignment).
-      if (opts.restartFleet !== false && !fleetOwner() && lastState && lastState.status === 'running') {
+      if (opts.restartFleet !== false && ownedByApp() && lastState && lastState.status === 'running') {
         const restarted = await runtime.restartBundled();
         if (restarted.code !== 0) log(`restart after update failed: ${(restarted.stderr || restarted.stdout).trim()}`);
       }
@@ -373,10 +383,13 @@ export async function runDesktopHost(): Promise<void> {
       const binDir = resolveBotmuxWrapperBinDir(process.env);
       const shim = ensureBotmuxShim({ binDir, bundledBinary: bundled.cliPath });
       let pathProfiles: string[] = [];
-      if (!pathProvidesBotmux(probeShellPathEnv())) {
+      // Once per machine: a user who removes the line again has decided, and
+      // the host relaunches often (after every runtime update).
+      if (!existsSync(pathMarker) && !pathProvidesBotmux(probeShellPathEnv())) {
         const result = ensurePathEntry({ installDir: binDir });
         pathProfiles = result.written;
         for (const failure of result.failed) log(`PATH entry not written to ${failure.file}: ${failure.error}`);
+        if (result.failed.length === 0) writeFileSync(pathMarker, `${new Date().toISOString()}\n`);
       }
       agentCli = { shim: shim.before.kind, wroteShim: shim.wrote, pathProfiles };
       log(`botmux launcher: ${shim.before.kind}${shim.wrote ? ' → app runtime' : ''}${pathProfiles.length ? `; PATH added in ${pathProfiles.join(', ')}` : ''}`);
@@ -392,14 +405,19 @@ export async function runDesktopHost(): Promise<void> {
   const closed = new Promise<void>(resolve => rl.once('close', () => resolve()));
 
   try {
-    await launchPolicy({
+    const outcome = await launchPolicy({
       runtime,
       state: await runtime.getState(),
       alignment: () => runtime.getState().then(state => overview(state).alignment),
-      runtimeReplaced: process.env.BOTMUX_DESKTOP_RUNTIME_REPLACED === '1',
-      ownedByApp: () => !fleetOwner(),
+      runtimeReplaced: existsSync(restartMarker),
+      // Auto-takeover only when the APP starts — never when the host merely
+      // relaunched (after its own update, a crash, a runtime swap), which would
+      // otherwise restart every bot at an arbitrary background moment.
+      appLaunch: process.env.BOTMUX_DESKTOP_APP_LAUNCH === '1',
+      ownedByApp,
       log,
     });
+    if (outcome !== 'restart-failed') rmSync(restartMarker, { force: true });
   } catch (error) {
     log(`launch policy failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -417,21 +435,25 @@ export async function runDesktopHost(): Promise<void> {
 /**
  * What the app does to the fleet when it starts:
  *  · nothing runs                          → start the app runtime
- *  · the app runtime was just replaced     → restart a fleet it owns, so the
- *    (newer app installed / runtime seeded)  fleet runs the app's version
- *  · an older PACKAGED install owns it     → take over (align to the app version)
- *  · a git checkout, or a newer install    → leave it; offered in the menu only
+ *  · the app runtime was reseeded          → restart a fleet it owns, so the
+ *    (marker persists until that succeeds)   fleet runs the app's version
+ *  · an older PACKAGED install owns it     → take over (align to the app version),
+ *    — on app launch only                    never on a background host relaunch
+ *  · a git checkout, a newer install, or   → leave it; offered in the menu only
+ *    an owner we cannot identify
  */
 export async function launchPolicy(input: {
   runtime: Pick<ReturnType<typeof createRuntimeService>, 'start' | 'takeover' | 'restartBundled'>;
   state: DesktopRuntimeState;
   alignment: () => Promise<FleetAlignment>;
   runtimeReplaced: boolean;
+  appLaunch: boolean;
   ownedByApp: () => boolean;
   log: (message: string) => void;
-}): Promise<'started' | 'restarted' | 'aligned' | 'none'> {
+}): Promise<'started' | 'restarted' | 'restart-failed' | 'aligned' | 'none'> {
   const report = (label: string, result: { code: number; stdout: string; stderr: string }) => {
     if (result.code !== 0) input.log(`${label} failed: ${(result.stderr || result.stdout).trim()}`);
+    return result.code === 0;
   };
   if (shouldAutoStartCliRuntime(input.state) && input.state.runtimeSource === 'bundled') {
     report('auto-start', await input.runtime.start());
@@ -441,9 +463,9 @@ export async function launchPolicy(input: {
   if (!running) return 'none';
   if (input.ownedByApp()) {
     if (!input.runtimeReplaced) return 'none';
-    report('restart onto the new app runtime', await input.runtime.restartBundled());
-    return 'restarted';
+    return report('restart onto the new app runtime', await input.runtime.restartBundled()) ? 'restarted' : 'restart-failed';
   }
+  if (!input.appLaunch) return 'none';
   const alignment = await input.alignment();
   if (alignment.kind === 'owner-older' && alignment.auto) {
     input.log(`aligning fleet ${alignment.ownerVersion} → app ${alignment.appVersion}`);

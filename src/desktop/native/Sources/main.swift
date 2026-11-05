@@ -42,7 +42,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         host = HostProcess(binaryURL: bundled)
         host.env["BOTMUX_DESKTOP_SHELL_VERSION"] = Self.shellVersion
         host.env["BOTMUX_DESKTOP_RUNTIME"] = runtime.binary.path
-        if runtime.replaced { host.oneShotEnv["BOTMUX_DESKTOP_RUNTIME_REPLACED"] = "1" }
+        // Auto-takeover of an older install is an app-launch decision only.
+        host.oneShotEnv["BOTMUX_DESKTOP_APP_LAUNCH"] = "1"
         windowController = MainWindowController(host: host, statusDir: statusDir, bridgeScript: bridgeScript)
         windowController.nativeMethods = [
             "getLoginItem": { _, reply in reply(Self.loginItemState(), nil) },
@@ -198,6 +199,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
+        if status == "degraded", (state["runtimeManaged"] as? Bool) == false {
+            menu.addItem(item("切换到 App 运行时（重启 fleet）", #selector(alignFleet)))
+        }
         switch alignment["kind"] as? String {
         case "owner-older":
             let app = alignment["appVersion"] as? String ?? ""

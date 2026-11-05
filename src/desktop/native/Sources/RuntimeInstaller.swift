@@ -20,6 +20,11 @@ enum RuntimeInstaller {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".botmux/app-runtime/botmux")
     }
 
+    /// Read and cleared by the host (desktop-host.ts launchPolicy).
+    static var restartMarkerURL: URL {
+        runtimeURL.deletingLastPathComponent().appendingPathComponent(".restart-needed")
+    }
+
     static func ensure(bundled: URL) -> Result {
         let fm = FileManager.default
         let target = runtimeURL
@@ -43,11 +48,21 @@ enum RuntimeInstaller {
             // its old inode, and nothing ever execs a half-written file.
             let temp = target.deletingLastPathComponent().appendingPathComponent(".botmux.\(UUID().uuidString)")
             try fm.copyItem(at: bundled, to: temp)
+            // copyItem keeps the bundle's (old) mtime; stamp "now" so the host's
+            // restart-pending check sees this file as newer than a running fleet.
+            try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: temp.path)
             if rename(temp.path, target.path) != 0 {
                 try? fm.removeItem(at: temp)
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
             }
-            return Result(binary: target, replaced: installedVersion != nil, version: bundledVersion)
+            let replaced = installedVersion != nil
+            if replaced {
+                // Persisted, not passed once: the host clears it only after the
+                // restart onto this build succeeded, so a failed restart or a host
+                // relaunch cannot silently leave the fleet on the old build.
+                fm.createFile(atPath: restartMarkerURL.path, contents: Data(ISO8601DateFormatter().string(from: Date()).utf8))
+            }
+            return Result(binary: target, replaced: replaced, version: bundledVersion)
         } catch {
             NSLog("[botmux] could not seed app runtime at \(target.path): \(error); using the bundled binary")
             return Result(binary: bundled, replaced: false, version: bundledVersion)
