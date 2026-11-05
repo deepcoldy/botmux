@@ -673,7 +673,8 @@ async function withholdIdentity(
   // the group. The refusal points at /login instead, whose reply goes to the
   // sender privately.
   if (!privateChat) {
-    writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel);
+    writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel,
+      undefined, undefined, senderOpenId ? 'not_authorized' : 'no_sender');
     return { tool, state: 'needs-authorization' };
   }
   // Pre-fetch a ready, valid authorization link for either tool so the moment a

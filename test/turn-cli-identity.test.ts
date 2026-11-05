@@ -199,6 +199,8 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).not.toContain('https://example.com/lark-device');
     expect(body).not.toMatch(/https?:\/\//);
     expect(body).toContain('/login');
+    // The cause is still named in a group, just without a link.
+    expect(body).toContain('[reason=not_authorized]');
     expect(vi.mocked(beginLarkCliLogin).mock.calls.length).toBe(begins);
   });
 
