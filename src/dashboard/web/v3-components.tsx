@@ -43,6 +43,7 @@ import { NewWorkflowEntry, WorkflowDraftPage, WorkflowDraftsSection, WorkflowNew
 import { parseWorkflowsRoute, workflowEntryMode } from './workflow-draft-model.js';
 import { SaveTemplateDialog, WorkflowLibraryEntry, WorkflowLibraryPage, WorkflowTemplatePage } from './workflow-library-page.js';
 import { fetchOrchestratorBots } from './workflow-draft-api.js';
+import { CopyWorkflowButton, CopyWorkflowDialog } from './workflow-copy.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
 
 function isDocumentHidden(): boolean {
@@ -188,6 +189,7 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
   // 「保存为模板」(D5): only with Dashboard orchestration on, on a finished run.
   const entryMode = workflowEntryMode(useWorkflowSwitches());
   const [saving, setSaving] = useState(false);
+  const [copying, setCopying] = useState(false);
   const [botNames, setBotNames] = useState<Map<string, string>>(() => new Map());
   useEffect(() => {
     if (!saving || botNames.size) return;
@@ -198,6 +200,7 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
 
   useEffect(() => {
     setSaving(false);
+    setCopying(false);
     setSelectedId(null);
     setInstanceId(null);
     setInstancePinned(false);
@@ -283,6 +286,8 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           {entryMode === 'ready' && ui.authed && terminal && !saving ? (
             <button type="button" onClick={() => setSaving(true)}>{tr('workflow.library.saveFromRun')}</button>
           ) : null}
+          {/* 「复制为新工作流」(D6): any run, finished or not. */}
+          {entryMode === 'ready' && ui.authed ? <CopyWorkflowButton active={copying} onOpen={() => setCopying(true)} /> : null}
           <V3CancelButton
             runStatus={view?.runStatus}
             busy={cancelBusy || cancelSubmitted}
@@ -296,6 +301,7 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
         </div>
       ) : null}
       {saving ? <SaveTemplateDialog source={{ kind: 'run', runId: props.runId }} botNames={botNames} onClose={() => setSaving(false)} /> : null}
+      {copying && entryMode === 'ready' ? <CopyWorkflowDialog source={{ kind: 'run', runId: props.runId }} onClose={() => setCopying(false)} /> : null}
       <div className="v3r-wrap">
         <section className="overview-block v3r-graph-section">
           <SectionHeader

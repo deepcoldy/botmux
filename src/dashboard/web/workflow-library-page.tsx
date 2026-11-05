@@ -11,6 +11,7 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useT } from './react-hooks.js';
 import { DagGraph } from './v3-components.js';
+import { CopyWorkflowButton, CopyWorkflowDialog } from './workflow-copy.js';
 import { fetchOrchestratorBots, postDraftAction } from './workflow-draft-api.js';
 import {
   draftGraphView,
@@ -194,9 +195,11 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
   const [error, setError] = useState<string | null>(null);
   const [checks, check] = useInitiatorChecks();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [copyRevision, setCopyRevision] = useState<string | null>(null);
 
   useEffect(() => {
     setDetail(null);
+    setCopyRevision(null);
     void fetchTemplate(props.workflowId).then((result) => {
       if (result.ok) setDetail(result.template);
       else setError(describeError(tr, result));
@@ -232,12 +235,26 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
           <h1>{entry.displayName}</h1>
           <span className={`v3r-pill wfl-scope wfl-scope-${entry.scope.kind}`}>{scopeLabel(tr, entry.scope)}</span>
         </div>
+        <div className="page-heading-actions">
+          {/* 「复制为新工作流」(D6): the version shown; older ones from the history below. */}
+          <CopyWorkflowButton active={copyRevision === current.revisionId} onOpen={() => setCopyRevision(current.revisionId)} />
+        </div>
       </div>
       <div className="wfd-meta">
         <span><span className="wfd-label">{tr('workflow.draft.orchestrator')}</span>{nameOf(entry.orchestratorAppId)}</span>
         <span><span className="wfd-label">{tr('workflow.library.owner')}</span>{who(entry.ownerOpenId)}</span>
         <span><span className="wfd-label">{tr('workflow.library.currentVersion')}</span>v{current.humanVersion}{current.published ? '' : `（${tr('workflow.library.unpublished')}）`}</span>
       </div>
+      {copyRevision ? (
+        <CopyWorkflowDialog
+          key={copyRevision}
+          source={{ kind: 'template', workflowId: entry.workflowId, revisionId: copyRevision }}
+          sourceOrchestratorAppId={entry.orchestratorAppId}
+          versionLabel={`v${detail.versions.find((version) => version.revisionId === copyRevision)?.humanVersion ?? current.humanVersion}`}
+          sourceName={entry.displayName}
+          onClose={() => setCopyRevision(null)}
+        />
+      ) : null}
       <p className="muted wfl-owner-note">{tr('workflow.library.ownerVsInitiator')}</p>
       <section className="overview-block wfd-panel" aria-labelledby="wfl-flow-title">
         <div className="sect-head overview-panel-head">
@@ -301,6 +318,10 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
                   <span className="wfd-tag">{tr(versionSourceKey(version))}</span>
                   <time dateTime={version.createdAt}>{formatDraftTime(version.createdAt)}</time>
                   <small className="muted">{tr('workflow.library.savedBy', { who: who(version.createdByOpenId) })}</small>
+                  {version.revisionId !== current.revisionId ? (
+                    <CopyWorkflowButton small label={tr('workflow.copy.versionAction')} active={copyRevision === version.revisionId}
+                      onOpen={() => { setCopyRevision(version.revisionId); if (typeof document !== 'undefined') document.querySelector('.page-heading')?.scrollIntoView?.(); }} />
+                  ) : null}
                 </div>
                 <GateWarnings comparisons={version.gateComparisons} role="note" />
                 {version.botChanges?.length ? (

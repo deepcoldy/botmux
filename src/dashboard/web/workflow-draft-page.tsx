@@ -30,6 +30,7 @@ import {
   assignableRows,
   autoFinalizeCandidate,
   canChat,
+  copyHasConversation,
   canStartDraft,
   draftErrorKey,
   draftGraphView,
@@ -63,6 +64,7 @@ import type { WorkflowDraftView } from '../../workflows/v3/draft-service.js';
 import type { WorkflowDraftSummary } from '../../workflows/v3/draft-store.js';
 import type { WorkflowOrchestratorBotOption } from '../workflow-drafts-api.js';
 import { SaveTemplateDialog, TEMPLATE_GROUP_SETUP_KEY, TemplateRunInfo } from './workflow-library-page.js';
+import { CopyInfoPanel, CopyNodeTextEditor } from './workflow-copy.js';
 
 type Translate = ReturnType<typeof useT>;
 
@@ -535,9 +537,10 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
       {me?.state === 'ok' && readOnly ? <p className="wfd-notice" role="status">{tr('workflow.draft.readOnly')}</p> : null}
       {me?.state === 'failed' ? <p className="wfd-notice" role="status">{tr('workflow.draft.readOnly')}（{describeError(tr, me)}）</p> : null}
       {notice ? <p className={`wfd-notice${notice.error ? ' wfd-error' : ''}`} role={notice.error ? 'alert' : 'status'}>{notice.text}</p> : null}
+      {sections.copy ? <CopyInfoPanel view={view} canWrite={isInitiator} busy={busy} act={act} botNames={botNames} /> : null}
       {sections.template && view.template ? <TemplateRunInfo template={view.template} isOwner={me?.state === 'ok' && me.initiator.openId === view.template.ownerOpenId} /> : null}
-      {sections.chat ? <div className={`wfd-layout${sections.spec ? ' wfd-two' : ''}`}>
-        <ChatPanel view={view} canWrite={isInitiator} busy={busy} act={act} />
+      {sections.chat || sections.spec ? <div className={`wfd-layout${sections.spec && sections.chat ? ' wfd-two' : ''}`}>
+        {sections.chat ? <ChatPanel view={view} canWrite={isInitiator} busy={busy} act={act} /> : null}
         {sections.spec ? (
           <SpecPanel
             view={view}
@@ -651,7 +654,7 @@ function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
       </ol>
       {needsContinue(view) ? (
         <div className="wfd-disconnected" role="status">
-          <span>{tr('workflow.draft.disconnected')}</span>
+          <span>{view.copy && !copyHasConversation(view.clarify) ? tr('workflow.copy.noSession') : tr('workflow.draft.disconnected')}</span>
           <button type="button" className="primary" disabled={!props.canWrite || !!props.busy}
             onClick={() => { void props.act({ kind: 'continue' }, 'continue'); }}>
             {tr('workflow.draft.continue')}
@@ -890,6 +893,9 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
             <>
               <p className="wfd-node-title"><code>{selected.id}</code>{selected.humanGate ? <span className="wfd-tag wfd-tag-gate">{tr('workflow.draft.gate')}</span> : null}</p>
               {selected.goal ? <p className="v3r-goal">{selected.goal}</p> : null}
+              {props.view.copy && selected.type !== 'host' && selected.type !== 'loop'
+                ? <CopyNodeTextEditor view={props.view} nodeId={selected.id} canWrite={props.canWrite} busy={props.busy} act={props.act} />
+                : null}
               {selected.type === 'host' ? <p className="muted">{tr('workflow.draft.hostNodeHelp', { executor: selected.executor ?? '' })}</p> : null}
               {rows.map((row) => {
                 const selectId = `wfd-node-bot-${row.nodeId.replace(/[^A-Za-z0-9_-]/g, '_')}`;

@@ -35759,3 +35759,22 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfl-param-editor textarea { font: inherit; width: 100%; }
 .wfl-param-grid { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 10px; align-items: center; }
 .wfl-save-entry { margin: 0 0 12px; }
+
+/* 基于历史创建（D6） */
+.wfc-dialog { margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
+.wfc-dialog .wfl-inline { padding-left: 0; }
+.wfc-source { margin: 0; font-size: 13px; }
+.wfc-info { display: flex; flex-direction: column; gap: 8px; }
+.wfc-info h2 a { color: inherit; }
+.wfc-unfinished { margin: 0; }
+.wfc-goal { border: 1px solid var(--border, #e5e7eb); border-radius: 8px; padding: 10px 12px; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.wfc-goal textarea { width: 100%; box-sizing: border-box; }
+.wfc-modes { display: flex; flex-direction: column; gap: 6px; }
+.wfc-mode { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; }
+.wfc-mode span { display: flex; flex-direction: column; gap: 2px; }
+.wfc-submodes { display: flex; flex-direction: column; gap: 4px; padding-left: 26px; font-size: 13px; }
+.wfc-prefill h3 { margin: 4px 0 2px; font-size: 14px; }
+.wfc-prefill-bots { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+.wfc-node-edit { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.wfc-node-edit textarea { width: 100%; box-sizing: border-box; }
+.wfl-version-head .wfd-small { margin-left: auto; }

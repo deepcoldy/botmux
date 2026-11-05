@@ -163,6 +163,11 @@ export const DRAFT_PHASE_KEY: Record<WorkflowDraftPhase, string> = {
   started: 'workflow.draft.phase.started',
 };
 
+/** 复制来的草稿已经开过澄清会话（有对话，或会话不是「未开」）。 */
+export function copyHasConversation(clarify: Pick<WorkflowDraftView['clarify'], 'turns' | 'state' | 'pending'>): boolean {
+  return clarify.pending || clarify.state !== 'disconnected' || clarify.turns.some((turn) => turn.role !== 'system');
+}
+
 /** 页面上哪些区块要展示（按阶段累积，之前的区块保留可回看）。 */
 export interface DraftSections {
   chat: boolean;
@@ -176,10 +181,12 @@ export interface DraftSections {
   template: boolean;
   /** 「存为模板」（D5）：通过第二道确认、还没写 run.json 的普通草稿。 */
   saveTemplate: boolean;
+  /** 复制来的草稿（D6）：来源、未结束提示、保留的参数、改目标。 */
+  copy: boolean;
 }
 
 export function draftSections(
-  view: Pick<WorkflowDraftView, 'phase' | 'clarify' | 'spec'> & { launch?: { commit?: unknown }; template?: unknown; flowConfirmation?: { valid: boolean } },
+  view: Pick<WorkflowDraftView, 'phase' | 'clarify' | 'spec'> & { launch?: { commit?: unknown }; template?: unknown; copy?: unknown; flowConfirmation?: { valid: boolean } },
 ): DraftSections {
   const phase = view.phase;
   const past = (list: WorkflowDraftPhase[]) => list.includes(phase);
@@ -193,12 +200,16 @@ export function draftSections(
       launch: !!view.launch,
       template: true,
       saveTemplate: false,
+      copy: false,
     };
   }
   return {
     template: false,
     saveTemplate: !!view.flowConfirmation?.valid && (phase === 'flow_confirmed' || phase === 'launching') && !view.launch?.commit,
-    chat: true,
+    copy: !!view.copy,
+    // A copy has no clarify session until one is opened (「按新目标重新编排」,
+    // 「继续」, or back to clarifying): no empty chat panel before that.
+    chat: !view.copy || phase === 'clarifying' || copyHasConversation(view.clarify),
     spec: !!view.clarify.specCandidate || !!view.spec?.markdown || !past(['clarifying', 'abandoned']),
     architect: past(['awaiting_architect', 'architect_running']),
     flow: past(['dag_ready', 'flow_confirmed', 'launching']),

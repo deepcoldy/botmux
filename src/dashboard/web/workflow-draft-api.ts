@@ -87,6 +87,19 @@ export function createDraft(input: { larkAppId: string; goal: string }, fetcher:
   return post<{ draft: WorkflowDraftView }>(fetcher, DRAFTS, input);
 }
 
+/** 复制为新工作流（D6）的来源：一个运行，或模板的某个版本。 */
+export type CopySource = { kind: 'run'; runId: string } | { kind: 'template'; workflowId: string; revisionId: string };
+
+/** Path and body of 「复制为新工作流」. No `larkAppId` = the source's orchestrating bot. */
+export function copyRequest(source: CopySource, larkAppId?: string): { path: string; body: Record<string, unknown> } {
+  return { path: `${DRAFTS}/from-source`, body: { source, ...(larkAppId ? { larkAppId } : {}) } };
+}
+
+export function copyAsNewWorkflow(source: CopySource, larkAppId?: string, fetcher: DraftFetch = fetch) {
+  const request = copyRequest(source, larkAppId);
+  return post<{ draft: WorkflowDraftView }>(fetcher, request.path, request.body);
+}
+
 type DraftAction =
   | { kind: 'message'; text: string }
   | { kind: 'continue' }
@@ -105,7 +118,10 @@ type DraftAction =
   | { kind: 'launch-abandon' }
   /** 人工确认群里没有这张卡 / 这条摘要后重发（新 uuid）。 */
   | { kind: 'launch-resend-root' }
-  | { kind: 'launch-resend-summary' };
+  | { kind: 'launch-resend-summary' }
+  /** D6：复制出来的草稿改目标、改节点文字。 */
+  | { kind: 'copy-goal'; goal: string; mode: 'text_only' | 'rearchitect' | 'reclarify' }
+  | { kind: 'node-text'; nodeId: string; goal?: string; completion?: string };
 
 /** Path and body of one draft write. `baseVersion` pins the version the page showed. */
 export function draftActionRequest(runId: string, action: DraftAction, baseVersion?: number): { path: string; body: Record<string, unknown> } {
@@ -146,6 +162,15 @@ export function draftActionRequest(runId: string, action: DraftAction, baseVersi
     case 'launch-abandon': return { path: draftPath(runId, '/launch/abandon'), body: {} };
     case 'launch-resend-root': return { path: draftPath(runId, '/launch/resend-root'), body: { confirmedAbsent: true, ...base } };
     case 'launch-resend-summary': return { path: draftPath(runId, '/launch/resend-summary'), body: { confirmedAbsent: true } };
+    case 'copy-goal': return { path: draftPath(runId, '/copy/goal'), body: { goal: action.goal, mode: action.mode, ...base } };
+    case 'node-text': return {
+      path: draftPath(runId, `/nodes/${encodeURIComponent(action.nodeId)}/text`),
+      body: {
+        ...(action.goal !== undefined ? { goal: action.goal } : {}),
+        ...(action.completion !== undefined ? { completion: action.completion } : {}),
+        ...base,
+      },
+    };
   }
 }
 
