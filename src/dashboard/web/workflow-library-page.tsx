@@ -34,6 +34,7 @@ import {
   filterTemplates,
   gateChangeSummary,
   loosenedGateLines,
+  personLabelKey,
   newTemplateRequestKey,
   paramEditTargets,
   templateParamFields,
@@ -66,9 +67,6 @@ function scopeLabel(tr: Translate, scope: SavedWorkflowCatalogEntry['scope']): s
   return scope.kind === 'global' ? tr('workflow.library.scopeGlobal') : tr('workflow.library.scopeChat');
 }
 
-function shortId(id: string): string {
-  return id.length > 14 ? `${id.slice(0, 10)}…${id.slice(-4)}` : id;
-}
 
 /** 工作流页标题区的「模板」入口。 */
 export function WorkflowLibraryEntry(): React.JSX.Element {
@@ -143,7 +141,7 @@ export function WorkflowLibraryPage(): React.JSX.Element {
               <tbody>
                 {shown.map((entry) => {
                   const me = checks.get(entry.orchestratorAppId);
-                  const mine = me?.state === 'ok' && me.initiator.openId === entry.ownerOpenId;
+                  const meOpenId = me?.state === 'ok' ? me.initiator.openId : undefined;
                   const runState = templateRunState(entry);
                   return (
                     <tr key={entry.workflowId}>
@@ -153,7 +151,7 @@ export function WorkflowLibraryPage(): React.JSX.Element {
                       </td>
                       <td>{nameOf(entry.orchestratorAppId)}</td>
                       <td><time dateTime={entry.latestAt}>{formatDraftTime(entry.latestAt)}</time> <small className="muted">v{entry.latestHumanVersion}</small></td>
-                      <td><code title={entry.ownerOpenId}>{shortId(entry.ownerOpenId)}</code>{mine ? <small className="wfd-me">{tr('workflow.draft.you')}</small> : null}</td>
+                      <td>{tr(personLabelKey(entry.ownerOpenId, meOpenId))}</td>
                       <td className="wfl-num">{entry.paramCount}</td>
                       <td className="wfl-num">{entry.nodeCount}</td>
                       <td className="wfl-num">{entry.gateCount}</td>
@@ -221,7 +219,8 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
   }
   const { entry, current } = detail;
   const me = checks.get(entry.orchestratorAppId);
-  const mine = me?.state === 'ok' && me.initiator.openId === entry.ownerOpenId;
+  const meOpenId = me?.state === 'ok' ? me.initiator.openId : undefined;
+  const who = (openId: string) => tr(personLabelKey(openId, meOpenId));
   const selected = current.dagTemplate.nodes.find((node) => node.id === selectedId);
   const fields = templateParamFields(current.inputs);
 
@@ -237,7 +236,7 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
       </div>
       <div className="wfd-meta">
         <span><span className="wfd-label">{tr('workflow.draft.orchestrator')}</span>{nameOf(entry.orchestratorAppId)}</span>
-        <span><span className="wfd-label">{tr('workflow.library.owner')}</span><code title={entry.ownerOpenId}>{shortId(entry.ownerOpenId)}</code>{mine ? <small className="wfd-me">{tr('workflow.draft.you')}</small> : null}</span>
+        <span><span className="wfd-label">{tr('workflow.library.owner')}</span>{who(entry.ownerOpenId)}</span>
         <span><span className="wfd-label">{tr('workflow.library.currentVersion')}</span>v{current.humanVersion}{current.published ? '' : `（${tr('workflow.library.unpublished')}）`}</span>
       </div>
       <p className="muted wfl-owner-note">{tr('workflow.library.ownerVsInitiator')}</p>
@@ -303,11 +302,11 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
                   {version.published ? <span className="v3r-pill wfl-published">{tr('workflow.library.published')}</span> : null}
                   <span className="wfd-tag">{tr(versionSourceKey(version))}</span>
                   <time dateTime={version.createdAt}>{formatDraftTime(version.createdAt)}</time>
-                  <small className="muted">{tr('workflow.library.savedBy', { who: shortId(version.createdByOpenId) })}</small>
+                  <small className="muted">{tr('workflow.library.savedBy', { who: who(version.createdByOpenId) })}</small>
                 </div>
                 {change?.fewer ? <p className="wfd-warning" role="note">⚠️ {tr('workflow.library.fewerGates', { count: change.fewer })}（{version.gates!.removed.join('、')}）</p> : null}
                 {loosenedGateLines(version.gates).map((line) => (
-                  <p key={line.nodeId} className="wfd-warning" role="note">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversRemoved', { node: line.nodeId, approvers: line.approvers })}</p>
+                  <p key={line.nodeId} className="wfd-warning" role="note">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversAdded', { node: line.nodeId, count: line.count })}</p>
                 ))}
                 {change?.more ? <p className="muted">{tr('workflow.library.moreGates', { count: change.more })}</p> : null}
                 {change?.changed ? <p className="muted">{tr('workflow.library.changedGates', { count: change.changed })}</p> : null}
@@ -315,7 +314,7 @@ export function WorkflowTemplatePage(props: { workflowId: string }): React.JSX.E
                   <p className="muted">{tr('workflow.library.botChangesLine', { nodes: version.botChanges.map((c) => c.nodeId).join('、') })}</p>
                 ) : null}
                 {version.confirmation ? (
-                  <p className="muted">{tr('workflow.library.confirmedLine', { who: shortId(version.confirmation.confirmedByOpenId), at: formatDraftTime(version.confirmation.confirmedAt) })}</p>
+                  <p className="muted">{tr('workflow.library.confirmedLine', { who: who(version.confirmation.confirmedByOpenId), at: formatDraftTime(version.confirmation.confirmedAt) })}</p>
                 ) : null}
               </li>
             );
@@ -592,7 +591,7 @@ export function SaveTemplateDialog(props: {
             </p>
           ) : null}
           {loosenedGateLines(preview.target?.gates).map((line) => (
-            <p key={line.nodeId} className="wfd-warning wfl-fewer" role="alert">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversRemoved', { node: line.nodeId, approvers: line.approvers })}</p>
+            <p key={line.nodeId} className="wfd-warning wfl-fewer" role="alert">⚠️ {tr(line.cleared ? 'workflow.library.approversCleared' : 'workflow.library.approversAdded', { node: line.nodeId, count: line.count })}</p>
           ))}
           {change?.more ? <p className="muted">{tr('workflow.library.moreGates', { count: change.more })}</p> : null}
           {change?.changed ? <p className="muted">{tr('workflow.library.changedGates', { count: change.changed })}</p> : null}
@@ -697,7 +696,7 @@ export function TemplateRunInfo(props: {
         <a className="sect-head-hint" href={workflowTemplateHref(template.workflowId)}>{template.displayName} · v{template.humanVersion}</a>
       </div>
       <div className="wfd-meta">
-        <span><span className="wfd-label">{tr('workflow.library.owner')}</span><code title={template.ownerOpenId}>{shortId(template.ownerOpenId)}</code>{props.isOwner ? <small className="wfd-me">{tr('workflow.draft.you')}</small> : null}</span>
+        <span><span className="wfd-label">{tr('workflow.library.owner')}</span>{props.isOwner ? tr('workflow.library.you') : tr('workflow.library.otherAdmin')}</span>
       </div>
       {params.length ? (
         <ul className="wfd-summary-list">{params.map(([key, value]) => <li key={key}><code>{key}</code> = {value}</li>)}</ul>

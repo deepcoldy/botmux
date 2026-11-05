@@ -136,6 +136,7 @@ describe('模板页的纯逻辑', () => {
 
 describe('页面渲染', () => {
   const location = { hash: '' };
+  let me: { openId: string; source: string } = OWNER;
   function stubBrowser(hash: string, routes: (url: string, init?: RequestInit) => unknown, switches = { enabled: true, nodeExecutor: 'bot' }) {
     const sent: Array<{ url: string; body?: unknown }> = [];
     location.hash = hash;
@@ -148,7 +149,7 @@ describe('页面渲染', () => {
     vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
       sent.push({ url, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
       if (url === '/api/settings') return { ok: true, status: 200, json: async () => ({ settings: { workflow: switches } }) } as Response;
-      if (url === '/api/v3/orchestration/initiator') return { ok: true, status: 200, json: async () => ({ ok: true, initiator: OWNER }) } as Response;
+      if (url === '/api/v3/orchestration/initiator') return { ok: true, status: 200, json: async () => ({ ok: true, initiator: me }) } as Response;
       if (url === '/api/v3/orchestration/bots') return { ok: true, status: 200, json: async () => ({ ok: true, bots: [] }) } as Response;
       const body = routes(url, init) ?? { ok: false, error: 'not_found' };
       return { ok: (body as { ok?: boolean }).ok !== false, status: 200, json: async () => body } as Response;
@@ -168,6 +169,28 @@ describe('页面渲染', () => {
     await flush();
     return { renderer, sent };
   }
+
+  it('页面不显示 open_id：列表与详情里 owner、保存人、确认人是「你」或「其他管理员」', async () => {
+    const detail = await twoVersions();
+    const { entries } = await listSavedWorkflowCatalogView(root);
+    for (const [who, label] of [[OWNER, '你'], [{ openId: 'ou_someone_else', source: 'dashboard-local' }, '其他管理员']] as const) {
+      me = who;
+      const list = await renderPage('#/workflows/library', (url) => (url === '/api/v3/orchestration/library' ? { ok: true, templates: entries, unreadable: 0 } : undefined));
+      const listText = text(list.renderer.root);
+      expect(listText).not.toMatch(/ou_/);
+      const row = list.renderer.root.find((node) => node.type === 'tbody').findAll((node) => node.type === 'tr')[0]!;
+      expect(text(row)).toContain(label);
+      act(() => { list.renderer.unmount(); });
+      const page = await renderPage(`#/workflows/library/${detail.entry.workflowId}`, (url) =>
+        url.endsWith(`/library/${detail.entry.workflowId}`) ? { ok: true, template: detail } : undefined);
+      const pageText = text(page.renderer.root);
+      expect(pageText).not.toMatch(/ou_/);
+      expect(pageText).toContain(`保存人 ${label}`);
+      expect(pageText).toContain(`${label} 于 `);
+      act(() => { page.renderer.unmount(); });
+    }
+    me = OWNER;
+  });
 
   it('详情：版本历史标出「比上一版少了 1 道人工确认」；参数说明；owner 与发起人分开说明', async () => {
     const detail = await twoVersions();

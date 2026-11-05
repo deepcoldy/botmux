@@ -297,14 +297,18 @@ describe('I13（11-05）：草稿来源版本直接运行，保存时的确认�
 });
 
 describe('I10 人工确认的放宽与发布版比较', () => {
-  it('approvers cleared or removed count as loosened', () => {
-    const before = { schemaVersion: 2 as const, nodes: GATED as any };
-    const cleared = { schemaVersion: 2 as const, nodes: [goalNode('inspect', MAIN), { ...goalNode('write', DOC), humanGate: { prompt: GATE.prompt } }] as any };
-    const fewer = { schemaVersion: 2 as const, nodes: [goalNode('inspect', MAIN), { ...goalNode('write', DOC), humanGate: { ...GATE, approvers: ['ou_lead'] } }] as any };
-    const reworded = { schemaVersion: 2 as const, nodes: [goalNode('inspect', MAIN), { ...goalNode('write', DOC), humanGate: { ...GATE, prompt: '再看看？' } }] as any };
-    expect(compareSavedWorkflowGates(before, cleared).loosened).toEqual([{ nodeId: 'write', reason: 'approvers_cleared', removedApprovers: ['ou_lead', 'ou_sec'] }]);
-    expect(compareSavedWorkflowGates(before, fewer).loosened).toEqual([{ nodeId: 'write', reason: 'approvers_removed', removedApprovers: ['ou_sec'] }]);
-    expect(compareSavedWorkflowGates(before, reworded)).toMatchObject({ loosened: [], changed: ['write'] });
+  it('more people may approve = loosened (cleared, or someone added); fewer named approvers narrows and is not', () => {
+    const at = (gate: Record<string, unknown>) => ({ schemaVersion: 2 as const, nodes: [goalNode('inspect', MAIN), { ...goalNode('write', DOC), humanGate: gate }] as any });
+    const before = at(GATE);
+    expect(compareSavedWorkflowGates(before, at({ prompt: GATE.prompt })).loosened)
+      .toEqual([{ nodeId: 'write', reason: 'approvers_cleared', approvers: ['ou_lead', 'ou_sec'] }]);
+    expect(compareSavedWorkflowGates(before, at({ ...GATE, approvers: ['ou_lead', 'ou_sec', 'ou_new'] })).loosened)
+      .toEqual([{ nodeId: 'write', reason: 'approvers_added', approvers: ['ou_new'] }]);
+    // Removing a named approver narrows who may approve: changed, not loosened.
+    expect(compareSavedWorkflowGates(before, at({ ...GATE, approvers: ['ou_lead'] }))).toMatchObject({ loosened: [], changed: ['write'] });
+    // Naming approvers where anyone could approve narrows too.
+    expect(compareSavedWorkflowGates(at({ prompt: GATE.prompt }), before)).toMatchObject({ loosened: [], changed: ['write'] });
+    expect(compareSavedWorkflowGates(before, at({ ...GATE, prompt: '再看看？' }))).toMatchObject({ loosened: [], changed: ['write'] });
   });
 
   it('appending after an unpublished latest compares with the published version too and shows the stricter warning', async () => {

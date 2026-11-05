@@ -554,16 +554,18 @@ export function savedWorkflowGatePositions(dagTemplate: V3DagTemplate): SavedWor
  * and who approves. `removed` are positions the earlier revision gated and
  * this one does not — what 「比上一版少了 N 道人工确认」 counts (N =
  * removed.length); a gate that moved is one removed plus one added.
- * `loosened`: the same position whose named approvers were cleared (empty =
- * anyone who can operate the bot) or lost someone — warned at the same level
- * as a removed gate. `changed`: any other change of the approval rule.
+ * `loosened`: the same position where more people may approve now — the
+ * named approvers were cleared (empty = anyone who can operate the bot), or
+ * someone was added to a non-empty list — warned at the same level as a
+ * removed gate. Removing a named approver narrows who may approve: not
+ * loosened, only `changed`. `changed`: any other change of the gate.
  */
 export interface SavedWorkflowGateComparison {
   previousCount: number;
   currentCount: number;
   removed: string[];
   added: string[];
-  loosened: Array<{ nodeId: string; reason: 'approvers_cleared' | 'approvers_removed'; removedApprovers: string[] }>;
+  loosened: Array<{ nodeId: string; reason: 'approvers_cleared' | 'approvers_added'; approvers: string[] }>;
   changed: string[];
 }
 
@@ -580,10 +582,12 @@ export function compareSavedWorkflowGates(previous: V3DagTemplate, current: V3Da
   for (const [nodeId, gate] of after) {
     if (!before.has(nodeId)) continue;
     const was = gateApprovers(before.get(nodeId));
-    const now = new Set(gateApprovers(gate));
-    const removedApprovers = was.filter((approver) => !now.has(approver));
-    if (was.length > 0 && now.size === 0) loosened.push({ nodeId, reason: 'approvers_cleared', removedApprovers });
-    else if (removedApprovers.length > 0) loosened.push({ nodeId, reason: 'approvers_removed', removedApprovers });
+    const now = gateApprovers(gate);
+    const wasSet = new Set(was);
+    const added = now.filter((approver) => !wasSet.has(approver));
+    // Empty = anyone who can operate the bot; a list allows only those named.
+    if (was.length > 0 && now.length === 0) loosened.push({ nodeId, reason: 'approvers_cleared', approvers: was });
+    else if (was.length > 0 && added.length > 0) loosened.push({ nodeId, reason: 'approvers_added', approvers: added });
     else if (canonicalJsonStringify(before.get(nodeId)) !== canonicalJsonStringify(gate)) changed.push(nodeId);
   }
   return {

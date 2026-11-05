@@ -40,13 +40,23 @@ export function gateChangeSummary(gates: SavedWorkflowGateComparison | undefined
   return summary.fewer || summary.loosened || summary.more || summary.changed ? summary : undefined;
 }
 
-/** One line per loosened gate: where, and whose approval is gone. */
-export function loosenedGateLines(gates: SavedWorkflowGateComparison | undefined): Array<{ nodeId: string; cleared: boolean; approvers: string }> {
+/** One line per loosened gate: where, and how many approvers (never their
+ *  open_ids: the page shows no open_id). */
+export function loosenedGateLines(gates: SavedWorkflowGateComparison | undefined): Array<{ nodeId: string; cleared: boolean; count: number }> {
   return (gates?.loosened ?? []).map((item) => ({
     nodeId: item.nodeId,
     cleared: item.reason === 'approvers_cleared',
-    approvers: item.removedApprovers.join('、'),
+    count: item.approvers.length,
   }));
+}
+
+/**
+ * Who a person is, as the page may say it (D3 rule: never an open_id): 「你」
+ * when it is the logged-in person as this bot sees them, else 「其他管理员」.
+ * The Dashboard has no cached name lookup; no per-row Feishu call is made.
+ */
+export function personLabelKey(openId: string, meOpenId: string | undefined): 'workflow.library.you' | 'workflow.library.otherAdmin' {
+  return meOpenId !== undefined && openId === meOpenId ? 'workflow.library.you' : 'workflow.library.otherAdmin';
 }
 
 /** 版本历史一行的来源标签键。 */
