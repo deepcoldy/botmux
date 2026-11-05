@@ -16,6 +16,7 @@ import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
+import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
@@ -154,7 +155,8 @@ import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../serv
 import { readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
-import { isPlatformTeamBot } from '../services/platform-team-store.js';
+import { isPlatformTeamBot, readPlatformTeamSync } from '../services/platform-team-store.js';
+import { platformMachineOwner } from '../platform/binding.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
@@ -4385,6 +4387,32 @@ export async function handleCommand(
           break;
         }
         if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
+          // The platform only issues to the machine owner or a teammate of theirs.
+          // Someone outside every team would authorize there and still get nothing
+          // here, so tell them that up front and offer what does work.
+          const senderUnionId = message.senderUnionId
+            ?? (loginOpenId ? (await resolveUserUnionId(botCfg2.larkAppId, loginOpenId)).unionId : undefined);
+          const owner = platformMachineOwner();
+          const teammate = platformTeammateVerdict({
+            senderUnionId,
+            ownerUnionId: owner.unionId,
+            teams: readPlatformTeamSync(config.session.dataDir),
+          });
+          if (teammate === 'not_teammate') {
+            const localCommands = [larkGoverned ? '/login lark' : '', bytedcliGoverned ? '/login bytedcli' : '']
+              .filter(Boolean).join(t('cmd.login.platform_not_teammate_or', undefined, loc));
+            await sessionReply(rootId, [
+              t('cmd.login.platform_not_teammate_title', undefined, loc), '',
+              t('cmd.login.platform_not_teammate_body', {
+                owner: owner.name ?? t('cmd.login.platform_not_teammate_owner_fallback', undefined, loc),
+              }, loc), '',
+              credSource === 'auto'
+                ? t('cmd.login.platform_not_teammate_local', { commands: localCommands }, loc)
+                : t('cmd.login.platform_not_teammate_platform_only', undefined, loc),
+              t('cmd.login.platform_not_teammate_join', { url: platformCredsUrl }, loc),
+            ].join('\n'));
+            break;
+          }
           const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
             : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
           const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'

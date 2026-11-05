@@ -328,6 +328,7 @@ vi.mock('../src/setup/owner-identity.js', () => ({
 }));
 
 vi.mock('../src/im/lark/client.js', () => ({
+  resolveUserUnionId: vi.fn(async () => ({})),
   // ou_ passes through literally (the reason the owner-identity probe exists);
   // on_xxx → ou_xxx (except on_ghost); emails/mobiles stay unresolved here
   // (modeling a definitive miss). Used by the real setBotAllowedUsers behind /botconfig.
@@ -664,6 +665,12 @@ vi.mock('../src/services/team-bots-store.js', () => ({
 
 vi.mock('../src/services/platform-team-store.js', () => ({
   isPlatformTeamBot: vi.fn(() => false),
+  readPlatformTeamSync: vi.fn((): unknown => null),
+}));
+
+vi.mock('../src/platform/binding.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/platform/binding.js')>()),
+  platformMachineOwner: vi.fn((): { unionId?: string; name?: string } => ({})),
 }));
 
 vi.mock('../src/services/worktree-cleanup-store.js', () => ({
@@ -733,6 +740,8 @@ import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
 import { hasLarkCliHome, beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge } from '../src/services/lark-cli-auth.js';
 import { platformCredentialsUrl } from '../src/platform/credential-grant-client.js';
+import { readPlatformTeamSync } from '../src/services/platform-team-store.js';
+import { platformMachineOwner } from '../src/platform/binding.js';
 import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
@@ -7079,6 +7088,52 @@ describe('handleCommand', () => {
       expect(reply(deps)).toContain(t('cmd.login.platform_unbound', undefined, 'zh'));
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
       expect(beginBytedcliLogin).not.toHaveBeenCalled();
+    });
+
+    describe('sender outside the machine owner\'s platform teams', () => {
+      const team = (memberUnionIds: string[]) => ({ teamId: 't1', teamName: 'T', groupChatIds: [], bots: [], memberUnionIds });
+      afterEach(() => {
+        vi.mocked(readPlatformTeamSync).mockReturnValue(null);
+        vi.mocked(platformMachineOwner).mockReturnValue({});
+      });
+
+      it('auto: explains the team boundary and offers the machine-local logins instead of the platform card', async () => {
+        vi.mocked(readPlatformTeamSync).mockReturnValue([team(['on_owner', 'on_mate'])]);
+        vi.mocked(platformMachineOwner).mockReturnValue({ unionId: 'on_owner', name: 'Owner A' });
+        const deps = withPolicy({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login', { senderUnionId: 'on_outsider' }), deps, LARK_APP_ID);
+        const text = reply(deps);
+        expect(text).toContain(t('cmd.login.platform_not_teammate_title', undefined, 'zh'));
+        expect(text).not.toContain(t('cmd.login.platform_title', undefined, 'zh'));
+        expect(text).toContain('Owner A');
+        expect(text).toContain('/login lark');
+        expect(text).toContain('/login bytedcli');
+        expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      });
+
+      it('platform: says a machine-local login is not available', async () => {
+        vi.mocked(readPlatformTeamSync).mockReturnValue([team(['on_owner'])]);
+        vi.mocked(platformMachineOwner).mockReturnValue({ unionId: 'on_owner' });
+        const deps = withPolicy({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, true);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark', { senderUnionId: 'on_outsider' }), deps, LARK_APP_ID);
+        const text = reply(deps);
+        expect(text).toContain(t('cmd.login.platform_not_teammate_platform_only', undefined, 'zh'));
+        expect(text).not.toContain('/login lark');
+        expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['a teammate', [team(['on_owner', 'on_mate'])], 'on_mate'],
+        ['the owner (even with no teams)', [], 'on_owner'],
+        ['anyone before the first team sync', null, 'on_outsider'],
+      ])('keeps the platform card for %s', async (_label, teams, sender) => {
+        vi.mocked(readPlatformTeamSync).mockReturnValue(teams as any);
+        vi.mocked(platformMachineOwner).mockReturnValue({ unionId: 'on_owner' });
+        const deps = withPolicy({ enabled: true, tools: ['lark-cli'] }, true);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login', { senderUnionId: sender }), deps, LARK_APP_ID);
+        expect(reply(deps)).toContain(t('cmd.login.platform_title', undefined, 'zh'));
+        expect(reply(deps)).toContain(PAGE);
+      });
     });
 
     it('platform + bound: /login lark for an ungoverned tool is not hijacked to the platform', async () => {
