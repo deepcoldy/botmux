@@ -87,9 +87,14 @@ describe('lark-cli argv metadata', () => {
   });
 
   it.each([
+    // Every branch of the JSON-array probe gets its own case, including the
+    // quoteless-array and false-first forms that no other case covers.
+    ['--strs', '["A1:B2", "C2:D10"]'],
+    ['--quoted', "['a', 'b']"],
     ['--nums', '[1, 2, 3]'],
     ['--neg', '[-1.5, 0]'],
     ['--bools', '[true, false]'],
+    ['--false-first', '[false, true]'],
     ['--nulls', '[null]'],
     ['--objs', '[{"k": "v"}]'],
   ])('treats a %s JSON-array example as a required value', (flag, type) => {
