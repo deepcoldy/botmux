@@ -329,6 +329,25 @@ describe('group secretary runtime — group marker and federation', () => {
     rt.stop();
   });
 
+  it('does not take over a marker another machine wrote during legacy migration, then stands down', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    let marker: string | undefined;
+    // The remote takeover lands between our read and our conditional write.
+    const writeMarker = vi.fn(async () => { marker = 'cli_remote'; return { ok: false, reason: 'marker_changed' }; });
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      readMarker: async () => marker, writeMarker: writeMarker as any,
+      deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
+    });
+    await rt.tick();
+    expect(writeMarker).toHaveBeenCalledWith(CHAT, APP, { expect: null });
+    expect(getGroupSecretaryChat(APP, CHAT)?.markerConfirmedAt).toBeUndefined();
+    await rt.tick(); // re-read right away, not a full refresh interval later
+    expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
+    expect(writeMarker).toHaveBeenCalledTimes(1);
+    rt.stop();
+  });
+
   it('a hanging marker read times out instead of freezing the loop', async () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1, markerConfirmedAt: 1 });
     vi.useFakeTimers();
@@ -359,7 +378,7 @@ describe('group secretary runtime — group marker and federation', () => {
     });
     await rt.tick(); clock += 61_000; await rt.tick();
     expect(writeMarker).toHaveBeenCalledTimes(1);
-    expect(writeMarker).toHaveBeenCalledWith(CHAT, APP);
+    expect(writeMarker).toHaveBeenCalledWith(CHAT, APP, { expect: null });
     rt.stop();
   });
 
@@ -437,7 +456,7 @@ describe('group secretary runtime — registration re-checked after awaits', () 
     await pending;
     expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
     // 迟到的迁移写把标记写回了自己：撤回，群里不留没人当的秘书标记。
-    expect(writeMarker).toHaveBeenLastCalledWith(CHAT, null);
+    expect(writeMarker).toHaveBeenLastCalledWith(CHAT, null, { expect: APP });
     rt.stop();
   });
 
@@ -454,7 +473,7 @@ describe('group secretary runtime — registration re-checked after awaits', () 
     resetGroupSecretaryStoreCache();
     expect(getGroupSecretaryChat('cli_other', CHAT)?.enabledAt).toBe(2);
     expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
-    expect(writeMarker).toHaveBeenLastCalledWith(CHAT, 'cli_other');
+    expect(writeMarker).toHaveBeenLastCalledWith(CHAT, 'cli_other', { expect: APP });
     rt.stop();
   });
 

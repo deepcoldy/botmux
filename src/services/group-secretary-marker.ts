@@ -42,11 +42,19 @@ export async function readSecretaryMarker(app: string, chat: string): Promise<st
 
 export type MarkerWriteResult = { ok: true; previous?: string } | { ok: false; reason: string };
 
-/** 把群秘书标记设为 appId（null = 清除）。 */
-export async function writeSecretaryMarker(app: string, chat: string, appId: string | null): Promise<MarkerWriteResult> {
+/** 把群秘书标记设为 appId（null = 清除）。
+ *  传 `expect` 时是条件写：写前回读到的标记必须仍是调用方之前读到的那个（null = 没有标记），
+ *  否则不写、返回 marker_changed。飞书没有 CAS，这只把「读到再写」之间的竞争窗口缩到一次回读，
+ *  写后仍回读确认。用于不该覆盖别人新写入标记的场景（旧登记迁移、迁移回滚）。 */
+export async function writeSecretaryMarker(
+  app: string, chat: string, appId: string | null, opts?: { expect?: string | null },
+): Promise<MarkerWriteResult> {
   try {
     const current = await readChatDescription(app, chat);
     const previous = parseSecretaryMarker(current).appId;
+    if (opts && 'expect' in opts && (previous ?? null) !== (opts.expect ?? null)) {
+      return { ok: false, reason: 'marker_changed' };
+    }
     const next = buildSecretaryDescription(current, appId);
     if (next === current) return { ok: true, ...(previous ? { previous } : {}) };
     if (Array.from(next).length > MAX_DESCRIPTION_CHARS) return { ok: false, reason: 'description_too_long' };

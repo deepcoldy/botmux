@@ -34934,7 +34934,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       return peer && appId ? fetchRemoteSecretaryTranscript(peer, appId, sessionId, chatId) : undefined;
     },
     readMarker: chatId => readSecretaryMarker(cfg.larkAppId, chatId),
-    writeMarker: (chatId, appId) => writeSecretaryMarker(cfg.larkAppId, chatId, appId),
+    writeMarker: (chatId, appId, opts) => writeSecretaryMarker(cfg.larkAppId, chatId, appId, opts),
     fetchRemoteViews: async chatIds => {
       const peers = listSecretaryPeers(config.session.dataDir);
       if (peers.length === 0 || chatIds.length === 0) return [];

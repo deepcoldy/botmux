@@ -20,7 +20,8 @@ export interface GroupSecretaryRuntimeDeps {
   /** 读 / 写群描述里的秘书标记（全群唯一登记）。不提供时只按本机登记判断。 */
   readMarker?: (chatId: string) => Promise<string | undefined>;
   /** appId 为 null 表示清除标记。 */
-  writeMarker?: (chatId: string, appId: string | null) => Promise<{ ok: boolean; reason?: string }>;
+  /** `expect`：条件写，写前回读到的标记必须仍是这个值（null = 没有标记），否则不写，返回 marker_changed。 */
+  writeMarker?: (chatId: string, appId: string | null, opts?: { expect?: string | null }) => Promise<{ ok: boolean; reason?: string }>;
   /** 读 / 写标记的单次超时（飞书接口挂住时不拖死整个秘书循环）。 */
   markerTimeoutMs?: number;
   markerRefreshMs?: number;
@@ -193,7 +194,8 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         if (marker === undefined && !entry.markerConfirmedAt) {
           // 旧版本只在本机登记：补写标记（迁移）。失败下次刷新再试，期间按本机登记继续工作。
           if (!deps.writeMarker) continue;
-          const wrote = await withTimeout(deps.writeMarker(chatId, deps.larkAppId));
+          // 条件写：只在标记仍然缺失时补写。await 期间另一台机器接管写入的标记不会被覆盖。
+          const wrote = await withTimeout(deps.writeMarker(chatId, deps.larkAppId, { expect: null }));
           if (wrote.ok) {
             const current = getGroupSecretaryChat(deps.larkAppId, chatId);
             if (!sameRegistration(current, entry)) {
@@ -202,7 +204,8 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
               if (!current) {
                 const owner = getGroupSecretaryOwner(chatId)?.larkAppId ?? null;
                 try {
-                  const undo = await withTimeout(deps.writeMarker(chatId, owner));
+                  // 只撤回自己刚写的那一份：标记若已被别人改写，保留对方的。
+                  const undo = await withTimeout(deps.writeMarker(chatId, owner, { expect: deps.larkAppId }));
                   if (!undo.ok) deps.log('warn', `[group-secretary] marker rollback failed chat=${chatId.slice(0, 12)}: ${undo.reason ?? 'unknown'}`);
                 } catch (err) {
                   deps.log('warn', `[group-secretary] marker rollback failed chat=${chatId.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
@@ -215,6 +218,10 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
             markers.set(chatId, deps.larkAppId);
             setGroupSecretaryChat(chatId, { ...current!, markerConfirmedAt: now() });
             deps.log('info', `[group-secretary] wrote marker for legacy registration chat=${chatId.slice(0, 12)}`);
+          } else if (wrote.reason === 'marker_changed') {
+            // 补写前别的 bot 已写入标记：不覆盖，下次刷新按新标记处理（指向别人就停手）。
+            markerReadAt.delete(chatId);
+            deps.log('info', `[group-secretary] marker appeared during migration chat=${chatId.slice(0, 12)}; not overwritten`);
           } else {
             deps.log('warn', `[group-secretary] marker migration failed chat=${chatId.slice(0, 12)}: ${wrote.reason ?? 'unknown'}; will retry`);
           }
