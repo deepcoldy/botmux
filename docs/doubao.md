@@ -88,6 +88,10 @@ botmux restart
 
 最终文本自动来自 Doubao 的本地原生日志：`assignment.md` 中的用户需求与 `trajectory.jsonl` 中的终态 assistant 回答。工具结果和带 `tool_calls` 的中间旁白不当作最终回答。**不要求模型执行 `botmux send` 才能收到结果**，HTTP wait 模式也通过同一 bridge 返回 `output.content`。
 
+Doubao Bot 的 `replyDelivery` 缺省为 `transcript`（其它 CLI 缺省仍是 `send`）：系统提示不教模型调用 `botmux send`，最终回复只从上述日志收取。原因是 Doubao 的工具命令由账号级常驻进程 `doubao --type=service` 执行，同一台机器上所有 Doubao 终端共用它；该进程的环境变量和进程树沿用**第一个**拉起它的终端。模型在工具里执行 `botmux send` 时，botmux 会按那棵进程树判断归属，可能把回复投到另一个会话、另一个群，甚至以另一个 Bot 的身份发出。不建议显式改回 `send`；确有需要时，请保证这台机器上只有一个 Doubao 会话，并在切换后重启常驻进程。
+
+首轮的原生 Session ID 在提交后最多等待 20 秒捕获（常驻进程冷启动时，`assignment.md` 要 7～8 秒才写入）。
+
 这是依赖原生落盘格式的桥接，不是官方稳定的 transcript API。不要在运行中删除/移动这些日志。Doubao 升级若改变格式，适配器可能需要跟进；中断、异常退出等终态覆盖尚不完整，不能保证每种失败都能返回结构化原因。
 
 ### 权限

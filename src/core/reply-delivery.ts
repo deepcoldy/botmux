@@ -39,7 +39,14 @@ export { supportsTranscriptReplyDelivery };
  * 保留 `cliId` 形参而不直接写死常量：缺省策略的唯一出口就在这里，将来若要为某个
  * CLI 单独换缺省，只改这一个函数即可，不必回头翻所有调用点。
  */
-export function defaultReplyDeliveryFor(_cliId: string | undefined): ReplyDelivery {
+export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
+  // Doubao 例外，缺省 transcript：它的工具命令由账号级常驻 `doubao --type=service`
+  // 进程执行，所有 TUI 共用一个；该进程的环境变量与进程树来自**第一个**拉起它的
+  // 终端，而不是当前收到消息的会话。模型自己跑 `botmux send` 时，provenance 会按
+  // 那棵进程树解析出别的会话（甚至别的 bot），回复被投到错误的群/身份下。
+  // transcript 模式下 daemon 从本会话 assignment.md / trajectory.jsonl 收最终回复，
+  // 系统提示也不再教 `botmux send`，绕开这条串号路径。显式写 `send` 仍可退回。
+  if (cliId === 'doubao') return 'transcript';
   return 'send';
 }
 

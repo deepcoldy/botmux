@@ -119,6 +119,9 @@ describe('defaultReplyDeliveryFor', () => {
     ['hermes', 'send'],
     ['cursor', 'send'],
     ['codex-app', 'send'],
+    // 唯一例外：doubao 的工具命令跑在共享常驻 service 进程里，`botmux send` 无法
+    // 可靠归属到当前会话，缺省改走 transcript。
+    ['doubao', 'transcript'],
     [undefined, 'send'],
     ['', 'send'],
   ];
@@ -159,6 +162,15 @@ describe('effectiveReplyDelivery', () => {
 
   it('未配置 + cursor → send', () => {
     expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('send');
+  });
+
+  it('未配置 + doubao → transcript（共享 service 进程下 botmux send 归属不可靠）', () => {
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('transcript');
+  });
+
+  it('显式 send + doubao → send（保留退回旧行为的出口）', () => {
+    vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('send');
   });
 
   it('显式 send + claude-code → send（退回旧行为）', () => {
