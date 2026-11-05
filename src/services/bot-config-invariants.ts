@@ -1,5 +1,5 @@
 import { parseSandboxNetworkPolicy } from '../core/sandbox-network-policy.js';
-import { supportsTranscriptReplyDeliveryForBot } from '../core/reply-delivery.js';
+import { supportsTranscriptReplyDelivery, supportsTranscriptReplyDeliveryForBot } from '../core/reply-delivery.js';
 export type BotConfigInvariantError =
   | 'codex_browser_requires_codex_app'
   | 'codex_browser_config_conflict'
@@ -35,23 +35,28 @@ export function botConfigInvariantError(entry: any): BotConfigInvariantError | u
   if (entry.existingAppServer && (sandboxEngaged(entry) || entry.readIsolation === true)) {
     return 'existing_app_server_sandbox_conflict';
   }
-  // replyDelivery=transcript × scratch × 无宿主侧转写采集的 CLI：scratch 全根 COW 把
-  // CLI 写的转写（cursor 的 agent-transcript mirror、doubao 的 agent_mode 会话树）
-  // 留在 merged overlay，host 侧桥读不到，开 transcript 信封会让模型不调 send 而整轮
-  // 静默。放全局不变量（而非只在 replyDelivery 写入门禁）是因为这条边还能从另外两个
-  // 写者进入：cliId 切换（codex+transcript+scratch 合法 → 切到 cursor/doubao）与
-  // sandbox 切换（cursor/doubao+transcript → scratch），两者都经 rmwBotEntry 落盘，
-  // 在此一处判死。
-  // 只判 scratch：非 scratch 下不支持 transcript 的 CLI（opencode / codex-app /
-  // antigravity…）若已带着显式 transcript 落盘（如从 claude-code 切 cliId 到达），
-  // 运行时会回落 send，不静默——master 历来放行这类 entry，这里扩大到「任何不支持的
-  // CLI」会把该 bot 的任何字段编辑全部锁死在看不懂的 reply_delivery_unsupported 上。
-  // 判据复用 core/reply-delivery 的能力闸，scratch 拒绝名单只有那一份。
+  // replyDelivery=transcript × scratch × 「本来支持 transcript、scratch 使其失效」
+  // 的 CLI：scratch 全根 COW 把 CLI 写的转写（cursor 的 agent-transcript mirror、
+  // doubao 的 agent_mode 会话树）留在 merged overlay，host 侧桥读不到，开 transcript
+  // 信封会让模型不调 send 而整轮静默。放全局不变量（而非只在 replyDelivery 写入门禁）
+  // 是因为这条边还能从另外两个写者进入：cliId 切换（codex+transcript+scratch 合法 →
+  // 切到 cursor/doubao）与 sandbox 切换（cursor/doubao+transcript → scratch），两者都
+  // 经 rmwBotEntry 落盘，在此一处判死。
+  // 两个收窄条件都必须留：
+  // - sandbox === 'scratch'：非 scratch 下带着显式 transcript 落盘的无采集 CLI
+  //  （如从 claude-code 切 cliId 到达）运行时回落 send，不静默，master 历来放行；
+  // - supportsTranscriptReplyDelivery(cliId)：opencode/codex-app/antigravity 这类
+  //  「从来没有」转写采集的 CLI，即使在 scratch 下也只是回落 send，不是 scratch 让它
+  //  失效。master 上 {codex,scratch,transcript} 切 cliId 到它们不拦，存量 bots.json
+  //  可能有此形状；把它们也算进来会让该 bot 的任何字段编辑都被
+  //  reply_delivery_unsupported 锁死（与静默无关，无收益）。
+  // 判据复用 core/reply-delivery 的两个谓词，CLI 名单只有那一份。
   // 注意：未配置的缺省值（如 doubao 缺省 transcript）不在 entry.replyDelivery 里，
   // 缺省组合由运行时回落 send 处理；机器级 BOTMUX_SANDBOX 不 materialize 进 entry，
   // 那条边由运行时回落与 worker spawnCli 的 resolved-mode 复核负责。
   if (entry.replyDelivery === 'transcript'
       && entry.sandbox === 'scratch'
+      && supportsTranscriptReplyDelivery(entry.cliId)
       && !supportsTranscriptReplyDeliveryForBot(entry.cliId, { sandbox: 'scratch' })) {
     return 'reply_delivery_unsupported';
   }

@@ -1800,11 +1800,29 @@ describe('bot-config store', () => {
     const reject = await store.applyConfigField('app_default', store.findConfigField('replyDelivery')!, 'transcript');
     expect(reject).toMatchObject({ ok: false, reason: 'reply_delivery_unsupported' });
 
-    // scratch 下该存量形状仍被 rmw 不变量拦（切换 sandbox 不能落静默组合）。
+    // 该 entry 切 scratch 也不锁：opencode「从来没有」转写采集，scratch 下显式
+    // transcript 只是运行时回落 send（不静默）。锁它会误伤存量 bots.json。
     const sandboxStore = await import('../src/services/sandbox-store.js');
     const sr = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
-    expect(sr.ok).toBe(false);
-    if (!sr.ok) expect(sr.reason).toBe('reply_delivery_unsupported');
+    expect(sr.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('#2828 P3: codex+scratch+transcript switching cliId to a never-capture CLI stays allowed (master-reachable legacy shape), to doubao/cursor stays rejected', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const cli = store.findConfigField('cli')!;
+    const toOpencode = await store.applyConfigField('app_default', cli, 'opencode');
+    expect(toOpencode.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', sandbox: 'scratch', replyDelivery: 'transcript' });
+    // 该存量 entry 的无关编辑不再被锁
+    const modelEdit = await store.applyConfigField('app_default', store.findConfigField('model')!, 'm');
+    expect(modelEdit.ok).toBe(true);
+
+    // 回到 codex 后切 doubao（真静默边）仍被 rmw 拦
+    expect((await store.applyConfigField('app_default', cli, 'codex')).ok).toBe(true);
+    const blocked = await store.applyConfigField('app_default', cli, 'doubao');
+    expect(blocked).toMatchObject({ ok: false, reason: 'reply_delivery_unsupported' });
+    expect(readConfig().cliId).toBe('codex');
   });
 
   it('doubao default (no explicit replyDelivery) may switch to scratch — the default resolves at runtime, the rmw invariant only rejects persisted transcript', async () => {

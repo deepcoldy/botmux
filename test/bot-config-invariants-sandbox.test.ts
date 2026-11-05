@@ -103,21 +103,39 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
     }
   });
 
-  it('rejects persisted transcript for any non-capture CLI under scratch while the repair exits stay open', () => {
-    // 窄化后的判据在 scratch 下对任何无采集 CLI 都成立：{unsupported cli, scratch,
-    // transcript} 无法经 cliId/sandbox 切换落成；切回支持的 CLI、显式 send、关掉
-    // scratch 三个修复出口仍可走。
+  it('under scratch rejects only CLIs that have transcript capture but lose it there (cursor/doubao); never-capture CLIs stay editable', () => {
+    // #2828 复审 P3 再收窄：opencode/codex-app/antigravity 是「从来没有」转写采集，
+    // scratch 下显式 transcript 也只是运行时回落 send，不静默。该形状在 master 可达
+    //（{codex,scratch,transcript} 切 cliId 到这些 CLI 时 master invariant 放行），
+    // 存量 bots.json 里可能存在；锁它的编辑没有收益。
     expect(botConfigInvariantError({
       cliId: 'opencode', replyDelivery: 'transcript', sandbox: 'scratch',
-    })).toBe('reply_delivery_unsupported');
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'codex-app', replyDelivery: 'transcript', sandbox: 'scratch',
+    })).toBeUndefined();
     expect(botConfigInvariantError({
       cliId: 'antigravity', replyDelivery: 'transcript', sandbox: 'scratch',
+    })).toBeUndefined();
+    // 真静默边：本有采集、scratch 让宿主桥读不到
+    expect(botConfigInvariantError({
+      cliId: 'doubao', replyDelivery: 'transcript', sandbox: 'scratch',
     })).toBe('reply_delivery_unsupported');
+    expect(botConfigInvariantError({
+      cliId: 'cursor', replyDelivery: 'transcript', sandbox: 'scratch',
+    })).toBe('reply_delivery_unsupported');
+    // 本就支持且 scratch 不影响的 CLI 放行；修复出口（显式 send / 未配置）放行
+    expect(botConfigInvariantError({
+      cliId: 'codex', replyDelivery: 'transcript', sandbox: 'scratch',
+    })).toBeUndefined();
     expect(botConfigInvariantError({
       cliId: 'opencode', replyDelivery: 'send', sandbox: 'scratch',
     })).toBeUndefined();
     expect(botConfigInvariantError({
       cliId: 'opencode', sandbox: 'scratch',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'doubao', sandbox: 'scratch',
     })).toBeUndefined();
   });
 });
