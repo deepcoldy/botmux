@@ -32,7 +32,8 @@ export function validateFeedbackTemplate(input: unknown): FeedbackTemplate {
       || element.content.length > 4000 || /<at[\s>]|!\[/.test(element.content)
       || Object.keys(element).some(key => !['tag', 'content'].includes(key))) throw new Error('feedback_template_element_invalid');
   }
-  if (slots.some(slot => !seen.has(slot))) throw new Error('feedback_template_slot_missing');
+  if (slots.filter(slot => slot !== 'actionButtons').some(slot => !seen.has(slot))) throw new Error('feedback_template_slot_missing');
+  if (Buffer.byteLength(JSON.stringify(raw)) > 20000) throw new Error('feedback_template_card_too_large');
   return structuredClone(raw);
 }
 function safePreview(value: unknown): unknown {
@@ -47,6 +48,7 @@ export function buildFeedbackSurface(input: {
   state?: FeedbackCardState; actions?: Array<{ id: string; label: string }>; status?: string;
 }): Record<string, unknown> {
   const template = validateFeedbackTemplate(input.template);
+  if (input.actions?.length && !template.elements.some(element => element.slot === 'actionButtons')) throw new Error('feedback_template_action_slot_missing');
   const url = new URL(input.answerUrl);
   if (url.protocol !== 'https:' || url.username || url.password) throw new Error('feedback_answer_url_invalid');
   const detailsCard = renderFeedbackCard({ schema: '2.0', body: { elements: [buildFeedbackElement(input.policy)] } }, input.policy, input.state);
@@ -61,7 +63,8 @@ export function buildFeedbackSurface(input: {
         for (const column of buttons.columns as Array<Record<string, unknown>>) column.width = 'weighted';
         buttons.flex_mode = 'none';
         const columns = buttons.columns as Array<{ elements: Record<string, unknown>[] }>;
-        elements.push({ tag: 'column_set', element_id: 'botmux_feedback', columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: columns.flatMap(column => column.elements) }] });
+        elements.push({ tag: 'column_set', element_id: 'botmux_feedback', columns: [{ tag: 'column', width: 'weighted', weight: 1,
+          elements: columns.flatMap(column => column.elements).map(button => ({ ...button, width: 'fill' })) }] });
       } else elements.push(buttons);
     }
     if (element.slot === 'feedbackDetails') elements.push(...details.slice(1));

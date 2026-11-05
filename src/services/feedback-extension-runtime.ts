@@ -12,7 +12,7 @@ export async function reconcileFeedbackSurfaces(input: {
   appId: string; sourceKey: string; source: CompatibleFeedbackStore; extensions: FeedbackExtensionStore;
   config: FeedbackExtensionConfig; now: () => number;
   startedAt?: string;
-  send: (subjectId: string, card: Record<string, unknown>, operationId: string) => Promise<string>;
+  send: (subjectId: string, card: Record<string, unknown>, operationId: string, chatId: string, round: number) => Promise<string>;
   answerUrl: (messageId: string, chatId: string) => string | Promise<string>;
   removeInline: (messageId: string) => Promise<void>;
 }): Promise<void> {
@@ -30,9 +30,11 @@ export async function reconcileFeedbackSurfaces(input: {
       const feedbackDelivery = await source.findDeliveryById(data.deliveryId);
       if (feedbackDelivery?.botAppId === input.appId) {
         for (const surface of extensions.surfacesForDelivery(input.appId, feedbackDelivery.deliveryId)) {
-          extensions.dirtySurface(input.appId, surface.messageId, {
+          const state = {
             feedbackId: data.feedbackId, result: data.verdictKey, reasonKey: data.reasonKey, comment: data.comment,
-          });
+          };
+          extensions.dirtySurface(input.appId, surface.messageId, state);
+          if (surface.binding.mode === 'both') extensions.dirtySurface(input.appId, feedbackDelivery.platformMessageId, state);
         }
       }
       for (const subscription of input.config.subscriptions ?? []) {
@@ -58,6 +60,10 @@ export async function reconcileFeedbackSurfaces(input: {
         const sourceDeliveries = await source.listSubjectDeliveries(input.appId, eventDelivery.chatId, eventDelivery.topicRootId);
         const sourceBinding = extensions.subject(input.appId, eventDelivery.sessionId ?? '', eventDelivery.turnId ?? '');
         const subjectId = sourceBinding?.sourceMessageId ?? eventDelivery.topicRootId;
+        if (subjectId === eventDelivery.chatId) {
+          entries.push({ sequence: entry.sequence, eventId: event.eventId, jobs });
+          continue;
+        }
         const groups = feedbackAnswerGroups(sourceDeliveries.filter(delivery => {
           const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
           return (binding?.sourceMessageId ?? delivery.topicRootId) === subjectId && (!binding || binding.answerKind === 'substantive');
@@ -79,12 +85,13 @@ export async function reconcileFeedbackSurfaces(input: {
             const template = input.config.templates.find(item => item.id === rule.templateId);
             if (!template) throw new Error('feedback_template_not_found');
             const actions = input.config.actions.filter(action => rule.actionIds.includes(action.id));
+            const answerUrl = await input.answerUrl(delivery.platformMessageId, delivery.chatId);
             const card = buildFeedbackSurface({ template, policy: delivery.policy, round,
-              answerUrl: await input.answerUrl(delivery.platformMessageId, delivery.chatId), preview: false, actions });
+              answerUrl, preview: false, actions });
             jobs.push({ id: identity(['surface', answerId]), kind: 'surface', payload: {
               appId: input.appId, subjectId, topicId: delivery.topicRootId, chatId: delivery.chatId, answerId,
               deliveryId: delivery.deliveryId, answerMessageId: delivery.platformMessageId, messageIds: group.messageIds, round, card, actions,
-              mode: rule.mode, templateId: template.id, template,
+              mode: rule.mode, templateId: template.id, template, answerUrl,
             } });
           }
         }
@@ -93,6 +100,12 @@ export async function reconcileFeedbackSurfaces(input: {
     entries.push({ sequence: entry.sequence, eventId: event.eventId, jobs });
   }
   if (entries.length) extensions.ingest(cursorKey, cursor, entries);
+  for (const messageId of extensions.inlineCleanups(input.appId)) {
+    try {
+      await input.removeInline(messageId);
+      extensions.clearInlineCleanup(input.appId, messageId);
+    } catch {}
+  }
   extensions.expire(input.now());
   const job = extensions.claim('surface', input.now(), 60000, input.appId);
   if (!job) return;
@@ -111,10 +124,12 @@ export async function reconcileFeedbackSurfaces(input: {
     return;
   }
   try {
-    const messageId = await input.send(payload.subjectId, payload.card, job.id.slice(0, 32));
-    extensions.bindSurface(input.appId, messageId, job.payload);
-    extensions.settle(job.id, job.token!, 'succeeded', { messageId }, input.now());
-    if (payload.mode === 'separate') await input.removeInline(payload.answerMessageId);
+    const messageId = await input.send(payload.subjectId, payload.card, job.id.slice(0, 32), String(job.payload.chatId), Number(job.payload.round));
+    if (!extensions.completeSurface(job.id, job.token!, messageId, input.now())) return;
+    if (payload.mode === 'separate') {
+      await input.removeInline(payload.answerMessageId);
+      extensions.clearInlineCleanup(input.appId, payload.answerMessageId);
+    }
   } catch {
     extensions.settle(job.id, job.token!, 'unknown', { reason: 'surface_delivery_unknown' }, input.now());
   }

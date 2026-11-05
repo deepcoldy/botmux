@@ -59,6 +59,10 @@ function normalize(input: unknown): FeedbackExtensionConfig {
         if ('match' in layer && layer.match && typeof layer.match === 'object'
           && !hook.allowedChatIds.includes((layer.match as { chatId: string }).chatId)) throw new Error('feedback_action_not_authorized');
       }
+      if (layer.actionIds?.length && layer.templateId) {
+        const template = templates.find(item => item.id === layer.templateId);
+        if (!template?.elements.some(element => element.slot === 'actionButtons')) throw new Error('feedback_template_action_slot_missing');
+      }
     }
     presentations[appId] = normalized;
   }

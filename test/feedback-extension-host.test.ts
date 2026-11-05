@@ -3,12 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const mock = vi.hoisted(() => ({ source: undefined as any }));
+const mock = vi.hoisted(() => ({ source: undefined as any, reply: vi.fn(), mode: vi.fn(), detail: vi.fn() }));
 vi.mock('../src/services/skill-feedback-store.js', async original => ({
   ...await original<any>(), getSkillFeedbackStore: async () => mock.source,
 }));
 vi.mock('../src/im/lark/client.js', async original => ({
-  ...await original<any>(), resolveUserUnionId: async () => ({}),
+  ...await original<any>(), resolveUserUnionId: async () => ({}), replyMessage: mock.reply,
+  getChatModeStrict: mock.mode, getMessageDetail: mock.detail,
 }));
 vi.mock('../src/bot-registry.js', async original => ({
   ...await original<any>(), getBot: () => ({ config: { feedback: { enabled: true, audience: 'everyone' } } }),
@@ -17,7 +18,7 @@ vi.mock('../src/bot-registry.js', async original => ({
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src/services/feedback-extension-config.js';
-import { handleFeedbackExtensionCard } from '../src/services/feedback-extension-host.js';
+import { handleFeedbackExtensionCard, sendFeedbackSurface, pendingFeedbackHookAuthorized } from '../src/services/feedback-extension-host.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackSurface, defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 
@@ -55,6 +56,40 @@ async function fixture() {
 }
 
 describe('feedback extension host callback', () => {
+  it('does not execute a queued subscription after the binding is removed', () => {
+    const config = { version: 1, hostId: 'host', templates: [], hooks: [], actions: [], presentations: {},
+      subscriptions: [{ id: 'sub', appId: 'app', chatId: 'chat', buttonKey: 'helpful', hookId: 'hook' }] };
+    const event = { type: 'feedback.revised', bot: { appId: 'app' }, scope: { chatId: 'chat' },
+      feedback: { buttonKey: 'helpful' }, action: null };
+    expect(pendingFeedbackHookAuthorized(config, 'hook', event)).toBe(true);
+    expect(pendingFeedbackHookAuthorized({ ...config, subscriptions: [] }, 'hook', event)).toBe(false);
+  });
+  it.each([['group', false], ['topic', true]] as const)('routes %s feedback replies without inventing a thread', async (mode, inThread) => {
+    mock.mode.mockResolvedValue(mode);
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.reply.mockResolvedValue('surface');
+    await sendFeedbackSurface('app', { chatId: 'chat', subjectId: 'question', card: { schema: '2.0' }, operationId: 'operation' });
+    expect(mock.reply).toHaveBeenLastCalledWith('app', 'question', '{"schema":"2.0"}', 'interactive', inThread, 'operation');
+  });
+  it('refuses an unknown chat mode or a mismatched source rather than sending to a guessed scope', async () => {
+    mock.reply.mockClear();
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'other-chat' }] });
+    await expect(sendFeedbackSurface('app', { chatId: 'chat', subjectId: 'question', card: {}, operationId: 'op' })).rejects.toThrow();
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('unknown');
+    await expect(sendFeedbackSurface('app', { chatId: 'chat', subjectId: 'question', card: {}, operationId: 'op' })).rejects.toThrow();
+    expect(mock.reply).not.toHaveBeenCalled();
+  });
+  it('passes a fresh authorization fence into the transport write boundary', async () => {
+    mock.mode.mockResolvedValue('topic');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.reply.mockImplementationOnce(async (...args: any[]) => {
+      await args[7].beforeWrite();
+      throw new Error('write should not be reached');
+    });
+    await expect(sendFeedbackSurface('app', { chatId: 'chat', subjectId: 'question', card: {}, operationId: 'op',
+      beforeWrite: async () => { throw new Error('revoked'); } })).rejects.toThrow('revoked');
+  });
   it('rejects non-human operator IDs before registering custom actions', async () => {
     const data = await fixture();
     const click = data.callback('feedback_custom_action', { action_id: 'help' });

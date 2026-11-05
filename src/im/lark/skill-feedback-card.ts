@@ -286,6 +286,7 @@ function callbackKey(input: Record<string, unknown>): string { return createHash
 export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: string, deps: {
   store: CompatibleFeedbackStore;
   loadBaseCard?: (platformMessageId: string) => Promise<Record<string, unknown> | undefined>;
+  renderCard?: (policy: FeedbackPolicy, state: FeedbackCardState) => Record<string, unknown>;
 }): Promise<any> {
   const data = normalizeCardActionData(input);
   const platformMessageId = data.context?.open_message_id;
@@ -330,7 +331,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
 
   const previous = await deps.store.getLatestFeedback(delivery.deliveryId, operatorSubjectId);
   if (previous && !delivery.policy.allowReselect && action === 'feedback_submit') {
-    return { card: { type: 'raw', data: renderFeedbackCard(baseCard, delivery.policy, previous) } };
+    return { card: { type: 'raw', data: deps.renderCard?.(delivery.policy, previous) ?? renderFeedbackCard(baseCard, delivery.policy, previous) } };
   }
   let result: string;
   let reasonKey: string | undefined;
@@ -382,7 +383,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
     }
     throw error;
   }
-  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
+  const renderedCard = deps.renderCard?.(delivery.policy, recorded.feedback) ?? renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
   const toast = recorded.status === 'stale'
     ? { type: 'warning', content: '反馈状态已更新，请基于最新卡片重试' }
     : undefined;

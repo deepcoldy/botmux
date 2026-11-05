@@ -30,6 +30,7 @@ export class FeedbackExtensionStore {
         actor TEXT NOT NULL,evidence TEXT NOT NULL,outcome TEXT NOT NULL,created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS subject_bindings(app_id TEXT NOT NULL,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,
         binding TEXT NOT NULL,PRIMARY KEY(app_id,session_id,turn_id));
+      CREATE TABLE IF NOT EXISTS inline_cleanup(app_id TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(app_id,message_id));
       PRAGMA user_version=1;
     `);
   }
@@ -74,6 +75,24 @@ export class FeedbackExtensionStore {
       this.database.prepare('INSERT INTO reconciliations(job_id,actor,evidence,outcome,created_at) VALUES(?,?,?,?,?)')
         .run(id, actor, evidence, outcome, new Date().toISOString());
       this.database.prepare("UPDATE jobs SET status=?,result=? WHERE id=? AND status='unknown'").run(outcome, JSON.stringify(result), id);
+      this.markActionState(job, outcome, result);
+      return true;
+    });
+  }
+  reconcileSurfaceReceipt(id: string, messageId: string, actor: string, evidence: string): boolean {
+    if (!messageId || !actor.trim() || !evidence.trim() || evidence.length > 2000) throw new Error('feedback_reconciliation_evidence_required');
+    return this.transaction(() => {
+      const job = this.job(id);
+      if (job?.kind !== 'surface' || job.status !== 'unknown') return false;
+      const payload = job.payload;
+      const appId = String(payload.appId);
+      if (this.surface(appId, messageId)) throw new Error('feedback_surface_binding_conflict');
+      this.database.prepare('INSERT INTO surfaces VALUES(?,?,?)').run(appId, messageId, JSON.stringify(payload));
+      this.database.prepare("UPDATE jobs SET status='succeeded',result=? WHERE id=? AND status='unknown'")
+        .run(JSON.stringify({ messageId, reconciled: true }), id);
+      this.database.prepare('INSERT INTO reconciliations(job_id,actor,evidence,outcome,created_at) VALUES(?,?,?,?,?)')
+        .run(id, actor, evidence, 'succeeded', new Date().toISOString());
+      if (payload.mode === 'separate') this.database.prepare('INSERT OR IGNORE INTO inline_cleanup VALUES(?,?)').run(appId, payload.answerMessageId);
       return true;
     });
   }
@@ -104,15 +123,57 @@ export class FeedbackExtensionStore {
     const row = this.database.prepare('SELECT binding FROM surfaces WHERE app_id=? AND message_id=?').get(appId, messageId) as { binding: string } | undefined;
     return row ? JSON.parse(row.binding) : undefined;
   }
+  completeSurface(id: string, token: string, messageId: string, now: number): boolean {
+    return this.transaction(() => {
+      const row = this.database.prepare("SELECT payload FROM jobs WHERE id=? AND kind='surface' AND status='running' AND token=? AND deadline>=?")
+        .get(id, token, now) as { payload: string } | undefined;
+      if (!row) return false;
+      const payload = JSON.parse(row.payload);
+      const existing = this.surface(payload.appId, messageId);
+      if (existing && JSON.stringify(existing) !== row.payload) throw new Error('feedback_surface_binding_conflict');
+      this.database.prepare('INSERT OR IGNORE INTO surfaces VALUES(?,?,?)').run(payload.appId, messageId, row.payload);
+      this.database.prepare("UPDATE jobs SET status='succeeded',result=?,token=NULL WHERE id=?")
+        .run(JSON.stringify({ messageId }), id);
+      if (payload.mode === 'separate') {
+        this.database.prepare('INSERT OR IGNORE INTO inline_cleanup VALUES(?,?)').run(payload.appId, payload.answerMessageId);
+      }
+      return true;
+    });
+  }
+  inlineCleanups(appId: string): string[] {
+    return (this.database.prepare('SELECT message_id FROM inline_cleanup WHERE app_id=?').all(appId) as Array<{ message_id: string }>).map(row => row.message_id);
+  }
+  clearInlineCleanup(appId: string, messageId: string): void {
+    this.database.prepare('DELETE FROM inline_cleanup WHERE app_id=? AND message_id=?').run(appId, messageId);
+  }
   surfacesForDelivery(appId: string, deliveryId: string): Array<{ messageId: string; binding: Record<string, unknown> }> {
     const rows = this.database.prepare("SELECT message_id,binding FROM surfaces WHERE app_id=? AND json_extract(binding,'$.deliveryId')=?")
       .all(appId, deliveryId) as Array<{ message_id: string; binding: string }>;
     return rows.map(row => ({ messageId: row.message_id, binding: JSON.parse(row.binding) }));
   }
   dirtySurface(appId: string, messageId: string, state: Record<string, unknown>): void {
+    this.transaction(() => this.writeDirtySurface(appId, messageId, state));
+  }
+  private writeDirtySurface(appId: string, messageId: string, state: Record<string, unknown>): void {
+    const binding = this.surface(appId, messageId);
+    if (binding) this.database.prepare('UPDATE surfaces SET binding=? WHERE app_id=? AND message_id=?')
+      .run(JSON.stringify({ ...binding, feedbackState: state }), appId, messageId);
     this.database.prepare(`INSERT INTO dirty_surfaces(app_id,message_id,state) VALUES(?,?,?)
       ON CONFLICT(app_id,message_id) DO UPDATE SET state=excluded.state,revision=dirty_surfaces.revision+1`)
       .run(appId, messageId, JSON.stringify(state));
+  }
+  private markActionState(job: ExtensionJob, status: string, result?: Record<string, unknown>): void {
+    const event = job.payload.event as { scope?: { subjectId?: string }; surface?: { messageId?: string } } | undefined;
+    const appId = job.payload.appId;
+    if (typeof appId !== 'string' || !event?.surface?.messageId) return;
+    const binding = this.surface(appId, event.surface.messageId);
+    if (!binding) return;
+    const labels: Record<string, string> = { pending: '请求已记录', running: '操作处理中', succeeded: '操作已完成',
+      blocked: '操作被阻止', failed_before_effect: '操作未执行，可确认后重试', unknown: '操作结果未知，等待核对' };
+    const actionStatus = typeof result?.publicMessage === 'string' ? result.publicMessage : labels[status] ?? status;
+    this.database.prepare('UPDATE surfaces SET binding=? WHERE app_id=? AND message_id=?')
+      .run(JSON.stringify({ ...binding, actionStatus }), appId, event.surface.messageId);
+    this.writeDirtySurface(appId, event.surface.messageId, (binding.feedbackState ?? {}) as Record<string, unknown>);
   }
   dirtySurfaces(appId: string): Array<{ messageId: string; state: Record<string, unknown>; revision: number }> {
     const rows = this.database.prepare('SELECT message_id,state,revision FROM dirty_surfaces WHERE app_id=?').all(appId) as Array<{ message_id: string; state: string; revision: number }>;
@@ -152,6 +213,8 @@ export class FeedbackExtensionStore {
       const previous = this.database.prepare('SELECT actor,job_id FROM action_requests WHERE request_id=?').get(input.requestId) as { actor: string; job_id: string } | undefined;
       if (previous && (previous.actor !== input.actor || previous.job_id !== input.job.id)) throw new Error('feedback_action_request_conflict');
       this.database.prepare('INSERT OR IGNORE INTO action_requests VALUES(?,?,?)').run(input.requestId, input.actor, input.job.id);
+      const job = this.job(input.job.id);
+      if (job) this.markActionState(job, job.status, job.result);
     });
   }
   retryBeforeEffect(id: string, expectedToken: string, requestId: string, actor: string): boolean {
@@ -189,15 +252,26 @@ export class FeedbackExtensionStore {
       if (!row) return undefined;
       this.database.prepare("UPDATE jobs SET status='running',token=?,deadline=? WHERE id=? AND status='pending'")
         .run(randomUUID(), now + timeoutMs, row.id);
-      return this.job(row.id);
+      const job = this.job(row.id)!;
+      this.markActionState(job, 'running');
+      return job;
     });
   }
   settle(id: string, token: string, status: Exclude<ExtensionJob['status'], 'pending' | 'running'>, result: Record<string, unknown>, now = Date.now()): boolean {
     if (status === 'failed_before_effect') result = { ...result, retryToken: randomUUID() };
-    return Number(this.database.prepare("UPDATE jobs SET status=?,result=?,token=NULL WHERE id=? AND status='running' AND token=? AND deadline>=?")
-      .run(status, JSON.stringify(result), id, token, now).changes) === 1;
+    return this.transaction(() => {
+      const changed = Number(this.database.prepare("UPDATE jobs SET status=?,result=?,token=NULL WHERE id=? AND status='running' AND token=? AND deadline>=?")
+        .run(status, JSON.stringify(result), id, token, now).changes) === 1;
+      const job = changed ? this.job(id) : undefined;
+      if (job) this.markActionState(job, status, result);
+      return changed;
+    });
   }
   expire(now: number): void {
-    this.database.prepare("UPDATE jobs SET status='unknown',token=NULL WHERE status='running' AND deadline<?").run(now);
+    this.transaction(() => {
+      const expired = this.database.prepare("SELECT id FROM jobs WHERE status='running' AND deadline<?").all(now) as Array<{ id: string }>;
+      this.database.prepare("UPDATE jobs SET status='unknown',token=NULL WHERE status='running' AND deadline<?").run(now);
+      for (const row of expired) this.markActionState(this.job(row.id)!, 'unknown');
+    });
   }
 }

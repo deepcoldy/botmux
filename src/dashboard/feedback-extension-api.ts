@@ -3,7 +3,10 @@ import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../ser
 import { buildFeedbackSurface, validateFeedbackTemplate } from '../services/feedback-template.js';
 import { resolveFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { resolveFeedbackPresentation, normalizeFeedbackPresentation } from '../services/feedback-presentation.js';
-import { loadBotConfigs } from '../bot-registry.js';
+import { loadBotConfigs, getBotOpenId } from '../bot-registry.js';
+import { getMessageDetail } from '../im/lark/client.js';
+import { stampBotmuxCallbackMarkers } from '../im/lark/callback-button-marker.js';
+import { canonicalJson } from '../utils/canonical-input-hash.js';
 import { FeedbackExtensionStore } from '../services/feedback-extension-store.js';
 
 export function authorizeFeedbackExtensionChange(
@@ -32,7 +35,9 @@ export async function handleFeedbackExtensionApi(req: IncomingMessage, res: Serv
         } finally { store.close(); }
       }
       if (url.pathname !== '/api/feedback/extensions') return respond(404, { error: 'not_found' });
-      return respond(200, { ...config, hostAdmin: deps.hostAdmin,
+      const presentations = { ...Object.fromEntries(loadBotConfigs().filter(bot => bot.feedbackPresentation)
+        .map(bot => [bot.larkAppId, bot.feedbackPresentation])), ...config.presentations };
+      return respond(200, { ...config, presentations, hostAdmin: deps.hostAdmin,
         hooks: deps.hostAdmin ? config.hooks : config.hooks.map(hook => ({ id: hook.id, enabled: hook.enabled, allowedBotAppIds: hook.allowedBotAppIds, allowedChatIds: hook.allowedChatIds, allowedActionIds: hook.allowedActionIds })) });
     }
     if (req.method !== 'POST') return respond(405, { error: 'method_not_allowed' });
@@ -43,6 +48,26 @@ export async function handleFeedbackExtensionApi(req: IncomingMessage, res: Serv
       if (Buffer.byteLength(raw) > 65536) throw new Error('feedback_extension_request_too_large');
     }
     const body = JSON.parse(raw || '{}') as Record<string, any>;
+    if (url.pathname === '/api/feedback/extensions/reconcile-surface') {
+      authorizeFeedbackExtensionChange(deps, 'hooks');
+      if (body.confirmed !== true || typeof body.messageId !== 'string' || !/^om_[A-Za-z0-9_-]+$/.test(body.messageId)
+        || typeof body.jobId !== 'string' || typeof body.evidence !== 'string') throw new Error('feedback_reconciliation_invalid');
+      const store = await FeedbackExtensionStore.open(deps.dataDir);
+      try {
+        const job = store.job(body.jobId);
+        if (job?.kind !== 'surface' || job.status !== 'unknown') return respond(409, { error: 'feedback_surface_not_unknown' });
+        const appId = String(job.payload.appId);
+        const detail = await getMessageDetail(appId, body.messageId, { userCardContent: false });
+        const message = detail?.items?.[0] ?? detail;
+        const botOpenId = getBotOpenId(appId);
+        if (!botOpenId || message?.sender?.id !== botOpenId || message?.chat_id !== job.payload.chatId
+          || message?.parent_id !== job.payload.subjectId || typeof message?.body?.content !== 'string') throw new Error('feedback_surface_receipt_unverified');
+        const card = JSON.parse(message.body.content);
+        if (canonicalJson(card) !== canonicalJson(JSON.parse(stampBotmuxCallbackMarkers(JSON.stringify(job.payload.card))))) throw new Error('feedback_surface_content_unverified');
+        const changed = store.reconcileSurfaceReceipt(body.jobId, body.messageId, 'dashboard:host-admin', body.evidence);
+        return respond(changed ? 200 : 409, { changed });
+      } finally { store.close(); }
+    }
     if (url.pathname === '/api/feedback/extensions/reconcile') {
       authorizeFeedbackExtensionChange(deps, 'hooks');
       if (body.confirmed !== true || !['succeeded', 'failed_before_effect'].includes(body.outcome)
@@ -58,7 +83,7 @@ export async function handleFeedbackExtensionApi(req: IncomingMessage, res: Serv
       if (!bot) throw new Error('feedback_bot_not_found');
       const policy = resolveFeedbackPolicyForDelivery({ dataDir: deps.dataDir, bot, larkAppId: body.appId, chatId: body.chatId });
       if (!policy) throw new Error('feedback_policy_disabled');
-      const presentation = resolveFeedbackPresentation(normalizeFeedbackPresentation(body.presentation ?? config.presentations[body.appId]),
+      const presentation = resolveFeedbackPresentation(normalizeFeedbackPresentation(body.presentation ?? config.presentations[body.appId] ?? bot.feedbackPresentation),
         { botAppId: body.appId, chatId: body.chatId ?? '', sourceMessageId: body.sourceMessageId ?? '', round: body.round ?? 1 });
       const template = validateFeedbackTemplate(body.template ?? (body.templates ?? config.templates).find((item: { id: string }) => item.id === presentation.templateId));
       const card = buildFeedbackSurface({ template, policy, preview: true, round: body.round ?? 1,
@@ -89,7 +114,8 @@ export async function handleFeedbackExtensionApi(req: IncomingMessage, res: Serv
     if (!loadBotConfigs().some(item => item.larkAppId === body.appId)) throw new Error('feedback_bot_not_found');
     const templates = body.templates ?? config.templates;
     const presentations = { ...config.presentations, [body.appId]: normalizeFeedbackPresentation(body.presentation) };
-    const updated = await saveFeedbackExtensionConfig(deps.dataDir, body.expectedVersion, { ...config, templates, presentations }, 'dashboard:manager');
+    const updated = await saveFeedbackExtensionConfig(deps.dataDir, body.expectedVersion, { ...config, templates, presentations,
+      actions: body.actions ?? config.actions }, 'dashboard:manager');
     return respond(200, { version: updated.version, templates: updated.templates, presentation: updated.presentations[body.appId] });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'feedback_extension_failed';

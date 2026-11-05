@@ -67,7 +67,7 @@ export function FeedbackExtensionPanel(props: { appId: string }) {
     try {
       const body = kind === 'hooks' ? { hooks: JSON.parse(hooks), actions: JSON.parse(actions), subscriptions: JSON.parse(subscriptions), confirmed }
         : kind === 'subscriptions' ? { subscriptions: JSON.parse(subscriptions) }
-          : { appId: props.appId, templates: JSON.parse(templates), presentation: JSON.parse(presentation) };
+          : { appId: props.appId, templates: JSON.parse(templates), presentation: JSON.parse(presentation), actions: JSON.parse(actions) };
       const response = await sendJson('POST', `/api/feedback/extensions/${kind}`, { ...body, expectedVersion: config.version });
       if (!response.ok) throw new Error(response.body.error);
       await reload(); setError('');
@@ -87,6 +87,14 @@ export function FeedbackExtensionPanel(props: { appId: string }) {
     if (!window.confirm(outcome === 'succeeded' ? '确认已有业务回执证明操作成功？' : '确认外部操作没有发生？核对后用户才能重新请求。')) return;
     const response = await sendJson('POST', '/api/feedback/extensions/reconcile', { jobId, outcome, evidence, confirmed: true });
     if (!response.ok) setError(response.body.error ?? '状态已变化，请刷新');
+    await loadExecutions();
+  }
+  async function reconcileSurface(jobId: string) {
+    const messageId = window.prompt('已发送反馈卡的消息 ID（服务端将核验应用、群、原问题及卡片内容）：');
+    const evidence = messageId ? window.prompt('填写定位到该消息的回执依据：') : null;
+    if (!messageId || !evidence?.trim()) return;
+    const response = await sendJson('POST', '/api/feedback/extensions/reconcile-surface', { jobId, messageId, evidence, confirmed: true });
+    if (!response.ok) setError(response.body.error ?? '回执未核实，保留未知状态');
     await loadExecutions();
   }
   if (!config) return <p role="status">{error || '正在加载反馈扩展配置…'}</p>;
@@ -131,7 +139,8 @@ export function FeedbackExtensionPanel(props: { appId: string }) {
       <p>脚本运行宿主：{config.hostId}。保存不是执行。新建请设 enabled:false。</p>
       <label>评价提交订阅 JSON（appId、chatId、buttonKey、hookId）<textarea rows={6} value={subscriptions} onChange={event => setSubscriptions(event.target.value)} /></label>
       <button type="button" onClick={() => void save('subscriptions')}>保存已授权 Hook 的订阅</button>
-      <label>动作与 Hook 绑定<textarea rows={6} value={actions} readOnly={!config.hostAdmin} onChange={event => setActions(event.target.value)} /></label>
+      <label>动作与已批准 Hook 绑定<textarea rows={6} value={actions} onChange={event => setActions(event.target.value)} /></label>
+      <button type="button" onClick={() => void save('presentation')}>保存动作绑定与展示规则</button>
       {config.hostAdmin ? <>
         <label>Hook 注册 JSON（命令数组、cwd、作用域、timeoutMs、concurrency、envRefs）<textarea rows={12} value={hooks} onChange={event => setHooks(event.target.value)} /></label>
         <button type="button" onClick={() => void save('hooks')}>保存 Hook 配置</button>
@@ -147,6 +156,8 @@ export function FeedbackExtensionPanel(props: { appId: string }) {
             <button type="button" onClick={() => void reconcile(item.id, 'succeeded')}>核对为已成功</button>
             <button type="button" onClick={() => void reconcile(item.id, 'failed_before_effect')}>核对为未执行</button>
           </>}
+          {config.hostAdmin && item.kind === 'surface' && item.status === 'unknown' &&
+            <button type="button" onClick={() => void reconcileSurface(item.id)}>核对已发送卡片</button>}
         </td></tr>)}
       </tbody></table>
     </details>

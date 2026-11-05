@@ -2214,11 +2214,21 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
     try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
+    const origin = ds?.managedTurnOrigin;
+    const turnId = origin?.turnId;
+    const { feedbackPolicyForRelayedDelivery } = await import('../services/feedback-relay-policy.js');
+    const feedback = ds ? await feedbackPolicyForRelayedDelivery({
+      dataDir: config.session.dataDir, appId: ds.larkAppId, chatId: ds.chatId, callerOpenId: origin?.callerOpenId,
+    }) : undefined;
+    if (ds && (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin !== origin || origin?.turnId !== turnId)) {
+      return jsonRes(res, 409, { ok: false, error: 'turn_mismatch' });
+    }
     const result = await recordRelayedTurnDelivery({
       ds,
       body,
       store: await getSkillFeedbackStore(config.session.dataDir),
       webhookDestinations,
+      feedback,
       teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
     });
     return result.ok

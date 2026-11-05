@@ -28,6 +28,8 @@ import { RELAYED_TURN_DELIVERY_MAX_BYTES } from '../src/core/relayed-turn-delive
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import * as larkClient from '../src/im/lark/client.js';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
+import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src/services/feedback-extension-config.js';
+import * as registry from '../src/bot-registry.js';
 
 const SECRET = 'turn-delivery-narrow-secret';
 const CAP_A = 'ab12cd34'.repeat(8);
@@ -93,6 +95,20 @@ async function rowFor(messageId: string) {
 }
 
 describe('POST /api/sessions/:sessionId/turn-delivery', () => {
+  it('freezes the host policy for a relayed surface without accepting caller-supplied policy or owner', async () => {
+    const session = liveSession('sess-a', CAP_A, 'turn-a');
+    session.managedTurnOrigin.callerOpenId = 'ou_verified';
+    await setup({ 'sess-a': session });
+    vi.spyOn(registry, 'getBot').mockReturnValue({ config: { feedback: { enabled: true, audience: 'requester' } } } as any);
+    const initial = await readFeedbackExtensionConfig(dataDir!);
+    await saveFeedbackExtensionConfig(dataDir!, initial.version, {
+      ...initial, presentations: { cli_app: { default: { enabled: true }, rules: [] } },
+    }, 'test-admin');
+    const response = await post('sess-a', { originCapability: CAP_A, messageId: 'om_answer', content: 'answer',
+      requesterSubjectId: 'ou_forged', policy: { enabled: true, audience: 'everyone' } });
+    expect(response.status).toBe(200);
+    expect(await rowFor('om_answer')).toMatchObject({ cardMode: 'card', requesterSubjectId: 'ou_verified', policy: { audience: 'requester' } });
+  });
   it('binds feedback only with the current turn capability and same-chat source', async () => {
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
     vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{ chat_id: 'oc_sess-a' }] } as any);

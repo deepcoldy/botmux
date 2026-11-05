@@ -2,7 +2,7 @@ import { existsSync, readFileSync, openSync, closeSync, fstatSync, constants } f
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { FeedbackExtensionStore } from './feedback-extension-store.js';
-import { readFeedbackExtensionConfig } from './feedback-extension-config.js';
+import { readFeedbackExtensionConfig, type FeedbackExtensionConfig } from './feedback-extension-config.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
 import { getSkillFeedbackStore } from './skill-feedback-store.js';
 import { reconcileFeedbackSurfaces } from './feedback-extension-runtime.js';
@@ -10,19 +10,47 @@ import { runFeedbackHook, type HookEvent } from './feedback-hook-runner.js';
 import { getBotBrand, getBot } from '../bot-registry.js';
 import { resolveFeedbackPolicyForDelivery } from './feedback-policy-resolver.js';
 import { chatAppLink, threadAppLink } from '../im/lark/lark-hosts.js';
-import { getMessageDetail, getMessageThreadId, replyMessage, updateMessage } from '../im/lark/client.js';
+import { getMessageDetail, getMessageThreadId, getChatModeStrict, replyMessage, updateMessage } from '../im/lark/client.js';
 import { normalizeCardActionData } from '../im/lark/card-action-data.js';
 import { resolveCardOperatorUnionId } from '../im/lark/card-handler.js';
 import { handleSkillFeedbackCardAction, renderFeedbackCard } from '../im/lark/skill-feedback-card.js';
-import { surfaceFeedbackStore } from './feedback-surface-delivery.js';
+import { surfaceFeedbackStore, renderFeedbackSurfaceState } from './feedback-surface-delivery.js';
 import { feedbackMaintenanceActive, acquireFeedbackSendLease } from './feedback-maintenance.js';
+import { resolveFeedbackPresentation } from './feedback-presentation.js';
 
 function configured(dataDir: string): boolean { return existsSync(join(dataDir, 'feedback-extensions.json')); }
+export function pendingFeedbackHookAuthorized(config: FeedbackExtensionConfig, hookId: string, event: {
+  type: string; bot: { appId: string }; scope: { chatId: string; subjectId?: unknown };
+  feedback?: { buttonKey?: string }; action: { id: string } | null; answer?: { round?: number };
+}): boolean {
+  if (event.type === 'feedback.revised') return !!config.subscriptions?.some(subscription =>
+    subscription.appId === event.bot.appId && subscription.chatId === event.scope.chatId
+    && subscription.hookId === hookId && subscription.buttonKey === event.feedback?.buttonKey);
+  if (!event.action || !config.actions.some(action => action.id === event.action!.id && action.hookId === hookId)) return false;
+  const presentation = config.presentations[event.bot.appId];
+  if (!presentation) return false;
+  const effective = resolveFeedbackPresentation(presentation, { botAppId: event.bot.appId, chatId: event.scope.chatId,
+    sourceMessageId: String(event.scope.subjectId ?? ''), round: event.answer?.round ?? 1 });
+  return effective.matched && effective.actionIds.includes(event.action.id);
+}
+export async function sendFeedbackSurface(appId: string, input: {
+  chatId: string; subjectId: string; card: Record<string, unknown>; operationId: string;
+  beforeWrite?: () => Promise<void>;
+}): Promise<string> {
+  const detail = await getMessageDetail(appId, input.subjectId, { userCardContent: false });
+  if ((detail?.items?.[0] ?? detail)?.chat_id !== input.chatId) throw new Error('feedback_surface_wrong_chat');
+  const mode = await getChatModeStrict(appId, input.chatId);
+  if (mode === 'unknown') throw new Error('feedback_surface_chat_mode_unknown');
+  if (!input.beforeWrite) return replyMessage(appId, input.subjectId, JSON.stringify(input.card), 'interactive', mode === 'topic', input.operationId);
+  return replyMessage(appId, input.subjectId, JSON.stringify(input.card), 'interactive', mode === 'topic', input.operationId,
+    undefined, { beforeWrite: input.beforeWrite });
+}
 export async function tickFeedbackExtensions(dataDir: string, appId: string): Promise<void> {
-  if (!configured(dataDir)) return;
+  const botPresentation = getBot(appId).config.feedbackPresentation;
+  if (!configured(dataDir) && !botPresentation && !existsSync(join(dataDir, 'feedback-extensions.sqlite'))) return;
   if (feedbackMaintenanceActive(dataDir)) return;
   const config = await readFeedbackExtensionConfig(dataDir);
-  if (!config.presentations[appId] && !config.subscriptions?.some(item => item.appId === appId)) return;
+  if (!config.presentations[appId] && botPresentation) config.presentations[appId] = botPresentation;
   const extensions = await FeedbackExtensionStore.open(dataDir);
   try {
     const startedAt = extensions.activate(appId, new Date().toISOString());
@@ -31,11 +59,16 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
     await reconcileFeedbackSurfaces({
       appId, source, extensions, config, now: Date.now, startedAt,
       sourceKey: `${storageConfig.instanceId}:${storageConfig.generation}`,
-      send: async (subjectId, card, operationId) => {
-        const current = await readFeedbackExtensionConfig(dataDir);
-        if (!current.presentations[appId]) throw new Error('feedback_presentation_disabled');
+      send: async (subjectId, card, operationId, chatId, round) => {
+        const beforeWrite = async () => {
+          const current = await readFeedbackExtensionConfig(dataDir);
+          const bot = getBot(appId).config;
+          const presentation = current.presentations[appId] ?? bot.feedbackPresentation;
+          if (!presentation || !resolveFeedbackPresentation(presentation, { botAppId: appId, chatId, sourceMessageId: subjectId, round }).matched
+            || !resolveFeedbackPolicyForDelivery({ dataDir, larkAppId: appId, chatId, bot })) throw new Error('feedback_presentation_disabled');
+        };
         const release = acquireFeedbackSendLease(dataDir);
-        try { return await replyMessage(appId, subjectId, JSON.stringify(card), 'interactive', true, operationId); }
+        try { return await sendFeedbackSurface(appId, { subjectId, card, operationId, chatId, beforeWrite }); }
         finally { release(); }
       },
       answerUrl: async (messageId, chatId) => {
@@ -54,11 +87,23 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
     });
     for (const dirty of extensions.dirtySurfaces(appId)) {
       const binding = extensions.surface(appId, dirty.messageId);
-      if (!binding) continue;
+      if (!binding) {
+        const original = await source.findDeliveryByPlatformMessage('lark', appId, dirty.messageId);
+        if (!original?.policy) continue;
+        try {
+          const detail = await getMessageDetail(appId, dirty.messageId);
+          const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
+          if (typeof content !== 'string') continue;
+          const card = renderFeedbackCard(JSON.parse(content), original.policy, dirty.state);
+          await updateMessage(appId, dirty.messageId, JSON.stringify(card));
+          extensions.clearDirtySurface(appId, dirty.messageId, dirty.revision);
+        } catch {}
+        continue;
+      }
       const delivery = await source.findDeliveryById(String(binding.deliveryId));
       if (!delivery?.policy) continue;
       try {
-        await updateMessage(appId, dirty.messageId, JSON.stringify(renderFeedbackCard(binding.card as Record<string, unknown>, delivery.policy, dirty.state)));
+        await updateMessage(appId, dirty.messageId, JSON.stringify(renderFeedbackSurfaceState(binding, delivery.policy, dirty.state)));
         extensions.clearDirtySurface(appId, dirty.messageId, dirty.revision);
       } catch {}
     }
@@ -69,7 +114,9 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
     if (!job) return;
     const hookId = job.payload.hookId;
     const hook = currentConfig.hooks.find(item => item.id === hookId);
-    if (!hook || job.payload.hookVersion !== hook.version || !hook.enabled) {
+    const event = job.payload.event as HookEvent;
+    if (!hook || job.payload.hookVersion !== hook.version || !hook.enabled
+      || !pendingFeedbackHookAuthorized(currentConfig, hook.id, event as Parameters<typeof pendingFeedbackHookAuthorized>[2])) {
       extensions.settle(job.id, job.token!, 'blocked', { reason: 'hook_disabled_or_changed' });
       return;
     }
@@ -94,7 +141,7 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
 }
 
 export async function handleFeedbackExtensionCard(input: unknown, appId: string, dataDir: string): Promise<any | undefined> {
-  if (!configured(dataDir)) return undefined;
+  if (!configured(dataDir) && !existsSync(join(dataDir, 'feedback-extensions.sqlite'))) return undefined;
   const data = normalizeCardActionData(input);
   const messageId = data.context?.open_message_id;
   if (!messageId) return undefined;
@@ -106,7 +153,7 @@ export async function handleFeedbackExtensionCard(input: unknown, appId: string,
     if (data.action?.value?.action !== 'feedback_custom_action') {
       return handleSkillFeedbackCardAction(input, appId, { store: surfaceFeedbackStore(source, {
         appId, surfaceMessageId: messageId, answerMessageId: String(binding.answerMessageId), card: binding.card as Record<string, unknown>,
-      }) });
+      }), renderCard: (policy, state) => renderFeedbackSurfaceState(binding, policy, state) });
     }
     const identity = await resolveCardOperatorUnionId(data, appId);
     const delivery = await source.findDeliveryByPlatformMessage('lark', appId, String(binding.answerMessageId));

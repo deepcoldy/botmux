@@ -6,6 +6,16 @@ import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src
 import { defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 
 describe('feedback extension configuration', () => {
+  it('does not replace the saved configuration with a template that cannot fit in a card', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'feedback-config-'));
+    try {
+      const initial = await readFeedbackExtensionConfig(directory);
+      const template = defaultFeedbackTemplate();
+      for (let index = 0; index < 8; index++) template.elements.push({ tag: 'markdown', content: 'a'.repeat(4000) });
+      await expect(saveFeedbackExtensionConfig(directory, initial.version, { ...initial, templates: [template] }, 'admin')).rejects.toThrow();
+      expect(await readFeedbackExtensionConfig(directory)).toEqual(initial);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it('preserves optimistic versions and leaves valid configuration intact after a rejected save', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'feedback-config-'));
     try {

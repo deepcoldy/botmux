@@ -1,4 +1,19 @@
 import type { CompatibleFeedbackStore } from './feedback-storage-types.js';
+import type { FeedbackPolicy } from './feedback-policy.js';
+import { buildFeedbackSurface, type FeedbackTemplate } from './feedback-template.js';
+import { renderFeedbackCard, type FeedbackCardState } from '../im/lark/skill-feedback-card.js';
+
+export function renderFeedbackSurfaceState(binding: Record<string, unknown>, policy: FeedbackPolicy, state: FeedbackCardState): Record<string, unknown> {
+  if (binding.template && typeof binding.answerUrl === 'string') {
+    return buildFeedbackSurface({
+      template: binding.template as FeedbackTemplate, policy, round: Number(binding.round),
+      answerUrl: binding.answerUrl, preview: false, state,
+      actions: binding.actions as Array<{ id: string; label: string }> | undefined,
+      status: typeof binding.actionStatus === 'string' ? binding.actionStatus : undefined,
+    });
+  }
+  return renderFeedbackCard(binding.card as Record<string, unknown>, policy, state);
+}
 
 export function surfaceFeedbackStore(store: CompatibleFeedbackStore, binding: {
   appId: string; surfaceMessageId: string; answerMessageId: string; card: Record<string, unknown>;

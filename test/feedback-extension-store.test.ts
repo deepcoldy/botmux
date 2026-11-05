@@ -5,6 +5,54 @@ import { describe, expect, it } from 'vitest';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 
 describe('feedback extension durability', () => {
+  it('records a verified unknown surface receipt without sending another card', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-surface-reconcile-'));
+    const store = await FeedbackExtensionStore.open(directory);
+    try {
+      store.ingest('source', 0, [{ sequence: 1, eventId: 'event', jobs: [{ id: 'job', kind: 'surface',
+        payload: { appId: 'app', subjectId: 'question', deliveryId: 'answer', answerMessageId: 'message', mode: 'separate' } }] }]);
+      store.claim('surface', 100, 100);
+      store.expire(201);
+      expect(store.reconcileSurfaceReceipt('job', 'surface', 'admin', 'verified provider receipt')).toBe(true);
+      expect(store.surface('app', 'surface')).toMatchObject({ subjectId: 'question', deliveryId: 'answer' });
+      expect(store.job('job')).toMatchObject({ status: 'succeeded', result: { messageId: 'surface' } });
+      expect(store.claim('surface', 300, 100)).toBeUndefined();
+      expect(store.reconcileSurfaceReceipt('job', 'other', 'admin', 'different')).toBe(false);
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('retains feedback state while action status advances and marks the surface dirty', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-action-display-'));
+    const store = await FeedbackExtensionStore.open(directory);
+    try {
+      store.bindSurface('app', 'surface', { deliveryId: 'delivery', subjectId: 'question' });
+      store.dirtySurface('app', 'surface', { feedbackId: 'feedback', result: 'positive' });
+      store.requestAction({ requestId: 'request', actor: 'user', job: { id: 'job', kind: 'hook',
+        payload: { appId: 'app', event: { scope: { subjectId: 'question' }, surface: { messageId: 'surface' } } } } });
+      const claim = store.claim('hook', 100, 1000)!;
+      store.settle('job', claim.token!, 'succeeded', { publicMessage: 'Sent; awaiting acceptance' }, 200);
+      expect(store.surface('app', 'surface')).toMatchObject({ feedbackState: { result: 'positive' }, actionStatus: 'Sent; awaiting acceptance' });
+      const dirty = store.dirtySurfaces('app')[0];
+      expect(dirty.state).toMatchObject({ result: 'positive' });
+      store.clearDirtySurface('app', dirty.messageId, dirty.revision);
+      expect(store.surface('app', 'surface')).toMatchObject({ feedbackState: { result: 'positive' } });
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('commits surface receipt and pending inline cleanup together, refusing expired ownership', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-receipt-'));
+    const store = await FeedbackExtensionStore.open(directory);
+    try {
+      store.ingest('source', 0, [{ sequence: 1, eventId: 'event', jobs: [{ id: 'surface-job', kind: 'surface',
+        payload: { appId: 'app', answerMessageId: 'answer', mode: 'separate' } }] }]);
+      const claim = store.claim('surface', 100, 1000)!;
+      expect(store.completeSurface(claim.id, claim.token!, 'surface', 1101)).toBe(false);
+      expect(store.surface('app', 'surface')).toBeUndefined();
+      expect(store.completeSurface(claim.id, claim.token!, 'surface', 200)).toBe(true);
+      expect(store.job(claim.id)?.status).toBe('succeeded');
+      expect(store.inlineCleanups('app')).toEqual(['answer']);
+      store.clearInlineCleanup('app', 'answer');
+      expect(store.inlineCleanups('app')).toEqual([]);
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('pins subject metadata to the exact bot session and turn', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-'));
     const store = await FeedbackExtensionStore.open(directory);
