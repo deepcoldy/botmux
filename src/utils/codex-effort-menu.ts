@@ -1,5 +1,6 @@
 import type { CodexDrainResult } from '../services/codex-transcript.js';
 import type { CodexAppEffortResult } from '../types.js';
+import { detectCodexChoiceModal } from './codex-choice-modal.js';
 type CodexThreadSettings = NonNullable<CodexDrainResult['latestThreadSettings']>;
 
 type Menu = { kind: 'model' | 'effort' | 'advanced'; rows: Array<{ label: string; selected: boolean }> };
@@ -71,7 +72,23 @@ export function hasEmptyCodexComposer(screen: string): boolean {
 
 export interface CodexEffortMenuIO {
   screen(): Promise<string>;
+  /**
+   * Type the literal `/model` line WITHOUT submitting it. The batch is
+   * deliberately split: the submitting Enter is issued by the controller only
+   * after `submitGuard()` has re-read the screen. A TUI confirmation popup that
+   * appears between the text and the Enter would otherwise receive that Enter
+   * and activate its highlighted row (`› 1. Yes, continue anyway`).
+   */
   command(): Promise<void>;
+  /**
+   * Pre-submit re-check, awaited after `command()` typed the text and before
+   * the Enter that submits it. It must re-read the CURRENT screen (draining any
+   * pending render first) and return false when a selection surface owns the
+   * keyboard. Returning false aborts without pressing Enter; the caller's
+   * caller keeps queued input held until the composer is provably clear.
+   * Absent = the backend cannot render such a popup.
+   */
+  submitGuard?(): Promise<boolean>;
   key(key: 'Up' | 'Down' | 'Enter' | 'Escape' | 's'): void;
   /** Only settings appended AFTER this operation started, from its exact rollout. */
   settings(): CodexThreadSettings | undefined;
@@ -79,7 +96,7 @@ export interface CodexEffortMenuIO {
   signal: AbortSignal;
   deadline: number;
   /** Fixed reason codes only: never include composer text or a raw screen. */
-  unavailable?(reason: 'inactive' | 'composer_not_empty' | 'menu_already_open' | 'session_selection_unavailable'): void;
+  unavailable?(reason: 'inactive' | 'composer_not_empty' | 'menu_already_open' | 'modal_surface' | 'session_selection_unavailable'): void;
   now?: () => number;
   delay?: (ms: number) => Promise<void>;
 }
@@ -106,13 +123,23 @@ export async function applyCodexEffortMenu(
     const initial = await io.screen();
     const unavailable = !alive() ? 'inactive'
       : parseCodexEffortMenu(initial) ? 'menu_already_open'
-        : !hasEmptyCodexComposer(initial) ? 'composer_not_empty' : undefined;
+        : detectCodexChoiceModal(initial) ? 'modal_surface'
+          : !hasEmptyCodexComposer(initial) ? 'composer_not_empty' : undefined;
     if (unavailable) {
       io.unavailable?.(unavailable);
       return { status: 'unavailable', reason: 'cli_menu_unavailable' };
     }
     await io.command();
     opened = true;
+    // A confirmation popup can paint between the typed text and this Enter.
+    // Only ask for the re-check when the caller provided one: its absence
+    // means the backend cannot show such a popup, not that the screen is clear.
+    if (io.submitGuard && !await io.submitGuard()) {
+      io.unavailable?.('modal_surface');
+      return { status: 'unavailable', reason: 'cli_menu_unavailable' };
+    }
+    if (!alive()) return { status: 'error' };
+    io.key('Enter');
     while (alive()) {
       const settings = io.settings();
       const screen = await io.screen();

@@ -165,3 +165,67 @@ describe('P2-3: runnerGenerationUnsafe survives the ambiguous-submission WAL rew
     expect(writeInput).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('sendRawCommandLine — submit:false routes to the typing-only writer', () => {
+  it('types without submitting when the caller keeps the Enter', async () => {
+    // The Codex effort controller passes `{ submit: false }` and presses Enter
+    // itself after re-checking the screen. If this option were ignored the
+    // /model line would be submitted before that re-check ever ran.
+    const typed = vi.fn(async () => true);
+    const submitted = vi.fn(async () => true);
+    const scope: Record<string, unknown> = {
+      cliAdapter: { writeInput: vi.fn() },
+      SubmissionWriteError,
+      writeRawCommandLine: submitted,
+      typeRawCommandLine: typed,
+      rawCommandWriteOptionsFor: vi.fn(() => ({ submitBeatMs: 200 })),
+      lastInitConfig: { cliId: 'codex' },
+      isWorkflowWorker: vi.fn(() => false),
+      send: vi.fn(),
+      log: vi.fn(),
+    };
+    const sendRaw = loadWorkerFunction<(be: unknown, c: string, o?: unknown) => Promise<void>>(
+      'sendRawCommandLine', scope,
+    );
+    const backend = { id: 'pane' };
+
+    await sendRaw(backend, '/model', { submit: false });
+    expect(typed).toHaveBeenCalledWith(backend, '/model', expect.anything());
+    expect(submitted).not.toHaveBeenCalled();
+
+    await sendRaw(backend, '/model');
+    expect(submitted).toHaveBeenCalledWith(backend, '/model', expect.anything());
+  });
+});
+
+describe('typeCodexEffortModelCommand — types /model without submitting', () => {
+  it('never presses the submitting Enter, so the controller owns it', async () => {
+    // `{ submit: false }` is what makes the pre-Enter modal re-check meaningful.
+    // Pinned on the named helper so dropping the flag at the call site fails here.
+    const typed = vi.fn(async () => true);
+    const submitted = vi.fn(async () => true);
+    const scope: Record<string, unknown> = {
+      cliAdapter: { writeInput: vi.fn() },
+      SubmissionWriteError,
+      writeRawCommandLine: submitted,
+      typeRawCommandLine: typed,
+      rawCommandWriteOptionsFor: vi.fn(() => ({ submitBeatMs: 200 })),
+      lastInitConfig: { cliId: 'codex' },
+      isWorkflowWorker: vi.fn(() => false),
+      send: vi.fn(),
+      log: vi.fn(),
+    };
+    // The helper calls sendRawCommandLine, so provide the REAL one from the
+    // same scope shape (it is what routes on `submit: false`).
+    scope.sendRawCommandLine = loadWorkerFunction<(be: unknown, c: string, o?: unknown) => Promise<void>>(
+      'sendRawCommandLine', scope,
+    );
+    const command = loadWorkerFunction<(be: unknown) => Promise<void>>(
+      'typeCodexEffortModelCommand', scope,
+    );
+    const backend = { id: 'pane' };
+    await command(backend);
+    expect(typed).toHaveBeenCalledWith(backend, '/model', expect.anything());
+    expect(submitted).not.toHaveBeenCalled();
+  });
+});
