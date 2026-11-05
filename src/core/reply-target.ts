@@ -398,9 +398,17 @@ export function setFinalOutputOriginRecorder(recorder: typeof finalOutputOriginR
   finalOutputOriginRecorder = recorder;
 }
 
-/** Copy only the exact prior turn's destination, never its execution identity. */
-export function inheritTurnReplyRouting(ds: DaemonSession, sourceTurnId: string | undefined, turnId: string): void {
-  if (!sourceTurnId) return;
+/** Copy only the exact prior turn's destination, never its execution identity.
+ * The returned rollback must run synchronously on dispatch refusal, before any
+ * await. Restore evicted entries too; deleting only the new turn loses history.
+ * The caller must persist the restored row because fork may have written it. */
+export function inheritTurnReplyRouting(ds: DaemonSession, sourceTurnId: string | undefined, turnId: string): () => void {
+  if (!sourceTurnId) return () => {};
+  const previous = structuredClone({
+    turnReplyContexts: ds.session.turnReplyContexts,
+    replyTargets: ds.session.replyTargets,
+    replyTargetsPrunedThrough: ds.session.replyTargetsPrunedThrough,
+  });
   const prior = pickTurnReplyTarget(ds.session, sourceTurnId);
   const context = frozenReplyContextForTurn(ds, sourceTurnId);
   ds.session.turnReplyContexts = { ...ds.session.turnReplyContexts,
@@ -419,6 +427,7 @@ export function inheritTurnReplyRouting(ds: DaemonSession, sourceTurnId: string 
   ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets,
     ds.session.replyTargetsPrunedThrough, cronPinnedTurnIds(ds.session.cronTaskReplyAnchors));
   ds.session.replyTargets = targets;
+  return () => { Object.assign(ds.session, previous); };
 }
 
 export function beginReplyTargetTurn(

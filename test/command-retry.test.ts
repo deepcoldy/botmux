@@ -129,7 +129,7 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 // created with vi.hoisted to be referenceable inside the factories.
 const { sendWorkerInput, forkWorker, rememberLastCliInput } = vi.hoisted(() => ({
   sendWorkerInput: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
-  forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
+  forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any, options?: any) => boolean>(),
   rememberLastCliInput: vi.fn<(ds: any, userPrompt: string, cliInput: any, opts?: any) => void>(),
 }));
 
@@ -373,6 +373,7 @@ function aliveWorker(): { killed: boolean } {
 beforeEach(() => {
   vi.clearAllMocks();
   sendWorkerInput.mockReturnValue(true);
+  forkWorker.mockImplementation((_ds, _input, _resume, options) => { options?.onAdmission?.('accepted'); return true; });
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -512,5 +513,43 @@ describe('/retry command', () => {
     await handleCommand('/help', ROOT_ID, makeLarkMessage('/help'), deps, LARK_APP_ID);
     const helpText = deps.sessionReply.mock.calls[0][1] as string;
     expect(helpText).toContain('/retry');
+  });
+});
+
+
+describe('/retry rejected admission routing transaction', () => {
+  it.each(['ipc', 'false', 'handled-rejected', 'partial-write-throw'] as const)(
+    'restores full indexes and persists rollback after repeated %s', async mode => {
+      const { fillRetryRouting, routingSnapshot } = await import('./helpers/retry-routing.js');
+      const ds = makeDaemonSession({ worker: mode === 'ipc' ? aliveWorker() as any : null,
+        session: makeSession({ lastFailedTurn: makeFailedTurn() }) });
+      const before = fillRetryRouting(ds, ds.session.lastFailedTurn!.turnId);
+      let persisted: unknown;
+      vi.mocked(sessionStore.updateSession).mockImplementation(row => {
+        persisted = structuredClone(row);
+        Object.assign(row, structuredClone(row));
+      });
+      sendWorkerInput.mockReturnValue(false);
+      forkWorker.mockImplementation((target, _input, _resume, opts) => {
+        sessionStore.updateSession(target.session);
+        if (mode === 'partial-write-throw') throw new Error('spawn failed');
+        opts.onAdmission('rejected');
+        return mode === 'handled-rejected';
+      });
+      for (let i = 0; i < 3; i++) {
+        await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
+        expect(routingSnapshot(ds)).toEqual(before);
+        expect(persisted).toMatchObject(before);
+        expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+        expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined();
+        expect(rememberLastCliInput).not.toHaveBeenCalled();
+      }
+    });
+  it('keeps an already queued deferred input and starts its cooldown', async () => {
+    const ds = makeDaemonSession({ session: makeSession({ lastFailedTurn: makeFailedTurn() }) });
+    forkWorker.mockImplementation((_ds, _input, _resume, opts) => { opts.onAdmission('deferred'); return true; });
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+    expect(rememberLastCliInput).toHaveBeenCalledTimes(1);
   });
 });

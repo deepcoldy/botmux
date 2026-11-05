@@ -1,3 +1,4 @@
+import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
@@ -2366,16 +2367,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     let accepted = false;
     try {
       if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
-      // Cold session: fork a worker with the transcript as its opening input,
-      // matching how retry_last_task revives a dead worker. `forkWorker` throws
-      // on refusal rather than returning a flag, so acceptance is claimed only
-      // after it returns — the earlier `accepted = true` before the call would
-      // have reported success for a fork that never happened, with the
-      // one-shot follow-up token already consumed and no retry affordance.
-      else {
-        forkWorker(ds, cliInput, ds.hasHistory);
-        accepted = true;
-      }
+      else accepted = forkManualTurn(ds, cliInput, turnId);
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -3846,13 +3838,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return;
       }
       const retryTurnId = `retry-${randomUUID()}`;
-      inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
       let accepted = false;
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, { resume: ds.hasHistory, turnId: retryTurnId });
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId);
         }
       } catch (err) {
         logger.warn(
@@ -3861,6 +3852,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
@@ -4011,13 +4004,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
       const retryTurnId = `retry-${randomUUID()}`;
-      inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, { resume: ds.hasHistory, turnId: retryTurnId });
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId);
         }
       } catch (err) {
         logger.warn(
@@ -4026,6 +4018,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       // Start the cooldown only after acceptance: a rejected click must not

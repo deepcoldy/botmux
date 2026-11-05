@@ -1,3 +1,4 @@
+import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
@@ -3737,19 +3738,20 @@ export async function handleCommand(
           ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
         };
         const retryTurnId = `retry-${randomUUID()}`;
-        inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
+        const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
         let accepted = false;
         try {
           if (ds.worker && !ds.worker.killed) {
             accepted = sendWorkerInput(ds, retryInput, retryTurnId);
           } else {
-            forkWorker(ds, retryInput, { resume: ds.hasHistory, turnId: retryTurnId });
-            accepted = true;
+            accepted = forkManualTurn(ds, retryInput, retryTurnId);
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (!accepted) {
+          rollbackReplyRouting();
+          sessionStore.updateSession(ds.session);
           await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
           break;
         }
