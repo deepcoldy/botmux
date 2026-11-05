@@ -37,7 +37,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   const { method, id, params } = message;
   if (method === 'initialize') send({ id, result: { protocolVersion: scenario === 'version' ? 2 : 1,
     ...(scenario === 'native-questionnaire' ? { agentInfo: { name: 'minimax-code' } } : {}),
-    agentCapabilities: { loadSession: true, mcpCapabilities: { http: true, sse: true }, sessionCapabilities: scenario === 'load' ? {} : { resume: {} } } } });
+    agentCapabilities: { loadSession: true, sessionCapabilities: scenario === 'load' ? {} : { resume: {} } } } });
   else if (method === 'session/new') { sessionId = 'session_fixture'; send({ id, result: { sessionId, ...control } }); }
   else if (method === 'session/resume' || method === 'session/load') {
     sessionId = params.sessionId;

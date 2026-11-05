@@ -45,40 +45,25 @@ async function stopped(pid: number) {
   });
 }
 describe('mcode ACP wire client', () => {
-  it.each(['new', 'resume', 'load'] as const)('passes account and project MCP servers through session/%s', async method => {
+  it.each(['new', 'resume', 'load'] as const)('leaves file-backed MCP configuration to mcode during session/%s', async method => {
     const f = fixture();
     mkdirSync(f.options.env.MINIMAX_DATA_DIR!, { recursive: true });
     writeFileSync(join(f.options.env.MINIMAX_DATA_DIR!, 'mcp.json'), JSON.stringify({ mcpServers: {
-      account: { type: 'streamable-http', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer synthetic' } },
+      account: { type: 'http', url: 'https://example.test/mcp' },
     } }));
     writeFileSync(join(f.root, '.mcp.json'), JSON.stringify({ mcpServers: {
-      project: { command: 'node', args: ['server.mjs'], env: { TOKEN: '${MCP_TEST_SECRET}' } },
+      project: { command: 'node', args: ['server.mjs'] },
     } }));
-    f.options.env.MCP_TEST_SECRET = 'synthetic-project-token';
     if (method === 'load') f.options.env.MCODE_ACP_SCENARIO = 'load';
     const result = await runMinimaxAcp({ ...f.options,
       ...(method === 'new' ? {} : { nativeSessionId: 'native-existing' }),
     }, bounded());
     const attach = f.calls().find(c => c.message?.method === `session/${method}`);
-    expect(attach.message.params.mcpServers).toEqual([
-      { name: 'account', type: 'http', url: 'https://example.test/mcp', headers: [{ name: 'Authorization', value: 'Bearer synthetic' }] },
-      { name: 'project', command: 'node', args: ['server.mjs'], env: [{ name: 'TOKEN', value: 'synthetic-project-token' }] },
-    ]);
+    // ACP session entries shadow native entries by name. An empty overlay
+    // preserves mcode's project context, auth and live configuration handling.
+    expect(attach.message.params.mcpServers).toEqual([]);
     expect(result.sessionId).toBe(method === 'new' ? 'session_fixture' : 'native-existing');
     expect(f.calls().filter(c => c.message?.method === 'session/new')).toHaveLength(method === 'new' ? 1 : 0);
-  });
-
-  it('reloads edited MCP configuration when attaching to the same exact native session', async () => {
-    const f = fixture();
-    const config = join(f.root, '.mcp.json');
-    writeFileSync(config, JSON.stringify({ mcpServers: { before: { command: 'before' } } }));
-    const first = await runMinimaxAcp(f.options, bounded());
-    writeFileSync(config, JSON.stringify({ mcpServers: { after: { command: 'after' } } }));
-    const resumed = await runMinimaxAcp({ ...f.options, nativeSessionId: first.sessionId }, bounded());
-    expect(resumed.sessionId).toBe(first.sessionId);
-    const calls = f.calls().filter(c => ['session/new', 'session/resume'].includes(c.message?.method));
-    expect(calls.map(c => c.message.params.mcpServers.map((server: { name: string }) => server.name)))
-      .toEqual([['before'], ['after']]);
   });
 
   it('accepts eight simultaneous permission requests and returns each exact response', async () => {
@@ -232,7 +217,6 @@ describe('mcode ACP wire client', () => {
     expect(session).toHaveBeenCalledWith('session_fixture');
     const calls = f.calls();
     expect(calls[0]).toMatchObject({ args: ['acp'], owner: 'ou_owner', legacyOwner: 'ou_owner' });
-    expect(calls.find(c => c.message?.method === 'session/new').message.params.mcpServers).toEqual([]);
     expect(calls[1].message.params.clientCapabilities).toEqual({ elicitation: { form: {} } });
     expect(calls.filter(c => c.message?.method === 'session/set_config_option').map(c => c.message.params))
       .toEqual([expect.objectContaining({ configId: 'permissionMode', value: 'bypassPermissions' }),

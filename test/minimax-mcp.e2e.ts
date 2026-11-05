@@ -1,7 +1,7 @@
 import { afterEach, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runMinimaxAcp } from '../src/services/minimax-acp.js';
@@ -93,6 +93,7 @@ it.skipIf(!executable).each([
   }));
   const env = { ...process.env, HOME: home, MINIMAX_DATA_DIR: dataDir, MAVIS_DATA_DIR: dataDir,
     MCODE_PROVIDER_API_KEY: 'synthetic-model-only', BOTMUX_OWNER_OPEN_ID: 'ou_local_mcp_fixture',
+    MCP_PROJECT_TOKEN: 'synthetic-mcp-only', MCP_PROJECT_CWD: cwd,
     NO_PROXY: `${process.env.NO_PROXY ?? ''},127.0.0.1,localhost`,
     no_proxy: `${process.env.no_proxy ?? ''},127.0.0.1,localhost` };
   await collectNativePrint(executable!, ['provider', 'add', '--name', 'Fixture', '--base-url', `${modelUrl}/v1`,
@@ -101,11 +102,15 @@ it.skipIf(!executable).each([
   // deliberately empty project cwd instead of this repository's dependencies.
   const node = resolveNodeExecutable();
   if (!node) throw new Error('node is required for the stdio MCP fixture');
+  const stdioFixture = resolve('test/fixtures/minimax-mcp-server.mjs');
+  if (source === 'project' && transport === 'stdio') copyFileSync(stdioFixture, join(cwd, 'mcp-server.mjs'));
   writeFileSync(source === 'project' ? join(cwd, '.mcp.json') : join(dataDir, 'mcp.json'), JSON.stringify({ mcpServers: { proofsrv: transport === 'http'
     ? { type: 'http', url: mcpUrl, headers: { Authorization: 'Bearer synthetic-mcp-only' },
       ...(source === 'native-options' ? { timeout: 5000 } : {}) }
-    : { command: node, args: [resolve('test/fixtures/minimax-mcp-server.mjs'), calls, marker],
-      env: { MCP_FIXTURE_TOKEN: 'synthetic-mcp-only' } } } }));
+    : { command: node, args: [source === 'project' ? 'mcp-server.mjs' : stdioFixture, calls, marker],
+      env: source === 'project'
+        ? { MCP_FIXTURE_TOKEN: '${MCP_PROJECT_TOKEN}', MCP_FIXTURE_CWD: '${MCP_PROJECT_CWD}' }
+        : { MCP_FIXTURE_TOKEN: 'synthetic-mcp-only' } } } }));
   const invoke = (nativeSessionId?: string) => runMinimaxAcp({ executable: executable!, cwd, env,
     content: 'Call the proof MCP tool and return its marker.', permission: 'full', nativeSessionId,
     onUserInput: async () => { throw new Error('Unexpected permission request for a read-only fixture'); },

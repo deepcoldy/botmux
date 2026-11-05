@@ -12,6 +12,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } }] };
   else if (request.method === 'tools/call') {
     if (process.env.MCP_FIXTURE_TOKEN !== 'synthetic-mcp-only') process.exit(3);
+    if (process.env.MCP_FIXTURE_CWD && process.cwd() !== process.env.MCP_FIXTURE_CWD) process.exit(4);
     appendFileSync(calls, JSON.stringify(request.params) + '\n');
     result = { content: [{ type: 'text', text: marker }] };
   } else if (request.method === 'ping') result = {};
