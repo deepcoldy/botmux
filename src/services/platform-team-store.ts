@@ -164,8 +164,12 @@ export function isPlatformHallChat(dataDir: string, chatId: string | undefined):
   return false;
 }
 
-/** Is `unionId` a bot in ANY platform team this machine belongs to? The auth
- *  gate's platform-mode predicate — membership-driven, no expiry. */
+/** Is `unionId` a bot in ANY platform team this machine belongs to?
+ *
+ *  Identity evidence only ("this union_id is a botmux bot"), NOT authorization:
+ *  the roster is per MACHINE (every team the machine's owner is in), so a hit
+ *  says nothing about whether the RECEIVING bot shares a team with the sender.
+ *  Auth gates must use {@link isPlatformTeamBotTrustedBy}. */
 export function isPlatformTeamBot(dataDir: string, unionId: string | undefined): boolean {
   const id = (unionId ?? '').trim();
   if (!id) return false;
@@ -175,6 +179,44 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
     for (const b of t.bots) if (b.unionId === id) return true;
   }
   return false;
+}
+
+/**
+ * Should the RECEIVING bot `receiverAppId` trust the platform-roster bot
+ * `unionId` (talk + operate, no /grant)? The auth gates' platform-mode
+ * predicate. Two ways in, both anchored on a roster entry whose union_id the
+ * caller has locked to a Feishu-stamped bot sender:
+ *
+ *  1. SAME TEAM — some team lists both the sender and the receiver in `bots`
+ *     (same anchor as {@link isPlatformTeamMember} for people).
+ *  2. SAME MACHINE — the sender's roster `appId` is configured on this machine
+ *     (`isLocalApp`, i.e. in this deployment's bots.json), whatever its team.
+ *     Bots one owner runs side by side keep collaborating grant-free.
+ *
+ * What it no longer accepts: a bot on ANOTHER machine whose only link is that
+ * this machine's owner is also in the sender's team. The roster is pushed per
+ * machine with every team the owner belongs to, so "in any team on this
+ * machine" let a remote bot from team A drive a bot that only belongs to team B.
+ */
+export function isPlatformTeamBotTrustedBy(
+  dataDir: string,
+  receiverAppId: string | undefined,
+  unionId: string | undefined,
+  isLocalApp: (appId: string) => boolean,
+): boolean {
+  const id = (unionId ?? '').trim();
+  const receiver = (receiverAppId ?? '').trim();
+  if (!id) return false;
+  const data = readFile(dataDir);
+  if (!data) return false;
+  let senderAppIds: string[] | undefined;
+  for (const t of data.teams) {
+    const sender = t.bots.find((b) => b.unionId === id);
+    if (!sender) continue;
+    if (receiver && t.bots.some((b) => b.appId === receiver)) return true;
+    (senderAppIds ??= []).push(sender.appId);
+  }
+  return !!senderAppIds && senderAppIds.some((appId) => isLocalApp(appId));
 }
 
 /** Is `unionId` a HUMAN member of a platform team that THIS bot (`botAppId`)

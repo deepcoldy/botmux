@@ -4,10 +4,10 @@
  * parity with legacy federation team trust — 双模式都免 /grant.
  * Run: pnpm vitest run test/platform-team-trust.test.ts
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
@@ -16,16 +16,29 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { config } from '../src/config.js';
 import { registerBot } from '../src/bot-registry.js';
-import { canOperate, evaluateTalk, isTrustedTeamBotSender } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, evaluateBotTalk, evaluateTalk, isTrustedTeamBotSender } from '../src/im/lark/event-dispatcher.js';
 import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 
 let dataDir: string;
+const prevBotsConfig = process.env.BOTS_CONFIG;
+/** 本机 bots.json（同机判定的来源）。默认只有本 bot pf1。 */
+function writeLocalBots(appIds: string[]): void {
+  writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify(
+    appIds.map(larkAppId => ({ larkAppId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] })),
+  ), 'utf-8');
+}
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-pftrust-'));
   config.session.dataDir = dataDir;
+  process.env.BOTS_CONFIG = join(dataDir, 'bots.json');
+  writeLocalBots(['pf1']);
   const bot = registerBot({ larkAppId: 'pf1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] });
   bot.resolvedAllowedUsers = ['ou_owner'];
+});
+afterEach(() => {
+  if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+  else process.env.BOTS_CONFIG = prevBotsConfig;
 });
 
 function seedPlatformTeam(): void {
@@ -44,14 +57,14 @@ function seedPlatformTeam(): void {
 describe('isTrustedTeamBotSender (platform mode)', () => {
   it('trusts a platform roster bot by union_id in ANY chat', () => {
     seedPlatformTeam();
-    expect(isTrustedTeamBotSender(dataDir, 'oc_random', 'on_peer')).toBe(true);
-    expect(isTrustedTeamBotSender(dataDir, 'oc_random', 'on_stranger')).toBe(false);
+    expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_random', 'on_peer')).toBe(true);
+    expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_random', 'on_stranger')).toBe(false);
   });
 
   it('trusts first contact inside the mirrored 大厅/团队群', () => {
     seedPlatformTeam();
     // union_id not in roster yet (fresh bot, not yet echoed) but the hall is trusted
-    expect(isTrustedTeamBotSender(dataDir, 'oc_hall', 'on_fresh')).toBe(true);
+    expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_hall', 'on_fresh')).toBe(true);
   });
 });
 
@@ -112,5 +125,61 @@ describe('evaluateTalk teamMember leg (human 免grant, talk-only, team-co-member
     // 第 4 参是 bot-locked：喂成员 union 进去不应命中 teamBot（它不在 bots roster）
     const ev = evaluateTalk('pf1', 'oc_random', 'ou_tp', 'on_teammate');
     expect(ev.allowed).toBe(false);
+  });
+});
+
+// 平台 roster 是按机器下发的（owner 所在的全部团队）。本机 owner 同时在 T1、T2：
+// pf1 只在 T1；cli_remote 只在 T2、跑在别的机器上；cli_local 只在 T2、但配置在本机。
+// 以前「本机任一团队里有它」就放行 → 别的机器上 T2 的 bot 能驱动只在 T1 的 pf1。
+describe('platform roster trust is scoped to the RECEIVING bot (same team or same machine)', () => {
+  function seedTwoTeams(): void {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r2',
+      teams: [
+        { teamId: 't1', teamName: 'T1', groupChatIds: ['oc_t1_hall'], bots: [{ appId: 'pf1', unionId: 'on_pf1' }, { appId: 'cli_peer', unionId: 'on_peer' }], memberUnionIds: [] },
+        { teamId: 't2', teamName: 'T2', groupChatIds: ['oc_t2_hall'], bots: [{ appId: 'cli_remote', unionId: 'on_remote' }, { appId: 'cli_local', unionId: 'on_local' }], memberUnionIds: [] },
+      ],
+    });
+  }
+
+  it('a remote bot from a team the receiver is NOT in gets neither talk nor operate', () => {
+    seedTwoTeams();
+    expect(evaluateTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
+    expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_public', 'on_remote')).toBe(false);
+    expect(canOperate('pf1', 'oc_public', 'ou_remote', 'on_remote')).toBe(false);
+  });
+
+  it('a remote bot on the SAME team as the receiver keeps talk + operate', () => {
+    seedTwoTeams();
+    const ev = evaluateBotTalk('pf1', 'oc_public', 'ou_peer', 'on_peer');
+    expect(ev).toMatchObject({ allowed: true, reason: 'teamBot' });
+    expect(canOperate('pf1', 'oc_public', 'ou_peer', 'on_peer')).toBe(true);
+  });
+
+  it('a bot configured on THIS machine stays trusted even from another team', () => {
+    seedTwoTeams();
+    writeLocalBots(['pf1', 'cli_local']);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_local', 'on_local')).toMatchObject({ allowed: true, reason: 'teamBot' });
+    expect(canOperate('pf1', 'oc_public', 'ou_local', 'on_local')).toBe(true);
+    // 同机放行只看发送方自己的 appId：别的机器上的 T2 队友不沾光
+    expect(canOperate('pf1', 'oc_public', 'ou_remote', 'on_remote')).toBe(false);
+  });
+
+  it('an unreadable bots.json fails closed for the same-machine leg only', () => {
+    seedTwoTeams();
+    writeFileSync(process.env.BOTS_CONFIG!, '{ not json', 'utf-8');
+    expect(canOperate('pf1', 'oc_public', 'ou_local', 'on_local')).toBe(false);
+    expect(canOperate('pf1', 'oc_public', 'ou_peer', 'on_peer')).toBe(true);
+  });
+
+  it('the receiving bot need not be on any team to trust a same-machine roster bot', () => {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r3',
+      teams: [{ teamId: 't2', teamName: 'T2', groupChatIds: [], bots: [{ appId: 'cli_local', unionId: 'on_local' }, { appId: 'cli_remote', unionId: 'on_remote' }], memberUnionIds: [] }],
+    });
+    writeLocalBots(['pf1', 'cli_local']);
+    expect(evaluateTalk('pf1', 'oc_public', 'ou_local', 'on_local').allowed).toBe(true);
+    expect(evaluateTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
   });
 });

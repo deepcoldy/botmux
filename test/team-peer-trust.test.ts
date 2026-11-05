@@ -33,20 +33,20 @@ describe('isTeamGroupChat', () => {
 describe('isTrustedTeamBotSender (gate predicate)', () => {
   it('trusts a learned teammate union_id in ANY chat (no /grant)', () => {
     recordTeamBot(dataDir, { unionId: 'on_codex', name: 'Codex' });
-    expect(isTrustedTeamBotSender(dataDir, 'oc_random', 'on_codex')).toBe(true);
+    expect(isTrustedTeamBotSender(dataDir, 'cli_recv', 'oc_random', 'on_codex')).toBe(true);
     // a stranger bot (unknown union_id) in a non-team chat is NOT trusted
-    expect(isTrustedTeamBotSender(dataDir, 'oc_random', 'on_stranger')).toBe(false);
+    expect(isTrustedTeamBotSender(dataDir, 'cli_recv', 'oc_random', 'on_stranger')).toBe(false);
   });
 
   it('trusts any bot inside a team-assembled group even on first contact', () => {
     recordTeamGroup(dataDir, 'team1', 'oc_team');
     // union_id not yet learned, but the chat itself is team-controlled
-    expect(isTrustedTeamBotSender(dataDir, 'oc_team', 'on_fresh')).toBe(true);
+    expect(isTrustedTeamBotSender(dataDir, 'cli_recv', 'oc_team', 'on_fresh')).toBe(true);
   });
 
   it('does NOT trust on a spoofable-name basis — only union_id / team group', () => {
     // no team group, union_id unknown → must fall back to /grant
-    expect(isTrustedTeamBotSender(dataDir, 'oc_random', undefined)).toBe(false);
-    expect(isTrustedTeamBotSender(dataDir, 'oc_random', 'on_unknown')).toBe(false);
+    expect(isTrustedTeamBotSender(dataDir, 'cli_recv', 'oc_random', undefined)).toBe(false);
+    expect(isTrustedTeamBotSender(dataDir, 'cli_recv', 'oc_random', 'on_unknown')).toBe(false);
   });
 });
