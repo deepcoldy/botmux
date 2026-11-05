@@ -78,7 +78,7 @@ describe('Codex choice-surface detection (real 0.164 captures)', () => {
     //   › 1. Yes, continue anyway …   /   2. Cancel …
     //   enter select · esc back
     //   › Ask Codex to do anything
-    //   GPT-6.1-Sol xhigh · /tmp/pi2847 · ← for agents
+    //   GPT-6.1-Sol xhigh · /tmp/botmux · ← for agents
     //
     // This is the shape a composer-only check cannot see: the LAST prompt row in
     // the viewport is a genuinely empty composer, so `hasEmptyCodexComposer()`

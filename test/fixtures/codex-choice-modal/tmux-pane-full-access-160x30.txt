@@ -1,13 +1,13 @@
 
   [38;5;75m>_ [1m[39mOpenAI Codex[0;2m[39m[49m (v0.164.0)
-[0m[39m[49m     [2m/tmp/pi2847/proj
+[0m[39m[49m     [2m/tmp/botmux/proj
 
 [0m[39m[49m  [1m[38;5;211mTip:[0m[39m[49m Maximize usage with GPT-6.1 Sol. Try it on complex work for near-Astra performance at a lower cost.
 
                                               [1mEnable full access?[0m[39m[49m
 [1m›[0m[39m[49m [2mAsk Codex to do anything[0m[39m[49m                    When Codex runs with full access, it can edit any file on your
                                               computer and run commands with network, without your approval.
-  [38;5;223mGPT-6.1-Sol xhigh[39m · [38;5;151m/tmp/pi2847/proj[39m · [1m←[0m[39m[49m f  [38;5;1mExercise caution when enabling full access. This significantly[39m
+  [38;5;223mGPT-6.1-Sol xhigh[39m · [38;5;151m/tmp/botmux/proj[39m · [1m←[0m[39m[49m f  [38;5;1mExercise caution when enabling full access. This significantly[39m
                                               [38;5;1mincreases the risk of data loss, leaks, or unexpected behavior.[39m
 
 
