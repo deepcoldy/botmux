@@ -2970,6 +2970,26 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
     });
   });
 
+  it('doubao: GET 缺省 transcript/supported（共享常驻 service 进程下 send 归属不可靠），PUT send 显式落盘可退回', async () => {
+    await withBot('doubao', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' 清 key，回到 doubao 的缺省 transcript（而不是通用缺省 send）。
+      const cleared = await put(base, '');
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+    });
+  });
+
   it('antigravity: 只有零注入转写，PUT transcript 4xx reply_delivery_unsupported 且不落盘，PUT send 落盘', async () => {
     await withBot('antigravity', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();

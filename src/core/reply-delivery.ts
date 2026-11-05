@@ -9,8 +9,9 @@
  *   （bridge fallback 升为主通道）；系统提示不再提及 `botmux send`、不注入每轮
  *   reminder；solo 会话去掉 `<user_message>` 壳与 `<sender/>`。
  *
- * 缺省值统一是 `send`（`defaultReplyDeliveryFor`），与上游一致；bots.json 显式写
- * `transcript` 才切换，写 `send` 亦持久化。所有判定 fail-closed：
+ * 缺省按 CLI 区分（`defaultReplyDeliveryFor`）：doubao 缺省 `transcript`（账号级常驻
+ * service 进程使 `botmux send` 归属不可靠，见该函数注释），其余 CLI 缺省 `send`、与上游
+ * 一致；bots.json 显式写 `transcript` / `send` 都覆盖缺省。所有判定 fail-closed：
  * 拿不准就回到 `send` / 非 solo。
  */
 import { getBot, getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
@@ -28,16 +29,17 @@ export type ReplyDelivery = 'send' | 'transcript';
 export { supportsTranscriptReplyDelivery };
 
 /**
- * 未显式配置时的缺省投递方式：**一律 `send`**，与上游行为逐字节一致——模型仍被
- * 教「botmux send」，最终回复由它自己发。
+ * 未显式配置时的缺省投递方式：除 doubao 外**一律 `send`**，与上游行为逐字节一致——
+ * 模型仍被教「botmux send」，最终回复由它自己发。doubao 是唯一例外（缺省
+ * `transcript`），原因见函数体注释。
  *
- * `transcript` 是 opt-in：它改的不只是投递路径，还会改写系统提示、去掉逐轮
- * `<botmux_reminder>`、并让 solo 会话的信封去壳，且 `/adopt` 不再把这类会话识别
- * 为本 bot 自产。这些都是对既有会话可感知的变化，不该由升级顺带发生，所以交给
- * 使用者在 bots.json 或 dashboard 上显式打开。
+ * `transcript` 在其余 CLI 上仍是 opt-in：它改的不只是投递路径，还会改写系统提示、
+ * 去掉逐轮 `<botmux_reminder>`、并让 solo 会话的信封去壳，且 `/adopt` 不再把这类
+ * 会话识别为本 bot 自产。这些都是对既有会话可感知的变化，不该由升级顺带发生，所以
+ * 交给使用者在 bots.json 或 dashboard 上显式打开。
  *
- * 保留 `cliId` 形参而不直接写死常量：缺省策略的唯一出口就在这里，将来若要为某个
- * CLI 单独换缺省，只改这一个函数即可，不必回头翻所有调用点。
+ * 保留 `cliId` 形参而不直接写死常量：缺省策略的唯一出口就在这里，为某个 CLI 单独换
+ * 缺省只改这一个函数即可，不必回头翻所有调用点。
  */
 export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
   // Doubao 例外，缺省 transcript：它的工具命令由账号级常驻 `doubao --type=service`
