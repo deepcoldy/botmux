@@ -29,8 +29,7 @@ import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.j
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
-import { isTeamGroupChat } from '../../services/team-groups-store.js';
-import { isPlatformTeamBotTrustedBy, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
+import { isPlatformTeamBotTrustedBy, isPlatformHallChat, isPlatformTeamMember, isTeamGroupChatFor, isLegacyTeamGroupChat } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { readBotAdminUnions } from '../../services/bot-admin-unions-store.js';
 import { isStewardSilentJoin } from '../../services/steward-auto-join.js';
@@ -1575,7 +1574,7 @@ export function resolveSiblingBotNameByUnionId(
  * 平台团队与旧版联邦团队同权：平台 team-sync 下发的团队 bot union_id roster
  *（{@link isPlatformTeamBotTrustedForReceiver}）与 isTeamBot（团队群里学来的 union_id）
  * 都是 union_id 锚定的 bot 专属信任；平台拉的团队群则经 platform: 前缀镜像进
- * team-groups，走同一个 isTeamGroupChat。两条路都算团队模式，都不需要 /grant。
+ * team-groups，走 isTeamGroupChatFor（平台群要求接收 bot 在该团队）。两条路都算团队模式，都不需要 /grant。
  * 平台 roster 是按**机器**下发的（owner 所在的全部团队），所以那条腿必须按接收 bot
  * 收窄：同队或同机才算，详见 isPlatformTeamBotTrustedBy。
  *
@@ -1591,7 +1590,24 @@ export function isTrustedTeamBotSender(
 ): boolean {
   return isTeamBot(dataDir, senderUnionId)
     || isPlatformTeamBotTrustedForReceiver(dataDir, larkAppId, senderUnionId)
-    || isTeamGroupChat(dataDir, chatId);
+    || isTeamGroupChatFor(dataDir, larkAppId, chatId);
+}
+
+/**
+ * 团队群里 bot 发言 → 把它的 union_id 学进整机共享的 team-bots.json（之后在任意群按队友放行，
+ * 见 team-bots-store）。调用方保证 `senderUnionId` 来自飞书盖章的 bot 发送方。
+ *
+ * 只在**旧版联邦**团队群里学：平台团队群的 bot 身份以平台 roster 为准（已按接收 bot 收窄到
+ * 同队/同机），在平台群里学会让别队、别机的 bot 经 isTeamBot 拿到本机所有 bot 的 talk + operate。
+ * 返回是否写入。
+ */
+export function learnTeamBotFromGroupMessage(
+  dataDir: string,
+  chatId: string | undefined,
+  senderUnionId: string | undefined,
+): boolean {
+  if (!senderUnionId || !isLegacyTeamGroupChat(dataDir, chatId)) return false;
+  return recordTeamBot(dataDir, { unionId: senderUnionId });
 }
 
 /** 本机 bots.json 是否配置了 `appId`（同机判定）。读配置失败按「不是本机」处理（fail closed）。 */
@@ -5205,9 +5221,7 @@ export function createLarkEventDispatcherRuntime(
         // (see team-bots-store). Done BEFORE the @mention gate so even a non-@
         // message in a team group teaches us the teammate. Cheap + idempotent.
         const senderUnionId = sender.sender_id?.union_id as string | undefined;
-        if (senderUnionId && isTeamGroupChat(config.session.dataDir, chatId)) {
-          recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
-        }
+        learnTeamBotFromGroupMessage(config.session.dataDir, chatId, senderUnionId);
         // 机器人大厅：bot 消息只用于身份登记（上面已学 sender union / mentions
         // 自学），绝不当任务路由——平台 bot 会 @ 新 bot 教它 union，不吞掉的话
         // 接收 bot 会把这类消息当任务拉起会话在大厅里回话（实测）。只吞 bot 发送方：

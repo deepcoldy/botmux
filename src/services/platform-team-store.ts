@@ -28,7 +28,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { replaceTeamGroupsByPrefix } from './team-groups-store.js';
+import { listTeamGroups, replaceTeamGroupsByPrefix } from './team-groups-store.js';
 
 /** teamId prefix used when mirroring platform team groups into team-groups.json. */
 export const PLATFORM_TEAM_PREFIX = 'platform:';
@@ -217,6 +217,44 @@ export function isPlatformTeamBotTrustedBy(
     (senderAppIds ??= []).push(sender.appId);
   }
   return !!senderAppIds && senderAppIds.some((appId) => isLocalApp(appId));
+}
+
+/**
+ * Is `chatId` a team-assembled group whose bots the RECEIVING bot may trust on
+ * first contact (the chat-dimension leg of isTrustedTeamBotSender)?
+ *
+ *  - Legacy federation 拉群 groups (team-groups.json entries WITHOUT the
+ *    `platform:` prefix): unchanged — the chat itself is the trust root.
+ *  - Platform team groups: only when the receiver is on THAT team. The mirror
+ *    holds every team the machine's owner is in, so a bot that was added to
+ *    another team's group must not treat that team's bots as its own teammates.
+ */
+export function isTeamGroupChatFor(
+  dataDir: string,
+  receiverAppId: string | undefined,
+  chatId: string | undefined,
+): boolean {
+  const id = (chatId ?? '').trim();
+  if (!id) return false;
+  if (isLegacyTeamGroupChat(dataDir, id)) return true;
+  const receiver = (receiverAppId ?? '').trim();
+  if (!receiver) return false;
+  const data = readFile(dataDir);
+  if (!data) return false;
+  return data.teams.some((t) => t.groupChatIds.includes(id) && t.bots.some((b) => b.appId === receiver));
+}
+
+/**
+ * Legacy federation team group only (team-groups.json entry without the
+ * `platform:` prefix). Gate for LEARNING teammate union_ids into the
+ * machine-wide team-bots.json: platform bot identity is already authoritative
+ * in the platform roster, and learning it from a platform group would hand a
+ * bot of team A machine-wide trust (isTeamBot) on bots that are only in team B.
+ */
+export function isLegacyTeamGroupChat(dataDir: string, chatId: string | undefined): boolean {
+  const id = (chatId ?? '').trim();
+  if (!id) return false;
+  return listTeamGroups(dataDir).some((b) => b.chatId === id && !b.teamId.startsWith(PLATFORM_TEAM_PREFIX));
 }
 
 /** Is `unionId` a HUMAN member of a platform team that THIS bot (`botAppId`)

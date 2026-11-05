@@ -16,9 +16,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { config } from '../src/config.js';
 import { registerBot } from '../src/bot-registry.js';
-import { canOperate, evaluateBotTalk, evaluateTalk, isTrustedTeamBotSender } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, evaluateBotTalk, evaluateTalk, isTrustedTeamBotSender, learnTeamBotFromGroupMessage } from '../src/im/lark/event-dispatcher.js';
 import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
-import { recordTeamBot } from '../src/services/team-bots-store.js';
+import { isTeamBot, recordTeamBot } from '../src/services/team-bots-store.js';
+import { recordTeamGroup } from '../src/services/team-groups-store.js';
 
 let dataDir: string;
 const prevBotsConfig = process.env.BOTS_CONFIG;
@@ -171,6 +172,33 @@ describe('platform roster trust is scoped to the RECEIVING bot (same team or sam
     writeFileSync(process.env.BOTS_CONFIG!, '{ not json', 'utf-8');
     expect(canOperate('pf1', 'oc_public', 'ou_local', 'on_local')).toBe(false);
     expect(canOperate('pf1', 'oc_public', 'ou_peer', 'on_peer')).toBe(true);
+  });
+
+  it('a remote other-team bot speaking in a platform team group is NOT learned into machine-wide team trust', () => {
+    seedTwoTeams();
+    writeLocalBots(['pf1', 'cli_local']);
+    // cli_local（T2，本机）所在的 T2 团队群里，别的机器上的 T2 bot 发了一句话
+    expect(learnTeamBotFromGroupMessage(dataDir, 'oc_t2_hall', 'on_remote')).toBe(false);
+    expect(isTeamBot(dataDir, 'on_remote')).toBe(false);
+    expect(canOperate('pf1', 'oc_public', 'ou_remote', 'on_remote')).toBe(false);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
+  });
+
+  it('legacy federation 拉群 groups still teach teammates', () => {
+    recordTeamGroup(dataDir, 'legacy-team', 'oc_legacy');
+    expect(learnTeamBotFromGroupMessage(dataDir, 'oc_legacy', 'on_legacy_mate')).toBe(true);
+    expect(evaluateTalk('pf1', 'oc_public', 'ou_legacy_mate', 'on_legacy_mate')).toMatchObject({ allowed: true, reason: 'teamBot' });
+  });
+
+  it('first contact inside a platform team group only counts for bots on THAT team', () => {
+    seedTwoTeams();
+    // pf1 只在 T1：T2 群里来的陌生 bot 不能因为「这是团队群」就免授权
+    expect(evaluateBotTalk('pf1', 'oc_t2_hall', 'ou_fresh', 'on_fresh').allowed).toBe(false);
+    // T1 自己的团队群照旧放行首次接触
+    expect(evaluateBotTalk('pf1', 'oc_t1_hall', 'ou_fresh', 'on_fresh')).toMatchObject({ allowed: true, reason: 'teamBot' });
+    // 旧版联邦团队群按群放行，不变
+    recordTeamGroup(dataDir, 'legacy-team', 'oc_legacy');
+    expect(evaluateBotTalk('pf1', 'oc_legacy', 'ou_fresh', 'on_fresh').allowed).toBe(true);
   });
 
   it('the receiving bot need not be on any team to trust a same-machine roster bot', () => {
