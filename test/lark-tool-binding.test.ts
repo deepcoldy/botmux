@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, larkToolLoopbackService } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
-import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
+import { nodeTsRunnerPrefix, spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 
 let dir: string;
 beforeEach(() => { dir = realpathSync(mkdtempSync(join(tmpdir(), 'lark-tool-binding-'))); });
@@ -181,5 +182,41 @@ describe('managed lark-cli binding', () => {
     ], { env, encoding: 'utf8' });
     expect(result.status, String(result.stderr)).toBe(3);
     expect(result.stdout).toBe('cli_current|--version');
+  });
+  it('reports a stable bridge rejection code instead of hiding it as an unavailable identity', async () => {
+    const bin = join(dir, 'bin'); mkdirSync(bin);
+    const real = join(bin, 'lark-cli');
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write("unexpected execution");\n');
+    chmodSync(real, 0o755);
+    symlinkSync(nodeTsRunnerPrefix().command, join(bin, 'node'));
+    const env = { PATH: bin, HOME: dir };
+    const binding = prepareLarkToolEnv({ env, dataDir: dir, sessionId: 'session-a', appId: defaults.appId });
+    const server = createServer((_req, res) => {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ code: 'botmux_protected_loopback_forbidden' }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    try {
+      binding.ipcPort = (server.address() as { port: number }).port;
+      writeFileSync(larkToolBindingPath(dir, 'session-a'), JSON.stringify(binding), { mode: 0o600 });
+      const result = await new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
+        const child = spawnTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), [
+          '--binding', larkToolBindingPath(dir, 'session-a'), '--', 'docs', '+fetch', '--doc', 'doc-token',
+        ], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+        let out = '', err = '';
+        child.stdout!.on('data', data => { out += data; });
+        child.stderr!.on('data', data => { err += data; });
+        child.once('error', reject);
+        child.once('close', code => resolve({ code, out, err }));
+      });
+      expect(result.code).toBe(77);
+      expect(result.err).toContain('botmux_protected_loopback_forbidden');
+      expect(result.out).toBe('');
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 });

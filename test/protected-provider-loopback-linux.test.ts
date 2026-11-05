@@ -8,7 +8,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   PROTECTED_HTTP_LOOPBACK_PLACEHOLDER_ORIGIN,
 } from '../src/core/protected-http-egress-loopback.js';
@@ -175,7 +176,7 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
     }]);
   });
 
-  it('forwards the isolated lark identity route to the real host loopback port', async () => {
+  it('forwards the isolated lark identity route when Bun owns the network runner and bwrap nests the task PID namespace', async () => {
     const path = '/api/sessions/session-a/lark-tool-identity';
     const secret = 'cd'.repeat(32);
     const daemonRequests: Array<{
@@ -270,11 +271,13 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
         'console.log(JSON.stringify(result));',
       ].join('\n'));
       const { sandboxNetworkLaunch } = await import('../dist/core/sandbox-network-launch.js');
+      const bwrap = spawnSync('/bin/sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' }).stdout.trim();
       const launch = sandboxNetworkLaunch(
         { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
-        '/bin/sh',
+        bwrap,
         [
-          '-c',
+          '--ro-bind', '/', '/', '--proc', '/proc', '--unshare-user', '--unshare-pid', '--die-with-parent',
+          '/bin/sh', '-c',
           'if test -e /proc/self/fd/7 || test -e /proc/self/fd/8; then exit 91; fi; exec "$@"',
           'botmux-broker-fd-probe',
           process.execPath,
@@ -293,7 +296,9 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
         })),
       );
       const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-        const child = spawn(launch.bin, launch.args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        const bun = spawnSync('/bin/sh', ['-c', 'command -v bun'], { encoding: 'utf8' }).stdout.trim();
+        const networkRunner = fileURLToPath(new URL('../dist/sandbox-network-runner.js', import.meta.url));
+        const child = spawn(bun, [networkRunner, launch.args.at(-1)!], { stdio: ['ignore', 'pipe', 'pipe'] });
         let stdout = '';
         let stderr = '';
         child.stdout.on('data', chunk => { stdout += chunk; });

@@ -73,7 +73,15 @@ function namespacePeerResolver(): ProtectedLocalServicePeerResolver {
     timer: ReturnType<typeof setTimeout>;
   }>();
   const requests = new Socket({ fd: PEER_REQUEST_FD, readable: false, writable: true });
-  const responses = new Socket({ fd: PEER_RESPONSE_FD, readable: true, writable: false });
+  // Bun does not reliably poll a readable socket inherited on a numbered FD.
+  // Drain it in a killable helper and consume the helper's ordinary stdout pipe,
+  // matching the readiness/control-FD pattern below.
+  const responseReader = spawn('/bin/sh', ['-c', `exec cat <&${PEER_RESPONSE_FD}`], {
+    stdio: ['ignore', 'pipe', 'ignore', 'ignore', 'ignore', 'ignore', 'ignore', 'ignore', PEER_RESPONSE_FD],
+  });
+  children.push(responseReader);
+  closeSync(PEER_RESPONSE_FD);
+  const responses = responseReader.stdout!;
   responses.setEncoding('utf8');
   const failAll = () => {
     if (closed) return;
@@ -130,10 +138,13 @@ function namespacePeerResolver(): ProtectedLocalServicePeerResolver {
   });
   responses.once('error', failAll);
   responses.once('end', failAll);
+  responseReader.once('error', failAll);
+  responseReader.once('exit', failAll);
   requests.once('error', failAll);
   closePeerResolver = () => {
     failAll();
     requests.destroy();
+    responseReader.kill('SIGKILL');
     responses.destroy();
   };
   return peer => new Promise(resolve => {

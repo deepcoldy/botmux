@@ -1,8 +1,8 @@
-import { readFileSync, readdirSync, readlinkSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { ProcessIdentity } from './current-actor-attestation.js';
-import { procStatStartTimeDigits } from '../utils/proc-stat.js';
+import { procStatFieldsAfterComm, procStatStartTimeDigits } from '../utils/proc-stat.js';
 
 function procStart(pid: number, procRoot: string): string | undefined {
   try {
@@ -12,12 +12,27 @@ function procStart(pid: number, procRoot: string): string | undefined {
   }
 }
 
-function pidNamespace(pid: number, procRoot: string): string | undefined {
+function procParent(pid: number, procRoot: string): number | undefined {
   try {
-    return readlinkSync(join(procRoot, String(pid), 'ns', 'pid'));
+    const raw = readFileSync(join(procRoot, String(pid), 'stat'), 'utf8');
+    const parent = Number(procStatFieldsAfterComm(raw)?.[1]);
+    return Number.isSafeInteger(parent) && parent > 0 ? parent : undefined;
   } catch {
     return undefined;
   }
+}
+
+function descendsFrom(pid: number, ancestorPid: number, procRoot: string): boolean {
+  const seen = new Set<number>();
+  let current = pid;
+  while (current > 1 && !seen.has(current)) {
+    if (current === ancestorPid) return true;
+    seen.add(current);
+    const parent = procParent(current, procRoot);
+    if (!parent) return false;
+    current = parent;
+  }
+  return false;
 }
 
 function namespacePids(pid: number, procRoot: string): number[] | undefined {
@@ -61,9 +76,11 @@ export function resolvePidNamespaceRoot(
 }
 
 /** Translate a process identity observed through a PID-namespace-local procfs
- * into the same live process's host identity. Start time is global across PID
- * namespaces; matching it together with the namespace inode prevents a PID
- * collision in a sibling namespace from being accepted. */
+ * into the same live process's host identity. The peer PID is the value visible
+ * from the network runner's PID namespace, while the task may live in a PID
+ * namespace nested further below it (for example bwrap --unshare-pid). Match
+ * that namespace depth and require the host process to descend from the runner,
+ * so an equal local PID in an unrelated namespace cannot be accepted. */
 export function mapPidNamespacePeerToHost(input: {
   namespaceRoot: ProcessIdentity;
   peer: ProcessIdentity;
@@ -77,8 +94,10 @@ export function mapPidNamespacePeerToHost(input: {
     || procStart(input.namespaceRoot.pid, procRoot) !== input.namespaceRoot.procStart) {
     return null;
   }
-  const wantedNamespace = pidNamespace(input.namespaceRoot.pid, procRoot);
-  if (!wantedNamespace) return null;
+  const rootNamespacePids = namespacePids(input.namespaceRoot.pid, procRoot);
+  if (!rootNamespacePids || rootNamespacePids[0] !== input.namespaceRoot.pid
+    || rootNamespacePids.at(-1) !== 1) return null;
+  const visiblePidIndex = rootNamespacePids.length - 1;
   let entries: string[];
   try {
     entries = readdirSync(procRoot);
@@ -90,8 +109,8 @@ export function mapPidNamespacePeerToHost(input: {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
     const nspids = namespacePids(pid, procRoot);
-    if (!nspids || nspids[0] !== pid || nspids.at(-1) !== input.peer.pid
-      || pidNamespace(pid, procRoot) !== wantedNamespace) continue;
+    if (!nspids || nspids[0] !== pid || nspids[visiblePidIndex] !== input.peer.pid
+      || !descendsFrom(pid, input.namespaceRoot.pid, procRoot)) continue;
     const start = procStart(pid, procRoot);
     if (start === input.peer.procStart) matches.push({ pid, procStart: start });
   }
