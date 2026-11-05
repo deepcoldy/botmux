@@ -11,8 +11,8 @@
 
   Sign in to use TRAE CLI
 
-> 1. ByteDance Employee
-     Sign in with Codebase Git or ByteDance SSO
+> 1. Company Employee
+     Sign in with Codebase Git or Company SSO
 
   2. Enterprise User
      Sign in with email, a custom domain, or a PAT

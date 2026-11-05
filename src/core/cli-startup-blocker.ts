@@ -121,7 +121,7 @@ const RULES: readonly StartupBlockerRule[] = [
   {
     // TraeX / CoCo 0.211 (binary strings): "Sign in with a Personal Access
     // Token". 0.213.1 (captured): "Sign in to use TRAE CLI" over the options
-    // "1. ByteDance Employee" / "2. Enterprise User — Sign in with email, a
+    // "1. Company Employee" / "2. Enterprise User — Sign in with email, a
     // custom domain, or a PAT" and "Press Enter to continue" — Enter starts a
     // login, so a queued prompt must never be typed into it.
     rule: 'traex-sign-in',
