@@ -135,6 +135,32 @@ describe('mention handoff: prepare', () => {
     expect(() => store()).toThrow();
   });
 
+  describe('from a workflow node session (交接带发起人身份, design §10.3)', () => {
+    const workflowRef = { runId: 'r1', nodeId: 'write', attemptId: 'write#001/attempts/001', revision: 1, nonce: `wfh_${'n'.repeat(24)}` };
+    function nodeTurn(passedOn: { inherit: true; workflow: unknown } | { inherit: false }) {
+      const h = harness({ caller: { senderType: 'bot', requestLarkAppId: 'cli_source', requestUserOpenId: 'ou_main_bot' } });
+      h.scope.dispatchUserForTurn = async () => ({
+        authority: { appId: 'cli_main', openId: 'ou_original', unionId: 'on_original', tools: ['bytedcli'] },
+        workflow: workflowRef,
+      });
+      h.scope.inheritWorkflowDelegation = vi.fn(async () => passedOn);
+      h.scope.v3DefaultBaseDir = () => '/runs';
+      return h;
+    }
+    it('registers the passed-on record tied to the node attempt', async () => {
+      const h = nodeTurn({ inherit: true, workflow: { ...workflowRef, hop: 1 } });
+      const prepared = await h.prepare();
+      expect(prepared).toMatchObject({ status: 200, value: { ok: true, delegated: true } });
+      expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)).toMatchObject({
+        domain: 'botmux.dispatch-user.workflow.v1', workflow: { hop: 1 }, authority: { openId: 'ou_original' },
+      });
+    });
+    it('otherwise hands on nobody, and the handoff still goes out', async () => {
+      const h = nodeTurn({ inherit: false });
+      expect(await h.prepare()).toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'no_direct_human' } });
+    });
+  });
+
   it('logs why a handoff carried no sender', async () => {
     const h = harness({ caller: { senderType: 'bot', requestLarkAppId: 'cli_source', requestUserOpenId: 'ou_bot' } });
     await h.prepare();

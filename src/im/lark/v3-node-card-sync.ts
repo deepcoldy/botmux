@@ -22,7 +22,18 @@ import {
 import { V3_EXTERNAL_ERROR_CODES } from '../../workflows/v3/external-executor.js';
 import { readJournal } from '../../workflows/v3/journal.js';
 import { materialize } from '../../workflows/v3/state.js';
+import {
+  v3CheckpointMarkedSince,
+  v3CheckpointSuccesses,
+  type V3CheckpointSuccess,
+} from '../../workflows/v3/checkpoint-hold.js';
+import {
+  foldV3NodeInterventions,
+  formatV3Intervention,
+  latestV3InterventionFor,
+} from '../../workflows/v3/interventions.js';
 import { buildV3NodeCard, type V3NodeCardStatus, type V3NodeCardView } from './v3-node-card.js';
+import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
 /** The card status an external attempt projects to (pure). */
 export function v3NodeCardStatusFor(
@@ -79,10 +90,23 @@ export function v3NodeCardStatusFor(
   }
 }
 
+/** The checkpoint line of a completed checkpoint node's card (§13.6). */
+export function checkpointLine(success: V3CheckpointSuccess | undefined): string | undefined {
+  if (!success) return undefined;
+  if (!success.released) return '检查点：等主 Bot 看完结果，后续节点暂停';
+  switch (success.released.reason) {
+    case 'wakeTurnEnded': return '检查点：主 Bot 已看过结果，后续节点继续';
+    case 'holdTimeout': return '检查点：等主 Bot 看结果超时，已按原流程继续';
+    case 'wakeSessionEnded': return '检查点：主 Bot 的会话中途结束，已按原流程继续';
+    default: return '检查点：没能唤醒主 Bot 看结果，已按原流程继续';
+  }
+}
+
 export interface V3NodeCardSyncDeps {
   baseDir: string;
-  /** Authorized run (pinned executor + DAG + display title), or undefined. */
-  loadRun(runDir: string): { dag: V3Dag; nodeExecutor?: 'bot'; title: string } | undefined;
+  /** Authorized run (pinned executor + effective DAG + display title, and
+   *  the approved DAG for when checkpoint marks took effect), or undefined. */
+  loadRun(runDir: string): { dag: V3Dag; authorizedDag?: V3Dag; nodeExecutor?: 'bot'; title: string } | undefined;
   patchCard(messageId: string, cardJson: string): Promise<void>;
   botName(larkAppId: string): string;
   selfLarkAppId: string;
@@ -91,6 +115,8 @@ export interface V3NodeCardSyncDeps {
   activity?(runDir: string, attemptId: string): { activeAt?: number };
   /** Node cards by topic key, recorded when each card was sent. */
   topicCards?(runDir: string): Record<string, string>;
+  /** §11: the run's「工作流 ›」sidebar entry (this daemon's bot is the main bot). */
+  workflowEntry?(runId: string): WorkflowSidebarEntryLink | undefined;
   now?(): number;
 }
 
@@ -131,6 +157,15 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
       if (cardId) latestByCard.set(cardId, attempt);
     }
     const goalIds = run.dag.nodes.filter((node) => isGoalNode(node)).map((node) => node.id);
+    const entry = deps.workflowEntry?.(runId);
+    // Roles only: whether the initiator or someone else handed a node over
+    // does not change the card line.
+    const interventions = foldV3NodeInterventions(events);
+    const checkpoints = new Map(v3CheckpointSuccesses({
+      events,
+      dag: run.dag,
+      markedSince: v3CheckpointMarkedSince(runDir, run.authorizedDag ?? run.dag, events),
+    }).map((success) => [success.attemptId, success]));
     for (const [messageId, attempt] of latestByCard) {
       const instanceStatus = attempt.instanceId
         ? snap.instances.get(attempt.instanceId)?.status
@@ -149,6 +184,9 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
       }));
       const target = attempt.targetLarkAppId ?? deps.selfLarkAppId;
       const index = goalIds.indexOf(authored?.id ?? '');
+      const handled = latestV3InterventionFor(interventions.get(attempt.nodeId), attempt.attemptId);
+      const intervention = handled ? formatV3Intervention(handled) : undefined;
+      const checkpoint = checkpointLine(checkpoints.get(attempt.attemptId));
       const view: V3NodeCardView = {
         runTitle: run.title,
         runId,
@@ -161,10 +199,13 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
         status,
         upstream,
         now: now(),
+        ...(entry ? { entry } : {}),
+        ...(intervention ? { intervention } : {}),
+        ...(checkpoint ? { checkpoint } : {}),
       };
       // Elapsed time is not part of the change signal: a card is patched when
       // the node's state changes, not on every drive.
-      const signature = JSON.stringify({ attempt: attempt.attemptId, status: { ...status, ...('since' in status ? { since: 0 } : {}) }, upstream, target, key: nodeTopicKey(attempt) });
+      const signature = JSON.stringify({ attempt: attempt.attemptId, status: { ...status, ...('since' in status ? { since: 0 } : {}) }, upstream, target, key: nodeTopicKey(attempt), intervention, checkpoint });
       if (shown.get(messageId) === signature) continue;
       await deps.patchCard(messageId, buildV3NodeCard(view));
       shown.set(messageId, signature);

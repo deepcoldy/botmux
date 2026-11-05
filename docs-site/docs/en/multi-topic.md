@@ -29,6 +29,12 @@ With `triggerUserAuth` enabled, `botmux dispatch --bot-app` establishes the mess
 
 A TRAE session ends a started turn at the structured `task_complete` (success or failure) or `turn_aborted` record. A transiently idle terminal while tools run does not revoke the current user identity. If the source turn is stale, a protected dispatch returns `dispatch_turn_unproven` instead of reporting an identity-less task as sent; the session Owner or a historical sender can never substitute for the current initiator.
 
+## Task-tree card (off by default)
+
+An orchestrating session can receive a **task-tree card** in its own topic: it is posted on the first `botmux dispatch` and then updated in place as child topics are accepted, report (`botmux report --status …`), finish or fail. Each subtask shows a state (running / waiting / done / failed / dispatched / closed), its last progress line and an "open topic" link. Use `botmux dispatch tree` to refresh manually, and `--kind review|task`, `--task-id`, `--task-url` to label the review type and requirement.
+
+This feature is **off by default** (it adds a message). Enable it under **Settings → Multi-topic collaboration → Send a task-tree card when dispatching subtasks**; multi-topic collaboration must be on first. When off, no card and no card record are written, dispatch records gain no related fields, and dispatch behaves exactly as before; `botmux dispatch tree` prints where to enable it and exits 0. Timing: daemon-side card posting/patching follows the toggle within about 2 seconds (global-config read cache), no restart. A CLI inside a sandboxed/file-isolated session cannot read the global config and instead receives the value from env injected when the session starts, so for an already-running session the in-pane dispatch-timestamp (`attemptAt`) decision applies from the next new session. In deployment environments you can set `BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=true`; the environment variable takes precedence.
+
 ## Disabling the feature
 
 Multi-topic collaboration is enabled by default. If a machine does not need it, turn off "Enable multi-topic collaboration" under **Settings → Multi-topic collaboration** in the Dashboard. The change takes effect from the next session, no restart required.

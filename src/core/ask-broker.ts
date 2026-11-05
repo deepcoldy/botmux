@@ -28,6 +28,7 @@ import type {
   PendingAsk,
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
+import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
  *  caller that has a reconnecting claimant after a daemon restart may persist:
@@ -425,6 +426,7 @@ function questionsShape(qs: PendingAsk['questions']): string {
       d: q.defaultSelectedKeys,
       input: q.inputMode,
       field: q.input,
+      custom: q.allowCustom !== false,
       o: q.options.map((o) => [o.key, o.label]),
     })),
   );
@@ -573,7 +575,7 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<
 
 /** Build the persisted projection from a live internal ask and write it. Only
  *  called for resumable asks. */
-function persistFromInternal(ask: InternalPending): void {
+function persistFromInternal(ask: InternalPending, strict = false): void {
   if (!persistStore || !ask.resumable) return;
   // A settled ask with a stashed answer is a durable handoff that must be KEPT
   // until claimed; a settled ask without one has nothing left to resume.
@@ -593,6 +595,8 @@ function persistFromInternal(ask: InternalPending): void {
     answererOpenId: ask.answererOpenId,
     deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
+    customAnswers: ask.customAnswers,
+    customRevision: ask.customRevision,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
     timeoutMs: ask.timeoutMs,
@@ -603,7 +607,7 @@ function persistFromInternal(ask: InternalPending): void {
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
   };
-  persistStore.put(persisted);
+  persistStore.put(persisted, { strict });
 }
 
 /**
@@ -628,7 +632,7 @@ export function toggleAsk(args: {
   const ask = pending.get(args.askId);
   const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
-  if (!ask || hasAskForm(ask.questions)) return 'stale';
+  if (!ask || hasAskForm(ask.questions) || ask.customRevision !== undefined) return 'stale';
 
   const question = ask.questions[args.questionIndex];
   if (!question) return 'stale';
@@ -678,7 +682,7 @@ export function submitAsk(args: {
   const ask = pending.get(args.askId);
   const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
-  if (!ask || hasAskForm(ask.questions)) return 'stale';
+  if (!ask || hasAskForm(ask.questions) || ask.customRevision !== undefined) return 'stale';
 
   // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
@@ -745,6 +749,70 @@ export function submitAskForm(args: { askId: string; nonce: string; by: string; 
   if (!values) return 'invalid_form';
   settle(args.askId, { kind: 'answered', ...values, by: args.by, comment: null, timedOut: false });
   return 'accepted';
+}
+
+/** Validate and persist per-question custom drafts before settling. */
+export function applyAskForm(args: {
+  askId: string; nonce: string; by: string; revision: number;
+  fields: Record<string, unknown>;
+  canRenderDraft?: (draft: PendingAsk) => boolean;
+  toggle?: { questionIndex: number; key: string; custom?: boolean };
+  confirmEmpty?: boolean;
+}): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
+  if (!ask || !supportsAskCustomInput(ask)) return 'stale';
+  if (!Number.isSafeInteger(args.revision) || args.revision !== (ask.customRevision ?? 0)) return 'draft_conflict';
+  const custom = parseAskCustomFields(args.fields, ask.questions, ask.customAnswers);
+  if (!custom) return 'invalid_custom';
+  const selections = ask.questions.map((_, i) => [...(ask.selections.get(i) ?? [])]);
+  if (args.toggle) {
+    const { questionIndex: i, key } = args.toggle;
+    const q = ask.questions[i];
+    if (!Number.isInteger(i) || !q) return 'stale';
+    if (args.toggle.custom) {
+      if (q.allowCustom === false || q.inputMode === 'text') return 'stale';
+      selections[i] = [];
+      custom[i] = custom[i] ?? '';
+    } else {
+      if (!q.options.some(o => o.key === key)) return 'stale';
+      const selected = new Set(selections[i]);
+      if (!q.multiSelect) selected.clear();
+      if (q.multiSelect && selected.has(key)) selected.delete(key); else selected.add(key);
+      selections[i] = [...selected];
+      custom[i] = null; // explicitly picking an option switches this question back
+    }
+  }
+  const answers = selections.map((keys, i) => custom[i] ? [] : keys);
+  const candidate = { ...snapshot(ask), selections, customAnswers: custom, customRevision: (ask.customRevision ?? 0) + 1 };
+  if (args.canRenderDraft && !args.canRenderDraft(candidate)) return 'invalid_custom';
+  const saveDraft = () => {
+    const nextSelections = new Map(selections.map((keys, i) => [i, new Set(keys)]));
+    const revision = (ask.customRevision ?? 0) + 1;
+    persistFromInternal({ ...ask, selections: nextSelections, customAnswers: custom, customRevision: revision }, true);
+    ask.selections = nextSelections;
+    ask.customAnswers = custom;
+    ask.customRevision = revision;
+  };
+  if (!args.toggle) {
+    if (custom.some(text => text === '')) return 'invalid_custom';
+    if (ask.questions.some((q, i) => !q.multiSelect && !custom[i] && answers[i].length !== 1)) return 'invalid_custom';
+    if (!args.confirmEmpty && answers.every(keys => !keys.length) && custom.every(text => !text)) {
+      saveDraft();
+      return 'needs_empty_confirm';
+    }
+    settle(args.askId, {
+      kind: 'answered', answers,
+      ...(custom.some(Boolean) ? { customAnswers: custom } : {}),
+      by: args.by, comment: null, timedOut: false,
+    });
+    return 'accepted';
+  }
+  // One durable projection holds both the option state and text drafts.
+  saveDraft();
+  return 'toggled';
 }
 
 /**
@@ -986,6 +1054,8 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       answererOpenId: p.answererOpenId,
       deliveryTarget: p.deliveryTarget,
       questions: p.questions,
+      customAnswers: p.customAnswers,
+      customRevision: p.customRevision,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
       timeoutMs: p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt),
@@ -1226,6 +1296,7 @@ function snapshot(ask: InternalPending): PendingAsk {
   } = ask;
   return {
     ...rest,
+    ...(ask.customAnswers ? { customAnswers: [...ask.customAnswers] } : {}),
     ...(ask.deliveryTarget ? { deliveryTarget: { ...ask.deliveryTarget } } : {}),
     ...(ask.terminalResult ? { result: ask.terminalResult } : {}),
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
@@ -1329,6 +1400,10 @@ export function submitAskFromDesktop(args: {
   if (ask.settled) return 'already_settled';
 
   if (hasAskForm(ask.questions)) return 'invalid_form';
+  // A per-question custom form may hold answerer text drafts this selections-only
+  // API cannot express. Once such a draft exists, desktop must not settle the ask
+  // with options and silently drop the typed answers.
+  if (ask.customRevision !== undefined) return 'stale';
 
   // 同 submitAsk：按 ask.questions 规范化，拒绝超长输入、缺失尾部补空集，越界槽不进结果。
   if (args.selections.length > ask.questions.length) return 'stale';

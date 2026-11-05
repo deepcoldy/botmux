@@ -40,6 +40,7 @@ import {
 import { isValidPluginId } from '../../core/plugins/ids.js';
 import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
+import { safeRequirementUrl } from '../../core/dispatch-task-tree.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -1755,7 +1756,7 @@ export function validateRelayRequest(
   // chat and refuses it unless it equals the validated target chat
   // (dispatch_chat_mismatch), then applies that chat's dispatch policy. At most
   // one root, so the request cannot mean different things on either side.
-  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--into', '--delegate', '--no-delegate']);
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--into', '--delegate', '--no-delegate', '--kind', '--task-id', '--task-url']);
   let dispatchIntoSeen = false;
   const sendRoutingSeen = new Set<string>();
   for (let i = 0; i < rawFlags.length; i++) {
@@ -1778,6 +1779,15 @@ export function validateRelayRequest(
         if (dispatchIntoSeen) return { ok: false, error: 'dispatch --into may only be specified once' };
         if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(v)) return { ok: false, error: 'dispatch --into is invalid' };
         dispatchIntoSeen = true;
+      }
+      // Behaviour validation with a second copy of the checks cmdDispatch runs
+      // on the host re-exec: reject bad values before they trigger a real Feishu
+      // write. Same https normalisation as the card (safeRequirementUrl).
+      if (f === '--kind' && v !== 'task' && v !== 'review') {
+        return { ok: false, error: 'dispatch --kind must be task or review' };
+      }
+      if (f === '--task-url' && !safeRequirementUrl(v)) {
+        return { ok: false, error: 'dispatch --task-url must be an https URL' };
       }
       if ((f === '--delegate' || f === '--no-delegate') && v !== 'schedule:create') {
         return { ok: false, error: `dispatch ${f} only supports schedule:create` };

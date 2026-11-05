@@ -111,10 +111,10 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
-  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
-  multiTopic: { enabled: boolean };
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -286,6 +286,7 @@ function parseSettings(s: any): DashboardSettings {
     workflow: {
       enabled: s?.workflow?.enabled === true,
       nodeExecutor: s?.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral',
+      handoffIdentity: s?.workflow?.handoffIdentity === true,
     },
     sessionCleanup: {
       archiveCodex: s?.sessionCleanup?.archiveCodex === true,
@@ -298,7 +299,7 @@ function parseSettings(s: any): DashboardSettings {
         : 60,
     },
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
-    multiTopic: { enabled: s?.multiTopic?.enabled !== false },
+    multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
@@ -1166,6 +1167,15 @@ export function SettingsBody(props: {
               void props.onSave('workflow', { workflow: { nodeExecutor } }, s => ({ ...s, workflow: { ...s.workflow, nodeExecutor } }));
             }}
           />
+          <ToggleRow
+            title={tr('settings.workflowHandoffIdentity')}
+            help={tr('settings.workflowHandoffIdentityHelp')}
+            checked={settings.workflow.handoffIdentity}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              void props.onSave('workflow', { workflow: { handoffIdentity: value } }, s => ({ ...s, workflow: { ...s.workflow, handoffIdentity: value } }));
+            }}
+          />
         </SettingsBlock>
         <SettingsBlock id="settings-multi-topic" title={tr('settings.sectionMultiTopic')}>
           <ToggleRow
@@ -1174,7 +1184,16 @@ export function SettingsBody(props: {
             checked={settings.multiTopic.enabled}
             disabled={dis || savingKey === 'multiTopic'}
             onChange={value => {
-              void props.onSave('multiTopic', { multiTopic: { enabled: value } }, s => ({ ...s, multiTopic: { enabled: value } }));
+              void props.onSave('multiTopic', { multiTopic: { enabled: value, taskTreeCard: settings.multiTopic.taskTreeCard } }, s => ({ ...s, multiTopic: { enabled: value, taskTreeCard: s.multiTopic.taskTreeCard } }));
+            }}
+          />
+          <ToggleRow
+            title={tr('settings.multiTopicTaskTreeCard')}
+            help={tr('settings.multiTopicTaskTreeCardHelp')}
+            checked={settings.multiTopic.taskTreeCard}
+            disabled={dis || !settings.multiTopic.enabled || savingKey === 'multiTopicTaskTreeCard'}
+            onChange={value => {
+              void props.onSave('multiTopicTaskTreeCard', { multiTopic: { enabled: settings.multiTopic.enabled, taskTreeCard: value } }, s => ({ ...s, multiTopic: { ...s.multiTopic, taskTreeCard: value } }));
             }}
           />
         </SettingsBlock>

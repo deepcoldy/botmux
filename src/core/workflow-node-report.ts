@@ -245,4 +245,5 @@ export const WORKFLOW_REPORT_REJECTION_TEXT: Record<string, string> = {
   reassigned: '本节点已改派给其他 Bot',
   closed: '本次尝试已结束',
   'session-mismatch': '提交的会话不是接单的那个会话',
+  'handed-to-human': '本节点已交给人决定，这次提交不再算数',
 };

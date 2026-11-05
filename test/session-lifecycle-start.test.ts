@@ -1,6 +1,12 @@
 import { EventEmitter, once } from 'node:events';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
+import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
+
+vi.mock('../src/services/session-group-title.js', () => ({
+  acceptSessionGroupTitle: vi.fn(),
+  scheduleSessionGroupTitle: vi.fn(),
+}));
 
 const {
   emitHookEventMock,
@@ -6564,6 +6570,20 @@ describe('session.start lifecycle integration', () => {
     expect(ds.initConfig?.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
     expect(ds.initConfig?.nativeSessionTitlePrompt).toBeUndefined();
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('forwards the current Codex chat resident semantic title to group naming', () => {
+    const ds = makeDs({ scope: 'chat' });
+    ds.session.scope = 'chat';
+    forkWorker(ds, '<user_message>排查超时</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(acceptSessionGroupTitle).mockClear();
+    worker.emit('message', { type: 'native_session_title_generated', title: '[BotMux·Lark] 排查超时' });
+    expect(acceptSessionGroupTitle).toHaveBeenCalledWith(ds.larkAppId, ds.session, '[BotMux·Lark] 排查超时');
+    vi.mocked(acceptSessionGroupTitle).mockClear();
+    ds.session.nativeSessionTitleUserDefined = true;
+    worker.emit('message', { type: 'native_session_title_generated', title: '[BotMux·Lark] 迟到标题' });
+    expect(acceptSessionGroupTitle).not.toHaveBeenCalled();
   });
 
   it('ignores a late generated title after the user explicitly renames the session', () => {

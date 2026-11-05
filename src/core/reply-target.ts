@@ -252,6 +252,13 @@ export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
  *   keeps logicalTurnId === currentTurnId on the live turn;
  * - every other synthetic mint (trg_, bmx-*, …) is refused here regardless of
  *   what its registry entry carries. */
+/** Whether `turnId` names a turn a human message opened (`om_…` inbound
+ *  message, `join_…` auto-start join). Every synthetic turn — `schedule:…`,
+ *  `trg_…`, `board:…`, `workflow-event:…` — has no human behind it. */
+export function isHumanInboundTurnId(turnId: string | undefined): boolean {
+  return typeof turnId === 'string' && (turnId.startsWith('om_') || turnId.startsWith('join_'));
+}
+
 export function registryTurnMayAuthenticateHuman(
   s: {
     ordinaryTurnRecovery?: { logicalTurnId: string; currentTurnId: string };
@@ -260,7 +267,7 @@ export function registryTurnMayAuthenticateHuman(
   },
   turnId: string,
 ): boolean {
-  if (!turnId.startsWith('om_') && !turnId.startsWith('join_')) return false;
+  if (!isHumanInboundTurnId(turnId)) return false;
   const ordinary = s.ordinaryTurnRecovery;
   if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
   if (s.failedTurnRecovery?.turnId === turnId) return false;
@@ -384,6 +391,12 @@ export function resolveSendTarget(opts: {
   return { mode: 'thread', rootMessageId: opts.rootMessageId };
 }
 
+let finalOutputOriginRecorder: ((ds: DaemonSession, turnId: string, context: FrozenSessionReplyContext) => void) | undefined;
+
+export function setFinalOutputOriginRecorder(recorder: typeof finalOutputOriginRecorder): void {
+  finalOutputOriginRecorder = recorder;
+}
+
 export function beginReplyTargetTurn(
   ds: DaemonSession,
   replyRootId: string | undefined,
@@ -407,6 +420,12 @@ export function beginReplyTargetTurn(
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
+    ...(opts?.senderOpenId && (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1' || ds.initConfig?.finalOutputHandoff?.admitNew)
+      ? { requesterOpenId: opts.senderOpenId,
+          ...(opts.participants?.some(p => p.openId === opts.senderOpenId)
+            ? { requesterIsBot: opts.participants.find(p => p.openId === opts.senderOpenId)!.isBot }
+            : ds.session.quoteTargetSenderOpenId === opts.senderOpenId && ds.session.quoteTargetSenderIsBot !== undefined
+              ? { requesterIsBot: ds.session.quoteTargetSenderIsBot } : {}) } : {}),
     ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
       ? { sourceMessageId: opts.sourceMessageId } : {}),
     ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
@@ -424,6 +443,9 @@ export function beginReplyTargetTurn(
       ? { inThread: opts.inThread }
       : {}),
   };
+  // The output owner records the authenticated origin before bounded UI
+  // projections can prune it. Failure prevents admission, not a forged ACK.
+  finalOutputOriginRecorder?.(ds, turnId, exactContexts[turnId]);
   const overflow = Object.keys(exactContexts).length - 256;
   if (overflow > 0) {
     for (const staleTurnId of Object.keys(exactContexts).slice(0, overflow)) {

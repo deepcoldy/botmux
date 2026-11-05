@@ -64,6 +64,73 @@ export interface V3HandoffIdempotency {
   handoff: string;
 }
 
+/**
+ * Why a runtime flow revision needs the initiator's confirmation before it
+ * takes effect (design §13.5 / M1). `callerNotInitiator` covers every edit
+ * made in a turn neither opened by the run's initiator nor woken by this
+ * run's own events; the rest are the §13.5 categories.
+ */
+export type V3RevisionConfirmReason =
+  | 'callerNotInitiator'
+  | 'newBot'
+  | 'hostNode'
+  | 'gateRelaxed'
+  | 'budgetExpanded';
+
+/**
+ * State changes a revision makes to already-dispatched work, folded
+ * atomically with its `dagRevised` event (one journal line, so a crash can
+ * never apply the new definition without its invalidations or vice versa).
+ */
+export interface V3RevisionEffects {
+  /** Current instances invalidated by a definition change, reassignment or
+   *  rerun — materialized exactly like `nodeInstanceSuperseded`: the node
+   *  re-dispatches a fresh instance (and re-passes its gate). `waitId` names a
+   *  pending gate wait voided by the change. */
+  supersede?: Array<{ nodeId: string; instanceId: string; waitId?: string }>;
+  /** Removed nodes that had already been dispatched or gated: neutral
+   *  cancellation of that exact instance/attempt (only ever via this effect,
+   *  never a separate `nodeCancelled`). `waitId` = a pending gate it voids. */
+  cancel?: Array<{ nodeId: string; instanceId?: string; attemptId?: string; waitId?: string }>;
+  /** Blocked instances whose gate approval no longer covers their changed
+   *  definition: the approval is dropped and their next retry runs as a
+   *  fresh instance that must pass the gate again, however it is triggered. */
+  regate?: Array<{ nodeId: string; instanceId: string }>;
+  /** Done nodes re-run with Revisit semantics; each consumes revisit budget. */
+  rerun?: string[];
+  /** Revisit budget the initiator's own edit lifted for its re-runs (M2 乙):
+   *  each entry is one more revisit, counted exactly like a
+   *  `revisitBudgetGranted` (`pair` = that node onto itself, `run` =
+   *  run-wide) and attributed to this revision's `by`. In this event, never
+   *  a separate line, so a crash cannot leave a lift without its revision. */
+  budgetGrants?: Array<{ nodeId: string; tier: 'pair' | 'run' }>;
+  /** RECORD ONLY: blocked nodes re-run by this revision. State advances
+   *  through the `nodeRetryRequested` written in the same lock; replay never
+   *  applies this list, reconciliation re-appends a lost retry from it. */
+  retry?: Array<{ nodeId: string; instanceId?: string }>;
+  /** RECORD ONLY: reassignments, applied by the `nodeReassigned` written in
+   *  the same lock (reconciled the same way as `retry`). */
+  assign?: Array<{ nodeId: string; from?: string; to: string }>;
+}
+
+/** Set when the main bot made the change on its own (`by: 'main_bot'`):
+ *  a turn woken by this run's events, or another turn no message of the
+ *  initiator opened (design §13.6). `reason` is the `--reason` the CLI
+ *  requires in a wake turn; elsewhere it may fall back to the edit's note or
+ *  be empty. */
+export interface V3AutoProvenance {
+  reason: string;
+}
+
+/** Why a checkpoint's dependants may go on (design §13.6):
+ *  `wakeTurnEnded` — the main bot's turn for its wake-up ended (it may have
+ *  changed the flow in it); `wakeNotDelivered` — the wake-up could not be
+ *  delivered after its retries; `wakeSessionEnded` — the session that took
+ *  the wake-up was closed, or its CLI stopped, before that turn was seen to
+ *  end; `holdTimeout` — the safety cap on how long a checkpoint may hold its
+ *  dependants ran out. */
+export type V3CheckpointReleaseReason = 'wakeTurnEnded' | 'wakeNotDelivered' | 'wakeSessionEnded' | 'holdTimeout';
+
 export type V3Event =
   | {
       type: 'runStarted';
@@ -81,6 +148,69 @@ export type V3Event =
        *  (`run.json` `nodeExecutor: "bot"`). Such attempts own no local worker
        *  process, so they never enter the worker attempt ledger. */
       nodeExecutor?: 'bot';
+      /** Flow revision the attempt was dispatched under. Absent = 1 (the
+       *  approved DAG), so runs that never revised keep their exact bytes. */
+      revision?: number;
+    }
+  | {
+      /** A flow revision took effect (design §13.3). `dag-revisions/<NNN>.json`
+       *  holds the full new DAG; every digest here is of the exact file bytes
+       *  and replay fails closed on a mismatch. */
+      type: 'dagRevised';
+      revision: number;
+      baseRevision: number;
+      sha256: string;
+      patchSha256: string;
+      /** `dag-revisions/<NNN>.bots.json`: snapshots of bots the revision
+       *  newly brought into the run (always initiator-confirmed). */
+      botsSha256?: string;
+      summary: string;
+      /** Free-text note supplied with the edit (display only). */
+      note?: string;
+      /** Operator: the turn's open_id, or `main_bot` for a change the main
+       *  bot made on its own in a turn this run's events woke. */
+      by: string;
+      /** Only with `by: 'main_bot'`: why it acted (design §13.6). */
+      auto?: V3AutoProvenance;
+      /** Present when the revision was a confirmed proposal. */
+      approval?: { by: string; proposedBy: string };
+      effects?: V3RevisionEffects;
+    }
+  | {
+      /** A revision that needs the initiator's confirmation (design §13.5).
+       *  Its files are already written; it takes effect only through a later
+       *  `dagRevised` carrying `approval`. A pending wait lives in
+       *  `waits/revisions/<NNN>.json`. */
+      type: 'dagRevisionProposed';
+      revision: number;
+      baseRevision: number;
+      sha256: string;
+      patchSha256: string;
+      botsSha256?: string;
+      summary: string;
+      note?: string;
+      by: string;
+      auto?: V3AutoProvenance;
+      reasons: V3RevisionConfirmReason[];
+      /** Existing nodes the proposal touches; they are not dispatched while
+       *  it is pending (the rest of the run keeps going). */
+      touched: string[];
+      /** The pending proposal this one carries onto a direct revision that
+       *  took effect first (same patch, same proposer, re-based): landing
+       *  supersedes it, and its card and wait move here. */
+      carriedFrom?: number;
+    }
+  | { type: 'dagRevisionApproved'; revision: number; by: string }
+  | {
+      type: 'dagRevisionRejected';
+      revision: number;
+      by: string;
+      /** `stale` = the flow moved on (another revision took effect, or the
+       *  proposal no longer applies to the current node states);
+       *  `superseded` = a newer proposal replaced it; `runEnded` = the run
+       *  left running/blocked before anyone decided. */
+      reason: 'rejected' | 'stale' | 'superseded' | 'runEnded';
+      detail?: string;
     }
   | {
       /** Durable intent written before any handoff message is sent. */
@@ -135,6 +265,8 @@ export type V3Event =
       from: string;
       to: string;
       by: string;
+      /** Main-bot provenance of an automatic change (design §13.6). */
+      auto?: V3AutoProvenance;
     }
   | {
       type: 'hostInputPrepared';
@@ -240,6 +372,41 @@ export type V3Event =
       previousErrorCode?: string;
       resetGate?: boolean;
       answer?: { path: string; preview: string; by: string };
+      /** Operator, when recorded: `main_bot` for a retry the main bot
+       *  decided on its own (with `auto`), the caller's open_id for a human
+       *  turn that gave a reason (with `note`). A retry recorded without a
+       *  reason keeps the original shape (no `by`). */
+      by?: string;
+      auto?: V3AutoProvenance;
+      /** The reason a human turn gave (`--reason`), display only. */
+      note?: string;
+    }
+  | {
+      /** A checkpoint node's success may now be followed by its dependants
+       *  (design §13.6; until then they are not dispatched). Names the exact
+       *  success: its attempt and journal position. Older readers skip it. */
+      type: 'checkpointReleased';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      eventSeq: number;
+      reason: V3CheckpointReleaseReason;
+    }
+  | {
+      /** The node was handed to a human (design §13.6): a record only. The
+       *  `nodeBlocked(HANDED_TO_HUMAN)` written right after it in the same
+       *  lock closes the attempt; if a crash separates the two, the runtime
+       *  writes that block on the next drive (never waiting for a deadline). */
+      type: 'nodeHandedToHuman';
+      nodeId: string;
+      instanceId?: string;
+      /** The attempt it was handed over on (open, or the latest closed one). */
+      attemptId: string;
+      reason: string;
+      /** `main_bot`, or the initiator's open_id in their own turn. */
+      by: string;
+      /** The turn that decided it (audit). */
+      turnId?: string;
     }
   | {
       type: 'gateDispatched';

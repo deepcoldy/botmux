@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import TestRenderer, { act } from 'react-test-renderer';
 import {
   V3_DISPLAY_LABEL,
@@ -10,8 +11,10 @@ import {
   isTerminalRunStatus,
   loopInstances,
   nodeBotLine,
+  nodeRevisionBadge,
   nodeStatusLine,
   nodeWaitingMs,
+  V3_CHECKPOINT_LABEL,
   resolveLoopTerminalNode,
   v3RunIdFromHash,
 } from '../src/dashboard/web/v3-model.js';
@@ -28,7 +31,7 @@ import {
   nodeTerminalSignature,
 } from '../src/dashboard/web/v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../src/workflows/v3/ops-projection.js';
-import { DagNode, NodeExecution, V3CancelButton } from '../src/dashboard/web/v3-components.js';
+import { DagNode, NodeExecution, NodeInterventions, V3CancelButton } from '../src/dashboard/web/v3-components.js';
 import { ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -383,6 +386,24 @@ describe('v3 dashboard 节点：负责 Bot、五类状态与耗时', () => {
     expect(nodeStatusLine(node({ status: 'pending' }), 9 * MIN)).toBe('等待');
   });
 
+  it('状态行：未开始且在等检查点的节点显示「等检查点」，优先于普通「等待」', () => {
+    // M23: waitingOnCheckpoint renders on the graph node (ops-projection).
+    expect(nodeStatusLine(node({ status: 'pending', waitingOnCheckpoint: ['survey'] }), 9 * MIN)).toBe('等待 · 等检查点');
+    // Only pending nodes wait; a running node never shows it.
+    expect(nodeStatusLine(node({ status: 'running', startedAt: 0, waitingOnCheckpoint: ['survey'] }), 9 * MIN)).toBe('进行中 · 9分');
+    expect(nodeStatusLine(node({ status: 'pending' }), 9 * MIN)).toBe('等待');
+  });
+
+  it('检查点三态标签：holding / reviewed / notReviewed 文案各不相同', () => {
+    // M24: the dashboard must distinguish "reviewed by the main bot" from
+    // "went on without that review" (a failed delivery, a closed session,
+    // the timeout) — collapsing them would hide a safety event.
+    expect(V3_CHECKPOINT_LABEL.holding).toBe('检查点：等主 Bot 看完结果，后续节点暂停');
+    expect(V3_CHECKPOINT_LABEL.reviewed).toBe('检查点：主 Bot 已看过结果');
+    expect(V3_CHECKPOINT_LABEL.notReviewed).toBe('检查点：没等到主 Bot 看结果，已按原流程继续');
+    expect(new Set(Object.values(V3_CHECKPOINT_LABEL)).size).toBe(3);
+  });
+
   it('等人时长：审批从发卡算起，受阻从卡住算起', () => {
     expect(nodeWaitingMs(node({ status: 'gateWaiting', gateSince: MIN }), 4 * MIN)).toBe(3 * MIN);
     expect(nodeWaitingMs(node({ status: 'blocked', startedAt: 0, endedAt: 2 * MIN }), 7 * MIN)).toBe(5 * MIN);
@@ -415,6 +436,73 @@ describe('v3 dashboard 节点：负责 Bot、五类状态与耗时', () => {
     const g = renderer.root.findByType('g');
     expect(g.props.className).toContain('ds-running');
     act(() => { renderer.unmount(); });
+  });
+
+  describe('节点框第一行：修改徽标不压住节点名', () => {
+    // Independent width model, upper bounds: the id is 12px monospace (0.6em a
+    // character); the badge is 10px — CJK 1em, anything else at most 0.6em.
+    const idPx = (text: string) => [...text].length * 12 * 0.6;
+    const badgePx = (text: string) => [...text].reduce((sum, ch) => sum + (/[\u2e80-\u9fff]/.test(ch) ? 10 : 6), 0);
+    const marks: Array<Partial<RunNodeView>> = [
+      { pendingChange: 'add' }, { pendingChange: 'remove' }, { pendingChange: 'change' },
+      { revisionMark: 'added' }, { revisionMark: 'changed' },
+    ];
+    const ids = ['collect_release_notes_v2', 'a'];
+    const renderBox = (n: RunNodeView, width: number) => renderToStaticMarkup(React.createElement('svg', null,
+      React.createElement(DagNode, { box: { node: n, x: 0, y: 0, width, height: 66 }, generatedAt: 0, selected: false, onSelect: vi.fn() })));
+    const heading = (html: string) => {
+      const id = /class="v3r-nid" x="([\d.]+)"[^>]*>([^<]*)</.exec(html);
+      const badge = /class="v3r-nrev" x="([\d.]+)"[^>]*>([^<]*)</.exec(html);
+      const title = /<title>([^<]*)<\/title>/.exec(html);
+      return {
+        id: id ? { x: Number(id[1]), text: id[2]! } : undefined,
+        badge: badge ? { right: Number(badge[1]), text: badge[2]! } : undefined,
+        title: title?.[1],
+      };
+    };
+
+    it.each([196, 160, 103, 88])('%ipx 宽的框：节点名和徽标都在、互不重叠', (width) => {
+      for (const id of ids) {
+        for (const mark of marks) {
+          const h = heading(renderBox(node({ id, ...mark }), width));
+          const where = `${width}px ${id} ${JSON.stringify(mark)}`;
+          expect(h.id?.text, where).toBeTruthy();
+          expect(id.startsWith(h.id!.text.replace(/…$/, '')), where).toBe(true);
+          expect(h.badge?.text, where).toBeTruthy();
+          const idEnd = h.id!.x + idPx(h.id!.text);
+          const badgeStart = h.badge!.right - badgePx(h.badge!.text);
+          expect(idEnd, where).toBeLessThanOrEqual(badgeStart);
+          expect(h.badge!.right, where).toBeLessThanOrEqual(width);
+        }
+      }
+    });
+
+    it('标准宽度显示完整徽标；放不下时缩成短标记，完整文字留在节点提示里', () => {
+      for (const mark of marks) {
+        const n = node({ id: ids[0]!, ...mark });
+        expect(heading(renderBox(n, 196)).badge?.text).toBe(nodeRevisionBadge(n));
+        const narrow = heading(renderBox(n, 88));
+        expect(narrow.badge?.text === nodeRevisionBadge(n) || narrow.title === nodeRevisionBadge(n)).toBe(true);
+      }
+    });
+  });
+
+  it('节点详情列出主 Bot 的每次自动处理和每次交给人，附理由；没有时不显示', () => {
+    const html = renderToStaticMarkup(React.createElement(NodeInterventions, {
+      node: node({
+        status: 'blocked',
+        interventions: [
+          { kind: 'retry', by: 'mainBot', reason: '上游接口偶发超时', at: 0 },
+          { kind: 'handedToHuman', by: 'initiator', reason: '需要发起人给生产权限', at: MIN },
+        ],
+      }),
+    }));
+    expect(html).toContain('主 Bot 自动重试');
+    expect(html).toContain('上游接口偶发超时');
+    expect(html).toContain('交给人决定');
+    expect(html).toContain('（发起人）');
+    expect(html).toContain('需要发起人给生产权限');
+    expect(renderToStaticMarkup(React.createElement(NodeInterventions, { node: node() }))).toBe('');
   });
 
   it('节点详情列出每次尝试的结果；只有一次成功尝试时不列清单', () => {

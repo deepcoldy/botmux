@@ -42,6 +42,12 @@ export interface TriggerRequest {
   // OUTSIDE envelope so it is never serialized into the untrusted event JSON;
   // the prompt builder renders it as a trusted directive above the event data.
   instruction?: string;
+  /** Connector-owner opt-in (`promptEnvelope.trustPayload`): the envelope came
+   * from an authenticated caller whose body IS the task, so the prompt renders
+   * it as a trusted task request instead of untrusted event data. Webhook turns
+   * only; absent = the default untrusted rendering, byte-for-byte. Kept outside
+   * `envelope`, which stays `trusted: false` as the schema invariant. */
+  payloadTrusted?: true;
   /** Trusted presentation chosen by the connector owner. Undefined keeps the
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
@@ -296,6 +302,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (typeof envelope.sourceName !== 'string' || envelope.trusted !== false) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'envelope.sourceName is required and envelope.trusted must be false' } };
+  }
+  if (raw.payloadTrusted !== undefined
+    && (raw.payloadTrusted !== true || source.type !== 'webhook' || target.kind !== 'turn')) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'payloadTrusted must be true and is only supported for webhook turn triggers' } };
   }
   if (raw.presentation !== undefined) {
     if (!isRecord(raw.presentation)) {

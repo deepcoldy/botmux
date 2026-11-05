@@ -1,3 +1,4 @@
+import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -15,6 +16,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
 import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
@@ -94,6 +96,14 @@ import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-
 import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
+import { handleWorkflowSidebar } from './dashboard/workflow-sidebar-api.js';
+import { publishDashboardH5Presence } from './core/dashboard-h5-presence.js';
+import {
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+  WorkflowSidebarMembershipCache,
+  type WorkflowSidebarMembershipRequest,
+  type WorkflowViewerMembership,
+} from './core/workflow-sidebar-membership.js';
 import {
   defaultRunsDir as v3RunsDir,
   liveV3TerminalPortForSession,
@@ -122,7 +132,8 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
-import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
+import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
+import { getFeedbackStorage, closeFeedbackStorage } from './services/feedback-storage.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -135,6 +146,7 @@ import {
   createDashboardH5AuthController,
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
+  dashboardH5LoginUsable,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
@@ -186,7 +198,7 @@ import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { applyGlobalSessionEnvOps, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, isWorkflowFeatureEnabled, workflowNodeExecutorMode, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -198,6 +210,11 @@ import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  createDurableTerminalRoutePublisher,
+  createDurableTerminalRouteRegistry,
+  durableTerminalRoutePort,
+} from './services/durable-terminal-route.js';
 import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
@@ -365,6 +382,8 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
+import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
+import { handleWorkflowDraftsApi } from './dashboard/workflow-drafts-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -486,6 +505,31 @@ const dashboardH5Auth = createDashboardH5AuthController({
   audit: dashboardControlAudit,
 });
 const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+const workflowSidebarMembership = new WorkflowSidebarMembershipCache();
+const WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS = 10_000;
+
+/** Ask the run's main bot daemon (its own app) whether the viewer is in the
+ *  run's chat. Offline daemon / any error → unavailable (the sidebar denies). */
+async function askWorkflowSidebarMembership(
+  mainLarkAppId: string,
+  request: WorkflowSidebarMembershipRequest,
+): Promise<WorkflowViewerMembership> {
+  try {
+    const response = await proxyToDaemon(mainLarkAppId, WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: request.chatId, ...request.principal }),
+      // The daemon makes up to one contact call plus the chat's member pages.
+      signal: AbortSignal.timeout(WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS),
+    });
+    if (!response.ok) return 'unavailable';
+    const body = await response.json().catch(() => null) as { ok?: unknown; member?: unknown } | null;
+    if (body?.ok !== true || typeof body.member !== 'boolean') return 'unavailable';
+    return body.member ? 'member' : 'not_member';
+  } catch {
+    return 'unavailable';
+  }
+}
 try {
   pluginResultArtifacts.sweepExpired();
 } catch (error) {
@@ -876,10 +920,39 @@ const previewGuardPage = createPreviewGuardPage({
   // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
+// Primary replicas need one shared route registry for Pod-local worker
+// terminals. Initialize it before the `/s/*` front proxy so a request landing
+// on a non-owner backend can resolve the current owner Dashboard NodePort.
+const dashboardCoordinationRuntime = coordinationModeIsPrimary()
+  ? await initializeDurableCoordinationRuntime({
+      ...process.env,
+      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
+      // narrow config/route provider must not race those reporters on one path.
+      BOTMUX_COORDINATION_HEALTH_FILE: '',
+    }, { allowPrimary: true })
+  : undefined;
+const terminalRouteInstanceId = (process.env.MY_POD_NAME || process.env.HOSTNAME || `dashboard-${process.pid}`).trim();
+const terminalRouteRegistry = dashboardCoordinationRuntime?.mode === 'primary'
+  ? createDurableTerminalRouteRegistry({
+      store: dashboardCoordinationRuntime.store,
+      ownerId: `terminal-route-dashboard:${terminalRouteInstanceId}:${process.pid}`,
+    })
+  : undefined;
 const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => (
     aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)
   ),
+  // #2062: cross-replica routing exists only when primary coordination is on.
+  // Single-replica Dashboards install neither hook and keep the local-only path.
+  ...(terminalRouteRegistry
+    ? {
+        resolveRemoteTarget: async (sessionId: string) => {
+          const route = await terminalRouteRegistry.resolveSession(sessionId, terminalRouteInstanceId);
+          return route ? { host: route.host, port: route.port } : undefined;
+        },
+        isLocalTerminalLive: (sessionId: string) => aggregator.hasLiveTerminalWorker(sessionId),
+      }
+    : {}),
   resolveActor: dashboardRequestIdentity,
   control: terminalControl,
   // P1-5: bound `?viewToken=` capabilities are refused once the auth session
@@ -896,6 +969,40 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // #2004: lets the daemon proxy wake a suspended session for a signed-in viewer.
   wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
 });
+
+// #2062: advertise this replica's live terminals so a request landing on a
+// peer Dashboard can be forwarded here. Primary-only; a single-replica
+// Dashboard installs no listener and no timer.
+const terminalRouteHost = process.env.BOTMUX_TERMINAL_ROUTE_HOST?.trim();
+const terminalRoutePort = durableTerminalRoutePort(process.env);
+if (terminalRouteRegistry && terminalRouteHost && terminalRoutePort !== undefined) {
+  const terminalRoutePublisher = createDurableTerminalRoutePublisher({
+    registry: terminalRouteRegistry,
+    listRows: () => aggregator.getSessions(),
+    ownerInstanceId: terminalRouteInstanceId,
+    host: terminalRouteHost,
+    port: terminalRoutePort,
+    onWarn: message => logger.warn(`[terminal-route] ${message}`),
+  });
+  let terminalRoutePublishInFlight: Promise<void> | undefined;
+  const scheduleTerminalRoutePublish = (): void => {
+    if (terminalRoutePublishInFlight) return;
+    terminalRoutePublishInFlight = terminalRoutePublisher.publishDue()
+      .catch(error => logger.warn(`[terminal-route] publish failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { terminalRoutePublishInFlight = undefined; });
+  };
+  aggregator.on(ev => {
+    if (ev.type === 'session.spawned' || ev.type === 'session.update') {
+      scheduleTerminalRoutePublish();
+    }
+  });
+  const terminalRouteHeartbeat = setInterval(scheduleTerminalRoutePublish, 10_000);
+  terminalRouteHeartbeat.unref?.();
+} else if (terminalRouteRegistry) {
+  logger.warn('[terminal-route] primary coordination is on but BOTMUX_TERMINAL_ROUTE_HOST / '
+    + 'BOTMUX_TERMINAL_ROUTE_PORT (or BOTMUX_DASHBOARD_PORT) is unset or invalid; '
+    + 'terminals on this replica are not reachable from peer replicas');
+}
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {
     const daemon = registry.getByAppId(appId);
@@ -1213,8 +1320,10 @@ interface ResolvedDashboardSettings {
   /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. `nodeExecutor`
-   *  is the experimental executor frozen into newly authorized runs. */
-  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+   *  is the experimental executor frozen into newly authorized runs;
+   *  `handoffIdentity` whether those runs hand their initiator's identity to
+   *  the node bots. */
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
@@ -1225,8 +1334,9 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON; the nested
+   *  dispatch task-tree card switch is default OFF. */
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1859,6 +1969,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     workflow: {
       enabled: global.workflow?.enabled === true, // default OFF
       nodeExecutor: global.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral', // default ephemeral
+      handoffIdentity: global.workflow?.handoffIdentity === true, // default OFF
     },
     sessionCleanup: {
       archiveCodex: global.sessionCleanup?.archiveCodex === true,
@@ -1867,7 +1978,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
-    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
+    multiTopic: {
+      enabled: global.multiTopic?.enabled !== false, // default ON
+      taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
+    },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     httpProxy: global.httpProxy ?? null,
@@ -1880,14 +1994,6 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // Single shared deps object for `applySettingsWrite` — both the browser
 // `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
 // route call through this so error codes / merge semantics stay identical.
-const dashboardCoordinationRuntime = coordinationModeIsPrimary()
-  ? await initializeDurableCoordinationRuntime({
-      ...process.env,
-      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
-      // narrow config-CAS provider must not race those reporters on one path.
-      BOTMUX_COORDINATION_HEALTH_FILE: '',
-    }, { allowPrimary: true })
-  : undefined;
 const dashboardConfigCoordinator = dashboardCoordinationRuntime?.mode === 'primary'
   ? createDurableConfigCoordinator({
       store: dashboardCoordinationRuntime.store,
@@ -4008,10 +4114,6 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
-let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
-function analyticsService(): FeedbackAnalyticsService {
-  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
-}
 
 const companionApi = (() => {
   try {
@@ -4110,6 +4212,14 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
+    // Pinned xterm 5.5.0 browser bundle (the #1940 set) for pages rendered at
+    // the Dashboard root — the v3 terminal replay iframe — instead of a public
+    // CDN. Public library files, so no auth (same as the worker's copy under
+    // `/s/<id>/`, which still reaches the worker through the front proxy).
+    if (handleXtermVendorHttp(req, res, url.pathname, 'root', (err) => {
+      logger.warn(`[dashboard] xterm vendor asset failed: ${err instanceof Error ? err.message : String(err)}`);
+    })) return;
+
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
@@ -4152,6 +4262,23 @@ const server = createServer(async (req, res) => {
         if (!dashboardH5AuthConfig.enabled) return undefined;
         return `${dashboardH5AuthConfig.entryPath}?returnTo=${encodeURIComponent(returnTo)}`;
       },
+    })) return;
+
+    // Workflow sidebar (design 2026-11-03 §11): the `/workflow/<app>/<run>`
+    // entry and its read-only data route own their D6 gate — admins see the
+    // full run, current chat members a server-trimmed view, everyone else 403.
+    // Mounted before the ordinary gate because the H5 session it accepts for
+    // non-allowlisted members is invisible to every other route.
+    if (await handleWorkflowSidebar(req, res, url, {
+      runsDir: v3RunsDir(),
+      identity: () => dashboardRequestIdentity(req),
+      h5: () => dashboardH5Auth.resolve(req),
+      h5Config: dashboardH5AuthConfig,
+      platformLoginUrl: returnTo => buildPlatformDashboardLoginUrl(returnTo),
+      membership: workflowSidebarMembership,
+      askMembership: askWorkflowSidebarMembership,
+      brand: appId => normalizeBrand(configuredBrands().get(appId)),
+      botName: v3RunBotNameResolver(),
     })) return;
 
     // Session Web preview is an authenticated, same-origin reverse proxy to an
@@ -4393,6 +4520,10 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Workflow orchestration refuses Feishu H5 免登 with its own code (design
+    // 2026-11-03 workflow-dashboard-orchestration I5) instead of the generic 401.
+    if (workflowInitiatorPreGateDenial(res, url.pathname, requestIdentity, canManageHost)) return;
+
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
@@ -4558,7 +4689,13 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
-      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
+      return;
+    }
+    if (url.pathname.startsWith('/api/feedback/storage')) {
+      if (!legacyAuthed || requestIdentity?.kind !== 'legacy-dashboard') return jsonRes(res, 403, { error: 'feedback_storage_admin_required' });
+      if (req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity)) return;
+      await handleFeedbackStorageApi(req, res, url, { dataDir: config.session.dataDir, isHostAdmin: true, csrfValid: true });
       return;
     }
 
@@ -6443,6 +6580,16 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
     }
 
+    // Owner authentication above applies; never fall back to a broad interrupt.
+    const sessionStop = await proxySessionStopControl(req.method, url.pathname, {
+      ownerOf: sid => aggregator.ownerOf(sid), proxyToDaemon,
+    });
+    if (sessionStop) {
+      res.writeHead(sessionStop.status, { 'content-type': 'application/json' });
+      res.end(await sessionStop.text());
+      return;
+    }
+
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
     // 四态 running/completed/failed/not_found，daemon 重启后从持久化结果兜底
     // 重建 completed。owner-only（写权限 cookie），代理到 owner daemon 同名 IPC。
@@ -6701,6 +6848,33 @@ const server = createServer(async (req, res) => {
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, { method: 'DELETE' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
+      return;
+    }
+
+    // Workflow initiator (design 2026-11-03 workflow-dashboard-orchestration
+    // §7.1): classify the login here, resolve the person and gate on the
+    // orchestrating bot's own daemon.
+    if (await handleWorkflowInitiatorApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // Workflow drafts (design 2026-11-03 workflow-dashboard-orchestration D2):
+    // the list reads disk; everything else goes to the draft's orchestrating
+    // bot's daemon, which checks the initiator on every write.
+    if (await handleWorkflowDraftsApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      runsDir: v3RunsDir(),
+      proxyToDaemon,
+    })) {
       return;
     }
 
@@ -8194,7 +8368,20 @@ listenWithProbe({
   try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
+  // Card builders (daemons / CLIs never see the H5 config) read this to pick
+  // the「工作流 ›」link: the Feishu sidebar only when H5 login can work there.
+  try { publishDashboardH5Presence(dashboardH5LoginUsable(dashboardH5AuthConfig)); } catch (e) {
+    logger.warn(`[dashboard] Failed to record H5 login availability: ${(e as Error).message}`);
+  }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  // #2062 F5: the advertised route port defaults to BOTMUX_DASHBOARD_PORT, but
+  // the listener may have probed past a busy port. An explicit
+  // BOTMUX_TERMINAL_ROUTE_PORT (e.g. a NodePort mapping) is trusted as-is.
+  if (terminalRouteRegistry && !process.env.BOTMUX_TERMINAL_ROUTE_PORT?.trim()
+      && terminalRoutePort !== undefined && terminalRoutePort !== port) {
+    logger.warn(`[terminal-route] advertised port ${terminalRoutePort} differs from the listening port ${port}; `
+      + 'peer replicas will fail to reach terminals here — set BOTMUX_TERMINAL_ROUTE_PORT explicitly');
+  }
   // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
   // (crash/restart mid-delete). Best-effort and fire-and-forget.
   sweepStoreTrash();
@@ -8380,7 +8567,7 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 }
 
 // Graceful shutdown
-function shutdown(): void {
+async function shutdown(): Promise<void> {
   codexNotifierAbort.abort();
   stopAutoCleanup();
   for (const sub of subs.values()) sub.off();
@@ -8389,7 +8576,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   hostTerminalManager.shutdown();
-  feedbackAnalyticsService?.close();
+  await closeFeedbackStorage(config.session.dataDir);
   setDurableConfigCoordinator(undefined);
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => {

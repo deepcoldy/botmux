@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -189,4 +189,16 @@ export function updateHeadlessSession(
     saveHeadlessSession(latest);
     return latest;
   });
+}
+
+/** Delete a headless session's sidecar record (the session row is closed by
+ *  its owner first). Missing record → false. */
+export function deleteHeadlessSession(id: string): boolean {
+  if (!isHeadlessId(id)) return false;
+  try {
+    rmSync(fileFor(id), { force: false });
+    return true;
+  } catch {
+    return false;
+  }
 }

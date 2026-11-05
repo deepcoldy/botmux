@@ -17,6 +17,7 @@ import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
 import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
+import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
@@ -25,6 +26,7 @@ import {
   triggerUserAuthApplies,
   credentialSourceOf,
   TRIGGER_USER_AUTH_TOOLS,
+  type TriggerUserAuthConfig,
   type TriggerUserAuthTool,
 } from '../services/trigger-user-auth.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
@@ -36,6 +38,7 @@ import {
 import {
   writeSessionIdentity,
   clearSessionIdentity,
+  recallProvenIdentityContent,
   type CliIdentity,
 } from './cli-identity.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
@@ -66,7 +69,40 @@ export interface DelegatedCliIdentity {
   unionId: string;
   tools: TriggerUserAuthTool[];
   dispatchRoot: string;
-  denialReason?: 'target_access_denied' | 'target_validation_unavailable';
+  /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
+   *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
+  denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
+    /** A workflow delegation passed on from a node session into a session
+     *  that keeps identities on disk: it could not be re-checked per use. */
+    | 'passed_on_unsupported';
+  /** A workflow handoff's delegation (design 2026-11-03 §10). */
+  workflowHandoff?: true;
+  /** Workflow handoff only: re-run its run / attempt / revocation checks
+   *  (local reads) and say why it no longer holds. Consulted on every use,
+   *  so a stop that never reached this daemon still ends it. Daemon memory
+   *  only; never serialized. */
+  recheck?: () => string | undefined;
+}
+
+/** Replace one tool's published identity for `turnId` with the refusal for
+ *  `delegated` (its `denialReason` explains it). Used when a workflow
+ *  delegation stops holding while its turn is still running. */
+export function publishDelegationRefusal(args: {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  tool: TriggerUserAuthTool;
+  delegated: DelegatedCliIdentity;
+  storageModel: IdentityStorageModel;
+}): void {
+  denyDelegated(args.tool, {
+    botConfig: {} as BotConfig,
+    sessionDataDir: args.sessionDataDir,
+    sessionId: args.sessionId,
+    senderOpenId: undefined,
+    turnId: args.turnId,
+    storageModel: args.storageModel,
+  }, args.delegated);
 }
 
 export interface PublishTurnIdentityArgs {
@@ -157,7 +193,11 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
     ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
     : user.denialReason === 'target_access_denied'
       ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
-      : 'The source must ask the original human to authorize.';
+      : user.denialReason === 'delegation_inactive'
+        ? 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn), so the requester\'s identity no longer applies; do not request another login.'
+        : user.denialReason === 'passed_on_unsupported'
+          ? 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call, and this session does not. Tools that need the person\'s authorization refuse here; do not request another login.'
+          : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
@@ -270,13 +310,228 @@ async function publishOne(
         const local = await resolveIdentityFor(tool, botConfig, senderOpenId);
         if (local) return publish(local, true);
       }
-      return refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform);
+      // Proven model only: the wrapper asks the daemon on every invocation, so
+      // a transient refusal can be re-asked there (see retryTransientTurnIdentity).
+      const retryable = platform.state === 'unavailable' && !!turnId && storageModel === 'proven';
+      const outcome = refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform, retryable);
+      if (retryable) {
+        rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId! });
+      }
+      return outcome;
     }
   }
 
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
   if (!identity) return await withheld();
   return publish(identity, true);
+}
+
+// ─── Transient platform refusals: give the turn's next call another chance ───
+//
+// A grant is fetched once when the turn is prepared. If the platform could not
+// be reached at that moment, the refusal published for the turn used to stand
+// for the whole turn, so one network blip spoiled every bytedcli / lark-cli
+// call the turn made. For the proven model (the wrapper asks the daemon for
+// each invocation) the daemon instead re-asks the platform when the wrapper
+// next fetches that refusal — rate-limited, and only while the refusal it
+// published is still what is in force (compare-and-set right before writing,
+// so a newer publication or a revocation is never overwritten).
+//
+// Only `unavailable` qualifies: an HTTP answer about the person (not
+// authorized, no consent, not a teammate, forbidden) is final for the turn.
+
+/** Minimum spacing between re-asks for one turn/tool. The FIRST re-ask is not
+ *  spaced: preparing the turn already waited out a full grant budget, and the
+ *  agent's first tool call is usually the only one before it gives up. */
+export const TRANSIENT_REFUSAL_RETRY_INTERVAL_MS = 10_000;
+/** Longest a wrapper's identity fetch waits on a re-ask. Stays well inside the
+ *  wrapper's own 20s IPC timeout (a contact lookup plus a grant can exceed it);
+ *  past this the current refusal is served and the attempt finishes in the
+ *  background for the next call. */
+export const TRANSIENT_REFUSAL_WAIT_CAP_MS = 10_000;
+/** Re-asks per turn/tool; an agent stuck in a retry loop cannot hammer the platform. */
+export const TRANSIENT_REFUSAL_MAX_RETRIES = 5;
+/** Forget an entry after this long even if its turn's material is still held. */
+const TRANSIENT_REFUSAL_TTL_MS = 2 * 60 * 60 * 1000;
+const TRANSIENT_REFUSAL_MAX_ENTRIES = 1000;
+
+interface TransientRefusal {
+  botConfig: BotConfig;
+  tool: TriggerUserAuthTool;
+  sessionDataDir: string;
+  sessionId: string;
+  senderOpenId: string;
+  locale: Locale | undefined;
+  turnId: string;
+  /** The refusal body this module published; the CAS token. */
+  body: string;
+  /** The person's local credential epoch when the refusal was published; a
+   *  revocation (`/logout`, Dashboard revoke) bumps it and ends the re-asks. */
+  authEpoch: number;
+  createdAt: number;
+  lastAttemptAt: number;
+  retries: number;
+  inFlight?: Promise<void>;
+}
+
+const transientRefusals = new Map<string, TransientRefusal>();
+
+function transientKey(sessionDataDir: string, sessionId: string, turnId: string, tool: TriggerUserAuthTool): string {
+  return JSON.stringify([sessionDataDir, sessionId, turnId, tool]);
+}
+
+function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEpoch' | 'createdAt' | 'lastAttemptAt' | 'retries'>): void {
+  const body = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool);
+  if (!body) return; // the refusal did not land; nothing to compare against
+  const now = Date.now();
+  const key = transientKey(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool);
+  transientRefusals.delete(key);
+  transientRefusals.set(key, {
+    ...entry, body, authEpoch: readCliAuthEpoch(entry.senderOpenId),
+    createdAt: now, lastAttemptAt: Number.NEGATIVE_INFINITY, retries: 0,
+  });
+  while (transientRefusals.size > TRANSIENT_REFUSAL_MAX_ENTRIES) {
+    const oldest = transientRefusals.keys().next().value;
+    if (oldest === undefined) break;
+    transientRefusals.delete(oldest);
+  }
+}
+
+/**
+ * Called by the proven identity route before it serves a turn's identity. When
+ * what is in force is a transient platform refusal this module published, ask
+ * the platform again (the first time right away, then at most once per
+ * {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS}) and publish the answer if the
+ * refusal is still the one in force. Concurrent callers share one attempt; no
+ * caller waits longer than {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
+ *
+ * `currentPolicy` — not `botConfig` — is what decides whether a re-ask may run
+ * and whether its answer may be written: a bot policy changed mid-turn (tool no
+ * longer governed, source switched to local) ends the re-asks instead of
+ * publishing under the policy the turn started with. `botConfig` is only the
+ * fallback for a caller with no registry reader.
+ */
+export async function retryTransientTurnIdentity(args: {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  tool: TriggerUserAuthTool;
+  botConfig?: BotConfig;
+  /** Reads the LIVE policy for this bot. Must be supplied by whoever holds the
+   *  bot registry: a mid-turn Dashboard edit replaces the whole config object,
+   *  so any snapshot (including `botConfig`) stays stale and would let an
+   *  in-flight attempt publish under a policy the operator already left. */
+  currentPolicy?: () => TriggerUserAuthConfig | undefined;
+}): Promise<void> {
+  const key = transientKey(args.sessionDataDir, args.sessionId, args.turnId, args.tool);
+  const entry = transientRefusals.get(key);
+  if (!entry) return;
+  if (!entry.inFlight) {
+    const now = Date.now();
+    if (!stillInForce(entry)
+      || now - entry.createdAt > TRANSIENT_REFUSAL_TTL_MS
+      || entry.retries >= TRANSIENT_REFUSAL_MAX_RETRIES
+      || !policyStillWants(args.currentPolicy, entry, args.botConfig)) {
+      transientRefusals.delete(key);
+      return;
+    }
+    if (now - entry.lastAttemptAt < TRANSIENT_REFUSAL_RETRY_INTERVAL_MS) return;
+    entry.lastAttemptAt = now;
+    entry.retries++;
+    entry.inFlight = runTransientRetry(key, entry, args.currentPolicy, args.botConfig)
+      .finally(() => { entry.inFlight = undefined; });
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    entry.inFlight,
+    new Promise<void>(resolve => { timer = setTimeout(resolve, TRANSIENT_REFUSAL_WAIT_CAP_MS); }),
+  ]);
+  clearTimeout(timer);
+}
+
+/** The refusal this entry published is still what the turn has, and the
+ *  person has not revoked their credentials since. */
+function stillInForce(entry: TransientRefusal): boolean {
+  return recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.turnId, entry.tool) === entry.body
+    && readCliAuthEpoch(entry.senderOpenId) === entry.authEpoch;
+}
+
+/** Does the bot's policy — read NOW, not when the refusal was published — still
+ *  take this tool's credentials from the platform?
+ *
+ *  Dashboard writes replace the whole bot config object
+ *  (`bots.set(appId, { config: cfg, … })`), so a snapshot taken at publication
+ *  time (the entry's `botConfig`) can never observe a mid-turn edit: only a
+ *  reader supplied by whoever holds the registry can.
+ *
+ *  A reader that throws means the bot is gone; that is "no longer governed", so
+ *  the re-ask stops rather than publishing under a policy nobody stated. */
+function policyStillWants(
+  live: (() => TriggerUserAuthConfig | undefined) | undefined,
+  entry: TransientRefusal,
+  fallbackConfig: BotConfig | undefined,
+): boolean {
+  let policy: TriggerUserAuthConfig | undefined;
+  if (live) {
+    try { policy = live(); } catch { return false; }
+  } else {
+    policy = (fallbackConfig ?? entry.botConfig).triggerUserAuth;
+  }
+  return triggerUserAuthApplies(policy, entry.tool) && credentialSourceOf(policy) !== 'local';
+}
+
+async function runTransientRetry(
+  key: string,
+  entry: TransientRefusal,
+  live: (() => TriggerUserAuthConfig | undefined) | undefined,
+  fallbackConfig: BotConfig | undefined,
+): Promise<void> {
+  // Only ever drop THIS entry: a republication of the same turn registers a
+  // fresh one under the same key, which an older attempt must not erase.
+  const drop = () => { if (transientRefusals.get(key) === entry) transientRefusals.delete(key); };
+  try {
+    const platform = await resolvePlatformIdentity({
+      botConfig: entry.botConfig, tool: entry.tool, openId: entry.senderOpenId,
+      sessionId: entry.sessionId, turnId: entry.turnId,
+    });
+    // Compare-and-set: synchronous from here to the write. The policy check
+    // belongs INSIDE this window: the attempt took a whole grant budget, and an
+    // operator switching this bot to local credentials (or turning the tool off)
+    // during it must not end with platform credentials on disk.
+    if (transientRefusals.get(key) !== entry
+      || !stillInForce(entry)
+      || !policyStillWants(live, entry, fallbackConfig)) {
+      drop();
+      return;
+    }
+    if (platform.state === 'granted') {
+      writeSessionIdentity(entry.sessionDataDir, entry.sessionId,
+        { ...platform.identity, turnId: entry.turnId, openId: entry.senderOpenId }, 'proven');
+      drop();
+      logger.info(`[trigger-user-auth] platform ${entry.tool} grant recovered for session ${entry.sessionId} on retry`);
+      return;
+    }
+    if (platform.state === 'unavailable') return; // keep the refusal; retry later
+    if (platform.state === 'unbound') {
+      // Unbound mid-turn: what applies now depends on the source (auto falls
+      // back to local logins) and is the next turn's decision. Keep the
+      // refusal the turn has; stop asking a platform that is gone.
+      drop();
+      return;
+    }
+    // The platform now answered about the person: publish that answer, final.
+    refuseViaPlatform(entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId, entry.senderOpenId,
+      entry.locale, entry.turnId, 'proven', platform);
+    drop();
+  } catch (e) {
+    logger.warn(`[trigger-user-auth] retry of ${entry.tool} identity failed for session ${entry.sessionId}: `
+      + `${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/** @internal test-only */
+export function __resetTransientRefusalsForTest(): void {
+  transientRefusals.clear();
 }
 
 /**
@@ -294,6 +549,8 @@ function refuseViaPlatform(
   turnId: string | undefined,
   storageModel: IdentityStorageModel,
   platform: Exclude<PlatformIdentityResolution, { state: 'granted' }>,
+  /** The daemon will re-ask on the turn's next call (proven model). */
+  retryable = false,
 ): ToolIdentityOutcome {
   const provider = tool === 'bytedcli' ? 'ByteCloud' : t('trigger_user_auth.provider_lark', undefined, locale);
   const vars = { tool, provider };
@@ -318,7 +575,9 @@ function refuseViaPlatform(
         : t('trigger_user_auth.denied_platform_forbidden', { ...vars, detail: platform.detail }, locale)];
       break;
     case 'unavailable':
-      tail = [t('trigger_user_auth.denied_platform_unavailable', vars, locale)];
+      tail = [t(retryable
+        ? 'trigger_user_auth.denied_platform_unavailable_retryable'
+        : 'trigger_user_auth.denied_platform_unavailable', vars, locale)];
       state = 'unavailable';
       break;
   }

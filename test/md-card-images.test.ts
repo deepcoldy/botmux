@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
-import { buildCanonicalFinalReplyCard, buildContextualReplyCard, buildImageCardElements, omitReplyCardImages, prepareCardMarkdown } from '../src/im/lark/md-card.js';
+import { buildCanonicalFinalReplyCard, buildContextualReplyCard, buildImageCardElements, omitReplyCardImages, prepareCardMarkdown, stripCardMarkdownImages } from '../src/im/lark/md-card.js';
 import { replyWithImageFallback } from '../src/im/lark/card-image-fallback.js';
 
 const parser = new MarkdownIt();
@@ -146,5 +146,73 @@ describe('reply cards with unsupported images', () => {
     expect(fallback).toContain('`![Example](img_v3_example)`');
     expect(fallback).not.toContain('![Preview]');
     expect(omitReplyCardImages(fallback)).toBe(fallback);
+  });
+
+  describe('stripCardMarkdownImages fixed point', () => {
+    // Independent ground truth: a fresh MarkdownIt parser (not the scanner the
+    // sanitizer itself uses) must see zero image tokens in the output.
+    const groundTruthImages = (text: string): string[] => {
+      const out: string[] = [];
+      const walk = (tokens: Token[]): void => {
+        for (const token of tokens) {
+          if (token.type === 'image') out.push(token.attrGet('src') ?? '');
+          if (token.children) walk(token.children);
+        }
+      };
+      const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+      md.validateLink = () => true;
+      walk(md.parse(text, {}));
+      return out;
+    };
+
+    it('strips reference-style (full and shortcut) image definitions', () => {
+      expect(groundTruthImages(stripCardMarkdownImages('见 ![图][r1]\n\n[r1]: img_v3_02k_aaa'))).toEqual([]);
+      expect(groundTruthImages(stripCardMarkdownImages('![ref]\n\n[ref]: /tmp/x.png'))).toEqual([]);
+    });
+
+    it('reaches a fixed point when a replacement resyncs an inert image out of a link destination', () => {
+      // The first replacement inserts "[Image omitted] [", adding bracket text
+      // inside the outer link's text. That re-forms the parse and promotes the
+      // image nested in the link DESTINATION into a live token. A single pass
+      // leaks it; iterating to the fixed point must leave zero image tokens.
+      // 600k randomized nested-link inputs found carriers needing up to 3
+      // passes; assert the concrete shapes for both key and non-key sources.
+      const carriers = [
+        'x[![y](/tmp/y.png)!](![z](img_v3_02k_alien_key))',
+        '[![](img_v3_02k_a)![x](/tmp/p.png)文![](img_v3_02k_b)](img_v3_02k_c)))',
+        '](![![](img_v3_02k_d)](![y](https://e.com/y))文',
+        '![\\![e](img:0)](![a](img:0)) ![a](img:0)[',
+      ];
+      for (const input of carriers) {
+        const stripped = stripCardMarkdownImages(input);
+        expect(groundTruthImages(stripped)).toEqual([]);
+        // Fixed point: a second call changes nothing (no hidden multi-pass
+        // requirement left for callers).
+        expect(stripCardMarkdownImages(stripped)).toBe(stripped);
+      }
+    });
+
+    it('leaves fences, inline code, escapes and ordinary links intact', () => {
+      const text = '```\n![fenced](img:0)\n```\n~~~\n![](tilde)\n~~~\n`![inline](x)` \\![e](img:0) [l](https://e.com/a?img:0)';
+      const stripped = stripCardMarkdownImages(text);
+      expect(stripped).toBe(text);
+      expect(groundTruthImages(stripped)).toEqual([]);
+    });
+
+    it('fixed-point sanitizes nested-link carriers inside the whole-card fallback too', () => {
+      // The fallback is the last line before resend: its own per-field
+      // sanitization must not leave a re-synced image token that rejects the
+      // retried (and persisted) card as well.
+      const carrier = 'x[![y](/tmp/y.png)!](![z](img_v3_02k_alien_key))';
+      const card = JSON.stringify({
+        schema: '2.0', body: { elements: [
+          { tag: 'markdown', content: `过程\n${carrier}` },
+          { tag: 'markdown', content: '正文图 ![](img_v3_body)' },
+        ] },
+      });
+      const fallback = omitReplyCardImages(card);
+      expect(imageSources(fallback)).toEqual([]);
+      expect(omitReplyCardImages(fallback)).toBe(fallback);
+    });
   });
 });

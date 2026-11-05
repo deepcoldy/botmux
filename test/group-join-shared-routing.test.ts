@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { t } from '../src/i18n/index.js';
 
 const mocks = vi.hoisted(() => ({
   forkWorker: vi.fn(),
@@ -86,6 +87,7 @@ vi.mock('../src/core/worker-pool.js', async () => {
 });
 
 let tempRoot = '';
+let allowJoinHook = '';
 let modules: Awaited<ReturnType<typeof loadModules>>;
 
 function tempDir(name: string): string {
@@ -110,6 +112,9 @@ async function loadModules() {
 
 beforeAll(async () => {
   tempRoot = mkdtempSync(join(tmpdir(), 'botmux-group-join-shared-'));
+  const hookPath = join(tempRoot, 'allow-join.cjs');
+  writeFileSync(hookPath, 'process.exit(0);');
+  allowJoinHook = `"${process.execPath}" "${hookPath}"`;
   process.env.SESSION_DATA_DIR = tempDir('sessions');
   modules = await loadModules();
 }, 30_000);
@@ -150,6 +155,88 @@ afterAll(() => {
   delete process.env.SESSION_DATA_DIR;
   modules?.identities.flushIdentityCacheSync();
   rmSync(tempRoot, { recursive: true, force: true });
+});
+
+describe('handleBotAdded — 默认入群任务', () => {
+  const cases = [
+    { cliId: 'claude-code', mode: 'group', replyMode: 'shared', prompt: undefined, lang: 'zh' },
+    { cliId: 'claude-code', mode: 'group', replyMode: 'chat', prompt: '', lang: 'zh' },
+    { cliId: 'claude-code', mode: 'group', replyMode: 'new-topic', prompt: ' \n\t ', lang: 'zh' },
+    { cliId: 'traex', mode: 'topic', replyMode: 'shared', prompt: undefined, lang: 'en' },
+    { cliId: 'codex', mode: 'group', replyMode: 'new-topic', prompt: '', lang: 'en' },
+    { cliId: 'codex-app', mode: 'group', replyMode: 'shared', prompt: undefined, lang: 'en' },
+  ] as const;
+
+  it.each(cases)('$cliId / $mode / $replyMode 把默认任务放入首轮正文', async ({ cliId, mode, replyMode, prompt, lang }) => {
+    const { daemon, registry } = modules;
+    const appId = `app_default_${cliId}_${mode}_${replyMode}`;
+    const chatId = `oc_default_${cliId}_${mode}_${replyMode}`;
+    mocks.getChatContext.mockResolvedValueOnce({
+      chatId, name: '待接待群', description: null, mode, fetchStatus: 'ok',
+    });
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId, lang,
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: prompt,
+      defaultWorkingDir: tempDir(`repo-${appId}`), regularGroupReplyMode: replyMode,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const [ds, input] = mocks.forkWorker.mock.calls[0];
+    const userMessage = input.content.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1];
+    const defaultTask = t('daemon.auto_start_join_prompt', undefined, lang);
+    expect(userMessage?.trim()).toBe(defaultTask);
+    expect(userMessage?.trim()).not.toBe('');
+    expect(ds.session.title).toBe(t('daemon.auto_start_join_title', undefined, lang));
+    if (cliId === 'codex-app') {
+      expect(input.codexAppInput.text).toBe(defaultTask);
+    }
+  });
+
+  it.each([[''], ['人工触发的明确任务']])('显式 forcePrompt 优先于默认任务和 bot 配置 (%j)', async (forced) => {
+    const { daemon, registry } = modules;
+    const appId = 'app_forced_join_task';
+    const chatId = 'oc_forced_join_task';
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: false,
+      autoStartOnGroupJoinPrompt: 'bot 配置中的任务',
+      defaultWorkingDir: tempDir('repo-forced-join-task'), regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId, { forcePrompt: forced });
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const [ds, input] = mocks.forkWorker.mock.calls[0];
+    const userMessage = input.content.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1];
+    expect(userMessage?.trim()).toBe(forced);
+    // 非空 forcePrompt 直接作为会话标题（Issue Board 领取行为）；空串不进标题，
+    // 回退内置入群标题。
+    expect(ds.session.title).toBe(forced || t('daemon.auto_start_join_title'));
+  });
+
+  it('forcePrompt 为空串时 codex-app 的可见 sidecar 回退为内置标题而非空 UserMessage（会议预热路径）', async () => {
+    const { daemon, registry } = modules;
+    const appId = 'app_forced_empty_codex_app';
+    const chatId = 'oc_forced_empty_codex_app';
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'codex-app', lang: 'zh',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: false,
+      defaultWorkingDir: tempDir('repo-forced-empty-codex-app'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId, { forcePrompt: '' });
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const input = mocks.forkWorker.mock.calls[0][1];
+    const userMessage = input.content.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1];
+    expect(userMessage?.trim()).toBe('');
+    // 空开场 PTY 正文为空，但 codex-app 需要非空可见 UserMessage：用本地化标题兜底。
+    expect(input.codexAppInput).toBeTruthy();
+    expect(input.codexAppInput.text).toBe(t('daemon.auto_start_join_title', undefined, 'zh'));
+  });
 });
 
 describe('handleBotAdded — 普通群 shared 路由', () => {
@@ -418,7 +505,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       defaultWorkingDir: tempDir(`repo-bot-${evidence}`), regularGroupReplyMode: 'shared',
     });
     process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
-      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      event: 'chat.bot_added', mode: 'sync', command: allowJoinHook, onError: 'deny',
       filter: { larkAppId: appId },
     }]);
 
@@ -484,7 +571,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const chatId = 'oc_join_no_operator';
     mocks.forkWorker.mockReturnValueOnce(true);
     process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
-      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      event: 'chat.bot_added', mode: 'sync', command: allowJoinHook, onError: 'deny',
       filter: { larkAppId: appId },
     }]);
     registry.registerBot({
@@ -514,7 +601,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'mention', name: 'Owner' });
     const before = identities.getIdentity(appId, 'ou_owner');
     process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
-      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      event: 'chat.bot_added', mode: 'sync', command: allowJoinHook, onError: 'deny',
       filter: { larkAppId: appId },
     }]);
     registry.registerBot({
@@ -562,7 +649,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
       event: 'chat.bot_added',
       mode: 'sync',
-      command: '/bin/true',
+      command: allowJoinHook,
       onError: 'deny',
       filter: { larkAppId: appId },
     }]);

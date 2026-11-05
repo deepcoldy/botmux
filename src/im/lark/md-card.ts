@@ -26,6 +26,7 @@ import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
+import { repairCardStrongPunctuation } from './card-strong-punctuation.js';
 import type Token from 'markdown-it/lib/token.mjs';
 import StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs';
 import { t, type Locale } from '../../i18n/index.js';
@@ -61,8 +62,10 @@ import {
 
 /** Room kept for chrome that callers attach *after* a card is built and
  * fitted — today the on-call group button (≈483B of request body), added by
- * `attachOncallGroupButton` in both `botmux send` and the daemon. Reserved
- * unconditionally; it costs nothing when no button is attached. */
+ * `attachOncallGroupButton` in both `botmux send` and the daemon, and a
+ * workflow node session's「工作流 ›」entry (≈0.8KB raw, ≈1KB escaped, with a
+ * 128-char run id; `attachWorkflowSidebarEntry`). Reserved unconditionally;
+ * it costs nothing when no button is attached. */
 export const CARD_LATE_CHROME_RESERVE_BYTES = 2_000;
 
 export type { CardRenderDiagnostic } from './vega-lite-chart.js';
@@ -1289,6 +1292,43 @@ function normalizeCardImages(input: string, omitAll = false): string {
     unsupported.has(offset) ? '[Image omitted] [' : match);
 }
 
+/**
+ * Omit-all normalization must reach a fixed point. One replacement pass can
+ * resynchronize the parser: it inserts a bracketed notice (`[Image omitted] [`),
+ * and the extra bracket text can change how an OUTER link's text/destination
+ * parses — an image token that was inert inside the link's destination can
+ * surface as a live image token when the output is re-parsed. A single pass
+ * therefore does not guarantee "zero image tokens". Iterate until the scan
+ * reports none. Termination is bounded by the input: every differing pass
+ * replaces at least one literal `![` with text that contains no `!`, so the
+ * count of `![` strictly decreases (fuzzed: nested-link carriers converge in
+ * <=3 passes).
+ */
+function omitAllCardImagesToFixedPoint(input: string): string {
+  let current = input;
+  for (;;) {
+    const next = normalizeCardImages(current, true);
+    if (next === current) return current;
+    current = next;
+  }
+}
+
+/**
+ * Neutralize every Markdown image token in display-only text (the turn
+ * reply-card's process panel: progress narration, thinking, tool labels and
+ * results). Such text has no upload/key-resolution path, so any image syntax —
+ * `img:N` placeholders, local paths, URLs, even a well-formed Feishu key —
+ * would be validated by Feishu as part of the *whole* card, collapsed panel
+ * included. One bad key rejects the entire card (230099 / 200570 "card contains
+ * invalid image keys"), and the whole-card image fallback then removes the
+ * valid body images too. Code spans/fences, escaped syntax and ordinary links
+ * are left intact; the body rendering pipeline keeps its own key-aware
+ * normalization and is unaffected.
+ */
+export function stripCardMarkdownImages(input: string): string {
+  return omitAllCardImagesToFixedPoint(input);
+}
+
 /** Last-resort image-free version of a rejected reply card. Keep the card
  * envelope, text, tables, code and controls so existing delivery accounting
  * can continue to use the same message type and provider UUID. */
@@ -1315,7 +1355,10 @@ export function omitReplyCardImages(cardJson: string): string {
     return Object.fromEntries(Object.entries(value).map(([key, child]) => {
       if (typeof child === 'string' && (markdownFields?.has(key)
         || ('tag' in value && (value.tag === 'markdown' || value.tag === 'lark_md') && key === 'content'))) {
-        const content = normalizeCardImages(child, true);
+        // Fixed-point like stripCardMarkdownImages: this fallback is the last
+        // line before resending, and a single pass can leave a re-synced image
+        // token (nested-link carrier) that rejects the retried card too.
+        const content = omitAllCardImagesToFixedPoint(child);
         if (content !== child) changed = true;
         return [key, content];
       }
@@ -1416,6 +1459,10 @@ export function buildCardBodyElements(
   // Only sanitize at the rendering boundary: sandbox relay preparation runs
   // before --images uploads resolve img:N placeholders to real image keys.
   input = normalizeCardImages(input);
+  // Feishu's markdown component pairs `**` by CommonMark flanking rules, so a
+  // label like `**说明：**正文` shows raw asterisks. Move the punctuation
+  // across the delimiter; already-renderable markdown stays byte-identical.
+  input = repairCardStrongPunctuation(input);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so

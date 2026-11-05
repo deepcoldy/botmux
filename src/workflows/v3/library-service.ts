@@ -74,6 +74,10 @@ export interface SavedWorkflowActorContext {
   chatType?: 'group' | 'p2p';
   rootMessageId?: string;
   sessionId?: string;
+  /** The current turn was opened by `actor`'s own message (not a scheduled
+   *  task or another synthetic turn). Only such a turn may freeze the actor
+   *  as a run initiator for 交接带发起人身份 (design §10.2). */
+  humanTurn?: boolean;
 }
 
 export type SavedWorkflowServiceErrorCode =
@@ -150,6 +154,9 @@ export type SaveTerminalRunAsWorkflowIdempotentInput =
 export interface SaveTerminalRunAsWorkflowResult extends SavedWorkflowWriteResult {
   sourceStatus: 'succeeded' | 'failed' | 'blocked';
   created: boolean;
+  /** Runtime flow revisions in the source run; the saved definition is its
+   *  final effective flow (design §13.8). */
+  runtimeRevisions: number;
 }
 
 /**
@@ -572,7 +579,7 @@ export async function saveTerminalRunAsWorkflow(
       expectedLatestRevision: input.expectedLatestRevision,
       now: input.now,
     });
-    return { ...written, sourceStatus: compiled.sourceStatus, created: false };
+    return { ...written, sourceStatus: compiled.sourceStatus, created: false, runtimeRevisions: compiled.runtimeRevisions };
   }
 
   const scope: SavedWorkflowScope = input.scope === 'global'
@@ -587,7 +594,7 @@ export async function saveTerminalRunAsWorkflow(
     publish: compiled.publish,
     now: input.now,
   });
-  return { ...written, sourceStatus: compiled.sourceStatus, created: true };
+  return { ...written, sourceStatus: compiled.sourceStatus, created: true, runtimeRevisions: compiled.runtimeRevisions };
 }
 
 /**
@@ -623,7 +630,12 @@ export async function saveTerminalRunAsWorkflowIdempotent(
     context,
     now: input.now,
   });
-  return { ...written, sourceStatus: compiled.sourceStatus, created: written.created };
+  return {
+    ...written,
+    sourceStatus: compiled.sourceStatus,
+    created: written.created,
+    runtimeRevisions: compiled.runtimeRevisions,
+  };
 }
 
 /** List the current chat's workflows plus global workflows. */
@@ -766,6 +778,7 @@ export async function instantiatePublishedSavedWorkflow(
     ? await resolveV3NodeExecutor({
         policy: input.nodeExecutorPolicy,
         binding: chatBinding,
+        humanTurn: context.humanTurn === true,
         targetsFor: (binding) => {
           // Same freeze the materializer applies for a bot run.
           const templateDag = { runId: 'executor-plan', nodes: current.revision.payload.dagTemplate.nodes } as V3Dag;
@@ -792,6 +805,7 @@ export async function instantiatePublishedSavedWorkflow(
     runId: input.runId,
     now: input.now,
     ...(executor.kind === 'bot' ? { nodeExecutor: 'bot' as const } : {}),
+    ...(executor.kind === 'bot' && executor.handoffIdentity ? { handoffIdentity: executor.handoffIdentity } : {}),
   });
   const executorNote = executor.kind === 'bot' ? executor.summary : executor.note;
   return executorNote ? { ...materialized, executorNote } : materialized;

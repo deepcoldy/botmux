@@ -18,6 +18,16 @@ import { homedir } from 'node:os';
 import { readJournal } from './journal.js';
 import { materialize, type V3RunStatus } from './state.js';
 import type { V3NodeStatus } from './orchestrator.js';
+import {
+  foldV3Revisions,
+  tryLoadEffectiveV3Dag,
+  v3RevisionDigest,
+  v3RevisionFilePaths,
+  type V3RevisionHistory,
+} from './dag-revision.js';
+import { foldV3NodeInterventions } from './interventions.js';
+import { v3CheckpointMarkedSince, v3CheckpointSuccesses } from './checkpoint-hold.js';
+import { loadDag } from './dag-loader.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
  *  caller-supplied runId, so it can't escape runsDir via traversal. */
@@ -121,6 +131,56 @@ export interface RunNodeView {
   /** Every work attempt of this node (all instances), oldest first. Enum and
    *  timestamps only — the free-text failure message is never projected. */
   attempts: RunAttemptView[];
+  /** Runtime flow revisions (design §13.7): `added` / `changed` relative to
+   *  the approved flow. Absent for an unchanged node or a never-edited run. */
+  revisionMark?: 'added' | 'changed';
+  /** What the pending (unconfirmed) proposal would do to this node. The
+   *  dashboard draws these dashed. `add` nodes exist only in the proposal. */
+  pendingChange?: 'add' | 'remove' | 'change';
+  /** The main bot's automatic retries / reassignments / re-runs of this node
+   *  and every hand-over to a human, oldest first (design §13.6). Roles and
+   *  the reasons as given only — never an open_id. Absent when none. */
+  interventions?: RunNodeInterventionView[];
+  /** A completed checkpoint node of a bot-executed run (design §13.6):
+   *  `holding` — its dependants wait for the main bot; `reviewed` — the main
+   *  bot's turn ended and they went on; `notReviewed` — they went on without
+   *  that review (the wake could not be delivered, or the wait timed out). */
+  checkpoint?: 'holding' | 'reviewed' | 'notReviewed';
+  /** Checkpoint nodes this not-yet-started node waits behind. */
+  waitingOnCheckpoint?: string[];
+}
+
+export interface RunNodeInterventionView {
+  kind: 'retry' | 'reassign' | 'rerun' | 'handedToHuman';
+  by: 'mainBot' | 'initiator' | 'other';
+  reason: string;
+  at: number;
+  attemptId?: string;
+}
+
+export interface RunRevisionEntryView {
+  revision: number;
+  state: 'applied' | 'pending' | 'rejected';
+  /** Generated count summary only (the free-text note is not projected). */
+  summary: string;
+  /** Who made it, as a role (open_ids are not projected). */
+  by: 'mainBot' | 'initiator' | 'other';
+  at: number;
+  /** Went through the initiator's confirmation card. */
+  confirmed: boolean;
+  rejectedReason?: 'rejected' | 'stale' | 'superseded' | 'runEnded';
+  /** `by: 'mainBot'` only: why the main bot made it (design §13.6). */
+  reason?: string;
+}
+
+export interface RunRevisionView {
+  /** Effective revision (1 = the approved flow). */
+  current: number;
+  history: RunRevisionEntryView[];
+  pending?: { revision: number; summary: string };
+  /** A revision file failed its digest check: the graph shows the last
+   *  verifiable flow and the runtime fails closed. */
+  integrityError?: boolean;
 }
 
 export interface RunNodeBotView {
@@ -156,6 +216,8 @@ export interface RunView {
   failedNodeId?: string;
   blockedNodeId?: string;
   nodes: RunNodeView[];
+  /** Present once the run's flow was edited or an edit was proposed. */
+  revision?: RunRevisionView;
   /** Server clock (epoch ms) when this view was projected. Clients compute
    *  live elapsed time against this instead of their own clock, so a skewed
    *  browser clock can't show negative or inflated durations. */
@@ -172,6 +234,8 @@ export interface ProjectRunOptions {
 
 interface DagNodeLite {
   id: string;
+  /** Canonical JSON of the authored node — compares revisions. */
+  signature: string;
   depends: string[];
   goal?: string;
   isLoop?: boolean;
@@ -198,10 +262,17 @@ function dependsToIds(v: unknown): string[] {
 }
 
 function readDagNodes(runDir: string): DagNodeLite[] {
-  const p = join(runDir, 'dag.json');
+  return readDagNodesFrom(join(runDir, 'dag.json'));
+}
+
+/** Read a DAG file's nodes; with `expectedSha256` the exact bytes must match
+ *  (revision files are pinned by the journal). Undefined on any mismatch. */
+function readDagNodesFrom(p: string, expectedSha256?: string): DagNodeLite[] {
   if (!existsSync(p)) return [];
   try {
-    const dag = JSON.parse(readFileSync(p, 'utf-8')) as { nodes?: unknown };
+    const bytes = readFileSync(p);
+    if (expectedSha256 !== undefined && v3RevisionDigest(bytes) !== expectedSha256) return [];
+    const dag = JSON.parse(bytes.toString('utf-8')) as { nodes?: unknown };
     if (!dag || !Array.isArray(dag.nodes)) return [];
     return dag.nodes.map((raw): DagNodeLite => {
       const n = raw as {
@@ -227,6 +298,7 @@ function readDagNodes(runDir: string): DagNodeLite[] {
       }
       return {
         id: String(n.id),
+        signature: JSON.stringify(raw),
         depends: dependsToIds(n.depends),
         goal: typeof n.goal === 'string' ? n.goal : undefined,
         isLoop: n.type === 'loop' || undefined,
@@ -299,8 +371,12 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     }
   }
   const snap = materialize(events);
-  const dagNodes = readDagNodes(runDir);
+  const approvedNodes = readDagNodes(runDir);
   const botSnapshots = readBotSnapshots(runDir);
+  const revisions = projectRevisions(runDir, events, approvedNodes, botSnapshots);
+  const interventions = foldV3NodeInterventions(events, readInitiatorOpenId(runDir));
+  const checkpoints = projectCheckpoints(runDir, events);
+  const dagNodes = revisions?.effectiveNodes ?? approvedNodes;
 
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
   const manifests = new Map<string, string>();
@@ -436,8 +512,10 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
   // after the dag order, in first-dispatch order.
   const dagById = new Map(dagNodes.map((n) => [n.id, n]));
   const instanceIds = [...loopRefs.keys()].filter((id) => !dagById.has(id));
+  const pendingAdded = (revisions?.pendingNodes ?? []).filter((node) => !dagById.has(node.id));
+  for (const node of pendingAdded) dagById.set(node.id, node);
   const ids = dagNodes.length
-    ? [...dagNodes.map((n) => n.id), ...instanceIds]
+    ? [...dagNodes.map((n) => n.id), ...pendingAdded.map((n) => n.id), ...instanceIds]
     : [...snap.nodes.keys()];
 
   // (loopId, iteration, bodyNodeId) → instance id, so an instance's template
@@ -547,6 +625,16 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     }
     const ref = loopRefs.get(id);
     if (ref) view.loop = ref;
+    const mark = revisions?.marks.get(id);
+    if (mark) view.revisionMark = mark;
+    const pendingChange = revisions?.pendingChanges.get(id);
+    if (pendingChange) view.pendingChange = pendingChange;
+    const handled = interventions.get(id);
+    if (handled?.length) view.interventions = handled.map((item) => ({ ...item }));
+    const checkpoint = checkpoints?.states.get(id);
+    if (checkpoint) view.checkpoint = checkpoint;
+    const waitingOn = checkpoints?.waiting.get(id);
+    if (waitingOn?.length && status === 'pending') view.waitingOnCheckpoint = waitingOn;
     return view;
   });
 
@@ -556,7 +644,160 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     failedNodeId: snap.failedNodeId,
     blockedNodeId: snap.blockedNodeId,
     nodes,
+    ...(revisions ? { revision: revisions.view } : {}),
     generatedAt: (opts.now ?? Date.now)(),
+  };
+}
+
+interface ProjectedRevisions {
+  view: RunRevisionView;
+  effectiveNodes?: DagNodeLite[];
+  pendingNodes?: DagNodeLite[];
+  marks: Map<string, 'added' | 'changed'>;
+  pendingChanges: Map<string, 'add' | 'remove' | 'change'>;
+}
+
+/** Checkpoint holds of a bot-executed run (display only; degrades to none). */
+function projectCheckpoints(
+  runDir: string,
+  events: ReturnType<typeof readJournal>,
+): { states: Map<string, 'holding' | 'reviewed' | 'notReviewed'>; waiting: Map<string, string[]> } | undefined {
+  if (!events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot')) return undefined;
+  try {
+    const authorized = loadDag(join(runDir, 'dag.json'));
+    const effective = tryLoadEffectiveV3Dag(runDir, authorized, events)?.dag ?? authorized;
+    const successes = v3CheckpointSuccesses({
+      events,
+      dag: effective,
+      markedSince: v3CheckpointMarkedSince(runDir, authorized, events),
+    });
+    if (successes.length === 0) return undefined;
+    const states = new Map<string, 'holding' | 'reviewed' | 'notReviewed'>();
+    for (const success of successes) {
+      states.set(success.nodeId, !success.released ? 'holding'
+        : success.released.reason === 'wakeTurnEnded' ? 'reviewed' : 'notReviewed');
+    }
+    const holding = new Set(successes.filter((success) => !success.released).map((success) => success.nodeId));
+    const waiting = new Map<string, string[]>();
+    for (const node of effective.nodes) {
+      const behind = node.depends.map((dep) => dep.from).filter((from) => holding.has(from));
+      if (behind.length > 0) waiting.set(node.id, behind);
+    }
+    return { states, waiting };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Minimal read of run.json for the initiator role (no schema import: this
+ *  projection stays defensive and dependency-light). */
+function readInitiatorOpenId(runDir: string): string | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf-8')) as {
+      authorization?: { kind?: unknown; authorizedByOpenId?: unknown };
+      chatBinding?: { ownerOpenId?: unknown };
+    };
+    const gate2 = raw.authorization?.kind === 'gate2' ? raw.authorization.authorizedByOpenId : undefined;
+    const owner = raw.chatBinding?.ownerOpenId;
+    return typeof gate2 === 'string' ? gate2 : typeof owner === 'string' ? owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Effective flow + revision history for the graph. Defensive: a corrupt or
+ *  tampered revision degrades to the last verifiable flow with a flag. */
+function projectRevisions(
+  runDir: string,
+  events: ReturnType<typeof readJournal>,
+  approvedNodes: DagNodeLite[],
+  botSnapshots: Map<string, Omit<RunNodeBotView, 'selector' | 'name'>>,
+): ProjectedRevisions | undefined {
+  let history: V3RevisionHistory;
+  try {
+    history = foldV3Revisions(events);
+  } catch {
+    return { view: { current: 1, history: [], integrityError: true }, marks: new Map(), pendingChanges: new Map() };
+  }
+  if (history.records.length === 0) return undefined;
+  const initiator = readInitiatorOpenId(runDir);
+  const role = (record: { by: string }): RunRevisionEntryView['by'] =>
+    record.by === 'main_bot' ? 'mainBot' : record.by === initiator ? 'initiator' : 'other';
+  let integrityError = false;
+  let effectiveNodes: DagNodeLite[] | undefined;
+  let verifiedRevision = 1;
+  for (const record of history.applied) {
+    const nodes = readDagNodesFrom(v3RevisionFilePaths(runDir, record.revision).dag, record.sha256);
+    if (nodes.length === 0) {
+      integrityError = true;
+      break;
+    }
+    effectiveNodes = nodes;
+    verifiedRevision = record.revision;
+    if (record.botsSha256) {
+      try {
+        const bytes = readFileSync(v3RevisionFilePaths(runDir, record.revision).bots);
+        if (v3RevisionDigest(bytes) === record.botsSha256) {
+          for (const [selector, value] of Object.entries(JSON.parse(bytes.toString('utf-8')) as Record<string, { larkAppId?: unknown; cliId?: unknown; model?: unknown }>)) {
+            if (botSnapshots.has(selector)) continue;
+            botSnapshots.set(selector, {
+              ...(typeof value.larkAppId === 'string' ? { larkAppId: value.larkAppId } : {}),
+              ...(typeof value.cliId === 'string' ? { cliId: value.cliId } : {}),
+              ...(typeof value.model === 'string' && value.model ? { model: value.model } : {}),
+            });
+          }
+        }
+      } catch { /* display only */ }
+    }
+  }
+  const current = effectiveNodes ?? approvedNodes;
+  const approvedById = new Map(approvedNodes.map((node) => [node.id, node]));
+  const marks = new Map<string, 'added' | 'changed'>();
+  if (effectiveNodes) {
+    for (const node of effectiveNodes) {
+      const approved = approvedById.get(node.id);
+      if (!approved) marks.set(node.id, 'added');
+      else if (approved.signature !== node.signature) marks.set(node.id, 'changed');
+    }
+  }
+  const pendingChanges = new Map<string, 'add' | 'remove' | 'change'>();
+  let pendingNodes: DagNodeLite[] | undefined;
+  const pending = history.pending;
+  if (pending) {
+    const proposed = readDagNodesFrom(v3RevisionFilePaths(runDir, pending.revision).dag, pending.sha256);
+    if (proposed.length > 0) {
+      pendingNodes = proposed;
+      const currentById = new Map(current.map((node) => [node.id, node]));
+      const proposedIds = new Set(proposed.map((node) => node.id));
+      for (const node of proposed) {
+        const before = currentById.get(node.id);
+        if (!before) pendingChanges.set(node.id, 'add');
+        else if (before.signature !== node.signature) pendingChanges.set(node.id, 'change');
+      }
+      for (const node of current) if (!proposedIds.has(node.id)) pendingChanges.set(node.id, 'remove');
+      for (const nodeId of pending.touched ?? []) if (!pendingChanges.has(nodeId)) pendingChanges.set(nodeId, 'change');
+    }
+  }
+  return {
+    view: {
+      current: integrityError ? verifiedRevision : history.current,
+      history: history.records.map((record) => ({
+        revision: record.revision,
+        state: record.state,
+        summary: record.summary,
+        by: role(record),
+        at: record.appliedAt ?? record.ts,
+        confirmed: !!record.approvedBy,
+        ...(record.rejected ? { rejectedReason: record.rejected.reason } : {}),
+        ...(record.by === 'main_bot' && record.auto?.reason ? { reason: record.auto.reason } : {}),
+      })),
+      ...(pending ? { pending: { revision: pending.revision, summary: pending.summary } } : {}),
+      ...(integrityError ? { integrityError: true } : {}),
+    },
+    ...(effectiveNodes ? { effectiveNodes } : {}),
+    ...(pendingNodes ? { pendingNodes } : {}),
+    marks,
+    pendingChanges,
   };
 }
 

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createExplicitAskContinuation, explicitAskRecoveryRequest } from '../src/core/explicit-ask-continuation.js';
+import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive } from '../src/core/explicit-ask-continuation.js';
 import { registerHostAsk, setCardDispatcher, setAskPersistStore, setCanTalkChecker,
   restorePersistedAsks, tryResolveAsk, releaseExplicitAskHandoff, _resetForTest } from '../src/core/ask-broker.js';
 import { createAskPersistStore } from '../src/core/ask-persist-store.js';
@@ -45,6 +45,40 @@ describe('explicit Ask durable continuation', () => {
     expect(await rebooted.wait(input)).toEqual(answer);
     await rebooted.sweep();
     expect(t.register).toHaveBeenCalledTimes(1); expect(t.dispatch).not.toHaveBeenCalled();
+  });
+  it('matches origin, attempt and worker generation against live daemon authority', () => {
+    const receipt = { version: 1 as const, input, result: answer,
+      origin: { turnId: 'turn-1', dispatchAttempt: 2, workerGeneration: 3 } };
+    const live = { workerAlive: true, turnId: 'turn-1', dispatchAttempt: 2, workerGeneration: 3 };
+    expect(explicitAskOriginIsLive(receipt, live)).toBe(true);
+    expect(explicitAskOriginIsLive(receipt, { ...live, terminal: true })).toBe(false);
+    expect(explicitAskOriginIsLive(receipt, { ...live, turnId: 'turn-2' })).toBe(false);
+    expect(explicitAskOriginIsLive(receipt, { ...live, dispatchAttempt: 3 })).toBe(false);
+    expect(explicitAskOriginIsLive(receipt, { ...live, workerGeneration: 4 })).toBe(false);
+    expect(explicitAskOriginIsLive(receipt, { ...live, workerAlive: false })).toBe(false);
+    expect(explicitAskOriginIsLive(receipt, undefined)).toBe(false);
+    expect(explicitAskOriginIsLive({ version: 1, input, result: answer }, undefined)).toBe(true);
+  });
+  it('does not accept stdout acknowledgement after the originating turn ended', async () => {
+    const t = setup();
+    const origin = { turnId: 'turn-1', workerGeneration: 3 };
+    await t.manager.wait(input, origin);
+    expect(t.manager.acknowledge(input, receipt => {
+      expect(receipt.origin).toEqual(origin);
+      return false;
+    })).toEqual(answer);
+    t.tick();
+    const rebooted = createExplicitAskContinuation(t.deps);
+    await rebooted.sweep(); await rebooted.sweep();
+    expect(t.dispatch).toHaveBeenCalledTimes(1);
+    expect(t.dispatch.mock.calls[0]![0].origin).toEqual(origin);
+  });
+  it('accepts acknowledgement while the originating turn is live', async () => {
+    const t = setup();
+    await t.manager.wait(input, { turnId: 'turn-1', workerGeneration: 3 });
+    expect(t.manager.acknowledge(input, () => true)).toEqual(answer);
+    t.tick(); await t.manager.sweep();
+    expect(t.dispatch).not.toHaveBeenCalled();
   });
   it('lost result/CLI death resumes the original session once across restart', async () => {
     const t = setup(); await t.manager.wait(input); t.tick();

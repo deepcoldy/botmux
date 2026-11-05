@@ -68,7 +68,8 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   quota?: { code: string; exhaustLast?: boolean; initial?: boolean; blocked?: boolean },
   delayedHistoryReceipt?: { submission: number; ms: number },
   preflight?: { enabled: boolean; initialPrompt?: string; dispatchAttempt?: number;
-    probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number }) {
+    probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number },
+  restoreInterruptedStructuredTurn = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -238,6 +239,28 @@ setInterval(() => {
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
   const sessionId = randomUUID();
+  if (restoreInterruptedStructuredTurn) {
+    const markTimeMs = Date.now() - 1_000;
+    const timestamp = new Date(markTimeMs).toISOString();
+    const interruptedPrompt = 'interrupted cold resume ask';
+    writeFileSync(rolloutPath, [
+      { type: 'session_meta', payload: { id: nativeId, cwd: dataDir } },
+      { timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: 'native_interrupted' } },
+      { timestamp, type: 'event_msg', payload: { type: 'user_message', message: interruptedPrompt, turn_id: 'native_interrupted' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const marksDir = join(dataDir, 'turn-marks');
+    mkdirSync(marksDir, { recursive: true });
+    writeFileSync(join(marksDir, `${sessionId}.json.structured`), `${JSON.stringify({
+      version: 1,
+      pending: [{
+        turnId: 'om_interrupted',
+        markTimeMs,
+        fingerprint: interruptedPrompt,
+        jsonlPath: rolloutPath,
+        offsetAtMark: 0,
+      }],
+    })}\n`);
+  }
   const binary = process.env.BOTMUX_TEST_WORKER_BINARY;
   const backendType = binary || process.env.BOTMUX_TEST_WORKER_BACKEND === 'tmux' ? 'tmux' : 'pty';
   if (backendType === 'tmux') panes.push(`bmx-${sessionId.slice(0, 8)}`);
@@ -349,6 +372,20 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('releases a cold-restored interrupted structured turn before accepting new input', async () => {
+    const f = await fixture(false, false, false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, true);
+    await f.wait(() => f.logs.join('').includes('Cleared 1 stale structured turn(s)'), 'stale structured turn cleared');
+    expect(interruptionNotices(f.messages)).toHaveLength(1);
+    expect(f.logs.join('')).not.toContain('Ignoring prompt-ready heuristic while a structured turn is unfinished');
+
+    f.child.send({ type: 'message', content: 'new request after cold recovery', turnId: 'om_after_recovery' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'new request submitted after recovery');
+    expect(rows(f.submissions)[0]).toMatchObject({ model: 'core' });
+    expect(rows(f.submissions)[0].text).toMatch(/^new request after cold recovery(?:\r|\n|$)/);
+    expect(rows(f.submissions)[0].text).not.toContain('interrupted cold resume ask');
+  }, 45_000);
+
   it('preflights a cold first turn before the only spawn and submits the original prompt once', async () => {
     const f = await fixture(true, 'ordered', false, undefined, false, undefined, true,
       undefined, 0, 0, false, false, undefined, undefined,

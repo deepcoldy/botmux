@@ -26,10 +26,27 @@ function builtinListLines(env: Record<string, string | undefined>): string[] {
   }).map((e) => `${e.name}\t${e.description}`.trimEnd());
 }
 
+function skillUsage(): string {
+  return [
+    'usage:',
+    '  botmux skill list                    list the skills available in this session (user + built-in)',
+    '  botmux skill show <name>             print a skill\'s full SKILL.md',
+    '  botmux skill resources <name>        list a skill\'s resource files',
+    '  botmux skill read <name> <path>      print one of a skill\'s resource files',
+  ].join('\n') + '\n';
+}
+
+/** `skill --help` / `-h` / `help` and `skill <sub> --help` must print usage
+ *  without touching the session id or manifest. */
+function isSkillHelpRequest(args: string[]): boolean {
+  return args[0] === 'help' || args.some((arg) => arg === '--help' || arg === '-h');
+}
+
 export function runSkillSessionCommand(
   args: string[],
   env: Record<string, string | undefined> = process.env,
 ): SkillCommandResult {
+  if (isSkillHelpRequest(args)) return { code: 0, stdout: skillUsage(), stderr: '' };
   const sub = args[0] ?? 'list';
   // A session executing a workflow node does that node itself: it is not
   // offered the multi-bot dispatch skills or the workflow skills its kind does

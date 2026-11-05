@@ -29,6 +29,14 @@ import {
   resolveLoopTerminalNode,
   trunc,
   v3RunIdFromHash,
+  nodeBoxHeading,
+  nodeRevisionBadge,
+  V3_NODE_HEADING,
+  V3_REVISION_ROLE_LABEL,
+  V3_REVISION_STATE_LABEL,
+  V3_INTERVENTION_LABEL,
+  V3_INTERVENTION_ROLE_LABEL,
+  V3_CHECKPOINT_LABEL,
 } from './v3-model.js';
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
@@ -267,12 +275,15 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
         <section className="overview-block v3r-graph-section">
           <SectionHeader
             title="运行拓扑"
-            hint={view ? `${view.nodes.length} 个节点` : statusText}
+            hint={view
+              ? `${view.nodes.filter((node) => node.pendingChange !== 'add').length} 个节点${view.revision ? ` · 第 ${view.revision.current} 版` : ''}`
+              : statusText}
           />
           <div className="v3r-graph-card">
             <DagGraph view={view} selectedId={selectedId} onSelect={selectNode} />
             <V3Legend />
           </div>
+          {view?.revision ? <RevisionHistory revision={view.revision} /> : null}
         </section>
         <section className="overview-block v3r-node-section">
           <SectionHeader
@@ -387,7 +398,7 @@ function DagGraph(props: {
             {layout.edges.map((edge) => (
               <path
                 key={`${edge.fromId}->${edge.toId}`}
-                className={`v3r-edge${edge.live ? ' live' : ''}`}
+                className={`v3r-edge${edge.live ? ' live' : ''}${edge.pending ? ' pending' : ''}`}
                 d={`M${edge.x1},${edge.y1} C${edge.mx},${edge.y1} ${edge.mx},${edge.y2} ${edge.x2},${edge.y2}`}
                 markerEnd="url(#v3arrow)"
               />
@@ -420,22 +431,34 @@ export function DagNode(props: {
     return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} />;
   }
   const botLine = nodeBotLine(node);
+  const fit = boxTextFit(box.width);
+  const heading = nodeBoxHeading(node, box.width, fit(22));
   return (
     <g
-      className={`v3r-node st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}`}
+      className={`v3r-node st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}${node.pendingChange ? ` pending pending-${node.pendingChange}` : ''}${node.revisionMark ? ` rev-${node.revisionMark}` : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
     >
-      <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.plainHeight} rx="10" />
-      <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, 22)}</text>
+      {heading.badgeTitle ? <title>{heading.badgeTitle}</title> : null}
+      <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.plainHeight} rx="10" />
+      <text className="v3r-nid" x={box.x + V3_NODE_HEADING.inset} y={box.y + 20}>{trunc(node.id, heading.idChars)}</text>
+      {heading.badge ? (
+        <text className="v3r-nrev" x={box.x + box.width - V3_NODE_HEADING.badgeInset} y={box.y + 20} textAnchor="end">{heading.badge}</text>
+      ) : null}
       <text className={`v3r-nbot${botLine ? '' : ' empty'}`} x={box.x + 14} y={box.y + 38}>
-        {botLine ? trunc(botLine, 24) : '—'}
+        {botLine ? trunc(botLine, fit(24)) : '—'}
       </text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 55}>
-        {trunc(nodeStatusLine(node, props.generatedAt), 22)}
+        {trunc(nodeStatusLine(node, props.generatedAt), fit(22))}
       </text>
     </g>
   );
+}
+
+/** Truncation budget for a box narrower than the standard width (the sidebar's
+ *  vertical layout); the standard box keeps its historical budgets. */
+function boxTextFit(width: number): (chars: number) => number {
+  return (chars) => (width >= V3_GRAPH.nodeWidth ? chars : Math.max(8, Math.floor(chars * width / V3_GRAPH.nodeWidth)));
 }
 
 function LoopGraphNode(props: {
@@ -463,10 +486,10 @@ function LoopGraphNode(props: {
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
     >
-      <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={V3_GRAPH.nodeWidth + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
-      <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.loopHeight} rx="10" />
+      <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={box.width + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
+      <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.loopHeight} rx="10" />
       <text className="v3r-spin" x={box.x + 14} y={box.y + 21}>⟳</text>
-      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, 20)}</text>
+      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, boxTextFit(box.width)(20))}</text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 39}>{statusLine}</text>
       {ls && budget !== undefined && budget <= V3_GRAPH.maxDots ? (
         <LoopBudgetDots node={node} x={box.x} y={box.y} budget={budget} maxIterations={maxIterations} />
@@ -536,8 +559,16 @@ function NodePanel(props: {
   return (
     <div id="v3-node-panel" className="v3r-panel">
       <div id="v3-node-meta">
+        {nodeRevisionBadge(node) ? (
+          <p className="v3r-rev-note">流程修改：{nodeRevisionBadge(node)}</p>
+        ) : null}
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
         <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
+        {node.checkpoint ? <p className="v3r-checkpoint">{V3_CHECKPOINT_LABEL[node.checkpoint]}</p> : null}
+        {node.waitingOnCheckpoint?.length ? (
+          <p className="v3r-checkpoint">等检查点 {node.waitingOnCheckpoint.join('、')} 由主 Bot 看完结果后再开始</p>
+        ) : null}
+        <NodeInterventions node={node} />
         {node.depends.length ? (
           <p className="v3r-deps">
             <span>依赖</span>
@@ -561,6 +592,34 @@ function NodePanel(props: {
         ) : null}
       </div>
       <TerminalSlot runId={props.runId} node={termNode} />
+    </div>
+  );
+}
+
+/** Revision history (design §13.7): time, who, summary, confirmed or not.
+ *  Also the workflow sidebar's version panel (§11.3). */
+export function RevisionHistory(props: { revision: NonNullable<RunView['revision']> }): React.JSX.Element {
+  const { revision } = props;
+  return (
+    <div className="v3r-revisions">
+      <p className="v3r-revisions-title">
+        流程版本：第 {revision.current} 版
+        {revision.pending ? <span className="v3r-rev-pending"> · 第 {revision.pending.revision} 版待发起人确认</span> : null}
+        {revision.integrityError ? <span className="v3r-rev-error"> · 修改记录校验失败</span> : null}
+      </p>
+      <ol className="v3r-revisions-list">
+        {revision.history.map((entry) => (
+          <li key={entry.revision} className={`v3r-rev-entry rev-${entry.state}`}>
+            <span className="v3r-rev-num">第 {entry.revision} 版</span>
+            <span className="v3r-rev-time">{formatClock(entry.at)}</span>
+            <span className="v3r-rev-by">{V3_REVISION_ROLE_LABEL[entry.by]}</span>
+            <span className="v3r-rev-summary">{entry.summary}</span>
+            <span className="v3r-rev-state">
+              {V3_REVISION_STATE_LABEL[entry.state]}{entry.confirmed ? ' · 已确认' : ''}
+            </span>
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }
@@ -615,7 +674,31 @@ export function NodeExecution(props: { node: RunNodeView; generatedAt: number | 
   );
 }
 
-function NodeErrorLine(props: { node: RunNodeView }): React.JSX.Element {
+/** Every automatic handling by the main bot and every hand-over to a
+ *  person, with the reason as given (design §13.6). */
+export function NodeInterventions(props: { node: RunNodeView }): React.JSX.Element | null {
+  const items = props.node.interventions ?? [];
+  if (items.length === 0) return null;
+  return (
+    <div className="v3r-interventions">
+      <p className="v3r-interventions-title">自动处理与交给人</p>
+      <ol className="v3r-interventions-list">
+        {items.map((item, index) => (
+          <li key={`${item.at}-${index}`} className={`v3r-intervention kind-${item.kind}`}>
+            <span className="t">{formatClock(item.at)}</span>
+            <span className="k">{V3_INTERVENTION_LABEL[item.kind]}</span>
+            {item.kind === 'handedToHuman' && item.by !== 'mainBot' ? (
+              <span className="b">（{V3_INTERVENTION_ROLE_LABEL[item.by]}）</span>
+            ) : null}
+            {item.reason ? <span className="r">{item.reason}</span> : null}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+export function NodeErrorLine(props: { node: RunNodeView }): React.JSX.Element {
   const node = props.node;
   return (
     <p className="v3r-err">
@@ -751,7 +834,7 @@ function RoundMiniDag(props: {
   );
 }
 
-function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React.JSX.Element {
+export function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React.JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   const renderedSignatureRef = useRef<string | null>(null);
   const signature = props.node ? `${props.runId}|${props.node.id}|${nodeTerminalSignature(props.node)}` : null;

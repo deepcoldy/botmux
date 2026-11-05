@@ -58,7 +58,10 @@ export type CredentialGrantResult = { ok: true; value: CredentialGrant } | Crede
 
 export interface CredentialGrantClientOptions {
   binding?: { platformUrl: string; machineToken: string; machineId: string } | null;
+  /** First attempt's budget (default {@link FIRST_ATTEMPT_TIMEOUT_MS}). */
   timeoutMs?: number;
+  /** Hard cap across the first attempt and its one retry (default {@link TOTAL_BUDGET_MS}). */
+  totalBudgetMs?: number;
   http?: { post: typeof postJson };
 }
 
@@ -75,8 +78,20 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
   },
 };
 
-/** Default per-call budget: a grant sits on the turn's critical path. */
-const DEFAULT_TIMEOUT_MS = 6_000;
+/**
+ * Budgets. A grant sits on the turn's critical path, so the whole call —
+ * including its one retry — is capped near the old single-attempt 6s budget.
+ *
+ * Why a retry at all: a request that got NO answer (silent socket, reset,
+ * timeout) never reached the platform's verdict; one new connection fixes the
+ * common cause (a dead path under a connection the client thought was alive)
+ * without making the person resend their message. An HTTP status is the
+ * platform's answer and is never retried here.
+ */
+export const FIRST_ATTEMPT_TIMEOUT_MS = 5_000;
+export const TOTAL_BUDGET_MS = 8_000;
+/** A retry with less time than this left is not worth starting. */
+export const MIN_RETRY_BUDGET_MS = 1_000;
 /** Defense in depth: a grant is a per-turn token. Whatever the platform says,
  *  never treat one as valid for longer than this. */
 const MAX_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -161,6 +176,33 @@ function classify(status: number, json: unknown, platformUrl: string): Credentia
   return { ok: false, reason: 'client', status, error: error || `http_${status}` };
 }
 
+/** Settle no later than `ms`, whatever the transport underneath does, and
+ *  abort the request then. The socket's own timeout is an IDLE timeout: a peer
+ *  that trickles bytes never trips it, and without the abort the retry would
+ *  leave the first request still running against the platform. */
+function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`连接超时（${ms}ms）`));
+    }, ms);
+  });
+  // Start `run` in its own microtask. `postJson` parses the URL and serializes
+  // the body BEFORE its own `new Promise`, so a malformed binding (a hand-edited
+  // or stale `platform.json`) throws SYNCHRONOUSLY. Racing that directly still
+  // fails the attempt — the throw reaches the caller's catch, so the retry runs
+  // as usual — but the race itself is never built, so `timeout` has no consumer:
+  // its timer fires later as an unhandledRejection (which the daemon's guard
+  // reports as a bug in this very code), the accompanying `.finally` never runs
+  // so `clearTimeout` never happens, and the abort lands on an attempt that
+  // already ended. Deferring `run` by one microtask turns the throw into an
+  // ordinary rejection: the race consumes it and the timer is always cleared.
+  const started = Promise.resolve().then(() => run(controller.signal));
+  return Promise.race([started, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Ask the platform for this turn's credentials. Never throws.
  */
@@ -191,25 +233,42 @@ async function requestCredentialGrantInner(
   }
   const http = opts.http ?? { post: postJson };
   const url = `${binding.platformUrl.replace(/\/+$/, '')}${CREDENTIAL_GRANT_PATH}`;
-  let status: number;
+  const body: Record<string, unknown> = {
+    unionId: req.unionId,
+    tool: req.tool,
+    appId: req.appId,
+    sessionId: req.sessionId,
+    ...(req.turnId ? { turnId: req.turnId } : {}),
+    machineId: binding.machineId,
+  };
+  const totalBudget = opts.totalBudgetMs ?? TOTAL_BUDGET_MS;
+  const deadline = Date.now() + totalBudget;
+  let status = 0;
   let json: unknown;
-  try {
-    const body: Record<string, unknown> = {
-      unionId: req.unionId,
-      tool: req.tool,
-      appId: req.appId,
-      sessionId: req.sessionId,
-      ...(req.turnId ? { turnId: req.turnId } : {}),
-      machineId: binding.machineId,
-    };
-    const r = await http.post(url, body, {
-      headers: { authorization: `Bearer ${binding.machineToken}` },
-      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    });
-    status = r.status;
-    json = r.json;
-  } catch (e) {
-    return { ok: false, reason: 'network', error: e instanceof Error ? e.message : String(e) };
+  for (let attempt = 0; ; attempt++) {
+    const remaining = deadline - Date.now();
+    const timeoutMs = Math.max(1, attempt === 0
+      ? Math.min(opts.timeoutMs ?? FIRST_ATTEMPT_TIMEOUT_MS, totalBudget)
+      : Math.min(FIRST_ATTEMPT_TIMEOUT_MS, remaining));
+    try {
+      // Always a connection of its own: grants are one per turn, so a pooled
+      // keep-alive socket saves one handshake but can be one the path already
+      // dropped silently — the request then waits out the whole budget with no
+      // response at all, and the platform never sees it.
+      const r = await withHardTimeout(signal => http.post(url, body, {
+        headers: { authorization: `Bearer ${binding.machineToken}` },
+        timeoutMs,
+        freshConnection: true,
+        signal,
+      }), timeoutMs);
+      status = r.status;
+      json = r.json;
+      break;
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      if (attempt === 0 && deadline - Date.now() >= MIN_RETRY_BUDGET_MS) continue;
+      return { ok: false, reason: 'network', error: attempt > 0 ? `${error} (after retry)` : error };
+    }
   }
   if (status < 200 || status >= 300) return classify(status, json, binding.platformUrl);
   const rec = (json && typeof json === 'object' ? json : {}) as Record<string, unknown>;
