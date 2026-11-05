@@ -427,6 +427,16 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
     expect(files.has(perUserPath(APP, ALICE))).toBe(true);
   });
 
+  it('identifies the authorizer by open_id or email even outside the contact scope', async () => {
+    const { mod } = await runCallback({ body: { code: 0, data: {
+      open_id: ALICE, name: '爱丽丝', union_id: 'on_alice', enterprise_email: 'Alice@example.com',
+    } } });
+    expect(mod.findAuthorizedIdentity(APP, 'alice@example.com', 'feishu')).toEqual({ openId: ALICE, unionId: 'on_alice' });
+    expect(mod.findAuthorizedIdentity(APP, ALICE, 'feishu')).toEqual({ openId: ALICE, unionId: 'on_alice' });
+    expect(mod.findAuthorizedIdentity('cli_other', ALICE, 'feishu')).toBeUndefined();
+    expect(mod.findAuthorizedIdentity(APP, 'bob@example.com', 'feishu')).toBeUndefined();
+  });
+
   it('includes the same user\'s existing scopes in an incremental browser authorization', async () => {
     files.set(perUserPath(APP, ALICE), tokenFor({
       appId: APP,

@@ -129,6 +129,12 @@ export interface TokenStore {
   openId?: string;
   /** 授权人姓名，仅用于 /status、/login status 等展示，非身份依据。 */
   userName?: string;
+  /**
+   * 授权人的 union_id 与邮箱，取自授权时的 user_info，不受应用通讯录权限范围限制。
+   * 供 `--run-as` 在通讯录查不到此人时识别身份（见 {@link findAuthorizedIdentity}）。
+   */
+  unionId?: string;
+  email?: string;
 }
 
 interface TokenResponse {
@@ -436,6 +442,31 @@ export function listAuthorizedUsers(
 }
 
 /**
+ * 按 open_id 或邮箱在本 app 的授权记录里找人，返回授权时 user_info 给出的
+ * open_id 与 union_id。只读归属字段，不碰 token 内容。授权早于记录 union_id 的
+ * 版本、或邮箱未随授权返回时找不到，重新 /login 后即可。
+ */
+export function findAuthorizedIdentity(
+  appId: string,
+  openIdOrEmail: string,
+  brand: Brand = 'feishu',
+): { openId: string; unionId: string } | undefined {
+  const wanted = openIdOrEmail.toLowerCase();
+  let names: string[];
+  try { names = readdirSync(TOKEN_DIR); } catch { return undefined; }
+  const prefix = `user-token-${appId}-`;
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue;
+    const token = loadTokenFromPath(join(TOKEN_DIR, name));
+    if (!token || !isUsableOpenId(token.openId) || !token.unionId || !tokenMatches(token, appId, brand)) continue;
+    if (token.openId === openIdOrEmail || token.email?.toLowerCase() === wanted) {
+      return { openId: token.openId, unionId: token.unionId };
+    }
+  }
+  return undefined;
+}
+
+/**
  * 这个人授权时留下的显示名，没有就返回 undefined。
  *
  * 只读归属字段，不碰 token 内容，也不触发刷新——调用点是「命令被拒」的错误文案，
@@ -517,6 +548,8 @@ async function refreshToken(
       // 没有，绝不在这里凭空归属给某个人。
       ...(token.openId ? { openId: token.openId } : {}),
       ...(token.userName ? { userName: token.userName } : {}),
+      ...(token.unionId ? { unionId: token.unionId } : {}),
+      ...(token.email ? { email: token.email } : {}),
     };
 
     // 写回原来那个文件：per-person token 刷新后仍是 per-person，不能落到
@@ -772,7 +805,7 @@ export async function requestUserAuthorization(
         appId,
         brand,
         openId,
-        ...(authorized.userName ? { userName: authorized.userName } : {}),
+        ...authorizedIdentityFields(authorized),
       }, appId, brand, openId, undefined, 'authorization', authEpoch);
       if (!replacement.saved) {
         return {
@@ -973,7 +1006,7 @@ export function getFeedGroupAuthStatus(
  * A 名下 —— 之后 A 的每次操作都在用 B 的权限，且无声无息。
  */
 type AuthorizedUser =
-  | { ok: true; openId: string; userName?: string }
+  | { ok: true; openId: string; userName?: string; unionId?: string; email?: string }
   /** Could not establish who authorized. `reason` is shown to the user, so it
    *  must say what failed rather than just "failed". */
   | { ok: false; reason: string };
@@ -989,7 +1022,11 @@ async function fetchAuthorizedUser(
       ...(signal ? { signal } : {}),
     });
     if (!res.ok) return { ok: false, reason: `user_info HTTP ${res.status}` };
-    const body = await res.json() as { code?: number; msg?: string; data?: { open_id?: string; name?: string } };
+    const body = await res.json() as {
+      code?: number;
+      msg?: string;
+      data?: { open_id?: string; name?: string; union_id?: string; email?: string; enterprise_email?: string };
+    };
     if (body.code !== 0 || !body.data) {
       return { ok: false, reason: `user_info code ${body.code ?? 'unknown'}${body.msg ? `: ${body.msg}` : ''}` };
     }
@@ -1000,10 +1037,23 @@ async function fetchAuthorizedUser(
       ok: true,
       openId: body.data.open_id,
       ...(body.data.name ? { userName: body.data.name } : {}),
+      ...(body.data.union_id ? { unionId: body.data.union_id } : {}),
+      ...(body.data.enterprise_email || body.data.email
+        ? { email: (body.data.enterprise_email || body.data.email)! } : {}),
     };
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) };
   }
+}
+
+function authorizedIdentityFields(
+  authorized: Extract<AuthorizedUser, { ok: true }>,
+): Pick<TokenStore, 'userName' | 'unionId' | 'email'> {
+  return {
+    ...(authorized.userName ? { userName: authorized.userName } : {}),
+    ...(authorized.unionId ? { unionId: authorized.unionId } : {}),
+    ...(authorized.email ? { email: authorized.email } : {}),
+  };
 }
 
 /**
@@ -1080,7 +1130,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       appId: pending.appId,
       brand: pending.brand,
       openId: ownerOpenId,
-      ...(authorized.userName ? { userName: authorized.userName } : {}),
+      ...authorizedIdentityFields(authorized),
     };
 
     // Normally generateAuthUrl already merged the requester's stored scopes.

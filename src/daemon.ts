@@ -548,7 +548,7 @@ import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompactRuntime } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
-import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
+import { isCallbackUrl, handleCallbackUrl, findAuthorizedIdentity } from './utils/user-token.js';
 import { consumeDispatchLaunchQuotaOnce, consumeQuota, removeChatGrant, removeGlobalGrant, sweepExpiredGrants } from './services/grant-store.js';
 import { initGrantStateForDaemon } from './services/grant-state-store.js';
 import { abortCharge, commitCharge, beginCharge } from './services/quota-dedup.js';
@@ -9246,10 +9246,16 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         || !/^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/.test(runAs)) {
         return jsonRes(res, 400, { ok: false, error: 'schedule_run_as_invalid' });
       }
-      const openId = runAs.startsWith('ou_')
+      // The contact API only sees users inside the app's contact scope; a person
+      // who authorized this bot is also identified by their own user_info.
+      let openId = runAs.startsWith('ou_')
         ? runAs
         : (await resolveAllowedUsersWithMap(selfDaemonLarkAppId, [runAs])).map.get(runAs);
-      const unionId = openId ? await resolveUnionIdFromOpenId(selfDaemonLarkAppId, openId) : null;
+      let unionId = openId ? await resolveUnionIdFromOpenId(selfDaemonLarkAppId, openId) : null;
+      if (!openId || !unionId) {
+        const authorized = findAuthorizedIdentity(selfDaemonLarkAppId, runAs, getBotBrand(selfDaemonLarkAppId));
+        if (authorized) ({ openId, unionId } = authorized);
+      }
       if (!openId || !unionId) return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_unresolved' });
       if (!canOperate(selfDaemonLarkAppId, task.chatId, openId, unionId)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_not_allowed' });

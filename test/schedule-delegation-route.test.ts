@@ -764,6 +764,7 @@ describe('host-terminal --run-as identity', () => {
     canOperate?: boolean;
     emailMap?: Map<string, string>;
     unionId?: string | null;
+    authorized?: { openId: string; unionId: string };
   } = {}) {
     const h = harness({ sessionId: '' });
     h.scope.findActiveBySessionId = () => undefined;
@@ -778,6 +779,8 @@ describe('host-terminal --run-as identity', () => {
     }));
     h.scope.resolveUnionIdFromOpenId = vi.fn(async () =>
       (overrides.unionId === undefined ? 'on_runner' : overrides.unionId));
+    h.scope.findAuthorizedIdentity = vi.fn(() => overrides.authorized);
+    h.scope.getBotBrand = () => 'feishu';
     h.scope.canOperate = vi.fn(() => overrides.canOperate ?? true);
     return h;
   }
@@ -810,6 +813,18 @@ describe('host-terminal --run-as identity', () => {
     expect(addTaskArg(h)).toMatchObject({
       ownerOpenId: 'ou_from_email', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
     });
+  });
+
+  it('identifies a person outside the contact scope by their authorization with this bot', async () => {
+    const h = hostRunAsHarness({
+      runAs: 'runner@example.com',
+      emailMap: new Map(),
+      authorized: { openId: 'ou_authorized', unionId: 'on_authorized' },
+    });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.findAuthorizedIdentity).toHaveBeenCalledWith('cli_target', 'runner@example.com', 'feishu');
+    expect(h.scope.canOperate).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_authorized', 'on_authorized');
+    expect(addTaskArg(h)).toMatchObject({ ownerOpenId: 'ou_authorized', ownerUnionId: 'on_authorized' });
   });
 
   it('refuses 403 when the named person cannot operate the bot', async () => {
