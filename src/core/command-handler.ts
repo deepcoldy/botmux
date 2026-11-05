@@ -1,3 +1,4 @@
+import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
@@ -6,7 +7,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -139,7 +140,7 @@ import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
-import { rehomeReplyTargetState } from './reply-target.js';
+import { rehomeReplyTargetState, inheritTurnReplyRouting } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
@@ -3208,8 +3209,8 @@ export async function handleCommand(
                 codexAppInputGateFrozen: true,
               };
             }
-            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput);
-            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput);
+            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput, current.pendingRawTurnId ?? current.pendingTurnId ?? current.session.pendingRepoSetup?.turnId);
+            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput, current.pendingTurnId ?? current.session.pendingRepoSetup?.turnId);
 
             // forkWorker performs the synchronous pre-accept/write-ahead work.
             // Keep the opening reservation and every buffered field intact if
@@ -3395,6 +3396,7 @@ export async function handleCommand(
                 current.session = session;
                 current.lastUserPrompt = undefined;
                 current.lastCliInput = undefined;
+                current.lastCliInputTurnId = undefined;
                 current.workingDir = selectedPath;
                 session.workingDir = selectedPath;
                 session.larkAppId = current.larkAppId;
@@ -3735,25 +3737,28 @@ export async function handleCommand(
           content: failedTurn.cliInput,
           ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
         };
+        const retryTurnId = `retry-${randomUUID()}`;
+        const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
         let accepted = false;
         try {
           if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput);
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId);
           } else {
-            forkWorker(ds, retryInput, ds.hasHistory);
-            accepted = true;
+            accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (!accepted) {
+          rollbackReplyRouting();
+          sessionStore.updateSession(ds.session);
           await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
           break;
         }
         // Update retry state + record the input as the session's last CLI turn
         // (same post-acceptance pattern as the daemon's live-worker path).
         markRetryAttempt(ds.session);
-        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
@@ -4003,16 +4008,19 @@ export async function handleCommand(
               const savedReplay = {
                 lastUserPrompt: current.session.lastUserPrompt,
                 lastCliInput: current.session.lastCliInput,
+                lastCliInputTurnId: current.session.lastCliInputTurnId,
                 lastFailedTurn: current.session.lastFailedTurn,
               };
               current.session.lastUserPrompt = undefined;
               current.session.lastCliInput = undefined;
+              current.session.lastCliInputTurnId = undefined;
               current.session.lastFailedTurn = undefined;
               try {
                 sessionStore.updateSession(current.session);
               } catch (err) {
                 current.session.lastUserPrompt = savedReplay.lastUserPrompt;
                 current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
                 current.session.lastFailedTurn = savedReplay.lastFailedTurn;
                 return asError(err, 'could not persist rewind state');
               }
@@ -4024,6 +4032,7 @@ export async function handleCommand(
                 // attempt leaves the session as it was.
                 current.session.lastUserPrompt = savedReplay.lastUserPrompt;
                 current.session.lastCliInput = savedReplay.lastCliInput;
+                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
                 current.session.lastFailedTurn = savedReplay.lastFailedTurn;
                 try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
                 return asError(err);
