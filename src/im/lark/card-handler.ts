@@ -99,7 +99,7 @@ import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
-import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
+import { fallbackTurnId, rehomeReplyTargetState, inheritTurnReplyRouting } from '../../core/reply-target.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
@@ -813,8 +813,8 @@ export async function commitRepoSelection(
           codexAppInputGateFrozen: true,
         };
       }
-      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput);
-      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput);
+      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput, ds.pendingRawTurnId ?? ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
+      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput, ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
       // Keep the reservation and every buffered opening field intact through
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
@@ -993,6 +993,7 @@ export async function commitRepoSelection(
         current.session = session;
         current.lastUserPrompt = undefined;
         current.lastCliInput = undefined;
+        current.lastCliInputTurnId = undefined;
         current.workingDir = dirPath;
         session.workingDir = dirPath;
         session.larkAppId = current.larkAppId;
@@ -2393,7 +2394,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // only ever driven through /quote would keep that flag forever — final text
     // answers still arrive, but its streaming card is permanently dead with no
     // visible cause and no way for the user to revive it.
-    rememberLastCliInput(ds, transcript.text, cliInput);
+    rememberLastCliInput(ds, transcript.text, cliInput, turnId);
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
@@ -3844,11 +3845,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      const retryTurnId = `retry-${randomUUID()}`;
+      inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
+          forkWorker(ds, retryInput, { resume: ds.hasHistory, turnId: retryTurnId });
           accepted = true;
         }
       } catch (err) {
@@ -3861,6 +3864,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      rememberLastCliInput(ds, ds.lastUserPrompt ?? cliInput, retryInput, retryTurnId);
       // Only now consume the one-shot retry state and advertise working: live
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
@@ -4006,11 +4010,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
+      const retryTurnId = `retry-${randomUUID()}`;
+      inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
+          forkWorker(ds, retryInput, { resume: ds.hasHistory, turnId: retryTurnId });
           accepted = true;
         }
       } catch (err) {
@@ -4025,7 +4031,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Start the cooldown only after acceptance: a rejected click must not
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
