@@ -15,11 +15,11 @@
  * Real node-daemon wiring, routes and registry over fake sessions / IPC.
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { createWorkflowNodeDaemon, type WorkflowNodeDaemonDeps } from '../src/core/workflow-node-daemon.js';
+import { createWorkflowNodeDaemon as createRealWorkflowNodeDaemon, type WorkflowNodeDaemon, type WorkflowNodeDaemonDeps } from '../src/core/workflow-node-daemon.js';
 import { BotRun, cleanupBotRuns, reportDag } from './helpers/v3-external-harness.js';
 import { CHAT, MAIN, SECRET, handoffWorld, nonceOf, orchestratorEvent } from './helpers/workflow-handoff-harness.js';
 import { authorizeRun } from './helpers/workflow-identity-world.js';
@@ -35,7 +35,39 @@ import {
 } from '../src/core/workflow-node-session.js';
 import { workflowNodeSessionEntry } from '../src/im/lark/workflow-sidebar-entry.js';
 
-afterEach(() => cleanupBotRuns());
+// A handoff admitInbound refuses records the refusal in the dispatch
+// registry fire-and-forget, then tells the main bot. Teardown waits until
+// every refusal of the test has reached the main bot — its registry write is
+// done by then — instead of racing the write when removing the run dirs.
+let refusalsStarted = 0;
+let refusalsDelivered = 0;
+function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): WorkflowNodeDaemon {
+  const postDaemon = deps.postDaemon;
+  const daemon = createRealWorkflowNodeDaemon({
+    ...deps,
+    postDaemon: async (port, path, body, secret) => {
+      if ((body as { kind?: unknown } | undefined)?.kind === 'refused') refusalsDelivered += 1;
+      return postDaemon(port, path, body, secret);
+    },
+  });
+  const admitInbound = daemon.admitInbound;
+  daemon.admitInbound = (...args) => {
+    const admission = admitInbound(...args);
+    if (!admission.start) refusalsStarted += 1;
+    return admission;
+  };
+  return daemon;
+}
+
+afterEach(async () => {
+  try {
+    await vi.waitFor(() => expect(refusalsDelivered).toBeGreaterThanOrEqual(refusalsStarted), { timeout: 10_000, interval: 10 });
+  } finally {
+    refusalsStarted = 0;
+    refusalsDelivered = 0;
+    cleanupBotRuns();
+  }
+});
 
 const ROOT = 'om_main_topic';
 const BINDING = { larkAppId: MAIN, chatId: CHAT, chatType: 'group' as const, rootMessageId: ROOT };
@@ -564,8 +596,8 @@ describe('ADV-3: one main-topic session carries one node at a time', () => {
     const admission = daemon.admitInbound(found.binding, b.attempt.handoffMessageId!, 'cli_a', undefined, ds.session.workflowNode);
     expect(admission).toMatchObject({ start: false, reason: expect.stringContaining('正在执行另一个工作流节点') });
     expect(ds.session.workflowNode?.nonce).toBe(a.marker.nonce);
-    await flush();
-    expect(posted).toEqual([expect.objectContaining({ body: expect.objectContaining({ kind: 'refused', errorCode: 'MAIN_TOPIC_BUSY', nonce: b.marker.nonce }) })]);
+    // The refusal is recorded, then sent, in the background (behind a file lock).
+    await vi.waitFor(() => expect(posted).toEqual([expect.objectContaining({ body: expect.objectContaining({ kind: 'refused', errorCode: 'MAIN_TOPIC_BUSY', nonce: b.marker.nonce }) })]), { timeout: 10_000, interval: 10 });
 
     // The same handoff again (a re-delivery), or one after the first ended or
     // was revoked: not refused as busy (the next gate is the run's directory).
