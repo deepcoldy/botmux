@@ -54,7 +54,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
 }));
 
-const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
@@ -541,7 +541,7 @@ describe('target daemon consumes signed message authority', () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
         return options.member === false ? [] : ['ou_alice_target'];
       },
-      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',

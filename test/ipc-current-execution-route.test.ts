@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishActiveTurn, writeSessionIdentity, recallProvenIdentityContent } from '../src/core/cli-identity.js';
 import { config } from '../src/config.js';
+import { trackTurnIdentityPublication } from '../src/core/turn-cli-identity.js';
 
 let ipc: IpcServerHandle | null = null;
 let previousDataDir = '';
@@ -167,6 +168,33 @@ describe('POST /api/current-execution', () => {
     });
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ error: 'identity_material_unavailable' });
+  });
+
+  it('waits for a publication still in flight instead of refusing the first call', async () => {
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'identity-in-flight-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      // The opening turn's replay is still resolving (e.g. a slow platform grant).
+      void trackTurnIdentityPublication(dataDir, 's-execution', new Promise<void>(resolve => setTimeout(() => {
+        writeSessionIdentity(dataDir, 's-execution', {
+          tool: 'bytedcli', cloudJwt: 'jwt-late', turnId: 'trigger-current', openId: 'ou-late',
+        }, 'proven');
+        resolve();
+      }, 300)));
+      const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(await response.json())).toContain('jwt-late');
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
   it.each([

@@ -577,7 +577,7 @@ import {
   closeCliMismatchedSessionsForBot,
   resolveScheduledTaskExecutionPosition,
 } from './core/session-manager.js';
-import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
+import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
@@ -4466,7 +4466,11 @@ async function handleIdentityDecisionFlip(
     // from its schedule authority again. refreshTurnCliIdentity reads the
     // turn's human sender, which a scheduled turn never has, so replaying
     // through it turned the creator's identity into an anonymous refusal.
-    await prepareTurnCliIdentity(ds, turnId);
+    // Tracked from the start: the CLI's first identity fetch can arrive while
+    // this replay is still resolving the sender, and must wait for it rather
+    // than be refused for missing material.
+    const replay = prepareTurnCliIdentity(ds, turnId);
+    if (replay) await trackTurnIdentityPublication(config.session.dataDir, ds.session.sessionId, replay);
     ds.lastIdentityDecisionRepublish = { model: context.model, turnId, ok: true };
   } catch (error) {
     // Keep the failure visible and replayable: no success baseline, no
