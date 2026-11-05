@@ -486,8 +486,8 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -8069,34 +8069,50 @@ for (const path of [
 // Fire-and-forget: the runner drives the run + posts gate cards; the caller
 // polls /api/v3/runs/:id for status.
 workflowDaemonMutationRoute('start', async (reply, params, _body, identity) => {
-  const runId = params.runId;
-  if (!isValidV3RunId(runId)) return reply(400, { ok: false, error: 'bad_run_id' });
+  const started = startV3RunOnThisDaemon(params.runId, identity);
+  return reply(started.status, started.body);
+});
+
+/**
+ * The start of a daemon-driven run, shared by the signed `start` mutation
+ * (`botmux workflow start`, the grill `approve-dag` kick) and the Dashboard
+ * 拉群开始 (design 2026-11-03 workflow-dashboard-orchestration §4.5 第 8 步).
+ * Idempotent: the start intent is one journal record.
+ */
+function startV3RunOnThisDaemon(
+  runId: string,
+  identity: { larkAppId: string },
+): { status: number; body: Record<string, unknown> } {
+  if (!isValidV3RunId(runId)) return { status: 400, body: { ok: false, error: 'bad_run_id' } };
   // Machine-wide workflow kill-switch: refuse launching a NEW daemon-driven run
   // when the feature is off. This is the common sink for both `botmux workflow
   // start` and the grill `approve-dag` kick, so gating here closes the edge where
   // a run was grilled+approved before the flip. Restart recovery of an
   // already-started run (coldAttach / reconcileV3PendingGates) is a separate path
   // and is intentionally NOT gated, and `retry`/`grant`/`cancel` stay available.
-  if (!isWorkflowFeatureEnabled()) return reply(409, { ok: false, error: 'workflow_disabled' });
+  if (!isWorkflowFeatureEnabled()) return { status: 409, body: { ok: false, error: 'workflow_disabled' } };
   const runDir = join(v3DefaultBaseDir(), runId);
   const preflight = preflightV3RunStart(runDir);
   if (!preflight.ok) {
     if (preflight.error === 'no_grill_state') {
-      return reply(404, { ok: false, error: 'unknown_run' });
+      return { status: 404, body: { ok: false, error: 'unknown_run' } };
     }
-    return reply(409, {
-      ok: false,
-      error: preflight.error,
-      ...(preflight.status ? { status: preflight.status } : {}),
-      ...(preflight.detail ? { detail: preflight.detail } : {}),
-    });
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: preflight.error,
+        ...(preflight.status ? { status: preflight.status } : {}),
+        ...(preflight.detail ? { detail: preflight.detail } : {}),
+      },
+    };
   }
   // Owner check (codex blocker #1): only the daemon owning this run's bot may
   // start it — otherwise the wrong daemon drives + posts cards with its client.
   const binding = preflight.context.binding;
-  if (!binding) return reply(404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (!binding) return { status: 404, body: { ok: false, error: 'unknown_run_or_no_binding' } };
   if (binding.larkAppId !== identity.larkAppId) {
-    return reply(409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+    return { status: 409, body: { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId } };
   }
   // A 202 means the start intent is recoverable after an immediate daemon
   // crash. Persist the journal boundary before scheduling detached work; cold
@@ -8104,15 +8120,18 @@ workflowDaemonMutationRoute('start', async (reply, params, _body, identity) => {
   try {
     persistV3StartIntent(runId, runDir);
   } catch (err) {
-    return reply(409, {
-      ok: false,
-      error: 'run_journal_invalid',
-      detail: err instanceof Error ? err.message : String(err),
-    });
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: 'run_journal_invalid',
+        detail: err instanceof Error ? err.message : String(err),
+      },
+    };
   }
   v3GateRunner.driveDetached(runId);
-  return reply(202, { ok: true, runId });
-});
+  return { status: 202, body: { ok: true, runId } };
+}
 
 // v3 durable cancel: journal intent first, then low-latency AbortController
 // delivery + replay. HTTP 202 is returned only after runCancelRequested has
@@ -33283,7 +33302,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Dashboard workflow drafts of this bot (design 2026-11-03
   // workflow-dashboard-orchestration D2): drafts left 编排中 by the previous
   // process go back to 待编排 before any route can start a new Architect.
-  installWorkflowDraftService(createProductionWorkflowDraftService(cfg.larkAppId, productionWorkflowDraftClarifier()));
+  installWorkflowDraftService(createProductionWorkflowDraftService(
+    cfg.larkAppId,
+    productionWorkflowDraftClarifier(),
+    createProductionDraftLaunchDeps({
+      appId: cfg.larkAppId,
+      startRun: async (runId) => {
+        const started = startV3RunOnThisDaemon(runId, { larkAppId: cfg.larkAppId });
+        if (started.status === 202) return { ok: true };
+        return {
+          ok: false,
+          status: started.status,
+          error: String(started.body.error ?? 'start_failed'),
+          ...(typeof started.body.detail === 'string' ? { detail: started.body.detail } : {}),
+        };
+      },
+      bindSession: productionWorkflowDraftSessionBinder(),
+      // §5.2 rule 3 at the Dashboard commit point: same read the Feishu
+      // /workflow run entry uses (the bound session is that topic's own).
+      mainTopicAvailability: (binding) => v3MainTopicAvailability(
+        binding,
+        binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined,
+      ),
+    }),
+  ));
   setDeviceIsolationDaemonIdentity({
     larkAppId: cfg.larkAppId,
     bootInstanceId: desc.bootInstanceId,

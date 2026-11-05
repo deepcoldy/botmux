@@ -4624,7 +4624,7 @@ describe('POST /api/grants/chat', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it('rejects stable subject app ids for revoke or readback before invoking the service', async () => {
+  it('rejects stable subject app ids for readback before invoking the service (grant and revoke resolve them)', async () => {
     const handler = vi.fn();
     setExactChatGrantHandler(handler as any);
     setLarkAppId('cli_receiver');
@@ -4635,7 +4635,7 @@ describe('POST /api/grants/chat', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
       body: JSON.stringify({
-        operation: 'revoke',
+        operation: 'readback',
         receiverLarkAppId: 'cli_receiver',
         chatId: 'oc_chat',
         subjectLarkAppIds: ['cli_pm'],
@@ -11503,6 +11503,34 @@ describe('POST /api/groups/create', () => {
     expect(spy).toHaveBeenCalledWith('cli_X', 'oc_new', process.cwd());
     addSpy.mockRestore();
     spy.mockRestore();
+    createSpy.mockRestore();
+    linkSpy.mockRestore();
+  });
+
+  it('optional topic-group mode and bot collaboration: passed through when sent, refused when malformed', async () => {
+    setLarkAppId('test-app');
+    const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({ chatId: 'oc_topic', invalidBotIds: [], invalidUserIds: [] });
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([{ id: 'cli_X', ok: true }]);
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({ ok: true, shareLink: 'https://example.test/chat' });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const post = (body: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/groups/create`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+
+    expect((await post({ larkAppIds: ['test-app'], chatMode: 'thread' })).status).toBe(400);
+    expect((await post({ larkAppIds: ['test-app'], botCollaboration: 'yes' })).status).toBe(400);
+    expect(createSpy).not.toHaveBeenCalled();
+
+    const plain = await (await post({ larkAppIds: ['test-app', 'cli_X'] })).json();
+    expect(createSpy).toHaveBeenLastCalledWith('test-app', { name: undefined, botIds: [], userIds: [], chatMode: undefined });
+    expect('collaborationError' in plain).toBe(false);
+
+    const topic = await (await post({ larkAppIds: ['test-app', 'cli_X'], chatMode: 'topic', botCollaboration: true })).json();
+    expect(createSpy).toHaveBeenLastCalledWith('test-app', expect.objectContaining({ chatMode: 'topic' }));
+    // The grant matrix ran for the joined bots (no host secret / daemon here,
+    // so it reports its error; without the flag the key is absent).
+    expect(typeof topic.collaborationError).toBe('string');
+    addSpy.mockRestore();
     createSpy.mockRestore();
     linkSpy.mockRestore();
   });

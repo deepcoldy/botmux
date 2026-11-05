@@ -247,7 +247,10 @@ import {
   cancelReadonlyTaskContinuationExplicit,
   startReadonlyTaskContinuation,
 } from '../services/readonly-task-continuation.js';
-import { listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { findOnlineDaemon, listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { ensureBotChatGrantMatrix } from '../cli/exact-chat-grant-client.js';
+import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
+import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { updateMessage } from '../im/lark/client.js';
@@ -5079,6 +5082,44 @@ ipcRoute('POST', '/api/headless/sessions/:sessionId/publish', requireBoundBot(as
   }
 }, NOT_BOUND_BODY.botNotFound));
 
+/** After a headless session moved into a chat / topic: the headless record
+ *  and the session's own `headless` block say where it is bound now. */
+function recordHeadlessBinding(
+  record: HeadlessSessionRecord,
+  bound: { boundAt: string; chatId: string; rootMessageId: string; scope: 'thread' | 'chat'; replayMessageId?: string },
+): { updated: HeadlessSessionRecord | null; metadataWarning?: string } {
+  let updated: HeadlessSessionRecord | null = null;
+  let metadataWarning: string | undefined;
+  try {
+    updated = updateHeadlessSession(record.id, current => {
+      current.boundAt = bound.boundAt;
+      current.boundChatId = bound.chatId;
+      current.boundRootMessageId = bound.rootMessageId;
+      current.boundScope = bound.scope;
+      if (bound.replayMessageId) {
+        current.lastPublishedAt = bound.boundAt;
+        current.lastPublishedMessageId = bound.replayMessageId;
+      }
+    });
+  } catch (error) {
+    metadataWarning = ipcErrorText(error);
+    logger.warn(`[headless] bind metadata update failed for ${record.id}: ${metadataWarning}`);
+  }
+  const session = findOwnedSessionRecord(record.sessionId);
+  if (session?.headless) {
+    session.headless.boundAt = bound.boundAt;
+    session.headless.boundChatId = bound.chatId;
+    session.headless.boundRootMessageId = bound.rootMessageId;
+    session.headless.boundScope = bound.scope;
+    if (bound.replayMessageId) {
+      session.headless.lastPublishedAt = bound.boundAt;
+      session.headless.lastPublishedMessageId = bound.replayMessageId;
+    }
+    sessionStore.updateSession(session);
+  }
+  return { updated, ...(metadataWarning ? { metadataWarning } : {}) };
+}
+
 ipcRoute('POST', '/api/headless/sessions/:sessionId/bind', requireBoundBot(async (req, res, params) => {
   const record = findHeadlessRecordForThisDaemon(params.sessionId);
   if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
@@ -5155,35 +5196,9 @@ ipcRoute('POST', '/api/headless/sessions/:sessionId/bind', requireBoundBot(async
       logger.warn(`[headless] replay failed after bind for ${record.id}: ${replayError}`);
     }
   }
-  let updated: HeadlessSessionRecord | null = null;
-  let metadataWarning: string | undefined;
-  try {
-    updated = updateHeadlessSession(record.id, current => {
-      current.boundAt = boundAt;
-      current.boundChatId = targetChatId;
-      current.boundRootMessageId = rootMessageId;
-      current.boundScope = targetScope;
-      if (replayMessageId) {
-        current.lastPublishedAt = boundAt;
-        current.lastPublishedMessageId = replayMessageId;
-      }
-    });
-  } catch (error) {
-    metadataWarning = ipcErrorText(error);
-    logger.warn(`[headless] bind metadata update failed for ${record.id}: ${metadataWarning}`);
-  }
-  const session = findOwnedSessionRecord(record.sessionId);
-  if (session?.headless) {
-    session.headless.boundAt = boundAt;
-    session.headless.boundChatId = targetChatId;
-    session.headless.boundRootMessageId = rootMessageId;
-    session.headless.boundScope = targetScope;
-    if (replayMessageId) {
-      session.headless.lastPublishedAt = boundAt;
-      session.headless.lastPublishedMessageId = replayMessageId;
-    }
-    sessionStore.updateSession(session);
-  }
+  const { updated, metadataWarning } = recordHeadlessBinding(record, {
+    boundAt, chatId: targetChatId, rootMessageId, scope: targetScope, ...(replayMessageId ? { replayMessageId } : {}),
+  });
   return jsonRes(res, 200, {
     ok: true,
     sessionId: record.sessionId,
@@ -6626,6 +6641,31 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
   });
 }
 
+/**
+ * 拉群开始 第 4 步 (design 2026-11-03 workflow-dashboard-orchestration §4.5,
+ * E7): move a draft's clarify session into the main topic — the same
+ * transferSession + headless metadata as `POST /api/headless/sessions/:id/bind`
+ * (thread scope, no replay: the launch posts its own summary). Already bound
+ * there → ok (a resumed launch). A session that is not active any more is
+ * reported unavailable; anything else (busy, …) is retried later.
+ */
+export function productionWorkflowDraftSessionBinder(): DraftLaunchDeps['bindSession'] {
+  return async ({ sessionId, headlessId, chatId, rootMessageId }) => {
+    const live = findActiveBySessionId(sessionId);
+    if (live && live.session.chatId === chatId && live.session.rootMessageId === rootMessageId) return { ok: true };
+    const result = await transferSession(sessionId, chatId, rootMessageId, 'group', 'thread');
+    if (!result.ok) {
+      if (result.error === 'same_anchor') return { ok: true };
+      return { ok: false, error: result.error, unavailable: result.error === 'session_not_active' };
+    }
+    const record = findHeadlessRecordForThisDaemon(headlessId ?? sessionId);
+    if (record && record.sessionId === sessionId) {
+      recordHeadlessBinding(record, { boundAt: new Date().toISOString(), chatId, rootMessageId, scope: 'thread' });
+    }
+    return { ok: true };
+  };
+}
+
 ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
@@ -7096,11 +7136,11 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
       message: 'Provide exactly one of subjectOpenIds or subjectLarkAppIds',
     });
   }
-  if (hasSubjectLarkAppIds && body.operation !== 'grant') {
+  if (hasSubjectLarkAppIds && body.operation !== 'grant' && body.operation !== 'resolve') {
     return jsonRes(res, 400, {
       ok: false,
       error: 'subject_lark_app_ids_grant_only',
-      message: 'subjectLarkAppIds may only be used with operation=grant',
+      message: 'subjectLarkAppIds may only be used with operation=grant or resolve',
     });
   }
   // Optional quota/validity window. Absent keys keep the legacy CLI wire shape
@@ -11284,6 +11324,8 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     notifyOwnerOpenId?: unknown;
     bindWorkingDir?: unknown;
     roleProfileId?: unknown;
+    chatMode?: unknown;
+    botCollaboration?: unknown;
   };
   try {
     body = await readJsonBody<{
@@ -11334,6 +11376,11 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
   if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
   }
+  // Optional (design 2026-11-03 workflow-dashboard-orchestration §8): a topic
+  // group, and the talk-only grant matrix between the bots that joined (what
+  // CLI create-group writes). Absent → today's behaviour, byte for byte.
+  const groupCreationExtras = parseGroupCreateExtras(body);
+  if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error });
   const bindWorkingDir = typeof body.bindWorkingDir === 'string' ? body.bindWorkingDir.trim() : '';
   let bindResolvedPath: string | undefined;
   if (bindWorkingDir) {
@@ -11353,12 +11400,42 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,
       roleProfileId: roleProfileId ?? undefined,
+      ...(groupCreationExtras.chatMode ? { chatMode: groupCreationExtras.chatMode } : {}),
+      ...(groupCreationExtras.botCollaboration
+        ? { ensureBotCollaboration: async (chatId: string, joined: string[]) => { await ensureLocalBotChatGrantMatrix(chatId, joined); } }
+        : {}),
     });
     jsonRes(res, 200, bindResolvedPath ? { ...r, bindResolvedPath } : r);
   } catch (e) {
     jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });
   }
 }));
+
+/** The optional `/api/groups/create` fields (absent = unchanged behaviour). */
+export function parseGroupCreateExtras(body: { chatMode?: unknown; botCollaboration?: unknown }):
+  | { ok: true; chatMode?: 'topic' | 'group'; botCollaboration: boolean }
+  | { ok: false; error: string } {
+  if (body.chatMode !== undefined && body.chatMode !== 'topic' && body.chatMode !== 'group') {
+    return { ok: false, error: 'invalid_chat_mode' };
+  }
+  if (body.botCollaboration !== undefined && typeof body.botCollaboration !== 'boolean') {
+    return { ok: false, error: 'invalid_bot_collaboration' };
+  }
+  return {
+    ok: true,
+    ...(body.chatMode !== undefined ? { chatMode: body.chatMode as 'topic' | 'group' } : {}),
+    botCollaboration: body.botCollaboration === true,
+  };
+}
+
+/** The talk-only grant matrix between local bots in one chat, through each
+ *  receiver's own daemon (the call CLI create-group / dispatch make). */
+async function ensureLocalBotChatGrantMatrix(chatId: string, participantAppIds: string[]): Promise<void> {
+  await ensureBotChatGrantMatrix(chatId, participantAppIds, {
+    findDaemon: (larkAppId) => findOnlineDaemon(larkAppId, config.session.dataDir),
+    secret: () => loadDaemonIpcSecret(),
+  });
+}
 
 // Complete a deferred team-group owner transfer after another deployment has
 // added the operator to the chat. The caller sends union_id so no app-scoped
