@@ -6562,6 +6562,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [chatId, setChatId] = useState(savedForm.chatId);
   const [autoJoin, setAutoJoin] = useState(savedForm.autoJoinNewGroups);
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
+  const [decisionCards, setDecisionCards] = useState(savedForm.decisionCards);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6580,6 +6581,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setChatId(savedForm.chatId); }, [appId, savedForm.chatId]);
   useEffect(() => { setAutoJoin(savedForm.autoJoinNewGroups); }, [appId, savedForm.autoJoinNewGroups]);
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
+  useEffect(() => { setDecisionCards(savedForm.decisionCards); }, [appId, savedForm.decisionCards]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6649,6 +6651,12 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     void save({ ...savedForm, autoJoinSoloGroups: on }, setStatus, () => setAutoJoinSolo(previous));
   }
 
+  function toggleDecisionCards(on: boolean): void {
+    const previous = decisionCards;
+    setDecisionCards(on);
+    void save({ ...savedForm, decisionCards: on }, setStatus, () => setDecisionCards(previous));
+  }
+
   function changeChat(next: string): void {
     const previous = chatId;
     setChatId(next);
@@ -6704,6 +6712,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
               {selectedChat?.chatMode === 'topic' ? <p className="bd-section-note">{tr('botDefaults.stewardChatTopic')}</p> : null}
             </div>
           </div>
+          <ToggleRow
+            checked={decisionCards}
+            disabled={busy}
+            dataAction="toggle-steward-decision-cards"
+            title={tr('botDefaults.stewardDecisionCards')}
+            help={tr('botDefaults.stewardDecisionCardsHelp')}
+            onChange={toggleDecisionCards}
+          />
           <ToggleRow
             checked={autoJoin}
             disabled={busy}

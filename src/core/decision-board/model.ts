@@ -136,7 +136,12 @@ export interface BoardBatch {
   turnId?: string;
   deliveredAt?: number;
   error?: string;
+  /** 从哪里提交的：飞书拍板卡片为 'card'；缺省 = 网页看板。 */
+  source?: BatchSource;
 }
+
+/** 批次来源：网页看板（缺省）或管家群里的拍板卡片。 */
+export type BatchSource = 'web' | 'card';
 
 export interface BoardDecision {
   batchId: number;
@@ -146,6 +151,8 @@ export interface BoardDecision {
   fileIds: string[];
   itemRev: number;
   handledAt?: number;
+  /** 同一项后来又提交了决定（卡片与网页之间以后提交的为准）：覆盖它的批次号。被覆盖的不再算待执行。 */
+  supersededBy?: number;
 }
 
 // ─── 字段上限 ───────────────────────────────────────────────────────────────
@@ -384,6 +391,11 @@ export interface StewardConfig {
    * 管家。默认关：带上后群里有两个 bot，原 bot 不再按单人单 bot 免 @ 续话。只在打开时写 `true`。
    */
   autoJoinSoloGroups?: boolean;
+  /**
+   * 事项进入待拍板（或改了选项）时，往管家群发一张能直接点选项的拍板卡片，之后原地更新。
+   * 默认开，只在关掉时写 `false`。
+   */
+  decisionCards?: boolean;
 }
 
 export const STEWARD_GUIDE_TEXT_MAX = 20_000;
@@ -398,7 +410,7 @@ export function normalizeStewardConfig(raw: unknown):
   if (raw === null || raw === undefined) return { ok: true, value: null };
   if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'steward 必须是对象' };
   const r = raw as Record<string, unknown>;
-  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups']);
+  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups', 'decisionCards']);
   const unknown = Object.keys(r).filter(k => !known.has(k));
   if (unknown.length) return { ok: false, reason: `steward 有未知字段：${unknown.join(', ')}` };
   if (r.enabled !== undefined && typeof r.enabled !== 'boolean') return { ok: false, reason: 'steward.enabled 必须是布尔值' };
@@ -407,6 +419,9 @@ export function normalizeStewardConfig(raw: unknown):
   }
   if (r.autoJoinSoloGroups !== undefined && r.autoJoinSoloGroups !== null && typeof r.autoJoinSoloGroups !== 'boolean') {
     return { ok: false, reason: 'steward.autoJoinSoloGroups 必须是布尔值' };
+  }
+  if (r.decisionCards !== undefined && r.decisionCards !== null && typeof r.decisionCards !== 'boolean') {
+    return { ok: false, reason: 'steward.decisionCards 必须是布尔值' };
   }
   let chatId: string | undefined;
   if (r.chatId !== undefined && r.chatId !== null && r.chatId !== '') {
@@ -437,9 +452,10 @@ export function normalizeStewardConfig(raw: unknown):
     ...(guideText ? { guideText } : {}),
     ...(r.autoJoinNewGroups === false ? { autoJoinNewGroups: false } : {}),
     ...(r.autoJoinSoloGroups === true ? { autoJoinSoloGroups: true } : {}),
+    ...(r.decisionCards === false ? { decisionCards: false } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
-    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true) {
+    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.decisionCards !== false) {
     return { ok: true, value: null };
   }
   return { ok: true, value };
@@ -459,6 +475,11 @@ export function stewardReady(cfg: StewardConfig | undefined): cfg is StewardConf
   return !!cfg?.enabled && !!cfg.chatId;
 }
 
+/** 要不要往管家群发拍板卡片：管家可用（开关开 + 选了管家群）且没关「飞书卡片拍板」。 */
+export function stewardDecisionCardsOn(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
+  return stewardReady(cfg) && cfg.decisionCards !== false;
+}
+
 /**
  * 拉新群时要不要带上这个管家：管家开着、且没关「拉新群时带上管家」；只有一个人和一个 bot 的新群
  * 另外要打开 autoJoinSoloGroups。不要求选了管家群。
@@ -467,6 +488,9 @@ export function stewardJoinsNewGroups(cfg: StewardConfig | undefined, chat: { so
   if (cfg?.enabled !== true || cfg.autoJoinNewGroups === false) return false;
   return chat.soloGroup ? cfg.autoJoinSoloGroups === true : true;
 }
+
+/** 拍板卡片上最多放几个选项按钮；更多时卡片只给看板链接。 */
+export const DECISION_CARD_MAX_OPTIONS = 6;
 
 // ─── 管家规则（`botmux board guide`）────────────────────────────────────────
 // 不常驻：管家群里只有一行提示（renderStewardHintBlock），正文按需由 guide 输出。
@@ -496,11 +520,13 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
   \`botmux board set <编号> --state decide --ask "要你定的问题" --option "A=做法 → 结果和风险" --option "B=…" --recommend A --reason "理由"\`。
   给两三个选项，写清后果和你的推荐。
 - 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接；发出去之后给每项记一句 \`botmux board history <编号> "已报 owner"\`。
+- 管家开着「飞书卡片拍板」（默认开）时，botmux 会在改成 decide 或改了选项后自动往管家群发这一项的拍板卡片，之后原地更新；owner 在卡片上点的选项和网页提交一样，以「决策看板 · 批次」送到你这里。这时上面那条消息一句话说明要定什么即可，不用再列选项、不要自己发带选项的卡片。选项超过 ${DECISION_CARD_MAX_OPTIONS} 个时卡片只给看板链接。
 
 ## 执行一批决定（收到「决策看板 · 批次」消息时）
 - 逐项处理：先 \`botmux board show <编号>\` 看最新内容，再按决定执行。
 - 每项做完：\`botmux board history <编号> --handled "做了什么、结果"\`，需要时改状态。
 - 决定看不懂，或者和现状冲突：不要猜，写 \`--handled "要你再确认：…"\`，并把状态设回 decide。
+- 同一项在卡片和网页上先后都提交过时以后提交的为准：标着「覆盖：批次 #N …」的只执行本次（#N 里那条已作废，不用再 --handled）；标着「已被覆盖」的跳过，等后来那个批次。
 - 最后回一条汇总。
 
 ## 定时巡检（收到「决策看板 · 巡检」消息时）
@@ -544,11 +570,13 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 - Anything you cannot decide, anything irreversible, or anything that would overturn an earlier owner decision becomes a decision item:
   \`botmux board set <n> --state decide --ask "question" --option "A=approach → outcome and risk" --option "B=…" --recommend A --reason "why"\`.
 - Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`; once sent, note \`botmux board history <n> "reported to owner"\` on each item.
+- With "Decision cards in Feishu" on (the default), botmux posts this item's decision card in the steward chat after it becomes decide or its options change, and updates it in place; an option the owner picks on the card reaches you as a "Decision board · batch", same as a web submission. Then one sentence on what needs deciding is enough: do not repeat the options or post your own option card. With more than ${DECISION_CARD_MAX_OPTIONS} options the card only links to the board.
 
 ## Executing a batch (when a "Decision board · batch" message arrives)
 - Item by item: \`botmux board show <n>\` for the latest state, then act on the decision.
 - After each one: \`botmux board history <n> --handled "what you did and the result"\`, and update the state if needed.
 - If a decision is unclear or conflicts with reality, do not guess: \`--handled "Please confirm: …"\` and set the state back to decide.
+- When an item was submitted from both the card and the web page, the later one wins: an entry marked "Supersedes: batch #N" is the one to execute (the older one is void; no --handled needed for it); skip an entry marked "Superseded" and wait for the later batch.
 - Finish with one summary reply.
 
 ## Scheduled patrol (when a "Decision board · patrol" message arrives)
@@ -628,6 +656,12 @@ export interface BatchMessageEntry {
   fileCount: number;
   /** 这一项的主群：管家群里的回显和批次消息都带上，点了直接进群。 */
   primaryChat?: { text: string; url: string };
+  /** 在管家群的拍板卡片上点的（缺省 = 网页看板）。 */
+  source?: BatchSource;
+  /** 这次决定作废了这些较早批次里对同一项的决定（以后提交的为准）。 */
+  supersedes?: number[];
+  /** 投递前同一项已有更新的决定：这一条以那个批次为准，不用执行。 */
+  supersededBy?: number;
 }
 
 export interface BatchMessageInput {
@@ -676,6 +710,19 @@ export function formatBatchEntries(
         : `Choice: ${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`);
     } else {
       lines.push(zh ? '选：未选' : 'Choice: none');
+    }
+    // 来源与覆盖关系紧跟「选」：放在多行说明后面会像说明的一部分。
+    if (e.source === 'card') lines.push(zh ? '来源：管家群的拍板卡片' : 'Source: decision card in the steward chat');
+    if (e.supersedes?.length) {
+      const ids = e.supersedes.map(id => `#${id}`).join(zh ? '、' : ', ');
+      lines.push(zh
+        ? `覆盖：批次 ${ids} 里对这一项的决定作废，以本次为准`
+        : `Supersedes: the decision on this item in batch ${ids} is void; follow this one`);
+    }
+    if (e.supersededBy !== undefined) {
+      lines.push(zh
+        ? `已被覆盖：这一项后来在批次 #${e.supersededBy} 改了决定，以那次为准，这条不用执行`
+        : `Superseded: batch #${e.supersededBy} changed the decision on this item; follow that one and skip this`);
     }
     if (e.text.trim()) {
       lines.push(`${zh ? '说明：' : 'Note:'}\n${e.text}`);

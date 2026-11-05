@@ -7,6 +7,7 @@ import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } fro
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
+import { setDecisionCardService } from './core/decision-board/card-action.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
 import { createBoardChatProbes, sameOwnerAs } from './services/board-chat-probes.js';
 import { resolveDashboardOrigin } from './core/workbench-link.js';
@@ -34914,8 +34915,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     })),
     log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
     lookupChat: (chatId, opts) => lookupChatAcrossBots(chatId, boardChatProbes(), { deadline: opts.deadline }),
+    // 管家群里的拍板卡片（steward.decisionCards，默认开）：发卡 / 原地更新，卡已失效时才另发。
+    cards: {
+      sendCard: (chatId, card) => sendMessage(cfg.larkAppId, chatId, card, 'interactive'),
+      updateCard: (messageId, card) => updateMessage(cfg.larkAppId, messageId, card),
+      isCardGone: error => error instanceof MessageUpdateExpiredError
+        || error instanceof MessageWithdrawnError
+        || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
+    },
   });
   setDecisionBoardService(decisionBoard);
+  setDecisionCardService(decisionBoard);
   // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。
   setTimeout(() => {
     void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`));

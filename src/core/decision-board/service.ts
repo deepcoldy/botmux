@@ -8,6 +8,7 @@
  *
  * 存储懒打开：第一次真的用到看板时才建 `decision-board.sqlite`。
  */
+import { randomUUID } from 'node:crypto';
 import { copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Locale } from '../../i18n/types.js';
@@ -20,6 +21,13 @@ import {
   type ItemPatch,
 } from '../../services/decision-board-store.js';
 import { formatChatLookupFailures, lookupProvesChatNotFound, type ChatLookupResult } from './chat-lookup.js';
+import {
+  DECISION_CARD_ACTION_NOTE,
+  DECISION_CARD_ACTION_PICK,
+  DecisionCards,
+  cardNoteText,
+  decisionAskKey,
+} from './card.js';
 import {
   BOARD_STATE_LABELS,
   CHAT_REF_PATTERN,
@@ -84,7 +92,58 @@ export interface DecisionBoardServiceDeps {
    * 只在写 chat 关联时调用；凭据只留在 daemon 进程内。`deadline` 是这条命令共用的截止时间。
    */
   lookupChat(chatId: string, opts: { deadline: number }): Promise<ChatLookupResult>;
+  /**
+   * 管家群里的拍板卡片（见 card.ts）。不接线时不发卡，其余行为不变。
+   */
+  cards?: {
+    sendCard(chatId: string, cardJson: string): Promise<string>;
+    updateCard(messageId: string, cardJson: string): Promise<void>;
+    isCardGone(error: unknown): boolean;
+  };
 }
+
+/** 卡片按钮回调交给 {@link DecisionBoardService.cardClick} 的内容（身份取自飞书事件，不取 value）。 */
+export interface BoardCardClick {
+  operatorOpenId?: string;
+  operatorUnionId?: string;
+  value: Record<string, unknown>;
+  formValue?: unknown;
+  messageId?: string;
+}
+
+/** 卡片回调的结果：toast 和 / 或换上的卡片；deliver 在回调应答之后执行（投递可能要几秒）。 */
+export interface BoardCardClickResult {
+  toast?: { type: 'success' | 'info' | 'warning' | 'error'; content: string };
+  card?: Record<string, unknown>;
+  deliver?: () => Promise<void>;
+}
+
+const CARD_TOASTS = {
+  zh: {
+    unavailable: '这张卡片已失效，去看板上处理',
+    disabled: '这个管家没开「飞书卡片拍板」，去看板上处理',
+    noPermission: '只有看板 owner 能在卡片上拍板',
+    gone: '这一项已经不在看板上了',
+    notDeciding: '这一项已经不在待拍板了，卡片已刷新',
+    stale: '选项刚改过，卡片已刷新，请按最新选项再点',
+    noteRequired: '先在说明框里写点什么',
+    duplicate: '这个决定已经交给管家了',
+    accepted: (label: string) => `已选 ${label}，正在交给管家`,
+    acceptedNote: '已提交说明，正在交给管家',
+  },
+  en: {
+    unavailable: 'This card has expired; use the board instead',
+    disabled: 'Decision cards are off for this steward; use the board instead',
+    noPermission: 'Only the board owner can decide on this card',
+    gone: 'This item is no longer on the board',
+    notDeciding: 'This item no longer awaits a decision; card refreshed',
+    stale: 'The options just changed; card refreshed, please pick again',
+    noteRequired: 'Write something in the note box first',
+    duplicate: 'This decision was already sent to the steward',
+    accepted: (label: string) => `Picked ${label}; sending to the steward`,
+    acceptedNote: 'Note submitted; sending to the steward',
+  },
+} as const;
 
 /** CLI 发来的请求体：选项和关联都传原始 spec 字符串，由这里统一解析。 */
 export interface BoardCliRequest {
@@ -133,8 +192,35 @@ const PATCH_TEXT_FIELDS = ['key', 'stage', 'kind', 'repo', 'summary', 'progress'
 export class DecisionBoardService {
   private storeRef?: DecisionBoardStore;
   private readonly delivering = new Map<number, Promise<BoardBatch>>();
+  readonly cards?: DecisionCards;
 
-  constructor(private readonly deps: DecisionBoardServiceDeps) {}
+  constructor(private readonly deps: DecisionBoardServiceDeps) {
+    const sink = deps.cards;
+    if (sink) {
+      this.cards = new DecisionCards({
+        store: () => this.store(),
+        appId: () => this.appId,
+        locale: () => this.deps.locale(),
+        steward: () => this.deps.steward(),
+        links: seq => this.itemLinks(seq),
+        sendCard: (chatId, card) => sink.sendCard(chatId, card),
+        updateCard: (messageId, card) => sink.updateCard(messageId, card),
+        isCardGone: error => sink.isCardGone(error),
+        log: (level, message) => this.deps.log(level, message),
+      });
+    }
+  }
+
+  /** 卡片同步不挡看板写入：失败只记日志（DecisionCards 内部已兜住）。 */
+  private syncCard(seq: number, create = false): void {
+    if (!this.cards) return;
+    void this.cards.sync(seq, { create });
+  }
+
+  /** 等卡片同步跑完（测试用）。 */
+  async cardsIdle(): Promise<void> {
+    await this.cards?.idle();
+  }
 
   private get appId(): string { return this.deps.larkAppId(); }
 
@@ -410,7 +496,9 @@ export class DecisionBoardService {
         await this.verifyChatLinks(patch, req.allowUnverifiedChat === true, existing);
         // 查群可能要等十几秒：期间管家被关掉了就不再写。
         this.requireSteward();
+        const before = existingSeq !== undefined ? store.getItem(app, existingSeq) : undefined;
         const { item, created } = store.addItem(app, { ...patch, title }, ctx.sessionId, undefined, this.deps.locale());
+        this.syncCard(item.seq, askChanged(before, item));
         return { created, item: this.itemOut(item.seq) };
       }
       case 'set': {
@@ -424,13 +512,16 @@ export class DecisionBoardService {
           const item = store.getItem(app, seq)!;
           if (!item.options.some(o => o.key === patch.recommend)) throw new BoardError('unknown_recommend', `推荐项 ${patch.recommend} 不在选项里`);
         }
-        store.updateItem(app, seq, patch, ctx.sessionId, undefined, this.deps.locale());
+        const before = store.getItem(app, seq);
+        const after = store.updateItem(app, seq, patch, ctx.sessionId, undefined, this.deps.locale());
+        this.syncCard(seq, askChanged(before, after));
         return { item: this.itemOut(seq) };
       }
       case 'history': {
         const seq = this.resolveRef(req.ref);
         if (typeof req.text !== 'string') throw new BoardError('text_required', '历史内容不能为空');
         const res = store.appendHistory(app, seq, req.text, { handled: req.handled === true, actorRef: ctx.sessionId });
+        if (res.handled) this.syncCard(seq);
         return { seq, eventId: res.eventId, handledDecisions: res.handled, ...this.itemLinks(seq) };
       }
       case 'attach': {
@@ -530,6 +621,7 @@ export class DecisionBoardService {
 
   async submit(input: { author: string; submitter?: string; authorName?: string; nonce: string; items: Array<{ seq: number; draftUpdatedAt: number }> }) {
     const res = this.store().submit(this.appId, input);
+    if (!res.duplicate) for (const d of res.decisions) this.syncCard(d.seq);
     if (res.duplicate && (res.batch.delivery === 'delivered' || res.batch.delivery === 'dispatched')) {
       // 同 nonce 重试：
       //  - delivered：已送达，直接返回；
@@ -604,13 +696,98 @@ export class DecisionBoardService {
     if (!batch || batch.delivery === 'delivered') return;
     this.deps.log('warn', `[decision-board] batch #${parsed.batchId} worker delivery failed (${reason})`);
     this.store().markBatchFailed(this.appId, parsed.batchId, reason.slice(0, 400));
+    this.syncBatchCards(parsed.batchId);
+  }
+
+  /** 批次投递状态变了：这一批里每一项的卡片跟着刷新（已选 X → 已交给管家 / 投递失败）。 */
+  private syncBatchCards(batchId: number): void {
+    if (!this.cards) return;
+    try {
+      for (const d of this.store().batchDecisions(this.appId, batchId)) this.syncCard(d.seq);
+    } catch (error) {
+      this.deps.log('warn', `[decision-board] card refresh for batch #${batchId} skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // ─── 飞书拍板卡片 ─────────────────────────────────────────────────────────
+
+  /**
+   * owner 在管家群的拍板卡片上点了选项（或只交说明）。只认管家 bot 的 owner；写进看板后
+   * 和网页提交一样建批次、走 deliverBatch 投递（投递放在 deliver 里，回调应答之后再跑）。
+   */
+  cardClick(click: BoardCardClick): BoardCardClickResult {
+    const T = CARD_TOASTS[this.deps.locale() === 'en' ? 'en' : 'zh'];
+    const cards = this.cards;
+    const v = click.value;
+    if (!cards || v.app !== this.appId) return { toast: { type: 'warning', content: T.unavailable } };
+    if (!cards.enabled()) return { toast: { type: 'warning', content: T.disabled } };
+    const owner = this.deps.ownerOpenId();
+    if (!owner || !click.operatorOpenId || click.operatorOpenId !== owner) {
+      this.deps.log('info', `[decision-board] card click by non-owner ${click.operatorOpenId ?? '?'} rejected`);
+      return { toast: { type: 'error', content: T.noPermission } };
+    }
+    const seq = typeof v.seq === 'string' && /^\d{1,9}$/.test(v.seq) ? Number(v.seq) : NaN;
+    const store = this.store();
+    const item = Number.isSafeInteger(seq) ? store.getItem(this.appId, seq) : undefined;
+    if (!item) return { toast: { type: 'warning', content: T.gone } };
+    const refreshed = (content: string, type: 'info' | 'warning' = 'warning'): BoardCardClickResult => {
+      const r = cards.render(seq);
+      if (r && click.messageId) cards.noteRendered(seq, click.messageId, r.hash);
+      return { toast: { type, content }, ...(r ? { card: r.card } : {}) };
+    };
+    const choice = v.action === DECISION_CARD_ACTION_PICK && typeof v.key === 'string' && v.key ? v.key : undefined;
+    if (v.action !== DECISION_CARD_ACTION_PICK && v.action !== DECISION_CARD_ACTION_NOTE) return { toast: { type: 'warning', content: T.unavailable } };
+    if (v.action === DECISION_CARD_ACTION_PICK && !choice) return { toast: { type: 'warning', content: T.unavailable } };
+    const text = cardNoteText(click.formValue);
+    if (!choice && !text) return { toast: { type: 'warning', content: T.noteRequired } };
+    if (item.state !== 'decide') return refreshed(T.notDeciding);
+    if (v.ask !== decisionAskKey(item) || (choice && !item.options.some(o => o.key === choice))) return refreshed(T.stale);
+    // 连点、或飞书没收到应答后的重试：最近一条还没被处理 / 覆盖的决定就是同一个选择和说明时不再建批次。
+    // 那一批投递失败时顺带重投一次（同一个回合 id，管家那边不会重复执行）。
+    const latest = store.latestDecision(this.appId, seq);
+    const latestBatch = latest ? store.getBatch(this.appId, latest.batchId) : undefined;
+    if (latest && latestBatch && !latest.handledAt && latest.supersededBy === undefined
+      && latestBatch.createdAt >= item.stateAt && (latest.choice ?? undefined) === choice && latest.text.trim() === text) {
+      const res = refreshed(T.duplicate, 'info');
+      return latestBatch.delivery === 'failed'
+        ? { ...res, deliver: async () => { await this.deliverBatch(latestBatch.id); } }
+        : res;
+    }
+    let submitted: ReturnType<DecisionBoardStore['submitCard']>;
+    try {
+      submitted = store.submitCard(this.appId, {
+        seq, ...(choice ? { choice } : {}), text,
+        submitter: click.operatorUnionId && /^[A-Za-z0-9_-]{1,128}$/.test(click.operatorUnionId) ? `u:${click.operatorUnionId}` : 'owner',
+        nonce: `card:${seq}:${randomUUID()}`,
+        // 校验与写入在同一把写锁里：两次检查之间管家刚好改了选项或关掉事项，也不会按旧卡片写进去。
+        verify: current => {
+          if (current.state !== 'decide') throw new BoardError('item_not_deciding');
+          if (decisionAskKey(current) !== v.ask) throw new BoardError('card_stale');
+        },
+      });
+    } catch (error) {
+      if (error instanceof BoardError && error.code === 'item_not_deciding') return refreshed(T.notDeciding);
+      if (error instanceof BoardError && (error.code === 'card_stale' || error.code === 'unknown_choice')) return refreshed(T.stale);
+      throw error;
+    }
+    const batchId = submitted.batch.id;
+    // 被覆盖的较早批次所在的卡片（同一项，就是这张）随下面的同步一起刷新。
+    const res = refreshed(choice ? T.accepted(`${choice} ${item.options.find(o => o.key === choice)?.label ?? ''}`.trim()) : T.acceptedNote, 'info');
+    return {
+      ...res,
+      toast: { type: 'success', content: res.toast!.content },
+      deliver: async () => { await this.deliverBatch(batchId); },
+    };
   }
 
   /** 同一批次同时只投一次；投完返回最新的批次状态（失败不抛，记在批次上）。 */
   deliverBatch(batchId: number): Promise<BoardBatch> {
     const inflight = this.delivering.get(batchId);
     if (inflight) return inflight;
-    const run = this.deliverBatchOnce(batchId).finally(() => this.delivering.delete(batchId));
+    const run = this.deliverBatchOnce(batchId).finally(() => {
+      this.delivering.delete(batchId);
+      this.syncBatchCards(batchId);
+    });
     this.delivering.set(batchId, run);
     return run;
   }
@@ -666,6 +843,9 @@ export class DecisionBoardService {
         ...(d.choice ? { choice: d.choice } : {}),
         ...(option ? { choiceLabel: option.label } : {}),
         recommended: !!d.choice && item?.recommend === d.choice,
+        ...(batch.source === 'card' ? { source: 'card' as const } : {}),
+        ...(() => { const ids = store.supersededBy(app, batchId, d.seq); return ids.length ? { supersedes: ids } : {}; })(),
+        ...(d.supersededBy !== undefined ? { supersededBy: d.supersededBy } : {}),
         text: d.text,
         fileCount: d.fileIds.length,
         ...(chat?.url ? { primaryChat: { text: chat.text, url: chat.url } } : {}),
@@ -715,6 +895,16 @@ export class DecisionBoardService {
     }
     return store.getBatch(app, batchId)!;
   }
+}
+
+/**
+ * 这次写入要不要（在还没有卡片时）发新卡：刚进入待拍板（含新建即待拍板），或待拍板的问题 / 选项 /
+ * 推荐变了。只改进展、阶段这类字段不发新卡（已有卡片照样原地刷新）。
+ */
+function askChanged(before: BoardItem | undefined, after: BoardItem): boolean {
+  if (after.state !== 'decide') return false;
+  if (!before || before.state !== 'decide') return true;
+  return decisionAskKey(before) !== decisionAskKey(after);
 }
 
 /** 统一把服务层错误映射成 IPC 响应。 */
