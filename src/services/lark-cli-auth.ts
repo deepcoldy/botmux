@@ -163,8 +163,15 @@ export function hasLarkCliHome(openId: string): boolean {
     if (!cliAuthEpochAllows(openId, home)) return false;
     // A seeded-but-never-authorized HOME holds no per-person token yet; only a
     // real <appId>_<openId>.enc counts as "has logged in".
-    return existsSync(larkCliConfigPath(home))
-      && listUserTokenFiles(home).length > 0;
+    // Count only a token for the app this HOME is configured for: after the
+    // issuer changed, an old app's token is unreadable to lark-cli, and must
+    // not keep the person on the "authorized" path where nobody polls a new
+    // login (a re-seed interrupted mid-way, or an old device code completed
+    // after another topic re-seeded).
+    if (!existsSync(larkCliConfigPath(home))) return false;
+    const seeded = seededAppId(home);
+    const tokens = listUserTokenFiles(home);
+    return seeded === undefined ? tokens.length > 0 : tokens.some(f => f.startsWith(`${seeded}_`));
   } catch { return false; }
 }
 
@@ -309,6 +316,9 @@ export function currentIssuerApp(cfg: unknown): string | undefined {
   if (typeof currentApp === 'string' && currentApp) {
     const selected = usable.find(a => a.name === currentApp) ?? usable.find(a => a.appId === currentApp);
     if (selected) return selected.appId;
+    // lark-cli itself refuses this config ("profile not found"); keep issuing
+    // with the first app as before, but leave a trace of the split.
+    logger.warn(`[lark-cli-auth] issuer config selects profile ${JSON.stringify(currentApp)}, which does not exist; using the first app`);
   }
   return usable[0]?.appId;
 }
@@ -333,15 +343,16 @@ function ensureBootstrapped(openId: string): boolean {
   // Check the issuer's material BEFORE touching this HOME: a profile without
   // its secret file must leave the person's existing state (and any device
   // code still valid on the server) exactly as it was.
-  if (!existsSync(sourceSecret) || !existsSync(sourceMasterKey)) {
-    logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: issuer ${machine.appId} has no secret or master key`);
-    return false;
-  }
   // The issuer is read fresh on every login, but this HOME was seeded once:
   // after the operator switches profile (or a personal issuer appears) the
   // person kept minting codes for the old app. Re-seed when the app changed.
   const seededApp = seededAppId(home);
   const reseed = seededApp !== undefined && seededApp !== machine.appId;
+  const needsCopy = reseed || !existsSync(secretFile) || !existsSync(masterKey);
+  if (needsCopy && (!existsSync(sourceSecret) || !existsSync(sourceMasterKey))) {
+    logger.warn(`[lark-cli-auth] could not seed app material for ${openId}: issuer ${machine.appId} has no secret or master key`);
+    return false;
+  }
   // Everything is staged next to its target first and only then renamed into
   // place, config last: a copy or write that fails leaves the HOME exactly as
   // it was (never a new key under the old app's config, which lark-cli can no

@@ -528,7 +528,7 @@ describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
 });
 
 describe('issuer app follows the operator\'s current lark-cli profile', () => {
-  const OTHER = 'cli_other_profile_app1';
+  const OTHER = 'cli_otherprofileapp1';
   function writeMachine(apps: unknown[], currentApp?: string) {
     mkdirSync(join(machineHome, '.lark-cli'), { recursive: true });
     const data = join(machineHome, '.local', 'share', 'lark-cli');
@@ -632,6 +632,27 @@ describe('issuer app follows the operator\'s current lark-cli profile', () => {
     expect(existsSync(join(data, `${APP_ID}_${OPEN}.enc`))).toBe(true);
     expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-1');
     expect(existsSync(join(data, 'master.key.botmux-seed'))).toBe(false);
+  });
+
+  it('only a token for the configured app counts as authorized (interrupted re-seed, late old-code completion)', async () => {
+    __setLarkCliRunnerForTest(async () => ({ ok: true, stdout: JSON.stringify({ verification_url: 'https://v/1', device_code: 'dc-1' }), stderr: '' }));
+    writeMachine([app(APP_ID), app(OTHER, 'work')], 'work');
+    await beginLarkCliLogin(OPEN); // HOME seeded for OTHER
+    const data = join(larkCliHomeFor(OPEN), '.local', 'share', 'lark-cli');
+    // A token for the previous app lands anyway.
+    writeFileSync(join(data, `${APP_ID}_${OPEN}.enc`), 'old-app-user-token');
+    expect(hasLarkCliHome(OPEN)).toBe(false);
+    writeFileSync(join(data, `${OTHER}_${OPEN}.enc`), 'current-app-user-token');
+    expect(hasLarkCliHome(OPEN)).toBe(true);
+  });
+
+  it('a healthy HOME still logs in when the issuer\'s copy of the material is gone', async () => {
+    __setLarkCliRunnerForTest(async () => ({ ok: true, stdout: JSON.stringify({ verification_url: 'https://v/1', device_code: 'dc-1' }), stderr: '' }));
+    writeMachine([app(APP_ID)]);
+    await beginLarkCliLogin(OPEN);
+    rmSync(join(machineHome, '.local', 'share', 'lark-cli', `appsecret_${APP_ID}.enc`));
+    rmSync(join(machineHome, '.local', 'share', 'lark-cli', 'master.key'));
+    expect(await beginLarkCliLogin(OPEN)).not.toBeNull();
   });
 
   it('unchanged issuer keeps the seeded HOME and the pending code', async () => {
