@@ -4146,7 +4146,7 @@ interface SessionData {
   cliSessionId?: string;
   /** Workflow node marker (Session.workflowNode): this session executes a
    *  handed-off node of a bot-executed run. Only the run / main bot are read. */
-  workflowNode?: Pick<import('./types.js').WorkflowNodeSessionMarker, 'runId' | 'orchestratorAppId'>;
+  workflowNode?: Pick<import('./types.js').WorkflowNodeSessionMarker, 'runId' | 'orchestratorAppId' | 'placement' | 'submittedAt' | 'closedAt'>;
   /** Frozen file-sandbox decision from the persisted session (tri-state). */
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   dispatchLaunchSpec?: import('./types.js').Session['dispatchLaunchSpec'];

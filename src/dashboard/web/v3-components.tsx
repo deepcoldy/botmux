@@ -23,6 +23,8 @@ import {
   loopInstances,
   loopRounds,
   nodeBotLine,
+  nodeBoxBotLine,
+  nodeInMainTopic,
   nodeElapsedMs,
   nodeStatusLine,
   nodeWaitingMs,
@@ -430,7 +432,7 @@ export function DagNode(props: {
   if (node.isLoop) {
     return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} />;
   }
-  const botLine = nodeBotLine(node);
+  const botLine = nodeBoxBotLine(node);
   const fit = boxTextFit(box.width);
   const heading = nodeBoxHeading(node, box.width, fit(22));
   return (
@@ -564,6 +566,16 @@ function NodePanel(props: {
         ) : null}
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
         <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
+        {nodeInMainTopic(node) ? (
+          // §5.5: no stable link to a single message — say when and what to
+          // look for in the main topic.
+          <p className="v3r-exec-row">
+            <span>落点</span>主话题
+            {node.handoff?.at !== undefined ? ` · ${formatClock(node.handoff.at)} 交接` : '（还没交接）'}
+            {node.handoff?.queued ? ' · 排队中：等执行 Bot 在主话题里的当前一轮结束' : ''}
+            {node.handoff?.title ? ` · 在主话题里找「${node.handoff.title}」` : ''}
+          </p>
+        ) : null}
         {node.checkpoint ? <p className="v3r-checkpoint">{V3_CHECKPOINT_LABEL[node.checkpoint]}</p> : null}
         {node.waitingOnCheckpoint?.length ? (
           <p className="v3r-checkpoint">等检查点 {node.waitingOnCheckpoint.join('、')} 由主 Bot 看完结果后再开始</p>
@@ -642,6 +654,7 @@ export function NodeExecution(props: { node: RunNodeView; generatedAt: number | 
       {botLine ? (
         <p className="v3r-exec-row"><span>执行</span>{botLine}{node.bot?.model ? ` · ${node.bot.model}` : ''}</p>
       ) : null}
+
       {elapsed !== undefined ? (
         <p className="v3r-exec-row">
           <span>耗时</span>{formatV3Duration(elapsed)}{node.status === 'running' ? '（进行中）' : ''}
