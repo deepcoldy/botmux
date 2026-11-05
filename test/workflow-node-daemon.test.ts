@@ -407,12 +407,13 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({ workingDirs: [d.lab] }) });
     const decision = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
     if (decision.start) throw new Error('expected a refusal');
-    await settle();
-    expect(target.posted).toEqual([{
+    // The refusal notice is sent by the fire-and-forget refuse chain (registry
+    // write behind a file lock first); wait for the post, not a fixed sleep.
+    await vi.waitFor(() => expect(target.posted).toEqual([{
       port: 4100,
       path: '/api/workflow/handoff-event',
       body: { kind: 'refused', nonce: nonceOf(attempt), dispatchRoot: attempt.handoffMessageId, reason: decision.reason },
-    }]);
+    }]), { timeout: 5_000, interval: 5 });
     const drives: string[] = [];
     const main = daemon(MAIN, world.dataDir, run.base, run, { drive: (runId) => { drives.push(runId); } });
     expect(await main.wiring.eventRoute(target.posted[0]!.body)).toMatchObject({ status: 200, body: { outcome: 'blocked' } });
@@ -436,8 +437,9 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
       },
     });
     expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toMatchObject({ start: false });
-    await settle();
-    expect(calls).toBe(2);
+    // Two notices (first fails, then the retry after the timer) are driven by
+    // the fire-and-forget refuse chain; wait for the second call, not a sleep.
+    await vi.waitFor(() => expect(calls).toBe(2), { timeout: 5_000, interval: 5 });
     expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
   });
 
@@ -480,8 +482,8 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     const other = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a', d.lab);
     expect(other).toMatchObject({ start: false });
     expect((other as { reason: string }).reason).toContain('节点话题里已有会话，工作目录与指定的不一致');
-    await settle();
-    expect(target.posted.map((post) => post.body.kind)).toEqual(['refused']);
+    // The refusal notice is fire-and-forget; wait for the post, not a sleep.
+    await vi.waitFor(() => expect(target.posted.map((post) => post.body.kind)).toEqual(['refused']), { timeout: 5_000, interval: 5 });
     // Without a pinned directory an existing session is used as before.
     const plainRun = await handedOffPinned('wdd-existing-plain', undefined);
     const plain = daemon('cli_a', plainRun.world.dataDir, plainRun.run.base, plainRun.run);
