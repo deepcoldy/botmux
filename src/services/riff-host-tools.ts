@@ -46,7 +46,7 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
   auth: { sub: ['request', 'wait'], values: '--scope --request-id', bools: '--json --allow-unknown' },
   schedule: {
     sub: ['list', 'add', 'update', 'remove', 'pause', 'resume', 'run', 'calendars'],
-    values: '--name --id --prompt --model --reasoning-effort --calendar --calendar-day-type --topic-title',
+    values: '--name --id --prompt --schedule --model --reasoning-effort --calendar --calendar-day-type --topic-title',
     bools: '--top-level --topic --new-topic --silent --follow-active', files: '--prompt-file',
   },
   history: { values: '--limit --scope', bools: '--with-card-json' },

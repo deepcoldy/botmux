@@ -167,19 +167,22 @@ botmux schedule remove <id>
 
 In a chat, `/schedule list` shows each task's run-as identity (`runAs`). A task with no usable identity is flagged, because tools that need a user identity will fail closed. See [Run-as identity](#run-as-identity-and-permissions).
 
-### Change only the prompt
+### Edit the frequency, prompt or calendar in place
 
-No need to delete and recreate. Use `update`:
+No need to delete and recreate — use `update`:
 
 ```bash
+botmux schedule update <id> --schedule "every 4h"         # change the frequency; same syntax as schedule add
 botmux schedule update <id> --prompt-file report-prompt.md
-# Short prompts can be passed inline (use one or the other)
+# Short prompts can be passed inline (--prompt or --prompt-file, not both)
 botmux schedule update <id> --prompt "new full prompt"
+# Fields can be combined
+botmux schedule update <id> --schedule "0 9 * * 1-5" --prompt-file report-prompt.md
 ```
 
-The task ID, schedule, enabled state, execution position and run history are kept, and nothing is re-run. A run already in progress keeps the old prompt; the next run uses the new one.
+`--schedule` accepts everything `schedule add` does (`每日17:50`, `every 2h`, 5-field cron, …); an expression it can't read is rejected with examples and the task is left alone. After a frequency change the next run is recomputed from now under the new rule — nothing is re-run or fired immediately — and the command prints the new rule and the next run time. A paused task stays paused. The frequency can't be changed while a run is in progress (you'll be asked to wait for it to finish), and a one-shot time can't be in the past.
 
-Tasks with a Bash precondition can't be changed with `update`; edit them in the Dashboard (the precondition is bound to a checksum of the task content, so changing the prompt directly would make every later run fail the check).
+The task ID, silent setting, execution position, Bash precondition, work calendar, creator identity, enabled state and run history are kept. A run already in progress keeps the old configuration; the next run uses the new one. Permissions match the Dashboard edit: whoever can change the prompt can change the frequency, and delegated tasks still need a new authorization. See `botmux schedule update --help` for every field.
 
 ## Run logs and multiple groups (Dashboard) {#logs-and-multi-chat}
 

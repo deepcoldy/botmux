@@ -110,7 +110,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
-import { resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { envSandboxMode, resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
@@ -1535,7 +1535,7 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   // Opt-in, so a CLI with the original strict key check never sees new keys.
   const fields = (body as Record<string, unknown>).fields;
   const includeOrigin = Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_ORIGIN_FIELD);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1573,7 +1573,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
   if (!sessionId || !tool) return jsonRes(res, 400, blocked);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1667,7 +1667,7 @@ for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
       || (route === BACKGROUND_REVOKE_ROUTE && (typeof body.jobId !== 'string' || body.jobId.length > 128))) {
       return jsonRes(res, 400, { error: 'invalid_background_request' });
     }
-    const peer = resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
+    const peer = await resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
       remotePort: req.socket.remotePort, localPort: req.socket.localPort });
     if (!peer.ok) return jsonRes(res, 403, { error: 'current_execution_unverified' });
     const input = { sessionDataDir: config.session.dataDir, sessionId: body.sessionId, peer: peer.peer };
@@ -1704,7 +1704,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     && body.expectedScheduledTurnId.length <= 256
     ? body.expectedScheduledTurnId
     : undefined;
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
     localPort: req.socket.localPort,
@@ -3426,7 +3426,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const peer = process.platform === 'linux'
     ? (proxyPeer
       ? { ok: true as const, peer: proxyPeer }
-      : resolveLoopbackPeerProcesses({
+      : await resolveLoopbackPeerProcesses({
           remoteAddress: req.socket.remoteAddress,
           remotePort: req.socket.remotePort,
           localPort: req.socket.localPort,
@@ -3624,7 +3624,7 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
     } else if (!boundTool) {
-      const peer = resolveLoopbackPeerProcesses({
+      const peer = await resolveLoopbackPeerProcesses({
         remoteAddress: req.socket.remoteAddress,
         remotePort: req.socket.remotePort,
         localPort: req.socket.localPort,
@@ -8866,6 +8866,11 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     askOptionLayout,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
+    // Machine-wide BOTMUX_SANDBOX force the worker applies over this bot's own
+    // selection (null = none). Lets the page say why "关闭" is not what runs.
+    sandboxEnvForce: (() => {
+      try { const m = envSandboxMode(process.env.BOTMUX_SANDBOX); return m === 'off' ? null : m; } catch { return null; }
+    })(),
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),

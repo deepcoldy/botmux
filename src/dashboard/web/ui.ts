@@ -346,7 +346,7 @@ export function nameMapsVersion(): number {
   return nameMapsGeneration;
 }
 
-export function loadNameMaps(): Promise<void> {
+export function loadNameMaps(options: { force?: boolean } = {}): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
       // 轻量视图：只要 bots 的名称/头像 + chats 的 chatId/name/avatar。完整矩阵
@@ -359,7 +359,13 @@ export function loadNameMaps(): Promise<void> {
       // 既有行为，不是本次引入的：bot 名称另有更快通路（/api/bots 每次刷新都带
       // botName，Bot 配置页优先用它），头像则由 overrideBotAvatar() 在改完后
       // 就地写内存+localStorage 生效，都不依赖本函数重跑。
-      const data = await fetchGroupsNamesSnapshot();
+      const data = await fetchGroupsNamesSnapshot(options.force ? { force: true } : {});
+      // localStorage 回灌的名字只是首屏占位：服务端这次没确认的（下线 bot、已删
+      // bot）一律丢掉，免得一个旧名永远盖过服务端按 appId 现查好的行内名字。
+      const confirmed = new Set((data.bots ?? []).map(b => String(b.larkAppId ?? '')).filter(Boolean));
+      for (const appId of [...botNameByAppId.keys()]) {
+        if (!confirmed.has(appId)) botNameByAppId.delete(appId);
+      }
       for (const b of data.bots ?? []) {
         if (b.larkAppId) registryBotAppIds.add(String(b.larkAppId));
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
@@ -383,6 +389,16 @@ export function loadNameMaps(): Promise<void> {
     }
   })();
   return nameMapsPromise;
+}
+
+/**
+ * Bot 名册变了（SSE `bots.changed`：改名 / 增删 bot，daemon 每次刷新飞书名片后
+ * descriptor 的 botName 变化都会触发）→ 丢掉本页的名称映射 memo 并强制重拉，
+ * 让长时间开着的页面也在一个刷新周期内换成新名字，而不是等到下次整页加载。
+ */
+export function reloadNameMaps(): Promise<void> {
+  nameMapsPromise = null;
+  return loadNameMaps({ force: true });
 }
 
 /** 按 larkAppId 查注册表友好名（含 localStorage 回灌的缓存）；查不到返回 undefined。 */

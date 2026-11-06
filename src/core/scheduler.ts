@@ -2006,6 +2006,24 @@ export function updateTask(
     } catch (err) {
       return { ok: false, error: `invalid_schedule: ${err instanceof Error ? err.message : String(err)}` };
     }
+    // A claimed run settles against the task as it is when it finishes: a
+    // one-shot rule written mid-run would be consumed by the old recurring
+    // run, and an until-done settle would overwrite the new nextRunAt. Ask
+    // the caller to wait for the run to finish instead.
+    if (task.lastStatus === 'running') return { ok: false, error: 'schedule_run_in_flight' };
+    // A one-shot time already past would leave an enabled task that never fires.
+    if (parsed.kind === 'once' && computeNextRun(parsed) === null) {
+      return { ok: false, error: 'schedule_in_past' };
+    }
+    // Keep the until-done invariants `add` enforces: a retry interval only
+    // exists for a one-shot, and a one-shot may not start after the deadline.
+    if (task.untilDone?.retryMinutes !== undefined && parsed.kind !== 'once') {
+      return { ok: false, error: 'until_done_retry_requires_once' };
+    }
+    if (task.untilDone?.deadline && parsed.kind === 'once' && parsed.runAt
+      && Date.parse(parsed.runAt) > Date.parse(task.untilDone.deadline)) {
+      return { ok: false, error: 'until_done_deadline_before_first_run' };
+    }
     patch.schedule = updates.schedule;
     patch.parsed = parsed;
     const next = computeNextRun(parsed);
