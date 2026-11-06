@@ -232,7 +232,7 @@ type SessionFieldFilter = (key: string) => boolean;
 /** Anonymous rule: named blacklist PLUS a `preview*` prefix sweep, so a future
  *  preview-prefixed field is private by default (fail-closed). */
 const isPrivateForAnonymous: SessionFieldFilter = key =>
-  PRIVATE_SESSION_FIELDS.has(key) || key.startsWith('preview');
+  key === 'modelPin' || PRIVATE_SESSION_FIELDS.has(key) || key.startsWith('preview');
 
 const isPrivateForWorkbench: SessionFieldFilter = key =>
   WORKBENCH_PRIVATE_SESSION_FIELDS.has(key);

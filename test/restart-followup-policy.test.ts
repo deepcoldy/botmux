@@ -208,6 +208,33 @@ describe('restart launch settings (value-based)', () => {
     expect(sameRestartLaunchSettings(base, { ...base, env: undefined })).toBe(false);
     expect(sameRestartLaunchSettings(base, { ...base, model: undefined })).toBe(false);
     expect(sameRestartLaunchSettings(base, { ...base, larkToolBinding: false })).toBe(false);
+    expect(sameRestartLaunchSettings(base, { ...base, launchShell: 'bash' })).toBe(false);
+  });
+
+  it('a different launchShell needs another respawn; different startup command text does not', () => {
+    // launchShell is baked into the spawn, so a folded request for another
+    // shell must converge. startupCommands are read from lastInitConfig at the
+    // replacement's first flush, so the window's replacement already runs the
+    // folded request's commands (and an auto-upgrade restore never types them).
+    expect(restartLaunchSettings({ ...base, launchShell: 'zsh' } as any).launchShell).toBe('zsh');
+    expect(classifyMergedRestart({
+      windowLaunch: { ...base, launchShell: 'zsh' }, requested: { ...base, launchShell: 'bash' }, convergencePending: false,
+    })).toBe('converge');
+    expect(classifyMergedRestart({
+      windowLaunch: restartLaunchSettings({ ...base, startupCommands: ['/effort max'] } as any),
+      requested: restartLaunchSettings({ ...base, startupCommands: ['/effort xhigh'] } as any),
+      convergencePending: false,
+    })).toBe('adopt');
+  });
+
+  it('gaining or losing startup commands converges: their presence decides Codex RPC eligibility at spawn', () => {
+    for (const [before, after] of [[[], ['/model gpt-5']], [['/model gpt-5'], undefined]] as const) {
+      expect(classifyMergedRestart({
+        windowLaunch: restartLaunchSettings({ ...base, startupCommands: before } as any),
+        requested: restartLaunchSettings({ ...base, startupCommands: after } as any),
+        convergencePending: false,
+      })).toBe('converge');
+    }
   });
 });
 

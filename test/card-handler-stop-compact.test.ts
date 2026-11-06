@@ -489,7 +489,7 @@ describe('reasoning selector card callback', () => {
     ds.worker = null;
     ds.session.suspendedColdResume = true;
     const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
-    expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high', expect.objectContaining({ source: 'card' }));
     expect(result).toMatchObject({ toast: { type: 'success' }, card: { type: 'raw' } });
     expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
   });
@@ -502,7 +502,7 @@ describe('reasoning selector card callback', () => {
     const { ds, data } = setup();
     const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
     expect(result.toast.type).toBe('info');
-    expect(pool.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(pool.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'high', undefined, expect.any(Function), expect.objectContaining({ source: 'card' }));
     expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
     expect(pool.deliverEphemeralOrReply).not.toHaveBeenCalled();
     expect(ds.session.reasoningEffort).toBe('ultra');

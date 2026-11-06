@@ -21,7 +21,7 @@ import {
   RefreshIconButton,
 } from './dashboard-components.js';
 import { store } from './store.js';
-import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';
+import { botNameForAppId, chatDisplayTitle, loadNameMaps, ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
@@ -1230,7 +1230,7 @@ function ScheduleRowCard(props: {
           </span>
         </div>
         <div className="schedule-row-meta">
-          <span>{s.botName ?? s.larkAppId ?? '-'}</span>
+          <span>{botNameForAppId(s.larkAppId) ?? s.botName ?? s.larkAppId ?? '-'}</span>
           <span>·</span>
           <code>{s.parsed?.display ?? '?'}</code>
         </div>

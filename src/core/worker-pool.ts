@@ -1,3 +1,4 @@
+import { resolveSessionModelPinView } from './session-model.js';
 import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
 import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
 import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
@@ -20,9 +21,10 @@ import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendErro
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
 import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
+import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
-import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -71,13 +73,14 @@ import {
   resolveSessionLaunchModelChoice,
   resolveSessionGroupSettings,
   resolveTopicReasoningEffort,
+  resolveSessionLaunchEffort,
 } from './session-model.js';
 import {
   initialNativeRenameStartupCommand,
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, normalizeBackgroundTaskPins, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildStuckPageCard, buildStuckKeyResultCard, buildInputNotSubmittedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -647,6 +650,13 @@ export function getDaemonReplyCardRenderSnapshot(
     ...(consoleUrl ? { consoleUrl } : {}), ...(timing ? { timing } : {}) };
 }
 
+function sessionModelPinView(ds: DaemonSession): ReturnType<typeof modelPinView> {
+  if (!ds.session.modelPin) return undefined;
+  let cfg: Parameters<typeof resolveSessionModelPinView>[1];
+  try { cfg = getBot(ds.larkAppId).config; } catch { /* bot removed */ }
+  return resolveSessionModelPinView(ds, cfg);
+}
+
 /** Streaming-card metrics obey usageDisplay; known model/effort do not depend
  * on transcript availability. Hidden metrics must not trigger transcript I/O. */
 export function getDaemonStreamingCardUsageSnapshot(
@@ -666,6 +676,7 @@ export function getDaemonStreamingCardUsageSnapshot(
   return {
     ...withCardRuntimeIdentity(ds, snapshot, effectiveCliId),
     ...(modelFallback ? { modelFallback } : {}),
+    modelPin: sessionModelPinView(ds),
     ...(reasoningControl ? { reasoningControl } : {}),
     ...(idleAutoCompact ? { idleAutoCompact } : {}),
   };
@@ -3289,7 +3300,7 @@ export function ensureReadonlyTaskContinuationAttached(
           content: dispatch.prompt,
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
-          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestLaunchCommandsForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
           trustedCaller: current.trustedCaller,
           ...(turnCallerOpenIdFor(ds, dispatch.turnId)
             ? { turnCallerOpenId: turnCallerOpenIdFor(ds, dispatch.turnId)! }
@@ -3459,7 +3470,7 @@ function sessionAgentConfig(
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
     // above), the bot's config profile belongs to the bot's own CLI, not the
     // selected one. ds.session.cliConfigDir stays unset for these sessions.
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort: resolveTopicReasoningEffort(ds.session, selected.cliId, model, reasoningEffort), serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort: resolveSessionLaunchEffort(ds, botCfg, model, reasoningEffort), serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -3582,7 +3593,7 @@ function sessionAgentConfig(
     model,
     traexAutoModel: modelChoice.traexAutoModel,
     modelBackendVariant: ds.session.modelBackendVariant,
-    reasoningEffort: resolveTopicReasoningEffort(ds.session, ds.session.cliId ?? botCfg.cliId, model, ds.session.reasoningEffort),
+    reasoningEffort: resolveSessionLaunchEffort(ds, botCfg, model, ds.session.reasoningEffort),
     serviceTier: sessionServiceTier(ds, ds.session.cliId ?? botCfg.cliId),
     launchShell: botCfg.launchShell,
     startupCommands: botCfg.startupCommands,
@@ -6353,7 +6364,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
-      frozenSessionSandboxMode(ds.session.sandbox),
+      sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+      sessionModelPinView(ds),
     );
   }
   const port = ds.workerPort ?? ds.session.webPort;
@@ -6371,7 +6383,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
-    frozenSessionSandboxMode(ds.session.sandbox),
+    sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+    sessionModelPinView(ds),
   );
 }
 
@@ -6461,7 +6474,8 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
-    frozenSessionSandboxMode(ds.session.sandbox),
+    sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+    sessionModelPinView(ds),
   );
 }
 
@@ -7525,6 +7539,51 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
   }
 }
 
+export function latestPinEffortForRespawn(ds: DaemonSession): { reasoningEffort?: import('../services/codex-reasoning-effort.js').CodexReasoningEffort | null } {
+  if (!ds.session.modelPin && !ds.modelPinCleared) return {};
+  try {
+    const cfg = getBot(ds.larkAppId).config;
+    const model = resolveSessionLaunchModel(ds, cfg);
+    const effort = resolveSessionLaunchEffort(ds, cfg, model, ds.session.reasoningEffort);
+    return { reasoningEffort: effort ?? null };
+  } catch { return {}; } // deregistered bot: keep the worker's existing snapshot
+}
+
+/** Persist first; a failed runtime apply must never claim that the pin was lost. */
+export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefined): boolean {
+  if (!pin && !ds.session.modelPin) return false;
+  if (pin) pin = retainPinEffort(pin, ds.session.modelPin);
+  if (isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) throw new Error('会话正在迁移、重启或修改推理强度，请稍后重试');
+  if (ds.session.dispatchLaunchSpec) throw new Error('dispatch 会话使用冻结的启动规格，不支持话题固定');
+  // An adopted CLI is owned by the user outside BotMux: it is never respawned
+  // with launch args (traditional adopted pane AND a codex --remote viewer of
+  // an existing App Server thread — isSharedAdoptSession covers all four
+  // shapes including session.existingAppServerEndpoint), so a saved pin could
+  // never apply while presenting as active. Clearing stays allowed (a row may
+  // already carry one). Remote BACKENDS (mojo/remote-runner) are NOT blocked —
+  // their cold spawn really consumes --model.
+  if (pin && isSharedAdoptSession(ds)) {
+    throw new Error('接管（adopt）的会话由外部 CLI 自己管理模型，不能设置话题固定');
+  }
+  const cfg = getBot(ds.larkAppId).config;
+  if (pin) {
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
+    if (cfg.cliId && cliId !== cfg.cliId) throw new Error('会话 CLI 与 bot CLI 不匹配，不能设置固定');
+    const error = validateModelPin(pin, { cliId, backendType: ds.initConfig?.backendType ?? ds.session.backendType ?? cfg.backendType });
+    if (error) throw new Error(error);
+  }
+  const before = ds.session.modelPin;
+  ds.session.modelPin = pin;
+  try { sessionStore.updateSession(ds.session, { modelPinWrite: true }); }
+  catch (error) { ds.session.modelPin = before; throw error; }
+  if (!pin) ds.modelPinCleared = true;
+  else delete ds.modelPinCleared;
+  dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
+    patch: { modelPin: resolveSessionModelPinView(ds, cfg) ?? null } } });
+  try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`[${tag(ds)}] Pin card refresh failed: ${String(error)}`); }
+  return true;
+}
+
 function latestTraexAutoModelForRespawn(ds: DaemonSession): TraexAutoModelConfig | null | undefined {
   try {
     const policy = resolveSessionLaunchModelChoice(ds, getBot(ds.larkAppId).config).traexAutoModel;
@@ -7554,6 +7613,49 @@ export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | nu
     return binding === false ? null : true;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Live-worker respawn 携带的最新 startupCommands / launchShell（与 env / model 同一条
+ * 通道、同一套三分态，worker 侧语义见 core/respawn-config-patch.ts）。
+ *
+ * 两者都是「下次 spawn 生效」的 Bot 配置，fork 时由 sessionAgentConfig 实时取，
+ * 但 `/restart`、卡片 / Dashboard 重启、CLI 崩溃自动重启都**不 refork**：worker 用
+ * fork 时刻的 `lastInitConfig` 原地 respawn。不捎带的话，Dashboard 改完启动命令再
+ * 重启，重放的还是旧命令。
+ *
+ * 与 sessionAgentConfig 同口径：per-session `/cli` 选择（cliLaunchSnapshot）冻结了
+ * 自己的启动命令与 shell，原样返回快照，不被 Bot 级改动覆盖。adopt 会话只观察不驱动
+ * （forkAdoptWorker 本就不下发），不携带。
+ * Codex profile 会话也不携带（见函数内注释）。
+ * 三分态：值 = 用它；null = 明确清空；undefined = 不携带 / 取不到，worker 保持快照。
+ */
+export function latestLaunchCommandsForRespawn(ds: DaemonSession): {
+  startupCommands: string[] | null | undefined;
+  launchShell: string | null | undefined;
+} {
+  if (ds.session.adoptedFrom) return { startupCommands: undefined, launchShell: undefined };
+  // Codex profile launches reject startup commands outright (assertCodexProfileRuntime
+  // → unsupported_launch) and the session froze its profile at creation. A later
+  // bot edit must not turn a working session's restart into a fatal launch: keep
+  // the fork-time snapshot, which already passed that gate.
+  if (ds.session.codexProfile) return { startupCommands: undefined, launchShell: undefined };
+  const selected = ds.session.cliLaunchSnapshot;
+  if (selected) {
+    return {
+      startupCommands: selected.startupCommands.length ? [...selected.startupCommands] : null,
+      launchShell: selected.launchShell || null,
+    };
+  }
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    return {
+      startupCommands: botCfg.startupCommands?.length ? [...botCfg.startupCommands] : null,
+      launchShell: botCfg.launchShell || null,
+    };
+  } catch {
+    return { startupCommands: undefined, launchShell: undefined };
   }
 }
 
@@ -7644,11 +7746,12 @@ export function requestSessionRestart(
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
-          ...(opts.topicEffort ? {} : restartSessionEnvFields(ds)), model: opts.topicEffort?.model ?? latestModelForRespawn(ds),
+          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model: opts.topicEffort?.model ?? latestModelForRespawn(ds),
           ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
           traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
           ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
-            larkToolBinding: latestLarkToolBindingForRespawn(ds) }) } as DaemonToWorker);
+            larkToolBinding: latestLarkToolBindingForRespawn(ds),
+            ...latestLaunchCommandsForRespawn(ds) }) } as DaemonToWorker);
         return;
       }
       // No live worker but the persistent pane may still be alive (e.g. after a
@@ -9460,6 +9563,63 @@ function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
   logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
 }
 
+type PinEffortActor = { source: 'command' | 'card'; setBy: string };
+
+function currentEffortModel(ds: DaemonSession): string | undefined {
+  return ds.activeModel?.trim() || ds.initConfig?.model?.trim() || ds.session.model?.trim();
+}
+
+/** One row write commits the preference and its matching pin together. */
+function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['reasoningEffort']>, model: string | undefined, actor?: PinEffortActor, topic = false): void {
+  const beforePin = ds.session.modelPin;
+  const beforeEffort = ds.session.reasoningEffort;
+  const beforeTopic = ds.session.topicReasoningEffort;
+  const snapshot = ds.session.cliLaunchSnapshot;
+  const beforeSnapshot = snapshot?.reasoningEffort ?? null;
+  const matched = !!beforePin && samePinModel(beforePin.model, model);
+  if (matched) {
+    // Read and compare inside the write transaction. A detached/stale session
+    // must never resurrect a cleared pin or replace a newer explicit choice.
+    const { rows } = sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+      const row = fresh.get(ds.session.sessionId)!;
+      if (JSON.stringify(row.modelPin) !== JSON.stringify(beforePin)) throw new Error('model_pin_changed');
+      row.modelPin = { ...row.modelPin!, effort, ...actor, setAt: new Date().toISOString() };
+      if (topic && model) row.topicReasoningEffort = { model, effort };
+      else {
+        row.reasoningEffort = effort;
+        if (row.cliLaunchSnapshot) row.cliLaunchSnapshot.reasoningEffort = effort;
+      }
+    }, { modelPinWrite: true });
+    Object.assign(ds.session, rows.get(ds.session.sessionId)!);
+  } else {
+    if (topic && model) ds.session.topicReasoningEffort = { model, effort };
+    else {
+      ds.session.reasoningEffort = effort;
+      if (snapshot) snapshot.reasoningEffort = effort;
+    }
+    try { sessionStore.updateSession(ds.session); }
+    catch (error) {
+      ds.session.modelPin = beforePin;
+      ds.session.reasoningEffort = beforeEffort;
+      ds.session.topicReasoningEffort = beforeTopic;
+      if (ds.session.cliLaunchSnapshot) ds.session.cliLaunchSnapshot.reasoningEffort = beforeSnapshot;
+      throw error;
+    }
+  }
+  if (matched) {
+    dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId, patch: { modelPin: sessionModelPinView(ds) } } });
+    try { scheduleActiveRuntimePatch(ds); } catch { /* saved selection remains authoritative */ }
+  }
+}
+
+function effortAuthorityAllowed(check: () => boolean): boolean {
+  try { return check(); } catch { return false; }
+}
+
+function effortSelectionStamp(ds: DaemonSession): string {
+  return JSON.stringify([ds.session.modelPin, ds.session.reasoningEffort, currentEffortModel(ds)]);
+}
+
 /** Only managed local Codex TUI sessions have a verified cold-resume effort path. */
 export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['reasoningControl'] {
   const cfg = ds.initConfig ?? ds.session;
@@ -9469,14 +9629,19 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
     || cfg.backendType !== 'tmux' || ds.initConfig?.codexRpcInput
     || ds.session.sandbox || ds.initConfig?.sandbox || ds.initConfig?.readIsolation || sandboxEnabled()
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return undefined;
+  const model = ds.activeModel ?? cfg.model;
+  let selected = ds.session.reasoningEffort;
+  if (ds.session.modelPin) {
+    try { selected = resolveSessionLaunchEffort(ds, getBot(ds.larkAppId).config, model, selected); } catch { /* retain legacy choice */ }
+  }
   return {
     choices: reasoningEffortsForCliModel('codex', ds.activeModel ?? cfg.model),
-    selected: ds.session.reasoningEffort,
-    ...(ds.codexCliEffortConfirmed?.effort === ds.session.reasoningEffort
+    selected,
+    ...(ds.codexCliEffortConfirmed?.effort === selected
       && ds.codexCliEffortConfirmed?.workerGeneration === ds.workerGeneration
       && ds.codexCliEffortConfirmed ? { nextTurn: true } : {}),
-    pending: !!ds.session.reasoningEffort && (!!ds.session.suspendedColdResume
-      || ds.session.reasoningEffort !== (ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort)),
+    pending: !!selected && (!!ds.session.suspendedColdResume
+      || selected !== (ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort)),
   };
 }
 
@@ -9490,26 +9655,20 @@ export function topicReasoningControl(ds: DaemonSession): { model: string; choic
   const model = ds.activeModel?.trim() || cfg.model?.trim();
   if (!model) return;
   const choices = reasoningEffortsForCliModel('traex', model);
-  const saved = resolveTopicReasoningEffort(ds.session, 'traex', model, undefined);
+  const saved = ds.session.modelPin ? resolveSessionLaunchEffort(ds, getBot(ds.larkAppId).config, model, undefined)
+    : resolveTopicReasoningEffort(ds.session, 'traex', model, undefined);
   const active = ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort;
   return { model, choices, selected: saved ?? active, active, pending: !!saved && saved !== active };
 }
 
 /** Save only the model-bound topic preference; physical application is an explicit restart. */
-export function setTopicReasoningEffort(ds: DaemonSession, effort: unknown): 'saved' | 'busy' | 'unsupported' | 'invalid' {
+export function setTopicReasoningEffort(ds: DaemonSession, effort: unknown, actor?: PinEffortActor): 'saved' | 'busy' | 'unsupported' | 'invalid' {
   const control = topicReasoningControl(ds);
   if (!control) return 'unsupported';
   const selected = control.choices.find(value => value === effort);
   if (!selected) return 'invalid';
-  if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds)) return 'busy';
-  const previous = Object.getOwnPropertyDescriptor(ds.session, 'topicReasoningEffort');
-  ds.session.topicReasoningEffort = { model: control.model, effort: selected as NonNullable<Session['reasoningEffort']> };
-  try { sessionStore.updateSession(ds.session); }
-  catch (error) {
-    if (previous) Object.defineProperty(ds.session, 'topicReasoningEffort', previous);
-    else Reflect.deleteProperty(ds.session, 'topicReasoningEffort');
-    throw error;
-  }
+  if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) return 'busy';
+  persistEffortSelection(ds, selected as NonNullable<Session['reasoningEffort']>, control.model, actor, true);
   return 'saved';
 }
 
@@ -9531,12 +9690,12 @@ export function sessionAcceptsDirectCommand(ds: DaemonSession): boolean {
 }
 
 /** Caller holds the bot mutation gate. Never interrupt or replay a business turn. */
-export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): 'saved' | 'busy' | 'unsupported' | 'invalid' {
+export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown, actor?: PinEffortActor): 'saved' | 'busy' | 'unsupported' | 'invalid' {
   const control = sessionReasoningControl(ds);
   if (!control) return 'unsupported';
   const selected = control.choices.find(candidate => candidate === effort);
   if (!selected) return 'invalid';
-  if (ds.session.status !== 'active' || isSessionTransferring(ds)
+  if (ds.session.status !== 'active' || isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)
     || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
     || [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds)) return 'busy';
   const live = ds.worker && !ds.worker.killed;
@@ -9568,21 +9727,9 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
     } catch { return 'busy'; }
   }
   if (ds.session.reasoningEffort === selected
+    && (!ds.session.modelPin || !samePinModel(ds.session.modelPin.model, currentEffortModel(ds)) || ds.session.modelPin.effort === selected)
     && (!live || ds.activeReasoningEffort === selected)) return 'saved';
-  const previous = ds.session.reasoningEffort;
-  const snapshot = ds.session.cliLaunchSnapshot;
-  const previousSnapshotEffort = snapshot?.reasoningEffort ?? null;
-  ds.session.reasoningEffort = selected;
-  if (snapshot) snapshot.reasoningEffort = selected;
-  try {
-    // Persist only the next launch preference. Keep the live CLI, preview and
-    // owned services intact; a normal cold resume will consume this setting.
-    sessionStore.updateSession(ds.session);
-  } catch (error) {
-    ds.session.reasoningEffort = previous;
-    if (snapshot) snapshot.reasoningEffort = previousSnapshotEffort;
-    throw error;
-  }
+  persistEffortSelection(ds, selected, currentEffortModel(ds), actor);
   return 'saved';
 }
 
@@ -11899,10 +12046,14 @@ export type ExactTurnInterruptResult =
 
 /** Native settings use their own receipt, without rotating business-turn state. */
 const pendingCodexCliEffort = new WeakSet<DaemonSession>();
+const pendingCodexAppEffort = new WeakSet<DaemonSession>();
+export function isSessionEffortChangeInFlight(ds: DaemonSession): boolean {
+  return pendingCodexCliEffort.has(ds) || pendingCodexAppEffort.has(ds);
+}
 
 /** A native menu receipt saves a future-turn preference, never activeRuntime. */
 export function updateCodexCliEffort(
-  ds: DaemonSession, effort: string, timeoutMs = 35_000,
+  ds: DaemonSession, effort: string, timeoutMs = 35_000, canApply: () => boolean = () => true, actor?: PinEffortActor,
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
   const cfg = ds.initConfig ?? ds.session;
@@ -11919,7 +12070,7 @@ export function updateCodexCliEffort(
     || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli
     || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
-    || pendingCodexCliEffort.has(ds)) {
+    || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds) || !effortAuthorityAllowed(canApply)) {
     logger.info(`[${tag(ds)}] Codex CLI effort unavailable at daemon admission: ${JSON.stringify({
       workerReady: !!ds.workerReady, cliReady: !!ds.cliReady,
       workerAlive: !!worker && !worker.killed, status: ds.session.status,
@@ -11935,13 +12086,16 @@ export function updateCodexCliEffort(
   const generation = ds.workerGeneration;
   const nativeId = ds.session.cliSessionId;
   const sessionGeneration = ds.session.workerGeneration;
+  const stamp = effortSelectionStamp(ds);
+  const selectedModel = currentEffortModel(ds);
   const requestId = randomUUID();
   pendingCodexCliEffort.add(ds);
   return new Promise(resolve => {
     let settled = false;
     const current = () => ds.worker === worker && ds.workerGeneration === generation
       && ds.session.workerGeneration === sessionGeneration
-      && ds.session.cliSessionId === nativeId && ds.session.status === 'active';
+      && ds.session.cliSessionId === nativeId && ds.session.status === 'active'
+      && !isSessionRestartInFlight(ds) && effortAuthorityAllowed(canApply) && effortSelectionStamp(ds) === stamp;
     const finish = (result: import('../types.js').CodexAppEffortResult): void => {
       if (settled) return;
       settled = true;
@@ -11956,17 +12110,8 @@ export function updateCodexCliEffort(
       if (!current()) return finish({ status: 'error' });
       if (msg.status === 'future_only' && msg.reason === 'cli_next_turn') {
         const selected = effort as NonNullable<Session['reasoningEffort']>;
-        const before = ds.session.reasoningEffort;
-        const snapshot = ds.session.cliLaunchSnapshot;
-        const beforeSnapshot = snapshot?.reasoningEffort ?? null;
-        ds.session.reasoningEffort = selected;
-        if (snapshot) snapshot.reasoningEffort = selected;
-        try { sessionStore.updateSession(ds.session); }
-        catch {
-          ds.session.reasoningEffort = before;
-          if (snapshot) snapshot.reasoningEffort = beforeSnapshot;
-          return finish({ status: 'error' });
-        }
+        try { persistEffortSelection(ds, selected, selectedModel, actor); }
+        catch { return finish({ status: 'error' }); }
         if (ds.initConfig) ds.initConfig.reasoningEffort = selected;
         ds.codexCliEffortConfirmed = { effort: selected, workerGeneration: generation };
         scheduleActiveRuntimePatch(ds);
@@ -11996,6 +12141,8 @@ export function updateCodexAppEffort(
   ds: DaemonSession,
   effort: string,
   timeoutMs = 35_000,
+  canApply: () => boolean = () => true,
+  actor?: PinEffortActor,
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
   // 优先级 snapshot ?? session.cliId（刻意不回落到 bot 配置）：只对已有 live worker 的
@@ -12003,9 +12150,15 @@ export function updateCodexAppEffort(
   if (!isCodexAppCliId(ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId)
     || !worker || worker.killed || !ds.workerReady || !ds.cliReady
     || ds.session.status !== 'active' || isSessionTransferring(ds)
-    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) {
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
+    || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds) || !effortAuthorityAllowed(canApply)) {
     return Promise.resolve({ status: 'unavailable' });
   }
+  const stamp = effortSelectionStamp(ds);
+  const generation = ds.workerGeneration;
+  const nativeId = ds.session.cliSessionId;
+  const selectedModel = currentEffortModel(ds);
+  pendingCodexAppEffort.add(ds);
   const requestId = randomUUID();
   return new Promise(resolve => {
     let settled = false;
@@ -12015,11 +12168,19 @@ export function updateCodexAppEffort(
       clearTimeout(timer);
       worker.off('message', onMessage);
       worker.off('exit', onExit);
+      pendingCodexAppEffort.delete(ds);
       resolve(result);
     };
     const onMessage = (msg: WorkerToDaemon): void => {
       if (msg.type !== 'codex_app_effort_result' || msg.requestId !== requestId) return;
-      finish(ds.worker === worker ? msg : { status: 'error' });
+      if (ds.worker !== worker || ds.workerGeneration !== generation || ds.session.cliSessionId !== nativeId
+        || ds.session.status !== 'active' || isSessionRestartInFlight(ds) || !effortAuthorityAllowed(canApply) || effortSelectionStamp(ds) !== stamp) return finish({ status: 'error' });
+      if (ds.session.modelPin && (msg.status === 'applied' || msg.status === 'future_only')) {
+        try { persistEffortSelection(ds, effort as NonNullable<Session['reasoningEffort']>, selectedModel, actor); }
+        catch { return finish({ status: 'error' }); }
+        if (ds.initConfig) ds.initConfig.reasoningEffort = effort as NonNullable<Session['reasoningEffort']>;
+      }
+      finish(msg);
     };
     const onExit = (): void => finish({ status: 'error' });
     const timer = setTimeout(() => finish({ status: 'error' }), timeoutMs);
@@ -12986,7 +13147,7 @@ async function forkFromSource(
     childSession.promptInjection = sessionPromptInjection(ds);
     childSession.nativeSessionTitle = childTitle;
     childSession.nativeSessionTitleUserDefined = true;
-    sessionStore.updateSession(childSession);
+    sessionStore.updateSession(childSession, { modelPinWrite: true });
 
     // ── Build the child runtime DaemonSession (mirrors the restore-path literal;
     //    worker:null → forkWorker cold-spawns a fresh worker for it) ──
@@ -13803,8 +13964,9 @@ export function sendWorkerInput(
     // refresh its launch snapshot — so carry the current model on the message
     // itself. Only while parked: an ordinary turn changes no launch config, and
     // an unconditional field would be pure noise on every message.
-    ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
@@ -14231,8 +14393,9 @@ export function promoteQueuedActivationTail(
       type: 'message',
       content: exactInput.content,
       // Same parked-worker launch-snapshot refresh as the ordinary send.
-      ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
       ...(admittedLinkRefs.mode !== 'disabled'
         ? { linkRefMode: admittedLinkRefs.mode }
@@ -17658,6 +17821,16 @@ function setupWorkerHandlers(
         sessionStore.updateSession(ds.session);
         break;
       }
+      case 'background_task_pins_sync': {
+        // Same eviction exemption for the launching turns of this worker's
+        // running Claude background tasks, so a wake answer forwarded long
+        // after launch still resolves to its topic. In-memory only: the
+        // worker holds the task→turn anchors in memory, and the exit handler
+        // drops these pins with it. Stale generations are rejected by the
+        // enclosing `ds.worker !== worker` guard.
+        ds.backgroundTaskPinnedTurnIds = normalizeBackgroundTaskPins(msg.turnIds);
+        break;
+      }
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
@@ -18344,7 +18517,8 @@ function setupWorkerHandlers(
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
-              frozenSessionSandboxMode(ds.session.sandbox),
+              sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+              sessionModelPinView(ds),
             );
             const fallbackPost = scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
               'interactive', cardReplyTarget.turnId, { replyTarget: cardReplyTarget.target, beforeWrite: beforeFallbackWrite });
@@ -18367,7 +18541,8 @@ function setupWorkerHandlers(
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
-                frozenSessionSandboxMode(ds.session.sandbox),
+                sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+                sessionModelPinView(ds),
               );
               try {
                 await updateMessage(postingAppId, fallbackCardId, readyCardJson, { beforeWrite: beforeFallbackWrite });
@@ -21713,6 +21888,9 @@ function setupWorkerHandlers(
       ds.workerReady = false;
       // The worker process died; its CLI died with it.
       ds.cliReady = false;
+      // Its background-task anchors died with it: nothing can forward a wake
+      // to those turns any more, so they stop holding their records.
+      ds.backgroundTaskPinnedTurnIds = undefined;
       ds.workerPort = null;
       // A dead worker can no longer refresh its card/usage view.
       clearUsageRefreshTimer(ds);

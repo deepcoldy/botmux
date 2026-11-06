@@ -1046,11 +1046,17 @@ export class BackgroundTaskTracker {
 
   /** Background tasks still running at `nowMs`. */
   pending(nowMs = Date.now()): number {
-    let n = 0;
-    for (const task of this.live.values()) {
-      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) n++;
+    return this.liveTaskIds(nowMs).length;
+  }
+
+  /** Ids of the background tasks still running at `nowMs` (what
+   *  {@link pending} counts). */
+  liveTaskIds(nowMs = Date.now()): string[] {
+    const ids: string[] = [];
+    for (const [taskId, task] of this.live) {
+      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) ids.push(taskId);
     }
-    return n;
+    return ids;
   }
 
   /** Mark the main turn open or ended from a source other than a Claude

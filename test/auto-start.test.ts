@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   chatHasAllowedUser,
+  pickGroupJoinAnchorMessageId,
   resolveGroupJoinPrompt,
   shouldAutoStartOnNewTopic,
   waitForAllowedUserInChat,
@@ -168,5 +169,56 @@ describe('waitForAllowedUserInChat (场景① D7 入群竞态)', () => {
     await expect(
       waitForAllowedUserInChat({ listMembers, allowedUsers: ['ou_owner'], sleep }),
     ).rejects.toThrow('no scope');
+  });
+});
+
+describe('pickGroupJoinAnchorMessageId (场景① latest-message anchor)', () => {
+  const appId = 'cli_self';
+  const msg = (id: string, createTime: number, extra: Record<string, unknown> = {}) => ({
+    message_id: id,
+    create_time: String(createTime),
+    msg_type: 'interactive',
+    sender: { id: 'cli_other', id_type: 'app_id', sender_type: 'app' },
+    ...extra,
+  });
+
+  it('picks the newest message regardless of input order', () => {
+    expect(pickGroupJoinAnchorMessageId([msg('om_new', 300), msg('om_old', 100), msg('om_mid', 200)], appId)).toBe('om_new');
+  });
+
+  it('skips system events, recalled messages and the bot\'s own messages', () => {
+    expect(pickGroupJoinAnchorMessageId([
+      msg('om_card', 100),
+      msg('om_self', 400, { sender: { id: appId, id_type: 'app_id', sender_type: 'app' } }),
+      msg('om_recalled', 300, { deleted: true }),
+      msg('om_system', 200, { msg_type: 'system' }),
+    ], appId)).toBe('om_card');
+  });
+
+  it('skips the bot\'s own message when the listing uses its per-app open_id sender shape', () => {
+    // Real im/v1/messages listings return THIS bot's own messages with either
+    // sender.id = app_id (id_type=app_id) or sender.id = the bot's own open_id
+    // (ou_…). The ou_ form must be skipped only when selfOpenId is supplied.
+    const selfOpenId = 'ou_self_bot';
+    const listing = [
+      msg('om_context', 100),
+      msg('om_self_open_id', 400, { sender: { id: selfOpenId, id_type: 'open_id', sender_type: 'app' } }),
+    ];
+    expect(pickGroupJoinAnchorMessageId(listing, appId, selfOpenId)).toBe('om_context');
+    // Without the open-id hint the ou_ shape is unknowable and stays eligible.
+    expect(pickGroupJoinAnchorMessageId(listing, appId)).toBe('om_self_open_id');
+  });
+
+  it('resolves a message inside a native topic to its root', () => {
+    expect(pickGroupJoinAnchorMessageId([msg('om_reply', 200, { root_id: 'om_root', thread_id: 'omt_1' })], appId)).toBe('om_root');
+  });
+
+  it('keeps a quote reply (root_id without thread_id) as its own anchor', () => {
+    expect(pickGroupJoinAnchorMessageId([msg('om_quote', 200, { root_id: 'om_root' })], appId)).toBe('om_quote');
+  });
+
+  it('returns undefined when nothing qualifies', () => {
+    expect(pickGroupJoinAnchorMessageId([], appId)).toBeUndefined();
+    expect(pickGroupJoinAnchorMessageId([msg('om_system', 1, { msg_type: 'system' })], appId)).toBeUndefined();
   });
 });

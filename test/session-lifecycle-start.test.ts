@@ -9168,6 +9168,15 @@ describe('forkWorker session agent config freeze', () => {
 
   // ── An EXPLICIT per-trigger override (trigger API options.model) still wins
   //    over the bot config — that is the only thing that outranks it now. ──
+  it.each([false, true])('explicit pin reaches the actual worker init on fresh/restore spawn (resume=%s)', resume => {
+    const ds = makeDs();
+    ds.session.modelPin = { model: 'gpt-6.1-terra', effort: 'high', source: 'topic-header', setBy: 'owner', setAt: new Date().toISOString() };
+    forkWorker(ds, '', resume);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', model: 'gpt-6.1-terra', reasoningEffort: 'high', resume }));
+    expect(ds.session.model).toBe('gpt-6.1-terra');
+  });
+
   it('prefers an explicit per-trigger model override over the bot config', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;

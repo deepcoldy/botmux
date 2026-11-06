@@ -8,7 +8,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
-import { startLarkConnection } from './transport/connection.js';
+import { startLarkConnection, type LarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
@@ -16,6 +16,7 @@ import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { classifyLarkError } from './error-classify.js';
 import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
 import { logger } from '../../utils/logger.js';
+import type { FetchedBotProfile } from '../../services/bot-profile-refresh.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -177,13 +178,32 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
   if (bot.botOpenId) return; // already known
 
+  const info = await fetchBotProfileFromLark(larkAppId);
+  bot.botOpenId = info.openId;
+  if (info.name) bot.botName = info.name;
+  if (info.avatarUrl) bot.botAvatarUrl = info.avatarUrl;
+  logger.info(`Bot open_id: ${bot.botOpenId}`);
+}
+
+const BOT_PROFILE_FETCH_TIMEOUT_MS = 20_000;
+
+/**
+ * One read-only `/bot/v3/info` call with the bot's tenant_access_token: the
+ * authoritative Feishu name / avatar / open_id of this app. Throws on any
+ * failure; callers that refresh a cached name keep the old value on throw
+ * (see services/bot-profile-refresh.ts).
+ */
+export async function fetchBotProfileFromLark(larkAppId: string): Promise<FetchedBotProfile> {
+  const bot = getBot(larkAppId);
   const openApi = larkHosts(normalizeBrand(bot.config.brand)).openApi;
 
-  // Call /bot/v3/info to get the bot's open_id using tenant_access_token
+  // Bounded: a stalled connection must fail (old name kept, next period
+  // retries) instead of wedging the refresher / the open_id gate forever.
   const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
+    signal: AbortSignal.timeout(BOT_PROFILE_FETCH_TIMEOUT_MS),
   });
   const tokenData = await tokenRes.json() as any;
   if (tokenData.code !== 0) {
@@ -192,6 +212,7 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
 
   const botRes = await fetch(`${openApi}/open-apis/bot/v3/info/`, {
     headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
+    signal: AbortSignal.timeout(BOT_PROFILE_FETCH_TIMEOUT_MS),
   });
   const botData = await botRes.json() as any;
   if (botData.code !== 0) {
@@ -199,15 +220,37 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   }
 
   const openId = botData.bot?.open_id;
+  if (typeof openId !== 'string' || !openId) throw new Error('No open_id in bot info response');
   const appName = botData.bot?.app_name;
   const avatarUrl = botData.bot?.avatar_url;
-  if (openId) {
-    bot.botOpenId = openId;
-    if (appName) bot.botName = appName;
-    if (avatarUrl) bot.botAvatarUrl = avatarUrl;
-    logger.info(`Bot open_id: ${bot.botOpenId}`);
-  } else {
-    throw new Error('No open_id in bot info response');
+  return {
+    openId,
+    ...(typeof appName === 'string' && appName.trim() ? { name: appName } : {}),
+    ...(typeof avatarUrl === 'string' && avatarUrl ? { avatarUrl } : {}),
+  };
+}
+
+/**
+ * Rename hint: an inbound @ of this bot whose mention name differs from the
+ * cached Feishu name. Only a *trigger* for an authoritative re-fetch — the
+ * mention name itself is never written anywhere.
+ */
+let selfMentionNameObserver: ((larkAppId: string, mentionName: string) => void) | null = null;
+
+export function setSelfMentionNameObserver(fn: ((larkAppId: string, mentionName: string) => void) | null): void {
+  selfMentionNameObserver = fn;
+}
+
+/** Exported for tests: report a self-mention whose name differs from the cached bot name. */
+export function noteSelfMentionNames(larkAppId: string, mentions: readonly any[], botOpenId: string, cachedName: string | undefined): void {
+  if (!selfMentionNameObserver) return;
+  for (const m of mentions) {
+    if (mentionOpenId(m) !== botOpenId) continue;
+    const name = typeof m?.name === 'string' ? m.name.trim() : '';
+    if (name && name !== cachedName) {
+      try { selfMentionNameObserver(larkAppId, name); } catch { /* display-only hint */ }
+    }
+    return;
   }
 }
 
@@ -1748,9 +1791,7 @@ export async function tryHandleIntroduceCommand(
 
   if (grantCommandRestriction(larkAppId, message.chat_id, senderOpenId).blocked) {
     const loc = localeForBot(larkAppId);
-    await replyMessage(larkAppId, message.message_id, JSON.stringify({
-      text: t('cmd.grant_restricted', { cmd: '/introduce' }, loc),
-    })).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
+    await replyMessage(larkAppId, message.message_id, t('cmd.grant_restricted', { cmd: '/introduce' }, loc)).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
     return true;
   }
 
@@ -1822,7 +1863,11 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
   }
 
   // Single source of truth shared with the poll + dashboard-preview legs.
-  return messageMentionsBot(message, larkAppId, botOpenId);
+  const mentioned = messageMentionsBot(message, larkAppId, botOpenId);
+  // Side channel only (never affects the return value): a name mismatch on our
+  // own @ asks the profile refresher to re-read /bot/v3/info early.
+  if (mentioned) noteSelfMentionNames(larkAppId, mentions, botOpenId, getBot(larkAppId).botName);
+  return mentioned;
 }
 
 /** Does this message @mention a *specific other member* (a person or bot that
@@ -2512,6 +2557,27 @@ export function canRunDaemonCommand(
   return botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
     : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+}
+
+/**
+ * 真人在群里打 daemon 命令 `cmd` 能不能执行——daemon.ts 两条路由对真人依次过的两道闸：
+ * 先 `restrictGrantCommands` 的授权用户限制（grantRestrictedSlashCommandText 同一判定），
+ * 再 {@link canRunDaemonCommand}（真人：无 union 信任腿、不是 bot 发送方）。
+ *
+ * 给「没有真实入站消息、但要按同一口径判断某人能不能用这条命令」的地方用：工作流节点的
+ * 工作目录（design 2026-11-03 §15.4）按 `/cd` 判断发起人能否操作执行 Bot。`openId`
+ * 必须是**本 bot 应用**下的 open_id（app-scoped，调用方负责换算）。
+ */
+export function humanCanRunDaemonCommand(
+  larkAppId: string,
+  chatId: string,
+  openId: string,
+  unionId: string | undefined,
+  cmd: string,
+  chatType: 'p2p' | 'group',
+): boolean {
+  if (grantCommandRestriction(larkAppId, chatId, openId).blocked) return false;
+  return canRunDaemonCommand(larkAppId, chatId, openId, undefined, cmd, unionId, chatType, false, false);
 }
 
 /**
@@ -4833,9 +4899,9 @@ async function processCommentEvent(
 }
 
 export interface LarkEventDispatcherRuntime {
-  connect(): Lark.WSClient;
+  connect(): LarkConnection;
   connectPrimary(input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   };
   close(): void;
@@ -6923,7 +6989,7 @@ export function createLarkEventDispatcherRuntime(
     };
   }
 
-  let wsClient: Lark.WSClient | undefined;
+  let wsClient: LarkConnection | undefined;
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
@@ -7066,6 +7132,9 @@ export function createLarkEventDispatcherRuntime(
     primaryTransportReady = false;
     if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
         || primaryLeadershipSignal.aborted) return;
+    // A replacement during the same outage must keep the first scan's
+    // history cutoff and ready promise, including during initial leadership.
+    if (pendingTransportReady?.leadershipSignal === primaryLeadershipSignal) return;
     const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
     void ready.catch(error => {
       if (primaryLeadershipSignal?.aborted) return;
@@ -7076,7 +7145,7 @@ export function createLarkEventDispatcherRuntime(
     });
   };
 
-  const connect = (): Lark.WSClient => {
+  const connect = (): LarkConnection => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
       onReady: settlePrimaryTransportReady,
@@ -7114,7 +7183,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const connectPrimary = (input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
@@ -7227,7 +7296,7 @@ export function startLarkEventDispatcher(
   handlers: EventHandlers,
   brand: Brand = 'feishu',
   durableInboxShadow?: DurableInboxStore,
-): Lark.WSClient {
+): LarkConnection {
   return createLarkEventDispatcherRuntime(
     larkAppId,
     larkAppSecret,

@@ -11,6 +11,9 @@
  *   - getChildPid resolves through display-message, not list-panes
  *   - captureCurrentScreen issues capture-pane -e -p -S -
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -941,6 +944,21 @@ describe('TmuxPipeBackend input addressing', () => {
     // the input box (replies-to-previous-message off-by-one). Regression guard
     // for PR #25, which added -p only to the unused TmuxBackend.
     expect(pasteArgs).toContain('-p');
+  });
+
+  it('submits multiline Codex input and Enter in one tmux command batch', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    expect(be.submitBracketedPaste('line one  \nline two')).toBe(true);
+    const calls = getExecFileCalls();
+    expect(calls).toHaveLength(2);
+    expect((calls[0][2] as any).input).toBe('line one  \nline two');
+    expect(calls[1][1]).toContain('paste-buffer');
+    expect(calls[1][1]).toContain('-r');
+    expect(calls[1][1]).not.toContain('-p');
+    expect((calls[1][1] as string[]).slice(-7)).toEqual([';', 'send-keys', '-t', '0:5.0', '-l', '--', '\x1b[201~\r']);
+    expect(calls[1][1]).toContain('\x1b[200~');
   });
 
   it('uses a fresh named tmux buffer for each paste', () => {
@@ -1946,6 +1964,56 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
       errSpy.mockRestore();
     }
   });
+
+  // The 60s continuous-unreachable escalation must carry the same
+  // server-replacement classification as the missing streak: when the outage
+  // ends with a DIFFERENT server answering the socket, the exit is not charged
+  // to the CLI. Pins the escalation call site of noteServerReplacedAtPaneLoss.
+  it('classifies the 60s server-unreachable escalation as a server replacement when a different server answers', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      // Spawn: anchor the pane on server pid 111.
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a.includes('display-message') && a.some(f => String(f) === '#{pane_id} #{pid}')) {
+          return '%1 111' as any;
+        }
+        return '' as any;
+      }) as typeof execFileSync);
+      const be = new TmuxPipeBackend('bmx-outage', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      expect((be as unknown as { lastLiveServerPid?: number }).lastLiveServerPid).toBe(111);
+
+      // After spawn every pane probe fails at CONNECTION level (server never
+      // answers); once the escalation fires, a DIFFERENT server (pid 222) is
+      // already answering on the socket.
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a[0] === 'list-sessions' && a.includes('#{pid}')) return '222\n' as any;
+        if (a.includes('kill-session')) return '' as any;
+        if (a.includes('display-message')) {
+          throw Object.assign(new Error('error connecting to /tmp/tmux-0/botmux'), {
+            status: 1, signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/botmux (No such file or directory)'),
+          });
+        }
+        return '' as any;
+      }) as typeof execFileSync);
+      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+      vi.advanceTimersByTime(90_000);
+      expect(exits).toHaveLength(1);
+      expect(be.exitedBecauseServerReplaced()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
 });
 
 describe('TmuxPipeBackend send failure handling', () => {
@@ -2123,6 +2191,56 @@ describe('TmuxPipeBackend send failure handling', () => {
     const { exits, killCalls } = runReapCase({ owns: false, deathAnswer: '1:77' });
     expect(killCalls).toHaveLength(0);
     expect(exits).toEqual([[77, null]]);
+  });
+
+  // Pane loss first detected from a FAILED WRITE (guardedSend) must carry the
+  // same server-replacement classification as the watcher's missing streak:
+  // the pid anchored at attach is compared with the server answering at
+  // teardown. Pins the guardedSend call site of noteServerReplacedAtPaneLoss.
+  it('guardedSend classifies a pane loss as a server replacement when a different server answers', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      // During spawn the attach-time anchor read must see this pane alive on a
+      // server with pid 111 (format '#{pane_id} #{pid}', same answer as a probe).
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a.includes('display-message') && a.some(f => String(f) === '#{pane_id} #{pid}')) {
+          return '%13 111' as any;
+        }
+        return '' as any;
+      }) as typeof execFileSync);
+      const be = new TmuxPipeBackend('bmx-replaced-send', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], spawnOpts());
+      expect((be as unknown as { lastLiveServerPid?: number }).lastLiveServerPid).toBe(111);
+
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a.includes('load-buffer') || a.includes('paste-buffer')) {
+          throw Object.assign(new Error('gone'), {
+            status: 1, signal: null, stderr: Buffer.from("can't find pane: bmx-replaced-send"),
+          });
+        }
+        // A DIFFERENT server (pid 222) now answers on the socket.
+        if (a[0] === 'list-sessions' && a.includes('#{pid}')) return '222\n' as any;
+        if (a.includes('display-message') && a.some(f => String(f).includes('#{pane_dead_status}'))) {
+          return '1:77' as any;
+        }
+        // Bare '#{pane_id}' answers empty -> authoritative missing; everything
+        // else (kill-session remnant reap) succeeds.
+        return '' as any;
+      }) as typeof execFileSync);
+      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+      expect(() => be.pasteText('x')).not.toThrow();
+      expect(be.exitedBecauseServerReplaced()).toBe(true);
+      expect(exits).toEqual([[77, null]]);
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 });
 
