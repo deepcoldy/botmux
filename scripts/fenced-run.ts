@@ -19,6 +19,9 @@
  * os.homedir() is frozen at process start — sees the fenced home):
  *   - HOME / USERPROFILE → a new temp home, plus the same CLI-home / XDG
  *     rewrites as the unit fence (test/helpers/fence-home-env.ts);
+ *   - SESSION_DATA_DIR / BOTMUX_MOJO_WORKSPACE_ROOT → under the temp home, and
+ *     inherited session-turn markers + the live daemon's IPC port + the turn
+ *     cli-identity binding are scrubbed (scrubSessionTurnMarkerEnv);
  *   - TMUX_TMPDIR → a private existing directory, TMUX/TMUX_PANE dropped, and
  *     the tmux shim first on PATH that refuses any host socket (including the
  *     fleet's `-L botmux`); any refusal fails this run with exit 3;
@@ -41,6 +44,7 @@ import {
   teardownTmuxFence,
   tmuxFenceDenialError,
 } from '../test/helpers/tmux-fence.js';
+import { scrubSessionTurnMarkerEnv } from '../src/utils/child-env.js';
 
 export const FENCE_DENIED_EXIT = 3;
 
@@ -66,6 +70,17 @@ export function fencedRunEnv(
   if (process.platform === 'win32') env.USERPROFILE = home;
   fenceHomeRootedEnv(home, env);
   applyTmuxFenceEnv(fence, env);
+  // config.session.dataDir honours SESSION_DATA_DIR BEFORE the HOME-derived
+  // fallback, so a redirected HOME alone does not keep a probe out of the live
+  // fleet's data dir. BOTMUX_MOJO_WORKSPACE_ROOT is the same shape for mojo.
+  // Both mirror what test/unit-setup.ts / test/bun-test-fence.ts do.
+  env.SESSION_DATA_DIR = join(home, '.botmux', 'data');
+  env.BOTMUX_MOJO_WORKSPACE_ROOT = join(home, 'mojo-workspaces');
+  // Drop per-session identity/capability injected by the daemon that spawned
+  // this shell: turn/chat markers, the live daemon's IPC port, the turn cli
+  // identity binding. Without this a probe can talk to the real daemon / act
+  // as this session even with a fenced HOME.
+  scrubSessionTurnMarkerEnv(env);
   if (!opts.keepUserBus) {
     delete env.XDG_RUNTIME_DIR;
     delete env.DBUS_SESSION_BUS_ADDRESS;

@@ -43,6 +43,34 @@ describe.skipIf(!bun)('fenced-run', () => {
     expect(r.stdout.trim()).toBe('/run/user/0');
   });
 
+  it('keeps config.session.dataDir, mojo workspaces and session markers out of the live fleet', async () => {
+    // config.session.dataDir honours SESSION_DATA_DIR BEFORE the HOME fallback,
+    // so a redirected HOME alone would not fence it.
+    const cfgPath = resolve(__dirname, '..', 'src', 'config.ts');
+    const keys = ['BOTMUX_SESSION_ID', 'BOTMUX_TURN_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_DAEMON_IPC_PORT',
+      'BOTMUX_LARK_TOOL_BINDING', 'BOTMUX_IDENTITY_BIN'];
+    const probe = `const c=await import(${JSON.stringify(cfgPath)});`
+      + `console.log(JSON.stringify({dataDir:c.config.session.dataDir,`
+      + `mojo:process.env.BOTMUX_MOJO_WORKSPACE_ROOT??null,`
+      + `markers:${JSON.stringify(keys)}.map(k=>[k,process.env[k]??null])}))`;
+    const inherited: NodeJS.ProcessEnv = {
+      ...process.env,
+      BOTMUX_MOJO_WORKSPACE_ROOT: '/real-mojo-root',
+      BOTMUX_SESSION_ID: 'sess', BOTMUX_TURN_ID: 'turn', BOTMUX_CHAT_ID: 'chat',
+      BOTMUX_DAEMON_IPC_PORT: '7974', BOTMUX_LARK_TOOL_BINDING: 'binding', BOTMUX_IDENTITY_BIN: '/x/cli-identity/y.bin',
+    };
+    const r = run(['--', bun!, '-e', probe], inherited);
+    expect(r.status, r.stderr).toBe(0);
+    const seen = JSON.parse(r.stdout.trim().split('\n').pop()!);
+    expect(seen.dataDir).toMatch(/bmx-fenced-home-/);
+    expect(seen.dataDir).not.toMatch(/^\/root/);
+    expect(seen.mojo).toMatch(/bmx-fenced-home-/);
+    expect(seen.mojo).not.toBe('/real-mojo-root');
+    for (const [key, value] of seen.markers as Array<[string, string | null]>) {
+      expect(value, `${key} must be scrubbed`).toBeNull();
+    }
+  });
+
   it.skipIf(!realTmux)('fails the run when the probe addresses a host tmux socket', () => {
     const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
     // A path in the host socket directory: the shim refuses it before tmux runs.
