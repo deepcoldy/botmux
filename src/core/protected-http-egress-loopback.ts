@@ -207,7 +207,7 @@ async function localServiceHeaders(
   const contentLength = valuesByName.get('content-length')?.[0];
   if (contentLength !== undefined) headers['content-length'] = contentLength;
   if (plan.attestProcessPeer) {
-    const peer = resolveLoopbackPeerProcesses({
+    const peer = await resolveLoopbackPeerProcesses({
       remoteAddress: request.socket.remoteAddress,
       remotePort: request.socket.remotePort,
       localPort: request.socket.localPort,
