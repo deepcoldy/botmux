@@ -6,6 +6,7 @@ import { join } from 'node:path';
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   reply: vi.fn(),
+  forward: vi.fn(),
   request: vi.fn(),
   emitHookEvent: vi.fn(),
   sharing: false,
@@ -22,7 +23,7 @@ vi.mock('../src/services/group-context-store.js', async importOriginal => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({
-    im: { v1: { message: { create: mocks.create, reply: mocks.reply } } },
+    im: { v1: { message: { create: mocks.create, reply: mocks.reply, forward: mocks.forward } } },
     request: mocks.request,
   }),
   getAllBots: () => [],
@@ -35,7 +36,7 @@ vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: mocks.emitHookEvent,
 }));
 
-import { replyMessage, sendMessage, sendUserMessage, urgentMessage } from '../src/im/lark/client.js';
+import { forwardMessage, replyMessage, sendMessage, sendUserMessage, urgentMessage } from '../src/im/lark/client.js';
 
 describe('Lark outbound hook provider replay suppression', () => {
   it.each(['create', 'reply'] as const)('preserves the provider rejection code from %s for report recovery', async method => {
@@ -303,6 +304,7 @@ describe('Lark send gate retry keeps one dedupe uuid', () => {
     vi.useFakeTimers();
     mocks.create.mockReset();
     mocks.reply.mockReset();
+    mocks.forward.mockReset();
     mocks.emitHookEvent.mockReset();
   });
   afterEach(() => { vi.useRealTimers(); });
@@ -364,7 +366,27 @@ describe('Lark send gate retry keeps one dedupe uuid', () => {
     const [first, second] = mocks.reply.mock.calls.map(c => c[0].data);
     expect(first.reply_in_thread).toBe(true);
     expect(second.reply_in_thread).toBe(true);
+    // Assert the shape first: comparing only `second.uuid === first.uuid` would
+    // pass with both undefined, so it cannot prove the wire token exists.
+    expect(first.uuid).toEqual(expect.any(String));
+    expect(first.uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
     expect(second.uuid).toBe(first.uuid);
+  });
+
+  it('forward retried after a lost response reuses the same uuid in params', async () => {
+    mocks.forward
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_fwd' } });
+    const action = forwardMessage('app-retry-uuid', 'om_src', 'oc_dest');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_fwd');
+
+    expect(mocks.forward).toHaveBeenCalledTimes(2);
+    const params = mocks.forward.mock.calls.map(c => c[0].params);
+    expect(params[0].receive_id_type).toBe('chat_id');
+    expect(params[0].uuid).toEqual(expect.any(String));
+    expect(params[0].uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    expect(params[1].uuid).toBe(params[0].uuid);
   });
 
   it('sendUserMessage retry reuses one uuid', async () => {
