@@ -839,6 +839,7 @@ export const messages: Record<string, string> = {
   'cmd.config.effect_next_session': '↳ Applies to new sessions; running sessions pick it up after /restart.',
   'cmd.config.write_failed': '⚠️ Write failed: {reason}',
   'cmd.config.cli_effort_incompatible': 'The current model and reasoning effort are incompatible with the target CLI. Configuration was kept. Run /botconfig unset reasoningEffort, then retry switching the CLI.',
+  'cmd.config.model_effort_incompatible': 'The saved reasoning effort is not supported by the target model. Configuration was kept. Run /botconfig unset reasoningEffort, then retry changing the model.',
   'cmd.config.unknown_sub': 'Unknown subcommand: {sub}\nSupported: /botconfig get | set | unset | help',
   'cmd.config.card_dmd': '⚙️ Config card sent to your DM (only you can see it) → open our 1:1 chat to view / edit.',
   'card.config.title': '⚙️ {name} · config',

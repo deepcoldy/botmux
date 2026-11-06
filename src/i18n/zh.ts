@@ -836,6 +836,7 @@ export const messages: Record<string, string> = {
   'cmd.config.effect_next_session': '↳ 新会话生效；运行中的会话发 /restart 重启后换用新值。',
   'cmd.config.write_failed': '⚠️ 写入失败：{reason}',
   'cmd.config.cli_effort_incompatible': '当前模型与思考强度不兼容目标 CLI，配置未修改。请先执行 /botconfig unset reasoningEffort，再重试切换 CLI。',
+  'cmd.config.model_effort_incompatible': '当前思考强度不支持目标模型，配置未修改。请先执行 /botconfig unset reasoningEffort，再重试修改模型。',
   'cmd.config.unknown_sub': '未知子命令：{sub}\n支持：/botconfig get | set | unset | help',
   'cmd.config.card_dmd': '⚙️ 配置卡片已私信给你（仅你可见）→ 去和我的私聊里查看 / 操作。',
   'card.config.title': '⚙️ {name} · 配置',

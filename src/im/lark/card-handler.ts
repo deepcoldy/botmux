@@ -1,7 +1,7 @@
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
-import { MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
+import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -112,7 +112,7 @@ import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuff
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { handleCommand } from '../../core/command-handler.js';
+import { configWriteFailureText, handleCommand } from '../../core/command-handler.js';
 import {
   DISMISS_CLEANUP_WT_ACTION,
   DISMISS_CONFIRM_ACTION,
@@ -2516,7 +2516,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         valueToApply = coerced.value as string | string[];
       }
       const r = await applyConfigField(larkAppId, spec, valueToApply);
-      if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+      if (!r.ok) {
+        const failure = configWriteFailureText(spec, r.reason, loc);
+        return { toast: { type: failure.actionable ? 'warning' : 'error', content: failure.text } };
+      }
       logger.info(`[config:${larkAppId}] text field ${spec.key} saved via card`);
       return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` } };
     }
@@ -2596,7 +2599,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';
-      if (defaultPicker && raw !== CONFIG_UNSET && (effortPicker ? !isCodexReasoningEffort(raw) : !MODEL_SLUG_PATTERN.test(raw))) {
+      if (defaultPicker && raw !== CONFIG_UNSET && (effortPicker ? !isCodexReasoningEffort(raw) : !DEFAULT_MODEL_VALUE_PATTERN.test(raw))) {
         return { toast: { type: 'error', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.reply_actions.model_unsupported', undefined, loc) } };
       }
       if (raw === CONFIG_UNSET) {
@@ -2615,10 +2618,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (defaultPicker && r.reason === 'reasoning_effort_not_supported_by_model') {
         return { toast: { type: 'warning', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.models.effort_incompatible', undefined, loc) }, ...(await reRender()) };
       }
-      if (spec.configKey === 'cliId' && r.reason === 'reasoning_effort_not_supported_by_model') {
-        return { toast: { type: 'warning', content: t('cmd.config.cli_effort_incompatible', undefined, loc) } };
-      }
-      return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+      const failure = configWriteFailureText(spec, r.reason, loc);
+      return { toast: { type: failure.actionable ? 'warning' : 'error', content: failure.text } };
     }
     if (defaultPicker) {
       const refreshKey = defaultModelSelectionKey(larkAppId);
