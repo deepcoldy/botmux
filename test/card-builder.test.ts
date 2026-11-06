@@ -3137,4 +3137,24 @@ describe('truncateContent single oversized line', () => {
     expect(out).not.toContain('\uFFFD');
     expect(out.endsWith('尾')).toBe(true);
   });
+
+  it('keeps the whole fitted last non-blank line pushed out by trailing newlines', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // The 600-byte non-blank line fits within the 970-byte body budget, but the
+    // 401 trailing newlines push total size to 1001, so line bisection leaves
+    // only blank lines. The line must be kept in full: a negative byte offset
+    // (600 - 970) must clamp to 0, not slice off the line's head.
+    const out = truncateContent('x'.repeat(600) + '\n'.repeat(401), 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('x'.repeat(600));
+  });
+
+  it('skips whitespace-only (not just empty) lines when picking the tail line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // After split('\n') the final element is spaces, not an empty string. The
+    // reverse scan must trim() candidates, otherwise the body is blank again.
+    const out = truncateContent('y'.repeat(3000) + '\n   ', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('y'.repeat(970));
+  });
 });
