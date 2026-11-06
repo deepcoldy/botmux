@@ -71,7 +71,8 @@ describe('cmdSend member display-name fallback', () => {
 /** The parent owns the proof writer; the CLI can read its own credentials but
  * cannot read the full host registry. No external Lark request is performed. */
 async function isolatedSend(permission: boolean | undefined, opts: {
-  revoke?: boolean; proofAppId?: string; scenario?: 'unique' | 'duplicate' | 'missing' | 'outsider';
+  revoke?: boolean; proofAppId?: string; shiftAppOnRevalidation?: boolean;
+  scenario?: 'unique' | 'duplicate' | 'missing' | 'outsider';
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-isolated-mention-'));
   const dataDir = join(dir, 'data');
@@ -92,7 +93,7 @@ async function isolatedSend(permission: boolean | undefined, opts: {
       writeManagedOriginAttestationProof({ dataDir, proof: {
         domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce: request.nonce,
         channelId, sessionId: 'test-member-mention', turnId: 'om_isolated_turn',
-        larkAppId: opts.proofAppId ?? 'cli_test',
+        larkAppId: opts.shiftAppOnRevalidation && challenges > 1 ? 'cli_other' : (opts.proofAppId ?? 'cli_test'),
         ...(permission === undefined ? {} : { allowArbitraryMention: opts.revoke && challenges > 1 ? false : permission }),
         requiresCodexAppLedger: false, issuedAtMs: Date.now(),
       } as any });
@@ -171,6 +172,14 @@ describe.skipIf(process.getuid?.() === 0 || process.platform === 'win32')('cmdSe
     const result = await isolatedSend(true, { revoke: true });
     expect(result.status, result.stderr).toBe(1);
     expect(result.stderr).toContain('allowArbitraryMention permission revoked before provider effect');
+    expect(result.stdout).not.toContain('CAPTURE_MESSAGE=');
+    expect(result.challenges).toBeGreaterThan(1);
+  }, 40_000);
+
+  it('refuses when the owning app changes between proof and pre-effect revalidation', async () => {
+    const result = await isolatedSend(true, { shiftAppOnRevalidation: true });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain('managed origin changed before provider effect');
     expect(result.stdout).not.toContain('CAPTURE_MESSAGE=');
     expect(result.challenges).toBeGreaterThan(1);
   }, 40_000);
