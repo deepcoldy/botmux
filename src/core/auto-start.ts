@@ -10,12 +10,13 @@
  * I/O (member lookup, session spawn, event subscription) lives in the
  * dispatcher / daemon and calls into these predicates.
  */
+import { t, type Locale } from '../i18n/index.js';
 
 /** Per-bot auto-start preferences, resolved from BotConfig. */
 export interface AutoStartPrefs {
   /** 场景①: auto-start when the bot is added to a new chat. */
   autoStartOnGroupJoin: boolean;
-  /** 场景①: optional pre-configured first-turn prompt. '' = empty user_message. */
+  /** 场景①: optional first-turn prompt. Blank uses the built-in join task. */
   autoStartOnGroupJoinPrompt: string;
   /** 场景②: auto-start on every new topic in a topic group (no @ required). */
   autoStartOnNewTopic: boolean;
@@ -74,13 +75,13 @@ export function chatHasAllowedUser(
 
 /**
  * 场景①: resolve the first-turn prompt body from the configured prompt.
- * Trims whitespace; an unset / blank config yields '' (empty user_message,
- * per D8 — the model reads the group context itself). The surrounding prompt
- * envelope (role / identity) is added by buildNewTopicPrompt, so '' here still
- * produces a non-empty CLI turn (FR-11).
+ * Trims a configured task; an unset / blank config uses a localized task that
+ * asks the model to inspect the group context and greet the chat when idle.
+ * Routing / identity context alone is not a task: the prompt envelope tells
+ * agents to act on user_message, so that body must not be empty on group join.
  */
-export function resolveGroupJoinPrompt(configured: string | undefined): string {
-  return (configured ?? '').trim();
+export function resolveGroupJoinPrompt(configured: string | undefined, locale?: Locale): string {
+  return configured?.trim() || t('daemon.auto_start_join_prompt', undefined, locale);
 }
 
 /**

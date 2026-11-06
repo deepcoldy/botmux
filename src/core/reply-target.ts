@@ -96,6 +96,14 @@ export function replyTargetKey(target: FrozenSessionReplyTarget): string {
     : `${target.mode}:${target.rootMessageId}`;
 }
 
+/** Lark chat ids (`oc_…`) are never a valid reply/thread root. Chat-scope
+ * card buttons carry the chat id as their `root_id`; letting one through as a
+ * reply root freezes `{ mode: 'thread', rootMessageId: oc_… }` and every later
+ * rootless post fails with 230001 (invalid message_id). Treat it as "no root". */
+function isLarkChatId(id: string | undefined): id is string {
+  return !!id && id.startsWith('oc_');
+}
+
 /** Freeze the visible Lark destination for one inbound turn before any
  * lifecycle mutation can replace or remove its session. `replyRootId` is
  * supplied only for a real chat-scope thread fold-back; quote-only turns keep
@@ -108,7 +116,7 @@ export function resolveInboundReplyTarget(args: {
   quoteOnly?: boolean;
 }): SessionReplyTarget {
   if (args.scope === 'chat') {
-    if (args.replyRootId) {
+    if (args.replyRootId && !isLarkChatId(args.replyRootId)) {
       return args.quoteOnly
         ? { mode: 'quote', rootMessageId: args.replyRootId }
         : { mode: 'thread', rootMessageId: args.replyRootId };
@@ -129,16 +137,29 @@ export const REPLY_TARGETS_MAX = 32;
  *  (beginReplyTargetTurn + trigger-final-suppression's inheritTriggerReplyAnchor)
  *  MUST route eviction through here so a pruned sibling can never silently
  *  under-count a turn's participant window — `botmux send` compares the returned
- *  watermark against the turn window to decide incompleteness. */
+ *  watermark against the turn window to decide incompleteness.
+ *
+ *  `pinnedTurnIds` lists turns whose routing record a LIVE built-in CronCreate
+ *  task still reports into (see {@link cronPinnedTurnIds}): those entries are
+ *  exempt from eviction even past REPLY_TARGETS_MAX, otherwise a task created
+ *  in topic A loses its replyTargets record after 32 newer turns and its next
+ *  scheduled fire falls back to the group top level — no restart required. */
 export function pruneReplyTargets(
   targets: Record<string, ReplyTargetEntry>,
   prevPrunedThrough: string | undefined,
+  pinnedTurnIds: ReadonlySet<string> = EMPTY_PINNED_SET,
 ): string | undefined {
   const keys = Object.keys(targets);
   if (keys.length <= REPLY_TARGETS_MAX) return prevPrunedThrough;
-  const evict = keys
-    .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
-    .slice(0, keys.length - REPLY_TARGETS_MAX);
+  // Pinned entries survive regardless of the bound; only unpinned records are
+  // eviction candidates and they are merely brought DOWN to REPLY_TARGETS_MAX
+  // (pinned ones are extra slots, so a session with P live cron tasks may hold
+  // up to 32 + P records).
+  const unpinned = keys
+    .filter(k => !pinnedTurnIds.has(k))
+    .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1));
+  const overflow = unpinned.length - REPLY_TARGETS_MAX;
+  const evict = overflow > 0 ? unpinned.slice(0, overflow) : [];
   let watermark = prevPrunedThrough;
   for (const k of evict) {
     const ts = targets[k].updatedAt;
@@ -148,10 +169,122 @@ export function pruneReplyTargets(
   return watermark;
 }
 
+const EMPTY_PINNED_SET: ReadonlySet<string> = new Set();
+
+/** Mirrors the worker's built-in CronCreate task → create-time Lark turnId
+ *  map on the DAEMON side, persisted with the session. The worker knows which
+ *  topic each task reports into only as a turnId; the daemon owns the
+ *  turnId → visible-target resolution via `replyTargets`. A task with
+ *  turnId null was created from a local-terminal turn (nothing to pin). */
+export interface CronTaskReplyAnchor {
+  turnId: string | null;
+  createdAtMs: number;
+}
+
+/** Same bound as the worker's durable anchor store. CronCreate jobs expire
+ *  after 7 days; oldest entries shed first. */
+export const CRON_TASK_ANCHORS_MAX = 64;
+
+/** The set of replyTargets turnIds currently referenced by a LIVE cron task.
+ *  Pruning must not evict these or a later scheduled fire loses its topic. */
+export function cronPinnedTurnIds(
+  anchors: Record<string, CronTaskReplyAnchor> | undefined,
+): Set<string> {
+  const pinned = new Set<string>();
+  if (!anchors) return pinned;
+  for (const rec of Object.values(anchors)) {
+    if (rec && typeof rec.turnId === 'string' && rec.turnId) pinned.add(rec.turnId);
+  }
+  return pinned;
+}
+
+/** Apply a worker full-snapshot sync of its task→turnId map. The worker is the
+ *  authority: tasks absent from its snapshot have been shed there too. A
+ *  task already known keeps its original createdAtMs so FIFO eviction order is
+ *  stable across re-attaches; new tasks stamp `nowMs`. Returns the next record
+ *  (bounded oldest-first) plus the distinct pinned-turn set for callers that
+ *  need to re-run prune with the new exemptions. */
+export function reconcileCronTaskReplyAnchors(
+  current: Record<string, CronTaskReplyAnchor> | undefined,
+  incoming: ReadonlyArray<{ taskId: string; turnId: string | null }>,
+  nowMs = Date.now(),
+): { anchors: Record<string, CronTaskReplyAnchor>; pinned: Set<string> } {
+  const merged: Record<string, CronTaskReplyAnchor> = {};
+  for (const { taskId, turnId } of incoming) {
+    if (!taskId) continue;
+    merged[taskId] = {
+      turnId,
+      createdAtMs: current?.[taskId]?.createdAtMs ?? nowMs,
+    };
+  }
+  const ordered = Object.entries(merged)
+    .sort((a, b) => a[1].createdAtMs - b[1].createdAtMs);
+  const bounded = ordered.length > CRON_TASK_ANCHORS_MAX
+    ? ordered.slice(ordered.length - CRON_TASK_ANCHORS_MAX)
+    : ordered;
+  const anchors = Object.fromEntries(bounded);
+  return { anchors, pinned: cronPinnedTurnIds(anchors) };
+}
+
 
 export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
   turnId: string;
   updatedAt?: string;
+}
+
+/** Whether `turnId`'s per-turn registry entry may authenticate schedule /
+ * workflow mutations as a human caller. Shared by the daemon
+ * (scheduleCallerForTurn) and the CLI-side provenance resolver so both enforce
+ * ONE rule:
+ * - `om_` turns are real Lark messages — the daemon writes their entry at turn
+ *   begin with the real sender;
+ * - `join_<uuid>` is the daemon-minted auto-start-on-join first turn — its
+ *   entry is written at session birth with the operator who added the bot;
+ * - recovery-minted continuations are excluded STRUCTURALLY, never by prefix:
+ *   ordinary auto-recovery clones the original entry under a new turn id
+ *   (ordinaryTurnRecovery.currentTurnId ≠ logicalTurnId), failed-turn recovery
+ *   re-dispatches as failedTurnRecovery.turnId, and readonly task continuation
+ *   clones the same way (readonlyTaskContinuation.currentTurnId ≠
+ *   logicalTurnId). A copied identity is not a new human request —
+ *   user-triggered retry included (fail-closed until a maintainer decides
+ *   explicit retry should re-authenticate). The `!== logicalTurnId` half is
+ *   load-bearing in all three: an ARMED-but-not-yet-continued recovery state
+ *   keeps logicalTurnId === currentTurnId on the live turn;
+ * - every other synthetic mint (trg_, bmx-*, …) is refused here regardless of
+ *   what its registry entry carries. */
+/** Whether `turnId` names a turn a human message opened (`om_…` inbound
+ *  message, `join_…` auto-start join). Every synthetic turn — `schedule:…`,
+ *  `trg_…`, `board:…`, `workflow-event:…` — has no human behind it. */
+export function isHumanInboundTurnId(turnId: string | undefined): boolean {
+  return typeof turnId === 'string' && (turnId.startsWith('om_') || turnId.startsWith('join_'));
+}
+
+export function registryTurnMayAuthenticateHuman(
+  s: {
+    ordinaryTurnRecovery?: { logicalTurnId: string; currentTurnId: string };
+    failedTurnRecovery?: { turnId: string };
+    readonlyTaskContinuation?: { logicalTurnId: string; currentTurnId: string };
+  },
+  turnId: string,
+): boolean {
+  if (!isHumanInboundTurnId(turnId)) return false;
+  const ordinary = s.ordinaryTurnRecovery;
+  if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
+  if (s.failedTurnRecovery?.turnId === turnId) return false;
+  const readonly = s.readonlyTaskContinuation;
+  if (readonly && readonly.currentTurnId === turnId && turnId !== readonly.logicalTurnId) return false;
+  return true;
+}
+
+/** Whether a per-turn registry entry proves a human opened its turn — the same
+ * rule dispatchCallerFromReply applies daemon-side: the sender must appear in
+ * the turn's own participant window as a non-bot. Entries predating the
+ * participant window (or written without it) fail closed. */
+export function registryEntryProvesHumanSender(
+  entry: Pick<ReplyTargetEntry, 'senderOpenId' | 'participants'> | undefined,
+): entry is ReplyTargetEntry & { senderOpenId: string } {
+  const sender = entry?.senderOpenId;
+  return !!sender && !!entry?.participants?.some(p => p.openId === sender && p.isBot === false);
 }
 
 /** Reply context for one exact turn. The per-turn entry is authoritative. Old
@@ -218,13 +351,13 @@ export function resolveSessionReplyTarget(
     // Exact per-turn anchor first: survives a later turn overwriting the
     // single slot while this turn is still executing/queued.
     const turnEntry = turnId ? ds.session.replyTargets?.[turnId] : undefined;
-    if (turnEntry?.rootMessageId) {
+    if (turnEntry?.rootMessageId && !isLarkChatId(turnEntry.rootMessageId)) {
       return turnEntry.quoteOnly
         ? { mode: 'quote', rootMessageId: turnEntry.rootMessageId }
         : { mode: 'thread', rootMessageId: turnEntry.rootMessageId };
     }
     const target = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
-    if (target?.rootMessageId && !!turnId && target.turnId === turnId) {
+    if (target?.rootMessageId && !isLarkChatId(target.rootMessageId) && !!turnId && target.turnId === turnId) {
       return target.quoteOnly
         ? { mode: 'quote', rootMessageId: target.rootMessageId }
         : { mode: 'thread', rootMessageId: target.rootMessageId };
@@ -258,13 +391,53 @@ export function resolveSendTarget(opts: {
   return { mode: 'thread', rootMessageId: opts.rootMessageId };
 }
 
+let finalOutputOriginRecorder: ((ds: DaemonSession, turnId: string, context: FrozenSessionReplyContext) => void) | undefined;
+const TURN_REPLY_CONTEXTS_MAX = 256;
+
+export function setFinalOutputOriginRecorder(recorder: typeof finalOutputOriginRecorder): void {
+  finalOutputOriginRecorder = recorder;
+}
+
+/** Copy only the exact prior turn's destination, never its execution identity.
+ * The returned rollback must run synchronously on dispatch refusal, before any
+ * await. Restore evicted entries too; deleting only the new turn loses history.
+ * The caller must persist the restored row because fork may have written it. */
+export function inheritTurnReplyRouting(ds: DaemonSession, sourceTurnId: string | undefined, turnId: string): () => void {
+  if (!sourceTurnId) return () => {};
+  const previous = structuredClone({
+    turnReplyContexts: ds.session.turnReplyContexts,
+    replyTargets: ds.session.replyTargets,
+    replyTargetsPrunedThrough: ds.session.replyTargetsPrunedThrough,
+  });
+  const prior = pickTurnReplyTarget(ds.session, sourceTurnId);
+  const context = frozenReplyContextForTurn(ds, sourceTurnId);
+  ds.session.turnReplyContexts = { ...ds.session.turnReplyContexts,
+    [turnId]: { target: structuredClone(context.target),
+      ...(context.quoteTargetId ? { quoteTargetId: context.quoteTargetId } : {}) } };
+  for (const stale of Object.keys(ds.session.turnReplyContexts).slice(0,
+    Math.max(0, Object.keys(ds.session.turnReplyContexts).length - TURN_REPLY_CONTEXTS_MAX))) {
+    delete ds.session.turnReplyContexts[stale];
+  }
+  const targets = { ...ds.session.replyTargets, [turnId]: {
+    ...(context.target.mode !== 'plain' ? { rootMessageId: context.target.rootMessageId } : {}),
+    ...(context.target.mode === 'quote' ? { quoteOnly: true } : {}),
+    ...(prior?.substitute ? { substitute: true } : {}),
+    updatedAt: new Date().toISOString(),
+  } };
+  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets,
+    ds.session.replyTargetsPrunedThrough, cronPinnedTurnIds(ds.session.cronTaskReplyAnchors));
+  ds.session.replyTargets = targets;
+  return () => { Object.assign(ds.session, previous); };
+}
+
 export function beginReplyTargetTurn(
   ds: DaemonSession,
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string },
 ): void {
+  if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
   // mention-back participant record below; both are written per turn.
@@ -280,6 +453,14 @@ export function beginReplyTargetTurn(
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
+    ...(opts?.senderOpenId && (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1' || ds.initConfig?.finalOutputHandoff?.admitNew)
+      ? { requesterOpenId: opts.senderOpenId,
+          ...(opts.participants?.some(p => p.openId === opts.senderOpenId)
+            ? { requesterIsBot: opts.participants.find(p => p.openId === opts.senderOpenId)!.isBot }
+            : ds.session.quoteTargetSenderOpenId === opts.senderOpenId && ds.session.quoteTargetSenderIsBot !== undefined
+              ? { requesterIsBot: ds.session.quoteTargetSenderIsBot } : {}) } : {}),
+    ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
+      ? { sourceMessageId: opts.sourceMessageId } : {}),
     ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
     ...(ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
@@ -295,7 +476,10 @@ export function beginReplyTargetTurn(
       ? { inThread: opts.inThread }
       : {}),
   };
-  const overflow = Object.keys(exactContexts).length - 256;
+  // The output owner records the authenticated origin before bounded UI
+  // projections can prune it. Failure prevents admission, not a forged ACK.
+  finalOutputOriginRecorder?.(ds, turnId, exactContexts[turnId]);
+  const overflow = Object.keys(exactContexts).length - TURN_REPLY_CONTEXTS_MAX;
   if (overflow > 0) {
     for (const staleTurnId of Object.keys(exactContexts).slice(0, overflow)) {
       delete exactContexts[staleTurnId];
@@ -324,7 +508,11 @@ export function beginReplyTargetTurn(
     ...(opts?.participants?.length ? { participants: dedupeParticipants(opts.participants) } : {}),
     ...(opts?.participantsIncomplete ? { participantsIncomplete: true } : {}),
   };
-  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets, ds.session.replyTargetsPrunedThrough);
+  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(
+    targets,
+    ds.session.replyTargetsPrunedThrough,
+    cronPinnedTurnIds(ds.session.cronTaskReplyAnchors),
+  );
   ds.session.replyTargets = targets;
 
   if (ds.scope !== 'chat') return;
@@ -369,6 +557,11 @@ export function frozenReplyContextForTurn(
   turnId?: string,
 ): FrozenSessionReplyContext {
   const frozen = turnId ? ds.session.turnReplyContexts?.[turnId] : undefined;
+  // Heal contexts persisted before chat ids were rejected as reply roots.
+  if (frozen && ds.scope === 'chat' && frozen.target.mode !== 'plain'
+    && isLarkChatId(frozen.target.rootMessageId)) {
+    return { ...frozen, target: { mode: 'plain', chatId: ds.chatId } };
+  }
   return frozen ?? { target: resolveSessionReplyTarget(ds, turnId) };
 }
 

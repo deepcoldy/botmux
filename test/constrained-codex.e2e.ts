@@ -8,6 +8,7 @@ import { runIsolatedCodex, isolatedCatalog, isolatedInvocationEnv } from '../src
 import { CONSTRAINED_CODEX_CONFIG } from '../src/services/constrained-invocation/codex-profile.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import type { InvocationRequest } from '../src/services/constrained-invocation/contract.js';
+import { completionResponse, parseChatRequest, toInvocation } from '../src/services/model-proxy/protocol.js';
 
 // Opt-in real Codex, fake provider, synthetic input, no auth and no IM traffic.
 const executable = process.env.BOTMUX_CONSTRAINED_CODEX;
@@ -62,10 +63,11 @@ async function harness(reply: (body: any, index: number) => any, model = 'gpt-5.
   const catalogPath = join(root, 'models.json');
   writeFileSync(catalogPath, JSON.stringify(catalog));
   writeFileSync(join(root, 'codex', 'config.toml'), `model_catalog_json=${JSON.stringify(catalogPath)}\nmodel_provider="fixture"\n${CONSTRAINED_CODEX_CONFIG}\n[model_providers.fixture]\nname="fixture"\nbase_url="http://127.0.0.1:${address.port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n`);
-  const run = (prompt: string, signal = AbortSignal.timeout(15_000)) => runIsolatedCodex({ requestId: 'fixture', prompt, model, deadlineMs: 15_000, outputSchema: schema } as InvocationRequest, {
+  const runInvocation = (request: InvocationRequest, signal = AbortSignal.timeout(request.deadlineMs)) => runIsolatedCodex(request, {
     executable: executable!, cwd: join(root, 'work'), env: isolatedInvocationEnv(join(root, 'home'), join(root, 'codex'), { PATH: process.env.PATH, NO_PROXY: '127.0.0.1' }),
   }, signal);
-  return { run, requests, root };
+  const run = (prompt: string, signal = AbortSignal.timeout(15_000)) => runInvocation({ requestId: 'fixture', prompt, model, deadlineMs: 15_000, outputSchema: schema }, signal);
+  return { run, runInvocation, requests, root };
 }
 const assistant = (value: unknown) => ({ type: 'message', role: 'assistant', id: 'fixture-final', content: [{ type: 'output_text', text: JSON.stringify(value) }] });
 
@@ -110,6 +112,50 @@ it.skipIf(!executable)('external tool proposal roundtrip is schema valid and con
   const second = await h.run(`Prior proposal: ${JSON.stringify(first.output)}\nTOOL_RESULT=${toolResult}`);
   expect(second.output).toEqual({ content: '42', tool_calls: [] });
   expect(second.usage?.inputTokens).toBe(10); // fresh native thread, no prior total
+  expect(h.requests.every(request => request.tools.length === 0)).toBe(true);
+});
+
+it.skipIf(!executable)('preserves twenty external tool proposals and replays every result through real Codex', async () => {
+  const proposals = Array.from({ length: 20 }, (_, left) => ({ name: 'add', arguments: JSON.stringify({ left, right: 1 }) }));
+  const chats: any[] = [];
+  const h = await harness(body => {
+    const text = body.input.flatMap((m: any) => m.content ?? []).find((c: any) => c.text?.includes('CHAT_REQUEST_JSON:\n'))?.text;
+    const chat = JSON.parse(text.split('CHAT_REQUEST_JSON:\n')[1]); chats.push(chat);
+    const results = chat.messages.filter((m: any) => m.role === 'tool');
+    return assistant(results.length ? { content: results.map((m: any) => m.content).join(', '), tool_calls: [] }
+      : { content: '', tool_calls: proposals });
+  });
+  const route = { bot: 'fixture', model: 'gpt-5.5', deadlineMs: 15_000 };
+  const firstRequest = parseChatRequest({
+    model: 'reasoner', messages: [{ role: 'user', content: 'Add 1 to each integer from 0 through 19.' }],
+    tools: [{ type: 'function', function: { name: 'add', parameters: {
+      type: 'object', properties: { left: { type: 'integer' }, right: { type: 'integer' } }, required: ['left', 'right'],
+    } } }], tool_choice: 'required',
+  });
+  const firstInvocation = toInvocation(firstRequest, route, 'twenty-proposals');
+  const first = completionResponse(firstRequest, {
+    ...await h.runInvocation(firstInvocation), requestId: firstInvocation.requestId, state: 'completed',
+    error: null, startedAt: new Date().toISOString(), durationMs: 1,
+  });
+  const message = first.choices[0].message;
+  const calls = message.tool_calls!;
+  expect(calls.map(call => call.function)).toEqual(proposals);
+  expect(new Set(calls.map(call => call.id)).size).toBe(20);
+  const toolResults = calls.map(call => {
+    const args = JSON.parse(call.function.arguments);
+    return { role: 'tool', tool_call_id: call.id, content: String(args.left + args.right) };
+  });
+  const secondRequest = parseChatRequest({ ...firstRequest, tool_choice: 'none', parallel_tool_calls: false,
+    messages: [...firstRequest.messages, message, ...toolResults] });
+  const secondInvocation = toInvocation(secondRequest, route, 'twenty-results');
+  const second = completionResponse(secondRequest, {
+    ...await h.runInvocation(secondInvocation), requestId: secondInvocation.requestId, state: 'completed',
+    error: null, startedAt: new Date().toISOString(), durationMs: 1,
+  });
+  expect(second.choices[0].message.content).toBe(Array.from({ length: 20 }, (_, i) => String(i + 1)).join(', '));
+  expect(second.choices[0].finish_reason).toBe('stop');
+  expect(chats[1].messages).toEqual(secondRequest.messages);
+  expect(h.requests).toHaveLength(2);
   expect(h.requests.every(request => request.tools.length === 0)).toBe(true);
 });
 

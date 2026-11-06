@@ -24,10 +24,16 @@
  * separator is `-`/space/emoji (`@Claude-Code`) the short name's lookahead would
  * otherwise pass and win, @-ing the wrong target and footer-mismatching.
  *
+ * Markdown code (inline spans and fenced blocks, see `codeSpanRanges`) is left
+ * verbatim: an `@Name` quoted in code is an example, not a mention, and the
+ * prose scanner already ignores it when deciding whom to auto-mention.
+ *
  * This replaces the previous `@(name)\b` matcher whose `\b` word boundary never
  * matched after a CJK character — pure-Chinese display names (`@张三`) silently
  * fell through to the footer and never rendered inline.
  */
+import { codeSpanRanges } from '../../utils/markdown-code.js';
+
 export interface NamedMention {
   open_id: string;
   name: string;
@@ -51,7 +57,7 @@ export function applyInlineMentions(
 ): InlineMentionResult {
   const usedIds = new Set<string>();
   const named = mentions.filter(m => m.name);
-  if (named.length === 0) return { text, usedIds };
+  if (named.length === 0 || !text.includes('@')) return { text, usedIds };
 
   // Lowercased lookup map; the `i` flag means the matched text may differ in
   // case from the registered name.
@@ -69,7 +75,13 @@ export function applyInlineMentions(
     'giu',
   );
 
-  const out = text.replace(pattern, (full: string, name: string) => {
+  // Match the whole text and drop any match that touches code. Code ranges
+  // start and end on a backtick/tilde, which neither boundary assertion treats
+  // as a word char, so this equals matching each prose segment on its own.
+  const code = codeSpanRanges(text);
+  const touchesCode = (from: number, to: number) => code.some(([start, end]) => from < end && to > start);
+  const out = text.replace(pattern, (full: string, name: string, offset: number) => {
+    if (touchesCode(offset, offset + full.length)) return full;
     const openId = map.get(name.toLowerCase());
     if (!openId) return full;
     usedIds.add(openId);

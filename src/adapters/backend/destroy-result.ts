@@ -49,18 +49,6 @@ export function normalizeDestroyResult(
 }
 
 /**
- * Is the close itself retryable — i.e. did nothing irreversible happen?
- *
- * This is the CLOSE-side question only. It must never be used to decide whether
- * writes may be admitted again; see mayRestoreWriteAdmission for why the two
- * answers legitimately differ.
- */
-export function mayRetryClose(result: SessionDestroyResult): boolean {
-  if (result.ok) return false;
-  return (result.recovery ?? 'retryable') !== 'irreversible';
-}
-
-/**
  * May a FAILED prepare restore write admission?
  *
  * Deliberately keyed on `admission`, NOT on `recovery`. Reading `recovery` here

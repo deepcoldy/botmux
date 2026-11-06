@@ -79,10 +79,10 @@ describe('requestAgentSessionRename', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('never sends a TUI command through the riff backend', () => {
+  it.each(['riff', 'mojo', 'remote-runner'] as const)('never sends a TUI command through the %s backend', backendType => {
     const send = vi.fn();
     const ds = makeDs({
-      session: { ...makeDs().session, backendType: 'riff' },
+      session: { ...makeDs().session, backendType },
       worker: liveWorker(send),
     });
 

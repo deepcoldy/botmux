@@ -28,11 +28,17 @@ import {
   buildSlashListCard,
   getCliDisplayName,
   frozenIdleLabel,
+  buildAdoptEntries,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
+import { excludeOwnedHerdrAdoptTargets, type AdoptableSession } from '../src/core/session-discovery.js';
+import type { ZellijAdoptableSession } from '../src/core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../src/core/orca-adopt-discovery.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
+import { resolveCliRuntime } from '../src/adapters/cli/runtime.js';
+import { configuredRuntimeDisplayName } from '../src/core/cli-runtime-display.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
 // setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
@@ -69,6 +75,30 @@ function buttonTexts(actions: any[]): string[] {
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
 }
+
+describe('Kimi-compatible CodeM runtime cards', () => {
+  it('uses the configured distribution name for waiting, streaming and closed cards', () => {
+    const runtime = resolveCliRuntime({
+      cliId: 'kimi',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: 'codem-wrapper', update: { provider: 'none' } },
+    });
+    const name = configuredRuntimeDisplayName(runtime);
+    const session = parse(buildSessionCard('session', 'root', 'https://terminal.example', 'Review', 'kimi', false, false, 'en', false, name));
+    const streaming = parse(buildStreamingCard(
+      'session', 'root', 'https://terminal.example', 'Review', '', 'idle', 'kimi',
+      'hidden', undefined, undefined, false, false, 'en', undefined, undefined, false, undefined, name,
+    ));
+    for (const card of [session, streaming]) {
+      expect(card.header.title.content).toContain('CodeM');
+      expect(card.header.title.content).not.toContain('Kimi');
+    }
+    const closed = buildSessionClosedCard('session', 'root', 'Review', 'kimi', '/work', null, 'en', name);
+    expect(closed).toContain('CodeM');
+    expect(closed).not.toContain('Kimi');
+    const plain = parse(buildSessionCard('plain', 'root', '', 'Review', 'kimi', false, false, 'en'));
+    expect(plain.header.title.content).toContain('Kimi');
+  });
+});
 
 describe('buildTuiPromptFailedCard', () => {
   it('renders an explicit red terminal state for unconfirmed TUI delivery', () => {
@@ -117,8 +147,88 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain('Pi');          // CLI name
+    expect(texts[0]).toContain('Source: 🟢 Running');
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
     expect(texts[0]).not.toContain('Session ID:');
+  });
+
+  it('uses an Orca session title as the heading while keeping its handle internal', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'orca',
+      orcaInstance: 'server',
+      orcaTerminalHandle: 'term_ea5b26db-18f8-4f88-a7f9-4af1fbe9c02f',
+      orcaPtyId: 'serve-1',
+      orcaIncarnationId: 'inc_1',
+      orcaExecutionHostId: 'local',
+      orcaWorktreeId: 'repo::/work',
+      orcaAgentIdentity: 'claude',
+      orcaTerminalTitle: '修复登录问题',
+      cliId: 'claude-code',
+      cwd: '/Users/test/botmux-adopt-orca',
+      paneCols: 100,
+      paneRows: 40,
+      paneSizeVerified: true,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).toContain('**修复登录问题**');
+    expect(text).toContain('来源: 🟢 运行中 · Orca（实验性）');
+    expect(text).not.toContain('位置:');
+    expect(text).not.toContain('term_ea5b26db');
+    const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
+    expect(container.behaviors[0].value.entry_key)
+      .toBe('live:orca:term_ea5b26db-18f8-4f88-a7f9-4af1fbe9c02f');
+  });
+
+  it('keeps underscores literal inside path and target code spans', () => {
+    const cwd = '/data00/home/test/governance_group_perception_faas-feat-aime-proxy';
+    const card = parse(buildAdoptSelectCard([{
+      source: 'tmux', tmuxTarget: 'a_b:0.0', cliPid: 42, cliId: 'traex', cwd,
+      paneCols: 100, paneRows: 40,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).toContain(`路径: \`${cwd}\``);
+    expect(text).toContain('位置: `a_b:0.0`');
+    expect(text.split('\n').find(line => line.startsWith('路径:'))).not.toContain('\\_');
+    expect(text.split('\n').find(line => line.startsWith('位置:'))).not.toContain('\\_');
+  });
+
+  it('does not expose an Orca handle when the terminal has no readable title', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'orca',
+      orcaInstance: 'relay',
+      orcaTerminalHandle: 'term_internal_uuid',
+      orcaPtyId: 'ssh:h@@pty:1',
+      orcaIncarnationId: 'inc_1',
+      orcaWorktreeId: 'repo::/work',
+      orcaAgentIdentity: 'claude',
+      cliId: 'claude-code',
+      cwd: '/Users/test/botmux-adopt-orca',
+      paneCols: 100,
+      paneRows: 40,
+      paneSizeVerified: true,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).not.toContain('位置:');
+    expect(text).not.toContain('term_internal_uuid');
+  });
+
+  it('renders a native title for a live TraeX session instead of the project directory', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'tmux',
+      tmuxTarget: 'traex:0.0',
+      cliPid: 42,
+      cliId: 'traex',
+      sessionId: 'traex-session-id',
+      title: 'Investigate rollout title metadata',
+      cwd: '/Users/test/project-dir',
+      paneCols: 120,
+      paneRows: 40,
+    }], 'om_root', 'en'));
+
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain('Investigate rollout title metadata');
+    expect(texts[0]).not.toMatch(/^\*\*project-dir\*\*/);
   });
 
   it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
@@ -130,6 +240,7 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     ));
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('Source: 🕘 History');
     expect(texts[0]).not.toContain('codex-rollout-abc123');
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
@@ -235,6 +346,270 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(md).toContain('\\[x\\]');
     expect(md).not.toContain('![x](');
   });
+
+  it('offers a clear-search button on no match that re-fires adopt_search', () => {
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'ja' }));
+    const buttons = (card.body.elements ?? []).filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].behaviors[0].value.action).toBe('adopt_search');
+    expect(buttons[0].behaviors[0].value.selected).toBe('');
+  });
+
+  const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
+    source: 'herdr',
+    herdrSessionName: 'collie',
+    herdrPaneId: 'w3:p1',
+    cliId: 'claude-code',
+    cwd: '/work/demo',
+    paneCols: 200,
+    paneRows: 50,
+    ...extra,
+  });
+
+  it('heads a titled live herdr entry with its escaped title, keeping the path and location lines', () => {
+    const titled = cardTexts(parse(buildAdoptSelectCard(
+      [herdrLive({ title: 'fix *login* _page_ [demo]' })], 'om_root', 'en',
+    )))[0]!.split('\n');
+    const untitled = cardTexts(parse(buildAdoptSelectCard([herdrLive()], 'om_root', 'en')))[0]!.split('\n');
+    expect(titled[0]).toBe('**fix \\*login\\* \\_page\\_ \\[demo\\]**');
+    expect(titled).toContain('Path: `/work/demo`');
+    expect(titled).toContain('Location: `collie:w3:p1`');
+    // Everything below the heading is identical to the untitled entry.
+    expect(titled.slice(1)).toEqual(untitled.slice(1));
+  });
+
+  it('falls back to the cwd basename for a live herdr entry without a title', () => {
+    const texts = cardTexts(parse(buildAdoptSelectCard([herdrLive()], 'om_root', 'en')));
+    expect(texts[0]!.split('\n')[0]).toBe('**demo**');
+  });
+
+  it('matches a titled live entry by a title fragment and still by its directory name', () => {
+    const titled = herdrLive({ title: '修复登录页样式' });
+    const other = herdrLive({ herdrPaneId: 'w3:p2', cwd: '/work/other' });
+    const keysFor = (searchQuery: string) => parse(buildAdoptSelectCard([titled, other], 'om_root', 'en', [], { searchQuery }))
+      .body.elements
+      .filter((e: any) => e.tag === 'interactive_container')
+      .map((e: any) => e.behaviors[0].value.entry_key);
+    expect(keysFor('登录页')).toEqual([adoptLiveKey(titled)]);
+    expect(keysFor('demo')).toEqual([adoptLiveKey(titled)]);
+  });
+
+  it('keeps tmux and zellij live entries titled by directory name', () => {
+    const tmux: AdoptableSession = {
+      source: 'tmux', tmuxTarget: 'dev:0.0', cliPid: 42, cliId: 'codex', cwd: '/work/alpha', paneCols: 80, paneRows: 24,
+    };
+    const zellij: ZellijAdoptableSession = {
+      zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid: 7, cliId: 'codex',
+      cwd: '/work/beta', paneCols: 80, paneRows: 24,
+    };
+    const texts = cardTexts(parse(buildAdoptSelectCard([tmux, zellij], 'om_root', 'en')));
+    expect(texts).toEqual([
+      ['**alpha**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/alpha`', 'Location: `dev:0.0`', 'Uptime: unknown'].join('\n'),
+      ['**beta**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/beta`', 'Location: `mywork/terminal_1`', 'Uptime: unknown'].join('\n'),
+    ]);
+  });
+
+  it('titles a zellij TraeX entry by the native title its discovery resolved', () => {
+    // zellij discovery only sets `title` for TraeX, through traexLiveTitle
+    // (botmux-origin filtered, cleaned like herdr titles).
+    const zellij: ZellijAdoptableSession = {
+      zellijSession: 'mywork', zellijPaneId: 'terminal_2', cliPid: 8, cliId: 'traex',
+      cwd: '/work/gamma', paneCols: 80, paneRows: 24, title: '回复确认收到',
+    };
+    const texts = cardTexts(parse(buildAdoptSelectCard([zellij], 'om_root', 'en')));
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.split('\n')[0]).toBe('**回复确认收到**');
+    expect(texts[0]).toContain('Path: `/work/gamma`');
+  });
+
+  describe('live herdr entries named after their tab / workspace', () => {
+    /** A herdr entry whose tab the picker's enrichment found (given name 整理笔记). */
+    const tabbed = (extra: Partial<AdoptableSession> = {}): AdoptableSession => herdrLive({
+      herdrSessionName: 'default',
+      herdrPaneId: 'w1:p2',
+      herdrTabId: 'w1:t1',
+      herdrTabLabel: '整理笔记',
+      herdrTabAutoNamed: false,
+      ...extra,
+    });
+    const defaultTab = { herdrTabLabel: '1', herdrTabAutoNamed: true };
+    const lines = (sessions: AdoptableSession[], locale: 'zh' | 'en' = 'en', resumable: any[] = []) =>
+      cardTexts(parse(buildAdoptSelectCard(sessions, 'om_root', locale, resumable))).map(text => text.split('\n'));
+    const titles = (sessions: AdoptableSession[], locale: 'zh' | 'en' = 'en') => lines(sessions, locale).map(l => l[0]);
+
+    it('alone in its tab: pane label > given tab name > native title > default tab name', () => {
+      const native = { herdrNativeTitle: '示例标题', title: '示例标题' };
+      expect([
+        tabbed({ herdrPaneLabel: '修复登录页样式', title: '修复登录页样式', herdrNativeTitle: '示例标题' }),
+        tabbed(native),
+        tabbed({ ...defaultTab, ...native }),
+        // Claude without a usable terminal title: the first prompt stands in for it.
+        tabbed({ ...defaultTab, herdrFirstPrompt: '帮我整理示例数据' }),
+        tabbed(defaultTab),
+      ].map(s => titles([s])[0])).toEqual([
+        '**修复登录页样式**',
+        '**整理笔记**',
+        '**示例标题**',
+        '**帮我整理示例数据**',
+        '**1**',
+      ]);
+    });
+
+    it('without complete tab info keeps the pre-change title (discovery title, else directory name)', () => {
+      expect(titles([herdrLive({ herdrTabId: 'w1:t1', title: '示例标题', herdrNativeTitle: '示例标题' })])).toEqual(['**示例标题**']);
+      expect(titles([herdrLive({ herdrTabId: 'w1:t1', herdrFirstPrompt: '帮我整理示例数据' })])).toEqual(['**demo**']);
+      // A label without the default-name verdict is not complete tab info either.
+      expect(titles([herdrLive({ herdrTabId: 'w1:t1', herdrTabLabel: '整理笔记' })])).toEqual(['**demo**']);
+    });
+
+    it('sharing a tab: <tab> · pane label / native title / untitled, in zh and en, default tab name included', () => {
+      const shared = [
+        tabbed({ herdrPaneId: 'w1:p1', herdrPaneLabel: '修复登录页样式', title: '修复登录页样式' }),
+        tabbed({ herdrPaneId: 'w1:p2', herdrNativeTitle: '示例标题', title: '示例标题' }),
+        tabbed({ herdrPaneId: 'w1:p3', herdrFirstPrompt: '帮我整理示例数据' }),
+        tabbed({ herdrPaneId: 'w1:p4' }),
+      ];
+      expect(titles(shared, 'zh')).toEqual([
+        '**整理笔记 · 修复登录页样式**',
+        '**整理笔记 · 示例标题**',
+        '**整理笔记 · 帮我整理示例数据**',
+        '**整理笔记 · 新会话**',
+      ]);
+      expect(titles(shared, 'en')[3]).toBe('**整理笔记 · New session**');
+      expect(titles(shared.map(s => ({ ...s, ...defaultTab })), 'en')).toEqual([
+        '**1 · 修复登录页样式**',
+        '**1 · 示例标题**',
+        '**1 · 帮我整理示例数据**',
+        '**1 · New session**',
+      ]);
+    });
+
+    it('groups only by (herdr session, tab id): the same tab id in another session or a missing tab id stays alone', () => {
+      const here = tabbed({ herdrPaneId: 'w1:p1' });
+      const otherServer = tabbed({ herdrSessionName: 'side', herdrPaneId: 'w1:p1' });
+      const noTabId = herdrLive({ herdrSessionName: 'default', herdrPaneId: 'w1:p3', cwd: '/work/other' });
+      expect(titles([here, otherServer, noTabId])).toEqual(['**整理笔记**', '**整理笔记**', '**other**']);
+    });
+
+    it('counts only the entries the card shows: an excluded owned pane does not make its tab shared', () => {
+      const mine = tabbed({ herdrPaneId: 'w1:p1', herdrAgentName: 'demo-agent' });
+      const owned = tabbed({ herdrPaneId: 'w1:p2', herdrAgentName: 'botmux-owned' });
+      expect(titles([mine, owned])).toEqual(['**整理笔记 · New session**', '**整理笔记 · New session**']);
+      const shown = excludeOwnedHerdrAdoptTargets([mine, owned], [{ sessionName: 'default', agentName: 'botmux-owned' }]);
+      expect(titles(shown)).toEqual(['**整理笔记**']);
+    });
+
+    it('cuts a long shared tab name to 30 code points so the part that tells entries apart survives', () => {
+      const longTab = '长'.repeat(80);
+      const [a, b] = buildAdoptEntries([
+        tabbed({ herdrPaneId: 'w1:p1', herdrTabLabel: longTab, herdrPaneLabel: `😀修复${'页'.repeat(70)}` }),
+        tabbed({ herdrPaneId: 'w1:p2', herdrTabLabel: longTab, herdrPaneLabel: `${'x'.repeat(45)}😀😀😀` }),
+      ], [], undefined, undefined, 'zh').map(e => e.title);
+      expect(a).not.toBe(b);
+      for (const title of [a!, b!]) {
+        const [prefix] = title.split(' · ');
+        expect(Array.from(prefix!).length).toBeLessThanOrEqual(30);
+        expect(prefix).toBe(`${'长'.repeat(29)}…`);
+        expect(Array.from(title).length).toBeLessThanOrEqual(80);
+        expect(title).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/);
+      }
+      expect(b).toBe(`${'长'.repeat(29)}… · ${'x'.repeat(45)}😀…`);
+    });
+
+    it('puts the workspace name ahead of the location (zh full-width, en half-width brackets), escaped', () => {
+      const s = tabbed({ herdrWorkspaceLabel: '示例空间' });
+      expect(lines([s], 'zh')[0]).toContain('位置: 示例空间（`default:w1:p2`）');
+      expect(lines([s], 'en')[0]).toContain('Location: 示例空间 (`default:w1:p2`)');
+      expect(lines([tabbed({ herdrWorkspaceLabel: 'demo*space_[x]' })])[0])
+        .toContain('Location: demo\\*space\\_\\[x\\] (`default:w1:p2`)');
+    });
+
+    it('keeps the location line unchanged without a workspace name', () => {
+      expect(lines([tabbed()])[0]).toContain('Location: `default:w1:p2`');
+      expect(lines([tabbed()])[0].slice(1)).toEqual(lines([herdrLive({ herdrSessionName: 'default', herdrPaneId: 'w1:p2' })])[0].slice(1));
+    });
+
+    it('finds entries by workspace name and by a tab name the title does not show', () => {
+      const named = tabbed({
+        herdrPaneId: 'w1:p1', herdrWorkspaceLabel: '示例空间', herdrPaneLabel: '修复登录页样式', title: '修复登录页样式',
+      });
+      const other = herdrLive({ herdrSessionName: 'default', herdrPaneId: 'w2:p1', cwd: '/work/other' });
+      const keysFor = (searchQuery: string) => parse(buildAdoptSelectCard([named, other], 'om_root', 'en', [], { searchQuery }))
+        .body.elements
+        .filter((e: any) => e.tag === 'interactive_container')
+        .map((e: any) => e.behaviors[0].value.entry_key);
+      expect(titles([named])).toEqual(['**修复登录页样式**']);
+      expect(keysFor('示例空间')).toEqual([adoptLiveKey(named)]);
+      expect(keysFor('整理笔记')).toEqual([adoptLiveKey(named)]);
+    });
+
+    it('leaves tmux, zellij and history entries byte-identical beside a named herdr entry', () => {
+      const tmux: AdoptableSession = {
+        source: 'tmux', tmuxTarget: 'dev:0.0', cliPid: 42, cliId: 'codex', cwd: '/work/alpha', paneCols: 80, paneRows: 24,
+      };
+      const zellij: ZellijAdoptableSession = {
+        zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid: 7, cliId: 'codex',
+        cwd: '/work/beta', paneCols: 80, paneRows: 24,
+      };
+      const history = [
+        { cliSessionId: 'h1', cwd: '/work/gamma', title: '示例会话', lastActivityAt: 1 },
+        { cliSessionId: 'h2', cwd: '/work/delta', title: 'old task', lastActivityAt: 2 },
+      ];
+      const named = tabbed({ herdrWorkspaceLabel: '示例空间', herdrPaneLabel: '修复登录页样式' });
+      for (const locale of ['zh', 'en'] as const) {
+        const without = lines([tmux, zellij as any], locale, history);
+        const withHerdr = lines([named, tmux, zellij as any], locale, history);
+        expect(withHerdr).toHaveLength(5);
+        expect(withHerdr.slice(1)).toEqual(without);
+      }
+    });
+
+    it('leaves an Orca entry as it renders alone and keeps it out of herdr tab groups', () => {
+      const orca: OrcaAdoptableSession = {
+        source: 'orca',
+        orcaInstance: 'server',
+        orcaTerminalHandle: 'term_demo',
+        orcaWorktreeId: 'repo::/work',
+        orcaAgentIdentity: 'claude',
+        orcaTerminalTitle: '整理示例数据',
+        cliId: 'claude-code',
+        cwd: '/work/orca',
+        paneCols: 100,
+        paneRows: 40,
+        paneSizeVerified: true,
+      };
+      const shared = [
+        tabbed({ herdrPaneId: 'w1:p1', herdrWorkspaceLabel: '示例空间', herdrPaneLabel: '修复登录页样式' }),
+        tabbed({ herdrPaneId: 'w1:p2', herdrWorkspaceLabel: '示例空间' }),
+      ];
+      // Alone in a tab it was given a name: the tab name, not `<tab> · …`.
+      const solo = tabbed({ herdrPaneId: 'w1:p3', herdrTabId: 'w1:t2', herdrTabLabel: '示例分组' });
+      const mixed = [shared[0]!, orca as any, shared[1]!, solo];
+      const keysFor = (searchQuery: string) => parse(buildAdoptSelectCard(mixed, 'om_root', 'en', [], { searchQuery }))
+        .body.elements
+        .filter((e: any) => e.tag === 'interactive_container')
+        .map((e: any) => e.behaviors[0].value.entry_key);
+
+      for (const locale of ['zh', 'en'] as const) {
+        const rendered = lines(mixed, locale);
+        expect(rendered[1]).toEqual(lines([orca as any], locale)[0]);
+        expect(rendered[1]![0]).toBe('**整理示例数据**');
+        expect(rendered[1]!.some(l => l.startsWith(locale === 'zh' ? '位置:' : 'Location:'))).toBe(false);
+      }
+      const en = lines(mixed, 'en');
+      expect([en[0]![0], en[2]![0], en[3]![0]]).toEqual([
+        '**整理笔记 · 修复登录页样式**',
+        '**整理笔记 · New session**',
+        '**示例分组**',
+      ]);
+      expect(en[0]).toContain('Location: 示例空间 (`default:w1:p1`)');
+      // Workspace / tab names find only the herdr entries; the Orca title finds only Orca.
+      expect(keysFor('示例空间')).toEqual([adoptLiveKey(shared[0]!), adoptLiveKey(shared[1]!)]);
+      expect(keysFor('整理笔记')).toEqual([adoptLiveKey(shared[0]!), adoptLiveKey(shared[1]!)]);
+      expect(keysFor('整理示例数据')).toEqual([adoptLiveKey(orca as any)]);
+    });
+  });
 });
 
 describe('adoptLiveKey (synthetic confirm key)', () => {
@@ -331,10 +706,6 @@ describe('getCliDisplayName', () => {
 
   it('should return "Codex" for codex', () => {
     expect(getCliDisplayName('codex')).toBe('Codex');
-  });
-
-  it('should return "Gemini" for gemini', () => {
-    expect(getCliDisplayName('gemini')).toBe('Gemini');
   });
 
   it('should return "OpenCode" for opencode', () => {
@@ -437,6 +808,72 @@ describe('buildConfigCard', () => {
         { key: 'p2pOpen', on: true },
       ],
     });
+
+  it('offers the reasoning-effort selector when the bot CLI supports it', () => {
+    const without = parse(buildConfigCard(configData(null), 'zh'));
+    expect(allActions(without).some((a: any) => a.value?.field === 'reasoningEffort')).toBe(false);
+
+    const card = parse(buildConfigCard({
+      ...configData(null), reasoningEfforts: ['low', 'high', 'max'], reasoningEffort: 'max',
+    }, 'zh'));
+    const select = allActions(card).find((a: any) => a.value?.field === 'reasoningEffort');
+    expect(select).toBeTruthy();
+    expect(select.value).toMatchObject({ action: 'config_set', field: 'reasoningEffort' });
+    // Sentinel first = "clear and follow the CLI/model default".
+    expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', 'low', 'high', 'max']);
+    expect(select.initial_option).toBe('max');
+  });
+
+  it('shows the shared-bot sandbox advice only when the data carries it, as short lines plus a folded CLI list', () => {
+    const texts = (card: any) => JSON.stringify(card.elements ?? card.body?.elements ?? card);
+    const plain = parse(buildConfigCard(configData(null), 'zh'));
+    // CLI display names legitimately appear in the CLI dropdown; the advice
+    // block has its own markers that must be absent without sandboxAdvice.
+    expect(texts(plain)).not.toContain('建议开启白名单隔离');
+    expect(texts(plain)).not.toContain('已验证可用的 CLI');
+
+    const card = (cliSupport: 'verified' | 'unverified' | 'unsupported' | 'wrapper' | 'blocked', cliId: string, reasons: string[] = ['oncall']) =>
+      parse(buildConfigCard({ ...configData(null), sandboxAdvice: { reasons, cliSupport, cliId } }, 'zh'));
+    const elementsOf = (c: any): any[] => c.elements ?? c.body?.elements ?? [];
+    const adviceBlock = (c: any) => elementsOf(c).find((e: any) => e.tag === 'markdown' && String(e.content).includes('建议开启白名单隔离'));
+    const fold = (c: any) => elementsOf(c).find((e: any) => e.tag === 'collapsible_panel');
+
+    const verified = card('verified', 'codex', ['oncall', 'allowedUsers']);
+    // One fact per line: headline, why, the reasons, where to turn it on, the current CLI.
+    expect(String(adviceBlock(verified).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式、allowedUsers 有多人',
+      '开启：Dashboard → Bot 配置 → 文件沙盒，新会话生效',
+      '当前 CLI：Codex，已验证可用',
+    ]);
+    // The verified list sits in a folded panel, not in the advice text.
+    // Literal list, not derived from the table: it must be the matrix result in table order.
+    expect(fold(verified).expanded).toBe(false);
+    expect(fold(verified).header.title.content).toBe('已验证可用的 CLI（Linux 实测）');
+    expect(fold(verified).elements[0].content).toBe('Claude、Codex、Antigravity、OpenCode、Pi、Oh My Pi、Grok Build、Kimi');
+    expect(String(adviceBlock(verified).content)).not.toContain('Grok Build');
+
+    // Each support state gets its own CLI line; the dynamic keys resolve to text.
+    const cliLine = (c: any) => String(adviceBlock(c).content).split('\n').at(-1);
+    expect(cliLine(card('unsupported', 'codex-app'))).toBe('当前 CLI：Codex App，暂不支持白名单隔离，请改用 Codex');
+    expect(cliLine(card('unverified', 'relay'))).toBe('当前 CLI：Relay，还没验证过，开启前先在测试会话里试一下');
+    expect(cliLine(card('wrapper', 'claude-code'))).toBe('当前 CLI：Claude，通过 wrapper 启动。开启白名单隔离后 wrapper 仍在沙盒内运行；若 wrapper 依赖的路径不在白名单内会明确报错拒绝启动，把这些路径加进沙盒白名单（只读/读写）即可');
+    expect(String(adviceBlock(card('verified', 'codex', ['allowedChatGroups'])).content)).toContain('原因：allowedChatGroups 授权了整群发言');
+    expect(texts(card('wrapper', 'claude-code'))).not.toContain('card.config.sandbox_advice');
+
+    // A local-but-sandbox-refusing backend (herdr/zellij/zmx/orca): no "turn it
+    // on" action line and no verified-list fold — they would brick sessions.
+    const backendBlocked = card('blocked', 'claude-code');
+    expect(String(adviceBlock(backendBlocked).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式',
+      '当前会话后端不支持文件沙盒（开启后新会话会起不来）；请先把后端切换为 tmux 或 pty，再回来开启',
+    ]);
+    expect(fold(backendBlocked)).toBeUndefined();
+    expect(String(adviceBlock(backendBlocked).content)).not.toContain('开启：Dashboard');
+  });
 
   it('renders card-behaviour toggles', () => {
     const card = parse(buildConfigCard(configData(null), 'en'));
@@ -755,16 +1192,16 @@ describe('buildSessionCard', () => {
 
     it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'mimocode', false, false, 'en', true));
       const actions = findActions(card);
       const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
-      expect(btn?.value.cli_id).toBe('gemini');
-      expect(btn?.text.content).toBe('💻 Open Gemini');
+      expect(btn?.value.cli_id).toBe('mimocode');
+      expect(btn?.text.content).toBe('💻 Open MiMoCode');
     });
 
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
       enableLocalCliOpen();
-      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
+      for (const cli of ['codex-app', 'mimocode', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
         expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
@@ -814,11 +1251,11 @@ describe('buildSessionCard', () => {
     });
 
     it('should include restart button with CLI display name', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'opencode', true));
       const actions = findActions(card);
       const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
       expect(restartBtn).toBeDefined();
-      expect(restartBtn.text.content).toContain('Gemini');
+      expect(restartBtn.text.content).toContain('OpenCode');
       expect(restartBtn.value.root_id).toBe(ROOT);
       expect(restartBtn.value.session_id).toBe(SID);
     });
@@ -983,15 +1420,14 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+    it('idle + silentIdle flag renders the silent turn terminal receipt', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, true,
       ));
       expect(card.header.template).toBe('green');
-      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
-      expect(card.header.title.content).not.toContain('等待输入');
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
@@ -1003,27 +1439,25 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('工作中');
     });
 
-    // transcript 模式：最终回复卡已投递 → idle 卡头「已完成」。颜色沿用 idle 的绿色。
-    it("idle + 'completed' label renders 「已完成」 instead of 「等待输入」", () => {
+    // transcript 模式：最终回复卡已投递 → idle 卡头展示本轮终态。颜色沿用 idle 的绿色。
+    it("idle + 'completed' label renders the completed turn terminal receipt", () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, 'completed',
       ));
       expect(card.header.template).toBe('green');
-      expect(card.header.title.content).toContain('已完成');
-      expect(card.header.title.content).not.toContain('等待输入');
-      expect(card.header.title.content).not.toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
+      expect(card.header.title.content).not.toContain('AI 判断无需回复');
     });
 
-    it("idle + 'completed' label renders 'Completed' in English", () => {
+    it("idle + 'completed' label renders the completed turn terminal receipt in English", () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         undefined, undefined, undefined, 'completed',
       ));
-      expect(card.header.title.content).toContain('Completed');
-      expect(card.header.title.content).not.toContain('Awaiting input');
+      expect(card.header.title.content).toContain('✓ Turn ended · Awaiting input');
     });
 
     it("idle + 'silent' string label equals the legacy boolean flag", () => {
@@ -1032,7 +1466,7 @@ describe('buildStreamingCard', () => {
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, 'silent',
       ));
-      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it("'completed' label is inert for non-idle statuses (working keeps its label)", () => {
@@ -1043,6 +1477,43 @@ describe('buildStreamingCard', () => {
       ));
       expect(card.header.title.content).toContain('工作中');
       expect(card.header.title.content).not.toContain('已完成');
+    });
+
+    // 主回合已结束、后台子任务仍在跑：working（钉住）与 idle 下卡头一致，且不给「停止」。
+    describe('background-wait label', () => {
+      const build = (status: 'working' | 'idle' | 'limited', label: unknown, locale?: 'en') => parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', status, 'claude-code', 'hidden',
+        undefined, undefined, false, false, locale, undefined, undefined, false,
+        undefined, undefined, undefined, label as any,
+      ));
+
+      it('replaces 工作中 / 等待输入 with the running count, in one colour', () => {
+        for (const status of ['working', 'idle'] as const) {
+          const card = build(status, { backgroundTasks: 2 });
+          expect(card.header.title.content).toContain('⏳ 主回合已结束 · 后台子任务运行中（2）');
+          expect(card.header.title.content).not.toContain('工作中');
+          expect(card.header.title.content).not.toContain('等待输入');
+          expect(card.header.template).toBe('wathet');
+        }
+        expect(build('idle', { backgroundTasks: 1 }, 'en').header.title.content)
+          .toContain('⏳ Main turn ended · background tasks running (1)');
+      });
+
+      it('offers no stop button: the turn it would interrupt is over', () => {
+        const actions = findActions(build('working', { backgroundTasks: 1 }));
+        expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(false);
+        expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
+        expect(findActions(build('working', undefined)).some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+      });
+
+      it('is inert for other statuses and for a zero count', () => {
+        const limited = build('limited', { backgroundTasks: 3 });
+        expect(limited.header.title.content).not.toContain('后台子任务');
+        expect(limited.header.template).toBe('red');
+        const zero = build('working', { backgroundTasks: 0 });
+        expect(zero.header.title.content).toContain('工作中');
+        expect(zero.header.template).toBe('blue');
+      });
     });
 
     // 冻结卡回读：新字段 idleLabel 优先；旧盘只有 silentIdle:true 仍按 silent 渲染。
@@ -1058,14 +1529,14 @@ describe('buildStreamingCard', () => {
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, frozenIdleLabel({ idleLabel: 'completed' }),
       ));
-      expect(completed.header.title.content).toContain('已完成');
+      expect(completed.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
 
       const legacySilent = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, frozenIdleLabel({ silentIdle: true }),
       ));
-      expect(legacySilent.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(legacySilent.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
@@ -1091,6 +1562,21 @@ describe('buildStreamingCard', () => {
       expect(line.content.indexOf('Total')).toBeLessThan(line.content.indexOf('GPT-5.6-Sol'));      // Not a two-column layout anymore.
       expect(card.elements.some((element: any) => element.tag === 'column_set'
         && JSON.stringify(element).includes('GPT-5.6-Sol'))).toBe(false);
+    });
+
+    it.each([
+      { model: 'claude-opus-5-5-high' },
+      { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    ])('shows runtime identity without native metrics: $model', runtime => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'cursor', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: null, ...runtime },
+      ));
+      const line = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes(runtime.model));
+      expect(line?.content).toContain(`**${runtime.model}**`);
+      if (runtime.reasoningEffort) expect(line.content).toContain('high');
+      expect(line.content).not.toMatch(/Context|Total|↑|↓|null|undefined/);
     });
 
     it('renders metrics alone (no trailing runtime) when there is no model', () => {
@@ -1303,7 +1789,7 @@ describe('buildStreamingCard', () => {
 
     it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
       const card = parse(buildStreamingCard(
-        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'opencode', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         { context: null, tokens: null },
       ));
@@ -1323,6 +1809,45 @@ describe('buildStreamingCard', () => {
       const mdElements = card.elements.filter((e: any) => e.tag === 'markdown');
       expect(mdElements).toHaveLength(1);
       expect(mdElements[0].content).toBe('_(等待第一张截图…)_');
+    });
+
+    // Positional helper: buildStreamingCard's 23rd argument is screenshotUnavailable.
+    const withUnavailable = (imageKey: string | undefined, unavailable: boolean, locale: 'zh' | 'en' = 'zh') =>
+      parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'screenshot',
+        'nonce_x', imageKey, false, false, locale, undefined, undefined, false,
+        undefined, undefined, undefined, undefined, undefined, [], unavailable,
+      ));
+
+    it('renders an explicit unavailable state instead of waiting when no frame can arrive', () => {
+      const card = withUnavailable(undefined, true);
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      expect(md[0].content).toBe('_(当前没有可用截图，请在会话恢复后刷新。)_');
+      expect(card.elements.some((e: any) => e.tag === 'img')).toBe(false);
+      expect(withUnavailable(undefined, true, 'en').elements.find((e: any) => e.tag === 'markdown').content)
+        .toBe('_(No screenshot is available. Refresh after the session resumes.)_');
+    });
+
+    it('keeps the waiting placeholder when a fresh frame is expected (default)', () => {
+      const card = withUnavailable(undefined, false);
+      expect(card.elements.find((e: any) => e.tag === 'markdown').content).toBe('_(等待第一张截图…)_');
+    });
+
+    it('a cached image always wins over the unavailable flag', () => {
+      const card = withUnavailable('img_cached', true);
+      expect(card.elements[0]).toMatchObject({ tag: 'img', img_key: 'img_cached' });
+      expect(card.elements.some((e: any) => e.tag === 'markdown'
+        && String(e.content).includes('当前没有可用截图'))).toBe(false);
+    });
+
+    it('hidden mode ignores the unavailable flag', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'hidden',
+        'nonce_x', undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, undefined, undefined, [], true,
+      ));
+      expect(card.elements.some((e: any) => e.tag === 'markdown'
+        && String(e.content).includes('当前没有可用截图'))).toBe(false);
     });
 
     it('should include hr separator after screenshot output', () => {
@@ -1368,6 +1893,29 @@ describe('buildStreamingCard', () => {
       const actions = findActions(card);
       const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
       expect(toggleBtn.value).not.toHaveProperty('card_nonce');
+    });
+  });
+
+  // #2062: the idempotent display target exists only for the primary
+  // multi-replica control lane; single-replica cards keep the old payload
+  // (byte-for-byte, see card-builder-wire-golden).
+  describe('display toggle target mode', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+    const toggleValue = (mode: 'hidden' | 'screenshot') => findActions(
+      parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, mode)),
+    ).find((a: any) => a.value?.action === 'toggle_display').value;
+
+    it('carries the visible target in primary coordination mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      expect(toggleValue('hidden').target_display_mode).toBe('screenshot');
+      expect(toggleValue('screenshot').target_display_mode).toBe('hidden');
+    });
+
+    it('omits it outside primary mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'disabled');
+      expect(toggleValue('hidden')).not.toHaveProperty('target_display_mode');
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', '');
+      expect(toggleValue('screenshot')).not.toHaveProperty('target_display_mode');
     });
   });
 
@@ -1996,7 +2544,7 @@ describe('buildSessionClosedCard', () => {
     expect(findMarkdownContent(card)).toContain('/proj/x');
   });
 
-  it('shows a fallback note when the CLI cannot resume from CLI args (gemini/opencode)', () => {
+  it('shows a fallback note when the CLI cannot resume from CLI args (e.g. opencode)', () => {
     const card = parse(buildSessionClosedCard(
       'sess-3', 'om_root', 'topic', 'opencode', undefined, null,
     ));
@@ -2043,6 +2591,18 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn).toBeDefined();
     expect(resumeBtn.value.session_id).toBe('sess-4');
     expect(resumeBtn.value.root_id).toBe('om_root_X');
+    expect(resumeBtn.type).toBe('primary');
+  });
+
+  it('keeps Resume available for a closed remote session', () => {
+    const card = parse(buildSessionClosedCard(
+      'sess-remote', 'om_root_remote', 'remote topic', 'remote-runner', '/srv/app',
+      null, 'en', 'Remote Runner', false,
+    ));
+    const action = card.elements.find((element: any) => element.tag === 'action');
+    const resumeBtn = action.actions.find((item: any) => item.value?.action === 'resume');
+    expect(resumeBtn).toBeDefined();
+    expect(resumeBtn.value.session_id).toBe('sess-remote');
     expect(resumeBtn.type).toBe('primary');
   });
 
@@ -2209,6 +2769,32 @@ describe('buildRelayPickerCard', () => {
     expect(containers(card)).toHaveLength(0);
     const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
     expect(allMd).toMatch(/没有匹配|No sessions match/);
+  });
+
+  // Regression: the no-match card used to dead-end — the only way back was to
+  // clear the input and submit '', which Lark doesn't fire. A clear-search
+  // button re-fires relay_search without input_value, so the handler resolves
+  // the query to '' and re-renders the full list.
+  it('offers a clear-search button on no match that re-fires relay_search', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'ja' }));
+    const buttons = card.body.elements.filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    const v = buttons[0].behaviors[0].value;
+    expect(v.action).toBe('relay_search');
+    expect(v.target_chat_id).toBe('oc_t');
+    expect(v.root_id).toBe('om_r');
+    expect(v.invoker_open_id).toBe('ou_invoker_test');
+    expect(v.selected).toBe('');
+    // Not shown when the search has hits.
+    const hit = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'session 1' }));
+    expect(hit.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+  });
+
+  it('escapes the echoed search query in the no-match message', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '![x](http://evil/b)' }));
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toContain('\\[x\\]');
+    expect(allMd).not.toContain('![x](');
   });
 
   // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while
@@ -2519,4 +3105,56 @@ describe('remote backends get no PTY quick-action keys', () => {
       expect(keysIn(cliId)).toEqual([]);
     });
   }
+});
+
+describe('truncateContent single oversized line', () => {
+  it('keeps the tail of a newline-free blob within budget', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('a'.repeat(900) + 'END')).toBe(true);
+  });
+
+  it.each(['\n', '\r\n', '\n\n'])('still keeps content when the blob ends with %j', async (eol) => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END' + eol, 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).toContain('a'.repeat(900) + 'END');
+  });
+
+  it('keeps the oversized last line even when short lines precede it', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('head\nmid\n' + 'b'.repeat(5000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('b'.repeat(900) + 'END')).toBe(true);
+    expect(out).not.toContain('head');
+  });
+
+  it('does not split multibyte characters when cutting a long line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('中'.repeat(5000) + '尾', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).not.toContain('\uFFFD');
+    expect(out.endsWith('尾')).toBe(true);
+  });
+
+  it('keeps the whole fitted last non-blank line pushed out by trailing newlines', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // The 600-byte non-blank line fits within the 970-byte body budget, but the
+    // 401 trailing newlines push total size to 1001, so line bisection leaves
+    // only blank lines. The line must be kept in full: a negative byte offset
+    // (600 - 970) must clamp to 0, not slice off the line's head.
+    const out = truncateContent('x'.repeat(600) + '\n'.repeat(401), 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('x'.repeat(600));
+  });
+
+  it('skips whitespace-only (not just empty) lines when picking the tail line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // After split('\n') the final element is spaces, not an empty string. The
+    // reverse scan must trim() candidates, otherwise the body is blank again.
+    const out = truncateContent('y'.repeat(3000) + '\n   ', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('y'.repeat(970));
+  });
 });

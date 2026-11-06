@@ -26,11 +26,11 @@ const DASHBOARD_MODULE_SPECS = {
   insights: { supported: true, route: '#/insights', capabilities: ['insights.read'] },
   schedules: { supported: true, route: '#/schedules', capabilities: ['schedules.read', 'schedules.manage'] },
   whiteboards: { supported: true, route: '#/whiteboards', capabilities: ['whiteboards.read', 'whiteboards.manage'] },
-  office: { supported: true, route: '#/office', capabilities: ['office.read'] },
   bots: { supported: true, route: '#/bot-defaults', capabilities: ['bots.read', 'bots.configure'] },
   skills: { supported: true, route: '#/skills', capabilities: ['skills.read', 'skills.manage'] },
   plugins: { supported: true, route: '#/plugins', capabilities: ['plugins.read', 'plugins.manage'] },
-  team: { supported: true, route: '#/team', capabilities: ['team.read', 'team.manage'] },
+  // 「团队协作」页面已从 Dashboard 下线；后端 /api/team/* 与平台侧逻辑仍在，只是不再有前端入口。
+  team: { supported: false, capabilities: ['team.read', 'team.manage'] },
   connectors: { supported: true, route: '#/connectors', capabilities: ['connectors.read', 'connectors.manage'] },
   settings: {
     supported: true,

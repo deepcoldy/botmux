@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-import { computeNextRun, parseSchedule } from '../../core/scheduler.js';
+import { computeNextRun, normalizeTopicTitle, parseSchedule } from '../../core/scheduler.js';
 import {
   canonicalScheduleInput,
   createTask,
@@ -27,6 +27,8 @@ export type ScheduleInput = {
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
+  /** First-message template for non-silent new-topic/task runs. Supports
+   * `{{date}}`, signed day offsets, and `{{owner}}`. */
   topicTitle?: string;
   larkAppId?: string;
   /** Run initiator's open_id, only materializable as the exact
@@ -166,6 +168,20 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         message: 'followActive requires executionPosition topic',
       };
     }
+    try {
+      normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
     if (input.parsed.kind !== 'once') return { ok: true };
     const runAtMs = input.parsed.runAt ? Date.parse(input.parsed.runAt) : Number.NaN;
     // Keep exactly the scheduler's two-minute one-shot catch-up window. Once
@@ -194,7 +210,12 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       rootMessageId: input.rootMessageId,
       scope: input.scope,
       executionPosition: input.executionPosition,
-      topicTitle: input.topicTitle?.trim() || undefined,
+      topicTitle: normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      }),
       larkAppId: input.larkAppId,
       ownerOpenId: input.ownerOpenId,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,

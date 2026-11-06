@@ -6,7 +6,7 @@
  * locally while a live owner daemon is authoritative, carries the current
  * session capability, and retains an offline fallback.
  */
-import { type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -58,6 +58,16 @@ afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** A pid that certainly belonged to a process which has already exited and
+ *  been reaped. Expired-lease cases must seed this instead of a hardcoded pid:
+ *  hostOccupancyLeaseHeld() fails closed on a LIVE owner even past the TTL, and
+ *  a fixed number (e.g. 4242) occasionally belongs to a real CI-runner process. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  if (!child.pid) throw new Error('could not spawn a throwaway child');
+  return child.pid;
+}
 
 function makeSession(sessionId: string, overrides: Partial<StoredSession> = {}): StoredSession {
   return {
@@ -169,6 +179,77 @@ function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>>
     });
   });
 }
+
+describe('primary coordination local lifecycle gate', () => {
+  it.each([
+    ['delete one', ['delete', 'sess-primary-local']],
+    ['delete all', ['delete', 'all']],
+    ['delete stopped', ['delete', 'stopped']],
+    ['resume', ['resume', 'sess-primary-local']],
+    ['suspend', ['suspend', 'all']],
+  ])('rejects %s before any Pod-local lifecycle mutation', async (_label, args) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-primary-lifecycle-'));
+    const dataDir = join(root, 'must-not-be-created');
+    tempDirs.push(root);
+
+    const result = await runCli(dataDir, args, {
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BOTMUX_COORDINATION_MODE=primary');
+    expect(result.stderr).toContain('PostgreSQL');
+    expect(result.stderr).toContain('本次未做任何修改');
+  });
+
+  it('reads primary mode from ~/.botmux/.env in a standalone shell', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-primary-env-file-'));
+    const homeDir = join(root, 'home');
+    const dataDir = join(root, 'data');
+    const configDir = join(homeDir, '.botmux');
+    tempDirs.push(root);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, '.env'), 'BOTMUX_COORDINATION_MODE=primary\n');
+    const session = makeSession('sess-primary-env-file');
+    writeSessions(dataDir, [session]);
+
+    const result = await runCli(dataDir, ['delete', session.sessionId], {
+      HOME: homeDir,
+      BOTMUX_COORDINATION_MODE: undefined,
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BOTMUX_COORDINATION_MODE=primary');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('keeps list read-only and skips local auto-prune in primary mode', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-primary-list-'));
+    tempDirs.push(dataDir);
+    const scratch = makeSession('sess-primary-scratch', { larkAppId: APP_ID });
+    writeSessions(dataDir, [scratch]);
+
+    const result = await runCli(dataDir, ['list', '--plain'], {
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('已跳过 1 个本地会话的自动清理');
+    expect(readSessions(dataDir)[scratch.sessionId].status).toBe('active');
+  });
+});
 
 describe('botmux delete — daemon-first close', () => {
   it('delegates a current-session close to the daemon with its rotating capability', async () => {
@@ -316,7 +397,7 @@ describe('botmux delete — daemon-first close', () => {
     tempDirs.push(dataDir, relayDir);
     const session = makeSession('sess-delete-rejected-expired-lease');
     writeSessions(dataDir, [session]);
-    seedOccupancyLease(dataDir, APP_ID, { ownerPid: 4242, bootId: 'boot-lapsed', leaseUntil: Date.now() - 1 });
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: deadPid(), bootId: 'boot-lapsed', leaseUntil: Date.now() - 1 });
     writeRelayCapability(relayDir);
 
     const server = createServer(async (req, res) => {
@@ -373,7 +454,7 @@ describe('botmux delete — daemon-first close', () => {
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-lease-lapsed');
     writeSessions(dataDir, [session]);
-    seedOccupancyLease(dataDir, APP_ID, { ownerPid: 4242, bootId: 'boot-gone', leaseUntil: Date.now() - 1 });
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: deadPid(), bootId: 'boot-gone', leaseUntil: Date.now() - 1 });
 
     const result = await runDelete(dataDir, [session.sessionId], {
       BOTMUX_SESSION_ID: undefined,

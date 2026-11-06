@@ -1,0 +1,99 @@
+import type { DaemonSession } from './types.js';
+import type { FeedbackWebhookDestination } from '../services/feedback-outbox.js';
+import type { CompatibleFeedbackStore } from '../services/feedback-storage-types.js';
+import type { FeedbackPolicy } from '../services/feedback-policy.js';
+import { buildFeedbackElement } from '../im/lark/skill-feedback-card.js';
+
+/**
+ * Daemon-side half of `botmux send --response-kind final` for a CLI that
+ * cannot open the feedback store itself (bwrap sandbox / macOS read isolation:
+ * `botmux-feedback.sqlite` holds every bot's delivery rows, so it is
+ * deliberately not exposed to the session). Without this, the canonical final
+ * answer of an isolated session never gets a delivery row, and the later
+ * `turn_terminal` has nothing to correlate a `turn.completed` against.
+ *
+ * It also serves a host CLI whose OWN sandbox denies the store write (e.g. a
+ * workspace-write policy) while the daemon secret stays readable.
+ *
+ * Trust boundary: the caller already passed `sessionCliIpcAuth` — it holds
+ * this session's current rotating turn capability, or it is a trusted host
+ * process. Every correlation field is therefore taken from the live
+ * DaemonSession — the CLI contributes only the platform message id and the
+ * answer text it just delivered, plus the turn it believes it answered
+ * (`expectedTurnId`), which can only make the daemon REFUSE: a host request
+ * carries no capability pinning the turn, and the daemon may already have
+ * moved on to a queued turn, so a mismatch must not be indexed under it. The worst a
+ * session can do is mis-index its own current turn, which a non-isolated CLI
+ * can already do by writing the store directly. No feedback policy or base
+ * card is accepted from the body. An opt-in separate surface may use a
+ * host-materialized policy while the original card remains without controls.
+ */
+export const RELAYED_TURN_DELIVERY_ROUTE = 'turn-delivery';
+/** Larger than any Lark message body; the store keeps only a content hash. */
+export const RELAYED_TURN_DELIVERY_MAX_BYTES = 1024 * 1024;
+
+const MESSAGE_ID = /^om_[A-Za-z0-9_-]{1,128}$/;
+
+export type RelayedTurnDeliveryResult =
+  | { ok: true; deliveryId: string; duplicate: boolean }
+  | { ok: false; status: 400 | 404 | 409; error: string };
+
+export async function recordRelayedTurnDelivery(input: {
+  ds: Pick<DaemonSession, 'session' | 'larkAppId' | 'chatId' | 'cliVersion' | 'managedTurnOrigin'> | undefined;
+  body: Record<string, unknown>;
+  store: Pick<CompatibleFeedbackStore, 'findDeliveryByPlatformMessage' | 'recordTurnDelivery'>;
+  webhookDestinations?: FeedbackWebhookDestination[];
+  teamId?: string;
+  feedback?: { policy: FeedbackPolicy; requesterSubjectId?: string };
+}): Promise<RelayedTurnDeliveryResult> {
+  const { ds, body, store } = input;
+  if (!ds || ds.session.status === 'closed') return { ok: false, status: 404, error: 'session_not_active' };
+  const messageId = body.messageId;
+  const content = body.content;
+  if (typeof messageId !== 'string' || !MESSAGE_ID.test(messageId)
+      || typeof content !== 'string' || !content) {
+    return { ok: false, status: 400, error: 'invalid_turn_delivery' };
+  }
+  // The turn is the one the presented capability was minted for — never a
+  // client-supplied id, so a session cannot index into another of its turns.
+  const turnId = ds.managedTurnOrigin?.turnId;
+  if (!turnId) return { ok: false, status: 409, error: 'turn_unbound' };
+  if (body.expectedTurnId !== undefined && body.expectedTurnId !== turnId) {
+    return { ok: false, status: 409, error: 'turn_mismatch' };
+  }
+  const existing = await store.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId);
+  if (existing) {
+    return existing.sessionId === ds.session.sessionId && existing.turnId === turnId
+      ? { ok: true, deliveryId: existing.deliveryId, duplicate: true }
+      : { ok: false, status: 409, error: 'message_already_recorded' };
+  }
+  const delivery = await store.recordTurnDelivery({
+    botAppId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    turnId,
+    // Same discriminator the in-process path uses for a bound turn.
+    correlationDiscriminator: messageId,
+    nativeSessionId: ds.session.cliSessionId,
+    platform: 'lark',
+    platformAppId: ds.larkAppId,
+    platformMessageId: messageId,
+    chatId: ds.chatId,
+    topicRootId: ds.session.rootMessageId,
+    dispatchAttempt: ds.managedTurnOrigin?.dispatchAttempt,
+    content,
+    cliId: ds.session.cliId,
+    cliVersion: ds.cliVersion,
+    model: ds.session.model,
+    reasoningEffort: ds.session.reasoningEffort,
+    cardMode: 'card',
+    status: 'delivered',
+    webhookDestinations: input.webhookDestinations,
+    ...(input.feedback ? {
+      policy: input.feedback.policy,
+      requesterSubjectId: input.feedback.requesterSubjectId,
+      baseCard: { schema: '2.0', body: { elements: [buildFeedbackElement(input.feedback.policy)] } },
+    } : {}),
+    context: input.teamId ? { teamId: input.teamId } : {},
+  });
+  return { ok: true, deliveryId: delivery.deliveryId, duplicate: false };
+}

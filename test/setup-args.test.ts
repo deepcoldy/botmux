@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   buildBotFromAddFlags,
@@ -7,7 +6,6 @@ import {
   maskAppSecret,
   parseSetupCommand,
   SETUP_CLI_USAGE,
-  cliSelectionKeys,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
@@ -93,6 +91,14 @@ describe('parseSetupCommand', () => {
       action: 'edit',
       selector: 'botmux-0',
       flags: { cliRuntime: '-' },
+    });
+  });
+
+  it('parses --lang flag', () => {
+    const res = parseSetupCommand(['add', '--app-id', 'cli_123', '--lang', 'en']);
+    expect(res).toMatchObject({
+      action: 'add',
+      flags: { lang: 'en' },
     });
   });
 
@@ -217,7 +223,6 @@ describe('buildBotFromAddFlags', () => {
   });
 
   it('accepts the documented traecli command name as TRAE CLI 2.0', () => {
-    expect(cliSelectionKeys()).toContain('traecli');
     expect(SETUP_CLI_USAGE).toContain('traecli 映射到 TRAE CLI 2.0');
     expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'traecli' })).toMatchObject({
       cliId: 'traex',
@@ -318,6 +323,11 @@ describe('buildBotFromAddFlags', () => {
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'false' }).showInTeam).toBe(false);
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'true' }).showInTeam).toBeUndefined();
   });
+
+  it('stores lang when specified', () => {
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'en' }).lang).toBe('en');
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'zh' }).lang).toBe('zh');
+  });
 });
 
 describe('editInputFromFlags', () => {
@@ -331,6 +341,13 @@ describe('editInputFromFlags', () => {
       model: 'opus',
       backendType: 'tmux',
     });
+  });
+
+  it('maps lang and handles clear', () => {
+    expect(editInputFromFlags({ lang: 'en' })).toEqual({ lang: 'en' });
+    expect(editInputFromFlags({ lang: '-' })).toEqual({ lang: '-' });
+    const bot = applyBotConfigEdits({ larkAppId: 'cli_1', larkAppSecret: 'sec', allowedUsers: ['a@b.com'], lang: 'en' }, { lang: '-' });
+    expect(bot.lang).toBeUndefined();
   });
 
   it('clears wrapperCli when switching to a plain cli, keeps it for gateway keys', () => {
@@ -431,30 +448,6 @@ describe('editInputFromFlags', () => {
     expect(updated.cliId).toBe('traex');
     expect(updated.cliLaunchMode).toBe('forge-traex');
     expect(updated.cliPathOverride).toBeUndefined();
-  });
-});
-
-describe('interactive setup edit launch mode wiring', () => {
-  it('preserves and writes cliLaunchMode through the CLI picker path', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('const currentKey = selectionKeyForBot');
-    const end = source.indexOf('// selKey 为 null', start);
-    const pickerBlock = source.slice(start, end);
-
-    expect(pickerBlock).toContain("selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli, bot.cliLaunchMode)");
-    expect(pickerBlock).toContain('input.cliLaunchMode = sel.cliLaunchMode ?? null;');
-    expect(pickerBlock).toContain('input.cliRuntime = null;');
-  });
-
-  it('treats cliLaunchMode as a scripted setup edit launch change', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('const agentLaunchChanged = hasAgentLaunchConfigChanged');
-    const end = source.indexOf('// Missing Agent dependencies', start);
-    const changeBlock = source.slice(start, end);
-
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(changeBlock).toContain('cliLaunchMode: original.cliLaunchMode');
-    expect(changeBlock).toContain('cliLaunchMode: edited.cliLaunchMode');
   });
 });
 

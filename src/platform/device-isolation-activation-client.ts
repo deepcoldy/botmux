@@ -2,7 +2,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname } from 'node:path';
 import { DEVICE_ISOLATION_ACTIVATION_VERSION } from '../core/device-isolation-activation.js';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';

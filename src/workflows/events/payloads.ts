@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { z } from 'zod';
 
 // ─── Shared primitives ──────────────────────────────────────────────────────
@@ -126,6 +127,12 @@ export const BotSnapshotSchema = z.object({
   sandboxHidePaths: z.array(z.string()).optional(),
   sandboxReadonlyPaths: z.array(z.string()).optional(),
   sandboxNetwork: z.boolean().optional(),
+  sandboxNetworkPolicy: z.unknown().transform((value, ctx) => {
+    if (value === undefined) return undefined;
+    try { return parseSandboxNetworkPolicy(value); } catch (error) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: (error as Error).message }); return z.NEVER;
+    }
+  }).optional(),
 });
 export type BotSnapshot = z.infer<typeof BotSnapshotSchema>;
 

@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -41,7 +42,7 @@ export interface FrozenCard {
   silentIdle?: boolean;
   /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
    *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
-  idleLabel?: 'silent' | 'completed';
+  idleLabel?: 'silent' | 'completed' | 'failed';
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -52,6 +53,31 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
   return fc.expanded ? 'screenshot' : 'hidden';
 }
 
+export interface GroupJoinContext {
+  event: 'chat.bot_added';
+  larkAppId: string;
+  chatId: string;
+  turnId: string;
+  operatorOpenId?: string;
+  gateMatched: boolean;
+}
+
+export type TurnTerminalCarrierKind = 'standard_reply_card' | 'non_patchable';
+
+/** Last user-visible output carrier observed for each in-flight turn. The
+ *  worker reconstructs explicit-send entries from the durable turn-sends
+ *  journal before publishing turn_terminal; daemon-owned fallback output is
+ *  recorded directly after Lark accepts it. Retained in a bounded map so a
+ *  duplicate terminal can safely retry after an unconfirmed provider error. */
+export type TurnTerminalCarrier = {
+  messageId: string;
+  kind: TurnTerminalCarrierKind;
+  /** Explicit send classification. `progress` / `auxiliary` are visible
+   *  interim output and must never be promoted to a completed-turn carrier.
+   *  Undefined is retained for rolling compatibility with older workers. */
+  responseKind?: TurnSendKind;
+};
+
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
  *  in the ImAdapter implementation (e.g. Map<string, ImRenderState>
@@ -59,6 +85,17 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** User-visible final replies that the daemon accepted from a worker but has
+   * not finished delivering yet. Graceful remote shutdown keeps the exact
+   * worker generation fenced until these promises settle, so a provider final
+   * cannot be lost between remote turn completion and daemon exit. In-memory
+   * only; entries are registered and removed by the final-output delivery
+   * pipeline. */
+  finalOutputDeliveriesInFlight?: Set<Promise<void>>;
+  /** Same delivery registrations grouped by their exact turn. Terminal-state
+   * receipts wait on only their own turn, so a slow sibling cannot reorder the
+   * visible answer/receipt pair or block an unrelated completion marker. */
+  finalOutputDeliveriesByTurn?: Map<string, Set<Promise<void>>>;
   /** True after the current worker generation has completed init. Kept
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
@@ -112,6 +149,12 @@ export interface DaemonSession {
     enginePid?: number;
     engineProcStart?: string;
     workerGeneration?: number;
+  };
+  /** Per-worker-generation HMAC key for the protected local-service proxy.
+   * It exists only in daemon/worker memory and crosses only their private IPC. */
+  protectedLoopbackProxyAttestation?: {
+    secret: string;
+    workerGeneration: number;
   };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
@@ -259,6 +302,19 @@ export interface DaemonSession {
    * In-memory only; not persisted.
    */
   consumedRepoCardMessageIds?: string[];
+  /**
+   * The session's working directory was gone when a CLI start was attempted
+   * (forkWorker refuses instead of starting it elsewhere), and a recovery card
+   * was published for it. `cardMessageId` is unset while that card is still
+   * being built. `rebuild` is where the deleted worktree came from, when git
+   * still knows. In-memory only: after a restart the next refused start
+   * publishes a fresh card.
+   */
+  workingDirRecovery?: {
+    path: string;
+    cardMessageId?: string;
+    rebuild?: { repo: string; branch: string };
+  };
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
   /** Exact Lark message id whose user input is waiting for the first worker
@@ -276,6 +332,13 @@ export interface DaemonSession {
   pendingCodexAppMessageContext?: string;
   /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
   pendingChatContext?: ChatContext;
+  /** Host-authored provenance for a real Lark bot-added lifecycle turn. Unlike
+   *  chat metadata this is trusted routing context and cannot be reconstructed
+   *  from group text. In-memory only; cleared with the opening buffers. */
+  pendingGroupJoinContext?: GroupJoinContext;
+  /** Exact host-signed caller paired with pendingGroupJoinContext while repo or
+   *  worktree setup delays the first fork. Never persisted or reconstructed. */
+  pendingTrustedCaller?: TrustedCaller;
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default
    *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
@@ -314,6 +377,8 @@ export interface DaemonSession {
    * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
    * bot-added / scheduler / system bootstrap) never infers it. */
   pendingCodexAppSteerable?: true;
+  /** LinkRef mode frozen when a pending-repository opening was admitted. */
+  pendingLinkRefMode?: import('../services/link-ref-types.js').LinkRefMode;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
@@ -345,6 +410,22 @@ export interface DaemonSession {
   streamCardTurnGeneration?: number;
   /** Exact newest turn awaiting its own streaming card. In-memory only. */
   streamCardPendingTurnId?: string;
+  /** In-memory proof of the last streaming card this daemon itself published
+   * (successful POST behind the publication fence, or a verified PATCH of the
+   * persisted current card). Recorded only by worker-pool publication paths —
+   * never derived from a card callback or a frozen-card self-heal, because an
+   * old card that self-healed carries the current nonce/session_id too. Used
+   * solely to prove that a clicked message may be re-bound as the current card
+   * after the runtime card id was lost. */
+  lastPublishedStreamingCardIdentity?: {
+    messageId: string;
+    nonce: string;
+    sessionId: string;
+    larkAppId: string;
+    anchorId: string;
+    runtimeKey: string;
+    turnGeneration: number;
+  };
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
@@ -359,6 +440,10 @@ export interface DaemonSession {
    *  Entries outlive turn_terminal briefly to cover trailing worker events and
    *  are pruned by age/size when new silent turns are armed. */
   silentScheduledTurns?: Map<string, number>;
+  /** The hidden schedule run's turn whose prompt the worker reported the CLI
+   *  never recorded; its settlement reports the run instead of closing it
+   *  quietly. In-memory: a restart closes unmaterialized hidden runs anyway. */
+  deferredScheduleUndeliveredTurnId?: string;
   /** Turn-exact ids for loud external triggers whose connector opted into
    *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
    *  (the streaming card / start notice still show); keyed on the trigger turn
@@ -385,6 +470,12 @@ export interface DaemonSession {
   lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
+  /** Native write observations, scoped to the worker generation and exact attempt. */
+  replyExecutionStarts?: Map<string, {
+    startedAtMs: number; workerGeneration: number;
+    stage?: 'model_output' | 'tool_started' | 'tool_returned';
+    lastProgressAtMs?: number;
+  }>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -396,8 +487,62 @@ export interface DaemonSession {
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
+  /** In-memory provenance of `currentImageKey` (the worker turn/attempt that
+   * captured it). Trusted only while `imageKey === currentImageKey`; a cache
+   * restored from disk has no provenance and is treated as legacy. */
+  currentImageSource?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
+  /** Read-only preview shown while the card's own turn is waiting for the
+   * previous turn to finish. It is deliberately separate from currentImageKey:
+   * never persisted, never treated as this card turn's frame, and cleared as
+   * soon as the target turn activates or the worker generation changes. */
+  waitingTurnPreview?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
+  /** The worker's actual screenshot capture identity, from capture_identity
+   * events emitted at real CLI write points (never from input ACKs). Scoped to
+   * one worker generation: once a generation announced it, that generation's
+   * frames must carry a matching revision + full tuple. `lastSource` is the
+   * last non-empty tuple — clearing to (undefined, undefined) does not clear
+   * the terminal's pixels, so suppression of that source still applies.
+   * In-memory only. */
+  captureIdentity?: {
+    workerGeneration: number;
+    revision: number;
+    turnId?: string;
+    dispatchAttempt?: number;
+    /** Mirror of `retainedCaptureSource` at commit time (see below). */
+    lastSource?: { turnId?: string; dispatchAttempt?: number };
+  };
+  /** Last NON-EMPTY capture tuple ever written to this session's terminal —
+   * evidence of whose pixels may still be on screen. Deliberately NOT scoped
+   * to a worker generation: a worker restart/reattach keeps the persistent
+   * terminal's pixels, and an initial empty identity from the replacement
+   * does not prove the screen was cleared. Replaced only by a new non-empty
+   * write. Grants no execution or frame-sending authority; it only restricts
+   * what may be displayed. In-memory only. */
+  retainedCaptureSource?: { turnId?: string; dispatchAttempt?: number };
+  /** Display target of the current streaming card, bound to its exact
+   * messageId and publication sequence. `waiting-exact-turn` accepts only
+   * frames positively matching `turnId`; it flips to `follow-live` (CAS on
+   * messageId + publication) once that turn's capture identity is observed.
+   * Revision ordering alone never proves target ownership. In-memory only. */
+  streamCardDisplayTarget?: {
+    messageId: string;
+    publication: number;
+    mode: 'waiting-exact-turn' | 'follow-live';
+    turnId?: string;
+  };
+  /** Highest dispatch attempt the daemon has observed for one turn (from
+   * managed_turn_origin publications and accepted frames). Monotonic per
+   * turn and deliberately NOT cleared with managedTurnOrigin at a worker
+   * generation change: it grants no authority, it only lets the screenshot
+   * fence reject a frame from an older attempt of the same turn. In-memory. */
+  turnDispatchAttemptHighWater?: { turnId: string; dispatchAttempt: number };
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** `backgroundTasks` of the last working/idle screen_update: the main turn
+   *  ended while this many background tasks kept running. Card label (see
+   *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
+   *  with the CLI). In-memory only. */
+  backgroundTaskCount?: number;
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -406,6 +551,20 @@ export interface DaemonSession {
    * until its next real idle edge.
    */
   idleSinceAt?: number;
+  /** Prompt-cache keep-alive bookkeeping for the current idle stretch
+   *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
+   *  turn or busy edge that is not a keep-alive. */
+  promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
+  /** Idle auto-compact topic notice waiting for the next sweep tick: posted
+   *  only once the compact's own busy→idle edge (or the worker's refusal) is
+   *  seen, so the topic never claims a compact that did not run
+   *  (core/idle-auto-compact.ts). In-memory only. */
+  idleAutoCompactPendingNotice?: import('./idle-auto-compact.js').IdleAutoCompactPendingNotice;
+  /** TurnId of the idle auto-compact this process itself dispatched. In-memory
+   *  ONLY (never persisted): a marker inherited from a restarted daemon folded
+   *  as handled must not be announced as a successful compact, because this
+   *  process never saw it run. Cleared on the finishing edge / terminal. */
+  idleAutoCompactDispatchedTurnId?: string;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -423,6 +582,13 @@ export interface DaemonSession {
    *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
    *  完全一致（每个新轮次入口）。内存态，不落盘。 */
   completedIdleTurnId?: string;
+  failedIdleTurnId?: string;
+  /** Last user-visible output carrier observed for each in-flight turn. The
+   *  worker reconstructs explicit-send entries from the durable turn-sends
+   *  journal before publishing turn_terminal; daemon-owned fallback output is
+   *  recorded directly after Lark accepts it. Retained in a bounded map so a
+   *  duplicate terminal can safely retry after an unconfirmed provider error. */
+  turnTerminalCarriers?: Map<string, TurnTerminalCarrier>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -431,6 +597,8 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** Successful listener terminal evidence; idle alone never authorizes closing. */
+  messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
   /**
@@ -497,19 +665,24 @@ export interface DaemonSession {
    *  daemon 在构建 CLI 输入前按轮重算（resolveSoloSessionForTurn）；send 模式恒为
    *  false 且不发额外 API。内存态，不持久化——重启后首轮重算即可。 */
   soloSession?: boolean;
-  /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
-   *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
-   *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
-   *  one-slot guard would let A₂ re-post. An entry is claimed BEFORE the reply
-   *  is sent and released if that send fails, so a later replay can compensate
-   *  instead of losing the closure permanently. */
+  /** Backward-compatible dedupe for old sessions that lack a frozen per-turn
+   *  Lark reply context and therefore still use the legacy explicit-@ silent
+   *  receipt. New ordinary Lark turns use terminalReceiptTurnIds instead. */
   silentReceiptTurnIds?: Set<string>;
+  /** Dedupe guard for the independent terminal-state strip. Claimed before
+   *  waiting for the answer delivery and retained when a newer turn supersedes
+   *  it; released only after all bounded send attempts fail. */
+  terminalReceiptTurnIds?: Set<string>;
   /** Latest model reported by the live executor. In-memory and rehydrated from
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** A confirmed native-menu preference awaiting its first new turn. */
+  codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
+  /** Undefined means no observation; null means native/default context. */
+  activeModelBackendVariant?: 'standard' | 'max' | null;
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
    *  without a live worker keeps the notice. Unlike the other runtime facts it
@@ -565,6 +738,8 @@ export interface DaemonSession {
     taskId?: string | null;
   };
   usageLimit?: CliUsageLimitState;
+  /** A failed persistence must be retried even if the next frame is identical. */
+  usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Latch for the proactive rate/usage-limit owner notification: the
    *  usageLimitStateKey of the limit episode we already posted about. Exactly
@@ -582,6 +757,8 @@ export interface DaemonSession {
   usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
@@ -593,6 +770,10 @@ export interface DaemonSession {
   pendingSubstituteControlCard?: boolean;
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
+  /** Exact message id targeted by the in-flight PATCH (pendingCardId is cleared
+   * before the HTTP request completes, so it cannot identify this). Cleared in
+   * the same finally that clears cardPatchInFlight. In-memory only. */
+  cardPatchInFlightMessageId?: string;
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
   pendingCardUserInitiated?: boolean; // latest queued PATCH came from an explicit card action; failures are surfaced at warn level
@@ -601,6 +782,8 @@ export interface DaemonSession {
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
   pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
+  settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
@@ -663,7 +846,11 @@ export interface DaemonSession {
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;
+    identityTurnId?: string;
     dispatchAttempt?: number;
+    trustedCaller?: TrustedCaller | null;
+    /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
+    linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;
@@ -672,6 +859,47 @@ export interface DaemonSession {
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
   };
+  /** Worker-reported identity storage decision for the CURRENT worker
+   *  generation. Only the worker knows the effective spawn shape (the
+   *  BOTMUX_SANDBOX override, remote-backend bypass, whether bwrap/Seatbelt
+   *  really engaged, and whether the daemon loopback is reachable inside the
+   *  spawn), so the daemon publishes identity material per this report instead
+   *  of deriving sandbox facts itself. Absent (nothing reported yet, or after a
+   *  daemon restart) is consumed fail-closed: publication uses the legacy
+   *  'single' shape and the proven content route refuses. `conflict` marks a
+   *  report the daemon's structural binding check cannot honor (e.g. binding
+   *  disabled after restart): identity publication is withheld on both models
+   *  until a live worker reports again. */
+  reportedIdentityModel?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    sandboxEngaged: boolean;
+    loopbackShared: boolean;
+    workerPid: number;
+    workerGeneration: number;
+    reportedAt: number;
+    conflict?: string;
+  };
+  /** Model used by the daemon's LAST actual identity publication for this
+   *  session (in-memory; absent before the first publish or after restart).
+   *  This — not the previous report value — is the flip baseline: after a
+   *  daemon restart the accept-time publication is written single before the
+   *  worker re-reports proven, and that must still count as a real flip even
+   *  though no prior report exists. */
+  lastPublishedIdentityModel?: import('./lark-tool-binding.js').IdentityStorageModel;
+  /** Last replay outcome of the identity-decision flip handler. A successful
+   *  replay moves the publication baseline (so identical reports stop
+   *  flipping); recording `ok:false` lets a later report of the OTHER model
+   *  heal the purge a failed attempt performed. */
+  lastIdentityDecisionRepublish?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    turnId: string;
+    ok: boolean;
+  };
+  /** Bounded set of turns the CURRENT worker generation has already sent
+   *  turn_terminal for. Refuses an identity-decision flip replay for a turn
+   *  that is over: a late spawn decision must not resurrect a terminal turn's
+   *  credentials or pin its proven material against GC. FIFO-trimmed. */
+  terminalIdentityTurnIds?: Set<string>;
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -708,6 +936,11 @@ export interface DaemonSession {
    *  Forwarded back to the worker in tui_keys so it can verify the backend
    *  hasn't been replaced within the same worker process. */
   stuckWarningCliLifetime?: number;
+  /** Turn initiator frozen when the active stuck-warning card was posted
+   *  (same rule as the recovery-retry card: daemon-authenticated caller or a
+   *  reply-registry entry proving a human sender). They may press the card's
+   *  `initiator` keys; undefined = operators only. */
+  stuckWarningInitiatorOpenId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
@@ -725,7 +958,7 @@ export interface DaemonSession {
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
    *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
-  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string }>;
+  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string; reactionType?: string; reactionIdentity?: 'tenant' | 'user' }>;
   /** Last scoped dedupe key emitted via the bridge final_output pipeline.
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */
@@ -742,10 +975,10 @@ export interface DaemonSession {
    *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
-   *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
+   *  The source-specific tmux, Zellij, Herdr, or Orca identity is set. */
   adoptedFrom?: {
     /** Source backend of the external session. Absent means legacy tmux metadata. */
-    source?: 'tmux' | 'herdr' | 'zellij';
+    source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
     tmuxTarget?: string;       // e.g. "0:2.0" — user's original tmux pane
     zellijSession?: string;    // zellij session name (zellij backend)
     zellijPaneId?: string;     // e.g. "terminal_1" — observe/drive target
@@ -754,6 +987,17 @@ export interface DaemonSession {
     herdrPaneId?: string;
     herdrAgentName?: string;
     herdrTerminalId?: string;
+    orcaTerminalHandle?: string;
+    /** Display snapshot from adoption; the handle remains the stable identity. */
+    orcaTerminalTitle?: string;
+    /** Orca control route; absent = desktop relay for legacy rows. */
+    orcaInstance?: import('../services/orca-cli.js').OrcaInstance;
+    orcaPtyId?: string;
+    orcaIncarnationId?: string;
+    orcaExecutionHostId?: string;
+    orcaWorktreeId?: string;
+    orcaAgentIdentity?: string;
+    orcaPaneSizeVerified?: boolean;
     originalCliPid?: number;   // CLI process PID in the user's pane, when the source exposes one
     sessionId?: string;       // CLI session ID (for takeover/resume)
     cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type

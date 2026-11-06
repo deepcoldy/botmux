@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createReadStream } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 
 // ──────────────────────────────────────────────────────── 配置 & 参数
 

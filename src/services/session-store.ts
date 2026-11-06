@@ -1,8 +1,12 @@
+import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
+import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { pidExistsEpermAlive } from '../utils/process-alive.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
@@ -10,6 +14,8 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
+import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -49,28 +55,14 @@ import {
 } from '../core/principal-lane-worktree.js';
 import {
   PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION,
-  parsePrincipalWorkspaceTicket,
-  parsePrincipalWorkspaceTicketLocator,
-  parsePrincipalWorkspaceTicketSequence,
   parsePrincipalWorkspaceGroup,
   parsePrincipalWorkspaceMember,
   principalWorkspaceGroupIdV2,
-  principalWorkspaceTicketIdV1,
   type PrincipalWorkspaceGroup,
   type PrincipalWorkspaceMember,
-  type PrincipalWorkspaceTicket,
-  type PrincipalWorkspaceTicketAuditEvent,
-  type PrincipalWorkspaceTicketLocator,
-  type PrincipalWorkspaceTicketSequence,
 } from '../core/principal-workspace-admission.js';
-import type { PrincipalLaneDispatchAuthority } from '../core/principal-lane-dispatch.js';
-import {
-  inventoryPrincipalLaneQueueRecords,
-  principalLaneAppendReceiptLocator,
-  type PrincipalLaneAppendReceipt,
-  type PrincipalLaneQueueHandle,
-} from './message-queue.js';
 import { configuredCodexInstanceBot, newSessionCodexInstanceState, legacyCodexInstanceBinding, type SessionCreationSource } from './codex-instance-pool.js';
+import { isCodexServiceTierCliId } from './codex-service-tier.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import type { HolderReason } from './session-store-copy.js';
@@ -514,7 +506,7 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   ensurePrincipalLaneWorktreeCommonDirColumns(db);
   ensureMessageProvenanceTrustFenceIdentityColumns(db);
   db.exec(OCCUPANCY_SCHEMA_SQL);
-  return db;
+  return guardSessionDirectoryWrites(db);
 }
 
 /** `0d6ab50d1` could create this sidecar before the common-dir proof columns
@@ -693,15 +685,8 @@ export function hostOccupancyLeaseHeld(
   return !!lease && (lease.leaseUntil > now || processAlive(lease.ownerPid));
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM: the process exists but is not ours to signal — still alive.
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
+// EPERM: the process exists but is not ours to signal — still alive.
+const processAlive = pidExistsEpermAlive;
 
 export type OccupancyClaimResult =
   /** This process holds the lease (claimed, taken over, or renewed). */
@@ -812,10 +797,6 @@ function sessionStatusText(value: unknown): string {
 
 let testOnlyBeforeRowPersist: ((sessionId: string) => void) | undefined;
 let testOnlyBeforePrincipalLaneCreateTransaction: (() => void) | undefined;
-let testOnlyAfterPrincipalWorkspaceReadFence: (() => void) | undefined;
-let testOnlyBeforePrincipalWorkspaceReadQuarantine: (() => void) | undefined;
-let testOnlyBeforePrincipalWorkspaceEnqueueCommit: (() => void) | undefined;
-let testOnlyAfterPrincipalWorkspaceEnqueueCommit: (() => void) | undefined;
 let testOnlyBeforePrincipalLaneWorktreeCommit: (() => void) | undefined;
 let testOnlyAfterPrincipalLaneWorktreeCommit: (() => void) | undefined;
 /** Failure injection for the SQLite row write (the JSON engine was injectable
@@ -842,38 +823,6 @@ export function __testOnly_setAfterPrincipalLaneWorktreeCommit(
   hook: (() => void) | undefined,
 ): void {
   testOnlyAfterPrincipalLaneWorktreeCommit = hook;
-}
-
-/** Race injection after the read snapshot has ended and before a narrow
- * quarantine begins. Production code never assigns this hook. */
-export function __testOnly_setBeforePrincipalWorkspaceReadQuarantine(
-  hook: (() => void) | undefined,
-): void {
-  testOnlyBeforePrincipalWorkspaceReadQuarantine = hook;
-}
-
-/** Race injection after source/fence validation while the read snapshot is
- * still open. Production code never assigns this hook. */
-export function __testOnly_setAfterPrincipalWorkspaceReadFence(
-  hook: (() => void) | undefined,
-): void {
-  testOnlyAfterPrincipalWorkspaceReadFence = hook;
-}
-
-/** Simulate a failed acknowledgement before SQLite COMMIT is attempted.
- * Production code never assigns this hook. */
-export function __testOnly_setBeforePrincipalWorkspaceEnqueueCommit(
-  hook: (() => void) | undefined,
-): void {
-  testOnlyBeforePrincipalWorkspaceEnqueueCommit = hook;
-}
-
-/** Simulate the SQLite commit-unknown boundary after COMMIT has returned.
- * Production code never assigns this hook. */
-export function __testOnly_setAfterPrincipalWorkspaceEnqueueCommit(
-  hook: (() => void) | undefined,
-): void {
-  testOnlyAfterPrincipalWorkspaceEnqueueCommit = hook;
 }
 
 // ─── Store resolution (SQLite only for cross-process readers) ────────────────
@@ -928,9 +877,9 @@ function resolveStoreFile(appId: string, dataDir: string): StoreFileRef | undefi
 
 /** App ids whose `sessions-<id>.json` exists and whose `.db` does not.
  *  Existence only — the JSON is never parsed. */
-export function listUnmigratedAppIds(dataDir: string): string[] {
+export function listUnmigratedAppIds(dataDir: string, opts: { strict?: boolean } = {}): string[] {
   let names: string[] = [];
-  try { names = readdirSync(dataDir); } catch { return []; }
+  try { names = readdirSync(dataDir); } catch (error) { if (opts.strict) throw error; return []; }
   const ids: string[] = [];
   for (const name of names) {
     if (!name.startsWith('sessions-') || !name.endsWith('.json')) continue;
@@ -963,13 +912,14 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
 
 /** All [key, value] entries of one store. Throws on an unreadable store;
  *  callers decide skip-vs-propagate (capability errors always propagate). */
-function readStoreEntries(ref: StoreFileRef): [string, Session][] {
+function readStoreEntries(ref: StoreFileRef, strict = false): [string, Session][] {
   const db = openDbForRead(ref.path);
   try {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     const entries: [string, Session][] = [];
     for (const r of rows) {
-      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
+      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); }
+      catch (error) { if (strict) throw error; /* display readers skip unparseable rows */ }
     }
     return entries;
   } finally {
@@ -992,6 +942,81 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
   } finally {
     db.close();
   }
+}
+
+/** Rows (active OR closed) of every store whose root_message_id is in the set,
+ *  in one IN-scan per store. Unlike findActiveSessionsByRoot this keeps closed
+ *  rows (the dispatch task tree renders a ⚫ closed node) and batches all roots
+ *  so N roots cost one scan per store, not N — and never parses unrelated rows
+ *  the way loadAllSessionsSnapshot does. Best-effort: an unreadable store is
+ *  skipped, but a missing SQLite engine still throws. */
+export function readSessionsByRoots(
+  rootMessageIds: ReadonlySet<string>,
+  options: { dataDir?: string } = {},
+): Session[] {
+  const roots = [...rootMessageIds].filter(id => typeof id === 'string' && id.length > 0);
+  if (roots.length === 0) return [];
+  const rootSet = new Set(roots);
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const out: Session[] = [];
+  const seen = new Set<string>();
+  // This app's live in-memory rows are freshest than its store (closed rows are
+  // evicted from memory, so they come only from disk below).
+  load();
+  for (const session of sessions.values()) {
+    if (session.rootMessageId && rootSet.has(session.rootMessageId) && !seen.has(session.sessionId)) {
+      // readOwnStoreAllRows only JSON.parses rows (no column backfill), so a
+      // live row missing the copy must inherit this process's own app id. This
+      // branch wins the dedup, so without it it would mask the corrected disk
+      // value. Project a copy: a read API must not mutate the live registry row.
+      seen.add(session.sessionId);
+      out.push(session.larkAppId ? session : { ...session, larkAppId: currentAppId });
+    }
+  }
+  let refs: StoreFileRef[];
+  try {
+    refs = listStoreRefs(dataDir);
+  } catch {
+    return out;
+  }
+  const CHUNK = 400; // stay well under SQLite's bound-parameter limit
+  for (const ref of refs) {
+    for (let start = 0; start < roots.length; start += CHUNK) {
+      const batch = roots.slice(start, start + CHUNK);
+      let rows: { row: string }[];
+      try {
+        const db = openDbForRead(ref.path);
+        try {
+          const placeholders = batch.map(() => '?').join(',');
+          rows = db.prepare(`SELECT row FROM sessions WHERE root_message_id IN (${placeholders})`).all(...batch) as { row: string }[];
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+        continue; /* absent/old-schema/unreadable store → skip for this view */
+      }
+      for (const r of rows) {
+        try {
+          const session = JSON.parse(r.row) as Session;
+          if (session && typeof session === 'object' && typeof session.sessionId === 'string'
+            && !seen.has(session.sessionId)) {
+            // Backfill the owning bot from the store directory, exactly like
+            // loadAllSessionsSnapshot's readInto: rows written before the
+            // column copy existed omit larkAppId, and the task tree matches
+            // child sessions by it (a missing value drops a cross-bot closed
+            // child back to dispatched/running). No repairMissingChatScope
+            // here: it only repairs chat-scope rows (rootMessageId === chatId),
+            // these are always thread rows, and the task tree never reads scope.
+            if (!session.larkAppId) session.larkAppId = ref.appId;
+            seen.add(session.sessionId);
+            out.push(session);
+          }
+        } catch { /* skip malformed row */ }
+      }
+    }
+  }
+  return out;
 }
 
 /** The active rows of one store, optionally narrowed by an indexed hint. */
@@ -1259,8 +1284,15 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
-  const tmp = openDatabaseSyncOrThrow(tmpFp);
+  // The rename below is the first moment every historical row becomes visible
+  // in a SQLite store (the staging db is a private tmp path no scanner reads).
+  // Register all rows' managed references for the staging-and-rename sequence,
+  // so a collection begun during the JSON→SQLite upgrade cannot retire a
+  // version a restored session is about to name.
+  const releaseImport = reserveManagedDirectories(entries.map(([, value]) => value));
+  let tmp: SqliteDatabaseLike | undefined;
   try {
+    tmp = openDatabaseSyncOrThrow(tmpFp);
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     // The staging database is deliberately NOT in WAL mode. `renameSync` below
     // publishes ONE file, so every imported row has to live inside it by the
@@ -1298,11 +1330,13 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     renameSync(tmpFp, dbFp);
     return entries.length;
   } catch (err) {
-    try { tmp.close(); } catch { /* already closed */ }
+    try { tmp?.close(); } catch { /* already closed or open failed */ }
     for (const suffix of ['', '-journal', '-wal', '-shm']) {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
     throw err;
+  } finally {
+    releaseImport();
   }
 }
 
@@ -2129,13 +2163,46 @@ function persistRow(session: Session): void {
       new Error(`session store ${currentAppId ? getDbPath() : '<uninitialized>'} is not attached`),
     );
   }
+  // Retirement is a terminal invariant even when the durable row has no marker yet.
+  if (session.workspaceRetirement && session.status !== 'closed') throw new Error('workspace_retired');
   testOnlyBeforeRowPersist?.(session.sessionId);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    if (durable.workspaceRetirement) {
+      if (session.status !== 'closed') throw new Error('workspace_retired');
+      // Late whole-row writers may hold a pre-close copy. Retirement cannot
+      // be erased by a stale metadata write or by changing workingDir.
+      session = { ...session, workspaceRetirement: durable.workspaceRetirement };
+    }
+    // Task continuation has its own compare-and-set writer. Metadata writers
+    // holding an old row must neither erase a live task nor resurrect a stop.
+    session = { ...session, deploymentContinuation: durable.deploymentContinuation };
     // Pre-migration whole-row writers must not erase the frozen input policy.
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
+    }
+    if (durable.codexProfile !== undefined) {
+      session = { ...session, codexProfile: durable.codexProfile, codexProfileHome: durable.codexProfileHome };
+    }
+    if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
+      session = { ...session, serviceTier: durable.serviceTier };
+    }
+    if (durable.protectedHttpEgressPolicy !== undefined) {
+      if (session.protectedHttpEgressPolicy !== undefined
+        && !isDeepStrictEqual(
+          session.protectedHttpEgressPolicy,
+          durable.protectedHttpEgressPolicy,
+        )) {
+        throw new Error('Protected HTTP egress policy is immutable');
+      }
+      // The first successful freeze owns this field permanently. Whole-row
+      // metadata writers created before that freeze must carry it forward,
+      // while later writers may only replay the exact durable value.
+      session = {
+        ...session,
+        protectedHttpEgressPolicy: durable.protectedHttpEgressPolicy,
+      };
     }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
@@ -2183,10 +2250,17 @@ function buildNewSession(
     status: 'active',
     createdAt: new Date().toISOString(),
     creationSource: source,
+    codexProfile: intent.inherit ? intent.inherit.codexProfile ?? null : source === 'external' ? null : bot?.codexProfile ?? null,
+    codexProfileHome: intent.inherit ? intent.inherit.codexProfileHome : source !== 'external' && bot?.codexProfile ? resolveCodexProfileHome(bot) : undefined,
     promptInjection: intent.inherit ? intent.inherit.promptInjection ?? 'default'
       : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
   };
+  if (source !== 'external' && isCodexServiceTierCliId(bot?.cliId)) {
+    session.serviceTier = bot?.serviceTier ?? 'inherit';
+  } else {
+    delete session.serviceTier;
+  }
   if (chatType !== 'p2p' && scope !== 'chat') {
     const models = resolveGroupDefaultModels?.(chatId);
     if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);
@@ -2275,6 +2349,39 @@ export function createSessionWithOwnedMutation<T>(
   sessions.set(created.sessionId, created);
   logger.info(`Created session ${created.sessionId} (thread: ${args.rootMessageId})`);
   return { session: created, result, rows: fresh };
+}
+
+/** Create the target-side dispatch session with its durable owner marker in one row write. */
+export function createDispatchLaunchSession(input: {
+  dispatchId: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  chatType: 'group' | 'p2p';
+  workingDir: string;
+  larkAppId: string;
+  requestedOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchRequestedOverride;
+  effectiveOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchEffectiveOverride;
+  createdAt: string;
+  expiresAt: string;
+}): Session {
+  loadForWrite();
+  const session: Session = {
+    sessionId: randomUUID(), dispatchLaunchId: input.dispatchId, chatId: input.chatId,
+    chatType: input.chatType, rootMessageId: input.rootMessageId, scope: 'thread',
+    title: input.title, status: 'active', createdAt: new Date().toISOString(),
+    workingDir: input.workingDir, larkAppId: input.larkAppId,
+    reasoningEffort: input.effectiveOverride.reasoningEffort,
+    dispatchLaunchSpec: {
+      version: 1, targetLarkAppId: input.larkAppId, chatId: input.chatId,
+      rootMessageId: input.rootMessageId, requested: input.requestedOverride,
+      effective: input.effectiveOverride, createdAt: input.createdAt, expiresAt: input.expiresAt,
+    },
+  };
+  sessions.set(session.sessionId, session);
+  persistRow(session);
+  logger.info(`Created dispatch launch session ${session.sessionId} (thread: ${input.rootMessageId})`);
+  return session;
 }
 
 export function getSession(sessionId: string): Session | undefined {
@@ -2659,7 +2766,9 @@ export function markMojoCloseUnresolved(
 export function closeSession(
   sessionId: string,
   opts: {
+    backgroundExecutionCleanup?: boolean;
     cleanupBridgeMarkers?: boolean;
+    workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
     /**
      * Park an uncancellable mojo lineage as PART of this transaction.
@@ -2716,8 +2825,10 @@ export function closeSession(
     const next: Session = { ...session };
     const applied = applySessionRowCommand(next, {
       type: 'close',
+      ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
+      ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
       ...(opts.parkMojoLineage ? { parkMojoLineage: opts.parkMojoLineage } : {}),
       ...(opts.parkLocalResidual ? { parkLocalResidual: opts.parkLocalResidual } : {}),
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
@@ -2744,6 +2855,12 @@ export function closeSession(
     removePromptContextDir(sessionId);
     // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
     removeStatuslineDir(config.session.dataDir, sessionId);
+    // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
+    // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
+    removePaneLaunchDir(config.session.dataDir, sessionId);
+    // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
+    // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
+    removeSessionSkillRuntime(sessionId, config.session.dataDir);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
@@ -2763,10 +2880,11 @@ export function closeSession(
 export function reactivateClosedSession(
   sessionId: string,
 ): { ok: true; session: Session }
-| { ok: false; error: 'not_found' | 'not_closed' } {
+| { ok: false; error: 'not_found' | 'not_closed' | 'workspace_retired' } {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
+  if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // Durable first (see closeSession): the reactivated row is committed before
@@ -2776,6 +2894,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
   next.codexAppGenerationCommits = undefined;
@@ -2804,13 +2923,41 @@ export function reactivateClosedSession(
 }
 
 
-export function updateSessionPid(sessionId: string, pid: number | null): void {
+export function updateSessionPid(sessionId: string, pid: number | null, procStart?: string): void {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     session.pid = pid ?? undefined;
+    session.pidProcStart = pid === null ? undefined : procStart;
     persistRow(session);
   }
+}
+
+/**
+ * Clear recorded worker pids in one transaction, each only if its row still
+ * records exactly that pid/identity pair — a worker forked for the session
+ * since the caller's snapshot keeps its fresh record. Only `pid` and
+ * `pidProcStart` change. Returns the number of rows cleared.
+ */
+export function clearSessionPidsIfUnchanged(
+  expected: ReadonlyArray<{ sessionId: string; pid: number; procStart: string | undefined }>,
+): number {
+  loadForWrite();
+  const targets = expected.flatMap(e => {
+    const session = sessions.get(e.sessionId);
+    return session && session.pid === e.pid && session.pidProcStart === e.procStart ? [session] : [];
+  });
+  if (targets.length === 0 || !ownStore) return 0;
+  ownStore.db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const session of targets) persistRow({ ...session, pid: undefined, pidProcStart: undefined });
+    ownStore.db.exec('COMMIT');
+  } catch (error) { ownStore.db.exec('ROLLBACK'); throw error; }
+  for (const session of targets) {
+    session.pid = undefined;
+    session.pidProcStart = undefined;
+  }
+  return targets.length;
 }
 
 export function updateSession(session: Session): void {
@@ -2831,6 +2978,28 @@ export function updateSession(session: Session): void {
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (durable) Object.assign(session, JSON.parse(durable.row));
   sessions.set(session.sessionId, session);
+}
+
+/** Exact task authority mutation; ordinary metadata updates cannot write it. */
+export function updateDeploymentContinuation(
+  session: Session,
+  expected: Session['deploymentContinuation'],
+): void {
+  loadForWrite();
+  const db = ownStore;
+  if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  const hit = db.selectRow.get(session.sessionId) as { row: string } | undefined;
+  if (!hit) throw new Error('continuation session is missing');
+  const durable = JSON.parse(hit.row) as Session;
+  if (durable.status !== 'active'
+    || JSON.stringify(durable.deploymentContinuation) !== JSON.stringify(expected)) {
+    throw new Error('continuation authority changed');
+  }
+  durable.deploymentContinuation = structuredClone(session.deploymentContinuation);
+  const result = db.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), session.sessionId, hit.row);
+  if (Number(result.changes) !== 1) throw new Error('continuation session changed concurrently');
+  const cached = sessions.get(session.sessionId);
+  if (cached) cached.deploymentContinuation = structuredClone(durable.deploymentContinuation);
 }
 
 /**
@@ -3160,51 +3329,6 @@ interface PrincipalWorkspaceMemberRow {
   row: string;
 }
 
-interface PrincipalWorkspaceTicketSequenceRow {
-  group_id: string;
-  last_sequence: number;
-  revision: number;
-  created_at: string;
-  updated_at: string;
-  row: string;
-}
-
-interface PrincipalWorkspaceTicketRow {
-  ticket_id: string;
-  group_id: string;
-  sequence: number;
-  source_session_id: string;
-  lane_id: string;
-  session_id: string;
-  workspace_epoch: number;
-  turn_id: string;
-  status: string;
-  revision: number;
-  namespace_version: number;
-  namespace: string;
-  record_version: number;
-  record_id: string;
-  payload_encoding: string;
-  payload_hash: string;
-  exact_file_length: number;
-  created_at: string;
-  updated_at: string;
-  row: string;
-}
-
-interface PrincipalWorkspaceTicketAuditRow {
-  audit_id: string;
-  group_id: string;
-  ticket_id: string | null;
-  source_session_id: string;
-  lane_id: string;
-  session_id: string;
-  turn_id: string;
-  event: string;
-  detail: string | null;
-  created_at: string;
-}
-
 function parseWorkspaceGroupSidecar(hit: PrincipalWorkspaceGroupRow | undefined):
   | { ok: true; value: PrincipalWorkspaceGroup }
   | { ok: false; error: string } {
@@ -3249,211 +3373,6 @@ function parseWorkspaceMemberSidecar(hit: PrincipalWorkspaceMemberRow | undefine
     return { ok: false, error: 'indexed_value_mismatch' };
   }
   return { ok: true, value };
-}
-
-function parseWorkspaceTicketSequenceSidecar(hit: PrincipalWorkspaceTicketSequenceRow | undefined):
-  | { ok: true; value: PrincipalWorkspaceTicketSequence }
-  | { ok: false; error: string } {
-  if (!hit) return { ok: false, error: 'missing_ticket_sequence' };
-  let raw: unknown;
-  try { raw = JSON.parse(hit.row); } catch { return { ok: false, error: 'invalid_json' }; }
-  const parsed = parsePrincipalWorkspaceTicketSequence(raw);
-  if (!parsed.ok) return parsed;
-  const value = parsed.value;
-  if (hit.group_id !== value.groupId
-      || Number(hit.last_sequence) !== value.lastSequence
-      || Number(hit.revision) !== value.revision
-      || hit.created_at !== value.createdAt
-      || hit.updated_at !== value.updatedAt) {
-    return { ok: false, error: 'indexed_value_mismatch' };
-  }
-  return { ok: true, value };
-}
-
-function ticketLocatorFromRow(hit: PrincipalWorkspaceTicketRow): PrincipalWorkspaceTicketLocator {
-  return {
-    namespaceVersion: Number(hit.namespace_version) as 1,
-    namespace: hit.namespace,
-    recordVersion: Number(hit.record_version) as 1,
-    recordId: hit.record_id,
-    turnId: hit.turn_id,
-    payloadEncoding: hit.payload_encoding as PrincipalWorkspaceTicketLocator['payloadEncoding'],
-    payloadHash: hit.payload_hash,
-    exactFileLength: Number(hit.exact_file_length),
-  };
-}
-
-function parseWorkspaceTicketSidecar(hit: PrincipalWorkspaceTicketRow | undefined):
-  | { ok: true; value: PrincipalWorkspaceTicket }
-  | { ok: false; error: string } {
-  if (!hit) return { ok: false, error: 'missing_ticket' };
-  let raw: unknown;
-  try { raw = JSON.parse(hit.row); } catch { return { ok: false, error: 'invalid_json' }; }
-  const parsed = parsePrincipalWorkspaceTicket(raw);
-  if (!parsed.ok) return parsed;
-  const value = parsed.value;
-  if (hit.ticket_id !== value.ticketId
-      || hit.group_id !== value.groupId
-      || Number(hit.sequence) !== value.sequence
-      || hit.source_session_id !== value.sourceSessionId
-      || hit.lane_id !== value.laneId
-      || hit.session_id !== value.sessionId
-      || Number(hit.workspace_epoch) !== value.workspaceEpoch
-      || hit.turn_id !== value.turnId
-      || hit.status !== value.status
-      || Number(hit.revision) !== value.revision
-      || hit.created_at !== value.createdAt
-      || hit.updated_at !== value.updatedAt
-      || !sameTicketLocator(ticketLocatorFromRow(hit), value.locator)) {
-    return { ok: false, error: 'indexed_value_mismatch' };
-  }
-  return { ok: true, value };
-}
-
-function sameTicketLocator(
-  left: Readonly<PrincipalWorkspaceTicketLocator>,
-  right: Readonly<PrincipalWorkspaceTicketLocator>,
-): boolean {
-  return left.namespaceVersion === right.namespaceVersion
-    && left.namespace === right.namespace
-    && left.recordVersion === right.recordVersion
-    && left.recordId === right.recordId
-    && left.turnId === right.turnId
-    && left.payloadEncoding === right.payloadEncoding
-    && left.payloadHash === right.payloadHash
-    && left.exactFileLength === right.exactFileLength;
-}
-
-function ticketCounterEvidence(row: PrincipalWorkspaceTicketSequenceRow | undefined): string | null {
-  if (!row) return null;
-  return JSON.stringify({
-    groupId: row.group_id,
-    lastSequence: row.last_sequence,
-    revision: row.revision,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    row: row.row,
-  });
-}
-
-const PRINCIPAL_WORKSPACE_TICKET_COLUMNS = 'ticket_id, group_id, sequence, source_session_id, '
-  + 'lane_id, session_id, workspace_epoch, turn_id, status, revision, namespace_version, '
-  + 'namespace, record_version, record_id, payload_encoding, payload_hash, exact_file_length, '
-  + 'created_at, updated_at, row';
-
-function readWorkspaceTicketById(
-  store: OwnSqliteStore,
-  ticketId: string,
-): PrincipalWorkspaceTicketRow | undefined {
-  return store.db.prepare(
-    `SELECT ${PRINCIPAL_WORKSPACE_TICKET_COLUMNS} FROM principal_workspace_tickets WHERE ticket_id = ?`,
-  ).get(ticketId) as PrincipalWorkspaceTicketRow | undefined;
-}
-
-function readWorkspaceTicketByTurn(
-  store: OwnSqliteStore,
-  sourceSessionId: string,
-  laneId: string,
-  sessionId: string,
-  turnId: string,
-): PrincipalWorkspaceTicketRow | undefined {
-  return store.db.prepare(
-    `SELECT ${PRINCIPAL_WORKSPACE_TICKET_COLUMNS} FROM principal_workspace_tickets `
-    + 'WHERE source_session_id = ? AND lane_id = ? AND session_id = ? AND turn_id = ?',
-  ).get(sourceSessionId, laneId, sessionId, turnId) as PrincipalWorkspaceTicketRow | undefined;
-}
-
-function readWorkspaceTicketByRecord(
-  store: OwnSqliteStore,
-  locator: Readonly<PrincipalWorkspaceTicketLocator>,
-): PrincipalWorkspaceTicketRow | undefined {
-  return store.db.prepare(
-    `SELECT ${PRINCIPAL_WORKSPACE_TICKET_COLUMNS} FROM principal_workspace_tickets `
-    + 'WHERE namespace_version = ? AND namespace = ? AND record_version = ? AND record_id = ?',
-  ).get(
-    locator.namespaceVersion, locator.namespace, locator.recordVersion, locator.recordId,
-  ) as PrincipalWorkspaceTicketRow | undefined;
-}
-
-function ticketAuditId(
-  event: PrincipalWorkspaceTicketAuditEvent,
-  ticketId: string | undefined,
-  turnId: string,
-  detail: string,
-): string {
-  const hash = createHash('sha256');
-  for (const value of [
-    'botmux.principal-workspace.ticket-audit', '1', event, ticketId ?? '', turnId, detail,
-  ]) {
-    const bytes = Buffer.from(value, 'utf8');
-    const length = Buffer.allocUnsafe(4);
-    length.writeUInt32BE(bytes.length, 0);
-    hash.update(length);
-    hash.update(bytes);
-  }
-  return `principal-workspace-ticket-audit:v1:${hash.digest('hex')}`;
-}
-
-function persistPrincipalWorkspaceTicketAudit(
-  store: OwnSqliteStore,
-  args: {
-    event: PrincipalWorkspaceTicketAuditEvent;
-    groupId: string;
-    ticketId?: string;
-    sourceSessionId: string;
-    laneId: string;
-    sessionId: string;
-    turnId: string;
-    detail: unknown;
-    now: string;
-  },
-): void {
-  const detail = JSON.stringify(args.detail);
-  store.db.prepare(
-    `INSERT ${args.event === 'enqueued' ? '' : 'OR IGNORE '}INTO principal_workspace_ticket_audit `
-    + '(audit_id, group_id, ticket_id, source_session_id, lane_id, session_id, turn_id, '
-    + 'event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  ).run(
-    ticketAuditId(args.event, args.ticketId, args.turnId, detail), args.groupId,
-    args.ticketId ?? null, args.sourceSessionId, args.laneId, args.sessionId,
-    args.turnId, args.event, detail, args.now,
-  );
-}
-
-function ticketAuditMatchesTicket(
-  hit: PrincipalWorkspaceTicketAuditRow | undefined,
-  ticket: PrincipalWorkspaceTicket,
-): boolean {
-  if (!hit || hit.event !== 'enqueued'
-      || hit.group_id !== ticket.groupId
-      || hit.ticket_id !== ticket.ticketId
-      || hit.source_session_id !== ticket.sourceSessionId
-      || hit.lane_id !== ticket.laneId
-      || hit.session_id !== ticket.sessionId
-      || hit.turn_id !== ticket.turnId
-      || !hit.detail) return false;
-  try {
-    const detail = JSON.parse(hit.detail) as { version?: unknown; ticket?: unknown };
-    if (detail.version !== 1) return false;
-    const parsed = parsePrincipalWorkspaceTicket(detail.ticket);
-    return parsed.ok
-      && JSON.stringify(parsed.value) === JSON.stringify(ticket)
-      && canonicalIso(hit.created_at)
-      && hit.audit_id === ticketAuditId('enqueued', ticket.ticketId, ticket.turnId, hit.detail);
-  } catch {
-    return false;
-  }
-}
-
-function readEnqueuedTicketAudit(
-  store: OwnSqliteStore,
-  ticketId: string,
-): PrincipalWorkspaceTicketAuditRow | undefined {
-  return store.db.prepare(
-    'SELECT audit_id, group_id, ticket_id, source_session_id, lane_id, session_id, turn_id, '
-    + 'event, detail, created_at FROM principal_workspace_ticket_audit '
-    + "WHERE ticket_id = ? AND event = 'enqueued' ORDER BY created_at, audit_id LIMIT 1",
-  ).get(ticketId) as PrincipalWorkspaceTicketAuditRow | undefined;
 }
 
 function readWorkspaceGroupRow(
@@ -3898,106 +3817,6 @@ export interface ExpectedPrincipalLaneSourceAuthority {
   displayTarget: PrincipalLaneDisplayTarget;
 }
 
-export interface ExpectedPrincipalWorkspaceTicketAuthority {
-  groupRevision: number;
-  memberRevision: number;
-}
-
-export type EnqueuePrincipalWorkspaceTicketResult =
-  | { status: 'ready'; created: boolean; ticket: PrincipalWorkspaceTicket }
-  | { status: 'retry'; reason: 'stale_authority' | 'enqueue_not_committed' | 'store_busy' }
-  | { status: 'busy'; reason: 'source_not_active' | 'lane_not_active'
-      | 'workspace_group_not_active' | 'workspace_member_not_active'
-      | 'sequence_exhausted' | 'counter_revision_exhausted' }
-  | { status: 'conflict'; reason: 'turn_record_conflict' }
-  | { status: 'quarantined'; target: 'source' | 'lane' | 'group' | 'member' | 'ticket'; reason: string }
-  | { status: 'invalid'; reason: string }
-  | { status: 'unknown'; reason: 'enqueue_unknown' };
-
-export type PrincipalWorkspaceTicketInventoryResult =
-  | {
-      status: 'ready';
-      namespaceVersion: 1;
-      namespace: string;
-      ticketed: Array<{ recordId: string; ticketId: string; sequence: number }>;
-      orphanRecords: Array<{ recordId: string; exactFileLength: number }>;
-      conflicts: Array<{
-        recordId: string;
-        ticketId: string;
-        sequence: number;
-        reason: 'ticket_authority_mismatch' | 'ticket_namespace_mismatch'
-          | 'record_length_mismatch';
-        expectedExactFileLength?: number;
-        observedExactFileLength?: number;
-      }>;
-      unknown: Array<{
-        recordId?: string;
-        ticketId: string;
-        sequence?: number;
-        reason: 'ticket_row_unverified' | 'ticket_audit_unverified'
-          | 'ticket_counter_unverified' | 'record_missing';
-      }>;
-      staging: Array<{ name: string; exactFileLength: number }>;
-    }
-  | { status: 'retry' | 'busy' | 'invalid' | 'quarantined'; reason: string };
-
-export type EnsurePrincipalWorkspaceMembershipV2Result =
-  | {
-      status: 'ready';
-      migrated: boolean;
-      source: PrincipalLaneSourceState;
-      group: PrincipalWorkspaceGroup;
-      members: PrincipalWorkspaceMember[];
-    }
-  | {
-      status: 'retry';
-      reason: 'stale_authority' | 'source_not_active' | 'canonical_cwd_unavailable'
-        | 'lane_not_active' | 'migration_busy';
-    }
-  | { status: 'conflict'; reason: 'group_identity_conflict' | 'membership_conflict' }
-  | { status: 'quarantined'; reason: string };
-
-export interface PrincipalWorkspaceMembershipLaneSnapshot {
-  lane: PrincipalLaneBinding;
-  session: Session;
-  member: PrincipalWorkspaceMember;
-}
-
-export type ReadPrincipalWorkspaceMembershipV2Result =
-  | {
-      status: 'ready';
-      source: PrincipalLaneSourceState;
-      sourceLane: PrincipalLaneBinding;
-      sourceSession: Session;
-      group: PrincipalWorkspaceGroup;
-      lanes: PrincipalWorkspaceMembershipLaneSnapshot[];
-    }
-  | { status: 'missing'; reason: string }
-  | { status: 'stale'; reason: string }
-  | { status: 'busy'; reason: string }
-  | { status: 'quarantined'; target: 'source' | 'lane' | 'group' | 'member'; reason: string };
-
-function expectedPrincipalLaneSourceMatches(
-  source: PrincipalLaneSourceState,
-  lane: PrincipalLaneBinding,
-  expected: ExpectedPrincipalLaneSourceAuthority,
-): boolean {
-  return source.sourcePrincipalKey === expected.sourcePrincipalKey
-    && source.revision === expected.sourceRevision
-    && lane.revision === expected.sourceLaneRevision
-    && source.workspaceEpoch === expected.workspaceEpoch
-    && source.canonicalCwd === expected.canonicalCwd
-    && source.workspaceGroupId === expected.workspaceGroupId
-    && source.workspaceGroupKeyVersion === expected.workspaceGroupKeyVersion
-    && samePrincipalDisplayTarget(source.displayTarget, expected.displayTarget);
-}
-
-type ValidatedPrincipalWorkspaceLane = {
-  lane: ParsedPrincipalLaneSidecar;
-  session: Session;
-  sessionRow: string;
-};
-
 type ValidatedPrincipalLaneWorkspace =
   | { ok: true; worktree?: PrincipalLaneWorktreeProof }
   | { ok: false; reason: string };
@@ -4076,1716 +3895,6 @@ async function principalLaneWorktreeGitCarrierIsIntact(proof: Pick<
   }
 }
 
-function validatePrincipalWorkspaceLanes(
-  store: OwnSqliteStore,
-  sourceSessionId: string,
-  source: PrincipalLaneSourceState,
-  displayTarget: PrincipalLaneDisplayTarget,
-  sourceSession: Session,
-  sourceSessionRow: string,
-):
-  | { ok: true; lanes: ValidatedPrincipalWorkspaceLane[] }
-  | { ok: false; kind: 'missing' | 'stale' | 'quarantined'; laneId: string; reason: string } {
-  const hits = store.db.prepare(
-    'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
-    + 'phase, revision, row FROM principal_lanes WHERE source_session_id = ? ORDER BY lane_id',
-  ).all(sourceSessionId) as PrincipalLaneSidecarRow[];
-  const lanes: ValidatedPrincipalWorkspaceLane[] = [];
-  for (const hit of hits) {
-    const parsed = parseLaneSidecar(hit, { displayTarget, sourceSessionId });
-    if (!parsed.ok) {
-      return { ok: false, kind: 'quarantined', laneId: hit.lane_id, reason: `lane:${parsed.error}` };
-    }
-    const binding = parsed.value.binding;
-    if (binding.workspaceEpoch !== source.workspaceEpoch) {
-      return {
-        ok: false, kind: 'quarantined', laneId: binding.laneId,
-        reason: 'lane_workspace_epoch_mismatch',
-      };
-    }
-    if (binding.phase !== 'active' && binding.phase !== 'dormant') {
-      return { ok: false, kind: 'stale', laneId: binding.laneId, reason: 'lane_not_active' };
-    }
-    const childHit = binding.laneId === 'source'
-      ? { row: sourceSessionRow }
-      : store.selectRow.get(parsed.value.sessionId) as { row: string } | undefined;
-    if (!childHit) {
-      return { ok: false, kind: 'missing', laneId: binding.laneId, reason: 'missing_lane_session' };
-    }
-    let child: Session;
-    try { child = binding.laneId === 'source' ? sourceSession : JSON.parse(childHit.row) as Session; }
-    catch {
-      return {
-        ok: false, kind: 'quarantined', laneId: binding.laneId,
-        reason: 'invalid_lane_session_json',
-      };
-    }
-    if (child.sessionId !== parsed.value.sessionId) {
-      return {
-        ok: false, kind: 'quarantined', laneId: binding.laneId,
-        reason: 'lane_session_identity_mismatch',
-      };
-    }
-    if (child.status !== 'active') {
-      return { ok: false, kind: 'stale', laneId: binding.laneId, reason: 'lane_not_active' };
-    }
-    const embedded = child.principalLane
-      ? parsePrincipalLaneBinding(child.principalLane, { displayTarget, sourceSessionId })
-      : { ok: false as const, error: 'not_object' };
-    if (!embedded.ok || !principalLaneBindingsEqual(embedded.value, binding)) {
-      return {
-        ok: false, kind: 'quarantined', laneId: binding.laneId,
-        reason: 'lane_session_sidecar_mismatch',
-      };
-    }
-    if (binding.laneId === 'source') {
-      const normalized = sourceSessionDisplayTarget(child, currentAppId!);
-      if (!normalized || !samePrincipalDisplayTarget(normalized, displayTarget)) {
-        return {
-          ok: false, kind: 'quarantined', laneId: binding.laneId,
-          reason: 'lane_session_display_mismatch',
-        };
-      }
-    } else {
-      const explicitDisplayMatches = child.larkAppId === displayTarget.larkAppId
-        && child.scope === displayTarget.scope
-        && child.chatId === displayTarget.chatId
-        && (displayTarget.scope === 'chat'
-          || child.rootMessageId === displayTarget.rootMessageId);
-      if (!explicitDisplayMatches) {
-        return {
-          ok: false, kind: 'quarantined', laneId: binding.laneId,
-          reason: 'lane_session_display_mismatch',
-        };
-      }
-    }
-    const workspace = validatePrincipalLaneWorkspace(
-      store, source, parsed.value, child,
-    );
-    if (!workspace.ok) {
-      return {
-        ok: false, kind: 'quarantined', laneId: binding.laneId,
-        reason: workspace.reason,
-      };
-    }
-    lanes.push({ lane: parsed.value, session: child, sessionRow: childHit.row });
-  }
-  if (!lanes.some(value => value.lane.binding.laneId === 'source')) {
-    return { ok: false, kind: 'missing', laneId: 'source', reason: 'missing_source_lane' };
-  }
-  return { ok: true, lanes };
-}
-
-function tableExists(store: OwnSqliteStore, tableName: string): boolean {
-  return !!store.db.prepare(
-    "SELECT 1 AS hit FROM sqlite_master WHERE type = 'table' AND name = ?",
-  ).get(tableName);
-}
-
-function principalWorkspaceStoreView(db: SqliteDatabaseLike): OwnSqliteStore {
-  return {
-    db,
-    selectRow: db.prepare('SELECT row FROM sessions WHERE session_id = ?'),
-    selectAll: db.prepare('SELECT session_id, row FROM sessions'),
-    updateExact: db.prepare(
-      'UPDATE sessions SET status = ?, row = ? WHERE session_id = ? AND row = ?',
-    ),
-    insertNew: db.prepare('INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?)'),
-  };
-}
-
-interface PrincipalWorkspaceReadEvidence {
-  sessions: unknown[];
-  sources: unknown[];
-  lanes: unknown[];
-  members: unknown[];
-  groups: unknown[];
-}
-
-function capturePrincipalWorkspaceReadEvidence(
-  db: SqliteDatabaseLike,
-  sourceSessionId: string,
-): PrincipalWorkspaceReadEvidence {
-  return {
-    sessions: db.prepare(
-      'SELECT session_id, status, row FROM sessions WHERE session_id = ? '
-      + 'OR session_id IN (SELECT session_id FROM principal_lanes WHERE source_session_id = ?) '
-      + 'ORDER BY session_id',
-    ).all(sourceSessionId, sourceSessionId),
-    sources: db.prepare(
-      'SELECT source_session_id, source_principal_key, canonical_cwd, workspace_epoch, '
-      + 'workspace_group_id, phase, revision, row FROM principal_lane_sources '
-      + 'WHERE source_session_id = ? ORDER BY source_session_id',
-    ).all(sourceSessionId),
-    lanes: db.prepare(
-      'SELECT lane_id, source_session_id, session_id, principal_key, routing_anchor, '
-      + 'workspace_epoch, phase, revision, row FROM principal_lanes '
-      + 'WHERE source_session_id = ? ORDER BY lane_id',
-    ).all(sourceSessionId),
-    members: db.prepare(
-      'SELECT source_session_id, lane_id, session_id, group_id, workspace_epoch, '
-      + 'membership_phase, revision, row FROM principal_workspace_members '
-      + 'WHERE source_session_id = ? ORDER BY lane_id',
-    ).all(sourceSessionId),
-    // Group quarantine is collision-sensitive. Capture the complete app-store
-    // index so a concurrently inserted identity alias cannot escape the CAS.
-    groups: db.prepare(
-      'SELECT group_id, group_key_version, lark_app_id, canonical_cwd, phase, revision, '
-      + 'last_lease_generation, row FROM principal_workspace_groups ORDER BY group_id',
-    ).all(),
-  };
-}
-
-function principalWorkspaceReadEvidenceEqual(
-  left: PrincipalWorkspaceReadEvidence,
-  right: PrincipalWorkspaceReadEvidence,
-): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-type PrincipalWorkspaceQuarantinePlan = {
-  result: Extract<ReadPrincipalWorkspaceMembershipV2Result, { status: 'quarantined' }>;
-  laneId?: string;
-  groupIds?: string[];
-  audit?: {
-    existingIdentity: unknown;
-    incomingIdentity: unknown;
-  };
-};
-
-function changedPrincipalWorkspaceReadResult(
-  evidence: PrincipalWorkspaceReadEvidence,
-): ReadPrincipalWorkspaceMembershipV2Result {
-  const hasBusyGroup = evidence.groups.some(row => {
-    const phase = (row as { phase?: unknown }).phase;
-    return phase === 'closing' || phase === 'closed';
-  });
-  const hasBusyMember = evidence.members.some(row => {
-    const phase = (row as { membership_phase?: unknown }).membership_phase;
-    return phase === 'closing' || phase === 'closed';
-  });
-  return hasBusyGroup || hasBusyMember
-    ? { status: 'busy', reason: 'authority_changed_before_quarantine' }
-    : { status: 'stale', reason: 'authority_changed_before_quarantine' };
-}
-
-function applyPrincipalWorkspaceReadQuarantine(
-  store: OwnSqliteStore,
-  sourceSessionId: string,
-  evidence: PrincipalWorkspaceReadEvidence,
-  plan: PrincipalWorkspaceQuarantinePlan,
-): ReadPrincipalWorkspaceMembershipV2Result {
-  let committed = false;
-  store.db.exec('BEGIN IMMEDIATE');
-  try {
-    const current = capturePrincipalWorkspaceReadEvidence(store.db, sourceSessionId);
-    if (!principalWorkspaceReadEvidenceEqual(current, evidence)) {
-      store.db.exec('COMMIT');
-      committed = true;
-      return changedPrincipalWorkspaceReadResult(current);
-    }
-    if (plan.audit) {
-      persistPrincipalWorkspaceConflict(store, {
-        sourceSessionId,
-        incomingIdentity: plan.audit.incomingIdentity,
-        existingIdentity: plan.audit.existingIdentity,
-        reason: 'group_identity_conflict',
-        now: new Date().toISOString(),
-      });
-    }
-    if (plan.result.target === 'source') quarantinePrincipalLaneSource(store, sourceSessionId);
-    if (plan.result.target === 'lane') {
-      quarantinePrincipalLane(store, sourceSessionId, plan.laneId ?? 'source');
-    }
-    if (plan.result.target === 'group') {
-      for (const groupId of plan.groupIds ?? []) quarantinePrincipalWorkspaceGroup(store, groupId);
-    }
-    if (plan.result.target === 'member' && plan.laneId) {
-      quarantinePrincipalWorkspaceMember(store, sourceSessionId, plan.laneId);
-    }
-    store.db.exec('COMMIT');
-    committed = true;
-    return plan.result;
-  } finally {
-    if (!committed) {
-      try { store.db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
-    }
-  }
-}
-
-/** Read a complete v2 workspace authority without migrating or repairing it.
- * Ready/missing/stale/busy paths are read-only. Persisted malformed state is
- * the sole case that performs the established narrow quarantine write. */
-export function readPrincipalWorkspaceMembershipV2(
-  sourceSessionId: string,
-  expectedSource?: ExpectedPrincipalLaneSourceAuthority,
-): ReadPrincipalWorkspaceMembershipV2Result {
-  const appId = currentAppId;
-  if (!appId) {
-    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
-  }
-  const path = getDbPath();
-  if (!existsSync(path)) return { status: 'missing', reason: 'store_missing' };
-  const db = openDbForRead(path);
-  const store = principalWorkspaceStoreView(db);
-  let snapshotOpen = false;
-  let plan: PrincipalWorkspaceQuarantinePlan | undefined;
-  let evidence: PrincipalWorkspaceReadEvidence | undefined;
-  const quarantine = (next: PrincipalWorkspaceQuarantinePlan): ReadPrincipalWorkspaceMembershipV2Result => {
-    plan = next;
-    return next.result;
-  };
-  try {
-    if (!tableExists(store, 'principal_lane_sources')
-        || !tableExists(store, 'principal_lanes')
-        || !tableExists(store, 'principal_workspace_groups')
-        || !tableExists(store, 'principal_workspace_members')
-        || !tableExists(store, 'principal_workspace_migration_audit')) {
-      return { status: 'missing', reason: 'workspace_schema_missing' };
-    }
-    db.exec('BEGIN');
-    snapshotOpen = true;
-    const result = (() => {
-      const sourceSessionHit = store.selectRow.get(sourceSessionId) as { row: string } | undefined;
-      if (!sourceSessionHit) return { status: 'missing', reason: 'source_session_missing' } as const;
-      let sourceSession: Session;
-      try { sourceSession = JSON.parse(sourceSessionHit.row) as Session; }
-      catch {
-        return quarantine({
-          result: { status: 'quarantined', target: 'source', reason: 'invalid_source_session_json' },
-        });
-      }
-      if (sourceSession.status !== 'active') {
-        return { status: 'stale', reason: 'source_not_active' } as const;
-      }
-      const displayTarget = sourceSessionDisplayTarget(sourceSession, appId);
-      if (!displayTarget) {
-        return quarantine({
-          result: { status: 'quarantined', target: 'source', reason: 'invalid_source_display_target' },
-        });
-      }
-      const sourceHit = store.db.prepare(
-        'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
-        + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
-      ).get(sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
-      const sourceLaneHit = store.db.prepare(
-        'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
-        + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
-      ).get(sourceSessionId) as PrincipalLaneSidecarRow | undefined;
-      if (!sourceHit || !sourceLaneHit) {
-        return {
-          status: 'missing',
-          reason: !sourceHit ? 'source_sidecar_missing' : 'source_lane_missing',
-        } as const;
-      }
-      const source = parseSourceSidecar(sourceHit, displayTarget, sourceSessionId);
-      if (!source.ok) {
-        if (source.error === 'stored_quarantine') {
-          return { status: 'quarantined', target: 'source', reason: `source:${source.error}` } as const;
-        }
-        return quarantine({
-          result: { status: 'quarantined', target: 'source', reason: `source:${source.error}` },
-        });
-      }
-      const sourceLane = parseLaneSidecar(sourceLaneHit, { displayTarget, sourceSessionId });
-      if (!sourceLane.ok) {
-        if (sourceLane.error === 'stored_quarantine') {
-          return { status: 'quarantined', target: 'lane', reason: `lane:${sourceLane.error}` } as const;
-        }
-        return quarantine({
-          result: { status: 'quarantined', target: 'lane', reason: `lane:${sourceLane.error}` },
-          laneId: 'source',
-        });
-      }
-      if (sourceLane.value.binding.laneId !== 'source'
-          || sourceLane.value.sessionId !== sourceSessionId
-          || sourceLane.value.binding.principalKey !== source.value.sourcePrincipalKey
-          || sourceLane.value.binding.workspaceEpoch !== source.value.workspaceEpoch) {
-        return quarantine({
-          result: { status: 'quarantined', target: 'lane', reason: 'source_lane_mismatch' },
-          laneId: 'source',
-        });
-      }
-      const embeddedSource = sourceSession.principalLaneSource
-        ? parsePrincipalLaneSourceState(sourceSession.principalLaneSource, displayTarget, sourceSessionId)
-        : { ok: false as const, error: 'not_object' };
-      if (!embeddedSource.ok || !principalLaneSourcesEqual(embeddedSource.value, source.value)) {
-        return quarantine({
-          result: { status: 'quarantined', target: 'source', reason: 'source_session_mismatch' },
-        });
-      }
-      const embeddedSourceLane = sourceSession.principalLane
-        ? parsePrincipalLaneBinding(sourceSession.principalLane, { displayTarget, sourceSessionId })
-        : { ok: false as const, error: 'not_object' };
-      if (!embeddedSourceLane.ok
-          || !principalLaneBindingsEqual(embeddedSourceLane.value, sourceLane.value.binding)) {
-        return quarantine({
-          result: { status: 'quarantined', target: 'lane', reason: 'source_lane_session_mismatch' },
-          laneId: 'source',
-        });
-      }
-      if (expectedSource
-          && !expectedPrincipalLaneSourceMatches(source.value, sourceLane.value.binding, expectedSource)) {
-        return { status: 'stale', reason: 'source_authority_changed' } as const;
-      }
-      if (source.value.phase !== 'active') {
-        return { status: 'stale', reason: 'source_not_active' } as const;
-      }
-      if (sourceLane.value.binding.phase !== 'active') {
-        return { status: 'stale', reason: 'lane_not_active' } as const;
-      }
-      if (source.value.workspaceGroupKeyVersion !== PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION) {
-        return { status: 'stale', reason: 'workspace_migration_required' } as const;
-      }
-      testOnlyAfterPrincipalWorkspaceReadFence?.();
-      let canonicalCwd: string;
-      try { canonicalCwd = realpathSync(source.value.canonicalCwd); }
-      catch { return { status: 'stale', reason: 'canonical_cwd_unavailable' } as const; }
-      if (canonicalCwd !== source.value.canonicalCwd) {
-        return { status: 'stale', reason: 'source_authority_changed' } as const;
-      }
-      const validatedLanes = validatePrincipalWorkspaceLanes(
-        store, sourceSessionId, source.value, displayTarget, sourceSession, sourceSessionHit.row,
-      );
-      if (!validatedLanes.ok) {
-        if (validatedLanes.kind === 'missing') {
-          return { status: 'missing', reason: validatedLanes.reason } as const;
-        }
-        if (validatedLanes.kind === 'stale') {
-          return { status: 'stale', reason: validatedLanes.reason } as const;
-        }
-        return quarantine({
-          result: { status: 'quarantined', target: 'lane', reason: validatedLanes.reason },
-          laneId: validatedLanes.laneId,
-        });
-      }
-
-      const groupById = readWorkspaceGroupRow(store, source.value.workspaceGroupId);
-      const groupByIdentity = store.db.prepare(
-        'SELECT group_id, group_key_version, lark_app_id, canonical_cwd, phase, revision, '
-        + 'last_lease_generation, row FROM principal_workspace_groups '
-        + 'WHERE group_key_version = ? AND lark_app_id = ? AND canonical_cwd = ?',
-      ).get(
-        PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION, appId, source.value.canonicalCwd,
-      ) as PrincipalWorkspaceGroupRow | undefined;
-      if (groupById && groupByIdentity && groupById.group_id !== groupByIdentity.group_id) {
-        return quarantine({
-          result: { status: 'quarantined', target: 'group', reason: 'group:identity_collision' },
-          groupIds: [groupById.group_id, groupByIdentity.group_id],
-          audit: {
-            incomingIdentity: {
-              targetGroupId: source.value.workspaceGroupId,
-              larkAppId: appId,
-              canonicalCwd: source.value.canonicalCwd,
-            },
-            existingIdentity: {
-              byId: groupById.group_id,
-              byIdentity: groupByIdentity.group_id,
-            },
-          },
-        });
-      }
-      const groupHit = groupById ?? groupByIdentity;
-      if (!groupHit) return { status: 'missing', reason: 'workspace_group_missing' } as const;
-      const group = parseWorkspaceGroupSidecar(groupHit);
-      if (!group.ok) {
-        if (group.error === 'stored_quarantine') {
-          return { status: 'quarantined', target: 'group', reason: `group:${group.error}` } as const;
-        }
-        return quarantine({
-          result: { status: 'quarantined', target: 'group', reason: `group:${group.error}` },
-          groupIds: [groupHit.group_id],
-        });
-      }
-      if (group.value.groupId !== source.value.workspaceGroupId
-          || group.value.larkAppId !== appId
-          || group.value.canonicalCwd !== source.value.canonicalCwd) {
-        return quarantine({
-          result: { status: 'quarantined', target: 'group', reason: 'group:identity_conflict' },
-          groupIds: [group.value.groupId],
-        });
-      }
-      if (group.value.phase !== 'active') {
-        return { status: 'busy', reason: 'workspace_group_not_active' } as const;
-      }
-
-      const memberRows = store.db.prepare(
-        'SELECT source_session_id, lane_id, session_id, group_id, workspace_epoch, '
-        + 'membership_phase, revision, row FROM principal_workspace_members '
-        + 'WHERE source_session_id = ? ORDER BY lane_id',
-      ).all(sourceSessionId) as PrincipalWorkspaceMemberRow[];
-      const laneIds = new Set(validatedLanes.lanes.map(value => value.lane.binding.laneId));
-      const extraMember = memberRows.find(row => !laneIds.has(row.lane_id));
-      if (extraMember) {
-        return quarantine({
-          result: { status: 'quarantined', target: 'member', reason: 'member:unexpected_lane' },
-          laneId: extraMember.lane_id,
-        });
-      }
-      const memberByLane = new Map(memberRows.map(row => [row.lane_id, row]));
-      const lanes: PrincipalWorkspaceMembershipLaneSnapshot[] = [];
-      for (const validated of validatedLanes.lanes) {
-        const laneId = validated.lane.binding.laneId;
-        const memberHit = memberByLane.get(laneId);
-        if (!memberHit) return { status: 'missing', reason: 'workspace_member_missing' } as const;
-        const member = parseWorkspaceMemberSidecar(memberHit);
-        if (!member.ok) {
-          if (member.error === 'stored_quarantine') {
-            return { status: 'quarantined', target: 'member', reason: `member:${member.error}` } as const;
-          }
-          return quarantine({
-            result: { status: 'quarantined', target: 'member', reason: `member:${member.error}` },
-            laneId,
-          });
-        }
-        if (!principalWorkspaceMemberIdentityMatchesLane(member.value, validated.lane, source.value)) {
-          return quarantine({
-            result: { status: 'quarantined', target: 'member', reason: 'member:identity_mismatch' },
-            laneId: member.value.laneId,
-          });
-        }
-        if (member.value.membershipPhase !== 'active') {
-          return { status: 'busy', reason: 'workspace_member_not_active' } as const;
-        }
-        lanes.push({ lane: validated.lane.binding, session: validated.session, member: member.value });
-      }
-      return {
-        status: 'ready', source: source.value, sourceLane: sourceLane.value.binding,
-        sourceSession, group: group.value, lanes,
-      } as const;
-    })();
-    if (plan) evidence = capturePrincipalWorkspaceReadEvidence(db, sourceSessionId);
-    db.exec('COMMIT');
-    snapshotOpen = false;
-    if (!plan || !evidence) return result;
-    testOnlyBeforePrincipalWorkspaceReadQuarantine?.();
-    return applyPrincipalWorkspaceReadQuarantine(store, sourceSessionId, evidence, plan);
-  } finally {
-    if (snapshotOpen) {
-      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
-    }
-    try { db.close(); } catch { /* already closed */ }
-  }
-}
-
-function persistPrincipalWorkspaceConflict(
-  store: OwnSqliteStore,
-  args: {
-    sourceSessionId: string;
-    laneId?: string;
-    sessionId?: string;
-    existingIdentity?: unknown;
-    incomingIdentity: unknown;
-    reason: 'group_identity_conflict' | 'membership_conflict';
-    now: string;
-  },
-): void {
-  store.db.prepare(
-    'INSERT INTO principal_workspace_migration_audit '
-    + '(audit_id, source_session_id, event, detail, created_at) VALUES (?, ?, ?, ?, ?)',
-  ).run(randomUUID(), args.sourceSessionId, 'conflict', JSON.stringify({
-    reason: args.reason,
-    laneId: args.laneId,
-    sessionId: args.sessionId,
-    existingIdentity: args.existingIdentity,
-    incomingIdentity: args.incomingIdentity,
-  }), args.now);
-  if (args.laneId && args.sessionId) {
-    store.db.prepare(
-      'INSERT INTO principal_workspace_member_conflicts '
-      + '(conflict_id, source_session_id, lane_id, session_id, existing_identity, '
-      + 'incoming_identity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ).run(
-      randomUUID(), args.sourceSessionId, args.laneId, args.sessionId,
-      args.existingIdentity === undefined ? null : JSON.stringify(args.existingIdentity),
-      JSON.stringify(args.incomingIdentity), args.now,
-    );
-  }
-}
-
-/** Upgrade one complete source and all of its lanes from the source-local v1
- * workspace id to the shared canonical-cwd v2 group. The supplied fence is
- * mandatory: an old-fence concurrent loser always returns stale rather than
- * inferring that another migration is "close enough". */
-export function ensurePrincipalWorkspaceMembershipV2(args: {
-  sourceSessionId: string;
-  expectedSource: ExpectedPrincipalLaneSourceAuthority;
-  now?: string;
-}): EnsurePrincipalWorkspaceMembershipV2Result {
-  loadForWrite();
-  const store = ownStore;
-  if (!store || !currentAppId) {
-    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
-  }
-  const now = args.now ?? new Date().toISOString();
-  if (!canonicalIso(now)) throw new Error('invalid principal workspace migration timestamp');
-  let committedSourceSession: Session | undefined;
-  let result: EnsurePrincipalWorkspaceMembershipV2Result;
-  try {
-    result = runOwnedWriteTransaction(store, false, (): EnsurePrincipalWorkspaceMembershipV2Result => {
-    const sourceSessionHit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
-    if (!sourceSessionHit) return { status: 'retry', reason: 'stale_authority' };
-    let sourceSession: Session;
-    try { sourceSession = JSON.parse(sourceSessionHit.row) as Session; }
-    catch {
-      quarantinePrincipalLaneSource(store, args.sourceSessionId);
-      return { status: 'quarantined', reason: 'invalid_source_session_json' };
-    }
-    if (sourceSession.status !== 'active') return { status: 'retry', reason: 'source_not_active' };
-    const displayTarget = sourceSessionDisplayTarget(sourceSession, currentAppId!);
-    if (!displayTarget) {
-      quarantinePrincipalLaneSource(store, args.sourceSessionId);
-      return { status: 'quarantined', reason: 'invalid_source_display_target' };
-    }
-    const sourceHit = store.db.prepare(
-      'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
-      + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
-    ).get(args.sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
-    const sourceLaneHit = store.db.prepare(
-      'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
-      + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
-    ).get(args.sourceSessionId) as PrincipalLaneSidecarRow | undefined;
-    const sourceState = parseSourceSidecar(sourceHit, displayTarget, args.sourceSessionId);
-    const sourceLane = parseLaneSidecar(sourceLaneHit, {
-      displayTarget, sourceSessionId: args.sourceSessionId,
-    });
-    if (!sourceState.ok) {
-      quarantinePrincipalLaneSource(store, args.sourceSessionId);
-      return { status: 'quarantined', reason: `source:${sourceState.error}` };
-    }
-    if (!sourceLane.ok
-        || sourceLane.value.binding.laneId !== 'source'
-        || sourceLane.value.sessionId !== args.sourceSessionId
-        || sourceLane.value.binding.principalKey !== sourceState.value.sourcePrincipalKey
-        || sourceLane.value.binding.workspaceEpoch !== sourceState.value.workspaceEpoch) {
-      quarantinePrincipalLane(store, args.sourceSessionId);
-      return { status: 'quarantined', reason: !sourceLane.ok
-        ? `lane:${sourceLane.error}` : 'source_lane_mismatch' };
-    }
-    const embeddedSource = sourceSession.principalLaneSource
-      ? parsePrincipalLaneSourceState(
-        sourceSession.principalLaneSource, displayTarget, args.sourceSessionId,
-      )
-      : { ok: false as const, error: 'not_object' };
-    if (!embeddedSource.ok || !principalLaneSourcesEqual(embeddedSource.value, sourceState.value)) {
-      quarantinePrincipalLaneSource(store, args.sourceSessionId);
-      return { status: 'quarantined', reason: 'source_session_mismatch' };
-    }
-    if (sourceState.value.phase !== 'active' || sourceLane.value.binding.phase !== 'active') {
-      return { status: 'retry', reason: 'source_not_active' };
-    }
-    if (!expectedPrincipalLaneSourceMatches(
-      sourceState.value, sourceLane.value.binding, args.expectedSource,
-    )) {
-      return { status: 'retry', reason: 'stale_authority' };
-    }
-    let canonicalCwd: string;
-    try { canonicalCwd = realpathSync(sourceState.value.canonicalCwd); }
-    catch { return { status: 'retry', reason: 'canonical_cwd_unavailable' }; }
-    if (canonicalCwd !== sourceState.value.canonicalCwd) {
-      return { status: 'retry', reason: 'stale_authority' };
-    }
-    const validatedLanes = validatePrincipalWorkspaceLanes(
-      store, args.sourceSessionId, sourceState.value, displayTarget,
-      sourceSession, sourceSessionHit.row,
-    );
-    if (!validatedLanes.ok) {
-      if (validatedLanes.kind === 'stale') {
-        return { status: 'retry', reason: 'lane_not_active' };
-      }
-      quarantinePrincipalLane(store, args.sourceSessionId, validatedLanes.laneId);
-      return { status: 'quarantined', reason: validatedLanes.reason };
-    }
-
-    const targetGroupId = principalWorkspaceGroupIdV2(currentAppId!, canonicalCwd);
-    const groupById = readWorkspaceGroupRow(store, targetGroupId);
-    const groupByIdentity = store.db.prepare(
-      'SELECT group_id, group_key_version, lark_app_id, canonical_cwd, phase, revision, '
-      + 'last_lease_generation, row FROM principal_workspace_groups '
-      + 'WHERE group_key_version = ? AND lark_app_id = ? AND canonical_cwd = ?',
-    ).get(
-      PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION, currentAppId!, canonicalCwd,
-    ) as PrincipalWorkspaceGroupRow | undefined;
-    if (groupById && groupByIdentity && groupById.group_id !== groupByIdentity.group_id) {
-      persistPrincipalWorkspaceConflict(store, {
-        sourceSessionId: args.sourceSessionId,
-        incomingIdentity: { targetGroupId, larkAppId: currentAppId, canonicalCwd },
-        existingIdentity: { byId: groupById.group_id, byIdentity: groupByIdentity.group_id },
-        reason: 'group_identity_conflict', now,
-      });
-      quarantinePrincipalWorkspaceGroup(store, groupById.group_id);
-      quarantinePrincipalWorkspaceGroup(store, groupByIdentity.group_id);
-      return { status: 'quarantined', reason: 'group:identity_collision' };
-    }
-    const groupHit = groupById ?? groupByIdentity;
-    let existingGroup: PrincipalWorkspaceGroup | undefined;
-    if (groupHit) {
-      const parsedGroup = parseWorkspaceGroupSidecar(groupHit);
-      if (!parsedGroup.ok) {
-        quarantinePrincipalWorkspaceGroup(store, groupHit.group_id);
-        return { status: 'quarantined', reason: `group:${parsedGroup.error}` };
-      }
-      existingGroup = parsedGroup.value;
-      if (existingGroup.groupId !== targetGroupId
-          || existingGroup.larkAppId !== currentAppId
-          || existingGroup.canonicalCwd !== canonicalCwd) {
-        persistPrincipalWorkspaceConflict(store, {
-          sourceSessionId: args.sourceSessionId,
-          incomingIdentity: { targetGroupId, larkAppId: currentAppId, canonicalCwd },
-          existingIdentity: existingGroup,
-          reason: 'group_identity_conflict', now,
-        });
-        quarantinePrincipalWorkspaceGroup(store, existingGroup.groupId);
-        return { status: 'quarantined', reason: 'group:identity_conflict' };
-      }
-      if (existingGroup.phase !== 'active') {
-        return { status: 'retry', reason: 'migration_busy' };
-      }
-    }
-
-    const memberRows = store.db.prepare(
-      'SELECT source_session_id, lane_id, session_id, group_id, workspace_epoch, '
-      + 'membership_phase, revision, row FROM principal_workspace_members '
-      + 'WHERE source_session_id = ? ORDER BY lane_id',
-    ).all(args.sourceSessionId) as PrincipalWorkspaceMemberRow[];
-    const byLaneId = new Map(memberRows.map(row => [row.lane_id, row]));
-
-    if (sourceState.value.workspaceGroupKeyVersion === PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION) {
-      if (sourceState.value.workspaceGroupId !== targetGroupId) {
-        return { status: 'retry', reason: 'stale_authority' };
-      }
-      const laneIds = new Set(validatedLanes.lanes.map(value => value.lane.binding.laneId));
-      if (memberRows.length !== validatedLanes.lanes.length
-          || memberRows.some(row => !laneIds.has(row.lane_id))) {
-        persistPrincipalWorkspaceConflict(store, {
-          sourceSessionId: args.sourceSessionId,
-          incomingIdentity: { lanes: [...laneIds].sort(), groupId: targetGroupId },
-          existingIdentity: memberRows.map(row => ({ laneId: row.lane_id, sessionId: row.session_id })),
-          reason: 'membership_conflict', now,
-        });
-        return { status: 'conflict', reason: 'membership_conflict' };
-      }
-      const members: PrincipalWorkspaceMember[] = [];
-      for (const validated of validatedLanes.lanes) {
-        const row = byLaneId.get(validated.lane.binding.laneId);
-        const parsedMember = parseWorkspaceMemberSidecar(row);
-        if (!parsedMember.ok) {
-          if (row) quarantinePrincipalWorkspaceMember(
-            store, args.sourceSessionId, validated.lane.binding.laneId,
-          );
-          return { status: 'quarantined', reason: `member:${parsedMember.error}` };
-        }
-        if (!principalWorkspaceMemberIdentityMatchesLane(
-          parsedMember.value, validated.lane, sourceState.value,
-        )) {
-          persistPrincipalWorkspaceConflict(store, {
-            sourceSessionId: args.sourceSessionId,
-            laneId: validated.lane.binding.laneId,
-            sessionId: validated.lane.sessionId,
-            existingIdentity: parsedMember.value,
-            incomingIdentity: {
-              sourceSessionId: args.sourceSessionId,
-              laneId: validated.lane.binding.laneId,
-              sessionId: validated.lane.sessionId,
-              groupId: targetGroupId,
-              workspaceEpoch: sourceState.value.workspaceEpoch,
-            },
-            reason: 'membership_conflict', now,
-          });
-          return { status: 'conflict', reason: 'membership_conflict' };
-        }
-        if (parsedMember.value.membershipPhase !== 'active') {
-          return { status: 'retry', reason: 'migration_busy' };
-        }
-        members.push(parsedMember.value);
-      }
-      if (!existingGroup) {
-        persistPrincipalWorkspaceConflict(store, {
-          sourceSessionId: args.sourceSessionId,
-          incomingIdentity: { targetGroupId, larkAppId: currentAppId, canonicalCwd },
-          reason: 'group_identity_conflict', now,
-        });
-        return { status: 'conflict', reason: 'group_identity_conflict' };
-      }
-      return {
-        status: 'ready', migrated: false, source: sourceState.value,
-        group: existingGroup, members,
-      };
-    }
-
-    const existingTicketWork = tableExists(store, 'principal_workspace_tickets')
-      && !!store.db.prepare(
-        'SELECT 1 AS hit FROM principal_workspace_tickets WHERE source_session_id = ? LIMIT 1',
-      ).get(args.sourceSessionId);
-    if (existingTicketWork || tableExists(store, 'principal_workspace_active_leases')) {
-      return { status: 'retry', reason: 'migration_busy' };
-    }
-    if (memberRows.length > 0) {
-      const row = memberRows[0]!;
-      persistPrincipalWorkspaceConflict(store, {
-        sourceSessionId: args.sourceSessionId,
-        laneId: row.lane_id,
-        sessionId: row.session_id,
-        existingIdentity: row,
-        incomingIdentity: { targetGroupId, workspaceEpoch: sourceState.value.workspaceEpoch },
-        reason: 'membership_conflict', now,
-      });
-      return { status: 'conflict', reason: 'membership_conflict' };
-    }
-    for (const validated of validatedLanes.lanes) {
-      const sessionOwner = store.db.prepare(
-        'SELECT source_session_id, lane_id, session_id, group_id, workspace_epoch, '
-        + 'membership_phase, revision, row FROM principal_workspace_members '
-        + 'WHERE session_id = ?',
-      ).get(validated.lane.sessionId) as PrincipalWorkspaceMemberRow | undefined;
-      if (sessionOwner) {
-        persistPrincipalWorkspaceConflict(store, {
-          sourceSessionId: args.sourceSessionId,
-          laneId: validated.lane.binding.laneId,
-          sessionId: validated.lane.sessionId,
-          existingIdentity: sessionOwner,
-          incomingIdentity: { targetGroupId, workspaceEpoch: sourceState.value.workspaceEpoch },
-          reason: 'membership_conflict', now,
-        });
-        return { status: 'conflict', reason: 'membership_conflict' };
-      }
-    }
-
-    const group = existingGroup ?? initialPrincipalWorkspaceGroup(currentAppId!, canonicalCwd, now);
-    const members = validatedLanes.lanes.map(value => initialPrincipalWorkspaceMember({
-      sourceSessionId: args.sourceSessionId,
-      laneId: value.lane.binding.laneId,
-      sessionId: value.lane.sessionId,
-      groupId: targetGroupId,
-      workspaceEpoch: sourceState.value.workspaceEpoch,
-      now,
-    }));
-    const nextSource: PrincipalLaneSourceState = {
-      ...sourceState.value,
-      workspaceGroupId: targetGroupId,
-      workspaceGroupKeyVersion: PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION,
-      revision: sourceState.value.revision + 1,
-      updatedAt: now,
-    };
-    const nextSourceSession: Session = {
-      ...sourceSession,
-      principalLaneSource: nextSource,
-    };
-
-    if (!existingGroup) insertPrincipalWorkspaceGroup(store, group);
-    for (const member of members) insertPrincipalWorkspaceMember(store, member);
-    const sourceUpdated = store.db.prepare(
-      'UPDATE principal_lane_sources SET workspace_group_id = ?, revision = ?, row = ? '
-      + 'WHERE source_session_id = ? AND revision = ? AND workspace_group_id = ?',
-    ).run(
-      nextSource.workspaceGroupId, nextSource.revision, JSON.stringify(nextSource),
-      args.sourceSessionId, sourceState.value.revision, sourceState.value.workspaceGroupId,
-    );
-    if (Number(sourceUpdated.changes) !== 1) throw new PrincipalLaneAuthorityChangedError();
-    const sessionUpdated = store.updateExact.run(
-      sessionStatusText(nextSourceSession), JSON.stringify(nextSourceSession),
-      args.sourceSessionId, sourceSessionHit.row,
-    );
-    if (Number(sessionUpdated.changes) !== 1) throw new PrincipalLaneAuthorityChangedError();
-    store.db.prepare(
-      'INSERT INTO principal_workspace_migration_audit '
-      + '(audit_id, source_session_id, event, from_group_id, target_group_id, '
-      + 'from_revision, from_epoch, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    ).run(
-      randomUUID(), args.sourceSessionId, 'migrated', sourceState.value.workspaceGroupId,
-      targetGroupId, sourceState.value.revision, sourceState.value.workspaceEpoch,
-      JSON.stringify({ laneCount: members.length }), now,
-    );
-    committedSourceSession = nextSourceSession;
-    return { status: 'ready', migrated: true, source: nextSource, group, members };
-    });
-  } catch (error) {
-    if (error instanceof PrincipalLaneAuthorityChangedError) {
-      return { status: 'retry', reason: 'stale_authority' };
-    }
-    throw error;
-  }
-  if (committedSourceSession) {
-    const cached = sessions.get(args.sourceSessionId);
-    if (cached) {
-      for (const key of Object.keys(cached)) delete (cached as unknown as Record<string, unknown>)[key];
-      Object.assign(cached, structuredClone(committedSourceSession));
-    } else {
-      sessions.set(args.sourceSessionId, committedSourceSession);
-    }
-  }
-  return result;
-}
-
-type ValidatedTicketEnqueueAuthority = {
-  source: PrincipalLaneSourceState;
-  lane: ParsedPrincipalLaneSidecar;
-  group: PrincipalWorkspaceGroup;
-  member: PrincipalWorkspaceMember;
-};
-
-function validateTicketEnqueueAuthority(
-  store: OwnSqliteStore,
-  authority: PrincipalLaneDispatchAuthority,
-  expected: ExpectedPrincipalWorkspaceTicketAuthority,
-): { ok: true; value: ValidatedTicketEnqueueAuthority }
-  | { ok: false; result: EnqueuePrincipalWorkspaceTicketResult } {
-  const sourceSessionId = authority.source.sourceSessionId;
-  if (!currentAppId || authority.source.source.displayTarget.larkAppId !== currentAppId) {
-    return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-  }
-  const sourceSessionHit = store.selectRow.get(sourceSessionId) as { row: string } | undefined;
-  if (!sourceSessionHit) {
-    return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-  }
-  let sourceSession: Session;
-  try { sourceSession = JSON.parse(sourceSessionHit.row) as Session; }
-  catch {
-    quarantinePrincipalLaneSource(store, sourceSessionId);
-    return {
-      ok: false,
-      result: { status: 'quarantined', target: 'source', reason: 'invalid_source_session_json' },
-    };
-  }
-  if (sourceSession.status !== 'active' || authority.source.source.phase !== 'active') {
-    return { ok: false, result: { status: 'busy', reason: 'source_not_active' } };
-  }
-  const displayTarget = sourceSessionDisplayTarget(sourceSession, currentAppId);
-  if (!displayTarget) {
-    quarantinePrincipalLaneSource(store, sourceSessionId);
-    return {
-      ok: false,
-      result: { status: 'quarantined', target: 'source', reason: 'invalid_source_display_target' },
-    };
-  }
-  const sourceHit = store.db.prepare(
-    'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
-    + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
-  ).get(sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
-  const sourceLaneHit = store.db.prepare(
-    'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
-    + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
-  ).get(sourceSessionId) as PrincipalLaneSidecarRow | undefined;
-  const source = parseSourceSidecar(sourceHit, displayTarget, sourceSessionId);
-  const sourceLane = parseLaneSidecar(sourceLaneHit, { displayTarget, sourceSessionId });
-  if (!source.ok) {
-    if (source.error === 'missing_sidecar') {
-      return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-    }
-    quarantinePrincipalLaneSource(store, sourceSessionId);
-    return {
-      ok: false,
-      result: { status: 'quarantined', target: 'source', reason: `source:${source.error}` },
-    };
-  }
-  if (!sourceLane.ok || sourceLane.value.binding.laneId !== 'source'
-      || sourceLane.value.sessionId !== sourceSessionId) {
-    if (!sourceLane.ok && sourceLane.error === 'missing_sidecar') {
-      return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-    }
-    quarantinePrincipalLane(store, sourceSessionId);
-    return {
-      ok: false,
-      result: {
-        status: 'quarantined', target: 'lane',
-        reason: !sourceLane.ok ? `lane:${sourceLane.error}` : 'source_lane_mismatch',
-      },
-    };
-  }
-  if (!principalLaneSourcesEqual(source.value, authority.source.source)
-      || !principalLaneBindingsEqual(sourceLane.value.binding, authority.source.lane)) {
-    return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-  }
-  const embeddedSource = sourceSession.principalLaneSource
-    ? parsePrincipalLaneSourceState(sourceSession.principalLaneSource, displayTarget, sourceSessionId)
-    : { ok: false as const, error: 'not_object' };
-  if (!embeddedSource.ok || !principalLaneSourcesEqual(embeddedSource.value, source.value)) {
-    quarantinePrincipalLaneSource(store, sourceSessionId);
-    return {
-      ok: false,
-      result: { status: 'quarantined', target: 'source', reason: 'source_session_mismatch' },
-    };
-  }
-  if (source.value.workspaceGroupKeyVersion !== PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION) {
-    return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-  }
-  const lanes = validatePrincipalWorkspaceLanes(
-    store, sourceSessionId, source.value, displayTarget, sourceSession, sourceSessionHit.row,
-  );
-  if (!lanes.ok) {
-    if (lanes.kind === 'missing') {
-      return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-    }
-    if (lanes.kind === 'stale') {
-      return { ok: false, result: { status: 'busy', reason: 'lane_not_active' } };
-    }
-    quarantinePrincipalLane(store, sourceSessionId, lanes.laneId);
-    return {
-      ok: false,
-      result: { status: 'quarantined', target: 'lane', reason: lanes.reason },
-    };
-  }
-  const target = lanes.lanes.find(value => value.lane.binding.laneId === authority.lane.lane.laneId);
-  if (!target
-      || target.lane.sessionId !== authority.lane.sessionId
-      || !principalLaneBindingsEqual(target.lane.binding, authority.lane.lane)
-      || authority.session.sessionId !== target.lane.sessionId) {
-    return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-  }
-  const groupHit = readWorkspaceGroupRow(store, source.value.workspaceGroupId);
-  const group = parseWorkspaceGroupSidecar(groupHit);
-  if (!group.ok) {
-    if (group.error === 'missing_group') {
-      return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-    }
-    if (group.error !== 'stored_quarantine' && groupHit) {
-      quarantinePrincipalWorkspaceGroup(store, source.value.workspaceGroupId);
-    }
-    return {
-      ok: false,
-      result: { status: 'quarantined', target: 'group', reason: `group:${group.error}` },
-    };
-  }
-  if (group.value.groupId !== source.value.workspaceGroupId
-      || group.value.larkAppId !== currentAppId
-      || group.value.canonicalCwd !== source.value.canonicalCwd
-      || group.value.revision !== expected.groupRevision) {
-    return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-  }
-  if (group.value.phase !== 'active') {
-    return { ok: false, result: { status: 'busy', reason: 'workspace_group_not_active' } };
-  }
-  const memberHit = readWorkspaceMemberRow(store, sourceSessionId, target.lane.binding.laneId);
-  const member = parseWorkspaceMemberSidecar(memberHit);
-  if (!member.ok) {
-    if (member.error === 'missing_member') {
-      return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-    }
-    if (member.error !== 'stored_quarantine' && memberHit) {
-      quarantinePrincipalWorkspaceMember(store, sourceSessionId, target.lane.binding.laneId);
-    }
-    return {
-      ok: false,
-      result: { status: 'quarantined', target: 'member', reason: `member:${member.error}` },
-    };
-  }
-  if (!principalWorkspaceMemberIdentityMatchesLane(member.value, target.lane, source.value)
-      || member.value.revision !== expected.memberRevision) {
-    return { ok: false, result: { status: 'retry', reason: 'stale_authority' } };
-  }
-  if (member.value.membershipPhase !== 'active') {
-    return { ok: false, result: { status: 'busy', reason: 'workspace_member_not_active' } };
-  }
-  return { ok: true, value: { source: source.value, lane: target.lane, group: group.value, member: member.value } };
-}
-
-function ticketConflictOrCorruption(
-  store: OwnSqliteStore,
-  existingRow: PrincipalWorkspaceTicketRow,
-  incoming: {
-    ticketId: string;
-    groupId: string;
-    sourceSessionId: string;
-    laneId: string;
-    sessionId: string;
-    turnId: string;
-    locator: PrincipalWorkspaceTicketLocator;
-    now: string;
-  },
-): EnqueuePrincipalWorkspaceTicketResult {
-  if (existingRow.ticket_id === incoming.ticketId
-      && (existingRow.group_id !== incoming.groupId
-        || existingRow.source_session_id !== incoming.sourceSessionId
-        || existingRow.lane_id !== incoming.laneId
-        || existingRow.session_id !== incoming.sessionId
-        || existingRow.turn_id !== incoming.turnId)) {
-    persistPrincipalWorkspaceTicketAudit(store, {
-      ...incoming,
-      event: 'ticket_id_collision',
-      detail: {
-        existingIdentity: {
-          groupId: existingRow.group_id,
-          sourceSessionId: existingRow.source_session_id,
-          laneId: existingRow.lane_id,
-          sessionId: existingRow.session_id,
-          turnId: existingRow.turn_id,
-        },
-        incomingIdentity: {
-          groupId: incoming.groupId,
-          sourceSessionId: incoming.sourceSessionId,
-          laneId: incoming.laneId,
-          sessionId: incoming.sessionId,
-          turnId: incoming.turnId,
-        },
-      },
-    });
-    quarantinePrincipalWorkspaceGroup(store, incoming.groupId);
-    if (existingRow.group_id !== incoming.groupId) {
-      quarantinePrincipalWorkspaceGroup(store, existingRow.group_id);
-    }
-    return { status: 'quarantined', target: 'ticket', reason: 'ticket_id_collision' };
-  }
-  const parsed = parseWorkspaceTicketSidecar(existingRow);
-  if (!parsed.ok) {
-    persistPrincipalWorkspaceTicketAudit(store, {
-      ...incoming, event: 'ticket_row_corruption', detail: { error: parsed.error },
-    });
-    quarantinePrincipalWorkspaceGroup(store, incoming.groupId);
-    return { status: 'quarantined', target: 'ticket', reason: `ticket:${parsed.error}` };
-  }
-  const ticket = parsed.value;
-  const enqueuedAudit = readEnqueuedTicketAudit(store, ticket.ticketId);
-  if (!ticketAuditMatchesTicket(enqueuedAudit, ticket)) {
-    persistPrincipalWorkspaceTicketAudit(store, {
-      ...incoming, event: 'ticket_row_corruption', detail: { error: 'enqueued_audit_mismatch' },
-    });
-    quarantinePrincipalWorkspaceGroup(store, incoming.groupId);
-    if (ticket.groupId !== incoming.groupId) {
-      quarantinePrincipalWorkspaceGroup(store, ticket.groupId);
-    }
-    return { status: 'quarantined', target: 'ticket', reason: 'ticket:enqueued_audit_mismatch' };
-  }
-  const sameTurnIdentity = ticket.ticketId === incoming.ticketId
-    && ticket.groupId === incoming.groupId
-    && ticket.sourceSessionId === incoming.sourceSessionId
-    && ticket.laneId === incoming.laneId
-    && ticket.sessionId === incoming.sessionId
-    && ticket.turnId === incoming.turnId;
-  if (sameTurnIdentity && sameTicketLocator(ticket.locator, incoming.locator)) {
-    return { status: 'ready', created: false, ticket };
-  }
-  if (ticket.sourceSessionId === incoming.sourceSessionId
-      && ticket.laneId === incoming.laneId
-      && ticket.sessionId === incoming.sessionId
-      && ticket.turnId === incoming.turnId) {
-    persistPrincipalWorkspaceTicketAudit(store, {
-      ...incoming, event: 'turn_record_conflict',
-      detail: { existingTicket: ticket, incomingLocator: incoming.locator },
-    });
-    return { status: 'conflict', reason: 'turn_record_conflict' };
-  }
-  const event: PrincipalWorkspaceTicketAuditEvent = existingRow.ticket_id === incoming.ticketId
-    ? 'ticket_id_collision' : 'record_ticket_conflict';
-  persistPrincipalWorkspaceTicketAudit(store, {
-    ...incoming, event, detail: { existingTicket: ticket, incomingLocator: incoming.locator },
-  });
-  quarantinePrincipalWorkspaceGroup(store, incoming.groupId);
-  if (ticket.groupId !== incoming.groupId) quarantinePrincipalWorkspaceGroup(store, ticket.groupId);
-  return { status: 'quarantined', target: 'ticket', reason: event };
-}
-
-function recoverPrincipalWorkspaceEnqueueOutcome(args: {
-  path: string;
-  ticketId: string;
-  groupId: string;
-  sourceSessionId: string;
-  laneId: string;
-  sessionId: string;
-  turnId: string;
-  locator: PrincipalWorkspaceTicketLocator;
-  counterBeforeCommit: string | null | undefined;
-}): EnqueuePrincipalWorkspaceTicketResult {
-  const db = openDbForRead(args.path);
-  const store = principalWorkspaceStoreView(db);
-  let open = false;
-  try {
-    db.exec('BEGIN');
-    open = true;
-    const byId = readWorkspaceTicketById(store, args.ticketId);
-    const byTurn = readWorkspaceTicketByTurn(
-      store, args.sourceSessionId, args.laneId, args.sessionId, args.turnId,
-    );
-    const byRecord = readWorkspaceTicketByRecord(store, args.locator);
-    const hits = [byId, byTurn, byRecord]
-      .filter((row): row is PrincipalWorkspaceTicketRow => !!row);
-    if (new Set(hits.map(row => row.ticket_id)).size > 1) {
-      db.exec('COMMIT');
-      open = false;
-      return { status: 'unknown', reason: 'enqueue_unknown' };
-    }
-    const row = byId ?? byTurn ?? byRecord;
-    if (!row) {
-      const auditTrace = store.db.prepare(
-        'SELECT COUNT(*) AS value FROM principal_workspace_ticket_audit '
-        + 'WHERE ticket_id = ? OR (source_session_id = ? AND lane_id = ? '
-        + 'AND session_id = ? AND turn_id = ?)',
-      ).get(
-        args.ticketId, args.sourceSessionId, args.laneId, args.sessionId, args.turnId,
-      ) as { value: number };
-      const counterRow = store.db.prepare(
-        'SELECT group_id, last_sequence, revision, created_at, updated_at, row '
-        + 'FROM principal_workspace_ticket_sequences WHERE group_id = ?',
-      ).get(args.groupId) as PrincipalWorkspaceTicketSequenceRow | undefined;
-      const currentCounterEvidence = ticketCounterEvidence(counterRow);
-      const provablyUncommitted = args.counterBeforeCommit !== undefined
-        && currentCounterEvidence === args.counterBeforeCommit
-        && Number(auditTrace.value) === 0;
-      db.exec('COMMIT');
-      open = false;
-      return provablyUncommitted
-        ? { status: 'retry', reason: 'enqueue_not_committed' }
-        : { status: 'unknown', reason: 'enqueue_unknown' };
-    }
-    const parsed = parseWorkspaceTicketSidecar(row);
-    const audit = readEnqueuedTicketAudit(store, row.ticket_id);
-    if (!parsed.ok || !ticketAuditMatchesTicket(audit, parsed.value)) {
-      db.exec('COMMIT');
-      open = false;
-      return { status: 'unknown', reason: 'enqueue_unknown' };
-    }
-    const counterRow = store.db.prepare(
-      'SELECT group_id, last_sequence, revision, created_at, updated_at, row '
-      + 'FROM principal_workspace_ticket_sequences WHERE group_id = ?',
-    ).get(parsed.value.groupId) as PrincipalWorkspaceTicketSequenceRow | undefined;
-    const counter = parseWorkspaceTicketSequenceSidecar(counterRow);
-    if (!counter.ok || counter.value.lastSequence < parsed.value.sequence) {
-      db.exec('COMMIT');
-      open = false;
-      return { status: 'unknown', reason: 'enqueue_unknown' };
-    }
-    const stableIdentity = parsed.value.ticketId === args.ticketId
-      && parsed.value.groupId === args.groupId
-      && parsed.value.sourceSessionId === args.sourceSessionId
-      && parsed.value.laneId === args.laneId
-      && parsed.value.sessionId === args.sessionId
-      && parsed.value.turnId === args.turnId;
-    const result: EnqueuePrincipalWorkspaceTicketResult = !stableIdentity
-      ? { status: 'unknown', reason: 'enqueue_unknown' }
-      : sameTicketLocator(parsed.value.locator, args.locator)
-        ? { status: 'ready', created: false, ticket: parsed.value }
-        : { status: 'conflict', reason: 'turn_record_conflict' };
-    db.exec('COMMIT');
-    open = false;
-    return result;
-  } catch {
-    return { status: 'unknown', reason: 'enqueue_unknown' };
-  } finally {
-    if (open) try { db.exec('ROLLBACK'); } catch { /* already ended */ }
-    try { db.close(); } catch { /* already closed */ }
-  }
-}
-
-/** Persist exactly one immutable record admission ticket. The turn id and
- * durable locator are extracted only from the opaque append receipt. */
-export function enqueuePrincipalWorkspaceTicket(args: {
-  receipt: PrincipalLaneAppendReceipt;
-  authority: PrincipalLaneDispatchAuthority;
-  expected: ExpectedPrincipalWorkspaceTicketAuthority;
-  now?: string;
-}): EnqueuePrincipalWorkspaceTicketResult {
-  const located = principalLaneAppendReceiptLocator(args.receipt, args.authority);
-  if (located.status !== 'ready') {
-    if (located.status === 'retry') return { status: 'retry', reason: 'store_busy' };
-    if (located.status === 'quarantined') {
-      return { status: 'quarantined', target: 'ticket', reason: located.reason };
-    }
-    return { status: 'invalid', reason: located.reason };
-  }
-  const locatorParsed = parsePrincipalWorkspaceTicketLocator(located.value);
-  if (!locatorParsed.ok) return { status: 'invalid', reason: locatorParsed.error };
-  const locator = locatorParsed.value;
-  const now = args.now ?? new Date().toISOString();
-  if (!canonicalIso(now)) return { status: 'invalid', reason: 'invalid_enqueue_timestamp' };
-  loadForWrite();
-  if (!currentAppId || !ownStore) {
-    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
-  }
-  const path = getDbPath();
-  const db = openDatabaseSyncOrThrow(path);
-  db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-  const store = principalWorkspaceStoreView(db);
-  const identity = {
-    ticketId: principalWorkspaceTicketIdV1({
-      groupId: args.authority.source.source.workspaceGroupId,
-      sourceSessionId: args.authority.source.sourceSessionId,
-      laneId: args.authority.lane.lane.laneId,
-      sessionId: args.authority.lane.sessionId,
-      turnId: locator.turnId,
-    }),
-    groupId: args.authority.source.source.workspaceGroupId,
-    sourceSessionId: args.authority.source.sourceSessionId,
-    laneId: args.authority.lane.lane.laneId,
-    sessionId: args.authority.lane.sessionId,
-    turnId: locator.turnId,
-    locator,
-    now,
-  };
-  let transactionOpen = false;
-  let counterBeforeCommit: string | null | undefined;
-  let result: EnqueuePrincipalWorkspaceTicketResult;
-  try {
-    db.exec('BEGIN IMMEDIATE');
-    transactionOpen = true;
-    const validated = validateTicketEnqueueAuthority(store, args.authority, args.expected);
-    if (!validated.ok) {
-      result = validated.result;
-    } else {
-      const observedCounterRow = store.db.prepare(
-        'SELECT group_id, last_sequence, revision, created_at, updated_at, row '
-        + 'FROM principal_workspace_ticket_sequences WHERE group_id = ?',
-      ).get(identity.groupId) as PrincipalWorkspaceTicketSequenceRow | undefined;
-      counterBeforeCommit = ticketCounterEvidence(observedCounterRow);
-      const hits = [
-        readWorkspaceTicketById(store, identity.ticketId),
-        readWorkspaceTicketByTurn(
-          store, identity.sourceSessionId, identity.laneId, identity.sessionId, identity.turnId,
-        ),
-        readWorkspaceTicketByRecord(store, locator),
-      ].filter((row): row is PrincipalWorkspaceTicketRow => !!row);
-      const distinct = [...new Map(hits.map(row => [row.ticket_id, row])).values()];
-      let existingCounterError: string | undefined;
-      let existingMaxSequence = 0;
-      if (distinct.length > 0) {
-        const existingMaxHit = store.db.prepare(
-          'SELECT MAX(sequence) AS value FROM principal_workspace_tickets WHERE group_id = ?',
-        ).get(identity.groupId) as { value: number | null };
-        existingMaxSequence = existingMaxHit.value === null ? 0 : Number(existingMaxHit.value);
-        const existingCounter = parseWorkspaceTicketSequenceSidecar(observedCounterRow);
-        if (!existingCounter.ok
-            || existingCounter.value.groupId !== identity.groupId
-            || existingCounter.value.lastSequence < existingMaxSequence) {
-          existingCounterError = existingCounter.ok
-            ? 'counter_range_mismatch' : existingCounter.error;
-        }
-      }
-      if (existingCounterError) {
-        persistPrincipalWorkspaceTicketAudit(store, {
-          ...identity, event: 'counter_corruption',
-          detail: { error: existingCounterError, maxSequence: existingMaxSequence },
-        });
-        quarantinePrincipalWorkspaceGroup(store, identity.groupId);
-        result = { status: 'quarantined', target: 'group', reason: 'counter_corruption' };
-      } else if (distinct.length > 1) {
-        persistPrincipalWorkspaceTicketAudit(store, {
-          ...identity, event: 'record_ticket_conflict',
-          detail: { existingTicketIds: distinct.map(row => row.ticket_id).sort() },
-        });
-        quarantinePrincipalWorkspaceGroup(store, identity.groupId);
-        result = { status: 'quarantined', target: 'ticket', reason: 'ticket_index_collision' };
-      } else if (distinct.length > 0) {
-        result = ticketConflictOrCorruption(store, distinct[0]!, identity);
-      } else {
-        const counterRow = observedCounterRow;
-        const maxHit = store.db.prepare(
-          'SELECT MAX(sequence) AS value FROM principal_workspace_tickets WHERE group_id = ?',
-        ).get(identity.groupId) as { value: number | null };
-        const maxSequence = maxHit.value === null ? 0 : Number(maxHit.value);
-        let sequence: number;
-        let nextCounter: PrincipalWorkspaceTicketSequence;
-        if (counterRow) {
-          const counter = parseWorkspaceTicketSequenceSidecar(counterRow);
-          if (!counter.ok || counter.value.groupId !== identity.groupId
-              || counter.value.lastSequence < maxSequence) {
-            persistPrincipalWorkspaceTicketAudit(store, {
-              ...identity, event: 'counter_corruption',
-              detail: { error: counter.ok ? 'counter_range_mismatch' : counter.error, maxSequence },
-            });
-            quarantinePrincipalWorkspaceGroup(store, identity.groupId);
-            result = { status: 'quarantined', target: 'group', reason: 'counter_corruption' };
-          } else if (counter.value.lastSequence === Number.MAX_SAFE_INTEGER) {
-            result = { status: 'busy', reason: 'sequence_exhausted' };
-          } else if (counter.value.revision === Number.MAX_SAFE_INTEGER) {
-            result = { status: 'busy', reason: 'counter_revision_exhausted' };
-          } else {
-            sequence = counter.value.lastSequence + 1;
-            nextCounter = {
-              ...counter.value, lastSequence: sequence,
-              revision: counter.value.revision + 1, updatedAt: now,
-            };
-            db.exec('SAVEPOINT enqueue_ticket');
-            try {
-              const updated = store.db.prepare(
-                'UPDATE principal_workspace_ticket_sequences SET last_sequence = ?, revision = ?, '
-                + 'updated_at = ?, row = ? WHERE group_id = ? AND last_sequence = ? '
-                + 'AND revision = ? AND row = ?',
-              ).run(
-                nextCounter.lastSequence, nextCounter.revision, nextCounter.updatedAt,
-                JSON.stringify(nextCounter), identity.groupId, counter.value.lastSequence,
-                counter.value.revision, counterRow.row,
-              );
-              if (Number(updated.changes) !== 1) throw new PrincipalLaneAuthorityChangedError();
-              result = insertPrincipalWorkspaceTicket(store, identity, validated.value.source, sequence, now);
-              db.exec('RELEASE enqueue_ticket');
-            } catch (error) {
-              db.exec('ROLLBACK TO enqueue_ticket');
-              db.exec('RELEASE enqueue_ticket');
-              if (error instanceof PrincipalLaneAuthorityChangedError) {
-                result = { status: 'retry', reason: 'stale_authority' };
-              } else {
-                const loser = readWorkspaceTicketByTurn(
-                  store, identity.sourceSessionId, identity.laneId, identity.sessionId,
-                  identity.turnId,
-                ) ?? readWorkspaceTicketByRecord(store, locator)
-                  ?? readWorkspaceTicketById(store, identity.ticketId);
-                if (!loser) throw error;
-                result = ticketConflictOrCorruption(store, loser, identity);
-              }
-            }
-          }
-        } else if (maxSequence !== 0) {
-          persistPrincipalWorkspaceTicketAudit(store, {
-            ...identity, event: 'counter_corruption', detail: { error: 'missing_counter', maxSequence },
-          });
-          quarantinePrincipalWorkspaceGroup(store, identity.groupId);
-          result = { status: 'quarantined', target: 'group', reason: 'counter_corruption' };
-        } else {
-          sequence = 1;
-          nextCounter = {
-            version: 1, groupId: identity.groupId, lastSequence: sequence,
-            revision: 1, createdAt: now, updatedAt: now,
-          };
-          db.exec('SAVEPOINT enqueue_ticket');
-          try {
-            store.db.prepare(
-              'INSERT INTO principal_workspace_ticket_sequences '
-              + '(group_id, last_sequence, revision, created_at, updated_at, row) '
-              + 'VALUES (?, ?, ?, ?, ?, ?)',
-            ).run(
-              identity.groupId, sequence, 1, now, now, JSON.stringify(nextCounter),
-            );
-            result = insertPrincipalWorkspaceTicket(store, identity, validated.value.source, sequence, now);
-            db.exec('RELEASE enqueue_ticket');
-          } catch (error) {
-            db.exec('ROLLBACK TO enqueue_ticket');
-            db.exec('RELEASE enqueue_ticket');
-            const loser = readWorkspaceTicketByTurn(
-              store, identity.sourceSessionId, identity.laneId, identity.sessionId,
-              identity.turnId,
-            ) ?? readWorkspaceTicketByRecord(store, locator)
-              ?? readWorkspaceTicketById(store, identity.ticketId);
-            if (!loser) throw error;
-            result = ticketConflictOrCorruption(store, loser, identity);
-          }
-        }
-      }
-    }
-    let commitAttempted = false;
-    try {
-      testOnlyBeforePrincipalWorkspaceEnqueueCommit?.();
-      commitAttempted = true;
-      db.exec('COMMIT');
-      transactionOpen = false;
-      testOnlyAfterPrincipalWorkspaceEnqueueCommit?.();
-      return result!;
-    } catch {
-      if (!commitAttempted) {
-        let rollbackConfirmed = false;
-        if (transactionOpen) {
-          try {
-            db.exec('ROLLBACK');
-            rollbackConfirmed = true;
-          } catch { /* outcome remains unknown */ }
-        }
-        transactionOpen = false;
-        try { db.close(); } catch { /* already closed */ }
-        return rollbackConfirmed
-          ? { status: 'retry', reason: 'enqueue_not_committed' }
-          : { status: 'unknown', reason: 'enqueue_unknown' };
-      }
-      transactionOpen = false;
-      try { db.close(); } catch { /* already closed */ }
-      try {
-        return recoverPrincipalWorkspaceEnqueueOutcome({
-          path, ...identity, counterBeforeCommit,
-        });
-      }
-      catch { return { status: 'unknown', reason: 'enqueue_unknown' }; }
-    }
-  } catch (error) {
-    if (transactionOpen) {
-      try {
-        db.exec('ROLLBACK');
-        transactionOpen = false;
-        return { status: 'retry', reason: 'enqueue_not_committed' };
-      } catch {
-        transactionOpen = false;
-        return { status: 'unknown', reason: 'enqueue_unknown' };
-      }
-    }
-    if (isTransientStoreContentionError(error)) return { status: 'retry', reason: 'store_busy' };
-    throw error;
-  } finally {
-    try { db.close(); } catch { /* already closed */ }
-  }
-}
-
-/** Correlate immutable record files with durable tickets for one verified lane.
- * This is a read-only report: it never signs a capability, repairs a ticket,
- * deletes staging, or backfills an orphan record. */
-export function inventoryPrincipalWorkspaceTickets(args: {
-  handle: PrincipalLaneQueueHandle;
-  authority: PrincipalLaneDispatchAuthority;
-  expected: ExpectedPrincipalWorkspaceTicketAuthority;
-}): PrincipalWorkspaceTicketInventoryResult {
-  const files = inventoryPrincipalLaneQueueRecords(args.handle, args.authority);
-  if (files.status !== 'ready') {
-    if (files.status === 'retry') return { status: 'retry', reason: files.reason };
-    if (files.status === 'quarantined') return { status: 'quarantined', reason: files.reason };
-    return { status: 'invalid', reason: files.reason };
-  }
-  if (!currentAppId) return { status: 'retry', reason: 'store_not_attached' };
-  const path = getDbPath();
-  if (!existsSync(path)) return { status: 'retry', reason: 'store_missing' };
-  const db = openDbForRead(path);
-  const store = principalWorkspaceStoreView(db);
-  let open = false;
-  try {
-    db.exec('BEGIN');
-    open = true;
-    const sourceSessionId = args.authority.source.sourceSessionId;
-    const sourceSessionHit = store.selectRow.get(sourceSessionId) as { row: string } | undefined;
-    if (!sourceSessionHit) return { status: 'retry', reason: 'stale_authority' };
-    let sourceSession: Session;
-    try { sourceSession = JSON.parse(sourceSessionHit.row) as Session; }
-    catch { return { status: 'quarantined', reason: 'invalid_source_session_json' }; }
-    if (sourceSession.status !== 'active') {
-      return { status: 'busy', reason: 'source_not_active' };
-    }
-    const displayTarget = sourceSessionDisplayTarget(sourceSession, currentAppId);
-    if (!displayTarget) return { status: 'quarantined', reason: 'invalid_source_display_target' };
-    const sourceHit = store.db.prepare(
-      'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
-      + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
-    ).get(sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
-    const source = parseSourceSidecar(sourceHit, displayTarget, sourceSessionId);
-    if (!source.ok) return source.error === 'missing_sidecar'
-      ? { status: 'retry', reason: 'stale_authority' }
-      : { status: 'quarantined', reason: `source:${source.error}` };
-    const sourceLaneHit = store.db.prepare(
-      'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
-      + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
-    ).get(sourceSessionId) as PrincipalLaneSidecarRow | undefined;
-    const sourceLane = parseLaneSidecar(sourceLaneHit, { displayTarget, sourceSessionId });
-    if (!sourceLane.ok) return sourceLane.error === 'missing_sidecar'
-      ? { status: 'retry', reason: 'stale_authority' }
-      : { status: 'quarantined', reason: `lane:${sourceLane.error}` };
-    if (!principalLaneSourcesEqual(source.value, args.authority.source.source)
-        || !principalLaneBindingsEqual(sourceLane.value.binding, args.authority.source.lane)) {
-      return { status: 'retry', reason: 'stale_authority' };
-    }
-    if (source.value.phase !== 'active') return { status: 'busy', reason: 'source_not_active' };
-    const embeddedSource = sourceSession.principalLaneSource
-      ? parsePrincipalLaneSourceState(sourceSession.principalLaneSource, displayTarget, sourceSessionId)
-      : { ok: false as const, error: 'not_object' };
-    if (!embeddedSource.ok || !principalLaneSourcesEqual(embeddedSource.value, source.value)) {
-      return { status: 'quarantined', reason: 'source_session_mismatch' };
-    }
-    const lanes = validatePrincipalWorkspaceLanes(
-      store, sourceSessionId, source.value, displayTarget, sourceSession, sourceSessionHit.row,
-    );
-    if (!lanes.ok) return lanes.kind === 'quarantined'
-      ? { status: 'quarantined', reason: lanes.reason }
-      : lanes.kind === 'missing'
-        ? { status: 'retry', reason: 'stale_authority' }
-        : { status: 'busy', reason: 'lane_not_active' };
-    const target = lanes.lanes.find(value => value.lane.binding.laneId === args.authority.lane.lane.laneId);
-    if (!target
-        || !principalLaneBindingsEqual(target.lane.binding, args.authority.lane.lane)
-        || target.lane.sessionId !== args.authority.lane.sessionId
-        || args.authority.session.sessionId !== target.lane.sessionId) {
-      return { status: 'retry', reason: 'stale_authority' };
-    }
-    if (target.lane.binding.phase !== 'active' && target.lane.binding.phase !== 'dormant') {
-      return { status: 'busy', reason: 'lane_not_active' };
-    }
-    const group = parseWorkspaceGroupSidecar(
-      readWorkspaceGroupRow(store, source.value.workspaceGroupId),
-    );
-    if (!group.ok) return group.error === 'missing_group'
-      ? { status: 'retry', reason: 'stale_authority' }
-      : { status: 'quarantined', reason: `group:${group.error}` };
-    if (group.value.revision !== args.expected.groupRevision
-        || group.value.groupId !== source.value.workspaceGroupId
-        || group.value.larkAppId !== currentAppId
-        || group.value.canonicalCwd !== source.value.canonicalCwd
-        || group.value.phase !== 'active') {
-      return group.value.phase === 'active'
-        ? { status: 'retry', reason: 'stale_authority' }
-        : { status: 'busy', reason: 'workspace_group_not_active' };
-    }
-    const member = parseWorkspaceMemberSidecar(
-      readWorkspaceMemberRow(store, sourceSessionId, target.lane.binding.laneId),
-    );
-    if (!member.ok) return member.error === 'missing_member'
-      ? { status: 'retry', reason: 'stale_authority' }
-      : { status: 'quarantined', reason: `member:${member.error}` };
-    if (member.value.revision !== args.expected.memberRevision
-        || !principalWorkspaceMemberIdentityMatchesLane(member.value, target.lane, source.value)) {
-      return { status: 'retry', reason: 'stale_authority' };
-    }
-    if (member.value.membershipPhase !== 'active') {
-      return { status: 'busy', reason: 'workspace_member_not_active' };
-    }
-    const rows = store.db.prepare(
-      `SELECT ${PRINCIPAL_WORKSPACE_TICKET_COLUMNS} FROM principal_workspace_tickets `
-      + 'WHERE source_session_id = ? AND lane_id = ? AND session_id = ? ORDER BY sequence',
-    ).all(
-      sourceSessionId, target.lane.binding.laneId, target.lane.sessionId,
-    ) as PrincipalWorkspaceTicketRow[];
-    const tickets: PrincipalWorkspaceTicket[] = [];
-    const conflicts: Extract<PrincipalWorkspaceTicketInventoryResult, { status: 'ready' }>['conflicts'] = [];
-    const unknown: Extract<PrincipalWorkspaceTicketInventoryResult, { status: 'ready' }>['unknown'] = [];
-    const referencedRecordIds = new Set<string>();
-    for (const row of rows) {
-      const parsed = parseWorkspaceTicketSidecar(row);
-      if (!parsed.ok) {
-        if (row.namespace_version === files.value.namespaceVersion
-            && row.namespace === files.value.namespace) {
-          referencedRecordIds.add(row.record_id);
-        }
-        unknown.push({
-          ticketId: row.ticket_id,
-          recordId: row.record_id,
-          sequence: Number.isSafeInteger(row.sequence) && row.sequence >= 1
-            ? row.sequence : undefined,
-          reason: 'ticket_row_unverified',
-        });
-        continue;
-      }
-      tickets.push(parsed.value);
-    }
-    const counterRow = store.db.prepare(
-      'SELECT group_id, last_sequence, revision, created_at, updated_at, row '
-      + 'FROM principal_workspace_ticket_sequences WHERE group_id = ?',
-    ).get(source.value.workspaceGroupId) as PrincipalWorkspaceTicketSequenceRow | undefined;
-    const counter = parseWorkspaceTicketSequenceSidecar(counterRow);
-    const groupMaxHit = store.db.prepare(
-      'SELECT MAX(sequence) AS value FROM principal_workspace_tickets WHERE group_id = ?',
-    ).get(source.value.workspaceGroupId) as { value: number | null };
-    const maxTicketSequence = groupMaxHit.value === null ? 0 : Number(groupMaxHit.value);
-    const counterVerified = counter.ok
-      && counter.value.groupId === source.value.workspaceGroupId
-      && counter.value.lastSequence >= maxTicketSequence;
-    const filesByRecord = new Map(files.value.records.map(record => [record.recordId, record]));
-    const ticketed: Array<{ recordId: string; ticketId: string; sequence: number }> = [];
-    for (const ticket of tickets) {
-      const belongsToInventoryNamespace = ticket.locator.namespaceVersion === files.value.namespaceVersion
-        && ticket.locator.namespace === files.value.namespace;
-      if (belongsToInventoryNamespace) referencedRecordIds.add(ticket.locator.recordId);
-      if (ticket.groupId !== source.value.workspaceGroupId
-          || ticket.sourceSessionId !== sourceSessionId
-          || ticket.laneId !== target.lane.binding.laneId
-          || ticket.sessionId !== target.lane.sessionId
-          || ticket.workspaceEpoch !== source.value.workspaceEpoch) {
-        conflicts.push({
-          recordId: ticket.locator.recordId,
-          ticketId: ticket.ticketId,
-          sequence: ticket.sequence,
-          reason: 'ticket_authority_mismatch',
-        });
-        continue;
-      }
-      if (!belongsToInventoryNamespace) {
-        conflicts.push({
-          recordId: ticket.locator.recordId,
-          ticketId: ticket.ticketId,
-          sequence: ticket.sequence,
-          reason: 'ticket_namespace_mismatch',
-        });
-        continue;
-      }
-      if (!ticketAuditMatchesTicket(readEnqueuedTicketAudit(store, ticket.ticketId), ticket)) {
-        unknown.push({
-          recordId: ticket.locator.recordId,
-          ticketId: ticket.ticketId,
-          sequence: ticket.sequence,
-          reason: 'ticket_audit_unverified',
-        });
-        continue;
-      }
-      if (!counterVerified) {
-        unknown.push({
-          recordId: ticket.locator.recordId,
-          ticketId: ticket.ticketId,
-          sequence: ticket.sequence,
-          reason: 'ticket_counter_unverified',
-        });
-        continue;
-      }
-      const record = filesByRecord.get(ticket.locator.recordId);
-      if (!record) {
-        unknown.push({
-          recordId: ticket.locator.recordId,
-          ticketId: ticket.ticketId,
-          sequence: ticket.sequence,
-          reason: 'record_missing',
-        });
-      } else if (record.exactFileLength !== ticket.locator.exactFileLength) {
-        conflicts.push({
-          recordId: ticket.locator.recordId,
-          ticketId: ticket.ticketId,
-          sequence: ticket.sequence,
-          reason: 'record_length_mismatch',
-          expectedExactFileLength: ticket.locator.exactFileLength,
-          observedExactFileLength: record.exactFileLength,
-        });
-      } else {
-        ticketed.push({
-          recordId: ticket.locator.recordId, ticketId: ticket.ticketId, sequence: ticket.sequence,
-        });
-      }
-    }
-    const orphanRecords = files.value.records.filter(record => !referencedRecordIds.has(record.recordId));
-    db.exec('COMMIT');
-    open = false;
-    return {
-      status: 'ready', namespaceVersion: files.value.namespaceVersion,
-      namespace: files.value.namespace, ticketed, orphanRecords,
-      conflicts, unknown, staging: files.value.staging,
-    };
-  } finally {
-    if (open) try { db.exec('ROLLBACK'); } catch { /* already ended */ }
-    try { db.close(); } catch { /* already closed */ }
-  }
-}
-
-function insertPrincipalWorkspaceTicket(
-  store: OwnSqliteStore,
-  identity: {
-    ticketId: string;
-    groupId: string;
-    sourceSessionId: string;
-    laneId: string;
-    sessionId: string;
-    turnId: string;
-    locator: PrincipalWorkspaceTicketLocator;
-  },
-  source: PrincipalLaneSourceState,
-  sequence: number,
-  now: string,
-): EnqueuePrincipalWorkspaceTicketResult {
-  const ticket: PrincipalWorkspaceTicket = {
-    version: 1, ticketId: identity.ticketId, groupId: identity.groupId, sequence,
-    sourceSessionId: identity.sourceSessionId, laneId: identity.laneId,
-    sessionId: identity.sessionId, workspaceEpoch: source.workspaceEpoch,
-    turnId: identity.turnId, status: 'queued', revision: 1,
-    locator: identity.locator, createdAt: now, updatedAt: now,
-  };
-  store.db.prepare(
-    'INSERT INTO principal_workspace_tickets '
-    + '(ticket_id, group_id, sequence, source_session_id, lane_id, session_id, '
-    + 'workspace_epoch, turn_id, status, revision, namespace_version, namespace, '
-    + 'record_version, record_id, payload_encoding, payload_hash, exact_file_length, '
-    + 'created_at, updated_at, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  ).run(
-    ticket.ticketId, ticket.groupId, ticket.sequence, ticket.sourceSessionId, ticket.laneId,
-    ticket.sessionId, ticket.workspaceEpoch, ticket.turnId, ticket.status, ticket.revision,
-    ticket.locator.namespaceVersion, ticket.locator.namespace, ticket.locator.recordVersion,
-    ticket.locator.recordId, ticket.locator.payloadEncoding, ticket.locator.payloadHash,
-    ticket.locator.exactFileLength, ticket.createdAt, ticket.updatedAt, JSON.stringify(ticket),
-  );
-  persistPrincipalWorkspaceTicketAudit(store, {
-    event: 'enqueued', groupId: ticket.groupId, ticketId: ticket.ticketId,
-    sourceSessionId: ticket.sourceSessionId, laneId: ticket.laneId,
-    sessionId: ticket.sessionId, turnId: ticket.turnId,
-    detail: { version: 1, ticket }, now,
-  });
-  if (!ticketAuditMatchesTicket(readEnqueuedTicketAudit(store, ticket.ticketId), ticket)) {
-    throw new Error('principal workspace enqueued audit did not round-trip');
-  }
-  return { status: 'ready', created: true, ticket };
-}
-
 class PrincipalLaneAuthorityChangedError extends Error {}
 
 type ResolvedHumanLaneEvidence = {
@@ -5837,10 +3946,11 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
-  'sandboxReadonlyPaths', 'sandboxNetwork',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+  'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {
@@ -7897,6 +6007,80 @@ export function loadAllSessionsSnapshot(options: {
   }
   for (const ref of refs) readInto(ref);
   return out;
+}
+
+/** Destructive lifecycle discovery must account for every store, including
+ * corrupt stores and duplicate owners. Unlike the display snapshot this does
+ * not skip errors or collapse two copies of the same session id. Pure reader. */
+export function loadAllSessionsStrict(dataDir = config.session.dataDir): Session[] {
+  // Display readers may omit unmigrated stores; destructive discovery cannot.
+  // Probe existence only, preserving the SQLite-only cross-process contract.
+  const refs = listStoreRefs(dataDir, { strict: true });
+  const unmigrated = listUnmigratedAppIds(dataDir, { strict: true });
+  if (unmigrated.length) {
+    throw new SessionStoreUnmigratedError(`Unmigrated session stores: ${unmigrated.join(', ')}`);
+  }
+  // The shared legacy projection has no authoritative owner index. Require
+  // explicit migration/removal before claiming complete discovery coverage.
+  if (existsSync(join(dataDir, 'sessions.json'))) {
+    throw new SessionStoreUnmigratedError('Legacy session store prevents complete workspace discovery');
+  }
+  const result: Session[] = [];
+  for (const ref of refs) {
+    for (const [key, raw] of readStoreEntries(ref, true)) {
+      const session = raw as Session;
+      if (!session || typeof session !== 'object' || Array.isArray(session)
+          || session.sessionId !== key || !['active', 'closed'].includes(session.status)) {
+        throw new Error(`Invalid session identity in ${ref.path}`);
+      }
+      if (ref.appId && session.larkAppId && session.larkAppId !== ref.appId) {
+        throw new Error(`Session owner mismatch in ${ref.path}`);
+      }
+      result.push({ ...session, larkAppId: ref.appId ?? session.larkAppId });
+    }
+  }
+  return result;
+}
+
+/**
+ * Session ids of every ACTIVE row in every per-bot SQLite store under
+ * `dataDir`, closed rows excluded. This is the protection set for sweeps over
+ * trees that every bot on the machine shares (sandbox trees, session scratch):
+ * all daemons run on one dataDir, so a suspended session of ANOTHER bot is as
+ * live as one of ours. Reads only the indexed `status` column.
+ *
+ * Fail-closed for destructive callers: an unlistable store dir, any unreadable
+ * store, or a not-yet-imported `sessions-<appId>.json` of a bot that still
+ * exists THROWS — the caller must skip its round rather than treat a partial
+ * set as complete. A leftover JSON of a bot removed from this machine is
+ * abandoned data (no daemon will ever import or serve it), see
+ * `services/known-bot-app-ids.ts`; the shared pre-1.13 `sessions.json` is only a
+ * first-import rescue source and never held rows a daemon serves.
+ */
+export function listActiveSessionIdsAcrossStores(
+  dataDir: string = config.session.dataDir,
+  opts: { knownAppIds?: () => ReadonlySet<string> } = {},
+): Set<string> {
+  const refs = listStoreRefs(dataDir, { strict: true });
+  const unmigrated = listUnmigratedAppIds(dataDir, { strict: true });
+  if (unmigrated.length > 0) {
+    const known = (opts.knownAppIds ?? (() => knownBotAppIds({ dataDir, strict: true })))();
+    const pending = unmigrated.filter(appId => known.has(appId));
+    if (pending.length > 0) {
+      throw new SessionStoreUnmigratedError(`Unmigrated session stores: ${pending.join(', ')}`);
+    }
+  }
+  const ids = new Set<string>();
+  for (const ref of refs) {
+    const db = openDbForRead(ref.path);
+    try {
+      const rows = db.prepare("SELECT session_id FROM sessions WHERE status = 'active'").all() as { session_id: string }[];
+      for (const r of rows) ids.add(r.session_id);
+    } finally {
+      db.close();
+    }
+  }
+  return ids;
 }
 
 /**

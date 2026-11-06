@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createConnection, type Socket as NetSocket } from 'node:net';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import type { Duplex } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -40,6 +42,7 @@ import { resolveBotmuxDataDir } from '../../data-dir.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
+import { pruneFilesByAge } from '../../../utils/prune-by-age.js';
 import { resolveSessionContext } from '../../session-marker.js';
 import { normalizePluginIdList } from '../ids.js';
 import { pluginHome, pluginRuntimeDir, resolvePluginPath } from '../paths.js';
@@ -48,6 +51,7 @@ import {
   readSessionMcpRuntimeManifest,
   type SessionMcpRuntimeManifest,
 } from './session-runtime.js';
+import { pluginMcpToolTimeoutOptions } from './runtime-options.js';
 import { readPluginMcpDescriptor } from './private-store.js';
 import type { PluginMcpServer } from '../types.js';
 import type { TrustedCaller } from '../../../types.js';
@@ -56,6 +60,30 @@ import {
   MCP_GATEWAY_SOCKET_ENV,
 } from './environment.js';
 import { readMcpGatewayAuthToken, sendMcpGatewayHandshake } from './socket-auth.js';
+import {
+  BOTMUX_HOST_DELIVERY_META_KEY,
+  parseTrustedResultDelivery,
+  TrustedResultDeliverySerialQueue,
+  type TrustedResultDelivery,
+  type TrustedResultDeliveryReceipt,
+} from './trusted-result-delivery.js';
+import {
+  appendResourceLinkRefCompanion,
+  appendToolLinkRefCompanion,
+} from '../../../services/link-ref-presenter.js';
+import type {
+  LinkRefExtractionStats,
+  LinkRefMode,
+} from '../../../services/link-ref-types.js';
+import {
+  PROTECTED_MCP_CHILD_SECRET_FD,
+  PROTECTED_MCP_SECRET_FD_ENV,
+  protectedMcpRedactedEnvKeys,
+  type ProtectedMcpWorkerPolicy,
+  type TrustedTurnPrincipal,
+} from '../../protected-mcp-capabilities.js';
+import { ProtectedSecretClientTransport } from './protected-secret-transport.js';
+import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../../protected-http-egress-host.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -78,6 +106,7 @@ interface GatewayDescriptor {
   pluginId: string;
   server: PluginMcpServer;
   pluginDir: string;
+  toolTimeoutMs?: number;
 }
 
 interface GatewayConnection extends GatewayDescriptor {
@@ -85,6 +114,7 @@ interface GatewayConnection extends GatewayDescriptor {
   transport: Transport;
   capabilities: ServerCapabilities;
   uriPrefix: string;
+  protectedCapabilityId?: string;
 }
 
 interface NamedRoute {
@@ -102,17 +132,35 @@ interface ResourceRoute {
 export interface GatewayTrustedTurnIdentity {
   caller?: TrustedCaller;
   turnId?: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
+  protectedMcpContainmentActiveCapabilityIds?: string[];
 }
 
 export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
-
+export type GatewayTrustedResultDeliveryHandler = (input: {
+  pluginId: string;
+  identity: GatewayTrustedTurnIdentity;
+  delivery: TrustedResultDelivery;
+}) => Promise<TrustedResultDeliveryReceipt>;
+export type GatewayLinkRefRegistrationHandler = (input: {
+  pluginId: string;
+  identity: GatewayTrustedTurnIdentity;
+  sourceType: 'mcp';
+  sourceId: string;
+  value: unknown;
+}) => Promise<{ companion?: string; stats: Partial<LinkRefExtractionStats> }>;
 const BOTMUX_META_RESERVED_PREFIX = 'botmux';
 const BOTMUX_TRUSTED_HEADER_PREFIX = 'x-botmux-trusted-';
 const BOTMUX_TURN_HEADERS = [
   'x-botmux-turn-id',
   'x-botmux-dispatch-attempt',
 ] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
 
 export interface McpGatewayDiagnostic {
   pluginId: string;
@@ -198,6 +246,7 @@ function snapshotGatewayDescriptors(snapshot: SessionMcpRuntimeManifest): Gatewa
     pluginId: entry.pluginId,
     server: entry.server,
     pluginDir: entry.pluginDir,
+    ...(entry.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: entry.toolTimeoutMs }),
   }));
 }
 
@@ -232,6 +281,9 @@ function writeDiagnostics(file: McpGatewayDiagnosticsFile, dataDir: string): voi
   const path = diagnosticsPath(file.sessionId, dataDir);
   mkdirSync(dirname(path), { recursive: true });
   atomicWriteFileSync(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  // 诊断快照每会话一个、只写不删；dashboard 只读最新 50 个。写入时顺手回收
+  // 7 天前的旧快照（至少保留最新 50 个），避免随会话数无限累积。
+  pruneFilesByAge({ dir: dirname(path), suffix: '.json', maxAgeMs: 7 * 24 * 60 * 60_000, retainMin: 50 });
 }
 
 function resolveStdioCommand(descriptor: GatewayDescriptor): { command: string; args: string[] } {
@@ -297,6 +349,11 @@ export class PluginMcpGateway {
   readonly server: Server;
   private readonly env: NodeJS.ProcessEnv;
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
+  private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
+  private readonly requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
+  private readonly protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
+  private readonly protectedEgressSocketPath?: string;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -306,14 +363,28 @@ export class PluginMcpGateway {
   private promptRoutes = new Map<string, NamedRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private resourceTemplateRoutes: ResourceRoute[] = [];
+  private readonly toolCallIdentity = new AsyncLocalStorage<{ identity?: GatewayTrustedTurnIdentity }>();
+  private readonly trustedResultDeliveryQueue = new TrustedResultDeliverySerialQueue();
 
   constructor(
     pluginIds?: string[],
     env: NodeJS.ProcessEnv = process.env,
-    opts: { trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider } = {},
+    opts: {
+      trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
+      trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+      linkRefRegistration?: GatewayLinkRefRegistrationHandler;
+      requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
+      protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
+      protectedEgressSocketPath?: string;
+    } = {},
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
+    this.trustedResultDelivery = opts.trustedResultDelivery;
+    this.linkRefRegistration = opts.linkRefRegistration;
+    this.requestProtectedSecretChannel = opts.requestProtectedSecretChannel;
+    this.protectedMcpPolicy = opts.protectedMcpPolicy;
+    this.protectedEgressSocketPath = opts.protectedEgressSocketPath;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -371,6 +442,14 @@ export class PluginMcpGateway {
     return this.initializePromise;
   }
 
+  private provisionedProtectedCapability(pluginId: string, capabilityId: string | undefined) {
+    if (!capabilityId) return undefined;
+    return this.protectedMcpPolicy?.capabilities.find(capability => (
+      capability.id === capabilityId
+      && capability.allowedPluginIds.includes(pluginId)
+    ));
+  }
+
   private async initializeDownstreams(): Promise<void> {
     const { tasks: _tasks, ...clientCapabilities } = this.server.getClientCapabilities() ?? {};
     const settled = await Promise.all(this.descriptors.map(descriptor => this.connectDownstream(descriptor, clientCapabilities)));
@@ -383,23 +462,59 @@ export class PluginMcpGateway {
     clientCapabilities: ClientCapabilities,
   ): Promise<GatewayConnection | null> {
     let transport: Transport;
+    let activeProtectedCapabilityId: string | undefined;
     try {
       if (descriptor.server.transport === 'stdio') {
         const resolved = resolveStdioCommand(descriptor);
-        transport = new StdioClientTransport({
+        const downstreamEnv: Record<string, string> = {
+          ...getDefaultEnvironment(),
+          ...descriptor.server.env,
+          BOTMUX_PLUGIN_ID: descriptor.pluginId,
+          BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
+          BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
+          ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
+          ...(descriptor.server.protectedEgressPolicy
+            && this.protectedEgressSocketPath
+            ? { [PROTECTED_HTTP_EGRESS_SOCKET_ENV]: this.protectedEgressSocketPath }
+            : {}),
+        };
+        for (const key of protectedMcpRedactedEnvKeys(this.protectedMcpPolicy)) {
+          delete downstreamEnv[key];
+        }
+        const parameters = {
           command: resolved.command,
           args: resolved.args,
           cwd: descriptor.pluginDir,
-          env: {
-            ...getDefaultEnvironment(),
-            ...descriptor.server.env,
-            BOTMUX_PLUGIN_ID: descriptor.pluginId,
-            BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
-            BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
-            ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
-          },
+          env: downstreamEnv,
           stderr: 'inherit',
-        });
+        } as const;
+        const protectedCapability = this.provisionedProtectedCapability(
+          descriptor.pluginId,
+          descriptor.server.protectedCapability,
+        );
+        let protectedSecretChannel: Duplex | undefined;
+        if (protectedCapability && this.requestProtectedSecretChannel) {
+          try {
+            protectedSecretChannel = await this.requestProtectedSecretChannel(protectedCapability.id);
+          } catch {
+            // A protected capability is optional for process startup. When the
+            // daemon cannot provide its one-shot channel, keep the MCP online
+            // without fd 3; the connection also remains ineligible for grants.
+          }
+        }
+        if (protectedCapability && protectedSecretChannel) {
+          activeProtectedCapabilityId = protectedCapability.id;
+          transport = new ProtectedSecretClientTransport({
+              ...parameters,
+              env: {
+                ...parameters.env,
+                [PROTECTED_MCP_SECRET_FD_ENV]: String(PROTECTED_MCP_CHILD_SECRET_FD),
+              },
+              requestSecretChannel: async () => protectedSecretChannel,
+            });
+        } else {
+          transport = new StdioClientTransport(parameters);
+        }
       } else {
         const staticHeaders = descriptor.server.headers;
         transport = new StreamableHTTPClientTransport(new URL(descriptor.server.url), {
@@ -454,6 +569,7 @@ export class PluginMcpGateway {
         transport,
         capabilities: client.getServerCapabilities() ?? {},
         uriPrefix: uriPrefix(descriptor.key),
+        ...(activeProtectedCapabilityId ? { protectedCapabilityId: activeProtectedCapabilityId } : {}),
       };
       this.diagnostics.push({
         pluginId: descriptor.pluginId,
@@ -487,11 +603,16 @@ export class PluginMcpGateway {
     }
   }
 
-  private requestOptions(request: { params?: { _meta?: { progressToken?: string | number } } }, extra: { signal: AbortSignal }) {
+  private requestOptions(
+    request: { params?: { _meta?: { progressToken?: string | number } } },
+    extra: { signal: AbortSignal },
+    timeout?: number,
+  ) {
     const token = request.params?._meta?.progressToken;
     return {
       signal: extra.signal,
       resetTimeoutOnProgress: true,
+      ...pluginMcpToolTimeoutOptions(timeout),
       ...(token === undefined ? {} : {
         onprogress: (progress: { progress: number; total?: number; message?: string }) => {
           void this.server.notification({ method: 'notifications/progress', params: { progressToken: token, ...progress } });
@@ -500,10 +621,10 @@ export class PluginMcpGateway {
     };
   }
 
-  private trustedTurnMeta(): Record<string, unknown> | undefined {
-    const identity = this.trustedTurnIdentity?.();
+  private trustedTurnMeta(identity: GatewayTrustedTurnIdentity | undefined): Record<string, unknown> | undefined {
     const caller = identity?.caller;
     if (!caller && !identity?.turnId) return undefined;
+    const hostCapabilities = this.trustedResultDelivery ? ['result_delivery_v1'] : [];
     return {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
@@ -520,17 +641,67 @@ export class PluginMcpGateway {
       // it, an unrelated HTTP-transport server does not.
       ...(caller?.senderType ? { senderType: caller.senderType } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+      ...(this.env.BOTMUX_SESSION_ID ? { sessionId: this.env.BOTMUX_SESSION_ID } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+      ...(hostCapabilities.length > 0 ? { hostCapabilities } : {}),
     };
   }
 
-  private withTrustedTurnMeta<T extends { _meta?: Record<string, unknown> }>(params: T): T {
-    const trusted = this.trustedTurnMeta();
+  private protectedTurnGrant(
+    connection: GatewayConnection,
+    identity: GatewayTrustedTurnIdentity | undefined,
+  ): { principal?: TrustedTurnPrincipal; capabilities: string[] } | undefined {
+    const server = connection.server;
+    if (server.transport !== 'stdio'
+      || !server.protectedCapability
+      || connection.protectedCapabilityId !== server.protectedCapability
+      || !identity?.protectedMcpContainmentActiveCapabilityIds?.includes(server.protectedCapability)) {
+      return undefined;
+    }
+    const capability = this.provisionedProtectedCapability(
+      connection.pluginId,
+      server.protectedCapability,
+    );
+    if (!capability) return undefined;
+    if (capability.principal !== 'verified-human-email') {
+      return { capabilities: [capability.id] };
+    }
+
+    const caller = identity.caller;
+    const actorBoundToEnvelope = !identity.identityTurnId
+      || identity.identityTurnId === identity.turnId;
+    if (!actorBoundToEnvelope
+      || !identity.turnId
+      || caller?.senderType !== 'user'
+      || caller.source !== undefined
+      || !caller.verifiedEmail
+      || !caller.requestLarkAppId) return undefined;
+    return {
+      principal: {
+        type: 'human',
+        ...(caller.requestUserOpenId ? { openId: caller.requestUserOpenId } : {}),
+        ...(caller.requestUserUnionId ? { unionId: caller.requestUserUnionId } : {}),
+        verifiedEmail: caller.verifiedEmail,
+        appId: caller.requestLarkAppId,
+        turnId: identity.turnId,
+        ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+      },
+      capabilities: [capability.id],
+    };
+  }
+
+  private withTrustedTurnMeta<T extends { _meta?: Record<string, unknown> }>(
+    params: T,
+    identity: GatewayTrustedTurnIdentity | undefined,
+    connection: GatewayConnection,
+  ): T {
+    const trusted = this.trustedTurnMeta(identity);
+    const grant = this.protectedTurnGrant(connection, identity);
     const cleanedMeta = Object.fromEntries(
       Object.entries(params._meta ?? {})
         .filter(([key]) => !key.toLowerCase().startsWith(BOTMUX_META_RESERVED_PREFIX)),
     );
-    if (!trusted) {
+    if (!trusted && !grant) {
       return Object.keys(cleanedMeta).length > 0
         ? { ...params, _meta: cleanedMeta }
         : { ...params, _meta: undefined };
@@ -539,7 +710,9 @@ export class PluginMcpGateway {
       ...params,
       _meta: {
         ...cleanedMeta,
-        botmuxTrustedCaller: trusted,
+        ...(trusted ? { botmuxTrustedCaller: trusted } : {}),
+        ...(grant?.principal ? { botmuxTrustedPrincipal: grant.principal } : {}),
+        ...(grant ? { botmuxGrantedCapabilities: grant.capabilities } : {}),
       },
     };
   }
@@ -558,7 +731,10 @@ export class PluginMcpGateway {
         headers.delete(key);
       }
     }
-    const trusted = this.trustedTurnMeta();
+    const activeToolCall = this.toolCallIdentity.getStore();
+    const trusted = this.trustedTurnMeta(
+      activeToolCall ? activeToolCall.identity : this.trustedTurnIdentity?.(),
+    );
     if (trusted?.requestUserOpenId) headers.set('x-botmux-trusted-open-id', String(trusted.requestUserOpenId));
     if (trusted?.requestUserUnionId) headers.set('x-botmux-trusted-union-id', String(trusted.requestUserUnionId));
     if (trusted?.requestLarkAppId) headers.set('x-botmux-trusted-app-id', String(trusted.requestLarkAppId));
@@ -698,11 +874,77 @@ export class PluginMcpGateway {
       if (this.toolRoutes.size === 0) await this.refreshTools();
       const route = this.toolRoutes.get(request.params.name);
       if (!route) throw methodUnsupported(`tools/call:${request.params.name}`);
-      return route.connection.client.callTool(
-        this.withTrustedTurnMeta({ ...request.params, name: route.originalName }),
+      const currentIdentity = this.trustedTurnIdentity?.();
+      const identity = currentIdentity
+        ? { ...currentIdentity, ...(currentIdentity.caller ? { caller: { ...currentIdentity.caller } } : {}) }
+        : undefined;
+      const result = await this.toolCallIdentity.run({ identity }, () => route.connection.client.callTool(
+        this.withTrustedTurnMeta(
+          { ...request.params, name: route.originalName },
+          identity,
+          route.connection,
+        ),
         undefined,
-        this.requestOptions(request, extra),
-      );
+        this.requestOptions(request, extra, route.connection.toolTimeoutMs),
+      ));
+      const deliveryValue = isRecord(result._meta)
+        ? result._meta[BOTMUX_HOST_DELIVERY_META_KEY]
+        : undefined;
+      if (deliveryValue === undefined) {
+        const registration = await this.registerLinkRefs({
+          pluginId: route.connection.pluginId,
+          identity,
+          sourceId: `tool:${route.originalName}`,
+          value: result,
+        });
+        return identity?.linkRefMode === 'enabled' && registration?.companion
+          ? appendToolLinkRefCompanion(result, registration.companion)
+          : result;
+      }
+      // Host delivery is deliberately restricted to installed local processes.
+      // A remote MCP server must never turn its response into a privileged Lark
+      // send, even when it happens to know the envelope shape.
+      if (route.connection.server.transport !== 'stdio') {
+        throw new Error('host_delivery_requires_local_stdio');
+      }
+      if (!identity?.turnId
+        || !identity.caller?.requestUserUnionId
+        || identity.caller.senderType !== 'user') {
+        throw new Error('host_delivery_requires_trusted_human_identity');
+      }
+      if (!this.trustedResultDelivery) throw new Error('host_delivery_unavailable');
+      return this.trustedResultDeliveryQueue.run(async () => {
+        // Parse inside the serial section so bounded file snapshots are never
+        // materialized concurrently within one worker.
+        const delivery = parseTrustedResultDelivery(
+          deliveryValue,
+          pluginHome(route.connection.pluginId),
+        );
+        const receipt: TrustedResultDeliveryReceipt = await this.trustedResultDelivery!({
+          pluginId: route.connection.pluginId,
+          identity,
+          delivery,
+        });
+        // The downstream result may contain business rows. Replace it wholesale:
+        // never merge/spread it into the response visible to the external CLI.
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              delivered: receipt.delivered,
+              deliveryId: receipt.deliveryId,
+              fileCount: receipt.fileCount,
+            }),
+          }],
+          _meta: {
+            botmuxHostDeliveryReceipt: {
+              delivered: receipt.delivered,
+              deliveryId: receipt.deliveryId,
+              fileCount: receipt.fileCount,
+            },
+          },
+        };
+      });
     });
 
     this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: await this.refreshPrompts() }));
@@ -727,17 +969,30 @@ export class PluginMcpGateway {
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
       const route = await this.resolveResourceRoute(request.params.uri);
       if (!route) throw methodUnsupported(`resources/read:${request.params.uri}`);
+      const currentIdentity = this.trustedTurnIdentity?.();
+      const identity = currentIdentity
+        ? { ...currentIdentity, ...(currentIdentity.caller ? { caller: { ...currentIdentity.caller } } : {}) }
+        : undefined;
       const result = await route.connection.client.readResource(
         { ...request.params, uri: route.originalUri },
         this.requestOptions(request, extra),
       );
-      return {
+      const remapped = {
         ...result,
         contents: result.contents.map(content => ({
           ...content,
           uri: route.exposedUri === route.originalUri ? content.uri : `${route.connection.uriPrefix}${content.uri}`,
         })),
       };
+      const registration = await this.registerLinkRefs({
+        pluginId: route.connection.pluginId,
+        identity,
+        sourceId: `resource:${route.originalUri}`,
+        value: remapped,
+      });
+      return identity?.linkRefMode === 'enabled' && registration?.companion
+        ? appendResourceLinkRefCompanion(remapped, registration.companion)
+        : remapped;
     });
     this.server.setRequestHandler(SubscribeRequestSchema, async (request, extra) => {
       const route = await this.resolveResourceRoute(request.params.uri);
@@ -786,6 +1041,26 @@ export class PluginMcpGateway {
       await this.ensureInitialized();
       await Promise.allSettled(this.connections.map(connection => connection.client.sendRootsListChanged()));
     });
+  }
+
+  private async registerLinkRefs(input: {
+    pluginId: string;
+    identity: GatewayTrustedTurnIdentity | undefined;
+    sourceId: string;
+    value: unknown;
+  }): Promise<{ companion?: string; stats: Partial<LinkRefExtractionStats> } | undefined> {
+    if (!input.identity?.turnId || !input.identity.linkRefMode || !this.linkRefRegistration) return undefined;
+    try {
+      return await this.linkRefRegistration({
+        pluginId: input.pluginId,
+        identity: input.identity,
+        sourceType: 'mcp',
+        sourceId: input.sourceId,
+        value: input.value,
+      });
+    } catch {
+      return undefined;
+    }
   }
 }
 

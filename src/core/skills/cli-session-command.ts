@@ -1,7 +1,9 @@
-import { readSessionSkillManifest } from './manifest-store.js';
+import { readSessionSkillManifest, SkillManifestReadError, SkillManifestParseError } from './manifest-store.js';
 import { listSkillResources, readSkillEntrypoint, readSkillResource } from './resource-reader.js';
-import { builtinSkillContent, builtinSkillEntries } from '../../skills/injection-mode.js';
+import { builtinSkillContent, builtinSkillEntries, isWithheldFromWorkflowNodeSession } from '../../skills/injection-mode.js';
+import type { SessionSkillManifest } from './types.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
+import { workflowSessionKind } from '../../workflows/session-kind.js';
 
 export interface SkillCommandResult {
   code: number;
@@ -16,16 +18,47 @@ function sessionIdFromEnv(env: Record<string, string | undefined>): string | und
 /** name\tdescription lines for the built-in botmux bridge skills — the ones the
  *  `prompt`-mode catalog advertises, so `botmux skill list` stays consistent
  *  with what the model was told even when there is no user-skill manifest. */
-function builtinListLines(): string[] {
-  return builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: whiteboardEnabled() })
-    .map((e) => `${e.name}\t${e.description}`.trimEnd());
+function builtinListLines(env: Record<string, string | undefined>): string[] {
+  return builtinSkillEntries({
+    asksViaHook: false,
+    whiteboardEnabled: whiteboardEnabled(),
+    sessionKind: workflowSessionKind(env),
+  }).map((e) => `${e.name}\t${e.description}`.trimEnd());
+}
+
+function skillUsage(): string {
+  return [
+    'usage:',
+    '  botmux skill list                    list the skills available in this session (user + built-in)',
+    '  botmux skill show <name>             print a skill\'s full SKILL.md',
+    '  botmux skill resources <name>        list a skill\'s resource files',
+    '  botmux skill read <name> <path>      print one of a skill\'s resource files',
+  ].join('\n') + '\n';
+}
+
+/** `skill --help` / `-h` / `help` and `skill <sub> --help` must print usage
+ *  without touching the session id or manifest. */
+function isSkillHelpRequest(args: string[]): boolean {
+  return args[0] === 'help' || args.some((arg) => arg === '--help' || arg === '-h');
 }
 
 export function runSkillSessionCommand(
   args: string[],
   env: Record<string, string | undefined> = process.env,
 ): SkillCommandResult {
+  if (isSkillHelpRequest(args)) return { code: 0, stdout: skillUsage(), stderr: '' };
   const sub = args[0] ?? 'list';
+  // A session executing a workflow node does that node itself: it is not
+  // offered the multi-bot dispatch skills or the workflow skills its kind does
+  // not use, and asking for one by name gets the reason instead of "not found".
+  if ((sub === 'show' || sub === 'resources' || sub === 'read') && args[1]
+    && isWithheldFromWorkflowNodeSession(args[1], env)) {
+    return {
+      code: 1,
+      stdout: '',
+      stderr: `${args[1]} is not available while executing a workflow node: do this node's work in this session instead of starting a workflow or handing it to another bot.\n`,
+    };
+  }
   // Built-in botmux bridge skills are delivered by prompt-catalog (no user-skill
   // manifest), so `show <builtin>` must resolve even when a session has no user
   // skills registered. Check built-ins first for `show`.
@@ -46,13 +79,44 @@ export function runSkillSessionCommand(
     const builtin = builtinSkillContent(name, builtinEnv);
     if (builtin) return { code: 0, stdout: builtin.endsWith('\n') ? builtin : builtin + '\n', stderr: '' };
   }
+  if (sub === 'resources') {
+    const name = args[1];
+    if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skill resources <name>\n' };
+    // Built-ins are generated in-memory and currently have no sidecar files.
+    // They remain valid skills even when the session has no user-skill
+    // manifest, so enumerate their empty resource set instead of reporting a
+    // misleading "skill manifest not found" error.
+    if (builtinSkillContent(name, env)) return { code: 0, stdout: '\n', stderr: '' };
+  }
+  if (sub === 'read') {
+    const name = args[1];
+    const path = args[2];
+    if (!name || !path) return { code: 2, stdout: '', stderr: 'usage: botmux skill read <name> <path>\n' };
+    if (builtinSkillContent(name, env)) {
+      return { code: 1, stdout: '', stderr: `built-in skill ${name} has no resources\n` };
+    }
+  }
   const sessionId = sessionIdFromEnv(env);
   if (!sessionId) return { code: 2, stdout: '', stderr: 'missing BOTMUX_SESSION_ID\n' };
-  const manifest = readSessionSkillManifest(sessionId);
+  let manifest;
+  try {
+    manifest = readSessionSkillManifest(sessionId);
+  } catch (err) {
+    // Present-but-unreadable (sandbox/policy) or corrupt manifest — a real
+    // fault, NOT "not found". Distinct message + exit 1 so the sandbox misconfig
+    // is diagnosable instead of masquerading as an absent manifest (exit 2).
+    if (err instanceof SkillManifestReadError) {
+      return { code: 1, stdout: '', stderr: `skill manifest exists but is unreadable for session ${sessionId} (${(err.cause as any)?.code ?? 'read error'}) — check the file sandbox read-only policy: ${err.path}\n` };
+    }
+    if (err instanceof SkillManifestParseError) {
+      return { code: 1, stdout: '', stderr: `skill manifest is corrupt for session ${sessionId}: ${err.path}\n` };
+    }
+    throw err;
+  }
   if (!manifest) {
     // No user-skill manifest — still surface built-ins for discovery.
     if (sub === 'list') {
-      const lines = builtinListLines();
+      const lines = builtinListLines(env);
       return { code: 0, stdout: lines.join('\n') + (lines.length > 0 ? '\n' : ''), stderr: '' };
     }
     return { code: 2, stdout: '', stderr: `skill manifest not found for session ${sessionId}\n` };
@@ -60,7 +124,7 @@ export function runSkillSessionCommand(
   try {
     if (sub === 'list') {
       const userLines = manifest.prioritySkills.map((skill) => `${skill.name}\t${skill.description ?? ''}`.trimEnd());
-      const lines = [...userLines, ...builtinListLines()];
+      const lines = [...userLines, ...builtinListLines(env)];
       return { code: 0, stdout: lines.join('\n') + (lines.length > 0 ? '\n' : ''), stderr: '' };
     }
     if (sub === 'show') {
@@ -82,6 +146,30 @@ export function runSkillSessionCommand(
     }
     return { code: 2, stdout: '', stderr: `unknown skill command: ${sub}\n` };
   } catch (err: any) {
-    return { code: 1, stdout: '', stderr: `${err?.message ?? err}\n` };
+    const reason = unavailableSkillReason(manifest, args[1], err, env);
+    return { code: 1, stdout: '', stderr: `${reason ?? err?.message ?? err}\n` };
   }
+}
+
+/** A skill whose source this session cannot read: explain WHY instead of a raw
+ *  ENOENT/EPERM. Only botmux-managed skills (store / plugin bundles) are
+ *  snapshotted into the session (snapshot.ts); linked / external ones keep
+ *  their own path, which the file sandbox does not expose. */
+function unavailableSkillReason(
+  manifest: SessionSkillManifest,
+  name: string | undefined,
+  err: any,
+  env: Record<string, string | undefined>,
+): string | null {
+  const skill = name ? manifest.prioritySkills.find((candidate) => candidate.name === name) : undefined;
+  if (!skill || skill.snapshotOf || skill.source?.type === 'project') return null;
+  if (!['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR', 'ELOOP'].includes(err?.code)) return null;
+  const sandboxed = env.BOTMUX_READ_ISOLATION === '1';
+  const where = sandboxed ? 'inside this sandboxed session' : 'from this session';
+  const failed = manifest.diagnostics.find((d) => d.skillName === skill.name && d.level === 'error'
+    && d.code.startsWith('skill_snapshot_'));
+  if (failed) return `skill ${skill.name} is not available ${where}: ${failed.message}`;
+  return `skill ${skill.name} is a linked/external skill (source ${skill.source?.type ?? 'unknown'}: ${skill.rootDir}) and is not available ${where} — `
+    + 'only skills installed into the botmux skill store are snapshotted into sandboxed sessions. '
+    + 'Install it in copy mode (`botmux skills install <path>` without --link) to use it here.';
 }

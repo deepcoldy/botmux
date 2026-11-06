@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
 import { copyText } from './clipboard.js';
@@ -12,6 +13,7 @@ import {
   isValidConnectorLifecycleGroupNameTemplate,
 } from '../../services/connector-lifecycle-group-name.js';
 import { SearchableGroupPicker } from './searchable-group-picker.js';
+import { BotPickerChips } from './bot-picker-chips.js';
 
 interface Connector {
   id: string;
@@ -27,7 +29,7 @@ interface Connector {
     allowChats?: string[];
     workflowId?: string;
   };
-  promptEnvelope: { sourceName: string; instruction?: string };
+  promptEnvelope: { sourceName: string; instruction?: string; trustPayload?: boolean };
   topicMessage?: {
     mode: 'default' | 'custom' | 'template' | 'none';
     text?: string;
@@ -80,6 +82,7 @@ interface CreateForm {
   topicMessageText: string;
   topicMessageExtractors: string;
   suppressFinalOutput: boolean;
+  trustPayload: boolean;
   verify: 'token' | 'hmac-sha256';
   secret: string;
   storePayload: boolean;
@@ -123,22 +126,11 @@ const emptyForm: CreateForm = {
   topicMessageText: '',
   topicMessageExtractors: '{}',
   suppressFinalOutput: false,
+  trustPayload: false,
   verify: 'token',
   secret: '',
   storePayload: true,
 };
-
-export function buildConnectorInstructionUpdateBody(
-  connector: { name: string; promptEnvelope?: { sourceName?: string } },
-  instruction: string,
-): { promptEnvelope: { sourceName: string; instruction: string } } {
-  return {
-    promptEnvelope: {
-      sourceName: connector.promptEnvelope?.sourceName || connector.name,
-      instruction,
-    },
-  };
-}
 
 export function buildConnectorTopicMessageConfig(
   mode: CreateForm['topicMessageMode'],
@@ -273,6 +265,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     topicMessageText: connector.topicMessage?.text || '',
     topicMessageExtractors: JSON.stringify(connector.topicMessage?.extractors || {}, null, 2),
     suppressFinalOutput: connector.suppressFinalOutput === true,
+    trustPayload: connector.promptEnvelope?.trustPayload === true,
     verify: connector.verify?.type || 'token',
     secret: '',
     storePayload: connector.loggingPolicy?.storePayload !== false,
@@ -295,7 +288,6 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   const tr = useT();
   const mountedRef = useRef(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const createDialogRef = useRef<HTMLDialogElement | null>(null);
   const [bots, setBots] = useState<BotOpt[]>([]);
   const [groups, setGroups] = useState<GroupOpt[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
@@ -320,39 +312,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       .map(id => additionalBotOptions.find(bot => bot.larkAppId === id))
       .filter((bot): bot is BotOpt => Boolean(bot));
     if (!selected.length) return undefined;
-    const visible = selected.slice(0, 4);
-    const overflow = selected.length - visible.length;
-    const botLabel = (bot: BotOpt) => bot.botName || bot.larkAppId;
-    const botTitle = (bot: BotOpt) => `${botLabel(bot)} (${bot.larkAppId})`;
-    const unselectBot = (event: React.MouseEvent, larkAppId: string) => {
-      event.preventDefault();
-      event.stopPropagation();
-      setForm(cur => ({ ...cur, additionalBotIds: cur.additionalBotIds.filter(id => id !== larkAppId) }));
-    };
     return (
-      <span className="connector-bot-picker-chips">
-        {visible.map(bot => (
-          <span key={bot.larkAppId} className="connector-bot-picker-chip" data-full={botTitle(bot)} title={botTitle(bot)}>
-            <span className="connector-bot-picker-chip-label">{botLabel(bot)}</span>
-            <span
-              className="connector-bot-picker-chip-remove"
-              aria-label={`取消选择 ${botLabel(bot)}`}
-              onClick={event => unselectBot(event, bot.larkAppId)}
-            >
-              &times;
-            </span>
-          </span>
-        ))}
-        {overflow > 0 ? (
-          <span
-            className="connector-bot-picker-chip connector-bot-picker-chip-overflow"
-            data-full={selected.slice(4).map(botTitle).join('\n')}
-            title={selected.slice(4).map(botTitle).join('\n')}
-          >
-            <span className="connector-bot-picker-chip-label">+{overflow}</span>
-          </span>
-        ) : null}
-      </span>
+      <BotPickerChips
+        bots={selected}
+        onRemove={larkAppId => setForm(cur => ({ ...cur, additionalBotIds: cur.additionalBotIds.filter(id => id !== larkAppId) }))}
+      />
     );
   }, [additionalBotOptions, form.additionalBotIds]);
   const botOptions = useMemo(
@@ -371,6 +335,10 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
     { value: 'token' as const, label: tr('connectors.verifyToken') },
     { value: 'hmac-sha256' as const, label: tr('connectors.verifyHmac') },
   ], [tr]);
+  // Mirrors the server gate (connectorPayloadTrustBlocker): a trusted payload is
+  // only offered on a verified connector. The server re-checks on save and at
+  // dispatch, so this is presentation, not the boundary.
+  const trustPayloadAllowed = form.kind === 'turn' && (form.verify === 'token' || form.verify === 'hmac-sha256');
 
   const groupName = useCallback((chatId: string): string => {
     const g = groups.find(x => x.chatId === chatId);
@@ -439,25 +407,6 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       allowChats: cur.allowChats.filter(id => valid.has(id)),
     }));
   }, [groupsForBot]);
-
-  useEffect(() => {
-    const dialog = createDialogRef.current;
-    if (!dialog) return;
-    if (createOpen) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* dialog already opening */ }
-      }
-      const body = dialog.querySelector<HTMLElement>('.connector-modal-body');
-      if (body) body.scrollTop = 0;
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [createOpen]);
-
-  useEffect(() => () => {
-    const dialog = createDialogRef.current;
-    if (dialog?.open) dialog.close();
-  }, []);
 
   function modeLabel(m: string): string {
     return m === 'fixed'
@@ -542,7 +491,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       name,
       enabled: editingConnector?.enabled ?? true,
       target: buildConnectorTargetBody({ ...form, chatId }),
-      promptEnvelope: { sourceName: name, instruction: form.instruction.trim() },
+      promptEnvelope: { sourceName: name, instruction: form.instruction.trim(), trustPayload: form.trustPayload && trustPayloadAllowed },
       topicMessage: topicMessage.value,
       suppressFinalOutput: form.suppressFinalOutput,
       verify: { type: form.verify },
@@ -645,12 +594,17 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           topicMessageText: '',
           topicMessageExtractors: '{}',
           suppressFinalOutput: false,
+          trustPayload: false,
           allowChats: [],
           storePayload: true,
         }));
         await load();
       } else {
-        const e = r.body?.error || r.status;
+        const e = r.body?.error === 'trust_payload_requires_verification'
+          ? tr('connectors.errTrustPayloadVerify')
+          : r.body?.error === 'trust_payload_requires_turn_target'
+            ? tr('connectors.errTrustPayloadTurn')
+            : r.body?.error || r.status;
         setCreateMsg({ text: tr('connectors.createFailed', { error: String(e) }), error: true });
       }
     } finally {
@@ -738,16 +692,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
 
       {props.tab === 'webhooks' ? (
         <>
-          <dialog
-            ref={createDialogRef}
+          <ModalDialog
+            open={createOpen}
             className="connector-create-modal"
-            onCancel={event => {
-              event.preventDefault();
-              closeCreateModal();
-            }}
             onClose={closeCreateModal}
-            onClick={event => {
-              if (event.target === event.currentTarget) closeCreateModal();
+            onRequestClose={closeCreateModal}
+            onOpen={dialog => {
+              const body = dialog.querySelector<HTMLElement>('.connector-modal-body');
+              if (body) body.scrollTop = 0;
             }}
           >
             <article className="connector-modal-card">
@@ -1087,6 +1039,28 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
             </span>
           </label>
 
+          <label className="connector-log-policy connector-trust-payload cn-field-wide" htmlFor="cn-trust-payload">
+            <input
+              id="cn-trust-payload"
+              type="checkbox"
+              checked={form.trustPayload && trustPayloadAllowed}
+              disabled={!trustPayloadAllowed}
+              aria-describedby="cn-trust-payload-hint cn-trust-payload-risk"
+              onChange={e => patchForm({ trustPayload: e.currentTarget.checked })}
+            />
+            <span>
+              <strong>{tr('connectors.trustPayload')}</strong>
+              <small id="cn-trust-payload-hint">
+                {tr(trustPayloadAllowed
+                  ? 'connectors.trustPayloadHint'
+                  : form.kind !== 'turn' ? 'connectors.errTrustPayloadTurn' : 'connectors.errTrustPayloadVerify')}
+              </small>
+              {trustPayloadAllowed
+                ? <small id="cn-trust-payload-risk" className="connector-trust-payload-risk" role="note">{tr('connectors.trustPayloadRisk')}</small>
+                : null}
+            </span>
+          </label>
+
           <div className="cn-field">
             <FieldTitle>{tr('connectors.fVerify')}</FieldTitle>
             <ConnectorDropdown
@@ -1127,7 +1101,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                 )}
               </footer>
             </article>
-          </dialog>
+          </ModalDialog>
 
           <section className="overview-block connector-section connector-list-section">
             <div className="card connector-list-card">
@@ -1269,6 +1243,7 @@ function ConnectorList(props: {
               </div>
             ) : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
+            {c.promptEnvelope?.trustPayload ? <div className="muted connector-item-note">{tr('connectors.trustPayloadListNote')}</div> : null}
             <div className="muted connector-item-note">
               {c.topicMessage?.mode === 'none'
                 ? tr('connectors.topicMessageListNone')

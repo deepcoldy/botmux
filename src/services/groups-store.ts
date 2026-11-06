@@ -87,7 +87,8 @@ export type RenameChatResult =
   | { ok: true; oldName: string; newName: string; changed: boolean }
   | {
       ok: false;
-      error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error' | 'rate_limited';
+      /** `name_changed`: the live name no longer matched `expectedOldName`. */
+      error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error' | 'rate_limited' | 'name_changed';
       detail?: string;
       oldName?: string;
       newName?: string;
@@ -110,6 +111,9 @@ export async function renameChat(
     beforeUpdate?: () =>
       | { ok: true }
       | { ok: false; error: 'rate_limited'; retryAfterSeconds: number };
+    /** Compare-and-set: only rename while the freshly read name is still this
+     *  one (automatic renames must not overwrite a member's manual name). */
+    expectedOldName?: string;
   } = {},
 ): Promise<RenameChatResult> {
   const client = getBotClient(larkAppId);
@@ -132,6 +136,9 @@ export async function renameChat(
     }
     const fetchedOldName = typeof current.data?.name === 'string' ? current.data.name.trim() : '';
     oldName = fetchedOldName;
+    if (opts.expectedOldName !== undefined && fetchedOldName !== opts.expectedOldName.trim()) {
+      return { ok: false, error: 'name_changed', oldName: fetchedOldName, newName };
+    }
     if (fetchedOldName === newName) return { ok: true, oldName: fetchedOldName, newName, changed: false };
     const gate = opts.beforeUpdate?.();
     if (gate && !gate.ok) return { ...gate, oldName: fetchedOldName, newName };
@@ -377,6 +384,18 @@ export async function deleteChat(
   }
 }
 
+/** Fresh (uncached) chat name; undefined when the lookup fails. */
+export async function getChatName(larkAppId: string, chatId: string): Promise<string | undefined> {
+  const client = getBotClient(larkAppId);
+  try {
+    const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0 && res.code !== undefined) return undefined;
+    return typeof res.data?.name === 'string' ? res.data.name.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Fetch the current owner of a chat (open_id by default, optionally union_id).
  * Used by group-creator to
@@ -541,7 +560,15 @@ export async function addUsersToChatByUnionId(
   chatId: string,
   unionIds: string[],
 ): Promise<{ invalidUserIds: string[] }> {
-  const ids = Array.from(new Set(unionIds.filter(Boolean)));
+  return addUsersToChatById(proxyLarkAppId, chatId, unionIds, 'union_id');
+}
+
+export async function addUsersToChatByOpenId(proxyLarkAppId: string, chatId: string, ids: string[]): Promise<{ invalidUserIds: string[] }> {
+  return addUsersToChatById(proxyLarkAppId, chatId, ids, 'open_id');
+}
+
+async function addUsersToChatById(proxyLarkAppId: string, chatId: string, userIds: string[], memberIdType: 'open_id' | 'union_id'): Promise<{ invalidUserIds: string[] }> {
+  const ids = Array.from(new Set(userIds.filter(Boolean)));
   if (ids.length === 0) return { invalidUserIds: [] };
   const client = getBotClient(proxyLarkAppId);
   // Add ONE id per call: Lark fails the WHOLE batch (HTTP 400, code 232024) if any
@@ -552,7 +579,7 @@ export async function addUsersToChatByUnionId(
     try {
       const res: any = await (client as any).im.v1.chatMembers.create({
         path: { chat_id: chatId },
-        params: { member_id_type: 'union_id' },
+        params: { member_id_type: memberIdType },
         data: { id_list: [id] },
       });
       if (res.code !== 0 && res.code !== undefined) {

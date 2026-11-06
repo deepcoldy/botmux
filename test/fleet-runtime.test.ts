@@ -13,6 +13,7 @@ import {
 } from '../src/core/fleet-runtime.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
+import { sessionTempDir } from '../src/core/session-temp.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-runtime-')); dirs.push(d); return d; }
@@ -90,14 +91,15 @@ describe('inspectSupervisorState', () => {
     expect(inspectSupervisorState(legacy, runtime('boot-a:123', '[ksoftirqd/9]'))).toEqual({ status: 'stale' });
   });
 
-  it('fails closed for old live state without enough process identity metadata', () => {
+  it('supports pre-identity state only when the live command is a built-in supervisor entry', () => {
     const malformed = { ...base, supervisorProcessStart: undefined, supervisorCommand: undefined, supervisorEntry: undefined };
-    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/botmux __supervisor'))).toEqual({ status: 'unverifiable' });
+    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/other __daemon'))).toEqual({ status: 'stale' });
   });
 });
 
 describe('liveSupervisorTarget', () => {
-  it('fails closed on a live legacy pid with no supervisor identity metadata', () => {
+  it('migrates a pre-identity state row after attesting the built-in supervisor command', () => {
     const p = join(tmp(), 'fleet.json');
     writeFleetState(p, {
       supervisorPid: process.pid,
@@ -107,6 +109,27 @@ describe('liveSupervisorTarget', () => {
     const runtime = {
       readIdentity: () => 'boot-a:123',
       readCommandLine: () => '/opt/botmux __supervisor',
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+
+    expect(liveSupervisorTarget(p, runtime)).toEqual({
+      pid: process.pid,
+      processStart: 'boot-a:123',
+      commandLine: '/opt/botmux __supervisor',
+    });
+  });
+
+  it('still fails closed when a pre-identity supervisor command is unreadable', () => {
+    const p = join(tmp(), 'fleet.json');
+    writeFleetState(p, {
+      supervisorPid: process.pid,
+      supervisorStartedAt: 'T',
+      procs: [],
+    });
+    const runtime = {
+      readIdentity: () => 'boot-a:123',
+      readCommandLine: () => undefined,
       readPidNamespace: () => undefined,
       pidExists: () => true,
     };
@@ -212,6 +235,41 @@ describe('resolveFleetDaemonEnv (migration: SESSION_DATA_DIR must survive pm2→
     vi.stubEnv('SESSION_DATA_DIR', '/custom/data/root');
     const env = resolveFleetDaemonEnv(process.env, '');
     expect(env.SESSION_DATA_DIR).toBe('/custom/data/root'); // ambient override wins
+  });
+
+  it('drops a session scratch TMPDIR inherited from a restart run inside a session', () => {
+    // `botmux restart` from a session shell carries that session's scratch as
+    // TMPDIR/TMP/TEMP. Workers pin their Gateway socket root from it, so it
+    // must not reach the fleet or g.sock exceeds macOS's AF_UNIX limit again.
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    const scratch = sessionTempDir(join(home, '.botmux', 'data'), '6c255026-e993-495d-80ec-85d2c3c440dc');
+    const env = resolveFleetDaemonEnv({
+      BOTMUX_SESSION_ID: 'session-1',
+      SESSION_DATA_DIR: '/custom/data/root',
+      TMPDIR: `${scratch}/`,
+      TMP: scratch,
+      TEMP: scratch,
+    }, '');
+
+    expect(env.TMPDIR).toBeUndefined();
+    expect(env.TMP).toBeUndefined();
+    expect(env.TEMP).toBeUndefined();
+  });
+
+  it('keeps an operator-chosen TMPDIR outside the session scratch tree', () => {
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    const env = resolveFleetDaemonEnv({
+      SESSION_DATA_DIR: '/custom/data/root',
+      TMPDIR: '/var/tmp/botmux/',
+      TMP: join(home, '.cache', 'botmux', 'session-tmp-other'),
+    }, '');
+
+    expect(env.TMPDIR).toBe('/var/tmp/botmux/');
+    expect(env.TMP).toBe(join(home, '.cache', 'botmux', 'session-tmp-other'));
   });
 
   it('reloads WEB_HOST from .env before a session-origin restart spawns the supervisor', () => {

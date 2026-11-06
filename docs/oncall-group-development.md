@@ -96,7 +96,7 @@ ONCALL_SERVICE_SECRET="<service-account-service-secret>"
 
 ## 自动化测试
 
-仓库使用 Bun `1.4.2`，具体约束见 [贡献指南](../CONTRIBUTING.md)。已有共享 `node_modules` 的 worktree 不运行 `bun install`，避免影响正在运行的其它 checkout。
+仓库使用 Bun `1.4.3`，具体约束见 [贡献指南](../CONTRIBUTING.md)。已有共享 `node_modules` 的 worktree 不运行 `bun install`，避免影响正在运行的其它 checkout。
 
 针对 Oncall、凭据隔离、原身份逻辑及 Bun runner 的回归：
 
@@ -112,7 +112,7 @@ bun run test test/oncall-group.test.ts test/oncall-group-callback.test.ts \
 ```bash
 bun run test test/skill-feedback-card.test.ts test/skill-feedback-callback.test.ts \
   test/feedback-policy.test.ts test/command-handler.test.ts \
-  test/cli-identity.test.ts test/dashboard-feedback-settings.test.ts \
+  test/cli-identity.test.ts test/dashboard-daemon-proxy-routes.test.ts \
   test/daemon-lifecycle-env.test.ts test/tmux-backend-env.test.ts
 ```
 

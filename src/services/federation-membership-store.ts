@@ -5,9 +5,10 @@
  * Storage: `{dataDir}/federation-memberships.json`, atomic writes. Keyed by
  * `${hubUrl}::${teamId}` so a deployment can join multiple teams / hubs.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 export interface RemoteMembership {
   hubUrl: string;
@@ -32,21 +33,17 @@ function keyOf(hubUrl: string, teamId: string): string {
 }
 
 function readFile(dataDir: string): FileShape {
-  const fp = filePath(dataDir);
-  if (!existsSync(fp)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as FileShape;
-  } catch { /* corrupt */ }
-  return {};
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次写入覆盖），见 utils/json-file.ts。
+  return readJsonFileSoft<FileShape>(filePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'federation-membership-store',
+  });
 }
 
 function writeFileAtomic(dataDir: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /** Record (or replace) a remote-team membership. */

@@ -1,0 +1,6 @@
+# Lane: scheduled tasks — long-running, so it gets its own lane.
+cases:
+  - name: Scheduled task remains in its source thread
+    tags: [schedule, topic]
+    steps:
+      - feishu.runScenario: { scenario: scheduled-task-thread }

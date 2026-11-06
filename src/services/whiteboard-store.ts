@@ -6,6 +6,7 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { withManagedDirectories } from './managed-directory-retention.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { loadAllSessionsSnapshot } from './session-store.js';
@@ -117,11 +118,8 @@ function readIndex(): WhiteboardIndex {
 
 function writeIndex(index: WhiteboardIndex): void {
   ensureRoot();
-  atomicWriteFileSync(indexPath(), JSON.stringify(index, null, 2) + '\n');
-}
-
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  withManagedDirectories(index, () =>
+    atomicWriteFileSync(indexPath(), JSON.stringify(index, null, 2) + '\n'));
 }
 
 // Locks reuse the cross-process file-lock primitive (utils/file-lock.ts): it
@@ -215,7 +213,8 @@ function defaultTitle(input: EnsureWhiteboardInput): string {
 
 function writeMeta(meta: WhiteboardMeta): void {
   mkdirSync(dirname(metaPath(meta.id)), { recursive: true });
-  atomicWriteFileSync(metaPath(meta.id), JSON.stringify(meta, null, 2) + '\n');
+  withManagedDirectories(meta, () =>
+    atomicWriteFileSync(metaPath(meta.id), JSON.stringify(meta, null, 2) + '\n'));
 }
 
 function syncMetaFromDisk(id: string, fallback?: WhiteboardMeta): WhiteboardMeta | undefined {
@@ -409,9 +408,7 @@ export function writeWhiteboard(id: string, content: string, opts?: { actor?: st
     if (opts?.expectedUpdatedAt && existing.updatedAt !== opts.expectedUpdatedAt) {
       throw new Error('whiteboard_cas_mismatch');
     }
-    const tmp = `${whiteboardBoardPath(clean)}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tmp, content.endsWith('\n') ? content : content + '\n', 'utf-8');
-    renameSync(tmp, whiteboardBoardPath(clean));
+    atomicWriteFileSync(whiteboardBoardPath(clean), content.endsWith('\n') ? content : content + '\n', { followTargetSymlink: false });
     appendLog(clean, { kind: opts?.kind ?? 'write', actor: opts?.actor, content: `[overwrite ${content.length} chars]` });
     return touchWhiteboard(clean);
   });

@@ -107,7 +107,8 @@ export async function executeChatTabsCli(
   }
   if (input.action === 'update') {
     const tabs = await updateChatTab(larkAppId, chatId, input.tabId!, { name: input.name, url: input.url });
-    return { action: 'updated', tab: tabs[0] ?? { tab_id: input.tabId, tab_name: input.name, tab_content: { url: input.url }, tab_type: 'url' } };
+    const tab = tabs.find(candidate => candidate.tab_id === input.tabId);
+    return { action: 'updated', tab: tab ?? { tab_id: input.tabId, tab_name: input.name, tab_content: { url: input.url }, tab_type: 'url' } };
   }
   if (input.action === 'remove') {
     await deleteChatTab(larkAppId, chatId, input.tabId!);

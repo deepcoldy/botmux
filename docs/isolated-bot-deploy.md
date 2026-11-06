@@ -66,7 +66,8 @@ pnpm switch:here && botmux restart
 SID=<会话 id 前 8 位>   # botmux list --plain 里能看到
 
 # 隔离 bot:应看到 sandbox-exec 包裹 + CLAUDE_CONFIG_DIR/CODEX_HOME 重定向
-tmux list-panes -t bmx-$SID -F '#{pane_start_command}' \
+# 新会话在独立的 botmux tmux server 上（升级前创建、还没重建的会话去掉 -L botmux）
+tmux -L botmux list-panes -t bmx-$SID -F '#{pane_start_command}' \
   | grep -oE "sandbox-exec -f [^ ]+|CLAUDE_CONFIG_DIR=[^ ]+|CODEX_HOME=[^ ]+"
 
 # 非隔离 bot:两者都没有(裸 CLI)

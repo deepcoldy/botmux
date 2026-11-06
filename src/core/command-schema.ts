@@ -31,10 +31,31 @@ export type CommandSessionPolicy =
 export type CommandSpecialHandler = 'sessions' | 'vc-auth' | 'card' | 'cot' | 'term';
 
 export interface CommandSpec {
+  /** Payload commands accept literal angle brackets and slash-prefixed body lines. */
+  readonly literalBody?: true;
   /** 主名，含前导 `/`，小写。 */
   readonly name: string;
   /** 别名（fallthrough case），含前导 `/`。 */
   readonly aliases?: readonly string[];
+  /** 仅指定 CLI 由 daemon 处理；不加入全局命令集合，保留其它 CLI 的透传行为。 */
+  readonly cliId?: string | readonly string[];
+  /**
+   * 仅在**无会话**时由 botmux 认领；话题/群里已有会话时按未知命令原样转发给 CLI（保留 CLI
+   * 自带同名命令）。同 `cliId` 命令一样不进全局集合：不遮蔽自定义透传、不进 canTalk 名单。
+   */
+  readonly claimWithoutSessionOnly?: boolean;
+  /**
+   * 权限门槛。缺省 = 需要 canOperate（可被 bot 的 canTalkDaemonCommands 逐条降到 canTalk）；
+   * `'talk'` = 有对话权限即可执行（`canRunDaemonCommand` 直接按 canTalk 判）。
+   */
+  readonly permission?: 'talk';
+  /**
+   * 群里免 @ 也能寻址本 bot（普通群、话题群、话题回复全部生效）。与用户配置的
+   * commandTriggers 不同，这是**内置白名单**，只给只读、无副作用、自带管理员闸的
+   * 控制命令开放（`/dash`）。dispatcher 只凭它放开群 @ 寻址，调用者仍需通过
+   * canTalk 入口闸，daemon 侧再按命令自身权限（canOperate 及命令内 owner 闸）结算。
+   */
+  readonly mentionless?: true;
   readonly sessionPolicy: CommandSessionPolicy;
   /**
    * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器，从不建会话。
@@ -59,7 +80,18 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
+  { name: '/models', sessionPolicy: 'sessionless', help: ['help.models'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
+  {
+    name: '/rewind', sessionPolicy: 'existingOnly', help: ['help.rewind'],
+    notes: '可选 `<n>` 预览、`<n> confirm` 执行；只对 Claude Code（append-only transcript）生效',
+  },
+  {
+    name: '/idlecompact', sessionPolicy: 'existingOnly', help: ['help.idlecompact'],
+    notes: '可选 `on` / `off` / `<分钟 1–59>`，不带参数看状态；只改本会话的闲置自动压缩设置，只对 Claude Code / tmux 后端 Codex 生效',
+  },
+  { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
+    notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },
   { name: '/help', sessionPolicy: 'default', help: ['help.help'] },
   { name: '/insight', sessionPolicy: 'default', help: ['help.insight'] },
   { name: '/detach', aliases: ['/disconnect'], sessionPolicy: 'default', help: ['help.detach'] },
@@ -99,7 +131,12 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/login', sessionPolicy: 'default', help: ['help.login', 'help.login_status'],
   },
-  { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane'] },
+  {
+    name: '/logout', sessionPolicy: 'sessionless', permission: 'talk',
+    help: ['help.logout'],
+    notes: '只撤销发送者自己的触发人凭据；撤销他人走 dashboard IPC',
+  },
+  { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane', 'help.adopt_orca'] },
   {
     name: '/oncall', sessionPolicy: 'default',
     help: ['help.oncall_bind', 'help.oncall_unbind', 'help.oncall_status'],
@@ -107,6 +144,10 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/project', sessionPolicy: 'sessionless', help: ['help.project'],
     notes: '多一个 token 即 unexpected_arguments，是所有命令里 arity 最严的',
+  },
+  {
+    name: '/context-sharing', sessionPolicy: 'sessionless', help: ['help.context_sharing'],
+    notes: '群级后台上下文开关；严格 owner/allowedUsers 闸，不创建或唤醒会话',
   },
   { name: '/group', aliases: ['/g'], sessionPolicy: 'sessionless', help: ['help.group'] },
   { name: '/relay', sessionPolicy: 'default', help: ['help.relay', 'help.relay_create'] },
@@ -147,6 +188,10 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: '/dashboard', sessionPolicy: 'sessionless', help: ['help.dashboard'],
   },
   {
+    name: '/dash', sessionPolicy: 'sessionless', mentionless: true, help: ['help.dash'],
+    notes: '等价于 `/dashboard link`：daemon 直接私信/临时卡返回管理首页链接，不建会话、不建 worktree。',
+  },
+  {
     name: '/sessions', sessionPolicy: 'sessionless', help: ['help.sessions'],
     special: 'sessions',
     notes: '授权在 canTalk 级（canTalkForGroupSessions），不是 canOperate',
@@ -159,6 +204,12 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
+  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['cmd.effort.usage'] },
+  {
+    name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
+    notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'
+      + '有对话权限即可用；带别处 id 时凭会话 id 复制（信任模型同 /fork：id 只在原聊天可见、不可猜）',
+  },
 ];
 
 /** 话题路由元命令：由 `parseTopicHeader` 在命令表之前拦截，不在 `DAEMON_COMMANDS` 里。
@@ -178,27 +229,79 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
   return BY_NAME.get(cmd.trim().toLowerCase());
 }
 
+/**
+ * Commands consumed before slash routing by `im/lark/event-dispatcher.ts` or
+ * the daemon's admitted entries. They are not in the table above, but a plugin
+ * declaring one would never receive it.
+ */
+const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
+]);
+
+/**
+ * Every slash token Botmux itself owns: table names and aliases (including
+ * CLI-specific ones such as `/effort`), the topic-header commands and the
+ * pre-routing commands. Plugin commands may never claim one of these.
+ */
+export function isBuiltinSlashCommandName(cmd: string): boolean {
+  const key = cmd.trim().toLowerCase();
+  return BY_NAME.has(key) || FORCE_TOPIC_COMMANDS.has(key) || PRE_ROUTING_COMMANDS.has(key);
+}
+
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────
 
-/** botmux 自己处理（而非透传给 CLI）的斜杠命令，含别名。 */
-export const DAEMON_COMMANDS: Set<string> = new Set(COMMANDS.flatMap(namesOf));
+/** 一条命令的 **CLI 限定值** 是否匹配当前会话 CLI：字符串精确相等，数组命中其一。
+ *  调用方负责先判空——`cliId === undefined` 是全局命令（不排除任何 CLI），
+ *  语义不是「匹配某 CLI」。路由闸与原生 slash 面板目录共用这一个口径。 */
+export function commandCliIdMatches(
+  specCliId: string | readonly string[],
+  cliId: string | undefined,
+): boolean {
+  return typeof specCliId === 'string'
+    ? specCliId === cliId
+    : specCliId.includes(cliId ?? '');
+}
+
+const GLOBAL_COMMANDS = COMMANDS.filter(s => !s.cliId && !s.claimWithoutSessionOnly);
+
+/** 所有 CLI 都由 botmux 自己处理（而非透传给 CLI）的斜杠命令，含别名。 */
+export const DAEMON_COMMANDS: Set<string> = new Set(GLOBAL_COMMANDS.flatMap(namesOf));
 
 /** 从不建会话的命令（`/watch-comment` 还按参数二次判定，见 isSessionlessCommandInvocation）。 */
 export const SESSIONLESS_DAEMON_COMMANDS: Set<string> = new Set(
-  COMMANDS.filter(s => s.sessionPolicy === 'sessionless').flatMap(namesOf),
+  GLOBAL_COMMANDS.filter(s => s.sessionPolicy === 'sessionless').flatMap(namesOf),
 );
 
 /** 只对已有会话有意义、路由绝不为它预建会话的命令。 */
 export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS: Set<string> = new Set(
-  COMMANDS.filter(s => s.sessionPolicy === 'existingOnly').flatMap(namesOf),
+  GLOBAL_COMMANDS.filter(s => s.sessionPolicy === 'existingOnly').flatMap(namesOf),
 );
 
 /** 允许多行正文的命令（`parseSlashCommandInvocation` 的豁免名单）。 */
 export const MULTILINE_COMMANDS: Set<string> = new Set(
-  COMMANDS.filter(s => s.multiline).flatMap(namesOf),
+  GLOBAL_COMMANDS.filter(s => s.multiline).flatMap(namesOf),
 );
 
 /** 路由入口前置特判：命令 → 处理器。 */
 export const ROUTE_SPECIAL_COMMANDS: ReadonlyMap<string, CommandSpecialHandler> = new Map(
-  COMMANDS.filter(s => s.special).flatMap(s => namesOf(s).map(n => [n, s.special!] as const)),
+  GLOBAL_COMMANDS.filter(s => s.special).flatMap(s => namesOf(s).map(n => [n, s.special!] as const)),
 );
+
+/** 群里免 @ 即可寻址本 bot 的内置保留命令（所有群形态；dispatcher 群闸消费）。 */
+export const MENTIONLESS_DAEMON_COMMANDS: ReadonlySet<string> = new Set(
+  GLOBAL_COMMANDS.filter(s => s.mentionless === true).flatMap(namesOf),
+);
+
+/**
+ * 一条已剥前导 @ 的斜杠文本是否属于内置免 @ 控制命令。
+ *
+ * 命令级白名单（{@link MENTIONLESS_DAEMON_COMMANDS}）之外，`/dashboard` 命令组里
+ * 只有 `link` 这一个无副作用、自带管理员闸的子命令免 @；其它子命令维持「必须 @」
+ * 的历史语义，避免非管理员裸发任何 `/dashboard xxx` 都在群里收到拒绝回执。
+ */
+export function isBuiltinMentionlessInvocation(cmd: string | undefined, rawText: string): boolean {
+  if (!cmd) return false;
+  if (MENTIONLESS_DAEMON_COMMANDS.has(cmd)) return true;
+  return cmd === '/dashboard' && /^\/dashboard\s+link\s*$/i.test(rawText.trim());
+}

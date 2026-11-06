@@ -202,6 +202,7 @@ describe('resolveAsyncTriggerState — failed', () => {
       state: 'failed',
       triggerId: 'trg_a',
       errorCode: 'trigger_failed',
+      terminalErrorCode: 'provider_unexpected_eof',
       error: expect.stringContaining('provider_unexpected_eof'),
       finishedAt: new Date(7000).toISOString(),
     });
@@ -226,6 +227,7 @@ describe('resolveAsyncTriggerState — failed', () => {
     expect(r).toMatchObject({
       state: 'failed',
       errorCode: 'trigger_failed',
+      terminalErrorCode: 'provider_server_error',
       error: expect.stringContaining('provider_server_error'),
     });
   });

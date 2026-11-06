@@ -2,10 +2,11 @@
  * Pairing-login store: device-code style browser ↔ Feishu identity binding.
  * Run: pnpm vitest run test/pairing-store.test.ts
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { logger } from '../src/utils/logger.js';
 import {
   createPairing, claimPairing, getPairingStatus, consumePairing,
 } from '../src/services/pairing-store.js';
@@ -65,5 +66,23 @@ describe('pairing-store', () => {
   it('codes are unique across concurrent pairings', () => {
     const codes = new Set(Array.from({ length: 50 }, () => createPairing(dataDir).code));
     expect(codes.size).toBe(50);
+  });
+});
+
+describe('pairing-store: corrupt file is quarantined, not overwritten', () => {
+  beforeEach(() => { vi.spyOn(logger, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('keeps the corrupt bytes as pairings.json.corrupt-* after the next write', () => {
+    const corrupt = '{"p1":{"pairingId":"p1","code":"ABCD2345","status":"claimed"  <<< half-written';
+    writeFileSync(join(dataDir, 'pairings.json'), corrupt);
+
+    const p = createPairing(dataDir); // read (→ quarantine) then write
+    expect(getPairingStatus(dataDir, p.pairingId, p.browserToken)).toEqual({ status: 'pending' });
+
+    const quarantined = readdirSync(dataDir).filter(f => f.startsWith('pairings.json.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    expect(readFileSync(join(dataDir, quarantined[0]), 'utf-8')).toBe(corrupt);
+    expect(Object.keys(JSON.parse(readFileSync(join(dataDir, 'pairings.json'), 'utf-8')))).toEqual([p.pairingId]);
   });
 });

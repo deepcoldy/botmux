@@ -7,7 +7,7 @@
 // import 走命名空间访问，spy 即时生效）。allowlist 依赖 getBotTuiSlashAllow
 // （bot-registry 内存态注册表的只读 accessor）——同样用 vi.spyOn(bot-registry
 // 命名空间) 打桩，避免真的注册 bot / 构造 Lark client。
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
@@ -18,6 +18,17 @@ const CAP = 'cafebabe'.repeat(8);
 const HOST_SECRET = 'test-ipc-slash-host-secret';
 
 let handle: IpcServerHandle | null = null;
+
+beforeEach(() => {
+  // sendWorkerSessionInput resolves the session CLI through the owning bot
+  // before it dispatches worker IPC. Keep this route fixture representative of
+  // an active registered bot so success cases reach worker.send, and the
+  // worker-send failure case tests the intended error instead of a registry
+  // lookup failure.
+  vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+    config: { cliId: 'claude-code' },
+  } as any);
+});
 
 afterEach(async () => {
   if (handle) await handle.close();

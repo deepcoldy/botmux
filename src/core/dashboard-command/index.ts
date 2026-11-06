@@ -9,11 +9,13 @@
 
 import type { LarkMessage } from '../../types.js';
 import { localeForBot, t } from '../../i18n/index.js';
+import { logger } from '../../utils/logger.js';
 import type { CommandHandlerDeps } from '../command-handler.js';
 
 import { sendUserMessage as defaultSendUserMessage } from '../../im/lark/client.js';
 
 import { ensureDashboardOwner, type EnsureDashboardOwnerDeps } from './owner-gate.js';
+import { deliverDashboardAdminLink, type DashboardLinkSeams } from './link.js';
 import {
   DASHBOARD_MODULES,
   buildHelpText,
@@ -35,6 +37,8 @@ export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   schedules?: DashboardSchedulesCommandDeps;
   overview?: DashboardOverviewCommandDeps;
   groups?: DashboardGroupsCommandDeps;
+  /** Test seams for `/dashboard link` (and the `/dash` alias). */
+  link?: DashboardLinkSeams;
 }
 
 export async function handleDashboardCommand(
@@ -47,11 +51,24 @@ export async function handleDashboardCommand(
   testDeps: DashboardCommandDeps = {},
 ): Promise<void> {
   const loc = localeForBot(larkAppId);
+  // Parse the subcommand ONCE, before the gate, so a denied `/dashboard link`
+  // can be audited without a second argv split. rawSub keeps the original case
+  // for arg slicing; sub is the lowercased dispatch token.
+  const trimmedArgs = args.trim();
+  const rawSub = trimmedArgs.split(/\s+/)[0] || 'overview';
+  const sub = rawSub.toLowerCase();
+  const subArgs = trimmedArgs ? trimmedArgs.slice(rawSub.length).trimStart() : '';
   // Integral admin gate — applies to ALL subcommands. It intentionally
   // matches `/botconfig`: any resolved allowedUsers entry can use dashboard,
   // but open-mode bots with no allowedUsers still fail closed.
   const gate = await ensureDashboardOwner(message, larkAppId, testDeps);
   if (!gate.ok) {
+    // `/dashboard link` hands out the admin token, so denied attempts at that
+    // subcommand get an explicit audit line; other subcommands keep their
+    // historical silent refusal. No token exists on this path.
+    if (sub === 'link') {
+      logger.warn(`[dashboard-command] denied sub=link sender=${message.senderId ?? '?'} chat=${message.chatId ?? '?'} reason=${gate.reason}`);
+    }
     // Admin gate failure: reply in the topic (we don't have an admin DM target).
     await deps.sessionReply(rootId, t('card.dashboard.owner_only', undefined, loc), undefined, larkAppId);
     return;
@@ -79,10 +96,26 @@ export async function handleDashboardCommand(
   };
 
   // ─── Dispatch (admin-only zone) ───
-  const trimmedArgs = args.trim();
-  const rawSub = trimmedArgs.split(/\s+/)[0] || 'overview';
-  const sub = rawSub.toLowerCase();
-  const subArgs = trimmedArgs ? trimmedArgs.slice(rawSub.length).trimStart() : '';
+  // `/dashboard link` hands out a token-bearing admin URL, so it bypasses the
+  // card DM idiom below and uses its own private-delivery flow (ephemeral card
+  // in plain groups, DM otherwise, never a public group message). It inherits
+  // the parent DM seam so tests overriding sendUserMessage at the command-group
+  // level observe the same client on this path.
+  if (sub === 'link') {
+    const linkSeams: DashboardCommandDeps['link'] = {
+      ...testDeps.link,
+      sendUserMessage: testDeps.link?.sendUserMessage ?? testDeps.sendUserMessage,
+    };
+    await deliverDashboardAdminLink({
+      larkAppId: larkAppId!,
+      message,
+      rootId,
+      adminOpenId: gate.adminOpenId,
+      reply: (content, msgType) => deps.sessionReply(rootId, content, msgType, larkAppId),
+      seams: linkSeams,
+    });
+    return;
+  }
 
   if (sub === 'help') {
     await reply(buildHelpText(loc));

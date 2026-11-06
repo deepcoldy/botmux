@@ -18,19 +18,23 @@ import { setAskOptionLayoutLookup } from '../src/im/lark/ask-option-layout.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { replyMessage, sendMessage, updateMessage } from '../src/im/lark/client.js';
+import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
+import { bindGroupContextDelivery, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
+import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
 vi.mock('../src/im/lark/ask-grant-request.js', () => ({ requestGrantForAskClicker: vi.fn(async () => 'unavailable') }));
 vi.mock('../src/im/lark/card-handler.js', () => ({ resolveCardOperatorUnionId: vi.fn() }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: { larkAppId: 'app', cliId: 'claude-code' } }), normalizeUsageDisplay: () => 'off' }));
-vi.mock('../src/im/lark/client.js', () => ({ replyMessage: vi.fn(), sendMessage: vi.fn(), updateMessage: vi.fn(), MessageWithdrawnError: class extends Error {} }));
+vi.mock('../src/im/lark/client.js', () => ({ replyMessage: vi.fn(), sendMessage: vi.fn(), sendUserMessage: vi.fn(), updateMessage: vi.fn(), MessageWithdrawnError: class extends Error {} }));
+vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
 
 const key = { larkAppId: 'app', sessionId: 'sid', turnId: 'om_turn' };
 const input: CreateAskInput = {
   larkAppId: 'app', sessionId: 'sid', chatId: 'oc_chat', rootMessageId: 'om_root', timeoutMs: 60_000,
   replyCardTarget: { turnId: 'om_turn' },
-  questions: [{ prompt: '继续执行吗？', multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
+  questions: [{ prompt: '继续执行吗？', allowCustom: false, multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
 };
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 let dir: string;
@@ -95,6 +99,35 @@ async function click(snapshot: PendingAsk, value: Record<string, string>, by = '
 }
 
 describe('Ask inside the running reply card', () => {
+  it('captures native question authorship at admission and omits it for the answered refresh', async () => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root', cliId: 'claude-code', cliSessionId: 'native_ask', workerGeneration: 1 } } as DaemonSession;
+    const binding = { appId: 'app', chatId: 'oc_chat', sessionId: 'sid', turnId: 'om_turn', workerGeneration: 1,
+      epoch: groupContextEpoch('sid', 'native_ask', 'claude-code', 'om_turn') };
+    writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, dir);
+    bindGroupContextDelivery(binding, dir);
+    const target = replyCardAskTarget(ds, input, { originTurnId: 'om_turn' });
+    expect(target?.groupContextAuthorOrigin).toEqual(binding);
+    const { snapshot, answer } = await ask({ replyCardTarget: target });
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toEqual(binding);
+    vi.mocked(observePublishedGroupMessage).mockClear();
+    submitAskFromDesktop({ askId: snapshot.askId, selections: [['yes']] });
+    await answer;
+    await Promise.allSettled([...publishing]);
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toBeUndefined();
+  });
+
+  it('observes the acknowledged inline question patch for shared history', async () => {
+    const { snapshot, answer } = await ask();
+    expect(observePublishedGroupMessage).toHaveBeenCalledWith('app', expect.objectContaining({
+      message_id: 'om_reply', chat_id: 'oc_chat', root_id: 'om_root', msg_type: 'interactive',
+      body: { content: body }, observed_at: expect.any(Number),
+    }));
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls[0]![1]).not.toHaveProperty('update_time');
+    submitAskFromDesktop({ askId: snapshot.askId, selections: [['yes']] });
+    await answer;
+  });
+
   it('keeps pending options usable when the execution history exceeds the card size limit', async () => {
     await store.update(key, { kind: 'tools', tools: [{ id: 't', name: 'Read', subject: 'large.txt', result: '工具输出'.repeat(10_000) }] }, io);
     const { snapshot, answer } = await ask();
@@ -126,6 +159,26 @@ describe('Ask inside the running reply card', () => {
     expect(body).toContain('继续执行吗');
     expect(body).toContain('✓ 继续');
     expect(body).not.toContain('ask_select');
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('submits per-question text from the same live card after another question is toggled', async () => {
+    const { snapshot, answer } = await ask({ questions: [
+      { ...input.questions[0], allowCustom: true },
+      { ...input.questions[0], prompt: '第二题', allowCustom: true },
+    ] });
+    const toggle = { action: 'ask_toggle', key: 'yes', question_index: '1', custom_form: 'v1', revision: '0' };
+    const response = await handleAskCardAction({ context: { open_message_id: 'om_reply' }, operator: { open_id: 'ou_owner' },
+      action: { value: { ...toggle, ask_id: snapshot.askId, nonce: snapshot.nonce }, form_value: { custom_0: '自定义社区', custom_1: '' } } }, { larkAppId: 'app' });
+    await (response as any)?.afterAck?.();
+    await store.update(key, { kind: 'progress', text: '等待确认' }, io);
+    expect(JSON.stringify(JSON.parse(body))).toContain('自定义社区');
+    await click(snapshot, { action: 'ask_submit', custom_form: 'v1', revision: '1' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [[], ['yes']], customAnswers: ['自定义社区', null] });
+    await Promise.allSettled([...publishing]);
+    expect(body).toContain('✓ 自定义社区');
+    expect(body).toContain('✓ 继续');
     expect(replyMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
   });
@@ -295,6 +348,7 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(ds, { ...input, chatId: 'oc_other' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, input, { ...origin, originDispatchAttempt: 2 })).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, questions: [{ ...input.questions[0], prompt: '文'.repeat(2000) }] }, origin)).toBeUndefined();
+    expect(replyCardAskTarget(ds, { ...input, questions: [{ prompt: 'Details', options: [], multiSelect: false, input: { type: 'text' } }] }, origin)).toBeUndefined();
     const group = { ...ds, scope: 'chat' as const };
     expect(replyCardAskTarget(group, { ...input, rootMessageId: null }, origin)).toEqual(input.replyCardTarget);
     expect(replyCardAskTarget(group, { ...input, rootMessageId: 'oc_chat' }, origin)).toEqual(input.replyCardTarget);

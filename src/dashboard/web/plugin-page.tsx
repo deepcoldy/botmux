@@ -3,13 +3,13 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ComponentType,
   type ReactNode,
 } from 'react';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 
 interface DashboardPluginEntry {
   pluginId: string;
@@ -662,25 +662,13 @@ function PluginCapabilitySummary(props: {
 }
 
 function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): void }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (props.feedback && !dialog.open) {
-      try { dialog.showModal(); } catch { dialog.setAttribute('open', ''); }
-    } else if (!props.feedback && dialog.open) {
-      dialog.close();
-    }
-  }, [props.feedback]);
   return (
-    <dialog
+    <ModalDialog
       className="plugin-feedback-dialog"
       data-plugin-feedback-dialog
-      ref={dialogRef}
+      open={!!props.feedback}
       onClose={props.onClose}
-      onClick={event => {
-        if (event.target === event.currentTarget) props.onClose();
-      }}
+      onOpenError={(_error, dialog) => dialog.setAttribute('open', '')}
     >
       <article>
         <header>
@@ -693,7 +681,7 @@ function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): voi
         <p className="plugin-feedback-message" data-plugin-feedback-message>{props.feedback?.message}</p>
         <footer><button type="button" className="btn-link" data-plugin-feedback-close onClick={props.onClose}>知道了</button></footer>
       </article>
-    </dialog>
+    </ModalDialog>
   );
 }
 

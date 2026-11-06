@@ -3,7 +3,7 @@
  * 跨进程文件锁 + bots.json 原子写，外加内存 registry 同步，让 daemon 的
  * 路由 / grant 处理不必重启即可生效。
  *
- * 六个独立设置：
+ * 八个独立设置：
  *   • restrictGrantCommands     — owner 开关：被授权人只能纯对话，拦截一切 slash 命令
  *   • autoGrantRequestCards     — 未授权者/外部 bot @ 本 bot 但被权限闸挡住时，是否自动发
  *                                 /grant 申请卡给 owner（默认开启；false 显式关闭）
@@ -17,6 +17,11 @@
  *                                 显式 `/grant @x N` 恒生效，与此无关。
  *   • grantDefaultDurationMs    — 新授权卡默认有限时长。缺省 = 产品默认 1 小时；
  *                                 只接受授权卡已有的四个有限时长。
+ *   • trustSameOwnerBots        — 信任同一 owner 的同机 Bot：可执行管理命令、未认出时也免授权
+ *                                 对话、@ 本 bot 时点名的人自动获本群对话授权（默认开启；false 显式关闭）。
+ *   • grantDelegateBots         — 委托授权的外部 bot 显式名单（ou_ open_id / cli_ app_id）：
+ *                                 名单里的 bot @ 本 bot 时点名的人自动获本群对话授权。
+ *                                 同机 Bot 之外的第二条委托来源；默认空，空名单不写盘。
  */
 import { rmwBotEntry } from './config-store.js';
 import { getBot } from '../bot-registry.js';
@@ -36,6 +41,15 @@ export interface BotGrantPrefs {
   messageQuotaDefaultLimit: number | null;
   /** 新授权默认有效期：null = 产品默认 1 小时；number = 卡片支持的有限时长（毫秒）。 */
   grantDefaultDurationMs: number | null;
+  /** 信任同一 owner 的同机 Bot。默认 true。 */
+  trustSameOwnerBots: boolean;
+  /** 委托授权的外部 bot 显式名单（ou_ / cli_）。空数组 = 未配置（默认）。 */
+  grantDelegateBots: string[];
+}
+
+/** grantDelegateBots 条目归一化：trim、丢空白项、去重（与 bot-registry 解析同口径）。 */
+function normalizeDelegateBots(raw: readonly string[]): string[] {
+  return [...new Set(raw.map(s => s.trim()).filter(Boolean))];
 }
 
 /** 把 entry.messageQuota.defaultLimit 归一成 number|null（只认正整数，其余视作无覆盖）。 */
@@ -57,6 +71,8 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
       grantDefaultDurationMs: isGrantDurationOption(c.grantDefaultDurationMs)
         ? c.grantDefaultDurationMs
         : null,
+      trustSameOwnerBots: c.trustSameOwnerBots !== false,
+      grantDelegateBots: c.grantDelegateBots ?? [],
     };
   } catch {
     return {
@@ -66,6 +82,8 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
       grantRequestToOwnerDm: false,
       messageQuotaDefaultLimit: null,
       grantDefaultDurationMs: null,
+      trustSameOwnerBots: true,
+      grantDelegateBots: [],
     };
   }
 }
@@ -79,6 +97,8 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
  *   • messageQuotaDefaultLimit=null → 删整个 messageQuota（恢复授权卡内置 3 条；不动 quotaState）
  *   • messageQuotaDefaultLimit=1–1000 的整数 → 写入；其它值直接拒绝，返回 bad_quota
  *   • grantDefaultDurationMs=null → 删 key（恢复产品默认 1 小时）；合法有限时长 → 写入
+ *   • trustSameOwnerBots=true → 删 key（默认开启）；false → 显式写 false
+ *   • grantDelegateBots=[] → 删 key（空名单不写盘）；非空 → 归一化（trim/去空白/去重）后写入
  * 返回写后解析出的完整 prefs。
  */
 export async function updateBotGrantPrefs(
@@ -131,6 +151,15 @@ export async function updateBotGrantPrefs(
       if (patch.grantDefaultDurationMs === null) delete entry.grantDefaultDurationMs;
       else entry.grantDefaultDurationMs = patch.grantDefaultDurationMs;
     }
+    if (patch.trustSameOwnerBots !== undefined) {
+      if (patch.trustSameOwnerBots === false) entry.trustSameOwnerBots = false;
+      else delete entry.trustSameOwnerBots;
+    }
+    if (patch.grantDelegateBots !== undefined) {
+      const list = normalizeDelegateBots(patch.grantDelegateBots);
+      if (list.length > 0) entry.grantDelegateBots = list;
+      else delete entry.grantDelegateBots;
+    }
     return {
       write: true,
       result: {
@@ -142,6 +171,10 @@ export async function updateBotGrantPrefs(
         grantDefaultDurationMs: isGrantDurationOption(entry.grantDefaultDurationMs)
           ? entry.grantDefaultDurationMs
           : null,
+        trustSameOwnerBots: entry.trustSameOwnerBots !== false,
+        grantDelegateBots: Array.isArray(entry.grantDelegateBots)
+          ? normalizeDelegateBots(entry.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string'))
+          : [],
       },
     };
   });
@@ -182,13 +215,23 @@ export async function updateBotGrantPrefs(
   if (patch.grantDefaultDurationMs !== undefined) {
     bot.config.grantDefaultDurationMs = patch.grantDefaultDurationMs ?? undefined;
   }
+  if (patch.trustSameOwnerBots !== undefined) {
+    bot.config.trustSameOwnerBots = patch.trustSameOwnerBots === false ? false : undefined;
+  }
+  if (patch.grantDelegateBots !== undefined) {
+    bot.config.grantDelegateBots = r.result.grantDelegateBots.length > 0
+      ? r.result.grantDelegateBots
+      : undefined;
+  }
   logger.info(
     `[grant-prefs:${larkAppId}] restrictGrantCommands=${r.result.restrictGrantCommands} ` +
     `autoGrantRequestCards=${r.result.autoGrantRequestCards} ` +
     `p2pOpen=${r.result.p2pOpen} ` +
     `grantRequestToOwnerDm=${r.result.grantRequestToOwnerDm} ` +
     `messageQuotaDefaultLimit=${r.result.messageQuotaDefaultLimit ?? 'built-in'} ` +
-    `grantDefaultDurationMs=${r.result.grantDefaultDurationMs ?? 'default'}`,
+    `grantDefaultDurationMs=${r.result.grantDefaultDurationMs ?? 'default'} ` +
+    `trustSameOwnerBots=${r.result.trustSameOwnerBots} ` +
+    `grantDelegateBots=${r.result.grantDelegateBots.length > 0 ? r.result.grantDelegateBots.join('/') : 'none'}`,
   );
   return { ok: true, prefs: r.result };
 }

@@ -155,6 +155,22 @@ export function getTmuxVersionCached(): TmuxVersion | null {
   return version;
 }
 
+/**
+ * Force a fresh `tmux -V` probe, bypassing the short null-result TTL.
+ *
+ * The cached getter deliberately serves `null` for a few seconds after a failed
+ * probe; that is right for hot paths, but session creation is a once-per-session
+ * decision — without a re-probe, a single transient `tmux -V` timeout on a
+ * modern host would downgrade that ENTIRE session's crash exit-code channel
+ * even though the binary is fine (`tmux -V` answers in ~2ms normally). At a
+ * session-start boundary it is worth re-asking once. Never throws.
+ */
+export function refreshTmuxVersion(): TmuxVersion | null {
+  cachedTmuxVersion = undefined;
+  cachedTmuxVersionNullAt = 0;
+  return getTmuxVersionCached();
+}
+
 /** Version comparison: true iff `version` is a known release >= major.minor.
  *  Deliberately false for null (unknown) — callers keep legacy behaviour on an
  *  unknown version rather than silently skipping commands. */
@@ -163,12 +179,120 @@ export function tmuxVersionAtLeast(version: TmuxVersion | null, major: number, m
   return version.major > major || (version.major === major && version.minor >= minor);
 }
 
+/**
+ * Minimum tmux that accepts the `failed` value for the `remain-on-exit` window
+ * option. CHANGES (3.1c → 3.2 block): "Add a value for remain-on-exit that
+ * only keeps the pane if the program failed". tmux 3.1c and older reject it
+ * with `bad value: failed`, which (because we chain it atomically into
+ * new-session) makes every new session fail to start — a v3.53.0 regression on
+ * Debian's tmux 3.1c.
+ */
+export const TMUX_REMAIN_ON_EXIT_FAILED: TmuxVersion = { major: 3, minor: 2 };
+
+/** Whether this tmux supports `set-option remain-on-exit failed`. Unknown
+ *  version is false on purpose: skipping the option keeps the pre-#2164 default
+ *  (sessions always start; crash exit-code semantics just degrade), while
+ *  sending it to an old tmux blocks session creation entirely. */
+export function tmuxSupportsRemainOnExitFailed(version: TmuxVersion | null): boolean {
+  return tmuxVersionAtLeast(version, TMUX_REMAIN_ON_EXIT_FAILED.major, TMUX_REMAIN_ON_EXIT_FAILED.minor);
+}
+
+/**
+ * Resolve the tmux version for a ONCE-PER-SESSION decision boundary (new-session
+ * argv, reattached-session option reapply, the worker startup self-check):
+ * serve the process-lifetime cache; when it holds a recent failed probe (null
+ * inside its short TTL), force exactly one fresh `tmux -V` before deciding, so a
+ * single transient probe timeout on a modern host does not downgrade that whole
+ * session's exit-code channel. The guarantee is scoped to THIS call: it does not
+ * pin two separate boundaries to the same answer — two consecutive unreadable
+ * probes followed by a successful one still let a later boundary decide
+ * differently than an earlier one (e.g. the one-shot startup log can read
+ * "degraded" while a subsequent session starts with the breaker enabled). A
+ * version that is still unreadable after the re-probe stays null and every
+ * caller fails closed (see tmuxSupportsRemainOnExitFailed). Never throws.
+ */
+export function resolveTmuxVersionAtSessionBoundary(): TmuxVersion | null {
+  const cached = getTmuxVersionCached();
+  return cached === null ? refreshTmuxVersion() : cached;
+}
+
+/**
+ * Version of the tmux SERVER currently answering `socketArgs` (`[]` = the
+ * default server), as reported by `display-message -p '#{version}'`. Commands
+ * and option values are parsed by that server, which can be older than the
+ * `tmux` binary on PATH: a package upgrade leaves the shared server running the
+ * old process until it restarts (a daemon restart only reattaches).
+ *
+ * When no server is running on the socket, the command FAILS rather than
+ * starting one (non-new-session commands carry an implicit -N since tmux 2.5);
+ * the next server is spawned from this client binary, so the caller-supplied
+ * client version stands in that case.
+ *
+ * Resolution order on a throwing call:
+ *  - a version already present in the error's stdout is rescued and trusted —
+ *    a NEWER client vs an OLDER server can print the answer and exit 0 while an
+ *    inherited stdout pipe stays open, so execFileSync waits out the timeout
+ *    and THROWS (ETIMEDOUT, status 0) despite holding the real version
+ *    (reproduced 3.3a client against a 3.1c server);
+ *  - a TIMEOUT with nothing readable fails CLOSED (null): the server might be
+ *    old, and trusting the newer client would re-send values it rejects
+ *    (`remain-on-exit failed`, `new-session -e`) and block session creation;
+ *  - only a FAST non-timeout failure (no server on the socket yet) stands down
+ *    to the client, since that client is what spawns the next server.
+ * Never throws.
+ */
+export function serverTmuxVersion(socketArgs: readonly string[], clientVersion: TmuxVersion | null): TmuxVersion | null {
+  try {
+    const out = execFileSync('tmux', [...socketArgs, 'display-message', '-p', '#{version}'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      // Same budget as the other version probes (TMUX_VERSION_PROBE_TIMEOUT_MS):
+      // a loaded host delays a SAME-version server's answer by seconds (the
+      // gate's own measurements saw 0.93–4.45s at load ~4 and a blown 3s
+      // budget at load ~70). A shorter budget here would time out on a modern
+      // but busy server, and the fail-closed branch would then silence the
+      // 77/127 crash-exit-code channel on exactly those hosts.
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
+      env: tmuxEnv(),
+    });
+    const parsed = parseTmuxVersion(String(out ?? ''));
+    return parsed ?? clientVersion;
+  } catch (err: any) {
+    // Answer already captured despite the throw (version/client pipe mismatch).
+    const captured = parseTmuxVersion(String(err?.stdout ?? ''));
+    if (captured) return captured;
+    // Bounded timeout, nothing readable: the server may be old — fail closed.
+    if (err?.code === 'ETIMEDOUT' || err?.signal || err?.killed) return null;
+    // Fast failure with no server: the next server comes from this client.
+    return clientVersion;
+  }
+}
+
+/**
+ * Child-process budgets for the worker-gate capability probe.
+ *
+ * These are fork+exec budgets, not tmux-work budgets: `tmux -V` answers in
+ * ~10ms and `new-session -d` well under a second on an idle host — what eats
+ * the budget is waiting to be scheduled. Measured `new-session -d` at 0.93–4.45s
+ * on a host at load ~4, i.e. already brushing the old 5s budget, and at load ~70
+ * `tmux -V` blew a 3s budget outright, turning a healthy tmux into a false
+ * "tmux 不可用" hard gate. A slower correct answer beats a fast false negative
+ * that refuses the user's session. Kept moderate (not unbounded) because the
+ * gate retries the probe and a genuinely hung tmux (restricted /tmp, broken
+ * install) must still fail in bounded time. The gate only runs this probe after
+ * an AUTHORITATIVE 'missing' existence answer, so these budgets are not on the
+ * load-timeout path for live sessions at all.
+ */
+export const TMUX_VERSION_PROBE_TIMEOUT_MS = 8_000;
+export const TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS = 10_000;
+export const TMUX_PROBE_CLEANUP_TIMEOUT_MS = 5_000;
+
 function probeTmuxVersion(): TmuxVersionProbe {
   try {
     const out = execFileSync('tmux', ['-V'], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 3000,
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
       env: tmuxEnv(),
     });
     return { ok: true, version: out.trim() };
@@ -176,7 +300,7 @@ function probeTmuxVersion(): TmuxVersionProbe {
     const code = err?.code;
     return {
       ok: false,
-      reason: childFailureReason('tmux -V', err, 3000),
+      reason: childFailureReason('tmux -V', err, TMUX_VERSION_PROBE_TIMEOUT_MS),
       // Only ENOENT proves absence. Timeout/EMFILE/EACCES must not be turned
       // into the old, misleading "not on PATH" diagnosis or a startup hard
       // gate; they prove only that this particular probe got no answer.
@@ -393,15 +517,15 @@ export function probeTmuxFunctional(): TmuxFunctionalProbe {
   // startup) and report "ok: false" even on a perfectly healthy install.
   const run = spawnSync('tmux', ['-L', sockName, 'new-session', '-d', '-s', 'probe', 'true'], {
     stdio: ['ignore', 'ignore', 'pipe'],
-    timeout: 5000,
+    timeout: TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS,
     env: tmuxEnv(),
   });
   if (run.status !== 0) {
-    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: TMUX_PROBE_CLEANUP_TIMEOUT_MS, env: tmuxEnv() });
     cleanupTmuxProbeSocket(sockName);
     return {
       ok: false,
-      reason: childFailureReason('tmux new-session', run, 5000),
+      reason: childFailureReason('tmux new-session', run, TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS),
       binaryPresent: true,
       retryable: (run.error as NodeJS.ErrnoException | undefined)?.code !== 'EACCES',
       version,
@@ -410,7 +534,7 @@ export function probeTmuxFunctional(): TmuxFunctionalProbe {
   // Tear down the probe server and remove the socket file. Some platforms leave
   // bmx-probe-* sockets behind after the server exits; thousands of stale
   // entries make later probe storms slower and easier to time out.
-  spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+  spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: TMUX_PROBE_CLEANUP_TIMEOUT_MS, env: tmuxEnv() });
   cleanupTmuxProbeSocket(sockName);
   return { ok: true, version };
 }

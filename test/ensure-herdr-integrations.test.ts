@@ -16,6 +16,8 @@ const spawn = vi.fn();
 const spawnSync = vi.fn<TextSpawnSync>();
 const execSync = vi.fn();
 
+// Command assertions use the bare name whether or not this host has herdr on PATH.
+vi.mock('../src/utils/herdr-executable.js', () => ({ herdrExecutable: () => 'herdr' }));
 vi.mock('node:child_process', () => ({ spawn, spawnSync, execSync }));
 
 function makeChild(result: { stdout?: string; stderr?: string; code?: number; error?: Error; pid?: number }) {

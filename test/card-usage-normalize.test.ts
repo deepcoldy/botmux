@@ -76,3 +76,40 @@ describe('normalizeCardUsageSnapshot — quota 白名单', () => {
     expect(normalizeCardUsageSnapshot([])).toBeNull();
   });
 });
+
+
+describe('normalizeCardUsageSnapshot — runtime identity', () => {
+  it('preserves runtime identity through daemon IPC even without metrics', () => {
+    expect(normalizeCardUsageSnapshot({
+      context: null, tokens: null, model: ' claude-opus-5-5-high ', reasoningEffort: ' high ', modelBackendVariant: 'max',
+    })).toEqual({ context: null, tokens: null, model: 'claude-opus-5-5-high', reasoningEffort: 'high', modelBackendVariant: 'max' });
+  });
+
+  it('drops malformed/unknown fields independently and does not infer effort from a model ID', () => {
+    expect(normalizeCardUsageSnapshot({
+      model: 'claude-opus-5-5-high', reasoningEffort: 1, modelBackendVariant: ['max'], arbitrary: 'ignored',
+    })).toEqual({ context: null, tokens: null, model: 'claude-opus-5-5-high' });
+    expect(normalizeCardUsageSnapshot({ model: {}, reasoningEffort: ' ', modelBackendVariant: null }))
+      .toEqual({ context: null, tokens: null });
+  });
+});
+
+describe('normalizeCardUsageSnapshot — tokens 缓存字段', () => {
+  it('放行合法的 cacheReadTokens / cacheCreateTokens', () => {
+    expect(normalizeCardUsageSnapshot({
+      context: null,
+      tokens: { in: 100, out: 2, cacheReadTokens: 80, cacheCreateTokens: 15, inputTokens: 5 },
+    })).toEqual({ context: null, tokens: { in: 100, out: 2, cacheReadTokens: 80, cacheCreateTokens: 15 } });
+  });
+
+  it('非法或超过 in 的缓存字段单独丢弃，in/out 保留', () => {
+    expect(normalizeCardUsageSnapshot({
+      context: null,
+      tokens: { in: 100, out: 2, cacheReadTokens: 101, cacheCreateTokens: -1 },
+    })).toEqual({ context: null, tokens: { in: 100, out: 2 } });
+    expect(normalizeCardUsageSnapshot({
+      context: null,
+      tokens: { in: 100, out: 2, cacheReadTokens: '50' },
+    })).toEqual({ context: null, tokens: { in: 100, out: 2 } });
+  });
+});

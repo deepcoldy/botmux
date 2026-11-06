@@ -3,13 +3,16 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Substituted by Bun.build; source/Node execution has no such global.
+declare const __BOTMUX_RUNTIME_BUILD_ID__: string | undefined;
+
 export interface RuntimeBuildEntry {
   path: string;
   content: string | Buffer;
 }
 
 export type RuntimeBuildIdentity =
-  | { status: 'known'; id: string; source: 'artifact' | 'source' }
+  | { status: 'known'; id: string; source: 'artifact' | 'source' | 'embedded' }
   | { status: 'unknown'; reason: 'artifact_invalid' | 'source_unavailable' | 'read_failed' };
 
 const BUILD_ID_RE = /^[a-f0-9]{64}$/;
@@ -66,7 +69,13 @@ export function collectCompiledRuntimeEntries(
 export function resolveRuntimeBuildIdentity(options: {
   artifactPath: string;
   sourceRoot?: string;
+  embeddedId?: string;
 }): RuntimeBuildIdentity {
+  if (options.embeddedId !== undefined) {
+    return isRuntimeBuildId(options.embeddedId)
+      ? { status: 'known', id: options.embeddedId, source: 'embedded' }
+      : { status: 'unknown', reason: 'artifact_invalid' };
+  }
   if (existsSync(options.artifactPath)) {
     try {
       const id = readFileSync(options.artifactPath, 'utf8').trim();
@@ -94,6 +103,7 @@ export function runtimeBuildIdentity(): RuntimeBuildIdentity {
   if (cachedIdentity) return cachedIdentity;
   const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
   cachedIdentity = resolveRuntimeBuildIdentity({
+    embeddedId: typeof __BOTMUX_RUNTIME_BUILD_ID__ === 'string' ? __BOTMUX_RUNTIME_BUILD_ID__ : undefined,
     artifactPath: join(projectRoot, 'dist', '.runtime-build-id'),
     sourceRoot: join(projectRoot, 'src'),
   });

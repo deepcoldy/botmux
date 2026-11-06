@@ -62,6 +62,10 @@ describe('critical terminal control delivery', () => {
   });
 });
 
+// 源码结构护栏(K3)：这些断言守的是 handleTermAction / handleExactTurnInterrupt 内部的
+// 顺序不变量（先过 viewer/RPC 拒绝分支，再写控制键；先在锁内投递成功，再清 TUI 状态）。
+// 逻辑埋在 worker.ts 的闭包里，无法从外部调用，而顺序错了就是线上事故（Ctrl+C 打到
+// 错误进程 / 不可用模式下仍写 PTY），所以只能钉源码文本。
 describe('worker interrupt action integration', () => {
   it('awaits reliable delivery, notifies on failure, and exits before clearing TUI state', () => {
     const start = workerSource.indexOf('async function handleTermAction');
@@ -94,9 +98,16 @@ describe('worker interrupt action integration', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     const region = workerSource.slice(start, end);
     const unsupported = region.indexOf("reason: 'unsupported'");
-    const controlWrite = region.indexOf("sendCriticalControlKey('ctrlc'");
-    expect(region).toContain("lastInitConfig?.cliId === 'codex-app'");
+    // The key is adapter-selected (`interruptKey`, defaulting to ctrlc) so a CLI
+    // whose Ctrl+C is an exit gesture can opt into Escape; the ordering
+    // invariant — unsupported modes are rejected before any key is written — is
+    // unchanged.
+    const controlWrite = region.indexOf('sendCriticalControlKey(interruptKey');
+    // Upstream routes the Codex App question through the single literal
+    // predicate; the ordering invariant under test is unaffected.
+    expect(region).toContain('isCodexAppCliId(lastInitConfig?.cliId)');
     expect(region).toContain('lastInitConfig?.codexRpcInput === true');
+    expect(region).toContain('cliAdapter?.interruptKey');
     expect(unsupported).toBeGreaterThanOrEqual(0);
     expect(controlWrite).toBeGreaterThan(unsupported);
   });

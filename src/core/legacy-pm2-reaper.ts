@@ -27,8 +27,9 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { isStandaloneBinary } from './self-spawn.js';
+import { locateExecutable } from '../utils/executable.js';
 
 /** A botmux core process name managed by the old pm2 ecosystem. */
 function isBotmuxPm2Name(name: unknown): boolean {
@@ -55,32 +56,20 @@ function resolvePm2Bin(pkgRoot: string): string | null {
   // No bundled pm2. A PATH lookup is only meaningful for a source/npm install;
   // the compiled binary ships no pm2 and must not pretend otherwise.
   if (isStandaloneBinary()) return null;
-  // Probe PATH rather than returning a hopeful 'pm2': knowing now whether the
-  // CLI exists lets the caller pick the fallback instead of discovering it
-  // through a chain of swallowed ENOENTs.
+  // Look pm2 up on PATH rather than returning a hopeful 'pm2': knowing now
+  // whether the CLI exists lets the caller pick the fallback instead of
+  // discovering it through a chain of swallowed ENOENTs.
   //
-  // PM2_HOME IS MANDATORY HERE, even though this only asks for a version.
-  // `pm2 --version` is NOT read-only: it DAEMONIZES a God (MEASURED — "Spawning
-  // PM2 daemon with pm2_home=… / PM2 Successfully daemonized"). Inheriting the
-  // ambient env would create that God in whatever home the caller happens to
-  // point at: ~/.botmux/pm2 (which this reaper then "finds and kills" — it would
-  // report a legacy fleet on a machine that never had one) or the SHARED ~/.pm2
-  // that the rest of this module takes pains never to touch. Every other pm2
-  // invocation in the repo passes an explicit PM2_HOME; this one must too.
-  // A throwaway dir keeps any God the probe spawns isolated and disposable.
-  const probeHome = join(tmpdir(), `botmux-pm2-probe-${process.pid}`);
-  const probe = spawnSync('pm2', ['--version'], {
-    encoding: 'utf-8', timeout: 15_000,
-    env: { ...process.env, PM2_HOME: probeHome },
-  });
-  // Stop and remove whatever the probe may have started, so it never outlives
-  // this call. Best-effort: a leftover temp dir is harmless either way.
-  if (!probe.error) {
-    spawnSync('pm2', ['kill'], { encoding: 'utf-8', timeout: 15_000, env: { ...process.env, PM2_HOME: probeHome } });
-  }
-  try { rmSync(probeHome, { recursive: true, force: true }); } catch { /* best effort */ }
-  if (probe.error || probe.status !== 0) return null;
-  return 'pm2';
+  // NEVER EXECUTE pm2 TO FIND OUT. Even `pm2 --version` is not read-only: it
+  // DAEMONIZES a God (MEASURED — "Spawning PM2 daemon with pm2_home=… / PM2
+  // Successfully daemonized"). The previous probe ran it against a throwaway
+  // PM2_HOME and then `pm2 kill` + rm'd that home, but the kill can time out —
+  // and once the home is gone nothing can address that God any more. MEASURED on
+  // a dev box with pm2 on PATH: orphaned `botmux-pm2-probe-<pid>` Gods
+  // accumulated across `botmux start/restart` runs. A filesystem lookup spawns
+  // nothing (and, like every other PATH lookup here, skips a directory that
+  // merely shares the name).
+  return locateExecutable('pm2');
 }
 
 /** A pm2-era botmux daemon process, recovered from PM2_HOME/pids/. */
@@ -453,11 +442,14 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
     { home: join(configDir, 'pm2'), exclusive: true },
     { home: join(homedir(), '.pm2'), exclusive: false },
   ];
-  const pm2 = resolvePm2Bin(pkgRoot);
+  // Resolved lazily: only a host that still has a legacy God needs the CLI, so
+  // the common case (fresh or fully migrated install) never touches pm2 at all.
+  let pm2: string | null | undefined;
 
   for (const { home, exclusive } of homes) {
     const god = liveGodAt(home);
     if (!god) continue;
+    if (pm2 === undefined) pm2 = resolvePm2Bin(pkgRoot);
 
     // ── No usable pm2 CLI: reap from the God's own pid files ─────────────────
     // This is the compiled-binary path (no bundled pm2, none on PATH). Skipped

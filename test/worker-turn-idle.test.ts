@@ -1,0 +1,683 @@
+/**
+ * Worker side of the structured turn-idle channel.
+ *
+ * A `turn_idle` IPC may only settle the turn THIS worker believes is in flight:
+ * accepting a stale/foreign report would mark a busy CLI idle and flush queued
+ * input into it. These cases drive a real worker (fake CLI, PTY backend) through
+ * the whole path — IPC → fence → idleDetector.fireIdle() → prompt_ready — and
+ * pin the rejections as observable behaviour, not as source text.
+ *
+ * Steered (type-ahead) turns are therefore NOT a "newer turn is already
+ * published" situation any more. Since #1781 a type-ahead write only holds the
+ * attribution (`src/worker.ts:13817-13843`) and the held turn is promoted by the
+ * running turn's own ready edge (`src/worker.ts:12804-12814`), so a report
+ * frozen on the running turn is accepted inside that window — that is upstream
+ * semantics (the idle edge is source-agnostic: `src/utils/idle-detector.ts:447-461`,
+ * `:581-589`, `:665-691`). What stays guarded is the expensive direction: a
+ * stale report is dropped once the newer turn IS active. See the last case.
+ */
+import { type ChildProcess } from 'node:child_process';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { sessionActiveTurnPath } from '../src/core/cli-identity.js';
+import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
+import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
+
+const TURN_ID = 'turn-idle-under-test';
+const NEXT_TURN_ID = 'turn-idle-steered-next';
+const STALE_TURN_ID = 'turn-idle-someone-else';
+
+interface Harness {
+  child: ChildProcess;
+  logs: string[];
+  messages: WorkerToDaemon[];
+  /** SESSION_DATA_DIR of this worker — where it publishes the active-turn
+   *  marker the in-CLI reporter freezes its turn identity from. */
+  root: string;
+}
+
+const children = new Set<ChildProcess>();
+const tempDirs = new Set<string>();
+
+afterEach(() => {
+  for (const child of children) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+  children.clear();
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  tempDirs.clear();
+});
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolvePromise => setTimeout(resolvePromise, ms));
+}
+
+async function waitFor(
+  harness: Harness,
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 20_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    if (harness.child.exitCode !== null || harness.child.signalCode !== null) {
+      throw new Error(`worker exited before ${description}\n${harness.logs.join('')}`);
+    }
+    await delay(25);
+  }
+  throw new Error(`timed out waiting for ${description}\n${harness.logs.join('')}`);
+}
+
+function readyCount(harness: Harness): number {
+  return harness.messages.filter(message => message.type === 'prompt_ready').length;
+}
+
+/** The active-turn marker the worker publishes for the in-CLI reporter
+ *  (`.botmux-cli-pids/<cli pid>`): `currentBotmuxTurnId` plus the type-ahead
+ *  attributions the write path is holding on its behalf. */
+interface CliPidMarker {
+  sessionId?: string;
+  turnId?: string;
+  identityTurnId?: string;
+  callerOpenId?: string;
+  dispatchAttempt?: number | null;
+  queuedTurnId?: string;
+  trustedCaller?: {
+    requestUserOpenId?: string;
+    requestUserUnionId?: string;
+    requestLarkAppId?: string;
+    senderType?: 'user' | 'bot';
+  };
+  queuedTurns?: Array<{ turnId?: string }>;
+}
+
+function readCliPidMarker(harness: Harness): CliPidMarker | undefined {
+  const dir = join(harness.root, '.botmux-cli-pids');
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return undefined;
+  }
+  for (const name of names) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, name), 'utf-8')) as CliPidMarker;
+      if (parsed?.turnId) return parsed;
+    } catch { /* not a marker we can read */ }
+  }
+  return undefined;
+}
+
+/** The worker's own view of the active turn — `writeCliPidMarker()` publishes
+ *  exactly `currentBotmuxTurnId` into this file. */
+function activeTurnId(harness: Harness): string | undefined {
+  return readCliPidMarker(harness)?.turnId;
+}
+
+function publishedIdentity(harness: Harness) {
+  const sessionId = readCliPidMarker(harness)?.sessionId;
+  if (!sessionId) throw new Error('worker PID marker has no session identity');
+  const [turnId, callerOpenId, , identityTurnId] = readFileSync(
+    sessionActiveTurnPath(harness.root, sessionId), 'utf-8',
+  ).split('\n');
+  return { turnId, callerOpenId, identityTurnId };
+}
+
+/** Turn ids the worker still holds as un-promoted type-ahead attributions (the
+ *  `queuedTurnId` / `queuedTurns` pair it writes into the same marker). */
+function queuedTurnIds(harness: Harness): string[] {
+  const marker = readCliPidMarker(harness);
+  return [...new Set([
+    ...(marker?.queuedTurnId ? [marker.queuedTurnId] : []),
+    ...(marker?.queuedTurns ?? [])
+      .map(entry => entry.turnId)
+      .filter((id): id is string => !!id),
+  ])];
+}
+
+/** `turnId` of the last `managed_turn_origin` the worker published; the daemon
+ *  mirrors that one as the session's active turn identity. */
+function lastManagedOriginTurnId(harness: Harness): string | undefined {
+  const origins = harness.messages.filter(message => message.type === 'managed_turn_origin');
+  return origins.length > 0 ? origins[origins.length - 1]!.turnId : undefined;
+}
+
+function startWorker(options: { controllablePrompt?: boolean } = {}): Harness {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-turn-idle-'));
+  tempDirs.add(root);
+  // By default the CLI renders nothing and stays alive, so dsh-tui's
+  // readyPattern (`❯`) is never seen and prompt_ready can only come from the
+  // structured channel under test. The controllable variant emits a prompt
+  // only after this harness changes its private trigger file.
+  const fakeCli = join(root, 'fake-dsh-tui');
+  writeFileSync(fakeCli, options.controllablePrompt
+    ? `#!/usr/bin/env node
+const { readFileSync } = require('node:fs');
+const trigger = ${JSON.stringify(join(root, '.emit-prompt'))};
+let observed = '';
+setInterval(() => {
+  try {
+    const value = readFileSync(trigger, 'utf8');
+    if (value !== observed) {
+      observed = value;
+      process.stdout.write('❯\\n');
+    }
+  } catch {}
+}, 20);
+`
+    : '#!/bin/sh\nstty -echo 2>/dev/null\nexec sleep 300\n');
+  chmodSync(fakeCli, 0o755);
+
+  const sessionId = `turnidle${Date.now().toString(36)}${process.pid.toString(36)}`;
+  const logs: string[] = [];
+  const messages: WorkerToDaemon[] = [];
+  // Node, not "whatever runs this file": the worker drives a real PTY, and
+  // node-pty's `tty.ReadStream` closes the master on the first EAGAIN read under
+  // Bun, so the kernel SIGHUPs the fake CLI ~5ms after spawn and every case here
+  // would fail on a dead CLI rather than on the channel under test. See
+  // `nodeTsRunnerPrefix` (test/helpers/ts-runner.ts), which exists for this shape.
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+    cwd: resolve('.'),
+    env: {
+      ...process.env,
+      HOME: root,
+      USERPROFILE: root,
+      SESSION_DATA_DIR: root,
+      BOTMUX_SESSION_ID: sessionId,
+      LARK_APP_ID: 'app_turn_idle',
+      LARK_APP_SECRET: 'secret',
+    },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  children.add(child);
+  child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+  child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+  child.on('message', raw => messages.push(raw as WorkerToDaemon));
+  child.send({
+    type: 'init',
+    sessionId,
+    chatId: 'oc_turn_idle',
+    rootMessageId: 'om_turn_idle',
+    workingDir: root,
+    cliId: 'dsh-tui',
+    cliPathOverride: fakeCli,
+    backendType: 'pty',
+    prompt: '',
+    turnId: 'turn-idle-init',
+    larkAppId: 'app_turn_idle',
+    larkAppSecret: 'secret',
+  } satisfies DaemonToWorker);
+  return { child, logs, messages, root };
+}
+
+/** Boot the worker, release the ready gate, then write one real turn so the
+ *  worker is genuinely waiting on `TURN_ID` (isPromptReady=false). */
+async function startWorkerWaitingOnTurn(
+  dispatchAttempt?: number,
+  options: {
+    controllablePrompt?: boolean;
+    trustedCaller?: {
+      requestUserOpenId: string;
+      requestUserUnionId?: string;
+      requestLarkAppId: string;
+      senderType: 'user' | 'bot';
+    };
+  } = {},
+): Promise<Harness> {
+  const harness = startWorker(options);
+  await waitFor(
+    harness,
+    () => harness.messages.some(message => message.type === 'ready'),
+    'worker readiness',
+  );
+  harness.child.send({ type: 'session_ready', source: 'startup' } satisfies DaemonToWorker);
+  // dsh-tui is not Claude-family, so the gate release marks the CLI ready and
+  // publishes prompt_ready (after its PTY-quiescence settle). Drain that edge
+  // BEFORE the probe turn, so the only prompt_ready this test can observe later
+  // is the structured one.
+  await waitFor(
+    harness,
+    () => readyCount(harness) > 0,
+    'ready-gate release to publish its own prompt_ready',
+  );
+  harness.child.send({
+    type: 'message',
+    content: 'structured turn idle probe',
+    turnId: TURN_ID,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
+  } satisfies DaemonToWorker);
+  await waitFor(
+    harness,
+    () => harness.messages.some(
+      message => message.type === 'managed_turn_origin'
+        && message.turnId === TURN_ID
+        && message.dispatchAttempt === dispatchAttempt,
+    ),
+    'the worker to publish the probe turn as its active turn',
+  );
+  return harness;
+}
+
+let promptTriggerSequence = 0;
+function emitControllablePrompt(harness: Harness): void {
+  promptTriggerSequence++;
+  writeFileSync(join(harness.root, '.emit-prompt'), String(promptTriggerSequence));
+}
+
+const PROMOTED_CALLER = {
+  requestUserOpenId: 'ou_promoted_before_ready',
+  requestUserUnionId: 'on_promoted_before_ready',
+  requestLarkAppId: 'app_turn_idle',
+  senderType: 'user' as const,
+};
+const TAIL_CALLER = {
+  requestUserOpenId: 'ou_tail_after_promoted',
+  requestUserUnionId: 'on_tail_after_promoted',
+  requestLarkAppId: 'app_turn_idle',
+  senderType: 'user' as const,
+};
+const TAIL_TURN_ID = 'turn-idle-tail-after-promoted';
+
+async function arrangeMarkerPromotedSuccessor(
+  harness: Harness,
+): Promise<{ readyBefore: number }> {
+  const readyBefore = readyCount(harness);
+  harness.child.send({
+    type: 'message', content: 'promoted turn', turnId: NEXT_TURN_ID,
+    trustedCaller: PROMOTED_CALLER,
+  } satisfies DaemonToWorker);
+  await waitFor(harness, () => queuedTurnIds(harness).includes(NEXT_TURN_ID), 'the promoted turn to queue');
+  // queuedTurnIds becomes visible as soon as the marker write lands; let the
+  // surrounding PTY write transaction finish before replacing that marker,
+  // otherwise its trailing publication can legitimately win this test race.
+  await delay(300);
+
+  const markersDir = join(harness.root, '.botmux-cli-pids');
+  const markerName = readdirSync(markersDir).find(name => /^\d+$/.test(name));
+  expect(markerName).toBeDefined();
+  const markerPath = join(markersDir, markerName!);
+
+  // The in-CLI wrapper observes that B has started before the worker handles
+  // A's final prompt edge. A following type-ahead write makes the worker adopt
+  // that disk promotion and records the PTY generation it belongs to.
+  writeFileSync(markerPath, JSON.stringify({
+    ...JSON.parse(readFileSync(markerPath, 'utf-8')),
+    turnId: NEXT_TURN_ID,
+    callerOpenId: PROMOTED_CALLER.requestUserOpenId,
+    trustedCaller: PROMOTED_CALLER,
+  }));
+  expect(readCliPidMarker(harness)).toMatchObject({ turnId: NEXT_TURN_ID });
+
+  harness.child.send({
+    type: 'message', content: 'tail turn', turnId: TAIL_TURN_ID,
+    trustedCaller: TAIL_CALLER,
+  } satisfies DaemonToWorker);
+  await waitFor(
+    harness,
+    () => activeTurnId(harness) === NEXT_TURN_ID && queuedTurnIds(harness).includes(TAIL_TURN_ID),
+    'the worker to adopt B and hold C',
+  );
+  return { readyBefore };
+}
+
+/** Assert the worker produces NO ready edge on its own in the current state, so
+ *  a later prompt_ready can only have come from the structured report. The fake
+ *  CLI renders nothing, so the quiescence detector has no way to fire. */
+async function expectNoAutonomousReadyEdge(harness: Harness, before: number): Promise<void> {
+  await delay(1200);
+  expect(readyCount(harness)).toBe(before);
+}
+
+describe('worker turn-idle channel', () => {
+  it('settles the matching turn (IPC → fireIdle → prompt_ready)', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+    await expectNoAutonomousReadyEdge(harness, before);
+
+    harness.child.send({
+      type: 'turn_idle',
+      turnId: TURN_ID,
+      seq: 1,
+      pid: process.pid,
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      harness,
+      () => readyCount(harness) > before,
+      'prompt_ready from the structured turn-idle report',
+    );
+  }, 60_000);
+
+  it('rejects a report for a different turn instead of settling the active one', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+
+    harness.child.send({
+      type: 'turn_idle',
+      turnId: STALE_TURN_ID,
+      seq: 1,
+    } satisfies DaemonToWorker);
+    await delay(1500);
+    expect(readyCount(harness)).toBe(before);
+    expect(harness.logs.join('')).toContain('Ignoring turn-idle report (turn-mismatch)');
+
+    // The real turn still settles afterwards — a rejected report never strands it.
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 2 } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => readyCount(harness) > before,
+      'prompt_ready for the real turn after the stale report was dropped',
+    );
+  }, 60_000);
+
+  it('rejects a report without a turn identity', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+
+    harness.child.send({ type: 'turn_idle', seq: 1 } satisfies DaemonToWorker);
+    await delay(1500);
+    expect(readyCount(harness)).toBe(before);
+    expect(harness.logs.join('')).toContain('Ignoring turn-idle report (missing-turn)');
+  }, 60_000);
+
+  it('rejects a report whose dispatch attempt differs from the active turn', async () => {
+    const harness = await startWorkerWaitingOnTurn(7);
+    const before = readyCount(harness);
+
+    harness.child.send({
+      type: 'turn_idle',
+      turnId: TURN_ID,
+      dispatchAttempt: 6,
+      seq: 1,
+    } satisfies DaemonToWorker);
+    await delay(1500);
+    expect(readyCount(harness)).toBe(before);
+    expect(harness.logs.join('')).toContain('Ignoring turn-idle report (attempt-mismatch)');
+
+    // A retry/restart of the same turn id under the NEW generation may settle:
+    // the fence is on the generation, not on the turn id alone.
+    harness.child.send({
+      type: 'turn_idle',
+      turnId: TURN_ID,
+      dispatchAttempt: 7,
+      seq: 2,
+    } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => readyCount(harness) > before,
+      'prompt_ready for the report naming the current generation',
+    );
+  }, 60_000);
+
+  it('rejects a report that omits the dispatch attempt while the active turn has one', async () => {
+    const harness = await startWorkerWaitingOnTurn(7);
+    const before = readyCount(harness);
+
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+    await delay(1500);
+    expect(readyCount(harness)).toBe(before);
+    expect(harness.logs.join('')).toContain('Ignoring turn-idle report (missing-attempt)');
+  }, 60_000);
+
+  it('reports the identity decision for the actual spawn before the CLI runs', async () => {
+    // F3: the daemon's publication model is the worker's report, not its own
+    // config derivation. The PTY spawn path must therefore emit the decision
+    // (with the real spawn facts) during init, before the first turn.
+    const harness = await startWorkerWaitingOnTurn();
+    const reports = harness.messages.filter(message => message.type === 'session_identity_decision');
+    expect(reports.length).toBeGreaterThan(0);
+    const report = reports.at(-1) as Extract<WorkerToDaemon, { type: 'session_identity_decision' }>;
+    expect(report.sessionId.startsWith('turnidle')).toBe(true);
+    expect(report.sandboxEngaged).toBe(false);
+    expect(report.loopbackShared).toBe(true);
+    expect(report.model).toBe(process.platform === 'linux' ? 'proven' : 'single');
+    // The decision lands before the first prompt_ready, so no turn can be
+    // published against an unreported model.
+    expect(harness.messages.findIndex(m => m.type === 'session_identity_decision'))
+      .toBeLessThan(harness.messages.findIndex(m => m.type === 'prompt_ready'));
+  }, 60_000);
+
+  it('publishes the adopted disk turn with its original identity snapshot', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+    const markersDir = join(harness.root, '.botmux-cli-pids');
+    const markerName = readdirSync(markersDir).find(name => /^\d+$/.test(name));
+    expect(markerName).toBeDefined();
+    const markerPath = join(markersDir, markerName!);
+    const identityTurnId = 'turn-idle-original-authorization';
+    const trustedCaller = {
+      requestUserOpenId: 'ou_turn_idle_original',
+      requestLarkAppId: 'app_turn_idle',
+      senderType: 'user' as const,
+    };
+    writeFileSync(markerPath, JSON.stringify({
+      ...JSON.parse(readFileSync(markerPath, 'utf-8')),
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      callerOpenId: trustedCaller.requestUserOpenId,
+      trustedCaller,
+    }));
+
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+    await waitFor(harness, () => readyCount(harness) > before, 'worker to adopt the promoted disk turn');
+
+    expect(readCliPidMarker(harness)).toMatchObject({
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      callerOpenId: trustedCaller.requestUserOpenId,
+    });
+    expect(publishedIdentity(harness)).toEqual({
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      callerOpenId: trustedCaller.requestUserOpenId,
+    });
+    const origins = harness.messages.filter(message => message.type === 'managed_turn_origin');
+    expect(origins.at(-1)).toMatchObject({
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      trustedCaller,
+    });
+  }, 60_000);
+
+  // Each malformation gets its OWN fresh harness: a shared adopt loop only
+  // lets the first malformed value reach the marker shape guard — the later
+  // iterations replay through the in-memory queued record and skip the guard
+  // entirely, which is why weakening the predicate used to stay green.
+  it.each([
+    { label: 'number', malformed: 12345 },
+    { label: 'embedded newline', malformed: 'bad\nturn' },
+    { label: '257 chars', malformed: 'x'.repeat(257) },
+    { label: 'whitespace', malformed: 'bad turn' },
+  ])('drops a malformed marker identityTurnId ($label) and falls back to the envelope turn', async ({ malformed }) => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+    const markersDir = join(harness.root, '.botmux-cli-pids');
+    const markerName = readdirSync(markersDir).find(name => /^\d+$/.test(name));
+    expect(markerName).toBeDefined();
+    const markerPath = join(markersDir, markerName!);
+    writeFileSync(markerPath, JSON.stringify({
+      ...JSON.parse(readFileSync(markerPath, 'utf-8')),
+      turnId: NEXT_TURN_ID,
+      identityTurnId: malformed,
+    }));
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+    await waitFor(harness, () => readyCount(harness) > before, `worker to adopt (${String(malformed).slice(0, 12)})`);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: NEXT_TURN_ID, identityTurnId: NEXT_TURN_ID });
+  }, 60_000);
+
+  /**
+   * The blocker this channel shipped with, restated for the post-#1781 worker.
+   *
+   * Original hazard: the turn identity was read LATER, inside the detached
+   * `botmux __turn-idle-v2` child, off the worker's MUTABLE active-turn marker —
+   * dsh-tui steers busy-period input, so that read could name turn B while the
+   * report was about turn A. Freezing the identity inside the `agent/status`
+   * callback (see the file header) is what closed it.
+   *
+   * What #1781 changed is WHEN a steered turn becomes the published active turn.
+   * A type-ahead write no longer publishes its turn: it only holds the
+   * attribution (`src/worker.ts:13817-13843`, log "Queuing type-ahead turn
+   * attribution"), and the marker/capability written right after the write still
+   * name the RUNNING turn (`src/worker.ts:13858-13859`). The held turn is
+   * promoted by the running turn's own ready edge: `markPromptReady()` →
+   * `syncQueuedTurnsFromMarkerDisk()` → `advanceQueuedTypeAheadTurn('prompt_ready')`
+   * (`src/worker.ts:12804-12814`, `:4042-4058`).
+   *
+   * Inside that A→B window A is therefore still the worker's active turn, and
+   * accepting A's frozen report is upstream semantics rather than a hole this
+   * channel opened. The worker's idle edge is source-agnostic:
+   * `IdleDetector.fireIdle()` → `markIdle('external')`
+   * (`src/utils/idle-detector.ts:447-461`) and the OSC-7501/screen sources
+   * (`:665-691`) share the single `markIdle` → `idleCallback` path (`:581-589`,
+   * registered at `src/worker.ts:19560`, reaching `markPromptReady()` at
+   * `:12668`/`:19678`), so any of them promotes B at that point.
+   *
+   * The expensive direction is what must stay pinned: once B IS the active turn,
+   * a stale report still frozen on A (duplicate or delayed delivery from the
+   * detached child) must be dropped before it can settle B early. That is the
+   * last step below.
+   */
+  it('settles A inside the steer window, then drops a stale A report once B is active', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+
+    // A is the published, in-flight turn: marker, daemon-visible origin and the
+    // type-ahead queue all agree.
+    expect(activeTurnId(harness)).toBe(TURN_ID);
+    expect(lastManagedOriginTurnId(harness)).toBe(TURN_ID);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: TURN_ID, identityTurnId: TURN_ID });
+    expect(queuedTurnIds(harness)).toEqual([]);
+
+    // Steer turn B while A is in flight. The write is type-ahead: B must NOT be
+    // published — the worker keeps naming A and only holds B as an attribution.
+    harness.child.send({
+      type: 'message',
+      content: 'steered follow-up',
+      turnId: NEXT_TURN_ID,
+    } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => harness.logs.join('').includes(
+        `Queuing type-ahead turn attribution: active=${TURN_ID.slice(0, 12)}, queued=${NEXT_TURN_ID.slice(0, 12)}`,
+      ),
+      'the worker to hold the steered turn as a type-ahead attribution',
+    );
+    // Give a late publish a chance to appear before asserting its absence.
+    await delay(1500);
+    expect(activeTurnId(harness)).toBe(TURN_ID);
+    expect(lastManagedOriginTurnId(harness)).toBe(TURN_ID);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: TURN_ID, identityTurnId: TURN_ID });
+    expect(queuedTurnIds(harness)).toEqual([NEXT_TURN_ID]);
+    expect(readyCount(harness)).toBe(before);
+
+    // Turn A's idle event, frozen at the moment A ended, now reaches the worker.
+    // A is still the active turn, so the fence accepts it and the ready edge it
+    // produces promotes the held B — upstream's own promotion path.
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 2 } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => readyCount(harness) > before,
+      "prompt_ready from turn A's frozen report inside the steer window",
+    );
+    expect(harness.logs.join('')).toContain(`Turn-idle report accepted (turn=${TURN_ID} seq=2`);
+    expect(harness.logs.join('')).toContain(
+      `Advanced active turn (prompt_ready): ${TURN_ID.slice(0, 12)} -> ${NEXT_TURN_ID.slice(0, 12)} (remaining queued: 0)`,
+    );
+    expect(activeTurnId(harness)).toBe(NEXT_TURN_ID);
+    expect(lastManagedOriginTurnId(harness)).toBe(NEXT_TURN_ID);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: NEXT_TURN_ID, identityTurnId: NEXT_TURN_ID });
+    expect(queuedTurnIds(harness)).toEqual([]);
+
+    // B was retired by that same edge, so B's own end-of-turn report is a no-op:
+    // the fence refuses it as `already-ready` once `promptReady` is set
+    // (src/utils/turn-idle-report.ts:99) and `fireIdle()` is idempotent
+    // (src/utils/idle-detector.ts:447-448) — no second ready edge.
+    const afterPromotion = readyCount(harness);
+    harness.child.send({ type: 'turn_idle', turnId: NEXT_TURN_ID, seq: 3 } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => harness.logs.join('').includes(
+        `Ignoring turn-idle report (already-ready) turn=${NEXT_TURN_ID}`,
+      ),
+      "the worker to treat B's own report as already settled",
+    );
+    expect(readyCount(harness)).toBe(afterPromotion);
+
+    // The original blocker, in its post-#1781 form: B is the active turn now, so
+    // a stale report still frozen on A must be dropped — it must not settle B or
+    // publish any further ready edge.
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 4 } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => harness.logs.join('').includes(
+        `Ignoring turn-idle report (turn-mismatch) turn=${TURN_ID}`,
+      ),
+      'the worker to drop the stale A report once B is active',
+    );
+    await delay(1500);
+    expect(readyCount(harness)).toBe(afterPromotion);
+    expect(activeTurnId(harness)).toBe(NEXT_TURN_ID);
+    expect(lastManagedOriginTurnId(harness)).toBe(NEXT_TURN_ID);
+  }, 60_000);
+
+  it('expires a marker-promotion observation on a newer prompt generation', async () => {
+    const originalCaller = {
+      requestUserOpenId: 'ou_original_active',
+      requestUserUnionId: 'on_original_active',
+      requestLarkAppId: 'app_turn_idle',
+      senderType: 'user' as const,
+    };
+    const harness = await startWorkerWaitingOnTurn(undefined, {
+      controllablePrompt: true,
+      trustedCaller: originalCaller,
+    });
+    const { readyBefore } = await arrangeMarkerPromotedSuccessor(harness);
+
+    // A's ready is lost. A later PTY generation is therefore B's own completion
+    // and must expire the old promotion observation, release B, advance C, and
+    // install C's exact caller rather than retaining B forever.
+    emitControllablePrompt(harness);
+    await waitFor(harness, () => readyCount(harness) > readyBefore, 'B completion prompt edge');
+    expect(readCliPidMarker(harness)).toMatchObject({
+      turnId: TAIL_TURN_ID,
+      callerOpenId: TAIL_CALLER.requestUserOpenId,
+      trustedCaller: TAIL_CALLER,
+    });
+  }, 60_000);
+
+  it('keeps marker-promoted B on A late ready without releasing B or advancing queued C', () => {
+    expect(decideQueuedReadyTransition({
+      observedOutputGeneration: 12,
+      currentOutputGeneration: 12,
+      durableTurnInFlight: false,
+      preserveActiveTurnAuthority: false,
+      syncedFromDisk: false,
+      hasQueuedTurn: true,
+    })).toEqual({
+      observationBelongsToReady: true,
+      releaseActiveTurnAuthority: false,
+      advanceQueuedTurn: false,
+    });
+  });
+
+  it('expires the marker-promotion observation when promoted B reports turn_idle', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const { readyBefore } = await arrangeMarkerPromotedSuccessor(harness);
+
+    harness.child.send({ type: 'turn_idle', turnId: NEXT_TURN_ID, seq: 20 } satisfies DaemonToWorker);
+    await waitFor(harness, () => readyCount(harness) > readyBefore, 'B structured idle edge');
+    expect(harness.logs.join('')).toContain(
+      `Turn-idle report accepted (turn=${NEXT_TURN_ID} seq=20`,
+    );
+    expect(readCliPidMarker(harness)).toMatchObject({
+      turnId: TAIL_TURN_ID,
+      callerOpenId: TAIL_CALLER.requestUserOpenId,
+      trustedCaller: TAIL_CALLER,
+    });
+  }, 60_000);
+});

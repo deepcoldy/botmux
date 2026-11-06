@@ -35,6 +35,10 @@ vi.mock('../src/utils/atomic-write.js', () => ({
   atomicWriteFileSync: vi.fn((p: string, data: string) => { files.set(p, data); }),
 }));
 
+vi.mock('../src/utils/file-lock.js', () => ({
+  withFileLockSync: vi.fn((_path: string, fn: () => unknown) => fn()),
+}));
+
 vi.mock('node:fs', async (importOriginal) => {
   const orig = await importOriginal<typeof import('node:fs')>();
   return {
@@ -112,6 +116,78 @@ describe('resolveUserToken — per-user isolation', () => {
     expect(await resolveUserToken(APP, 'sec', 'feishu', ALICE)).toBeNull();
   });
 
+  it('cancels an expired-token refresh without overwriting the stored credential', async () => {
+    const original = tokenFor({ appId: APP, brand: 'feishu', openId: ALICE }, -3_600_000);
+    files.set(perUserPath(APP, ALICE), original);
+    const controller = new AbortController();
+    const fetchMock = vi.fn((_url: unknown, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { resolveUserToken } = await fresh();
+    const task = resolveUserToken(APP, 'sec', 'feishu', ALICE, controller.signal);
+    const rejected = expect(task).rejects.toThrow('refresh budget expired');
+    expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
+    controller.abort(new Error('refresh budget expired'));
+    await rejected;
+    expect(files.get(perUserPath(APP, ALICE))).toBe(original);
+  });
+
+  it('does not persist a late refresh body after cancellation', async () => {
+    const original = tokenFor({ appId: APP, brand: 'feishu', openId: ALICE }, -3_600_000);
+    files.set(perUserPath(APP, ALICE), original);
+    let release!: (body: unknown) => void;
+    const json = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json })));
+    const controller = new AbortController();
+    const { resolveUserToken } = await fresh();
+    const task = resolveUserToken(APP, 'sec', 'feishu', ALICE, controller.signal);
+    const rejected = expect(task).rejects.toThrow('cancelled');
+    await vi.waitFor(() => expect(json).toHaveBeenCalled());
+    controller.abort(new Error('cancelled'));
+    release({ access_token: 'LATE', refresh_token: 'NEW_RT', expires_in: 7200, refresh_token_expires_in: 1000, token_type: 'Bearer' });
+    await rejected;
+    expect(files.get(perUserPath(APP, ALICE))).toBe(original);
+  });
+
+  it('keeps a newer token that replaces the credential while refresh is in flight', async () => {
+    const path = perUserPath(APP, ALICE);
+    files.set(path, tokenFor({
+      access_token: 'EXPIRED',
+      refresh_token: 'OLD_RT',
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+    }, -60_000));
+    let release!: (body: unknown) => void;
+    const json = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json })));
+
+    const { resolveUserToken } = await fresh();
+    const task = resolveUserToken(APP, 'sec', 'feishu', ALICE);
+    await vi.waitFor(() => expect(json).toHaveBeenCalled());
+
+    const newer = tokenFor({
+      access_token: 'NEWER',
+      refresh_token: 'NEWER_RT',
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+    });
+    files.set(path, newer);
+    release({
+      access_token: 'LATE',
+      refresh_token: 'LATE_RT',
+      token_type: 'Bearer',
+      expires_in: 7200,
+      refresh_token_expires_in: 2_592_000,
+      scope: 's',
+    });
+
+    expect(await task).toBe('NEWER');
+    expect(files.get(path)).toBe(newer);
+  });
+
   it('refreshes into the same person\'s file, never the per-app path', async () => {
     // Access token already expired, refresh token still good.
     files.set(perUserPath(APP, ALICE), tokenFor(
@@ -133,6 +209,36 @@ describe('resolveUserToken — per-user isolation', () => {
     expect(written.openId).toBe(ALICE);
     expect(written.userName).toBe('Alice');
     expect(files.has(perAppPath(APP))).toBe(false);
+  });
+
+  it('persists rotated credentials when refresh returns a reduced scope set', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'EXPIRED',
+      refresh_token: 'OLD_RT',
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+      scope: 'offline_access docs:document.comment:read',
+    }, -60_000));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      access_token: 'FRESH',
+      refresh_token: 'ROTATED_RT',
+      token_type: 'Bearer',
+      expires_in: 7200,
+      refresh_token_expires_in: 2_592_000,
+      scope: 'offline_access',
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+
+    const { resolveUserToken } = await fresh();
+    expect(await resolveUserToken(APP, 'sec', 'feishu', ALICE)).toBe('FRESH');
+
+    const written = JSON.parse(files.get(perUserPath(APP, ALICE))!);
+    expect(written).toMatchObject({
+      access_token: 'FRESH',
+      refresh_token: 'ROTATED_RT',
+      scope: 'offline_access',
+      openId: ALICE,
+    });
   });
 
   it('does not invent an owner when refreshing an unattributed file', async () => {
@@ -177,6 +283,73 @@ describe('listAuthorizedUsers', () => {
   it('is empty for a bot nobody authorized', async () => {
     const { listAuthorizedUsers } = await fresh();
     expect(listAuthorizedUsers('cli_nobody', 'feishu')).toEqual([]);
+  });
+});
+
+describe('userTokenAuthState — one person, no token contents', () => {
+  beforeEach(() => { files.clear(); });
+
+  it('reports a live token as authorized with both expiry times and no secrets', async () => {
+    const accessAt = new Date(Date.now() + 3_600_000).toISOString();
+    const refreshAt = new Date(Date.now() + 30 * 86_400_000).toISOString();
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'TOK_ALICE', refresh_token: 'REFRESH_ALICE',
+      appId: APP, brand: 'feishu', openId: ALICE, userName: 'Fixture',
+      expires_at: accessAt, refresh_expires_at: refreshAt,
+    }));
+    files.set(perUserPath(APP, BOB), tokenFor({
+      access_token: 'TOK_BOB', appId: APP, brand: 'feishu', openId: BOB,
+      expires_at: '2099-02-02T00:00:00.000Z', refresh_expires_at: '2099-03-03T00:00:00.000Z',
+    }));
+
+    const { userTokenAuthState } = await fresh();
+    const alice = userTokenAuthState(APP, 'feishu', ALICE);
+    expect(alice).toEqual({ state: 'authorized', expiresAt: accessAt, refreshExpiresAt: refreshAt });
+    expect(JSON.stringify(alice)).not.toContain('TOK_');
+    expect(JSON.stringify(alice)).not.toContain('REFRESH_');
+    expect(JSON.stringify(alice)).not.toContain('Fixture');
+    expect(userTokenAuthState(APP, 'feishu', BOB).expiresAt).toBe('2099-02-02T00:00:00.000Z');
+  });
+
+  it('stays authorized while the access token is expired but the refresh token is not', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'TOK_ALICE', refresh_token: 'REFRESH_ALICE',
+      appId: APP, brand: 'feishu', openId: ALICE,
+      expires_at: '2000-01-01T00:00:00.000Z',
+      refresh_expires_at: '2099-01-01T00:00:00.000Z',
+    }));
+    const { userTokenAuthState } = await fresh();
+    expect(userTokenAuthState(APP, 'feishu', ALICE)).toEqual({
+      state: 'authorized',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      refreshExpiresAt: '2099-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('needs a new login once both expiries are past, and still reports those times', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'TOK_DEAD', refresh_token: 'REFRESH_DEAD',
+      appId: APP, brand: 'feishu', openId: ALICE,
+      expires_at: '2000-01-01T00:00:00.000Z',
+      refresh_expires_at: '2000-02-01T00:00:00.000Z',
+    }));
+    const { userTokenAuthState } = await fresh();
+    expect(userTokenAuthState(APP, 'feishu', ALICE)).toEqual({
+      state: 'needs-login',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      refreshExpiresAt: '2000-02-01T00:00:00.000Z',
+    });
+    expect(userTokenAuthState(APP, 'feishu', BOB)).toEqual({ state: 'needs-login' });
+  });
+
+  it('does not treat another person or an unattributed file as this person', async () => {
+    files.set(perUserPath(APP, BOB), tokenFor({ access_token: 'TOK_BOB', appId: APP, brand: 'feishu', openId: BOB }));
+    files.set(perAppPath(APP), tokenFor({ access_token: 'TOK_APP', appId: APP, brand: 'feishu' }));
+    files.set(perUserPath(APP, ALICE), tokenFor({ access_token: 'TOK_MISFILED', appId: APP, brand: 'feishu', openId: BOB }));
+    const { userTokenAuthState } = await fresh();
+    expect(userTokenAuthState(APP, 'feishu', ALICE)).toEqual({ state: 'needs-login' });
+    expect(userTokenAuthState(APP, 'feishu', '../../etc/passwd')).toEqual({ state: 'unknown' });
+    expect(JSON.stringify(userTokenAuthState(APP, 'feishu', ALICE))).not.toContain('TOK_');
   });
 });
 
@@ -254,12 +427,53 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
     expect(files.has(perUserPath(APP, ALICE))).toBe(true);
   });
 
+  it('includes the same user\'s existing scopes in an incremental browser authorization', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+      scope: 'docs:document.comment:read offline_access',
+    }));
+    const mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(
+      APP,
+      'sec',
+      'feishu',
+      ['contact:user.base:readonly'],
+      ALICE,
+    );
+    expect(new URL(authUrl).searchParams.get('scope')?.split(' ')).toEqual([
+      'im:message:readonly',
+      'im:resource',
+      'offline_access',
+      'contact:user.base:readonly',
+      'docs:document.comment:read',
+    ]);
+  });
+
   // The forwarded-link case: Bob clicked Alice's link. Bob's token is Bob's.
   it('files under the clicker, not the requester, and says so', async () => {
     const { msg } = await runCallback({ body: { code: 0, data: { open_id: BOB, name: '鲍勃' } } });
     expect(files.has(perUserPath(APP, BOB))).toBe(true);
     expect(files.has(perUserPath(APP, ALICE))).toBe(false);
     expect(msg).toContain('不是同一个人');
+  });
+
+  it('refuses to overwrite the clicker when a forwarded link would drop their existing scopes', async () => {
+    const original = tokenFor({
+      access_token: 'TOK_BOB',
+      appId: APP,
+      brand: 'feishu',
+      openId: BOB,
+      scope: 'docs:document.comment:read offline_access',
+    });
+    files.set(perUserPath(APP, BOB), original);
+
+    const { msg } = await runCallback({ body: { code: 0, data: { open_id: BOB, name: '鲍勃' } } });
+
+    expect(files.get(perUserPath(APP, BOB))).toBe(original);
+    expect(msg).toContain('避免覆盖后降权');
+    expect(msg).toContain('docs:document.comment:read');
   });
 
   it.each([

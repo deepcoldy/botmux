@@ -1,9 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-
-function expandHome(path: string): string {
-  return path.startsWith('~') ? join(homedir(), path.slice(1)) : path;
-}
+import { expandHomePath as expandHome } from '../utils/working-dir.js';
 
 /** Codex stores config, history, and transcripts under CODEX_HOME when set;
  *  otherwise it defaults to ~/.codex. Keep this dynamic so tests and child

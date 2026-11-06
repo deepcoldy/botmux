@@ -1,11 +1,12 @@
 /**
- * Unit tests for TmuxBackend input methods (sendText, sendSpecialKeys, pasteText).
- * Verifies the correct tmux commands are invoked.
+ * Unit tests for TmuxBackend's static diagnostic-session helper.
  *
- * pasteText uses load-buffer + paste-buffer (tmux auto-wraps in bracketed paste
- * if the pane has it enabled). Only used by CLIs that support it (Claude Code).
+ * TmuxBackend is a static-only helper now (the pty-under-tmux instance was
+ * removed; live tmux sessions run on TmuxPipeBackend). Input addressing,
+ * paste-buffer handling, copy-mode guards and launch-wrapper shapes for the
+ * live backend are covered in tmux-pipe-backend.test.ts / tmux-copy-mode.test.ts.
  *
- * Run:  pnpm vitest run test/tmux-backend-input.test.ts
+ * Run:  bun run vitest run test/tmux-backend-input.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,26 +19,15 @@ vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
 }));
 
-// Mock node-pty
-vi.mock('node-pty', () => ({
-  spawn: vi.fn(),
-}));
-
 import { execFileSync, execSync } from 'node:child_process';
-import * as pty from 'node-pty';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedExecSync = vi.mocked(execSync);
-const mockedPtySpawn = vi.mocked(pty.spawn);
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function createBackend(sessionName = 'bmx-test1234'): TmuxBackend {
-  return new TmuxBackend(sessionName);
-}
 
 type FakeShell = {
   readonly dir: string;
@@ -56,37 +46,12 @@ function cleanupFakeShell(shell: FakeShell): void {
   rmSync(shell.dir, { recursive: true, force: true });
 }
 
-function makeNewSessionProbeMiss(): void {
-  mockedExecFileSync.mockImplementation((_command, args) => {
-    if (Array.isArray(args) && args.includes('has-session')) {
-      throw Object.assign(new Error('missing session'), { status: 1, signal: null });
-    }
-    return Buffer.from('');
-  });
-}
-
-function getCalls(): Array<{ cmd: string; args: string[]; opts?: any }> {
-  return mockedExecFileSync.mock.calls
-    .map((call: any[]) => ({
-      cmd: call[0] as string,
-      args: call[1] as string[],
-      opts: call[2],
-    }))
-    .filter(call => !call.args.includes('display-message'));
-}
-
-function lastPtySpawnArgs(): string[] {
-  const call = mockedPtySpawn.mock.calls.at(-1);
-  if (!call) throw new Error('expected pty.spawn call');
-  return call[1];
-}
-
 function tmuxNewSessionArgs(): string[] {
   const call = mockedExecFileSync.mock.calls.find(([_, args]) => {
     return Array.isArray(args) && args.includes('new-session');
   });
   if (!call) throw new Error('expected tmux new-session call');
-  return call[1];
+  return call[1] as string[];
 }
 
 function scriptIndex(args: readonly string[]): number {
@@ -99,96 +64,10 @@ function scriptIndex(args: readonly string[]): number {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('TmuxBackend fish launch wrapping', () => {
+describe('TmuxBackend.parkDiagnosticSession', () => {
   beforeEach(() => {
     mockedExecFileSync.mockReset();
     mockedExecSync.mockReset();
-    mockedPtySpawn.mockReset();
-    mockedPtySpawn.mockReturnValue({
-      onData: () => {},
-      onExit: () => {},
-      write: () => {},
-      resize: () => {},
-      kill: () => {},
-    } as pty.IPty);
-    makeNewSessionProbeMiss();
-  });
-
-  it('uses fish script syntax and omits the POSIX _ sentinel when launchShell is fish', () => {
-    const shell = createFakeShell('fish');
-    try {
-      const be = createBackend('bmx-fish');
-      be.spawn('/bin/echo', ['hello'], {
-        cwd: '/tmp',
-        cols: 80,
-        rows: 24,
-        env: { PATH: '/usr/bin:/bin' },
-        launchShell: shell.path,
-      });
-
-      const args = lastPtySpawnArgs();
-      const cIdx = scriptIndex(args);
-      const script = args[cIdx + 1] ?? '';
-      expect(args.slice(cIdx - 2, cIdx + 2)).toEqual([shell.path, '-i', '-c', script]);
-      expect(args[cIdx + 2]).toBe('/tmp');
-      expect(args[cIdx + 2]).not.toBe('_');
-      expect(script).toContain('cd -- $argv[1]');
-      expect(script).toContain('set -e argv[1]');
-      expect(script).toContain('exec /usr/bin/env $argv');
-      expect(script).not.toContain('cd -- "$1" && shift');
-      expect(script).not.toContain('"$@"');
-      expect(script).not.toMatch(/\bshift\b/);
-    } finally {
-      cleanupFakeShell(shell);
-    }
-  });
-
-  it('uses fish debug keep-shell script when BOTMUX_DEBUG_KEEP_SHELL=1 and launchShell is fish', () => {
-    const shell = createFakeShell('fish');
-    const previous = process.env.BOTMUX_DEBUG_KEEP_SHELL;
-    process.env.BOTMUX_DEBUG_KEEP_SHELL = '1';
-    try {
-      const be = createBackend('bmx-fish-debug');
-      be.spawn('/bin/echo', ['hello'], {
-        cwd: '/tmp',
-        cols: 80,
-        rows: 24,
-        env: { PATH: '/usr/bin:/bin' },
-        launchShell: shell.path,
-      });
-
-      const args = lastPtySpawnArgs();
-      const cIdx = scriptIndex(args);
-      const script = args[cIdx + 1] ?? '';
-      expect(args[cIdx + 2]).toBe('/tmp');
-      expect(script).toContain('/usr/bin/env $argv');
-      expect(script).toContain('[botmux debug]');
-      expect(script).toContain(`exec '${shell.path}' -i`);
-      expect(script).not.toContain('/usr/bin/env "$@"');
-      expect(script).not.toMatch(/\bshift\b/);
-    } finally {
-      if (previous === undefined) delete process.env.BOTMUX_DEBUG_KEEP_SHELL;
-      else process.env.BOTMUX_DEBUG_KEEP_SHELL = previous;
-      cleanupFakeShell(shell);
-    }
-  });
-
-  it('keeps the POSIX launch argv unchanged for sh-compatible shells', () => {
-    const be = createBackend('bmx-posix');
-    be.spawn('/bin/echo', ['hello'], {
-      cwd: '/tmp',
-      cols: 80,
-      rows: 24,
-      env: { PATH: '/usr/bin:/bin' },
-      launchShell: '/bin/sh',
-    });
-
-    const args = lastPtySpawnArgs();
-    const cIdx = scriptIndex(args);
-    const script = args[cIdx + 1] ?? '';
-    expect(args.slice(cIdx - 1, cIdx + 4)).toEqual(['/bin/sh', '-c', script, '_', '/tmp']);
-    expect(script).toContain('cd -- "$1" && shift');
-    expect(script).toContain('exec /usr/bin/env "$@"');
   });
 
   it('parks fish diagnostic sessions with fish argv and diagnostic syntax', () => {
@@ -223,237 +102,5 @@ describe('TmuxBackend fish launch wrapping', () => {
       else process.env.SHELL = previousShell;
       cleanupFakeShell(shell);
     }
-  });
-});
-
-describe('TmuxBackend.sendText', () => {
-  beforeEach(() => mockedExecFileSync.mockReset());
-
-  it('sends text via tmux send-keys -l', () => {
-    const be = createBackend();
-    be.sendText('hello world');
-
-    const calls = getCalls();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].cmd).toBe('tmux');
-    expect(calls[0].args).toContain('send-keys');
-    expect(calls[0].args).toContain('-l');
-    expect(calls[0].args).toContain('hello world');
-  });
-
-  it('targets the correct tmux session', () => {
-    const be = createBackend('bmx-mysess');
-    be.sendText('test');
-
-    const calls = getCalls();
-    const tIdx = calls[0].args.indexOf('-t');
-    expect(calls[0].args[tIdx + 1]).toBe('bmx-mysess');
-  });
-});
-
-describe('TmuxBackend.sendSpecialKeys', () => {
-  beforeEach(() => mockedExecFileSync.mockReset());
-
-  it('sends Enter key', () => {
-    const be = createBackend();
-    be.sendSpecialKeys('Enter');
-
-    const calls = getCalls();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].args).toContain('Enter');
-    expect(calls[0].args).not.toContain('-l');
-  });
-
-  it('sends multiple keys in one call', () => {
-    const be = createBackend();
-    be.sendSpecialKeys('Escape', 'q');
-
-    const calls = getCalls();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].args).toContain('Escape');
-    expect(calls[0].args).toContain('q');
-  });
-});
-
-describe('TmuxBackend.pasteText', () => {
-  beforeEach(() => mockedExecFileSync.mockReset());
-
-  it('uses tmux load-buffer + paste-buffer', () => {
-    const be = createBackend();
-    be.pasteText('line1\n\nline2');
-
-    const calls = getCalls();
-    expect(calls).toHaveLength(2);
-
-    // Call 1: load-buffer from stdin
-    expect(calls[0].cmd).toBe('tmux');
-    expect(calls[0].args).toContain('load-buffer');
-    expect(calls[0].args).toContain('-');
-    expect(calls[0].opts?.input).toBe('line1\n\nline2');
-    const bIdx = calls[0].args.indexOf('-b');
-    expect(bIdx).toBeGreaterThanOrEqual(0);
-    const bufferName = calls[0].args[bIdx + 1];
-    expect(bufferName).toMatch(/^botmux-[a-f0-9]{16}$/);
-
-    // Call 2: paste-buffer to the session
-    expect(calls[1].cmd).toBe('tmux');
-    expect(calls[1].args).toContain('paste-buffer');
-    const pasteBIdx = calls[1].args.indexOf('-b');
-    expect(pasteBIdx).toBeGreaterThanOrEqual(0);
-    expect(calls[1].args[pasteBIdx + 1]).toBe(bufferName);
-    expect(calls[1].args).toContain('-d');
-  });
-
-  it('targets the correct session in paste-buffer', () => {
-    const be = createBackend('bmx-target');
-    be.pasteText('content');
-
-    const calls = getCalls();
-    const pasteCall = calls[1];
-    const tIdx = pasteCall.args.indexOf('-t');
-    expect(tIdx).toBeGreaterThanOrEqual(0);
-    expect(pasteCall.args[tIdx + 1]).toBe('bmx-target');
-  });
-
-  it('passes content via stdin to load-buffer', () => {
-    const be = createBackend();
-    const content = '中文内容\n带换行\n\nSession ID: abc-123';
-    be.pasteText(content);
-
-    const calls = getCalls();
-    expect(calls[0].opts?.input).toBe(content);
-    expect(calls[0].opts?.stdio).toEqual(['pipe', 'ignore', 'ignore']);
-  });
-
-  // Each paste must use its OWN named buffer; reusing a name would reopen the
-  // cross-session race the named-buffer scheme exists to kill.
-  it('uses a fresh named buffer for each paste', () => {
-    const be = createBackend();
-    be.pasteText('one');
-    be.pasteText('two');
-
-    const loadCalls = getCalls().filter(c => c.args.includes('load-buffer'));
-    const firstBuffer = loadCalls[0].args[loadCalls[0].args.indexOf('-b') + 1];
-    const secondBuffer = loadCalls[1].args[loadCalls[1].args.indexOf('-b') + 1];
-    expect(firstBuffer).toMatch(/^botmux-[a-f0-9]{16}$/);
-    expect(secondBuffer).not.toBe(firstBuffer);
-  });
-
-  // load OK but paste-buffer throws: the named buffer was created but -d never
-  // ran, so the finally{} must delete it (else named buffers accumulate on the
-  // tmux server over repeated paste failures).
-  it('deletes the named buffer when paste-buffer fails', () => {
-    const be = createBackend();
-    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
-      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
-      return '' as any;
-    }) as any);
-
-    // TmuxBackend.pasteText has no guardedSend wrapper, so the paste failure
-    // propagates — but the finally{} cleanup still runs first.
-    expect(() => be.pasteText('boom')).toThrow();
-
-    const calls = getCalls();
-    const loadArgs = calls.find(c => c.args.includes('load-buffer'))!.args;
-    const bufferName = loadArgs[loadArgs.indexOf('-b') + 1];
-    const deleteCall = calls.find(c => c.args.includes('delete-buffer'));
-    expect(deleteCall).toBeDefined();
-    expect(deleteCall!.args[deleteCall!.args.indexOf('-b') + 1]).toBe(bufferName);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Adopt mode: input must address the real pane target, not the synthetic
-// session name. Without this, send-keys falls through to whichever pane
-// tmux happens to have active and the user's message lands in the wrong
-// CLI (the bug v3 turned up).
-// ---------------------------------------------------------------------------
-
-describe('TmuxBackend adopt-mode pane addressing', () => {
-  beforeEach(() => {
-    mockedExecFileSync.mockReset();
-    // execSync is called by attachToExisting (grouped-session setup,
-    // select-window, select-pane, zoom). Mock it as a no-op so each test
-    // only inspects the execFileSync calls (the real input commands).
-    mockedExecSync.mockReset();
-    mockedExecSync.mockReturnValue(Buffer.from('') as any);
-    mockedPtySpawn.mockReset();
-    mockedPtySpawn.mockReturnValue({
-      onData: () => {},
-      onExit: () => {},
-      write: () => {},
-      resize: () => {},
-      kill: () => {},
-    } as any);
-  });
-
-  function adoptedBackend(target = '0:2.0') {
-    // Synthetic name mirrors what worker.ts uses in adopt mode.
-    const be = new TmuxBackend('adopt-deadbeef', { ownsSession: false });
-    be.attachToExisting(target, {
-      cwd: '/tmp',
-      cols: 200,
-      rows: 50,
-      env: process.env as Record<string, string>,
-    });
-    return be;
-  }
-
-  it('sendText addresses the adopted pane, not the synthetic session name', () => {
-    const be = adoptedBackend('0:3.1');
-    mockedExecFileSync.mockClear();
-    be.sendText('飞书消息');
-
-    const calls = getCalls();
-    expect(calls).toHaveLength(1);
-    const tIdx = calls[0].args.indexOf('-t');
-    // CRITICAL: target must be the real pane "0:3.1", NOT "adopt-deadbeef".
-    expect(calls[0].args[tIdx + 1]).toBe('0:3.1');
-    expect(calls[0].args[tIdx + 1]).not.toBe('adopt-deadbeef');
-  });
-
-  it('sendSpecialKeys addresses the adopted pane', () => {
-    const be = adoptedBackend('0:2.0');
-    mockedExecFileSync.mockClear();
-    be.sendSpecialKeys('Enter');
-
-    const calls = getCalls();
-    const tIdx = calls[0].args.indexOf('-t');
-    expect(calls[0].args[tIdx + 1]).toBe('0:2.0');
-  });
-
-  it('pasteText addresses the adopted pane on paste-buffer', () => {
-    const be = adoptedBackend('1:0.2');
-    mockedExecFileSync.mockClear();
-    be.pasteText('multi\nline\ntext');
-
-    const calls = getCalls();
-    const pasteCall = calls.find(c => c.args.includes('paste-buffer'))!;
-    const tIdx = pasteCall.args.indexOf('-t');
-    expect(pasteCall.args[tIdx + 1]).toBe('1:0.2');
-  });
-
-  it('non-adopt backend keeps using the bmx-* session name', () => {
-    const be = createBackend('bmx-real');
-    be.sendText('hello');
-    const calls = getCalls();
-    const tIdx = calls[0].args.indexOf('-t');
-    expect(calls[0].args[tIdx + 1]).toBe('bmx-real');
-  });
-
-  // getChildPid must resolve to ONE pane, not the first listed in a multi-
-  // pane window. tmux list-panes -F returns every pane in the window when
-  // the target is a pane address; display-message -p resolves exactly
-  // the target pane.
-  it('getChildPid uses display-message (single-pane resolver), not list-panes', () => {
-    const be = adoptedBackend('0:2.0');
-    mockedExecSync.mockReset();
-    mockedExecSync.mockReturnValue('98765\n' as any);
-    const pid = be.getChildPid();
-    expect(pid).toBe(98765);
-    const cmd = mockedExecSync.mock.calls[0][0] as string;
-    expect(cmd).toContain('display-message');
-    expect(cmd).toContain('#{pane_pid}');
-    expect(cmd).not.toContain('list-panes');
   });
 });

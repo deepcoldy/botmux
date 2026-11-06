@@ -8,22 +8,43 @@
  * to flip a page. We snapshot candidates at first render, keyed by the card's
  * root message id, and serve search / page re-renders from that snapshot.
  *
- * Confirmation does NOT use the cache: a live pane may have exited between
+ * Confirmation does NOT trust the cache: a live pane may have exited between
  * render and click, so the card-handler re-discovers and re-validates the
- * chosen target before committing (mirrors the legacy adopt_select path).
+ * chosen target before committing (mirrors the legacy adopt_select path). The
+ * resume confirm only borrows the snapshot's live session ids, so its re-query
+ * hides the same live duplicates the rendered card hid.
  */
 import type { DaemonSession } from '../core/types.js';
 import type { AdoptableSession } from '../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../core/orca-adopt-discovery.js';
 import type { ResumableSession } from '../adapters/cli/types.js';
 import {
   discoverAdoptableSessions,
   excludeOwnedHerdrAdoptTargets,
 } from '../core/session-discovery.js';
 import { discoverAdoptableZellijSessions } from '../core/zellij-adopt-discovery.js';
+import { discoverAdoptableOrcaSessions } from '../core/orca-adopt-discovery.js';
+import { enrichAdoptLiveSessions } from './adopt-live-enrich.js';
+
+export type LiveAdoptableSession = AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession;
+
+/** Card callbacks that re-collect on a cache miss pass `deadlineMs` = callback
+ *  start + this, leaving the rest of Lark's 3 s budget to render and reply. */
+export const ADOPT_CALLBACK_COLLECT_BUDGET_MS = 2500;
+
+export interface CollectAdoptCandidatesOptions {
+  /** Absolute epoch-ms deadline; bounds the live-name enrichment (see adopt-live-enrich). */
+  deadlineMs?: number;
+  /** Live-name enrichment, injectable for tests. */
+  enrichLive?: (
+    sessions: LiveAdoptableSession[],
+    opts: { deadlineMs?: number },
+  ) => Promise<LiveAdoptableSession[]>;
+}
 
 export interface AdoptCandidates {
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>;
+  sessions: LiveAdoptableSession[];
   resumable: ResumableSession[];
   /** The resume cap applied, so the card can show a truncation hint. */
   resumeLimit: number;
@@ -43,11 +64,13 @@ export async function collectAdoptCandidates(
     cliPathOverride: string | undefined,
     activeSessions: Map<string, DaemonSession>,
     limit?: number,
+    extraExclude?: ReadonlySet<string>,
   ) => Promise<ResumableSession[]>,
   resumeLimit: number,
   /** Exact live-process identity asserted only by a structured cliRuntime.
    *  Kept separate from cliPathOverride because legacy paths may be wrappers. */
   runtimeExecutable?: string,
+  options: CollectAdoptCandidatesOptions = {},
 ): Promise<AdoptCandidates> {
   // Only offer live panes for THIS bot's configured CLI (adopting another
   // CLI's pane would silently change the agent behind the bot).
@@ -69,18 +92,30 @@ export async function collectAdoptCandidates(
   const zellij = runtimeExecutable
     ? discoverAdoptableZellijSessions(botCliId as any, runtimeExecutable)
     : discoverAdoptableZellijSessions(botCliId as any);
-  const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
+  const orca = await discoverAdoptableOrcaSessions(botCliId as any, runtimeExecutable);
+  orca.sort((a, b) => (b.lastOutputAt ?? 0) - (a.lastOutputAt ?? 0));
+  const sessions: LiveAdoptableSession[] = [
     ...excludeOwnedHerdrAdoptTargets(
       tmuxAndHerdr,
       ownedHerdrTargets,
     ),
     ...zellij,
+    ...orca,
   ];
+  // A session running in a pane is offered above as a live entry; don't list
+  // its transcript again as history (resuming it would start a second CLI on
+  // the same session). Excluded inside the adapter, before the resume cap.
+  const liveSessionIds = new Set(sessions.flatMap(s => s.sessionId ? [s.sessionId] : []));
+  // Names for the live herdr entries are looked up alongside the history scan,
+  // not after it, and on the final list (owned panes already excluded) so tab
+  // counts match the card. It never rejects and never outlasts its budget.
+  const enrichLive = options.enrichLive ?? enrichAdoptLiveSessions;
+  const enriched = enrichLive(sessions, { deadlineMs: options.deadlineMs });
   // Resume needs the bot's own CLI binary, so only offer it when known.
   const resumable = botCliId
-    ? await discoverResumable(botCliId, cliPathOverride, activeSessions, resumeLimit)
+    ? await discoverResumable(botCliId, cliPathOverride, activeSessions, resumeLimit, liveSessionIds)
     : [];
-  return { sessions, resumable, resumeLimit };
+  return { sessions: await enriched, resumable, resumeLimit };
 }
 
 // ─── Snapshot cache (keyed by card root message id) ─────────────────────────

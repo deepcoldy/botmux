@@ -120,7 +120,7 @@ describe('feedback policy layered resolution', () => {
     expect(resolveFeedbackPolicyForDelivery({ dataDir, larkAppId: 'appB', chatId: 'sameChat', bot: botB })).toMatchObject({ allowReselect: true });
   });
 
-  it('merges a reviewers allowlist across layers and fails closed on an invalid merged whole', () => {
+  it('merges a reviewers allowlist across layers and keeps an empty reviewers audience', () => {
     // audience and reviewers may legitimately arrive from different layers.
     expect(resolveEffectiveFeedbackPolicy({
       team: { enabled: true },
@@ -134,10 +134,11 @@ describe('feedback policy layered resolution', () => {
       chat: { reviewers: ['ou_carol'] },
     })).toMatchObject({ audience: 'reviewers', reviewers: ['ou_carol'] });
 
-    // Individually-valid layers can merge into an invalid whole (reviewers
-    // audience with an empty allowlist, or an allowlist without the audience) —
-    // fail closed instead of shipping a dead or mis-gated button.
-    expect(resolveEffectiveFeedbackPolicy({ team: { enabled: true, audience: 'reviewers' } })).toBeUndefined();
+    // An empty reviewers audience deliberately keeps the controls visible; its
+    // callback allowlist is empty, so every click is still rejected. An
+    // allowlist paired with another audience remains invalid.
+    expect(resolveEffectiveFeedbackPolicy({ team: { enabled: true, audience: 'reviewers' } }))
+      .toMatchObject({ audience: 'reviewers', reviewers: [] });
     expect(resolveEffectiveFeedbackPolicy({ team: { enabled: true, reviewers: ['ou_alice'] } })).toBeUndefined();
   });
 

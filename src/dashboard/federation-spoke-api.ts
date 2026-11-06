@@ -24,7 +24,6 @@ import { buildFederatedRoster } from '../services/federation-roster.js';
 import { getDeploymentIdentity, setDeploymentName } from '../services/deployment-identity.js';
 import { addMembership, listMemberships, removeMembership } from '../services/federation-membership-store.js';
 import type { FederatedBot } from '../services/federation-store.js';
-import { listFederatedDeployments } from '../services/federation-store.js';
 import { ensureDefaultTeam, DEFAULT_TEAM_ID, listTeams, createTeam, deleteTeam, getTeam, setTeamFeedbackPolicy } from '../services/team-store.js';
 import { listTeamGroups, recordTeamGroup } from '../services/team-groups-store.js';
 import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js';
@@ -238,7 +237,7 @@ export async function syncAllMemberships(
           // Mirror this team's 拉群 groups onto THIS (member) deployment so its
           // auth gate sees the same trust boundary as the hub — a teammate bot
           // talking in one of these groups is then learned + trusted locally
-          // (see [[team-bots-store]] / isTeamGroupChat). Recorded regardless of
+          // (see [[team-bots-store]] / isLegacyTeamGroupChat). Recorded regardless of
           // sessionsProvider; the session-report below is the separate concern.
           for (const cid of groupChatIds) recordTeamGroup(dataDir, m.teamId, String(cid));
           if (groupChatIds.length && sessionsProvider) {

@@ -1,0 +1,16 @@
+# Lane: Claude private-chat modes (/reply-mode chat|topic|group in the DM).
+# The DM mode is per bot, so these cases hold the Claude DM exclusively
+# (chat-lease.ts) while other Claude DM lanes wait; each case restores the mode.
+cases:
+  - name: Claude DM chat mode replies inline and keeps one session
+    tags: [mode, dm, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: dm-chat-claude }
+  - name: Claude DM thread mode gives each message its own topic and session
+    tags: [mode, dm, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: dm-thread-claude }
+  - name: Claude DM group mode moves the conversation into a new session group
+    tags: [mode, dm, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: dm-group-claude }

@@ -1,5 +1,3 @@
-import type { ChildProcess } from 'node:child_process';
-
 /**
  * Producer-quiescence fences for graceful shutdown of the feedback turn-terminal
  * pipeline. Extracted from daemon shutdown so the concurrency-sensitive fence

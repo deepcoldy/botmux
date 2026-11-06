@@ -76,21 +76,13 @@ console.log(`  /proc readable  : ${existsSync('/proc/net/unix')}`);
 // Say which path is under test: a reachable pm2 would silently switch the reaper to
 // its CLI branch and make these expectations meaningless.
 //
-// PM2_HOME even here: `pm2 --version` DAEMONIZES a God rather than just printing a
-// version, so an inherited env would create one in the caller's pm2 home — and with
-// PM2_HOME unset (which this script does above) that home is the SHARED ~/.pm2 this
-// repo takes pains never to touch. After the PATH filter this spawn should always
-// ENOENT, so today the argument is unreachable; it is passed anyway because the cost
-// is one line and the failure mode of being wrong is polluting a user's own pm2.
-const pm2ProbeHome = join(tmpdir(), `botmux-musl-gate-probe-${process.pid}`);
-const pm2Reachable = !spawnSync('pm2', ['--version'], {
-  encoding: 'utf-8', env: { ...process.env, PM2_HOME: pm2ProbeHome },
-}).error;
-if (pm2Reachable) {
-  // Stop and remove anything that probe may have started, so it never outlives us.
-  spawnSync('pm2', ['kill'], { encoding: 'utf-8', env: { ...process.env, PM2_HOME: pm2ProbeHome } });
-}
-try { rmSync(pm2ProbeHome, { recursive: true, force: true }); } catch { /* best effort */ }
+// Look it up on disk rather than running `pm2 --version`: that DAEMONIZES a God
+// rather than just printing a version (see resolvePm2Bin in the reaper). After the
+// PATH filter above this should always be false.
+const pm2Reachable = (process.env.PATH ?? '').split(':').some((seg) => {
+  if (!seg) return false;
+  try { accessSync(join(seg, 'pm2'), fsConstants.X_OK); return true; } catch { return false; }
+});
 console.log(`  pm2 on PATH     : ${pm2Reachable ? 'YES — expectations below assume none' : 'no (CLI-less path under test)'}`);
 if (psWorks) {
   // Not a failure — the script is also runnable on glibc for comparison — but say so

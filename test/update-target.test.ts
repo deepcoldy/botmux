@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  decideUpgradeArgs,
   fetchDistTagVersion,
   fetchLatestVersion,
+  multipleUpgradeTargetsMessage,
   parseUpdateTarget,
   registryDistTagUrl,
   shouldApplySelfUpdate,
@@ -132,6 +134,57 @@ describe('parseUpdateTarget', () => {
     for (const invalid of invalidTargets) {
       expect(parseUpdateTarget(invalid)).toBeNull();
     }
+  });
+});
+
+describe('decideUpgradeArgs', () => {
+  const messageOf = (decision: ReturnType<typeof decideUpgradeArgs>): string =>
+    decision.kind === 'reject' ? decision.message : '';
+
+  it('rejects more than one target with rc=2, in any flag/positional order', () => {
+    for (const args of [['--canary', '--beta'], ['--canary', 'latest'], ['latest', '--canary']]) {
+      for (const localDevInstall of [true, false]) {
+        const decision = decideUpgradeArgs(args, localDevInstall);
+        expect(decision).toEqual({ kind: 'reject', exitCode: 2, message: multipleUpgradeTargetsMessage(args) });
+        for (const arg of args) expect(messageOf(decision)).toContain(arg);
+      }
+    }
+  });
+
+  it('rejects URL, protocol, alias, semver range and wildcard specs with rc=2', () => {
+    const invalid = [
+      'npm:other-package@1.0.0',
+      'https://example.invalid/botmux.tgz',
+      'file:./local-botmux',
+      'git+https://github.com/foo/bar.git',
+      'x', 'X', 'vx', 'v3', '3.x',
+    ];
+    for (const raw of invalid) {
+      for (const localDevInstall of [true, false]) {
+        const decision = decideUpgradeArgs([raw], localDevInstall);
+        expect(decision).toMatchObject({ kind: 'reject', exitCode: 2 });
+        expect(messageOf(decision)).toContain(raw);
+      }
+    }
+  });
+
+  it('refuses npm channels and versions on a local git checkout with rc=1 only', () => {
+    for (const raw of ['canary', '@canary', '--canary', '3.28.0']) {
+      const decision = decideUpgradeArgs([raw], true);
+      expect(decision).toMatchObject({ kind: 'reject', exitCode: 1 });
+      expect(messageOf(decision)).toContain(raw);
+      expect(decideUpgradeArgs([raw], false)).toEqual({ kind: 'proceed', target: parseUpdateTarget(raw) });
+    }
+  });
+
+  it('lets a local git checkout update to latest, implicitly or explicitly', () => {
+    expect(decideUpgradeArgs([], true)).toEqual({ kind: 'proceed', target: parseUpdateTarget() });
+    expect(decideUpgradeArgs(['latest'], true)).toEqual({ kind: 'proceed', target: parseUpdateTarget('latest') });
+  });
+
+  it('treats a lone `help` positional as a help request', () => {
+    expect(decideUpgradeArgs(['help'], true)).toEqual({ kind: 'help' });
+    expect(decideUpgradeArgs(['help', 'canary'], false)).toMatchObject({ kind: 'reject', exitCode: 2 });
   });
 });
 

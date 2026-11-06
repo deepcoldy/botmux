@@ -18,13 +18,19 @@
  * daemon-side watcher re-executes the send OUTSIDE the sandbox with real
  * credentials. No Feishu credential ever enters the sandbox.
  */
+import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
+import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
+import type { ProtectedHttpEgressLoopbackPlan, ProtectedLocalServiceLoopbackPlan } from '../../core/protected-http-egress-loopback.js';
+import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
+import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
-import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
+import { accessForPath, compileToBwrap, relocateSymlinkedBaselineRules, type FsPolicy, type FsRule } from '../cli/fs-policy.js';
+import { bwrapExecutable, bwrapNamespaceDocUrl, classifyBwrapNamespaceFailure, type BwrapNamespaceFailure } from '../../core/system-bwrap.js';
 import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
@@ -32,7 +38,17 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import {
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+  PROTECTED_HTTP_EGRESS_PROTOCOL_ENV,
+  PROTECTED_HTTP_SHARED_READ_PROTOCOL,
+  protectedHttpEgressAuthTokenPath,
+} from '../../core/protected-http-egress-host.js';
+import { ensurePrivateGatewayDir } from '../../core/plugins/mcp/socket-dir.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
+import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
+import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
+import { safeRequirementUrl } from '../../core/dispatch-task-tree.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -41,7 +57,7 @@ import { isValidPluginId } from '../../core/plugins/ids.js';
  *  unsandboxed run). */
 function ensureSandboxDeps(): boolean {
   const has = (cmd: string) => spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
-  if (has('bwrap')) return true;
+  if (bwrapExecutable()) return true;
   const pm =
     has('apt-get') ? ['apt-get', 'install', '-y', 'bubblewrap'] :
     has('dnf')     ? ['dnf', 'install', '-y', 'bubblewrap'] :
@@ -55,7 +71,7 @@ function ensureSandboxDeps(): boolean {
     // (never blocks on an interactive prompt).
     const argv = isRoot ? pm : ['sudo', '-n', ...pm];
     const r = spawnSync(argv[0], argv.slice(1), { stdio: 'ignore', timeout: 180_000 });
-    if (r.status === 0 && has('bwrap')) return true;
+    if (r.status === 0 && bwrapExecutable()) return true;
   }
   const guide = pm ? `${isRoot ? '' : 'sudo '}${pm.join(' ')}` : 'install bubblewrap';
   console.error(`[sandbox] bwrap missing; auto-install unavailable — install manually then retry: ${guide}`);
@@ -77,6 +93,11 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideFiles: string[];
   readonlyPaths?: string[];
   privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
+  /** Host-owned relay outbox, bound read-WRITE so the confined `botmux send`
+   *  can drop its request for the host watcher. Everything else this flavour
+   *  binds is read-only; see prepareCredentialOnlySandbox for why the relay
+   *  (not an in-pane file proof) is the only sound channel here. */
+  writableOutbox?: string;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -95,6 +116,13 @@ export function buildCredentialOnlySandboxArgs(input: {
   const args: string[] = [
     '--bind', '/', '/',
     '--proc', '/proc',
+    // bwrap's own minimal /dev (null, zero, full, random, urandom, tty, a
+    // private devpts and shm), never the host's. The `/` bind above carries
+    // the host /dev in as a nodev mount, so without this every open of
+    // /dev/null or /dev/urandom fails EACCES and a CLI like codex-app dies at
+    // startup. Placed before the masks: hideFiles bind the HOST /dev/null
+    // (sources resolve in the old root), unaffected by this mount.
+    '--dev', '/dev',
   ];
   const privateReadonlyByParent = new Map<string, string[]>();
   for (const entry of input.privateReadonlyDirectories ?? []) {
@@ -125,6 +153,30 @@ export function buildCredentialOnlySandboxArgs(input: {
   }
   for (const directory of hideDirectories.sort()) args.push('--tmpfs', directory);
   for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
+  // AFTER the masks on purpose: `--tmpfs` over an ancestor of the outbox would
+  // otherwise shadow this bind away and the confined `botmux send` would write
+  // its request into a throwaway tmpfs no host watcher is reading.
+  if (input.writableOutbox !== undefined) {
+    const outbox = assertCredentialIsolationPath(input.writableOutbox, 'writable outbox');
+    args.push('--bind', outbox, outbox);
+    // Deliver the relay path INSIDE the wrapper, exactly like the full sandbox
+    // (prepareDirectSandbox's --setenv). The worker's childEnv alone does not
+    // reach a persistent-terminal pane: tmuxEnv() strips every BOTMUX* key from
+    // the client env and buildBotmuxEnvAssignments() forwards only its
+    // allowlist, which deliberately excludes BOTMUX_SEND_RELAY (a per-session
+    // capability path must never seed a shared server's global env). Being in
+    // this pane's own bwrap argv, it cannot leak to any other session.
+    args.push('--setenv', 'BOTMUX_SEND_RELAY', outbox);
+    // Marks this relay as the credential-only flavour's. `botmux send` always
+    // uses it; `botmux dispatch` routes by shape (cmdDispatch): `--bot-app`
+    // forms keep the relay (the host sets up chat grants with the secret this
+    // pane cannot read), while the legacy/governed forms the relay refuses
+    // (--bot, --repo, --standby, --model, --reasoning-effort) take the direct
+    // path, which needs no masked secret here. The full sandbox never sets
+    // this, so its relay-only dispatch is unchanged; forging it there reaches a
+    // direct path that has no bot credentials to use.
+    args.push('--setenv', 'BOTMUX_SEND_RELAY_SCOPE', 'send');
+  }
   args.push(
     '--unshare-user',
     '--unshare-pid',
@@ -148,39 +200,57 @@ export type HostCredentialIsolationMechanismProbe =
   | { supported: true; mechanism: 'seatbelt' | 'bwrap'; executable: string }
   | { supported: false; mechanism: null; reason: string };
 
+/** Same mount/namespace shape as buildCredentialOnlySandboxArgs, then really
+ *  write /dev/null and read /dev/urandom: `/bin/true` alone passed on hosts
+ *  where the real session could not open a single device node. */
+export const CREDENTIAL_ONLY_PROBE_ARGS: readonly string[] = [
+  '--bind', '/', '/',
+  '--proc', '/proc',
+  '--dev', '/dev',
+  '--tmpfs', '/tmp',
+  '--unshare-user',
+  '--unshare-pid',
+  '--unshare-ipc',
+  '--unshare-uts',
+  '--unshare-cgroup-try',
+  '--die-with-parent',
+  '--new-session',
+  '--', '/bin/sh', '-c', 'printf x >/dev/null && head -c 1 /dev/urandom >/dev/null',
+];
+
+/** User-facing line appended when bwrap refused the namespaces themselves. */
+export function bwrapNamespaceFailureHint(kind: BwrapNamespaceFailure): string {
+  return `the current environment does not support ${kind === 'pid' ? 'PID' : 'user'} namespaces for bubblewrap `
+    + `(common in containers and nested sandboxes); see ${bwrapNamespaceDocUrl('en')}`;
+}
+
 function probeBubblewrapCredentialMasks(): HostCredentialIsolationMechanismProbe {
-  const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
-  const located = lookup.status === 0 ? lookup.stdout.trim() : '';
-  if (!located || !isAbsolute(located)) {
+  const executable = bwrapExecutable();
+  if (!executable) {
     return { supported: false, mechanism: null, reason: 'bubblewrap is unavailable' };
   }
-  let executable = located;
-  try { executable = realpathSync(located); } catch { /* spawn probe reports failure below */ }
   const probe = spawnSync(executable, ['--help'], { encoding: 'utf8' });
   if (probe.status !== 0) {
     return { supported: false, mechanism: null, reason: 'bubblewrap is unavailable' };
   }
-  const launch = linuxIsolationLaunch(executable, [
-    '--bind', '/', '/',
-    '--proc', '/proc',
-    '--tmpfs', '/tmp',
-    '--unshare-user',
-    '--unshare-pid',
-    '--unshare-ipc',
-    '--unshare-uts',
-    '--unshare-cgroup-try',
-    '--die-with-parent',
-    '--new-session',
-    '--', '/bin/true',
-  ]);
-  const runtime = spawnSync(launch.bin, launch.args, { stdio: 'ignore', timeout: 5_000 });
+  const launch = linuxIsolationLaunch(executable, [...CREDENTIAL_ONLY_PROBE_ARGS]);
+  const runtime = spawnSync(launch.bin, launch.args, {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    encoding: 'utf8',
+    timeout: 5_000,
+  });
   if (runtime.status === 0) return { supported: true, mechanism: 'bwrap', executable };
+  if (runtime.error?.message) {
+    return { supported: false, mechanism: null, reason: `bubblewrap execution probe failed: ${runtime.error.message}` };
+  }
+  const stderr = (runtime.stderr ?? '').trim().split('\n').slice(-3).join(' | ');
+  const namespace = classifyBwrapNamespaceFailure(stderr);
   return {
     supported: false,
     mechanism: null,
-    reason: runtime.error?.message
-      ? `bubblewrap execution probe failed: ${runtime.error.message}`
-      : 'bubblewrap cannot establish the required user/mount/PID namespaces',
+    reason: 'bubblewrap cannot establish the required user/mount/PID namespaces or devices'
+      + (stderr ? ` (${stderr})` : '')
+      + (namespace ? `: ${bwrapNamespaceFailureHint(namespace)}` : ''),
   };
 }
 
@@ -211,11 +281,145 @@ export function credentialOnlySandboxAvailable(): boolean {
   return false;
 }
 
+export interface CredentialOnlyRelayOutbox {
+  outbox: string;
+  sessionsRoot: string;
+  cleanup: () => void;
+}
+
+function credentialOnlyRelayPaths(opts: { sessionId: string; dataDir: string }): {
+  sessionsRoot: string;
+  sessionRoot: string;
+  outbox: string;
+} {
+  const sessionsRoot = join(canonical(opts.dataDir), 'sandboxes');
+  const sessionRoot = join(sessionsRoot, opts.sessionId);
+  return { sessionsRoot, sessionRoot, outbox: join(sessionRoot, 'outbox') };
+}
+
+function credentialOnlyRelayHandle(
+  paths: ReturnType<typeof credentialOnlyRelayPaths>,
+): CredentialOnlyRelayOutbox {
+  return {
+    outbox: paths.outbox,
+    // The caller MUST mask this whole root inside the pane (the outbox bind is
+    // emitted after every mask, so its own outbox stays reachable). Every
+    // session's outbox carries its live relay capability leaf, and this flavour
+    // binds `/` — without the mask a pane could read a SIBLING session's token
+    // and drop a forged request into that session's outbox.
+    sessionsRoot: paths.sessionsRoot,
+    // No deny-mask mountpoints are created on this flavour (it masks in-place
+    // with --tmpfs/--ro-bind rather than carving empties), so a plain remove of
+    // the session tree is the whole teardown.
+    cleanup: () => { removeSandboxTree(paths.sessionRoot); },
+  };
+}
+
+/** Whether a session's per-session sandbox tree must OUTLIVE the worker that
+ * owns it when that worker exits without ending the CLI (daemon restart / IPC
+ * disconnect / parent watchdog / crash; a topic transfer always keeps it).
+ *
+ * Every flavour shares the tree layout `<data>/sandboxes/<sid>`: the relay
+ * outbox for oncall / scratch / credential-only, the oncall deny-mask
+ * mountpoints, the scratch COW overlay + upper (Linux) or clone (macOS). A
+ * CLI that survives its worker (see {@link cliSurvivesWorkerExit}) keeps
+ * running against that tree (Linux panes hold the outbox bind by inode; a
+ * scratch CLI's whole root/cwd lives in it), and the successor worker
+ * reattaches the same CLI and re-serves the relay. Deleting it there silently
+ * breaks every later `botmux send` (or wipes a live scratch CLI's files). A PTY
+ * CLI dies with the worker, so its tree is cleaned up as before; a real close
+ * removes the tree for every backend. */
+export function sandboxTreeSurvivesWorkerExit(input: {
+  /** This CLI generation established a per-session tree (holds its cleanup). */
+  ownsTree: boolean;
+  backendType: string;
+  /** Present only when the CLI runs in a named persistent session. */
+  persistentSessionName: string | null | undefined;
+}): boolean {
+  return input.ownsTree && cliSurvivesWorkerExit(input);
+}
+
+/** The relay outbox a LIVE Linux pane bound into its bwrap namespace BY INODE
+ * at spawn, if that directory still exists for a successor worker to re-serve.
+ *
+ * Shared by every Linux reattach (oncall, scratch, credential-only) and by the
+ * pre-reattach isolation gate. This NEVER creates the directory: a freshly made
+ * one would be a different inode the pane cannot see, so the watcher would
+ * service an outbox nobody writes to while every send in the pane times out. A
+ * missing / non-directory / symlinked / foreign entry returns null and the
+ * caller must cold-spawn instead of reattaching. */
+export function reattachableRelayOutbox(sessionRoot: string): string | null {
+  const outbox = join(sessionRoot, 'outbox');
+  try {
+    const stat = lstatSync(outbox);
+    const uid = process.getuid?.();
+    if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) return null;
+  } catch {
+    return null;
+  }
+  return outbox;
+}
+
+/** Warm-reattach counterpart of {@link prepareCredentialOnlyRelayOutbox}.
+ *
+ * A live credential-only pane holds a bind of the ORIGINAL outbox directory
+ * inode. Transfer/restart teardown keeps that directory (only the capability
+ * leaf is revoked), so a successor worker can re-serve it. Never creates it —
+ * see {@link reattachableRelayOutbox}; null means cold-spawn instead. */
+export function attachCredentialOnlyRelayOutbox(opts: {
+  sessionId: string;
+  dataDir: string;
+}): CredentialOnlyRelayOutbox | null {
+  if (process.platform !== 'linux') return null;
+  let paths: ReturnType<typeof credentialOnlyRelayPaths>;
+  try { paths = credentialOnlyRelayPaths(opts); } catch { return null; }
+  if (!reattachableRelayOutbox(paths.sessionRoot)) return null;
+  return credentialOnlyRelayHandle(paths);
+}
+
+/** Host-owned relay outbox for a credential-only pane, provisioned in the SAME
+ * per-session tree the full sandbox uses so close/exit cleanup and the orphan
+ * sweep already cover it.
+ *
+ * WHY THIS FLAVOUR NEEDS A RELAY AT ALL (all four points MEASURED on bwrap
+ * 0.8.0, and each one independently breaks the in-pane alternative):
+ *
+ *  1. `--unshare-pid` gives the child pid=2/ppid=1 with only 2 visible /proc
+ *     entries, so `findAncestorSessionContext`'s process-tree marker walk can
+ *     NEVER resolve — the marker directory is readable, the host pids simply
+ *     are not in this namespace. `cmdSend` therefore classifies the pane via
+ *     the isolation MARKER arm and demands a data-root locator.
+ *  2. That locator is only written on the `sandboxRequested && darwin` path, so
+ *     it does not exist here.
+ *  3. Writing it does not help: its basename is `.dashboard-secret.origin-root-
+ *     <hash>.json`, which this flavour's own mask enumeration matches, so it is
+ *     ro-bound to /dev/null and reads back as a 0-byte char device (EACCES).
+ *  4. Even past that, the follow-up gate wants the data-root probe to read
+ *     EPERM, but the `--tmpfs` over `read-isolation/` makes it ENOENT.
+ *
+ * And an in-pane proof cannot substitute: with `--unshare-user` the child can
+ * `mount --bind` a writable directory OVER a host ro-bind (measured: succeeds),
+ * so neither "this path is read-only" nor "this file exists" is a trust root
+ * inside the pane. Only a host-side channel is sound — which is exactly the
+ * relay the full sandbox already uses, with the daemon-side watcher performing
+ * the authoritative policy check. */
+export function prepareCredentialOnlyRelayOutbox(opts: {
+  sessionId: string;
+  dataDir: string;
+}): CredentialOnlyRelayOutbox | null {
+  if (process.platform !== 'linux') return null;
+  const paths = credentialOnlyRelayPaths(opts);
+  try { mkdirSync(paths.outbox, { recursive: true, mode: 0o700 }); }
+  catch { return null; }
+  return credentialOnlyRelayHandle(paths);
+}
+
 export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
   privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
+  writableOutbox?: string;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -237,6 +441,84 @@ export function reexposeRunBinArgs(binPaths: (string | undefined)[]): string[] {
   const out: string[] = [];
   for (const dir of dirs) out.push('--ro-bind-try', dir, dir);
   return out;
+}
+
+/** systemd-resolved, resolvconf and NetworkManager make /etc/resolv.conf a
+ *  symlink into /run, which every sandbox replaces with a fresh tmpfs — the
+ *  link then dangles inside and name resolution fails (EAI_AGAIN) while the
+ *  host terminal works. Follows the chain hop by hop and returns the FIRST
+ *  hop lexical-under a shadowed root: that is where the in-sandbox lookup
+ *  stops, since the fresh tmpfs holds none of the host's entries — not even a
+ *  symlinked directory that happens to live under /run on the host. A
+ *  symlinked PARENT outside the shadowed roots (Debian's /var/run → /run) is
+ *  still resolved on the host because the sandbox replicates that one.
+ *  Undefined when the chain never enters a shadowed root, loops, or cannot be
+ *  read. Note the link TEXT escaping the bound tree is not handled (an oncall
+ *  root has no /var/run symlink, so /etc/resolv.conf → /var/run/… breaks one
+ *  hop earlier than any bind can reach). */
+export function shadowedResolverPath(link = '/etc/resolv.conf', shadowedRoots: readonly string[] = ['/run']): string | undefined {
+  let current = link;
+  for (let hop = 0; hop < 16; hop++) {
+    let target: string;
+    try {
+      if (!lstatSync(current).isSymbolicLink()) return undefined;
+      target = readlinkSync(current);
+    } catch { return undefined; }
+    current = resolve(dirname(current), target);
+    // Canonicalise a symlinked parent only while the chain is still OUTSIDE
+    // the shadowed roots (the sandbox follows those too, e.g. /var/run → /run);
+    // a missing one (dangling link) stays lexical. Once lexical-inside a
+    // shadowed root, resolving the parent would point at a host path the fresh
+    // tmpfs does not contain — the in-sandbox lookup stops at the literal name.
+    const insideShadowedRoot = shadowedRoots.some(
+      root => current === root || current.startsWith(`${root}/`),
+    );
+    if (!insideShadowedRoot) {
+      try { current = join(realpathSync(dirname(current)), basename(current)); } catch { /* */ }
+    }
+    if (shadowedRoots.some(root => current.startsWith(`${root}/`))) return current;
+  }
+  return undefined;
+}
+
+/** Read-only bind of the host's resolver file at its shadowed hop. Only the
+ *  one file: its directory also holds resolved's Unix sockets. A bind pins
+ *  the inode, so a resolver rewritten by rename mid-session is seen by the
+ *  next session, not the running one. No args when /etc/resolv.conf is a
+ *  plain file, the chain does not end in a regular file, or `denied` matches
+ *  any name of it — policies hold CANONICAL paths, so an operator's deny of
+ *  /etc/resolv.conf arrives as the /run target and must still win. */
+export function hostResolverBindArgs(opts: {
+  denied: (path: string) => boolean;
+  link?: string;
+  shadowedRoots?: readonly string[];
+}): string[] {
+  const link = opts.link ?? '/etc/resolv.conf';
+  const hop = shadowedResolverPath(link, opts.shadowedRoots);
+  if (!hop) return [];
+  let source: string;
+  try {
+    source = realpathSync(link);
+    if (!statSync(source).isFile()) return [];
+  } catch { return []; }
+  if ([link, hop, source].some(opts.denied)) return [];
+  return ['--dir', dirname(hop), '--ro-bind', source, hop];
+}
+
+/** Predicate for {@link hostResolverBindArgs}: a resolver name is denied when
+ *  EITHER the policy as handed to prepareDirectSandbox (pre-relocation) or the
+ *  relocated rules compileToBwrap actually mounts says so. The bind is compiled
+ *  from the relocated set, but a lexical (not-yet-canonicalized) deny in the
+ *  input must stay authoritative — judging by the relocated set alone would
+ *  silently re-bind a file the operator denied when a baseline directory is
+ *  itself a symlink. Worker-supplied denies are realpath-canonicalized
+ *  upstream, so in production the two agree; the union is defense in depth. */
+export function resolverPathDenied(
+  preRelocationRules: readonly FsRule[],
+  compiledRules: readonly FsRule[],
+): (path: string) => boolean {
+  return path => accessForPath(preRelocationRules, path).access === 'deny'
+    || accessForPath(compiledRules, path).access === 'deny';
 }
 
 /** Canonicalize if possible (Seatbelt/bwrap both resolve symlinks). */
@@ -395,19 +677,20 @@ function classifyProbe(r: ReturnType<typeof spawnSync>): BwrapProbeOutcome {
 
 export function bwrapCanUnsharePid(): boolean {
   if (_canUnsharePid !== undefined) return _canUnsharePid;
-  const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
-  const located = lookup.status === 0 ? lookup.stdout.trim() : '';
-  if (!located || !isAbsolute(located)) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
-  let executable = located;
-  try { executable = realpathSync(located); } catch { /* fall through to probe */ }
+  const executable = bwrapExecutable();
+  if (!executable) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
   // Same SHAPE as the real fs-policy compile (compileToBwrap): --unshare-user
   // is always present there, and its userns interacts with the proc mount, so
   // the probe must carry it too or it isn't testing the real condition.
   const base = ['--dev-bind', '/', '/', '--proc', '/proc', '--unshare-user', '--', '/bin/true'];
   // FULL: real shape WITH --unshare-pid. Nested pid-ns-restricted sandbox →
   // clean-nonzero ("Can't mount proc … Operation not permitted"); normal host
-  // → success.
-  const full = classifyProbe(spawnSync(executable, ['--unshare-pid', ...base], { stdio: 'ignore', timeout: 5_000 }));
+  // → success. stderr is kept only for the startup-failure diagnosis.
+  const fullRun = spawnSync(executable, ['--unshare-pid', ...base], {
+    stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: 5_000,
+  });
+  const full = classifyProbe(fullRun);
+  _namespaceFailure = full === 'clean-nonzero' ? classifyBwrapNamespaceFailure(fullRun.stderr) : undefined;
   if (full === 'success') { _canUnsharePid = true; return true; } // full works → never degrade
   // WEAK: same minus --unshare-pid. Only a clean-nonzero full + success weak is
   // the nested signature; a full timeout/spawn-error (inconclusive) never
@@ -417,9 +700,26 @@ export function bwrapCanUnsharePid(): boolean {
   return _canUnsharePid;
 }
 
+let _namespaceFailure: BwrapNamespaceFailure | undefined;
+
+/**
+ * Why this host's bwrap cannot create the namespaces the sandbox launches
+ * with, if the (cached) probe above saw bwrap itself say so. For the
+ * startup-failure notice ONLY: a Linux tmux pane that dies at once leaves no
+ * terminal output to read the bwrap error from. It never changes whether or
+ * how a sandbox runs — dropping --unshare-pid stays limited to
+ * {@link coreOnlyPidNamespaceDegrade}.
+ */
+export function bwrapNamespaceFailure(): BwrapNamespaceFailure | undefined {
+  if (process.platform !== 'linux') return undefined;
+  bwrapCanUnsharePid();
+  return _namespaceFailure;
+}
+
 /** Test-only: reset the cached pid-ns probe. */
 export function __testOnly_resetPidNamespaceProbe(): void {
   _canUnsharePid = undefined;
+  _namespaceFailure = undefined;
 }
 
 /**
@@ -435,12 +735,32 @@ export function __testOnly_resetPidNamespaceProbe(): void {
  *      --unshare-pid MUST stay — hence this gate never fires there.
  *   2. The host actually can't unshare-pid (nested sandbox) — otherwise keep
  *      full isolation; there's no reason to weaken it when it works.
+ * A credential-bearing host channel (MCP socket or protected local-service
+ * bridge) independently forbids the degrade: sharing the runner's PID namespace
+ * would make its private broker descriptors reachable through `/proc/1/fd`.
  * The on-disk credential seal (fs-policy deny masks) is UNCHANGED regardless;
  * only the pid-namespace defense-in-depth is dropped, and only where it both
  * (a) can't work and (b) protects nothing.
  */
-export function coreOnlyPidNamespaceDegrade(): boolean {
-  return process.env.BOTMUX_CORE_ONLY === '1' && !bwrapCanUnsharePid();
+export function coreOnlyPidNamespaceDegradeDecision(input: {
+  coreOnly: boolean;
+  canUnsharePid: boolean;
+  credentialBearingHostChannel: boolean;
+}): boolean {
+  return !input.credentialBearingHostChannel && input.coreOnly && !input.canUnsharePid;
+}
+
+export function coreOnlyPidNamespaceDegrade(
+  opts: { credentialBearingHostChannel?: boolean } = {},
+): boolean {
+  if (opts.credentialBearingHostChannel) return false;
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  if (!coreOnly) return false;
+  return coreOnlyPidNamespaceDegradeDecision({
+    coreOnly,
+    canUnsharePid: bwrapCanUnsharePid(),
+    credentialBearingHostChannel: false,
+  });
 }
 
 /**
@@ -473,13 +793,82 @@ export function localSandboxApplies(
     env?: Record<string, string>;
   },
 ): boolean {
-  if (backendType === 'riff') return false;
+  if (backendType === 'riff' || backendType === 'remote-runner') return false;
   if (backendType === 'mojo') {
     return !isMojoFullyRemote(remoteExecution);
   }
   return true;
 }
 
+/**
+ * The worker's EFFECTIVE local file-sandbox mode, as ONE shared pure resolver.
+ *
+ * worker.ts resolves `sandboxMode` with this exact call; the auto-worktree
+ * fail-closed gate (services/default-worktree.ts) reuses it so the two can never
+ * drift again — the riff exemption once only existed in the worker (a sandboxed
+ * riff bot then fell back to the real default dir on a worktree failure), and
+ * the mojo backend (#803) repeated the SAME drift for a provably-remote session.
+ *
+ * Shape:
+ *   localSandboxApplies(backend, mojoConfig)
+ *     ? resolveSandboxMode({ configSandbox, readIsolation, envValue })
+ *     : 'off'
+ *
+ * - The REMOTE exemption (riff / remote-runner / provably-remote mojo) wraps the
+ *   WHOLE resolution: a remote backend has no local CLI process, so even
+ *   BOTMUX_SANDBOX=1|scratch must not engage a local sandbox there.
+ * - mojo is NOT exempt by name alone: only a PROVABLY remote mojo session is
+ *   (see localSandboxApplies / isMojoFullyRemote — cloud on, localDaemon off,
+ *   no wrapperCli, no unprovable env). A local mojo session keeps its sandbox.
+ * - There is no no-transport arm: forkWorker does not force-isolate a
+ *   no-transport session (#899 dropped the forced readIsolation).
+ * - Throws exactly where resolveSandboxMode throws (invalid config value or
+ *   BOTMUX_SANDBOX): a typo'd mode must never silently run without isolation.
+ */
+export function resolveLocalSandboxMode(input: {
+  backendType: string;
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
+  configSandbox?: unknown;
+  readIsolation?: boolean;
+  envValue?: string | undefined;
+}): SandboxMode {
+  if (!localSandboxApplies(input.backendType, input.mojoConfig)) return 'off';
+  return resolveSandboxMode({
+    configSandbox: input.configSandbox,
+    readIsolation: input.readIsolation === true,
+    envValue: input.envValue,
+  });
+}
+
+
+/**
+ * Fork-side half of the auto-worktree fail-closed gate. When the gate let a
+ * session degrade to the real default dir (`fallbackDir`), the worker may only
+ * STRENGTHEN that verdict: if the spawn now resolves to the LOCAL oncall
+ * sandbox (which binds workingDir read-write to the host) in that same dir,
+ * refuse instead of running it there. Closes the TOCTOU between the gate (T0,
+ * before the worktree build) and the fork (T1, after it) for every input the
+ * gate cannot freeze — e.g. a mojo remote proof voided mid-build.
+ * scratch / off are fine: scratch leaves the host untouched.
+ */
+export function autoWorktreeFallbackSandboxError(input: {
+  sandboxMode: SandboxMode;
+  workingDir: string | undefined;
+  fallbackDir: string | undefined;
+}): string | undefined {
+  if (input.sandboxMode !== 'oncall' || !input.fallbackDir || !input.workingDir) return undefined;
+  const canon = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
+  if (canon(input.workingDir) !== canon(input.fallbackDir)) return undefined;
+  return `auto-worktree fell back to the real default dir ${input.fallbackDir} because no local sandbox applied when it was decided, `
+    + 'but this spawn now resolves to the local oncall file sandbox (workingDir bound read-write to the real project). '
+    + 'Refusing to start; fix the default dir (git repo) or pick a working dir with /repo.';
+}
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
@@ -503,7 +892,7 @@ const USRMERGE_CANDIDATES = ['/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx
  *  removes ONLY when the on-disk inode still matches. That defeats both a
  *  swapped manifest pointing at a victim path AND the "empty mountpoint deleted,
  *  a new empty object created at the same path" reuse race. */
-const MASK_MANIFEST_NAME = 'mask-mounts.json';
+export const MASK_MANIFEST_NAME = 'mask-mounts.json';
 
 interface MaskMountEntry {
   path: string;
@@ -581,14 +970,100 @@ function reclaimMaskMounts(sessionRoot: string): void {
   reclaimMaskEntries(entries);
 }
 
+/** Marker every scratch session tree carries (Linux overlay and macOS clone
+ *  share the name). Those trees are owned by the scratch teardown/sweeps, which
+ *  unmount (Linux) or unlock (macOS) before removing anything. */
+export const SCRATCH_TREE_MARKER = 'scratch.json';
+
+function isScratchSessionTree(sessionRoot: string): boolean {
+  return entryExistsNoFollow(join(sessionRoot, SCRATCH_TREE_MARKER));
+}
+
+function entryExistsNoFollow(path: string): boolean {
+  try { lstatSync(path); return true; } catch { return false; }
+}
+
+function decodeMountinfoPath(raw: string): string {
+  return raw.replace(/\\([0-7]{3})/g, (_m, oct: string) => String.fromCharCode(parseInt(oct, 8)));
+}
+
+/** Mount points AT or BELOW `root` in this process's mount namespace (the host
+ *  namespace for the daemon and workers — botmux never unshares mounts there),
+ *  deepest first. null = cannot tell (Linux without a readable mountinfo):
+ *  callers that are about to delete must then treat the tree as mounted. Only
+ *  Linux scratch puts host-side mounts into a session tree; elsewhere botmux
+ *  creates none, so other platforms answer "none". */
+export function mountsAtOrUnder(rootInput: string): string[] | null {
+  if (process.platform !== 'linux') return [];
+  let raw: string;
+  try { raw = readFileSync('/proc/self/mountinfo', 'utf8'); } catch { return null; }
+  // mountinfo lists canonical paths; a symlinked prefix must not hide a mount.
+  let root = rootInput;
+  try { root = realpathSync(rootInput); } catch { /* absent: lexical */ }
+  const prefix = root.endsWith('/') ? root : `${root}/`;
+  const out: string[] = [];
+  for (const line of raw.split('\n')) {
+    const separator = line.indexOf(' - ');
+    if (separator < 0) continue;
+    const mountPoint = decodeMountinfoPath(line.slice(0, separator).split(' ')[4] ?? '');
+    if (mountPoint === root || mountPoint.startsWith(prefix)) out.push(mountPoint);
+  }
+  return out.sort((a, b) => b.length - a.length);
+}
+
 /** Remove the known-empty mode-000 mask before recursive traversal. rmdir
  * needs write permission on its parent, not read permission on the mask itself.
- * Keep the mask mode unchanged and never follow a replacement symlink. */
-function removeSandboxTree(sessionRoot: string): void {
+ * Keep the mask mode unchanged and never follow a replacement symlink.
+ *
+ * NEVER recurses into a mount: a recursive rm does not stop at filesystem
+ * boundaries, and a still-mounted scratch tree holds the full-root COW view of
+ * the whole host (deleting through it walks every file and fills the upper with
+ * whiteouts). A tree with any mount at or below it is left alone; its owner
+ * (the scratch teardown/sweep) unmounts first. */
+function removeSandboxTree(sessionRoot: string): boolean {
+  if (!treeUnmounted(sessionRoot)) return false;
   try {
     if (lstatSync(sessionRoot).isDirectory()) rmdirSync(join(sessionRoot, 'empty'));
   } catch { /* absent or replaced */ }
-  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+  return removeTreeUnlessMounted(sessionRoot);
+}
+
+function treeUnmounted(path: string): boolean {
+  const mounts = mountsAtOrUnder(path);
+  if (mounts === null || mounts.length > 0) {
+    console.error(
+      `[sandbox] refusing to remove ${path}: `
+      + (mounts === null ? 'mount table unreadable' : `still mounted (${mounts.join(', ')})`),
+    );
+    return false;
+  }
+  return true;
+}
+
+/** THE recursive removal for anything that is, or lives in, a sandbox tree
+ *  (every flavour's cleanup, teardown, rollback and sweep goes through it). A
+ *  recursive rm does not stop at filesystem boundaries; a path with a mount at
+ *  or below it is refused (reported, kept) and its owner must unmount first.
+ *  Returns whether the removal ran. */
+export function removeTreeUnlessMounted(path: string): boolean {
+  if (!treeUnmounted(path)) return false;
+  try { rmSync(path, { recursive: true, force: true }); } catch { /* */ }
+  return true;
+}
+
+/** Close-time teardown of a direct (oncall) / credential-only session tree
+ *  from DISK state alone, for a session whose worker is gone: reclaim the
+ *  recorded deny-mask mountpoints, then remove the tree. Same mount guard as
+ *  every other removal; scratch trees are refused (their teardown unmounts
+ *  first). */
+export function teardownDirectSandboxSession(sessionId: string, dataDir: string): void {
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return;
+  const sessionRoot = join(canonical(dataDir), 'sandboxes', sessionId);
+  if (isScratchSessionTree(sessionRoot)) return;
+  const mounts = mountsAtOrUnder(sessionRoot);
+  if (mounts === null || mounts.length > 0) return;
+  reclaimMaskMounts(sessionRoot);
+  removeSandboxTree(sessionRoot);
 }
 
 /** Spawn-setup rollback: reclaim the mountpoints we pre-created FROM THE
@@ -674,7 +1149,26 @@ export interface DirectSandboxSpawn {
  * No overlays, no upper/work dirs — writes inside readWrite zones hit the
  * real filesystem directly.
  */
+/**
+ * TAR_OPTIONS for the bwrap child. `--unshare-user` maps only the worker's own
+ * uid, so for a daemon running as root GNU tar (root → --same-owner by
+ * default) fails every extraction of an archive owned by anyone else
+ * ("Cannot change ownership to uid 1001: Invalid argument"). CLIs that fetch
+ * their helpers as tarballs hit it on every start: Pi re-downloads fd/rg each
+ * launch and swallows the first input while doing so. `--no-same-owner` is
+ * already tar's default for non-root, so only root gets it; the child's own
+ * TAR_OPTIONS (bot env or worker env) is kept and extended, and one that
+ * already picks an owner mode is left alone. undefined = set nothing.
+ */
+export function sandboxTarOptions(inherited: string | undefined, uid: number | undefined): string | undefined {
+  if (uid !== 0) return undefined;
+  const current = inherited?.trim() ?? '';
+  if (/(^|\s)--(no-)?same-owner(\s|$)/.test(current)) return undefined;
+  return current ? `${current} --no-same-owner` : '--no-same-owner';
+}
+
 export function prepareDirectSandbox(opts: {
+  networkPolicy?: SandboxNetworkPolicy;
   sessionId: string;
   dataDir: string;
   /** Compile-ready policy (canonical + existence-filtered by the worker). */
@@ -685,12 +1179,25 @@ export function prepareDirectSandbox(opts: {
   home: string;
   cliBin: string;
   cliArgs: string[];
+  /** Host-backed, per-session scratch directory already admitted by policy. */
+  tempDir?: string;
+  /** Final per-bot PATH; the session identity wrapper must precede real tools. */
+  effectivePath?: string;
+  identityBin?: string;
   /** Absolute Botmux command paths already persisted in CLI MCP configs.
    * Bind the worker-generated relay shim at those exact paths so a stale or
    * tampered host wrapper cannot replace the trusted gateway entry. */
   trustedBotmuxCommandPaths?: readonly string[];
   /** Worker-owned Unix socket for the credential-bearing MCP Gateway. */
   mcpGatewaySocketPath?: string;
+  /** Worker-owned protected HTTP egress guard socket beside the MCP socket. */
+  protectedEgressSocketPath?: string;
+  /** Optional loopback bridge for a process control-plane origin that overlaps
+   *  a protected target. It is started by the network-namespace runner. */
+  protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
+  /** Exact localhost services re-exposed inside an isolated network namespace.
+   *  Each declaration is route- and header-scoped at the trusted Unix guard. */
+  localServiceBridges?: ProtectedLocalServiceLoopbackPlan[];
   /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
    *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
    *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
@@ -701,13 +1208,55 @@ export function prepareDirectSandbox(opts: {
   larkCliDataDir?: string | null;
   /** Keep the large bwrap option list out of tmux's command parser. */
   useBwrapArgsFile?: boolean;
+  /** mcode OAuth keys include the lexical data-directory path. Preserve that
+   * exact alias to its already-granted canonical directory on symlinked homes.
+   * Only the minimax worker supplies this; absent leaves the mount plan intact. */
+  minimaxDataDir?: string;
+  /** wrapperCli inside the sandbox: `<cli name>` alias placed in the private
+   *  shim dir (first on PATH) pointing at the real, already-allowed CLI. */
+  cliNameLink?: { name: string; target: string };
+  /** The child's own TAR_OPTIONS (bot env merged over the worker env), the
+   *  base sandboxTarOptions extends. Absent → the worker process env. */
+  childTarOptions?: string;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
+  if (opts.protectedHttpBridge && (!opts.networkPolicy
+    || !opts.protectedEgressSocketPath
+    || resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath))) {
+    throw new Error('protected HTTP loopback bridge requires the matching guarded network sandbox');
+  }
+  if (opts.localServiceBridges?.length && !opts.networkPolicy) {
+    throw new Error('protected local service bridge requires a guarded network sandbox');
+  }
+  const proxyError = networkProxyError(opts.networkPolicy, process.env);
+  if (proxyError) throw new Error(proxyError);
   if (!ensureSandboxDeps()) return null;
+  const bwrap = bwrapExecutable();
+  if (!bwrap) return null;
+  // Validate all dependencies before creating files.
+  if (opts.networkPolicy) sandboxNetworkLaunch(opts.networkPolicy, '/bin/true', []);
 
   // Validate marker support before creating any session files or deny masks.
-  const launch = linuxIsolationLaunch('bwrap', []);
+  const launch = linuxIsolationLaunch(bwrap, []);
+  // --seccomp and --add-seccomp-fd are mutually exclusive. Stack both trusted
+  // filters using the repeatable form for this opt-in path.
+  if (opts.networkPolicy) launch.args = launch.args.map(arg => arg === '--seccomp' ? '--add-seccomp-fd' : arg);
 
+  let minimaxAlias: { path: string; target: string } | undefined;
+  if (opts.minimaxDataDir) {
+    const path = resolve(opts.minimaxDataDir);
+    const target = realpathSync(path);
+    if (path !== target) {
+      const applicable = opts.policy.rules.filter(r => target === r.path || target.startsWith(`${r.path}/`))
+        .sort((a, b) => a.path.length - b.path.length);
+      if (!statSync(target).isDirectory() || applicable.at(-1)?.access !== 'readWrite'
+        || !opts.policy.rules.some(r => r.path === target && r.access === 'readWrite')
+        || opts.policy.rules.some(r => r.path === path || r.path.startsWith(`${path}/`))) {
+        throw new Error('mcode sandbox data alias requires its exact canonical writable grant');
+      }
+      minimaxAlias = { path, target };
+    }
+  }
   const dataDir = canonical(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
@@ -723,6 +1272,9 @@ export function prepareDirectSandbox(opts: {
   const shim = join(shimBin, 'botmux');
   writeFileSync(shim, botmuxShimExecLine());
   chmodSync(shim, 0o755);
+  // A wrapperCli running inside the sandbox may exec the CLI by name: alias
+  // that name to the (already allowed) real CLI binary in this private dir.
+  writeCliNameLink(shimBin, opts.cliNameLink);
 
   // usrmerge symlinks to replicate; deny rules that are FILES on the host need
   // a file-shaped mask, everything else (existing dir OR a not-yet-existing
@@ -735,13 +1287,45 @@ export function prepareDirectSandbox(opts: {
       if (lstatSync(p).isSymbolicLink()) symlinks.push({ path: p, target: readlinkSync(p) });
     } catch { /* absent on this distro */ }
   }
+  // Baseline dirs (/opt, …) that are symlinks on this host: bwrap cannot bind a
+  // symlink as such into the fresh root, so rebuild the link the usrmerge way
+  // and bind its real target (see relocateSymlinkedBaselineRules).
+  const relocated = relocateSymlinkedBaselineRules(opts.policy.rules, {
+    isSymlink: (path) => { try { return lstatSync(path).isSymbolicLink(); } catch { return false; } },
+    realpath: (path) => { try { return realpathSync(path); } catch { return undefined; } },
+  });
+  const usrmergePaths = new Set(symlinks.map(link => link.path));
+  for (const link of relocated.symlinks) if (!usrmergePaths.has(link.path)) symlinks.push(link);
+  const policy: FsPolicy = { ...opts.policy, rules: relocated.rules };
   const filePaths = new Set<string>();
-  for (const r of opts.policy.rules) {
+  for (const r of policy.rules) {
     if (r.access !== 'deny') continue;
-    try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir-shaped mask */ }
+    try {
+      const entry = lstatSync(r.path);
+      // Never follow a denied leaf symlink to classify/mask its target. A
+      // symlink or other special leaf is file-shaped for the lexical mask.
+      if (!entry.isDirectory()) filePaths.add(r.path);
+    } catch { /* absent → dir-shaped mask */ }
   }
 
-  const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
+  const compiled = compileToBwrap(policy, {
+    symlinks,
+    emptyDir,
+    emptiesDir: empties,
+    filePaths,
+    chdir: opts.chdir,
+    skipPidNamespace: coreOnlyPidNamespaceDegrade({
+      credentialBearingHostChannel: !!opts.mcpGatewaySocketPath || !!opts.localServiceBridges?.length,
+    }),
+  });
+  if (minimaxAlias) {
+    // After tmpfs setup and before any host binds. Parent directories are
+    // empty namespace scaffolding; the alias grants no additional host path.
+    const index = compiled.args.indexOf('/dev/shm') + 1;
+    if (!index) throw new Error('mcode sandbox data alias requires the initial tmpfs mount plan');
+    compiled.args.splice(index, 0,
+      '--dir', dirname(minimaxAlias.path), '--symlink', minimaxAlias.target, minimaxAlias.path);
+  }
   // The shared empty dir + every empty placeholder file are the ro-bind SOURCES
   // for deny masks: real content hidden + read-only. mode 000 additionally makes
   // the mask unlistable for a NON-root uid (a real deny, not a listable "empty");
@@ -786,6 +1370,32 @@ export function prepareDirectSandbox(opts: {
   }
 
   const args = [...compiled.args];
+  // Recreate only this session's short link in the private namespace. Link to
+  // the already-mounted policy view so descendant deny masks still apply.
+  if (opts.tempDir && resolve(opts.tempDir) !== canonical(opts.tempDir)) {
+    const target = resolve(opts.tempDir);
+    const source = canonical(opts.tempDir);
+    if (!opts.policy.rules.some(rule => rule.access === 'readWrite' && rule.path === source)) {
+      rollbackSandboxSetup(sessionRoot, createdMasks);
+      throw new Error('session temp alias requires an exact writable scratch grant');
+    }
+    args.push('--dir', dirname(target), '--symlink', source, target);
+  }
+  if (opts.networkPolicy) {
+    args.push('--cap-drop', 'ALL', '--disable-userns', '--add-seccomp-fd', '5');
+    const resolver = join(sessionRoot, 'resolv.conf');
+    writeFileSync(resolver, (opts.networkPolicy.dnsServers ?? []).map(ip => `nameserver ${ip}`).join('\n') + '\n', { mode: 0o600 });
+    // systemd-resolved links /etc/resolv.conf into /run, which the sandbox
+    // masks with a fresh tmpfs. Recreate only the resolved parent and bind our
+    // explicit DNS file there, without exposing the host resolver directory.
+    const resolverTarget = shadowedResolverPath() ?? canonical('/etc/resolv.conf');
+    args.push('--dir', dirname(resolverTarget), '--ro-bind', resolver, resolverTarget);
+  } else {
+    // Same /run masking without a policy: re-expose the host's own resolver
+    // file (read-only) unless the operator denied it, under EITHER the input
+    // policy or the relocated rules actually compiled into mounts.
+    args.push(...hostResolverBindArgs({ denied: resolverPathDenied(opts.policy.rules, policy.rules) }));
+  }
   // Shim bin at a fixed path under the fresh /run tmpfs — appended after the
   // rule mounts (later mount wins over the tmpfs). PATH points here first.
   args.push('--ro-bind', shimBin, '/run/sbxbin');
@@ -825,14 +1435,39 @@ export function prepareDirectSandbox(opts: {
   }
 
   let sandboxMcpGatewaySocketPath: string | undefined;
-  if (opts.mcpGatewaySocketPath) {
+  let sandboxProtectedEgressSocketPath: string | undefined;
+  if (opts.mcpGatewaySocketPath || opts.protectedEgressSocketPath) {
     try {
-      const socketPath = resolve(opts.mcpGatewaySocketPath);
-      if (!lstatSync(socketPath).isSocket()) { rollbackSandboxSetup(sessionRoot, createdMasks); return null; }
-      const hostDir = realpathSync(dirname(socketPath));
+      if (!opts.mcpGatewaySocketPath) {
+        rollbackSandboxSetup(sessionRoot, createdMasks);
+        return null;
+      }
+      const mcpSocketPath = resolve(opts.mcpGatewaySocketPath);
+      if (!lstatSync(mcpSocketPath).isSocket()) {
+        rollbackSandboxSetup(sessionRoot, createdMasks);
+        return null;
+      }
+      const hostDir = realpathSync(dirname(mcpSocketPath));
       const sandboxDir = '/run/botmux-mcp';
       args.push('--dir', sandboxDir, '--ro-bind', hostDir, sandboxDir);
-      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(socketPath));
+      // Keep the rotating MCP socket directory live, but never expose the
+      // egress bridge's authentication to task processes. Mask BOTH aliases:
+      // another file-policy ancestor grant may also admit the canonical path.
+      // The outer network runner reads the real directory outside bwrap.
+      const egressAuthDir = dirname(protectedHttpEgressAuthTokenPath(join(hostDir, 'e.sock')));
+      ensurePrivateGatewayDir(egressAuthDir);
+      args.push('--tmpfs', join(sandboxDir, basename(egressAuthDir)),
+        '--dir', hostDir, '--tmpfs', egressAuthDir);
+      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(mcpSocketPath));
+      if (opts.protectedEgressSocketPath) {
+        const egressSocketPath = resolve(opts.protectedEgressSocketPath);
+        if (!lstatSync(egressSocketPath).isSocket()
+          || realpathSync(dirname(egressSocketPath)) !== hostDir) {
+          rollbackSandboxSetup(sessionRoot, createdMasks);
+          return null;
+        }
+        sandboxProtectedEgressSocketPath = join(sandboxDir, basename(egressSocketPath));
+      }
     } catch {
       // Spawn-setup failure AFTER mask mountpoints were pre-created: reclaim the
       // empty ones (from the in-memory list) and drop the tree so nothing leaks.
@@ -851,7 +1486,8 @@ export function prepareDirectSandbox(opts: {
   // root — so the trusted `botmux` shim's bare `node` would fail `not found`
   // and the MCP gateway would exit (Connection closed). Prepend the canonical
   // dirs of node + the CLI bin (deduped) so bare-name resolution always hits a
-  // bound path, THEN keep the host PATH as a lexical fallback.
+  // bound path. Keep the session identity entry ahead of those dirs and resolve
+  // the effective per-bot PATH in the same namespace as the mounted paths.
   const canonicalExecDirs: string[] = [];
   const pushExecDir = (p: string | undefined) => {
     if (!p) return;
@@ -869,14 +1505,29 @@ export function prepareDirectSandbox(opts: {
     // locate the owning session store or its per-bot schedule directory.
     SESSION_DATA_DIR: dataDir,
     BOTMUX_SEND_RELAY: outbox,
-    PATH: ['/run/sbxbin', ...canonicalExecDirs, process.env.PATH ?? ''].filter(Boolean).join(':'),
+    PATH: [...new Set([
+      '/run/sbxbin', opts.identityBin ? canonical(opts.identityBin) : '',
+      ...canonicalExecDirs,
+      ...(opts.effectivePath ?? process.env.PATH ?? '').split(':').filter(Boolean).map(canonical),
+    ].filter(Boolean))].join(':'),
+    ...(opts.tempDir ? {
+      TMPDIR: opts.tempDir,
+      TMP: opts.tempDir,
+      TEMP: opts.tempDir,
+    } : {}),
   };
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
   }
+  const tarOptions = sandboxTarOptions('childTarOptions' in opts ? opts.childTarOptions : process.env.TAR_OPTIONS, process.getuid?.());
+  if (tarOptions !== undefined) env.TAR_OPTIONS = tarOptions;
   if (sandboxMcpGatewaySocketPath) {
     env[MCP_GATEWAY_SOCKET_ENV] = sandboxMcpGatewaySocketPath;
     env[MCP_GATEWAY_REQUIRED_ENV] = '1';
+  }
+  if (sandboxProtectedEgressSocketPath) {
+    env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] = sandboxProtectedEgressSocketPath;
+    env[PROTECTED_HTTP_EGRESS_PROTOCOL_ENV] = PROTECTED_HTTP_SHARED_READ_PROTOCOL;
   }
   for (const k of PROXY_ENV_KEYS) {
     const v = process.env[k];
@@ -919,18 +1570,37 @@ export function prepareDirectSandbox(opts: {
   const command = [execBin, ...opts.cliArgs];
   let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
   try {
-    compactLaunch = opts.useBwrapArgsFile
-      ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
+    compactLaunch = opts.useBwrapArgsFile && !opts.networkPolicy
+      ? linuxIsolationLaunchViaArgsFile(bwrap, args, command, sessionRoot)
       : null;
   } catch (error) {
     rollbackSandboxSetup(sessionRoot, createdMasks);
     throw error;
   }
+  // Carry the CLI boundary explicitly: the network runner receives shell +
+  // bwrap arguments, whose -c and -- have different meanings from Codex's.
+  const protectedHttpBridgeArgsOffset = launch.args.length + args.length + 2;
   if (!compactLaunch) args.push('--', ...command);
 
+  let networkLaunch: ReturnType<typeof sandboxNetworkLaunch> | undefined;
+  try {
+    networkLaunch = opts.networkPolicy
+      ? sandboxNetworkLaunch(
+        opts.networkPolicy,
+        launch.bin,
+        [...launch.args, ...args],
+        opts.protectedHttpBridge,
+        opts.localServiceBridges,
+        opts.protectedHttpBridge ? protectedHttpBridgeArgsOffset : undefined,
+      )
+      : undefined;
+  } catch (error) {
+    rollbackSandboxSetup(sessionRoot, createdMasks);
+    throw error;
+  }
   return {
-    bin: compactLaunch?.bin ?? launch.bin,
-    args: compactLaunch?.args ?? [...launch.args, ...args],
+    bin: networkLaunch?.bin ?? compactLaunch?.bin ?? launch.bin,
+    args: networkLaunch?.args ?? compactLaunch?.args ?? [...launch.args, ...args],
     ...(compactLaunch ? { argsFile: compactLaunch.argsFile } : {}),
     env,
     outbox,
@@ -946,18 +1616,19 @@ export function prepareDirectSandbox(opts: {
 
 /**
  * Re-attach the daemon/worker side to an ALREADY-spawned sandbox session (a
- * live bwrap'd CLI surviving in a tmux/herdr/zellij pane across a daemon
- * restart). Only the outbox path is needed back so the watcher keeps servicing
+ * live bwrap'd CLI surviving in a tmux pane across a daemon restart or a topic
+ * transfer). Only the outbox path is needed back so the watcher keeps servicing
  * the live CLI's `botmux send`, plus a cleanup that removes the tree at
- * close/exit. Returns null if the session has no sandbox tree on disk (never
- * sandboxed). Linux-only, mirrors prepareDirectSandbox's layout.
+ * close/exit. Returns null when the pane's outbox is no longer on disk (never
+ * sandboxed, or the tree was lost): it is never recreated — see
+ * {@link reattachableRelayOutbox}. Linux-only, mirrors prepareDirectSandbox's
+ * layout.
  */
 export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }): { outbox: string; cleanup: () => void } | null {
   if (process.platform !== 'linux') return null;
   const sessionRoot = join(canonical(opts.dataDir), 'sandboxes', opts.sessionId);
-  if (!existsSync(sessionRoot)) return null; // never sandboxed
-  const outbox = join(sessionRoot, 'outbox');
-  try { mkdirSync(outbox, { recursive: true }); } catch { /* */ }
+  const outbox = reattachableRelayOutbox(sessionRoot);
+  if (!outbox) return null;
   return {
     outbox,
     cleanup: () => {
@@ -1012,6 +1683,13 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
     if (live.has(sid)) continue;              // a running process holds this tree
     if (activeSessionIds.has(sid)) continue;  // active (possibly suspended) session
     const sessionRoot = join(root, sid);
+    // Scratch trees belong to sweepOrphanScratchSandboxes (Linux, unmounts
+    // first) / sweepOrphanMacScratchSandboxes. Removing one here would recurse
+    // through a still-mounted full-root COW view. Independently of the marker,
+    // never touch a tree with a mount at or below it.
+    if (isScratchSessionTree(sessionRoot)) continue;
+    const mounts = mountsAtOrUnder(sessionRoot);
+    if (mounts === null || mounts.length > 0) continue;
     let ageOk = false;
     try { ageOk = now - statSync(sessionRoot).mtimeMs > GRACE_MS; } catch { ageOk = false; }
     if (!ageOk) continue;
@@ -1035,6 +1713,8 @@ export interface RelayRequest {
   contentFile?: unknown;
   preparedContentFile?: unknown;
   cardFile?: unknown;
+  completionProposalFile?: unknown;
+  images?: unknown;
   attachments?: unknown;
   videos?: unknown;
   videoCovers?: unknown;
@@ -1045,11 +1725,23 @@ export interface RelayRequest {
 }
 // Presentation flags plus the plugin id required to authorize a callback card.
 // Path-bearing flags
-// (--content-file/--file(s)/--image(s)/--video(s)), routing flags
-// (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
-// content/attachments come from validated outbox files, and session-id is
-// forced by the worker.
-const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
+// (--content-file/--file(s)/--image(s)/--video(s)) and --session-id are NOT
+// allowlisted: content/attachments come from validated outbox files, and
+// session-id is forced by the worker. SEND routing flags
+// (--chat-id/--into/--top-level) pass only for watchers started with
+// `allowRouting` (file / scratch sandbox), only in bounded shapes, and the host
+// re-exec still asks the daemon to decide the real destination before any
+// provider effect (core/sandbox-send-route.ts). (`dispatch` has its own
+// bounded allowlist below.)
+const RELAY_FLAGS_NOVAL = new Set([
+  '--mention-back',
+  '--no-mention',
+  '--no-quote',
+  '--voice',
+  '--slash',
+  '--urgent',
+  '--schedule-remove-self',
+]);
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
@@ -1065,6 +1757,8 @@ export interface ValidatedRelay {
   contentName: string;
   preparedContentName?: string;
   cardName?: string;
+  completionProposalName?: string;
+  imageNames: string[];
   attachmentNames: string[];
   videoNames: string[];
   videoCoverNames: string[];
@@ -1077,14 +1771,17 @@ export interface ValidatedRelay {
 /**
  * PURE validation of an outbox relay request (schema + flag allowlist only — no
  * filesystem access, so it's deterministically testable):
- *  - contentFile/preparedContentFile/cardFile/attachments/videos/videoCovers
+ *  - contentFile/preparedContentFile/cardFile/images/attachments/videos/videoCovers
  *    must be plain basenames (no `/`, `\`, `..`).
  *  - only allowlisted presentation flags pass; any other flag → reject (this
  *    rejects raw `--content-file`/`--session-id`/path flags etc.).
  * The TOCTOU-safe filesystem read is handled separately by materializeOutboxFile,
  * NOT here — this function deliberately resolves no paths.
  */
-export function validateRelayRequest(req: RelayRequest): { ok: true; value: ValidatedRelay } | { ok: false; error: string } {
+export function validateRelayRequest(
+  req: RelayRequest,
+  opts: { allowRouting?: boolean } = {},
+): { ok: true; value: ValidatedRelay } | { ok: false; error: string } {
   const safeName = (n: unknown): n is string =>
     typeof n === 'string' && !!n && !n.includes('/') && !n.includes('\\') && !n.includes('..');
 
@@ -1103,6 +1800,19 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       ? req.cardFile
       : null;
   if (cardName === null) return { ok: false, error: 'cardFile must be a plain outbox basename' };
+  const completionProposalName = req.completionProposalFile === undefined
+    ? undefined
+    : safeName(req.completionProposalFile)
+      ? req.completionProposalFile
+      : null;
+  if (completionProposalName === null) {
+    return { ok: false, error: 'completionProposalFile must be a plain outbox basename' };
+  }
+  const imageNames: string[] = [];
+  for (const image of Array.isArray(req.images) ? req.images : []) {
+    if (!safeName(image)) return { ok: false, error: 'image must be a plain outbox basename' };
+    imageNames.push(image);
+  }
   const attachmentNames: string[] = [];
   for (const a of Array.isArray(req.attachments) ? req.attachments : []) {
     if (!safeName(a)) return { ok: false, error: 'attachment must be a plain outbox basename' };
@@ -1127,6 +1837,8 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   if (command === 'dispatch' && (
     preparedContentName !== undefined
     || cardName !== undefined
+    || completionProposalName !== undefined
+    || imageNames.length > 0
     || attachmentNames.length > 0
     || videoNames.length > 0
     || videoCoverNames.length > 0
@@ -1135,7 +1847,14 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
-  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id']);
+  // `--into` appends to an existing topic. It is safe to relay because the
+  // host re-exec's daemon delivery route re-resolves the root message's real
+  // chat and refuses it unless it equals the validated target chat
+  // (dispatch_chat_mismatch), then applies that chat's dispatch policy. At most
+  // one root, so the request cannot mean different things on either side.
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--into', '--delegate', '--no-delegate', '--kind', '--task-id', '--task-url']);
+  let dispatchIntoSeen = false;
+  const sendRoutingSeen = new Set<string>();
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
@@ -1152,7 +1871,37 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
         return { ok: false, error: 'dispatch --chat-id is invalid' };
       }
+      if (f === '--into') {
+        if (dispatchIntoSeen) return { ok: false, error: 'dispatch --into may only be specified once' };
+        if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(v)) return { ok: false, error: 'dispatch --into is invalid' };
+        dispatchIntoSeen = true;
+      }
+      // Behaviour validation with a second copy of the checks cmdDispatch runs
+      // on the host re-exec: reject bad values before they trigger a real Feishu
+      // write. Same https normalisation as the card (safeRequirementUrl).
+      if (f === '--kind' && v !== 'task' && v !== 'review') {
+        return { ok: false, error: 'dispatch --kind must be task or review' };
+      }
+      if (f === '--task-url' && !safeRequirementUrl(v)) {
+        return { ok: false, error: 'dispatch --task-url must be an https URL' };
+      }
+      if ((f === '--delegate' || f === '--no-delegate') && v !== 'schedule:create') {
+        return { ok: false, error: `dispatch ${f} only supports schedule:create` };
+      }
       flags.push(f, v); i++; continue;
+    }
+    if (opts.allowRouting && (f === '--top-level' || f === '--chat-id' || f === '--into')) {
+      if (sendRoutingSeen.has(f)) return { ok: false, error: `flag ${f} may only be specified once` };
+      sendRoutingSeen.add(f);
+      if (f === '--top-level') { flags.push(f); continue; }
+      const v = rawFlags[i + 1];
+      if (f === '--chat-id' && (typeof v !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v))) {
+        return { ok: false, error: 'flag --chat-id must be an oc_ chat id' };
+      }
+      if (f === '--into' && (typeof v !== 'string' || !/^om_[A-Za-z0-9_-]{1,128}$/.test(v))) {
+        return { ok: false, error: 'flag --into must be an om_ topic root message id' };
+      }
+      flags.push(f, v as string); i++; continue;
     }
     if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
     if (/^--urgent=(app|sms|phone)$/.test(f)) { flags.push(f); continue; }
@@ -1221,6 +1970,8 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       contentName: req.contentFile,
       preparedContentName,
       cardName,
+      completionProposalName,
+      imageNames,
       attachmentNames,
       videoNames,
       videoCoverNames,
@@ -1278,6 +2029,8 @@ export function buildRelayHostEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
+  delete env.BOTMUX_LINK_REFS_MODE;
+  delete env.BOTMUX_LINK_REF_TURN_MODE;
   // This channel locates the pane's read-isolation proof, not the host
   // watcher's origin. Carrying it across re-exec misclassifies the host child
   // as isolated. Durable origin still comes from authorize below; do not add
@@ -1285,6 +2038,9 @@ export function buildRelayHostEnv(
   delete env.BOTMUX_ORIGIN_CHANNEL_ID;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
   delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+  // Every host re-exec of a sandbox relay carries the route gate: routing
+  // flags it forwards must be decided by the daemon, never trusted as given.
+  env[SANDBOX_RELAY_ROUTE_GATE_ENV] = '1';
   if (preparedContentFile) {
     env.BOTMUX_CARD_LOCAL_LINK_MODE = 'disabled';
     env.BOTMUX_CARD_PREPARED_CONTENT_FILE = preparedContentFile;
@@ -1295,6 +2051,34 @@ export function buildRelayHostEnv(
     env.BOTMUX_CARD_LOCAL_LINK_MODE = 'lexical';
   }
   return env;
+}
+
+export function buildRelayHostArgs(opts: {
+  command: 'send' | 'dispatch';
+  flags: string[];
+  contentPath: string;
+  cardPath?: string;
+  completionProposalPath?: string;
+  imagePaths: string[];
+  attachmentPaths: string[];
+  videoPaths: string[];
+  videoCoverPaths: string[];
+  sessionId: string;
+}): string[] {
+  return [
+    ...opts.flags,
+    ...(opts.command === 'dispatch'
+      ? ['--brief-file', opts.contentPath]
+      : opts.cardPath ? ['--card-file', opts.cardPath] : ['--content-file', opts.contentPath]),
+    ...(opts.command === 'send' && opts.completionProposalPath
+      ? ['--completion-proposal-file', opts.completionProposalPath]
+      : []),
+    ...(opts.command === 'send' ? opts.imagePaths.flatMap(image => ['--images', image]) : []),
+    ...(opts.command === 'send' ? opts.attachmentPaths.flatMap(attachment => ['--files', attachment]) : []),
+    ...(opts.command === 'send' ? opts.videoPaths.flatMap(video => ['--videos', video]) : []),
+    ...(opts.command === 'send' ? opts.videoCoverPaths.flatMap(cover => ['--video-covers', cover]) : []),
+    '--session-id', opts.sessionId,
+  ];
 }
 
 export function startOutboxWatcher(
@@ -1317,10 +2101,16 @@ export function startOutboxWatcher(
              * and re-exec therefore fails closed instead of degrading to an
              * ordinary mutable-session send. */
             requiresCodexAppLedger?: boolean;
+            /** Admission-frozen LinkRef mode. Absence is the disabled path. */
+            linkRefMode?: 'observe' | 'enabled';
           };
         }
       | { ok: false; error: string };
     cliPath?: string;
+    /** Accept send routing flags (--top-level/--chat-id/--into). Only the
+     *  file / scratch sandbox watchers set this; the credential-only relay
+     *  keeps rejecting them. */
+    allowRouting?: boolean;
   } = {},
 ): () => void {
   const cliInvocation = botmuxCliInvocation(opts.cliPath);
@@ -1330,9 +2120,12 @@ export function startOutboxWatcher(
   const staging = join(dirname(outbox), 'relay-staging');
 
   const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string) => {
+    // 先消费请求、再发布响应：任何人看到 res.json 时，req.json 都已不在。
+    // 反过来的话，两步之间这条已执行完的请求看上去仍在排队，接手同一 outbox
+    // 的 watcher（restore / transfer 之后）会把它再执行一遍。
+    try { rmSync(reqPath, { force: true }); } catch { /* */ }
     // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
     try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
-    try { rmSync(reqPath, { force: true }); } catch { /* */ }
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
   };
@@ -1350,7 +2143,7 @@ export function startOutboxWatcher(
       try { req = JSON.parse(readFileSync(reqPath, 'utf8')); }
       catch { finish(id, reqPath, name, staged, 1, '', 'relay: bad json'); continue; }
 
-      const v = validateRelayRequest(req);
+      const v = validateRelayRequest(req, { allowRouting: opts.allowRouting === true });
       if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
       const authorization = authorize?.({ capability: v.value.originCapability });
       if (authorization && !authorization.ok) {
@@ -1384,6 +2177,24 @@ export function startOutboxWatcher(
         }
         staged.push(cardPath);
       }
+      let completionProposalPath: string | undefined;
+      if (v.value.completionProposalName) {
+        completionProposalPath = join(staging, `${id}.completion-proposal.json`);
+        if (!materializeOutboxFile(outbox, v.value.completionProposalName, completionProposalPath)) {
+          finish(id, reqPath, name, staged, 1, '', 'relay rejected: completion proposal not a regular file in outbox');
+          continue;
+        }
+        staged.push(completionProposalPath);
+      }
+      let imageBad = false;
+      const imagePaths: string[] = [];
+      v.value.imageNames.forEach((imageName, i) => {
+        if (imageBad) return;
+        const dest = join(staging, `${id}-image${i}-${imageName}`);
+        if (!materializeOutboxFile(outbox, imageName, dest)) { imageBad = true; return; }
+        staged.push(dest); imagePaths.push(dest);
+      });
+      if (imageBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: image not a regular file in outbox'); continue; }
       let attBad = false;
       const attPaths: string[] = [];
       v.value.attachmentNames.forEach((an, i) => {
@@ -1412,16 +2223,18 @@ export function startOutboxWatcher(
       });
       if (coverBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: video cover not a regular file in outbox'); continue; }
 
-      const hostArgs = [
-        ...v.value.flags,
-        ...(v.value.command === 'dispatch'
-          ? ['--brief-file', contentDest]
-          : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
-        ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
-        ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
-        ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),
-        '--session-id', sessionId,  // forced — sandbox cannot target another session
-      ];
+      const hostArgs = buildRelayHostArgs({
+        command: v.value.command,
+        flags: v.value.flags,
+        contentPath: contentDest,
+        cardPath,
+        completionProposalPath,
+        imagePaths,
+        attachmentPaths: attPaths,
+        videoPaths,
+        videoCoverPaths,
+        sessionId,
+      });
       // Fail closed: a durable origin (turnId/dispatchAttempt) may come ONLY
       // from a host-side authorize decision. The sandbox controls every byte of
       // the relay request, so its originTurnId/dispatchAttempt are never trusted
@@ -1448,6 +2261,11 @@ export function startOutboxWatcher(
         requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER = '1';
       } else {
         delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+      }
+      if (trustedOrigin?.linkRefMode) {
+        requestEnv.BOTMUX_LINK_REF_TURN_MODE = trustedOrigin.linkRefMode;
+      } else {
+        delete requestEnv.BOTMUX_LINK_REF_TURN_MODE;
       }
       const child = spawn(cliInvocation.command, [...cliInvocation.args, v.value.command, ...hostArgs], { env: requestEnv });
       let out = '', err = '';

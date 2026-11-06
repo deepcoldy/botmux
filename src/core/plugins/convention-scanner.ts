@@ -3,14 +3,23 @@ import { join } from 'node:path';
 import { assertSafePluginRelativePath, resolvePluginPath } from './paths.js';
 import { loadSkillPackage } from '../skills/package.js';
 import { pluginCardActionSelectorOverlapsBotmux } from '../card-action-namespace.js';
+import { isBuiltinSlashCommandName } from '../command-schema.js';
+import { PASSTHROUGH_COMMANDS, SLASH_COMMAND_SHAPE } from '../passthrough-commands.js';
 import type {
   BotmuxPluginManifest,
   PluginCliCommandIndexEntry,
   PluginCardActionsContribution,
+  PluginCommandEntry,
+  PluginCommandsContribution,
   PluginMcpServer,
   PluginServiceMode,
   ScannedPluginContributions,
 } from './types.js';
+import {
+  isValidProtectedMcpCapabilityId,
+  PROTECTED_MCP_SECRET_FD_ENV,
+} from '../protected-mcp-capabilities.js';
+import { normalizeProtectedHttpEgressPolicy } from '../protected-http-egress.js';
 
 function isFile(path: string): boolean {
   try {
@@ -79,6 +88,12 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   const record = optionalRecord(raw, `mcp_${source}`);
   const transport = record.transport === undefined ? 'stdio' : record.transport;
   if (transport === 'streamable-http') {
+    if (record.protectedCapability !== undefined) {
+      throw new Error(`protected_capability_requires_stdio:${name}`);
+    }
+    if (record.protectedEgressPolicy !== undefined) {
+      throw new Error(`protected_egress_policy_requires_stdio:${name}`);
+    }
     const url = optionalString(record.url);
     if (!url) throw new Error(`invalid_plugin_mcp_url:${name}`);
     let parsed: URL;
@@ -92,6 +107,19 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   if (transport !== 'stdio') throw new Error(`invalid_plugin_mcp_transport:${name}`);
   const command = readCommand(record.command, `mcp_command_${name}`);
   const env = readEnv(record.env, `mcp_env_${name}`);
+  if (env?.[PROTECTED_MCP_SECRET_FD_ENV] !== undefined) {
+    throw new Error(`reserved_plugin_mcp_env:${PROTECTED_MCP_SECRET_FD_ENV}`);
+  }
+  const protectedCapability = record.protectedCapability;
+  if (protectedCapability !== undefined && !isValidProtectedMcpCapabilityId(protectedCapability)) {
+    throw new Error(`invalid_plugin_mcp_protected_capability:${name}`);
+  }
+  const protectedEgressPolicy = record.protectedEgressPolicy === undefined
+    ? undefined
+    : normalizeProtectedHttpEgressPolicy(record.protectedEgressPolicy);
+  if (record.protectedEgressPolicy !== undefined && !protectedEgressPolicy) {
+    throw new Error(`invalid_plugin_mcp_protected_egress_policy:${name}`);
+  }
   const templated = [...command, ...Object.values(env ?? {})].find(value => /\$\{[^}]+\}/.test(value));
   if (templated) throw new Error(`unsupported_plugin_mcp_runtime_template:${name}`);
   for (const part of command) {
@@ -99,7 +127,14 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
     const target = resolvePluginPath(runtimeDir, part, `mcp_command_${name}`);
     if (!existsSync(target)) throw new Error(`plugin_mcp_command_path_not_found:${name}:${part}`);
   }
-  return { name, transport, command, ...(env ? { env } : {}) };
+  return {
+    name,
+    transport,
+    command,
+    ...(env ? { env } : {}),
+    ...(protectedCapability ? { protectedCapability } : {}),
+    ...(protectedEgressPolicy ? { protectedEgressPolicy } : {}),
+  };
 }
 
 function readCliCommands(raw: unknown): PluginCliCommandIndexEntry[] {
@@ -248,6 +283,60 @@ const scanCardActions = (
   return contribution;
 };
 
+const PLUGIN_COMMANDS_MAX = 16;
+const PLUGIN_COMMAND_DESCRIPTION_MAX = 120;
+
+const readPluginCommand = (raw: unknown): PluginCommandEntry => {
+  const record = optionalRecord(raw, 'plugin_command');
+  const name = record.name;
+  if (typeof name !== 'string' || name !== name.trim().toLowerCase() || !SLASH_COMMAND_SHAPE.test(name)) {
+    throw new Error('invalid_plugin_command_name');
+  }
+  // Built-in and CLI passthrough tokens stay Botmux's: a plugin can never
+  // shadow /close, /help, /compact … even if it is the only plugin installed.
+  if (isBuiltinSlashCommandName(name) || PASSTHROUGH_COMMANDS.has(name)) {
+    throw new Error(`plugin_command_reserved:${name}`);
+  }
+  const description = record.description;
+  if (description === undefined) return { name };
+  if (
+    typeof description !== 'string'
+    || !description.trim()
+    || Array.from(description).length > PLUGIN_COMMAND_DESCRIPTION_MAX
+    || /[\u0000-\u001f\u007f]/.test(description)
+  ) {
+    throw new Error('invalid_plugin_command_description');
+  }
+  return { name, description };
+};
+
+const scanCommands = (
+  runtimeDir: string,
+  service: ScannedPluginContributions['service'],
+): PluginCommandsContribution | undefined => {
+  const rel = 'commands/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  if (!service) throw new Error('plugin_commands_service_required');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf-8')), 'commands');
+  if (record.schemaVersion !== 1) throw new Error('invalid_plugin_commands_schema');
+  if (!Array.isArray(record.commands) || record.commands.length === 0) {
+    throw new Error('plugin_commands_required');
+  }
+  if (record.commands.length > PLUGIN_COMMANDS_MAX) throw new Error('plugin_commands_too_many');
+  const commands = record.commands.map(readPluginCommand);
+  const names = commands.map(command => command.name);
+  const duplicate = names.find((name, index) => names.indexOf(name) !== index);
+  if (duplicate) throw new Error(`duplicate_plugin_command:${duplicate}`);
+  // Same relative-path rules as card actions: Botmux builds the loopback URL itself.
+  let endpoint: string;
+  try {
+    endpoint = readCardActionEndpoint(record.endpoint);
+  } catch {
+    throw new Error('invalid_plugin_commands_endpoint');
+  }
+  return { schemaVersion: 1, endpoint, commands };
+};
+
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
   const skills = scanSkills(runtimeDir, manifest.id);
   const mcp = scanMcp(runtimeDir, manifest.id);
@@ -255,6 +344,7 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   const cli = scanCli(runtimeDir);
   const service = scanService(runtimeDir, manifest.service?.mode);
   const cardActions = scanCardActions(runtimeDir, service);
+  const commands = scanCommands(runtimeDir, service);
   const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
@@ -263,6 +353,7 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
     ...(service ? { service } : {}),
   };
   if (cardActions) contributions.cardActions = cardActions;
+  if (commands) contributions.commands = commands;
   return Object.keys(contributions).length > 0 ? contributions : undefined;
 }
 

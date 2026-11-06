@@ -2,26 +2,18 @@ import type React from 'react';
 import {
   useCallback,
   useEffect,
-  useMemo,
   useReducer,
   useRef,
   useState,
   type CSSProperties,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent,
   type SyntheticEvent,
 } from 'react';
 import {
-  clampSplitRatio,
   formatWorkbenchRelativeTime,
-  paneTreeForLayout,
   workbenchExternalTerminalHref,
   workbenchPreviewHref,
   workbenchSessionTitle,
   workbenchTerminalHref,
-  type WorkbenchLayoutState,
-  type WorkbenchPaneKind,
-  type WorkbenchPaneTree,
   type WorkbenchSessionRow,
   type WorkbenchTerminalLocation,
 } from './agent-workbench-model.js';
@@ -29,7 +21,6 @@ import {
   WorkbenchApiError,
   newTerminalAcquisitionId,
   type PreviewInteractionState,
-  type TerminalControlState,
   type WorkbenchApi,
 } from './agent-workbench-api.js';
 // 控制权只有一份状态机（面板侧 + 外层意图），见该文件头部的注释。
@@ -1081,107 +1072,6 @@ export function WebPane(props: PaneCommonProps): React.JSX.Element {
   );
 }
 
-interface PaneTreeProps extends PaneCommonProps {
-  tree: WorkbenchPaneTree;
-  location: WorkbenchTerminalLocation | null;
-  onRatioChange(ratio: number): void;
-}
-
-function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { type: 'split' }> }): React.JSX.Element {
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const drag = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    const move = (next: PointerEvent) => {
-      const rect = rootRef.current?.getBoundingClientRect();
-      if (!rect) return;
-      const ratio = props.tree.axis === 'horizontal'
-        ? (next.clientX - rect.left) / rect.width
-        : (next.clientY - rect.top) / rect.height;
-      props.onRatioChange(clampSplitRatio(ratio));
-    };
-    const end = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', end);
-      window.removeEventListener('pointercancel', end);
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', end, { once: true });
-    window.addEventListener('pointercancel', end, { once: true });
-  };
-  const keyResize = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-    const negative = event.key === 'ArrowLeft' || event.key === 'ArrowUp';
-    const positive = event.key === 'ArrowRight' || event.key === 'ArrowDown';
-    if (!negative && !positive) return;
-    event.preventDefault();
-    props.onRatioChange(clampSplitRatio(props.tree.ratio + (negative ? -0.04 : 0.04)));
-  };
-  const splitStyle = {
-    '--wb-split-first': `${props.tree.ratio * 100}%`,
-    '--wb-split-second': `${(1 - props.tree.ratio) * 100}%`,
-  } as CSSProperties;
-  const childProps = {
-    session: props.session,
-    api: props.api,
-    authenticated: props.authenticated,
-    capabilities: props.capabilities,
-    now: props.now,
-    location: props.location,
-    onRatioChange: props.onRatioChange,
-  };
-  return (
-    <div ref={rootRef} className={`wb-pane-split is-${props.tree.axis}`} style={splitStyle}>
-      <PaneTreeNode tree={props.tree.first} {...childProps} />
-      <button
-        type="button"
-        className="wb-pane-separator"
-        role="separator"
-        aria-label={props.tree.axis === 'horizontal' ? '调整左右面板' : '调整上下面板'}
-        aria-orientation={props.tree.axis === 'horizontal' ? 'vertical' : 'horizontal'}
-        aria-valuemin={28}
-        aria-valuemax={72}
-        aria-valuenow={Math.round(props.tree.ratio * 100)}
-        onPointerDown={drag}
-        onKeyDown={keyResize}
-      ><span aria-hidden="true">⋮</span></button>
-      <PaneTreeNode tree={props.tree.second} {...childProps} />
-    </div>
-  );
-}
-
-function PaneTreeNode(props: PaneTreeProps): React.JSX.Element {
-  if (props.tree.type === 'split') return <SplitPane {...props} tree={props.tree} />;
-  return props.tree.pane === 'terminal'
-    ? <TerminalPane session={props.session} api={props.api} authenticated={props.authenticated} capabilities={props.capabilities} now={props.now} location={props.location} />
-    : <WebPane session={props.session} api={props.api} authenticated={props.authenticated} capabilities={props.capabilities} now={props.now} />;
-}
-
-export function WorkbenchPaneRegion(props: PaneCommonProps & {
-  layout: WorkbenchLayoutState;
-  effectivePaneMode: 'focus' | 'split';
-  location: WorkbenchTerminalLocation | null;
-  onRatioChange(ratio: number): void;
-}): React.JSX.Element {
-  const effective = useMemo(
-    () => paneTreeForLayout({ ...props.layout, paneMode: props.effectivePaneMode }),
-    [props.effectivePaneMode, props.layout],
-  );
-  return (
-    <div className="wb-pane-region" data-pane-mode={props.effectivePaneMode}>
-      <PaneTreeNode
-        tree={effective}
-        session={props.session}
-        api={props.api}
-        authenticated={props.authenticated}
-        capabilities={props.capabilities}
-        now={props.now}
-        location={props.location}
-        onRatioChange={props.onRatioChange}
-      />
-    </div>
-  );
-}
-
 export function WorkbenchInfo(props: { session: WorkbenchSessionRow }): React.JSX.Element {
   const session = props.session;
   const entries = [
@@ -1207,21 +1097,4 @@ export function WorkbenchInfo(props: { session: WorkbenchSessionRow }): React.JS
       </dl>
     </div>
   );
-}
-
-export function WorkbenchInfoDrawer(props: { session: WorkbenchSessionRow; open: boolean; onClose(): void }): React.JSX.Element | null {
-  if (!props.open) return null;
-  return (
-    <aside className="wb-info-drawer" role="dialog" aria-modal="false" aria-labelledby="wb-info-title">
-      <header>
-        <strong id="wb-info-title">会话信息</strong>
-        <button type="button" aria-label="关闭会话信息" onClick={props.onClose}>×</button>
-      </header>
-      <WorkbenchInfo session={props.session} />
-    </aside>
-  );
-}
-
-export function paneLabel(kind: WorkbenchPaneKind): string {
-  return kind === 'terminal' ? '终端' : '网页';
 }

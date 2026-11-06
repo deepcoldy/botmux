@@ -1,104 +1,12 @@
-/**
- * Unit tests for `botmux send` same-name bot disambiguation.
- *
- * Regression: bots-info.json can hold multiple entries with the same
- * `botName` (multi-tenant deployments running two apps under the same
- * display name). Cross-ref reverse lookup used `Array.find` on botName,
- * which silently routed to whichever entry sorted first — typically not
- * the one bound to the outbound chat. `pickBotEntryByName` now prefers
- * the entry whose `oncallChats` includes the outbound `chatId`.
- */
 import { describe, it, expect } from 'vitest';
 import {
   buildFooterAddressing,
   hasKnownBotMention,
+  mentionedBotAppIds,
   orderedFooterRecipients,
-  pickBotEntryByName,
   stripCodeSpans,
+  codeSpanRanges,
 } from '../src/utils/bot-routing.js';
-
-type Entry = { larkAppId: string; botName: string | null };
-
-const ENTRY_COCO_UNBOUND: Entry = { larkAppId: 'cli_coco_unbound', botName: 'CoCo' };
-const ENTRY_COCO_BOUND: Entry = { larkAppId: 'cli_coco_bound', botName: 'CoCo' };
-const ENTRY_CLAUDE: Entry = { larkAppId: 'cli_claude', botName: 'Claude' };
-const TARGET_CHAT = 'oc_target_chat';
-
-describe('pickBotEntryByName', () => {
-  it('returns undefined when no entry matches the name', () => {
-    const result = pickBotEntryByName(
-      [ENTRY_CLAUDE],
-      'CoCo',
-      TARGET_CHAT,
-      new Map(),
-    );
-    expect(result).toBeUndefined();
-  });
-
-  it('returns the sole match when only one entry has the name', () => {
-    const result = pickBotEntryByName(
-      [ENTRY_CLAUDE, ENTRY_COCO_UNBOUND],
-      'CoCo',
-      TARGET_CHAT,
-      new Map(),
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-
-  it('prefers the same-named bot bound to the outbound chat over the first match', () => {
-    // bots-info.json order: unbound CoCo first, bound CoCo second.
-    // Without oncall preference, Array.find would silently return unbound.
-    const oncallChatsByApp = new Map([
-      [ENTRY_COCO_BOUND.larkAppId, new Set([TARGET_CHAT])],
-    ]);
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND, ENTRY_COCO_BOUND],
-      'CoCo',
-      TARGET_CHAT,
-      oncallChatsByApp,
-    );
-    expect(result).toEqual(ENTRY_COCO_BOUND);
-  });
-
-  it('falls back to the first match when no candidate is bound to the chat', () => {
-    // None bound — preserve old behavior (route to whichever bots-info.json
-    // sorts first) so single-instance deployments keep working unchanged.
-    const oncallChatsByApp = new Map([
-      [ENTRY_COCO_BOUND.larkAppId, new Set(['oc_some_other_chat'])],
-    ]);
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND, ENTRY_COCO_BOUND],
-      'CoCo',
-      TARGET_CHAT,
-      oncallChatsByApp,
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-
-  it('falls back to the first match when targetChatId is missing', () => {
-    // Top-level publish (no specific chat) — no preference to apply.
-    const oncallChatsByApp = new Map([
-      [ENTRY_COCO_BOUND.larkAppId, new Set([TARGET_CHAT])],
-    ]);
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND, ENTRY_COCO_BOUND],
-      'CoCo',
-      undefined,
-      oncallChatsByApp,
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-
-  it('matches case-insensitively', () => {
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND],
-      'coco',
-      TARGET_CHAT,
-      new Map(),
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-});
 
 describe('hasKnownBotMention', () => {
   const entries = [
@@ -305,5 +213,62 @@ describe('stripCodeSpans', () => {
 
   it('leaves an unbalanced stray backtick harmless (name still in prose)', () => {
     expect(hasAt('这里有个 ` 未闭合，@Codex 仍要 @', 'Codex')).toBe(true);
+  });
+
+  // Previous two-regex form of stripCodeSpans; the range-based one must agree.
+  const legacyStrip = (text: string) => text
+    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
+    .replace(/(`+)[\s\S]*?\1/g, ' ');
+
+  it('keeps stripCodeSpans identical to the previous two-pass regex form', () => {
+    for (const text of [
+      '',
+      'plain @Codex',
+      '`a` b ``c`` d',
+      '```\nx\n``` y `z`',
+      '~~~\n@C\n~~~ ~~strike~~',
+      'stray ` then ```\nfence\n``` and ` again',
+      '`` ` `` and ```js\n`inner`\n```',
+      'open ``` never closed `x`',
+      '```\nx\n```' + '`y`' + '`z`',
+    ]) {
+      expect(stripCodeSpans(text)).toBe(legacyStrip(text));
+    }
+  });
+});
+
+describe('codeSpanRanges', () => {
+  it('returns sorted [start, end) offsets for inline spans and fences', () => {
+    const text = 'a `x` b\n```\ny\n```\nc';
+    expect(codeSpanRanges(text)).toEqual([[2, 5], [8, 17]]);
+  });
+});
+
+describe('mentionedBotAppIds', () => {
+  const entries = [
+    { larkAppId: 'cli_self', botName: 'Ayla', botOpenId: 'ou_self_own' },
+    { larkAppId: 'cli_claude', botName: 'Claude', botOpenId: 'ou_claude_own' },
+    { larkAppId: 'cli_codex', botName: 'Codex' },
+  ];
+  const crossRef = { Claude: 'ou_claude_seen_by_self', Codex: 'ou_codex_seen_by_self', Ayla: 'ou_self_seen' };
+
+  it('resolves mentioned bots by the open_id this app sees them as', () => {
+    expect(mentionedBotAppIds([
+      { open_id: 'ou_codex_seen_by_self' }, { open_id: 'ou_claude_own' }, { open_id: 'ou_codex_seen_by_self' },
+    ], entries, crossRef, 'cli_self')).toEqual(['cli_codex', 'cli_claude']);
+  });
+
+  it('does not guess between two bots that share a name', () => {
+    // Either listing order: neither bot may claim the name's open_id.
+    const twins = [{ larkAppId: 'cli_codex_2', botName: 'Codex', botOpenId: 'ou_codex2_own' }, ...entries];
+    expect(mentionedBotAppIds([{ open_id: 'ou_codex_seen_by_self' }], [...entries, twins[0]], crossRef, 'cli_self')).toEqual([]);
+    expect(mentionedBotAppIds([{ open_id: 'ou_codex_seen_by_self' }, { open_id: 'ou_codex2_own' }],
+      twins, crossRef, 'cli_self')).toEqual(['cli_codex_2']);
+  });
+
+  it('never trusts a display name, a human, or this bot itself', () => {
+    expect(mentionedBotAppIds([
+      { open_id: 'ou_human', name: 'Claude' }, { open_id: 'ou_self_seen' }, { open_id: 'ou_self_own' },
+    ], entries, crossRef, 'cli_self')).toEqual([]);
   });
 });

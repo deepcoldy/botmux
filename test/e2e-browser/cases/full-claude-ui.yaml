@@ -1,0 +1,18 @@
+# Lane: Claude private-chat cards and topic presentation.
+cases:
+  - name: Streaming card lifecycle
+    tags: [card]
+    steps:
+      - feishu.runScenario: { scenario: card-lifecycle }
+  - name: Private chat topic reply
+    tags: [private, topic]
+    steps:
+      - feishu.runScenario: { scenario: private-topic-reply }
+  - name: Mixed image and text card
+    tags: [card, image]
+    steps:
+      - feishu.runScenario: { scenario: image-text-mixing }
+  - name: Web terminal opens from the streaming card
+    tags: [terminal]
+    steps:
+      - feishu.runScenario: { scenario: web-terminal }

@@ -6,6 +6,15 @@ import { logger } from '../utils/logger.js';
 
 export type DaemonSnapshot = { sessions: any[]; schedules: any[] };
 export type SnapshotFetcher = (port: number, signal: AbortSignal) => Promise<DaemonSnapshot>;
+export type SessionSnapshotFetcher = (port: number, signal: AbortSignal) => Promise<{ sessions: any[] }>;
+
+const defaultFetchSessions: SessionSnapshotFetcher = async (port, signal) => {
+  const response = await fetchDaemonIpc(port, '/api/sessions', { signal });
+  if (!response.ok) throw new Error(`daemon session snapshot returned HTTP ${response.status}`);
+  const body = await response.json() as { sessions?: unknown };
+  if (!Array.isArray(body.sessions)) throw new Error('daemon session snapshot has invalid shape');
+  return { sessions: body.sessions };
+};
 
 const defaultFetchSnapshot: SnapshotFetcher = async (port, signal) => {
   const [sRes, schRes] = await Promise.all([
@@ -16,6 +25,40 @@ const defaultFetchSnapshot: SnapshotFetcher = async (port, signal) => {
   const sch = await schRes.json() as { schedules: any[] };
   return { sessions: s.sessions ?? [], schedules: sch.schedules ?? [] };
 };
+
+/**
+ * Refresh only one daemon's Session projection. The standalone Dashboard uses
+ * this before serving `/api/sessions` in primary mode: canonical Session
+ * changes can be committed by another TCE replica and therefore do not appear
+ * on this Pod's daemon SSE stream.
+ *
+ * Fetch every row before mutating the aggregator, and discard the result if
+ * the caller's generation/request was aborted while the snapshot was in
+ * flight. A failed refresh never replaces the last known-good projection.
+ */
+export async function reconcileDaemonSessions(
+  d: DaemonInfo,
+  agg: Aggregator,
+  signal: AbortSignal,
+  fetchSessions: SessionSnapshotFetcher = defaultFetchSessions,
+): Promise<any[] | undefined> {
+  try {
+    const snapshot = await fetchSessions(
+      d.ipcPort,
+      AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+    );
+    if (signal.aborted) return undefined;
+    const rows = snapshot.sessions.map((row: any) => (
+      d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
+    ));
+    agg.hydrateSessions(d.larkAppId, rows);
+    return rows;
+  } catch (e: any) {
+    if (signal.aborted) return undefined;
+    logger.warn(`[dashboard] reconcile sessions ${d.larkAppId}: ${e?.message ?? e}`);
+    return undefined;
+  }
+}
 
 /**
  * Install one daemon's authoritative snapshot into the aggregator. Runs as

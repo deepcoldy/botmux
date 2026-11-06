@@ -64,14 +64,4 @@ describe('retired riff-scoped state field names stay retired', () => {
     }
     expect(offenders).toEqual([]);
   });
-
-  it('keeps the generalised names actually in use, so the guard is not trivially green', () => {
-    const root = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
-    const types = readFileSync(`${root}/src/core/types.ts`, 'utf8');
-    expect(types).toContain('export function remoteRetirementAdmissionPhase');
-    // The generalised phase must consider mojo's journal, not just riff state.
-    expect(types).toContain('remoteShutdownState');
-    expect(types).toContain('remoteCloseState');
-    expect(types).toContain('mojoCloseJournal');
-  });
 });

@@ -5,6 +5,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
@@ -16,6 +17,14 @@ export interface PendingCliInput {
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  /** This item belongs to the durable-primary Lark Inbox commit protocol. */
+  durablePrimaryInbox?: true;
+  /** Admission-frozen mode for the exact queued turn. */
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
+  /** Open id of the human whose turn this is. The worker publishes it beside
+   *  the live-turn marker so the identity wrapper can keep a same-principal
+   *  credential across consecutive turns. */
+  turnCallerOpenId?: string;
   codexAppDispatchId?: string;
   /** Explicit positive steer authorization copied from the daemon ledger entry
    * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */
@@ -51,7 +60,19 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
+  /** Worker-authored continuation after a TraeX capacity model switch. It keeps
+   * the original turn id for reply attribution but is never merged with a
+   * later user input. */
+  traexAutoModelRecovery?: true;
+  /** This still-queued independent turn has completed its read-only TraeX load
+   * admission. It survives an intentional exact-resume model restart so the
+   * original prompt is submitted once without repeating the preflight. */
+  traexAutoModelPreflightDone?: true;
   taskContinuation?: TaskContinuationDispatchMarker;
+  /** `content` as it was before a restart note was put in front of it (see
+   *  services/restart-interruption.ts). Lets a replay of this input after a
+   *  second restart carry only the newest note. */
+  restartNoteOriginalContent?: string;
 }
 
 /**
@@ -110,6 +131,7 @@ export function mergeQueuedCliInput(
   if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
     || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
+    || tail.traexAutoModelRecovery || next.traexAutoModelRecovery
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
@@ -229,43 +251,51 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
 
 /**
  * Whether markPromptReady must treat the first post-spawn ready as
- * "pre-execution SessionStart" (report working, keep busy) rather than true
+ * "pre-execution working" (report working, keep busy) rather than true
  * end-of-turn idle.
  *
- * Strict conditions (PR #633 review):
+ * Strict conditions:
  *  - adapter actually bakes the first prompt into argv (`passesInitialPromptViaArgs`)
  *  - an argv prompt exists and was NOT deferred to the write queue
- *  - SessionStart ready exists (`injectsReadyHook`) so first ready ≠ completion
- *  - turn terminal is authoritative (`reliableTurnTerminal`) so a later
- *    assistant_final/fireIdle will produce a real idle edge
+ *  - turn terminal is authoritative (`reliableTurnTerminal`), meaning turn
+ *    completion is signaled independently (e.g. structured updates.jsonl)
+ *    rather than by quiescence / initial ready edge.
  *
  * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
  * — must return false, or the first markPromptReady would clear isPromptReady
  * and leave the post-spawn queue flush never firing.
- * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
+ * Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
  * idle signal — first ready IS completion; must return false or they stick
  * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
+ *
+ * Grok passes prompt via argv and provides an authoritative turn terminal
+ * via updates.jsonl (`reliableTurnTerminal`), so its first ready (when the
+ * composer/TUI mounts) is pre-execution / in-flight (not completion) and must
+ * arm busy to avoid a false working→idle transition before updates.jsonl completes.
  */
 export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   passesInitialPromptViaArgs: boolean;
   preparedInitialPrompt?: string | null;
   queuedInitialPrompt?: string | null;
-  injectsReadyHook: boolean;
   reliableTurnTerminal: boolean;
 }): boolean {
   if (!shouldTrackArgvBakedFirstPrompt(opts)) return false;
-  if (!opts.injectsReadyHook) return false;
   if (!opts.reliableTurnTerminal) return false;
   return true;
 }
 
-/** Once either side of a queue boundary is durable, stop this batch and wait
- *  for the next reliable idle edge before writing the following turn. */
+/** Stop this batch when back-to-back writes are disabled or either side of the
+ *  queue boundary is durable. A message can arrive while writeInput is awaiting
+ *  its receipt; `isFlushing` admits it to the queue so the active drain can see
+ *  it, but an opted-in adapter must leave it there until the next real idle
+ *  edge. */
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  allowBackToBackWrites = true,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return !allowBackToBackWrites
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken

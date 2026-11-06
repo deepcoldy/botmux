@@ -87,6 +87,19 @@ export function isP2pForceTopicRoot(larkAppId: string, rootId: string, chatId: s
   return load(larkAppId).get(rootId)?.chatId === chatId;
 }
 
+/** Drop an explicit-topic marker. Used when a fork anchor is recalled after a
+ *  failed fork: the topic never materialized, so later root-linked replies must
+ *  keep folding into the flat DM session instead of promoting to thread-scope.
+ *  chatId is optional — the marker is app-scoped by root, but passing it keeps
+ *  the delete symmetric with isP2pForceTopicRoot's chat match. */
+export function removeP2pForceTopicRoot(larkAppId: string, rootId: string, chatId?: string): void {
+  if (!larkAppId || !rootId) return;
+  const roots = load(larkAppId);
+  if (chatId && roots.get(rootId)?.chatId !== chatId) return;
+  if (!roots.delete(rootId)) return;
+  persist(larkAppId, roots);
+}
+
 /** Test-only: simulate a daemon restart without touching persisted files. */
 export function __resetP2pForceTopicRootsForTest(): void {
   caches.clear();

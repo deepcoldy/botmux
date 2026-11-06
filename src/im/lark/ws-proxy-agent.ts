@@ -122,8 +122,3 @@ export function larkWsAgentFor(resolution: LarkWsProxyResolution): Agent | undef
   }
   return legacyProxyAgent();
 }
-
-/** Convenience: resolve + build in one call. */
-export function createLarkWsAgent(openApiDomain: string): Agent | undefined {
-  return larkWsAgentFor(resolveLarkWsProxy(openApiDomain));
-}

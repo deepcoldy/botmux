@@ -1,12 +1,28 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as childProcess from 'node:child_process';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import {
   checkCliAvailability,
+  checkCliAvailabilityAsync,
   cliUnavailableMessage,
   hasAgentLaunchConfigChanged,
+  preliminaryCliAvailability,
 } from '../src/setup/cli-availability.js';
+
+// Pass-through spies: every process the availability check could start (the
+// login-shell `command -v` probe, `forge doctor`) goes through these.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawnSync: vi.fn(actual.spawnSync),
+    execFileSync: vi.fn(actual.execFileSync),
+    execSync: vi.fn(actual.execSync),
+  };
+});
 
 const originalPath = process.env.PATH;
 const originalMircli = process.env.MIRCLI_BIN;
@@ -26,6 +42,73 @@ function executable(dir: string, name: string): string {
 }
 
 describe('CLI launch availability', () => {
+  it('keeps PATH misses and untested Forge readiness preliminary', () => {
+    process.env.PATH = '';
+    for (const cliId of ALL_CLI_IDS) {
+      const result = preliminaryCliAvailability({ cliId });
+      expect(result.status).toBe(result.available ? 'available' : 'unknown');
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      executable(dir, 'forge');
+      process.env.PATH = dir;
+      expect(preliminaryCliAvailability({ cliId: 'traex', cliLaunchMode: 'forge-traex' }).status).toBe('unknown');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('checks asynchronous PATH/override/wrapper/remote dependencies without global env changes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      const traex = executable(dir, 'traex');
+      const wrapper = executable(dir, 'gateway');
+      const env = { PATH: dir };
+      expect(await checkCliAvailabilityAsync({ cliId: 'traex' }, { env })).toMatchObject({
+        status: 'available', resolvedPath: traex,
+      });
+      expect(await checkCliAvailabilityAsync({ cliId: 'codex', cliPathOverride: traex }, { env })).toMatchObject({
+        status: 'available', resolvedPath: traex,
+      });
+      expect(await checkCliAvailabilityAsync({ cliId: 'codex', wrapperCli: 'gateway codex' }, { env })).toMatchObject({
+        status: 'available', resolvedPath: wrapper,
+      });
+      expect(await checkCliAvailabilityAsync({ cliId: 'codex', cliPathOverride: '/missing/codex' }, { env })).toMatchObject({
+        status: 'unavailable', command: '/missing/codex',
+      });
+      for (const cliId of ['mira', 'riff'] as const) {
+        expect(await checkCliAvailabilityAsync({ cliId }, { env })).toMatchObject({
+          status: 'available', localExecutableRequired: false,
+        });
+      }
+      expect(process.env.PATH).toBe(originalPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs asynchronous Forge doctor and checks both executables', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      const forge = executable(dir, 'forge');
+      const input = { cliId: 'traex' as const, cliLaunchMode: 'forge-traex' as const };
+      const opts = { env: { PATH: dir }, shellFallback: false };
+      expect((await checkCliAvailabilityAsync(input, opts)).status).toBe('available');
+      writeFileSync(forge, '#!/bin/sh\nexit 7\n');
+      expect((await checkCliAvailabilityAsync(input, opts)).status).toBe('unavailable');
+      rmSync(forge);
+      expect(await checkCliAvailabilityAsync(input, opts)).toMatchObject({
+        status: 'unavailable', command: 'forge',
+      });
+      expect((await checkCliAvailabilityAsync({ cliId: 'codex', cliLaunchMode: 'forge-traex' }, opts)).status)
+        .toBe('unavailable');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('only treats actual Agent launch-field changes as a new availability gate', () => {
     const current = {
       cliId: 'codex' as const,
@@ -39,15 +122,33 @@ describe('CLI launch availability', () => {
     expect(hasAgentLaunchConfigChanged(current, { ...current, cliLaunchMode: 'forge-traex' })).toBe(true);
   });
 
-  it('keeps PATH-only checks shell-free by avoiding adapter resolvedBin getters', () => {
-    const source = readFileSync(new URL('../src/setup/cli-availability.ts', import.meta.url), 'utf8');
-    expect(source).not.toContain('createCliAdapterSync');
-
+  it('never starts a process for a PATH-only check, for any CLI', () => {
     process.env.PATH = '';
+    vi.mocked(childProcess.spawnSync).mockClear();
+    vi.mocked(childProcess.execFileSync).mockClear();
+    vi.mocked(childProcess.execSync).mockClear();
+
     expect(checkCliAvailability({ cliId: 'pi' }, { shellFallback: false })).toMatchObject({
       available: false,
       command: 'pi',
     });
+    for (const cliId of ALL_CLI_IDS) checkCliAvailability({ cliId }, { shellFallback: false });
+
+    // A resolvable Forge x TraeX pair must not run `forge doctor` either.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      executable(dir, 'forge');
+      process.env.PATH = dir;
+      expect(checkCliAvailability({ cliId: 'traex', cliLaunchMode: 'forge-traex' }, { shellFallback: false }))
+        .toMatchObject({ available: true, command: 'forge' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    expect(childProcess.spawnSync).not.toHaveBeenCalled();
+    expect(childProcess.execFileSync).not.toHaveBeenCalled();
+    expect(childProcess.execSync).not.toHaveBeenCalled();
   });
 
   it('checks the wrapper binary instead of the replaced adapter binary', () => {

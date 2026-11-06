@@ -12,14 +12,18 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { openSync, closeSync, mkdirSync } from 'node:fs';
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
+import { resolveBotmuxDataDir } from './data-dir.js';
+import { closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import {
   builtinFleetEntryMatches,
   inspectFleetProcess,
+  inspectSupervisorState,
   fleetProcessIdentityRuntime,
   signalAttestedFleetProcess,
   type FleetProcessIdentityRuntime,
@@ -152,8 +156,17 @@ export class FleetSupervisor {
 
   /** Start (or reconcile) the fleet: spawn every configured bot not already
    *  alive. Idempotent — an already-live child (per state + kill -0) is left be.
-   *  This is both the initial start and the resurrect path. */
-  start(bots: readonly FleetBotSpec[]): void {
+   *  This is both the initial start and the resurrect path.
+   *
+   *  Returns false — having touched nothing — when fleet-state names ANOTHER
+   *  live, identity-verified supervisor: that one owns the fleet. */
+  start(bots: readonly FleetBotSpec[]): boolean {
+    const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
+    const owner = this.claimFleetOwnership(identityRuntime);
+    if (owner !== undefined) {
+      this.log(`fleet is owned by live supervisor pid ${owner}; not starting a second one`);
+      return false;
+    }
     const specByName = new Map(bots.map((b) => [b.name, b]));
     // Remember the spec set so queued start-bot/stop-bot can resolve name→spec.
     this.knownSpecs.clear();
@@ -183,7 +196,6 @@ export class FleetSupervisor {
     // the reconcile branch below are both natural no-ops; only genuinely unowned
     // live procs are reclaimed. (Relying on pid-inequality would miss the corner
     // where the OS recycles the dead supervisor's pid onto the new one.)
-    const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
     const unreclaimable = new Set<string>();
     const unowned = (p: FleetProcState): boolean =>
       specByName.has(p.name) && p.status === 'online' && pidAlive(p.pid) && !this.children.has(p.name);
@@ -237,28 +249,6 @@ export class FleetSupervisor {
       }
     }
     mutateFleetState(this.opts.statePath, (cur) => {
-      // Refresh the start time whenever a NEW supervisor takes over (pid differs
-      // from the one on record); a plain `||` would pin it to the first-ever
-      // start forever, so status/uptime would misreport across restarts. Keep it
-      // only when the SAME supervisor re-reconciles (idempotent re-start).
-      const recordedPid = cur.supervisorPid;
-      cur.supervisorEntry = isStandaloneBinary() ? process.execPath : process.argv[1];
-      const supervisorProcessStart = identityRuntime.readIdentity(process.pid);
-      if (!supervisorProcessStart) throw new Error('fleet: cannot determine supervisor process identity');
-      cur.supervisorProcessStart = supervisorProcessStart;
-      const supervisorPidNamespace = identityRuntime.readPidNamespace(process.pid);
-      if (process.platform === 'linux' && !supervisorPidNamespace) {
-        throw new Error('fleet: cannot determine supervisor PID namespace');
-      }
-      if (supervisorPidNamespace) cur.supervisorPidNamespace = supervisorPidNamespace;
-      else delete cur.supervisorPidNamespace;
-      const supervisorCommand = identityRuntime.readCommandLine(process.pid);
-      if (!supervisorCommand) throw new Error('fleet: cannot determine supervisor command identity');
-      cur.supervisorCommand = supervisorCommand;
-      if (recordedPid !== process.pid || !cur.supervisorStartedAt) {
-        cur.supervisorStartedAt = new Date().toISOString();
-      }
-      cur.supervisorPid = process.pid;
       // Drop procs no longer configured; mark not-online any proc we don't own a
       // live handle to (dead pid, OR alive-but-unowned orphan we just SIGTERM'd)
       // so planStart respawns it under our ownership — an orphan we hold no handle
@@ -280,6 +270,62 @@ export class FleetSupervisor {
       const spec = specByName.get(name);
       if (spec) this.spawnBot(spec, /* isRestart */ false);
     }
+    return true;
+  }
+
+  /**
+   * Atomically (under the fleet-state lock) either record THIS process as the
+   * fleet's supervisor, or report the pid of another live supervisor that
+   * already owns it.
+   *
+   * The CLI's `botmux start` checks for a live supervisor under the fleet
+   * mutation lock, but the supervisor it spawns is detached and only records
+   * itself here, after its own boot. The lock is released as soon as the spawn
+   * returns, so a second `start` landing in that window — the autostart
+   * watchdog firing while a slow first `start` is still booting, measured at
+   * ~30s on a fresh host — sees no supervisor and spawns another. Without this
+   * claim the second one would then treat the first one's live daemons as
+   * orphans of a dead generation, SIGTERM them, and both supervisors would keep
+   * resurrecting their own copy: two daemons per bot consuming the same Lark
+   * events and session store.
+   *
+   * Only an 'exact' identity match counts as an owner. A stale record (dead
+   * pid, recycled pid) is taken over as before, and an 'unverifiable' legacy
+   * record keeps the existing takeover path so upgrades are not blocked.
+   */
+  private claimFleetOwnership(identityRuntime: FleetProcessIdentityRuntime): number | undefined {
+    let owner: number | undefined;
+    mutateFleetState(this.opts.statePath, (cur) => {
+      const recordedPid = cur.supervisorPid;
+      if (recordedPid > 1 && recordedPid !== process.pid
+        && inspectSupervisorState(cur, identityRuntime).status === 'exact') {
+        owner = recordedPid;
+        return cur;
+      }
+      cur.supervisorEntry = isStandaloneBinary() ? process.execPath : process.argv[1];
+      const supervisorProcessStart = identityRuntime.readIdentity(process.pid);
+      if (!supervisorProcessStart) throw new Error('fleet: cannot determine supervisor process identity');
+      cur.supervisorProcessStart = supervisorProcessStart;
+      const supervisorPidNamespace = identityRuntime.readPidNamespace(process.pid);
+      if (process.platform === 'linux' && !supervisorPidNamespace) {
+        throw new Error('fleet: cannot determine supervisor PID namespace');
+      }
+      if (supervisorPidNamespace) cur.supervisorPidNamespace = supervisorPidNamespace;
+      else delete cur.supervisorPidNamespace;
+      const supervisorCommand = identityRuntime.readCommandLine(process.pid);
+      if (!supervisorCommand) throw new Error('fleet: cannot determine supervisor command identity');
+      cur.supervisorCommand = supervisorCommand;
+      // Refresh the start time whenever a NEW supervisor takes over (pid differs
+      // from the one on record); a plain `||` would pin it to the first-ever
+      // start forever, so status/uptime would misreport across restarts. Keep it
+      // only when the SAME supervisor re-reconciles (idempotent re-start).
+      if (recordedPid !== process.pid || !cur.supervisorStartedAt) {
+        cur.supervisorStartedAt = new Date().toISOString();
+      }
+      cur.supervisorPid = process.pid;
+      return cur;
+    });
+    return owner;
   }
 
   /** Start (or reconcile) ONE bot without touching the rest — the live side of
@@ -386,6 +432,16 @@ export class FleetSupervisor {
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
     const entry = spec.entry ?? 'daemon';
+    if (!spec.external && entry === 'daemon' && feedbackMaintenanceActive(resolveBotmuxDataDir({ env: this.opts.daemonEnv }))) {
+      this.log(`feedback maintenance: deferred ${spec.name}`);
+      const timer = setTimeout(() => {
+        this.restartTimers.delete(spec.name);
+        this.spawnBot(spec, isRestart);
+      }, 1000);
+      timer.unref();
+      this.restartTimers.set(spec.name, timer);
+      return;
+    }
     // An external member (a plugin service) runs an arbitrary command instead of
     // one of our entry modules. Everything BELOW this point — logs, state,
     // restart budget, graceful stop — is shared verbatim; only the command and
@@ -414,8 +470,9 @@ export class FleetSupervisor {
     if (this.opts.logDir) {
       try {
         mkdirSync(this.opts.logDir, { recursive: true });
-        outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
-        errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
+        // 打开前按大小轮转（默认 20MiB，保留 1 份 .1），防止单一日志无限增长吃满磁盘。
+        outFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-out.log`));
+        errFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-err.log`));
         stdio = ['ignore', outFd, errFd];
       } catch (err) {
         this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);

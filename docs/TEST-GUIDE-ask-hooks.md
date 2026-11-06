@@ -73,7 +73,7 @@ curl -sS -X POST "http://127.0.0.1:<ipcPort>/api/asks" \
   -H 'content-type: application/json' \
   -d '{
     "sessionId":"smoke","chatId":"<你所在话题的 chatId>","larkAppId":"<bot 的 appId>",
-    "rootMessageId":null,"timeoutMs":300000,"approvers":["<你的 open_id>"],
+    "rootMessageId":null,"timeoutMs":300000,
     "questions":[
       {"prompt":"部署还是回滚？","multiSelect":false,"options":[{"key":"deploy","label":"部署"},{"key":"rollback","label":"回滚"}]},
       {"prompt":"跑哪些检查？","multiSelect":true,"options":[{"key":"unit","label":"单测"},{"key":"types","label":"类型检查"},{"key":"lint","label":"lint"}]}

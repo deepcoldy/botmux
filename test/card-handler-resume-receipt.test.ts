@@ -345,6 +345,38 @@ describe('card-handler resume receipt', () => {
     expect(textReceipt(sessionReply)).toContain('会话已恢复');
   });
 
+  it('reports a remote provider start failure without reposting a live card', async () => {
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('remote-runner');
+    mockedResume.mockResolvedValue({ ok: false, error: 'resume_start_failed' });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
+
+    await handler.handleCardAction(resumeAction(), deps, APP_ID);
+
+    expect(repostedCardCount(sessionReply)).toBe(0);
+    expect(textReceipt(sessionReply)).toContain('恢复进程未能启动');
+    expect(textReceipt(sessionReply)).toContain('仍保持关闭');
+  });
+
+  it('reports remote recovery as started until the provider becomes ready', async () => {
+    configureBot({ disableStreamingCard: true });
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('remote-runner');
+    mockedResume.mockResolvedValue({ ok: true, ds, recoveryPending: true });
+    const { sessionReply, receipt: receiptDone } = replyWithReceiptBarrier();
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
+
+    await handler.handleCardAction(resumeAction(), deps, APP_ID);
+    await receiptDone;
+
+    expect(repostedCardCount(sessionReply)).toBe(0);
+    expect(textReceipt(sessionReply)).toContain('远程恢复已启动');
+    expect(textReceipt(sessionReply)).not.toContain('✅ 会话已恢复');
+  });
+
   it('does not repost a live card when streaming cards are disabled for the chat', async () => {
     configureBot({ noCardChats: [CHAT_ID] });
     const { handler, workerPool, resumeSession: mockedResume } = await fresh();

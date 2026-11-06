@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -39,6 +39,37 @@ describe('skill discovery', () => {
     expect(discoverProjectSkills(repo).map((s) => s.name).sort()).toEqual(['agent-skill', 'botmux-skill']);
   });
 
+  it('ignores project skill symlinks that point to files', () => {
+    const file = join(repo, 'not-a-skill-directory.md');
+    write(file, 'not a skill directory');
+    mkdirSync(join(repo, '.agents', 'skills'), { recursive: true });
+    symlinkSync(file, join(repo, '.agents', 'skills', 'file-link'), 'file');
+
+    expect(discoverProjectSkills(repo)).toEqual([]);
+  });
+
+  it('only discovers project skill symlinks whose targets stay inside the working directory', () => {
+    const project = join(repo, 'project');
+    const insideTarget = join(project, 'linked-skill-target');
+    const dotPrefixedInsideTarget = join(project, '..hidden-skill-target');
+    const outsideTarget = join(repo, 'outside-skill-target');
+    const skillsRoot = join(project, '.agents', 'skills');
+    write(join(insideTarget, 'SKILL.md'), '---\nname: inside-linked-skill\n---');
+    write(join(dotPrefixedInsideTarget, 'SKILL.md'), '---\nname: hidden-linked-skill\n---');
+    write(join(outsideTarget, 'SKILL.md'), '---\nname: outside-linked-skill\n---');
+    mkdirSync(skillsRoot, { recursive: true });
+    symlinkSync(insideTarget, join(skillsRoot, 'inside-linked-skill'), 'dir');
+    symlinkSync(dotPrefixedInsideTarget, join(skillsRoot, 'hidden-linked-skill'), 'dir');
+    symlinkSync(outsideTarget, join(skillsRoot, 'outside-linked-skill'), 'dir');
+
+    const skills = discoverProjectSkills(project);
+    expect(skills.map((skill) => skill.name).sort()).toEqual(['hidden-linked-skill', 'inside-linked-skill']);
+    expect(skills.find((skill) => skill.name === 'inside-linked-skill')).toEqual(expect.objectContaining({
+      rootDir: realpathSync(insideTarget),
+      source: expect.objectContaining({ type: 'project' }),
+    }));
+  });
+
   it('discovers native codex skills from CODEX_HOME', () => {
     const codexHome = mkdtempSync(join(tmpdir(), 'botmux-codex-home-'));
     process.env.CODEX_HOME = codexHome;
@@ -61,6 +92,28 @@ describe('skill discovery', () => {
       }),
     ]);
     rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  it('discovers native skills linked into a CLI skill root', () => {
+    const home = join(repo, 'home');
+    const skillsRoot = join(home, '.trae', 'skills');
+    const target = join(repo, 'linked-native-skill');
+    process.env.HOME = home;
+    write(join(target, 'SKILL.md'), '---\nname: linked-native-skill\ndescription: Linked native skill\n---');
+    mkdirSync(skillsRoot, { recursive: true });
+    symlinkSync(target, join(skillsRoot, 'linked-native-skill'), 'dir');
+    symlinkSync(join(repo, 'missing-skill'), join(skillsRoot, 'broken-skill'), 'dir');
+
+    const groups = discoverNativeCliSkillGroups(['traex']);
+    const trae = groups.find(group => group.rootDir === skillsRoot);
+
+    expect(trae?.skills).toEqual([
+      expect.objectContaining({
+        name: 'linked-native-skill',
+        rootDir: realpathSync(target),
+        source: expect.objectContaining({ type: 'user' }),
+      }),
+    ]);
   });
 
   it('groups skills per CLI and skips a CLI whose skill root is empty', () => {

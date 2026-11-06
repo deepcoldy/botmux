@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { shouldSuppressStructuredFallback, structuredFallbackKind, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
@@ -58,6 +60,137 @@ function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-0
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'codex-transcript-'));
   path = join(dir, 'rollout.jsonl');
+});
+
+describe('post-delivery provider failure notification', () => {
+  it.each([false, true])('keeps the delivered final after an empty 527 terminal (incremental=%s)', incremental => {
+    const start = Date.parse('2026-04-29T07:00:00.000Z');
+    const queue = new CodexBridgeQueue(() => start);
+    queue.mark('lark-delivered-turn', 'Run the probe', start);
+    writeFileSync(path, ev(userResponseItem('Run the probe')));
+    const first = incremental ? drainCodexRollout(path, 0) : undefined;
+    if (first) queue.ingest(first.events);
+    const delivered: BridgeSendMarker = {
+      sentAtMs: start + 1_000, messageId: 'om_success', responseKind: 'final',
+      turnId: 'lark-delivered-turn', terminalCarrier: 'standard_reply_card',
+    };
+    appendFileSync(path, ev({
+      timestamp: '2026-04-29T07:02:44.000Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'native-provider-turn', last_agent_message: null,
+        error: { message: 'unexpected status 527: empty provider response',
+          codex_error_info: { http_connection_failed: { http_status_code: 527 } } } },
+    }));
+    queue.ingest(drainCodexRollout(path, first?.newOffset ?? 0, first?.state).events);
+    const [ready] = queue.drainEmittable();
+    expect(ready).toMatchObject({ turnId: 'lark-delivered-turn', finalText: '',
+      terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE });
+    const gate = { ...ready, markTimeMs: ready.markTimeMs, isLocal: ready.isLocal };
+    const kind = structuredFallbackKind(gate, undefined, [delivered], false, true);
+    // Default (experimental opt-in absent): the legacy failure notice is unchanged.
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false)).toBe(false);
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false, 'send', true)).toBe(true);
+    // Progress is not a final: the same real provider failure still reaches the user.
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined,
+      [{ ...delivered, responseKind: 'progress' }], false, 'send', true)).toBe(false);
+    expect(ready.terminalStatus).toBe('failed');
+  });
+});
+
+describe('Codex environment updates in adopted turns', () => {
+  const nativeTurnId = 'native-active-turn';
+  const environment = '<environment_context>\n  <current_date>2026-10-06</current_date>\n  <timezone>Asia/Singapore</timezone>\n</environment_context>';
+  const metadata = (kinds: readonly string[]) => ({
+    turn_id: nativeTurnId,
+    content_item_kinds: kinds,
+  });
+
+  it.each([
+    ['structured', metadata(['environments.environment_context'])],
+    ['legacy', undefined],
+  ])('keeps the original thinking timeline and final reply for a %s environment update', (_name, contextMetadata) => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    const thinkingTurns: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('lark-turn', 'Keep working', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    q.setCotObserver((_entries, turn) => thinkingTurns.push(turn.turnId));
+    const prompt = userResponseItem('Keep working');
+    const context = userResponseItem(environment, '2026-04-29T07:00:02.000Z');
+    writeFileSync(path, [
+      { timestamp: '2026-04-29T07:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: nativeTurnId } },
+      { ...prompt, payload: { ...prompt.payload, internal_chat_message_metadata_passthrough: metadata(['user.text']) } },
+    ].map(ev).join(''));
+    const initial = drainCodexRollout(path, 0);
+    q.ingest(initial.events);
+    appendFileSync(path, [
+      { ...context, payload: { ...context.payload, ...(contextMetadata ? { internal_chat_message_metadata_passthrough: contextMetadata } : {}) } },
+      { timestamp: '2026-04-29T07:00:03.000Z', type: 'response_item', payload: { type: 'function_call', name: 'read_file', call_id: 'read-1', arguments: '{}' } },
+    ].map(ev).join(''));
+    const update = drainCodexRollout(path, initial.newOffset, initial.state);
+    q.ingest(update.events);
+    expect(retired).toEqual([]);
+    expect(thinkingTurns).toEqual(['lark-turn']);
+    expect(q.peek()).toMatchObject([{ turnId: 'lark-turn', sourceTurnId: nativeTurnId }]);
+    expect(q.hasBlockingTurn()).toBe(true);
+    expect(q.drainEmittable()).toEqual([]);
+
+    appendFileSync(path, ev({ timestamp: '2026-04-29T07:00:04.000Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: nativeTurnId, last_agent_message: 'Finished' } }));
+    q.ingest(drainCodexRollout(path, update.newOffset, update.state).events);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'lark-turn', finalText: 'Finished' }]);
+    expect(q.hasBlockingTurn()).toBe(false);
+  });
+
+  it.each([
+    ['typed environment example', environment, metadata(['user.text'])],
+    ['mixed user and environment content', environment, metadata(['environments.environment_context', 'user.text'])],
+    ['unknown content kind', environment, metadata(['future.content'])],
+    ['empty content kinds', environment, metadata([])],
+    ['malformed content kinds', environment, { content_item_kinds: 'environments.environment_context' }],
+    ['legacy local input', 'Keep working on the next part', undefined],
+    ['legacy incomplete wrapper', '<environment_context>', undefined],
+    ['legacy quoted block with a request', `${environment}\nExplain this configuration`, undefined],
+    ['legacy request between blocks', `${environment}\nExplain this\n${environment}`, undefined],
+  ])('preserves real input and steer behavior for %s', (_name, text, contextMetadata) => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('lark-turn', 'Keep working', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    const successor = userResponseItem(text, '2026-04-29T07:00:02.000Z');
+    writeFileSync(path, [userResponseItem('Keep working'),
+      { ...successor, payload: { ...successor.payload, ...(contextMetadata ? { internal_chat_message_metadata_passthrough: contextMetadata } : {}) } },
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(retired).toEqual(['lark-turn']);
+    expect(q.peek()).toMatchObject([{ isLocal: true, userText: text }]);
+  });
+
+  it('attributes a real same-native-turn Lark steer after an environment update', () => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('first', 'First request', now);
+    q.mark('second', 'Additional request', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    const rows = [
+      ['First request', ['user.text']],
+      [environment, ['environments.environment_context']],
+      ['Additional request', ['user.text']],
+    ] as const;
+    writeFileSync(path, rows.map(([text, kinds]) => {
+      const item = userResponseItem(text);
+      return ev({ ...item, payload: { ...item.payload, internal_chat_message_metadata_passthrough: metadata(kinds) } });
+    }).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(retired).toEqual(['first']);
+    expect(q.peek()).toMatchObject([{ turnId: 'second' }]);
+    expect(q.peek()[0].isLocal).not.toBe(true);
+  });
 });
 
 afterEach(() => {
@@ -1620,4 +1753,34 @@ describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
     expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: '' })).toEqual([]);
     expect(codexCotEntriesFromResponseItem(undefined)).toEqual([]);
   });
+});
+
+describe('explicit Codex capacity failures', () => {
+  it.each([
+    { message: 'Selected model is at capacity. Please try a different model.', codex_error_info: 'server_overloaded' },
+    { message: 'capacity', codexErrorInfo: 'serverOverloaded' },
+    { code: 'serverOverloaded' },
+  ])('recognises the real terminal shape: %j', async error => {
+    const { CODEX_CAPACITY_ERROR_CODE, isCodexCapacityError } = await import('../src/services/codex-transcript.js');
+    expect(isCodexCapacityError(error)).toBe(true);
+    writeFileSync(path, ev({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'capacity', error } }));
+    expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({ terminalStatus: 'failed', terminalErrorCode: CODEX_CAPACITY_ERROR_CODE });
+    // The taxonomy shared by other CLI readers stays unchanged.
+    expect(codexTaskFailureCode(error)).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it.each([{ code: 'Overloaded: please retry' }, { message: 'Selected model is at capacity, retry later.' }])('keeps non-exact object payloads out of recovery: %j', async error => {
+    const { isCodexCapacityError } = await import('../src/services/codex-transcript.js');
+    expect(isCodexCapacityError(error)).toBe(false);
+  });
+
+  it.each(['503 Service Unavailable', 'Overloaded: please retry', '429 Too Many Requests', 'gateway timeout'])('does not opt generic %s into capacity recovery', async error => {
+    const { isCodexCapacityError } = await import('../src/services/codex-transcript.js');
+    expect(isCodexCapacityError(error)).toBe(false);
+  });
+});
+
+it.each(['401 Unauthorized', '429 Too Many Requests', '400 invalid request'])('a capacity message cannot override %s', async code => {
+  const { isCodexCapacityError } = await import('../src/services/codex-transcript.js');
+  expect(isCodexCapacityError({ code, message: 'Selected model is at capacity. Please try a different model.' })).toBe(false);
 });

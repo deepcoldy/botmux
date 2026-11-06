@@ -14,6 +14,8 @@ import {
 } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from './services/codex-app-runner-protocol.js';
+import { codexAppTurnFailureCode } from './services/codex-app-failure.js';
+import { captureCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   CODEX_APP_CONTROL_BOOTSTRAP_ENV,
   CODEX_APP_CONTROL_FINAL_CHUNK_BYTES,
@@ -30,6 +32,8 @@ import {
   takeCodexAppControlLocatorEndpoint,
 } from './utils/codex-app-control.js';
 import { CODEX_APP_NO_PROGRESS_TIMEOUT_MS } from './utils/codex-app-turn-liveness.js';
+import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
+import { createRunnerTerminal } from './runner-common.js';
 import {
   TurnTokenUsageAccumulator,
   parseTokenUsagePair,
@@ -40,7 +44,13 @@ import {
   type DynamicToolCallParams,
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
+import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
+
+import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
+import { parseCodexAsyncQuestions, parseCodexAsyncUserInput, codexAsyncSteerTargetMatches } from './services/codex-async-user-input.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
+import { readProcessStartIdentity } from './utils/process-identity.js';
 
 type JsonObject = Record<string, any>;
 
@@ -59,15 +69,10 @@ interface Args {
   locale?: string;
   model?: string;
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
+  browserAutoApproveOrigins?: boolean;
   browserPluginRoot?: string;
-}
-
-interface PendingRequest {
-  resolve: (value: any) => void;
-  reject: (error: Error) => void;
-  method: string;
-  timer?: NodeJS.Timeout;
 }
 
 interface ActiveTurn {
@@ -91,8 +96,12 @@ interface ActiveTurn {
   startedAtMs: number;
   lastActivityMarkerAtMs: number;
   finalText: string;
+  failureCode?: string;
+  userInputFailure?: string;
   allAgentText: string;
   itemText: Map<string, string>;
+  asyncItemIds: Set<string>;
+  knownAgentItemIds: Set<string>;
   done: Promise<void>;
   resolveDone: () => void;
   // ─── Blocking 1 ordered-steer driver (codex decision A/B/C) ──────────────
@@ -158,7 +167,7 @@ interface QueuedInput {
    * marker as both PR's `turnId` and master's `replyTurnId`. */
   replyTurnId?: string;
   /** Explicit positive (from the daemon admission gate, decision A): this
-   * plain-human-interactive input may `turn/steer` into an already-active Codex
+   * authorized human input/answer may `turn/steer` into an already-active Codex
    * App turn. Missing/false ⇒ forced serial (starts its own turn only when the
    * runner is idle). Never inferred here — copied verbatim from the decoded
    * control line's `codexAppSteerable`. */
@@ -170,6 +179,7 @@ interface QueuedInput {
 }
 
 const output = new RunnerControlWriter();
+const { writeLine, prompt } = createRunnerTerminal(output);
 const cotCollector = new CodexAppCotCollector();
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const RECONCILIATION_TIMEOUT_MS = 5_000;
@@ -267,8 +277,16 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
+    else if (key === '--service-tier' && val !== undefined) {
+      if (val !== 'default' && val !== 'priority' && val !== 'ultrafast') {
+        throw new Error('--service-tier accepts default, priority, or ultrafast');
+      }
+      out.serviceTier = val;
+      i++;
+    }
     else if (key === '--browser-family' && (val === 'chrome' || val === 'edge')) { out.browserFamily = val; i++; }
     else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
+    else if (key === '--browser-auto-approve-origins') { out.browserAutoApproveOrigins = true; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   if (out.strictResume && !out.threadId) throw new Error('--strict-resume requires --thread-id');
@@ -279,14 +297,6 @@ function parseArgs(argv: string[]): Args {
   out.controlSocketPath = control.socketPath;
   out.controlLocatorPath = control.locatorPath;
   return out;
-}
-
-function writeLine(text = ''): void {
-  output.line(text);
-}
-
-function prompt(): void {
-  output.display('› ');
 }
 
 function appDeveloperInstructions(args: Args): string {
@@ -302,10 +312,12 @@ function appDeveloperInstructions(args: Args): string {
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
       '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
       '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
+      '需要用户选择时，原生 `request_user_input` 会桥接为飞书问答卡片并等待答复；也可使用 `botmux ask`。不要通过聊天卡片索取密码等秘密。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
       args.browserFamily
         ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
         : '',
+      larkToolPromptFromEnv('zh'),
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
   }
@@ -314,37 +326,63 @@ function appDeveloperInstructions(args: Args): string {
     'You are connected to Feishu/Lark through botmux, but the runtime is the Codex App app-server protocol rather than the Codex CLI TUI.',
     'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
     'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
+    'Native request_user_input questions are bridged to Lark ask cards and wait for a human answer; botmux ask is also available. Do not request secrets through chat cards.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
     args.browserFamily
       ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
       : '',
+    larkToolPromptFromEnv('en'),
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
 }
 
 class AppServerClient {
+  processIdentity?: CodexAppProcessIdentity;
   private child: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private stdoutBuffer = '';
-  private pending = new Map<number, PendingRequest>();
+  /** NDJSON framing + pending table. 'microtask' dispatch keeps a response's
+   *  awaiting continuation ahead of a notification coalesced behind it. */
+  private readonly rpc = new JsonRpcStdioCore({
+    dispatch: 'microtask',
+    mapRpcError: (method, error) => new AppServerRpcError(
+      method,
+      typeof error.code === 'number' ? error.code : undefined,
+      error.data,
+      typeof error.message === 'string' ? error.message : JSON.stringify(error),
+    ),
+    onMessage: msg => this.dispatch(msg),
+  });
   private notificationHandlers: Array<(msg: JsonObject) => void> = [];
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
   private fatalError?: Error;
+  private initialized = false;
+  readonly lifetime = new AbortController();
 
   get hasExited(): boolean {
     // 后代可能继续持有 stdio，进程退出不能等到 close 才识别。
     return this.child.exitCode !== null || this.child.signalCode !== null;
   }
 
-  constructor(private readonly codexBin: string, private readonly cwd: string) {
+  get executionIdentity(): { pid: number; procStart: string } | undefined {
+    if (process.platform !== 'linux' || !this.initialized || this.hasExited || !this.child.pid) return undefined;
+    // The npm entry point stays alive as a Node launcher. Its native Codex
+    // child owns the persistent tool host and must be the signed engine root;
+    // attesting Node instead makes the native child look like an old tool on
+    // the next turn. Reuse the kernel/stdio proof captured at initialization.
+    const pid = this.processIdentity?.enginePid ?? this.child.pid;
+    const procStart = readProcessStartIdentity(pid);
+    if (this.processIdentity && procStart !== this.processIdentity.engineProcStart) return undefined;
+    return procStart ? { pid, procStart } : undefined;
+  }
+
+  constructor(codexBin: string, cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
       cwd,
       env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    this.child.stdout.on('data', chunk => this.onStdout(chunk.toString('utf8')));
+    this.child.stdout.on('data', chunk => this.rpc.push(chunk.toString('utf8')));
     this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
       const text = chunk.toString('utf8');
@@ -360,6 +398,7 @@ class AppServerClient {
     this.child.on('exit', (code, signal) => {
       writeLine(`[codex-app] app-server exited (code=${code}, signal=${signal})`);
       const err = this.fatalError ?? new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
+      if (this.lastStderr) output.error(`[codex-app-server] exited with code=${code}, signal=${signal}; stderr tail:\n${this.lastStderr}\n`);
       this.failAll(err);
     });
   }
@@ -378,6 +417,11 @@ class AppServerClient {
       capabilities: { experimentalApi: true },
     }, { timeoutMs });
     this.notify('initialized');
+    this.processIdentity = captureCodexAppProcessIdentity(this.child.pid ?? 0);
+    // Idle-state timers can run while a replacement client is initializing.
+    // Publish no root until capture finishes, so a live launcher can never be
+    // registered first and then mistaken for an unauthorized engine swap.
+    this.initialized = true;
   }
 
   request(
@@ -385,34 +429,30 @@ class AppServerClient {
     params: unknown,
     options: { timeoutMs?: number } = {},
   ): Promise<any> {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      const timeoutMs = options.timeoutMs;
-      const pending: PendingRequest = { resolve, reject, method };
-      if (timeoutMs !== undefined) {
-        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-          reject(new AppServerRequestTimeoutError(method, Math.max(0, timeoutMs)));
-          return;
-        }
-        pending.timer = setTimeout(() => {
-          if (!this.pending.delete(id)) return;
-          reject(new AppServerRequestTimeoutError(method, timeoutMs));
-        }, timeoutMs);
-        pending.timer.unref?.();
-      }
-      this.pending.set(id, pending);
-      try {
-        this.write({ jsonrpc: '2.0', id, method, params });
-      } catch (err) {
-        this.pending.delete(id);
-        if (pending.timer) clearTimeout(pending.timer);
-        reject(asError(err));
-      }
+    const id = this.rpc.nextId();
+    const { timeoutMs } = options;
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+      return Promise.reject(new AppServerRequestTimeoutError(method, Math.max(0, timeoutMs)));
+    }
+    const response = this.rpc.track(id, method, {
+      timeoutMs,
+      onTimeout: (m, ms) => new AppServerRequestTimeoutError(m, ms),
+      unrefTimer: true,
     });
+    try {
+      this.write({ jsonrpc: '2.0', id, method, params });
+    } catch (err) {
+      this.rpc.abort(id, asError(err));
+    }
+    return response;
   }
 
-  respond(id: number, result: unknown): void {
+  respond(id: number | string, result: unknown): void {
     this.write({ jsonrpc: '2.0', id, result });
+  }
+
+  respondError(id: number | string, message: string): void {
+    this.write({ jsonrpc: '2.0', id, error: { code: -32000, message } });
   }
 
   notify(method: string, params?: unknown): void {
@@ -422,6 +462,7 @@ class AppServerClient {
   }
 
   close(): void {
+    this.lifetime.abort();
     try { this.child.kill(); } catch { /* already gone */ }
   }
 
@@ -431,76 +472,14 @@ class AppServerClient {
   }
 
   private failAll(err: Error): void {
+    this.lifetime.abort();
     this.fatalError = this.fatalError ?? err;
-    const fatal = this.fatalError;
-    for (const pending of this.pending.values()) {
-      if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(fatal);
-    }
-    this.pending.clear();
+    this.rpc.failAll(this.fatalError);
   }
 
-  /**
-   * Message ordering must not depend on pipe chunk boundaries. Dispatching
-   * line N+1 synchronously after line N starves the microtask continuations
-   * line N scheduled: a response resolving `await request(...)` runs its
-   * awaiting caller (which records protocol state, e.g. "steer accepted,
-   * group grew") only AFTER the whole synchronous loop — so a notification
-   * coalesced into the same chunk behind its own request's response was
-   * processed against stale state and the turn stalled forever. The kernel
-   * coalesces adjacent writes whenever this reader is scheduled late (routine
-   * on loaded CI runners, possible anywhere), so yield a MICROtask between
-   * lines: already-queued continuations run before the next dispatch, while
-   * anything the runner deliberately defers past the current burst (e.g.
-   * macrotask-deferred publications) still sees the burst as one unit.
-   */
-  private stdoutDraining = false;
-
-  private onStdout(data: string): void {
-    this.stdoutBuffer += data;
-    if (this.stdoutDraining) return;
-    this.stdoutDraining = true;
-    const step = (): void => {
-      const nl = this.stdoutBuffer.indexOf('\n');
-      if (nl < 0) {
-        this.stdoutDraining = false;
-        return;
-      }
-      const line = this.stdoutBuffer.slice(0, nl).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
-      if (line) {
-        let msg: JsonObject | undefined;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          msg = undefined;
-        }
-        if (msg) this.dispatch(msg);
-      }
-      queueMicrotask(step);
-    };
-    step();
-  }
-
+  /** Server requests and notifications; responses are settled by the RPC core. */
   private dispatch(msg: JsonObject): void {
-    if (typeof msg.id === 'number' && (msg.result !== undefined || msg.error !== undefined)) {
-      const pending = this.pending.get(msg.id);
-      if (!pending) return;
-      this.pending.delete(msg.id);
-      if (pending.timer) clearTimeout(pending.timer);
-      if (msg.error) {
-        pending.reject(new AppServerRpcError(
-          pending.method,
-          typeof msg.error.code === 'number' ? msg.error.code : undefined,
-          msg.error.data,
-          typeof msg.error.message === 'string' ? msg.error.message : JSON.stringify(msg.error),
-        ));
-      }
-      else pending.resolve(msg.result);
-      return;
-    }
-
-    if (typeof msg.id === 'number' && typeof msg.method === 'string') {
+    if ((typeof msg.id === 'number' || typeof msg.id === 'string') && typeof msg.method === 'string') {
       for (const handler of this.requestHandlers) {
         if (handler(msg)) return;
       }
@@ -753,6 +732,7 @@ const browserBroker = args.browserFamily
   ? new CodexBrowserBroker({
       sessionId: args.sessionId,
       family: args.browserFamily,
+      autoApproveOrigins: args.browserAutoApproveOrigins === true,
       codexBin: args.codexBin,
       ...(args.browserPluginRoot ? { pluginRoot: args.browserPluginRoot } : {}),
       readConfig: params => client.request('config/read', params, { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }),
@@ -772,6 +752,8 @@ let activeTurnEpoch = 0;
  * is incorrectly sent with turn/start and its completion can be discarded as
  * belonging to an "unexpected" native turn. */
 let nativeActiveTurnId: string | undefined;
+let currentModel: string | undefined;
+let effortUpdateTail: Promise<void> = Promise.resolve();
 const queue: QueuedInput[] = [];
 let inputBuffer = '';
 let processing = false;
@@ -822,6 +804,8 @@ function emitRunnerState(
   busy = processing || queue.length > 0 || nativeActiveTurnId !== undefined,
   tracksTurn = activeTurn !== null,
 ): void {
+  const activeReplyTurnId = activeTurn?.accepted?.at(-1)?.replyTurnId;
+  const appServerProcess = client?.executionIdentity;
   emitMarker('state', {
     busy,
     atMs: Date.now(),
@@ -829,6 +813,11 @@ function emitRunnerState(
     // signed state. The worker uses this field as a runtime type-ahead gate;
     // authentication alone never releases a prompt.
     acceptingInput: runnerReady,
+    ...(busy && tracksTurn && activeReplyTurnId ? { activeReplyTurnId } : {}),
+    ...(client?.processIdentity ? { processIdentity: client.processIdentity } : {}),
+    // This process owns tool execution. The outer runner owns reply routing;
+    // the signed state must attest both sides of that process boundary.
+    ...(appServerProcess ? { appServerProcess } : {}),
     ...(busy && !tracksTurn ? { tracksTurn: false } : {}),
   });
 }
@@ -896,6 +885,8 @@ function makeTurn(clientUserMessageId: string | undefined, requestKind: 'start' 
     finalText: '',
     allAgentText: '',
     itemText: new Map(),
+    asyncItemIds: new Set(),
+    knownAgentItemIds: new Set(),
     phase: 'starting',
     done,
     resolveDone,
@@ -921,6 +912,137 @@ function emitTurnActivity(turn: ActiveTurn, phase: 'submitted' | 'progress' | 'c
   });
 }
 
+const userInputRequests = new Map<number | string, { turnId?: string; controller: AbortController }>();
+const asyncUserInputRequests = new Map<string, { turnId: string; controller: AbortController }>();
+const seenAsyncQuestions = new Set<string>();
+
+function cancelAsyncUserInputRequests(turnId?: string): void {
+  for (const [id, pending] of asyncUserInputRequests) {
+    if (turnId !== undefined && pending.turnId !== turnId) continue;
+    asyncUserInputRequests.delete(id);
+    pending.controller.abort();
+  }
+}
+
+function handleAsyncUserInput(item: JsonObject, nativeTurnId: string, turn: ActiveTurn): void {
+  const identity = parseCodexAsyncUserInput({ threadId, itemId: item.id, nativeTurnId });
+  if (!identity || generationFenced || seenAsyncQuestions.has(identity.itemId)) return;
+  const current = client;
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, current.lifetime.signal]);
+  const owner = turn.accepted?.at(-1);
+  const originTurnId = owner?.replyTurnId ?? owner?.clientUserMessageId ?? turn.clientUserMessageId;
+  const context = {
+    sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
+    chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID, originTurnId,
+  };
+  const reportFailure = (reason: 'limit' | 'invalid_questions', questions?: import('./core/ask-types.js').AskQuestion[]) => {
+    void postCodexAsk(context, questions ?? [{ prompt: 'Async question could not be displayed', inputMode: 'text',
+      multiSelect: false, options: [] }], signal, identity, reason)
+      .catch(error => { if (!signal.aborted) writeLine(`[codex-app] async question notice failed: ${asError(error).message}`); });
+  };
+  try {
+    const questions = parseCodexAsyncQuestions(item);
+    if (asyncUserInputRequests.size >= 32) {
+      reportFailure('limit', questions);
+      output.display(String(item.text ?? questions.map(q => q.prompt).join('\n')));
+      return;
+    }
+    if (seenAsyncQuestions.size >= 1024) {
+      const oldest = [...seenAsyncQuestions].find(id => !asyncUserInputRequests.has(id));
+      if (oldest) seenAsyncQuestions.delete(oldest);
+    }
+    seenAsyncQuestions.add(identity.itemId);
+    asyncUserInputRequests.set(identity.itemId, { turnId: nativeTurnId, controller });
+    // Nonblocking: the model continues; the daemon will admit a correlated
+    // human answer through its existing worker FIFO, even after this turn ends.
+    void postCodexAsk(context, questions, signal, identity).then(result => {
+      if (!signal.aborted && result.kind !== 'answered') {
+        writeLine(`[codex-app] async question ${identity.itemId} ended: ${result.kind}`);
+      }
+    }).catch(error => {
+      if (!signal.aborted) {
+        writeLine(`[codex-app] async question ${identity.itemId} failed: ${asError(error).message}`);
+        // Retain the question in ordinary terminal output if no card can be used.
+        output.display(String(item.text ?? questions.map(q => q.prompt).join('\n')));
+      }
+    }).finally(() => {
+      if (asyncUserInputRequests.get(identity.itemId)?.controller === controller) {
+        asyncUserInputRequests.delete(identity.itemId);
+      }
+    });
+  } catch (error) {
+    writeLine(`[codex-app] async question ${identity.itemId} rejected: ${asError(error).message}`);
+    reportFailure('invalid_questions');
+  }
+}
+
+function cancelUserInputRequests(turnId?: string): void {
+  for (const [id, pending] of userInputRequests) {
+    if (turnId !== undefined && pending.turnId !== turnId) continue;
+    userInputRequests.delete(id);
+    pending.controller.abort();
+  }
+}
+
+function handleNativeUserInput(msg: JsonObject): void {
+  if (generationFenced || userInputRequests.has(msg.id)) return;
+  const current = client;
+  const params = msg.params ?? {};
+  if (params.threadId && threadId && params.threadId !== threadId) {
+    current.respondError(msg.id, 'requestUserInput belongs to a different thread');
+    return;
+  }
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, current.lifetime.signal]);
+  const nativeTurnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+  userInputRequests.set(msg.id, { turnId: nativeTurnId, controller });
+  const turn = activeTurn;
+  const onClientDead = () => {
+    if (client === current && !generationFenced && userInputRequests.get(msg.id)?.controller === controller) {
+      fenceUnknown('turn/start', 'transport', turn);
+    }
+  };
+  current.lifetime.signal.addEventListener('abort', onClientDead, { once: true });
+  const owner = turn?.accepted?.at(-1);
+  const originTurnId = owner?.replyTurnId ?? owner?.clientUserMessageId ?? turn?.clientUserMessageId;
+  void bridgeCodexUserInput({
+    sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
+    chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
+    originTurnId,
+  }, params, signal).then(
+    result => {
+      if (!signal.aborted && client === current && !generationFenced) current.respond(msg.id, result);
+    },
+    async error => {
+      if (signal.aborted || client !== current || generationFenced) return;
+      const message = `Codex user input failed: ${asError(error).message}`;
+      writeLine(message);
+      if (activeTurn === turn && turn) turn.userInputFailure = message;
+      // An empty/error tool reply may be normalized to an unanswered success
+      // by app-server. Interrupt instead, preserving the missing-human-answer
+      // boundary. Only requests without native coordinates use an RPC error.
+      if (!params.threadId || !nativeTurnId) { current.respondError(msg.id, message); return; }
+      try {
+        await current.request('turn/interrupt', { threadId: params.threadId, turnId: nativeTurnId }, { timeoutMs: 10_000 });
+      } catch (interruptError) {
+        if (!signal.aborted && client === current) {
+          writeLine(`Codex user input interrupt failed: ${asError(interruptError).message}`);
+          fenceUnknown('turn/start', 'transport', turn);
+          current.close();
+        }
+      }
+    },
+  ).finally(() => {
+    current.lifetime.signal.removeEventListener('abort', onClientDead);
+    if (userInputRequests.get(msg.id)?.controller === controller) userInputRequests.delete(msg.id);
+  }).catch(error => {
+    if (!signal.aborted && client === current) {
+      writeLine(asError(error).message); fenceUnknown('turn/start', 'transport', turn); current.close();
+    }
+  });
+}
+
 function handleServerRequest(msg: JsonObject): boolean {
   const method = msg.method;
   if (method === 'item/commandExecution/requestApproval') {
@@ -936,7 +1058,7 @@ function handleServerRequest(msg: JsonObject): boolean {
     return true;
   }
   if (method === 'item/tool/requestUserInput') {
-    client.respond(msg.id, { answers: {} });
+    handleNativeUserInput(msg);
     return true;
   }
   if (method === 'mcpServer/elicitation/request') {
@@ -989,7 +1111,7 @@ function isTerminalNativeTurn(turn: JsonObject): boolean {
 function rebuildReconciledFinal(turn: JsonObject, userItemIndex: number): string {
   const following = Array.isArray(turn.items) ? turn.items.slice(userItemIndex + 1) : [];
   const finalAnswers = following.filter(
-    (item: JsonObject) => item?.type === 'agentMessage' && item.phase === 'final_answer',
+    (item: JsonObject) => item?.type === 'agentMessage' && item.phase === 'final_answer' && item.delivery !== 'async',
   );
   if (finalAnswers.length > 0) return String(finalAnswers.at(-1)?.text ?? '');
   if (turn?.error?.message) return `Codex App turn failed: ${String(turn.error.message)}`;
@@ -998,9 +1120,12 @@ function rebuildReconciledFinal(turn: JsonObject, userItemIndex: number): string
 
 function completeActiveTurnFromNative(turn: ActiveTurn, nativeTurn: JsonObject, exactIndex?: number): void {
   if (activeTurn !== turn || turn.completed || !isTerminalNativeTurn(nativeTurn)) return;
+  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
   if (exactIndex !== undefined) {
     turn.finalText = rebuildReconciledFinal(nativeTurn, exactIndex);
     turn.allAgentText = '';
+    turn.itemText.clear();
+    turn.knownAgentItemIds.clear();
   } else if (nativeTurn?.error?.message && !turn.finalText) {
     turn.finalText = `Codex App turn failed: ${String(nativeTurn.error.message)}`;
   }
@@ -1033,6 +1158,8 @@ function reportIdentityConflict(turn: ActiveTurn, observedNativeTurnId?: string,
   // client turn id; never reuse untrusted native text.
   turn.finalText = `Codex App turn failed: ${message}`;
   turn.allAgentText = '';
+  turn.itemText.clear();
+  turn.knownAgentItemIds.clear();
   if (turn.nativeTurnId && nativeActiveTurnId === turn.nativeTurnId) {
     nativeActiveTurnId = undefined;
   }
@@ -1163,6 +1290,10 @@ async function reconcileCompletedTurn(
 function handleNotification(msg: JsonObject, replayedAfterResponse = false): void {
   const params = msg.params ?? {};
   if (params.threadId !== threadId) return;
+  if (msg.method === 'thread/settings/updated') {
+    if (typeof params.threadSettings?.model === 'string') currentModel = params.threadSettings.model;
+    return;
+  }
   const notificationTurnId = params.turnId ?? params.turn?.id;
 
   // Per-turn token usage rides on thread/tokenUsage/updated (NOT turn/completed).
@@ -1248,6 +1379,8 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'turn/completed') {
     const nativeTurn = params.turn ?? {};
     const completedId = typeof notificationTurnId === 'string' ? notificationTurnId : undefined;
+    if (completedId) cancelUserInputRequests(completedId);
+    if (completedId && nativeTurn.status !== 'completed') cancelAsyncUserInputRequests(completedId);
     if (completedId && browserBroker) {
       void browserBroker.handleTurnEnded(completedId).catch(error => {
         writeLine(`[codex-app] browser turn-ended hook failed: ${asError(error).message}`);
@@ -1417,6 +1550,14 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
 
   if (msg.method === 'item/started') {
     const item = params.item;
+    if (item?.type === 'agentMessage') {
+      if (item.delivery === 'async') turn.asyncItemIds.add(String(item.id));
+      else {
+        turn.knownAgentItemIds.add(String(item.id));
+        const buffered = turn.itemText.get(String(item.id));
+        if (buffered) output.display(buffered);
+      }
+    }
     if (item?.type === 'commandExecution') {
       writeLine(`\n$ ${item.command}`);
     } else if (item?.type === 'fileChange') {
@@ -1428,9 +1569,12 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'item/agentMessage/delta') {
     const delta = String(params.delta ?? '');
     const itemId = String(params.itemId ?? '');
+    if (turn.asyncItemIds.has(itemId)) return;
     turn.itemText.set(itemId, (turn.itemText.get(itemId) ?? '') + delta);
-    turn.allAgentText += delta;
-    output.display(delta);
+    turn.allAgentText = [...turn.itemText.values()].join('');
+    // If started is missing, wait for completed to identify delivery before
+    // displaying it. An async question must never leak through a delta first.
+    if (turn.knownAgentItemIds.has(itemId)) output.display(delta);
     return;
   }
 
@@ -1442,10 +1586,19 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'item/completed') {
     const item = params.item;
     if (item?.type === 'agentMessage') {
-      if (item.phase === 'final_answer') turn.finalText = String(item.text ?? '');
-      else if (!turn.itemText.has(item.id) && item.text) {
-        turn.allAgentText += String(item.text);
+      if (item.delivery === 'async') {
+        turn.asyncItemIds.add(String(item.id));
+        turn.itemText.delete(String(item.id));
+        turn.allAgentText = [...turn.itemText.values()].join('');
+        if (typeof notificationTurnId === 'string') handleAsyncUserInput(item, notificationTurnId, turn);
+        return;
       }
+      const id = String(item.id);
+      if (!turn.knownAgentItemIds.has(id)) output.display(String(turn.itemText.get(id) ?? item.text ?? ''));
+      turn.knownAgentItemIds.add(id);
+      if (item.phase === 'final_answer') turn.finalText = String(item.text ?? '');
+      else if (!turn.itemText.has(id) && item.text) turn.itemText.set(id, String(item.text));
+      turn.allAgentText = [...turn.itemText.values()].join('');
     }
     return;
   }
@@ -1512,6 +1665,15 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     strictThreadResume = true;
     startupDeadlineAtMs ??= Date.now() + DEFAULT_REQUEST_TIMEOUT_MS;
     await initializeAppServer(startupDeadlineAtMs);
+    // No native turn has been submitted to the replacement engine yet. Publish
+    // its proof before thread/resume or turn/start can emit activity/tools.
+    // The queued input is still work: never publish prompt-ready at this edge.
+    emitMarker('state', {
+      busy: true, tracksTurn: false, acceptingInput: runnerReady, atMs: Date.now(),
+      ...(client.processIdentity ? { processIdentity: client.processIdentity } : {}),
+      ...(client.executionIdentity ? { appServerProcess: client.executionIdentity } : {}),
+      processIdentityBoundary: 'idle_restart',
+    });
   }
   if (threadReady && threadId) return threadId;
 
@@ -1534,6 +1696,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         // Keep Codex App's rich history in sync with turns created by this
         // external runner so the desktop UI can render follow-up messages.
         persistExtendedHistory: true,
+        ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
         ...(browserBroker ? { dynamicTools: [CODEX_BROWSER_DYNAMIC_TOOL] } : {}),
       }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/resume') });
       const resumedThreadId = String(resumed.thread.id);
@@ -1541,6 +1704,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         throw new Error(`Strict resume expected thread ${threadId}, received ${resumedThreadId}`);
       }
       threadId = resumedThreadId;
+      currentModel = resumed.model;
       threadReady = true;
       emitMarker('thread', { threadId: resumedThreadId });
       return resumedThreadId;
@@ -1572,6 +1736,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     // fresh thread/start, so a fold-in (existing thread) keeps its frozen model —
     // matching the API's fresh-spawn-only override semantics.
     ...(args.model && args.model.trim() ? { model: args.model.trim() } : {}),
+    ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,
@@ -1583,6 +1748,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/start') });
   const startedThreadId = String(started.thread.id);
   threadId = startedThreadId;
+  currentModel = started.model;
   threadReady = true;
   emitMarker('thread', { threadId: startedThreadId });
   void client.request('thread/name/set', {
@@ -1615,6 +1781,8 @@ function fenceUnknown(
 ): void {
   if (generationFenced) return;
   generationFenced = true;
+  cancelUserInputRequests();
+  cancelAsyncUserInputRequests();
   if (turn) turn.phase = 'fenced';
   emitLifecycle({ kind: 'unknown_outcome', operation, category });
   emitLifecycle({ kind: 'fatal', operation, category });
@@ -1667,6 +1835,13 @@ function inGroupMode(turn: ActiveTurn): boolean {
  * follow-up head explicitly authorized by the daemon admission gate. A Goal
  * root additionally requires its own matching steer to have been accepted.
  */
+function canSteerInputToNativeTurn(head: QueuedInput, nativeTurnId: string | undefined): boolean {
+  return head.codexAppSteerable === true
+    && codexAsyncSteerTargetMatches(head.replyTurnId, head.codexAppInput, nativeTurnId)
+    && (!head.codexAppInput?.steerTargetTurnId
+      || (!cleanInputUnsupported && supportsClientUserMessageId(detectedCodexVersion())));
+}
+
 function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
   return !generationFenced
     && !turn.completed
@@ -1679,7 +1854,8 @@ function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
     && turn.accepted !== undefined
     && turn.accepted.length > 0
     && turn.accepted[0].input.codexAppSteerable === true
-    && head.codexAppSteerable === true;
+    && canSteerInputToNativeTurn(head, turn.canonicalNativeTurnId)
+    && (!head.codexAppInput?.steerTargetTurnId || !!turn.accepted[0].clientUserMessageId);
 }
 
 /**
@@ -1741,8 +1917,11 @@ function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void
     // Rebuild the real answer from the LAST accepted member's user item.
     turn.finalText = rebuildReconciledFinal(nativeTurn, verdict.lastIndex);
     turn.allAgentText = '';
+    turn.itemText.clear();
+    turn.knownAgentItemIds.clear();
   }
   turn.terminalCompletion = nativeTurn;
+  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
   if (typeof nativeTurn?.id === 'string' && nativeActiveTurnId === nativeTurn.id) {
     nativeActiveTurnId = undefined;
   }
@@ -1803,7 +1982,10 @@ async function reconcileSteeredGroupFromHistory(
       const { turn: matched, lastIndex } = matches[0];
       turn.finalText = rebuildReconciledFinal(matched, lastIndex);
       turn.allAgentText = '';
+      turn.itemText.clear();
+      turn.knownAgentItemIds.clear();
       turn.terminalCompletion = matched;
+      turn.failureCode = codexAppTurnFailureCode(matched);
       // R4-B3: the matched turn is now the authoritative native identity for this
       // group — the final marker, native id, and usage drain must all key off
       // matched.id, not the stale pre-history canonical. Compare-and-clear the OLD
@@ -2013,7 +2195,10 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
   const group = turn.accepted && turn.accepted.length > 0
     ? turn.accepted
     : [{ input: { content: '' }, receivedAtMs: turn.startedAtMs } as Dispatch];
-  const finalText = (turn.finalText || turn.allAgentText).trim();
+  for (const [id, text] of turn.itemText) {
+    if (!turn.knownAgentItemIds.has(id) && !turn.asyncItemIds.has(id)) output.display(text);
+  }
+  const finalText = (turn.userInputFailure || turn.finalText || turn.allAgentText).trim();
   const completedAtMs = Date.now();
   const lastIndex = group.length - 1;
   for (let index = 0; index < group.length; index++) {
@@ -2024,6 +2209,7 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
       ...(replyTurnId ? { turnId: replyTurnId } : {}),
       ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
       content: isReal ? finalText : '',
+      ...(isReal && turn.failureCode ? { errorCode: turn.failureCode } : {}),
       // The real answer's clock starts at the LAST accepted dispatch so a
       // botmux-send marker emitted before the follow-up landed cannot race
       // ahead and suppress it. A single-member group keeps the turn's own
@@ -2038,6 +2224,12 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
 
 async function runTurn(message: QueuedInput): Promise<void> {
   const tid = await ensureThread();
+  // Native work can change while ensureThread awaits. A late answer must never
+  // turn into a steer of a different Goal/native turn at this boundary.
+  if (nativeActiveTurnId !== undefined && !canSteerInputToNativeTurn(message, nativeActiveTurnId)) {
+    queue.unshift(message);
+    return;
+  }
   // The botmux/Lark reply identity is the top-level replyTurnId (which already
   // fell back to the sidecar clientUserMessageId at decode time). This is the id
   // exposed on the final marker for reply routing; the app-server's native turn
@@ -2142,6 +2334,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
         turn.finalText = '';
         turn.allAgentText = '';
         turn.itemText.clear();
+        turn.knownAgentItemIds.clear();
         writeLine('[codex-app] captured native turn completed before steer acceptance; starting the same client-id input as a new turn');
         continue;
       }
@@ -2355,7 +2548,7 @@ async function drainQueue(): Promise<void> {
       // no-active-turn branch re-kicks drainQueue so the head starts its own
       // turn. Without this a special-sink / non-interactive input would be
       // silently merged into the Goal turn and its output mis-delivered.
-      if (nativeActiveTurnId !== undefined && queue[0].codexAppSteerable !== true) {
+      if (nativeActiveTurnId !== undefined && !canSteerInputToNativeTurn(queue[0], nativeActiveTurnId)) {
         break;
       }
       const next = queue.shift()!;
@@ -2375,6 +2568,7 @@ async function drainQueue(): Promise<void> {
           ...(replyTurnId ? { turnId: replyTurnId } : {}),
           ...(nativeTurnId ? { nativeTurnId } : {}),
           content: message,
+          errorCode: codexAppTurnFailureCode({ status: 'failed', error: err }),
           startedAtMs: activeTurn?.startedAtMs ?? completedAtMs,
           completedAtMs,
         });
@@ -2392,13 +2586,71 @@ async function drainQueue(): Promise<void> {
       // and never wedges without an idle/ready edge.
       const parkedBehindGoal = queue.length > 0
         && nativeActiveTurnId !== undefined
-        && queue[0].codexAppSteerable !== true;
+        && !canSteerInputToNativeTurn(queue[0], nativeActiveTurnId);
       if (queue.length === 0 || parkedBehindGoal) {
         settleRunnerState();
       }
     }
   } finally {
     processing = false;
+  }
+}
+
+async function updateReasoningEffort(
+  requestId: string, effort: string, tid: string | undefined, targetTurnId: string | undefined, deadline: number,
+): Promise<void> {
+  const current = client;
+  const modelId = currentModel;
+  let saved = false;
+  try {
+    if (!runnerReady || !threadReady || !tid || tid !== threadId || !modelId
+      || generationFenced || current.hasExited || Date.now() >= deadline) {
+      emitMarker('effort_result', { requestId, status: 'unavailable' });
+      return;
+    }
+    let cursor: string | undefined;
+    let model: JsonObject | undefined;
+    do {
+      const page = await current.request('model/list', { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      model = page.data?.find((entry: JsonObject) => entry.model === modelId || entry.id === modelId);
+      cursor = page.nextCursor ?? undefined;
+    } while (!model && cursor);
+    if (!model) throw new Error('current model not advertised');
+    const choices = model.supportedReasoningEfforts?.map((entry: JsonObject) => entry.reasoningEffort) ?? [];
+    if (!choices.includes(effort)) {
+      emitMarker('effort_result', { requestId, status: 'invalid', choices });
+      return;
+    }
+    if (client !== current || threadId !== tid || currentModel !== modelId || generationFenced) throw new Error('runner changed');
+    await current.request('thread/settings/update', { threadId: tid, effort }, {
+      timeoutMs: Math.min(10_000, deadline - Date.now()),
+    });
+    saved = true;
+    let status = 'future_only';
+    let reason: import('./types.js').CodexAppEffortResult['reason'];
+    // Capture the native id on command arrival. Never retarget a later turn
+    // when the original completes while model/list or settings/update waits.
+    if (targetTurnId) {
+      const result = await current.request('turn/settings/update', { threadId: tid, turnId: targetTurnId, effort }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      if (result.status === 'applied') status = 'applied';
+      else if (result.status === 'targetUnavailable') reason = 'target_unavailable';
+      else throw new Error('unknown settings status');
+    }
+    emitMarker('effort_result', { requestId, status, ...(reason ? { reason } : {}) });
+  } catch (error) {
+    // Only the specific turn-settings gate proves the feature is disabled.
+    const featureDisabled = saved && error instanceof AppServerRpcError
+      && error.method === 'turn/settings/update' && error.code === -32600
+      && error.message.includes('turn settings updates require the step_model_switching feature');
+    // An ambiguous settings response never cancels/replays the business turn.
+    emitMarker('effort_result', {
+      requestId, status: saved ? 'future_only' : 'error',
+      ...(featureDisabled ? { reason: 'step_model_switching_disabled' } : {}),
+    });
   }
 }
 
@@ -2409,6 +2661,15 @@ function enqueueLine(line: string): void {
     const encoded = trimmed.slice('::botmux-codex-app:'.length);
     try {
       const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      if (decoded?.type === 'effort' && typeof decoded.requestId === 'string'
+        && decoded.requestId.length > 0 && decoded.requestId.length <= 128
+        && typeof decoded.effort === 'string' && /^(low|medium|high|xhigh|max|ultra)$/.test(decoded.effort)) {
+        const targetTurnId = activeTurn?.nativeTurnId ?? nativeActiveTurnId;
+        const targetThreadId = threadId;
+        const deadline = Date.now() + 30_000;
+        effortUpdateTail = effortUpdateTail.then(() => updateReasoningEffort(decoded.requestId, decoded.effort, targetThreadId, targetTurnId, deadline));
+        return;
+      }
       if (decoded?.type === 'message' && typeof decoded.content === 'string') {
         const codexAppInput = isCodexAppTurnInput(decoded.codexAppInput)
           ? decoded.codexAppInput
@@ -2423,7 +2684,7 @@ function enqueueLine(line: string): void {
           ? decoded.replyTurnId
           : codexAppInput?.clientUserMessageId;
         // Explicit positive only: the daemon admission gate (decision A) sets
-        // `true` solely for a plain-human-interactive turn. Any other value is
+        // `true` for an eligible human input or correlated answer. Any other value is
         // treated as absent → forced serial, never a silent steer authorization.
         const codexAppSteerable = decoded.codexAppSteerable === true;
         queue.push({
@@ -2513,6 +2774,8 @@ async function main(): Promise<void> {
 }
 
 process.on('SIGTERM', async () => {
+  cancelUserInputRequests();
+  cancelAsyncUserInputRequests();
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
@@ -2522,6 +2785,8 @@ process.on('SIGTERM', async () => {
 });
 
 process.on('SIGINT', async () => {
+  cancelUserInputRequests();
+  cancelAsyncUserInputRequests();
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();

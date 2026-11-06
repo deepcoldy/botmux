@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from '../../core/group-default-models.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { useT } from './react-hooks.js';
-import { DropdownField, ModelPickerField } from './bot-defaults-page.js';
+import { DropdownField, ModelPickerField } from './field-controls.js';
 import { fetchCliOptions, fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption, selectedCliOption } from './bot-defaults.js';
 
 type Props = {
@@ -20,7 +20,7 @@ type Props = {
 /** The CLI is display-only and always follows the bot's Agent configuration. */
 export function GroupDefaultModelsRow(props: Props) {
   if (props.cliId !== 'codex' && props.cliId !== 'claude-code') {
-    return <p>{props.botName} · CLI：{props.cliId ?? '未加载'}（暂不支持群级模型配置）</p>;
+    return <p className="group-default-models-cli">CLI：{props.cliId ?? '未加载'}（暂不支持群级模型配置）</p>;
   }
   return <GroupAgentDefaults key={`${props.appId}:${props.cliId}`} {...props} cliId={props.cliId} />;
 }
@@ -40,14 +40,14 @@ function GroupAgentDefaults(props: Props & { cliId: 'codex' | 'claude-code' }) {
   }, [props.models, props.cliId]);
   useEffect(() => {
     let stale = false;
-    Promise.all([fetchCliOptions(), fetchDetectedModels(props.cliId)]).then(([catalog, detected]) => {
+    Promise.all([fetchCliOptions(), fetchDetectedModels(props.cliId, props.appId)]).then(([catalog, detected]) => {
       if (stale) return;
       setOptions(mergeModelCandidates(modelSuggestionsForOption(selectedCliOption(catalog.options, props.cliId), catalog), detected?.models ?? null));
       setDetectedCount(detected?.source === 'live' ? detected.models.length : 0);
       setDetecting(false);
     });
     return () => { stale = true; };
-  }, [props.cliId]);
+  }, [props.cliId, props.appId]);
 
   const efforts = reasoningEffortsForCliModel(props.cliId, settings.model || props.botModel);
   function changeModel(model: string) {
@@ -80,7 +80,7 @@ function GroupAgentDefaults(props: Props & { cliId: 'codex' | 'claude-code' }) {
 
   const id = `group-${props.appId}`;
   return <form onSubmit={save} className="group-default-models-row">
-    <strong>{props.botName} · CLI：{props.cliId === 'codex' ? 'Codex' : 'Claude'}（跟随 Agent 配置）</strong>
+    <small className="group-default-models-cli">CLI：{props.cliId === 'codex' ? 'Codex' : 'Claude'}（跟随 Agent 配置）</small>
     <div className="group-default-models-field"><span>模型</span>
       <ModelPickerField value={settings.model ?? ''} onChange={changeModel} options={options}
         disabled={props.disabled || saving} busy={detecting} dataInput={`${id}-model`}

@@ -82,7 +82,7 @@ export const BLOCK_META: Record<string, { label: string; hint?: string }> = {
   },
   routing_shell: {
     label: 'Shell 提示路径 · 同批规则散文版',
-    hint: 'codex / gemini / opencode 等无系统提示参数的 CLI，随首轮 prompt 注入',
+    hint: 'codex / opencode 等无系统提示参数的 CLI，随首轮 prompt 注入',
   },
   identity: {
     label: '<identity> 身份与多 bot 归属',
@@ -167,7 +167,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     key: 'ai.routing.workflow_hint', block: 'routing_system', stage: 'new', label: 'Workflow 发现提示', kind: 'editable',
     gateLabel: '仅机器级 Workflow 功能开关开启时注入',
   },
-  { key: 'ai.routing.feedback_response_kind', block: 'routing_system', stage: 'new', label: '最终回答反馈提示（--response-kind final）', kind: 'editable' },
+  { key: 'ai.routing.feedback_response_kind', block: 'routing_system', stage: 'new', label: '最终答复标记（--response-kind final）', kind: 'editable' },
   { key: 'ai.routing.hidden_context_defense', block: 'routing_system', stage: 'new', label: '隐藏上下文防注入说明', kind: 'editable' },
   {
     key: 'ai.routing.xpi_as_hint', block: 'routing_system', stage: 'new',
@@ -176,7 +176,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '实验开关：跨主体插队 XPI（默认关）；强制开/关同时作用于 Shell 路径',
   },
 
-  // shell-hints path (codex / gemini / opencode / …) — the same guidance, prose form
+  // shell-hints path (codex / opencode / …) — the same guidance, prose form
   { key: 'ai.shell.intro', block: 'routing_shell', stage: 'new', label: 'Shell：开场说明（标准模式）', kind: 'editable' },
   {
     key: 'ai.shell.intro_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
@@ -236,8 +236,14 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   // <botmux_credentials> — trigger-user-auth sessions only
   {
-    key: 'ai.credentials.acting_identity', block: 'credentials', stage: 'new', kind: 'editable',
+    key: 'ai.credentials.acting_identity', block: 'credentials', stage: 'new',
+    kind: 'placeholder', placeholders: ['tools'],
     label: '凭证：当前授权身份说明', gateLabel: '仅该 bot 开启 trigger-user CLI 鉴权时注入',
+  },
+  {
+    key: 'ai.credentials.git_identity', block: 'credentials', stage: 'new',
+    kind: 'placeholder', placeholders: ['host'],
+    label: '凭证：git 鉴权身份说明', gateLabel: '仅当 bytedcli 在 tools 内且配置了 gitHost 时注入',
   },
   {
     key: 'ai.credentials.never_read_others', block: 'credentials', stage: 'new', kind: 'editable',
@@ -249,7 +255,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.credentials.on_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：鉴权失败处理流程', gateLabel: '仅 trigger-user 鉴权会话',
+    label: '凭证：飞书鉴权失败处理流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
+  },
+  {
+    key: 'ai.credentials.on_bytedcli_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
+    label: '凭证：ByteCloud 鉴权失败处理流程', gateLabel: '仅当 bytedcli 在 triggerUserAuth.tools 内时注入',
   },
   {
     key: 'ai.credentials.on_auth_link', block: 'credentials', stage: 'new', kind: 'editable',
@@ -257,7 +267,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：missing_scope 补授权流程', gateLabel: '仅 trigger-user 鉴权会话',
+    label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
   },
 
   // ───────── cross-listed: 会话开始 + 每条新消息 (new + followup) ──────────
@@ -363,6 +373,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   // ───────────────────── stage: 每条新消息 (followup) ──────────────────────
 
   { key: 'ai.followup.reminder', block: 'followup', stage: 'followup', label: '续轮提醒（默认）', kind: 'editable' },
+  { key: 'ai.followup.feishu_safe_emphasis', block: 'followup', stage: 'followup', label: '飞书安全强调格式', kind: 'editable' },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
     label: '续轮提醒（Claude Code hook 离带注入版）',

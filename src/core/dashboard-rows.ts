@@ -11,9 +11,14 @@ import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStat
 import type { CliId } from '../adapters/cli/types.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
-import { getBotBrand } from '../bot-registry.js';
+import { getBot, getBotBrand } from '../bot-registry.js';
+import { sessionSandboxDrift, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { type Brand, chatAppLink, threadAppLink } from '../im/lark/lark-hosts.js';
-import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
+import { getSessionUsageWithContext, type SessionTokenUsage } from './cost-calculator.js';
+import { buildContextUsage } from './session-context-usage.js';
+import type { ObserveContext } from '../services/session-observe.js';
+import { readStatuslineSnapshot } from '../services/statusline-snapshot.js';
+import { config } from '../config.js';
 import { readSessionOpenTodos } from '../services/todo-state.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
 import { safeSessionPreviewTarget, type SessionPreviewTarget } from './session-preview.js';
@@ -25,6 +30,9 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  /** Present only when the session's frozen sandbox mode differs from what the
+   *  bot's CURRENT config would give a new session (dashboard badge). */
+  sandboxDrift?: { session: SandboxMode; current: SandboxMode };
   cliInstanceId?: string;
   cliInstanceSource?: string;
   creationSource?: string;
@@ -33,6 +41,15 @@ export interface SessionRow extends SessionMessagePreview {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
+  requestedLaunch?: NonNullable<Session['dispatchLaunchSpec']>['requested'];
+  /** Only populated once the worker has actually observed the runtime (i.e. the
+   *  session carries dispatchLaunchSpec.effectiveRuntime). No synthetic
+   *  "requested-as-effective" fallback: consumers that need pre-observation
+   *  intent must read requestedLaunch. */
+  effectiveRuntime?: {
+    model: string; reasoningEffort?: string;
+    workerGeneration?: number; observedAt?: string;
+  };
   /** Concrete distribution identity frozen on the session. Older path-only
    * sessions expose a basename-derived legacy identity. */
   runtimeId?: string;
@@ -113,6 +130,11 @@ export interface SessionRow extends SessionMessagePreview {
   openTodos?: { total: number; done: number; remaining: number; hasInProgress: boolean; items: Array<{ status: string; text: string }> };
   /** Native Agent CLI token usage for this session. Null means unavailable. */
   tokenUsage?: SessionTokenUsage | null;
+  /** How full the context is right now (latest request's prompt size, window,
+   *  compactions). Computed together with `tokenUsage` from the same transcript
+   *  read, so it is absent whenever token scans are skipped (bulk lists) or the
+   *  CLI/transcript cannot prove a measurement. Feeds `botmux observe`. */
+  contextUsage?: ObserveContext;
   /** Worker process PID, active rows only. Used by dashboard resource attribution. */
   workerPid?: number;
   /** Persisted row intentionally kept active but detached from daemon routing
@@ -204,14 +226,34 @@ export function sessionLastActivityAtMs(s: Session): number {
   return parseSessionTime(s.lastMessageAt) ?? sessionCreatedAtMs(s);
 }
 
-function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage | null {
-  return getSessionTokenUsage({
-    cliId: s.cliId ?? 'unknown',
+interface SessionRowUsage {
+  tokenUsage: SessionTokenUsage | null;
+  contextUsage?: ObserveContext;
+}
+
+/** One transcript read (via the shared stat/incremental cache) feeds both the
+ *  cumulative token totals and the context gauge — never two scans. */
+function readSessionRowUsage(s: Session, workingDir?: string): SessionRowUsage {
+  const cliId = s.cliId ?? 'unknown';
+  const { snapshot, contextObservation } = getSessionUsageWithContext({
+    cliId,
     sessionId: s.sessionId,
     cliSessionId: s.cliSessionId,
     cwd: workingDir ?? s.workingDir,
     larkAppId: s.larkAppId,
   });
+  // A Remote Runner transcript lives behind the provider boundary; the
+  // daemon-host resolver would be reading the wrong filesystem.
+  if (s.backendType === 'remote-runner') return { tokenUsage: snapshot.tokens };
+  let statuslineWindowTokens: number | undefined;
+  if (cliId === 'claude-code') {
+    // Claude's transcript only names the model, never its window; the window is
+    // whatever the statusline last reported (undefined once that is stale).
+    try { statuslineWindowTokens = readStatuslineSnapshot(config.session.dataDir, s.sessionId)?.contextWindowTokens; }
+    catch { /* best-effort: the window is optional */ }
+  }
+  const contextUsage = buildContextUsage({ snapshot, contextObservation, statuslineWindowTokens });
+  return { tokenUsage: snapshot.tokens, ...(contextUsage ? { contextUsage } : {}) };
 }
 
 function sessionOpenTodos(s: Session, workingDir?: string, fresh?: boolean): SessionRow['openTodos'] {
@@ -260,6 +302,14 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
+function sandboxDriftField(s: Session): Pick<SessionRow, 'sandboxDrift'> {
+  if (s.sandbox === undefined || !s.larkAppId) return {};
+  let botCfg: Parameters<typeof sessionSandboxDrift>[1];
+  try { botCfg = getBot(s.larkAppId).config; } catch { return {}; }
+  const drift = sessionSandboxDrift(s.sandbox, botCfg);
+  return drift ? { sandboxDrift: drift } : {};
+}
+
 export interface DashboardRowOptions {
   fresh?: boolean;
   /**
@@ -271,14 +321,14 @@ export interface DashboardRowOptions {
   includeTokenUsage?: boolean;
 }
 
-function maybeSessionTokenUsage(
+function maybeSessionRowUsage(
   s: Session,
   workingDir: string | undefined,
   opts?: DashboardRowOptions,
   opts2?: { usePersistedSnapshot?: boolean },
-): SessionTokenUsage | null {
-  if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return s.tokenUsage;
-  return opts?.includeTokenUsage === false ? null : sessionTokenUsage(s, workingDir);
+): SessionRowUsage {
+  if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return { tokenUsage: s.tokenUsage };
+  return opts?.includeTokenUsage === false ? { tokenUsage: null } : readSessionRowUsage(s, workingDir);
 }
 
 export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
@@ -290,6 +340,12 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...(ds.session.dispatchLaunchSpec ? {
+      requestedLaunch: ds.session.dispatchLaunchSpec.requested,
+      ...(ds.session.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: ds.session.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: ds.session.cliInstanceBinding?.source,
     creationSource: ds.session.creationSource,
@@ -349,10 +405,11 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     agentAttention: ds.agentAttention
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
-    tokenUsage: maybeSessionTokenUsage(ds.session, ds.workingDir, opts),
+    ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
+    ...sandboxDriftField(ds.session),
     ...buildSessionMessagePreview(ds.session),
     ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
   };
@@ -367,6 +424,12 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
@@ -399,7 +462,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     ...(topicId ? { threadId: topicId } : {}),
-    tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
+    ...maybeSessionRowUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
     ...composeSendRoutingFields(s),
   };
@@ -422,6 +485,12 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
@@ -455,7 +524,8 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
-    tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
+    ...sandboxDriftField(s),
+    ...maybeSessionRowUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
     ...composeSendRoutingFields(s),
   };

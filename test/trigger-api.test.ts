@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../src/services/trigger-log-store.js', () => ({ appendTriggerLog: vi.fn() }));
 
 import { buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
-import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
+import { validateTriggerRequest, TRIGGER_SOURCE_TYPES, type TriggerRequest } from '../src/services/trigger-types.js';
 import { dispatchTriggerRequest, queryTriggerResult } from '../src/dashboard/trigger-api.js';
 
 function request(): TriggerRequest {
@@ -34,6 +34,45 @@ describe('trigger request contract', () => {
     const v = validateTriggerRequest(bad);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('accepts payloadTrusted only as literal true on a webhook turn', () => {
+    const ok = request();
+    ok.payloadTrusted = true;
+    expect(validateTriggerRequest(ok).ok).toBe(true);
+    for (const mutate of [
+      (r: any) => { r.payloadTrusted = 'true'; },
+      (r: any) => { r.payloadTrusted = false; },
+      (r: any) => { r.payloadTrusted = 1; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'headless'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'vc_meeting'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'ui'; },
+      (r: any) => { r.payloadTrusted = true; r.target = { kind: 'workflow', botId: 'app1', chatId: 'oc_1', workflowId: 'w' }; },
+    ]) {
+      const bad = request() as any;
+      mutate(bad);
+      const v = validateTriggerRequest(bad);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.status).toBe(400);
+    }
+  });
+
+  it('accepts every known connector source type and rejects unknown ones', () => {
+    for (const type of TRIGGER_SOURCE_TYPES) {
+      const req = request();
+      req.source = { ...req.source, type };
+      expect(validateTriggerRequest(req).ok, type).toBe(true);
+    }
+    for (const badType of ['email', 'EMAIL', '', 'webhoox', 42, undefined]) {
+      const bad = request() as any;
+      bad.source = { ...bad.source, type: badType };
+      const v = validateTriggerRequest(bad);
+      expect(v.ok, String(badType)).toBe(false);
+      if (!v.ok) {
+        expect(v.status).toBe(400);
+        expect(v.body.errorCode).toBe('bad_request');
+      }
+    }
   });
 
   it('accepts a custom or suppressed topic message and rejects malformed presentation', () => {
@@ -543,5 +582,36 @@ describe('queryTriggerResult — legacy ok translation for webhook consumers', (
     const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
     expect(res.body.ok).toBe(false);
     expect(res.status).toBe(400);
+  });
+});
+
+
+describe('async group communication contract', () => {
+  it.each(['ui', 'webhook'] as const)('allows authorized messages for %s callers and keeps the sentinel', type => {
+    const req = request();
+    req.source = { ...req.source, type, connectorId: 'generic-caller' };
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'existing' };
+    req.options = { asyncReturnSessionId: true, allowChatMessages: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    const prompt = buildUntrustedEventPrompt(req, 't');
+    expect(prompt).toContain('may call botmux send for messages authorized by the current request');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(prompt).not.toContain('Do not call botmux send; do not post');
+    for (const allowChatMessages of [false, undefined]) {
+      req.options.allowChatMessages = allowChatMessages;
+      expect(buildUntrustedEventPrompt(req, 't')).toContain('Do not call botmux send; do not post');
+    }
+  });
+  it('rejects invalid opt-in shapes', () => {
+    for (const changes of [
+      { options: { asyncReturnSessionId: true, allowChatMessages: 'true' } },
+      { options: { waitForFinalOutput: true, allowChatMessages: true } },
+      { options: { asyncReturnSessionId: true, allowChatMessages: true, steer: true } },
+      { target: { kind: 'turn', chatId: 'oc_real' } },
+      { source: { type: 'headless', requestId: 'headless' } },
+    ]) {
+      const req = { ...request(), target: { kind: 'turn', sessionId: 's' }, options: { asyncReturnSessionId: true, allowChatMessages: true }, ...changes };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
   });
 });

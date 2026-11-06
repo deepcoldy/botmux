@@ -11,7 +11,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),
@@ -100,6 +100,7 @@ import {
   suspendWorker,
   __testOnly_reserveWorkerGeneration,
   __testOnly_setupWorkerHandlers,
+  __testOnly_setSuspendBackingVerifier,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -169,6 +170,7 @@ function previewClearEvents(): unknown[] {
 }
 
 beforeEach(() => {
+  __testOnly_setSuspendBackingVerifier(() => true);
   vi.clearAllMocks();
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_reply'),
@@ -177,6 +179,8 @@ beforeEach(() => {
     closeSession: vi.fn(),
   });
 });
+
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 
 describe('P1-13 worker generation boundaries drop the preview target', () => {
   it('clears and persists on generation reservation (refork / CLI switch / adopt all reserve here)', () => {

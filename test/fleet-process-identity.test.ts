@@ -25,6 +25,10 @@ describe('fleet process identity', () => {
     expect(builtinFleetEntryMatches('daemon', '/new/botmux __dashboard')).toBe(false);
     expect(builtinFleetEntryMatches('daemon', '/tmp/index-daemon.js.backup')).toBe(false);
     expect(builtinFleetEntryMatches('dashboard', '/usr/bin/node /new/dist/index-dashboard.js')).toBe(true);
+    expect(builtinFleetEntryMatches('supervisor', '/usr/bin/node /old/dist/index-supervisor.js')).toBe(true);
+    expect(builtinFleetEntryMatches('supervisor', '/new/botmux __supervisor')).toBe(true);
+    expect(builtinFleetEntryMatches('supervisor', '/new/botmux __supervisor-helper')).toBe(false);
+    expect(builtinFleetEntryMatches('supervisor', '/tmp/index-supervisor.js.backup')).toBe(false);
   });
   it('accepts a persisted birth identity without consulting a recomputed command', () => {
     const result = inspectFleetProcess(61, 'boot-a:123', undefined, cmd => cmd.includes('__supervisor'),

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, watch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
@@ -48,6 +49,65 @@ export function botsRosterSignature(online: DaemonInfo[]): string {
     .map(d => `${d.larkAppId}:${d.botName ?? ''}:${d.cliId ?? ''}:${d.botIndex}`)
     .sort()
     .join('|');
+}
+
+/**
+ * 名册的短摘要，只用来比「断线前后变没变」。`/events` 每条连接一建立就推一帧
+ * `bots.roster` 带上它，前端拿它和断线前记住的值比对，决定要不要补发 `bots.changed`。
+ *
+ * 比 {@link botsRosterSignature} 多算进每个 daemon 的进程代次（bootInstanceId / pid /
+ * startedAt）：标签页挂起期间某个 bot 停掉、改了配置再起来，签名前后一模一样，可配置
+ * 已经变了——只比签名就会漏补发，Bot 配置页继续显示旧值。心跳时间仍不算进来。
+ * 只发摘要不发明文：这一帧每条连接都会收到，没必要把名册本身多送一遍。
+ */
+export function botsRosterDigest(online: DaemonInfo[]): string {
+  const generations = [...online]
+    .map(d => `${d.larkAppId}:${d.bootInstanceId ?? ''}:${d.pid}:${d.startedAt}`)
+    .sort()
+    .join('|');
+  return createHash('sha256')
+    .update(`${botsRosterSignature(online)}\n${generations}`)
+    .digest('hex')
+    .slice(0, 16);
+}
+
+/** `/events` 上关于 Bot 名册的一帧。 */
+export type RosterFrame =
+  | { event: 'bots.changed'; body: { signature: string; digest: string } }
+  /**
+   * `phase: 'connect'`：建流时的对账摘要，前端拿它和断线前的基线比，变了才补发
+   * bots.changed。`phase: 'live'`：连接期间 daemon 原地重启（签名没变、代次变了），
+   * 只同步基线、不触发刷新——否则下次挂起恢复会拿着过期基线白白补发一次，Bot 配置页
+   * 重拉会卸掉编辑器、丢掉未保存的草稿。
+   */
+  | { event: 'bots.roster'; body: { digest: string; phase: 'connect' | 'live' } };
+
+/**
+ * 一条 `/events` 流的名册帧状态机：建流先给对账摘要；之后签名变了推 bots.changed
+ * （行为同以往：只有名册真的变了才让页面重拉），签名没变但代次变了推 live 摘要，
+ * 纯心跳变化什么都不推。
+ */
+export function trackRosterFrames(online: DaemonInfo[]): {
+  connect: RosterFrame;
+  next(online: DaemonInfo[]): RosterFrame | null;
+} {
+  let signature = botsRosterSignature(online);
+  let digest = botsRosterDigest(online);
+  return {
+    connect: { event: 'bots.roster', body: { digest, phase: 'connect' } },
+    next(current) {
+      const nextSignature = botsRosterSignature(current);
+      const nextDigest = botsRosterDigest(current);
+      if (nextSignature !== signature) {
+        signature = nextSignature;
+        digest = nextDigest;
+        return { event: 'bots.changed', body: { signature, digest } };
+      }
+      if (nextDigest === digest) return null;
+      digest = nextDigest;
+      return { event: 'bots.roster', body: { digest, phase: 'live' } };
+    },
+  };
 }
 
 export interface DaemonRegistryOptions {

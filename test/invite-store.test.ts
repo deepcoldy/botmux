@@ -2,10 +2,11 @@
  * Team invite store: single-use, short-TTL admission codes.
  * Run: pnpm vitest run test/invite-store.test.ts
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { logger } from '../src/utils/logger.js';
 import { createInvite, consumeInvite, deleteInvitesForTeam } from '../src/services/invite-store.js';
 
 let dataDir: string;
@@ -51,5 +52,22 @@ describe('invite-store', () => {
     // other teams untouched
     expect(consumeInvite(dataDir, b.code)).toEqual({ ok: true, teamId: 'team_b' });
     expect(deleteInvitesForTeam(dataDir, 'team_none')).toBe(0);
+  });
+});
+
+describe('invite-store: corrupt file is quarantined, not overwritten', () => {
+  beforeEach(() => { vi.spyOn(logger, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('keeps the corrupt bytes as team-invites.json.corrupt-* after the next write', () => {
+    const corrupt = '{"oldcode":{"code":"oldcode","teamId":"team_a"';
+    writeFileSync(join(dataDir, 'team-invites.json'), corrupt);
+
+    const inv = createInvite(dataDir, 'team_b', 'on_1');
+    expect(consumeInvite(dataDir, inv.code)).toEqual({ ok: true, teamId: 'team_b' });
+
+    const quarantined = readdirSync(dataDir).filter(f => f.startsWith('team-invites.json.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    expect(readFileSync(join(dataDir, quarantined[0]), 'utf-8')).toBe(corrupt);
   });
 });

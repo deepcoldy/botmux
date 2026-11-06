@@ -1,9 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-
-function expandHome(path: string): string {
-  return path.startsWith('~') ? join(homedir(), path.slice(1)) : path;
-}
+import { expandHomePath as expandHome } from '../utils/working-dir.js';
 
 function xdgRoot(envName: string, fallback: string): string {
   const value = process.env[envName]?.trim();

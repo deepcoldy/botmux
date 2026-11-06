@@ -76,6 +76,24 @@ describe('prompt fragment catalog', () => {
     expect(validateFragmentOverride(line.key, '群里有 {count} 个：{names}')).toBeUndefined();
   });
 
+  it('protects {tools}/{host} on the credential-identity fragments', () => {
+    // The governed-tool list and git host are runtime values: an override that
+    // drops either token would silently render a credential block that names no
+    // tool (or no host), recreating the over-broad promise this catalog tracks.
+    expect(
+      validateFragmentOverride('ai.credentials.acting_identity', '本会话已启用按发起人身份注入。'),
+    ).toMatch(/tools/);
+    expect(
+      validateFragmentOverride('ai.credentials.acting_identity', '已为 {tools} 启用。'),
+    ).toBeUndefined();
+    expect(
+      validateFragmentOverride('ai.credentials.git_identity', 'git 鉴权使用本轮身份。'),
+    ).toMatch(/host/);
+    expect(
+      validateFragmentOverride('ai.credentials.git_identity', 'git 对 {host} 使用本轮身份。'),
+    ).toBeUndefined();
+  });
+
   it('fragmentStages lists primary + extra stages without duplicates', () => {
     const attach = PROMPT_FRAGMENTS.find((f) => f.key === 'ai.attach.hint')!;
     expect(fragmentStages(attach).sort()).toEqual(['followup', 'new']);

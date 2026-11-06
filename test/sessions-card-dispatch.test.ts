@@ -151,7 +151,7 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
     expect(mockedUpdateMessage).not.toHaveBeenCalled();
   });
 
-  it('close (happy): returns { card } with closed-state detail; updateMessage NOT called', async () => {
+  it.each([undefined, 'mock archive error'])('close returns closed card and surfaces archive warning (%s)', async archiveError => {
     const sessions = [
       { sessionId: 'sess_close', rootMessageId: 'om', chatId: 'oc', chatType: 'group',
         title: 'close me', cliId: 'claude-code', workingDir: '~/x', status: 'idle',
@@ -163,7 +163,7 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
         return { status: 200, raw: '', body: { sessions } };
       }
       if (req.method === 'POST' && req.path === '/__daemon/sessions/sess_close/close') {
-        return { status: 200, raw: '', body: { ok: true, outcome: 'closed', alreadyClosed: false } };
+        return { status: 200, raw: '', body: { ok: true, outcome: 'closed', alreadyClosed: false, archiveError } };
       }
       throw new Error('unexpected: ' + JSON.stringify(req));
     });
@@ -183,6 +183,8 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
     // Closed-state synth (slice 2b): close button replaced by resume.
     expect(cardJson).toContain('dash_sessions_resume');
     expect(cardJson).not.toContain('"action":"dash_sessions_close"');
+    if (archiveError) expect(cardJson).toContain('Codex 归档失败');
+    else expect(cardJson).not.toContain('Codex 归档失败');
 
     await new Promise(resolve => setImmediate(resolve));
     expect(mockedUpdateMessage).not.toHaveBeenCalled();

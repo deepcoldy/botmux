@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>文档评论 Ask 私聊卡片 · 离线示意</title>
+<style>
+* { box-sizing: border-box; }
+html { background: #fff; }
+body { margin: 0; width: 720px; padding: 32px; color: #1f2329; font: 16px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+h1 { margin: 0 0 4px; font-size: 22px; } .caption { color: #646a73; font-size: 13px; margin: 0 0 20px; }
+.transport { color: #1456f0; font-size: 14px; margin: 0 0 10px; } .card { border: 1px solid #dfe3e8; border-radius: 10px; overflow: hidden; }
+header { background: #e8f0ff; padding: 14px 20px; font-weight: 650; color: #245bdb; } section { padding: 18px 20px; }
+.fields { display: flex; gap: 44px; font-size: 14px; } strong { font-weight: 600; } .fields strong { color: #646a73; }
+.mention { color: #1456f0; background: #eff4ff; padding: 1px 3px; border-radius: 3px; }
+p { margin: 14px 0; } .note { color: #646a73; font-size: 13px; overflow-wrap: anywhere; } hr { border: 0; border-top: 1px solid #e5e6eb; margin: 16px 0; }
+.actions { display: flex; gap: 12px; } button { font: inherit; font-size: 14px; background: white; color: #1f2329; border: 1px solid #c9cdd4; border-radius: 5px; padding: 6px 14px; }
+footer { margin-top: 18px; font-size: 13px; color: #646a73; } code { background: #f2f3f5; padding: 1px 4px; border-radius: 3px; }
+</style></head><body>
+<h1>文档评论 → 私聊确认卡片</h1>
+<p class="caption">离线截图示意 · 源于 buildAskCard 的脱敏输出 · 非飞书客户端实测截图</p>
+<p class="transport">投递到原评论发起人的私聊，而非 doc: 虚拟会话 ID</p>
+<article class="card"><header>botmux ask</header><section><div class="fields"><div><strong>截止</strong><br>2026/10/14 23:00:00</div><div><strong>可答复</strong><br><span class="mention">原评论发起人</span></div></div><p class="note">文档任务：example_document · 评论：example_comment</p><hr><p><strong>问题 1</strong><br>是否允许仅在原画板内重建这张图？<br>保留文档正文、评论和其他画板不变。</p><div class="actions"><button>允许，仅限原画板</button><button>暂不修改</button></div><hr><p class="note">💬 这是文档评论任务的提问。文字作答请使用“回复”引用这张卡片；仅原评论发起人可答复。</p></section></article>
+<footer>按钮或引用这张卡片作答 → 回到原评论任务<br>无法校验收件人时明确报“卡片无法投递”，不转发到其他人。</footer>
+</body></html>

@@ -1,11 +1,18 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
+import type { Duplex } from 'node:stream';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { PluginMcpGateway, type GatewayTrustedTurnIdentityProvider } from './gateway.js';
+import {
+  PluginMcpGateway,
+  type GatewayLinkRefRegistrationHandler,
+  type GatewayTrustedResultDeliveryHandler,
+  type GatewayTrustedTurnIdentityProvider,
+} from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
+import { ensurePrivateGatewayDir, sessionMcpGatewaySocketDir } from './socket-dir.js';
+import type { ProtectedMcpWorkerPolicy } from '../../protected-mcp-capabilities.js';
 
 export interface SessionMcpGatewayHost {
   socketPath: string;
@@ -26,58 +33,14 @@ export function sessionMcpGatewayPathRegex(
   return `^${escapeForRegex(root)}/bmcp-${uid}-[^/]+(?:/|$)`;
 }
 
-/** Deterministic per-session Gateway socket directory.
- *
- * The name is a pure function of (dataDir, sessionId) — NO random component —
- * so a replacement worker (daemon restart / upgrade) re-serves the socket at
- * the exact path a surviving persistent pane's relay already holds in its
- * environment, and the relay can simply reconnect instead of the worker having
- * to kill the pane and cold-resume the CLI.
- *
- * Stays under tmpdir (not dataDir) to keep the Unix socket below macOS's short
- * sun_path limit, and keeps the `bmcp-<uid>-` prefix so the existing Seatbelt
- * deny regex (sessionMcpGatewayPathRegex) covers it unchanged. The predictable
- * name is safe because ensurePrivateGatewayDir fails closed unless the
- * directory is a real 0700 directory owned by this uid — a squatter can only
- * DoS session startup, never observe traffic (connections still require the
- * rotating auth token). */
-export function sessionMcpGatewaySocketDir(sessionId: string, dataDir: string): string {
-  const uid = process.getuid?.() ?? 0;
-  const sessionKey = createHash('sha256')
-    .update(dataDir)
-    .update('\0')
-    .update(sessionId)
-    .digest('hex')
-    .slice(0, 16);
-  return join(tmpdir(), `bmcp-${uid}-${sessionKey}`);
-}
-
-/** Deterministic per-session Gateway socket path (see sessionMcpGatewaySocketDir). */
-export function sessionMcpGatewaySocketPath(sessionId: string, dataDir: string): string {
-  return join(sessionMcpGatewaySocketDir(sessionId, dataDir), 'g.sock');
-}
-
-/** Create-or-verify the deterministic socket directory. Fail closed on
- *  anything that is not a 0700 directory owned by this uid: a symlink or a
- *  foreign-owned squat must abort session startup rather than let the Gateway
- *  serve (or the token be written) through an attacker-controlled path. */
-function ensurePrivateGatewayDir(dir: string): void {
-  try {
-    mkdirSync(dir, { mode: 0o700 });
-    return;
-  } catch (err: any) {
-    if (err?.code !== 'EEXIST') throw err;
-  }
-  const stat = lstatSync(dir);
-  if (!stat.isDirectory()) {
-    throw new Error(`Gateway socket dir ${dir} exists and is not a directory (planted symlink/file?)`);
-  }
-  const uid = process.getuid?.();
-  if (uid !== undefined && stat.uid !== uid) {
-    throw new Error(`Gateway socket dir ${dir} is owned by uid ${stat.uid} (expected ${uid})`);
-  }
-  if ((stat.mode & 0o077) !== 0) chmodSync(dir, 0o700);
-}
+export {
+  ensurePrivateGatewayDir,
+  pinSessionMcpGatewaySocketRoot,
+  sessionMcpGatewaySocketDir,
+  sessionMcpGatewaySocketPath,
+  sessionMcpGatewaySocketRoot,
+  sessionProtectedHttpEgressSocketPath,
+} from './socket-dir.js';
 
 /** Rotate the Gateway auth token atomically (tmp + rename) so a relay that
  *  re-reads the file mid-rotation always sees either the old or the new token,
@@ -100,6 +63,11 @@ export async function startSessionMcpGatewayHost(opts: {
   sessionId: string;
   dataDir: string;
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
+  trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  linkRefRegistration?: GatewayLinkRefRegistrationHandler;
+  requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
+  protectedEgressSocketPath?: string;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -132,6 +100,11 @@ export async function startSessionMcpGatewayHost(opts: {
         BOTMUX_SESSION_ID: opts.sessionId,
       }, {
         trustedTurnIdentity: opts.trustedTurnIdentity,
+        trustedResultDelivery: opts.trustedResultDelivery,
+        linkRefRegistration: opts.linkRefRegistration,
+        requestProtectedSecretChannel: opts.requestProtectedSecretChannel,
+        protectedMcpPolicy: opts.protectedMcpPolicy,
+        protectedEgressSocketPath: opts.protectedEgressSocketPath,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {
@@ -191,7 +164,9 @@ export async function startSessionMcpGatewayHost(opts: {
         // pane's view. The replacement host reuses the directory in place,
         // rotates the token, and re-binds the socket at the same path so the
         // pane's relay can reconnect. A token file without a listener grants
-        // nothing.
+        // nothing. The directory itself goes when the session is durably
+        // closed (removeSessionMcpGatewayDir, run by the daemon after the
+        // worker exits) or when the orphan sweep finds nobody using it.
         rmSync(socketPath, { force: true });
         const serverClosed = new Promise<void>((resolve) => {
           if (!server.listening) {

@@ -17,7 +17,7 @@
 | R5 | 可选参数两条规则：①只在下一个 token **匹配该参数类型的模式**时才吃；②**不跨行**（`#1361` D2 收窄为 D2′：换行仍等价于空格，唯一例外是行尾终止当前指令的可选参数）。**不引入 `--` 之类的终止符** | 分支名的**消费模式**是粗模式（latin/数字开头、`[\w./-]`、无 `..`、无 CJK），中文正文永远不匹配，单行最常见写法无歧义；多行写法一行一指令，一眼确定。合法性由 §8 的 `check-ref-format` 严校验兜底，两者不同层：不匹配粗模式的 token 是正文，匹配粗模式但 git 拒绝的 token 是错误。终止符是为"单行 + latin 正文 + 不给分支"一个角落发明的语法，所有人都得学，撤掉。残余角落（`/repo wt botmux fix login bug` 单行）行为确定：`fix` 是分支名，用法串写明"latin 正文请换行" |
 | R6 | 定义 `SessionPhase`，**由现有状态推导，不新增持久化字段**；命令合法性 = `phase × command` 矩阵 | 推导输入有两层：内存 `DaemonSession` 上的运行旗标（`worker`、`pendingRepo`、`pendingRepoCommitInFlight`、`worktreeCreating`，`src/core/types.ts:57-204`）与**持久化** `Session` 上刻意落盘以扛 daemon 重启的状态（`initialUserTurnPending` `src/types.ts:405`、`pendingRepoSetup` `:385`、`queued`/`queuedPrompt` `:346-352`、`status`）。"ready" 这一格今天 daemon 侧没有可读旗标，需新增一个**内存态** `ds.cliReady`（§5）。矩阵是数据，能测、能生成文档；它取代 `SESSIONLESS_DAEMON_COMMANDS` / `EXISTING_SESSION_ONLY_DAEMON_COMMANDS` / `isInitialSessionPassthrough` / `topicHeaderDeclaresSpec` 以及路由里为了不产生幽灵会话而前置的特判。矩阵**首版每一格都填今天的行为**（PR-2 零语义变化），不动持久化 ⟹ 回滚免费 |
 | R7 | 计划：**跨相位按生命周期定序**（pre-spawn → spawn-args → post-ready → runtime），与文本顺序无关；**runtime 相位内按书写顺序，逐条等 CLI 空闲**（仅级联，即一条消息里 ≥ 2 条 runtime 项；单条透传行为不变） | 这是 `#1361` D1 与"级联"的和解：启动期声明、运行期级联，分界就是 CLI 提示符就绪。worker 侧有两个按 `isPromptReady` 门控的队列——`pendingRawInputs`（`raw_input` 在 backend 未起 / 写入闸命中时入队，flush 时 `isPromptReady` 门控，写入即 `isPromptReady=false` + `idleDetector.reset()`）与 `pendingInjections`（`inject_command`，无 turn 记账、TUI-only、唯一发送方是 dashboard `/slash`）——但**没有一个以"级联在飞"为入队条件**：正常情况下 `raw_input` 刻意 busy delivery（`/btw` 类 steering 要在忙时也能进）。级联因此在 **daemon 侧**定序（§6）：每条仍走今天的 `raw_input`，只在两条之间等 worker 的 `prompt_ready`。选 daemon 侧的原因：定序、超时、后端拒绝、每条的 turn 标识本来都在 daemon；若改在 worker 侧复用 `pendingRawInputs`，还得给正文的 type-ahead 旁路（`flushPending` 在 `!isPromptReady` 时先排空 `pendingMessages`）加一把新闸，否则正文会插到未发的透传前面 |
-| R8 | 透传命令的参数**首版一律整行**（`freeText`，今天的契约）；**行是唯一分隔符**。按 CLI 声明 `none` / `token` 形状留作后续扩展，且只在有实测证据的 CLI 上开 | CLI 自己的斜杠命令吃不吃参数是它的交互语义，探测不了；仓库内证据也不足以填表：`/effort max please` 今天就是整行透传（`test/effort-confirm-dialog.test.ts:20` 钉着确认框只对单 token 形式 arm），改成 `token` 反而是行为变化；Codex `/model` 是否为不吃参数的交互选择器，仓库里没有证据。整行 + 按行级联已经覆盖 §4 的三个示例，而且对"今天已接受的单行输入"零变化，与 R10 一致 |
+| R8 | 透传命令的参数**首版一律整行**（`freeText`，今天的契约）；**行是唯一分隔符**。按 CLI 声明 `none` / `token` 形状留作后续扩展，且只在有实测证据的 CLI 上开 | CLI 自己的斜杠命令吃不吃参数是它的交互语义，探测不了；仓库内证据也不足以填表：`/effort max please` 今天就是整行透传（`test/effort-confirm-dialog.test.ts:19` 钉着确认框只对单 token 形式 arm），改成 `token` 反而是行为变化；Codex `/model` 是否为不吃参数的交互选择器，仓库里没有证据。整行 + 按行级联已经覆盖 §4 的三个示例，而且对"今天已接受的单行输入"零变化，与 R10 一致 |
 | R9 | 头部 `/repo wt <目标> [分支]` 复用现有 **pre-fork auto-worktree 路径**（`startAutoWorktreePending` → `runAutoWorktreeCommit` → card-handler 导出的 `commitRepoSelection`），只把 git 腿从 `maybeCreateDefaultWorktree` 换成显式 `{ repoPath, branch? }` 并改为 fail closed；`#1361` D5 只在 **git 运行期失败**一处放宽 | 这条入口今天已经是 4 处 spawn 路径共用的"话题建好 → 建 worktree → 提交选仓 → fork"，且自带 `worktreeCreating` 去重、pending 行公告、代际复检。会话内 `/repo wt` 用的是 `handleCommand` `/repo` case 里的**闭包** `commitRepoSelection`（`src/core/command-handler.ts:2187`，与 card-handler 的导出同名不同物），它连着 IM 回复语义，不抽。能提前查的（目标可解析、分支名合法、目标目录不存在）全部 fail closed；git 侧最长一步是 `worktree add`（60s）只能在话题建好后跑，失败时会话停在 `pendingRepo` 并回错误——与今天会话内 `/repo wt` 失败留下的是同一个状态，用户在话题内重发即可 |
 | R10 | 兼容原则：**严格扩宽**——老路径接受的每条输入，新路径产生相同效果；新路径只在老路径拒绝的地方增加行为。做不到的地方**显式列出**（§9） | 这是差分测试能直接断言的性质，不靠感觉。头部 `wt` 今天被拒 ⟹ R5 两条规则影响的输入集合为空 |
 | R11 | 验证不依赖线上观测：老解析器逐字冻结为**测试内 oracle**，对小字母表**穷举**差分；发布走既有 canary 通道 + 本机 fleet dogfood | botmux 是装在用户机器上的 npm 包，没有上报通道，影子模式/黄金语料/分命令切流在这里是空话。老路由的全部行为在源码里，有限且可读，现有 22 个路由层测试文件（其中 11 个跑真 `handleNewTopic` / `handleThreadReply`）就是兼容契约 |
@@ -196,7 +196,7 @@ type SessionPhase =
 
 首版（R8）：透传命令整行归 CLI，行是唯一分隔符。adapter 上今天已声明的能力照旧参与分类（`defaultPassthroughCommands`、有无 raw 面、`/fast` 的后端限制 `fastToggleUnsupportedBackend`——排除 riff / mojo / `codexRpcInput`，**不是** `backend: ['pty']`，tmux/herdr/zellij/zmx 同样可用）。
 
-后续扩展（不在本设计三个 PR 内）：按 CLI 声明 `none` / `token` 形状，让 `/model opus 然后继续修` 单行也能拆。前提是逐个 CLI 实测填表，且守住两条今天被测试钉住的不变量：`/fast` 与 `/effort` 留在全局 `PASSTHROUGH_COMMANDS`（`test/command-handler.test.ts:1485`、`:1491`），不能收窄成某个 adapter 的声明；`/effort <档位>` 单 token 才 arm 确认框、多 token 整行透传（`effort-confirm-dialog.test.ts:20`）。
+后续扩展（不在本设计三个 PR 内）：按 CLI 声明 `none` / `token` 形状，让 `/model opus 然后继续修` 单行也能拆。前提是逐个 CLI 实测填表，且守住两条今天被测试钉住的不变量：`/fast` 与 `/effort` 留在全局 `PASSTHROUGH_COMMANDS`（`test/command-handler.test.ts:1485`、`:1491`），不能收窄成某个 adapter 的声明；`/effort <档位>` 单 token 才 arm 确认框、多 token 整行透传（`effort-confirm-dialog.test.ts:19`）。
 
 `/model` 同名两相位：头部是 `--model` 启动参数（能力门 `launch-model-capability.ts`，riff 一律否），会话内是透传键入；schema 按相位区分，两处各声明。
 
@@ -232,6 +232,14 @@ type SessionPhase =
 
 | 变化 | 今天 | 之后 | 理由 | PR |
 |---|---|---|---|---|
+| `/resume [id]` | 未注册，整条当未知命令转发给 CLI | 无会话（相位 `none`，或现有会话只是命令空壳 `sessionIsCommandScratch`；`closed` 臂是防御性的，两条入口关闭即删注册项、当前不可达）时由 schema 的 `claimWithoutSessionOnly` 认领为 sessionless daemon 命令（`permission: 'talk'`，有对话权限即可）：恢复本锚点最近关闭的会话，或把别处的已关闭会话复制（cold fork）到这里；有会话时与今天逐字一致（自定义透传照常透传，否则未知命令转发）。不进全局 daemon 集合 | 会话群关闭后改为默认开新会话，需要一个不翻聊天记录的恢复入口；有会话时保留 CLI 原生 `/resume` | session-group 新会话 |
+| `/queue <消息>` | 未注册，作为普通模型输入，可引导当前轮 | existingOnly、多行 daemon 命令；Codex App 活会话冻结为 serial FIFO，新轮次执行；其它 CLI / 无活 worker 明确拒绝 | 不改变普通消息引导；不创建会话；仍走命令授权；附件暂不支持 |  #1880（接纳前刷新按人身份；等待期间单槽可被新消息覆盖） |
+| `/models` | 未注册，整条作为未知命令转发 | sessionless daemon 命令；顶层选择机器人默认模型与思考强度（新会话生效，复用 config_set 管理员门及配置锁内模型/CLI前置条件）；话题内选择当前会话模型；托管本地 TraeX 可保存模型绑定的思考强度并显式重载应用（精确 native ID，不消耗崩溃重启预算）；不创建新会话 | 让飞书原生命令面板提供模型切换入口，保留 `/model` 透传语义 | 本次变更 |
+| `/rewind [n\|n confirm]` | 未注册，整条当未知命令转发给 CLI | existingOnly daemon 命令；Claude Code 会话列出检查点、按轮次截断 CLI 原生 transcript 后重启；其它 CLI / 远端后端明确拒绝 | 用户级上下文回退（读到污染内容后可丢弃该轮）；执行前自动备份 transcript；不创建会话 | 本次变更 |
+| `/idlecompact [on\|off\|分钟]` | 未注册，整条当未知命令转发给 CLI | existingOnly daemon 命令；开关本会话的闲置自动压缩（闲置 N 分钟后自动 `/compact`）或查看状态；不支持的 CLI / 后端明确拒绝 | 与流式卡片「⏲️ 闲置自动压缩」按钮同一设置；不创建会话 | 本次变更 |
+| Codex App 会话内 `/effort <档位>` | 无 raw 透传面，作为普通模型输入 | schema 按 `cliId: codex-app` 登记为只用于已有会话的 daemon 命令，通过原生设置接口更新；其它 CLI 仍透传 | 调整后续轮次推理强度；更新当前轮需显式启用实验特性 `step_model_switching`（默认关闭）；不创建模型轮次，CLI 专属命令不进入全局 daemon 集合 | #1817 |
+| Codex CLI 会话内 `/effort <档位>` | 原样透传，CLI 不识别 `/effort` | schema 匹配 `codex`，操作原生 `/model` 菜单；按新增的原生设置记录确认后保存会话设置 | 仅后续轮次生效；不创建或中断模型轮次，其它 CLI 继续透传 | 本次变更 |
+| Codex CLI/App `/effort <档位> [任务]` | 同行任务被当成档位拒绝，多行任务当讨论文字 | 有效档位后剩余文字为字面任务，支持同行/多行；原生强度确认后走接纳输入流程 | 不创建新会话；失败或会话变代时不投递任务并显示原任务；其它 CLI 解析行为保留 | #2370 后续 |
 | 头部 `/repo wt <目标> [分支]` | 拒（`repo_worktree_unsupported`） | 可用 | 直接动因 | PR-1 |
 | `/repo wt` 用法串与帮助行不一致（zh/en） | 两条互相矛盾 | 由 schema 生成一条 | 自相矛盾的东西修好必然改掉一条 | PR-2 |
 | thread 路径 `/card` `/cot` 的前置特判 | 与新话题路径不一致（§3 第 9 层） | 两条路径同一张矩阵 | 收敛；行为上 `/card`/`/cot` 在 thread 里本就不需要会话 | PR-2 |
@@ -241,6 +249,7 @@ type SessionPhase =
 | `标题 /tw 干活` | 主干：正则锚在行首，不识别为生命周期头部（topic 模式群里按普通消息开话题，无标题、无 worktree） | 带标题的生命周期头部 | 解析只有一处（§16.1 第 1 条） | rebase 2026-09-16 |
 | chat 模式群里的 `/tw` `/th` | 主干：不是 `/t` 头部，不强制开话题（落进群会话） | 与 `/t` 同：强制开新话题；触发 API 里同为保留命令（`FORCE_TOPIC_COMMANDS`） | 同上 | rebase 2026-09-16 |
 | 已有会话的话题里发 `/tw 干活` | 主干：当普通输入送进 CLI（`/tw` 成为字面文本） | 回「指令头只在新话题第一条生效」 | `topicHeaderDeclaresSpec` 计入 lifecycle | rebase 2026-09-16 |
+| 当前 bot 有效插件声明的 `/xxx`（如 `/work-bind`） | `unknown_slash`，作为普通消息转给 CLI | `plugin` 决策：不建会话、不进 CLI，转给插件服务；内置名、固定透传名与 bot 有效透传集同名时仍按原判定 | 插件需要确定性的群内入口；`pluginCommands` 缺省为空时判定逐字不变（差分测试守护） | 2026-10-14 `docs/design/2026-10-14-plugin-slash-commands.md` |
 
 ## 10. 验证
 
@@ -308,6 +317,21 @@ PR-1 独立有价值；PR-2 若延期，PR-1 不受影响；PR-3 依赖 PR-2 的
 - 预设别名（`#1361` §8）在 schema 就位后成为"结构化展开"的自然扩展，本设计不做。
 
 ## 15. 执行记录
+
+### Codex effort 后续任务与菜单关闭（2026-10-26）
+
+- 有效 `/effort low|medium|high|xhigh|max|ultra` 头可附同行或多行任务；仅匹配 Codex CLI/App 的 schema，多行任务中的 `<组件 />`、`/文本` 保持字面正文，其它 CLI 的历史路由保留。
+- 强度更新确认后才接纳附带任务，复用输入身份、reply target 与发送流程；检查 Worker/原生会话代次，失败不静默丢任务。只设置强度且没有任务时不创建模型输入。
+- 菜单完成需要原生设置回执和空输入框同时出现。tmux 的恢复 hold 使用当前 viewport 并去掉 ANSI 控制符；不把 full-history ANSI 种子当作纯文本输入证据。
+- 不重写 legacy oracle；有效 effort 多行任务的路由扩展登记于 INTENTIONAL，并增加有效档位的定向夹具。
+
+### Codex effort 已确认任务的持久重试（2026-10-27）
+
+- primary Inbox 的同一消息重试保存已确认设置阶段，绑定任务/发送者/资源/回复上下文的 hash、原 CLI/native/Worker 代次；不得仅凭当前 effort 值重复打开菜单或复用另一条消息的确认。
+- 设置确认后、本地及 canonical 预准入检查点完成后才尝试任务准入。检查点使用既有同身份 active Session 的 exact lane，保留 admission/control 历史；不产生当前输入的提交回执。
+- 临时未就绪或检查点故障继续 retry；claim 丢失与代替换停止投递。direct IPC 接纳在原生 provider submit proof 到达之前保持 retry；proof 到达后同消息只完成 Inbox，不二次发任务。
+- canonical admission 以同一次原子写保存 terminal 处理证明，ignored 也先持久化 retirement；终态只用于去重和容量回收，不能授权发送任务。pending 不被淘汰，canonical/local 合并保留 pending 且 terminal 不回退。
+- 跨 principal 的 settle、inserted、duplicate merged 三条接纳路径及 await 后代替换均经真实 handleThreadReply 和删除式变异覆盖。
 
 按分期在 `feat/command_op` 上实施时的决策与拿不准的点，供事后追溯。每期以一个标题含「收口」的 commit 作为分界，中间可以有多次提交。
 

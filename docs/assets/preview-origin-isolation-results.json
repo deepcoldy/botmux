@@ -6,7 +6,7 @@
   "assertions": {
     "parentDomUnreadable": true,
     "managementApiAnonymous": true,
-    "debugTerminalUnreachable": true,
+    "hostTerminalUnreachable": true,
     "exfiltrationEmpty": true,
     "previewOwnResourcesWork": true,
     "cspSandboxOnProxiedDocuments": true
@@ -22,8 +22,8 @@
       "cookieRead": "THREW:SecurityError",
       "localStorage": "THREW:SecurityError",
       "apiSessions": "THREW:TypeError",
-      "debugCreate": "THREW:TypeError",
-      "debugSocketKnownId": "error",
+      "hostTerminalCreate": "THREW:TypeError",
+      "hostTerminalSocketKnownId": "error",
       "ownWebSocket": "message:preview-own-ws:ping",
       "ownRelativeFetch": {
         "status": 200,
@@ -31,7 +31,7 @@
       },
       "exfiltration": "sent:200"
     },
-    "exfiltratedBytes": 448,
+    "exfiltratedBytes": 462,
     "reportedByPreview": 1,
     "contentSecurityPolicy": "sandbox allow-scripts allow-forms allow-popups"
   }

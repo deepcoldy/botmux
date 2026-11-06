@@ -12,6 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
+import { pidIsSignalable } from '../utils/process-alive.js';
 import { config } from '../config.js';
 import { readProcessStartIdentity } from '../core/session-marker.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -161,7 +162,7 @@ export function hasActiveRestartLeaseTo(dir: string, nowMs: number): boolean {
     }
   }
   if (age < 0 || age > RESTART_LEASE_MAX_MS) return false;
-  try { process.kill(lease.pid, 0); return true; } catch { return false; }
+  return pidIsSignalable(lease.pid);
 }
 
 /** Claim the restart handoff while holding globalInstallUpdateLockTarget(). */

@@ -12,7 +12,7 @@
  * Dedicated lifecycle cases below use a fake child process to cover the real
  * daemon-side detach fence.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -103,6 +103,7 @@ import {
   rollbackRejectedSessionAndGetWinner,
   sendWorkerInput,
   sendWorkerSessionInput,
+  __testOnly_setSuspendBackingVerifier,
 } from '../src/core/worker-pool.js';
 import {
   acquireDeviceIsolationFreeze,
@@ -113,6 +114,9 @@ import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+
+beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 import type { Session } from '../src/types.js';
 import {
   __testOnly_resetBotTurnMutationGates,
@@ -1181,6 +1185,7 @@ describe('transferSession', () => {
       'cli_app_test',
       'om_old_card',
       expect.any(String),
+      { beforeWrite: expect.any(Function) },
     );
     const closedCard = JSON.parse(updateMessageMock.mock.calls[0][2]);
     expect(closedCard.header.title.content).toContain('会话已关闭');
@@ -2318,7 +2323,8 @@ describe('closeSession concurrency', () => {
       { fileToken: 'doc-token', fileType: 'docx' },
       'comment-1',
       'reply-1',
-      'reaction-1',
+      'Typing',
+      { identity: undefined },
     );
   });
 
@@ -2344,6 +2350,33 @@ describe('closeSession concurrency', () => {
     expect(sessionStore.updateSession).toHaveBeenCalledWith(stored);
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
     expect(removeCommentReactionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cleans a pre-upgrade closed target that has replyId but no reaction metadata', async () => {
+    setActiveSessionsRegistry(new Map());
+    const stored = makeDs().session;
+    stored.status = 'closed';
+    stored.docCommentTargets = {
+      'turn-legacy': {
+        fileToken: 'doc-token',
+        fileType: 'docx',
+        commentId: 'comment-1',
+        turnId: 'turn-legacy',
+        replyId: 'reply-1',
+      },
+    };
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(stored);
+
+    await closeSession(stored.sessionId);
+
+    expect(removeCommentReactionMock).toHaveBeenCalledWith(
+      'cli_app_test',
+      { fileToken: 'doc-token', fileType: 'docx' },
+      'comment-1',
+      'reply-1',
+      'Typing',
+      { identity: undefined },
+    );
   });
 
   it('does not treat another bot file found by read-only lookup as owned close state', async () => {

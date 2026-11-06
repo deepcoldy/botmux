@@ -8,7 +8,6 @@ const paths = {
   botmuxHome: '/home/.botmux',
   dataDir: '/home/.botmux/data',
   logsDir: '/home/.botmux/logs',
-  pm2Home: '/home/.botmux/pm2',
 };
 
 const configuredBots = '[{"larkAppId":"cli_x","larkAppSecret":"secret"}]';
@@ -46,7 +45,7 @@ describe('runtime service', () => {
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       run,
       bundledRuntime: bundledRuntime(),
-      pm2Apps: async () => [],
+      fleetApps: async () => [],
     });
 
     expect(await svc.getState()).toMatchObject({
@@ -76,7 +75,7 @@ describe('runtime service', () => {
       // nvm-in-.zshrc user: their node must stay ahead of the bundled fallback
       // so PtyBackend-spawned CLIs resolve `#!/usr/bin/env node` like a terminal.
       shellPathEnv: () => '/Users/me/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin',
-      pm2Apps: async () => [],
+      fleetApps: async () => [],
     });
 
     await svc.start();
@@ -100,7 +99,7 @@ describe('runtime service', () => {
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       run,
       bundledRuntime: bundledRuntime(),
-      pm2Apps: async () => [{
+      fleetApps: async () => [{
         name: 'botmux-dashboard',
         script: '/usr/local/lib/node_modules/botmux/dist/dashboard.js',
         status: 'online',
@@ -120,7 +119,7 @@ describe('runtime service', () => {
     }));
   });
 
-  it('recognises PM2 processes launched from the bundled runtime', async () => {
+  it('recognises fleet processes launched from the bundled runtime', async () => {
     const svc = createRuntimeService({
       paths,
       appVersion: '3.0.0',
@@ -128,7 +127,7 @@ describe('runtime service', () => {
       env: {},
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       bundledRuntime: bundledRuntime(),
-      pm2Apps: async () => [{
+      fleetApps: async () => [{
         name: 'botmux-dashboard',
         script: `${bundledRuntime().root}/dist/dashboard.js`,
         status: 'online',
@@ -150,7 +149,7 @@ describe('runtime service', () => {
       env: {},
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       bundledRuntime: bundledRuntime('3.0.0'),
-      pm2Apps: async () => [{
+      fleetApps: async () => [{
         name: 'botmux-dashboard',
         script: `${bundledRuntime().root}/dist/dashboard.js`,
         status: 'online',
@@ -249,7 +248,7 @@ describe('runtime service', () => {
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       run,
       externalRuntime: globalCli(),
-      pm2Apps: async () => [
+      fleetApps: async () => [
         { name: 'botmux-dashboard', script: '/Users/me/src/botmux/dist/dashboard.js', status: 'online' },
         { name: 'botmux', script: '/Users/me/src/botmux/dist/index-daemon.js', status: 'stopped' },
       ],
@@ -270,11 +269,11 @@ describe('runtime service', () => {
       command: '/usr/local/bin/botmux',
       args: ['start'],
       env: expect.objectContaining({
-        PM2_HOME: '/home/.botmux/pm2',
         SESSION_DATA_DIR: '/home/.botmux/data',
       }),
     }));
     expect(run.mock.calls[0]![0].env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
+    expect(run.mock.calls[0]![0].env).not.toHaveProperty('PM2_HOME');
   });
 
   it('keeps the discovered login shell PATH when invoking a wrapper runtime', async () => {
@@ -292,7 +291,7 @@ describe('runtime service', () => {
         binPath: '/home/.botmux/bin/botmux',
         pathEnv: shellPath,
       },
-      pm2Apps: async () => [],
+      fleetApps: async () => [],
     });
 
     await svc.start();
@@ -389,7 +388,7 @@ describe('runtime service', () => {
     }
   });
 
-  it('reports stopped when global CLI is installed and no botmux PM2 app is running', async () => {
+  it('reports stopped when global CLI is installed and no botmux fleet app is running', async () => {
     const svc = createRuntimeService({
       paths,
       appVersion: '1.0.0',
@@ -397,7 +396,7 @@ describe('runtime service', () => {
       env: { PATH: '/usr/bin' },
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       externalRuntime: globalCli(),
-      pm2Apps: async () => [],
+      fleetApps: async () => [],
     });
 
     const state = await svc.getState();
@@ -410,9 +409,9 @@ describe('runtime service', () => {
     });
   });
 
-  it('coalesces concurrent state probes so PM2 is queried once', async () => {
+  it('coalesces concurrent state probes so the fleet is queried once', async () => {
     let resolvePm2!: (apps: { name: string; script: string }[]) => void;
-    const pm2Apps = vi.fn(() => new Promise<{ name: string; script: string }[]>(resolve => {
+    const fleetApps = vi.fn(() => new Promise<{ name: string; script: string }[]>(resolve => {
       resolvePm2 = resolve;
     }));
     const svc = createRuntimeService({
@@ -422,12 +421,12 @@ describe('runtime service', () => {
       env: { PATH: '/usr/bin' },
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       externalRuntime: globalCli(),
-      pm2Apps,
+      fleetApps,
     });
 
     const first = svc.getState();
     const second = svc.getState();
-    expect(pm2Apps).toHaveBeenCalledTimes(1);
+    expect(fleetApps).toHaveBeenCalledTimes(1);
 
     resolvePm2([
       { name: 'botmux-dashboard', script: '/usr/local/lib/node_modules/botmux/dist/dashboard.js' },
@@ -494,7 +493,7 @@ describe('runtime service', () => {
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       run,
       externalRuntime: globalCli(),
-      pm2Apps: async () => [
+      fleetApps: async () => [
         { name: 'botmux-dashboard', script: '/usr/local/lib/node_modules/botmux/dist/dashboard.js' },
       ],
     });
@@ -579,7 +578,7 @@ describe('runtime service', () => {
     }
   });
 
-  it('reports degraded instead of stopped when PM2 discovery fails', async () => {
+  it('reports degraded instead of stopped when fleet discovery fails', async () => {
     const svc = createRuntimeService({
       paths,
       appVersion: '1.0.0',
@@ -587,8 +586,8 @@ describe('runtime service', () => {
       env: {},
       fs: { existsSync: () => true, readFileSync: () => configuredBots },
       externalRuntime: globalCli(),
-      pm2Apps: async () => {
-        throw new Error('PM2 jlist timed out');
+      fleetApps: async () => {
+        throw new Error('Invalid fleet state');
       },
     });
 
@@ -599,6 +598,6 @@ describe('runtime service', () => {
       runtimeSource: 'global-cli',
       runtimeManaged: false,
     });
-    expect(state.message).toContain('PM2 jlist timed out');
+    expect(state.message).toContain('Invalid fleet state');
   });
 });

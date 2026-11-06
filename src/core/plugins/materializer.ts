@@ -75,6 +75,9 @@ export function materializePlugin(pluginId: string): PluginMaterializedFile {
   if (record.contributions?.cardActions) {
     materialized.cardActions = record.contributions.cardActions;
   }
+  if (record.contributions?.commands) {
+    materialized.commands = record.contributions.commands;
+  }
   writeMaterialized(materialized);
   return materialized;
 }

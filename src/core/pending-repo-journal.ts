@@ -1,23 +1,42 @@
 import type { DaemonSession } from './types.js';
 import type { PendingRepoSetup } from '../types.js';
+import { readGlobalConfig } from '../global-config.js';
+import { getBot } from '../bot-registry.js';
+import { resolveEffectiveLinkRefMode } from '../services/link-ref-config.js';
 import * as sessionStore from '../services/session-store.js';
 
 export function stagePendingRepoSetup(
   ds: DaemonSession,
   args: Pick<PendingRepoSetup, 'mode'> & Partial<Pick<
     PendingRepoSetup,
-    'baseDir' | 'turnId' | 'force' | 'worktreePath' | 'branch' | 'reuseExisting' | 'targetSubdir'
+    'baseDir' | 'turnId' | 'force' | 'worktreePath' | 'branch' | 'reuseExisting' | 'targetSubdir' | 'linkRefMode'
   >>,
 ): void {
+  const effectiveLinkRefMode = args.linkRefMode
+    ?? ds.pendingLinkRefMode
+    ?? ds.session.pendingRepoSetup?.linkRefMode
+    ?? (() => {
+      try {
+        return resolveEffectiveLinkRefMode({
+          env: process.env,
+          bot: getBot(ds.larkAppId).config.linkRefs,
+          global: readGlobalConfig().linkRefs,
+        });
+      } catch {
+        return 'disabled' as const;
+      }
+    })();
   const prior = {
     queued: ds.session.queued,
     queuedPrompt: ds.session.queuedPrompt,
     queuedCodexAppText: ds.session.queuedCodexAppText,
     queuedCodexAppMessageContext: ds.session.queuedCodexAppMessageContext,
     pendingRepoSetup: ds.session.pendingRepoSetup,
+    pendingLinkRefMode: ds.pendingLinkRefMode,
   };
   const setup: PendingRepoSetup = {
     mode: args.mode,
+    linkRefMode: effectiveLinkRefMode,
     prompt: ds.pendingPrompt ?? '',
     ...(ds.pendingRawInput ? { rawInput: ds.pendingRawInput } : {}),
     ...(args.turnId ? { turnId: args.turnId } : {}),
@@ -50,6 +69,7 @@ export function stagePendingRepoSetup(
   ds.session.queuedCodexAppText = setup.codexAppText;
   ds.session.queuedCodexAppMessageContext = setup.codexAppMessageContext;
   ds.session.pendingRepoSetup = setup;
+  ds.pendingLinkRefMode = setup.linkRefMode;
   try {
     sessionStore.updateSession(ds.session);
   } catch (err) {
@@ -58,6 +78,7 @@ export function stagePendingRepoSetup(
     ds.session.queuedCodexAppText = prior.queuedCodexAppText;
     ds.session.queuedCodexAppMessageContext = prior.queuedCodexAppMessageContext;
     ds.session.pendingRepoSetup = prior.pendingRepoSetup;
+    ds.pendingLinkRefMode = prior.pendingLinkRefMode;
     throw err;
   }
 }
@@ -90,6 +111,7 @@ export function restorePendingRepoRuntime(ds: DaemonSession): boolean {
     ? structuredClone(setup.substituteTrigger)
     : undefined;
   ds.pendingSender = setup.sender ? { ...setup.sender } : undefined;
+  ds.pendingLinkRefMode = setup.linkRefMode;
   ds.repoCardMessageId = setup.repoCardMessageId;
   ds.initialStartPending = false;
   return true;

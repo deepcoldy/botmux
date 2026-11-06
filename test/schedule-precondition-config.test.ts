@@ -17,7 +17,6 @@ import {
   resolveSchedulePrecondition,
   schedulePreconditionPath,
   schedulePreconditionRoot,
-  schedulePreconditionTrustedFileExamplePath,
   schedulePreconditionTrustedFilesRoot,
   stageSchedulePrecondition,
 } from '../src/services/schedule-precondition-store.js';
@@ -304,10 +303,6 @@ describe('trusted schedule precondition configuration', () => {
       'schedule-preconditions',
       'trusted-files',
     ));
-    expect(schedulePreconditionTrustedFileExamplePath()).toBe(join(
-      schedulePreconditionTrustedFilesRoot(),
-      'check-ready.sh',
-    ));
     expect(existsSync(schedulePreconditionTrustedFilesRoot())).toBe(true);
   });
 
@@ -467,7 +462,7 @@ describe('trusted schedule precondition configuration', () => {
     });
     expect(disabled.task?.preconditionRef).toBe(created.preconditionRef);
 
-    const trustedFilePath = schedulePreconditionTrustedFileExamplePath();
+    const trustedFilePath = join(schedulePreconditionTrustedFilesRoot(), 'check-ready.sh');
     const replacedAndEnabled = updateTaskWithOptionalPrecondition(
       created.id,
       {},
@@ -618,4 +613,19 @@ describe('trusted schedule precondition configuration', () => {
     expect(getTask(task.id, APP_ID)).toBeUndefined();
     expect(listTasks(APP_ID)).toHaveLength(0);
   });
+});
+
+it('rebinds the protected Bash input after a Dashboard calendar edit', () => {
+  const task = createTaskWithOptionalPrecondition(createParams(), APP_ID, {
+    enabled: true, source: { kind: 'inline', script: 'printf 1' },
+  });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendar: 'demo' }, APP_ID)).toMatchObject({ ok: true });
+  const after = getTask(task.id)!;
+  expect(after.calendar).toBe('demo');
+  expect(resolveSchedulePrecondition(after, APP_ID)).toMatchObject({ kind: 'configured', enabled: true });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendarDayType: 'restday' }, APP_ID)).toMatchObject({ ok: true });
+  expect(getTask(task.id)?.calendarDayType).toBe('restday');
+  expect(resolveSchedulePrecondition(getTask(task.id)!, APP_ID)).toMatchObject({ kind: 'configured', enabled: true });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendar: null }, APP_ID)).toMatchObject({ ok: true });
+  expect(resolveSchedulePrecondition(getTask(task.id)!, APP_ID)).toMatchObject({ kind: 'configured' });
 });

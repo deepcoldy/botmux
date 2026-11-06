@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { callDashboard, type DashboardResult } from '../../cli/dashboard-endpoint.js';
 import type { DesktopPaths, DesktopRuntimeState, RuntimeSource } from '../shared/types.js';
 import { buildBundledBotmuxCommand, buildExternalBotmuxCommand, type BotmuxCommand } from './node-command.js';
-import { classifyRuntimeSource, countActiveBotmuxDaemonApps, type Pm2AppSummary } from './runtime-source.js';
+import { classifyRuntimeSource, countActiveBotmuxDaemonApps, type FleetAppSummary } from './runtime-source.js';
 import { sanitizeDeviceStatusCommandResult } from './device-status.js';
 
 export interface RunResult {
@@ -151,7 +151,7 @@ export interface RuntimeServiceDeps {
   bundledRuntime?: BundledRuntimeCandidate;
   /** Probed user shell PATH for bundled-runtime spawns (see probeShellPathEnv). */
   shellPathEnv?: () => string | undefined;
-  pm2Apps?: (runtime: RuntimeLaunchTarget) => Promise<Pm2AppSummary[]>;
+  fleetApps?: () => Promise<FleetAppSummary[]>;
 }
 
 export function createRuntimeService(deps: RuntimeServiceDeps) {
@@ -306,11 +306,11 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       };
     }
 
-    if (deps.pm2Apps) {
+    if (deps.fleetApps) {
       try {
-        const pm2Apps = await deps.pm2Apps(active);
-        const source = classifyRuntimeSource({ pm2Apps });
-        const onlineDaemonCount = countActiveBotmuxDaemonApps(pm2Apps);
+        const apps = await deps.fleetApps();
+        const source = classifyRuntimeSource({ apps });
+        const onlineDaemonCount = countActiveBotmuxDaemonApps(apps);
         if (source.running) {
           if (!isRuntimeOwned(active, source.sourcePath, source.sourceVersion)) {
             return {
@@ -341,7 +341,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
           };
         }
       } catch (err) {
-        // PM2 discovery failure should be visible in the rail instead of
+        // Fleet discovery failure should be visible in the rail instead of
         // silently pretending the runtime is stopped.
         return {
           status: 'degraded',

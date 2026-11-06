@@ -9,7 +9,7 @@ export type CodexUpdateDialogKey = 'Up' | 'Down' | 'Enter';
 export function codexUpdateDialogSafeKeys(data: string): CodexUpdateDialogKey[] | undefined {
   const lines = stripAnsiForLog(data).replace(/\r/g, '\n').split('\n');
   const options = lines.flatMap(line => {
-    const match = line.match(/^\s*([›>])?\s*(\d+)\.\s*(.+?)\s*$/);
+    const match = line.match(/^\s*([›>»])?\s*(\d+)\.\s*(.+?)\s*$/);
     if (!match) return [];
     return [{ selected: !!match[1], number: Number(match[2]), label: match[3]! }];
   });
@@ -62,6 +62,6 @@ export class CodexUpdateDialogGuard {
 export function aidenCodexResumeNeedsRedraw(screen: string): boolean {
   if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
   const lines = screen.trimEnd().split(/\r?\n/).filter(line => line.trim());
-  return /^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines.at(-2) ?? '')
+  return /^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines.at(-2) ?? '')
     && /^\s*\S+ (?:low|medium|high|xhigh|max|ultra) · (?:\/|~)\S*(?: · [^\r\n]+)?\s*$/.test(lines.at(-1) ?? '');
 }

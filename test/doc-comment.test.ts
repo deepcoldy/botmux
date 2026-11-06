@@ -8,6 +8,7 @@ import {
   isBotAuthoredReply,
   hasBotSentinel,
   commentTriggerAllowed,
+  polledReplyTriggerAllowed,
   BOT_REPLY_SENTINEL,
 } from '../src/im/lark/doc-comment.js';
 
@@ -102,5 +103,36 @@ describe('commentTriggerAllowed (mention-only trigger gate)', () => {
     // 启动期 open_id 尚未探到：宁可漏触发也不误触发（调用方会先 await ensureBotOpenId）。
     expect(commentTriggerAllowed('mention-only', [SELF], undefined)).toBe(false);
     expect(commentTriggerAllowed('mention-only', [SELF], '')).toBe(false);
+  });
+});
+describe('owner-mention 触发（替身语义）', () => {
+  const SELF = 'ou_selfbot';
+  const OWNER = 'ou_owner';
+
+  it('WS 闸 commentTriggerAllowed：@ 了负责人或 @ 了本 bot 才放行', () => {
+    expect(commentTriggerAllowed('owner-mention', [OWNER], SELF, OWNER)).toBe(true);
+    expect(commentTriggerAllowed('owner-mention', [SELF], SELF, OWNER)).toBe(true);
+    expect(commentTriggerAllowed('owner-mention', ['ou_other', OWNER], SELF, OWNER)).toBe(true);
+  });
+
+  it('WS 闸：没 @ 负责人/本 bot 的普通评论不放行；负责人缺失时保守拒绝', () => {
+    expect(commentTriggerAllowed('owner-mention', ['ou_stranger'], SELF, OWNER)).toBe(false);
+    expect(commentTriggerAllowed('owner-mention', [], SELF, OWNER)).toBe(false);
+    expect(commentTriggerAllowed('owner-mention', [OWNER], SELF, undefined)).toBe(false);
+  });
+
+  it('轮询谓词 polledReplyTriggerAllowed：all 恒真、mention-only 不靠轮询恒假', () => {
+    expect(polledReplyTriggerAllowed('all', [], SELF, OWNER)).toBe(true);
+    expect(polledReplyTriggerAllowed('all', ['ou_x'], undefined, undefined)).toBe(true);
+    expect(polledReplyTriggerAllowed('mention-only', [SELF], SELF, OWNER)).toBe(false);
+    expect(polledReplyTriggerAllowed('mention-only', [OWNER], SELF, OWNER)).toBe(false);
+  });
+
+  it('轮询谓词 owner-mention：@负责人/@本bot 投递，普通评论不投递，缺 owner 保守不投递', () => {
+    expect(polledReplyTriggerAllowed('owner-mention', [OWNER], SELF, OWNER)).toBe(true);
+    expect(polledReplyTriggerAllowed('owner-mention', [SELF], SELF, OWNER)).toBe(true);
+    expect(polledReplyTriggerAllowed('owner-mention', ['ou_coworker'], SELF, OWNER)).toBe(false);
+    expect(polledReplyTriggerAllowed('owner-mention', [], SELF, OWNER)).toBe(false);
+    expect(polledReplyTriggerAllowed('owner-mention', [OWNER], SELF, undefined)).toBe(false);
   });
 });

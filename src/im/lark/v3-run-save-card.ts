@@ -8,6 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import type { V3RunEnvelope } from '../../workflows/v3/run-envelope.js';
+import { short, escapeMd } from './v3-card-common.js';
 
 export const V3_RUN_SAVE_ACTION = 'v3_run_save';
 export const V3_RUN_SAVE_CONFIRM_ACTION = 'v3_run_save_confirm';
@@ -125,6 +126,8 @@ export function buildV3RunSavedCard(input: {
   scope: V3RunSaveScope;
   /** When a replay requested another scope, first valid commit still wins. */
   requestedScope?: V3RunSaveScope;
+  /** Runtime flow revisions in the source run (design §13.8). */
+  runtimeRevisions?: number;
 }): string {
   const runCommand = `/workflow run ${input.workflowId}`;
   return JSON.stringify({
@@ -147,6 +150,13 @@ export function buildV3RunSavedCard(input: {
         tag: 'div',
         text: { tag: 'lark_md', content: `下次运行：\`${escapeMd(runCommand)}\`` },
       },
+      ...(input.runtimeRevisions && input.runtimeRevisions > 0 ? [{
+        tag: 'note',
+        elements: [{
+          tag: 'plain_text',
+          content: `本流程在运行中修改过 ${input.runtimeRevisions} 次，保存的是最终生效的版本，请核对节点与审批设置。`,
+        }],
+      }] : []),
       ...(input.requestedScope && input.requestedScope !== input.scope ? [{
         tag: 'note',
         elements: [{
@@ -158,16 +168,9 @@ export function buildV3RunSavedCard(input: {
   });
 }
 
-function short(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, max)}…`;
-}
-
 function plainTitle(value: string, max: number): string {
   const normalized = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
   const chars = Array.from(normalized || 'Saved Workflow');
   return chars.length <= max ? chars.join('') : `${chars.slice(0, max).join('')}…`;
 }
 
-function escapeMd(value: string): string {
-  return value.replace(/[\\*_~`\[\]]/g, (char) => `\\${char}`);
-}

@@ -1,6 +1,10 @@
 import type { CliId } from '../adapters/cli/types.js';
+import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
+import { RETIRED_CLIS, retiredCliNotice } from '../adapters/cli/retired-cli.js';
 import {
+  dropConfiguredCliRuntime,
   normalizeCliRuntimeConfig,
+  supportsConfiguredCliRuntime,
   type CliRuntimeConfig,
 } from '../adapters/cli/runtime.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
@@ -16,7 +20,8 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '3': 'coco',
   '4': 'codex',
   '5': 'cursor',
-  '6': 'gemini',
+  // '6' 是已移除的 gemini（见 adapters/cli/retired-cli.ts），留空不复用：
+  // 老脚本喂 6 应当报错，而不是静默选中别的 CLI。
   '7': 'opencode',
   '8': 'antigravity',
   '9': 'mtr',
@@ -52,49 +57,14 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
   // 插位会让老脚本静默选错 CLI。
   '31': 'mimocode',
+  '32': 'remote-runner',
+  '33': 'codem',
+  '34': 'zcode',
+  '35': 'doubao',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
 
-/**
- * CLI 展示名. 与 worker.ts 的 CLI_DISPLAY_NAMES / card-builder.ts 的
- * cliDisplayNames 保持一致——这三处是已知的展示名复制点 (见 CLAUDE.md
- * "添加新 CLI 适配器" 清单), 新增 CLI 时一并更新.
- */
-const CLI_DISPLAY_LABELS: Record<CliId, string> = {
-  'claude-code': 'Claude',
-  'aiden': 'Aiden',
-  'coco': 'CoCo',
-  'codex': 'Codex',
-  'cursor': 'Cursor',
-  'gemini': 'Gemini',
-  'genius': 'Genius',
-  'opencode': 'OpenCode',
-  'opencode2': 'OpenCode 2',
-  'mimocode': 'MiMoCode',
-  'antigravity': 'Antigravity',
-  'mtr': 'MTR',
-  'hermes': 'Hermes',
-  'codex-app': 'Codex App',
-  'mira': 'Mira',
-  'seed': 'Seed',
-  'traex': 'TRAE',
-  'pi': 'Pi',
-  'copilot': 'Copilot',
-  'oh-my-pi': 'Oh My Pi',
-  'ebsd': 'ebsd',
-  'relay': 'Relay',
-  'mir': 'Mir CLI',
-  'kimi': 'Kimi',
-  'grok': 'Grok Build',
-  'kiro-cli': 'Kiro',
-  'riff': 'Riff',
-  'reasonix': 'Reasonix',
-  'dsh': 'DeepSeek Harness',
-  'dsh-tui': 'DeepSeek Harness TUI',
-  'mojo': 'Mojo',
-  'minimax': 'MiniMax',
-};
 
 /**
  * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号)
@@ -102,7 +72,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
  * 列表. 单一事实源: CLI_ID_CHOICES 的值序.
  */
 export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
-  Object.values(CLI_ID_CHOICES).map(id => ({ id, label: CLI_DISPLAY_LABELS[id] ?? id }));
+  Object.values(CLI_ID_CHOICES).map(id => ({ id, label: CLI_DISPLAY_NAMES[id] ?? id }));
 
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
@@ -117,8 +87,10 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   const mapped = CLI_ID_CHOICES[raw];
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
+  const retiredId = Object.keys(RETIRED_CLIS).find(id => id === raw || RETIRED_CLIS[id]!.setupChoice === raw);
+  if (retiredId) throw new Error(retiredCliNotice(retiredId));
   // 序号上界从 CLI_ID_CHOICES 派生, 新增 CLI 时自动跟随, 不再手写硬编码区间.
-  const maxChoice = Object.keys(CLI_ID_CHOICES).length;
+  const maxChoice = Math.max(...Object.keys(CLI_ID_CHOICES).map(Number));
   throw new Error(
     `Unknown CLI 适配器 "${raw}"。请输入序号 1-${maxChoice} 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
@@ -267,6 +239,8 @@ export interface BotConfigEditInput {
    *   - '' / '-' → 清空（回到默认 ON）
    */
   showInTeam?: string;
+  /** UI 语言：zh 或 en；'-' 或 null 清空。 */
+  lang?: string | null;
 }
 
 /**
@@ -479,6 +453,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'grantExpiryState',
   'sessionGroup',
   'chatReplyModes',
+  'chatSoloGroupMentionBypass',
   'chatFeedbackPolicies',
   'noCardChats',
   'quotaFallbackBot',
@@ -580,6 +555,7 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   const appSecret = trimmed(input.larkAppSecret);
   if (appSecret) out.larkAppSecret = appSecret;
 
+  const previousCliId = out.cliId;
   const cliId = resolveCliId(input.cliChoice);
   if (cliId) out.cliId = cliId;
 
@@ -611,16 +587,13 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     delete out.cliRuntime;
   }
 
-  // The first supported custom-runtime family is Codex. Switching a bot to a
-  // different adapter must not strand a stale Codex distribution descriptor
-  // that a later edit or old client could accidentally revive.
-  if (out.cliId !== 'codex') {
-    if (explicitlySettingRuntime) throw new Error('cliRuntime is currently supported only for cliId "codex"');
-    const oldRuntimeExecutable = out.cliRuntime && typeof out.cliRuntime === 'object'
-      ? out.cliRuntime.executable
-      : undefined;
-    delete out.cliRuntime;
-    if (oldRuntimeExecutable && out.cliPathOverride === oldRuntimeExecutable) delete out.cliPathOverride;
+  // A distribution implements one adapter contract. Changing adapters must
+  // clear the old descriptor even when both families support custom runtimes.
+  const supportsRuntime = supportsConfiguredCliRuntime(out.cliId);
+  const adapterChanged = !!cliId && cliId !== previousCliId;
+  if (!supportsRuntime || (adapterChanged && !explicitlySettingRuntime)) {
+    if (explicitlySettingRuntime) throw new Error('cliRuntime is currently supported only for cliId "codex" or "kimi"');
+    dropConfiguredCliRuntime(out, true);
   }
 
   if (out.cliRuntime) {
@@ -686,8 +659,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", or "mojo": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", "mojo", or "remote-runner": ${backendType}`);
       }
       out.backendType = backendType;
     }
@@ -723,6 +696,19 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
 
   // 平台团队展示默认 ON → 只把显式 false 落盘。
   applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
+
+  if (input.lang !== undefined) {
+    if (input.lang === null || input.lang.trim() === '-') {
+      delete out.lang;
+    } else {
+      const v = input.lang.trim().toLowerCase();
+      if (v === 'zh' || v === 'en') {
+        out.lang = v;
+      } else {
+        throw new Error(`lang must be "zh" or "en": ${input.lang}`);
+      }
+    }
+  }
 
   return normalizeBotConfig(out) as T;
 }

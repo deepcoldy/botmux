@@ -1,9 +1,10 @@
 import type { ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const fixtures: Array<{ root: string; child: ChildProcess; observation: string }> = [];
@@ -29,7 +30,7 @@ afterEach(async () => {
     await until(() => child.exitCode !== null || child.signalCode !== null, [], 3000);
     // PTY children create their own process groups. Record every fake CLI PID
     // (including short-lived metadata probes), and reap any surviving process.
-    const pids = existsSync(observation) ? readFileSync(observation, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line).pid as number) : [];
+    const pids = readJsonLines<{ pid: number }>(observation).map(row => row.pid);
     for (const pid of pids) if (alive(pid)) process.kill(pid, 'SIGKILL');
     await until(() => pids.every(pid => !alive(pid)), [], 3000);
     rmSync(root, { recursive: true, force: true });
@@ -79,8 +80,9 @@ describe('frozen Codex instance through real worker IPC (workflow PTY path)', ()
   it('launches the fake CLI with the frozen HOME and removes inherited authentication overrides', async () => {
     const f = launch();
     await until(() => f.messages.some(m => m.type === 'ready'), f.logs);
-    await until(() => existsSync(f.observation), f.logs);
-    const invocations = readFileSync(f.observation, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    // The file exists from the first append's open(), before its line lands.
+    await until(() => readJsonLines(f.observation).length > 0, f.logs);
+    const invocations = readJsonLines(f.observation);
     expect(invocations.length).toBeGreaterThan(0);
     for (const invocation of invocations) {
       expect(invocation.home).toBe(f.home);
@@ -90,6 +92,23 @@ describe('frozen Codex instance through real worker IPC (workflow PTY path)', ()
       if (!invocation.argv.includes('--version')) expect(invocation.gatewayConfigured).toBe(true);
     }
     expect(existsSync(join(f.root, 'wrong-global-home'))).toBe(false);
+  }, 20000);
+  it('launches Codex with the default-on hook-trust bypass and model-nudge suppression', async () => {
+    // Both toggles are live global getters handed to buildArgs by the worker;
+    // dropping either from the spawn wedges headless TUIs on an interactive gate.
+    const f = launch();
+    await until(() => f.messages.some(m => m.type === 'ready'), f.logs);
+    // The --version probe can land first: wait for the launch itself.
+    const launchesOf = () => readJsonLines<{ argv: string[] }>(f.observation)
+      .map(row => row.argv)
+      .filter(argv => !argv.includes('--version'));
+    await until(() => launchesOf().length > 0, f.logs);
+    const launches = launchesOf();
+    expect(launches.length).toBeGreaterThan(0);
+    for (const argv of launches) {
+      expect(argv).toContain('--dangerously-bypass-hook-trust');
+      expect(argv[argv.indexOf('notice.hide_rate_limit_model_nudge=true') - 1]).toBe('-c');
+    }
   }, 20000);
   it('fails before spawning any CLI when the frozen home is missing, without global fallback', async () => {
     const f = launch(true);

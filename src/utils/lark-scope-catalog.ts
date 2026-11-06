@@ -20,9 +20,22 @@ const USER_SCOPES: ReadonlySet<string> = new Set(
   (scopeManifest as { scopes?: { user?: string[] } }).scopes?.user ?? [],
 );
 
+export function isValidLarkScopeSyntax(scope: string): boolean {
+  return /^[a-z0-9_]+(:[a-z0-9_.-]+)+$/i.test(scope) || scope === 'offline_access';
+}
+
 /** Whether `scope` is a real Lark user scope. An empty catalog accepts
- *  everything, so a packaging problem cannot lock people out of /login. */
-export function isKnownLarkUserScope(scope: string): boolean {
-  return USER_SCOPES.size === 0 || USER_SCOPES.has(scope)
-    || scope === 'im:chat' || scope === 'im:chat:readonly';
+ *  everything, so a packaging problem cannot lock people out of /login.
+ *  When `options.allowUnknown` is true (or BOTMUX_ALLOW_UNKNOWN_SCOPES=1),
+ *  syntactically valid Lark scopes are accepted as an escape hatch. */
+export function isKnownLarkUserScope(
+  scope: string,
+  options?: { allowUnknown?: boolean },
+): boolean {
+  if (USER_SCOPES.size === 0) return true;
+  if (USER_SCOPES.has(scope) || scope === 'im:chat' || scope === 'im:chat:readonly') return true;
+  if (options?.allowUnknown || process.env.BOTMUX_ALLOW_UNKNOWN_SCOPES === '1') {
+    return isValidLarkScopeSyntax(scope);
+  }
+  return false;
 }

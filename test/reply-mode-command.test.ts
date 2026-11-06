@@ -21,9 +21,11 @@ vi.mock('../src/im/lark/message-parser.js', () => ({
 }));
 
 const mockGetChatMode = vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p');
+const mockGetChatModeStrict = vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p' | 'unknown');
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 vi.mock('../src/im/lark/client.js', () => ({
   getChatMode: (...a: any[]) => mockGetChatMode(...a),
+  getChatModeStrict: (...a: any[]) => mockGetChatModeStrict(...a),
   replyMessage: (...a: any[]) => mockReplyMessage(...a),
 }));
 
@@ -35,6 +37,12 @@ vi.mock('../src/i18n/index.js', () => ({
 
 const mockApplyConfigField = vi.fn(async () => ({ ok: true as const }));
 const mockSetChatReplyMode = vi.fn(async (_a: string, _c: string, mode: string) => ({ ok: true as const, mode }));
+const mockClearChatReplyMode = vi.fn(async () => ({
+  ok: true as const, cleared: true, override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true,
+}));
+const mockGetChatReplyModeState = vi.fn(() => ({
+  override: null as string | null, default: 'chat-topic', effective: 'chat-topic', inherited: true,
+}));
 vi.mock('../src/services/bot-config-store.js', () => ({
   findConfigField: () => ({ key: 'p2pMode' }),
   applyConfigField: (...a: any[]) => mockApplyConfigField(...a),
@@ -45,6 +53,8 @@ vi.mock('../src/services/chat-reply-mode-store.js', async (importOriginal) => {
   return {
     ...actual,
     setChatReplyMode: (...a: any[]) => mockSetChatReplyMode(...a),
+    clearChatReplyMode: (...a: any[]) => mockClearChatReplyMode(...a),
+    getChatReplyModeState: (...a: any[]) => mockGetChatReplyModeState(...a),
     resolveRegularGroupMode: () => 'chat',
   };
 });
@@ -138,6 +148,7 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
     mockIsBotMentioned.mockReturnValue(true);
     mockCanOperate.mockReturnValue(true);
     mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
   });
 
   it('group `/reply-mode topic` (owner) → setChatReplyMode("shared") + updated', async () => {
@@ -175,5 +186,74 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode shared', 'group'), USER, true);
     expect(handled).toBe(true);
     expect(mockSetChatReplyMode).not.toHaveBeenCalled();
+  });
+
+  it('status shows the source: inherited bot default vs group override', async () => {
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode', 'group'), USER, true);
+    expect(lastReply()).toBe('cmd.reply_mode.status_inherited');
+    mockGetChatReplyModeState.mockReturnValueOnce({ override: 'new-topic', default: 'chat-topic', effective: 'new-topic', inherited: false });
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode status', 'group'), USER, true);
+    expect(lastReply()).toBe('cmd.reply_mode.status_override');
+    // status 是本地读：不走 strict 拓扑闸
+    expect(mockGetChatModeStrict).not.toHaveBeenCalled();
+  });
+
+  it('status without canTalk stays silent', async () => {
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode status', 'group'), USER, false);
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('`/reply-mode inherit` (owner) clears the override without any topology gate', async () => {
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode inherit', 'group'), USER, true);
+    expect(mockClearChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group');
+    expect(mockSetChatReplyMode).not.toHaveBeenCalled();
+    expect(mockGetChatModeStrict).not.toHaveBeenCalled();
+    expect(lastReply()).toBe('cmd.reply_mode.inherited');
+  });
+
+  it('`/reply-mode inherit` still clears a dormant override after the chat became a topic group', async () => {
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatModeStrict.mockResolvedValue('topic');
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode inherit', 'group'), USER, true);
+    expect(mockClearChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group');
+    expect(lastReply()).toBe('cmd.reply_mode.inherited');
+  });
+
+  it('`/reply-mode inherit` aliases (default/reset) and idempotent clear', async () => {
+    mockClearChatReplyMode.mockResolvedValueOnce({
+      ok: true, cleared: false, override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true,
+    });
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode default', 'group'), USER, true);
+    expect(lastReply()).toBe('cmd.reply_mode.already_inherited');
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode reset', 'group'), USER, true);
+    expect(mockClearChatReplyMode).toHaveBeenCalledTimes(2);
+  });
+
+  it('`/reply-mode inherit` by non-owner → owner_only, no clear', async () => {
+    mockCanOperate.mockReturnValue(false);
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode inherit', 'group'), USER, true);
+    expect(mockClearChatReplyMode).not.toHaveBeenCalled();
+    expect(lastReply()).toBe('cmd.reply_mode.owner_only');
+  });
+
+  it('setting a new mode fails closed when the topology cannot be confirmed', async () => {
+    mockGetChatModeStrict.mockResolvedValue('unknown');
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode chat', 'group'), USER, true);
+    expect(mockSetChatReplyMode).not.toHaveBeenCalled();
+    expect(lastReply()).toBe('cmd.reply_mode.chat_mode_unconfirmed');
+  });
+
+  it('setting a new mode in a topic group is rejected', async () => {
+    mockGetChatModeStrict.mockResolvedValue('topic');
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode new-topic', 'group'), USER, true);
+    expect(mockSetChatReplyMode).not.toHaveBeenCalled();
+    expect(lastReply()).toBe('cmd.reply_mode.unsupported');
+  });
+
+  it('DM `/reply-mode inherit` → dm_usage (DMs have no per-chat override)', async () => {
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode inherit', 'p2p'), USER, true);
+    expect(mockClearChatReplyMode).not.toHaveBeenCalled();
+    expect(mockApplyConfigField).not.toHaveBeenCalled();
+    expect(lastReply()).toBe('cmd.reply_mode.dm_usage');
   });
 });

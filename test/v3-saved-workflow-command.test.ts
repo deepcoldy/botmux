@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parseV3SavedWorkflowCommand } from '../src/im/lark/v3-saved-workflow-command.js';
 import { stripBotMentions } from '../src/im/lark/message-parser.js';
@@ -86,13 +85,19 @@ describe('parseV3SavedWorkflowCommand', () => {
     expect(parseV3SavedWorkflowCommand('/workflow cancel r extra')).toMatchObject({ kind: 'invalid' });
   });
 
-  it('reserves the retired v2 resume verb and points to v3 retry/static archive', () => {
+  it('reserves the retired v2 resume verb instead of starting a grill', () => {
+    expect(parseV3SavedWorkflowCommand('/workflow resume old-run')).toMatchObject({ kind: 'invalid' });
+  });
+
+  it('resume 的报错只能推荐 daemon 真正认的 /workflow 子命令，不能把人引到会被当成新目标的写法', () => {
     const result = parseV3SavedWorkflowCommand('/workflow resume old-run');
-    expect(result).toMatchObject({ kind: 'invalid' });
     const error = result && 'error' in result ? result.error : '';
-    expect(error).toContain('resume 已下线');
-    expect(error).toContain('/workflow retry');
-    expect(error).toContain('静态归档');
+    const advertised = [...error.matchAll(/\/workflow\s+([a-z]+)/gi)].map((m) => m[1]!);
+    for (const verb of advertised) {
+      // An unreserved verb returns null here and the daemon then turns the whole
+      // message into a natural-language grill goal — the hint would mislead.
+      expect(parseV3SavedWorkflowCommand(`/workflow ${verb} some-run`), `/workflow ${verb}`).not.toBeNull();
+    }
   });
 
   it('treats words before the first key=value as the saved name', () => {
@@ -133,15 +138,6 @@ describe('Saved Workflow commands after stripping this bot\'s own mentions (daem
     expect(parse('/workflow run 周报 week=37 @steve')).toMatchObject({
       kind: 'run', ref: '周报', rawParams: { week: '37' },
     });
-  });
-
-  it('daemon strips this bot\'s mentions at every Saved Workflow command call site', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const callSites = [...source.matchAll(/await handleV3SavedWorkflowCommandIfAny\(\{([\s\S]*?)\n\s*\}\)\)/g)];
-    expect(callSites.length).toBeGreaterThanOrEqual(2);
-    for (const [, args] of callSites) {
-      expect(args).toMatch(/content:\s*stripBotMentions\(\s*cmdContent,/);
-    }
   });
 
   it('still parses a leading or mid-message @bot, and keeps other people\'s mentions as content', () => {

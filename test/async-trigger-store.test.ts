@@ -1,6 +1,6 @@
 /**
- * Unit tests for async-trigger-store: recordPending, recordCompleted, lookup,
- * deleteResults — the durable backing that lets trigger-result survive a daemon
+ * Unit tests for async-trigger-store: recordPending, recordCompleted, lookup —
+ * the durable backing that lets trigger-result survive a daemon
  * restart (design A).
  *
  * Uses a real temp directory with vi.mock to redirect config.session.dataDir,
@@ -30,13 +30,13 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   recordPending,
   recordCompleted,
+  recordCompletedStrict,
   recordFailedStrict,
   recordTerminalFailureStrict,
   supersedePendingTriggerByCompletedSuccessorStrict,
   recordInterruptedStrict,
   lookup,
   lookupStrict,
-  deleteResults,
   recordSteerParked,
   followSteerParkedChain,
 } from '../src/services/async-trigger-store.js';
@@ -263,21 +263,6 @@ describe('owner stamping (cross-bot isolation)', () => {
   });
 });
 
-describe('deleteResults', () => {
-  it('removes the persisted file', () => {
-    recordPending('sess1', 'trg_a', 1000, 'cli_test');
-    const fp = join(tempDir, 'async-triggers', 'sess1.json');
-    expect(existsSync(fp)).toBe(true);
-    deleteResults('sess1');
-    expect(existsSync(fp)).toBe(false);
-    expect(lookup('sess1')).toBeUndefined();
-  });
-
-  it('does not throw when the file is absent', () => {
-    expect(() => deleteResults('never')).not.toThrow();
-  });
-});
-
 describe('robustness', () => {
   it('atomic write leaves no .tmp behind', () => {
     recordPending('sess1', 'trg_a', 1000, 'cli_test');
@@ -295,9 +280,6 @@ describe('robustness', () => {
     recordCompleted('sess1', 'trg_a', 'one', 1, 'cli_test');
     recordCompleted('sess2', 'trg_b', 'two', 2, 'cli_test');
     expect(lookup('sess1')?.result.content).toBe('one');
-    expect(lookup('sess2')?.result.content).toBe('two');
-    deleteResults('sess1');
-    expect(lookup('sess1')).toBeUndefined();
     expect(lookup('sess2')?.result.content).toBe('two');
   });
 
@@ -352,6 +334,14 @@ describe('recordFailedStrict (authoritative dispatch_unknown terminal)', () => {
 });
 
 describe('recordTerminalFailureStrict (explicit worker terminal)', () => {
+  it('preserves an explicit failure when a late completion arrives after a reload', () => {
+    recordPending('failed-turn', 'turn1', 1000, 'cli_test');
+    recordTerminalFailureStrict('failed-turn', 'turn1', 2000, 'cli_test', 'codex_quota_exceeded');
+    const before = lookupStrict('failed-turn', 'turn1');
+    recordCompleted('failed-turn', 'turn1', 'late diagnostic', 3000, 'cli_test');
+    expect(lookupStrict('failed-turn', 'turn1')).toEqual(before);
+  });
+
   it('persists the structured terminal code and preserves createdAt', () => {
     recordPending('sessT', 'trg_t', 1000, 'cli_test');
     recordTerminalFailureStrict('sessT', 'trg_t', 7000, 'cli_test', 'provider_unexpected_eof');
@@ -491,5 +481,23 @@ describe('recordSteerParked (HTTP steer group restart insurance)', () => {
     file.results.trg_bad = { status: 'completed', createdAt: 1, completedAt: 2, steerParkedBy: 'trg_q' };
     writeFileSync(fp, JSON.stringify(file));
     expect(() => lookupStrict('sessS4', 'trg_bad')).toThrow();
+  });
+});
+
+describe('strict final result capture', () => {
+  it('retains a pending result when the atomic completion write fails', () => {
+    const sid = 's'.repeat(240);
+    mkdirSync(join(tempDir, 'async-triggers'), { recursive: true });
+    writeFileSync(join(tempDir, 'async-triggers', `${sid}.json`), JSON.stringify({ ownerLarkAppId: 'cli_owner', results: { turn: { status: 'pending', createdAt: 1 } } }));
+    expect(() => recordCompletedStrict(sid, 'turn', 'answer', 2, 'cli_owner')).toThrow();
+    expect(lookupStrict(sid, 'turn')?.result.status).toBe('pending');
+  });
+  it('does not promote an interrupted turn or overwrite another bot owner', () => {
+    recordPending('strict-session', 'turn', 1, 'cli_owner');
+    recordInterruptedStrict('strict-session', 'turn', 2, 'cli_owner');
+    expect(recordCompletedStrict('strict-session', 'turn', 'late', 3, 'cli_owner')).toBe('terminal');
+    expect(lookupStrict('strict-session', 'turn')?.result.status).toBe('interrupted');
+    expect(() => recordCompletedStrict('strict-session', 'turn', 'cross bot', 4, 'cli_other')).toThrow('owner_mismatch');
+    expect(lookupStrict('strict-session', 'turn')?.ownerLarkAppId).toBe('cli_owner');
   });
 });

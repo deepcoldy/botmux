@@ -20,15 +20,18 @@
  *
  * Group chats are additionally mirrored into [[team-groups-store]] under the
  * `platform:<teamId>` teamId prefix (replace-by-prefix, never touching legacy
- * federation entries) so every existing isTeamGroupChat consumer — the
- * first-contact trust leg AND the recordTeamBot learning gate — works unchanged.
+ * federation entries). Auth consumers do NOT treat that mirror as a chat-wide
+ * trust root: first contact in a platform group only counts for bots on THAT
+ * team ({@link isTeamGroupChatFor}), and teammate learning into the
+ * machine-wide team-bots.json is limited to legacy groups
+ * ({@link isLegacyTeamGroupChat}) — platform bot identity comes from the roster.
  *
  * Storage: `{dataDir}/platform-team-sync.json`.
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { replaceTeamGroupsByPrefix } from './team-groups-store.js';
+import { listTeamGroups, replaceTeamGroupsByPrefix } from './team-groups-store.js';
 
 /** teamId prefix used when mirroring platform team groups into team-groups.json. */
 export const PLATFORM_TEAM_PREFIX = 'platform:';
@@ -94,7 +97,11 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
-      bots.push({ appId, unionId: unionId || undefined, name });
+      bots.push({
+        appId,
+        unionId: unionId || undefined,
+        name,
+      });
     }
   }
   const memberUnionIds = Array.isArray(t.memberUnionIds)
@@ -136,6 +143,12 @@ export function getPlatformTeamSyncRev(dataDir: string): string {
   return readFile(dataDir)?.rev ?? '';
 }
 
+/** Last applied team-sync's teams, or null when no sync has been received —
+ *  distinguishes "not synced yet" from "the owner has no teams". */
+export function readPlatformTeamSync(dataDir: string): PlatformTeamSyncTeam[] | null {
+  return readFile(dataDir)?.teams ?? null;
+}
+
 /** All platform teams this machine belongs to (last applied sync). */
 export function listPlatformTeams(dataDir: string): PlatformTeamSyncTeam[] {
   return readFile(dataDir)?.teams ?? [];
@@ -154,8 +167,12 @@ export function isPlatformHallChat(dataDir: string, chatId: string | undefined):
   return false;
 }
 
-/** Is `unionId` a bot in ANY platform team this machine belongs to? The auth
- *  gate's platform-mode predicate — membership-driven, no expiry. */
+/** Is `unionId` a bot in ANY platform team this machine belongs to?
+ *
+ *  Identity evidence only ("this union_id is a botmux bot"), NOT authorization:
+ *  the roster is per MACHINE (every team the machine's owner is in), so a hit
+ *  says nothing about whether the RECEIVING bot shares a team with the sender.
+ *  Auth gates must use {@link isPlatformTeamBotTrustedBy}. */
 export function isPlatformTeamBot(dataDir: string, unionId: string | undefined): boolean {
   const id = (unionId ?? '').trim();
   if (!id) return false;
@@ -165,6 +182,84 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
     for (const b of t.bots) if (b.unionId === id) return true;
   }
   return false;
+}
+
+/**
+ * Should the RECEIVING bot `receiverAppId` trust the platform-roster bot
+ * `unionId` (talk + operate, no /grant)? The auth gates' platform-mode
+ * predicate. Two ways in, both anchored on a roster entry whose union_id the
+ * caller has locked to a Feishu-stamped bot sender:
+ *
+ *  1. SAME TEAM — some team lists both the sender and the receiver in `bots`
+ *     (same anchor as {@link isPlatformTeamMember} for people).
+ *  2. SAME MACHINE — the sender's roster `appId` is configured on this machine
+ *     (`isLocalApp`, i.e. in this deployment's bots.json), whatever its team.
+ *     No owner check and `trustSameOwnerBots` does not apply here (unchanged
+ *     from before this leg was narrowed): any bot in this bots.json counts.
+ *     The owner-scoped sibling leg is isTrustedSameOwnerSiblingBot.
+ *
+ * What it no longer accepts: a bot on ANOTHER machine whose only link is that
+ * this machine's owner is also in the sender's team. The roster is pushed per
+ * machine with every team the owner belongs to, so "in any team on this
+ * machine" let a remote bot from team A drive a bot that only belongs to team B.
+ */
+export function isPlatformTeamBotTrustedBy(
+  dataDir: string,
+  receiverAppId: string | undefined,
+  unionId: string | undefined,
+  isLocalApp: (appId: string) => boolean,
+): boolean {
+  const id = (unionId ?? '').trim();
+  const receiver = (receiverAppId ?? '').trim();
+  if (!id) return false;
+  const data = readFile(dataDir);
+  if (!data) return false;
+  let senderAppIds: string[] | undefined;
+  for (const t of data.teams) {
+    const sender = t.bots.find((b) => b.unionId === id);
+    if (!sender) continue;
+    if (receiver && t.bots.some((b) => b.appId === receiver)) return true;
+    (senderAppIds ??= []).push(sender.appId);
+  }
+  return !!senderAppIds && senderAppIds.some((appId) => isLocalApp(appId));
+}
+
+/**
+ * Is `chatId` a team-assembled group whose bots the RECEIVING bot may trust on
+ * first contact (the chat-dimension leg of isTrustedTeamBotSender)?
+ *
+ *  - Legacy federation 拉群 groups (team-groups.json entries WITHOUT the
+ *    `platform:` prefix): unchanged — the chat itself is the trust root.
+ *  - Platform team groups: only when the receiver is on THAT team. The mirror
+ *    holds every team the machine's owner is in, so a bot that was added to
+ *    another team's group must not treat that team's bots as its own teammates.
+ */
+export function isTeamGroupChatFor(
+  dataDir: string,
+  receiverAppId: string | undefined,
+  chatId: string | undefined,
+): boolean {
+  const id = (chatId ?? '').trim();
+  if (!id) return false;
+  if (isLegacyTeamGroupChat(dataDir, id)) return true;
+  const receiver = (receiverAppId ?? '').trim();
+  if (!receiver) return false;
+  const data = readFile(dataDir);
+  if (!data) return false;
+  return data.teams.some((t) => t.groupChatIds.includes(id) && t.bots.some((b) => b.appId === receiver));
+}
+
+/**
+ * Legacy federation team group only (team-groups.json entry without the
+ * `platform:` prefix). Gate for LEARNING teammate union_ids into the
+ * machine-wide team-bots.json: platform bot identity is already authoritative
+ * in the platform roster, and learning it from a platform group would hand a
+ * bot of team A machine-wide trust (isTeamBot) on bots that are only in team B.
+ */
+export function isLegacyTeamGroupChat(dataDir: string, chatId: string | undefined): boolean {
+  const id = (chatId ?? '').trim();
+  if (!id) return false;
+  return listTeamGroups(dataDir).some((b) => b.chatId === id && !b.teamId.startsWith(PLATFORM_TEAM_PREFIX));
 }
 
 /** Is `unionId` a HUMAN member of a platform team that THIS bot (`botAppId`)

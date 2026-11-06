@@ -1,19 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { strictInputHandle } from '../src/adapters/cli/strict-input-handle.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 import {
   refreshCodexTerminalSession,
-  prepareCodexTerminalStatusLine,
   codexTerminalSessionIsBound,
+  bindCodexSessionFromCorrelatedInput,
 } from '../src/services/codex-terminal-session.js';
-
-import { codexConfigPathForPid, ensureCodexStatusLineConfig } from '../src/services/codex-statusline-config.js';
-
-vi.mock('../src/services/codex-statusline-config.js', () => ({
-  codexConfigPathForPid: vi.fn(),
-  ensureCodexStatusLineConfig: vi.fn(),
-}));
 
 vi.mock('../src/services/codex-transcript.js', () => ({ findCodexRolloutSetByPid: vi.fn() }));
 
@@ -38,7 +33,45 @@ function terminal(id = sid) {
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe('Codex terminal session identity', () => {
-  it('requires a visible thread ID without injecting a status command', async () => {
+  it('uses the submitted ZMX handle when the worker checks correlated ownership without readable fds', () => {
+    // Execute both real worker functions, rather than reimplementing their
+    // handle selection here. Replacing the worker's wrapped lookup with the
+    // raw backend must fail this test. The fixture never launches ZMX.
+    class FakeZmxBackend {
+      cliPid = 43212;
+      write = vi.fn();
+    }
+    const backend = new FakeZmxBackend();
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(undefined);
+    const scope: Record<string, any> = {
+      backend,
+      ZmxBackend: FakeZmxBackend,
+      strictInputHandle,
+      codexTerminalSessionIsBound,
+      currentCodexObservedPid: () => scope.backend.cliPid,
+      findCodexRolloutSetByPid,
+      // No fd ownership is available: this independent fallback refuses the
+      // session, so only the real handle-bound receipt can admit it.
+      codexHistorySidIsOwned: vi.fn(() => false),
+      log: vi.fn(),
+    };
+    scope.adapterInputHandle = loadWorkerFunction('adapterInputHandle', scope);
+    const ownsSession = loadWorkerFunction<(id: string) => boolean>('codexHistorySidOwnedByCurrentPid', scope);
+    const submittedHandle = scope.adapterInputHandle(backend);
+    expect(bindCodexSessionFromCorrelatedInput(submittedHandle, backend.cliPid, sid)).toBe(true);
+    expect(codexTerminalSessionIsBound(backend, sid)).toBe(false);
+    expect(ownsSession(sid)).toBe(true);
+    expect(ownsSession(other)).toBe(false);
+
+    // An identical PID on another backend is not the submitting instance.
+    scope.backend = new FakeZmxBackend();
+    expect(ownsSession(sid)).toBe(false);
+    scope.backend = backend;
+    backend.cliPid += 1;
+    expect(ownsSession(sid)).toBe(false);
+  });
+
+  it('reports missing footer evidence without writing to the terminal', async () => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal('');
     expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
@@ -65,12 +98,48 @@ describe('Codex terminal session identity', () => {
     expect(t.sendSpecialKeys).not.toHaveBeenCalled();
   });
 
+  it('reads the thread ID behind the Codex 0.154 U+00BB composer marker', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal('');
+    t.pty.captureInputState = () => ({
+      viewport: `\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · ${sid}`,
+      cursor: { x: 2, y: 1 },
+    });
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'terminal', sessionId: sid });
+  });
+
+  it('leaves the 0.154 footer unbound when the thread ID is absent', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal('');
+    t.pty.captureInputState = () => ({
+      viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+      cursor: { x: 2, y: 1 },
+    });
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
+  });
+
   // Two-row layouts reproduced from the Linux 0.158 review captures.
   it.each([
     `  GPT-6-Astra xhigh · /tmp · ${sid}\n  ← for agents · ? for shortcuts`,
     `  GPT-6-Astra xhigh · /tmp · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
     `  ⠙ ${sid} · GPT-6 · ⠋\n  ← for agents · ? for shortcuts`,
     `  /tmp/${other} · ${sid}\n  ← for agents · ? for shortcuts`,
+    // A right-aligned `⚠ N warnings · f2 to view` notice is space-padded onto
+    // the SAME status segment (no ` · ` between id and warning). Reproduced on
+    // codex 0.160 with a live warning present.
+    `  GPT-6-Astra xhigh · /tmp · ${sid}                                 ⚠ 1 warning · f2 to view`,
+    `  ${sid} ⠋                                  ⚠ 2 warnings · f2 to view`,
+    // When hints are hidden the warning can also occupy the second row alone.
+    `  GPT-6 · ${sid}\n  ⚠ 1 warning · f2 to view`,
+    // Codex degrades the notice by width (warning_notice.rs): compact and
+    // minimal shapes share only the `⚠ N` prefix and no longer say "warnings".
+    `  GPT-6 · ${sid}\n  ⚠ 3 · f2`,
+    `  GPT-6 · ${sid}\n  ⚠ 3 · /warnings`,
+    `  GPT-6 · ${sid}\n  ⚠ 3`,
+    // Emoji-presentation variant (⚠ + U+FE0F) must not fool the row gate.
+    `  GPT-6 · ${sid}\n  ⚠️ 2 warnings · f2 to view`,
+    // Hints on the left and the warning on the right of the same second row.
+    `  GPT-6 · ${sid}\n  ← for agents · ? for shortcuts                        ⚠ 1 warning · f2 to view`,
   ])('reads the two-row Codex 0.158 footer: %s', async (footer) => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal();
@@ -89,6 +158,16 @@ describe('Codex terminal session identity', () => {
     `${sid} · ${other}`,
     `${sid} · ${sid}`,
     `GPT-6 · Context 79% used`,
+    // A non-id suffix may not smuggle a second UUID past the uniqueness gate.
+    `${sid} see /tmp/${other}`,
+    // The id has to open the segment; a hyphen glued to it is not a boundary.
+    `${sid}-x · GPT-6`,
+    // A non-word punctuation glued directly after the id is still glued, not a
+    // whitespace-delimited status token: file/path/colon suffixes must not bind.
+    `${sid}.json · GPT-6`,
+    `${sid}/sub · GPT-6`,
+    `${sid}:x · GPT-6`,
+    `${sid},foo · GPT-6`,
   ])('rejects non-ID or ambiguous segments in the two-row footer: %s', async (footer) => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal();
@@ -105,7 +184,7 @@ describe('Codex terminal session identity', () => {
     { line: '› draft', x: 7, y: 0 },
     { line: '› first line\n  second line', x: 13, y: 1 },
     { line: '› 1. Update now', x: 2, y: 0 },
-  ])('does not bind or configure while the composer contains a draft or picker: %s', async ({ line, x, y }) => {
+  ])('does not bind while the composer contains a draft or picker: %s', async ({ line, x, y }) => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal();
     t.pty.captureInputState = () => ({
@@ -113,8 +192,6 @@ describe('Codex terminal session identity', () => {
       cursor: { x, y },
     });
     expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -280,53 +357,5 @@ describe('Codex terminal session identity', () => {
     expect(t.pty.captureInputState).not.toHaveBeenCalled();
     expect(t.sendText).not.toHaveBeenCalled();
   });
-});
 
-
-describe('Codex terminal statusline setup', () => {
-  it('configures once but still requires the running TUI to expose the ID before binding', async () => {
-    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
-    vi.mocked(codexConfigPathForPid).mockReturnValue('/custom/config.toml');
-    vi.mocked(ensureCodexStatusLineConfig).mockReturnValue({ kind: 'updated', configPath: '/custom/config.toml' });
-    const t = terminal('');
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('updated');
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('updated');
-    expect(ensureCodexStatusLineConfig).toHaveBeenCalledTimes(1);
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
-    expect(codexTerminalSessionIsBound(t.pty, sid)).toBe(false);
-    t.pty.captureInputState = () => ({ viewport: `\n› Ask Codex to do anything\n\n  ${sid}`, cursor: { x: 2, y: 1 } });
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'terminal', sessionId: sid });
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    expect(t.sendText).not.toHaveBeenCalled();
-    expect(t.sendSpecialKeys).not.toHaveBeenCalled();
-  });
-
-  it('does not alter config for visible IDs, drafts, or unknown layouts', () => {
-    const t = terminal();
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    t.pty.captureInputState = () => ({ viewport: '› draft', cursor: { x: 2, y: 0 } });
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    expect(codexConfigPathForPid).not.toHaveBeenCalled();
-    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
-  });
-
-  it('does not guess another config path when process inspection fails', () => {
-    const t = terminal('');
-    expect(prepareCodexTerminalStatusLine(t.pty)).toEqual({ kind: 'failed' });
-    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
-  });
-
-  it('retries failed edits and invalidates the cached setup after PID replacement', () => {
-    const t = terminal('');
-    vi.mocked(codexConfigPathForPid).mockReturnValue('/custom/config.toml');
-    vi.mocked(ensureCodexStatusLineConfig)
-      .mockReturnValueOnce({ kind: 'failed', configPath: '/custom/config.toml' })
-      .mockReturnValue({ kind: 'configured', configPath: '/custom/config.toml' });
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('failed');
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('configured');
-    t.pty.cliPid = 1000;
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('configured');
-    expect(ensureCodexStatusLineConfig).toHaveBeenCalledTimes(3);
-  });
 });

@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   probeSessionScopeCapabilities,
   sessionScopeUnitName,
+  sessionScopePayloadPid,
   stopSessionScope,
   userSystemdBusEnv,
   wrapCommandInSessionScope,
@@ -84,8 +85,9 @@ describe('real tmux pane systemd-scope lifecycle', () => {
       writeFileSync(childScript, `#!/bin/sh\necho $$ > "$1/child.pid"\nsh "$1/grandchild.sh" "$1" &\nwait\n`);
       writeFileSync(grandchildScript, `#!/bin/sh\necho $$ > "$1/grandchild.pid"\nsleep 300\n`);
       try {
-        // The pane command itself is systemd-run. This is the production
-        // boundary: the shared tmux server is deliberately outside the scope.
+        // The wrapper keeps the pane PID outside the owned scope, even if tmux
+        // later moves that PID into its own cgroup. The payload and descendants
+        // must still belong to the botmux scope and die when it is stopped.
         execFileSync('tmux', [
           'new-session', '-d', '-s', tmuxSession,
           scoped.bin, ...scoped.args,
@@ -97,6 +99,16 @@ describe('real tmux pane systemd-scope lifecycle', () => {
           return pids.length === pidFiles.length;
         });
         expect(pids.every(pid => pid > 1)).toBe(true);
+        const panePid = Number(execFileSync('tmux', [
+          'display-message', '-p', '-t', tmuxSession, '#{pane_pid}',
+        ], { encoding: 'utf8' }).trim());
+        expect(panePid).toBeGreaterThan(1);
+        expect(pids[0]).not.toBe(panePid);
+        // Startup detection must see the payload rather than the supervisor;
+        // in particular a shell payload must remain classified as a shell.
+        expect(sessionScopePayloadPid(panePid)).toBe(pids[0]);
+        expect(readFileSync(`/proc/${sessionScopePayloadPid(panePid)}/comm`, 'utf8').trim()).toBe('sh');
+        expect(readFileSync(`/proc/${panePid}/cgroup`, 'utf8')).not.toContain(unit);
         for (const pid of pids) {
           expect(readFileSync(`/proc/${pid}/cgroup`, 'utf8')).toContain(unit);
         }

@@ -75,5 +75,3 @@ export function createMojoAdapter(_pathOverride?: string): CliAdapter {
         modelChoices: CLI_MODEL_CHOICES['mojo'],
     };
 }
-
-export const create = createMojoAdapter;

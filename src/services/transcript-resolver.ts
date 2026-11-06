@@ -12,11 +12,13 @@ import { config } from '../config.js';
 import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
+import { resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
+import { minimaxDataDirForBot } from './minimax-paths.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity';
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity' | 'minimax';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -27,7 +29,7 @@ export interface TranscriptPathQuery {
    *  (CLI-data-redirected) bots whose transcripts live under
    *  `<botmuxHome>/bots/<appId>/claude` instead of the global data dir. */
   larkAppId?: string;
-  /** Bypass a cached miss for lazily-created transcripts. */
+  /** Bypass a cached miss; for Codex also refresh a possibly rotated path. */
   fresh?: boolean;
 }
 
@@ -41,6 +43,7 @@ const SESSION_PATH_CACHE_MAX_ENTRIES = 1024;
 /** A missed lookup (transcript not on disk yet) is retried only after this
  *  window — fresh sessions otherwise trigger a directory scan per row render. */
 const PATH_MISS_RETRY_MS = 30_000;
+const CODEX_PATH_HIT_TTL_MS = 5_000;
 
 export function __resetTranscriptResolverCacheForTest(): void {
   sessionPathCache.clear();
@@ -133,6 +136,23 @@ export function getClaudeSessionJsonlPath(
     if (globbed && regularFileMtime(globbed) !== null) return globbed;
   }
   return null;
+}
+
+/** Claude Code data root for one session: its frozen config profile, else ~/.claude.
+ *  Only trusted when the stored session belongs to the queried bot. */
+function claudeSessionDataRoot(q: TranscriptPathQuery): string {
+  // Best-effort: this path never depended on the session store before profiles
+  // existed, so an unavailable store must degrade to ~/.claude, not throw.
+  let session: ReturnType<typeof getSession>;
+  try { session = getSession(q.sessionId); } catch { session = undefined; }
+  // Adopted sessions wrap an external CLI on the default data root; an older
+  // build may have frozen the bot profile onto such a row, so ignore it there.
+  const profile = session?.cliConfigDir
+    && !session.adoptedFrom
+    && (!q.larkAppId || q.larkAppId === session.larkAppId)
+    ? session.cliConfigDir
+    : undefined;
+  return profile ? resolve(expandHome(profile)) : join(homedir(), '.claude');
 }
 
 /** Resolve a Claude-family fork's (seed / relay) data root EXACTLY as the worker
@@ -276,14 +296,14 @@ function codexRolloutInHome(
   };
   let path = cachedTranscriptPathLookup(
     key,
-    null,
+    CODEX_PATH_HIT_TTL_MS,
     lookup,
-    { retryMiss: q.fresh },
+    { retryMiss: q.fresh, refreshHit: q.fresh },
   );
   // Positive entries were historically cached forever. Refresh immediately if
   // the file vanished or was replaced by a symlink/non-regular node.
   if (path && candidateMtime(path) === null) {
-    path = cachedTranscriptPathLookup(key, null, lookup, { refreshHit: true, retryMiss: true });
+    path = cachedTranscriptPathLookup(key, CODEX_PATH_HIT_TTL_MS, lookup, { refreshHit: true, retryMiss: true });
   }
   return candidateMtime(path) === null ? null : path;
 }
@@ -294,7 +314,9 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'grok', 'antigravity',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
+  // ZCode reports usage from its own ledger (services/zcode-usage.ts), not a transcript.
+  'zcode',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).
@@ -336,8 +358,15 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
   const svMappings = sessionScratchMappings(q);
   const v = (hostPath: string): string => scratchViewPath(svMappings, hostPath);
   switch (q.cliId) {
+    case 'minimax': {
+      const path = join(v(minimaxDataDirForBot(q.larkAppId)), 'v2', 'sqlite', 'runtime-state.sqlite');
+      return existsSync(path) ? { path, kind: 'minimax' } : null;
+    }
     case 'claude-code': {
-      const homeRoot = v(join(homedir(), '.claude'));
+      // A session launched on a config profile (`cliConfigDir`, frozen on the
+      // session) wrote its transcript under that profile, not ~/.claude.
+      const dataRoot = claudeSessionDataRoot(q);
+      const homeRoot = v(dataRoot);
       // cwd must be remapped too: on macOS Claude runs with the CLONE path as
       // cwd and keys its project dir by that slug; passing the host cwd here
       // yields a slug that never matches. (Linux identity-maps, so v() is a
@@ -346,7 +375,7 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const sq: TranscriptPathQuery = scratchCwd === q.cwd ? q : { ...q, cwd: scratchCwd };
       const path = svMappings
         ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
-        : claudeJsonlWithBotHomeFallback(sid, sq, join(homedir(), '.claude'));
+        : claudeJsonlWithBotHomeFallback(sid, sq, dataRoot);
       return path ? { path, kind: 'claude' } : null;
     }
     case 'aiden': {
@@ -432,14 +461,13 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'pi' } : null;
     }
     case 'antigravity': {
-      // Validate the CLI session id before interpolating it into a path (every
-      // other branch resolves by scanning a data dir; this one builds the path
-      // directly). Conservative charset rules out traversal / separators, and
-      // existsSync keeps the null-when-absent contract the other branches honor.
-      if (!q.cliSessionId || !/^[A-Za-z0-9._-]+$/.test(q.cliSessionId)) return null;
-      const pReal = join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
-      const p = v(pReal);
-      return existsSync(p) ? { path: p, kind: 'antigravity' } : null;
+      // The conversation id is interpolated into the brain path; the helper
+      // validates the charset (traversal / separators). Read it through the
+      // per-session scratch overlay like every other host-derived root; the
+      // untruncated transcript_full.jsonl wins over the compact log, and the
+      // existence check keeps the null-when-absent contract every branch honors.
+      const p = resolveAntigravityTranscriptPath(q.cliSessionId, { mapPath: v });
+      return p ? { path: p, kind: 'antigravity' } : null;
     }
     default:
       return null;

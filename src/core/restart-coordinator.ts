@@ -1,6 +1,18 @@
 import { randomBytes } from 'node:crypto';
 
-export type RestartSource = 'slash' | 'card';
+/**
+ * Who asked for the physical restart. Every in-worker respawn must go through
+ * the coordinator: the attemptId-correlated `restart_result` is the only edge
+ * that lifts the daemon's workerReady fence (an in-worker respawn never emits a
+ * second process-level `ready`), so a bare restart IPC strands the session as
+ * `worker_busy` forever.
+ *
+ *  - `slash` / `card`  — IM `/restart` and the streaming-card button.
+ *  - `cli_crash`       — daemon auto-restart after an unexpected CLI exit.
+ *  - `dashboard`       — dashboard restart button (operator).
+ *  - `cwd_move`        — role-switch working-directory move (respawn in new cwd).
+ */
+export type RestartSource = 'slash' | 'card' | 'cli_crash' | 'dashboard' | 'cwd_move';
 export type RestartTerminalStatus = 'succeeded' | 'failed' | 'timed_out';
 export type RestartObserverStatus = 'in_progress' | RestartTerminalStatus;
 

@@ -234,7 +234,7 @@ describe('durable turn queue boundary', () => {
     expect(pendingInputAllowsTypeAhead(true, false, { content: 'follow-up' }, false)).toBe(true);
   });
 
-  it('forces separate idle edges on both sides of a durable attempt', () => {
+  it('forces separate idle edges for durable attempts and explicit serial batches', () => {
     expect(shouldStopPendingBatch(
       { content: 'delivery', dispatchAttempt: 1 },
       { content: 'user follow-up' },
@@ -243,6 +243,16 @@ describe('durable turn queue boundary', () => {
       { content: 'user turn' },
       { content: 'delivery', dispatchAttempt: 1 },
     )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'serial turn 1' },
+      { content: 'serial turn 2' },
+      false,
+    )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'ordinary turn 1' },
+      { content: 'ordinary turn 2' },
+      true,
+    )).toBe(false);
     expect(shouldStopPendingBatch({ content: 'user 1' }, { content: 'user 2' })).toBe(false);
   });
 

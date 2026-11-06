@@ -54,6 +54,29 @@ describe('vc meeting runtime store', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('freezes policy for future meetings without changing legacy or restored records', () => {
+    const base = { larkAppId: 'cli_a', meeting: { id: 'policy' }, listenerChatId: 'oc_listener', selectedAgents: [] };
+    const policy = { rawMessages: false, finalSummary: true, allowSummarySharing: true };
+    recordVcMeetingRuntimeSession(dir, { ...base, listenerPolicy: policy }, 1000);
+    recordVcMeetingRuntimeSession(dir, { ...base, listenerPolicy: { ...policy, rawMessages: true } }, 2000);
+    expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 2500)[0].listenerPolicy).toEqual(policy);
+    recordVcMeetingRuntimeSession(dir, { ...base, meeting: { id: 'legacy' } }, 1000);
+    recordVcMeetingRuntimeSession(dir, { ...base, meeting: { id: 'legacy' }, listenerPolicy: policy }, 2000);
+    expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 2500).find(row => row.meeting.id === 'legacy')!.listenerPolicy).toBeUndefined();
+  });
+
+  it('round-trips pending/verified inviter grants without leaking them into a different meeting', () => {
+    const grant = { openId: 'ou_inviter', eventId: 'evt1', invitedAt: 1000, policyEnabledAt: 500, memberReady: false };
+    const input = { larkAppId: 'cli_listener', meeting: { id: 'm1' }, listenerChatId: 'oc_one', inviterManagers: [grant], listenerChatCreatedForMeeting: true };
+    recordVcMeetingRuntimeSession(dir, input, 2000);
+    expect(listVcMeetingRuntimeSessions(dir, 'cli_listener', 2001)[0]).toMatchObject({ inviterManagers: [grant], listenerChatCreatedForMeeting: true });
+    recordVcMeetingRuntimeSession(dir, { ...input, inviterManagers: [{ ...grant, memberReady: true }] }, 2002);
+    recordVcMeetingRuntimeSession(dir, { larkAppId: 'cli_listener', meeting: { id: 'm2' }, listenerChatId: 'oc_two' }, 2003);
+    const records = listVcMeetingRuntimeSessions(dir, 'cli_listener', 2004);
+    expect(records.find(r => r.meeting.id === 'm1')?.inviterManagers?.[0].memberReady).toBe(true);
+    expect(records.find(r => r.meeting.id === 'm2')?.inviterManagers).toBeUndefined();
+  });
+
   it('records, updates, lists, and removes runtime listener routes', () => {
     recordVcMeetingRuntimeSession(dir, {
       larkAppId: 'cli_a',

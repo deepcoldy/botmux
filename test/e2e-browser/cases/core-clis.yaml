@@ -1,0 +1,28 @@
+# Lane: the public CLIs, each in its own private chat — new topic, streaming
+# card, ACK reply. On CI every CLI talks to the mock LLM: scripts/run-e2e.ts
+# (mockCliEnv) and the workflow's "Install public CLI runtimes" step wire them.
+cases:
+  - name: OpenCode basic bot flow
+    tags: [bot, smoke, core, cli]
+    steps:
+      - feishu.runScenario: { scenario: bot-opencode-basic }
+  - name: Pi basic bot flow
+    tags: [bot, smoke, core, cli]
+    steps:
+      - feishu.runScenario: { scenario: bot-pi-basic }
+  - name: OhMyPi basic bot flow
+    tags: [bot, smoke, core, cli]
+    steps:
+      - feishu.runScenario: { scenario: bot-ohmypi-basic }
+  - name: Kimi basic bot flow
+    tags: [bot, smoke, core, cli]
+    steps:
+      - feishu.runScenario: { scenario: bot-kimi-basic }
+  - name: Antigravity basic bot flow
+    tags: [bot, smoke, core, cli]
+    steps:
+      - feishu.runScenario: { scenario: bot-antigravity-basic }
+  - name: Grok basic bot flow
+    tags: [bot, smoke, core, cli]
+    steps:
+      - feishu.runScenario: { scenario: bot-grok-basic }

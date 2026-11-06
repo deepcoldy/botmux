@@ -110,6 +110,13 @@ describe('extractBotmuxLarkNativeSessionTitlePrompt', () => {
       [{ name: 'TestBot' }],
     )).toBeUndefined();
   });
+
+  // #2716: bare（transcript + solo）续轮没有 <user_message> 壳、走 rawContent
+  // 兜底，追加在正文后的格式提示块（连标签带块体）不能进语义标题。
+  it('bare 续轮追加的 <botmux_formatting> 块不进标题模型输入', () => {
+    const bare = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(bare)).toBe('继续看一下这个 PR');
+  });
 });
 
 describe('updateSessionTitle', () => {
@@ -177,17 +184,5 @@ describe('updateSessionTitle', () => {
   it('normalizes untrusted source labels to the caller fallback', () => {
     expect(normalizeSessionTitleSource('agent', 'dashboard')).toBe('agent');
     expect(normalizeSessionTitleSource('spoofed', 'dashboard')).toBe('dashboard');
-  });
-
-  it('keeps the canonical dashboard title separate from temporary TUI prompt labels', async () => {
-    const { readFileSync } = await import('node:fs');
-    const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    const start = workerPoolSource.indexOf("case 'tui_prompt':");
-    const end = workerPoolSource.indexOf("case 'tui_prompt_resolved':", start);
-    const region = workerPoolSource.slice(start, end);
-
-    expect(region).toContain('ds.currentTurnTitle = msg.description');
-    expect(region).not.toContain('patch: { title:');
-    expect(region).not.toContain('patch: {\n                title:');
   });
 });

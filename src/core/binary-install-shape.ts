@@ -107,10 +107,8 @@ export function classifyBinaryInstall(
   // honours, so an install that used it is recognised WHEN THAT VARIABLE IS STILL
   // EXPORTED at runtime. ⚠️ It usually is not: `BOTMUX_INSTALL_DIR=/opt/bm sh
   // install.sh` sets it for the installer only, so a later `botmux update` sees a
-  // bare environment and this falls through to `unknown` — fail-closed, so nothing
-  // is damaged, but self-update is unavailable for that install. Do not describe
-  // custom dirs as unconditionally covered; making them work without the variable
-  // would need a persisted install record, which is out of scope here.
+  // bare environment and this falls through to `unknown`. A manual update then
+  // installs the release at the default launcher path, preserving this binary.
   //
   // Compared BOTH raw and canonicalized (see {@link canonical}): a symlinked home
   // makes the raw strings differ for one and the same file.
@@ -196,12 +194,14 @@ export function mainPackageRootForSubpackageBinary(execPath: string): string | n
  *    plain Node install AND a compiled binary living inside a package manager's
  *    tree (the manager owns that file).
  *  · `self-replace`    — download the release asset and swap the binary.
+ *  · `install-release` — manually install a release at the default launcher path.
  *  · `unsupported`     — could not identify the install; callers keep their
  *                        existing "unsupported install" behaviour.
  */
 export type UpdateStrategy =
   | { kind: 'package-manager'; packageRoot: string }
   | { kind: 'self-replace'; target: string }
+  | { kind: 'install-release'; target: string }
   | { kind: 'unsupported'; reason: 'unknown-binary-location' };
 
 /**
@@ -234,7 +234,7 @@ export function resolveUpdateStrategy(
     if (root) return { kind: 'package-manager', packageRoot: root };
   }
   if (shape === 'curl-binary') return { kind: 'self-replace', target: execPath };
-  return { kind: 'unsupported', reason: 'unknown-binary-location' };
+  return { kind: 'install-release', target: join(defaultInstallDir(home), 'botmux') };
 }
 
 /** Production wiring for {@link resolveUpdateStrategy}. */

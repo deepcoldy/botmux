@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { platform } from 'node:os';
+import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../../utils/proc-stat.js';
 import { sampleDarwin } from './darwin.js';
 import type { ProcfsSample, ProcessResourceSample } from './types.js';
 
@@ -122,11 +123,11 @@ export function parseProcessStat(raw: string): { pid: number; ppid: number; cpuT
   if (open < 0 || close < open) return null;
 
   const pid = Number(raw.slice(0, open).trim());
-  const fieldsAfterComm = raw.slice(close + 1).trim().split(/\s+/);
+  const fieldsAfterComm = procStatFieldsAfterComm(raw)!;
   const ppid = Number(fieldsAfterComm[1]);
   const utime = Number(fieldsAfterComm[11]) || 0;
   const stime = Number(fieldsAfterComm[12]) || 0;
-  const startTicks = Number(fieldsAfterComm[19]) || 0;
+  const startTicks = Number(fieldsAfterComm[PROC_STAT_STARTTIME_INDEX]) || 0;
   const rssPages = Number(fieldsAfterComm[21]) || 0;
   if (!Number.isInteger(pid) || !Number.isInteger(ppid)) return null;
   return { pid, ppid, cpuTicks: utime + stime, startTicks, rssPages };

@@ -53,8 +53,11 @@ import {
   applySessionCommandUnowned,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
+  listActiveSessionIdsAcrossStores,
   listSessionsStrict,
+  readSessionsByRoots,
   SessionStoreSqliteUnavailableError,
+  SessionStoreUnmigratedError,
 } from '../src/services/session-store.js';
 import {
   readPersistedSessionRows,
@@ -179,6 +182,22 @@ describe('first-start JSON import', () => {
     init('appA');
     expect(getSession('s1')?.status).toBe('closed');
     expect(JSON.parse(readFileSync(jsonFp, 'utf-8')).s1.status).toBe('active');
+  });
+
+  it('closeSession removes the session\'s skill manifest and runtime-skills snapshot (sibling sessions untouched)', () => {
+    seedJson('sessions-appA.json', { s1: row('s1'), s2: row('s2') });
+    init('appA');
+    for (const sid of ['s1', 's2']) {
+      mkdirSync(join(tempDir, 'skill-manifests'), { recursive: true });
+      writeFileSync(join(tempDir, 'skill-manifests', `${sid}.json`), '{}');
+      mkdirSync(join(tempDir, 'runtime-skills', sid, 'snapshot', 'deploy'), { recursive: true });
+      writeFileSync(join(tempDir, 'runtime-skills', sid, 'snapshot', 'deploy', 'SKILL.md'), '# Deploy');
+    }
+    closeSession('s1');
+    expect(existsSync(join(tempDir, 'skill-manifests', 's1.json'))).toBe(false);
+    expect(existsSync(join(tempDir, 'runtime-skills', 's1'))).toBe(false);
+    expect(existsSync(join(tempDir, 'skill-manifests', 's2.json'))).toBe(true);
+    expect(existsSync(join(tempDir, 'runtime-skills', 's2', 'snapshot', 'deploy', 'SKILL.md'))).toBe(true);
   });
 
   it('publishes the store atomically: no .db.tmp survives, and stale tmp leftovers are replaced', () => {
@@ -524,5 +543,115 @@ describe('SQLite capability gate', () => {
     expect(copies.matches).toHaveLength(1);
     expect(copies.unreadableStores).toBe(1);
     expect(copies.matches[0]?.title).toBe('other-bot');
+  });
+});
+
+// ─── 跨 bot 共享树清扫的保护集合 ─────────────────────────────────────────────
+
+describe('listActiveSessionIdsAcrossStores', () => {
+  const noKnownBots = () => new Set<string>();
+
+  it('unions the active rows of every bot store and leaves closed rows out', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      a1: row('a1'),
+      aClosed: row('aClosed', { status: 'closed' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      b1: row('b1'),
+      bClosed: row('bClosed', { status: 'closed' }),
+    });
+
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })].sort())
+      .toEqual(['a1', 'b1']);
+  });
+
+  it('is empty before any store exists', () => {
+    expect(listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }).size).toBe(0);
+  });
+
+  it('throws when one store cannot be read instead of returning the rest', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'this is not a database');
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })).toThrow();
+  });
+
+  it('throws while a bot that still exists has not imported its JSON store', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    seedJson('sessions-appA.json', { a1: row('a1') });
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appA']) }))
+      .toThrow(SessionStoreUnmigratedError);
+  });
+
+  it('ignores the leftover JSON store of a bot removed from this machine', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    seedJson('sessions-gone.json', { g1: row('g1') });
+
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appB']) })])
+      .toEqual(['b1']);
+  });
+
+  it('propagates a missing SQLite engine', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    __testOnly_setSqliteUnavailable(true);
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }))
+      .toThrow(SessionStoreSqliteUnavailableError);
+  });
+});
+
+describe('readSessionsByRoots (dispatch task-tree narrow read)', () => {
+  const PROJECTION = ['sessionId', 'larkAppId', 'rootMessageId', 'status'] as const;
+  const project = (sessions: Array<Record<string, unknown>>) =>
+    Object.fromEntries(sessions
+      .filter(s => typeof s.sessionId === 'string')
+      .map(s => [s.sessionId, Object.fromEntries(PROJECTION.map(k => [k, s[k]]))]));
+
+  it('equals the full snapshot restricted to the roots on tree fields, including app-id backfill for column-less rows', () => {
+    // Two stores: active + closed, rows written WITHOUT larkAppId (as older
+    // versions did), plus rows for roots outside the query set.
+    seedPersistedSessionRows(tempDir, 'appA', {
+      aActive: row('aActive', { rootMessageId: 'om_r1', larkAppId: undefined }),
+      aClosed: row('aClosed', { rootMessageId: 'om_r1', status: 'closed', closedAt: '2026-02-01T00:00:00.000Z', larkAppId: undefined }),
+      aTwo: row('aTwo', { rootMessageId: 'om_r2', larkAppId: undefined }),
+      aOther: row('aOther', { rootMessageId: 'om_other', larkAppId: undefined }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      bClosed: row('bClosed', { rootMessageId: 'om_r3', status: 'closed', closedAt: '2026-02-02T00:00:00.000Z' }),
+      bOther: row('bOther', { rootMessageId: 'om_other' }),
+    });
+    const roots = new Set(['om_r1', 'om_r2', 'om_r3']);
+    const narrow = project(readSessionsByRoots(roots, { dataDir: tempDir }));
+    const snapshotSubset = project(
+      [...loadAllSessionsSnapshot({ dataDir: tempDir }).values()]
+        .filter(s => typeof s.rootMessageId === 'string' && roots.has(s.rootMessageId))
+        .map(s => s as unknown as Record<string, unknown>),
+    );
+    expect(narrow).toEqual(snapshotSubset);
+    expect(narrow).toEqual({
+      aActive: { sessionId: 'aActive', larkAppId: 'appA', rootMessageId: 'om_r1', status: 'active' },
+      aClosed: { sessionId: 'aClosed', larkAppId: 'appA', rootMessageId: 'om_r1', status: 'closed' },
+      aTwo: { sessionId: 'aTwo', larkAppId: 'appA', rootMessageId: 'om_r2', status: 'active' },
+      bClosed: { sessionId: 'bClosed', larkAppId: 'appB', rootMessageId: 'om_r3', status: 'closed' },
+    });
+  });
+
+  it('backfills the owning app id for a column-less row served from its own live in-memory store', () => {
+    // Seed before init so the row enters the in-memory map through
+    // readOwnStoreAllRows (which only JSON.parses, no backfill).
+    seedPersistedSessionRows(tempDir, 'appMem', {
+      memChild: row('memChild', { rootMessageId: 'om_m', larkAppId: undefined }),
+    });
+    init('appMem');
+    const [got] = readSessionsByRoots(new Set(['om_m']), { dataDir: tempDir });
+    expect(got).toMatchObject({ sessionId: 'memChild', larkAppId: 'appMem', rootMessageId: 'om_m', status: 'active' });
+  });
+
+  it('returns nothing for an empty root set or unknown roots', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { rootMessageId: 'om_r1' }) });
+    expect(readSessionsByRoots(new Set(), { dataDir: tempDir })).toEqual([]);
+    expect(readSessionsByRoots(new Set(['om_nope']), { dataDir: tempDir })).toEqual([]);
   });
 });

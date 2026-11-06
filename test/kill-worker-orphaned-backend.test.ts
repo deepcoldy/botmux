@@ -100,10 +100,13 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import { config } from '../src/config.js';
 import { managedHerdrAgentName } from '../src/adapters/backend/session-backend-selector.js';
+import type { SessionWorkerProcessRuntime } from '../src/core/session-worker-identity.js';
 import {
   killStalePids,
   killWorker,
+  sweepStaleSessionWorkerPids,
   setActiveSessionSafe,
+  setActiveSessionIfActive,
   teardownAuthoritativePersistentBackingBeforeClose,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
@@ -131,6 +134,28 @@ beforeEach(() => {
   herdrList.mockReturnValue([]);
   zmxList.mockReturnValue([]);
   getBotMock.mockReturnValue({ resolvedAllowedUsers: [], config: {} } as any);
+});
+
+describe('workspace retirement registration guard', () => {
+  it.each(['sync', 'locked'] as const)('rejects active retired rows at the %s gate and preserves a newer occupant', async gate => {
+    const register = async (map: Map<string, DaemonSession>, key: string, incoming: DaemonSession) => gate === 'sync'
+      ? setActiveSessionIfActive(map, key, incoming)
+      : (await setActiveSessionSafe(map, key, incoming)).accepted;
+    const { logger } = await import('../src/utils/logger.js');
+    const incoming = ds();
+    incoming.session.status = 'active';
+    incoming.session.workspaceRetirement = { operationId: 'recycle-registration', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    const key = activeSessionKey(incoming);
+    const map = new Map([[key, incoming]]);
+    expect(await register(map, key, incoming)).toBe(false);
+    expect(map.size).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('workspace-retired session (status=active, operationId=recycle-registration)'));
+    const winner = ds({ session: { ...incoming.session, sessionId: 'new-session', workspaceRetirement: undefined } });
+    map.set(key, winner);
+    expect(await register(map, key, incoming)).toBe(false);
+    expect(map.get(key)).toBe(winner);
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('inactive session (status=active)'));
+  });
 });
 
 describe('killStalePids — ZMX CLI-change cleanup', () => {
@@ -180,23 +205,27 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
   });
 
   it('signals only the stale worker PID for an existing App Server share', () => {
-    const kill = vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
     const sharedPid = 42_424;
+    const kill = vi.fn();
+    // The recorded worker is still running: same birth identity, worker entry.
+    const runtime: SessionWorkerProcessRuntime = {
+      readIdentity: () => 'boot:4242',
+      readCommandLine: () => '/usr/bin/bun /opt/botmux/dist/worker.js',
+      readSystemdUnit: () => undefined,
+      pidExists: () => true,
+      kill,
+    };
 
-    try {
-      killStalePids([{
-        sessionId: SID,
-        pid: sharedPid,
-        backendType: 'pty',
-        existingAppServerEndpoint: 'unix:///tmp/codex-app-server.sock',
-      } as any]);
+    sweepStaleSessionWorkerPids([{
+      sessionId: SID,
+      pid: sharedPid,
+      pidProcStart: 'boot:4242',
+      backendType: 'pty',
+      existingAppServerEndpoint: 'unix:///tmp/codex-app-server.sock',
+    } as any], undefined, runtime);
 
-      expect(kill).toHaveBeenCalledWith(sharedPid, 0);
-      expect(kill).toHaveBeenCalledWith(sharedPid, 'SIGTERM');
-      expect(kill).not.toHaveBeenCalledWith(-sharedPid, 'SIGTERM');
-    } finally {
-      kill.mockRestore();
-    }
+    expect(kill).toHaveBeenCalledWith(sharedPid, 'SIGTERM');
+    expect(kill).not.toHaveBeenCalledWith(-sharedPid, 'SIGTERM');
   });
 
   it('keeps the complete owning session identity and does not issue a second name-only kill', () => {

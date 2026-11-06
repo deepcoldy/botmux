@@ -4,6 +4,7 @@ import {
   normalizeSandboxMode,
   normalizeScratchStorage,
   resolveSandboxMode,
+  resolveSpawnNetworkShape,
   sandboxBoolValue,
   sandboxIsActive,
 } from '../src/adapters/cli/sandbox-mode.js';
@@ -58,9 +59,24 @@ describe('envSandboxMode (BOTMUX_SANDBOX)', () => {
 });
 
 describe('resolveSandboxMode', () => {
-  it('env override wins', () => {
+  it('an active env value (1 / oncall / scratch) forces that mode on every bot', () => {
     expect(resolveSandboxMode({ configSandbox: 'oncall', envValue: 'scratch' })).toBe('scratch');
-    expect(resolveSandboxMode({ configSandbox: 'scratch', envValue: '0' })).toBe('off');
+    expect(resolveSandboxMode({ configSandbox: false, envValue: '1' })).toBe('oncall');
+    expect(resolveSandboxMode({ configSandbox: 'scratch', envValue: 'oncall' })).toBe('oncall');
+  });
+
+  it('an inactive env value (0 / false / empty / unset) never turns off a bot\'s own sandbox', () => {
+    for (const envValue of ['0', 'false', '', undefined]) {
+      expect(resolveSandboxMode({ configSandbox: true, envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: 'oncall', envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: 'scratch', envValue })).toBe('scratch');
+      expect(resolveSandboxMode({ configSandbox: false, readIsolation: true, envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: false, envValue })).toBe('off');
+    }
+  });
+
+  it('an invalid env value still fails closed even when the bot config is valid', () => {
+    expect(() => resolveSandboxMode({ configSandbox: true, envValue: 'no' })).toThrow(/invalid BOTMUX_SANDBOX/);
   });
 
   it('legacy readIsolation implies oncall', () => {
@@ -88,5 +104,47 @@ describe('normalizeScratchStorage', () => {
     expect(normalizeScratchStorage('disk')).toBe('disk');
     expect(normalizeScratchStorage('tmpfs')).toBe('tmpfs');
     expect(() => normalizeScratchStorage('ram')).toThrow(/invalid scratchStorage/);
+  });
+});
+
+describe('resolveSpawnNetworkShape (identity-model single source)', () => {
+  it('reports no sandbox and shared loopback for off', () => {
+    expect(resolveSpawnNetworkShape({ mode: 'off', sandboxNetwork: false })).toEqual({
+      sandboxEngaged: false, netEnabled: false, loopbackShared: true,
+    });
+    // Frozen network inputs must not matter when no sandbox engages.
+    expect(resolveSpawnNetworkShape({ mode: 'off' })).toEqual({
+      sandboxEngaged: false, netEnabled: false, loopbackShared: true,
+    });
+  });
+
+  it('oncall without policy follows the frozen network switch', () => {
+    expect(resolveSpawnNetworkShape({ mode: 'oncall', sandboxNetwork: true })).toEqual({
+      sandboxEngaged: true, netEnabled: true, loopbackShared: true,
+    });
+    expect(resolveSpawnNetworkShape({ mode: 'oncall', sandboxNetwork: false })).toEqual({
+      sandboxEngaged: true, netEnabled: false, loopbackShared: false,
+    });
+    expect(resolveSpawnNetworkShape({ mode: 'oncall' })).toEqual({
+      sandboxEngaged: true, netEnabled: true, loopbackShared: true,
+    });
+  });
+
+  it('oncall with a slirp policy keeps networking on but cuts host loopback', () => {
+    expect(resolveSpawnNetworkShape({
+      mode: 'oncall', sandboxNetwork: true, sandboxNetworkPolicy: { mode: 'slirp' },
+    })).toEqual({ sandboxEngaged: true, netEnabled: true, loopbackShared: false });
+  });
+
+  it('scratch follows the frozen network switch and ignores policy-shaped input', () => {
+    // networkPolicySupportError rejects policy outside oncall before spawn;
+    // the shape helper itself stays a pure table (scratch + policy is
+    // unreachable, not silently mis-shaped here).
+    expect(resolveSpawnNetworkShape({ mode: 'scratch', sandboxNetwork: false })).toEqual({
+      sandboxEngaged: true, netEnabled: false, loopbackShared: false,
+    });
+    expect(resolveSpawnNetworkShape({ mode: 'scratch', sandboxNetwork: true })).toEqual({
+      sandboxEngaged: true, netEnabled: true, loopbackShared: true,
+    });
   });
 });

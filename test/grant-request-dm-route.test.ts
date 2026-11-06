@@ -43,7 +43,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
 
 import { registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { maybeSendGrantRequestCard } from '../src/im/lark/event-dispatcher.js';
-import { isThrottled, OWNER_DM_MAX_PER_WINDOW, tryReserveOwnerDmSlot, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { checkNonce, isThrottled, OWNER_DM_MAX_PER_WINDOW, tryReserveOwnerDmSlot, _resetForTest as _resetGrantPending, _simulateRestartForTest } from '../src/im/lark/grant-pending.js';
 import { clearChatMemberCache } from '../src/im/lark/grant-owner.js';
 import { replyMessage, sendUserMessage, listChatMemberOpenIds, getChatName } from '../src/im/lark/client.js';
 
@@ -68,6 +68,7 @@ function registerRestrictedBot(extra: Record<string, unknown> = {}) {
 }
 
 const groupMsg = (id: string) => ({ message_id: id, chat_type: 'group' });
+const nonceOf = (card: string) => /"nonce":"([^"]+)"/.exec(card)?.[1] ?? '';
 const p2pMsg = (id: string) => ({ message_id: id, chat_type: 'p2p' });
 
 describe('maybeSendGrantRequestCard — grantRequestToOwnerDm off (default)', () => {
@@ -125,6 +126,47 @@ describe('maybeSendGrantRequestCard — grantRequestToOwnerDm on', () => {
     expect([to, msgType]).toEqual(['om_g1', 'interactive']);
     expect(card).toContain(`<at id=${OWNER}></at>`);
     expect(card).not.toContain('"delivery"');
+  });
+
+  // 接线钉：两条投递分支都是卡发出去之后才落盘，daemon 重启后管理员照样能点；发卡失败则不落盘。
+  it('in-chat card delivered → survives a daemon restart', async () => {
+    registerRestrictedBot();
+    vi.mocked(listChatMemberOpenIds).mockResolvedValue([OWNER, REQUESTER]);
+    await maybeSendGrantRequestCard(APP, groupMsg('om_g_persist'), GROUP, REQUESTER, { message: { message_id: 'om_g_persist' } });
+    const nonce = nonceOf(vi.mocked(replyMessage).mock.calls[0]![2] as string);
+    _simulateRestartForTest();
+    expect(checkNonce(APP, GROUP, REQUESTER, nonce)).toBe(true);
+  });
+
+  it('in-chat card send failure → nothing persisted, no throttle after a restart', async () => {
+    registerRestrictedBot();
+    vi.mocked(listChatMemberOpenIds).mockResolvedValue([OWNER, REQUESTER]);
+    vi.mocked(replyMessage).mockRejectedValueOnce(new Error('send failed'));
+    await maybeSendGrantRequestCard(APP, groupMsg('om_g_fail'), GROUP, REQUESTER);
+    const nonce = nonceOf(vi.mocked(replyMessage).mock.calls[0]![2] as string);
+    _simulateRestartForTest();
+    expect(checkNonce(APP, GROUP, REQUESTER, nonce)).toBe(false);
+    expect(isThrottled(APP, GROUP, REQUESTER)).toBe(false);
+  });
+
+  it('owner-DM card delivered → survives a daemon restart', async () => {
+    registerRestrictedBot();
+    vi.mocked(listChatMemberOpenIds).mockResolvedValue([REQUESTER]);
+    await maybeSendGrantRequestCard(APP, groupMsg('om_dm_persist'), GROUP, REQUESTER);
+    const nonce = nonceOf(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+    _simulateRestartForTest();
+    expect(checkNonce(APP, GROUP, REQUESTER, nonce)).toBe(true);
+  });
+
+  it('owner-DM card send failure → nothing persisted, no throttle after a restart', async () => {
+    registerRestrictedBot();
+    vi.mocked(listChatMemberOpenIds).mockResolvedValue([REQUESTER]);
+    vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('send failed'));
+    await maybeSendGrantRequestCard(APP, groupMsg('om_dm_fail'), GROUP, REQUESTER);
+    const nonce = nonceOf(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+    _simulateRestartForTest();
+    expect(checkNonce(APP, GROUP, REQUESTER, nonce)).toBe(false);
+    expect(isThrottled(APP, GROUP, REQUESTER)).toBe(false);
   });
 
   it('group without any admin → card to owner DM with chat name, neutral ack in the group', async () => {

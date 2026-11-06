@@ -14,8 +14,6 @@ export type PrincipalLaneIntent =
   | 'explicit_new_topic'
   | 'explicit_suggest_current';
 
-export const SOURCE_PRINCIPAL_LANE_ID = 'source';
-
 export interface TrustedPrincipalLaneReference {
   trusted: boolean;
   principalKey?: string;
@@ -59,18 +57,6 @@ export function lanePrincipalFromInbound(args: {
     larkAppId: args.larkAppId,
     openId,
   };
-}
-
-/** Lane 0 is a durable mapping, not an active-turn heuristic. This keeps the
- * original principal on the source session even after its current turn is
- * idle, and prevents accidental creation of a shadow copy of lane 0. */
-export function resolveCallerLaneId(args: {
-  callerPrincipalKey: string;
-  sourcePrincipalKey: string;
-  indexedLaneId?: string;
-}): string | undefined {
-  if (args.callerPrincipalKey === args.sourcePrincipalKey) return SOURCE_PRINCIPAL_LANE_ID;
-  return args.indexedLaneId;
 }
 
 /** Pure precedence table. In particular explicit new-topic intent is exact and
@@ -165,24 +151,6 @@ export function decideLegacySourceMigration(args: {
   }
 
   return { kind: 'disable_principal_lanes', reason: 'caller_identity_unproven' };
-}
-
-export function principalLaneDisplayTarget(
-  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'larkAppId' | 'principalLane'>,
-  expectedDisplayTarget: PrincipalLaneDisplayTarget,
-): PrincipalLaneDisplayTarget | undefined {
-  if (session.larkAppId && session.larkAppId !== expectedDisplayTarget.larkAppId) return undefined;
-  if (session.principalLane) {
-    const parsed = parsePrincipalLaneBinding(session.principalLane, { displayTarget: expectedDisplayTarget });
-    return parsed.ok ? parsed.value.displayTarget : undefined;
-  }
-  const carrierTarget: PrincipalLaneDisplayTarget = session.scope === 'chat'
-    ? { scope: 'chat', larkAppId: expectedDisplayTarget.larkAppId, chatId: session.chatId }
-    : {
-        scope: 'thread', larkAppId: expectedDisplayTarget.larkAppId,
-        chatId: session.chatId, rootMessageId: session.rootMessageId,
-      };
-  return sameDisplayTarget(carrierTarget, expectedDisplayTarget) ? carrierTarget : undefined;
 }
 
 /** Build the authoritative visible target from the persisted source session,

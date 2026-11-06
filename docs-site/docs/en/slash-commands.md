@@ -9,32 +9,41 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/repo` | When a repository is pending selection, start with the default workingDir; if a session is in progress, pop up the project selection card |
 | `/repo <N>` | Switch to the Nth project from the last scan |
 | `/repo <path\|project name>` | Directly specify a path or a top-level project name under workingDir |
+| `/repo wt <number\|project name\|path> [branch]` | Create a worktree from the remote default branch and open the session in it; without a branch, a semantic name is generated |
 | `/cd <path>` | Switch the working directory and restart the CLI process |
 | `/status` | View session info (uptime, terminal address, etc.) |
-| `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available when the existing bot-level XPI switch enables principal lanes) |
+| `/models` | Top-level messages select the bot default model and supported reasoning effort for new sessions (admins only). Effort follows the model and can be reset to the CLI default. Incompatible pairs preserve the previous settings. Within an existing topic, select the current session model when idle. Managed local TraeX topics also save model-specific session effort; use Apply and reload session when idle to restore the original conversation with that effort. This leaves bot/CLI defaults intact and stops the session background terminal tasks. Each model option displays load: native local TRAE CLI uses the catalog percentage, including values above 100%. Missing data, failed queries, and other CLIs show unknown load. This is a snapshot; reopen /models to refresh. Load does not affect model or effort validation. |
+| `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available once the [XPI experimental switch](/en/global-settings#xpi) is on) |
 | `/lane close` | Safely close your isolated principal lane: refuses while work is running/queued or files are uncommitted, pushes unpublished commits before cleanup, and never auto-merges or deletes the branch |
 | `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |
+| `/rewind [n\|n confirm]` | Roll the session context back: no args lists recent checkpoints; `n` previews and `n confirm` truncates the context to before turn n. Claude Code only; the transcript is backed up first and the next message cold-starts from the rolled-back context |
+| `/idlecompact [on\|off\|minutes]` | Idle auto-compact for this session: once on, `/compact` is sent after the CLI idles for N minutes (default 55, 1–59), while the 1h prompt cache is still warm; skipped below 100k context tokens. No argument shows status; same setting as the live card's "⏲️ Idle auto-compact" button. Claude Code and Codex on tmux only |
+| `/queue <text>` | Codex App live sessions: submit a separate turn after the active task, or start immediately when idle. Multiline plain text supported; rich text and attachments are not supported yet. Requires command permission (canTalkDaemonCommands may grant access). Missing/unready sessions and other CLIs are explicitly rejected. When per-user trigger-user credentials are enabled, the turn identity is refreshed before admission; later messages may overwrite the single credential slot, so a waiting turn may still see bytedcli/lark-cli turn-mismatch rejection and require retry. |
 | `/stop` | Interrupt the current turn while keeping the session; same as the streaming card's Stop button |
 | `/restart` | Restart the CLI process (preserving the session context) |
-| `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
-| `/dismiss` | Top level of a dedicated session group only: after confirmation, closes the session and disbands the whole group (the creator with operator permission only; code and worktrees are kept; not supported in DMs, ordinary groups, subtopics, or adopted sessions). To keep the chat, use `/close` |
+| `/close` | Close the session and send a recoverable card (including the CLI's own resume command). A later message starts a new session |
+| `/resume [session id]` | When this topic/chat has **no session**, resume a closed one: no argument resumes the latest one closed here; an id from elsewhere is copied here like `/fork` (full context, original untouched; fork-capable CLIs only; closed Codex / TraeX sessions must be resumed where they were). **With a session**, it goes to the CLI's own `/resume` unchanged. Anyone who can talk to the bot may use it; cross-location copies are keyed by the session id (visible only in the original chat, not guessable), the same trust level as `/fork` |
+| `/dismiss` | Top level of a dedicated session group only: after confirming on a card, closes all of this machine's bot sessions in the group, then disbands the whole group (the creator with operator permission only; code and worktrees are kept; not supported in DMs, ordinary groups, subtopics, or adopted sessions). To keep the chat, use `/close` |
 | `/cleanup-wt <ID>` | Retry a persisted worktree cleanup after a final removal failure; revalidates authorization, active sessions, worktree identity, and safety state before deleting |
-| `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family, Codex terminal, or TraeX terminal mode) |
+| `/fork <task>` | Fork the current session with full context into a new parallel fork topic (works in DMs, topic groups, and session topics of regular groups); the source session keeps running untouched (Claude family, Codex terminal, or TraeX terminal mode) |
 | `/forklist` | Re-post the current session's forked-task panel with live/closed status and links to the child topics |
-| `/fork --create <group name>` | Clone the current session into a freshly-created group instead of a sub-topic |
 | `/rename <title>` | Rename this Botmux session and sync the running Codex/Claude native session name |
-| `/fork --create <new group name>` | Clone the current idle session into a newly-created group while leaving the source session untouched (Claude family, Codex terminal, or TraeX terminal mode; Hybrid RPC / external app-server sessions are unsupported; invoke inside the source session) |
+| `/fork --create <new group name>` | Instead of a sub-topic, clone the current idle session into a newly-created group while leaving the source session untouched (Claude family, Codex terminal, or TraeX terminal mode; Hybrid RPC / external app-server sessions are unsupported; invoke inside the source session) |
 | `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead). `/card off` and `/card on` toggle streaming cards for this chat; `/card pin off`, `/card pin on`, and `/card pin status` control the per-chat streaming-card Pin override. `allowedUsers` only (the switch affects the whole chat — Lark has no per-person card view) |
 | `/cot` | CoT switch: `/cot off` mutes this chat's thinking and tool activity, `/cot on` restores it, `/cot show` reveals the current turn once while the switch is off, `/cot status` reports the state (bot-level master switch `cotEnabled`, on by default; supports claude-code / codex / traex). `allowedUsers` only |
-| `/mention-mode [always\|topic\|never\|ambient\|status]` | The regular-group mention policy: when the bot answers without an @. Querying needs talk access, changing needs operate rights; **regular groups only** (rejected in DMs, topic groups, and session groups). The four modes and the 8 no-@ exceptions are explained in [Mention Policy](/en/mention-mode) |
+| `/mention-mode [always\|topic\|never\|ambient\|status]` | The regular-group mention policy: when the bot answers without an @. Querying needs talk access, changing needs operate rights; **regular groups only** (rejected in DMs, topic groups, and session groups). The four modes and the no-@ exceptions are explained in [Mention Policy](/en/mention-mode) |
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
 | `/quote` | Pop a picker of this chat's topics; choosing one reads that topic's transcript into the current session. This fills a gap in Feishu itself — its quote-reply UI can only reference a single message, never a whole topic. The bot replies with a short acknowledgement (how many messages, time span, subject) and waits for your next instruction |
 | `/quote <instruction>` | Same, but runs your instruction as soon as you pick a topic, saving a round trip. The transcript is still injected explicitly labelled as material rather than instructions |
 | `/sessions` | List this bot's active topic sessions in the current group and jump directly back to a topic (legacy sessions use a safe locate fallback) |
-| `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
+| `/dashboard [module]` | Open Dashboard control cards in Feishu. Modules: `overview` (cross-bot overview, default), `sessions`, `groups`, `schedules`, `settings` (global settings), `link` (admin home link, same as `/dash`), `help`. Except for `link`, cards are sent to you by DM; the topic only gets a short confirmation. `allowedUsers` only. For the multi-session web view, see [Agent Workbench](/en/workbench) |
+| `/dash` | Alias of `/dashboard link`: privately returns the current dashboard admin home URL (for direct local access it looks like `http://<host>:<port>/?t=<token>#/`; with remote access or a reverse proxy configured, the matching address is used instead; requester-only ephemeral card in plain groups, DM in topic groups/topic replies/p2p; allowedUsers only; `/dash` and `/dashboard link` work in groups without an @; no session or worktree is created; re-run after a token rotation to get the fresh link) |
 | `@bot /project enable\|status\|roles\|disable` | Enable, inspect, configure agent roles, or leave project-group mode in the current ordinary group (owner/allowedUsers only; does not consume a session slot) |
+| `@bot /context-sharing on\|off\|status` | Enable, disable, or inspect passive context sharing for the current group (off by default; owner/allowedUsers only; creates no session or extra model turn) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
-| `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
+| `/vc prepare <meeting link or number> [--qa auto\|off]` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting; `--qa` controls in-meeting auto Q&A (default `auto`). Send it from a regular group's chat-scope session; topic sessions are not supported. All `/vc` subcommands are bot-owner only |
+| `/vc status [meeting number]` | View meeting-prep records; with a meeting number, show only that meeting |
+| `/vc off [meeting number\|all]` | Remove bindings: no argument removes the current group's, a meeting number removes that meeting's, `all` removes every binding |
 | `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
 | `[title] /t [/repo <repo> \| /repo wt <repo> [branch]] [/model <model>] [/effort <level>] [<first task>]` (alias `/topic`) | Force a new topic inside a regular group, declaring the title, repository (or a fresh worktree on it), model, reasoning effort and first task in one message. Newlines are equivalent to spaces; the title goes **before** `/t` (Lark shows the raw message in its topic list and a bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. A bare `/t` opens topic setup |
@@ -81,6 +90,28 @@ A few boundaries:
 - The header's `/repo wt` does not accept the numeric form (numbers only mean something on the picker card); the in-session `/repo wt <N|project name> [branch]` still does.
 - A standalone mid-session `/repo` still takes the rest of the line, unlike the single-token rule inside the header.
 
+Codex capacity recovery is **off by default**. Administrators can enable it with `/botconfig set codexCapacityRecovery on` and disable it with `/botconfig set codexCapacityRecovery off`. When enabled, managed Codex and Codex App Lark sessions automatically continue explicit model-capacity failures (`server_overloaded`) after 15 seconds and, if needed, another 45 seconds. Each continuation appends a recovery input to the native session (at most two per task); these inputs may remain in model context, and disabling recovery does not delete history. An opted-out pending recovery is saved as cancelled with one notice, so re-enabling recovery or restarting does not revive that old task. Detection is not specific to modelhub and does not guarantee a quick recovery. Continuations resume existing progress instead of replaying the original task. New input, `/stop`, or closing the session cancels the previous recovery. After a process restart, pending or unconfirmed recovery stops and requires manual continuation. Already running work can still deliver a successful result, but a late capacity failure will not trigger another automatic continuation, avoiding replay of a cancellation that could not be saved. After two unsuccessful continuations, the failure card offers a manual retry. Generic 503, stream, authentication and rate-limit errors retain their existing behavior, as do adopted, HTTP and meeting-receiver sessions.
+
+### Rename a session, pick a CLI for a new session (`/rename`, `/cli`) {#rename-cli}
+
+Both are available by default and need operate permission (admins / `allowedUsers`, or opened up through `canTalkDaemonCommands`).
+
+- **`/rename <title>`**: send it in an existing session to rename the Botmux session (the Dashboard and the `/sessions` list follow); a running Codex / Claude Code session also gets its native session name updated. The Lark group and topic names don't change.
+- **`/cli <cliId>`**: picks the CLI only for a session **whose CLI hasn't started yet** — for example, send `/cli codex` as the first message of a new topic, then send the task, and that session runs on Codex while the bot's default CLI stays the same. For `cliId` values see [Supported CLIs](/en/adapters#supported-clis--agents). It is refused when the session already has history or a running CLI, for adopted sessions, for queued sessions, when the bot sets `env`, when it uses the Riff backend, when you pick `riff`, or when the chosen CLI doesn't work with the bot's zero prompt injection (`promptInjection: "none"`) or `codexRpcInput`. `/cli` is not listed in `/help`.
+
+## Group manager (Agent tool)
+
+In a regular group, mention the target bot and ask it to run `botmux manager set`, `botmux manager clear`, or `botmux manager status`. The built-in `botmux-chat-manager` skill calls session-scoped IPC; this is not a daemon `/manager` slash command.
+
+**Off by default, enabled per bot**: turn on "Group manager (default responder)" under Dashboard, bot configuration, session & mention policy (or `/botconfig set chatManagerEnabled on`). Only then does the bot expose the in-session tool and allow `set`. Turning it off stops un-@ answering and blocks `set`, but it never changes the group name or description; `clear` and `status` stay available and the saved manager record is kept (re-enabling restores it).
+
+Mutations require the current human sender to explicitly authorize the action and belong to the target bot's administrator allowlist. A session owner, bot, scheduled task or stale turn is not a substitute. Only the current regular group is supported, excluding automatically managed session groups.
+
+Managers answer talk-authorized top-level messages without a mention, yielding when another member is addressed (@all is not a handoff). The bot name is appended to the group title; clearing preserves manual renames. Existing ambient, never and reply-mode settings remain independent. Manager ownership is a group-level handoff, not a new mention mode or a guarantee that no other bot replies.
+
+Clear the old manager before setting the new one. Each manager-specific mention-free decision verifies the remote description marker with no stale fallback and requires local administrator opt-in. Description overflow is rejected without truncating human text.
+
+Lark has no cross-host conditional writes: concurrent claims are not strongly consistent. After network failures or `chat_update_unconfirmed`, inspect status before retrying. Local records are stored under `chat-managers/` in the data directory with mode 0600; include them in backups.
 ## 💬 Reply Mode (`/reply-mode`)
 
 Controls how the bot opens a session when @mentioned. No argument (or `status`) shows the current mode; changing it needs `canOperate`, viewing needs `canTalk`. In group chats you must @ the target bot (in multi-bot groups, @ the specific bot). Only regular groups and 1:1 DMs are supported; topic groups need no setting (they're already topics) and the command is rejected there.
@@ -92,7 +123,7 @@ Controls how the bot opens a session when @mentioned. No argument (or `status`) 
 | `/reply-mode` `/reply-mode status` | Show the current DM session mode |
 | `/reply-mode chat` | Each 1:1 DM is one flat continuous session — all messages in that DM share one session (**default**) |
 | `/reply-mode topic` `/reply-mode new-topic` | Each **top-level** DM opens its own session/thread; replies inside an existing thread continue that thread's session |
-| `/reply-mode group` | Each **top-level** DM births a dedicated user+bot session group hosting the conversation (AI-generated name; returning to the group resumes the session — see `p2pMode=group`) |
+| `/reply-mode group` | Each **top-level** DM births a dedicated user+bot session group hosting the conversation (AI-generated name; after the session closes a new message starts a fresh one — use the close card's "Resume session" or `/resume` to continue; see `p2pMode=group`) |
 
 `shared` / `chat-topic` rely on native group topics and are rejected in DMs.
 
@@ -100,13 +131,14 @@ Controls how the bot opens a session when @mentioned. No argument (or `status`) 
 
 | Command | Description |
 |------|------|
-| `/reply-mode` `/reply-mode status` | Show the current group reply mode |
+| `/reply-mode` `/reply-mode status` | Show the current group reply mode and where it comes from (bot default / group override) |
+| `/reply-mode inherit` | Clear this group's override and follow the bot default again (aliases `default` / `reset` / `clear`) |
 | `/reply-mode chat` | One continuous group session (all top-level @mentions share it) |
 | `/reply-mode chat-topic` | Flat at top level, native topics each get their own session |
 | `/reply-mode new-topic` | Each @mention opens a new topic and its own session |
 | `/reply-mode topic` `/reply-mode shared` | Topic UI but a shared session (`topic` is a compat alias of `shared`) |
 
-The group-level setting overrides the dashboard "Bot Config → Regular Group Mode" default.
+The group-level setting overrides the dashboard "Bot Config → Regular Group Mode" default. An explicit setting is kept as an override even when it equals the current default (later default changes do not affect this group); use `/reply-mode inherit` to follow the default again. You can also pick it per bot in the dashboard under "Groups → Manage". Setting a new mode requires confirming the chat is a regular group; status and clearing are not gated.
 
 `/substitute [status|on|off]` — show or toggle **substitute mode** for the current group (owner-only to change).
 
@@ -115,7 +147,7 @@ The group-level setting overrides the dashboard "Bot Config → Regular Group Mo
 `/mention-mode always|topic|never|ambient` switches this chat's policy; `/mention-mode status` (or no argument) reports it. Regular groups only: DMs never need @, and topic groups and `/group` session groups reject the command. Querying needs only talk access; changing needs operate rights (`allowedUsers`).
 
 - `always`: @ required to get an answer (default); `topic`: replies inside the bot's own topics skip @; `never`: no @ required anywhere in the group; `ambient`: no @ required, but the bot yields when a message explicitly @-mentions someone else.
-- Skipping @ never skips the permission gate, and 8 no-@ exceptions still apply (in-topic replies, substitute triggers, the message listener, and more) — see [Mention Policy](/en/mention-mode) for the full semantics.
+- Skipping @ never skips the permission gate, and a set of no-@ exceptions still applies (in-topic replies, substitute triggers, the message listener, and more) — see [Mention Policy](/en/mention-mode) for the full semantics.
 
 ## 📑 Chat Tabs
 
@@ -138,9 +170,30 @@ botmux tabs add "https://example.com/project/releases/2026" \
 
 The CLI resolves the bot and chat from the current `BOTMUX_SESSION_ID`. Use `--session-id` outside the current process tree or `--chat-id` to override the destination. `add` is idempotent by URL: an existing page tab is reused and renamed when needed. This works for merge requests, project boards, release pages, and other automation scenarios. Background callers can also use `botmux tabs list|update|remove|sort`.
 
+## Change Reasoning Effort in a Codex App Session
+
+Send `/effort low|medium|high|xhigh|max|ultra` in an existing Codex App session. Available levels are validated against the current model's advertised capabilities. The command saves settings for future turns without adding a model message or interrupting the task.
+
+**Updating the active turn requires explicitly enabling the experimental Codex `step_model_switching` feature.** In the verified Codex 0.160 / 0.162.1 versions, it is UnderDevelopment and off by default; Botmux does not enable it automatically. To opt in, merge the following into the `CODEX_HOME/config.toml` actually used by this session's app-server, then use it after the next app-server start (if `[features]` already exists, add or update only this key):
+
+```toml
+[features]
+step_model_switching = true
+```
+
+With the feature disabled, commands sent during a task still save future-turn settings and explicitly report why the active turn was not updated. A completed or unavailable target turn produces a separate notice. Only an `applied` response confirms that the server accepted the active-turn update; requests already issued keep their original parameters, and the turn may have no further inference steps.
+
+## Change reasoning effort in a Codex CLI session
+
+Send `/effort low|medium|high|xhigh|max|ultra` in an existing local Codex CLI session. Botmux drives the native `/model` menu, keeps the current model, and selects the level for **this session only**. After native confirmation, it saves the session launch preference. The receipt explicitly says **next turn only; the running turn keeps its original effort**, even when `step_model_switching` is enabled.
+
+This supports managed local PTY / tmux sessions with the native `s session` menu action and `thread_settings_applied` receipts (verified with Codex 0.162.1). RPC input, remote backends, wrappers, adopted sessions, sandbox and read isolation are excluded. Drafts, other menus, conflicting input and unrecognized screens are rejected without clearing the composer or restarting the task. You can still use `/model` manually.
+
+For Claude Code and other CLIs, `/effort` continues to follow the passthrough rules below.
+
 ## 🔀 Passthrough to the Underlying CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands.
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands (except Codex CLI / App `/effort`, described above).
 
 `/fast` is Codex-specific: it toggles Codex's native service tier, and the streaming card shows a read-only `⚡ <tier>` badge reflecting whatever tier Codex actually runs. On RPC-input or Riff backends the keystroke can't reach Codex's executor, so `/fast` fails closed there with a clear notice instead of a silent no-op.
 
@@ -158,6 +211,10 @@ Now go through the review comments on PR #1361
 
 Rules: only a leading run of passthrough lines forms a cascade (a botmux command such as `/cd` or an unknown `/xxx` inside that run makes the whole message ordinary text, as today); the body starts at the first line not beginning with `/`, and any later `/xxx` is part of the body; a single line such as `/model opus then continue` is still sent verbatim as one line. The idle wait is capped at 120 s, after which the remaining items are sent immediately with a notice. Remote sandbox backends (riff / mojo) and adopted external sessions do not support cascades and reply "send them one by one"; messages with attachments are not split either.
 
+### Claude Code's `/btw`: side answers come back to the topic {#claude-btw}
+
+Send `/btw <question>` in a Claude Code session and the command goes to Claude Code as is; the side answer it shows in a terminal overlay is read by botmux, posted back to the topic as "💬 /btw side answer", and the overlay is closed so the main task carries on. On by default, nothing to configure. Claude Code only, and not for adopted sessions or remote backends such as Riff / Mojo; long answers are truncated, with the full text in the web terminal.
+
 ## 🧩 View Available Commands
 
 `/list-slash-command` (alias `/slash`): lists the currently available slash commands in a card, in four sections —
@@ -169,23 +226,46 @@ Rules: only a leading run of passthrough lines forms a cascade (a botmux command
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
+Dashboard's **Bot Config → Security → Slash commands** section also has an optional **native Lark command panel** (see the next section, [Get botmux commands when you type / in Lark](#native-slash-panel), for how to turn it on). It lists botmux's own commands (including aliases, derived directly from the command registry) as candidates and marks each entry as synced, missing, or outdated on Lark; users decide what to register with each row's **Sync** action. Commands that only exist remotely are shown too and can be deleted one at a time. **Sync all to Lark** is an explicit additive operation: it creates missing entries and updates descriptions, but never deletes implicitly. CLI passthrough commands (`/compact`, `/model`, …) are not candidates yet, because support differs across CLIs and input backends.
+
+The panel needs the optional scopes `application:app_slash_command:read` / `application:app_slash_command:write`. They are **not** part of the default scope manifest and the startup self-check never tops them up automatically; when they are missing, or the tenant is not in Lark's gated rollout (desktop 7.70+ and the FG allowlist), the panel only shows "unavailable" plus grant links, and every other bot feature keeps working. The native `/` panel may take about five minutes to refresh in Lark clients. Working-directory `.claude` discoveries, skills, plugins, and MCP prompts are not stable app-wide capabilities, so they remain visible only in botmux's `/slash` card and are not registered remotely.
+
+## ⌨️ Get botmux commands when you type / in Lark {#native-slash-panel}
+
+Typing `/` in a Lark chat can show botmux's commands with hints and completion. This is **off by default**: the commands first have to be registered on the Lark app, one bot at a time.
+
+1. **Grant the app two optional scopes**: Lark developer console → (this bot's app) → Permissions, request `application:app_slash_command:read` and `application:app_slash_command:write`, then **publish an app version**. They aren't in botmux's default scope manifest, and the startup self-check won't add them for you.
+2. **Sync the commands in the Dashboard**: **Bot Config** → pick the bot → **Security** → **Slash commands** → **Native Lark command panel**. It lists botmux's own commands (aliases included), each marked synced / missing / outdated. Click **Sync all to Lark** to register everything, or **Sync** on individual rows.
+3. **Wait for the client to refresh**: Lark clients take about five minutes to pick up the change; after that, typing `/` in a chat with this bot shows them.
+
+Notes:
+
+- This is a gated Lark capability: it needs **desktop 7.70 or later** and the tenant on Lark's FG allowlist. Without the scopes or outside the rollout, the panel only shows "unavailable" plus grant links, and the bot's other features keep working.
+- Only botmux's own commands are registered. Passthrough commands such as `/compact` and `/model`, and custom commands or skills discovered under `.claude`, are not; use the `/slash` card for those.
+- **Sync all to Lark** only adds and updates, never deletes. Commands that exist only on Lark are marked as remote-only; delete them one by one with **Delete** if needed.
+- core-only (`apiOnly`) bots have no Lark connection and can't use the panel.
+
 ## 📡 Session Onboarding
 
 | Command | Description |
 |------|------|
-| `/adopt` | Scan the local tmux and pop up a card to select a running session to adopt |
-| `/adopt <tmux_pane>` | Directly adopt the specified pane (e.g. `/adopt 0:2.0`) |
+| `/adopt` | Scan local tmux, Zellij, Herdr, and Orca sessions and open a picker, which also lists this bot's resumable history sessions of the same CLI; Orca support is experimental |
+| `/adopt <target>` | Directly adopt a specific tmux / Zellij / Herdr session (e.g. `/adopt 0:2.0`), or pass the CLI's own session ID to resume a history session |
+| `/adopt orca:<terminal>` | Directly adopt a specific Orca session (experimental) |
 | `/detach` | Disconnect this topic from the adopted session (the original CLI is untouched; `/disconnect` is an alias) |
+
+See [Session Adopt](/en/adopt).
 
 ## 🔐 User Authorization
 
 | Command | Description |
 |------|------|
 | `/login` | Basic Lark user authorization: read messages, access resources, and renew authorization; does not request docs, contacts, or calendar permissions by default |
-| `/login --scope <scope> [more scopes]` | Add only the requested permissions to the basic scopes, e.g. `/login --scope docx:document:readonly` |
+| `/login --scope <scope>... [--force]` | Add requested permissions to basic scopes, e.g. `/login --scope docx:document:readonly`; add `--force` to bypass local catalog validation for uncataloged new scopes |
 | `/login status` | View authorization status |
+| `/logout` | Revoke your own trigger-user authorization on this machine (lark-cli / bytedcli login, and this bot's user token). Does not revoke anyone else |
 | `/login tags` | Session-group tag authorization (feed-group scopes); once granted, new session groups auto-join your sidebar feed group (for p2pMode=group with the feed-group tag mode — the default) |
-| `/pair <pairing code>` | Pair a Web/Dashboard-side session with your Lark identity (get the pairing code on the web side, then send `/pair <code>` in the topic to claim it) |
+| `/pair <pairing code>` | Team platform web login pairing: click "Log in" on the web page to get a pairing code, then send `/pair <code>` in Feishu to finish logging in |
 
 Basic authorization requires the app to enable `im:message:readonly`, `im:resource`, and `offline_access`. If another operation returns `missing_scope`, request the names reported by the error with `/login --scope ...`; the app administrator must first enable those user permissions in the developer console. Resource visibility/access errors require access to that resource, not another `/login`.
 
@@ -197,6 +277,7 @@ Basic authorization requires the app to enable `im:message:readonly`, `im:resour
 | `/role set <Markdown>` | Set **this group's** Role (overrides the default role) |
 | `/role delete` | Delete this group's Role |
 | `/role team set <Markdown>` | Set the **default role** (the cross-group default persona; the command name keeps `team`, = dashboard "Bot Config → Default Role") |
+| `/role team delete` | Delete the default role |
 | `/role cap set <one-liner>` / `/role cap clear` | Set/clear the capability tag in the roster |
 | `/role profile list` | List local role profiles |
 | `/role profile show <profile> [--all]` | Show this bot's profile entry, or all local entries known to this daemon |
@@ -211,7 +292,7 @@ See [Roles & Teams](/en/roles) for details.
 | Command | Description |
 |------|------|
 | `/relay` | Pop up a card in the target group to **pull** an active session of yours from another group and continue it |
-| `@botA @botB /relay --create` | **Move** the current session (with its collaborators) into a newly created group |
+| `@botA @botB /relay --create [group name]` | **Move** the current session (with its collaborators) into a newly created group; in a DM, send `/relay --create [group name]` directly and the new group holds just you and this bot |
 
 See [Session Relay](/en/relay) for details.
 
@@ -243,6 +324,8 @@ Written and hot-applied — no restart needed.
 
 `/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once.
 
+Like session groups, the new group gets a gradient logo avatar by default, and without a name it is renamed from its first message.
+
 Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot roles:
 
 ```bash
@@ -269,6 +352,24 @@ On every project turn, the coordinator receives Botmux's fixed project-state pro
 
 The command works only in ordinary groups and only for the Bot's owner/allowedUsers. Repeating `enable` preserves any worker subset and auto-enrollment policy already curated in Dashboard. Dashboard can disable “automatically enroll new bots”; when disabled, the explicit worker list remains unchanged. Dashboard also lists the same project agents and deep-links to their group-role editors; both entry points share one role source of truth.
 
+## 🧠 Group Context Sharing
+
+In a real Lark group, mention any bot managed by this deployment:
+
+```text
+@bot /context-sharing on
+@bot /context-sharing status
+@bot /context-sharing off
+```
+
+The switch is group-wide and off by default. Once enabled, bots managed by this deployment passively retain published messages from the group. A bot that was not mentioned stays asleep. On its next activation under the existing mention policy, it receives attributed background it missed. The switch does not change mention routing or create a model turn or session merely to deliver background.
+
+Only a human owner/member of that bot's `allowedUsers` can inspect or change the switch; ordinary talk grants and other bots do not qualify. DMs and API virtual sessions are unsupported. Sessions configured with `promptInjection=none` explicitly do not receive automatic background.
+
+By default, injected background is bounded to 24,000 characters per turn, while stored group observations are retained for 30 days or 10,000 messages. Injected background counts toward the activated model's input tokens, but passive observation does not call a model. Scope is limited to published group messages and resource references; it excludes DMs, hidden reasoning, unpublished tool results, and private files. If platform backfill is incomplete because of history limits, permissions, or retention, the background carries an incomplete-range marker instead of presenting the gap as complete history.
+
+`status` and successful enable responses also show a recall-event subscription diagnostic. Only a `subscribed` reason means the app configuration was verified to include `im.message.recalled_v1`; this does not promise 100% push delivery. `update_submitted` means an update was submitted but still requires publishing a new app version in Lark Developer Console. Unknown, unavailable-login, or stale results mean historical background may temporarily retain recalled messages; inspect that event subscription and retry. Disabling performs no subscription check or setup action.
+
 ## 📄 Feishu Doc Comment Entry
 
 `/watch-comment`: watch Feishu doc comments, bind them to an AI session, and post replies back into their threads; supports `<doc link> [--dir <path>] [--all|--mentions-only]` and `list/off`. `/subscribe-lark-doc` keeps the original per-file Feishu API subscription flow. See [Feishu Doc Comment Entry](/en/doc-comment) for details.
@@ -287,7 +388,19 @@ See [Workflow](/en/workflow) for details.
 
 ## 👥 Multi-Bot Collaboration
 
-`@botA @botB /t <prompt>` (each opens a new topic) · `@botA @botB /introduce` (register the bots in this chat with each other by open_id for precise collaboration mentions) · `botmux bots list` (show bots available in the current group)
+| Command | Description |
+|------|------|
+| `@botA @botB /t <prompt>` | Each opens a new topic |
+| `@botA @botB /introduce` | Register the bots in this chat with each other by open_id for precise collaboration mentions |
+| `@this-bot /invite @target-bot ...` | Pull bots that are not yet in the group into it; @ several at once if needed. You can also name them by app_id with `--app cli_xxx` (repeatable) |
+
+Rules for `/invite`:
+
+- Only this bot's admins (`allowedUsers`) can use it, and the message must @ this bot. It does not work in DMs.
+- Names are resolved against the local and team rosters. When a name matches several bots, botmux does not guess and asks you to use `--app`; it also suggests `--app` when neither roster has the name.
+- Bots already in the group are skipped and listed in the reply.
+
+To see which bots in the current group you can collaborate with: `botmux bots list`.
 
 ## ⏰ Scheduling & ❓ Help
 

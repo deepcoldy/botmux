@@ -15,12 +15,13 @@ export type WorkflowSandboxPolicySource = {
   sandboxHidePaths?: string[];
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy;
 };
 
 export type WorkflowSandboxInitFields = Pick<
   WorkerInit,
   'sandbox' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'
-  | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork'
+  | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy'
 >;
 
 export function workflowSandboxInitFields(
@@ -50,5 +51,6 @@ export function workflowSandboxInitFields(
     sandboxHidePaths: [...(policy?.sandboxHidePaths ?? [])],
     sandboxReadonlyPaths: [...(policy?.sandboxReadonlyPaths ?? [])],
     sandboxNetwork: policy?.sandboxNetwork !== false,
+    ...(policy?.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(policy.sandboxNetworkPolicy) } : {}),
   };
 }

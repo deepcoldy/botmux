@@ -9,6 +9,7 @@ import {
   readTerminalFrameWrite,
   readTerminalWriteReport,
 } from '../src/dashboard/web/agent-workbench-panes.js';
+import { WORKBENCH_TERM_WRITE_MESSAGE } from '../src/dashboard/web/agent-workbench-terminal-control.js';
 
 /**
  * 「这条 WS 到底能不能写」这条信号的通道完整性。
@@ -80,37 +81,15 @@ describe('带外写权限控制帧', () => {
   });
 });
 
-describe('worker 终端页的跨文件接缝', () => {
-  const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-
-  it('握手完成后发的是带外控制帧，不再往 PTY 流里塞 OSC 写权限', () => {
-    expect(worker).toContain('terminalWriteFrame(hasWrite)');
-    expect(worker).not.toContain(']1989;write;');
-  });
-
-  it('终端页嵌的是同一份解码器，且只在首帧上用', () => {
-    expect(worker).toContain('decodeTerminalWriteFrameSource');
-    expect(worker).toContain('_wbFirstFrame');
-  });
-
-  it('每次重连先把写权限退回未知', () => {
-    expect(worker).toContain('_wbSetWsWrite(null)');
-  });
-
-  it('ws.onclose 当下就把写权限退回未知并上抛（重连中不再停留在旧判定）', () => {
-    // 关闭那一刻就 reset，不能等 2 秒后的 connect() 才退回未知：否则断线到重连的
-    // 空窗里，终端页仍以上一条连接的 wsHasWrite 放行输入，父页也还显示旧的可写判定。
-    const at = worker.indexOf('ws.onclose=function(){');
-    expect(at, 'worker.ts 里应有 ws.onclose 处理器').toBeGreaterThan(-1);
-    const body = worker.slice(at, worker.indexOf('}', at) + 1);
-    expect(body).toContain('_wbSetWsWrite(null)');
-    // 且必须等新连接的新首帧才恢复——onclose 先把首帧标志复位。
-    expect(body).toContain('_wbFirstFrame=true');
-  });
-
-  it('页面仍然导出 wsHasWrite 全局并按同一个消息类型上抛', () => {
-    expect(worker).toContain('var wsHasWrite=null');
-    expect(worker).toContain("'botmux:wb-terminal-write'");
+describe('worker 终端页与工作台的跨文件契约', () => {
+  // 源码结构护栏(K4)：终端页脚本是 worker.ts 模板字符串里的浏览器 JS，测试 import 不进来；工作台
+  // 靠同源读终端页的 `wsHasWrite` 全局、以及 postMessage 类型 WORKBENCH_TERM_WRITE_MESSAGE 认写权限
+  // （见下一组 readTerminalFrameWrite / readTerminalWriteReport）。任一侧改名，面板都会静默退回「未知」。
+  // 这里拿工作台真实导出的常量去核对页面源码，而不是两边各写一份字面量（#971）。
+  it('终端页落下 wsHasWrite 全局，并按工作台认的消息类型上抛', () => {
+    const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    expect(worker).toMatch(/\bvar wsHasWrite\b/);
+    expect(worker).toContain(`'${WORKBENCH_TERM_WRITE_MESSAGE}'`);
   });
 });
 
@@ -136,56 +115,5 @@ describe('工作台侧只认已建立的 WS（第 12 点）', () => {
     expect(readTerminalWriteReport({ type: 'other', write: true })).toBeNull();
     expect(readTerminalWriteReport({ type: 'botmux:wb-terminal-write', write: 'yes' })).toBeNull();
     expect(readTerminalWriteReport(null)).toBeNull();
-  });
-});
-
-/**
- * 终端页的**输入门**：只有已建立的 WS 明确回报可写(wsHasWrite===true)才放行，null
- * （还没确认 / 重连中）与 false（这条连接只读）一律不发（第 17 点）。
- *
- * 上面「工作台侧只认已建立的 WS」验的是**父页读数**（readTerminalFrameWrite）；这一
- * 组钉的是**终端页自己发不发输入**——把 worker.ts 里 term.onData 与触屏 toolbar 那两处
- * if 判据从源码抓出来直接跑真值表，抓的就是页面里真正那行逻辑，改回「只拦 ===false」
- * 会立刻红。
- */
-describe('终端页输入门只放行已确认可写的 WS（第 17 点）', () => {
-  const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-
-  // 从 worker.ts 源码里抓 anchor 之后那处对 wsHasWrite 的输入门判据，构造出「这一状态
-  // 放不放行」的真值函数——跑的是页面里真正那行 if，不是另写一份等价物。
-  function inputGate(anchor: string): (wsHasWrite: boolean | null) => boolean {
-    const at = worker.indexOf(anchor);
-    expect(at, `worker.ts 里应有 ${anchor}`).toBeGreaterThan(-1);
-    const region = worker.slice(at, at + 400);
-    const matched = region.match(/if\((wsHasWrite!==true)\)/);
-    expect(matched, `${anchor} 之后应以「只有 wsHasWrite===true 才放行」为输入门`).not.toBeNull();
-    const guard = matched![1];
-    // guard 为真 = 拦截；放行 = !guard。用 Function 把源码里那条判据原样跑起来。
-    // eslint-disable-next-line no-new-func
-    const blocks = new Function('wsHasWrite', `return (${guard});`) as (v: boolean | null) => boolean;
-    return (wsHasWrite) => !blocks(wsHasWrite);
-  }
-
-  it('term.onData 与触屏 toolbar：只有 wsHasWrite===true 放行，null/false 都拦', () => {
-    for (const anchor of ['term.onData(function(d){', 'function fire(){']) {
-      const allows = inputGate(anchor);
-      expect(allows(true)).toBe(true);   // WS 明确回报可写 → 放行
-      expect(allows(false)).toBe(false); // 明确只读 → 拦截
-      expect(allows(null)).toBe(false);  // 还没确认（含重连中）→ 拦截，桌面也等首帧
-    }
-  });
-
-  it('不再以「只拦 wsHasWrite===false」放行 hasToken=true & wsHasWrite=null 的盲打', () => {
-    const onData = worker.slice(
-      worker.indexOf('term.onData(function(d){'),
-      worker.indexOf('var fixedSize='),
-    );
-    // 拦截块（带 { 的那条 if）必须是新判据；输入放行由它把守，_sendInput 在其后。
-    expect(onData).toContain('if(wsHasWrite!==true){');
-    expect(onData.indexOf('if(wsHasWrite!==true){')).toBeLessThan(onData.indexOf('_sendInput(d);'));
-    // 回归的形状：旧门 `if(!hasToken||wsHasWrite===false){` 把守输入，hasToken=true &
-    // wsHasWrite=null 时照发，用户对着未确认连接盲打。注意：同样的判据现在只作为**只读
-    // 提示**的条件保留（不带 {、不 return），所以这里钉的是带 { 的那条拦截块已消失。
-    expect(onData).not.toContain('if(!hasToken||wsHasWrite===false){');
   });
 });

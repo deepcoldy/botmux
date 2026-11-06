@@ -6,10 +6,10 @@
  *   预览 iframe 无 sandbox、内容又挂在 Dashboard 同源的 /preview/… 之下
  *   → agent 的 dev server 页面拿到 Dashboard origin
  *   → 读 parent DOM / 带 owner cookie 调 /api/*
- *   → POST /api/debug-terminal 拿到 id，再连 /debug-terminal/<id>/ws
- *   → 宿主上一个裸 bash。
+ *   → POST /api/host-terminal 拿到 id，再连 /host-terminal/<id>/ws
+ *   → 宿主上一个 shell。
  *
- * 本脚本用真实 Chromium + 真实 debug-terminal（真的 spawn /bin/bash）跑完整条链：
+ * 本脚本用真实 Chromium + 真实宿主终端（真的 spawn 登录 shell）跑完整条链：
  * 恶意预览页会把每一步的结果既写进自己的 window，也回传给「外部收集器」，
  * 我们对两侧同时断言。修复后每一步都必须失败，而预览自身的相对脚本与 WebSocket
  * 必须照常工作——只断攻击链，不断功能。
@@ -19,7 +19,7 @@
  *
  * 反转验证（先红后绿）：把 preview-guard-page.ts 里 iframe 的 sandbox 属性去掉、
  * 并把 preview-proxy.ts 里追加 CSP sandbox 的那几行注释掉，再跑本脚本——
- * parent DOM、/api/sessions、debug-terminal WS 三条断言会立刻炸开。
+ * parent DOM、/api/sessions、宿主终端 WS 三条断言会立刻炸开。
  */
 import assert from 'node:assert/strict';
 import { constants } from 'node:fs';
@@ -33,7 +33,7 @@ import { chromium, type Frame } from 'playwright';
 import { WebSocket, WebSocketServer } from 'ws';
 import { resolvePreviewPortOwner } from '../src/core/preview-port-owner.js';
 import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
-import { createDebugTerminalManager } from '../src/dashboard/debug-terminal.js';
+import { createHostTerminalManager } from '../src/dashboard/host-terminal.js';
 import { createPreviewGuardPage } from '../src/dashboard/preview-guard-page.js';
 import {
   PREVIEW_SANDBOX_TOKENS,
@@ -65,8 +65,8 @@ interface SeenRequest {
 
 const frontRequests: SeenRequest[] = [];
 const exfiltrated: string[] = [];
-let debugUpgradeAttempts = 0;
-let debugUpgradeAccepted = 0;
+let hostUpgradeAttempts = 0;
+let hostUpgradeAccepted = 0;
 
 function json(res: ServerResponse, status: number, value: unknown, extra: Record<string, string> = {}): void {
   res.writeHead(status, {
@@ -128,8 +128,8 @@ const collectorPort = await listen(collector);
 const collectorBase = `http://127.0.0.1:${collectorPort}`;
 
 // ── agent 的 dev server：这就是被攻陷/恶意的一侧 ────────────────────────────────
-/** 攻击者「已经知道」的调试终端 id——把断言从「猜不到 id」提升到「即使知道 id 也连不上」。 */
-let knownDebugTerminalId = '';
+/** 攻击者「已经知道」的宿主终端 id——把断言从「猜不到 id」提升到「即使知道 id 也连不上」。 */
+let knownHostTerminalId = '';
 const attackReports: unknown[] = [];
 
 function attackScript(): string {
@@ -175,21 +175,21 @@ function attackScript(): string {
         return r.text().then(function(t){ return { status: r.status, body: t.slice(0, 400) }; });
       }));
     })
-    // ③ RCE 链第一跳：创建 debug terminal
+    // ③ RCE 链第一跳：创建宿主终端
     .then(function(){
-      return attempt('debugCreate', fetch('/api/debug-terminal', {
+      return attempt('hostTerminalCreate', fetch('/api/host-terminal', {
         method: 'POST',
         credentials: 'include',
         headers: { 'content-type': 'text/plain' },
-        body: '{}'
+        body: '{"target":{"kind":"shell"}}'
       }).then(function(r){
         return r.text().then(function(t){ return { status: r.status, body: t.slice(0, 400) }; });
       }));
     })
-    // ③ RCE 链第二跳：即便 id 已知，也要连不上那个裸 bash
+    // ③ RCE 链第二跳：即便 id 已知，也要连不上那个 shell（输入按宿主终端协议发二进制帧）
     .then(function(){
-      return attempt('debugSocketKnownId', socket(host + '/debug-terminal/' + ${JSON.stringify('')} + window.__knownDebugTerminalId + '/ws',
-        JSON.stringify({ type: 'input', data: 'echo ${RCE_MARKER}\\n' })));
+      return attempt('hostTerminalSocketKnownId', socket(host + '/host-terminal/' + window.__knownHostTerminalId + '/ws',
+        new TextEncoder().encode('echo ${RCE_MARKER}\\n')));
     })
     // ④ 预览自身功能：相对资源已执行（见 relativeScriptExecuted），自己的 WS 必须通
     .then(function(){ return attempt('ownWebSocket', socket(host + location.pathname.replace(/[^/]*$/, '') + 'ws', 'ping')); })
@@ -241,7 +241,7 @@ const evilUpstream = createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   // Relative script tag on purpose: it is the "preview still works" control.
   res.end(`<!doctype html><html><body><h1>agent dev server</h1>`
-    + `<script>window.__knownDebugTerminalId=${JSON.stringify(knownDebugTerminalId)}</script>`
+    + `<script>window.__knownHostTerminalId=${JSON.stringify(knownHostTerminalId)}</script>`
     + `<script src="./attack.js"></script></body></html>`);
 });
 const evilWss = new WebSocketServer({ server: evilUpstream });
@@ -270,14 +270,13 @@ assert.ok(
 );
 const evilTargetOwner = evilOwner.proof;
 
-// ── Dashboard 前门：真 guard shell + 真 preview proxy + 真 debug terminal ──────
-const debugTerminals = createDebugTerminalManager({
+// ── Dashboard 前门：真 guard shell + 真 preview proxy + 真宿主终端 ──────────────
+const hostTerminals = createHostTerminalManager({
   getActiveToken: () => DASHBOARD_TOKEN,
   // 生产里这条是「解析出 legacy-dashboard 管理身份」。本 harness 没有平台绑定、也不注入
   // X-Botmux-Role，等价物就是 owner cookie 本身——这条链要证的是「预览 origin 隔离把
   // 攻击链断死」，所以真 owner 那条正常路径必须照常通，不能被这里顺手一起堵上。
   isLegacyManagementRequest: (req) => ownerCookiePresent(req),
-  defaultWorkingDirs: () => [root],
 });
 
 function ownerCookiePresent(req: IncomingMessage): boolean {
@@ -334,10 +333,10 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     if (!ownerCookiePresent(req)) return json(res, 401, { ok: false, error: 'authentication_required' });
     return json(res, 200, { ok: true, sessions: [{ sessionId: SESSION_ID, secret: SESSION_INVENTORY_MARKER }] });
   }
-  if (url.pathname.startsWith('/api/debug-terminal') || url.pathname.startsWith('/debug-terminal/')) {
+  if (url.pathname === '/api/host-terminal' || url.pathname.startsWith('/api/host-terminal/')) {
     // Auth gate first, exactly like dashboard.ts mounts it.
     if (!ownerCookiePresent(req)) return json(res, 401, { ok: false, error: 'authentication_required' });
-    if (debugTerminals.handleHttp(req, res, url)) return;
+    if (hostTerminals.handleHttp(req, res, url)) return;
     return json(res, 404, { ok: false, error: 'not_found' });
   }
 
@@ -356,13 +355,13 @@ const front = createServer((req, res) => {
 });
 front.on('upgrade', (req, socket, head) => {
   const pathname = (req.url ?? '/').split('?')[0];
-  if (pathname.startsWith('/debug-terminal/')) {
-    debugUpgradeAttempts += 1;
-    const before = debugUpgradeAttempts;
+  if (pathname.startsWith('/host-terminal/')) {
+    hostUpgradeAttempts += 1;
+    const before = hostUpgradeAttempts;
     // The manager self-authenticates; count an accepted upgrade by watching for
     // the socket surviving the call.
-    const handled = debugTerminals.handleUpgrade(req, socket as Duplex, head);
-    if (handled && !socket.destroyed) debugUpgradeAccepted = before;
+    const handled = hostTerminals.handleUpgrade(req, socket as Duplex, head);
+    if (handled && !socket.destroyed) hostUpgradeAccepted = before;
     if (handled) return;
   }
   if (previewProxy.handleUpgrade(req, socket as Duplex, head)) return;
@@ -371,15 +370,15 @@ front.on('upgrade', (req, socket, head) => {
 const frontPort = await listen(front);
 const base = `http://127.0.0.1:${frontPort}`;
 
-// Pre-create a debug terminal AS THE AUTHENTICATED OWNER and prime it with a
-// marker, so "the attacker already knows the id" is the starting position.
-const created = await fetch(`${base}/api/debug-terminal`, {
+// Pre-create a host terminal AS THE AUTHENTICATED OWNER, so "the attacker
+// already knows the id" is the starting position.
+const created = await fetch(`${base}/api/host-terminal`, {
   method: 'POST',
   headers: { cookie: `botmux_dashboard_token=${DASHBOARD_TOKEN}`, 'content-type': 'application/json' },
-  body: JSON.stringify({ workingDir: root }),
-}).then(response => response.json() as Promise<{ ok: boolean; id: string }>);
-assert.equal(created.ok, true, 'harness could not create the reference debug terminal');
-knownDebugTerminalId = created.id;
+  body: JSON.stringify({ target: { kind: 'shell' } }),
+}).then(response => response.json() as Promise<{ ok: boolean; terminal: { id: string } }>);
+assert.equal(created.ok, true, 'harness could not create the reference host terminal');
+knownHostTerminalId = created.terminal.id;
 
 const browserPath = await executablePath();
 const browser = await chromium.launch({
@@ -396,8 +395,8 @@ interface AttackResult {
   cookieRead?: string;
   localStorage?: string;
   apiSessions?: { status: number; body: string } | string;
-  debugCreate?: { status: number; body: string } | string;
-  debugSocketKnownId?: string;
+  hostTerminalCreate?: { status: number; body: string } | string;
+  hostTerminalSocketKnownId?: string;
   ownWebSocket?: string;
   ownRelativeFetch?: { status: number; body: string } | string;
   exfiltration?: string;
@@ -461,30 +460,30 @@ try {
     assert.equal(entry.origin, 'null', `expected an opaque origin on /api/sessions, saw ${entry.origin}`);
   }
 
-  // ── ③ debug-terminal RCE 链断死 ────────────────────────────────────────────
-  const debugCreate = result.debugCreate;
-  if (typeof debugCreate === 'string') {
-    assert.match(debugCreate, /^THREW:/, `unexpected debug-terminal create outcome: ${debugCreate}`);
+  // ── ③ 宿主终端 RCE 链断死 ──────────────────────────────────────────────────
+  const hostTerminalCreate = result.hostTerminalCreate;
+  if (typeof hostTerminalCreate === 'string') {
+    assert.match(hostTerminalCreate, /^THREW:/, `unexpected host-terminal create outcome: ${hostTerminalCreate}`);
   } else {
-    assert.equal(debugCreate?.status, 401, `debug terminal was created from the preview: ${JSON.stringify(debugCreate)}`);
-    assert.ok(!String(debugCreate?.body ?? '').includes('"id"'), 'a debug terminal id leaked into the preview');
+    assert.equal(hostTerminalCreate?.status, 401, `host terminal was created from the preview: ${JSON.stringify(hostTerminalCreate)}`);
+    assert.ok(!String(hostTerminalCreate?.body ?? '').includes('"id"'), 'a host terminal id leaked into the preview');
   }
   assert.match(
-    String(result.debugSocketKnownId),
+    String(result.hostTerminalSocketKnownId),
     /^(closed:|error|timeout|THREW:)/,
-    `the preview reached host bash over the debug WebSocket: ${result.debugSocketKnownId}`,
+    `the preview reached the host shell over the terminal WebSocket: ${result.hostTerminalSocketKnownId}`,
   );
   assert.ok(
-    !String(result.debugSocketKnownId).includes('message:'),
-    `the debug terminal streamed data into the preview: ${result.debugSocketKnownId}`,
+    !String(result.hostTerminalSocketKnownId).includes('message:'),
+    `the host terminal streamed data into the preview: ${result.hostTerminalSocketKnownId}`,
   );
-  assert.equal(debugUpgradeAccepted, 0, 'a debug-terminal WebSocket upgrade was accepted from the preview');
-  assert.ok(debugUpgradeAttempts > 0, 'the preview never attempted the debug WebSocket — assertion would be vacuous');
+  assert.equal(hostUpgradeAccepted, 0, 'a host-terminal WebSocket upgrade was accepted from the preview');
+  assert.ok(hostUpgradeAttempts > 0, 'the preview never attempted the host-terminal WebSocket — assertion would be vacuous');
 
   // ── 外传：能发出去，但里面没有任何值钱的东西 ──────────────────────────────
   assert.ok(collectorRequests.length > 0, 'the malicious page never attempted exfiltration');
   const loot = exfiltrated.join('\n');
-  for (const secret of [DASHBOARD_TOKEN, SESSION_INVENTORY_MARKER, RCE_MARKER, knownDebugTerminalId]) {
+  for (const secret of [DASHBOARD_TOKEN, SESSION_INVENTORY_MARKER, RCE_MARKER, knownHostTerminalId]) {
     assert.ok(!loot.includes(secret), `exfiltrated payload contained a protected value (${secret.slice(0, 24)}…)`);
   }
   findings.exfiltratedBytes = loot.length;
@@ -520,7 +519,7 @@ try {
     assertions: {
       parentDomUnreadable: true,
       managementApiAnonymous: true,
-      debugTerminalUnreachable: true,
+      hostTerminalUnreachable: true,
       exfiltrationEmpty: true,
       previewOwnResourcesWork: true,
       cspSandboxOnProxiedDocuments: true,
@@ -532,7 +531,7 @@ try {
 } finally {
   for (const socket of evilUpstreamSockets) socket.terminate();
   await browser.close();
-  debugTerminals.shutdown();
+  hostTerminals.shutdown();
   await new Promise<void>(resolve => evilWss.close(() => resolve()));
   await closeServer(front);
   await closeServer(evilUpstream);

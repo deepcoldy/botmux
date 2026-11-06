@@ -12,11 +12,14 @@ import { config } from '../../config.js';
 import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS } from '../../workflows/v3/dag.js';
 import { splitV3HostGatePrompt } from '../../workflows/v3/host-bindings.js';
+import { short, truncate, escapeMd } from './v3-card-common.js';
 
 export const V3_GATE_APPROVE_ACTION = 'v3_gate_approve';
 export const V3_GATE_REJECT_ACTION = 'v3_gate_reject';
 
-export type V3GateResolutionKind = 'approved' | 'rejected';
+/** `voided` = a runtime flow revision changed the node before anyone decided
+ *  (design §13.4); the gate is asked again under the new definition. */
+export type V3GateResolutionKind = 'approved' | 'rejected' | 'voided';
 
 /** card 按钮回传的 value 形态——v3-gate-card-handler 据此解析。 */
 export interface V3GateActionValue {
@@ -75,7 +78,9 @@ export function buildV3GateCard(input: V3GateCardInput): string {
   const title = resolution
     ? `${resolutionPrefix(resolution.kind)}：${titleText(input.nodeId)}`
     : `需要审批：${titleText(input.nodeId)}`;
-  const template = resolution ? (resolution.kind === 'approved' ? 'green' : 'red') : 'blue';
+  const template = resolution
+    ? (resolution.kind === 'approved' ? 'green' : resolution.kind === 'voided' ? 'grey' : 'red')
+    : 'blue';
 
   const elements: Array<Record<string, unknown>> = [
     {
@@ -129,7 +134,9 @@ export function buildV3GateCard(input: V3GateCardInput): string {
       text: {
         tag: 'plain_text',
         content:
-          (resolution.kind === 'approved' ? '✅ 已通过' : '❌ 已拒绝') +
+          (resolution.kind === 'approved' ? '✅ 已通过'
+            : resolution.kind === 'voided' ? '⏹️ 流程已修改，本次审批作废'
+            : '❌ 已拒绝') +
           (resolution.selected ? ` · ${short(resolution.selected, 20)}` : '') +
           (resolution.by ? ` · by ${short(resolution.by, 20)}` : ''),
       },
@@ -200,23 +207,10 @@ function optionButton(
 }
 
 function resolutionPrefix(kind: V3GateResolutionKind): string {
-  return kind === 'approved' ? '已通过' : '已拒绝';
+  return kind === 'approved' ? '已通过' : kind === 'voided' ? '已作废' : '已拒绝';
 }
 
 function titleText(nodeId: string): string {
   return `humanGate · ${nodeId}`;
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…（截断，完整见 Web 详情）`;
-}
-
-function short(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, max)}…`;
-}
-
-/** 转义 lark_md 里会被解析的字符，防 prompt 注入破坏卡片结构。 */
-function escapeMd(s: string): string {
-  return s.replace(/[\\*_~`\[\]]/g, (c) => `\\${c}`);
-}

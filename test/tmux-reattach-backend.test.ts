@@ -648,6 +648,30 @@ describe('managed Herdr agent identity', () => {
 });
 
 describe('backendSandboxCompatibilityError', () => {
+  it('rejects Linux Codex App file/read sandbox requests before a wrapper-owned launch', () => {
+    for (const backendType of ['pty', 'tmux'] as const) {
+      for (const request of [
+        { fileSandboxRequested: true, effectiveReadIsolationRequested: false },
+        { fileSandboxRequested: false, effectiveReadIsolationRequested: true },
+      ]) {
+        expect(backendSandboxCompatibilityError({
+          backendType, cliId: 'codex-app', platform: 'linux', ...request,
+        })).toBe('codex_app_file_sandbox_unsupported');
+      }
+    }
+  });
+
+  it('leaves other CLIs, remote runners, non-Linux and credential-only requests unchanged', () => {
+    for (const config of [
+      { backendType: 'pty' as const, cliId: 'codex', platform: 'linux' as const, fileSandboxRequested: true },
+      { backendType: 'tmux' as const, cliId: 'codex-app', platform: 'darwin' as const, fileSandboxRequested: true },
+      { backendType: 'riff' as const, cliId: 'codex-app', platform: 'linux' as const, fileSandboxRequested: true },
+      { backendType: 'pty' as const, cliId: 'codex-app', platform: 'linux' as const, fileSandboxRequested: false },
+    ]) {
+      expect(backendSandboxCompatibilityError({ ...config, effectiveReadIsolationRequested: false })).toBeUndefined();
+    }
+  });
+
   it('fails closed for local persistent backends outside the isolation wrapper', () => {
     for (const backendType of ['herdr', 'zellij', 'zmx'] as const) {
       expect(backendSandboxCompatibilityError({

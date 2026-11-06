@@ -27,7 +27,7 @@ supervisor 的 lifetime lock 防止重复宿主。宿主异常退出后，下次
 
 若 `~/.botmux/pm2` 仍有活跃 God daemon，插件操作会返回 `plugin_legacy_pm2_running`，不会同时启动第二套服务，也不会擅自终止旧进程。请在维护窗口使用旧安装停止对应 PM2 fleet（例如确认该 HOME 只属于 botmux 后运行 `PM2_HOME="$HOME/.botmux/pm2" pm2 kill`），关闭可能再次拉起它的旧启动项，然后执行 `botmux plugin service start <id>`。
 
-新安装不需要 PM2。旧版本桌面运行时的只读观察和既有迁移清理仍保留兼容代码，但不作为新插件服务的运行依赖。
+新安装不需要 PM2。仅保留针对旧 PM2 God 的迁移检测与清理代码，它们不要求安装 PM2（本机有 pm2 CLI 时借它停止，否则按 PM2_HOME 里的 pid 记录处理）。
 
 ## 验证入口
 

@@ -134,21 +134,24 @@ describe('#933 managementUpgradeOrigin 认平台子域', () => {
 });
 
 /**
- * 独立安全边界：WS 升级过去在「这是 /s 还是 /debug-terminal」分流**之前**就统一按
- * `terminal-upgrade` 档跑同源判定，于是平台分享出去的终端子域 `t-` 连带成了调试终端
- * WS 的可信来源——而那条 WS 的另一头是宿主的裸 bash。两条路径的信任面本来就不同：
+ * 独立安全边界：WS 升级过去在「这是 /s 还是宿主终端」分流**之前**就统一按
+ * `terminal-upgrade` 档跑同源判定，于是平台分享出去的终端子域 `t-` 连带成了宿主终端
+ * WS 的可信来源——而那条 WS 的另一头是宿主 shell。两条路径的信任面本来就不同：
  *   • `/s/<id>`：终端页住在 `t-`，必须继续认 m-+t-（否则平台浏览器终端整片断线）；
- *   • `/debug-terminal/<id>/ws`：只有管理壳页会开它，只认 management 档（m- / 本机 Host）。
+ *   • `/host-terminal/<id>/ws`：只有管理壳页会开它，只认 management 档（m- / 本机 Host）。
  * 未知升级路径同样落窄档：漏加一条前缀的失败方向是「连不上」，而不是静默放行。
  */
-describe('WS 升级按 path 分流 authority 档位（调试终端不认 t-）', () => {
-  it('/s/<id> 落 terminal-upgrade 档，/debug-terminal/<id>/ws 落 management 档', () => {
+describe('WS 升级按 path 分流 authority 档位（宿主终端不认 t-）', () => {
+  it('/s/<id> 落 terminal-upgrade 档，/host-terminal/<id>/ws 落 management 档', () => {
     expect(classifyManagementUpgrade('/s/s1?token=abc'))
       .toEqual({ route: 'session-terminal', surface: 'terminal-upgrade' });
     expect(classifyManagementUpgrade('/s'))
       .toEqual({ route: 'session-terminal', surface: 'terminal-upgrade' });
+    expect(classifyManagementUpgrade('/host-terminal/xyz/ws'))
+      .toEqual({ route: 'host-terminal', surface: 'management' });
+    // 旧的调试终端路径已下线：不再是可识别的管理升级路径。
     expect(classifyManagementUpgrade('/debug-terminal/xyz/ws'))
-      .toEqual({ route: 'debug-terminal', surface: 'management' });
+      .toEqual({ route: 'unknown', surface: 'management' });
   });
 
   it('未知升级路径落窄档且标 unknown（fail-closed，不给平台 t- 背书）', () => {
@@ -167,7 +170,7 @@ describe('WS 升级按 path 分流 authority 档位（调试终端不认 t-）',
     })).toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
   });
 
-  it('平台 t- 终端子域：/s 升级仍放行（不回退 #960），/debug-terminal 升级被拒', () => {
+  it('平台 t- 终端子域：/s 升级仍放行（不回退 #960），/host-terminal 升级被拒', () => {
     bindTo('https://botmux.example.com');
     const headers = {
       origin: `https://t-${MACHINE_ID}.botmux.example.com`,
@@ -175,7 +178,7 @@ describe('WS 升级按 path 分流 authority 档位（调试终端不认 t-）',
     };
     expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/s/s1').surface))
       .toEqual({ ok: true });
-    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/debug-terminal/t1/ws').surface))
+    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/host-terminal/t1/ws').surface))
       .toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
   });
 
@@ -187,7 +190,7 @@ describe('WS 升级按 path 分流 authority 档位（调试终端不认 t-）',
     };
     expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/s/s1').surface))
       .toEqual({ ok: true });
-    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/debug-terminal/t1/ws').surface))
+    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/host-terminal/t1/ws').surface))
       .toEqual({ ok: true });
   });
 });

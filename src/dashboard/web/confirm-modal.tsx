@@ -1,4 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from 'react';
+import { ModalDialog } from './modal-dialog.js';
 
 // ── ConfirmModal 系统 ─────────────────────────────────────────────────────────
 // 基于原生 <dialog>：showModal() 提供顶层渲染、Esc 取消与焦点圈禁（Tab 循环
@@ -80,7 +81,6 @@ function settle(accepted: boolean, text: string): void {
 
 export function ConfirmModalRoot() {
   const [, force] = useReducer((c: number) => c + 1, 0);
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const confirmRef = useRef<HTMLButtonElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [typed, setTyped] = useState('');
@@ -102,22 +102,6 @@ export function ConfirmModalRoot() {
     };
   }, []);
 
-  // 队首变化时打开/关闭原生 dialog。dialog 保持挂载，靠 children 切换内容，
-  // 这样排队中的下一个弹窗可以无缝接上。
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (current && !dialog.open) {
-      try {
-        dialog.showModal();
-      } catch {
-        /* already opening/unsupported */
-      }
-    } else if (!current && dialog.open) {
-      dialog.close();
-    }
-  }, [current]);
-
   // 每次队首变化：把输入框重置为初始值（prompt 用 defaultValue，其余清空），
   // 并把焦点落到输入框/确认按钮
   useEffect(() => {
@@ -129,29 +113,14 @@ export function ConfirmModalRoot() {
     });
   }, [current, showInput]);
 
-  // 卸载兜底：避免残留打开的 modal 卡住页面交互
-  useEffect(
-    () => () => {
-      const dialog = dialogRef.current;
-      if (dialog?.open) dialog.close();
-    },
-    [],
-  );
-
   return (
-    <dialog
-      ref={dialogRef}
+    // open 随队首开合；dialog 保持挂载，靠 children 切换内容，这样排队中的下一个
+    // 弹窗可以无缝接上。Esc / 点遮罩都 = 取消（Esc 阻止默认 close，统一走 settle 关队列）。
+    <ModalDialog
+      open={!!current}
       className="confirm-modal-dialog"
       aria-labelledby={options ? 'confirm-modal-title' : undefined}
-      onCancel={event => {
-        // Esc = 取消（阻止默认 close，统一走 settle 关队列）
-        event.preventDefault();
-        settle(false, '');
-      }}
-      onClick={event => {
-        // 点击 mask（::backdrop 的点击 retarget 到 dialog 自身）= 取消
-        if (event.target === event.currentTarget) settle(false, '');
-      }}
+      onRequestClose={() => settle(false, '')}
     >
       {options ? (
         <div className="confirm-modal-card">
@@ -195,6 +164,6 @@ export function ConfirmModalRoot() {
           </div>
         </div>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }

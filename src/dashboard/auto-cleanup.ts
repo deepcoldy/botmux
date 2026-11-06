@@ -29,6 +29,7 @@ import {
 } from '../global-config.js';
 import {
   cleanupIdleSessions,
+  AUTO_CLEANUP_HOUR_OPTIONS,
   parseIdleCleanupHours,
   type IdleCleanupResult,
   type IdleCleanupCloseResult,
@@ -44,7 +45,8 @@ export const AUTO_CLEANUP_TICK_MS = 60_000;
  *  stored value is missing or (defensively) not one of the supported options. */
 export function resolveCleanupHours(cfg: SessionCleanupGlobalConfig | undefined): SessionCleanupHours {
   const parsed = parseIdleCleanupHours(cfg?.olderThanHours);
-  return (parsed ?? SESSION_CLEANUP_DEFAULT_HOURS) as SessionCleanupHours;
+  return parsed !== null && (AUTO_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(parsed)
+    ? parsed as SessionCleanupHours : SESSION_CLEANUP_DEFAULT_HOURS;
 }
 
 /** Resolve the effective check interval in ms, applying the default and the
@@ -126,8 +128,13 @@ export async function runAutoCleanupTick<T extends IdleCleanupSessionRow>(
     const residualNote = result.residual > 0 ? `, residual ${result.residual}` : '';
     deps.log(
       `swept idle>${due.hours}h: matched ${result.matched}, closed ${result.closed}, `
-      + `failed ${result.failed}${residualNote}`,
+      + `failed ${result.failed}, Codex archive failed ${result.archiveFailed}${residualNote}`,
     );
+  }
+  for (const row of result.results) {
+    if (row.archiveError) deps.log?.(`session ${row.sessionId}: Codex archive ${
+      row.archiveError === 'codex_archive_target_unverified' || row.archiveError === 'codex_archive_target_invalid'
+        ? row.archiveError : 'rpc_failed'}`);
   }
   return result;
 }

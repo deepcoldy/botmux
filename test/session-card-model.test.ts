@@ -4,9 +4,6 @@ import type { SessionRow } from '../src/core/dashboard-rows.js';
 import {
   composeDetail,
   composeEntries,
-  filterByCli,
-  filterBySearch,
-  filterByStatus,
   paginate,
   sortByStatus,
   statusToDot,
@@ -60,39 +57,6 @@ describe('session-card-model · composeEntries / statusToDot', () => {
       pulse: false,
       label: 'sessions.status.stalled',
     });
-  });
-});
-
-describe('session-card-model · filters', () => {
-  it("filterByStatus(chip='all') keeps content + order and never mutates input (M1)", () => {
-    const entries = composeEntries([
-      makeRow({ sessionId: 'a', status: 'working' }),
-      makeRow({ sessionId: 'b', status: 'closed' }),
-      makeRow({ sessionId: 'c', status: 'idle' }),
-    ], FIXED_NOW);
-    const before = entries.map(e => e.sessionId);
-    const out = filterByStatus(entries, 'all');
-    expect(out.map(e => e.sessionId)).toEqual(before);
-    expect(entries.map(e => e.sessionId)).toEqual(before);
-  });
-
-  it('filterBySearch is case-insensitive and matches workingDir substring', () => {
-    const entries = composeEntries([
-      makeRow({ sessionId: 'a', workingDir: '/home/user/SECRET-Repo' }),
-      makeRow({ sessionId: 'b', workingDir: '/tmp/other' }),
-    ], FIXED_NOW);
-    const matched = filterBySearch(entries, 'secret-repo');
-    expect(matched.map(e => e.sessionId)).toEqual(['a']);
-  });
-
-  it('filterByCli with undefined or empty string returns all entries unchanged', () => {
-    const entries = composeEntries([
-      makeRow({ sessionId: 'a', cliId: 'claude' }),
-      makeRow({ sessionId: 'b', cliId: 'codex' }),
-    ], FIXED_NOW);
-    expect(filterByCli(entries, undefined).map(e => e.sessionId)).toEqual(['a', 'b']);
-    expect(filterByCli(entries, '').map(e => e.sessionId)).toEqual(['a', 'b']);
-    expect(filterByCli(entries, 'claude').map(e => e.sessionId)).toEqual(['a']);
   });
 });
 
@@ -169,17 +133,13 @@ describe('session-card-model · composeDetail action matrix (M5 extended)', () =
 });
 
 describe('session-card-model · invariants', () => {
-  it('filter / sort / paginate do not mutate the input (immutability)', () => {
+  it('sort / paginate do not mutate the input (immutability)', () => {
     const entries = composeEntries([
       makeRow({ sessionId: 'a', status: 'working' }),
       makeRow({ sessionId: 'b', status: 'closed' }),
     ], FIXED_NOW);
     const frozen = Object.freeze(entries.slice());
     const snapshot = frozen.map(e => e.sessionId);
-    filterByStatus(frozen, 'all');
-    filterByStatus(frozen, 'working');
-    filterBySearch(frozen, 'a');
-    filterByCli(frozen, 'claude');
     sortByStatus(frozen);
     paginate(frozen, 1, 10);
     expect(frozen.map(e => e.sessionId)).toEqual(snapshot);

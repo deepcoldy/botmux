@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -42,6 +42,49 @@ function toolResult(uuid: string): TranscriptEvent {
     type: 'user',
     uuid,
     message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] as any },
+  };
+}
+/** Claude Code built-in CronCreate fire record: isMeta user event with
+ *  turnOrigin:"scheduled", exactly as written to the transcript. */
+function scheduledFire(uuid: string, opts: { fireId?: string; content?: string; taskId?: string } = {}): TranscriptEvent {
+  const ev: TranscriptEvent = {
+    type: 'user',
+    uuid,
+    isMeta: true,
+    turnOrigin: 'scheduled',
+    scheduledTaskId: opts.taskId ?? 'task-1',
+    scheduledFireId: opts.fireId ?? `fire-${uuid}`,
+    message: { role: 'user', content: opts.content ?? `<scheduled fire ${uuid}>` },
+  };
+  return ev;
+}
+/** Assistant tool_use block calling the built-in CronCreate. */
+function cronCreateCall(blockId: string): TranscriptEvent {
+  return {
+    type: 'assistant',
+    uuid: `caller-${blockId}`,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: blockId, name: 'CronCreate', input: { cron: '7,37 * * * *' } }] as any,
+    },
+  };
+}
+/** User tool_result ack carrying the scheduled task id, as Claude writes it.
+ *  Note the REAL noun differs by kind: recurring prints "… recurring job",
+ *  one-shot prints "… one-shot TASK" (verified on Claude Code 2.1.276/2.1.284). */
+function cronCreateAck(blockId: string, taskId: string, kind: 'recurring' | 'oneshot' = 'recurring'): TranscriptEvent {
+  const phrase = kind === 'recurring' ? 'recurring job' : 'one-shot task';
+  return {
+    type: 'user',
+    uuid: `ack-${taskId}`,
+    message: {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: blockId,
+        content: `Scheduled ${phrase} ${taskId} (7,37 * * * *). Use CronDelete to cancel sooner.`,
+      }] as any,
+    },
   };
 }
 
@@ -390,6 +433,25 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].assistantUuids).toEqual(['a1', 'a2', 'a3']);
   });
 
+  it('a turn read in the same batch after another turn\'s duration marker stays its own turn', () => {
+    // A rotation switch replays every turn the bridge did not read at once:
+    // two background-task wake-ups, then one after a Lark turn.
+    const notification = (uuid: string) => user(uuid, `<task-notification>\n<task-id>${uuid}</task-id>\n</task-notification>`);
+    const done = (uuid: string): TranscriptEvent => ({ type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint('lark question'));
+    q.ingest([
+      notification('n1'), assistant('a1', 'first wake-up reply'), done('d1'),
+      notification('n2'), assistant('a2', 'second wake-up reply'), done('d2'),
+      user('u1', 'lark question'), assistant('a3', 'lark answer'), done('d3'),
+      notification('n3'), assistant('a4', 'third wake-up reply'), done('d4'),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready.map(turn => [turn.isLocal === true, turn.assistantUuids])).toEqual([
+      [true, ['a1']], [true, ['a2']], [false, ['a3']], [true, ['a4']],
+    ]);
+  });
+
   it('headless local turn does not block a Lark turn that arrives next', () => {
     const q = new BridgeTurnQueue();
     // In-flight assistant text after a daemon restart — synthesises a headless turn.
@@ -619,6 +681,10 @@ describe('BridgeTurnQueue', () => {
         message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
       } as TranscriptEvent;
     }
+    /** Claude Code's last record of a turn: a reply's `end_turn` alone is held for it. */
+    function turnDurationMarker(uuid: string): TranscriptEvent {
+      return { type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent;
+    }
     function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
       return {
         type: 'assistant', uuid, isApiErrorMessage: false,
@@ -643,7 +709,7 @@ describe('BridgeTurnQueue', () => {
     it('control: the same record served by a real model is the completed reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['s1']);
@@ -682,7 +748,7 @@ describe('BridgeTurnQueue', () => {
     it('does not downgrade a turn that already completed with a real reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
@@ -698,7 +764,7 @@ describe('BridgeTurnQueue', () => {
     it('lets an API-error line override an earlier completed outcome (recovery must still fire)', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
@@ -1079,6 +1145,141 @@ describe('BridgeTurnQueue', () => {
       expect(ready[0].assistantUuids).toEqual(['a-start', 'a-final']);
     });
 
+    it('mid-turn absorbed reminder queued_command is filtered and does not split or drop turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1', 'first question'), assistant('a1', 'answering')]);
+      const absorbedEvent: any = {
+        type: 'attachment',
+        uuid: 'q-absorbed',
+        timestamp: new Date().toISOString(),
+        attachment: {
+          type: 'queued_command',
+          prompt: '<system-reminder>User sent another message while you were working</system-reminder>',
+        },
+        renderedRole: 'system',
+        rendered: [{ content: '<system-reminder>User sent another message</system-reminder>' }],
+      };
+      q.ingest([absorbedEvent]);
+      const peek = q.peek();
+      expect(peek).toHaveLength(1);
+      expect(peek[0].turnId).toBe('t1');
+      expect(peek[0].assistantUuids).toEqual(['a1']);
+    });
+
+    // Real Claude Code 2.1+ shape of a message typed while a turn runs: the
+    // attachment carries the full botmux envelope, rendered to the model as a
+    // system reminder. No `role:user` line follows it.
+    function absorbedQueued(uuid: string, prompt: string, timestamp: string): TranscriptEvent {
+      return {
+        type: 'attachment',
+        uuid,
+        timestamp,
+        attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+        renderedRole: 'system',
+        rendered: [{ content: `<system-reminder>\nThe user sent a new message while you were working:\n${prompt}\n</system-reminder>` }],
+      } as any;
+    }
+
+    it('binds a type-ahead mark to its mid-turn absorbed input and ends it with the host turn', () => {
+      const started: string[] = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (turn, evidence) => {
+        started.push(`${turn.turnId}:${evidence.fullContentMatch}`);
+      });
+      const promptB = '<user_message>用pil 再看一遍</user_message>';
+      q.mark('tA', makeFingerprint('进度如何'), 100, normaliseForFingerprint('进度如何'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', '进度如何'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'both answered'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+
+      // Not split: the running turn keeps collecting the reply.
+      expect(q.peek().map(t => t.turnId)).toEqual(['tA', 'tB']);
+      expect(q.peek()[0].assistantUuids).toEqual(['a-final']);
+      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', assistantUuids: [] });
+      expect(started).toEqual(['tA:true', 'tB:true']);
+
+      // A pruning pass cannot expire it any more: it is started.
+      expect(q.pruneExpired(0, 10_000_000)).toEqual([]);
+
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tA', 'tB']);
+      expect(ready[1].terminalObserved).toBe(true);
+      expect(ready[1].terminalOutcome).toEqual({ status: 'completed' });
+      expect(ready[1].markTimeMs).toBe(5000);
+      expect(q.size()).toBe(0);
+    });
+
+    it('absorbed input stays queued until its host turn closes', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'second request while busy';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', 'first request'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+      ]);
+      expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+      expect(q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true })).toEqual([]);
+    });
+
+    it('an absorbed reminder that matches no pending mark changes nothing', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('first request'));
+      q.mark('tB', makeFingerprint('unrelated pending prompt'));
+      q.ingest([
+        user('uA', 'first request'),
+        assistant('a1', 'working'),
+        absorbedQueued('q-absorbed', 'typed directly in the terminal', new Date(5000).toISOString()),
+      ]);
+      expect(q.peek().map(t => [t.turnId, t.started])).toEqual([['tA', true], ['tB', false]]);
+      expect(q.peek()[0].absorbedTurns).toBeUndefined();
+    });
+
+    it('with nothing collecting, the absorbed input collects the rest of the turn', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'follow-up after a worker restart';
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'answer'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tB']);
+      expect(ready[0].assistantUuids).toEqual(['a-final']);
+      expect(ready[0].absorbedIntoTurnId).toBeUndefined();
+    });
+
+    it('protects turn with assistant activity from HOL drop even without visible text', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1', makeFingerprint('task 1'));
+      const toolUseEv: any = {
+        type: 'assistant',
+        uuid: 'a-tool',
+        timestamp: new Date().toISOString(),
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'tool_1', name: 'botmux_send', input: {} }],
+        },
+      };
+      q.ingest([user('u1', 'task 1'), toolUseEv]);
+      expect(q.peek()[0].hasAssistantActivity).toBe(true);
+      expect(q.peek()[0].assistantUuids).toHaveLength(0);
+
+      q.mark('t2', makeFingerprint('task 2'));
+      q.ingest([user('u2', 'task 2')]);
+
+      const emittable = q.drainEmittable();
+      expect(emittable).toHaveLength(1);
+      expect(emittable[0].turnId).toBe('t1');
+    });
+
     it('task notifications do not cap the send-marker window before the final botmux send', () => {
       const q = new BridgeTurnQueue();
       const firstPrompt = '<user_message>research startup hooks</user_message>';
@@ -1325,20 +1526,385 @@ describe('BridgeTurnQueue', () => {
       expect(q.drainEmittable({ terminalBoundary: true }).map(t => t.turnId)).toContain('lark-1');
     });
 
-    it('worker.ts drains the report BEFORE the empty-ready early return', () => {
-      // Wiring, not policy: a queue that reports perfectly is inert if nobody
-      // drains it. Ordering matters — a head-of-line drop usually lands on a
-      // tick that emits nothing, so draining after `if (ready.length === 0)
-      // return;` would skip exactly the case this fix exists for.
+    // 源码结构护栏(K3)：emitReadyTurns 在 worker.ts 闭包里、没有行为 seam；一次 head-of-line drop
+    // 通常落在什么都不 emit 的 tick 上，若排空放到「ready 为空就 return」之后，journal 条目永不退役，
+    // 每次重启都重放旧 provider 错误成新的「本轮执行失败」卡（#1170，线上实测六次重启两次重放）。
+    // 只钉不变量：排空 + journalBridgeTurnClear 先于空 ready 的提前返回。
+    it('worker retires dropped turns\' journal entries before the empty-ready early return', () => {
       const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
       const fn = source.slice(source.indexOf('function emitReadyTurns('));
       const drainAt = fn.indexOf('takeDroppedNeedingJournalClear()');
-      const earlyReturnAt = fn.indexOf('if (ready.length === 0) return;');
+      const earlyReturnAt = fn.search(/if\s*\(\s*ready\.length\s*===\s*0\s*\)\s*return\b/);
       expect(drainAt).toBeGreaterThan(-1);
       expect(earlyReturnAt).toBeGreaterThan(-1);
       expect(drainAt).toBeLessThan(earlyReturnAt);
-      // ...and it must actually retire the journal entry, not just log.
       expect(fn.slice(drainAt, earlyReturnAt)).toContain('journalBridgeTurnClear(');
+    });
+  });
+
+  // ── Built-in CronCreate scheduled turns (turnOrigin:"scheduled") ─────────
+  describe('built-in scheduled turn fires', () => {
+    it('mints a scheduled turn from the isMeta fire record and collects its answer', () => {
+      const q = new BridgeTurnQueue();
+      q.ingest([scheduledFire('sf1'), assistant('sa1', 'scheduled briefing')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('scheduled-fire-sf1');
+      expect(ready[0].isLocal).toBe(true);
+      expect(ready[0].isScheduled).toBe(true);
+      expect(ready[0].userUuid).toBe('sf1');
+      expect(ready[0].assistantUuids).toEqual(['sa1']);
+    });
+
+    it('does NOT bind a pending Lark mark to the scheduler prompt', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_1', makeFingerprint('real user question'));
+      q.ingest([scheduledFire('sf1'), assistant('sa1', 'scheduled briefing')]);
+      const ready = q.drainEmittable();
+      // The scheduled turn emits; the Lark mark remains unstarted, still
+      // waiting for its real user line.
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isScheduled).toBe(true);
+      const pending = q.peek().find(t => t.turnId === 'om_1');
+      expect(pending?.started).toBe(false);
+    });
+
+    it('gives an UNKNOWN task no anchor even when a Lark turn (started or unstarted) is latest', () => {
+      // Round-3 Must fix: after a worker re-attach the task map is whatever
+      // was restored from disk. A fire whose task is NOT in the map — created
+      // before this worker ever observed it and absent from the durable store
+      // — must NEVER borrow the most recent Lark turn's topic. Borrowing would
+      // route the fire into whatever topic happened to be active after the
+      // restart (the cross-topic leak). It omits replyTurnId instead and lets
+      // the daemon pick its default routing.
+      const q = new BridgeTurnQueue();
+      q.mark('om_1', makeFingerprint('first question'));
+      q.ingest([
+        user('u1', 'first question full text'),
+        assistant('a1', 'first answer'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // A newer, still-unstarted mark must not move the anchor either.
+      q.mark('om_2', makeFingerprint('second question'));
+      // Fire of a task this queue has never seen a CronCreate/ack for.
+      q.ingest([scheduledFire('sf1', { taskId: 'ghost-task' }), assistant('sa1', 'scheduled briefing')]);
+      const [turn] = q.drainEmittable();
+      expect(turn.isScheduled).toBe(true);
+      expect(turn.replyAnchorTurnId).toBeUndefined();
+    });
+
+    it('anchors a task created inside a Lark turn to THAT turn for every later fire', () => {
+      const q = new BridgeTurnQueue();
+      // Topic A: user asks something, the turn calls CronCreate, gets the ack.
+      q.mark('om_A', makeFingerprint('create a cron please'));
+      q.ingest([
+        user('uA', 'create a cron please full text'),
+        cronCreateCall('block-1'),
+        cronCreateAck('block-1', 'jobA'),
+        assistant('aA', 'scheduled it'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // A fire of jobA — even with no recent other activity — anchors to A.
+      q.ingest([scheduledFire('sf1', { taskId: 'jobA' }), assistant('sa1', 'jobA result')]);
+      let ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready[0].replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('keeps the create-time topic when OTHER topics receive messages before a fire', () => {
+      const q = new BridgeTurnQueue();
+      // Task created inside topic A.
+      q.mark('om_A', makeFingerprint('set up cron in A'));
+      q.ingest([
+        user('uA', 'set up cron in A full text'),
+        cronCreateCall('block-1'),
+        cronCreateAck('block-1', 'jobA'),
+        assistant('aA', 'ok'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // Later, topic B gets a fully-bound Lark turn.
+      q.mark('om_B', makeFingerprint('unrelated question in B'));
+      q.ingest([
+        user('uB', 'unrelated question in B full text'),
+        assistant('aB', 'answer in B'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // jobA fires: result MUST go to A (the create-time topic), not B.
+      q.ingest([scheduledFire('sf1', { taskId: 'jobA' }), assistant('sa1', 'jobA result')]);
+      const ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready[0].isScheduled).toBe(true);
+      expect(ready[0].replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('tracks two tasks independently by scheduledTaskId across interleaved topics', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_A', makeFingerprint('cron alpha'));
+      q.ingest([
+        user('uA', 'cron alpha full text'),
+        cronCreateCall('block-a'),
+        cronCreateAck('block-a', 'jobA'),
+        assistant('aA', 'a scheduled'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      q.mark('om_B', makeFingerprint('cron beta'));
+      q.ingest([
+        user('uB', 'cron beta full text'),
+        cronCreateCall('block-b'),
+        cronCreateAck('block-b', 'jobB'),
+        assistant('aB', 'b scheduled'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // Fire B first, then A; each anchors to its own create-time topic.
+      q.ingest([scheduledFire('sfB', { taskId: 'jobB' }), assistant('sB', 'B result')]);
+      q.ingest([scheduledFire('sfA', { taskId: 'jobA' }), assistant('sA', 'A result')]);
+      const ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready.map(t => t.replyAnchorTurnId)).toEqual(['om_B', 'om_A']);
+    });
+
+    it('has no anchor when the task was created before the queue saw any Lark turn', () => {
+      const q = new BridgeTurnQueue();
+      // CronCreate runs in a local-terminal turn (no Lark turn involved).
+      q.ingest([
+        user('uL', 'typed locally'),
+        cronCreateCall('block-1'),
+        cronCreateAck('block-1', 'jobA'),
+        assistant('aL', 'scheduled locally'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      q.ingest([scheduledFire('sf1', { taskId: 'jobA' }), assistant('sa1', 'result')]);
+      const [turn] = q.drainEmittable({ terminalBoundary: true });
+      expect(turn.replyAnchorTurnId).toBeUndefined();
+    });
+
+    it('is ignored without scheduledFireId and falls back to normal local handling', () => {
+      const q = new BridgeTurnQueue();
+      const fake: TranscriptEvent = {
+        type: 'user',
+        uuid: 'x1',
+        isMeta: true,
+        turnOrigin: 'scheduled',
+        message: { role: 'user', content: 'no fire id' },
+      };
+      q.ingest([fake, assistant('a1', 'reply')]);
+      // Not a scheduled turn; treated as any non-meaningful isMeta record →
+      // the assistant becomes a headless local turn.
+      const ready = q.drainEmittable();
+      expect(ready[0].isScheduled).toBeUndefined();
+      expect(ready[0].turnId).toBe('local-headless-a1');
+    });
+
+    it('real chronology: system fire marker + user fire + answer + turn_duration, then a bound Lark turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_1', makeFingerprint('do the thing'));
+      // The system record precedes the isMeta user record in the transcript.
+      const sysFire: TranscriptEvent = {
+        type: 'system', subtype: 'scheduled_task_fire', uuid: 'sys1',
+        cron: '*/30 * * * *',
+      } as unknown as TranscriptEvent;
+      q.ingest([
+        sysFire,
+        scheduledFire('sf1', { fireId: 'fire-A' }),
+        assistant('sa1', '09:30 进度：无新分'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'td1' },
+      ]);
+      // Worker drains at an idle boundary.
+      const ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('scheduled-fire-A');
+      expect(ready[0].assistantUuids).toEqual(['sa1']);
+      expect(ready[0].terminalObserved).toBe(true);
+      // Pending Lark mark is intact and binds when its real prompt lands.
+      q.ingest([user('u1', 'do the thing now'), assistant('a1', 'done')]);
+      const next = q.drainEmittable({ terminalBoundary: true });
+      expect(next).toHaveLength(1);
+      expect(next[0].turnId).toBe('om_1');
+      expect(next[0].assistantUuids).toEqual(['a1']);
+    });
+
+    // ── Round-3 review: ack spoofing + durable-anchor recovery ──────────────
+
+    it('an unrelated tool_result merely CONTAINING a job ack text does not overwrite the anchor', () => {
+      // Must fix A: handleCronCreateAcks must pair the ack's tool_use_id with
+      // a PENDING CronCreate call. Here task jobA is created and anchored in
+      // topic A. Later, in topic B, an unrelated Read tool_result whose text
+      // happens to contain "Scheduled recurring job jobA …" must NOT be
+      // accepted as jobA's ack (it is not the CronCreate result) and must not
+      // clobber jobA's anchor to undefined / reroute it to B.
+      const anchored: Array<[string, string | undefined]> = [];
+      const q = new BridgeTurnQueue(undefined, (taskId, anchor) => anchored.push([taskId, anchor]));
+      q.mark('om_A', makeFingerprint('create cron in A'));
+      q.ingest([
+        user('uA', 'create cron in A full text'),
+        cronCreateCall('cc-A'),
+        cronCreateAck('cc-A', 'jobA'),
+        assistant('aA', 'scheduled'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      expect(q.scheduledTaskAnchor('jobA')).toBe('om_A');
+      const persistsAfterCreate = anchored.length;
+
+      // Topic B: a normal Lark turn runs an unrelated Read whose RESULT text
+      // quotes the jobA ack line (e.g. the agent greps its own transcript).
+      const spoofRead: TranscriptEvent = {
+        type: 'assistant',
+        uuid: 'readCall',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'read-1', name: 'Read', input: {} }] as any },
+      };
+      const spoofResult: TranscriptEvent = {
+        type: 'user',
+        uuid: 'readResult',
+        message: { role: 'user', content: [{
+          type: 'tool_result',
+          tool_use_id: 'read-1',
+          content: 'some log excerpt:\nScheduled recurring job jobA (7,37 * * * *). Use CronDelete to cancel sooner.',
+        }] as any },
+      };
+      q.mark('om_B', makeFingerprint('grep logs in B'));
+      q.ingest([
+        user('uB', 'grep logs in B full text'),
+        spoofRead,
+        spoofResult,
+        assistant('aB', 'found it'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+
+      // No new anchor event fired for jobA, and its stored anchor is intact.
+      expect(anchored.length).toBe(persistsAfterCreate);
+      expect(q.scheduledTaskAnchor('jobA')).toBe('om_A');
+      // jobA's next fire still routes to A, not B.
+      q.ingest([scheduledFire('fire2', { taskId: 'jobA' }), assistant('sa2', 'A update')]);
+      const [turn] = q.drainEmittable({ terminalBoundary: true });
+      expect(turn.replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('a spoofed ack CANNOT register a brand-new task anchor', () => {
+      // Defence in depth on Must fix A: without any pending CronCreate call,
+      // a tool_result that looks exactly like an ack registers nothing.
+      const anchored: Array<[string, string | undefined]> = [];
+      const q = new BridgeTurnQueue(undefined, (taskId, anchor) => anchored.push([taskId, anchor]));
+      q.ingest([cronCreateAck('never-called-id', 'jobX')]);
+      expect(q.scheduledTaskAnchor('jobX')).toBeUndefined();
+      expect(anchored).toHaveLength(0);
+    });
+
+    it('restored anchors survive a fresh worker queue and are NOT rerouted by later other-topic traffic', () => {
+      // Must fix B: simulate worker recovery. The "old worker" observed jobA's
+      // CronCreate/ack in topic A; the persisted map is handed to a NEW queue
+      // instance (the new worker has no in-memory state). Topic B then sees
+      // activity, and jobA's first post-restart fire must still anchor to A.
+      const old = new BridgeTurnQueue();
+      old.mark('om_A', makeFingerprint('cron in A'));
+      old.ingest([
+        user('uA', 'cron in A full text'),
+        cronCreateCall('cc-A'),
+        cronCreateAck('cc-A', 'jobA'),
+        assistant('aA', 'ok'),
+      ]);
+      old.drainEmittable({ terminalBoundary: true });
+      expect(old.scheduledTaskAnchor('jobA')).toBe('om_A');
+
+      // The worker would persist jobA→om_A; a brand-new queue restores it.
+      const restored = new Map<string, string | undefined>([['jobA', 'om_A']]);
+      const fresh = new BridgeTurnQueue();
+      fresh.restoreScheduledTaskAnchors(restored);
+
+      // After re-attach, topic B gets a fully-bound turn BEFORE jobA fires.
+      fresh.mark('om_B', makeFingerprint('later question in B'));
+      fresh.ingest([
+        user('uB', 'later question in B full text'),
+        assistant('aB', 'answer B'),
+      ]);
+      fresh.drainEmittable({ terminalBoundary: true });
+
+      fresh.ingest([scheduledFire('f1', { taskId: 'jobA' }), assistant('s1', 'A report')]);
+      const [turn] = fresh.drainEmittable({ terminalBoundary: true });
+      expect(turn.isScheduled).toBe(true);
+      expect(turn.replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('a restored null anchor (local-created task) stays unanchored after other-topic traffic', () => {
+      // Must fix B corner: a task created from a local-terminal turn is
+      // persisted with anchor=null to prove it WAS observed. Recovery must
+      // keep it anchorless (daemon default routing), not borrow topic B.
+      const fresh = new BridgeTurnQueue();
+      fresh.restoreScheduledTaskAnchors(new Map<string, string | undefined>([['jobLocal', undefined]]));
+      fresh.mark('om_B', makeFingerprint('some B question'));
+      fresh.ingest([
+        user('uB', 'some B question full text'),
+        assistant('aB', 'answer'),
+      ]);
+      fresh.drainEmittable({ terminalBoundary: true });
+      fresh.ingest([scheduledFire('f1', { taskId: 'jobLocal' }), assistant('s1', 'report')]);
+      const [turn] = fresh.drainEmittable({ terminalBoundary: true });
+      expect(turn.isScheduled).toBe(true);
+      expect(turn.replyAnchorTurnId).toBeUndefined();
+    });
+
+    it('a CronCreate issued DURING a scheduled turn inherits that turn’s topic anchor', () => {
+      // Anchor propagation across scheduled turns: a re-created task inside a
+      // fire of jobA keeps reporting into jobA's create-time topic A.
+      const q = new BridgeTurnQueue();
+      q.restoreScheduledTaskAnchors(new Map<string, string | undefined>([['jobA', 'om_A']]));
+      q.ingest([
+        scheduledFire('f1', { taskId: 'jobA' }),
+        cronCreateCall('cc-B'),
+        cronCreateAck('cc-B', 'jobB'),
+        assistant('s1', 'rescheduled as jobB'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      expect(q.scheduledTaskAnchor('jobB')).toBe('om_A');
+      q.ingest([scheduledFire('f2', { taskId: 'jobB' }), assistant('s2', 'B→A report')]);
+      const [turn] = q.drainEmittable({ terminalBoundary: true });
+      expect(turn.replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('accepts the one-shot ack phrasing and anchors identically', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_A', makeFingerprint('remind me once'));
+      q.ingest([
+        user('uA', 'remind me once full text'),
+        cronCreateCall('cc-1'),
+        cronCreateAck('cc-1', 'jobOne', 'oneshot'),
+        assistant('aA', 'will do'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      expect(q.scheduledTaskAnchor('jobOne')).toBe('om_A');
+    });
+
+    it('scheduledTaskAnchorsSnapshot exposes the full map with local-created tasks as turnId null', () => {
+      // Round-4 daemon pin: the IPC snapshot is the worker's authoritative
+      // full state; an undefined anchor (task created in a local turn) must
+      // serialize as explicit null so the daemon pins nothing but still knows
+      // the task exists (and can drop it on a later absent-task snapshot).
+      const q = new BridgeTurnQueue();
+      q.ingest([cronCreateCall('cc-loc'), cronCreateAck('cc-loc', 'jobLocal')]);
+      q.mark('om_A', makeFingerprint('cron in A'));
+      q.ingest([
+        user('uA', 'cron in A full text'),
+        cronCreateCall('cc-A'),
+        cronCreateAck('cc-A', 'jobA'),
+        assistant('aA', 'ok'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      const snap = q.scheduledTaskAnchorsSnapshot()
+        .sort((a, b) => a.taskId.localeCompare(b.taskId));
+      expect(snap).toEqual([
+        { taskId: 'jobA', turnId: 'om_A' },
+        { taskId: 'jobLocal', turnId: null },
+      ]);
+    });
+
+    it('restored anchors appear in the snapshot handed to the daemon after re-attach', () => {
+      const q = new BridgeTurnQueue();
+      q.restoreScheduledTaskAnchors(new Map<string, string | undefined>([
+        ['jobA', 'om_A'],
+        ['jobLocal', undefined],
+      ]));
+      const snap = q.scheduledTaskAnchorsSnapshot()
+        .sort((a, b) => a.taskId.localeCompare(b.taskId));
+      expect(snap).toEqual([
+        { taskId: 'jobA', turnId: 'om_A' },
+        { taskId: 'jobLocal', turnId: null },
+      ]);
     });
   });
 });
@@ -1385,3 +1951,255 @@ describe('BridgeTurnQueue — bare (solo transcript) input fingerprint', () => {
 function makeFingerprintFull(message: string): string {
   return message.replace(/\s+/g, ' ').trim();
 }
+
+// ── Native consumption evidence for shared group background ───────────────────
+// Only a transcript record whose normalised text contains the WHOLE marked
+// content proves that the dispatched input (envelope included) entered the
+// conversation. Fingerprint-prefix and truncation binds still attribute the
+// reply but must not be reported as consumption evidence.
+describe('onLarkTurnStarted evidence', () => {
+  const marked = '<shared_group_context>history</shared_group_context>\n<user_message>看一下图库</user_message>';
+  function queueWith(record: (turn: { turnId: string }, evidence: { fullContentMatch: boolean; sourceJsonlPath?: string }) => void) {
+    return new BridgeTurnQueue(undefined, undefined, record);
+  }
+
+  it('reports a full-content match with the source transcript path', () => {
+    const seen: unknown[] = [];
+    const q = queueWith((turn, evidence) => seen.push([turn.turnId, evidence]));
+    q.mark('om_turn', makeFingerprint(marked), Date.now(), normaliseForFingerprint(marked));
+    q.ingest([user('u1', marked)], '/claude/projects/x/abcd-session.jsonl');
+    expect(seen).toEqual([['om_turn', { fullContentMatch: true, sourceJsonlPath: '/claude/projects/x/abcd-session.jsonl' }]]);
+  });
+
+  it('reports fingerprint-only and truncated binds as non-proof', () => {
+    const seen: boolean[] = [];
+    const q = queueWith((_turn, evidence) => seen.push(evidence.fullContentMatch));
+    q.mark('om_prefix', makeFingerprint(marked), Date.now(), normaliseForFingerprint(marked));
+    // Same 30-char head, different tail: attribution heuristic, not proof.
+    q.ingest([user('u1', '<shared_group_context>history</shared_group_context>\n<user_message>看一下别的</user_message>')]);
+    q.mark('om_truncated', makeFingerprint(marked), Date.now(), normaliseForFingerprint(marked));
+    // Claude persisted only the surviving tail of the envelope.
+    q.ingest([assistant('a1', 'reply'), user('u2', '<user_message>看一下图库</user_message>')]);
+    expect(seen).toEqual([false, false]);
+  });
+
+  it('does not report local or legacy unfingerprinted turns as full matches', () => {
+    const seen: boolean[] = [];
+    const q = queueWith((_turn, evidence) => seen.push(evidence.fullContentMatch));
+    q.ingest([user('local', 'pwd')]);
+    q.mark('om_legacy');
+    q.ingest([user('u1', marked)]);
+    expect(seen).toEqual([false]);
+  });
+});
+
+describe('input held in Claude\'s own queue', () => {
+  const TTL = 120_000;
+  const markAt = Date.parse('2026-10-31T12:20:38.866Z');
+  const iso = (offsetMs: number) => new Date(markAt + offsetMs).toISOString();
+  const text = '<botmux_reminder>r</botmux_reminder> <user_message>do it in parallel</user_message>';
+  const queueOp = (operation: string, offsetMs: number, content?: string, reason?: string, extra?: Record<string, unknown>) => ({
+    type: 'queue-operation', operation, timestamp: iso(offsetMs),
+    ...(content === undefined ? {} : { content }), ...(reason ? { reason } : {}), ...extra,
+  }) as unknown as TranscriptEvent;
+  const absorbed = (uuid: string, prompt: string, offsetMs: number) => ({
+    type: 'attachment', uuid, timestamp: iso(offsetMs),
+    attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+    renderedRole: 'system',
+    rendered: [{ content: `<system-reminder>${prompt}</system-reminder>` }],
+  }) as unknown as TranscriptEvent;
+  function marked(content = text, turnId = 't1', atMs = markAt): BridgeTurnQueue {
+    const q = new BridgeTurnQueue();
+    q.mark(turnId, makeFingerprint(content), atMs, normaliseForFingerprint(content));
+    return q;
+  }
+
+  it('keeps the mark past the TTL and binds it when Claude absorbs the input mid-turn', () => {
+    const started: string[] = [];
+    const q = new BridgeTurnQueue(undefined, undefined, turn => { started.push(turn.turnId); });
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 3_500, text)]);
+    expect(q.pruneExpired(TTL, markAt + TTL + 1)).toEqual([]);
+    q.ingest([
+      queueOp('remove', 137_400, text, 'absorbed_mid_turn'),
+      absorbed('q1', text, 3_000),
+    ]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it('expires a mark with no enqueue record at the TTL, as before', () => {
+    const q = marked();
+    expect(q.pruneExpired(TTL, markAt + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('does not treat another input or an older identical input as this mark being queued', () => {
+    const other = marked();
+    other.ingest([queueOp('enqueue', 1_000, '<task-notification>done</task-notification>')]);
+    expect(isHeldInCliQueue(other.peek()[0])).toBe(false);
+    const older = marked();
+    older.ingest([queueOp('enqueue', -60_000, text)]);
+    expect(isHeldInCliQueue(older.peek()[0])).toBe(false);
+  });
+
+  it('runs the normal TTL from the moment the input leaves the queue unbound', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.ingest([queueOp('remove', 600_000, text, 'cancelled')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('follows queue order for content-less dequeues, past items that are not marks', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 500, '<task-notification>done</task-notification>'),
+      queueOp('enqueue', 1_000, text),
+      queueOp('dequeue', 5_000),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    q.ingest([queueOp('dequeue', 6_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('pairs identical inputs with their marks in order', () => {
+    const q = marked();
+    q.mark('t2', makeFingerprint(text), markAt + 100, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, false]);
+    q.ingest([queueOp('enqueue', 1_000, text)]); // same record replayed by a transcript switch
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, false]);
+    q.ingest([queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+  });
+
+  it('stops holding at the upper bound, so a dropped input cannot block the queue for good', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    expect(q.pruneExpired(TTL, markAt + 1_000 + CLI_QUEUE_HOLD_MAX_MS)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 1_000 + CLI_QUEUE_HOLD_MAX_MS + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('stops holding when Claude returns to its prompt, then runs the normal TTL from there', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.cliQueueDrained(markAt + 600_000);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('stops holding when a remove carries no content to match', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('remove', 50_000, undefined, 'dropped_by_hook')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('does not hold a mark too short to identify its own enqueue', () => {
+    const q = marked('test');
+    q.ingest([queueOp('enqueue', 1_000, 'please run tests for the bridge module')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('counts dequeues that share a millisecond', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 500, '<task-notification>done</task-notification>'),
+      queueOp('enqueue', 1_000, text),
+      queueOp('dequeue', 5_000),
+      queueOp('dequeue', 5_000),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('matches a remove to its input by content, not by queue position', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 1_000, text),
+      queueOp('enqueue', 1_500, '<task-notification>second in line</task-notification>'),
+      queueOp('remove', 5_000, '<task-notification>second in line</task-notification>', 'absorbed_mid_turn'),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+  });
+
+  it('a new mark is not held by an enqueue that a cleared queue left behind', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.clearPending();
+    q.mark('t2', makeFingerprint(text), markAt + 2_000, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 4_000, text)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    q.ingest([queueOp('dequeue', 5_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('holds the next unstarted mark, not one that already started with the same text', () => {
+    const q = marked();
+    q.ingest([{ type: 'user', uuid: 'u1', timestamp: iso(500), message: { role: 'user', content: text } } as unknown as TranscriptEvent]);
+    q.mark('t2', makeFingerprint(text), markAt + 1_000, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().filter(t => !t.isLocal).map(t => [t.turnId, t.started, isHeldInCliQueue(t)]))
+      .toEqual([['t1', true, false], ['t2', false, true]]);
+  });
+
+  it('stops holding once the queue is no longer observable', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.forgetCliQueue(markAt + 10_000);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 10_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('does not fold same-millisecond equal-length records with different content or command ids', () => {
+    // Fleet transcripts contain 14 groups of same-ms records whose texts are
+    // equal length but different (each remove carries its own commandUuid).
+    // A length-based dedup key discarded the second record and drifted the
+    // queue mirror: the second mark never held, or its release never applied.
+    const A = 'please alpha the bridge module now';
+    const B = 'please bravo the bridge module now';
+    expect(A).not.toBe(B);
+    expect(A.length).toBe(B.length);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint(A), markAt, normaliseForFingerprint(A));
+    q.mark('t2', makeFingerprint(B), markAt, normaliseForFingerprint(B));
+    q.ingest([
+      queueOp('enqueue', 1_000, A, undefined, { commandUuid: 'u-A' }),
+      queueOp('enqueue', 1_000, B, undefined, { commandUuid: 'u-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 2_000, A, 'cancelled', { commandUuid: 'u-A', deliveryId: 'd-A' }),
+      queueOp('remove', 2_000, B, 'cancelled', { commandUuid: 'u-B', deliveryId: 'd-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('distinguishes same-ms same-content removes of distinct commands by commandUuid', () => {
+    // Fleet transcripts also contain 5 groups of same-ms removes with IDENTICAL
+    // text but different commandUuid (separate commands), vs 1 group sharing a
+    // commandUuid (a genuine replay). A text-only key would fold the former.
+    const q = marked();
+    q.mark('t2', makeFingerprint(text), markAt + 100, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-1', deliveryId: 'd-1' }),
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-2', deliveryId: 'd-2' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('treats a same-ms same-content enqueue with no command id as a replay, leaving no ghost slot', () => {
+    // enqueues carry no commandUuid: the same ms+text record replayed across a
+    // transcript switch must fold to ONE mirror slot, or a later dequeue order
+    // shifts and the next mark's release lands on the wrong item.
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 1_000, text)]);
+    q.ingest([queueOp('dequeue', 2_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    q.mark('t2', makeFingerprint(text), markAt + 2_500, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 3_000, text), queueOp('dequeue', 3_500)]);
+    expect(q.peek().map(turn => [turn.turnId, isHeldInCliQueue(turn)]))
+      .toEqual([['t1', false], ['t2', false]]);
+  });
+});

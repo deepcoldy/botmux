@@ -85,7 +85,12 @@ function waitFor(
 }
 
 describe('dsh worker final_output integration', () => {
-  it('delivers one final_output with correct content/turnId/usage and no OSC leak', async () => {
+  it.each([
+    { scenario: 'happy', timeoutMs: undefined },
+    { scenario: 'reasoning', timeoutMs: undefined },
+    { scenario: 'progressive', timeoutMs: 300 },
+    { scenario: 'empty', timeoutMs: undefined },
+  ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-'));
     tempDirs.add(root);
     const fakeDsh = join(root, 'fake-dsh-server');
@@ -108,7 +113,7 @@ describe('dsh worker final_output integration', () => {
         BOTMUX_SESSION_ID: sessionId,
         LARK_APP_ID: 'app_dsh_it',
         LARK_APP_SECRET: 'secret',
-        FAKE_DSH_SCENARIO: 'happy',
+        FAKE_DSH_SCENARIO: scenario,
       },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
@@ -134,26 +139,52 @@ describe('dsh worker final_output integration', () => {
       larkAppId: 'app_dsh_it',
       larkAppSecret: 'secret',
       turnId: 'om_dsh_it_turn_1',
+      ...(timeoutMs ? { turnTimeoutMs: timeoutMs } : {}),
     };
 
     try {
       child.send(init);
       await waitFor(child, logs, () =>
-        messages.some(m => m.type === 'final_output'));
+        messages.some(m => m.type === 'final_output')
+        && (scenario !== 'reasoning' || messages.some(m => m.type === 'turn_terminal')));
 
       const finals = messages.filter(
         (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
       );
       expect(finals).toHaveLength(1);
-      expect(finals[0].content).toContain('你好，我是 dsh。');
+      if (scenario === 'empty') {
+        expect(finals[0].content).toContain('没有生成最终回复');
+        expect(finals[0].content).toContain('无法确认任务是否成功');
+      } else {
+        expect(finals[0].content).toContain('你好，我是 dsh。');
+      }
       expect(finals[0].turnId).toBe('om_dsh_it_turn_1');
+      if (scenario === 'reasoning') {
+        expect(finals[0].content).toBe('你好，我是 dsh。');
+        const updates = messages.filter(
+          (m): m is Extract<WorkerToDaemon, { type: 'thinking_update' }> => m.type === 'thinking_update',
+        );
+        expect(updates.length).toBeGreaterThan(0);
+        for (const update of updates) expect(update.turnId).toBe('om_dsh_it_turn_1');
+        const lastUpdate = updates[updates.length - 1];
+        expect(lastUpdate.entries.map(entry => entry.kind)).toEqual([
+          'thinking', 'text', 'tool_call', 'tool_result', 'thinking',
+        ]);
+        expect(JSON.stringify(lastUpdate.entries)).not.toContain(finals[0].content);
+        const terminalIndex = messages.findIndex(m => m.type === 'turn_terminal');
+        expect(terminalIndex).toBeGreaterThan(messages.indexOf(lastUpdate));
+      }
       // Usage comes through the four-bucket shape.
-      expect(finals[0].usage).toEqual({
-        inputTokens: 100,
-        outputTokens: 42,
-        cacheReadTokens: 10,
-        cacheCreateTokens: 0,
-      });
+      if (scenario === 'happy' || scenario === 'reasoning') {
+        expect(finals[0].usage).toEqual({
+          inputTokens: 100,
+          outputTokens: 42,
+          cacheReadTokens: 10,
+          cacheCreateTokens: 0,
+        });
+      } else {
+        expect(finals[0].usage).toBeUndefined();
+      }
 
       // OSC control bytes must not appear in any screen/display payload.
       const screenLeaks = messages

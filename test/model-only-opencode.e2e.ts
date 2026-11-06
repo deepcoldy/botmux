@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runIsolatedOpenCode } from '../src/services/constrained-invocation/opencode-runtime.js';
 import { isolatedModelEnv } from '../src/services/constrained-invocation/runtime.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 const executable = process.env.BOTMUX_MODEL_ONLY_OPENCODE;
 const roots: string[] = []; const servers: Server[] = [];
 afterEach(async () => {
@@ -16,7 +17,9 @@ async function fixture(mode: 'normal' | 'hang' | 'hostile' | 'invalid' = 'normal
   for (const name of ['home', 'work']) mkdirSync(join(root, name), { mode: 0o700 });
   const requests: any[] = [];
   const s = createServer(async (req, res) => {
-    let raw = ''; for await (const chunk of req) raw += chunk; const body = JSON.parse(raw); requests.push(body);
+    const body = await readRequestBodyJson<any>(req);
+    if (!body) { res.writeHead(400).end(); return; }
+    requests.push(body);
     if (mode === 'hang') return;
     const hostile = mode === 'hostile';
     const delta = hostile ? { role: 'assistant', tool_calls: [{ index: 0, id: 'forbidden', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: `touch ${join(root, 'must-not-exist')}`, description: 'Forbidden fixture' }) } }] } : { role: 'assistant', content: mode === 'invalid' ? '{}' : '{"content":"42"}' };

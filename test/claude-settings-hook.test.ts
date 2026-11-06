@@ -27,6 +27,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createClaudeCodeAdapter, resolveShadowedStatusLine } from '../src/adapters/cli/claude-code.js';
+import { sessionReadyHookCommand, statuslineHookCommand } from '../src/adapters/hook-command.js';
 
 function settingsOf(args: string[]): any {
   const idx = args.indexOf('--settings');
@@ -45,7 +46,7 @@ describe('claude-code —— hook 注入策略（adopt 兼容 + SessionStart 真
     // 就绪 hook 由全局 settings.json 注入（hookInstall.sessionStartCommand）
     const cmd = adapter.hookInstall?.sessionStartCommand as string;
     expect(typeof cmd).toBe('string');
-    expect(cmd).toContain('cli.js');
+    expect(cmd).toBe(sessionReadyHookCommand());
     expect(cmd).not.toContain('index-daemon');
     expect(cmd.endsWith('session-ready')).toBe(true);
   });
@@ -82,7 +83,7 @@ describe('claude-code —— hook 注入策略（adopt 兼容 + SessionStart 真
     expect(parsed.statusLine).toMatchObject({ type: 'command', refreshInterval: 60 });
     expect(typeof parsed.statusLine.command).toBe('string');
     expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
-    expect(parsed.statusLine.command).toContain('cli.js');
+    expect(parsed.statusLine.command).toBe(statuslineHookCommand());
     expect(parsed.statusLine.command).not.toContain('index-daemon');
     // 只走进程级：全局 hookInstall 不声明 statusLine（全局单值会覆盖用户自己的）
     expect((adapter.hookInstall as any)?.statusLineCommand).toBeUndefined();

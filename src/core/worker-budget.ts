@@ -3,18 +3,19 @@ import { totalmem } from 'node:os';
 import { posix } from 'node:path';
 import type { WorkerConfig } from '../global-config.js';
 
-export const DEFAULT_MIN_AVAILABLE_MEMORY_BYTES = 4 * 1024 ** 3;
 export const DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION = 0.25;
 /** Upper bound for the fraction-derived default reserve. The reserve only has
  *  to cover spawning ONE worker — production measurement of ~200 live CLI
- *  workers showed RSS p99 ≈ 0.43 GiB / max ≈ 0.57 GiB, so the 4 GiB floor
- *  already leaves ~7x headroom and the fraction must not grow with host
- *  capacity. Without this cap a 248 GiB host demanded ~62 GiB free to start a
- *  single worker, rejecting spawns at 60 GiB available with zero PSI stall.
- *  On the host path this makes the default reserve uniformly 4 GiB; the
- *  fraction still scales small finite cgroup limits (v1 or v2, e.g. an 8 GiB
- *  limit reserves 2 GiB). The live PSI gate (maxMemoryFullAvg10) remains the
- *  signal for genuine host-wide contention. */
+ *  workers showed RSS p99 ≈ 0.43 GiB / max ≈ 0.57 GiB, so 4 GiB already
+ *  leaves ~7x headroom and the fraction must not grow with capacity. Without
+ *  this cap a 248 GiB host demanded ~62 GiB free to start a single worker,
+ *  rejecting spawns at 60 GiB available with zero PSI stall.
+ *  The default reserve is min(cap, 25% of total) for the host and for finite
+ *  cgroup limits (v1 or v2) alike: ≥16 GiB → 4 GiB, an 8 GiB box → 2 GiB.
+ *  There is deliberately NO 4 GiB floor on the host path: on a sub-4 GiB VPS
+ *  that floor exceeded the whole RAM, MemAvailable could never reach it, and
+ *  every worker fork was rejected. The live PSI gate (maxMemoryFullAvg10)
+ *  remains the signal for genuine host-wide contention. */
 export const DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES = 4 * 1024 ** 3;
 export const DEFAULT_MAX_MEMORY_FULL_AVG10 = 20;
 /**
@@ -124,8 +125,14 @@ function parseV1ByteValue(raw: string): number | 'max' | undefined {
   return parsed <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(parsed) : undefined;
 }
 
-function parseInactiveFile(raw: string): number | undefined {
-  const match = /^inactive_file\s+(\d+)$/m.exec(raw);
+function parseInactiveFile(raw: string, version: 1 | 2): number | undefined {
+  // cgroup v1's memory.usage_in_bytes is hierarchical. On kernels that expose
+  // both fields, `inactive_file` is local to this cgroup while
+  // `total_inactive_file` includes descendants and therefore matches the usage
+  // scope. Prefer the total only for v1; cgroup v2's `inactive_file` already
+  // describes the current cgroup tree and has no standard total_* twin.
+  const match = (version === 1 ? /^total_inactive_file\s+(\d+)$/m.exec(raw) : undefined)
+    ?? /^inactive_file\s+(\d+)$/m.exec(raw);
   if (!match) return undefined;
   const parsed = Number(match[1]);
   return Number.isSafeInteger(parsed) ? parsed : undefined;
@@ -266,7 +273,7 @@ function readBoundary(
     if (typeof current === 'number') {
       let inactiveFile = 0;
       try {
-        inactiveFile = parseInactiveFile(readFile(posix.join(directory, files.stat))) ?? 0;
+        inactiveFile = parseInactiveFile(readFile(posix.join(directory, files.stat)), version) ?? 0;
       } catch {}
       const workingSet = Math.max(0, current - Math.min(inactiveFile, current));
       availableMemoryBytes = Math.max(0, Math.min(memoryMax, memoryMax - workingSet));
@@ -509,20 +516,13 @@ export function readHostMemoryPressure(options: MemoryPressureReadOptions = {}):
 export function resolveWorkerPressurePolicy(
   config: WorkerConfig | undefined,
   totalMemoryBytes: number,
-  totalMemorySource: HostMemoryPressure['totalMemorySource'] = 'host',
 ): ResolvedWorkerPressurePolicy {
-  // With the cap equal to the host floor, the host reserve is uniformly the
-  // 4 GiB spawn-cost floor. The fraction only still scales the reserve for
-  // small finite cgroup limits (v1 or v2). See the cap constant for the
-  // production incident that an uncapped fraction caused.
-  const fractionalReserve = Math.min(
+  // Same formula for host RAM and finite cgroup limits — see the cap constant
+  // for why there is neither an uncapped fraction nor a host-only floor.
+  const defaultReserve = Math.min(
     DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES,
     Math.max(1, Math.ceil(totalMemoryBytes * DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION)),
   );
-  const finiteCgroupLimit = totalMemorySource === 'cgroup-v2' || totalMemorySource === 'cgroup-v1';
-  const defaultReserve = finiteCgroupLimit
-    ? fractionalReserve
-    : Math.max(DEFAULT_MIN_AVAILABLE_MEMORY_BYTES, fractionalReserve);
   return {
     memoryAdmissionEnabled: config?.memoryAdmissionEnabled !== false,
     minAvailableMemoryBytes: config?.minAvailableMemoryBytes ?? defaultReserve,
@@ -542,15 +542,14 @@ export function evaluateWorkerAdmission(
 ): WorkerAdmissionDecision {
   const boundaries = pressure.cgroupBoundaries;
   if (!boundaries || boundaries.length === 0) {
-    const policy = resolveWorkerPressurePolicy(config, pressure.totalMemoryBytes, pressure.totalMemorySource);
+    const policy = resolveWorkerPressurePolicy(config, pressure.totalMemoryBytes);
     const reasons = evaluatePressureReasons(pressure, policy);
     return { allowed: reasons.length === 0, reasons, pressure, policy };
   }
 
   const evaluated = boundaries.map(boundary => {
     const candidate = pressureFromBoundary(boundary, boundaries, pressure.warnings);
-    const boundarySource: MemoryMetricSource = boundary.version === 2 ? 'cgroup-v2' : 'cgroup-v1';
-    const policy = resolveWorkerPressurePolicy(config, boundary.totalMemoryBytes, boundarySource);
+    const policy = resolveWorkerPressurePolicy(config, boundary.totalMemoryBytes);
     const availableScore = boundary.availableMemoryBytes === undefined
       ? Number.POSITIVE_INFINITY
       : (boundary.availableMemoryBytes - policy.minAvailableMemoryBytes) / Math.max(1, policy.minAvailableMemoryBytes);

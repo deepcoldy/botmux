@@ -92,3 +92,42 @@ it('normalizes actual GIF bytes and carries the temporal hint into the CLI promp
   expect(prompt).toContain('Inspect or extract frames in time order');
   expect(formatAttachmentsHint([{ type: 'image', name: 'old.jpg', path: '/tmp/old.jpg' }])).toContain('<image n="1" path="/tmp/old.jpg" />');
 });
+
+
+describe('video attachments and CLI media hints', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('preserves video body type and path through the attachment downloader', async () => {
+    vi.mocked(downloadMessageResource).mockResolvedValue(undefined);
+    const { attachments, needLogin } = await downloadResources('app', 'om_video', [
+      { type: 'video', key: 'video_body', name: 'clip.mp4' },
+    ], 'ou_sender');
+    expect(needLogin).toBe(false);
+    expect(attachments).toMatchObject([{ type: 'video', name: 'clip.mp4', resourceKey: 'video_body' }]);
+    expect(attachments[0].path).toMatch(/\/attachments\/app\/om_video\/clip\.mp4$/);
+    expect(vi.mocked(downloadMessageResource).mock.calls[0].slice(0, 4)).toEqual(['app', 'om_video', 'video_body', 'video']);
+  });
+
+  it('keeps independent image/file/video indices and escapes video paths', () => {
+    const prompt = formatAttachmentsHint([
+      { type: 'video', path: '/tmp/a&b.mp4', name: 'a&b.mp4' },
+      { type: 'image', path: '/tmp/image.png', name: 'image.png' },
+      { type: 'file', path: '/tmp/file.pdf', name: 'file.pdf' },
+      { type: 'video', path: '/tmp/next.mp4', name: 'next.mp4' },
+    ], 'en', 'zcode');
+    expect(prompt).toContain('<video n="1" path="/tmp/a&amp;b.mp4" />');
+    expect(prompt).toContain('<video n="2" path="/tmp/next.mp4" />');
+    expect(prompt).toContain('<image n="1" path="/tmp/image.png" />');
+    expect(prompt).toContain('<file n="1" path="/tmp/file.pdf" />');
+    expect(prompt).toContain('Prefer Read or');
+    expect(prompt).not.toContain('ReadMediaFile');
+  });
+
+  it('names Kimi media tools only for Kimi and leaves non-video prompts alone', () => {
+    const video = [{ type: 'video' as const, path: '/tmp/clip.mp4', name: 'clip.mp4' }];
+    expect(formatAttachmentsHint(video, 'en', 'kimi')).toContain('Prefer ReadMediaFile');
+    expect(formatAttachmentsHint(video, 'en', 'codex')).not.toContain('ReadMediaFile');
+    expect(formatAttachmentsHint([{ type: 'image', path: '/tmp/img.png', name: 'img.png' }], 'en', 'codex'))
+      .not.toContain('<video_hint>');
+  });
+});

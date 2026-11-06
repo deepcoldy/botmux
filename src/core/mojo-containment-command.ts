@@ -73,7 +73,6 @@ export async function defaultIsSessionActive(
     const { config } = await import('../config.js');
     const {
       readSessionRowCopiesAcrossStores,
-      SessionStoreSqliteUnavailableError,
     } = await import('../services/session-store.js');
     const dir = dataDir ?? config.session.dataDir;
     const { matches, unreadableStores } = readSessionRowCopiesAcrossStores(sessionId, dir);

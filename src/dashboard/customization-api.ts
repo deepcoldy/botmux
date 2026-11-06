@@ -37,8 +37,6 @@ import {
 } from '../services/customization-store.js';
 import { PROMPT_FRAGMENTS, PROMPT_STAGES, BLOCK_META, validateFragmentOverride } from '../skills/prompt-fragments.js';
 import { BUILTIN_SKILLS } from '../skills/definitions.js';
-import { loadBotConfigs } from '../bot-registry.js';
-import { supportsZeroPromptInjection } from '../core/prompt-injection.js';
 import { frontmatterDescription } from '../skills/injection-mode.js';
 import {
   exportBundle,
@@ -63,11 +61,8 @@ function isLocale(v: unknown): v is Locale {
 /** Build the full page payload: every fragment with factory + override text
  *  (per locale), every built-in skill with override/disable state, plus the
  *  master flag and history. This is the single GET the React page hydrates from. */
-function buildSnapshot(botNames?: ReadonlyMap<string, string>) {
+function buildSnapshot() {
   const state = readCustomizationState();
-  // Prompt editing remains available before onboarding creates bots.json.
-  let bots: ReturnType<typeof loadBotConfigs> = [];
-  try { bots = loadBotConfigs(); } catch { /* no readable bot config yet */ }
   const fragments = PROMPT_FRAGMENTS.map((f) => {
     const perLocale: Record<string, { factory: string; override: string | null }> = {};
     for (const loc of SUPPORTED_LOCALES) {
@@ -105,13 +100,6 @@ function buildSnapshot(botNames?: ReadonlyMap<string, string>) {
 
   return {
     enabled: customizationEnabled(),
-    bots: bots.map(bot => ({
-      larkAppId: bot.larkAppId,
-      name: bot.displayName || botNames?.get(bot.larkAppId) || bot.name || bot.larkAppId,
-      cliId: bot.cliId,
-      promptInjection: bot.promptInjection === 'none' ? 'none' : 'default',
-      supported: supportsZeroPromptInjection(bot.cliId, bot),
-    })),
     stages: PROMPT_STAGES,
     blocks: Object.entries(BLOCK_META).map(([id, meta]) => ({ id, ...meta })),
     fragments,
@@ -125,13 +113,10 @@ export async function handleCustomizationApi(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
-  deps?: { getBotNames?: () => ReadonlyMap<string, string> },
 ): Promise<boolean> {
   const p = url.pathname;
   if (!p.startsWith('/api/customization')) return false;
-  // Use the same name sources for initial loading and mutation snapshots, so
-  // saving another customization never resets the roster back to App IDs.
-  const snapshot = () => buildSnapshot(deps?.getBotNames?.());
+  const snapshot = () => buildSnapshot();
 
   try {
     if (req.method === 'GET' && p === '/api/customization') {

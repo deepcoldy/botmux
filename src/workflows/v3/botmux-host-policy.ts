@@ -1,4 +1,7 @@
+import type { OutboundMessageOptions } from '../../im/lark/client.js';
+import { assertMessageTopicAvailable, TopicSendError } from '../../cli/topic-send-guard.js';
 import type {
+  ExecutionContextSnapshot,
   HostExecutorPolicy,
   HostExecutorPolicyRequest,
 } from './runtime-host-contract.js';
@@ -43,3 +46,24 @@ export const authorizeChatBoundHostExecution: HostExecutorPolicy = (
     }
   }
 };
+
+
+/** Reuse the run's already authorized, persisted identity for every IM attempt.
+ * Copy primitive source values now: later context/session mutation must not
+ * retarget a queued call or the reconciler's idempotent submission. */
+export function chatBoundWorkflowWriteOptions(snapshot?: ExecutionContextSnapshot, operation: 'send' | 'reply' = 'send'): OutboundMessageOptions {
+  const appId = snapshot?.context.larkAppId;
+  const chatId = snapshot?.context.chatId;
+  const rootMessageId = snapshot?.context.rootMessageId;
+  return { beforeWrite: async () => {
+    if (!appId || (operation === 'send' ? !chatId : !rootMessageId)) throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', '缺少已授权 workflow 的原会话依据。');
+    const { getBot } = await import('../../bot-registry.js');
+    if (getBot(appId).config.topicUnavailablePolicy !== 'stop' || rootMessageId === undefined) return;
+    if (typeof rootMessageId !== 'string' || !rootMessageId) {
+      throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', 'workflow 原话题依据无效。');
+    }
+    const { getMessageDetail } = await import('../../im/lark/client.js');
+    await assertMessageTopicAvailable(appId, rootMessageId,
+      (app, id) => getMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 }));
+  } };
+}

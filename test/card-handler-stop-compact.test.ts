@@ -69,8 +69,21 @@ vi.mock('../src/services/session-store.js', () => ({
 const sendWorkerSessionInputMock = vi.fn();
 const isSessionTransferringMock = vi.fn(() => false);
 
-vi.mock('../src/core/worker-pool.js', () => ({
+vi.mock('../src/core/worker-pool.js', async () => {
+  const { supportsIdleAutoCompact } = await vi.importActual<typeof import('../src/core/idle-auto-compact.js')>('../src/core/idle-auto-compact.js');
+  return {
+  // Same projection as the real helper, over the pure support predicate.
+  sessionSupportsIdleAutoCompact: (ds: any) => supportsIdleAutoCompact({
+    cliId: ds.session.cliId ?? 'claude-code',
+    backendType: ds.initConfig?.backendType ?? ds.session.backendType,
+    codexRpcInput: ds.initConfig?.codexRpcInput === true,
+    adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
+    headless: !!ds.session.headless,
+    vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+  }),
   setSessionReasoningEffort: vi.fn(() => 'saved'),
+  sessionReasoningControl: vi.fn(() => ({ choices: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] })),
+  updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
   sendWorkerSessionInput: (...args: any[]) => sendWorkerSessionInputMock(...args),
@@ -85,6 +98,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   workerHasInitialized: vi.fn(() => true),
   sessionSupportsWebTerminal: vi.fn(() => true),
   readableTerminalUrlFor: vi.fn(() => 'https://example.com/term'),
+  liveReadableTerminalUrlFor: vi.fn(() => 'https://example.com/term'),
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
   deliverEphemeralOrReply: vi.fn(),
@@ -94,10 +108,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_map: any, _key: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
+  substituteCardControlFor: vi.fn(() => undefined),
   silentIdleCardFlag: vi.fn(() => false),
   idleCardLabel: vi.fn(() => undefined),
+  streamCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
-}));
+  };
+});
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
@@ -146,8 +163,7 @@ import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -221,6 +237,13 @@ beforeEach(() => {
 // ─── stop_turn ────────────────────────────────────────────────────────────
 
 describe('stop_turn card action', () => {
+  it.each(['stop_turn', 'term_action'])('refuses %s while a native Antigravity fork is pending', async action => {
+    const ds = makeDs({ sessionOverrides: { cliId: 'antigravity', pendingForkSession: true } });
+    const result = await handleCardAction(actionData(action), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(result.toast.content).toContain('/close');
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
   it('stops the verified reply-card turn without replacing its answer with a terminal card', async () => {
     const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
     const replyCards = await import('../src/core/turn-reply-card.js');
@@ -335,6 +358,31 @@ describe('compact_session card action', () => {
     expect(result.toast.content).toContain('/compact');
   });
 
+  it('keeps the thread root as the reply root for a thread-scope session', async () => {
+    const ds = makeDs();
+    const deliver = vi.fn();
+    await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver.mock.calls[0][2].replyRootId).toBe(ROOT);
+  });
+
+  it('does not pass the chat id as a reply root for a chat-scope session', async () => {
+    // Chat-scope cards carry the chat id as root_id; treating it as a thread
+    // root froze an unreplyable target for every later rootless post.
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat', rootMessageId: 'om_first' } });
+    const deliver = vi.fn();
+    const deps = depsWith(undefined, deliver);
+    deps.activeSessions.set(sessionKey('oc_chat', LARK_APP_ID), ds);
+    const data = actionData('compact_session');
+    data.action.value.root_id = 'oc_chat';
+    const result = await handleCardAction(data, deps, LARK_APP_ID);
+
+    expect(result.toast.type).toBe('success');
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const opts = deliver.mock.calls[0][2];
+    expect(opts.anchor).toBe('oc_chat');
+    expect(opts.replyRootId).toBeUndefined();
+  });
+
   it('falls back to an unsupported toast when the daemon did not wire the dep', async () => {
     const ds = makeDs();
     const result = await handleCardAction(actionData('compact_session'), depsWith(ds, undefined), LARK_APP_ID);
@@ -365,7 +413,7 @@ describe('compact_session card action', () => {
   // mira/mir 把它当**普通用户消息**发给模型白烧一个 turn。router
   // （resolvePassthroughCommands）对这些 CLI 返回空集，handler 也必须拒——否则
   // 卡片侧闸门一旦再漏，这条路又会被打开（本次缺陷正是这么发生的）。
-  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app'])(
+  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app', 'minimax'])(
     'refuses for %s (no raw passthrough surface) instead of writing a literal /compact',
     async (cliId) => {
       const ds = makeDs({ sessionOverrides: { cliId } as any });
@@ -402,41 +450,94 @@ describe('compact_session card action', () => {
   });
 });
 
-// ─── isSensitive source lock ──────────────────────────────────────────────
+// ─── sensitive-action table lock ───────────────────────────────────────────
 
-describe('stop_turn / compact_session permission gate (source lock)', () => {
-  it('both actions are registered in the isSensitive canOperate gate', () => {
+describe('stop_turn / compact_session permission gate (table lock)', () => {
+  it('both actions are registered in the canOperate gate table', () => {
     // 防止后续重构把两个新 action 误移出权限闸（与 term_action/close 同档）。
-    const source = readFileSync(resolve('src/im/lark/card-handler.ts'), 'utf8');
-    const line = source.split('\n').find(l => l.includes('const isSensitive ='));
-    expect(line).toBeTruthy();
-    expect(line!).toContain('stop_turn');
-    expect(line!).toContain('compact_session');
+    // 清单原先是 card-handler.ts 里 `const isSensitive = …` 的手写数组、靠 grep 源码行锁住；
+    // 现在登记在 SENSITIVE_CARD_ACTIONS，直接断言表本身（行为侧的拒绝用例在上面各 describe 里）。
+    expect(sensitiveCardActionMeta('stop_turn')).toBeDefined();
+    expect(sensitiveCardActionMeta('compact_session')).toBeDefined();
   });
 });
 
 
 describe('reasoning selector card callback', () => {
   function setup() {
-    const ds = makeDs({ streamCardId: 'om_clicked', streamCardNonce: 'nonce', sessionOverrides: { reasoningEffort: 'ultra' } });
+    const ds = makeDs({ streamCardId: 'om_clicked', streamCardNonce: 'nonce', lastScreenStatus: 'working',
+      sessionOverrides: { cliId: 'codex', reasoningEffort: 'ultra' } });
     const data = actionData('set_reasoning_effort');
     Object.assign(data.action.value, { card_nonce: 'nonce', expected_effort: 'ultra' });
     data.action.option = 'high';
     return { ds, data };
   }
 
-  it('dispatches a verified current-card selection and returns updated card data', async () => {
+  beforeEach(async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.updateCodexCliEffort).mockReset();
+    vi.mocked(pool.updateCodexCliEffort).mockResolvedValue({ status: 'future_only', reason: 'cli_next_turn' });
+    vi.mocked(pool.setSessionReasoningEffort).mockClear();
+    vi.mocked(pool.deliverEphemeralOrReply).mockClear();
+    vi.mocked(pool.scheduleCardPatch).mockClear();
+  });
+
+  it('keeps the cold-start preference path for suspended sessions', async () => {
     const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
     vi.mocked(setSessionReasoningEffort).mockClear();
     const { ds, data } = setup();
+    ds.worker = null;
+    ds.session.suspendedColdResume = true;
     const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
     expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high');
     expect(result).toMatchObject({ toast: { type: 'success' }, card: { type: 'raw' } });
     expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
   });
 
+  it('acknowledges a running-session selection before the native receipt, releasing the mutation gate', async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    const { withBotTurnAdmission } = await import('../src/core/bot-turn-mutation-gate.js');
+    let confirm!: (result: import('../src/types.js').CodexAppEffortResult) => void;
+    vi.mocked(pool.updateCodexCliEffort).mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+    const { ds, data } = setup();
+    const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('info');
+    expect(pool.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
+    expect(pool.deliverEphemeralOrReply).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(await withBotTurnAdmission(LARK_APP_ID, () => 'admitted')).toBe('admitted');
+    confirm({ status: 'future_only', reason: 'cli_next_turn' });
+    await vi.waitFor(() => expect(pool.deliverEphemeralOrReply).toHaveBeenCalledOnce());
+    expect(pool.scheduleCardPatch).toHaveBeenCalledWith(ds, expect.any(String), undefined, { userInitiated: true });
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['unavailable', 'error', 'invalid'] as const)('reports native %s without falling back to a saved preference', async status => {
+    const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.updateCodexCliEffort).mockResolvedValueOnce({ status });
+    const { ds, data } = setup();
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    await vi.waitFor(() => expect(pool.deliverEphemeralOrReply).toHaveBeenCalledOnce());
+    expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
+  });
+
+  it('does not publish a delayed receipt onto a replacement worker', async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    let confirm!: (result: import('../src/types.js').CodexAppEffortResult) => void;
+    vi.mocked(pool.updateCodexCliEffort).mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+    const { ds, data } = setup();
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    ds.worker = { killed: false } as any;
+    confirm({ status: 'future_only', reason: 'cli_next_turn' });
+    await Promise.resolve();
+    expect(pool.deliverEphemeralOrReply).not.toHaveBeenCalled();
+    expect(pool.scheduleCardPatch).not.toHaveBeenCalled();
+  });
+
   it.each(['nonce', 'session', 'message', 'selection', 'operator'])('rejects stale or unauthorized %s without mutation', async field => {
-    const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
+    const { setSessionReasoningEffort, updateCodexCliEffort } = await import('../src/core/worker-pool.js');
     vi.mocked(setSessionReasoningEffort).mockClear();
     const { ds, data } = setup();
     if (field === 'nonce') data.action.value.card_nonce = 'old';
@@ -446,5 +547,82 @@ describe('reasoning selector card callback', () => {
     if (field === 'operator') vi.mocked(canOperate).mockReturnValue(false);
     await handleCardAction(data, depsWith(ds), LARK_APP_ID);
     expect(setSessionReasoningEffort).not.toHaveBeenCalled();
+    expect(updateCodexCliEffort).not.toHaveBeenCalled();
+  });
+});
+
+// ─── toggle_idle_compact ──────────────────────────────────────────────────
+
+describe('toggle_idle_compact card action', () => {
+  function toggle(desired?: 'on' | 'off', clicked = 'om_clicked'): any {
+    const data = actionData('toggle_idle_compact');
+    if (desired) data.action.value.desired = desired;
+    data.context.open_message_id = clicked;
+    return data;
+  }
+
+  it('turns the session on, persists it, and re-renders the clicked live card', async () => {
+    const store = await import('../src/services/session-store.js');
+    vi.mocked(store.updateSession).mockClear();
+    const ds = makeDs({ streamCardId: 'om_clicked' });
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.idleAutoCompact).toEqual({ enabled: true });
+    expect(store.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(result.toast.type).toBe('success');
+    expect(result.toast.content).toContain('55');
+    expect(result.card.type).toBe('raw');
+  });
+
+  it('turns it off; desired state makes stale-card double clicks idempotent', async () => {
+    const ds = makeDs();
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.idleAutoCompact?.enabled).toBe(true);
+    const result = await handleCardAction(toggle('off'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.idleAutoCompact?.enabled).toBe(false);
+    expect(result.toast.type).toBe('success');
+    // A frozen (non-live) card only gets a toast.
+    expect(result.card).toBeUndefined();
+  });
+
+  it('only changes the clicked session', async () => {
+    const ds = makeDs();
+    const other = makeDs({ sessionOverrides: { sessionId: 'sess-other' } });
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(other.session.idleAutoCompact).toBeUndefined();
+  });
+
+  it('refuses unsupported CLIs without touching the session', async () => {
+    for (const cliId of ['gemini', 'codex-app']) {
+      const ds = makeDs({ sessionOverrides: { cliId } as any });
+      const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+      expect(result.toast.type, cliId).toBe('warning');
+      expect(ds.session.idleAutoCompact, cliId).toBeUndefined();
+    }
+  });
+
+  it('refuses adopted sessions', async () => {
+    const ds = makeDs({ adoptedFrom: { cliId: 'claude-code' } as any });
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.idleAutoCompact).toBeUndefined();
+  });
+
+  it('rolls back the in-memory setting when the save fails', async () => {
+    const store = await import('../src/services/session-store.js');
+    vi.mocked(store.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    const ds = makeDs();
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.idleAutoCompact).toBeUndefined();
+  });
+
+  it('non-operators are refused with a toast and nothing changes', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = makeDs();
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.idleAutoCompact).toBeUndefined();
+    expect(sensitiveCardActionMeta('toggle_idle_compact')).toBeDefined();
   });
 });

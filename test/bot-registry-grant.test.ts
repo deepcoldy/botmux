@@ -47,6 +47,31 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].chatGrants).toEqual({ oc_1: ['ou_a', 'ou_b'], oc_3: ['ou_c'] });
   });
 
+  it('preserves explicit solo-group mention overrides across config round trips', () => {
+    const parse = (entry: object) => parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'solo-policy', larkAppSecret: 's', ...entry,
+    }]))[0];
+    const cfg = parse({
+      soloGroupMentionBypass: false,
+      chatSoloGroupMentionBypass: {
+        oc_enabled: true, oc_disabled: false, oc_invalid: 'false', oc_null: null,
+        '': false, '   ': true,
+      },
+    });
+    expect(cfg.soloGroupMentionBypass).toBe(false);
+    expect(cfg.chatSoloGroupMentionBypass).toEqual({ oc_enabled: true, oc_disabled: false });
+    expect(parse(cfg)).toMatchObject({
+      soloGroupMentionBypass: false,
+      chatSoloGroupMentionBypass: { oc_enabled: true, oc_disabled: false },
+    });
+    for (const value of [undefined, true, 'false', 0, null]) {
+      expect(parse({ soloGroupMentionBypass: value }).soloGroupMentionBypass).toBeUndefined();
+    }
+    for (const value of [undefined, [], false, { oc_invalid: 'false' }]) {
+      expect(parse({ chatSoloGroupMentionBypass: value }).chatSoloGroupMentionBypass).toBeUndefined();
+    }
+  });
+
   it('parseBotConfigsFromText leaves chatGrants undefined when absent', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'a1b', larkAppSecret: 's' }]));
     expect(cfgs[0].chatGrants).toBeUndefined();
@@ -67,6 +92,26 @@ describe('bot-registry grant additions', () => {
       plugins: ['agent-chrome', 'bad/id', 'agent-chrome', 'gitlab'],
     }]));
     expect(cfgs[0].plugins).toEqual(['agent-chrome', 'gitlab']);
+  });
+
+  it('normalizes host-only plugin runtime options without exposing invalid entries', () => {
+    const [config] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'plugin-runtime',
+      larkAppSecret: 's',
+      pluginRuntime: {
+        report: {
+          env: { PROFILE: 'prod', RETRIES: 3, 'bad-key': 'drop' },
+          toolTimeoutMs: 120_000,
+        },
+        'bad/id': { toolTimeoutMs: 10_000 },
+        toolong: { toolTimeoutMs: 2_147_483_648 },
+        fractional: { toolTimeoutMs: 1.5 },
+        empty: { env: { 'bad-key': 'drop' }, toolTimeoutMs: 0 },
+      },
+    }]));
+    expect(config.pluginRuntime).toEqual({
+      report: { env: { PROFILE: 'prod', RETRIES: '3' }, toolTimeoutMs: 120_000 },
+    });
   });
 
   it('parseBotConfigsFromText leaves globalGrants undefined when absent / all-invalid / non-array', () => {

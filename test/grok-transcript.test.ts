@@ -8,9 +8,12 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   drainGrokUpdates,
+  isGrokNarrationInterruption,
   matchGrokPromptAppend,
+  matchGrokPromptEnqueue,
   discoverGrokSessions,
   findGrokSessionByPid,
   grokSessionDirExists,
@@ -62,6 +65,36 @@ function agentChunk(sessionId: string, text: string, eventId: string, ts = 1_000
       update: {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text },
+        _meta: { eventId, agentTimestampMs: ts },
+      },
+    },
+  };
+}
+
+function hookExecution(sessionId: string, eventName: string, eventId: string, ts = 1_000_180) {
+  return {
+    timestamp: ts,
+    method: '_x.ai/session/update',
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: 'hook_execution',
+        event_name: eventName,
+        runs: [],
+        _meta: { eventId, agentTimestampMs: ts },
+      },
+    },
+  };
+}
+
+function passiveUpdate(sessionId: string, sessionUpdate: string, eventId: string, ts = 1_000_180) {
+  return {
+    timestamp: ts,
+    method: '_x.ai/session/update',
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate,
         _meta: { eventId, agentTimestampMs: ts },
       },
     },
@@ -126,6 +159,257 @@ describe('drainGrokUpdates', () => {
   afterEach(() => {
     rmSync(ROOT, { recursive: true, force: true });
     delete process.env.GROK_HOME;
+  });
+
+  it('emits public narration and completed tools without making them final or exposing thoughts', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const call = toolCall(sid, 'read');
+    Object.assign(call.params.update, { rawInput: { target_file: 'README.md' } });
+    const event = (update: object) => ({ params: { sessionId: sid, update } });
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect the project', 'user'),
+      agentChunk(sid, 'Reading ', 'a1'), agentChunk(sid, 'the README.', 'a2'),
+      event({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'private reasoning' } }),
+      call,
+      event({ sessionUpdate: 'tool_call_update', toolCallId: 'call-read', title: 'Read', rawInput: { target_file: 'README.md' } }),
+      event({ sessionUpdate: 'tool_call_update', toolCallId: 'call-read', status: 'in_progress', rawOutput: 'partial' }),
+      event({ sessionUpdate: 'tool_call_update', toolCallId: 'call-read', status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'Project documentation' } }], rawOutput: { internal: 'not shown' } }),
+      agentChunk(sid, 'Final summary.', 'final'), turnDone(sid, 'done'),
+    ]);
+    const legacy = drainGrokUpdates(path, 0);
+    expect(legacy.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.map(e => e.kind)).toEqual(['user', 'cot', 'cot', 'cot', 'assistant_final']);
+    expect(result.events.filter(e => e.kind === 'cot').flatMap(e => e.cotEntries ?? [])).toEqual([
+      { kind: 'text', text: 'Reading the README.' },
+      { kind: 'tool_call', id: 'call-read', name: 'run_terminal_command', args: '{"target_file":"README.md"}', subject: 'README.md' },
+      { kind: 'tool_result', id: 'call-read', result: 'Project documentation' },
+    ]);
+    expect(result.events.at(-1)).toEqual(legacy.events.at(-1));
+    expect(result.events.every(e => e.sourceSessionId === sid)).toBe(true);
+    expect(JSON.stringify(result.events)).not.toContain('private reasoning');
+    expect(JSON.stringify(result.events)).not.toContain('partial');
+    expect(JSON.stringify(result.events)).not.toContain('not shown');
+  });
+
+  it('retains stable narration identities across partial polls and consumes tool activity only once', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking.', 'a')]);
+    const first = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(first.events.map(e => e.kind)).toEqual(['user']);
+    appendFileSync(path, JSON.stringify(toolCall(sid, 'tool')) + '\n');
+    const next = drainGrokUpdates(path, first.newOffset, { includePublicActivity: true });
+    expect(next.events.map(e => e.kind)).toEqual(['cot', 'cot']);
+    expect(next.events).toEqual(drainGrokUpdates(path, first.newOffset, { includePublicActivity: true }).events);
+    expect(drainGrokUpdates(path, next.newOffset, { includePublicActivity: true }).events).toEqual([]);
+    appendFileSync(path, JSON.stringify(agentChunk(sid, 'Done.', 'f')) + '\n' + JSON.stringify(turnDone(sid, 'done')) + '\n');
+    const final = drainGrokUpdates(path, next.newOffset, { includePublicActivity: true });
+    expect(final.events).toHaveLength(1);
+    expect(final.events[0]).toMatchObject({ kind: 'assistant_final', text: 'Done.', terminalStatus: 'completed' });
+  });
+
+  it.each(['stop', 'stop_failure'])('keeps %s final text out of public activity', hook => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Full final answer.', 'answer'),
+      hookExecution(sid, hook, 'hook'), turnDone(sid, 'done'),
+    ]);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(result.events.at(-1)).toMatchObject({ text: 'Full final answer.', terminalStatus: 'completed' });
+    expect(result.events).toEqual(drainGrokUpdates(path, 0).events);
+    expect(result.newOffset).toBe(statSync(path).size);
+  });
+
+  it('retains final chunks across stop_failure and passive events with public activity enabled', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'First part, ', 'a1'),
+      hookExecution(sid, 'stop_failure', 'hook'),
+      passiveUpdate(sid, 'background_tasks', 'background'),
+      passiveUpdate(sid, 'memory_dream_completed', 'memory'),
+      passiveUpdate(sid, 'auto_compact_completed', 'compact'),
+      agentChunk(sid, 'second part.', 'a2'), turnDone(sid, 'done'),
+    ]);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(result.events.at(-1)).toMatchObject({ text: 'First part, second part.', terminalStatus: 'completed' });
+  });
+
+  it('reports background task launches and stops without touching the buffered reply', () => {
+    // Record shapes as Grok 1.x writes them (command / cwd / output paths omitted).
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const bg = (update: Record<string, unknown>, eventId: string, ts: number) => ({
+      timestamp: Math.floor(ts / 1000),
+      method: '_x.ai/session/update',
+      params: { sessionId: sid, update, _meta: { eventId, agentTimestampMs: ts } },
+    });
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'run it in the background', 'user'),
+      agentChunk(sid, 'Started ', 'a1'),
+      bg({ sessionUpdate: 'task_backgrounded', tool_call_id: 'call-1', task_id: 'call-1' }, 'launch', 1_000_110),
+      bg({ sessionUpdate: 'task_backgrounded', tool_call_id: 'call-2', task_id: 'call-2', monitor_description: 'watch CI' }, 'launch-2', 1_000_115),
+      bg({ sessionUpdate: 'background_tasks', tasks: [
+        { task_id: 'call-1', kind: 'bash', status: 'running', started_at: '2026-09-18T00:00:32Z' },
+        { task_id: 'call-2', kind: 'monitor', status: 'running', started_at: '2026-09-18T00:00:33Z' },
+        { task_id: 'call-0', kind: 'bash', status: 'completed', started_at: '2026-09-18T00:00:01Z' },
+      ] }, 'list', 1_000_120),
+      agentChunk(sid, 'it.', 'a2'),
+      turnDone(sid, 'done'),
+    ]);
+    const first = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(first.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(first.events.at(-1)).toMatchObject({ text: 'Started it.' });
+    expect(first.backgroundTasks).toEqual({
+      launched: [
+        { taskId: 'call-1', kind: 'shell', atMs: 1_000_110 },
+        { taskId: 'call-2', kind: 'monitor', atMs: 1_000_115 },
+        { taskId: 'call-1', kind: 'shell', atMs: 1_000_120 },
+        { taskId: 'call-2', kind: 'monitor', atMs: 1_000_120 },
+      ],
+      settled: ['call-0'],
+    });
+
+    appendFileSync(path, [
+      bg({ sessionUpdate: 'task_completed', task_snapshot: { task_id: 'call-1', kind: 'bash', exit_code: 0, is_backgrounded: true }, will_wake: true }, 'done-1', 1_000_300),
+      bg({ sessionUpdate: 'background_tasks', tasks: [
+        { task_id: 'call-1', kind: 'bash', status: 'completed' },
+        { task_id: 'call-2', kind: 'monitor', status: 'running' },
+      ] }, 'list-2', 1_000_301),
+    ].map(line => JSON.stringify(line)).join('\n') + '\n');
+    const second = drainGrokUpdates(path, first.newOffset, { includePublicActivity: true });
+    expect(second.events).toEqual([]);
+    expect(second.backgroundTasks).toEqual({
+      launched: [{ taskId: 'call-2', kind: 'monitor', atMs: 1_000_301 }],
+      settled: ['call-1', 'call-1'],
+    });
+    // A range with no background records carries no field at all.
+    expect(drainGrokUpdates(path, second.newOffset).backgroundTasks).toBeUndefined();
+  });
+
+  it.each(['pre_tool_use', 'post_tool_use', 'post_tool_use_failure', 'session_end'])(
+    'emits interrupted narration once and releases its cursor on %s', hook => {
+      const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const path = writeUpdates(sid, '/tmp/proj', [
+        userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking.', 'narration'),
+        hookExecution(sid, hook, 'hook'),
+      ]);
+      const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+      expect(result.events.map(e => e.kind)).toEqual(['user', 'cot']);
+      expect(result.events[1]).toMatchObject({ sourceSessionId: sid, cotEntries: [{ kind: 'text', text: 'Checking.' }] });
+      expect(result.newOffset).toBe(statSync(path).size);
+      expect(drainGrokUpdates(path, result.newOffset, { includePublicActivity: true }).events).toEqual([]);
+      if (hook !== 'session_end') {
+        appendFileSync(path, JSON.stringify(turnDone(sid, 'done')) + '\n');
+        expect(drainGrokUpdates(path, result.newOffset, { includePublicActivity: true }).events)
+          .toMatchObject([{ kind: 'assistant_final', text: '', terminalStatus: 'completed' }]);
+      }
+    },
+  );
+
+  it('delivers complete narration to the queue once across passive events and partial polls', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking ', 'a1'),
+      hookExecution(sid, 'stop', 'stop'),
+    ]);
+    const queue = new CodexBridgeQueue();
+    const narration: string[] = [];
+    queue.setCotObserver(entries => {
+      for (const entry of entries) if (entry.kind === 'text') narration.push(entry.text);
+    });
+    queue.mark('om_test', 'inspect', 100);
+    const first = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    queue.ingest(first.events);
+    expect(first.events.map(e => e.kind)).toEqual(['user']);
+    expect(first.newOffset).toBe(Buffer.byteLength(JSON.stringify(userChunk(sid, 'inspect', 'user')) + '\n'));
+    appendFileSync(path, [
+      passiveUpdate(sid, 'background_tasks', 'background'), agentChunk(sid, 'the project.', 'a2'),
+      hookExecution(sid, 'pre_tool_use', 'pre-tool'), toolCall(sid, 'tool'),
+    ].map(e => JSON.stringify(e)).join('\n') + '\n');
+    const next = drainGrokUpdates(path, first.newOffset, { includePublicActivity: true });
+    queue.ingest(next.events);
+    queue.ingest(next.events);
+    expect(narration).toEqual(['Checking the project.']);
+    expect(queue.drainEmittable()).toEqual([]);
+    appendFileSync(path, [agentChunk(sid, 'Done.', 'final'), hookExecution(sid, 'stop', 'last-stop'), turnDone(sid, 'done')]
+      .map(e => JSON.stringify(e)).join('\n') + '\n');
+    queue.ingest(drainGrokUpdates(path, next.newOffset, { includePublicActivity: true }).events);
+    expect(narration).toEqual(['Checking the project.']);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_test', finalText: 'Done.' }]);
+  });
+
+  it('preserves failed tool output without converting it into a turn terminal', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'run a check', 'user'), toolCall(sid, 'tool'),
+      { params: { sessionId: sid, update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-tool', status: 'failed', rawOutput: { error: 'command failed' } } } },
+    ]);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.at(-1)).toMatchObject({ kind: 'cot', cotEntries: [{ kind: 'tool_result', id: 'call-tool', result: '{"error":"command failed"}' }] });
+    expect(result.events.some(e => e.kind === 'assistant_final')).toBe(false);
+  });
+
+  it.each(['content', 'raw-string', 'raw-object'] as const)('bounds oversized %s tool output before it leaves the reader', source => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const large = 'x'.repeat(200_000);
+    const output = source === 'raw-object' ? { output: large } : large;
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'inspect', 'user'),
+      { params: { sessionId: sid, update: { sessionUpdate: 'tool_call', toolCallId: 'read-large', title: 'Read', rawInput: { target_file: 'README.md', extra: large } } } },
+      { params: { sessionId: sid, update: { sessionUpdate: 'tool_call_update', toolCallId: 'read-large', status: 'completed',
+        ...(source === 'content' ? { content: [{ type: 'content', content: { type: 'text', text: large } }], rawOutput: 'unused fallback' } : { rawOutput: output }),
+      } } }, agentChunk(sid, 'Full final answer.', 'final'), turnDone(sid, 'done'),
+    ]);
+    const events = drainGrokUpdates(path, 0, { includePublicActivity: true }).events;
+    const entries = events.flatMap(e => e.cotEntries ?? []);
+    const call = entries.find(e => e.kind === 'tool_call');
+    const result = entries.find(e => e.kind === 'tool_result');
+    expect(call).toMatchObject({ kind: 'tool_call', subject: 'README.md' });
+    expect(call?.kind === 'tool_call' && call.args.length).toBeLessThanOrEqual(601);
+    const original = source === 'raw-object' ? JSON.stringify(output) : large;
+    expect(result).toEqual({ kind: 'tool_result', id: 'read-large', result: `${original.slice(0, 800)}…` });
+    expect(events.at(-1)).toMatchObject({ kind: 'assistant_final', text: 'Full final answer.' });
+  });
+
+  it('attributes public activity once to the matching native turn without settling on a tool', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking.', 'a'), toolCall(sid, 'tool')]);
+    const events = drainGrokUpdates(path, 0, { includePublicActivity: true }).events;
+    const queue = new CodexBridgeQueue();
+    const seen: string[] = [];
+    queue.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    queue.ingest(events.filter(e => e.kind === 'cot').map(e => ({ ...e, uuid: `history:${e.uuid}` })));
+    expect(seen).toEqual([]);
+    queue.mark('om_test', 'inspect', 100);
+    queue.ingest(events);
+    queue.ingest(events);
+    expect(seen).toEqual(['om_test', 'om_test']);
+    expect(queue.drainEmittable()).toEqual([]);
+    queue.ingest([{ ...events[1], uuid: 'wrong-session', sourceSessionId: 'another-native-session' }]);
+    expect(seen).toHaveLength(2);
+    appendFileSync(path, JSON.stringify(agentChunk(sid, 'Done.', 'f')) + '\n' + JSON.stringify(turnDone(sid, 'done')) + '\n');
+    queue.ingest(drainGrokUpdates(path, 0, { includePublicActivity: true }).events);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_test', finalText: 'Done.' }]);
+    queue.ingest([{ ...events[1], uuid: 'after-final' }]);
+    expect(seen).toHaveLength(2);
+  });
+
+  it('retires a merged Grok input without manufacturing an earlier final', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'first request', 'u1'),
+      userChunk(sid, 'follow-up', 'u2', 1_000_050),
+      agentChunk(sid, 'Combined answer.', 'final'), turnDone(sid, 'done'),
+    ]);
+    const queue = new CodexBridgeQueue();
+    const superseded: string[] = [];
+    queue.setCotSupersededObserver(turn => superseded.push(turn.turnId));
+    queue.mark('om_first', 'first request', 100);
+    queue.mark('om_second', 'follow-up', 200);
+    queue.ingest(drainGrokUpdates(path, 0, { includePublicActivity: true }).events);
+    expect(superseded).toEqual(['om_first']);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_second', finalText: 'Combined answer.' }]);
+    expect(queue.drainEmittable()).toEqual([]);
   });
 
   it('emits user + assistant_final for a completed turn', () => {
@@ -354,6 +638,105 @@ describe('drainGrokUpdates', () => {
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0]).toMatchObject({ kind: 'user', text: 'hello world' });
   });
+
+  it('preserves final agent text when followed by hook_execution stop before turn_completed', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, '请注册 Agent', 'e1'),
+      agentChunk(sid, '目前还没有你的字节邮箱，请确认。', 'e2'),
+      hookExecution(sid, 'stop', 'e3'),
+      turnDone(sid, 'e4'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('目前还没有你的字节邮箱，请确认。');
+  });
+
+  it('preserves agent text when hook_execution stop is interleaved between chunks', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '第一部分，', 'e2'),
+      hookExecution(sid, 'stop', 'e3'),
+      agentChunk(sid, '第二部分。', 'e4'),
+      turnDone(sid, 'e5'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('第一部分，第二部分。');
+  });
+
+  it('drops narration when followed by hook_execution pre_tool_use and tool_call', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '先查一下记录。', 'e2'),
+      hookExecution(sid, 'pre_tool_use', 'e3'),
+      toolCall(sid, 'e4'),
+      agentChunk(sid, '这是最终回复。', 'e5'),
+      hookExecution(sid, 'stop', 'e6'),
+      turnDone(sid, 'e7'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('这是最终回复。');
+  });
+
+  it('does not drop agent text on passive background updates before turn_completed', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '已处理完成。', 'e2'),
+      passiveUpdate(sid, 'background_tasks', 'e3'),
+      turnDone(sid, 'e4'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('已处理完成。');
+  });
+
+  it('drops unfinished agent text on session_end and advances offset to avoid pinning', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '未完成的一半回答...', 'e2'),
+      hookExecution(sid, 'session_end', 'e3'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    expect(r.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+    const size = statSync(path).size;
+    expect(r.newOffset).toBe(size);
+  });
+});
+
+describe('isGrokNarrationInterruption', () => {
+  it('returns true for tool calls, thoughts, and plans', () => {
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'tool_call' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'tool_call_update' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'agent_thought_chunk' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'plan' })).toBe(true);
+  });
+
+  it('returns true for tool execution hooks and session_end', () => {
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'pre_tool_use' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'post_tool_use' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'post_tool_use_failure' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'session_end' })).toBe(true);
+  });
+
+  it('returns false for turn lifecycle hooks and passive updates', () => {
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'stop' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'stop_failure' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'session_start' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'user_prompt_submit' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'background_tasks' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'memory_dream_completed' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'auto_compact_completed' })).toBe(false);
+  });
 });
 
 describe('matchGrokPromptAppend', () => {
@@ -420,6 +803,83 @@ describe('matchGrokPromptAppend', () => {
     expect(matchGrokPromptAppend(path, 0, prompt, {
       preferSessionId: 'cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee',
     }).found).toBe(false);
+  });
+
+  it('matches the form Grok stores for bodies with tabs or CRLF', () => {
+    // Pasted body → stored prompt, measured identical on 1.0.5/1.0.13/1.0.67/1.0.70.
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const measured: Array<[pasted: string, stored: string]> = [
+      ['ab\tc\td', 'ab    c    d'],
+      ['\tleading tab', 'leading tab'],
+      ['crlf line1\r\nline2', 'crlf line1\n\nline2'],
+    ];
+    const path = writePromptHistory('/tmp/proj', measured.map(([, stored]) => promptHistoryLine(sid, stored)));
+    for (const [pasted] of measured) {
+      expect(matchGrokPromptAppend(path, 0, pasted)).toEqual({ found: true, cliSessionId: sid });
+    }
+    expect(matchGrokPromptAppend(path, 0, 'ab c d').found).toBe(false);
+  });
+});
+
+describe('matchGrokPromptEnqueue', () => {
+  const PID = 1740552;
+  let path: string;
+  beforeEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(join(ROOT, 'logs'), { recursive: true });
+    path = join(ROOT, 'logs', 'unified.jsonl');
+    writeFileSync(path, '');
+  });
+  afterEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  /** Line shape copied from a real 1.0.5 / 1.0.70 unified.jsonl. */
+  function logLine(o: { ts: string; pid?: number; msg?: string; len?: number; ver?: string }): string {
+    return JSON.stringify({
+      ts: o.ts, src: 'grok-pager', pid: o.pid ?? PID, ver: o.ver ?? '1.0.5', lvl: 'info',
+      msg: o.msg ?? 'prompt.enqueue', ...(o.len !== undefined ? { ctx: { len: o.len } } : {}),
+    }) + '\n';
+  }
+  const since = Date.parse('2026-10-25T05:05:45.500Z');
+
+  it('accepts the line Grok logs when a mid-turn follow-up is queued', () => {
+    // Real 1.0.5 capture: this body was queued behind a running turn and
+    // logged len 71 (UTF-8 bytes, tab expanded to four spaces) — while
+    // prompt_history only got it at dequeue, 23s later.
+    const body = '忙时追加：中文 CJK 内容 ✅ emoji\n第二行 second line\ttab';
+    const base = statSync(path).size;
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:45.760Z', len: 71 }));
+    appendFileSync(path, JSON.stringify({
+      ts: '2026-10-25T05:05:45.760Z', src: 'grok-pager', pid: PID, ver: '1.0.5', lvl: 'debug',
+      sid: '4431c06b-bdae-4380-af4b-e0ea01c11562', msg: 'prompt.drain_blocked',
+      ctx: { reason: 'turn_running', queue_depth: 1 },
+    }) + '\n');
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(true);
+  });
+
+  it('binds the receipt to this process, this body and this write', () => {
+    const body = 'second follow-up message ALPHA-7781 with some words'; // 51 bytes
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:40.000Z', len: 51 })); // before baseline
+    const base = statSync(path).size;
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: 51, pid: PID + 1 })); // sibling Grok
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: 52 })); // other body
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:45.000Z', len: 51 })); // earlier submit, flushed late
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: 51, msg: 'prompt.drain' }));
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(false);
+
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.100Z', len: 51 }).slice(0, 40)); // torn tail
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(false);
+    appendFileSync(path, '\n' + logLine({ ts: '2026-10-25T05:05:46.200Z', len: 51 }));
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(true);
+  });
+
+  it('still finds the line after Grok trims the log below the baseline', () => {
+    const body = 'after trim';
+    appendFileSync(path, 'x'.repeat(4096) + '\n');
+    const base = statSync(path).size;
+    writeFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: Buffer.byteLength(body) }));
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(true);
   });
 });
 
@@ -559,6 +1019,26 @@ describe('discoverGrokSessions', () => {
     expect(out.map((s) => s.cliSessionId)).toContain(external);
     expect(out.map((s) => s.cliSessionId)).not.toContain(botmux);
     expect(out.find((s) => s.cliSessionId === external)?.cwd).toBe('/tmp/a');
+  });
+
+  // #2716: grok has injectsSessionContext=true, so an envelope-less bare
+  // (replyDelivery=transcript + solo) follow-up stored in updates.jsonl is the
+  // user text followed by <botmux_formatting>. It passes the structural
+  // botmux-origin filter (a pre-existing bare gap), but its picker title must
+  // still be the user's text alone.
+  it('titles an envelope-less bare follow-up without the <botmux_formatting> block', async () => {
+    const sid = '55555555-5555-4555-8555-555555555555';
+    const dir = join(ROOT, 'sessions', encodeURIComponent('/tmp/fmt'), sid);
+    mkdirSync(dir, { recursive: true });
+    const barePrompt = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    writeFileSync(
+      join(dir, 'updates.jsonl'),
+      `${JSON.stringify(userChunk(sid, barePrompt, 'e1'))}\n`,
+    );
+    // No generated_title / session_summary: discovery falls back to first prompt.
+    writeFileSync(join(dir, 'summary.json'), JSON.stringify({ info: { id: sid, cwd: '/tmp/fmt' } }));
+    const out = await discoverGrokSessions(10);
+    expect(out.find((s) => s.cliSessionId === sid)?.title).toBe('继续看一下这个 PR');
   });
 
   it('keeps external prompts that merely discuss botmux tags (structural filter only)', async () => {

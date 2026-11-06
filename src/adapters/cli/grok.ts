@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import {
@@ -11,15 +12,20 @@ import {
   grokHooksDir,
   grokPromptHistoryPath,
   grokSkillsDir,
+  grokUnifiedLogPath,
 } from '../../services/grok-paths.js';
 import {
   discoverGrokSessions,
+  drainGrokUpdates,
   findGrokSessionByPid,
+  findGrokUpdatesBySessionId,
   grokFileSize,
   grokSessionDirExists,
   grokSessionExists,
   matchGrokPromptAppend,
+  matchGrokPromptEnqueue,
 } from '../../services/grok-transcript.js';
+import { ensureGrokFolderTrust } from '../../services/grok-folder-trust.js';
 import { builtinSkillBlockForInjectsSessionContext } from '../../skills/injection-mode.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 
@@ -72,9 +78,8 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  bodies never self-submit.
  *  There is deliberately NO Enter-only retry for an unconfirmed submit:
  *  `submitted:false` does not prove the body is parked in the composer.
- *  Every mid-turn submit verifies late by design (grok queues it and
- *  appends prompt_history only at dequeue — see below), so an Enter-only
- *  path would routinely fire a bare Enter at an EMPTY composer, which with
+ *  A mid-turn submit leaves the composer EMPTY (grok queues it — see below),
+ *  so an Enter-only path would fire a bare Enter at it, which with
  *  a queued follow-up is send-now (cancels the running turn — the exact
  *  hazard #865 removed the second Enter for), and would swallow a genuine
  *  identical resend (Enter without ever pasting the new message). An
@@ -86,14 +91,26 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  (`user_message_chunk` / `agent_message_chunk` + `turn_completed`),
  *  drained via `drainGrokUpdates`. Submit VERIFY uses the bucket-level
  *  `prompt_history.jsonl`: an idle-composer submit appends at submit time
- *  (0.5–1s on 1.0.5). KNOWN LIMIT (1.0.5, measured): a mid-turn submit
- *  parks in grok's own queue and appends only at DEQUEUE — the instant the
- *  previous turn completes — so busy-turn verify misses regardless of the
- *  poll window (the bound is the running turn's duration, unbounded) and
- *  the caller sees a spurious「提交未确认」. Pre-existing on master; the
- *  verify-semantics fix (dequeue-independent evidence) is a separate PR.
- *  Ready gate: global `$GROK_HOME/hooks/botmux-session-ready.json`
- *  SessionStart → `botmux session-ready` (`injectsReadyHook`).
+ *  (0.5–1s on 1.0.5). A mid-turn submit parks in grok's own queue and
+ *  appends — like its `user_message_chunk` — only at DEQUEUE, the instant
+ *  the previous turn completes, which no poll window can wait out. Its
+ *  receipt is instead the `prompt.enqueue` line `$GROK_HOME/logs/unified.jsonl`
+ *  gets when Enter lands, idle or mid-turn (measured on 1.0.5 / 1.0.13 /
+ *  1.0.67 / 1.0.70): bound to this process by `pid` and to this body by its
+ *  UTF-8 byte length (see matchGrokPromptEnqueue). That confirms the submit
+ *  like any type-ahead CLI's; the structured bridge then owns the dequeue —
+ *  the hand-off lease starts when the predecessor's turn completes, and a
+ *  user event that never follows is reported as an uncollected turn. Without
+ *  the line (no cliPid, a PID-namespaced sandbox) the deferred recheck still
+ *  falls back to prompt_history.
+ *  Ready gate: Do NOT arm ready-gate (no `injectsReadyHook`).
+ *  Measured on Grok 1.0.46 / 1.0.50: a bare spawn DOES create a session and
+ *  DOES fire the SessionStart hook pre-prompt (~1.2s on a light GROK_HOME).
+ *  The failure this removes is different: on a heavy production `~/.grok`
+ *  (marketplace + MCP servers such as lynx-devtool) session creation can run
+ *  past the gate's whole window, so the signal arrives after the 45s fallback
+ *  — the gate then holds the first prompt for 45s for no benefit. Readiness is
+ *  driven by `readyPattern: /❯/` and quiescence, the same shape as Hermes.
  *
  *  ## Session context / system prompt
  *  Grok's append flag is `--rules` (docs: alias of Claude's
@@ -113,12 +130,36 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  Claude disallows EnterPlanMode/ExitPlanMode for Feishu UX (blocking
  *  approval). Grok's TUI equivalent is `--no-plan`.
  *
+ *  ## Folder trust (≥1.0.64)
+ *  While any user-level hook exists (Botmux installs its own under
+ *  `$GROK_HOME/hooks/`), Grok opens on "Do you trust the contents of this
+ *  directory?" in every untrusted folder, before the composer — the argv
+ *  prompt never starts. `ensureWorkspaceTrust` pre-writes the workspace root
+ *  into `$GROK_HOME/trusted_folders.toml` under Grok's own flock, never
+ *  overriding an explicit `trusted = false` (see grok-folder-trust.ts).
+ *
  *  ## Sandbox
  *  `authPaths: [$GROK_HOME]` (directory) — grok keeps SQLite DBs there
  *  (session_search.sqlite, worktrees.db); under the deny-by-default file sandbox
  *  a path not in authPaths doesn't exist, so they'd be unreachable / lack fcntl
  *  locks.
  */
+/** Grok updates.jsonl. botmux passes `--session-id`, so the adapter id is a valid first
+ *  lookup key; a collision-fallback spawn (grok mints its own id) is recovered through
+ *  writeInput's prompt_history verify. */
+export const grokBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainGrokUpdates(path, offset, { includePublicActivity: true }),
+  locate: {
+    bySessionId: (sessionId, cwd) => findGrokUpdatesBySessionId(sessionId, cwd),
+    byPid: pid => {
+      const probed = findGrokSessionByPid(pid);
+      return probed && existsSync(probed.updatesPath) ? probed.updatesPath : undefined;
+    },
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+  adopt: { attach: 'split-live' },
+};
+
 export function createGrokAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand).
@@ -126,6 +167,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'grok',
+    bridgeSpec: grokBridgeSpec,
     // Absolute runtime paths (not `~/…` literals): GROK_HOME can override the
     // data root, and sandbox/auth carve-outs must track the same resolved dir
     // the spawned CLI uses (split-brain bug if we freezed `~/.grok` at build).
@@ -140,12 +182,19 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // idle. Crash/submit failures are reconciled by the worker's exact-attempt
     // terminal path.
     reliableTurnTerminal: true,
-    injectsReadyHook: true,
+    // Do NOT arm Botmux's ready-gate for Grok. The gate exists to hold the
+    // first prompt until a SessionStart hook proves an outer startup selector
+    // has been passed. Grok has no such selector, and its SessionStart fires
+    // pre-prompt only after the TUI has finished bringing the session up
+    // (measured ~1.2s on a light GROK_HOME; the production `~/.grok` with
+    // marketplace + MCP servers can take far longer, and a hook pointing at a
+    // stale checkout path never signals at all). Arming it therefore buys no
+    // safety and only adds a 45s hold whenever the signal is late or absent.
+    // Instead, like Hermes, Grok relies on `readyPattern: /❯/` and
+    // `deferFirstPromptTimeoutUntilReady: true` to detect composer readiness.
     injectsSessionContext: true,
-    // Hold soft first-prompt timeout until SessionStart ready signal or the
-    // composer's readyPattern — cold-start TUI can accept (and drop) stdin
-    // before the real composer exists.
     deferFirstPromptTimeoutUntilReady: true,
+    ensureWorkspaceTrust: workingDir => ensureGrokFolderTrust(workingDir),
 
     buildArgs({
       sessionId,
@@ -163,6 +212,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       larkAppId,
       noTransport,
       triggerUserAuth,
+      larkToolAppId,
       promptInjection,
     }) {
       const args: string[] = [];
@@ -219,6 +269,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           botOpenId,
           noTransport,
           triggerUserAuth,
+          larkToolAppId,
           builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
             asksViaHook: false,
             whiteboardEnabled: whiteboardEnabled(),
@@ -234,6 +285,9 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // Tighter than TMUX_INITIAL_PROMPT_ARG_BUDGET: `--rules` is already in this
+    // command. See GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET.
+    maxInitialPromptArgBytes: GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
     buildResumeCommand({ sessionId, cliSessionId }) {
       const sid = cliSessionId || sessionId;
@@ -256,7 +310,8 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       // Submit verify against the bucket-level prompt_history.jsonl (one
       // {timestamp, session_id, prompt} line per submit; idle-composer
       // submits append at submit time, mid-turn queued submits only at
-      // dequeue — see header). Requires cliCwd: without
+      // dequeue, so those confirm via the unified log's enqueue line — see
+      // header). Requires cliCwd: without
       // it we cannot safely pick a bucket (scanning every cwd's history
       // would risk cross-session false matches + persist wrong cliSessionId).
       // Production always sets cliCwd (spawn + adopt); missing cwd → fail
@@ -293,7 +348,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
             return pty.sendText(content) !== false;
           }
           // Raw PTY: wrap the markers ourselves (codex parity).
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
           return true;
         } catch {
           return false;
@@ -310,12 +365,15 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       const historyPath = grokPromptHistoryPath(cwd);
       const baseByte = grokFileSize(historyPath);
+      const unifiedLogPath = grokUnifiedLogPath();
+      const unifiedLogBaseByte = grokFileSize(unifiedLogPath);
+      const writeStartedAtMs = Date.now();
 
       if (!deliverBody()) return { submitted: false };
       await delay(scaleMs(200));
       // One paste + one Enter per call, and NEVER an Enter without a paste
       // in the same call: `submitted:false` is not proof the body is parked
-      // in the composer (every mid-turn submit verifies late — see header),
+      // in the composer (a queued mid-turn submit empties it — see header),
       // and a bare Enter on an empty composer with a queued follow-up is
       // send-now (cancels the running turn). An unconfirmed submit is
       // recovered by the worker's flush retry (full re-paste) and the
@@ -332,8 +390,21 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           : undefined;
         return matchGrokPromptAppend(historyPath, base, content, { preferSessionId });
       };
+      // Busy-turn receipt: the composer logged accepting this body into its
+      // queue (see header). prompt_history follows only at dequeue, so the
+      // turn's start is then owned by the structured bridge's hand-off lease.
+      const probeQueued = (): { found: boolean; cliSessionId?: string } => {
+        const pid = pty.cliPid;
+        if (!pid || !matchGrokPromptEnqueue(unifiedLogPath, unifiedLogBaseByte, content, {
+          pid,
+          sinceMs: writeStartedAtMs,
+        })) return { found: false };
+        const sessionId = findGrokSessionByPid(pid)?.sessionId;
+        return sessionId ? { found: true, cliSessionId: sessionId } : { found: true };
+      };
 
-      // Keep polling for a late history append. An unconfirmed submit is
+      // Keep polling for a late history append: an idle submit records it
+      // within ~1s and carries the owning session id. An unconfirmed submit is
       // recovered by the worker's flush retry and the deferred recheck —
       // never by a second in-band Enter.
       const confirm = (hit: { found: boolean; cliSessionId?: string }) =>
@@ -349,9 +420,12 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       const late = probe();
       if (late.found) return confirm(late);
+      const queued = probeQueued();
+      if (queued.found) return confirm(queued);
 
       const recheck = () => {
-        const hit = probe();
+        const history = probe();
+        const hit = history.found ? history : probeQueued();
         if (!hit.found) return false;
         return hit.cliSessionId
           ? { submitted: true as const, cliSessionId: hit.cliSessionId }
@@ -361,9 +435,10 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    // Composer box `❯` renders once the TUI is interactive — pairs with
+    // Composer box `❯` renders once the TUI is interactive. This is Grok's
+    // ONLY readiness signal (no ready-gate): pairs with
     // deferFirstPromptTimeoutUntilReady to keep the first prompt held past
-    // the soft timeout (the SessionStart ready hook is the primary signal).
+    // the soft timeout until the composer actually exists.
     readyPattern: /❯/,
     // Busy markers verified on 0.2.93: "⠧ Waiting for response…" spinner
     // during the model phase, and the "Ctrl+c:cancel" shortcut-bar entry
@@ -379,7 +454,15 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // Global skill root under $GROK_HOME (TUI has no --plugin-dir); layout is
     // `skills/<name>/SKILL.md`, same operational model as Codex.
     get skillsDir(): string { return grokSkillsDir(); },
-    // SessionStart → botmux session-ready for injectsReadyHook gate.
+    // Installed for historical / diagnostic parity only: the worker no longer
+    // arms a ready-gate for Grok, so no `session_ready` IPC is consumed.
+    // Deliberately kept rather than deleted: dropping this block does NOT
+    // uninstall the already-written `$GROK_HOME/hooks/botmux-session-ready.json`
+    // (installHook only ever writes, there is no uninstall path), so the hook
+    // would keep firing either way — while removing it here would also discard
+    // the only code that can rewrite that file. The hook itself is fail-open
+    // (`botmux session-ready` exits 0 without a matching session), so the cost
+    // is one no-op subprocess per session. Revisit together with the gate.
     hookInstall: {
       get configPath(): string { return join(grokHooksDir(), 'botmux-session-ready.json'); },
       format: 'grok-hooks',
@@ -388,5 +471,3 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['grok'],
   };
 }
-
-export const create = createGrokAdapter;

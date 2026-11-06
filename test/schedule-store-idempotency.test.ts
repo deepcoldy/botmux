@@ -395,3 +395,13 @@ describe('createTask — id namespace isolation', () => {
     expect(listTasks()).toHaveLength(2);
   });
 });
+
+it('calendar binding is canonical input while lastCalendarCheck is runtime state', async () => {
+  const { createTask, canonicalScheduleInput } = await freshImport();
+  const task = createTask({ ...BASE_PARAMS, id: 'calendar_canonical', calendar: 'demo' });
+  expect(() => createTask({ ...BASE_PARAMS, id: task.id })).toThrow();
+  expect(() => createTask({ ...BASE_PARAMS, id: task.id, calendar: 'other' })).toThrow();
+  expect(() => createTask({ ...BASE_PARAMS, id: task.id, calendar: 'demo', calendarDayType: 'restday' })).toThrow();
+  expect(createTask({ ...BASE_PARAMS, id: task.id, calendar: 'demo', calendarDayType: 'workday' }).id).toBe(task.id);
+  expect(canonicalScheduleInput({ ...task, lastCalendarCheck: { reason: 'rest_date' } } as any)).toEqual(canonicalScheduleInput(task));
+});

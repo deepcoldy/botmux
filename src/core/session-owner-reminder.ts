@@ -72,6 +72,17 @@ export function normalizeSessionOwnerReminderConfig(
   };
 }
 
+/**
+ * The Feishu card currently waiting for a TUI choice, if any. The Codex
+ * stuck-warning card (hook review: trust / review / close) is the live
+ * producer; `tuiPromptCardId` was set only by the retired ScreenAnalyzer and
+ * is kept so a future TUI-prompt producer is covered too. Both ids are
+ * cleared on every resolve / recovery path, which ends the reminder.
+ */
+function pendingTuiChoiceCardId(ds: DaemonSession): string | undefined {
+  return ds.tuiPromptCardId ?? ds.stuckWarningCardId;
+}
+
 export function deriveSessionOwnerReminderStates(ds: DaemonSession): SessionOwnerReminderState[] {
   const states: SessionOwnerReminderState[] = [];
   const workerAlive = !!ds.worker && !ds.worker.killed;
@@ -80,7 +91,7 @@ export function deriveSessionOwnerReminderStates(ds: DaemonSession): SessionOwne
   // CLI. Likewise stale screen status belongs to the old worker lifetime.
   if (!workerAlive && !ds.pendingRepo) states.push('dormant');
   if (ds.pendingRepo) states.push('pending_repo');
-  if (ds.tuiPromptCardId) states.push('tui_prompt');
+  if (pendingTuiChoiceCardId(ds)) states.push('tui_prompt');
   if (ds.agentAttention) states.push('agent_attention');
   if (workerAlive && ds.lastScreenStatus === 'limited') states.push('limited');
   return states;
@@ -94,8 +105,8 @@ export function deriveSessionOwnerReminderStates(ds: DaemonSession): SessionOwne
  *
  *   - `agent_attention` → a fresh `{kind, reason, at}` is written on every new
  *     attention raise, so key on `agentAttention.at`.
- *   - `tui_prompt`      → an old TUI prompt card is cleared and a new
- *     `tuiPromptCardId` set between scans, so key on that id.
+ *   - `tui_prompt`      → an old TUI choice card is resolved and a new one
+ *     posted between scans, so key on that card's message id.
  *
  * Without the instance component, the old signal being resolved and a brand-new
  * same-category signal appearing (e.g. a second, unrelated attention request)
@@ -118,7 +129,7 @@ export function sessionOwnerReminderObservationFingerprint(
   return states
     .map(state => {
       if (state === 'agent_attention') return `agent_attention:${ds.agentAttention?.at ?? ''}`;
-      if (state === 'tui_prompt') return `tui_prompt:${ds.tuiPromptCardId ?? ''}`;
+      if (state === 'tui_prompt') return `tui_prompt:${pendingTuiChoiceCardId(ds) ?? ''}`;
       return state;
     })
     .join(',');
@@ -189,7 +200,7 @@ export class SessionOwnerReminderController {
       // Eligibility follows the configured subset, but timer resets follow the
       // complete runtime state. An unselected attention signal still represents
       // a state transition and starts a fresh quiet period. The fingerprint also
-      // captures instance identity (attention.at / tuiPromptCardId) so a NEW
+      // captures instance identity (attention.at / TUI choice card id) so a NEW
       // same-category signal replacing a resolved one resets the timer instead
       // of inheriting the old quiet period — see the fingerprint helper above.
       const stateFingerprint = sessionOwnerReminderObservationFingerprint(ds, projectedStates);

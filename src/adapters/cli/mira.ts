@@ -1,18 +1,7 @@
-import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
-
-function runnerPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const compiledSibling = resolve(here, '..', '..', 'mira-runner.js');
-  if (existsSync(compiledSibling)) return compiledSibling;
-  const builtFromSourceTree = resolve(here, '..', '..', '..', 'dist', 'mira-runner.js');
-  if (existsSync(builtFromSourceTree)) return builtFromSourceTree;
-  return compiledSibling;
-}
+import { resolveRunnerPath } from './runner-path.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -26,7 +15,7 @@ export function createMiraAdapter(_pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale }) {
       const args = [
-        runnerArgv0('mira-runner', runnerPath()),
+        runnerArgv0('mira-runner', resolveRunnerPath('mira-runner.js')),
         '--session-id', sessionId,
       ];
       if (resume && resumeSessionId) args.push('--mira-session-id', resumeSessionId);
@@ -55,5 +44,3 @@ export function createMiraAdapter(_pathOverride?: string): CliAdapter {
     altScreen: false,
   };
 }
-
-export const create = createMiraAdapter;

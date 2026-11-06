@@ -3,6 +3,8 @@ import type {
   RoleProfileEntryLike,
 } from './role-profile-match.js';
 import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
+import { readJson } from './dashboard-api.js';
+import type { ListenerContentPolicy } from '../../services/message-listener-content-policy.js';
 
 export interface BotInfo {
   larkAppId: string;
@@ -34,12 +36,15 @@ export interface RoleData {
   hasRole: boolean;
   injectMode?: RoleInjectMode;
   dispatchCompletionEnabled?: boolean;
+  replyPrivately?: boolean;
+  privateReplyNotice?: string;
   effectiveContent?: string | null;
   effectiveSource?: string;
   hasEffectiveRole?: boolean;
 }
 
 export interface MessageListenerData {
+  autoCloseAfterCompletion?: boolean;
   enabled: boolean;
   name?: string;
   replyCardTitle?: string;
@@ -65,11 +70,15 @@ export interface MessageListenerData {
    * V1 is keyword-only: regexes are not evaluated on the daemon main loop
    * (catastrophic-backtracking DoS risk).
    */
-  contentPolicy?: {
-    includeKeywords?: string[];
-    matchMode?: 'any' | 'all';
-  };
+  contentPolicy?: ListenerContentPolicy;
   replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
+}
+
+export function mergeListenerContentPolicy(
+  current: MessageListenerData['contentPolicy'],
+  patch: NonNullable<MessageListenerData['contentPolicy']>,
+): NonNullable<MessageListenerData['contentPolicy']> {
+  return { ...(current ?? {}), ...patch };
 }
 
 export interface MessageListenerPreviewItem {
@@ -201,10 +210,6 @@ export function botInChatCount(group: GroupInfo): number {
   return group.memberBots.filter(bot => bot.inChat).length;
 }
 
-export function profileHasEntry(profile: RoleProfileSummary, larkAppId: string): boolean {
-  return (profile.botEntries ?? []).some(entry => entry.larkAppId === larkAppId && entry.hasEntry);
-}
-
 export function entryForBot(entries: RoleProfileEntry[], larkAppId: string | null): RoleProfileEntry | undefined {
   return larkAppId ? entries.find(entry => entry.larkAppId === larkAppId) : undefined;
 }
@@ -224,10 +229,6 @@ export function filterRoleGroups(groups: GroupInfo[], filter: string): GroupInfo
 export function filterRoleProfiles(profiles: RoleProfileSummary[], filter: string): RoleProfileSummary[] {
   const q = filter.toLowerCase();
   return profiles.filter(profile => !q || profile.profileId.toLowerCase().includes(q));
-}
-
-async function readJson(r: Response): Promise<any> {
-  return r.json().catch(() => ({}));
 }
 
 export async function loadGroups(): Promise<{ groups: GroupInfo[]; bots: DashboardBot[] }> {
@@ -312,26 +313,6 @@ export async function saveDispatchCompletionEnabled(
 
 export async function deleteRole(larkAppId: string, chatId: string): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
-  return r.ok;
-}
-
-export async function loadMessageListener(larkAppId: string, chatId: string): Promise<MessageListenerData> {
-  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`);
-  const data = await readJson(r);
-  return data.listener ?? { enabled: false, prompt: '', messagePolicy: { scope: 'top_level' } };
-}
-
-export async function saveMessageListener(larkAppId: string, chatId: string, listener: MessageListenerData): Promise<boolean> {
-  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(listener),
-  });
-  return r.ok;
-}
-
-export async function deleteMessageListener(larkAppId: string, chatId: string): Promise<boolean> {
-  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
   return r.ok;
 }
 
@@ -502,4 +483,11 @@ export async function applyRoleProfile(input: {
     error: body.error,
     wouldRefuse: body.wouldRefuse,
   };
+}
+
+export async function saveReplyPrivately(larkAppId: string, chatId: string, settings: { replyPrivately?: boolean; privateReplyNotice?: string }): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings),
+  });
+  return r.ok;
 }

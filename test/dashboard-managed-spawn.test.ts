@@ -174,12 +174,12 @@ describe('dashboard host children run on a redacted env', () => {
     expect(await spawnStartBotLive('cli_target')).toEqual({ ok: false, message: '启动失败' });
   });
 
+  // 源码结构护栏(K1/K2)：dashboard.ts 是持有飞书 H5 登录密钥族的进程，宿主子进程必须全部经
+  // managed-spawn 的 env 脱敏出口（P1-9）。直接在 dashboard.ts 里引入 child_process 就能绕过
+  // 脱敏且不会让上面任何行为用例变红，只能用 import 边界来守。
   it('dashboard.ts forks nothing on its own — every host child comes from this module', async () => {
-    // Structural companion to the behavior above: a new `spawn(...)` inlined in
-    // dashboard.ts would bypass the redaction this module centralizes.
     const { readFileSync } = await import('node:fs');
     const src = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf-8');
-    expect(src).not.toMatch(/from\s+['"]node:child_process['"]/);
-    expect(src).toContain("from './dashboard/managed-spawn.js'");
+    expect(src).not.toMatch(/['"](?:node:)?child_process['"]/);
   });
 });

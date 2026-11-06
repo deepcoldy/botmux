@@ -3,7 +3,10 @@
 // vitest/test-harness handles propping up the loop) with one crash-looping fake
 // daemon. If the restart timer were unref'd, this process would drain its loop
 // and exit mid-backoff after the first crash, never reaching restarts>=2 — the
-// exact bug this guards. argv: <statePath> <distDir> <cwd>
+// exact bug this guards. Also hosts the concurrent-start race test: two of
+// these share one statePath, and the one that loses the ownership claim gets
+// `false` from start(), spawns nothing and exits 0 on an empty loop.
+// argv: <statePath> <distDir> <cwd>
 import { FleetSupervisor } from '../../src/core/fleet-supervisor.js';
 
 const [statePath, distDir, cwd] = process.argv.slice(2);

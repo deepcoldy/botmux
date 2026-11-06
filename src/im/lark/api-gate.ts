@@ -25,6 +25,15 @@
  * BOTMUX_LARK_GATE_CIRCUIT_PROBE_INTERVAL_MS。
  */
 import { logger } from '../../utils/logger.js';
+import {
+  LARK_CODE_CHAT_RATE_LIMITED,
+  LARK_CODE_FREQUENCY_LIMITED,
+  LARK_CODE_MESSAGE_BEING_SENT,
+  extractLarkBusinessCode,
+} from './lark-errors.js';
+
+// 规范实现已迁到 lark-errors.ts；此处保留再导出，老 import 路径（content-audit、测试）不变。
+export { extractLarkBusinessCode };
 
 export interface LarkGateConfig {
   /** token bucket 填充速率（req/s），默认 15。 */
@@ -45,8 +54,32 @@ export interface LarkGateConfig {
   circuitProbeIntervalMs: number;
 }
 
-/** 瞬时 Lark 业务码：即使 HTTP 4xx 也值得重试（频控/后端抖动）。 */
-const TRANSIENT_LARK_CODES = new Set([230049, 230020, 99991400]);
+/**
+ * Feishu business error codes that mean "the request is transient — retry
+ * later", per the official IM v1 send/reply error table + frequency-control
+ * guide (codex P1-3). These must be retryable EVEN when the HTTP status is a
+ * 4xx (some legacy freq-control surfaces as HTTP 400) or a 2xx-body business
+ * error — otherwise a same-uuid partial-success convergence (the second request
+ * arriving while the first is still "being sent") is wrongly given up on.
+ *
+ *   230049  the message is being sent — official "please retry"
+ *   230020  message API per-chat rate limit
+ *   99991400 generic OpenAPI frequency control (modern = HTTP 429, legacy = 400)
+ *
+ * NOT included: 11232 / 11233 are the old V4 message API; the current im.v1
+ * create/reply path never returns them, so mixing them in would only widen the
+ * whitelist without cause.
+ *
+ * Rate-limit codes (99991400 / HTTP 429) ideally honour `x-ogw-ratelimit-reset`
+ * as the retry delay — the broker's short fixed backoff can't outlast a long
+ * official reset window. Plumbing that through AskDispatchError.retryAfterMs is
+ * a follow-up (see PR notes); 230049/230020 converge within the short backoff.
+ */
+export const TRANSIENT_LARK_CODES: ReadonlySet<number> = new Set([
+  LARK_CODE_MESSAGE_BEING_SENT,
+  LARK_CODE_CHAT_RATE_LIMITED,
+  LARK_CODE_FREQUENCY_LIMITED,
+]);
 
 function positiveFinite(raw: string | undefined, fallback: number): number {
   if (raw == null || raw.trim() === '') return fallback;
@@ -166,20 +199,6 @@ export function __testOnly_resetLarkGate(): void {
 }
 
 // ─── 错误分类（镜像 ask-card.classifyAskDispatchError，自包含） ────────────────
-
-/** 提取 Lark 业务码：axios response.data.code / 顶层 code / 消息尾部 (code: NNN)。 */
-function extractLarkBusinessCode(err: unknown): number | undefined {
-  const e = err as {
-    response?: { data?: { code?: number } };
-    code?: unknown;
-    message?: string;
-  } | null | undefined;
-  const structured = e?.response?.data?.code ?? e?.code;
-  if (typeof structured === 'number' && Number.isFinite(structured)) return structured;
-  const message = typeof e?.message === 'string' ? e.message : '';
-  const m = /\(code:\s*(\d+)\)/.exec(message);
-  return m ? Number(m[1]) : undefined;
-}
 
 /**
  * 判断错误是否值得重试：

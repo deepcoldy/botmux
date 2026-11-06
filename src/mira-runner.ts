@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
 import { extractMiraHistoryFinalText, sanitizeMiraFinalText } from './mira-output.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { errorMessage } from './utils/error-message.js';
+import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
 
 type JsonObject = Record<string, any>;
 
@@ -31,38 +33,20 @@ const LAST_ROUND_RETRY_DELAYS_MS = [0, 250, 750];
 const COOKIE_DB_PATH = process.env.MIRA_COOKIE_DB
   ?? join(homedir(), 'Library', 'Application Support', 'mira', 'Cookies');
 const output = new RunnerControlWriter();
+const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
 
 function parseArgs(argv: string[]): Args {
   const out: Args = { sessionId: '' };
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    const val = argv[i + 1];
-    if (key === '--session-id' && val !== undefined) { out.sessionId = val; i++; }
-    else if (key === '--mira-session-id' && val !== undefined) { out.miraSessionId = val; i++; }
-    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
-    else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
-    else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
-    else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
-  }
+  parseRunnerFlags(argv, out, {
+    '--session-id': 'sessionId',
+    '--mira-session-id': 'miraSessionId',
+    '--model': 'model',
+    '--bot-name': 'botName',
+    '--bot-open-id': 'botOpenId',
+    '--locale': 'locale',
+  });
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
-}
-
-function emitMarker(kind: string, payload: unknown): void {
-  output.marker(kind, payload);
-}
-
-function writeLine(text = ''): void {
-  output.line(text);
-}
-
-function prompt(): void {
-  output.display('› ');
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
 }
 
 function sleep(ms: number): Promise<void> {

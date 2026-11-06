@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { extractSkillsInstallCommandSource } from '../../../core/skills/install-command.js';
 import { useT } from '../react-hooks.js';
+import { ModalDialog } from '../modal-dialog.js';
 import { toast } from '../toast.js';
 import type { SkillGraph } from './shared.js';
 import type { InstallSkillCandidate, NativeSkillGroup, SkillRow, SkillsNavIntent, StatusMessage } from './types.js';
@@ -177,14 +178,6 @@ function PostInstallPackDialog(props: {
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (dlg && !dlg.open) {
-      try { dlg.showModal(); } catch { /* already open */ }
-    }
-  }, []);
 
   const create = async () => {
     if (!id.trim() || !name.trim()) return;
@@ -200,7 +193,7 @@ function PostInstallPackDialog(props: {
   };
 
   return (
-    <dialog className="bd-dialog skills-post-install-pack" ref={dialogRef} onClose={() => !busy && props.onClose()}>
+    <ModalDialog open backdropClose={false} className="bd-dialog skills-post-install-pack" onClose={() => !busy && props.onClose()}>
       <form method="dialog" onSubmit={event => { event.preventDefault(); void create(); }}>
         <h3>{tr('skills.postInstallPackTitle')}</h3>
         <p>{tr('skills.postInstallPackHelp', { count: props.skillNames.length })}</p>
@@ -224,7 +217,7 @@ function PostInstallPackDialog(props: {
           </button>
         </div>
       </form>
-    </dialog>
+    </ModalDialog>
   );
 }
 

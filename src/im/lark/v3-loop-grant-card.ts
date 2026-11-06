@@ -9,8 +9,7 @@
  * iteration 对不上 core 的 expectedIteration 比对，天然失效。
  */
 
-import { config } from '../../config.js';
-import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
+import { short, truncate, escapeMd, v3RunDetailUrl } from './v3-card-common.js';
 
 export const V3_LOOP_GRANT_ACTION = 'v3_loop_grant';
 
@@ -49,10 +48,6 @@ const DEFAULT_DETAIL_MAX_CHARS = 500;
  *  iteration 入 nonce —— 追加被消费后旧卡对不上新耗尽轮，不会误触。 */
 export function v3LoopGrantCardNonce(runId: string, loopId: string, iteration: number): string {
   return `v3loopgrant:${runId}:${loopId}:${iteration}`;
-}
-
-function v3RunDetailUrl(runId: string): string {
-  return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
 }
 
 export function buildV3LoopGrantCard(input: V3LoopGrantCardInput): string {
@@ -148,16 +143,3 @@ export function buildV3LoopGrantCard(input: V3LoopGrantCardInput): string {
   });
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…（截断，完整见 Web 详情）`;
-}
-
-function short(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, max)}…`;
-}
-
-/** 转义 lark_md 里会被解析的字符，防 detail 注入破坏卡片结构。 */
-function escapeMd(s: string): string {
-  return s.replace(/[\\*_~`\[\]]/g, (c) => `\\${c}`);
-}

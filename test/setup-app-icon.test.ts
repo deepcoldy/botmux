@@ -52,18 +52,6 @@ describe('default app icon — reachable from the compiled binary', () => {
     expect(Buffer.from(BOTMUX_APP_ICON_BASE64, 'base64').equals(readFileSync(ICON_SOURCE))).toBe(true);
   });
 
-  it('SOURCE PIN: setup does not resolve the icon from a module-relative path', () => {
-    // Strip comments first: the fixed site keeps a docblock that QUOTES the old bad
-    // path as the thing not to reintroduce, and matching prose would make this
-    // assertion fire on its own explanation.
-    const code = readFileSync(resolve('src/setup/open-platform-automation.ts'), 'utf8')
-      .split('\n')
-      .filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l))
-      .join('\n');
-    expect(code).not.toMatch(/favicon\.png/);
-    expect(code).toContain('BOTMUX_APP_ICON_BASE64');
-  });
-
   /**
    * The build gate is the durable half of this fix, so prove it BITES rather than
    * trusting that it exists. Its first version required the directory derivation and

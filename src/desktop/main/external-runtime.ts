@@ -87,7 +87,6 @@ export function selectExternalRuntimeCandidate(
 }
 
 function createInstallProbeDeps(deps: ExternalRuntimeDiscoveryDeps): InstallProbeDeps {
-  const exists = deps.existsSync ?? defaultExistsSync;
   const readFile = deps.readFileSync ?? defaultReadFileSync;
   const realpath = deps.realpathSync ?? defaultRealpathSync;
   const stat = deps.statSync ?? defaultStatSync;

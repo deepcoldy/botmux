@@ -1,18 +1,35 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
 import {
-  BOT_DEFAULTS_TABS,
   BotAgentSection,
   BotDefaultsTabs,
   CardBehaviorSection,
+  patchCardPrefsFromBody,
   CodexAppDisplaySection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
+// Profile scanning has its own component/browser tests. Keep these agent-save
+// contract tests independent of that additional GET request.
+vi.mock('../src/dashboard/web/codex-profile-picker.js', () => ({
+  CodexProfilePicker: (props: any) => React.createElement('codex-profile-picker', props),
+}));
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+const originalFetch = globalThis.fetch;
+afterEach(() => { vi.unstubAllGlobals(); globalThis.fetch = originalFetch; });
+
+// Readiness timing/responses have dedicated coverage. Keep this fixture's
+// request recorders scoped to the save/model APIs they assert.
+function stubReadinessProbe(): void {
+  const configuredFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', ((url: any, init?: any) => String(url).includes('/api/cli-options/availability?')
+    ? Promise.resolve({ ok: true, json: async () => ({ status: 'unknown' }) } as Response)
+    : configuredFetch(url, init)) as typeof fetch);
+}
 
 describe('bot defaults task tabs', () => {
   it('renders five accessible categories and supports pointer selection', () => {
@@ -26,7 +43,6 @@ describe('bot defaults task tabs', () => {
     });
 
     const tabs = renderer.root.findAllByProps({ role: 'tab' });
-    expect(BOT_DEFAULTS_TABS).toEqual(['common', 'sessions', 'security', 'cards', 'advanced']);
     expect(tabs).toHaveLength(5);
     expect(tabs[0]!.props['aria-selected']).toBe(true);
     expect(tabs[1]!.props.tabIndex).toBe(-1);
@@ -107,7 +123,7 @@ describe('bot defaults cli label', () => {
     });
     const root = renderer.root;
     const dropdown = root.findByProps({ dataInput: 'agentCliId' });
-    expect(dropdown.props.options[0].label).toContain('未安装');
+    expect(dropdown.props.options[0].label).toMatch(/未安装|不可用/);
     expect(root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
   });
 });
@@ -127,6 +143,7 @@ describe('Codex-compatible runtime editor', () => {
   };
 
   function renderAgent(bot: Record<string, any>, patchBot = vi.fn()) {
+    stubReadinessProbe();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
@@ -138,6 +155,58 @@ describe('Codex-compatible runtime editor', () => {
     });
     return { renderer, root: renderer.root, patchBot };
   }
+
+  it('sends the Codex profile only when edited, and resets touched state after authoritative clear', async () => {
+    const original = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      if (String(url).includes('/api/cli-options/models')) return { ok: true, json: async () => ({ models: [] }) };
+      const body = JSON.parse(init?.body ?? '{}'); requests.push(body);
+      return { ok: true, json: async () => ({ ...body, ok: true, codexProfile: null }) };
+    });
+    try {
+      const { root, renderer } = renderAgent({ cliId: 'codex', codexProfile: 'saved' });
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[0]).not.toHaveProperty('codexProfile');
+      act(() => root.findByType('codex-profile-picker' as any).props.onChange(''));
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[1].codexProfile).toBeNull();
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[2]).not.toHaveProperty('codexProfile');
+      act(() => renderer.unmount());
+    } finally { globalThis.fetch = original; }
+  });
+
+  it('auto-clears the Codex profile when switching away; switching back before saving restores it', async () => {
+    const original = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      if (String(url).includes('/api/cli-options/models')) return { ok: true, json: async () => ({ models: [] }) };
+      const body = JSON.parse(init?.body ?? '{}'); requests.push(body);
+      // The server preserves an omitted field: echo the draft's saved value when
+      // the request does not carry codexProfile.
+      return { ok: true, json: async () => ({ ...body, ok: true, codexProfile: 'codexProfile' in body ? body.codexProfile : 'saved' }) };
+    });
+    try {
+      const { root, renderer } = renderAgent({ cliId: 'codex', codexProfile: 'saved' });
+      // Round-trip BEFORE any save: leaving Codex marks a clear and explains it;
+      // coming back restores the saved value and withdraws the clear.
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('claude-code'));
+      expect(root.findAllByProps({ 'data-section': 'codex-profile-cleared' })).toHaveLength(1);
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('codex'));
+      expect(root.findAllByProps({ 'data-section': 'codex-profile-cleared' })).toHaveLength(0);
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[0].cliId).toBe('codex');
+      expect(requests[0]).not.toHaveProperty('codexProfile');
+      // Actually leaving Codex and saving sends an explicit null so the daemon
+      // clears the profile instead of rejecting cliId!=codex.
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('traex'));
+      expect(root.findAllByProps({ 'data-section': 'codex-profile-cleared' })).toHaveLength(1);
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[1]).toMatchObject({ cliId: 'traex', codexProfile: null });
+      act(() => renderer.unmount());
+    } finally { globalThis.fetch = original; }
+  });
 
   async function flushEffects(cycles = 1): Promise<void> {
     for (let i = 0; i < cycles; i += 1) {
@@ -177,6 +246,52 @@ describe('Codex-compatible runtime editor', () => {
     expect(oldWrapperPayload.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
   });
 
+
+  it.each([
+    ['codex', 'codex', 'codex --profile withhooks'],
+    ['claude-code', 'claude-code', 'custom-launcher claude'],
+    ['codex', 'ttadk-x-codex', 'ttadk codex'],
+  ])('sends replacement intent only after explicitly selecting the launch option for %s', async (cliId, key, wrapperCli) => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (init?.method !== 'PUT') return { ok: true, status: 200, json: async () => ({ models: [], source: 'static', profiles: [] }) } as any;
+      const body = JSON.parse(String(init.body));
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({
+        ok: true, cliId, selectionKey: key, model: body.model,
+        wrapperCli: body.replaceCliSelection ? null : wrapperCli,
+      }) } as any;
+    });
+    let renderer: TestRenderer.ReactTestRenderer | undefined;
+    try {
+      const rendered = renderAgent({ cliId, wrapperCli, agentSelectionKey: key });
+      renderer = rendered.renderer;
+      const { root, patchBot } = rendered;
+      const save = async () => { await act(async () => { root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); }); };
+      await save();
+      expect(requests[0]).not.toHaveProperty('replaceCliSelection');
+      expect(requests[0]).not.toHaveProperty('wrapperCli');
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli }));
+      act(() => root.findByProps({ dataInput: 'agentModel' }).props.onChange('new-model'));
+      await save();
+      expect(requests[1]).toMatchObject({ model: 'new-model' });
+      expect(requests[1]).not.toHaveProperty('replaceCliSelection');
+      // The picker can deliberately choose the same key. This is distinguishable
+      // from an untouched fallback key even for an unregistered Codex wrapper.
+      act(() => root.findByProps({ id: 'bd-menu-agentCliId' }).findAllByType('button')
+        .find(button => button.props['aria-current'] === 'true')!.props.onClick());
+      await save();
+      expect(requests[2]).toMatchObject({ cliId: key, replaceCliSelection: true });
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli: null }));
+      await save();
+      expect(requests[3]).not.toHaveProperty('replaceCliSelection');
+    } finally {
+      if (renderer) act(() => renderer!.unmount());
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   it('shows and saves the configured Codex reasoning effort', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
@@ -206,6 +321,153 @@ describe('Codex-compatible runtime editor', () => {
       expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('sends Codex serviceTier only after the field is edited', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      if (String(_url).includes('/api/dsh/profiles')) {
+        return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, ...body, selectionKey: 'codex' }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6.1-sol', serviceTier: 'priority' });
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.value).toBe('priority');
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: '' }]);
+
+      act(() => picker.props.onChange('default'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests.at(-1)).toEqual({
+        cliId: 'codex',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: '',
+        serviceTier: 'default',
+      });
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('renders service tier options from the selected model capabilities and keeps a saved value', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            models: ['gpt-6-astra'],
+            source: 'live',
+            modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority', 'experimental'] }],
+          }),
+        } as any;
+      }
+      return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6-astra', serviceTier: 'ultrafast' });
+      await flushEffects();
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.options.map((option: any) => option.value)).toEqual(['', 'default', 'priority', 'ultrafast']);
+      expect(picker.props.options.map((option: any) => option.label)).toContain('Fast');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('falls back to inherit and standard when the selected model is absent from the capabilities', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'unknown-model' });
+      await flushEffects();
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.options.map((option: any) => option.value)).toEqual(['', 'default']);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('refetches model capabilities whenever the saved bot row identity changes', async () => {
+    const previousFetch = globalThis.fetch;
+    const modelFetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    globalThis.fetch = modelFetch;
+    try {
+      const bot = { larkAppId: 'cli_runtime', cliId: 'codex', model: 'gpt-6-astra' };
+      const { renderer } = renderAgent(bot);
+      await flushEffects();
+      expect(modelFetch).toHaveBeenCalledTimes(1);
+
+      renderer.update(React.createElement(BotAgentSection, {
+        bot: { ...bot, env: '', envKeys: ['OPENAI_API_KEY'] },
+        sessionFallback: 'codex',
+        cliState,
+        patchBot: vi.fn(),
+      }));
+      await flushEffects();
+      expect(modelFetch).toHaveBeenCalledTimes(2);
+      expect(modelFetch.mock.calls[1]?.[0]).toBe('/api/cli-options/models?key=codex&bot=cli_runtime');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('omits ultrafast when the selected model catalog only proves priority', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-sol'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-sol', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6-sol' });
+      await flushEffects();
+      const options = root.findByProps({ dataInput: 'agentServiceTier' }).props.options;
+      expect(options.map((option: any) => option.value)).toEqual(['', 'default', 'priority']);
+    } finally {
+      globalThis.fetch = previousFetch;
     }
   });
 
@@ -358,6 +620,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
+      stubReadinessProbe();
       const grokCliState = {
         options: [
           { id: 'grok', label: 'Grok' },
@@ -409,6 +672,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
+      stubReadinessProbe();
       const traexCliState = {
         options: [
           { id: 'traex', label: 'TraeX' },
@@ -664,7 +928,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       expect(requests).toEqual([{
-        cliId: 'traex',
+        cliId: 'traex', replaceCliSelection: true,
         model: 'GPT-5.6-Terra',
         reasoningEffort: 'xhigh',
         modelBackendVariant: '',
@@ -880,7 +1144,7 @@ describe('Codex-compatible runtime editor', () => {
         value => value === 1,
       );
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
+      expect(requests).toEqual([{ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null }]);
       await waitForObserved(
         () => root.findByProps({ 'data-agent-status': '' }).children.join(''),
         text => text.includes('已保存'),
@@ -912,29 +1176,31 @@ describe('Codex-compatible runtime editor', () => {
     expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' }).props.value).toBe('ultra');
   });
 
-  const dshCliState = {
+  const budgetCliState = {
     options: [
       { id: 'codex', label: 'Codex' },
       { id: 'dsh', label: 'dsh' },
+      { id: 'minimax', label: 'MiniMax Code' },
     ],
     ttadkModelDefault: '',
     ttadkModelSuggestions: [],
   };
 
-  function renderDsh(bot: Record<string, any>, patchBot = vi.fn()) {
+  function renderBudget(bot: Record<string, any>, patchBot = vi.fn()) {
+    stubReadinessProbe();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
         bot: { larkAppId: 'cli_dsh', model: '', ...bot },
-        sessionFallback: 'dsh',
-        cliState: dshCliState as any,
+        sessionFallback: bot.cliId ?? 'dsh',
+        cliState: budgetCliState as any,
         patchBot,
       }));
     });
     return { renderer, root: renderer.root, patchBot };
   }
 
-  it('shows the dsh turn timeout in minutes and PUTs it as milliseconds', async () => {
+  it.each(['dsh', 'minimax'])('shows the turn timeout in minutes and PUTs it as milliseconds (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -947,12 +1213,12 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: cliId }),
       } as any;
     });
     try {
       // 1_800_000 ms = 30 min
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 1_800_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       expect(input.props.value).toBe('30');
       act(() => input.props.onChange({ currentTarget: { value: '45' } }));
@@ -962,13 +1228,13 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       // 45 min → 2_700_000 ms
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('clears the dsh turn timeout to the runner default when emptied', async () => {
+  it.each(['dsh', 'minimax'])('clears the turn timeout to the runner default when emptied (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -981,11 +1247,11 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }),
       } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 1_800_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       expect(input.props.value).toBe('30');
       act(() => input.props.onChange({ currentTarget: { value: '' } }));
@@ -994,19 +1260,19 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      // Empty → '' so the daemon deletes the field (revert to 10-min default).
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
+      // Empty → '' so the daemon deletes the field (remove the opt-in limit).
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('omits the turn timeout field for non-dsh CLIs', () => {
-    const { root } = renderDsh({ cliId: 'codex' });
+  it('omits the turn timeout field for unsupported CLIs', () => {
+    const { root } = renderBudget({ cliId: 'codex' });
     expect(root.findAllByProps({ 'data-input': 'agentTurnTimeout' })).toHaveLength(0);
   });
 
-  it('shows a legal non-whole-minute timeout and preserves it on a model-only save', async () => {
+  it.each(['dsh', 'minimax'])('shows a legal non-whole-minute timeout and preserves it on a model-only save (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1020,12 +1286,12 @@ describe('Codex-compatible runtime editor', () => {
         ok: true,
         status: 200,
         // Daemon preserved the stored ms because the field was absent from the body.
-        json: async () => ({ ok: true, cliId: 'dsh', model: body.model, turnTimeoutMs: 90_001, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: body.model, turnTimeoutMs: 90_001, selectionKey: cliId }),
       } as any;
     });
     try {
       // 90_001 ms is a legal positive integer but not a whole minute.
-      const { root } = renderDsh({ cliId: 'dsh', model: 'm0', turnTimeoutMs: 90_001 });
+      const { root } = renderBudget({ cliId, model: 'm0', turnTimeoutMs: 90_001 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // Shown as exact decimal minutes (≈ 1.5000166667), never blanked.
       expect(input.props.value).not.toBe('');
@@ -1039,14 +1305,14 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'dsh', model: 'm1', reasoningEffort: '' }]);
+      expect(requests).toEqual([{ cliId, model: 'm1', reasoningEffort: '' }]);
       expect(Object.prototype.hasOwnProperty.call(requests[0], 'turnTimeoutMs')).toBe(false);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('re-saves the displayed non-whole-minute value back to the exact stored ms', async () => {
+  it.each(['dsh', 'minimax'])('re-saves the displayed non-whole-minute value back to the exact stored ms (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1059,11 +1325,11 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: cliId }),
       } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 90_001 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 90_001 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       const shown = input.props.value; // e.g. "1.5000166667"
       // Re-enter the exact displayed minutes (a touch) and save: rounding to the
@@ -1074,14 +1340,14 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
       expect(root.findAllByProps({ 'data-turn-timeout-error': '' })).toHaveLength(0);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('blocks the save and shows an inline error on invalid turn timeout input', async () => {
+  it.each(['dsh', 'minimax'])('blocks the save and shows an inline error on invalid turn timeout input (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1090,10 +1356,10 @@ describe('Codex-compatible runtime editor', () => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
-      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }) } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 600_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // 0 is not a clearable blank and not a positive timeout → must error, not clear.
       act(() => input.props.onChange({ currentTarget: { value: '0' } }));
@@ -1110,7 +1376,7 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
-  it('blocks the save when the minutes value exceeds the arm-able millisecond bound', async () => {
+  it.each(['dsh', 'minimax'])('blocks the save when the minutes value exceeds the arm-able millisecond bound (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1119,10 +1385,10 @@ describe('Codex-compatible runtime editor', () => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
-      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }) } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 600_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // 40000 min = 2.4e9 ms > 2_147_483_647 ms → invalid (would overflow setTimeout).
       act(() => input.props.onChange({ currentTarget: { value: '40000' } }));
@@ -1618,7 +1884,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -1926,6 +2192,35 @@ describe('Codex App history switch', () => {
       .toContain('write_failed');
   });
 
+  it('disables origin delegation without the browser bridge and saves an explicit opt-in', async () => {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true, codexBrowserAutoApproveOrigins: true } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    const render = (enabled: boolean) => React.createElement(CodexAppDisplaySection, {
+      bot: { larkAppId: 'cli_browser_policy', cliId: 'codex-app', codexBrowser: enabled },
+      putCardPref,
+    });
+    act(() => { renderer = TestRenderer.create(render(false)); });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-codex-browser-auto-approve-origins' });
+    expect(toggle().props.disabled).toBe(true);
+    expect(toggle().props.checked).toBe(false);
+    act(() => { renderer.update(render(true)); });
+    expect(toggle().props.disabled).toBe(false);
+    await act(async () => { toggle().props.onChange({ currentTarget: { checked: true } }); await Promise.resolve(); });
+    expect(putCardPref).toHaveBeenCalledWith({ codexBrowserAutoApproveOrigins: true });
+    expect(toggle().props.checked).toBe(true);
+  });
+
+  it('rolls origin delegation back when the bot setting cannot be saved', async () => {
+    const putCardPref = vi.fn(async () => ({ ok: false, status: 500, body: { error: 'write_failed' } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+      bot: { larkAppId: 'cli_browser_policy', cliId: 'codex-app', codexBrowser: true }, putCardPref,
+    })); });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-codex-browser-auto-approve-origins' });
+    await act(async () => { toggle().props.onChange({ currentTarget: { checked: true } }); await Promise.resolve(); });
+    expect(toggle().props.checked).toBe(false);
+  });
+
   it('renders and persists the default-off Codex browser bridge switch', async () => {
     const putCardPref = vi.fn(async () => ({
       ok: true,
@@ -2084,6 +2379,39 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-cot' }).props.checked).toBe(false);
   });
 
+  it('PUTs replyCardShowTools from the unified-card tool toggle and stays disabled in legacy mode', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_show_tools', replyCardMode: 'unified' }, putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-show-tools' });
+    expect(toggle.props.checked).toBe(true);
+    expect(toggle.props.disabled).toBe(false);
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenCalledWith({ replyCardShowTools: false });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-show-tools' }).props.checked).toBe(false);
+    act(() => renderer.unmount());
+
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_show_tools_legacy' }, putCardPref,
+      }));
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-show-tools' }).props.disabled).toBe(true);
+    act(() => renderer.unmount());
+  });
+
   it('persists live-card button visibility as a canonical hidden list', async () => {
     const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
       ok: true,
@@ -2124,7 +2452,8 @@ describe('card behavior defaults', () => {
 
     const grid = renderer.root.findByProps({ 'data-card-button-grid': true });
     const toggles = grid.findAllByProps({ className: 'toggle-row bd-card-button-toggle' });
-    expect(toggles).toHaveLength(6);
+    // 紧凑网格逐一枚举 STREAMING_CARD_BUTTON_IDS（output/terminal/writeLink/compact/stop/close/substitute）。
+    expect(toggles).toHaveLength(7);
     expect(toggles.every(toggle => toggle.findAllByType('small').length === 0)).toBe(true);
   });
 
@@ -2222,6 +2551,7 @@ describe('card behavior defaults', () => {
       'toggle-writable-link',
       'toggle-private-card',
       'toggle-cot',
+      'toggle-show-tools',
       'toggle-streaming-button-output',
       'toggle-streaming-button-terminal',
       'toggle-streaming-button-writeLink',
@@ -2255,7 +2585,7 @@ describe('card behavior defaults', () => {
       renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card', 'toggle-cot']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card', 'toggle-cot', 'toggle-show-tools']) {
       expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
     }
     expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);
@@ -2265,5 +2595,132 @@ describe('card behavior defaults', () => {
       await pending;
     });
     expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
+  });
+});
+
+
+describe('reply footer controls', () => {
+  it('preserves independent choices while toggling the master and rolls back failed saves', async () => {
+    let fail = false;
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({ ok: !fail, status: fail ? 500 : 200, body: fail ? { error: 'write_failed' } : { ok: true, ...patch } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+      bot: { larkAppId: 'cli_footer', replyFooterModel: false }, putCardPref,
+    })); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); await Promise.resolve(); });
+    };
+    await set('replyFooterEnabled', false);
+    expect(putCardPref).toHaveBeenLastCalledWith({ replyFooterEnabled: false });
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    // Child settings remain visible and editable while the master is off.
+    expect(toggle('replyFooterUsage').props.disabled).toBe(false);
+    await set('replyFooterUsage', false);
+    await set('replyFooterEnabled', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    expect(toggle('replyFooterUsage').props.checked).toBe(false);
+    fail = true;
+    await set('replyFooterModel', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+});
+
+
+describe('card pref save response backfills tool visibility onto the page row', () => {
+  it('maps replyCardShowTools from the PUT response body back onto the bot row', () => {
+    const base = { larkAppId: 'cli_show_tools_backfill' };
+    expect(patchCardPrefsFromBody(base, { replyCardShowTools: false }).replyCardShowTools).toBe(false);
+    // A true response restores the default-on display state.
+    expect(patchCardPrefsFromBody({ ...base, replyCardShowTools: false }, { replyCardShowTools: true }).replyCardShowTools).toBe(true);
+  });
+});
+
+describe('reply footer parent response synchronization', () => {
+  it('clears saved false values when a sparse response restores defaults', async () => {
+    const backend: Record<string, boolean> = { replyFooterEnabled: false, replyFooterModel: false };
+    function Parent() {
+      const [bot, setBot] = React.useState({ larkAppId: 'cli_footer_parent', ...backend });
+      return React.createElement(CardBehaviorSection, { bot, putCardPref: async patch => {
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === true) delete backend[key];
+          else backend[key] = value as boolean;
+        }
+        const body = { ok: true, ...backend };
+        setBot(current => patchCardPrefsFromBody(current, body));
+        return { ok: true, status: 200, body };
+      } });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(Parent)); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); });
+    };
+    await set('replyFooterEnabled', true);
+    await set('replyFooterModel', true);
+    await set('replyFooterBrand', false);
+    expect(toggle('replyFooterEnabled').props.checked).toBe(true);
+    expect(toggle('replyFooterModel').props.checked).toBe(true);
+    expect(toggle('replyFooterBrand').props.checked).toBe(false);
+    expect(backend).toEqual({ replyFooterBrand: false });
+    act(() => renderer.unmount());
+  });
+});
+
+describe('Codex CLI runtime no-progress notice (3.2 dashboard switch)', () => {
+  it('shows the CLI opt-in (not App-only controls) and PUTs cliEnabled while preserving enabled', async () => {
+    const patchBot = vi.fn();
+    const fetches: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal('fetch', ((url: any, init?: any) => {
+      const body = init?.body ? JSON.parse(init.body) : undefined;
+      fetches.push({ url: String(url), body });
+      return Promise.resolve({ ok: true, json: async () => ({ ok: true, noProgressNotify: body.noProgressNotify }) } as Response);
+    }) as typeof fetch);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex', cliId: 'codex', noProgressNotify: { enabled: true } },
+        putCardPref: vi.fn(),
+        patchBot,
+      }));
+    });
+    const tree = () => JSON.stringify(renderer.toJSON());
+    expect(tree()).toContain('Codex CLI');
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-codex-app-clean-input' })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-codex-browser' })).toHaveLength(0);
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' });
+    expect(toggle.props.checked).toBe(false);
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0]!.url).toContain('/api/bots/cli_codex/no-progress-notify');
+    expect(fetches[0]!.body).toEqual({ noProgressNotify: { enabled: true, cliEnabled: true } });
+    expect(patchBot).toHaveBeenCalledWith('cli_codex', { noProgressNotify: { enabled: true, cliEnabled: true } });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' }).props.checked).toBe(true);
+  });
+
+  it('rolls the CLI switch back when the PUT fails and keeps existing timeout/cliEnabled merge shape', async () => {
+    vi.stubGlobal('fetch', (() => Promise.resolve({
+      ok: false,
+      json: async () => ({ ok: false, error: 'write_failed' }),
+    })) as typeof fetch);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex2', cliId: 'codex', noProgressNotify: { enabled: true, cliEnabled: false, timeoutMs: 300000 } },
+        putCardPref: vi.fn(),
+        patchBot: vi.fn(),
+      }));
+    });
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' }).props.checked).toBe(false);
   });
 });

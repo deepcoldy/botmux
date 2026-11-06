@@ -1,6 +1,6 @@
 # botmux
 
-飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Gemini 等 20+ 种，完整列表见 README）。
+飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Antigravity / Grok / Pi 等 20+ 种，完整列表见 README）。
 
 ## 构建 & 运行
 
@@ -20,7 +20,7 @@ SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照�
 —— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
 现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
 
-**包管理器是 bun**（`packageManager: bun@1.4.2`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
+**包管理器是 bun**（`packageManager: bun@1.4.3`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
 
@@ -39,9 +39,11 @@ bun run dashboard:bun        # bun src/index-dashboard.ts
 bun run build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
 ```
 
-发版编译用的 Bun 版本**钉在 1.4.2**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
+发版编译用的 Bun 版本**钉在 1.4.3**，唯一来源是 `package.json` 的 `packageManager`（`.github/workflows/` 各处与它一致，`test/release-darwin-codesign-gate.test.ts` 守着）。本地 bun 与它不一致时，编译产物、bun.lock 重写、`bun test` 的行为可能和 CI 不一致：`bun run build` 与 `scripts/build-bun-binary.mjs` 开头会比对并**告警（不拦截）**，见 `scripts/check-bun-version.mjs`。对齐用告警给出的官方安装命令装指定版本——它解压到同目录再 `mv` 换 inode，fleet 正跑着的 bun 进程不受影响。
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
+
+**本机测试有整机并发闸**（`scripts/test-concurrency.mjs`，接在 `vitest.config.ts` 的 sequencer 与 `scripts/run-bun-tests.mjs` 上）：vitest 选中 ≥50 个文件、或跑全量 `test:bun` 时，在 `/tmp/botmux-test-slots` 的 flock 名额上排队，整机同时最多 `核数/16` 份（64 核 = 4 份）；vitest 默认 `maxWorkers = min(16, 核数/名额)`。CI（`CI=true`）上两者都不生效，行为不变。看到 `[test-gate] 名额已满` 说明机器忙——别用 `BOTMUX_TEST_GATE=0` 绕过，定向测试（少量文件）本来就不排队；其余覆盖变量见脚本头注释。
 
 worktree 里也能直接用 bun，且**不额外占依赖体积**——只要不跑 install（见下节）。实测在「源码 + `node_modules` symlink 到 canonical」的 worktree 里，`bun src/cli.ts`、`bun run build`、`tsc`、`vitest`、`build:bun`（`pty.node` 经 symlink 解析，不复制）以及编出二进制跑 smoke 六项，全部正常。
 
@@ -140,6 +142,27 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 - **跨 CLI**：改某个 CLI 适配器时，确认没动到 `adapters/cli/` 的共用基类/工具（`shared-hints`、`runner-input`、`registry` 等）或 worker 侧共用逻辑，否则可能连带影响其它 20+ 个 CLI。共用改动要在至少一个「别的 CLI」上验证仍可用
 - **跨后端 / 跨会话类型**：改动涉及 `PtyBackend` vs `TmuxBackend`、话题会话 vs 群会话 vs adopt/restore、sandbox on vs off、v3 workflow vs 普通会话时，逐一核对受影响的组合
 - **改公共层**（`core/`、`config.ts`、`bot-registry.ts`、`im/lark/`）时影响面最大——PR 描述里写清评估结论：动了什么共用路径、哪些平台/CLI/会话类型受影响、各自怎么验证的
+
+## 测试原则（写/改测试必读）
+
+测试要证明**行为**，不是给实现拍照。下面几类已经集中治理过，不要再新增：
+
+- **不读 `src/` 源码文本做断言。** `readFileSync('src/worker.ts')` 后 `toContain` 某行代码、或比 `indexOf` 先后，钉的是实现文本：改名、重构就红，代码还在但已经走不到时照样绿。git 历史里这类文件几乎每次改 `worker.ts` / `daemon.ts` 都得跟着改字符串。被测逻辑埋在闭包里时，**把它抽成可导出的纯函数再测**，而不是 grep；治理时因为没有 seam 而删掉的绊线记在 `docs/plans/2026-10-20-test-seam-backlog.md`，动到对应代码时顺手补上。只有真正的结构约束才保留这种写法：K1 import 边界与编译态限制、K2 没有行为 seam 的安全护栏、K3 高危回归绊线（数据丢失、fleet 崩溃、消息丢失或重复）、K4 机器可校验的一致性。保留时在用例或外层 `describe` 上方写 `// 源码结构护栏(Kx)：<为什么只能读源码、守的是什么不变量>`；只是把 src 下的 HTML/CSS 当夹具或交给浏览器、并不断言其文本的，写 `// 非文本断言：<说明>`。`test/test-hygiene.test.ts` 会拒绝没有标注的读源码用例。从 `worker.ts` / `daemon.ts` 切出真实函数执行再断言结果（`test/helpers/worker-function-harness.ts`）是没有 seam 时的过渡写法，扫描器不拦，但它依赖函数名和自由变量名，能导出时就直接 import。
+- **不钉文案和文档措辞。** 断言 docs / README / 卡片文案里有某句话，或断言另一个测试文件里有某个用例标题，都证明不了行为。文档由代码生成时，用 `--check` 式的漂移检查；需要「文档覆盖全部枚举值」这类一致性时，两侧都从真实数据取，不要抄字符串。
+- **不钉内部常量。** `expect(TIMEOUT_MS).toBe(60_000)` 只是把字面量再抄一遍。外部协议值（飞书错误码、终端转义序列、跨进程退出码、HTTP 路由、wire format）可以钉；常量之间的关系（`A >= B + C`）写成关系断言。
+- **不为死代码写测试。** 一个导出如果只有测试在调用，要么接进生产路径，要么连同测试一起删掉。测试隔离用的 `reset*` / `clear*Cache` 钩子不在此列。
+- 落笔前自问两句：这条测试会在**真实的行为回归**时变红吗？会在**无害的重构、改文案、调参数**时变红吗？前一问答「会」、后一问答「不会」，才值得写。
+
+## 独立对抗复核（改持久状态语义必做）
+
+改动**新增或修改持久状态的行为语义**——任务认领/结算、暂停恢复、通知投递、账本计数、重试窗口、会话生命周期——push 前做一次**独立对抗复核**。动机：同一心智模型既写实现又写测试，**「交叠」类缺陷（状态语义与时序/并发交叉处）靠读代码和自查发现不了**；由未参与实现的独立上下文在提交前从异常场景攻一遍，能把问题留在提交侧，减少外部评审往返。#2237（有状态定时任务）的复盘显示，这类「交叠」缺陷集中在下面三类通用场景（另有一类是测试覆盖缺失，见下「变异复验」）；其中五处旁路由提交前的一次独立复核发现并随修复一并提交。
+
+- **触发条件**：持久状态的**行为语义**变了（纯重构、只读展示、纯文案不算）。拿不准就按触发处理——复核成本远低于一轮外部评审往返。
+- **做法**：由**未参与实现的独立上下文**（另一会话/另一 agent）执行，只提供 diff、设计文档与现有测试环境，不传达实现者自己的解读。本条面向 agent 贡献流程（AGENTS.md 转发至此），**不设 CI 门禁**，不约束人类贡献者。
+- **攻击面至少覆盖三类通用场景**（与具体功能无关）：①**人工中途干预**——操作进行到一半人介入（暂停/取消/改配置），流程转回来时状态是否自洽；②**多步写入只完成一半**——前半步落盘、后半步失败，重启或下一轮是否永久静默/永久重复；③**周期循环 × 长操作/等待窗口交叠**——tick、重试窗口、超时与下一次常规运行在时间上穿插时，先后与重入是否成立。
+- **探针证据**：每个怀疑用**真实组件 + 假时钟**（可控 timer）跑出复现序列才算数，**不接受仅读代码得出的「应该没问题」**。
+- **变异复验**：对本次新增的测试，摘掉被测守卫（或把条件写反）必须**咬红**；照旧绿说明测试没钉住行为，按「测试原则」修。
+- **产出**：问题清单（**级别/场景/探针证据/建议修法**）连同修法、回归用例写进 PR 描述（**只写问题清单与探针证据，不写由谁执行的复核编排**）；复核未发现问题的，注明攻过哪些场景即可。
 
 ## PR 规范
 

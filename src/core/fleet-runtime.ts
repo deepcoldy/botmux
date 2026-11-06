@@ -23,15 +23,19 @@ import { resolveDaemonEnv } from '../cli/daemon-lifecycle-env.js';
 import { scrubDetachedRestartEnvRefresh } from './restart-env-refresh.js';
 import type { RestartEnvFallback } from './restart-env-refresh.js';
 import { stripDashboardH5Env } from '../utils/child-env.js';
+import { scrubSessionTempEnv } from './session-temp.js';
 import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
+import { findRetiredCliBots } from '../adapters/cli/retired-cli.js';
 import {
   inspectFleetProcess,
   signalAttestedFleetProcess,
   type FleetProcessAttestation,
   type FleetProcessIdentityRuntime,
-  type FleetProcessInspection,
   fleetProcessIdentityRuntime,
+  inspectSupervisorState,
 } from './fleet-process-identity.js';
+
+export { inspectSupervisorState };
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -152,6 +156,7 @@ export function resolveFleetDaemonEnv(
   };
   scrubDetachedRestartEnvRefresh(env);
   stripDashboardH5Env(env);
+  scrubSessionTempEnv(env);
   //
   // MIGRATION-CRITICAL: pin SESSION_DATA_DIR for every supervised child. The old
   // pm2 ecosystem injected `SESSION_DATA_DIR: DATA_DIR` into both the bot daemons
@@ -206,6 +211,9 @@ export function resolveFleetBots(): FleetBotSpec[] {
  * resolveFleetMembers(), so operators retain a recovery surface. */
 export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotSpec[] {
   const cyclicAppIds = new Set(findQuotaFallbackCycles(list as any[]).flat());
+  // Rows on a removed CLI (gemini) are not started either: their daemon would
+  // only exit on the same notice in a restart loop (see retired-cli.ts).
+  const retiredIndexes = new Set(findRetiredCliBots(list).map(bot => bot.index));
   return list.map((b, index) => {
     const bot = (b ?? {}) as { name?: unknown; larkAppId?: unknown };
     return {
@@ -216,7 +224,7 @@ export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotS
       appId: typeof bot.larkAppId === 'string' ? bot.larkAppId : '',
       botIndex: index,
     };
-  }).filter(spec => !cyclicAppIds.has(spec.appId));
+  }).filter(spec => !cyclicAppIds.has(spec.appId) && !retiredIndexes.has(spec.botIndex));
 }
 
 const LOG_DIR = join(CONFIG_DIR, 'logs');
@@ -256,28 +264,6 @@ export function resolveDashboardSpec(): FleetBotSpec {
  */
 export function resolveFleetMembers(): FleetBotSpec[] {
   return [...resolveFleetBots(), resolveDashboardSpec()];
-}
-
-function supervisorCommandMatches(state: FleetState, commandLine: string): boolean {
-  if (!state.supervisorEntry || !commandLine.includes(state.supervisorEntry)) return false;
-  return state.supervisorEntry.includes('index-supervisor') || commandLine.includes('__supervisor');
-}
-
-export function inspectSupervisorState(
-  state: FleetState,
-  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
-): FleetProcessInspection {
-  const pid = state?.supervisorPid ?? 0;
-  if (pid > 1 && !state.supervisorCommand && !state.supervisorEntry) return { status: 'unverifiable' };
-  return inspectFleetProcess(
-    pid,
-    state.supervisorProcessStart,
-    state.supervisorPidNamespace,
-    commandLine => state.supervisorCommand
-      ? commandLine === state.supervisorCommand
-      : supervisorCommandMatches(state, commandLine),
-    runtime,
-  );
 }
 
 export function liveSupervisorTarget(
@@ -323,8 +309,13 @@ export interface StartFleetResult {
  * outlives this CLI (detached + unref), with stdout/err to the botmux log dir;
  * boot persistence (systemd/launchd) re-invokes `botmux start` → here.
  *
- * NOTE: the caller must already hold the fleet-mutation file lock so two
- * concurrent `botmux start` invocations can't both pass the liveness check.
+ * NOTE: the caller must already hold the fleet-mutation file lock. That alone
+ * does NOT make the check-then-spawn exclusive: the spawned supervisor records
+ * itself in fleet-state only after its own boot, so a second `botmux start`
+ * in that window still sees no supervisor. The single-owner guarantee is
+ * completed supervisor-side by FleetSupervisor's ownership claim, which makes
+ * the later of two concurrently spawned supervisors exit without touching
+ * anything.
  */
 export interface StartFleetOptions {
   refreshPersistedEnv?: boolean;

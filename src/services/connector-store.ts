@@ -1,7 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
@@ -51,6 +53,12 @@ export interface ConnectorDefinition {
     // Trusted task ("what should the bot do with this event"); injected above the
     // untrusted event data when a turn fires. Empty/absent = no extra instruction.
     instruction?: string;
+    /** Connector-owner opt-in: render the (authenticated) event body as a
+     *  trusted task request instead of untrusted event data. For callers whose
+     *  body IS the task (e.g. an agent platform dispatching work). Only allowed
+     *  on a connector with token / hmac-sha256 verification — see
+     *  connectorPayloadTrustBlocker. Absent (older stores) = false. */
+    trustPayload?: boolean;
   };
   /** Feishu topic seed shown when this webhook has to open a new topic.
    *  Missing on older stores means `default` for backwards compatibility. */
@@ -110,6 +118,25 @@ export interface ConnectorDefinition {
   updatedAt: string;
 }
 
+const VERIFIED_TYPES: readonly string[] = ['token', 'hmac-sha256'];
+
+/** Why `promptEnvelope.trustPayload` cannot be on for this connector, or null
+ *  when it may. Trusting the body is only meaningful when every delivery is
+ *  authenticated: without a token / HMAC secret anyone who learns the URL
+ *  could inject instructions. `hasSecret` reports whether verify.secretRef
+ *  resolves to a stored secret (callers pass the webhook-key lookup). */
+export function connectorPayloadTrustBlocker(
+  connector: Pick<ConnectorDefinition, 'verify'>,
+  hasSecret: boolean,
+): 'trust_payload_requires_verification' | null {
+  const verify = connector.verify as Partial<ConnectorDefinition['verify']> | undefined;
+  if (!verify || typeof verify.type !== 'string' || !VERIFIED_TYPES.includes(verify.type)) {
+    return 'trust_payload_requires_verification';
+  }
+  if (!verify.secretRef || !hasSecret) return 'trust_payload_requires_verification';
+  return null;
+}
+
 export interface ConnectorStoreFile {
   version: 1;
   connectors: ConnectorDefinition[];
@@ -135,21 +162,18 @@ function normalizeStore(raw: unknown): ConnectorStoreFile {
 }
 
 export function readConnectorStore(dataDir: string = config.session.dataDir): ConnectorStoreFile {
-  const fp = storePath(dataDir);
-  if (!existsSync(fp)) return emptyStore();
-  try {
-    return normalizeStore(JSON.parse(readFileSync(fp, 'utf-8')));
-  } catch {
-    return emptyStore();
-  }
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次 writeConnectorStore 覆盖），见 utils/json-file.ts。
+  return normalizeStore(readJsonFileSoft<Record<string, any>>(storePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'connector-store',
+  }));
 }
 
 function writeConnectorStore(dataDir: string, store: ConnectorStoreFile): void {
   const fp = storePath(dataDir);
   mkdirSync(dirname(fp), { recursive: true });
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(normalizeStore(store), null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  renameSync(tmp, fp);
+  atomicWriteFileSync(fp, JSON.stringify(normalizeStore(store), null, 2) + '\n', { mode: 0o600, followTargetSymlink: false });
 }
 
 export function listConnectors(dataDir: string = config.session.dataDir): ConnectorDefinition[] {

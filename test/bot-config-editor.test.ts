@@ -391,6 +391,26 @@ describe('applyBotConfigEdits', () => {
     expect(out.cliPathOverride).toBeUndefined();
   });
 
+  it('configures and preserves a named Kimi-compatible CodeM distribution', () => {
+    const cliRuntime = { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper', update: { provider: 'none' as const } };
+    const configured = applyBotConfigEdits({ larkAppId: 'app', larkAppSecret: 'secret', cliId: 'kimi' }, { cliRuntime });
+    expect(configured.cliRuntime).toEqual(cliRuntime);
+    expect(configured.cliPathOverride).toBe(cliRuntime.executable);
+    expect(applyBotConfigEdits(configured, { model: null }).cliRuntime).toEqual(cliRuntime);
+  });
+
+  it('clears the old distribution when changing between supported adapter families', () => {
+    for (const [from, to] of [['codex', 'kimi'], ['kimi', 'codex']]) {
+      const switched = applyBotConfigEdits({
+        larkAppId: 'app', larkAppSecret: 'secret', cliId: from,
+        cliRuntime: { id: 'custom', executable: '/opt/custom' }, cliPathOverride: '/opt/custom',
+      }, { cliChoice: to });
+      expect(switched.cliId).toBe(to);
+      expect(switched.cliRuntime).toBeUndefined();
+      expect(switched.cliPathOverride).toBeUndefined();
+    }
+  });
+
   it('does not strand a runtime shadow when TUI switches to a non-Codex adapter with a blank path answer', () => {
     const out = applyBotConfigEdits({
       larkAppId: 'app',
@@ -470,6 +490,15 @@ describe('applyBotConfigEdits', () => {
       larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
     }, { backendType: 'zmx' });
     expect(edited.backendType).toBe('zmx');
+  });
+
+  it('accepts remote-runner as a backendType', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'cli_remote_runner',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+    }, { backendType: 'remote-runner' });
+    expect(edited.backendType).toBe('remote-runner');
   });
 
   it('keeps fields unchanged on empty input and clears optional fields with dash', () => {
@@ -592,6 +621,7 @@ describe('resolveCliId', () => {
     expect(resolveCliId('29')).toBe('ebsd');
     expect(resolveCliId('30')).toBe('minimax'); // v3.21.0 起已发布，禁止移位
     expect(resolveCliId('31')).toBe('mimocode');
+    expect(resolveCliId('32')).toBe('remote-runner');
   });
 
   it('passes through literal cliIds unchanged', () => {

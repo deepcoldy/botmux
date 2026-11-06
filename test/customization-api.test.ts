@@ -49,10 +49,10 @@ function mockReq(method: string, body?: unknown): IncomingMessage {
   return req as IncomingMessage;
 }
 
-async function call(method: string, path: string, body?: unknown, search = '', getBotNames?: () => ReadonlyMap<string, string>) {
+async function call(method: string, path: string, body?: unknown, search = '') {
   const { res, out } = mockRes();
   const url = new URL(`http://localhost${path}${search}`);
-  const handled = await handleCustomizationApi(mockReq(method, body), res, url, { getBotNames });
+  const handled = await handleCustomizationApi(mockReq(method, body), res, url);
   return { handled, ...out };
 }
 
@@ -75,28 +75,10 @@ describe('customization dashboard API', () => {
     expect(r.body.skills.length).toBeGreaterThan(0);
   });
 
-  it('uses display names and resolved live/offline names even when bots.json has no name', async () => {
-    const configPath = join(tmp, 'bots.json');
-    vi.stubEnv('BOTS_CONFIG', configPath);
-    writeFileSync(configPath, JSON.stringify([
-      { larkAppId: 'custom', displayName: '自定义备注', name: '旧配置名' },
-      { larkAppId: 'live' },
-      { larkAppId: 'offline' },
-      { larkAppId: 'legacy', name: '配置名称' },
-      { larkAppId: 'unknown' },
-    ].map(bot => ({ ...bot, larkAppSecret: 'secret', cliId: 'claude-code' }))));
-    const names = new Map([['custom', '飞书应用名'], ['live', '在线机器人'], ['offline', '离线缓存名']]);
-    const getBotNames = () => names;
-    const result = await call('GET', '/api/customization', undefined, '', getBotNames);
-    expect(result.body.bots.map((bot: any) => [bot.larkAppId, bot.name])).toEqual([
-      ['custom', '自定义备注'], ['live', '在线机器人'], ['offline', '离线缓存名'],
-      ['legacy', '配置名称'], ['unknown', 'unknown'],
-    ]);
-    // Renaming and saving prompt/skill settings must retain current names.
-    names.set('live', '更新后的名称');
-    const saved = await call('PUT', '/api/customization/enabled', { enabled: false }, '', getBotNames);
-    expect(saved.body.snapshot.bots.find((bot: any) => bot.larkAppId === 'live').name).toBe('更新后的名称');
-    expect(saved.body.snapshot.bots.find((bot: any) => bot.larkAppId === 'offline').name).toBe('离线缓存名');
+  it('does not return a bot roster: zero injection moved to Bot / Agent config', async () => {
+    const result = await call('GET', '/api/customization');
+    expect(result.status).toBe(200);
+    expect(result.body).not.toHaveProperty('bots');
   });
 
   it('PUT prompt override then snapshot reflects it', async () => {

@@ -2,14 +2,17 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
-import * as pty from 'node-pty';
+import * as pty from '../../utils/pty.js';
 import xtermHeadless from '@xterm/headless';
-import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
+import type { BackendType, SessionBackend, SpawnOpts, SessionProbe, HerdrBackendConfig, HerdrBackendPlacement } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { sessionChildEnvWithInject, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
+import { herdrExecutable } from '../../utils/herdr-executable.js';
+import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/herdr-pane-grid.js';
 
 const { Terminal } = xtermHeadless;
 
-export type PersistentBackendType = Exclude<BackendType, 'pty'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
 
 export interface HerdrExternalTarget {
   sessionName: string;
@@ -27,14 +30,27 @@ interface HerdrBackendOptions {
   ownsSession?: boolean;
   /** Whether /close should close just the managed pane in a shared session. */
   ownsAgent?: boolean;
+  herdrConfig?: HerdrBackendConfig;
+  isCustomHost?: boolean;
 }
 
 // Slow output-streaming poll. We deliberately avoid the original 250ms tick:
-// herdr exposes `wait agent-status`, which we use to fire an immediate read on
+// herdr exposes status waits, which we use to fire an immediate read on
 // every idle/working/blocked transition. The 500ms timer is a fallback for the
 // in-the-middle-of-working case where output streams without a status flip.
 const POLL_INTERVAL_MS = 500;
+// An unchanged pane backs the poll off by doubling up to IDLE_POLL_MAX_MS, so
+// idle topics stop costing two Herdr CLI processes (list + 10k-line read) every
+// 0.5 s. New output, input sent to the pane, or a status transition returns to
+// POLL_INTERVAL_MS at once. Exit stays prompt while backed off: the status
+// wait returns as soon as the agent process goes away, which wakes the poll.
+const IDLE_POLLS_BEFORE_BACKOFF = 6;
+const IDLE_POLL_MAX_MS = 5_000;
 const READ_LINES = 10_000;
+// An adopted pane is sized by the user's Herdr client and can change at any
+// time. getPaneSize() feeds every snapshot render and web-terminal pin, so
+// re-read the pane PTY at most this often rather than once per caller.
+const EXTERNAL_GRID_TTL_MS = 2_000;
 const MAX_AGENT_PROBE_FAILURES = 3;
 // While `agent list` keeps failing (keep-alive), re-confirm liveness through
 // `session list` at most once per this window. Without it every
@@ -46,18 +62,24 @@ const SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS = 5_000;
 // Synchronous (execFileSync 'sleep') because spawn() must stay sync.
 const SERVER_BOOT_POLL_MS = 100;
 const SERVER_BOOT_DEADLINE_MS = 5000;
-// `herdr wait agent-status` blocks until the requested status, or succeeds
-// immediately when that status is already current. We cap it so a long-stuck
+// A status wait blocks until one of the requested statuses, or succeeds
+// immediately when one of them is already current. We cap it so a long-stuck
 // agent still re-arms the watcher and we never accumulate an
 // indefinitely-orphaned subprocess on process teardown.
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // Bound automatic agent detection after explicitly running the launcher in a
 // new pane. Input readiness remains gated by the worker's onAgentStatus hook.
-const PANE_AGENT_START_TIMEOUT_MS = 30_000;
+// 60s rather than 30s: on a heavily loaded host a cold CLI start
+// plus herdr's own detection can exceed 30s, and the failure is terminal for
+// a session started by an inbound message (no daemon-side startup auto-retry).
+export const PANE_AGENT_START_TIMEOUT_MS = 60_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
-// Watch the full useful lifecycle, not just settled statuses. Herdr's
-// `wait agent-status --status X` is level-triggered: when the pane is already
-// in X it succeeds immediately. After one status wins we therefore exclude it
+// A started launcher deletes itself. This fallback only reaps one Herdr never
+// ran, and is long enough for a macOS Gatekeeper assessment of the exec to end.
+const PANE_AGENT_LAUNCHER_FALLBACK_CLEANUP_MS = 60_000;
+// Watch the full useful lifecycle, not just settled statuses. Herdr's status
+// waits are level-triggered: when the pane is already in X they succeed
+// immediately. After one status wins we therefore exclude it
 // from the next cohort until another lifecycle status wins. Watching `working`
 // is what re-enables `done`/`blocked`/`idle` for the following turn without
 // hot-looping on the settled state between turns.
@@ -71,7 +93,6 @@ const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
   pi: 'pi',
   claude: 'claude',
   codex: 'codex',
-  gemini: 'gemini',
   'cursor-agent': 'cursor',
   agy: 'agy',
   omp: 'omp',
@@ -96,7 +117,7 @@ export interface HerdrWebTerminalCursor {
 
 function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): JsonCommandResult {
   try {
-    const out = execFileSync('herdr', args, {
+    const out = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       input: opts?.input,
       stdio: opts?.input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
@@ -115,6 +136,9 @@ function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; 
   return result.ok ? result.value : undefined;
 }
 
+/** exec failures (errno codes) that waiting will not fix. */
+const HERDR_EXEC_PERMANENT_CODES = new Set(['ENOENT', 'EACCES', 'ENOEXEC', 'ENOTDIR']);
+
 /** Required command variant used by multi-step Herdr protocols.
  *
  * `jsonCommand()` intentionally collapses command failures to undefined for
@@ -132,7 +156,7 @@ function requiredJsonCommand(
 ): any {
   let raw = '';
   try {
-    raw = execFileSync('herdr', args, {
+    raw = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       input: opts?.input,
       stdio: opts?.input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
@@ -144,17 +168,24 @@ function requiredJsonCommand(
     const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : err?.stderr?.toString?.().trim();
     const stdout = typeof err?.stdout === 'string' ? err.stdout.trim() : err?.stdout?.toString?.().trim();
     const detail = stderr || stdout;
-    throw new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`);
+    // herdr did not answer (our exec deadline hit, the host could not fork, or
+    // it exited without output), as opposed to answering with an error. A
+    // missing or unusable executable will not get better by waiting.
+    const transient = err?.code
+      ? !HERDR_EXEC_PERMANENT_CODES.has(err.code)
+      : !detail;
+    throw Object.assign(new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`),
+      transient ? { herdrTransient: true } : {});
   }
   if (!raw) {
     if (opts?.allowEmpty) return undefined;
-    throw new Error(`${operation} failed: empty response`);
+    throw Object.assign(new Error(`${operation} failed: empty response`), { herdrTransient: true });
   }
   let value: any;
   try {
     value = JSON.parse(raw);
   } catch {
-    throw new Error(`${operation} failed: invalid JSON response`);
+    throw Object.assign(new Error(`${operation} failed: invalid JSON response`), { herdrTransient: true });
   }
   if (value?.error) {
     const code = typeof value.error.code === 'string' ? value.error.code : 'unknown_error';
@@ -166,7 +197,7 @@ function requiredJsonCommand(
 
 function herdrUsesManagedAgentFacade(): boolean {
   try {
-    const out = execFileSync('herdr', ['--version'], {
+    const out = execFileSync(herdrExecutable(), ['--version'], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 3000,
@@ -183,8 +214,26 @@ function herdrUsesManagedAgentFacade(): boolean {
   }
 }
 
-function paneAgentKindForExecutable(bin: string): string | undefined {
-  return PANE_AGENT_KIND_BY_EXECUTABLE[basename(bin)];
+function paneAgentKindForExecutable(bin: string, cliId?: string): string | undefined {
+  const base = basename(bin);
+  if (PANE_AGENT_KIND_BY_EXECUTABLE[base]) {
+    return PANE_AGENT_KIND_BY_EXECUTABLE[base];
+  }
+  // Support wrappers like claude-botmux, claude_wrapper, codex-v2
+  for (const [key, kind] of Object.entries(PANE_AGENT_KIND_BY_EXECUTABLE)) {
+    if (base.startsWith(`${key}-`)) return kind;
+    if (base.startsWith(`${key}_`)) return kind;
+  }
+  if (cliId) {
+    if (PANE_AGENT_KIND_BY_EXECUTABLE[cliId]) {
+      return PANE_AGENT_KIND_BY_EXECUTABLE[cliId];
+    }
+    for (const [key, kind] of Object.entries(PANE_AGENT_KIND_BY_EXECUTABLE)) {
+      if (cliId.startsWith(`${key}-`)) return kind;
+      if (cliId.startsWith(`${key}_`)) return kind;
+    }
+  }
+  return undefined;
 }
 
 function environmentForPaneAgent(bin: string, childEnv: Record<string, string> | undefined): Record<string, string> {
@@ -207,22 +256,29 @@ function shellSingleQuote(value: string): string {
  * Run this script by absolute path so interactive shell rc files cannot
  * shadow it by prepending real CLI directories to PATH. The mode-0700 script
  * restores the launch PATH and execs the full command, including wrappers and
- * multiline prompts. It removes itself before exec; the backend also cleans
- * up when automatic agent detection succeeds or any launch step fails.
+ * multiline prompts. It removes itself before exec; the backend removes it at
+ * once when a launch step fails, and only as a delayed fallback after the
+ * agent was detected (see startPaneAgent).
  */
 function createPaneAgentLauncher(
   canonicalExecutable: string,
   bin: string,
   args: string[],
   originalPath: string,
+  protectedUnsetEnv?: readonly string[],
 ): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-herdr-launch-'));
   const path = join(dir, canonicalExecutable);
-  const command = [bin, ...args].map(shellSingleQuote).join(' ');
+  const protectedUnsetFlags = trustedSessionEnvUnsetFlags(protectedUnsetEnv);
+  const command = [
+    ...(protectedUnsetFlags.length > 0 ? ['/usr/bin/env', ...protectedUnsetFlags] : []),
+    bin,
+    ...args,
+  ].map(shellSingleQuote).join(' ');
   writeFileSync(path, [
     '#!/bin/sh',
     // Minimise the lifetime of the mode-0700 file containing the exact argv.
-    // The backend's finally block is the fallback if Herdr never executes it.
+    // The backend's cleanup is the fallback if Herdr never executes it.
     '/bin/rm -f -- "$0"',
     '/bin/rmdir -- "${0%/*}" 2>/dev/null || true',
     `PATH=${shellSingleQuote(originalPath)}`,
@@ -247,7 +303,6 @@ function envCommandArgs(env: Record<string, string>): string[] {
 function sharedServerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const safeKeys = [
     'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
-    'TMPDIR', 'TMP', 'TEMP',
     'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR',
     'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'COLORTERM',
   ];
@@ -258,7 +313,7 @@ function sharedServerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 function runHerdr(args: string[], opts?: { timeout?: number; input?: string }): boolean {
   try {
-    execFileSync('herdr', args, {
+    execFileSync(herdrExecutable(), args, {
       input: opts?.input,
       stdio: opts?.input === undefined ? 'ignore' : ['pipe', 'ignore', 'ignore'],
       timeout: opts?.timeout ?? 5000,
@@ -273,6 +328,35 @@ function herdrSessionArgs(sessionName: string, args: string[]): string[] {
   return ['--session', sessionName, ...args];
 }
 
+/** Linux MAX_ARG_STRLEN caps one argv element at 131072 bytes (32 pages).
+ *  Keep the `pane send-text` argument below it with headroom, since execve
+ *  rejects the whole call (E2BIG) once any single element reaches the cap. */
+const HERDR_SEND_TEXT_MAX_ARG_BYTES = 131072 - 8192;
+
+/** Split a string into pieces whose UTF-8 byte length is <= maxBytes, never
+ *  cutting through a multi-byte character. Returns one piece for short/empty
+ *  input so callers always issue at least one write. */
+export function chunkByUtf8Bytes(text: string, maxBytes: number): string[] {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 4) {
+    throw new RangeError('maxBytes must be an integer >= 4');
+  }
+  const chunks: string[] = [];
+  let chunk = '';
+  let chunkBytes = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (chunk && chunkBytes + charBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = '';
+      chunkBytes = 0;
+    }
+    chunk += char;
+    chunkBytes += charBytes;
+  }
+  chunks.push(chunk);
+  return chunks;
+}
+
 function extractAgent(raw: any): any | undefined {
   return raw?.result?.agent;
 }
@@ -280,6 +364,28 @@ function extractAgent(raw: any): any | undefined {
 function extractAgents(raw: any): any[] {
   const agents = raw?.result?.agents;
   return Array.isArray(agents) ? agents : [];
+}
+
+/** A workspace/tab/pane list that placement decisions rest on. Unlike the
+ *  best-effort `jsonCommand`, a failed or malformed list throws: read as
+ *  "nothing there", it would make us create a workspace or tab in the user's
+ *  session. */
+function requiredHerdrList(operation: string, args: string[], key: 'workspaces' | 'tabs' | 'panes'): any[] {
+  const raw = requiredJsonCommand(operation, args);
+  const items = raw?.result?.[key] ?? raw?.[key];
+  if (!Array.isArray(items)) throw new Error(`${operation} failed: response has no ${key} list`);
+  return items;
+}
+
+/** The workspace/tab a configured name points to: exact id or label first,
+ *  then the label's first word (so "3" picks "3 其他", not "30 …"), then a
+ *  label prefix, then a substring. */
+function matchHerdrTarget(rows: any[], target: string, idKey: 'workspace_id' | 'tab_id'): any | undefined {
+  const label = (row: any): string => (typeof row?.label === 'string' ? row.label : '');
+  return rows.find(row => row?.[idKey] === target || label(row) === target)
+    ?? rows.find(row => label(row).split(/\s+/)[0] === target)
+    ?? rows.find(row => label(row).startsWith(target))
+    ?? rows.find(row => label(row).includes(target));
 }
 
 // Whether a matched `agent list` row represents an exited CLI. Verified against
@@ -293,6 +399,39 @@ function agentRowExited(agent: any): boolean {
   return agent?.agent_status === 'exited'
     || agent?.status === 'exited'
     || agent?.running === false;
+}
+
+let agentWaitSupported: boolean | undefined;
+
+/** Whether this Herdr has `agent wait --until` (probed once per process). */
+function supportsAgentWait(): boolean {
+  if (agentWaitSupported === undefined) {
+    try {
+      const help = execFileSync(herdrExecutable(), ['agent', 'wait', '--help'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      });
+      agentWaitSupported = typeof help === 'string' && help.includes('--until');
+    } catch {
+      agentWaitSupported = false;
+    }
+  }
+  return agentWaitSupported;
+}
+
+export function __testOnly_resetHerdrAgentWaitProbe(): void {
+  agentWaitSupported = undefined;
+}
+
+/** The status an `agent wait --until …` call matched, from its JSON stdout. */
+function agentWaitStatus(stdout: string, watched: readonly WatchedStatus[]): WatchedStatus | undefined {
+  try {
+    const status = JSON.parse(stdout.trim())?.result?.agent?.agent_status;
+    return watched.find(candidate => candidate === status);
+  } catch {
+    return undefined;
+  }
 }
 
 function extractReadText(raw: any): string {
@@ -309,7 +448,7 @@ function extractReadText(raw: any): string {
  */
 function readHerdrTextCommand(args: string[]): string {
   try {
-    const raw = execFileSync('herdr', args, {
+    const raw = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 5000,
@@ -339,9 +478,12 @@ function longestSuffixPrefix(previous: string, next: string): number {
 export class HerdrBackend implements SessionBackend {
   private serverProcess: ChildProcess | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
+  private pollDelayMs = POLL_INTERVAL_MS;
+  private unchangedPolls = 0;
   private statusWaitProcesses: ChildProcess[] = [];
   private readonly dataCbs: Array<(d: string) => void> = [];
   private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
+  private readonly paneGridCbs: Array<(grid: HerdrWebTerminalSize) => void> = [];
   private readonly webCursorCbs: Array<(cursor: HerdrWebTerminalCursor) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private readonly agentStatusCbs: Array<(status: HerdrAgentStatus) => void> = [];
@@ -353,6 +495,12 @@ export class HerdrBackend implements SessionBackend {
   private actuallyReattached = false;
   private cols = 200;
   private rows = 50;
+  /** Last grid read from an adopted pane's PTY (see getPaneSize). */
+  private externalGrid: HerdrWebTerminalSize | null = null;
+  private externalGridReadAtMs: number | null = null;
+  private externalTtyDevice: string | null = null;
+  /** Grid seen by the previous poll, to re-emit a frame when only it changed. */
+  private polledExternalGrid: HerdrWebTerminalSize | null = null;
   private agentProbeFailures = 0;
   /** Earliest wall-clock time a keep-alive `session list` confirmation may run
    *  again (backoff for sustained `agent list` failures; see
@@ -368,8 +516,12 @@ export class HerdrBackend implements SessionBackend {
 
   private childEnv: Record<string, string> | undefined;
 
+  private createdWorkspaceId?: string;
+  private createdTabId?: string;
+
   claudeJsonlPath?: string;
   cliPid?: number;
+  private cliExecutable?: string;
   cliCwd?: string;
 
   /** Default managed agent name for a Botmux-launched CLI (the single source of
@@ -389,7 +541,7 @@ export class HerdrBackend implements SessionBackend {
 
   static isAvailable(): boolean {
     try {
-      execFileSync('herdr', ['--version'], { stdio: 'ignore', timeout: 3000 });
+      execFileSync(herdrExecutable(), ['--version'], { stdio: 'ignore', timeout: 3000 });
       return true;
     } catch {
       return false;
@@ -502,10 +654,18 @@ export class HerdrBackend implements SessionBackend {
     return this.actuallyReattached;
   }
 
+  /** True only when spawn() launched the CLI process itself. Re-attaching to a
+   *  surviving agent or adopting an external pane observes a CLI that was
+   *  already running, so Herdr's status for it is not a boot-time guess. */
+  get launchedNewCli(): boolean {
+    return this.started && !this.actuallyReattached && !this.opts.externalTarget;
+  }
+
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     this.cols = opts.cols;
     this.rows = opts.rows;
     this.cliCwd = opts.cwd;
+    this.cliExecutable = basename(opts.cliBin ?? bin);
     // worker.ts builds opts.env via redactChildEnv() (drops bare LARK_APP_*)
     // and injects BOTMUX_SESSION_ID/CHAT_ID/LARK_APP_ID/ROOT_MESSAGE_ID. We
     // must thread this env into the herdr daemon spawn AND the agent-start
@@ -524,7 +684,11 @@ export class HerdrBackend implements SessionBackend {
     // Appended last so injected values win over same-named keys in opts.env.
     this.childEnv = this.opts.externalTarget
       ? undefined
-      : { ...opts.env, ...(opts.injectEnv ?? {}) };
+      : sessionChildEnvWithInject(opts);
+    const protectedUnsetFlags = trustedSessionEnvUnsetFlags(opts.protectedUnsetEnv);
+    for (let index = 1; index < protectedUnsetFlags.length; index += 2) {
+      delete this.childEnv?.[protectedUnsetFlags[index]!];
+    }
     this.ensureServer();
 
     const external = this.opts.externalTarget;
@@ -567,13 +731,16 @@ export class HerdrBackend implements SessionBackend {
         const envArgs = this.opts.ownsSession === false
           ? envCommandArgs(this.childEnv ?? {})
           : [];
+        const protectedCommand = protectedUnsetFlags.length > 0
+          ? ['/usr/bin/env', ...protectedUnsetFlags, bin, ...args]
+          : [bin, ...args];
         const started = requiredJsonCommand(
           `herdr agent start ${this.agentName} in ${this.sessionName}`,
           herdrSessionArgs(this.sessionName, [
           'agent', 'start', this.agentName,
           '--cwd', opts.cwd,
           ...envArgs,
-          '--', bin, ...args,
+          '--', ...protectedCommand,
           ]),
           { timeout: 10_000, env: this.childEnv },
         );
@@ -584,6 +751,9 @@ export class HerdrBackend implements SessionBackend {
     }
 
     this.started = true;
+    // Baseline for grid-change detection: the grid getPaneSize() advertises
+    // right now, spawn-time fallback included (see externalGridChanged()).
+    if (this.opts.externalTarget) this.polledExternalGrid = this.getPaneSize();
     // Baseline policy mirrors the tmux/PTY backends:
     //   - Fresh spawn: lastText='' so the first poll emits everything from
     //     t=0 (matches the PTY contract — listeners see all output even if
@@ -597,19 +767,33 @@ export class HerdrBackend implements SessionBackend {
   }
 
   write(data: string): boolean {
+    this.wakePolling();
     if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
-    return runHerdr(
-      herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, data]),
-      { timeout: 5000 },
-    );
+    // Linux caps a SINGLE argv element at MAX_ARG_STRLEN (32 pages = 131072
+    // bytes), independent of ARG_MAX. A longer `pane send-text` payload dies
+    // with E2BIG before exec — the whole message is lost, and runHerdr reports
+    // false. Split oversized payloads into argv-safe pieces on UTF-8 boundaries
+    // and write them in order: the pane receives the identical byte sequence.
+    // A bracketed paste keeps one pair of markers because they are part of the
+    // stream; split points between the markers never leave paste mode.
+    const chunks = chunkByUtf8Bytes(data, HERDR_SEND_TEXT_MAX_ARG_BYTES);
+    for (const chunk of chunks) {
+      if (!runHerdr(
+        herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, chunk]),
+        { timeout: 5000 },
+      )) return false;
+    }
+    return true;
   }
 
   sendText(text: string): boolean {
+    this.wakePolling();
     return this.write(text);
   }
 
   sendSpecialKeys(...keys: string[]): boolean {
+    this.wakePolling();
     if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
     return runHerdr(
@@ -618,11 +802,20 @@ export class HerdrBackend implements SessionBackend {
     );
   }
 
+  /** One frame avoids per-line Enter/paste-burst ambiguity in Claude's composer.
+   * Send the paste boundaries through the raw terminal transport. */
+  sendBracketedPaste(text: string): boolean {
+    return this.write('\x1b[200~' + text + '\x1b[201~');
+  }
+
   pasteText(text: string): boolean {
     return this.write(text);
   }
 
   resize(cols: number, rows: number): void {
+    // An adopted pane belongs to the user's Herdr client: a browser grid can
+    // neither resize it nor stand in for its size (see getPaneSize()).
+    if (this.opts.externalTarget) return;
     this.cols = cols;
     this.rows = rows;
   }
@@ -680,6 +873,13 @@ export class HerdrBackend implements SessionBackend {
     this.snapshotCbs.push(cb);
   }
 
+  /** An adopted pane's grid changed (the user resized it in Herdr). Fired from
+   *  the poll before the frame is re-emitted, so geometry-dependent captures can
+   *  be invalidated even when the pane text itself is unchanged. */
+  onPaneGridChange(cb: (grid: HerdrWebTerminalSize) => void): void {
+    this.paneGridCbs.push(cb);
+  }
+
   /** Cursor coordinates from the real managed attach stream (0-based). */
   onWebTerminalCursor(cb: (cursor: HerdrWebTerminalCursor) => void): void {
     this.webCursorCbs.push(cb);
@@ -722,11 +922,15 @@ export class HerdrBackend implements SessionBackend {
 
   destroySession(): void {
     this.kill();
-    // Adopted targets are observation-only. A managed agent placed in a user's
-    // existing session owns its pane but never the surrounding herdr session.
-    if (this.opts.ownsSession ?? !this.opts.externalTarget) {
+    const isCustomSession = Boolean(
+      this.opts.isCustomHost
+      || (this.opts.herdrConfig?.sessionName && this.opts.herdrConfig.sessionName !== HerdrBackend.managedSessionName()),
+    );
+    // Adopted targets and custom user sessions are never killed at session-level.
+    // A managed agent placed in a user's session owns its pane but never the surrounding session.
+    if (!isCustomSession && (this.opts.ownsSession ?? !this.opts.externalTarget)) {
       HerdrBackend.killSession(this.sessionName);
-    } else if (this.opts.ownsAgent) {
+    } else if (this.opts.ownsAgent ?? isCustomSession) {
       if (this.paneId) {
         runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
       } else {
@@ -736,6 +940,22 @@ export class HerdrBackend implements SessionBackend {
   }
 
   getChildPid(): number | null {
+    if (this.cliPid) return this.cliPid;
+    if (!this.paneId || !this.cliExecutable || this.exited) return null;
+    // HERDR owns the process, so it is not a child of the worker. Resolve
+    // the exact pane's foreground CLI for the worker's procStart-bound marker.
+    // Retry on later calls when process detection has not caught up yet.
+    const info = jsonCommand(herdrSessionArgs(this.sessionName, [
+      'pane', 'process-info', '--pane', this.paneId,
+    ]))?.result?.process_info;
+    const candidates = (info?.foreground_processes ?? []).filter((p: any) => {
+      const executable = Array.isArray(p.argv) ? p.argv[0] : p.argv0;
+      return typeof executable === 'string'
+        && basename(executable) === this.cliExecutable
+        && Number.isSafeInteger(p.pid) && p.pid > 1 && p.pid !== info.shell_pid;
+    });
+    if (candidates.length !== 1) return null;
+    this.cliPid = candidates[0].pid;
     return this.cliPid ?? null;
   }
 
@@ -752,12 +972,66 @@ export class HerdrBackend implements SessionBackend {
   }
 
   getPaneSize(): { cols: number; rows: number } | null {
+    if (this.opts.externalTarget || this.opts.herdrConfig?.placement === 'split') {
+      return this.readExternalGrid() ?? { cols: this.cols, rows: this.rows };
+    }
     return { cols: this.cols, rows: this.rows };
+  }
+
+  /**
+   * Real grid of an adopted pane. Snapshot lines carry the pane's width, so a
+   * web terminal pinned or a screenshot canvas sized to anything else wraps
+   * every full-width TUI row. Discovery's size is only a guess for Herdr, and
+   * the user may resize the pane later, so read its PTY window size (cached).
+   * A failed probe keeps the last known grid.
+   */
+  private readExternalGrid(): HerdrWebTerminalSize | null {
+    const now = Date.now();
+    if (
+      this.exited
+      || (this.externalGridReadAtMs !== null && now - this.externalGridReadAtMs < EXTERNAL_GRID_TTL_MS)
+    ) {
+      return this.externalGrid;
+    }
+    this.externalGridReadAtMs = now;
+    let grid = this.externalTtyDevice ? readTerminalDeviceGrid(this.externalTtyDevice) : null;
+    if (!grid && this.paneId) {
+      // The pane holds its PTY open for its whole life, so the device is
+      // resolved once and only re-resolved after a failed read.
+      this.externalTtyDevice = herdrPaneTerminalDevice(jsonCommand(
+        herdrSessionArgs(this.sessionName, ['pane', 'process-info', '--pane', this.paneId]),
+        { timeout: 5000 },
+      ));
+      grid = this.externalTtyDevice ? readTerminalDeviceGrid(this.externalTtyDevice) : null;
+    }
+    if (grid) this.externalGrid = grid;
+    return this.externalGrid;
+  }
+
+  private externalGridChanged(): boolean {
+    if (!this.opts.externalTarget) return false;
+    // Compare what getPaneSize() advertises, fallback included: viewers pinned
+    // to the spawn-time fallback must be re-pinned once a probe first succeeds.
+    const grid = this.getPaneSize();
+    if (!grid) return false;
+    const previous = this.polledExternalGrid;
+    this.polledExternalGrid = grid;
+    if (!previous || (previous.cols === grid.cols && previous.rows === grid.rows)) return false;
+    for (const cb of this.paneGridCbs) {
+      try { cb(grid); } catch { /* listener crash shouldn't kill polling */ }
+    }
+    return true;
   }
 
   private ensureServer(): void {
     if (HerdrBackend.hasSession(this.sessionName)) return;
-    if (this.opts.externalTarget) throw new Error(`herdr session ${this.sessionName} is not running`);
+    const isCustomSession = Boolean(
+      this.opts.isCustomHost
+      || (this.opts.herdrConfig?.sessionName && this.opts.herdrConfig.sessionName !== HerdrBackend.managedSessionName()),
+    );
+    if (this.opts.externalTarget || isCustomSession) {
+      throw new Error(`herdr session "${this.sessionName}" is not running`);
+    }
     // Botmux's machine-wide host is shared across bots, so its long-lived
     // server must be credential-neutral. Each agent receives childEnv
     // explicitly in startPaneAgent()/agent start. Legacy per-topic owned
@@ -765,7 +1039,7 @@ export class HerdrBackend implements SessionBackend {
     const serverEnv = this.opts.ownsSession === false
       ? sharedServerEnv(process.env)
       : this.childEnv;
-    this.serverProcess = spawn('herdr', ['--session', this.sessionName, 'server'], {
+    this.serverProcess = spawn(herdrExecutable(), ['--session', this.sessionName, 'server'], {
       stdio: 'ignore',
       detached: true,
       env: serverEnv,
@@ -782,6 +1056,55 @@ export class HerdrBackend implements SessionBackend {
     throw new Error(`failed to start herdr session ${this.sessionName}`);
   }
 
+  private resolveTargetWorkspaceId(target?: string): string {
+    const workspaces = requiredHerdrList(
+      `herdr workspace list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['workspace', 'list']),
+      'workspaces',
+    );
+    if (target?.trim()) {
+      const matched = matchHerdrTarget(workspaces, target.trim(), 'workspace_id');
+      if (matched?.workspace_id) return matched.workspace_id;
+    }
+    const focused = workspaces.find((w: any) => w?.focused === true);
+    if (focused?.workspace_id) return focused.workspace_id;
+    if (workspaces.length > 0 && workspaces[0]?.workspace_id) return workspaces[0].workspace_id;
+
+    const created = requiredJsonCommand(
+      `herdr workspace create for ${this.sessionName}`,
+      // Only reached when the session has no workspace at all. Name it after
+      // the configured target so the next lookup matches it.
+      herdrSessionArgs(this.sessionName, ['workspace', 'create', '--label', target?.trim() || 'botmux', '--no-focus']),
+      { timeout: 10_000, env: this.childEnv },
+    );
+    const wsId = created?.result?.workspace?.workspace_id;
+    if (typeof wsId !== 'string' || !wsId) {
+      throw new Error(`failed to resolve or create workspace in herdr session ${this.sessionName}`);
+    }
+    this.createdWorkspaceId = wsId;
+    return wsId;
+  }
+
+  private resolveTargetTab(workspaceId: string, target?: string): any | undefined {
+    const tabs = requiredHerdrList(
+      `herdr tab list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['tab', 'list']),
+      'tabs',
+    ).filter((t: any) => t?.workspace_id === workspaceId);
+    if (target?.trim()) return matchHerdrTarget(tabs, target.trim(), 'tab_id');
+    return tabs.find((t: any) => t?.focused === true) || tabs[0];
+  }
+
+  private resolvePaneInTab(tabId: string): string | undefined {
+    const panes = requiredHerdrList(
+      `herdr pane list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['pane', 'list']),
+      'panes',
+    ).filter((p: any) => p?.tab_id === tabId);
+    const focused = panes.find((p: any) => p?.focused === true);
+    return focused?.pane_id || panes[panes.length - 1]?.pane_id || panes[0]?.pane_id;
+  }
+
   /** Herdr >=0.7.5 managed-agent launch protocol.
    *
    * `agent start --kind` types a bare CLI name into the interactive shell. Its
@@ -794,7 +1117,7 @@ export class HerdrBackend implements SessionBackend {
     // Identify the managed kind by the original CLI; the launcher still
     // executes the complete wrapped command.
     const cliBin = opts.cliBin ?? bin;
-    const kind = paneAgentKindForExecutable(cliBin);
+    const kind = paneAgentKindForExecutable(cliBin, opts.cliId);
     if (!kind) {
       throw new Error(
         `Herdr >=0.7.5 cannot launch executable "${basename(cliBin)}" as a managed coding agent; ` +
@@ -803,27 +1126,90 @@ export class HerdrBackend implements SessionBackend {
     }
     const workspaceEnv = environmentForPaneAgent(cliBin, this.childEnv);
     const originalPath = workspaceEnv.PATH ?? process.env.PATH ?? '';
-    let workspaceId: string | undefined;
+    const placement: HerdrBackendPlacement = this.opts.herdrConfig?.placement ?? 'workspace';
+    let paneId: string | undefined;
     let launcher: ReturnType<typeof createPaneAgentLauncher> | undefined;
+    let launched = false;
     try {
-      const created = requiredJsonCommand(
-        `herdr workspace create for ${this.agentName} in ${this.sessionName}`,
-        herdrSessionArgs(this.sessionName, [
-          'workspace', 'create',
-          '--cwd', opts.cwd,
-          '--label', this.agentName,
-          '--no-focus',
-          ...envCommandArgs(workspaceEnv),
-        ]),
-        { timeout: 10_000, env: this.childEnv },
-      );
-      const paneId = created?.result?.root_pane?.pane_id;
-      workspaceId = created?.result?.workspace?.workspace_id;
-      if (typeof paneId !== 'string' || !paneId) {
-        throw new Error(`herdr workspace create for ${this.agentName} in ${this.sessionName} failed: missing root pane`);
+      if (placement === 'split') {
+        const targetWsId = this.resolveTargetWorkspaceId(this.opts.herdrConfig?.workspace);
+        const targetTab = this.resolveTargetTab(targetWsId, this.opts.herdrConfig?.tab);
+        if (targetTab?.tab_id) {
+          const splitTargetPaneId = this.resolvePaneInTab(targetTab.tab_id);
+          if (splitTargetPaneId) {
+            const splitDir = this.opts.herdrConfig?.splitDirection ?? 'right';
+            const split = requiredJsonCommand(
+              `herdr pane split for ${this.agentName} in ${this.sessionName}`,
+              herdrSessionArgs(this.sessionName, [
+                'pane', 'split',
+                '--pane', splitTargetPaneId,
+                '--direction', splitDir,
+                '--cwd', opts.cwd,
+                '--no-focus',
+                ...envCommandArgs(workspaceEnv),
+              ]),
+              { timeout: 10_000, env: this.childEnv },
+            );
+            paneId = split?.result?.pane?.pane_id;
+          }
+        }
+        if (!paneId) {
+          // Tab not found or empty: auto-create tab in target workspace so launch succeeds
+          const tabLabel = this.opts.herdrConfig?.tab?.trim() || this.agentName;
+          const createdTab = requiredJsonCommand(
+            `herdr tab create for ${this.agentName} in ${this.sessionName}`,
+            herdrSessionArgs(this.sessionName, [
+              'tab', 'create',
+              '--workspace', targetWsId,
+              '--label', tabLabel,
+              '--cwd', opts.cwd,
+              '--no-focus',
+              ...envCommandArgs(workspaceEnv),
+            ]),
+            { timeout: 10_000, env: this.childEnv },
+          );
+          paneId = createdTab?.result?.root_pane?.pane_id;
+          this.createdTabId = createdTab?.result?.tab?.tab_id;
+        }
+      } else if (placement === 'tab') {
+        const targetWsId = this.resolveTargetWorkspaceId(this.opts.herdrConfig?.workspace);
+        const tabLabel = this.opts.herdrConfig?.tab?.trim() || this.agentName;
+        const createdTab = requiredJsonCommand(
+          `herdr tab create for ${this.agentName} in ${this.sessionName}`,
+          herdrSessionArgs(this.sessionName, [
+            'tab', 'create',
+            '--workspace', targetWsId,
+            '--label', tabLabel,
+            '--cwd', opts.cwd,
+            '--no-focus',
+            ...envCommandArgs(workspaceEnv),
+          ]),
+          { timeout: 10_000, env: this.childEnv },
+        );
+        paneId = createdTab?.result?.root_pane?.pane_id;
+        this.createdTabId = createdTab?.result?.tab?.tab_id;
+      } else {
+        const created = requiredJsonCommand(
+          `herdr workspace create for ${this.agentName} in ${this.sessionName}`,
+          herdrSessionArgs(this.sessionName, [
+            'workspace', 'create',
+            '--cwd', opts.cwd,
+            '--label', this.agentName,
+            '--no-focus',
+            ...envCommandArgs(workspaceEnv),
+          ]),
+          { timeout: 10_000, env: this.childEnv },
+        );
+        paneId = created?.result?.root_pane?.pane_id;
+        this.createdWorkspaceId = created?.result?.workspace?.workspace_id;
       }
 
-      launcher = createPaneAgentLauncher(basename(cliBin), bin, args, originalPath);
+      if (typeof paneId !== 'string' || !paneId) {
+        throw new Error(`herdr placement ${placement} for ${this.agentName} in ${this.sessionName} failed: missing root pane`);
+      }
+      this.paneId = paneId;
+
+      launcher = createPaneAgentLauncher(kind, bin, args, originalPath, opts.protectedUnsetEnv);
       requiredJsonCommand(
         `herdr pane run ${paneId} in ${this.sessionName}`,
         // One quoted COMMAND argument reaches the shell verbatim, even while
@@ -834,12 +1220,26 @@ export class HerdrBackend implements SessionBackend {
 
       const detectionDeadline = Date.now() + PANE_AGENT_START_TIMEOUT_MS;
       let detected = false;
+      let lastListError: Error | undefined;
       while (Date.now() < detectionDeadline) {
-        const listed = requiredJsonCommand(
-          `herdr agent list in ${this.sessionName}`,
-          herdrSessionArgs(this.sessionName, ['agent', 'list']),
-          { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
-        );
+        let listed: any;
+        try {
+          listed = requiredJsonCommand(
+            `herdr agent list in ${this.sessionName}`,
+            herdrSessionArgs(this.sessionName, ['agent', 'list']),
+            { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
+          );
+        } catch (err: any) {
+          // A poll herdr did not answer (timed out / no output / empty / not
+          // JSON) on a loaded host is not a verdict on the launch: keep polling
+          // until the deadline. Anything herdr actually answered with — a JSON
+          // error on stdout or stderr, a missing binary — still fails at once.
+          if (!err?.herdrTransient) throw err;
+          lastListError = err;
+          sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
+          continue;
+        }
+        lastListError = undefined;
         const agent = extractAgents(listed).find(row => row?.pane_id === paneId && !agentRowExited(row));
         if (agent?.agent === kind) {
           detected = true;
@@ -851,7 +1251,10 @@ export class HerdrBackend implements SessionBackend {
         sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
       }
       if (!detected) {
-        throw new Error(`Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`);
+        throw new Error(
+          `Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`
+          + (lastListError ? ` (last agent list error: ${lastListError.message})` : ''),
+        );
       }
 
       requiredJsonCommand(
@@ -869,20 +1272,41 @@ export class HerdrBackend implements SessionBackend {
       }
       // Recognition can precede interactive readiness. The worker retains its
       // first-prompt gate until onAgentStatus/normal prompt detection releases it.
+      launched = true;
       return paneId;
     } catch (err) {
-      // Workspace creation succeeded but the CLI did not. Remove only the
-      // workspace created by this attempt so a shared user session is never
-      // left with an empty Botmux tab after a failed spawn.
-      if (typeof workspaceId === 'string' && workspaceId) {
+      if (typeof this.createdWorkspaceId === 'string' && this.createdWorkspaceId) {
         runHerdr(
-          herdrSessionArgs(this.sessionName, ['workspace', 'close', workspaceId]),
+          herdrSessionArgs(this.sessionName, ['workspace', 'close', this.createdWorkspaceId]),
+          { timeout: 5000 },
+        );
+      }
+      if (typeof this.createdTabId === 'string' && this.createdTabId) {
+        runHerdr(
+          herdrSessionArgs(this.sessionName, ['tab', 'close', this.createdTabId]),
+          { timeout: 5000 },
+        );
+      }
+      if (typeof paneId === 'string' && paneId) {
+        runHerdr(
+          herdrSessionArgs(this.sessionName, ['pane', 'close', paneId]),
           { timeout: 5000 },
         );
       }
       throw err;
     } finally {
-      if (launcher) rmSync(launcher.dir, { recursive: true, force: true });
+      if (launcher && launched) {
+        // Detection matches the launcher's argv, which can happen while macOS
+        // still holds its exec for a Gatekeeper assessment. Deleting the file
+        // then makes the XProtect scan fail and Gatekeeper SIGKILLs the CLI
+        // (`zsh: killed`), so a launched launcher is left to remove itself.
+        const dir = launcher.dir;
+        setTimeout(() => {
+          try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+        }, PANE_AGENT_LAUNCHER_FALLBACK_CLEANUP_MS).unref?.();
+      } else if (launcher) {
+        rmSync(launcher.dir, { recursive: true, force: true });
+      }
     }
   }
 
@@ -895,7 +1319,7 @@ export class HerdrBackend implements SessionBackend {
       allowProposedApi: true,
     });
     try {
-      const attach = pty.spawn('herdr', [
+      const attach = pty.spawn(herdrExecutable(), [
         '--session', this.sessionName,
         'agent', 'attach', target,
       ], {
@@ -982,7 +1406,7 @@ export class HerdrBackend implements SessionBackend {
   private readVisibleAnsi(): string {
     const target = this.paneId ?? this.agentName;
     return readHerdrTextCommand(
-      herdrSessionArgs(this.sessionName, ['agent', 'read', target, '--source', 'visible', '--lines', String(this.rows), '--format', 'ansi']),
+      herdrSessionArgs(this.sessionName, ['agent', 'read', target, '--source', 'visible', '--lines', String(this.getPaneSize()?.rows ?? this.rows), '--format', 'ansi']),
     );
   }
 
@@ -995,13 +1419,47 @@ export class HerdrBackend implements SessionBackend {
 
   private startPolling(): void {
     this.stopPolling();
-    this.pollTimer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
-    this.pollTimer.unref?.();
+    this.pollDelayMs = POLL_INTERVAL_MS;
+    this.unchangedPolls = 0;
+    this.schedulePoll();
+  }
+
+  private schedulePoll(): void {
+    if (this.exited) return;
+    const timer = setTimeout(() => {
+      this.pollTimer = null;
+      try {
+        this.poll();
+      } finally {
+        // Keep the chain alive even if poll() throws (setInterval never
+        // stopped on a throwing tick). poll() may already have re-armed
+        // through wakePolling().
+        if (this.pollTimer === null) this.schedulePoll();
+      }
+    }, this.pollDelayMs);
+    timer.unref?.();
+    this.pollTimer = timer;
   }
 
   private stopPolling(): void {
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
+  }
+
+  /** Return to the fast cadence; a pending backed-off poll is pulled in. */
+  private wakePolling(): void {
+    this.unchangedPolls = 0;
+    if (this.pollDelayMs === POLL_INTERVAL_MS) return;
+    this.pollDelayMs = POLL_INTERVAL_MS;
+    if (this.pollTimer) {
+      this.stopPolling();
+      this.schedulePoll();
+    }
+  }
+
+  private noteUnchangedPoll(): void {
+    if (++this.unchangedPolls < IDLE_POLLS_BEFORE_BACKOFF) return;
+    this.pollDelayMs = Math.min(this.pollDelayMs * 2, IDLE_POLL_MAX_MS);
   }
 
   private poll(): void {
@@ -1074,7 +1532,18 @@ export class HerdrBackend implements SessionBackend {
   private readAndEmitDelta(): void {
     if (this.exited) return;
     const next = this.readRecentAnsi();
-    if (!next || next === this.lastText) return;
+    if (!next) {
+      this.noteUnchangedPoll();
+      return;
+    }
+    // A user-resized adopted pane may keep its text (or redraw only inside the
+    // grid cache window); viewers pinned to the old grid still need the frame.
+    const gridChanged = this.externalGridChanged();
+    if (next === this.lastText && !gridChanged) {
+      this.noteUnchangedPoll();
+      return;
+    }
+    this.wakePolling();
     for (const cb of this.snapshotCbs) {
       try { cb(next); } catch { /* listener crash shouldn't kill polling */ }
     }
@@ -1096,9 +1565,16 @@ export class HerdrBackend implements SessionBackend {
   }
 
   /**
-   * Spawn one `herdr wait agent-status` child per useful status other than the
-   * current one. The first to fire wins → we read+emit, tear down the losers,
-   * and re-arm while excluding the winning (now-current) status.
+   * Watch for the next lifecycle status other than the current one. The first
+   * watcher to fire wins → we read+emit, tear down the losers, and re-arm while
+   * excluding the winning (now-current) status.
+   *
+   * Herdr 0.9 (verified on 0.9.1 and 0.9.3) has `agent wait <pane> --until S…`
+   * and no longer has `wait agent-status <pane> --status S`: that command
+   * fails instantly ("unknown command"), which turned every watcher into a
+   * 500 ms spawn-and-list loop with no status ever reported. One `agent wait`
+   * child watches every status at once; a Herdr without it keeps one child
+   * per status.
    *
    * Excluding the current status is essential because Herdr waits are
    * level-triggered. Re-arming the same status immediately would make a pane
@@ -1111,88 +1587,127 @@ export class HerdrBackend implements SessionBackend {
     const paneTarget = this.paneId ?? this.agentName;
     if (!paneTarget) return;
     this.stopStatusWatcher();
+    const watched = WATCHED_STATUSES.filter(status => status !== currentStatus);
     const cohort: ChildProcess[] = [];
     const armedAt = Date.now();
-    for (const status of WATCHED_STATUSES) {
-      if (status === currentStatus) continue;
-      const child = spawn('herdr', [
-        '--session', this.sessionName,
-        'wait', 'agent-status', paneTarget,
-        '--status', status,
-        '--timeout', String(STATUS_WAIT_TIMEOUT_MS),
-      ], { stdio: ['ignore', 'ignore', 'ignore'] });
-      cohort.push(child);
 
-      child.on('exit', (code) => {
-        // Only the first child to finish (across the cohort) drives the
-        // re-arm cycle; later finishers in the same cohort are dropped.
-        if (!this.statusWaitProcesses.includes(child)) return;
-        const wasFirstExit = this.statusWaitProcesses === cohort;
-        // Drop this child from the active cohort.
-        this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
-        if (!wasFirstExit || this.exited) return;
-        // First exit in this cohort — tear down siblings, then read+re-arm.
-        this.stopStatusWatcher();
-        this.readAndEmitDelta();
+    const settle = (child: ChildProcess, code: number | null, status: WatchedStatus | undefined) => {
+      // Only the first child to finish (across the cohort) drives the
+      // re-arm cycle; later finishers in the same cohort are dropped.
+      if (!this.statusWaitProcesses.includes(child)) return;
+      const wasFirstExit = this.statusWaitProcesses === cohort;
+      // Drop this child from the active cohort.
+      this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
+      if (!wasFirstExit || this.exited) return;
+      // First exit in this cohort — tear down siblings, then read+re-arm.
+      this.stopStatusWatcher();
+      this.readAndEmitDelta();
 
-        // code 0 means the watched status is now current. Re-arm immediately,
-        // but exclude that status from the next cohort: Herdr returns success
-        // immediately while a status remains current, so including it again is
-        // the level-triggered success storm this state machine prevents.
-        if (code === 0) {
-          for (const cb of this.agentStatusCbs) {
-            try { cb(status); } catch { /* listener crash shouldn't kill watcher */ }
-          }
-          this.startStatusWatcher(status);
-          return;
-        }
-
-        // Non-zero storm guard: when the agent's pane has gone away (the CLI
-        // exited), `herdr wait agent-status` returns code 1 within MILLISECONDS
-        // rather than after the 30s timeout. The old code re-armed on every non-0 code
-        // synchronously, so a dead pane spun a tight spawn loop (thousands of
-        // `herdr wait` children/sec) that starved the 500ms poll timer → the
-        // session never reported its exit and hung. So for a non-zero code we
-        // first distinguish "real long timeout" (child lived a meaningful
-        // fraction of the window — agent still working, re-arm normally) from
-        // "instant return" (pane likely gone — check liveness; only re-arm via
-        // a deferred timer, never synchronously, so poll() can run and we can't
-        // spin). Verified on v0.6.6: the exited agent's row disappears from
-        // `agent list`.
-        const elapsed = Date.now() - armedAt;
-        const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
-        if (returnedInstantly) {
-          const agents = this.listAgents();
-          if (agents !== null) {
-            const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
-            const exited = matching ? agentRowExited(matching) : true;
-            if (exited) {
-              const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
-              this.handleExit(exitCode, null);
-              return;
-            }
-          }
-          // Agent still alive but the wait returned instantly (transient
-          // herdr hiccup). Re-arm on a later tick, never synchronously, so we
-          // can't spin: the deferred timer yields the loop to poll(). unref
-          // so we never hold the event loop open.
-          if (this.exited) return;
+      // code 0 means the watched status is now current. Re-arm immediately,
+      // but exclude that status from the next cohort: Herdr returns success
+      // immediately while a status remains current, so including it again is
+      // the level-triggered success storm this state machine prevents.
+      if (code === 0 && status) {
+        // A wait also resolves when the CLI dies: Herdr reports its last
+        // idle/done state, then drops the row. idle/done release queued input
+        // into the pane, which must never reach the bare shell left behind, so
+        // only announce a status for an agent that is still listed.
+        const agents = this.listAgents();
+        if (agents === null) {
+          // Unconfirmed. Waits are level-triggered, so re-arming with the
+          // previous status returns this one again for another check.
           const t = setTimeout(() => {
             if (!this.exited) this.startStatusWatcher(currentStatus);
           }, POLL_INTERVAL_MS);
           t.unref?.();
           return;
         }
-        // A real long-timeout after ~30s: preserve the last winning status so
-        // the periodic timeout itself cannot re-introduce a level-triggered
-        // waiter for the unchanged current state.
-        this.startStatusWatcher(currentStatus);
-      });
-      child.on('error', () => {
-        // `herdr` missing or unspawnable: drop from cohort. Timer-based poll
-        // still acts as the fallback signal.
-        this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
-      });
+        const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
+        if (!matching || agentRowExited(matching)) {
+          const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+          this.handleExit(exitCode, null);
+          return;
+        }
+        this.wakePolling();
+        for (const cb of this.agentStatusCbs) {
+          try { cb(status); } catch { /* listener crash shouldn't kill watcher */ }
+        }
+        this.startStatusWatcher(status);
+        return;
+      }
+
+      // Non-zero storm guard: when the agent's pane has gone away (the CLI
+      // exited), a status wait returns within MILLISECONDS rather than after
+      // the 30s timeout. The old code re-armed on every non-0 code
+      // synchronously, so a dead pane spun a tight spawn loop (thousands of
+      // wait children/sec) that starved the 500ms poll timer → the session
+      // never reported its exit and hung. So for a non-zero code we first
+      // distinguish "real long timeout" (child lived a meaningful fraction of
+      // the window — agent still working, re-arm normally) from "instant
+      // return" (pane likely gone — check liveness; only re-arm via a deferred
+      // timer, never synchronously, so poll() can run and we can't spin).
+      // Verified on v0.6.6: the exited agent's row disappears from `agent list`.
+      const elapsed = Date.now() - armedAt;
+      const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
+      if (returnedInstantly) {
+        const agents = this.listAgents();
+        if (agents !== null) {
+          const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
+          const exited = matching ? agentRowExited(matching) : true;
+          if (exited) {
+            const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+            this.handleExit(exitCode, null);
+            return;
+          }
+        }
+        // Agent still alive but the wait returned instantly (transient
+        // herdr hiccup). Re-arm on a later tick, never synchronously, so we
+        // can't spin: the deferred timer yields the loop to poll(). unref
+        // so we never hold the event loop open.
+        if (this.exited) return;
+        const t = setTimeout(() => {
+          if (!this.exited) this.startStatusWatcher(currentStatus);
+        }, POLL_INTERVAL_MS);
+        t.unref?.();
+        return;
+      }
+      // A real long-timeout after ~30s: preserve the last winning status so
+      // the periodic timeout itself cannot re-introduce a level-triggered
+      // waiter for the unchanged current state.
+      this.startStatusWatcher(currentStatus);
+    };
+    // `herdr` missing or unspawnable: drop from cohort. Timer-based poll
+    // still acts as the fallback signal.
+    const drop = (child: ChildProcess) => () => {
+      this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
+    };
+
+    if (supportsAgentWait()) {
+      const child = spawn(herdrExecutable(), [
+        '--session', this.sessionName,
+        'agent', 'wait', paneTarget,
+        ...watched.flatMap(status => ['--until', status]),
+        '--timeout', String(STATUS_WAIT_TIMEOUT_MS),
+      ], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let stdout = '';
+      child.stdout?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk: string) => { stdout += chunk; });
+      // `close` (not `exit`) so the matched status in stdout is complete.
+      child.on('close', (code) => settle(child, code, code === 0 ? agentWaitStatus(stdout, watched) : undefined));
+      child.on('error', drop(child));
+      cohort.push(child);
+    } else {
+      for (const status of watched) {
+        const child = spawn(herdrExecutable(), [
+          '--session', this.sessionName,
+          'wait', 'agent-status', paneTarget,
+          '--status', status,
+          '--timeout', String(STATUS_WAIT_TIMEOUT_MS),
+        ], { stdio: ['ignore', 'ignore', 'ignore'] });
+        child.on('exit', (code) => settle(child, code, status));
+        child.on('error', drop(child));
+        cohort.push(child);
+      }
     }
     this.statusWaitProcesses = cohort;
   }
@@ -1213,6 +1728,12 @@ export class HerdrBackend implements SessionBackend {
     this.stopStatusWatcher();
     for (const cb of this.exitCbs) {
       try { cb(code, signal); } catch { /* listener crash shouldn't kill teardown */ }
+    }
+    // The managed CLI is gone; its pane now holds only the shell it was
+    // launched from. The worker drops this exited backend before restarting,
+    // so nothing else would close the pane and every attempt would leave one.
+    if (this.opts.ownsAgent && !this.opts.externalTarget && this.paneId) {
+      runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
     }
   }
 }

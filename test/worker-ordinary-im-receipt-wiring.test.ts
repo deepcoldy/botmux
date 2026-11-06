@@ -1,64 +1,56 @@
-import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+/**
+ * native_input_consumed covers shared group background, so it may only be sent
+ * where the CLI itself evidenced this exact input. Executes the worker's real
+ * Claude transcript boundary (helpers/worker-function-harness.ts). Ordinary IM
+ * receipt / queue-head ordering during init is executed against a real worker
+ * in worker-ordinary-im-init-concurrency.integration.test.ts.
+ */
+import { basename } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+type Notify = (
+  turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
+  evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
+) => void;
 
-function caseRegion(name: 'init' | 'message', next: 'message' | 'raw_input'): string {
-  const start = workerSource.indexOf(`case '${name}': {`);
-  const end = workerSource.indexOf(`case '${next}':`, start + 1);
-  expect(start).toBeGreaterThanOrEqual(0);
-  expect(end).toBeGreaterThan(start);
-  return workerSource.slice(start, end);
+function claudeTranscriptHarness(overrides: Record<string, unknown> = {}) {
+  const acknowledgeNativeInputConsumed = vi.fn();
+  const scope: Record<string, unknown> = {
+    cliAdapter: { claudeDataDir: '/home/u/.claude' },
+    lastInitConfig: { cliSessionId: 'configured-session', adoptMode: false },
+    basename,
+    acknowledgeNativeInputConsumed,
+    ...overrides,
+  };
+  const notify = loadWorkerFunction<Notify>('notifyNativeTranscriptConsumedLarkTurn', scope);
+  return { notify, acknowledgeNativeInputConsumed };
 }
 
-describe('ordinary IM worker receipt wiring', () => {
-  it('recognizes both real Lark ids and synthetic recovery ids', () => {
-    expect(workerSource).toContain("msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-')");
-  });
+const transcript = '/home/u/.claude/projects/p/0f3c1d2e-aaaa-bbbb-cccc-1234567890ab.jsonl';
 
-  it('claims and ACKs init before any slow startup await', () => {
-    const init = caseRegion('init', 'message');
-    const receipt = init.indexOf('receiveOrdinaryImTurn(ordinaryImTurnId)');
-    const firstStartupAwait = Math.min(
-      ...[
-        init.indexOf('await startWebServer('),
-        init.indexOf('await orchestrateCodexRpcInit('),
-        init.indexOf('await spawnCli('),
-      ].filter(index => index >= 0),
+describe('Claude transcript native input consumption receipt', () => {
+  it('acknowledges a full transcript match with the transcript-derived native session id', () => {
+    const h = claudeTranscriptHarness();
+    h.notify({ turnId: 'om_turn' }, { fullContentMatch: true, sourceJsonlPath: transcript });
+    expect(h.acknowledgeNativeInputConsumed).toHaveBeenCalledExactlyOnceWith(
+      'om_turn', 'claude_transcript_user_record', '0f3c1d2e-aaaa-bbbb-cccc-1234567890ab',
     );
-
-    expect(receipt).toBeGreaterThanOrEqual(0);
-    expect(receipt).toBeLessThan(firstStartupAwait);
   });
 
-  it('claims and ACKs a steady-state turn before crash recovery awaits', () => {
-    const message = caseRegion('message', 'raw_input');
-    const receipt = message.indexOf('receiveOrdinaryImTurn(ordinaryImTurnId)');
-    const crashRestart = message.indexOf('await spawnCli(restartCfg)');
-
-    expect(receipt).toBeGreaterThanOrEqual(0);
-    expect(crashRestart).toBeGreaterThan(receipt);
-  });
-
-  it('queues pre-adapter follow-ups and preserves the init prompt at the head', () => {
-    const sendToPtyStart = workerSource.indexOf('function sendToPty(');
-    const sendToPtyEnd = workerSource.indexOf('// ─── Screen Update Timer', sendToPtyStart);
-    const sendToPty = workerSource.slice(sendToPtyStart, sendToPtyEnd);
-    const backendQueue = sendToPty.indexOf('if (cliRestartInProgress || !backend)');
-    const adapterReject = sendToPty.indexOf('if (!cliAdapter) return false;');
-    const init = caseRegion('init', 'message');
-    const initialPromptQueue = init.indexOf('pendingMessages.unshift(...recoveredAcceptedInputs, {');
-    const flushStart = workerSource.indexOf('async function flushPending()');
-    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
-    const flush = workerSource.slice(flushStart, flushEnd);
-
-    expect(backendQueue).toBeGreaterThanOrEqual(0);
-    expect(adapterReject).toBeGreaterThan(backendQueue);
-    expect(initialPromptQueue).toBeGreaterThanOrEqual(0);
-    expect(flush).toContain('if (initialInputOwnershipPending) return;');
-    expect(init.indexOf('initialInputOwnershipPending = !!msg.prompt;'))
-      .toBeLessThan(init.indexOf('await startWebServer('));
-    expect(init.indexOf('initialInputOwnershipPending = false;'))
-      .toBeGreaterThan(initialPromptQueue);
+  it('never acknowledges partial matches, local or scheduled turns, adopted or non-Claude sessions', () => {
+    const cases: Array<[Parameters<Notify>, Record<string, unknown>]> = [
+      [[{ turnId: 'om_partial' }, { fullContentMatch: false, sourceJsonlPath: transcript }], {}],
+      [[{ turnId: 'om_local', isLocal: true }, { fullContentMatch: true, sourceJsonlPath: transcript }], {}],
+      [[{ turnId: 'om_scheduled', isScheduled: true }, { fullContentMatch: true, sourceJsonlPath: transcript }], {}],
+      [[{ turnId: 'om_adopted' }, { fullContentMatch: true, sourceJsonlPath: transcript }],
+        { lastInitConfig: { cliSessionId: 'adopted', adoptMode: true } }],
+      [[{ turnId: 'om_codex' }, { fullContentMatch: true, sourceJsonlPath: transcript }], { cliAdapter: {} }],
+    ];
+    for (const [args, overrides] of cases) {
+      const h = claudeTranscriptHarness(overrides);
+      h.notify(...args);
+      expect(h.acknowledgeNativeInputConsumed, args[0].turnId).not.toHaveBeenCalled();
+    }
   });
 });

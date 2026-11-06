@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, realpathSync } from 'node:fs';
 import { spawn, ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -532,6 +532,79 @@ setInterval(() => {}, 1000);
       await sup.stopAll();
     }
   });
+
+  it('REGRESSION: refuses to start while another LIVE supervisor owns the fleet, leaving its daemons alone', async () => {
+    // REGRESSION #3's reclaim is only safe because the recorded supervisor is
+    // dead. When it is alive (two `botmux start`s overlapped), its daemons are
+    // not orphans: SIGTERMing them and overwriting supervisorPid yields two
+    // supervisors that each keep resurrecting a daemon for the same bot.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const distDir = fakeDist(root, STAY);
+    const owner = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    const ownersDaemon = await spawnReadyOrphan([join(distDir, 'index-daemon.js')]);
+    mutateFleetState(statePath, () => ({
+      supervisorPid: owner.pid!,
+      supervisorStartedAt: 'T-owner',
+      supervisorProcessStart: readDurableProcessIdentity(owner.pid!),
+      supervisorPidNamespace: fleetProcessIdentityRuntime.readPidNamespace(owner.pid!),
+      supervisorCommand: fleetProcessIdentityRuntime.readCommandLine(owner.pid!),
+      procs: [{
+        name: 'botmux-0', appId: 'cli_a', pid: ownersDaemon.pid!, generation: 1, status: 'online',
+        processStart: readDurableProcessIdentity(ownersDaemon.pid!),
+        restarts: 0, lastExitCode: null, startedAt: 'T',
+      }],
+    }));
+    const before = readFileSync(statePath, 'utf8');
+
+    const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
+    try {
+      const started = sup.start([bots[0]]);
+      await delay(500);
+      expect(pidAlive(ownersDaemon.pid!)).toBe(true);
+      expect(readFleetState(statePath)!.supervisorPid).toBe(owner.pid);
+      expect(readFleetState(statePath)!.procs).toEqual(JSON.parse(before).procs);
+      expect(started).toBe(false);
+    } finally {
+      await sup.stopAll();
+    }
+  });
+
+  it('REGRESSION: two supervisor processes started together leave exactly one fleet', async () => {
+    // Field shape: `botmux autostart enable` arms the 30s watchdog, the first
+    // `botmux start` is still booting (font download), the watchdog's start sees
+    // no supervisor in fleet-state yet and launches a second one. Two real
+    // processes, one state file: the loser must leave and the bot must end up
+    // with ONE live daemon — whichever process registers first.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const liveDir = join(root, 'live');
+    mkdirSync(liveDir);
+    const distDir = fakeDist(root, `
+require('fs').writeFileSync(require('path').join(${JSON.stringify(liveDir)}, String(process.pid)), '');
+process.on('SIGTERM', () => process.exit(90));
+setInterval(() => {}, 1000);
+`);
+    const host = resolve('test/fixtures/fleet-supervisor-host.ts');
+    const hosts = [0, 1].map(() => {
+      const child = spawnTsScript(host, [statePath, distDir, root], { stdio: 'ignore' });
+      hostProcs.push(child);
+      return child;
+    });
+    const exits = hosts.map(child => new Promise<number | null>(r => child.once('exit', code => r(code))));
+    const liveDaemons = () => readdirSync(liveDir).map(Number).filter(pid => pidAlive(pid));
+    try {
+      expect(await waitFor(() => liveDaemons().length > 0, 15_000)).toBe(true);
+      // Let any reclaim → unsolicited-90 → respawn cycle play out.
+      await delay(2_000);
+      const loser = await Promise.race([...exits, delay(10_000).then(() => 'none' as const)]);
+      expect(liveDaemons()).toHaveLength(1);
+      expect(hosts.filter(child => child.exitCode === null && child.signalCode === null)).toHaveLength(1);
+      expect(loser).toBe(0);
+    } finally {
+      for (const pid of readdirSync(liveDir).map(Number)) killLater(pid);
+    }
+  }, 40_000);
 
   it('reclaims a built-in orphan after switching to another checkout path', async () => {
     const root = tmp();
