@@ -213,6 +213,13 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Admission failure cleanup; wrapper logs both.',
     count: 4,
   },
+  'daemon.ts::closePatrolSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Group-secretary patrol cleanup: only a session the patrol itself created, '
+      + 'with no human activity during the round, is closed after its ledger is written; '
+      + 'nobody is waiting on it, the wrapper logs refusal and residual, and the next '
+      + 'patrol re-opens a fresh session from the ledger.',
+  },
   'daemon.ts::closeSession::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Deferred-schedule settlement injection: settlement returns close_refused '
