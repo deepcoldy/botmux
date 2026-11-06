@@ -247,6 +247,25 @@ export type V3Event =
       acceptedAt: number;
       /** Absolute engine-clock deadline = acceptedAt + node timeoutSec. */
       deadlineAt: number;
+      /** Main-topic placement only (design §5.5): the handoff entered the
+       *  target session's queue — that session may be busy with another turn
+       *  — and its own turn has not been seen to start. `deadlineAt` is then
+       *  a backstop (queued past it, the node times out); the node's real
+       *  deadline is set by `nodeHandoffStarted`. Absent everywhere else, so
+       *  node-topic attempts keep their bytes. */
+      startPending?: true;
+    }
+  | {
+      /** Main-topic placement only: the handoff's own turn reached the CLI
+       *  (its input was committed) after a `startPending` acceptance; the
+       *  node timeout now counts from here. At most once per attempt. */
+      type: 'nodeHandoffStarted';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      startedAt: number;
+      /** Absolute engine-clock deadline = startedAt + node timeoutSec. */
+      deadlineAt: number;
     }
   | {
       /** The bot's turn ended without a valid submission (display only). */

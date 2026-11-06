@@ -14,7 +14,9 @@ describe('Hook review input hold', () => {
     const flushStart = worker.indexOf('async function flushPending(): Promise<void>');
     expect(flushStart).toBeGreaterThanOrEqual(0);
     const flush = worker.slice(flushStart, worker.indexOf('\n}\n', flushStart));
-    expect(flush).toMatch(/refreshHookReviewInputHold\([\s\S]*?if \(hookReviewInputHold\)/);
+    // hookReviewHoldsQueuedWrite 本身（刷新 hold + 持有时发卡）的行为在
+    // test/stuck-page-input-hold.test.ts 里以真实函数执行覆盖；这里只守「flush 写入前调用它并在持有时返回」。
+    expect(flush).toMatch(/if \(hookReviewHoldsQueuedWrite\(\)\) return;/);
 
     const rawStart = worker.indexOf("case 'raw_input': {");
     expect(rawStart).toBeGreaterThanOrEqual(0);

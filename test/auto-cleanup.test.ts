@@ -41,6 +41,7 @@ describe('auto-cleanup config resolution', () => {
     // Unsupported thresholds fall back to the default, never pass through.
     expect(resolveCleanupHours({ olderThanHours: 12 as never })).toBe(168);
     expect(resolveCleanupHours({ olderThanHours: 0 as never })).toBe(168);
+    expect(resolveCleanupHours({ olderThanHours: 1 as never })).toBe(168);
   });
 
   it('resolves the interval, defaulting to 60min and enforcing a 5min floor', () => {

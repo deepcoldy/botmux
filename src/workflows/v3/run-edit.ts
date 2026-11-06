@@ -70,6 +70,7 @@ import { isValidRunId } from './ops-projection.js';
 import type { RunChatBinding } from './grill-state.js';
 import { resolveV3RunInitiator, type V3RunEditTurnOrigin } from './cli-daemon-command-authority.js';
 import { v3ReasonRequiredProblem } from './action-provenance.js';
+import { v3NodePlacement, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
 
 // ─── Who may change the flow directly (M1) ────────────────────────────────
 
@@ -354,6 +355,33 @@ export interface ApplyV3RunEditInput {
   /** Resolve a bot the run has not used yet (proposal-only). Throws when the
    *  selector names no usable bot. */
   resolveNewBotSnapshot: (selector: string) => BotSnapshot;
+  /** §5.2 hard rule 3: whether the run's main topic can host `main` nodes
+   *  (the daemon reads the main session). Consulted only when the edit moves
+   *  a node into the main topic; absent = unknown, and such an edit is
+   *  refused rather than guessed. */
+  mainTopic?: V3MainTopicAvailability;
+}
+
+/** §5.2 hard rule 3 for the nodes an edit newly places in the main topic
+ *  (added as `main`, or moved there). Placements already in effect passed it
+ *  when they took effect, and the main session's shape does not change. */
+function newlyMainTopicProblems(
+  before: V3Dag,
+  after: V3Dag,
+  mainTopic: V3MainTopicAvailability | undefined,
+): string[] {
+  const beforeById = new Map(before.nodes.map((node) => [node.id, node]));
+  const moved = new Set(after.nodes
+    .filter((node) => v3NodePlacement(node) === 'main' && v3NodePlacement(beforeById.get(node.id)) !== 'main')
+    .map((node) => node.id));
+  if (moved.size === 0) return [];
+  return v3PlacementProblems({
+    dag: after,
+    mainLarkAppId: '',
+    executorOf: () => '',
+    mainTopic: mainTopic ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+    rule3Nodes: moved,
+  }).filter((problem) => problem.rule === 3).map((problem) => problem.message);
 }
 
 interface WrittenRevision {
@@ -538,6 +566,8 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     }
     const plan = planned.plan;
     if (!hasChanges(plan.changes)) return { kind: 'invalid', problems: ['the patch changes nothing'] };
+    const placementProblems = newlyMainTopicProblems(effective.dag, plan.dag, input.mainTopic);
+    if (placementProblems.length > 0) return { kind: 'invalid', problems: placementProblems };
     const reasons = v3ConfirmReasonsForTurn(turn, plan.reasons);
     const direct = reasons.length === 0;
     if (!direct && plan.budgetGrants.length > 0) {

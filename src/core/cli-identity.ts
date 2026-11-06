@@ -46,6 +46,7 @@ import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 import { ensureBackgroundJobHome } from '../services/bytedcli-home.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
 export type { IdentityStorageModel };
 
@@ -1239,7 +1240,11 @@ export function renderIdentityWrapper(
     `    if [ -n "$${DENY_MSG_VAR}" ]; then`,
     `      printf '%s\\n' "$${DENY_MSG_VAR}" >&2`,
     '    else',
-    `      printf '%s\\n' 'botmux: ${tool} 需要发起人本人的授权，当前会话没有可用凭证，命令未执行。请发送 /login 完成授权后重试。' >&2`,
+    // Nothing was published for this call (no refusal text either): the turn's
+    // identity is still being prepared, or its publication failed. That is
+    // not an authorization verdict, so say so instead of sending the person
+    // to /login again.
+    `      printf '%s\\n' 'botmux: ${tool} 本轮的发起人身份还没有准备好（可能仍在获取凭据），命令未执行。这不一定是没授权：稍等几秒重试本命令；连续失败再发 /login status 查看授权状态。' '[reason=identity_not_published]' >&2`,
     '    fi',
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
@@ -1429,8 +1434,14 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
   const reprepend = [
     '# botmux trigger-user identity — generated, do not edit.',
     '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
+    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ]; then',
+    '  case "$PATH:" in',
+    '    "$BOTMUX_WRAPPER_BIN":*) ;;',
+    '    *) PATH="$BOTMUX_WRAPPER_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '  esac',
+    'fi',
     'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
-    '  case ":$PATH:" in',
+    '  case "$PATH:" in',
     '    "$BOTMUX_IDENTITY_BIN":*) ;;',
     '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
     '  esac',
@@ -1842,6 +1853,7 @@ export function prepareTriggerUserCliEnv(
     try {
       const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
       childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+      childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
       childEnv.ZDOTDIR = zdotdir;
       childEnv.BASH_ENV = bashEnv;
     } catch (e) {

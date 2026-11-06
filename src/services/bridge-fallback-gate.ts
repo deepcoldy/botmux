@@ -519,21 +519,25 @@ function markerMatchesExactTurn(turn: BridgeGateInput, marker: BridgeSendMarker)
  * The CLI's explicit send can still carry the first input's authority while
  * the transcript terminal belongs to its successor. The queue records this
  * relation only after matching a native turn id. Do not widen the time window
- * or accept progress credit from any of these earlier inputs. */
+ * or accept progress credit from any of these earlier inputs. An empty normal
+ * completion has no body to compare: its explicit final receipt still proves
+ * delivery, provided it was sent after the latest folded input was processed. */
 function markerMatchesSupersededFinal(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
   const normalizedFinal = normaliseForFingerprint(bridgePostText(turn.finalText ?? '', false));
   // Same-native evidence does not make an earlier answer cover a later human
   // request. Require a completed body sent after the successor input, and an
-  // exact body proof. Durable attempts keep their separate recovery owner.
-  if (!normalizedFinal || turn.markTimeMs === undefined || !Number.isFinite(turn.markTimeMs)
+  // exact body proof for non-empty output. Durable attempts keep their separate recovery owner.
+  if (turn.markTimeMs === undefined || !Number.isFinite(turn.markTimeMs)
     || !Number.isFinite(marker.sentAtMs) || marker.sentAtMs < turn.markTimeMs
     || turn.dispatchAttempt !== undefined || marker.dispatchAttempt !== undefined) return false;
-  const sameBody = marker.contentHash !== undefined
+  const emptyCompletion = turn.finalText !== undefined && !normalizedFinal
+    && (turn.terminalStatus === undefined || turn.terminalStatus === 'completed');
+  const sameBody = !!normalizedFinal && (marker.contentHash !== undefined
     ? marker.contentHash === createHash('sha256').update(normalizedFinal).digest('hex')
     : typeof marker.previewText === 'string'
       && marker.contentLength === normalizedFinal.length
-      && normaliseForFingerprint(marker.previewText) === normalizedFinal;
-  return sameBody
+      && normaliseForFingerprint(marker.previewText) === normalizedFinal);
+  return (emptyCompletion || sameBody)
     && !!turn.turnId
     && !!turn.sessionId
     && marker.sessionId === turn.sessionId

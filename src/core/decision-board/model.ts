@@ -62,7 +62,36 @@ export interface BoardLink {
 export type BoardChatCheck = 'verified' | 'unverified';
 
 export type BoardActor = 'steward' | 'owner' | 'system';
-export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link';
+export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link' | 'hint';
+
+/**
+ * 这一项什么时候可以关：
+ *   - pr：这个 PR 合入（`pr:owner/repo#12 merged`）；
+ *   - item：看板上另一项完成（`item:66 done`）；
+ *   - manual：只由管家判断，巡检不提示（挂了 PR 也不按默认规则判）。
+ * 没写时：挂了 PR 关联的项按「挂的 PR 全部合入」判断，没挂的不判断。
+ */
+export type BoardCloseWhen =
+  | { kind: 'pr'; ref: string }
+  | { kind: 'item'; seq: number }
+  | { kind: 'manual' };
+
+/**
+ * 后台巡检（不调模型）给这一项打的提示。只提示、不改状态：
+ *   - close：关闭条件满足，建议关闭；
+ *   - advance：依赖的项都结束了 / 挂的 PR 没合就关了，建议推进；
+ *   - stale：过了复查时间还没动。
+ * key 由提示类型和触发它的事实拼成，同一个 key 只通知管家一次。
+ */
+export type BoardHintKind = 'close' | 'advance' | 'stale';
+
+export interface BoardHint {
+  kind: BoardHintKind;
+  key: string;
+  /** 给人读的一句话原因（中文 / 英文按看板语言），如「PR owner/repo#12 已合入」。 */
+  reason: string;
+  at: number;
+}
 
 export interface BoardItem {
   seq: number;
@@ -88,6 +117,14 @@ export interface BoardItem {
   primaryChat?: string;
   /** 确实没有群时管家写的原因；只在这一项没有 chat 关联时生效。 */
   noChatReason?: string;
+  /** 什么时候可以关；缺省 = 挂了 PR 就按「PR 全部合入」判断，见 {@link BoardCloseWhen}。 */
+  closeWhen?: BoardCloseWhen;
+  /** 依赖的事项编号：都结束（完成 / 关闭）后提示推进。 */
+  dependsOn?: number[];
+  /** 下次复查时间（毫秒）；过了还没动（这之后没有更新）就标「该看一眼」。 */
+  nextCheckAt?: number;
+  /** 后台巡检当前给的提示；没有提示时缺省。 */
+  hint?: BoardHint;
 }
 
 export interface BoardEvent {
@@ -136,7 +173,12 @@ export interface BoardBatch {
   turnId?: string;
   deliveredAt?: number;
   error?: string;
+  /** 从哪里提交的：飞书拍板卡片为 'card'；缺省 = 网页看板。 */
+  source?: BatchSource;
 }
+
+/** 批次来源：网页看板（缺省）或管家群里的拍板卡片。 */
+export type BatchSource = 'web' | 'card';
 
 export interface BoardDecision {
   batchId: number;
@@ -146,6 +188,13 @@ export interface BoardDecision {
   fileIds: string[];
   itemRev: number;
   handledAt?: number;
+  /**
+   * 同一项后来又提交了决定（卡片与网页之间以后提交的为准）：覆盖它的批次号。还没送到管家时同时记
+   * handledAt（作废）；已送到的仍待执行，由管家按实际情况 --handled。
+   */
+  supersededBy?: number;
+  /** 决定时待拍板内容（问题 + 选项 + 推荐）的指纹；旧数据没有。 */
+  askKey?: string;
 }
 
 // ─── 字段上限 ───────────────────────────────────────────────────────────────
@@ -384,6 +433,16 @@ export interface StewardConfig {
    * 管家。默认关：带上后群里有两个 bot，原 bot 不再按单人单 bot 免 @ 续话。只在打开时写 `true`。
    */
   autoJoinSoloGroups?: boolean;
+  /**
+   * 事项进入待拍板（或改了选项）时，往管家群发一张能直接点选项的拍板卡片，之后原地更新。
+   * 默认开，只在关掉时写 `false`。
+   */
+  decisionCards?: boolean;
+  /**
+   * 后台巡检（几分钟一次，不调模型）找出可以关 / 可以推进 / 过了复查时间的事项：在这一项上标提示、
+   * 记一条历史，并给管家会话发一条合并的短通知。只提示，不改状态。默认关，只在打开时写 `true`。
+   */
+  closeHints?: boolean;
 }
 
 export const STEWARD_GUIDE_TEXT_MAX = 20_000;
@@ -398,7 +457,7 @@ export function normalizeStewardConfig(raw: unknown):
   if (raw === null || raw === undefined) return { ok: true, value: null };
   if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'steward 必须是对象' };
   const r = raw as Record<string, unknown>;
-  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups']);
+  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups', 'closeHints', 'decisionCards']);
   const unknown = Object.keys(r).filter(k => !known.has(k));
   if (unknown.length) return { ok: false, reason: `steward 有未知字段：${unknown.join(', ')}` };
   if (r.enabled !== undefined && typeof r.enabled !== 'boolean') return { ok: false, reason: 'steward.enabled 必须是布尔值' };
@@ -407,6 +466,12 @@ export function normalizeStewardConfig(raw: unknown):
   }
   if (r.autoJoinSoloGroups !== undefined && r.autoJoinSoloGroups !== null && typeof r.autoJoinSoloGroups !== 'boolean') {
     return { ok: false, reason: 'steward.autoJoinSoloGroups 必须是布尔值' };
+  }
+  if (r.decisionCards !== undefined && r.decisionCards !== null && typeof r.decisionCards !== 'boolean') {
+    return { ok: false, reason: 'steward.decisionCards 必须是布尔值' };
+  }
+  if (r.closeHints !== undefined && r.closeHints !== null && typeof r.closeHints !== 'boolean') {
+    return { ok: false, reason: 'steward.closeHints 必须是布尔值' };
   }
   let chatId: string | undefined;
   if (r.chatId !== undefined && r.chatId !== null && r.chatId !== '') {
@@ -437,17 +502,39 @@ export function normalizeStewardConfig(raw: unknown):
     ...(guideText ? { guideText } : {}),
     ...(r.autoJoinNewGroups === false ? { autoJoinNewGroups: false } : {}),
     ...(r.autoJoinSoloGroups === true ? { autoJoinSoloGroups: true } : {}),
+    ...(r.decisionCards === false ? { decisionCards: false } : {}),
+    ...(r.closeHints === true ? { closeHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
-    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true) {
+    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
+    && value.decisionCards !== false) {
     return { ok: true, value: null };
   }
   return { ok: true, value };
 }
 
+/**
+ * 这个 bot 是不是管家（只看总开关，不要求选了管家群）。管家不执行工作流节点：
+ * Dashboard 草稿与飞书 /workflow 两个入口的 Architect 名单都按这一条排除
+ * （design 2026-11-03 workflow-dashboard-orchestration §4.4）。
+ */
+export function isStewardBot(cfg: StewardConfig | undefined): boolean {
+  return cfg?.enabled === true;
+}
+
 /** 管家可用 = 开关开 + 选了管家群。只开开关没选群时，看板可读写，但批次无处投递。 */
 export function stewardReady(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
   return !!cfg?.enabled && !!cfg.chatId;
+}
+
+/** 要不要往管家群发拍板卡片：管家可用（开关开 + 选了管家群）且没关「飞书卡片拍板」。 */
+export function stewardDecisionCardsOn(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
+  return stewardReady(cfg) && cfg.decisionCards !== false;
+}
+
+/** 后台巡检开着：管家开着、选了管家群（通知要有地方投）、且打开了 closeHints。 */
+export function stewardCloseHintsOn(cfg: StewardConfig | undefined): boolean {
+  return stewardReady(cfg) && cfg.closeHints === true;
 }
 
 /**
@@ -458,6 +545,9 @@ export function stewardJoinsNewGroups(cfg: StewardConfig | undefined, chat: { so
   if (cfg?.enabled !== true || cfg.autoJoinNewGroups === false) return false;
   return chat.soloGroup ? cfg.autoJoinSoloGroups === true : true;
 }
+
+/** 拍板卡片上最多放几个选项按钮；更多时卡片只给看板链接。 */
+export const DECISION_CARD_MAX_OPTIONS = 6;
 
 // ─── 管家规则（`botmux board guide`）────────────────────────────────────────
 // 不常驻：管家群里只有一行提示（renderStewardHintBlock），正文按需由 guide 输出。
@@ -487,11 +577,13 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
   \`botmux board set <编号> --state decide --ask "要你定的问题" --option "A=做法 → 结果和风险" --option "B=…" --recommend A --reason "理由"\`。
   给两三个选项，写清后果和你的推荐。
 - 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接；发出去之后给每项记一句 \`botmux board history <编号> "已报 owner"\`。
+- 管家开着「飞书卡片拍板」（默认开）时，botmux 会在改成 decide 或改了选项后自动往管家群发这一项的拍板卡片，之后原地更新；owner 在卡片上点的选项和网页提交一样，以「决策看板 · 批次」送到你这里。这时上面那条消息一句话说明要定什么即可，不用再列选项、不要自己发带选项的卡片。选项超过 ${DECISION_CARD_MAX_OPTIONS} 个时卡片只给看板链接。
 
 ## 执行一批决定（收到「决策看板 · 批次」消息时）
 - 逐项处理：先 \`botmux board show <编号>\` 看最新内容，再按决定执行。
 - 每项做完：\`botmux board history <编号> --handled "做了什么、结果"\`，需要时改状态。
 - 决定看不懂，或者和现状冲突：不要猜，写 \`--handled "要你再确认：…"\`，并把状态设回 decide。
+- 同一项在卡片和网页上先后都提交过时以后提交的为准，按批次消息里的标记做：「覆盖：批次 #N … 作废」——#N 那条已作废，不用执行也不用 --handled，只执行本次；「覆盖：批次 #N … 已送到你这里」——先给 #N 那条按实际情况 --handled（做了写做了什么，没做写「已被覆盖，未执行」），再执行本次；「已被覆盖」——这一项跳过，等后来那个批次。
 - 最后回一条汇总。
 
 ## 定时巡检（收到「决策看板 · 巡检」消息时）
@@ -535,11 +627,13 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 - Anything you cannot decide, anything irreversible, or anything that would overturn an earlier owner decision becomes a decision item:
   \`botmux board set <n> --state decide --ask "question" --option "A=approach → outcome and risk" --option "B=…" --recommend A --reason "why"\`.
 - Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`; once sent, note \`botmux board history <n> "reported to owner"\` on each item.
+- With "Decision cards in Feishu" on (the default), botmux posts this item's decision card in the steward chat after it becomes decide or its options change, and updates it in place; an option the owner picks on the card reaches you as a "Decision board · batch", same as a web submission. Then one sentence on what needs deciding is enough: do not repeat the options or post your own option card. With more than ${DECISION_CARD_MAX_OPTIONS} options the card only links to the board.
 
 ## Executing a batch (when a "Decision board · batch" message arrives)
 - Item by item: \`botmux board show <n>\` for the latest state, then act on the decision.
 - After each one: \`botmux board history <n> --handled "what you did and the result"\`, and update the state if needed.
 - If a decision is unclear or conflicts with reality, do not guess: \`--handled "Please confirm: …"\` and set the state back to decide.
+- When an item was submitted from both the card and the web page, the later one wins; follow the marks in the batch message: "Supersedes … is void": batch #N's decision is void, neither execute nor --handled it, just execute this one; "Supersedes … already reached you": first --handled #N's decision as it actually went (what you did, or "superseded, not executed"), then execute this one; "Superseded": skip this item and wait for the later batch.
 - Finish with one summary reply.
 
 ## Scheduled patrol (when a "Decision board · patrol" message arrives)
@@ -560,11 +654,51 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 ## Standard
 (The owner has not written one. Only report and nudge; take no irreversible action.)`;
 
+// 「自动发现可以关的项」打开时才插进规则（closeHints 默认关：没开的管家读到的 guide 与之前逐字相同）。
+// 一行插在「推进」一节写回进展那一行后面，一节插在「定时巡检」前面。
+const HINT_RULES: Record<Locale, { afterLine: string; line: string; beforeSection: string; section: string }> = {
+  zh: {
+    afterLine: '一句话用 `--note` 进历史。\n',
+    line: `- 写清什么时候能收：挂了 PR 的默认按「PR 全部合入」判断；别的写 \`--close-when "item:66 done"\` / \`"pr:owner/repo#12 merged"\`，只能你判断的写 \`manual\`。等别的事项的写 \`--depends-on 66,70\`；要过一阵再看的写 \`--next-check +2d\`（或带时区的时间）。
+`,
+    beforeSection: '## 定时巡检（',
+    section: `## 收到提示（收到「决策看板 · 提示」消息时）
+- 这是后台巡检按关闭条件、依赖和复查时间自动发现的，只是提示，状态没改。
+- 逐项 \`botmux board show <编号>\` 核对现状：确实可以了就照常 \`set --state …\`（改状态会收起提示）；核对后不改的用 \`botmux board set <编号> --dismiss-hint\` 收起，同一条提示不会再出现。
+- 「该看一眼」= 过了 \`--next-check\` 还没更新：看一下现状，回写进展，需要的话重设复查时间。
+
+`,
+  },
+  en: {
+    afterLine: 'add a one-line `--note` for the history.\n',
+    line: `- Say when an item can close: items with linked PRs default to "all linked PRs merged"; otherwise use \`--close-when "item:66 done"\` / \`"pr:owner/repo#12 merged"\`, or \`manual\` if only you can judge. Items waiting on others get \`--depends-on 66,70\`; items to revisit later get \`--next-check +2d\` (or a time with a timezone).
+`,
+    beforeSection: '## Scheduled patrol (',
+    section: `## Board hints (when a "Decision board · hint" message arrives)
+- These come from a background check of close conditions, dependencies and next check times. They are hints only; no state was changed.
+- For each item, \`botmux board show <n>\` and verify: if it really is ready, \`set --state …\` as usual (changing the state clears the hint); if you keep it as is, \`botmux board set <n> --dismiss-hint\` and the same hint will not come back.
+- "Check in" means the item passed its \`--next-check\` with no update: look at it, write back progress, and set a new check time if needed.
+
+`,
+  },
+};
+
+function withHintRules(text: string, locale: Locale): string {
+  const rules = HINT_RULES[locale];
+  let out = text;
+  const at = out.indexOf(rules.afterLine);
+  if (at >= 0) out = out.slice(0, at + rules.afterLine.length) + rules.line + out.slice(at + rules.afterLine.length);
+  const sec = out.indexOf(rules.beforeSection);
+  if (sec >= 0) out = out.slice(0, sec) + rules.section + out.slice(sec);
+  return out;
+}
+
 const STANDARD_HEADING: Record<Locale, string> = { zh: '## 推进标准', en: '## Standard' };
 const CUSTOM_HEADING: Record<Locale, string> = { zh: '## owner 的自定义规则（与上文冲突时以这里为准）', en: '## Owner custom rules (these win over anything above)' };
 
-export function stewardGuidePreset(locale: Locale): string {
-  return locale === 'en' ? GUIDE_PRESET_EN : GUIDE_PRESET_ZH;
+export function stewardGuidePreset(locale: Locale, cfg?: StewardConfig): string {
+  const preset = locale === 'en' ? GUIDE_PRESET_EN : GUIDE_PRESET_ZH;
+  return stewardCloseHintsOn(cfg) ? withHintRules(preset, locale) : preset;
 }
 
 /**
@@ -572,7 +706,7 @@ export function stewardGuidePreset(locale: Locale): string {
  * 占位正文，让自定义整段接在后面——通常自定义里写的就是推进标准。
  */
 export function composeStewardGuide(cfg: StewardConfig | undefined, locale: Locale): string {
-  const preset = stewardGuidePreset(locale);
+  const preset = stewardGuidePreset(locale, cfg);
   const custom = cfg?.guideText?.trim();
   if (!custom) return preset;
   if (cfg?.guideMode === 'replace') return custom;
@@ -619,6 +753,17 @@ export interface BatchMessageEntry {
   fileCount: number;
   /** 这一项的主群：管家群里的回显和批次消息都带上，点了直接进群。 */
   primaryChat?: { text: string; url: string };
+  /** 在管家群的拍板卡片上点的（缺省 = 网页看板）。 */
+  source?: BatchSource;
+  /** 这次决定作废了这些较早批次里对同一项的决定（以后提交的为准；它们还没送到管家，不用执行）。 */
+  supersedes?: number[];
+  /**
+   * 这次决定覆盖的较早决定里，已经送到管家、还没标执行的那些批次：管家可能已经在做，
+   * 要先按实际情况 --handled 那一条，再执行本次。
+   */
+  supersedesPending?: number[];
+  /** 投递前同一项已有更新的决定：这一条以那个批次为准，不用执行。 */
+  supersededBy?: number;
 }
 
 export interface BatchMessageInput {
@@ -667,6 +812,24 @@ export function formatBatchEntries(
         : `Choice: ${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`);
     } else {
       lines.push(zh ? '选：未选' : 'Choice: none');
+    }
+    // 来源与覆盖关系紧跟「选」：放在多行说明后面会像说明的一部分。
+    if (e.source === 'card') lines.push(zh ? '来源：管家群的拍板卡片' : 'Source: decision card in the steward chat');
+    const ids = (list: number[]) => list.map(id => `#${id}`).join(zh ? '、' : ', ');
+    if (e.supersedes?.length) {
+      lines.push(zh
+        ? `覆盖：批次 ${ids(e.supersedes)} 里对这一项的决定作废，以本次为准`
+        : `Supersedes: the decision on this item in batch ${ids(e.supersedes)} is void; follow this one`);
+    }
+    if (e.supersedesPending?.length) {
+      lines.push(zh
+        ? `覆盖：批次 ${ids(e.supersedesPending)} 里对这一项的决定已送到你这里、还没标执行，以本次为准。先按实际情况给那一条 --handled（做了写做了什么，没做写「已被覆盖，未执行」），再执行本次`
+        : `Supersedes: batch ${ids(e.supersedesPending)} already reached you and is not marked handled; this one wins. First --handled that one as it actually went (what you did, or "superseded, not executed"), then execute this one`);
+    }
+    if (e.supersededBy !== undefined) {
+      lines.push(zh
+        ? `已被覆盖：这一项后来在批次 #${e.supersededBy} 改了决定，以那次为准，这条不用执行`
+        : `Superseded: batch #${e.supersededBy} changed the decision on this item; follow that one and skip this`);
     }
     if (e.text.trim()) {
       lines.push(`${zh ? '说明：' : 'Note:'}\n${e.text}`);

@@ -9,11 +9,15 @@
  */
 
 import type { BotConfig } from '../../bot-registry.js';
+import { isStewardBot } from '../../core/decision-board/model.js';
 import { isV3SupportedCli, type Spec } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
+import type { V3MainTopicAvailability } from './placement.js';
 import {
   describeV3BotEligibilityCode,
   judgeV3BotEligibility,
+  v3BotExecutorPlanHeading,
+  v3PlacementLabel,
   type V3BotEligibilityProbe,
   type V3NodeExecutorTarget,
 } from './node-executor-mode.js';
@@ -55,12 +59,14 @@ function oneLine(text: string, max: number): string {
 
 /** Why a bot can never execute a workflow node, from its config alone (the
  *  same rules the Gate-2 snapshot freeze enforces). */
-function staticExclusion(bot: BotConfig): string | undefined {
+export function v3BotStaticExclusion(bot: BotConfig): string | undefined {
   if (!isV3SupportedCli(bot.cliId)) return `CLI ${bot.cliId} 不能执行工作流节点`;
   if (bot.disableCliBypass === true) return '关闭了 CLI bypass，不能执行工作流节点';
   if (bot.codexProfile) return '配置了 Codex profile，不能执行工作流节点';
   return undefined;
 }
+
+const STEWARD_EXCLUSION = '是管家 Bot，不执行工作流节点';
 
 async function mapLimited<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out = new Array<R>(items.length);
@@ -100,9 +106,14 @@ export async function buildV3BotRoster(input: {
     ...unique.filter((bot) => bot.larkAppId !== input.orchestratorAppId),
   ];
   const verdicts = await mapLimited(ordered, ROSTER_PROBE_CONCURRENCY, async (bot): Promise<string | undefined> => {
-    const fixed = staticExclusion(bot);
+    const fixed = v3BotStaticExclusion(bot);
     if (fixed) return fixed;
     if (bot.larkAppId === input.orchestratorAppId) return undefined;
+    // The steward (decision board) never executes workflow nodes; one rule for
+    // the Dashboard draft and the Feishu /workflow entry (design 2026-11-03
+    // workflow-dashboard-orchestration §4.4). The orchestrator itself is kept:
+    // its nodes default to it whatever the roster says.
+    if (isStewardBot(bot.steward)) return STEWARD_EXCLUSION;
     const problem = await judgeV3BotEligibility(bot.larkAppId, input.probe, { grant: false });
     return problem
       ? describeV3BotEligibilityCode(problem.code) + (problem.detail ? `（${problem.detail}）` : '')
@@ -176,6 +187,9 @@ export interface V3SketchAssignee {
 export interface V3ArchitectBotAssignment {
   roster: V3BotRoster;
   assignees: V3SketchAssignee[];
+  /** §5.2 rule 3: whether nodes may be placed in the main topic (absent =
+   *  unknown: the Architect is told to use node topics only). */
+  mainTopic?: V3MainTopicAvailability;
 }
 
 export function planV3SketchAssignees(
@@ -281,6 +295,29 @@ export function parseV3AssignmentReasons(notes: string): Map<string, { bot: stri
   return reasons;
 }
 
+const PLACEMENT_HEADING_RE = /^#{1,6}\s*placements?\b/i;
+const PLACEMENT_LINE_RE = /^\s*[-*]\s+`?([A-Za-z0-9._#-]+)`?\s*(?:→|->)\s*`?(main|topic)`?\s*[:：]\s*(.+?)\s*$/i;
+
+/** nodeId → (placement as written, reason) from the notes' `## Placements`
+ *  section (design §5.2: one line per goal node). Kept apart from
+ *  `## Bot assignments`, whose line format and parser stay as they are. */
+export function parseV3PlacementReasons(notes: string): Map<string, { placement: string; reason: string }> {
+  const reasons = new Map<string, { placement: string; reason: string }>();
+  let inSection = false;
+  for (const line of notes.split(/\r?\n/)) {
+    if (HEADING_RE.test(line)) {
+      inSection = PLACEMENT_HEADING_RE.test(line);
+      continue;
+    }
+    if (!inSection) continue;
+    const match = PLACEMENT_LINE_RE.exec(line);
+    if (!match || reasons.has(match[1]!)) continue;
+    const reason = oneLine(match[3]!, MAX_REASON_CHARS);
+    if (reason) reasons.set(match[1]!, { placement: match[2]!.toLowerCase(), reason });
+  }
+  return reasons;
+}
+
 export type V3AssigneeCheck =
   | { sketchId: string; assignee: string; status: 'honoured'; larkAppId: string; nodeIds: string[] }
   /** The name matches no configured bot, or several. */
@@ -345,6 +382,11 @@ export interface V3Gate2BotPlanRow {
   reason?: string;
   /** ⚠️ a named bot (`assignee`) this node was meant for is not honoured. */
   missedAssignee?: { assignee: string; why?: string };
+  /** §5.2: where the node is handed off, set only when some node of the run
+   *  goes to the main topic (not part of the flow summary: dagSha256 covers it). */
+  placementLabel?: string;
+  /** §5.2: the Architect's placement reason, when it matches the placement. */
+  placementReason?: string;
 }
 
 /** ⚠️ lines not attached to a node: an unresolvable name, or a named bot no
@@ -373,12 +415,17 @@ export function projectV3Gate2BotPlan(input: {
   cliOf: (larkAppId: string) => string | undefined;
   reasons: ReadonlyMap<string, { bot: string; reason: string }>;
   assignees: readonly V3AssigneeCheck[];
+  /** §5.2: the Architect's placement reasons (`## Placements`). */
+  placementReasons?: ReadonlyMap<string, { placement: string; reason: string }>;
 }): V3Gate2BotPlan {
   const notHonouredByNode = new Map<string, Extract<V3AssigneeCheck, { status: 'not-honoured' }>>();
   for (const check of input.assignees) {
     if (check.status !== 'not-honoured') continue;
     for (const nodeId of check.nodeIds) notHonouredByNode.set(nodeId, check);
   }
+  // Placements are named only when some node goes to the main topic: a run
+  // whose nodes all open topics keeps its lines exactly as before.
+  const placed = input.targets.some((target) => target.placement === 'main');
   const rows = input.targets.map((target): V3Gate2BotPlanRow => {
     const name = input.nameOf(target.larkAppId);
     const cli = input.cliOf(target.larkAppId);
@@ -386,6 +433,10 @@ export function projectV3Gate2BotPlan(input: {
     const reasonMatches = written
       && [target.larkAppId, name].some((candidate) => normalName(candidate) === normalName(written.bot));
     const missed = notHonouredByNode.get(target.nodeId);
+    // §5.2: every line also names where the node is handed off.
+    const placementLabel = placed ? v3PlacementLabel(target) : undefined;
+    const placementWhy = !placed || target.loop ? undefined : input.placementReasons?.get(target.nodeId);
+    const placementReason = placementWhy && placementWhy.placement === (target.placement ?? 'topic') ? placementWhy.reason : undefined;
     return {
       nodeId: target.nodeId,
       larkAppId: target.larkAppId,
@@ -394,6 +445,8 @@ export function projectV3Gate2BotPlan(input: {
       main: target.larkAppId === input.orchestratorAppId,
       ...(reasonMatches ? { reason: written.reason } : {}),
       ...(missed ? { missedAssignee: { assignee: missed.assignee, ...(missed.why ? { why: missed.why } : {}) } } : {}),
+      ...(placementLabel ? { placementLabel } : {}),
+      ...(placementReason ? { placementReason } : {}),
     };
   });
   const unplaced: V3Gate2UnplacedAssignee[] = [];
@@ -412,19 +465,20 @@ export function projectV3Gate2BotPlan(input: {
 
 /**
  * The Gate-2 "node → executing bot" lines of a bot run (§6.2/§6.3): bot name
- * and CLI, the Architect's reason, and a ⚠️ on every named bot that is not
- * honoured.
+ * and CLI, the Architect's reason, where the node is handed off (§5.2), and a
+ * ⚠️ on every named bot that is not honoured.
  */
 export function formatV3Gate2BotPlan(input: Parameters<typeof projectV3Gate2BotPlan>[0]): string {
   const plan = projectV3Gate2BotPlan(input);
   const named = (check: { assignee: string }) => `点名「${check.assignee}」`;
-  const lines = ['执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）'];
+  const lines = [v3BotExecutorPlanHeading(input.targets)];
   for (const row of plan.rows) {
-    const detail = [row.cli, row.main ? '主 Bot 自己' : undefined].filter(Boolean).join('，');
+    const detail = [row.cli, row.main ? '主 Bot 自己' : undefined, row.placementLabel].filter(Boolean).join('，');
     const missed = row.missedAssignee;
     lines.push(
       `- ${missed ? '⚠️ ' : ''}${row.nodeId} → ${row.name}${detail ? `（${detail}）` : ''}` +
       (row.reason ? `：${row.reason}` : '') +
+      (row.placementReason ? `${row.reason ? '；' : '：'}落点理由：${row.placementReason}` : '') +
       (missed ? ` —— ${named(missed)}未满足${missed.why ? `：${missed.why}` : ''}` : ''),
     );
   }

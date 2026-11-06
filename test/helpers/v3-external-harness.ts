@@ -82,9 +82,17 @@ export class FakeExecutor implements V3ExternalNodeExecutor {
 }
 
 const bases: string[] = [];
-/** Call from afterEach: removes every run dir created since the last call. */
+/** Call from afterEach: removes every run dir created since the last call.
+ *  A refusal the node daemon records fire-and-forget (a registry write behind
+ *  `withFileLock` + an atomic rename) can still be landing when the test body
+ *  returns. The write itself is quick, but acquiring its file lock on a
+ *  loaded CI runner can take seconds; retry the removal generously instead
+ *  of failing teardown with ENOTEMPTY (the first 10 × 50 ms budget still lost
+ *  that race in CI twice). This is teardown only, so the wait is harmless. */
 export function cleanupBotRuns(): void {
-  for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true });
+  for (const base of bases.splice(0)) {
+    rmSync(base, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
+  }
 }
 
 /** Register an extra temp dir for cleanupBotRuns. */

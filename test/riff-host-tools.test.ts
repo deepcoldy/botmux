@@ -386,7 +386,7 @@ describe('Riff host boundary', () => {
     expect(await maybeRunRiffHostTool(['project', 'status'], async () => '', {})).toBe(false);
     await expect(maybeRunRiffHostTool(['project', 'status'], async () => '', {
       BOTMUX_SESSION_ID: 'session-1', BOTMUX_RIFF_HOST_TOOLS: '1', SESSION_DATA_DIR: root(),
-    })).rejects.toThrow();
+    })).rejects.toThrow(/^riff_host_binding_missing: run this turn's <botmux_host_tools> bootstrap/);
   });
 
   it('does not activate an old binding without this invocation explicitly enabling host tools', async () => {

@@ -149,6 +149,19 @@ export function nodeBotLine(node: RunNodeView): string {
   return bot.cliId ? `${who} · ${bot.cliId}` : who;
 }
 
+/** §5.1: whether a bot run hands this node off in the main topic. */
+export function nodeInMainTopic(node: RunNodeView): boolean {
+  return node.handoff ? node.handoff.placement === 'main' : node.placement === 'main';
+}
+
+/** Graph box second row: the bot, plus「主话题」for a main-topic node (a
+ *  node topic is the default and is not marked). */
+export function nodeBoxBotLine(node: RunNodeView): string {
+  const line = nodeBotLine(node);
+  if (!line || !nodeInMainTopic(node)) return line;
+  return node.handoff?.queued ? `${line} · 主话题 · 排队中` : `${line} · 主话题`;
+}
+
 export const V3_DECISION_LABEL: Record<string, string> = {
   exit: '✓ 通过',
   continue: '↻ 继续返工',
@@ -177,9 +190,14 @@ export function isTerminalRunStatus(status: RunView['runStatus'] | undefined): b
   return status === 'succeeded' || status === 'failed' || status === 'cancelled';
 }
 
+/** Segments under `#/workflows/` that name a page, not a run (design
+ *  2026-11-03 workflow-dashboard-orchestration E13); matched before run detail. */
+const V3_RESERVED_WORKFLOW_SEGMENTS = new Set(['new', 'drafts', 'library']);
+
 export function v3RunIdFromHash(hash = typeof location !== 'undefined' ? location.hash : ''): string | null {
   const m = hash.match(/^#\/workflows\/([^?#]+)/);
   if (!m) return null;
+  if (V3_RESERVED_WORKFLOW_SEGMENTS.has(m[1]!.split('/')[0]!)) return null;
   try {
     return decodeURIComponent(m[1]!);
   } catch {

@@ -1,0 +1,50 @@
+
+████████ ████████   ███████  ████████    ██████ ██      ██
+   ██    ██     ██ ██    ██  ██         ██      ██      ██
+   ██    ██     ██ ██    ██  ██         ██      ██      ██
+   ██    ████████  ████████  ██████     ██      ██      ██
+   ██    ██   ██   ██    ██  ██         ██      ██      ██
+   ██    ██    ██  ██    ██  ██         ██      ██      ██
+   ██    ██     ██ ██    ██  ████████    ██████ ██████  ██
+
+  Welcome to TRAE CLI — your intelligent coding companion
+
+  Sign in to use TRAE CLI
+
+> 1. Company Employee
+     Sign in with Codebase Git or Company SSO
+
+  2. Enterprise User
+     Sign in with email, a custom domain, or a PAT
+
+  Press Enter to continue
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

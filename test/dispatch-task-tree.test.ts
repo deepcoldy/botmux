@@ -200,4 +200,32 @@ describe('renderDispatchTaskTreeCard', () => {
     expect(card).not.toContain('****');
     expect(renderDispatchTaskTreeText(escaped)).toContain('子任务');
   });
+
+  it('keeps a title of exactly the max length uncut', () => {
+    expect(taskTreeDisplayTitle('a'.repeat(40))).toBe('a'.repeat(40));
+  });
+
+  it('joins every whitespace run, not only the first', () => {
+    expect(taskTreeDisplayTitle('a\nb\nc')).toBe('a b c');
+  });
+
+  it('falls back to 编排任务 when the orchestration title is empty or blank', () => {
+    for (const title of ['', ' \n ']) {
+      const blank = buildDispatchTaskTree({
+        registry: { om_a: entry({}) }, orchSessionId: ORCH, title, sessions: [], localAppIds: LOCAL,
+      });
+      const header = renderDispatchTaskTreeCard(blank).header as { title: { content: string } };
+      expect(header.title.content).toBe('编排任务');
+      expect(renderDispatchTaskTreeText(blank).split('\n')[0]).toMatch(/^编排任务（/);
+    }
+  });
+
+  it('shows a non-empty orchestration title verbatim in the card header and text heading', () => {
+    const named = buildDispatchTaskTree({
+      registry: { om_a: entry({}) }, orchSessionId: ORCH, title: '主任务标题', sessions: [], localAppIds: LOCAL,
+    });
+    const header = renderDispatchTaskTreeCard(named).header as { title: { content: string } };
+    expect(header.title.content).toBe('主任务标题');
+    expect(renderDispatchTaskTreeText(named).split('\n')[0]).toMatch(/^主任务标题（/);
+  });
 });

@@ -34,7 +34,9 @@ import {
   unlinkSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { classifyClaudeTerminalEvent, type ClaudeTerminalOutcome } from './claude-transcript.js';
+import {
+  classifyClaudeTerminalEvent, eventTimeMs, type ClaudeTerminalOutcome, type TranscriptEvent,
+} from './claude-transcript.js';
 
 /** How long the transcript path gets to settle the failed turn before the
  *  hook settles it. Claude writes the API-error record before it runs the
@@ -55,6 +57,10 @@ export interface ClaudeStopFailureReport {
   transcriptPath?: string;
   /** `CLAUDE_PID` of the CLI that ran the hook. */
   claudePid?: number;
+  /** Set when a sub-agent's query loop failed (Claude puts the sub-agent's id
+   *  on every hook it runs). */
+  agentId?: string;
+  agentType?: string;
 }
 
 const MAX_ERROR_LENGTH = 64;
@@ -80,6 +86,8 @@ function buildReport(fields: {
   cliSessionId: unknown;
   transcriptPath: unknown;
   claudePid: unknown;
+  agentId: unknown;
+  agentType: unknown;
 }): ClaudeStopFailureReport | undefined {
   const error = boundedString(fields.error, MAX_ERROR_LENGTH);
   if (!error) return undefined;
@@ -94,6 +102,10 @@ function buildReport(fields: {
   if (transcriptPath) report.transcriptPath = transcriptPath;
   const claudePid = positiveInt(fields.claudePid);
   if (claudePid !== undefined) report.claudePid = claudePid;
+  const agentId = boundedString(fields.agentId, MAX_ID_LENGTH);
+  if (agentId) report.agentId = agentId;
+  const agentType = boundedString(fields.agentType, MAX_ID_LENGTH);
+  if (agentType) report.agentType = agentType;
   return report;
 }
 
@@ -117,6 +129,8 @@ export function parseClaudeStopFailureHookInput(
     cliSessionId: p.session_id,
     transcriptPath: p.transcript_path,
     claudePid,
+    agentId: p.agent_id,
+    agentType: p.agent_type,
   });
 }
 
@@ -131,6 +145,8 @@ export function normalizeClaudeStopFailureReport(value: unknown): ClaudeStopFail
     cliSessionId: v.cliSessionId,
     transcriptPath: v.transcriptPath,
     claudePid: v.claudePid,
+    agentId: v.agentId,
+    agentType: v.agentType,
   });
 }
 
@@ -175,6 +191,117 @@ export function claudeStopFailureBelongsToOwner(
   if (report.claudePid !== undefined && report.claudePid === owner.cliPid) return true;
   if (report.cliSessionId !== undefined && owner.cliSessionIds.has(report.cliSessionId)) return true;
   return report.transcriptPath !== undefined && report.transcriptPath === owner.transcriptPath;
+}
+
+// ─── Transcript corroboration ────────────────────────────────────────────────
+//
+// `StopFailure` does not only fire for the main conversation. Claude Code runs
+// background forks from the main context after a turn (`extract_memories`,
+// `prompt_suggestion`, …: `skipTranscript` query loops) and a failure there
+// runs the same hook with the main session's `session_id` and
+// `transcript_path`, usually without an `agent_id`. Nothing of it reaches the
+// transcript and the conversation carries on. Measured on 2.1.318: six such
+// reports 21–41s after normal `end_turn`s of an already completed turn, no
+// API-error record anywhere.
+//
+// What a real main-chain failure always leaves is its terminal record. Every
+// 2.1.318 `StopFailure` call site yields the record first and then runs the
+// hook with that same message: the API-error record itself, and the synthetic
+// terminals built the same way (`malformed_tool_use_exhausted`,
+// `empty_completion`, `prompt_too_long` / `image_error`,
+// `autocompact_thrashing`) — all `type:"assistant"`, `isApiErrorMessage:true`,
+// `apiError:<kind>`, and an `error` field that is the hook's `error` (the hook
+// says `unknown` when the record has none). So when the hook names the
+// transcript the bridge reads, the report only counts once the bridge has read
+// a matching non-sidechain record.
+
+/** How far a record's own timestamp may precede the report. Claude creates
+ *  the record, writes it and only then starts the hook, so a real report
+ *  normally lands within a second of its record (measured on this fleet:
+ *  0.4–0.7s). The bound leaves room for a slow hook start, and stays short so
+ *  a record whose own hook got lost cannot back a later background failure. */
+export const CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS = 30_000;
+/** Same, for `invalid_request`: a prompt-too-long / autocompact terminal can
+ *  surface after Claude tried, and failed, to compact, and an image error
+ *  surfaces the record of the request that failed before that attempt. */
+export const CLAUDE_STOP_FAILURE_COMPACT_RECORD_MAX_LEAD_MS = 5 * 60_000;
+/** How far a record's timestamp may follow the report's arrival. The record is
+ *  created before the hook starts; this only absorbs timestamp rounding and
+ *  the worker's view of arrival. Kept short so the next real failure's record
+ *  is not claimed by a background report that came just before it. */
+export const CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS = 3_000;
+/** Extra time, after the grace period, for a transcript write that lost the
+ *  race against the hook to reach the bridge. */
+export const CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS = 10_000;
+const MAX_OBSERVED_RECORDS = 32;
+const DIAGNOSTIC_FIELD_MAX = 200;
+
+interface ObservedTerminalRecord {
+  path: string;
+  uuid?: string;
+  error: string;
+  atMs: number;
+  used: boolean;
+}
+
+/** Main-chain terminal records the bridge read, for {@link handleClaudeStopFailureReport}
+ *  to match reports against. Each record backs one report at most. */
+export class ClaudeStopFailureTranscriptEvidence {
+  private records: ObservedTerminalRecord[] = [];
+
+  /** Feed every batch of events the bridge read from `path`. */
+  observe(events: readonly TranscriptEvent[], path: string): void {
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object' || ev.isSidechain === true || ev.isApiErrorMessage !== true) continue;
+      const role = ev.message?.role ?? ev.type;
+      if (role !== 'assistant') continue;
+      const atMs = eventTimeMs(ev);
+      if (atMs === undefined) continue;
+      // The same file can be read twice (a path that is primary again while
+      // still listed as a retired secondary path).
+      const uuid = typeof ev.uuid === 'string' && ev.uuid ? ev.uuid : undefined;
+      if (uuid && this.records.some(r => r.uuid === uuid && r.path === path)) continue;
+      const error = (typeof ev.error === 'string' && ev.error.trim() ? ev.error.trim() : 'unknown').slice(0, MAX_ERROR_LENGTH);
+      this.records.push({ path, ...(uuid ? { uuid } : {}), error, atMs, used: false });
+    }
+    if (this.records.length > MAX_OBSERVED_RECORDS) {
+      // Keep the newest unused records: used ones back nothing any more.
+      this.records.sort((a, b) => (Number(b.used) - Number(a.used)) || (a.atMs - b.atMs));
+      this.records.splice(0, this.records.length - MAX_OBSERVED_RECORDS);
+    }
+  }
+
+  /** Claim the record a report that arrived at `arrivedAtMs` stands for: the
+   *  unused one of the same error and transcript closest to the arrival. */
+  take(report: ClaudeStopFailureReport, arrivedAtMs: number): boolean {
+    const path = report.transcriptPath;
+    if (!path) return false;
+    const maxLeadMs = report.error === 'invalid_request'
+      ? CLAUDE_STOP_FAILURE_COMPACT_RECORD_MAX_LEAD_MS
+      : CLAUDE_STOP_FAILURE_RECORD_MAX_LEAD_MS;
+    let found: ObservedTerminalRecord | undefined;
+    for (const r of this.records) {
+      if (r.used || r.path !== path || r.error !== report.error) continue;
+      if (r.atMs < arrivedAtMs - maxLeadMs || r.atMs > arrivedAtMs + CLAUDE_STOP_FAILURE_RECORD_MAX_LAG_MS) continue;
+      if (!found || Math.abs(r.atMs - arrivedAtMs) < Math.abs(found.atMs - arrivedAtMs)) found = r;
+    }
+    if (!found) return false;
+    found.used = true;
+    return true;
+  }
+}
+
+function diagnosticText(value: string | undefined): string {
+  if (!value) return '-';
+  const flat = value.replace(/\s+/g, ' ');
+  return JSON.stringify(flat.length > DIAGNOSTIC_FIELD_MAX ? `${flat.slice(0, DIAGNOSTIC_FIELD_MAX)}…` : flat);
+}
+
+/** One bounded line for a report that is dropped without telling the chat. */
+export function describeClaudeStopFailureReport(report: ClaudeStopFailureReport): string {
+  return `error=${diagnosticText(report.error)} agent_id=${diagnosticText(report.agentId)} `
+    + `agent_type=${diagnosticText(report.agentType)} error_details=${diagnosticText(report.errorDetails)} `
+    + `last_assistant_message=${diagnosticText(report.lastAssistantMessage)}`;
 }
 
 export type ClaudeStopFailureFallback =
@@ -242,6 +369,11 @@ export interface ClaudeStopFailureContext<TTimer = unknown> {
   /** When the worker last emitted a failed/ambiguous terminal or a failure
    *  notice. */
   lastFailureSurfacedAtMs: () => number | undefined;
+  /** Main-chain terminal records the bridge read (see
+   *  {@link ClaudeStopFailureTranscriptEvidence}). */
+  transcriptEvidence: { take: (report: ClaudeStopFailureReport, arrivedAtMs: number) => boolean };
+  /** Reserve the one notice a closed turn may get; false when it already had it. */
+  claimTurnNotice: (turnId: string, dispatchAttempt?: number) => boolean;
   now: () => number;
   emit: (
     turnId: string,
@@ -272,6 +404,13 @@ export interface ClaudeStopFailureContext<TTimer = unknown> {
  * turn-idle report. Whatever cannot be settled safely is reported as a notice,
  * replying to the claimed turn only if this worker knows it.
  *
+ * A report that names the transcript the bridge reads only counts once the
+ * bridge read the failure's main-chain terminal record (see the corroboration
+ * section above); one that names another transcript — the bridge lost the
+ * session, which is what this fallback is for — is taken as it is. A
+ * sub-agent's report never reaches the chat: the parent gets that failure as
+ * a tool result and carries on. A closed turn gets one notice at most.
+ *
  * `notifyOnly` marks a report whose bytes the sandbox controls (the relay
  * outbox, see below): it may produce a notice, never a terminal.
  */
@@ -286,6 +425,14 @@ export function handleClaudeStopFailureReport<TTimer>(
       + `(pid=${report.claudePid ?? '?'} sid=${report.cliSessionId?.slice(0, 8) ?? '?'})`);
     return undefined;
   }
+  if (report.agentId !== undefined) {
+    ctx.log(`Claude StopFailure from sub-agent ${report.agentType ?? '?'}: not reported, the parent agent `
+      + `receives it as a tool result (${describeClaudeStopFailureReport(report)})`);
+    return undefined;
+  }
+  const arrivedAtMs = ctx.now();
+  // Same transcript as the bridge: the failure is real only if its record is there.
+  const needsRecord = report.transcriptPath !== undefined && report.transcriptPath === ctx.owner.transcriptPath;
   const active = ctx.activeTurn;
   const claimMatches = claimedTurn.turnId === undefined
     || (claimedTurn.turnId === active.turnId && claimedTurn.dispatchAttempt === active.dispatchAttempt);
@@ -306,11 +453,22 @@ export function handleClaudeStopFailureReport<TTimer>(
   ctx.log(`Claude StopFailure (${report.error}${opts.notifyOnly ? ', notify-only' : ''}) for turn `
     + `${failedTurn.turnId?.slice(0, 12) ?? '-'}; waiting ${CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS}ms `
     + 'for the transcript to surface it');
-  return ctx.schedule(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS, () => {
+  const settle = (lastChance: boolean): void => {
     try {
       ctx.catchUp();
     } catch (err) {
       ctx.log(`Claude StopFailure catch-up read failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (needsRecord && outcome && (outcome.status === 'failed' || outcome.status === 'ambiguous')
+      && !ctx.transcriptEvidence.take(report, arrivedAtMs)) {
+      if (!lastChance) {
+        ctx.schedule(CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS, () => settle(true));
+        return;
+      }
+      ctx.log('Claude StopFailure without a main-chain terminal record in the transcript the bridge reads '
+        + '(a background request of the session failed, not the conversation); not reported '
+        + `(${describeClaudeStopFailureReport(report)})`);
+      return;
     }
     const settledStatus = failedTurn.turnId
       ? ctx.settledStatus(failedTurn.turnId, failedTurn.dispatchAttempt)
@@ -335,11 +493,20 @@ export function handleClaudeStopFailureReport<TTimer>(
         ctx.emit(settleTurnId!, decision.status, decision.errorCode, active.dispatchAttempt, decision.retryable);
         return;
       case 'notify':
+        // A closed turn gets one notice: whatever else fails after it stopped
+        // is the same "check the terminal" the chat already has.
+        if (failedTurn.turnId && settledStatus !== undefined
+          && !ctx.claimTurnNotice(failedTurn.turnId, failedTurn.dispatchAttempt)) {
+          ctx.log(`Claude StopFailure (${report.error}): closed turn ${failedTurn.turnId.slice(0, 12)} already got `
+            + 'its failure notice; not repeating it');
+          return;
+        }
         ctx.log(`Claude StopFailure fallback: no open turn to settle and nothing surfaced the failure; `
           + `notifying (${decision.errorCode})`);
         ctx.notify(decision.errorCode, failedTurn.turnId);
     }
-  });
+  };
+  return ctx.schedule(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS, () => settle(false));
 }
 
 // ─── Relay outbox: the notify-only channel of an isolated session ─────────────

@@ -32,7 +32,14 @@ import {
   formatV3Intervention,
   latestV3InterventionFor,
 } from '../../workflows/v3/interventions.js';
-import { buildV3NodeCard, type V3NodeCardStatus, type V3NodeCardView } from './v3-node-card.js';
+import {
+  buildV3HandoffCard,
+  buildV3NodeCard,
+  v3HandoffCardStatus,
+  type V3HandoffCardInput,
+  type V3NodeCardStatus,
+  type V3NodeCardView,
+} from './v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
 /** The card status an external attempt projects to (pure). */
@@ -52,6 +59,8 @@ export function v3NodeCardStatusFor(
         ...(attempt.deadlineAt !== undefined ? { deadlineAt: attempt.deadlineAt } : {}),
         ...(attempt.stalledAt !== undefined ? { stalledAt: attempt.stalledAt } : {}),
         ...(activeAt !== undefined ? { activeAt } : {}),
+        ...(attempt.startPending ? { queued: true as const } : {}),
+        ...(attempt.startedAt !== undefined ? { startedAt: attempt.startedAt } : {}),
       };
     }
     return acceptanceUnknownSince !== undefined
@@ -73,8 +82,9 @@ export function v3NodeCardStatusFor(
       const message = verdict && 'message' in verdict && typeof verdict.message === 'string' ? verdict.message : undefined;
       const errorCode = closed.errorCode ?? (closed.kind === 'failed' ? 'failed' : undefined);
       // A timeout reads as its own state; the engine's own timeout text adds
-      // nothing to "超时未提交有效结果".
-      return errorCode === V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT
+      // nothing to "超时未提交有效结果" — except for a main-topic handoff that
+      // never left the queue (§5.5), whose reason is the point.
+      return errorCode === V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT && !attempt.startPending
         ? { kind: 'blocked', errorCode }
         : { kind: 'blocked', ...(errorCode ? { errorCode } : {}), ...(message ? { message } : {}) };
     }
@@ -117,6 +127,9 @@ export interface V3NodeCardSyncDeps {
   topicCards?(runDir: string): Record<string, string>;
   /** §11: the run's「工作流 ›」sidebar entry (this daemon's bot is the main bot). */
   workflowEntry?(runId: string): WorkflowSidebarEntryLink | undefined;
+  /** Main-topic placement (P2): the saved input of an attempt's handoff
+   *  card, whose status line stands in for the node card. */
+  handoffCardInput?(runDir: string, attemptId: string): V3HandoffCardInput | undefined;
   now?(): number;
 }
 
@@ -150,7 +163,13 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
     const snap = materialize([...events]);
     const topicCards = deps.topicCards?.(runDir) ?? {};
     const latestByCard = new Map<string, V3ExternalAttempt>();
+    /** Main topic: every attempt has its own handoff card (P2). */
+    const mainTopicCards = new Map<string, V3ExternalAttempt>();
     for (const attempt of foldV3ExternalAttempts(events).values()) {
+      if (attempt.placement === 'main') {
+        if (attempt.handoffMessageId) mainTopicCards.set(attempt.handoffMessageId, attempt);
+        continue;
+      }
       // An attempt whose Sent never reached the journal still owns the card
       // its node topic was opened with.
       const cardId = attempt.nodeCardMessageId ?? (attempt.phase !== 'dispatched' ? topicCards[nodeTopicKey(attempt)] : undefined);
@@ -208,6 +227,33 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
       const signature = JSON.stringify({ attempt: attempt.attemptId, status: { ...status, ...('since' in status ? { since: 0 } : {}) }, upstream, target, key: nodeTopicKey(attempt), intervention, checkpoint });
       if (shown.get(messageId) === signature) continue;
       await deps.patchCard(messageId, buildV3NodeCard(view));
+      shown.set(messageId, signature);
+    }
+    for (const [messageId, attempt] of mainTopicCards) {
+      const input = deps.handoffCardInput?.(runDir, attempt.attemptId);
+      if (!input) continue;
+      const instanceStatus = attempt.instanceId
+        ? snap.instances.get(attempt.instanceId)?.status
+        : snap.nodes.get(attempt.nodeId)?.status;
+      const status = v3NodeCardStatusFor(
+        attempt,
+        events,
+        instanceStatus,
+        deps.acceptanceUnknownSince?.(runDir, attempt.attemptId),
+        deps.activity?.(runDir, attempt.attemptId).activeAt,
+      );
+      const handled = latestV3InterventionFor(interventions.get(attempt.nodeId), attempt.attemptId);
+      const intervention = handled ? formatV3Intervention(handled) : undefined;
+      const checkpoint = checkpointLine(checkpoints.get(attempt.attemptId));
+      const signature = JSON.stringify({ attempt: attempt.attemptId, status: { ...status, ...('since' in status ? { since: 0 } : {}) }, intervention, checkpoint, main: true });
+      if (shown.get(messageId) === signature) continue;
+      await deps.patchCard(messageId, buildV3HandoffCard({
+        ...input,
+        status: v3HandoffCardStatus(status, input.attemptNumber, {
+          ...(intervention ? { intervention } : {}),
+          ...(checkpoint ? { checkpoint } : {}),
+        }),
+      }));
       shown.set(messageId, signature);
     }
   }

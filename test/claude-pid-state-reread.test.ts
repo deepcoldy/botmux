@@ -8,7 +8,7 @@
  * in CI).
  */
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -107,5 +107,82 @@ describe('resolveJsonlFromPid reads through a record Claude is rewriting', () =>
 
     expect(resolveJsonlFromPid(pid, cwd, dataDir)?.cliSessionId).toBe(after);
     expect(sleeps).toEqual([]);
+  });
+});
+
+describe.skipIf(process.platform !== 'linux')('resolveJsonlFromPid after an in-session cwd change', () => {
+  function publishMovedState(sessionId = after, procStartOverride?: string) {
+    const movedCwd = join(root, 'moved-work');
+    mkdirSync(movedCwd);
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const procStart = procStartOverride ?? stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/)[19];
+    writeFileSync(recordPath, JSON.stringify({ pid, sessionId, cwd: movedCwd, procStart }));
+    return claudeJsonlPathForSession(sessionId, movedCwd, dataDir);
+  }
+
+  function transcript(sessionId = after) {
+    const path = claudeJsonlPathForSession(sessionId, cwd, dataDir);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '{"type":"user","message":{"role":"user","content":"confirm this input"}}\n');
+    return path;
+  }
+
+  it('keeps reading the existing same-session transcript when only the pid cwd moved', () => {
+    const originalPath = transcript();
+    publishMovedState();
+    const result = resolveJsonlFromPid(pid, cwd, dataDir);
+    expect(result).toEqual({ path: originalPath, cliSessionId: after });
+    expect(readFileSync(result!.path, 'utf8')).toContain('confirm this input');
+  });
+
+  it('prefers the current-cwd transcript when Claude actually writes it', () => {
+    transcript();
+    const currentPath = publishMovedState();
+    mkdirSync(dirname(currentPath), { recursive: true });
+    writeFileSync(currentPath, 'current transcript');
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toEqual({ path: currentPath, cliSessionId: after });
+  });
+
+  it('retains the projected path for a cold session that has not written any transcript', () => {
+    const currentPath = publishMovedState();
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toEqual({ path: currentPath, cliSessionId: after });
+  });
+
+  it('does not fall back to a different session after a native session rotation', () => {
+    transcript(before);
+    const currentPath = publishMovedState(after);
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toEqual({ path: currentPath, cliSessionId: after });
+  });
+
+  it('does not let an existing transcript bypass the pid-reuse identity guard', () => {
+    transcript();
+    publishMovedState(after, 'invalid-start-time');
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toBeNull();
+  });
+
+  it('finds the original transcript under Claude\'s truncated long-cwd bucket', () => {
+    cwd = join(root, 'long-work', ...Array(6).fill('x'.repeat(40)));
+    mkdirSync(cwd, { recursive: true });
+    cwd = realpathSync(cwd);
+    const slug = cwd.replace(/[^A-Za-z0-9-]/g, '-');
+    const originalPath = join(dataDir, 'projects', `${slug.slice(0, 200)}-abc123`, `${after}.jsonl`);
+    mkdirSync(dirname(originalPath), { recursive: true });
+    writeFileSync(originalPath, 'original transcript');
+    publishMovedState();
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toEqual({ path: originalPath, cliSessionId: after });
+  });
+
+  it('ignores a current-cwd directory named like a JSONL instead of hiding the original file', () => {
+    const originalPath = transcript();
+    const currentPath = publishMovedState();
+    mkdirSync(currentPath, { recursive: true });
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toEqual({ path: originalPath, cliSessionId: after });
+  });
+
+  it('does not use a directory as the original-cwd transcript fallback', () => {
+    const originalPath = claudeJsonlPathForSession(after, cwd, dataDir);
+    mkdirSync(originalPath, { recursive: true });
+    const currentPath = publishMovedState();
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toEqual({ path: currentPath, cliSessionId: after });
   });
 });

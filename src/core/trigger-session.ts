@@ -1,3 +1,5 @@
+import { config } from '../config.js';
+import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
@@ -38,7 +40,8 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
 
 export interface TriggerSessionDeps {
@@ -734,6 +737,7 @@ function waitForSessionFinalOutput(
       },
     });
     try {
+      if (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1') outputDeliveryJournal(config.session.dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, triggerId, { kind: 'http', mode: 'wait' });
       dispatchTurn();
     } catch (err) {
       clearTimeout(timer);
@@ -749,6 +753,7 @@ function waitForSessionFinalOutput(
 }
 
 function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+  if (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1') outputDeliveryJournal(config.session.dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, triggerId, { kind: 'http', mode: 'async' });
   const createdAt = Date.now();
   ds.asyncTriggerResults ??= new Map();
   ds.asyncTriggerResults.set(triggerId, {
@@ -928,7 +933,7 @@ async function triggerSessionTurnAdmitted(
     rendered: string | CliTurnPayload,
   ): void => {
     if (internal?.persistInputHistory === false) return;
-    rememberLastCliInput(target, original, rendered);
+    rememberLastCliInput(target, original, rendered, triggerId);
   };
   const recordHeadlessTurn = (target: DaemonSession): void => {
     const headless = target.session.headless;
@@ -1803,12 +1808,12 @@ async function triggerSessionTurnAdmitted(
   }
 
   const bot = getBot(larkAppId);
-  const hasReasoningControl = isConfigurableReasoningCliId(bot.config.cliId);
+  const acceptsTaskOverride = allowsTaskModelOverride(bot.config.cliId);
   const effectiveModel = typeof req.options?.model === 'string' && req.options.model.trim()
     ? req.options.model.trim()
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
-  if (hasReasoningControl && effectiveReasoningEffort
+  if (acceptsTaskOverride && effectiveReasoningEffort
       && bot.config.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
@@ -1872,24 +1877,21 @@ async function triggerSessionTurnAdmitted(
     session.lastMessageAt = nowIso;
     session.workingDir = wd.workingDir;
     session.cliId = bot.config.cliId;
-    // Per-turn model / reasoning-effort override — scoped to CLIs with an
-    // explicit reasoning control and to a freshly-created trigger session.
-    // Gating on cliId keeps the contract honest and bounded: it never silently
-    // changes the model of a Claude/Kimi/CoCo bot, and a fold-in to an existing
-    // worker never reaches here. Model is gated here so it cannot leak to
-    // other CLIs whose adapters do not implement this contract.
+    // Per-turn model / reasoning-effort overrides follow the same explicit CLI
+    // policy as schedules, independently of bot-level effort configuration.
+    // A fold-in to an existing worker never reaches here.
     //
     // The model override lands on the in-memory DaemonSession below, NOT on the
     // persisted session record: the documented semantics are per-trigger, and a
     // persisted copy used to survive every later resume and outrank the bot's
     // configured model forever (see sessionAgentConfig). reasoningEffort stays
     // persisted with the session (unchanged by that PR).
-    const triggerModelOverride = hasReasoningControl
+    const triggerModelOverride = acceptsTaskOverride
       && typeof req.options?.model === 'string'
       && req.options.model.trim()
       ? req.options.model.trim()
       : undefined;
-    if (hasReasoningControl && req.options?.reasoningEffort) {
+    if (acceptsTaskOverride && req.options?.reasoningEffort) {
       session.reasoningEffort = req.options.reasoningEffort;
     }
     sessionStore.updateSession(session);
@@ -2340,7 +2342,7 @@ async function triggerSessionTurnAdmitted(
     releaseInitialReservation();
   }
   else {
-    forkWorker(newDs, promptInput);
+    forkWorker(newDs, promptInput, triggerId);
     releaseInitialReservation();
   }
 

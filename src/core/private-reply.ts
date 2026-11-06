@@ -18,17 +18,19 @@ export function privateReplyEnabled(s: Pick<ReplySession, 'larkAppId' | 'chatId'
 
 /** Undefined resumes the existing group reply path, including when private delivery fails. */
 export async function sendPrivateReply(
-  s: ReplySession, turnId: string | undefined, content: string, msgType = 'text', uuid?: string,
+  s: ReplySession, turnId: string | undefined, content: string, msgType = 'text', uuid?: string, options?: { senderOpenId?: string; senderIsBot?: boolean; failClosed?: boolean; beforeWrite?: () => void | Promise<void> },
 ): Promise<string | undefined> {
   if (!privateReplyEnabled(s) || !turnId) return undefined;
-  const sender = pickTurnReplyTarget(s, turnId)?.senderOpenId;
-  const senderIsBot = s.turnReplyContexts?.[turnId]?.replyTargetSenderIsBot
+  const sender = options?.senderOpenId ?? pickTurnReplyTarget(s, turnId)?.senderOpenId;
+  const senderIsBot = options?.senderIsBot ?? s.turnReplyContexts?.[turnId]?.replyTargetSenderIsBot
     ?? (s.quoteTargetId === turnId && s.quoteTargetSenderIsBot);
   if (!sender?.startsWith('ou_') || senderIsBot) return undefined;
   let messageId: string;
   try {
+    await options?.beforeWrite?.();
     messageId = await sendUserMessage(s.larkAppId!, sender, content, msgType, uuid);
   } catch (err) {
+    if (options?.failClosed) throw err;
     logger.warn(`[private-reply] delivery failed for turn ${turnId}; using group reply: ${String(err)}`);
     return undefined;
   }

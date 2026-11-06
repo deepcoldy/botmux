@@ -271,6 +271,10 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Process-scoped Codex-compatible provider origin override. Used when the
+     *  active model provider shares an origin with a protected business target
+     *  and must enter through the session loopback HTTP bridge. */
+    modelProviderBaseUrlOverride?: { providerId: string; baseUrl: string };
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
      *  (dsh / MiniMax). Forwarded as `--turn-timeout-ms`; semantics belong to the runner;
      *  adapters without a runner turn timeout ignore the field. */
@@ -845,6 +849,13 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
+  /** This CLI renders the codex_core hook-review / migration pages recognised
+   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
+   *  the "CLI is stuck" card: queued input is held off any of those pages and
+   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
+   *  Undefined = only the legacy hook-review input hold, never a card. */
+  readonly stuckPageFamily?: 'codex-family';
+
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
    *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
@@ -995,6 +1006,16 @@ export interface CliAdapter {
    *  listing a path absent on this host is a no-op. Missing/empty → nothing extra
    *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
   sandboxReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
+
+  /** Single FILES (never directories) the CLI must be able to open read-write
+   *  inside the oncall file sandbox even though their parent dir stays hidden
+   *  or read-only — e.g. TRAE's `<TRAE_HOME>/installation_id`, which the
+   *  embedded app server opens O_RDWR|O_CREAT on every cold start and aborts
+   *  on EROFS. Bound readWrite like `authPaths`, but the worker pre-creates a
+   *  missing one as an EMPTY regular file (authPaths' pre-create would mkdir a
+   *  directory in its place) and binds only regular files. Not consulted when
+   *  the sandbox is off or in scratch mode. Missing/empty → nothing extra. */
+  sandboxWritableFiles?(env?: NodeJS.ProcessEnv): readonly string[];
 
   /** Credential files a trusted service CLI must read inside the sandbox.
    *  This is deliberately separate from ordinary readonlyRoots so adapters
