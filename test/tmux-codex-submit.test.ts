@@ -49,6 +49,21 @@ process.stdin.on('data', data => appendFileSync(process.argv[2], data));
   const legacy = Buffer.from(mode === 'h' ? '\x1b[200~legacy text\x1b[201~' : 'legacy text');
   await waitFor(() => readFileSync(output).length >= expected.length + legacy.length);
   expect(readFileSync(output)).toEqual(Buffer.concat([expected, legacy]));
+  // Empty input must close its paste frame; the next input must remain intact.
+  const emptyStart = readFileSync(output).length;
+  const emptyFrame = Buffer.from('\x1b[200~\x1b[201~\r');
+  const emptySent = backend.submitBracketedPaste('');
+  await waitFor(() => readFileSync(output).length > emptyStart);
+  await delay(100);
+  expect({ sent: emptySent, bytes: readFileSync(output).subarray(emptyStart) })
+    .toEqual({ sent: true, bytes: emptyFrame });
+  expect(tmux('list-buffers')).toBe('');
+  const nextFrame = Buffer.from('\x1b[200~after empty\x1b[201~\r');
+  expect(backend.submitBracketedPaste('after empty')).toBe(true);
+  await waitFor(() => readFileSync(output).length >= emptyStart + emptyFrame.length + nextFrame.length);
+  await delay(100);
+  expect(readFileSync(output).subarray(emptyStart)).toEqual(Buffer.concat([emptyFrame, nextFrame]));
   tmux('kill-session', '-t', 'fixture');
   expect(backend.submitBracketedPaste('after disconnect')).toBe(false);
+  expect(backend.submitBracketedPaste('')).toBe(false);
 });
