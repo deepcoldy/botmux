@@ -28,6 +28,7 @@ Settings in the Steward section:
 |---|---|---|
 | Make this bot a steward | This bot's sessions can maintain the board with `botmux board` | Off |
 | Steward chat | Where you hand out tasks; submitted decisions go to this chat's session | Not set |
+| Decision cards in Feishu | See "Deciding on a Feishu card" below | On |
 | Add the steward to new chats | See "Adding the steward to new chats" below | On |
 | Also add it to chats with only you and one bot | Same | Off |
 | Find items that are ready to close | See "Finding items that are ready to close" below | Off |
@@ -38,6 +39,7 @@ You can also use `/botconfig` in Feishu:
 ```text
 /botconfig set steward {"enabled":true,"chatId":"oc_…"}
 /botconfig set steward {"enabled":true,"chatId":"oc_…","guideMode":"append","guideText":"Progress standard: …"}
+/botconfig set steward {"enabled":true,"chatId":"oc_…","decisionCards":false}   # no decision cards
 /botconfig unset steward          # turn the steward off; board data is kept
 ```
 
@@ -113,6 +115,20 @@ From top to bottom:
 - The checked drafts become one batch, delivered as **one turn** in the steward session; if the steward is busy, it queues behind the current turn.
 - If delivery fails, "Recent submissions" shows why and offers **Deliver again**; undelivered batches are retried automatically after the daemon restarts.
 - What you submitted is also posted verbatim in the steward chat: each item's number, title, main chat link, chosen option and your note, followed by the images. Long content is split across several messages, never cut.
+
+### Deciding on a Feishu card
+
+When the steward turns an item into a decision item or changes its options, a decision card for that item appears in the steward chat, so you can decide without opening the board:
+
+- The card shows the title, a one-line status and the question, with one button per option; the steward's recommendation is marked and highlighted. Type a note in the box above to send it along with the option, or click **Send note only**. **Open in board** is at the bottom.
+- Only you (the owner of the steward bot) can click; anyone else gets a no-permission message.
+- A click works like submitting on the board: the item goes to the steward as its own batch and shows up in the timeline and "Recent submissions". The card switches to "Picked X, sending to the steward" and then "sent to the steward"; if delivery fails it shows why, and you can deliver it again on the board or click the same option again.
+- Each item has one card. Later changes (new options, a web submission, the steward handling it, the item closing) update that card in place instead of posting a new one.
+- When both the card and the web page submit for the same item, **the later one wins**, and the card says which batch it superseded or was superseded by. If the earlier batch has not reached the steward yet, it is voided and no longer pending. If it already reached the steward, which may be working on it, it stays pending, and the new batch tells the steward to mark that one as it actually went before acting on the new decision. Consecutive web submissions still run batch by batch as before.
+- A web draft written before the steward changed the options (the chosen option is gone), or for an item no longer awaiting a decision, is still delivered when submitted, but does not supersede the card decision.
+- With more than 6 options, content too long for a card, or an item that no longer awaits a decision (including closed or done), the card only shows the status and the board link.
+
+To turn cards off, switch off **Decision cards in Feishu** in the Steward section of the bot settings. It only applies to bots with the steward on and a steward chat picked; other chats are unaffected.
 
 ### States
 

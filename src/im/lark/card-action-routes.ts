@@ -116,6 +116,15 @@ export const CARD_PREFIX_ROUTES: readonly CardPrefixRoute[] = [
   // `/dashboard overview`：goto 按钮通过重新请求对应的专用 Route B 端点重建目标卡
   // （sessions-list / schedules-list / settings-snapshot）。不新增端点、不用 multi_url 跨卡跳转。
   dashboardRoute('dash_overview_', async () => (await import('./overview-card.js')).handleOverviewCardAction),
+  // 决策看板的拍板卡片（管家群）：只认管家 bot 的 owner，权限门在 DecisionBoardService.cardClick 里，
+  // 不走 canOperate（那是 bot 管理员口径）。
+  {
+    prefix: 'board_card_',
+    async handle(data, larkAppId) {
+      const { handleDecisionCardAction } = await import('../../core/decision-board/card-action.js');
+      return handleDecisionCardAction(data, larkAppId);
+    },
+  },
 ];
 
 /** 命中前缀路由则返回它；`action` 非字符串或缺 `larkAppId` 一律不命中。 */
@@ -234,6 +243,7 @@ const NO_META: SensitiveCardActionMeta = {};
 // 不在本表、但有自己权限门的动作（别「顺手」补进来，会把合法点击者挡掉）：
 // - `retry_recovery_turn`（自动恢复失败卡的「重试」）：原发起人（仍能对话）或
 //   bot 管理员可点，门在 core/ordinary-recovery-retry.ts 的 handleOrdinaryRecoveryRetryClick。
+// - `board_card_*`（决策看板拍板卡片）：只认管家 bot 的 owner，门在 DecisionBoardService.cardClick。
 // - `stuck_key`（CLI 卡在阻塞页时卡片上的安全按键）：本轮发起人（仍能对话）可点
 //   只做拒绝/跳过的键，bot 管理员可点全部键；门在 core/stuck-warning-card.ts 的
 //   decideStuckKeyClick（键由服务端按页面类型 + 下标查 core/stuck-page-catalog.ts，

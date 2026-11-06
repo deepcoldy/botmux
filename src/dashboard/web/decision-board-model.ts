@@ -557,6 +557,8 @@ export interface StewardForm {
   autoJoinNewGroups: boolean;
   /** 只有一个人和一个 bot 的新群也带上管家；默认关。 */
   autoJoinSoloGroups: boolean;
+  /** 待拍板时往管家群发能直接点选项的卡片；默认开。 */
+  decisionCards: boolean;
   /** 后台巡检找出可以关 / 可以推进 / 该看一眼的事项；默认关。 */
   closeHints: boolean;
 }
@@ -569,6 +571,7 @@ export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardF
     guideText: cfg?.guideText ?? '',
     autoJoinNewGroups: cfg?.autoJoinNewGroups !== false,
     autoJoinSoloGroups: cfg?.autoJoinSoloGroups === true,
+    decisionCards: cfg?.decisionCards !== false,
     closeHints: cfg?.closeHints === true,
   };
 }
@@ -588,10 +591,12 @@ export function stewardPayload(form: StewardForm): StewardConfig | null {
     ...(guideText ? { guideText } : {}),
     ...(form.autoJoinNewGroups ? {} : { autoJoinNewGroups: false }),
     ...(form.autoJoinSoloGroups ? { autoJoinSoloGroups: true } : {}),
+    ...(form.decisionCards ? {} : { decisionCards: false }),
     ...(form.closeHints ? { closeHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
-    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true) return null;
+    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
+    && value.decisionCards !== false) return null;
   return value;
 }
 

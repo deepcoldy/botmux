@@ -223,14 +223,15 @@ describe('batches', () => {
 
 describe('steward config payload', () => {
   const forms: StewardForm[] = [
-    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '  推进标准：合码按 STANDARD.md 执行\r\n', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: '只汇报', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: false, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false },
-    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false },
-    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: true },
+    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '  推进标准：合码按 STANDARD.md 执行\r\n', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: '只汇报', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: false, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: true, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: false },
   ];
 
   it('sends null for the default and omits the default append mode and the default auto-join', () => {
@@ -243,6 +244,8 @@ describe('steward config payload', () => {
     expect(stewardPayload(forms[7]!)).toEqual({ enabled: true, autoJoinSoloGroups: true });
     expect(stewardFormFrom(null).autoJoinNewGroups).toBe(true);
     expect(stewardFormFrom(null).autoJoinSoloGroups).toBe(false);
+    expect(stewardPayload(forms[8]!)).toEqual({ enabled: true, chatId: 'oc_abc', decisionCards: false });
+    expect(stewardFormFrom(null).decisionCards).toBe(true);
   });
 
   it('produces exactly what the server validator accepts and stores', () => {
@@ -255,7 +258,7 @@ describe('steward config payload', () => {
   });
 
   it('catches "replace" without text before the server does', () => {
-    const form: StewardForm = { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: ' ', autoJoinNewGroups: true, autoJoinSoloGroups: false };
+    const form: StewardForm = { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: ' ', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true };
     expect(stewardGuideProblem(form)).toBe('replace_empty');
     expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_abc', guideMode: 'replace' }).ok).toBe(false);
     expect(stewardGuideProblem({ ...form, guideText: '只汇报' })).toBeNull();
