@@ -57,7 +57,9 @@ const LOGGED_OUT_RULES: readonly ScreenRule[] = [
 ];
 
 const INTERACTIVE_MENU_RULES: readonly ScreenRule[] = [
-  { id: 'interactive_menu:hooks_need_review', re: /hooks need review/i },
+  // 启动页 "Hooks need review"、浏览页 "2 hooks need review before they can run."、
+  // 详情页单数 "1 hook needs review before it can run."（Codex 0.162+ / traex）
+  { id: 'interactive_menu:hooks_need_review', re: /\bhooks?\s+needs?\s+review\b/i },
   // 真机迁移菜单 "Legacy TraeCode … migrate"
   { id: 'interactive_menu:legacy_trae_migrate', re: /legacy\s*trae(?:code)?[^\n]{0,40}migrat/i },
   { id: 'interactive_menu:migration_target', re: /\bmigrat(?:e|ion)[^\n]{0,30}(?:data|session|legacy)/i },

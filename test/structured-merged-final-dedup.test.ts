@@ -61,6 +61,35 @@ function finalMarker(overrides: Partial<BridgeSendMarker> = {}): BridgeSendMarke
 }
 
 describe('structured merged execution final delivery', () => {
+  it.each(['', '   '])('accepts a delivered merged final when task_complete has empty text (%j)', finalText => {
+    const input = { ...gate(mergedTurn(4)), finalText };
+    expect(structuredFallbackKind(input, undefined, [finalMarker()], false, true)).toBe('none');
+    expect(shouldSuppressBridgeEmit(input, undefined, [finalMarker()], false)).toBe(true);
+  });
+
+  it.each([
+    ['no receipt', []],
+    ['unrelated input', [finalMarker({ turnId: 'unrelated' })]],
+    ['previous final before latest input', [finalMarker({ sentAtMs: 200 })]],
+    ['progress only', [finalMarker({ responseKind: 'progress' })]],
+    ['another session', [finalMarker({ sessionId: 'other-session' })]],
+    ['stale retry', [finalMarker({ dispatchAttempt: 1 })]],
+    ['independent side effect', [finalMarker({ terminalIndependent: true })]],
+  ] as const)('keeps an empty completion diagnostic with %s', (_label, markers) => {
+    const input = { ...gate(mergedTurn(4)), finalText: '' };
+    expect(structuredFallbackKind(input, undefined, markers, false, true)).toBe('empty_completed');
+  });
+
+  it.each(['failed', 'ambiguous'] as const)('does not use a folded final to erase an empty %s terminal', terminalStatus => {
+    const input = { ...gate(mergedTurn()), finalText: '', terminalStatus };
+    expect(shouldSuppressBridgeEmit(input, undefined, [finalMarker()], false)).toBe(false);
+  });
+
+  it('does not treat an uncollected final as a completed empty answer', () => {
+    const input = { ...gate(mergedTurn()), finalText: undefined };
+    expect(shouldSuppressBridgeEmit(input, undefined, [finalMarker()], false)).toBe(false);
+  });
+
   it.each([2, 3])('delivers an explicit final once after %i native same-turn reports', count => {
     const turn = mergedTurn(count);
     const input = gate(turn);
@@ -318,6 +347,56 @@ describe('merged final delivery across checkpoint recovery', () => {
 });
 
 describe('native Codex rollout merge evidence', () => {
+  it('keeps null completions and late receipts isolated across successive native executions', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'empty-merged-rollout-'));
+    try {
+      const path = join(dir, 'rollout.jsonl');
+      const row = (type: string, payload: unknown, time: number) => JSON.stringify({
+        type, payload, timestamp: new Date(time).toISOString(),
+      }) + '\n';
+      writeFileSync(path, row('session_meta', { id: 'provider-session' }, 1));
+      const queue = new CodexBridgeQueue(() => 10_000);
+      let cursor = drainCodexRollout(path, 0);
+      const ingest = (type: string, payload: unknown, time: number) => {
+        appendFileSync(path, row(type, payload, time));
+        cursor = drainCodexRollout(path, cursor.newOffset, cursor.state);
+        queue.ingest(cursor.events);
+      };
+      const markers: BridgeSendMarker[] = [];
+      // Two executions absorb multiple inputs; a third has no steer at all.
+      // Every actual task_complete has last_agent_message=null, as in Codex 0.161.
+      for (const [index, count] of [4, 3, 1].entries()) {
+        const base = (index + 1) * 1_000;
+        const first = `execution-${index}-input-0`;
+        queue.mark(first, first, base);
+        ingest('event_msg', { type: 'task_started', turn_id: `native-${index}` }, base + 1);
+        for (let i = 0; i < count; i++) {
+          const id = `execution-${index}-input-${i}`;
+          if (i > 0) queue.mark(id, id, base + i * 10);
+          ingest('response_item', { type: 'message', role: 'user', content: [
+            { type: 'input_text', text: id },
+          ] }, base + i * 10 + 2);
+        }
+        ingest('event_msg', { type: 'task_complete', turn_id: `native-${index}`,
+          last_agent_message: null }, base + 100);
+        const ready = queue.drainEmittable();
+        expect(ready).toHaveLength(1);
+        const input = gate(ready[0]);
+        expect(input.finalText).toBe('');
+        expect(input.turnId).toBe(`execution-${index}-input-${count - 1}`);
+        // Even a late old receipt inside the new time window is unrelated.
+        const lateOld = markers.map(marker => ({ ...marker, sentAtMs: base + 90 }));
+        expect(structuredFallbackKind(input, undefined, lateOld, false, true)).toBe('empty_completed');
+        const receipt = finalMarker({ turnId: first, sentAtMs: base + 90 });
+        markers.push(receipt);
+        expect(structuredFallbackKind(input, undefined, markers, false, true)).toBe('none');
+        expect(queue.size()).toBe(0);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['task_complete', 'turn_aborted'])('releases the HOL successor after START X USER a USER b %s Y', terminal => {
     const dir = mkdtempSync(join(tmpdir(), 'abandoned-native-rollout-'));
     try {

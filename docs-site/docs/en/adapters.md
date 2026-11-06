@@ -246,6 +246,24 @@ Remote Runner connects any remote agent platform over a JSONL protocol. botmux s
 
 ## Notes for specific CLIs
 
+### Using the newly added CLIs {#new-clis}
+
+Grok Build, Reasonix, OpenCode 2, DeepSeek Harness (dsh / dsh-tui), MiniMax Code (mcode), MiMoCode, CodeM, ZCode and Doubao are all built-in adapters with no extra switch. Turning one on works like switching to any other CLI (see [Switching a bot's CLI](#switching-a-bots-cli) above): install the command and log in under the daemon's system user, then set the bot's `cliId` to the value below.
+
+| CLI | `cliId` | Default command |
+|---|---|---|
+| Grok Build | `grok` | `grok` |
+| Reasonix | `reasonix` | `reasonix` |
+| OpenCode 2 (beta) | `opencode2` | `opencode2` |
+| DeepSeek Harness | `dsh` | `dsh` (for the full-screen TUI also set `dshRuntime: "tui"`, which launches `dsh-tui`; see below) |
+| MiniMax Code | `minimax` | `mcode` |
+| MiMoCode | `mimocode` | `mimo` |
+| CodeM | `codem` | `codem` |
+| ZCode | `zcode` | `zcode` |
+| Doubao | `doubao` | `doubao` |
+
+**Forge × TraeX**: to start TraeX through Forge, pick **Forge x TraeX** in the CLI menu of `botmux setup` or the Dashboard, or write `"cliId": "traex", "cliLaunchMode": "forge-traex"` in `bots.json`. botmux then launches `forge run --agent traex --agent-args ...`, so `forge` must be on PATH. This launch mode only works with `cliId: "traex"` and can't be combined with `wrapperCli`, `cliRuntime`, `cliPathOverride`, the file sandbox or `readIsolation`; such configs are rejected.
+
 ### TraeX automatic model switching (experimental) {#traex-auto-model}
 
 A TraeX bot can set `model` to `auto` and provide an ordered model pool. A session starts on the first model and moves on to later models in the pool when it queues or runs out of quota. Switching restarts TraeX and resumes the same session; inputs already sent are not replayed.
@@ -403,6 +421,18 @@ In `codex-app` sessions (and `codex` sessions with app-server RPC enabled), when
 **Not covered by this bridge**: Workflow sub-tasks (use `humanGate` / decision nodes), API-only sessions without a Lark channel, plain terminal-paste mode, and the App history viewer. Whether the native tool is available ultimately depends on the Codex version and mode.
 
 To test: in a normal Codex App session, ask the model to use `request_user_input` for a choice question, check that the card arrives in Lark, then submit and confirm the same turn continues and can repeat your choice.
+
+### Steering a running Codex App turn {#codex-app-steer}
+
+Only for `cliId: "codex-app"` sessions; on by default with nothing to configure on the Lark side. While Codex App is running a turn, a new message you send in the topic is injected into **the current turn** (Codex turn/steer) instead of waiting in the queue. When it lands, the bot replies "Got it — guidance accepted". Handy for "also handle X" or "stop that, do Y instead" mid-task.
+
+- Only messages sent directly by people steer. Messages from other bots queue as usual unless `@steer` is the first semantic line of the body (it may follow the line that @mentions the recipient).
+- If it can't be injected (for example, the turn is wrapping up), the message is queued like a normal one; nothing is lost.
+- Tasks triggered through the HTTP API must pass `steer: true` in `options` explicitly, starting with the first turn; see [API task trigger](/en/api-task-trigger).
+
+### Claude Code busy/idle detection (OSC 7501) {#claude-osc-7501}
+
+Automatic, nothing to configure. The Claude Code adapter supports the OSC 7501 program status protocol: as soon as the CLI reports its first valid status, "working / idle" follows that report instead of guessing from the terminal screen, so card status and "turn ended" are more accurate. Until a status arrives, the screen is still used. The Pi and Kimi adapters use the same protocol.
 
 ## Adding a new adapter (contributors)
 

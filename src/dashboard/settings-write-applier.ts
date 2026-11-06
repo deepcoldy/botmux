@@ -64,6 +64,8 @@ export interface ResolvedDashboardSettingsView {
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
   cardBrandLabel: boolean;
+  /** Whether the turn initiator may press the safe keys on a stuck card. Default ON. */
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -269,6 +271,7 @@ export type ApplySettingsWriteError =
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
+  | 'invalid_stuckCardInitiatorKeys'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -536,6 +539,15 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_cardBrandLabel' };
     }
     patch.cardBrandLabel = obj.cardBrandLabel;
+  }
+  if ('stuckCardInitiatorKeys' in obj) {
+    if (typeof obj.stuckCardInitiatorKeys !== 'boolean') {
+      return { ok: false, error: 'invalid_stuckCardInitiatorKeys' };
+    }
+    // Default ON: only `false` is stored. Writing the default removes the key
+    // (mergeDashboardConfig drops undefined), so the file never pins the
+    // default and a future default change still reaches untouched installs.
+    patch.stuckCardInitiatorKeys = obj.stuckCardInitiatorKeys ? undefined : false;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {

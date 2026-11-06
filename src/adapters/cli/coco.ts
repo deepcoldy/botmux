@@ -145,6 +145,9 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
+    // Same traecli binary as traex (see the sandbox note below): same
+    // codex_core hook-review flow and legacy-data migration picker.
+    stuckPageFamily: 'codex-family',
     mcpGateway: {
       get configPath(): string { return traeConfigPath(); },
       format: 'codex-toml',

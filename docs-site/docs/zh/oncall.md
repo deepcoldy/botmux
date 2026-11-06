@@ -1,5 +1,7 @@
 # Oncall 模式
 
+<video src="img/video-v6-oncall-voice.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 把机器人拉进值班群、报警群或答疑群，给它绑定一个项目目录。之后群里**任何成员**都能直接 @ 它提问，不用选仓库，也不用先申请授权，机器人会在这个目录里回答。
 
 适合「人多、随时问、问的都是同一个项目」的群：值班群、报警群、跨团队答疑群。

@@ -202,9 +202,12 @@ export interface WorkerConfig {
   sessionMemoryMaxBytes?: number;
 }
 
-/** Supported idle thresholds (hours) for both the manual「清理空闲」button and
- *  scheduled auto-cleanup. Kept in lockstep with session-cleanup's
- *  IDLE_CLEANUP_HOUR_OPTIONS so the two paths never diverge. */
+/** Supported idle thresholds (hours) for scheduled auto-cleanup ONLY.
+ *  Deliberately a strict subset of the manual button's options
+ *  (session-cleanup IDLE_CLEANUP_HOUR_OPTIONS additionally offers 1 and 0 =
+ *  "all"); never align the two — a 0 leaking into unattended sweeps means
+ *  "close every eligible session". The invariant is
+ *  AUTO_CLEANUP_HOUR_OPTIONS === SESSION_CLEANUP_HOUR_OPTIONS (unit-tested). */
 export const SESSION_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
 export type SessionCleanupHours = typeof SESSION_CLEANUP_HOUR_OPTIONS[number];
 /** Bounds for the check cadence. A 5-minute floor keeps a hand-edited config
@@ -218,7 +221,8 @@ export interface SessionCleanupGlobalConfig {
   archiveCodex?: boolean;
   /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
   enabled?: boolean;
-  /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
+  /** 空闲阈值（小时）。定时自动清理仅接受 24 / 72 / 168；手动清理按钮另提供
+   *  1 与 0（全部）。缺省 168（7 天）。 */
   olderThanHours?: SessionCleanupHours;
   /** 检查频率（分钟）。缺省 60，最小 5（低于则回退到最小值）。 */
   intervalMinutes?: number;
@@ -517,6 +521,11 @@ export interface DashboardGlobalConfig {
    *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
    *  Live 读取（见 bot-registry.ts `isCardBrandLabelEnabled`），Settings 翻转后无需重启。 */
   cardBrandLabel?: boolean;
+  /** 「CLI 卡住」卡片上，本轮发起人能否按只做拒绝/跳过的安全键（core/stuck-page-catalog.ts
+   *  里 audience='initiator' 的键，如 Esc 不信任继续 / 暂不迁移）。缺省 ON（absent ⇒ 允许）；
+   *  显式 `false` 时只有 Bot 管理员（canOperate）能按卡片上的任何键。与默认值相同的 `true`
+   *  不落盘（Dashboard 写入时删键）。点击时 live 读取（见 config.ts `stuckCardInitiatorKeys`）。 */
+  stuckCardInitiatorKeys?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -677,6 +686,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored
   // `false` must be preserved to let an operator suppress footer brands fleet-wide.
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
+  // Default ON: only an explicit stored false disables (config.ts getter).
+  if (typeof d.stuckCardInitiatorKeys === 'boolean') out.stuckCardInitiatorKeys = d.stuckCardInitiatorKeys;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -799,9 +810,11 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
 
 /** Parse `sessionCleanup` from config. Whitelist known keys; drop invalid
  *  values so a hand-edited config degrades to defaults rather than crashing.
- *  `olderThanHours` accepts only the three supported thresholds (same set as the
- *  manual button); `intervalMinutes` is clamped to a 5-minute floor. The tick
- *  (dashboard/auto-cleanup.ts) layers defaults over whatever survives here. */
+ *  `olderThanHours` accepts only the three scheduled-sweep thresholds
+ *  24 / 72 / 168 — deliberately NOT the manual button's full set (which also
+ *  offers 1 and 0 = all); `intervalMinutes` is clamped to a 5-minute floor. The
+ *  tick (dashboard/auto-cleanup.ts) layers defaults over whatever survives
+ *  here. */
 function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const value = raw as Record<string, unknown>;

@@ -1830,9 +1830,9 @@ export interface ScheduledTask {
    *  session and then keep it. Creation surfaces say so out loud rather than
    *  letting the difference be discovered at fire time.
    *
-   *  Gated at fire time on the bot's CLI actually supporting the override
-   *  (isConfigurableReasoningCliId) — an unsupported pairing is dropped with a
-   *  warning, never a skipped run.
+   *  Gated at fire time by the per-task CLI policy (allowsTaskModelOverride),
+   *  independently of bot-level effort controls. An unsupported pairing is
+   *  dropped with a warning, never a skipped run.
    *
    *  It rides on the in-memory DaemonSession (spawnModelOverride), never on the
    *  session record, so a daemon restart drops it: a `topic` / `top-level` task
@@ -2544,9 +2544,29 @@ export type WorkerToDaemon =
   | { type: 'explicit_reply_observed'; turnId: string; messageId?: string; responseKind?: TurnSendKind; terminalCarrier?: TurnTerminalCarrierKind }
   | { type: 'tui_prompt_resolved'; selectedText?: string; cardMessageId?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_submit_failed'; cardMessageId?: string; stuckNonce?: number; turnId?: string; dispatchAttempt?: number }
-  | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number }
+  | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number;
+      /** Why the card is raised. Absent = 'turn_stalled' (the StuckDetector
+       *  path that predates the field). 'input_held': a queued message is
+       *  being held off a blocking page; 'submit_unconfirmed': a written
+       *  message was never confirmed and the page explains why. */
+      reason?: 'turn_stalled' | 'input_held' | 'submit_unconfirmed';
+      /** Bounded plain-text bottom of the screen (core/stuck-page-catalog
+       *  stuckScreenTail) for the card. Only from an authoritative backend. */
+      screenTail?: string;
+      /** Already-localised context line shown above the page explanation
+       *  (e.g. the submit_unconfirmed notice this card replaces). */
+      noticeText?: string }
   | { type: 'stuck_warning_expired'; nonce: number; turnId?: string; dispatchAttempt?: number }
-  | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }
+  | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number;
+      /** Key that was written (stuck cards only). */
+      key?: string;
+      /** Page re-classified on a fresh capture shortly after the key landed;
+       *  absent = no known blocking page any more. Only reported together
+       *  with afterScreenTail when the capture was authoritative. */
+      afterPageType?: string;
+      afterScreenTail?: string;
+      /** False when the post-key capture could not be taken. */
+      afterObserved?: boolean }
 
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
       /** capture_identity revision this frame was captured under (bound before
@@ -2565,7 +2585,11 @@ export type WorkerToDaemon =
          *  re-renders the status card from its current state: a single
          *  working→idle edge PATCH may have been lost, and nothing else would
          *  ever correct a card still claiming the unsubmitted turn runs. */
-        | 'input_not_submitted' }
+        | 'input_not_submitted';
+      /** Bounded plain-text bottom of the screen for an input_not_submitted
+       *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
+       *  the notice as a card with this text; absent = plain text as before. */
+      screenTail?: string }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' | 'fork_pending' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable

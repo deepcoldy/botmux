@@ -41,6 +41,37 @@ async function fixture() {
 }
 
 describe('PostgreSQL feedback integration', () => {
+  it('serializes feedback stream sequence publication until the earlier producer commits', async () => {
+    const { store, target, password } = await fixture();
+    expect(await store.readFeedbackEventsAfter({ after: 0, limit: 10 })).toEqual([]);
+    const pool = feedbackPostgresPool(target, password);
+    const first = await pool.connect();
+    const second = await pool.connect();
+    const insert = (client: typeof first, eventId: string, time: string) => client.query(
+      'INSERT INTO feedback_events VALUES($1,$2,1,$3,$4,$5)',
+      [eventId, 'feedback.revised', 'delivery', JSON.stringify({ eventId, type: 'feedback.revised', version: 1, time, data: {} }), time],
+    );
+    try {
+      await first.query('BEGIN');
+      await insert(first, 'first', '2026-11-05');
+      await second.query('BEGIN');
+      const laterInsert = insert(second, 'second', '2026-11-04');
+      expect(await store.readFeedbackEventsAfter({ after: 0, limit: 10 })).toEqual([]);
+      await first.query('COMMIT');
+      const page = await store.readFeedbackEventsAfter({ after: 0, limit: 10 });
+      expect(page.map(row => row.event.eventId)).toEqual(['first']);
+      await laterInsert;
+      await second.query('COMMIT');
+      expect((await store.readFeedbackEventsAfter({ after: page[0].sequence, limit: 10 })).map(row => row.event.eventId)).toEqual(['second']);
+      await first.query('BEGIN');
+      await insert(first, 'rollback', '2026-11-01');
+      await first.query('ROLLBACK');
+      expect((await store.readFeedbackEventsAfter({ after: 0, limit: 10 })).map(row => row.event.eventId)).toEqual(['first', 'second']);
+    } finally {
+      await first.query('ROLLBACK'); await second.query('ROLLBACK');
+      first.release(); second.release(); await pool.end();
+    }
+  });
   it('connects to the PostgreSQL major version selected by the test environment', async () => {
     if (!admin) throw new Error('BOTMUX_TEST_POSTGRES_URL_required');
     const version = Number((await admin.query('SHOW server_version_num')).rows[0].server_version_num);

@@ -1,5 +1,7 @@
 # Streaming Cards
 
+<video src="../img/video-v2-daily-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Botmux uses Lark cards to show what the CLI is doing, and lets you control it right from your phone. This page goes from most common to advanced: first what shows up during a turn, then the status card, dynamic single cards and the switches, and finally the features for scripts and integrators.
 
 ## What shows up in the chat during a turn
@@ -31,10 +33,16 @@ The card body is a **live screenshot** of the terminal: xterm renders the CLI's 
 | Working | Blue | The turn is in progress |
 | Analyzing… | Purple | Analysis in progress |
 | Awaiting input / ✓ Turn ended · Awaiting input | Green | The turn is done; send the next message |
+| ✓ Turn ended (AI determined no reply was needed) · Awaiting input | Green | The AI decided this turn needs no answer; see below |
 | ⏳ Main turn ended · background tasks running (N) | Light blue | The main agent has answered, but background work it started (background agents, `run_in_background` Bash, Monitor, Grok background tasks) is still running; N matches the web terminal, and the turn only counts as done once all of it finishes |
 | No recent progress | Red | No progress seen for a long time |
 | Limit reached | Red | The model quota is used up; turns green "Ready to retry" once a retry is possible |
 | Interrupted | Orange | The turn was interrupted |
+
+### "No reply needed" and timing {#no-reply-needed}
+
+- **No reply needed**: when the AI decides a message needs no answer (say, a status line someone posted in the group), no reply card is sent and the status card header reads "✓ Turn ended (AI determined no reply was needed) · Awaiting input", so you can tell it apart from a stuck turn. Automatic, nothing to configure. If the message explicitly @mentioned the bot, an automatic receipt is posted too; to force an answer, @mention it again and ask for a reply explicitly.
+- **Waiting / execution time**: off by default; see [Showing timing](#showing-timing) below to turn it on.
 
 ### Card buttons
 
@@ -235,7 +243,7 @@ This only affects display, not usage accounting.
 
 ### Showing timing
 
-After `/botconfig set showReplyTiming on`, the final reply footer shows "waited 3.2s · ran 23.4s", starting with newly received messages.
+Off by default. Turn it on in the Dashboard under **Bot Config → Message cards → Task Cards → Waiting and execution time**, or send `/botconfig set showReplyTiming on` (`showReplyTiming` in `bots.json`). Once on, the final reply footer shows "waited 3.2s · ran 23.4s", starting with newly received messages.
 
 - **Waiting**: from Botmux accepting the message to actually handing it to the CLI, including queueing and cold start.
 - **Execution**: from handing it to the CLI to seeing the final output. Codex App uses its own completion time.
@@ -280,6 +288,12 @@ When an ordinary Claude message hits a transient model failure (API unreachable,
 - If the Lark API is also down when the card is due, it keeps retrying (up to 24 hours) and lands exactly once; a daemon restart won't send it twice.
 - Failed scheduled tasks get the card too, without a Retry button; run the task again manually if needed.
 
+## Stop, retry and spend {#stop-retry-cost}
+
+- **⏹ Stop**: there by default, shown on the status card only while the turn is still running. It is the same as pressing ^C and keeps the session; `/stop` in the topic does the same. Codex App sessions and sessions with `codexRpcInput` on can't be stopped this way; pressing it only suggests `/close`. To hide the button: `/botconfig set hiddenStreamingCardButtons stop`, or switch it off under the Dashboard's live card buttons (see [Hiding card buttons](#hiding-card-buttons) above).
+- **🔁 Retry**: available on failure cards by default; the original sender or a bot admin can press it (see [Automatic-recovery failure card](#automatic-recovery-failure-card) above). For other failed or interrupted turns, send `/retry` in the topic.
+- **Spend**: botmux only converts token usage into CNY after you set `pricing` for the bot in `bots.json` (the simplest is `"pricing": { "usdCny": 7.2 }`, which uses the built-in price table); without it the amount stays 0. In the current version the amount feeds monthly budget alerts (`budget`) and is not shown on cards; see [Spend and budget](/en/bots-json#budget). What the cards do show is the token usage line, see [Where usage is shown](#where-usage-is-shown) above.
+
 ## Richer messages with `botmux send`
 
 Messages the agent sends with `botmux send` are separate messages that can carry images, files, videos and @ mentions. See [CLI commands](/en/cli-commands) for all flags. These are the ones most related to cards.
@@ -289,6 +303,20 @@ Messages the agent sends with `botmux send` are separate messages that can carry
 `--card-file` / `--card-json` send raw Lark interactive card JSON.
 
 > ⚠️ Custom cards allow **display-only content and open_url buttons only**. Any callback control (buttons with a `value`, dropdowns, person pickers, date pickers, inputs, form submits) is rejected, so custom cards can't forge interactive callbacks.
+
+### Videos, @mentions, urgent pings and dry runs {#send-rich}
+
+These are all `botmux send` flags. The agent in the session calls them as needed; there is nothing to switch on:
+
+| Want to | Flags |
+|---|---|
+| Send a video with a preview | `--videos <mp4>` plus `--video-covers <image>`, paired in order, both repeatable |
+| Send a custom card | `--card-json '<json>'` or `--card-file <path>` (display-only content and open_url buttons, see above) |
+| @mention someone | `--mention <open_id>` (repeatable; with `allowArbitraryMention` on for the bot, a full email / phone / union_id also works, as long as the person is in the group); `--mention-back` @mentions this turn's sender. Every reply must pick one of `--mention`, `--mention-back` or `--no-mention` |
+| Send an urgent ping | `--urgent` (in-app, default), `--urgent=sms` or `--urgent=phone`, targeting this turn's sender; **must be used with `--mention-back`**. The app needs the matching `im:message.urgent*` permission; SMS / phone consume tenant quota |
+| Check before sending | `--dry-run` renders the body as a card and prints JSON plus warnings without sending (no image / file uploads, no @ resolution) |
+
+See `botmux send --help` for the full list.
 
 ### Semantic reply headers (`--layout`)
 

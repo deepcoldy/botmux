@@ -1,5 +1,7 @@
 # Connectors (Webhook)
 
+<video src="../img/video-v5-automation-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 A connector lets an external system (monitoring alerts, CI, tickets, scheduled scripts…) **put a bot to work** through a URL: send one HTTP POST and the bot reads the event in a group and handles it.
 
 botmux doesn't parse each platform's format. It hands the JSON it receives to the model **as-is**, so connecting a new system usually just means pasting the URL in.

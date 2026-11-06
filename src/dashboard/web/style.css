@@ -5292,6 +5292,17 @@ table[hidden] { display: none !important; }
   background: color-mix(in srgb, var(--border-soft) 60%, transparent);
   color: var(--accent-strong);
 }
+#idle-cleanup-threshold {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+#idle-cleanup-threshold button {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
 .idle-cleanup-threshold-options button.active,
 .idle-cleanup-threshold-options button[aria-pressed="true"] {
   background: var(--idle-cleanup-segment-active-bg);
@@ -35074,6 +35085,14 @@ dialog.command-palette-dialog::backdrop {
 .dboard-row-ask,
 .dboard-row-pending { color: var(--fg-2); font-size: var(--fs-12); overflow-wrap: anywhere; }
 .dboard-row-pending { color: var(--info); }
+.dboard-hint-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; min-width: 0; font-size: var(--fs-12); }
+.dboard-hint-reason { color: var(--fg-2); overflow-wrap: anywhere; }
+.dboard-hint-chip { justify-self: start; flex: 0 0 auto; padding: 1px 8px; border-radius: var(--radius-full); font-size: var(--fs-12); background: var(--info-soft); color: var(--info); }
+.dboard-hint-chip.is-close { background: var(--success-soft); color: var(--success); }
+.dboard-hint-chip.is-stale { background: var(--warning-soft); color: var(--warning); }
+.dboard-hint-banner { margin: 8px 0; padding: 8px 12px; border-radius: var(--radius-sm); border-left: 3px solid var(--info); background: var(--info-soft); font-size: var(--fs-12); overflow-wrap: anywhere; }
+.dboard-hint-banner.is-close { border-left-color: var(--success); background: var(--success-soft); }
+.dboard-hint-banner.is-stale { border-left-color: var(--warning); background: var(--warning-soft); }
 .dboard-row-meta {
   display: flex;
   align-items: center;
