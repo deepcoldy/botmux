@@ -1,3 +1,6 @@
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // A plain module-level const, deliberately NOT `vi.hoisted`. `vi.hoisted` is a

@@ -224,35 +224,95 @@ describe('dashboard restart notice reaches Feishu wrapped once', () => {
 });
 
 describe('dashboard resume notice reaches Feishu wrapped once', () => {
-  it('thread-scope resume posts a single {"text"} layer', async () => {
+  // Each scenario runs under BOTH bot locales: hardcoding either locale at the
+  // call site (instead of resolving localeForBot) must turn one direction red.
+  const LOCALES = [
+    { lang: 'en' as const, hasCjk: false },
+    { lang: 'zh' as const, hasCjk: true },
+  ];
+
+  /** Create+close a session, POST /resume, and return the single text write. */
+  async function resumeOnce(
+    lang: 'en' | 'zh',
+    opts: { root: string; cliId: string; backendType?: string },
+  ): Promise<{ api: string; data: any; path: any; status: number; body: any }> {
     const dataDir = mkdtempSync(join(tmpdir(), 'text-notice-resume-'));
     const prevDataDir = config.session.dataDir;
     const registry = new Map<string, any>();
+    const forkSpy = opts.backendType === 'remote-runner'
+      ? vi.spyOn(workerPool, 'forkWorker').mockImplementation((ds: any, _prompt, _resume, o: any) => {
+        ds.worker = { killed: false };
+        o?.onAdmission?.('accepted');
+        return true;
+      })
+      : undefined;
     try {
+      __testOnly_resetBotRegistry();
+      registerBot({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: opts.cliId, lang });
       config.session.dataDir = dataDir;
       setLarkAppId(APP_ID);
       sessionStore.init(APP_ID);
       workerPool.setActiveSessionsRegistry(registry);
-      const session = sessionStore.createSession('oc_chat', 'om_resume_root', 'resume notice', 'group');
-      Object.assign(session, { larkAppId: APP_ID, scope: 'thread', cliId: 'codex', workingDir: '/tmp' });
+      const session = sessionStore.createSession('oc_chat', opts.root, 'resume notice', 'group');
+      Object.assign(session, {
+        larkAppId: APP_ID,
+        scope: 'thread',
+        cliId: opts.cliId,
+        workingDir: '/tmp',
+        ...(opts.backendType ? { backendType: opts.backendType } : {}),
+      });
       sessionStore.updateSession(session);
       sessionStore.closeSession(session.sessionId);
 
       const res = await ipc(`/api/sessions/${session.sessionId}/resume`);
+      const body = await res.json();
       expect(res.status).toBe(200);
 
       await vi.waitFor(() => expect(textWrites()).toHaveLength(1));
       const [w] = textWrites();
-      expect(w.api).toBe('reply');
-      expect(w.path).toMatchObject({ message_id: 'om_resume_root' });
-      expect(expectSingleWrap(w.data.content, '🔄')).toContain('Codex');
+      return { ...w, status: res.status, body };
     } finally {
+      forkSpy?.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
       setLarkAppId('');
       sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
+  }
+
+  it.each(LOCALES)('ordinary resume ($lang) resolves the bot locale and keeps the CLI name', async ({ lang, hasCjk }) => {
+    const fragment = lang === 'en' ? 'Session resumed through the command line' : '会话已通过命令行恢复';
+    const otherFragment = lang === 'en' ? '会话已通过命令行恢复' : 'Session resumed through the command line';
+    const w = await resumeOnce(lang, { root: 'om_resume_root', cliId: 'codex' });
+    expect(w.api).toBe('reply');
+    expect(w.path).toMatchObject({ message_id: 'om_resume_root' });
+    const notice = expectSingleWrap(w.data.content, '🔄');
+    expect(notice).toContain(fragment);
+    expect(notice).not.toContain(otherFragment);
+    expect(notice).toContain('Codex');
+    expect(/[一-鿿]/u.test(notice)).toBe(hasCjk);
+  });
+
+  it.each(LOCALES)('remote recovery ($lang) reuses the localized in-progress notice', async ({ lang, hasCjk }) => {
+    const fragment = lang === 'en' ? 'Remote recovery for Codex has started' : '远程恢复已启动';
+    const w = await resumeOnce(lang, { root: 'om_remote_resume_root', cliId: 'codex', backendType: 'remote-runner' });
+    expect(w.body).toMatchObject({ recoveryPending: true });
+    const notice = expectSingleWrap(w.data.content, '🔄');
+    expect(notice).toContain(fragment);
+    expect(notice).toContain('Codex');
+    expect(/[一-鿿]/u.test(notice)).toBe(hasCjk);
+  });
+
+  it.each(LOCALES)('fresh-only resume ($lang) warns the next message starts a fresh session', async ({ lang, hasCjk }) => {
+    // cursor can only resume a precise cliSessionId and none was persisted.
+    const fragment = lang === 'en' ? 'fresh session' : '新起干净会话';
+    const w = await resumeOnce(lang, { root: 'om_fresh_resume_root', cliId: 'cursor' });
+    expect(w.body).toMatchObject({ recoveryPending: false });
+    const notice = expectSingleWrap(w.data.content, '✅');
+    expect(notice).toContain(fragment);
+    expect(notice).toContain('Cursor');
+    expect(/[一-鿿]/u.test(notice)).toBe(hasCjk);
   });
 });
 

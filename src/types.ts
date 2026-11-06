@@ -543,6 +543,10 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** 已在来源话题直投的项目结果；下次输入携带引用，不额外启动模型。 */
+  reportReplyReferences?: import('./core/report-source-reply.js').ReportReplyReference[];
+  /** 最近一次真人输入/停止，用于使旧委托的自动直投失效。 */
+  reportReplyInputId?: string;
   /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
   topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
@@ -2430,6 +2434,13 @@ export type WorkerToDaemon =
    *  scheduled fire still routes into its originating topic after 32+ newer
    *  turns. turnId null = task created from a local-terminal turn. */
   | { type: 'cron_task_anchors_sync'; anchors: Array<{ taskId: string; turnId: string | null }> }
+  /** Full snapshot of the Lark turns that this worker's still-running Claude
+   *  background tasks were launched from. Sent only where a wake answer is
+   *  forwarded (transcript delivery, not adopt / zero-injection), and only
+   *  when the set changes. The daemon keeps those turns' replyTargets records
+   *  past the 32-entry eviction until the set drops them or the worker exits,
+   *  so the wake answer still routes into its launching topic. */
+  | { type: 'background_task_pins_sync'; turnIds: string[] }
   /** Transport-only receipt for ordinary Lark IM delivery. Emitted
    * synchronously when the live worker's IPC handler claims the exact turn,
    * before slow startup work; input-queue ownership is acknowledged separately

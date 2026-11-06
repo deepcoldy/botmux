@@ -132,7 +132,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -157,6 +157,7 @@ import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
 import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
+import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -2240,6 +2241,8 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
  *  (non-forced) config, so healthy restarts (e.g. user `/restart`) are
  *  unaffected. */
 let consecutiveInWorkerRestarts = 0;
+/** The last CLI exit was the tmux server being lost, not the CLI (see restart-fresh-budget.ts). */
+let lastCliExitServerReplaced = false;
 let tmuxRestartTimer: NodeJS.Timeout | null = null;
 /** Guard: user_notify for "resume → fresh fallback" is sent once per worker
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
@@ -8132,6 +8135,8 @@ const bridgeQueue = new BridgeTurnQueue(
  *  - `backgroundWait()`: the count the card shows while the main turn has
  *    ended but background work is still running (see backgroundWaitTasks). */
 const backgroundTaskTracker = new BackgroundTaskTracker();
+/** What this worker last reported as pinned (syncBackgroundTaskPinsToDaemon). */
+const backgroundTaskPins = new BackgroundTaskPinSnapshot();
 /** Background tasks shown on the card as 「主回合已结束 · 后台子任务运行中（N）」;
  *  0 otherwise. Mirrors backgroundTaskTracker.backgroundWait(), re-read after
  *  every transcript drain and sampler tick; the sampler publishes a change.
@@ -8148,6 +8153,28 @@ function refreshBackgroundWait(): void {
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
   if (next === 0) backgroundStopScanOffsets.clear();
   backgroundWaitTasks = next;
+  syncBackgroundTaskPinsToDaemon();
+}
+
+/** Tell the daemon which Lark turns this worker's running Claude background
+ *  tasks were launched from. A wake answer is forwarded to that turn's topic
+ *  (emitReadyTurns), and the daemon resolves the topic from a replyTargets
+ *  record it would otherwise evict once newer turns pile up — so it keeps
+ *  these records while the task runs, as it does for a live CronCreate task.
+ *  Only where a wake is forwarded at all (transcript delivery, not adopt /
+ *  zero-injection), so send-mode sessions keep their eviction unchanged; sent
+ *  only when the set changes. The daemon drops the pins when this worker exits. */
+function syncBackgroundTaskPinsToDaemon(): void {
+  if (lastInitConfig?.adoptMode === true || zeroPromptTerminalSync() || replyDeliveryMode() !== 'transcript') return;
+  const turnIds = bridgeQueue.backgroundTaskAnchorTurnIds(backgroundTaskTracker.liveTaskIds());
+  // The first snapshot always goes out, even empty (see BackgroundTaskPinSnapshot).
+  if (!backgroundTaskPins.changed(turnIds)) return;
+  try {
+    send({ type: 'background_task_pins_sync', turnIds });
+    backgroundTaskPins.markSent(turnIds);
+  } catch (err: any) {
+    log(`Background task pin sync failed (${err.message})`);
+  }
 }
 
 /** Sibling Claude transcripts already read for background-task stops, and
@@ -11158,7 +11185,16 @@ function emitReadyTurns(opts: {
     // check at the gate below can never run. Scheduled turns are always
     // evaluated AFTER the transcript text is available, where NOTHING_TO_SEND
     // and send-marker dedup (incl. the length comparison) have the final.
-    if (!turn.isScheduled && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+    // A background-task wake in transcript delivery is forwarded like a
+    // scheduled turn (its final is the session's only reply channel), so it
+    // skips this pre-text gate for the same reason. Every other delivery mode
+    // keeps it an ordinary headless local turn.
+    const forwardBackgroundWake = turn.isBackgroundWake === true && !adoptMode
+      && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript';
+    if (turn.backgroundWakeUnrouted === true && !adoptMode && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript') {
+      log(`Background wake ${turn.turnId.substring(0, 8)} not forwarded: its task notifications resolve to no single launching Lark turn`);
+    }
+    if (!turn.isScheduled && !forwardBackgroundWake && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (local-typed)`);
       continue;
     }
@@ -11210,6 +11246,7 @@ function emitReadyTurns(opts: {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       isScheduled: turn.isScheduled,
+      ...(forwardBackgroundWake ? { isBackgroundWake: true } : {}),
       finalText: assistantText,
       forwardLocalFinal: zeroPromptTerminalSync(),
     }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
@@ -11221,7 +11258,8 @@ function emitReadyTurns(opts: {
       // turn here already means completed. The claude family's limits arrive via
       // maybeEmitStructuredRateLimit → noteStructuredLimit, which revokes this.
       usageLimitTracker.noteTurnCompleted('answered');
-      const reason = turn.isScheduled ? 'scheduled turn already sent / silent' : 'local-typed';
+      const reason = turn.isScheduled ? 'scheduled turn already sent / silent'
+        : forwardBackgroundWake ? 'background wake already sent / silent' : 'local-typed';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
       // Positive silence evidence for the terminal — only a bare nothing-to-send
       // sentinel (no prose, no send), never "already sent" / local-typed.
@@ -11244,7 +11282,7 @@ function emitReadyTurns(opts: {
     const postText = bridgePostText(assistantText, adoptMode);
     if (!adoptMode && postText.trim().length === 0) continue;
 
-    if (turn.isLocal && !turn.isScheduled && !zeroPromptTerminalSync()) {
+    if (turn.isLocal && !turn.isScheduled && !forwardBackgroundWake && !zeroPromptTerminalSync()) {
       if (turn.userUuid) {
         // Local turn (adopt mode only): also surface the user prompt so the
         // Lark thread shows both sides of the exchange. User text comes from
@@ -11319,7 +11357,9 @@ function emitReadyTurns(opts: {
       // durable anchor store after a re-attach). Thread scope ignores this and
       // routes to the session root. Omitted in zero-injection mode —
       // terminalLocal owns routing there.
-      ...(turn.isScheduled && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
+      // A forwarded background wake anchors to the Lark turn that launched
+      // its task (the queue only flags a wake when that anchor is known).
+      ...((turn.isScheduled || forwardBackgroundWake) && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
         ? { replyTurnId: turn.replyAnchorTurnId }
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
@@ -11377,6 +11417,10 @@ function emitReadyTurns(opts: {
       const notice = localTurnFailureNotice(turn, {
         liveSinceMs: WORKER_STARTED_AT_MS,
         zeroPromptTerminalSync: zeroPromptTerminalSync(),
+        // Same condition as the forwarding above: a wake whose answer would
+        // have gone to its launching topic reports its failure there too.
+        backgroundWakeForwarded: turn.isBackgroundWake === true && !adoptMode
+          && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript',
       });
       if (notice) {
         log(`Bridge terminal for synthesised local turn ${turn.turnId.substring(0, 8)} `
@@ -28117,6 +28161,10 @@ async function spawnCli(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    lastCliExitServerReplaced = exitMarksServerReplaced({
+      intentionalRestart,
+      backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
+    });
     if (codexAutoUpgrade) {
       backend = null;
       isPromptReady = false;
@@ -28741,10 +28789,15 @@ async function restartCliProcess(
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
+    // This restart is abandoned; the server-loss marker must not survive to be
+    // consumed by a later, unrelated restart.
+    lastCliExitServerReplaced = false;
     codexAutoUpgrade.reject?.(new Error(reason));
     return;
   }
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
+    // Adopt workers never restart in place; no restart consumes the marker.
+    lastCliExitServerReplaced = false;
     log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
   }
@@ -28776,9 +28829,15 @@ async function restartCliProcess(
   // adapter probing is still re-run on every spawn. skipRestartBudget（角色
   // 切换的 cwd-move respawn）不计入：那是用户主动迁移不是崩溃恢复，计进去
   // 会让「切角色 + 一次无关重启」无故触发强制 FRESH 丢上下文。
-  if (!opts.skipRestartBudget) {
+  // 上一次退出是整个 tmux server 丢失（另一个 server 接管了 socket）时同样不计：
+  // CLI 本身没有失败，计进去会让 server 重建期间的二次波及把会话打成 FRESH。
+  const previousExitServerReplaced = lastCliExitServerReplaced;
+  lastCliExitServerReplaced = false;
+  if (restartSpendsFreshBudget({ skipRestartBudget: opts.skipRestartBudget, previousExitServerReplaced })) {
     consecutiveInWorkerRestarts++;
     log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  } else if (previousExitServerReplaced) {
+    log(`Restart count stays ${consecutiveInWorkerRestarts}: previous exit was a tmux server loss, not a CLI failure`);
   }
   const restart = async (): Promise<void> => {
     try {

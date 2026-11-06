@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/command-handler.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../src/services/feed-group-tagger.js', () => ({
@@ -4707,6 +4710,16 @@ describe('handleCommand', () => {
   // ─── /stop ──────────────────────────────────────────────────────────────
 
   describe('/stop', () => {
+    it.each(['claude-code', 'codex-app'] as const)('invalidates pending source replies when stopping %s', async cliId => {
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: vi.fn() } as any,
+        session: makeSession({ cliId, quoteTargetId: 'om_request', reportReplyInputId: 'om_request' }),
+      });
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), makeDeps(ds), LARK_APP_ID);
+      expect(ds.session.reportReplyInputId).toBe('msg_001');
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+      expect(ds.session.quoteTargetId).toBe('om_request');
+    });
     it('does not claim a stop was sent while an Antigravity fork is pending', async () => {
       const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any });
       ds.session.cliId = 'antigravity';

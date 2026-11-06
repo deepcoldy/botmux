@@ -80,7 +80,7 @@ import {
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, normalizeBackgroundTaskPins, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildStuckPageCard, buildStuckKeyResultCard, buildInputNotSubmittedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -17821,6 +17821,16 @@ function setupWorkerHandlers(
         sessionStore.updateSession(ds.session);
         break;
       }
+      case 'background_task_pins_sync': {
+        // Same eviction exemption for the launching turns of this worker's
+        // running Claude background tasks, so a wake answer forwarded long
+        // after launch still resolves to its topic. In-memory only: the
+        // worker holds the task→turn anchors in memory, and the exit handler
+        // drops these pins with it. Stale generations are rejected by the
+        // enclosing `ds.worker !== worker` guard.
+        ds.backgroundTaskPinnedTurnIds = normalizeBackgroundTaskPins(msg.turnIds);
+        break;
+      }
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
@@ -21878,6 +21888,9 @@ function setupWorkerHandlers(
       ds.workerReady = false;
       // The worker process died; its CLI died with it.
       ds.cliReady = false;
+      // Its background-task anchors died with it: nothing can forward a wake
+      // to those turns any more, so they stop holding their records.
+      ds.backgroundTaskPinnedTurnIds = undefined;
       ds.workerPort = null;
       // A dead worker can no longer refresh its card/usage view.
       clearUsageRefreshTimer(ds);

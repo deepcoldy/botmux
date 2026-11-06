@@ -2558,6 +2558,27 @@ export function canRunDaemonCommand(
 }
 
 /**
+ * 真人在群里打 daemon 命令 `cmd` 能不能执行——daemon.ts 两条路由对真人依次过的两道闸：
+ * 先 `restrictGrantCommands` 的授权用户限制（grantRestrictedSlashCommandText 同一判定），
+ * 再 {@link canRunDaemonCommand}（真人：无 union 信任腿、不是 bot 发送方）。
+ *
+ * 给「没有真实入站消息、但要按同一口径判断某人能不能用这条命令」的地方用：工作流节点的
+ * 工作目录（design 2026-11-03 §15.4）按 `/cd` 判断发起人能否操作执行 Bot。`openId`
+ * 必须是**本 bot 应用**下的 open_id（app-scoped，调用方负责换算）。
+ */
+export function humanCanRunDaemonCommand(
+  larkAppId: string,
+  chatId: string,
+  openId: string,
+  unionId: string | undefined,
+  cmd: string,
+  chatType: 'p2p' | 'group',
+): boolean {
+  if (grantCommandRestriction(larkAppId, chatId, openId).blocked) return false;
+  return canRunDaemonCommand(larkAppId, chatId, openId, undefined, cmd, unionId, chatType, false, false);
+}
+
+/**
  * 入口 A：无权限者 @bot（或私聊 bot）时弹授权申请卡，由管理员处置。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
  * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝

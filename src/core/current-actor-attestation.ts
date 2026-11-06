@@ -13,6 +13,7 @@ import {
   procStatStartTimeDigits,
 } from '../utils/proc-stat.js';
 import { isLoopbackPeer } from '../utils/loopback-peers.js';
+import { logger } from '../utils/logger.js';
 
 const TCP_ESTABLISHED_STATE = '01';
 
@@ -82,13 +83,142 @@ function peerSocketInodes(procRoot: string, clientPort: number, serverPort: numb
   return tableRead ? out : undefined;
 }
 
+/**
+ * Socket-holder scan over the whole host, time-sliced and shared.
+ *
+ * Mapping a socket inode to its process means reading every process's fd
+ * table: on a busy multi-user host that is ~2k processes and ~100k fds, a few
+ * hundred milliseconds of synchronous syscalls (much more on slower hosts).
+ * Done in one go it froze the daemon's event loop for that long on every
+ * execution-identity request, so health checks, card updates and outbound
+ * requests (the platform credential grant among them) all stalled behind it.
+ *
+ * The scan still has to cover the whole host: the peer must be the ONLY holder
+ * of the socket (an fd passed to or inherited by another process makes the
+ * caller ambiguous), and a registered background job may sit outside every
+ * session's process tree. So instead of narrowing it, the scan
+ *  - yields to the event loop every {@link PEER_SCAN_SLICE_MS} of work;
+ *  - serves every request queued when a pass starts from that one pass
+ *    (a later request waits for the next pass, which re-reads every table);
+ *  - fails closed past {@link PEER_SCAN_BUDGET_MS}.
+ */
+export const PEER_SCAN_SLICE_MS = 4;
+export const PEER_SCAN_BUDGET_MS = 5_000;
+
+interface PeerScanJob {
+  needle: string;
+  /** Start time read at the moment the fd was seen (undefined: unreadable). */
+  holders: Array<{ pid: number; procStart: string | undefined }>;
+  resolve: (holders: PeerScanJob['holders'] | undefined) => void;
+}
+
+interface PeerScanQueue { jobs: PeerScanJob[]; running: boolean }
+const peerScanQueues = new Map<string, PeerScanQueue>();
+
+/** @internal test seam: slice/budget overrides (production uses the defaults). */
+export interface PeerScanTuning { sliceMs?: number; budgetMs?: number; onYield?: () => void }
+
+const yieldToEventLoop = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+
+type PeerScanOutcome = 'completed' | 'budget_exceeded' | 'scan_failed';
+
+async function runPeerScanPass(procRoot: string, jobs: PeerScanJob[], tuning: PeerScanTuning): Promise<PeerScanOutcome> {
+  const sliceMs = tuning.sliceMs ?? PEER_SCAN_SLICE_MS;
+  const budgetMs = tuning.budgetMs ?? PEER_SCAN_BUDGET_MS;
+  let entries: string[];
+  try { entries = readdirSync(procRoot); } catch { return 'scan_failed'; }
+  const byNeedle = new Map<string, PeerScanJob[]>();
+  for (const job of jobs) {
+    const list = byNeedle.get(job.needle);
+    if (list) list.push(job); else byNeedle.set(job.needle, [job]);
+  }
+  const started = Date.now();
+  let sliceStart = started;
+  let sinceCheck = 0;
+  /** Yield once the current slice is used up; false when the budget is gone.
+   *  Checked per fd as well as per process: one process can hold tens of
+   *  thousands of fds (seen: 73k), a few hundred ms on its own. */
+  const keepGoing = async (): Promise<boolean> => {
+    if (++sinceCheck < 64 && sliceMs > 0) return true;
+    sinceCheck = 0;
+    if (Date.now() - sliceStart < sliceMs) return true;
+    tuning.onYield?.();
+    await yieldToEventLoop();
+    if (Date.now() - started > budgetMs) return false;
+    sliceStart = Date.now();
+    return true;
+  };
+  for (const entry of entries) {
+    if (!await keepGoing()) return 'budget_exceeded';
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    // One listing per process is a single syscall batch (~50ms for the 73k-fd
+    // outlier above); Bun's Dir.readSync buffers the whole listing too, so a
+    // streamed read would not split it further.
+    let fds: string[];
+    try { fds = readdirSync(join(procRoot, entry, 'fd')); } catch { continue; }
+    let matched: Set<string> | undefined;
+    for (const fd of fds) {
+      if (!await keepGoing()) return 'budget_exceeded';
+      let link: string;
+      try { link = readlinkSync(join(procRoot, entry, 'fd', fd)); } catch { continue; /* raced away */ }
+      if (!byNeedle.has(link) || matched?.has(link)) continue;
+      (matched ??= new Set()).add(link);
+      // Pin the identity now: the scan spans many event-loop turns, and a pid
+      // read only at the end could already belong to a different process.
+      const procStart = readProcStart(pid, procRoot);
+      for (const job of byNeedle.get(link)!) job.holders.push({ pid, procStart });
+    }
+  }
+  return 'completed';
+}
+
+function scanSocketHolders(procRoot: string, inode: string, tuning: PeerScanTuning): Promise<PeerScanJob['holders'] | undefined> {
+  let queue = peerScanQueues.get(procRoot);
+  if (!queue) { queue = { jobs: [], running: false }; peerScanQueues.set(procRoot, queue); }
+  const q = queue;
+  const done = new Promise<PeerScanJob['holders'] | undefined>(resolve => {
+    q.jobs.push({ needle: `socket:[${inode}]`, holders: [], resolve });
+  });
+  if (!q.running) {
+    q.running = true;
+    void (async () => {
+      try {
+        // A pass runs with the tuning of whichever request started it; requests
+        // coalesced into that pass share it. Production callers never pass
+        // scanTuning, so it only differs via the internal test seam.
+        while (q.jobs.length > 0) {
+          const jobs = q.jobs.splice(0);
+          let outcome: PeerScanOutcome = 'scan_failed';
+          try { outcome = await runPeerScanPass(procRoot, jobs, tuning); } catch { outcome = 'scan_failed'; }
+          // One log line per batch, with a distinct reason: a procfs read error
+          // is not a timeout, and N coalesced jobs must not log N identical lines.
+          if (outcome !== 'completed') {
+            const budget = tuning.budgetMs ?? PEER_SCAN_BUDGET_MS;
+            logger.warn(outcome === 'budget_exceeded'
+              ? `[current-actor] socket owner scan exceeded ${budget}ms; refusing ${jobs.length} request(s)`
+              : `[current-actor] socket owner scan failed while reading procfs; refusing ${jobs.length} request(s)`);
+          }
+          for (const job of jobs) job.resolve(outcome === 'completed' ? job.holders : undefined);
+        }
+      } finally {
+        q.running = false;
+        if (q.jobs.length === 0) peerScanQueues.delete(procRoot);
+      }
+    })();
+  }
+  return done;
+}
+
 /** Resolve the process that owns the client half of one live loopback TCP request. */
-export function resolveLoopbackPeerProcesses(input: {
+export async function resolveLoopbackPeerProcesses(input: {
   remoteAddress?: string;
   remotePort?: number;
   localPort?: number;
   procRoot?: string;
-}): LoopbackPeerResolution {
+  /** @internal test seam */
+  scanTuning?: PeerScanTuning;
+}): Promise<LoopbackPeerResolution> {
   const procRoot = input.procRoot ?? '/proc';
   // First ring: the peer address must be local (default loopback set, plus
   // BOTMUX_LOOPBACK_PEERS for hosts whose kernel reports a same-machine peer
@@ -108,31 +238,12 @@ export function resolveLoopbackPeerProcesses(input: {
   const inodes = peerSocketInodes(procRoot, input.remotePort, input.localPort);
   if (!inodes || inodes.size !== 1) return { ok: false, reason: 'peer_unresolved' };
   const inode = [...inodes][0];
-  const needle = `socket:[${inode}]`;
-  let entries: string[];
-  try { entries = readdirSync(procRoot); } catch { return { ok: false, reason: 'peer_unresolved' }; }
-  const peers: ProcessIdentity[] = [];
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    const pid = Number(entry);
-    let fds: string[];
-    try { fds = readdirSync(join(procRoot, entry, 'fd')); } catch { continue; }
-    let ownsSocket = false;
-    for (const fd of fds) {
-      try {
-        if (readlinkSync(join(procRoot, entry, 'fd', fd)) === needle) {
-          ownsSocket = true;
-          break;
-        }
-      } catch { /* process/fd raced away */ }
-    }
-    if (!ownsSocket) continue;
-    const procStart = readProcStart(pid, procRoot);
-    if (procStart) peers.push({ pid, procStart });
-  }
-  return peers.length === 1
-    ? { ok: true, peer: peers[0] }
-    : { ok: false, reason: 'peer_unresolved' };
+  const holders = await scanSocketHolders(procRoot, inode, input.scanTuning ?? {});
+  if (!holders) return { ok: false, reason: 'peer_unresolved' };
+  // Exactly one holder, whose start time can be read: anything else is ambiguous.
+  const [holder] = holders;
+  if (holders.length !== 1 || !holder?.procStart) return { ok: false, reason: 'peer_unresolved' };
+  return { ok: true, peer: { pid: holder.pid, procStart: holder.procStart } };
 }
 
 /** Codex keeps its native tool dispatcher alive across turns. It is part of

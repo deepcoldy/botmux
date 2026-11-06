@@ -795,6 +795,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用。',
   'cmd.adopt.managed_other_topic': '⚠️ 该 ID 是另一个话题的 Botmux 会话，不能用 /adopt 搬到当前话题。请到原话题点击「恢复会话」，或在本机运行 `botmux resume {id}`。',
   'cmd.resume.none': '⚠️ 这里没有可恢复的已关闭会话。',
+  'cmd.resume.cli_success': '🔄 会话已通过命令行恢复，发条消息继续与 {cliName} 对话。',
   'cmd.resume.lane_unsupported': 'ℹ️ 该会话是并行车道的分身，不能用 /resume 恢复。请在原会话上继续。',
   'cmd.resume.primary_unsupported': 'ℹ️ 当前部署启用了持久协调（primary），暂不支持用 /resume 恢复。请点击原会话关闭卡上的「恢复会话」按钮。',
   'cmd.close.primary_unsupported': 'ℹ️ 当前部署启用了持久协调（primary），本次请求未进入持久关闭通道，已拒绝本地关闭。请在话题中重新发送不带参数的 `/close`；暂不支持 `/close wt` 或卡片确认删除 worktree。',
@@ -1311,6 +1312,7 @@ export const messages: Record<string, string> = {
   'ai.zcode.progress_report': '长时间任务要中途汇报，不要等全部做完才回一次。满足任一条件就发一条一两句话的进展（正在做什么、下一步、是否卡住）：完成了一个明显阶段（代码写完/测试跑完/文件改完）；或距上次汇报已过约 3–5 分钟；或你要连续执行超过两次长工具调用。用 `botmux send` 发，不要贴大段日志。用户在等，沉默会被当成卡死。',
   'ai.cursor.background_task_note': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，不要再 botmux send，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才发一条 progress。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
   'ai.cursor.background_task_note_transcript': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才简短作答。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
+  'ai.claude.background_task_note_transcript': '后台任务（`run_in_background` 的命令、后台 Agent、Monitor）结束或产生事件时，Claude Code 会注入一条后台任务通知再开一轮——它不是飞书用户的新消息，但这一轮的最终 assistant message 会照常转发到飞书。例行事件（仍在运行、监视器重启、无新结论的中间状态）让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才简短作答。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',
 
