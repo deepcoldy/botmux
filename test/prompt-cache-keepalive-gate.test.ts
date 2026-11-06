@@ -37,6 +37,28 @@ const PERMISSION_DIALOG = [
   ' Esc to cancel · Tab to amend',
 ].join('\n');
 
+// A permission dialog whose wrapped question used to be invisible while the
+// empty composer box is still painted below it: the last readyPattern hit then
+// sits inside a framed composer, so without the wrap fix the gate ALLOWED the
+// keep-alive — an Enter landing on the dialog selects the highlighted choice
+// unattended.
+const WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER = [
+  RULE,
+  ' Edit file',
+  ' │ const x = 1;',
+  '',
+  ' Do you want to make this edit to a-very-long-component-file-name-for-the-',
+  ' settings-panel-of-account.tsx?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel',
+  RULE,
+  '❯ ',
+  RULE,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n');
+
 const ASK_USER_QUESTION = [
   RULE,
   ' ☐ Deploy',
@@ -71,6 +93,11 @@ describe('promptCacheKeepaliveRefusal', () => {
   it('refuses a permission dialog even though it matches the ready pattern', () => {
     expect(READY.test(PERMISSION_DIALOG)).toBe(true);
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: PERMISSION_DIALOG })).toBe('action_prompt_open');
+  });
+
+  it('refuses a wrapped permission dialog even with the composer box still painted', () => {
+    expect(READY.test(WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER })).toBe('action_prompt_open');
   });
 
   it('refuses an AskUserQuestion picker (prompt not inside an input box)', () => {

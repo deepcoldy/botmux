@@ -22,6 +22,12 @@ function joinWrappedQuestion(lines: string[]): string[] {
   const out = [...lines];
   for (let i = 0; i < out.length; i++) {
     if (!/^Do you want\b/.test(out[i]) || out[i].endsWith('?')) continue;
+    // The real question always sits below a blank row (a box rule strips to
+    // blank too). A head row directly beneath body text would join the dialog
+    // body — e.g. a command line that happens to start "Do you want" — into
+    // the projection, which must never leave the terminal. i === 0 has no row
+    // above to inspect (it can be the top of the 35-row window).
+    if (i > 0 && out[i - 1] !== '') continue;
     for (let j = i + 1; j <= i + 3 && j < out.length; j++) {
       // A blank row, a choice row, or a row that is already a complete
       // question ends the search: never swallow a valid question line.
@@ -69,6 +75,14 @@ export function claudeActionPrompt(screen: string): string | undefined {
     }
   }
   const title = (titleLine ?? '权限确认').slice(0, 80);
-  const question = lines[questionIndex].slice(0, 180);
+  // Keep the TAIL within the display budget: the file name the user must
+  // identify — and the closing "?" — end the question. With QUESTION_RE capped
+  // at 140 a head-only slice never triggered; the 400 cap makes it fire, and
+  // cutting the head hides precisely the long path this projection exists to
+  // surface (issue #2879).
+  const fullQuestion = lines[questionIndex];
+  const question = fullQuestion.length > 180
+    ? `…${fullQuestion.slice(-179)}`
+    : fullQuestion;
   return `Claude 正等待你确认「${title}」：${question}\n${choices.slice(0, 4).map(match => `${match[1]}. ${match[2]}`).join('\n')}\n请在原终端核对具体操作后选择。`;
 }

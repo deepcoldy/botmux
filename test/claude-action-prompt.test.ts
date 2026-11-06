@@ -159,7 +159,9 @@ it('detects a dialog whose very long path wrapped over 3 rows (>156 chars joined
     ' panel-of-account-and-billing-notifications-screen-with-extra-segments/',
     ' final-file.tsx?',
   ]));
-  expect(prompt).toContain('Do you want to make this edit to /home/tiger');
+  // The joined question exceeds the 180-char display budget: the projection
+  // keeps its tail so the file name the user must identify stays visible.
+  expect(prompt).toContain('final-file.tsx?');
   expect(prompt).toContain('2. No');
 });
 
@@ -184,6 +186,44 @@ it('does not turn trailing chat text into a dialog without choices', () => {
   expect(claudeActionPrompt([
     ' Do you want to know more',
     ' about something?',
+    ' Esc to cancel',
+  ].join('\n'))).toBeUndefined();
+});
+
+it('does not join a question wrapped over more than 3 continuation rows', () => {
+  // Five physical rows = head + 4 continuations; joined length stays well
+  // under the 400-char cap, so only the 3-row continuation limit can refuse.
+  expect(claudeActionPrompt(wrapped([
+    ` Do you want to make this edit to components-${'a'.repeat(40)}`,
+    ` panel-${'b'.repeat(40)}`,
+    ` section-${'c'.repeat(40)}`,
+    ` view-${'d'.repeat(40)}`,
+    ' final.tsx?',
+  ]))).toBeUndefined();
+});
+
+it('does not join when the row ending in "?" is not followed directly by choices', () => {
+  // Prose between the wrapped question and the choices must not produce a
+  // joined question the downstream triple then accepts.
+  expect(claudeActionPrompt(wrapped([
+    ' Do you want to follow the repository',
+    ' guidelines for this change?',
+    ' Here are the available actions:',
+  ]))).toBeUndefined();
+});
+
+it('does not join from a dialog-body row starting "Do you want" without a blank separator', () => {
+  // The │ prefix is stripped by the projection, so a body command line can
+  // itself start "Do you want". Without the blank-row separator such a row
+  // must never anchor a join — it would pull the command body into Lark.
+  expect(claudeActionPrompt([
+    ' Edit file',
+    ' │ Do you want to review the command rm -rf /tmp/private-target',
+    ' Do you want to make this edit to a-very-long-component-file-name-for-the-',
+    ' settings-panel-of-account.tsx?',
+    ' ❯ 1. Yes',
+    '   2. No',
+    '',
     ' Esc to cancel',
   ].join('\n'))).toBeUndefined();
 });
