@@ -75,6 +75,12 @@ botmux lang en       # 切成英文（zh / en）
 botmux lang en --bot 0   # 只改 bots.json 里第 0 个机器人
 ```
 
+#### 安装向导里切换中英文 {#setup-lang}
+
+跑 `botmux setup` 时，在第一步的选择菜单里直接按 **L** 键（搜索框为空时），界面立刻在中文和英文之间切换，选择也会存成本机的全局语言。用编号输入的简易模式时，输入 `L` 回车效果一样。
+
+也可以启动时直接指定：`botmux setup --lang en`（或 `zh`），同样会存成全局语言。之后想改界面语言，用上面的 `botmux lang`。
+
 ## 启停 daemon
 
 | 命令 | 说明 |
@@ -244,6 +250,17 @@ botmux autostart status   # 查看状态
 | `botmux auth request [--scope "<scope1 scope2>"] [--json]` | 为本轮发消息的人生成飞书授权链接，返回 JSON。AI 把链接发给用户去点 |
 | `botmux auth wait --request-id <id> [--json]` | 等这次授权完成，最多等 5 分钟。成功后再重试原来的操作 |
 
+#### Agent 自助发起授权 {#agent-auth-request}
+
+**用户不用做任何设置。** AI 在会话里用 `lark-cli --as user` 调飞书接口、发现缺你的授权时，会自己跑 `botmux auth request`（需要的权限用 `--scope` 一次带齐），把授权链接发给**本轮发消息的那个人**：
+
+- 私聊里，AI 把链接直接回给你；
+- 群里，botmux 私聊把链接发给你本人，不会贴到群里。
+
+你点开链接完成授权后，AI 用 `botmux auth wait` 在同一轮里等授权生效（最多 5 分钟），然后重试原来的操作。这一轮已经结束也没关系：链接有效期内授权完，再发一条消息就能接着做。不想等 AI 发链接，也可以自己在话题里发 `/login`（或 `/login --scope <权限名>`）。
+
+前提：这个 Bot 的 `lark-cli` 走 botmux 的应用绑定（`larkToolBinding`，默认开），或者 Bot 开了[按触发人身份调用 CLI](/bots-json#trigger-user-auth) 且覆盖 `lark-cli`。两者都关时 daemon 会拒绝，返回 `lark_user_auth_disabled`。链接只发给本轮经过验证的真人，AI 不能替别人申请。
+
 ### 只读查询
 
 这些命令只查状态，不改任何东西。
@@ -268,6 +285,24 @@ botmux autostart status   # 查看状态
 | `botmux whiteboard ...` | 本地项目白板 | [白板](/whiteboard) |
 
 AI 怎么发现和使用这些命令，见 [Skill + CLI 交互](/skill-cli)。
+
+### 建群后自动开工、直接建话题群 {#create-group}
+
+`botmux create-group` 在宿主终端或会话里都能跑，不用额外开关：
+
+```bash
+botmux create-group --bot reviewer-a --bot reviewer-b --name "PR #123 评审" \
+  --chat-mode topic \
+  --kickoff-bot ou_xxx --kickoff-prompt "请 review PR #123"
+```
+
+- `--bot`：至少一个，可重复。推荐写 Bot 显示名或完整 AppID。**第一个是建群人（creator）**。
+- `--chat-mode topic`：直接建成话题群（每条顶层消息自成一个话题）；`group` 或不写就是普通群。群形态只在建群那一刻能定，之后改不了。
+- `--kickoff-bot` + `--kickoff-prompt`：建群成功后，由建群人 @ 这个 Bot 发出这段 prompt，让它自动开始干活（比如 PR review）。两个参数要一起给；`--kickoff-bot` 填那个 Bot 的 open_id（会话里可用 `botmux bots list` 查），它必须在 `--bot` 列表里，而且不能是第一个。
+- `--working-dir <路径>`：把新群给所有入群 Bot 绑定到这个目录，开话题时不再弹选仓卡片。
+- `--json-status`：在输出的 chatId 后追加一行结构化状态。不管带不带它，指定了 kickoff 却没发出去时命令都以非零退出。
+
+完整参数见 `botmux create-group --help`，跨机器的团队建群（`--team` / `--agent`）也在里面。
 
 ## 其它配置命令
 

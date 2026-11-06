@@ -8,7 +8,7 @@
  *
  * 存储懒打开：第一次真的用到看板时才建 `decision-board.sqlite`。
  */
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Locale } from '../../i18n/types.js';
 import type { Brand } from '../../im/lark/lark-hosts.js';
@@ -17,8 +17,20 @@ import { parseDashboardImageUploads } from '../dashboard-images.js';
 import {
   BoardError,
   DecisionBoardStore,
+  decisionBoardDbPath,
   type ItemPatch,
 } from '../../services/decision-board-store.js';
+import {
+  formatHintNotice,
+  formatHintPrompt,
+  formatHintTurnId,
+  parseCloseWhenSpec,
+  parseDependsOnSpec,
+  parseHintTurnId,
+  parseNextCheckSpec,
+  type HintNoticeEntry,
+  type PrMergeState,
+} from './hints.js';
 import { formatChatLookupFailures, lookupProvesChatNotFound, type ChatLookupResult } from './chat-lookup.js';
 import {
   BOARD_STATE_LABELS,
@@ -43,8 +55,10 @@ import {
   parseUnlinkSpec,
   sidebarAppLink,
   stewardGuidePreset,
+  stewardCloseHintsOn,
   stewardReady,
   type BoardBatch,
+  type BoardHint,
   type BoardItem,
   type BoardLink,
   type BoardOption,
@@ -84,6 +98,11 @@ export interface DecisionBoardServiceDeps {
    * 只在写 chat 关联时调用；凭据只留在 daemon 进程内。`deadline` 是这条命令共用的截止时间。
    */
   lookupChat(chatId: string, opts: { deadline: number }): Promise<ChatLookupResult>;
+  /**
+   * 后台巡检查 PR 合没合（`owner/repo#12`）。查不到（网络、频控、没权限、不是 GitHub 上的仓库）返回
+   * undefined，巡检这轮不据此下结论。缓存与限流由实现负责（见 github-pr-state.ts）。
+   */
+  prState?(ref: string): Promise<PrMergeState | undefined>;
 }
 
 /** CLI 发来的请求体：选项和关联都传原始 spec 字符串，由这里统一解析。 */
@@ -107,6 +126,14 @@ export interface BoardCliRequest {
   noChat?: unknown;
   /** `--allow-unverified-chat`：查不到的群也写，标「未核实」。 */
   allowUnverifiedChat?: unknown;
+  /** `--close-when "pr:owner/repo#12 merged" | "item:66 done" | manual | auto` */
+  closeWhen?: unknown;
+  /** `--depends-on 66,70 | none` */
+  dependsOn?: unknown;
+  /** `--next-check +2d | 2026-11-10T09:30+08:00 | none` */
+  nextCheck?: unknown;
+  /** `--dismiss-hint`：收起当前提示。 */
+  dismissHint?: unknown;
 }
 
 /** 建项缺群时的报错：写清楚三种写法（管家照着改命令即可）。 */
@@ -130,9 +157,31 @@ const CHAT_VERIFY_BUDGET_MS = 20_000;
 
 const PATCH_TEXT_FIELDS = ['key', 'stage', 'kind', 'repo', 'summary', 'progress', 'question', 'recommend', 'recommendReason', 'note', 'title'] as const;
 
+/**
+ * 一轮巡检里最多问这么多个 PR（多数命中查询模块的缓存，不发请求）。超出时按轮转着查：每轮从上一轮停下的
+ * 位置接着往后，几轮就覆盖全部；没轮到的 PR 用上次查到的状态。
+ */
+const HINT_PR_LOOKUPS_PER_ROUND = 40;
+
+/**
+ * 同一条提示的通知最多自动投这么多次（投递抛错时重试）。deliver() 可能已经在群里发出横幅才失败，
+ * 无上限重试会每 5 分钟往管家群刷一条；超过就不再自动发，提示仍留在看板上。
+ */
+const HINT_NOTICE_MAX_ATTEMPTS = 3;
+
 export class DecisionBoardService {
   private storeRef?: DecisionBoardStore;
   private readonly delivering = new Map<number, Promise<BoardBatch>>();
+  private sweeping = false;
+  /** 正在投的提示通知（与 sweeping 分开：投递卡住时巡检照常给看板标提示，只是这期间不再发新通知）。 */
+  private noticeInFlight = false;
+  /** 已送进 worker、还没确认的提示回合 → 这一轮通知的 key。送达失败回执到了按它撤销「已通知」。 */
+  private readonly hintRounds = new Map<string, Array<{ seq: number; key: string }>>();
+  /** `<seq>:<key>` → 已经自动投过几次（只在内存里：重启后从头算，最多再多发几次）。 */
+  private readonly hintAttempts = new Map<string, number>();
+  /** 上次查到的 PR 状态：这一轮没轮到、或这轮查不到的 PR 用它。 */
+  private readonly prKnown = new Map<string, PrMergeState>();
+  private prCursor = 0;
 
   constructor(private readonly deps: DecisionBoardServiceDeps) {}
 
@@ -206,7 +255,8 @@ export class DecisionBoardService {
 
   guide(): { effective: string; preset: string } {
     const locale = this.deps.locale();
-    return { effective: composeStewardGuide(this.deps.steward(), locale), preset: stewardGuidePreset(locale) };
+    const steward = this.deps.steward();
+    return { effective: composeStewardGuide(steward, locale), preset: stewardGuidePreset(locale, steward) };
   }
 
   // ─── CLI ─────────────────────────────────────────────────────────────────
@@ -271,6 +321,25 @@ export class DecisionBoardService {
         throw new BoardError('no_chat_conflict', '同时给了群（--link chat=）和无群原因（--no-chat），只能二选一');
       }
     }
+    if (req.closeWhen !== undefined) {
+      if (typeof req.closeWhen !== 'string') throw new BoardError('invalid_close_when', '--close-when 必须是字符串');
+      const parsed = parseCloseWhenSpec(req.closeWhen);
+      if (typeof parsed === 'object' && 'error' in parsed) throw new BoardError('invalid_close_when', parsed.error);
+      patch.closeWhen = parsed === 'auto' ? null : parsed;
+    }
+    if (req.dependsOn !== undefined) {
+      if (typeof req.dependsOn !== 'string') throw new BoardError('invalid_depends_on', '--depends-on 必须是字符串');
+      const parsed = parseDependsOnSpec(req.dependsOn);
+      if (!Array.isArray(parsed)) throw new BoardError('invalid_depends_on', parsed.error);
+      patch.dependsOn = parsed;
+    }
+    if (req.nextCheck !== undefined) {
+      if (typeof req.nextCheck !== 'string') throw new BoardError('invalid_next_check', '--next-check 必须是字符串');
+      const parsed = parseNextCheckSpec(req.nextCheck, Date.now());
+      if (parsed !== null && typeof parsed === 'object') throw new BoardError('invalid_next_check', parsed.error);
+      patch.nextCheckAt = parsed;
+    }
+    if (req.dismissHint === true) patch.dismissHint = true;
     if (req.clearAsk === true) {
       patch.question = null;
       patch.options = [];
@@ -357,8 +426,17 @@ export class DecisionBoardService {
     return seq;
   }
 
+  /**
+   * 提示只在开着「自动发现可以关的项」时给出：关掉后巡检不再刷新，库里留下的提示会过时，不往外带。
+   */
+  private withVisibleHint<T extends Pick<BoardItem, 'hint'>>(item: T): T {
+    if (!item.hint || stewardCloseHintsOn(this.deps.steward())) return item;
+    const { hint: _hidden, ...rest } = item;
+    return rest as T;
+  }
+
   private itemOut(seq: number) {
-    const item = this.store().getItem(this.appId, seq)!;
+    const item = this.withVisibleHint(this.store().getItem(this.appId, seq)!);
     const rest = this.withoutStaleReason(item, this.store().links(this.appId, seq));
     return { ...rest, stateLabel: BOARD_STATE_LABELS[this.deps.locale()][item.state], ...this.itemLinks(seq),
       ...this.chatState(item, this.store().links(this.appId, seq)) };
@@ -381,6 +459,7 @@ export class DecisionBoardService {
           ...(i.stage ? { stage: i.stage } : {}), ...(i.key ? { key: i.key } : {}), ...(i.repo ? { repo: i.repo } : {}),
           pendingDecisions: i.pendingDecisions, updatedAt: i.updatedAt, ...this.itemLinks(i.seq),
           ...this.chatState(i, i.links),
+          ...(this.withVisibleHint(i).hint ? { hint: i.hint } : {}),
         }));
         return { view, counts: store.counts(app), missingChat: items.filter(i => i.missingChat).length, items };
       }
@@ -475,7 +554,7 @@ export class DecisionBoardService {
     return {
       ...this.meta(),
       items: store.listItems(this.appId, view, { author, query }).map(i => ({
-        ...this.withoutStaleReason(i, i.links), links: this.renderLinks(i.links, i.primaryChat), ...this.itemLinks(i.seq),
+        ...this.withVisibleHint(this.withoutStaleReason(i, i.links)), links: this.renderLinks(i.links, i.primaryChat), ...this.itemLinks(i.seq),
         missingChat: itemMissingChat(i, i.links),
       })),
       drafts: store.listDrafts(this.appId, author).map(d => ({ seq: d.seq, updatedAt: d.updatedAt })),
@@ -489,7 +568,7 @@ export class DecisionBoardService {
     if (!detail) throw new BoardError('item_not_found', `没有 #${seq}`);
     return {
       ...detail,
-      item: this.withoutStaleReason(detail.item, detail.links),
+      item: this.withVisibleHint(this.withoutStaleReason(detail.item, detail.links)),
       links: this.renderLinks(detail.links, detail.item.primaryChat),
       missingChat: itemMissingChat(detail.item, detail.links),
       ...this.itemLinks(seq),
@@ -597,13 +676,137 @@ export class DecisionBoardService {
    * 回调转到这里：不往管家群发失败卡片（owner 在看板前，不是群里），把批次退回 failed，
    * 页面的「重新投递」用同一个稳定 turnId 再投。已 delivered 的不动。
    */
-  noteDeliveryFailure(turnId: string, reason: string): void {
+  noteDeliveryFailure(turnId: string, reason: string, messageKey?: string): void {
+    const hintRound = parseHintTurnId(turnId);
+    if (hintRound) {
+      if (hintRound.appId !== this.appId) return;
+      const entries = this.hintRounds.get(turnId);
+      this.hintRounds.delete(turnId);
+      if (!entries?.length) return;
+      // 只有 worker 明确说没收下（入队前拒绝）才重发；收据超时之类是「结果未知」，CLI 可能已经拿到了，
+      // 重发会在群里和会话里各多一份，就保持「已通知」（提示还留在看板上）。
+      if (messageKey !== 'worker.input_rejected_before_admission') {
+        this.deps.log('warn', `[decision-board] hint notice ${turnId} delivery unconfirmed (${reason}); not resending`);
+        return;
+      }
+      this.deps.log('warn', `[decision-board] hint notice ${turnId} rejected by worker (${reason}); will retry next sweep`);
+      this.store().unmarkHintsNotified(this.appId, this.retryable(entries));
+      return;
+    }
     const parsed = parseBoardTurnId(turnId);
     if (!parsed || parsed.appId !== this.appId) return;
     const batch = this.store().getBatch(this.appId, parsed.batchId);
     if (!batch || batch.delivery === 'delivered') return;
     this.deps.log('warn', `[decision-board] batch #${parsed.batchId} worker delivery failed (${reason})`);
     this.store().markBatchFailed(this.appId, parsed.batchId, reason.slice(0, 400));
+  }
+
+  // ─── 自动发现可以关的项 ─────────────────────────────────────────────────
+
+  /**
+   * 后台巡检一轮（daemon 定时调用，不调模型）：查 PR 状态 → 在一个写事务里给每一项求提示（只标提示、
+   * 记历史，不改状态）→ 有还没通知过的提示就合成一条通知送进管家会话（一轮最多一条）。
+   *
+   * 只在「自动发现可以关的项」开着、管家群选好、看板库已经存在时跑；同一时间只跑一轮。
+   * 通知送不出去（管家会话在开场、投递抛错）时不记「已通知」，下一轮重试；送进 worker 之后
+   * 异步失败的回执由 {@link noteDeliveryFailure} 撤销「已通知」。
+   */
+  async sweepHints(now = Date.now()): Promise<{ marked: number; cleared: number; notified: number } | undefined> {
+    const steward = this.deps.steward();
+    if (!stewardCloseHintsOn(steward)) return undefined;
+    // 没用过看板的 bot 不为巡检建库。
+    if (!this.storeRef && !existsSync(decisionBoardDbPath(this.deps.dataDir))) return undefined;
+    if (this.sweeping) return undefined;
+    this.sweeping = true;
+    let pending: Array<{ seq: number; title: string; hint: BoardHint }> = [];
+    let summary: { marked: number; cleared: number };
+    let at: number;
+    try {
+      const store = this.store();
+      const app = this.appId;
+      const refs = store.hintPrRefs(app);
+      const batch = refs.length > HINT_PR_LOOKUPS_PER_ROUND
+        ? Array.from({ length: HINT_PR_LOOKUPS_PER_ROUND }, (_, i) => refs[(this.prCursor + i) % refs.length]!)
+        : refs;
+      if (refs.length > HINT_PR_LOOKUPS_PER_ROUND) {
+        this.prCursor = (this.prCursor + HINT_PR_LOOKUPS_PER_ROUND) % refs.length;
+        this.deps.log('info', `[decision-board] hint sweep: ${refs.length} PRs, checking ${HINT_PR_LOOKUPS_PER_ROUND} this round (rotating)`);
+      }
+      for (const ref of batch) {
+        let state: PrMergeState | undefined;
+        try {
+          state = await this.deps.prState?.(ref);
+        } catch (error) {
+          this.deps.log('warn', `[decision-board] hint sweep: PR ${ref} lookup failed (${error instanceof Error ? error.message : String(error)})`);
+        }
+        if (state) this.prKnown.set(ref, state);
+      }
+      // 查 PR 期间开关可能被关掉：关了就不再写。
+      if (!stewardCloseHintsOn(this.deps.steward())) return undefined;
+      // 查 PR 可能花了一阵：提示时间和历史按查完的时间记，不早于期间管家的改动。
+      at = Math.max(now, Date.now());
+      const locale = this.deps.locale();
+      const result = store.sweepHints(app, { now: at, locale, prState: ref => this.prKnown.get(ref) }, at);
+      pending = result.pending;
+      summary = { marked: result.marked, cleared: result.cleared };
+    } finally {
+      this.sweeping = false;
+    }
+    let notified = 0;
+    if (pending.length) notified = await this.deliverHintNotice(pending, at, this.deps.locale());
+    if (summary.marked || summary.cleared || notified) {
+      this.deps.log('info', `[decision-board] hint sweep: marked ${summary.marked}, cleared ${summary.cleared}, notified ${notified}`);
+    }
+    return { ...summary, notified };
+  }
+
+  /** 还没到自动投递上限的那些 key（超过上限的保持「已通知」，不再自动发）。 */
+  private retryable(entries: ReadonlyArray<{ seq: number; key: string }>): Array<{ seq: number; key: string }> {
+    return entries.filter(e => (this.hintAttempts.get(`${e.seq}:${e.key}`) ?? 0) < HINT_NOTICE_MAX_ATTEMPTS);
+  }
+
+  private async deliverHintNotice(pending: Array<{ seq: number; title: string; hint: BoardHint }>, round: number, locale: Locale): Promise<number> {
+    const steward = this.deps.steward();
+    if (!stewardReady(steward)) return 0;
+    // 上一条通知还在投（deliver 卡住）：这轮不再叠一条，提示留到下一轮。
+    if (this.noticeInFlight) return 0;
+    this.noticeInFlight = true;
+    try {
+      const entries: HintNoticeEntry[] = pending.map(p => {
+        const links = this.itemLinks(p.seq);
+        const link = links.appLink ?? links.url;
+        return { seq: p.seq, title: p.title, hint: p.hint, ...(link ? { link } : {}) };
+      });
+      const keys = pending.map(p => ({ seq: p.seq, key: p.hint.key }));
+      for (const k of keys) this.hintAttempts.set(`${k.seq}:${k.key}`, (this.hintAttempts.get(`${k.seq}:${k.key}`) ?? 0) + 1);
+      while (this.hintAttempts.size > 512) this.hintAttempts.delete(this.hintAttempts.keys().next().value!);
+      const turnId = formatHintTurnId(this.appId, round);
+      // 先记「已通知」再投：deliver() 里进程死掉时宁可漏一次（看板上的提示还在），也不重复刷屏；
+      // deliver() 明确失败就撤销（没到次数上限的），下一轮重试。
+      this.store().markHintsNotified(this.appId, keys);
+      this.hintRounds.set(turnId, keys);
+      while (this.hintRounds.size > 16) this.hintRounds.delete(this.hintRounds.keys().next().value!);
+      try {
+        await this.deps.deliver({
+          turnId,
+          prompt: formatHintPrompt(entries, locale),
+          announcement: { texts: splitEchoText(formatHintNotice(entries, locale)), images: [] },
+          attachments: [],
+          chatId: steward.chatId,
+          sessionTitle: locale === 'en' ? 'Steward' : '管家',
+        });
+      } catch (error) {
+        this.hintRounds.delete(turnId);
+        const retry = this.retryable(keys);
+        this.store().unmarkHintsNotified(this.appId, retry);
+        this.deps.log('warn', `[decision-board] hint notice ${turnId} delivery failed: ${error instanceof Error ? error.message : String(error)}`
+          + (retry.length < keys.length ? `; ${keys.length - retry.length} hint(s) reached ${HINT_NOTICE_MAX_ATTEMPTS} attempts, not retrying` : ''));
+        return 0;
+      }
+      return keys.length;
+    } finally {
+      this.noticeInFlight = false;
+    }
   }
 
   /** 同一批次同时只投一次；投完返回最新的批次状态（失败不抛，记在批次上）。 */

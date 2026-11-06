@@ -159,6 +159,21 @@ botmux 自带的 skill（发消息、建定时任务等）要交给 CLI 用。�
 
 这是整台机器的默认值，用命令改：`botmux skills injection [global|prompt|off|unset]`，不带参数是查看。单个机器人在 bots.json 里设了 `skillInjection` 时，以机器人自己的为准。详见 [Skill](/skill-cli)。
 
+## 同群多人独立会话（XPI，实验性） {#xpi}
+
+**默认关闭。** 关着时，群里所有人共用同一个会话：别人在 Bot 干活时发的消息按普通方式排队，等当前任务做完再处理。
+
+打开后，同一个群里**每个真人各用一套独立的 CLI 上下文和 git worktree**，可以并行干活、互不打断：
+
+- 消息仍然在群里公开可见，只是各自进各自的「lane」。
+- 引用别人正在执行的任务时，会走建议 / 确认流程，不会直接插进别人的任务；其它消息直接在发送者自己的 lane 里继续。
+- 在话题里发 `/lane status` 查看自己 lane 的分支、worktree、未提交改动和未推送提交数；`/lane close` 安全关闭自己的 lane（有任务在跑或有未提交文件时会拒绝，回收前先推送未发布的提交，不会自动合并或删分支）。
+- Agent 给别的 Bot 发消息时，要用 `botmux send --as independent|suggestion` 说明是「另开任务」还是「留给当前任务」。
+
+怎么开：Dashboard「全局设置 → 通用设置 → 实验性配置 → 跨身份打断隔离（XPI）」，对应 `config.json` 的 `dashboard.crossPrincipalInterruption: true`。开关对这台机器上所有 Bot 生效，**下一轮消息就生效，不用重启**。只想让某个 daemon 进程开或关，可以给它设环境变量 `BOTMUX_XPI_ENABLED=true` / `false`，它优先于 Dashboard 开关。
+
+大家需要共用同一份上下文和文件时保持关闭；任务彼此完全独立时再开。
+
 ## 常见问题
 
 **改了 config.json 要重启吗？**

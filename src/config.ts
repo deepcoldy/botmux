@@ -443,6 +443,11 @@ export const config = {
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
   get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
+  // Live getter: whether the turn initiator may press the `initiator` (decline /
+  // skip) keys on a "CLI is stuck" card. Default ON (absent ⇒ true); an explicit
+  // stored `false` limits every key to bot operators. Read at click time by the
+  // stuck_key gate and at card build time for the who-may-press hint.
+  get stuckCardInitiatorKeys(): boolean { return readGlobalConfig().dashboard?.stuckCardInitiatorKeys !== false; },
 };
 
 export type Config = typeof config;
