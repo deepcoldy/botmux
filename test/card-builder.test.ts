@@ -3225,3 +3225,19 @@ describe('truncateContent single oversized line', () => {
     }
   });
 });
+
+describe('truncateContent JSON-escape byte budget across lines (#2929)', () => {
+  it.each(['"', '\\'])('accounts for escape expansion when line-bisecting %j-dense multi-line input', async (denseChar) => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    // 20 lines × 80 escape-doubled chars: 1600 raw bytes but ~3200 JSON-escaped.
+    // Newlines force the LINE bisection path; the single-line cases above only
+    // exercise the single-oversized-line char fallback, so reverting the line
+    // predicate to raw byte length survives those but must fail here.
+    const content = Array.from({ length: 20 }, () => denseChar.repeat(80)).join('\n');
+    const out = truncateContent(content, 'zh', maxBytes);
+    expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    // Tail is retained rather than the output collapsing to just the prefix.
+    expect(out.endsWith(denseChar)).toBe(true);
+  });
+});

@@ -877,7 +877,8 @@ export function buildRelayedFrozenCard(
 
 /**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
- * Cap markdown content byte size with headroom for card JSON overhead.
+ * Budget is measured in JSON-serialized (escaped: `"`, `\`, control chars)
+ * UTF-8 bytes with headroom for the surrounding card JSON overhead.
  */
 const MAX_CONTENT_BYTES = 100_000;
 
@@ -931,6 +932,11 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
         loChar = midChar + 1;
       }
     }
+    // Defensive: a paired surrogate costs 4 escaped bytes but a lone low
+    // surrogate costs 6, so on well-formed input the minimum always lands on a
+    // pair lead. Only input that already contains an unpaired surrogate can
+    // leave the cut on a trailing low one; skip it so the tail never opens with
+    // a lone low surrogate.
     if (loChar < last.length && last.charCodeAt(loChar) >= 0xdc00 && last.charCodeAt(loChar) <= 0xdfff) {
       loChar++;
     }
