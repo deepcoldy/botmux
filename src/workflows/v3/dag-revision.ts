@@ -1249,16 +1249,19 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   //  - cancelled: an early-release loser is cancelled WITH its instance, so a
   //    cone supersede revives it; one cancelled before dispatch has no
   //    instance and stays cancelled;
-  //  - skipped: never dispatched (skip only applies to a pending node), so no
-  //    cone supersede can bring it back.
+  //  - skipped: normally a pending node that never dispatched (no instance);
+  //    but a blocked node re-queued on its same instance
+  //    (nodeRetryRequested resetGate) and then skipped KEEPS the instance, so
+  //    the same cone-supersede revival applies to it.
   if (input.nodeExecutor === 'bot') {
     const redone = new Set([...rerun].flatMap((nodeId) => affectedNodesFrom(next, nodeId)));
     const settled = (nodeId: string): boolean => {
       if (added.has(nodeId)) return false;
       const state = snap.nodes.get(nodeId);
-      if (state?.status === 'skipped') return true;
       if (state?.status === 'done') return !redone.has(nodeId);
-      if (state?.status === 'cancelled') return !redone.has(nodeId) || !state.effectiveInstanceId;
+      if (state?.status === 'skipped' || state?.status === 'cancelled') {
+        return !redone.has(nodeId) || !state.effectiveInstanceId;
+      }
       return false;
     };
     const sinks = v3CheckpointsWithoutDependants(next).filter((nodeId) => !settled(nodeId));

@@ -351,7 +351,9 @@ describe('workflow edit', () => {
    * `u`/`o` finish; `j` is released by `o` and the losing source `c` is
    * cancelled as an early-release loser. `c`'s only dependant is `j`.
    * Without dispatch the cancel carries no instance and `c` stays a node that
-   * was never dispatched (skipped likewise never has one).
+   * was never dispatched (the skipped variant here is that no-instance shape;
+   * a skipped node that KEEPS an instance via a same-instance retry has its
+   * own case below).
    */
   function seedEarlyReleaseRun(opts: { c: 'cancelled-with-instance' | 'cancelled-no-instance' | 'skipped' }): { base: string; runDir: string } {
     const { base, runDir } = seedRun([
@@ -425,6 +427,57 @@ describe('workflow edit', () => {
       { op: 'rerunNode', nodeId: 'u' },
     ])).toMatchObject({ kind: 'applied' });
     const after = revisedState(base, runDir);
+    expect(after.supersede.some((item) => item.nodeId === 'c')).toBe(false);
+    expect(after.state).toBe('skipped');
+  });
+
+  it('refuses a skipped-with-instance sink the cone revives (blocked retried on its instance, then skipped)', () => {
+    // Plain chain u → c(checkpoint) → j: c's only dependant is j. c ran,
+    // blocked, was re-queued on the SAME instance (resetGate retry) and then
+    // skipped before re-dispatch: the node view is skipped but keeps
+    // effectiveInstanceId, so a cone supersede revives it exactly like the
+    // cancelled-with-instance case.
+    const { base, runDir } = seedRun([
+      goal('u', { bot: 'cli_x' }),
+      goal('c', { bot: 'cli_x', checkpoint: true, depends: ['u'] }),
+      goal('j', { bot: 'cli_x', depends: ['c'] }),
+    ], 'bot');
+    const journal = join(runDir, 'journal.ndjson');
+    appendEvent(journal, { type: 'nodeDispatched', nodeId: 'u', instanceId: 'u#001', attemptId: 'u#001/attempts/001', nodeExecutor: 'bot' });
+    appendEvent(journal, { type: 'nodeSucceeded', nodeId: 'u', instanceId: 'u#001', attemptId: 'u#001/attempts/001', manifestPath: join(runDir, 'm.json') });
+    appendEvent(journal, { type: 'nodeDispatched', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', nodeExecutor: 'bot' });
+    appendEvent(journal, { type: 'nodeBlocked', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', errorClass: 'other' });
+    appendEvent(journal, {
+      type: 'nodeRetryRequested', nodeId: 'c', instanceId: 'c#001',
+      previousAttemptId: 'c#001/attempts/001', nextAttemptId: 'c#001/attempts/001',
+      reason: 'blockedRetry', resetGate: true,
+    });
+    appendEvent(journal, { type: 'nodeSkipped', nodeId: 'c', reason: 'triggerRuleUnsatisfied', detail: 'probe' });
+    expect(materialize(readJournal(journal)).nodes.get('c'))
+      .toMatchObject({ status: 'skipped', effectiveInstanceId: 'c#001' });
+    expect(edit(base, [
+      { op: 'removeNode', nodeId: 'j' },
+      { op: 'rerunNode', nodeId: 'u' },
+    ])).toEqual({ kind: 'invalid', problems: [`节点 c：${REFUSAL}`] });
+    // Outside the cone it stays exempt: nothing re-dispatches it.
+    const { base: base2, runDir: runDir2 } = seedRun([
+      goal('u', { bot: 'cli_x' }),
+      goal('c', { bot: 'cli_x', checkpoint: true, depends: ['u'] }),
+      goal('j', { bot: 'cli_x', depends: ['c'] }),
+    ], 'bot');
+    const journal2 = join(runDir2, 'journal.ndjson');
+    appendEvent(journal2, { type: 'nodeDispatched', nodeId: 'u', instanceId: 'u#001', attemptId: 'u#001/attempts/001', nodeExecutor: 'bot' });
+    appendEvent(journal2, { type: 'nodeSucceeded', nodeId: 'u', instanceId: 'u#001', attemptId: 'u#001/attempts/001', manifestPath: join(runDir2, 'm.json') });
+    appendEvent(journal2, { type: 'nodeDispatched', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', nodeExecutor: 'bot' });
+    appendEvent(journal2, { type: 'nodeBlocked', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', errorClass: 'other' });
+    appendEvent(journal2, {
+      type: 'nodeRetryRequested', nodeId: 'c', instanceId: 'c#001',
+      previousAttemptId: 'c#001/attempts/001', nextAttemptId: 'c#001/attempts/001',
+      reason: 'blockedRetry', resetGate: true,
+    });
+    appendEvent(journal2, { type: 'nodeSkipped', nodeId: 'c', reason: 'triggerRuleUnsatisfied', detail: 'probe' });
+    expect(edit(base2, [{ op: 'removeNode', nodeId: 'j' }])).toMatchObject({ kind: 'applied' });
+    const after = revisedState(base2, runDir2);
     expect(after.supersede.some((item) => item.nodeId === 'c')).toBe(false);
     expect(after.state).toBe('skipped');
   });
