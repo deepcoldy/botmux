@@ -480,6 +480,7 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
   buildStreamingCardJson,
+  substituteCardControlFor,
   isResumeRecoveryPlaceholder,
   identityStorageModelForDaemonSession,
   identityDecisionConflict,
@@ -6469,6 +6470,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       previousIdleLabel,
       dshRuntimeForSession(ds),
       resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+      false,
+      substituteCardControlFor(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 

@@ -12,9 +12,19 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
+
+// Real-filesystem carve-out for the per-chat substitute toggle integration
+// tests below. Every other path keeps the original mock behaviour.
+const { SUBST_TEST_TMP_PREFIX, useRealSubstituteStore } = vi.hoisted(() => ({
+  SUBST_TEST_TMP_PREFIX: 'botmux-subst-e2e-',
+  useRealSubstituteStore: { value: false },
+}));
 
 const mockExistsSync = vi.fn(() => true);
 const mockReadFileSync = vi.fn(() => '[]');
@@ -22,15 +32,22 @@ const mockWriteFileSync = vi.fn();
 const mockCrossRefStatSync = vi.fn();
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
+  const isSubstTmp = (path: unknown) => String(path).includes(SUBST_TEST_TMP_PREFIX);
   return {
     ...actual,
-    existsSync: (...args: any[]) => mockExistsSync(...args),
-    readFileSync: (...args: any[]) => mockReadFileSync(...args),
+    existsSync: (...args: any[]) => isSubstTmp(args[0]) ? actual.existsSync(args[0] as any) : mockExistsSync(...args),
+    readFileSync: (...args: any[]) => isSubstTmp(args[0])
+      ? actual.readFileSync(args[0] as any, args[1] as any)
+      : mockReadFileSync(...args),
     statSync: (path: any, ...args: any[]) => String(path).includes('bot-openids-')
       ? mockCrossRefStatSync(path, ...args)
       : (actual.statSync as any)(path, ...args),
-    writeFileSync: (...args: any[]) => mockWriteFileSync(...args),
-    mkdirSync: vi.fn(),
+    writeFileSync: (...args: any[]) => (typeof args[0] === 'number' || isSubstTmp(args[0]))
+      ? (actual.writeFileSync as any)(...args)
+      : mockWriteFileSync(...args),
+    mkdirSync: (...args: any[]) => isSubstTmp(args[0])
+      ? (actual.mkdirSync as any)(...args)
+      : undefined,
   };
 });
 
@@ -46,9 +63,14 @@ vi.mock('node-pty', () => ({
 
 // bots-info.json 走原子写 helper；这里直接代理到 mockWriteFileSync，
 // 断言面（最终路径 + 完整内容）与裸 writeFileSync 时代保持一致。
-vi.mock('../src/utils/atomic-write.js', () => ({
-  atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
-}));
+vi.mock('../src/utils/atomic-write.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/utils/atomic-write.js')>();
+  return {
+    atomicWriteFileSync: (...args: any[]) => String(args[0]).includes(SUBST_TEST_TMP_PREFIX)
+      ? (actual.atomicWriteFileSync as any)(...args)
+      : mockWriteFileSync(...args),
+  };
+});
 // bots-info.json upserts take a cross-process lock on a real `<path>.lock`
 // file; the fs-mocked `/data` dir here does not exist. This file covers the
 // merge logic only — test/bots-info-store.test.ts covers real concurrency.
@@ -133,6 +155,7 @@ const mockResolveSiblingBot = vi.fn(async () => ({ ok: false, reason: 'default_n
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetCachedChatMode = vi.fn(() => undefined as 'group' | 'topic' | 'p2p' | undefined);
 const mockGetChatModeStrict = vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p' | 'unknown');
+const mockGetCachedChatModeStrict = vi.fn(() => 'group' as 'group' | 'topic' | 'p2p' | undefined);
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 const mockUpdateMessage = vi.fn(async () => true);
@@ -159,6 +182,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   getCachedChatMode: (...args: any[]) => mockGetCachedChatMode(...args),
   getChatModeStrict: (...args: any[]) => mockGetChatModeStrict(...args),
+  getCachedChatModeStrict: (...args: any[]) => mockGetCachedChatModeStrict(...args),
+  deleteMessage: vi.fn(async () => true),
+  sendMessage: vi.fn(async () => 'om_msg'),
+  sendEphemeralCard: vi.fn(async () => 'om_eph'),
+  resolveUserUnionId: vi.fn(async () => null),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   resolveSiblingBotBySenderOpenId: (...args: any[]) => mockResolveSiblingBot(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
@@ -197,10 +225,19 @@ vi.mock('../src/services/observed-bots-store.js', () => ({
 }));
 
 const mockIsSubstituteEnabledForChat = vi.fn(() => true);
-vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
-  isSubstituteEnabledForChat: (...args: any[]) => mockIsSubstituteEnabledForChat(...args),
-  setSubstituteEnabledForChat: vi.fn(),
-}));
+vi.mock('../src/services/substitute-chat-toggle-store.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/services/substitute-chat-toggle-store.js')>(
+    '../src/services/substitute-chat-toggle-store.js',
+  );
+  return {
+    isSubstituteEnabledForChat: (...args: any[]) => useRealSubstituteStore.value
+      ? actual.isSubstituteEnabledForChat(args[0], args[1])
+      : mockIsSubstituteEnabledForChat(...args),
+    setSubstituteEnabledForChat: (...args: any[]) => useRealSubstituteStore.value
+      ? actual.setSubstituteEnabledForChat(args[0], args[1], args[2])
+      : undefined,
+  };
+});
 
 const mockP2pForceTopicRoots = new Set<string>();
 const mockIsP2pForceTopicRoot = vi.fn((larkAppId: string, rootId: string, chatId: string) => (
@@ -256,6 +293,7 @@ import { localeForBot, t } from '../src/i18n/index.js';
 import { hasTriggeredMessage } from '../src/services/triggered-message-store.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
+import { isSubstituteEnabledForChat, setSubstituteEnabledForChat } from '../src/services/substitute-chat-toggle-store.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
@@ -14397,5 +14435,400 @@ describe('im.message.receive_v1 — /dash 内置免@ 控制命令', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     const ctx = handlers.handleNewTopic.mock.calls[0][1];
     expect(ctx.commandTrigger).toBeUndefined();
+  });
+});
+
+// ─── Real-store per-chat substitute toggle gate ─────────────────────────────
+// These cases intentionally do NOT use the fixed mock: they point the real
+// substitute-chat-toggle-store at a temp data dir (the node:fs mock above
+// passes that prefix through) and prove the dispatcher honours the actual
+// persisted state, including the generic never/solo relax paths.
+describe('substitute per-chat off — real store routing gate', () => {
+  let tmpDir: string;
+  let prevDataDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'botmux-subst-e2e-'));
+    prevDataDir = config.session.dataDir;
+    (config.session as any).dataDir = tmpDir;
+    useRealSubstituteStore.value = true;
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+  });
+
+  afterEach(() => {
+    useRealSubstituteStore.value = false;
+    (config.session as any).dataDir = prevDataDir;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('drops @target messages while off and restores them when on, even under never + solo relax', async () => {
+    const chatId = 'chat-subst-real-store';
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'new-topic',
+      regularGroupMentionMode: 'never',
+      soloGroupMentionBypass: true,
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+        disclosure: 'prefix',
+      },
+    });
+    const handlers = makeHandlers();
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    handlers.isSessionOwner.mockReturnValue(true);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const fireTargetMessage = async (messageId: string) => {
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@Sub Person help with this' }),
+        messageId,
+        chatId,
+        chatType: 'group',
+        mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+      });
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+    };
+
+    // The dispatcher test file mocks node:fs for unrelated paths; seed the real
+    // store file in the carve-out temp dir and let the real store read it.
+    // Real-store WRITE is covered by card-handler-substitute-toggle.test.ts.
+    const seedStore = (enabled: boolean) => {
+      writeFileSync(
+        join(tmpDir, 'substitute-chat-toggles.json'),
+        JSON.stringify({ disabled: enabled ? {} : { [MY_APP_ID]: [chatId] } }),
+      );
+      expect(isSubstituteEnabledForChat(MY_APP_ID, chatId)).toBe(enabled);
+    };
+
+    seedStore(true);
+    await fireTargetMessage('msg-subst-real-on-1');
+    expect(handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length)
+      .toBeGreaterThan(0);
+    handlers.handleNewTopic.mockClear();
+    handlers.handleThreadReply.mockClear();
+
+    seedStore(false);
+    await fireTargetMessage('msg-subst-real-off');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    seedStore(true);
+    await fireTargetMessage('msg-subst-real-on-2');
+    expect(handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length)
+      .toBeGreaterThan(0);
+
+    // A direct @bot message is never affected by the substitute gate.
+    handlers.handleNewTopic.mockClear();
+    handlers.handleThreadReply.mockClear();
+    seedStore(false);
+    const direct = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: `@BotA <at user_id="${MY_OPEN_ID}">BotA</at> help` }),
+      messageId: 'msg-subst-real-direct',
+      chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](direct);
+    await flushEventWork();
+    expect(handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length).toBeGreaterThan(0);
+  });
+});
+
+// ─── Real ACK wrapper: actual timeout state ───────────────────────────────
+describe('card action ACK timeout state', () => {
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockSendUserMessage.mockClear();
+  });
+
+  function click(messageId: string): any {
+    return {
+      action: { value: { action: 'toggle_substitute', root_id: 'om_root_slow', session_id: 'sess-slow' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: messageId },
+    };
+  }
+
+  it('passes timedOut=true and sends exactly one visible notice after the real ACK deadline', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], cardActionAckTimeoutMs: 500 });
+    const handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    handlers.handleCardAction.mockImplementation(async () => {
+      await new Promise(resolve => setTimeout(resolve, 650));
+      return {
+        toast: { type: 'warning', content: 'slow warning' },
+        afterAck: async (timedOut?: boolean) => {
+          if (timedOut) mockSendUserMessage(MY_APP_ID, USER_OPEN_ID, 'slow warning', 'text');
+        },
+      };
+    });
+
+    const result = await capturedHandlers['card.action.trigger'](click('om_slow_card'));
+
+    expect(result).toEqual({ toast: expect.objectContaining({ type: 'info' }) });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendUserMessage).toHaveBeenCalledWith(MY_APP_ID, USER_OPEN_ID, 'slow warning', 'text');
+  });
+
+  it('passes timedOut=false and does not duplicate a fast toast as a notice', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], cardActionAckTimeoutMs: 500 });
+    const handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    handlers.handleCardAction.mockResolvedValue({
+      toast: { type: 'warning', content: 'fast warning' },
+      afterAck: async (timedOut?: boolean) => {
+        if (timedOut) mockSendUserMessage(MY_APP_ID, USER_OPEN_ID, 'fast warning', 'text');
+      },
+    });
+
+    const result = await capturedHandlers['card.action.trigger'](click('om_fast_card'));
+
+    expect(result).toEqual({ toast: { type: 'warning', content: 'fast warning' } });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(mockSendUserMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Real handler → real store → real dispatcher closed loop ───────────────
+describe('substitute toggle real handler/store/dispatcher chain', () => {
+  let tmpDir: string;
+  let prevDataDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'botmux-subst-e2e-chain-'));
+    prevDataDir = config.session.dataDir;
+    (config.session as any).dataDir = tmpDir;
+    useRealSubstituteStore.value = true;
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockGetMessageDetail.mockResolvedValue({ items: [{ chat_id: 'chat-subst-chain' }] });
+    mockGetChatModeStrict.mockResolvedValue('group');
+    mockGetCachedChatModeStrict.mockReturnValue('group');
+  });
+
+  afterEach(() => {
+    useRealSubstituteStore.value = false;
+    (config.session as any).dataDir = prevDataDir;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('a real button click turns the real dispatcher off and back on, with other chats isolated', async () => {
+    const chatId = 'chat-subst-chain';
+    const otherChatId = 'chat-subst-other';
+    const rootId = 'om_subst_chain_root';
+    const cardId = 'om_subst_chain_card';
+    const sid = 'sess-subst-chain';
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'new-topic',
+      regularGroupMentionMode: 'never',
+      soloGroupMentionBypass: true,
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+        disclosure: 'prefix',
+      },
+    });
+    const handlers = makeHandlers();
+    const { handleCardAction } = await import('../src/im/lark/card-handler.js');
+    const { sessionKey } = await import('../src/core/types.js');
+    const ds: any = {
+      session: {
+        sessionId: sid,
+        chatId,
+        rootMessageId: rootId,
+        title: 'substitute chain',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        scope: 'thread',
+        chatType: 'group',
+        larkAppId: MY_APP_ID,
+        ownerOpenId: USER_OPEN_ID,
+        workingDir: '/tmp',
+        cliId: 'claude-code',
+      },
+      worker: { killed: false },
+      workerPort: null,
+      workerToken: null,
+      larkAppId: MY_APP_ID,
+      chatId,
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: Date.now(),
+      cliVersion: '1.0.0',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+      workingDir: '/tmp',
+      streamCardId: cardId,
+      displayMode: 'hidden',
+    };
+    const deps: any = {
+      activeSessions: new Map<string, any>([[sessionKey(rootId, MY_APP_ID), ds]]),
+      sessionReply: vi.fn(async () => 'om_reply'),
+      lastRepoScan: new Map(),
+    };
+    handlers.handleCardAction.mockImplementation((data: any, appId: string) => handleCardAction(data, deps, appId));
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const fireTarget = async (messageId: string, targetChat = chatId) => {
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@Sub Person help with this' }),
+        messageId,
+        chatId: targetChat,
+        chatType: 'group',
+        mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+      });
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+    };
+    const click = (desired: 'on' | 'off') => ({
+      action: { value: { action: 'toggle_substitute', desired, root_id: rootId, session_id: sid } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: cardId },
+    });
+    const handled = () => handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length;
+    const clearHandled = () => { handlers.handleNewTopic.mockClear(); handlers.handleThreadReply.mockClear(); };
+
+    // Sanity: the real store mock delegates to the real file store.
+    setSubstituteEnabledForChat(MY_APP_ID, chatId, false);
+    expect(isSubstituteEnabledForChat(MY_APP_ID, chatId)).toBe(false);
+    setSubstituteEnabledForChat(MY_APP_ID, chatId, true);
+    expect(isSubstituteEnabledForChat(MY_APP_ID, chatId)).toBe(true);
+
+    // Baseline: the real store is enabled, so the dispatcher handles @target.
+    clearHandled();
+    await fireTarget('msg-chain-on-1');
+    expect(handled()).toBeGreaterThan(0);
+
+    // Real card handler → real store off.
+    clearHandled();
+    const off = await capturedHandlers['card.action.trigger'](click('off'));
+    expect(off?.toast).toEqual(expect.objectContaining({ type: 'success' }));
+    expect(isSubstituteEnabledForChat(MY_APP_ID, chatId)).toBe(false);
+    await fireTarget('msg-chain-off');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    // Real card handler → real store on again; dispatcher resumes.
+    clearHandled();
+    const on = await capturedHandlers['card.action.trigger'](click('on'));
+    expect(on?.toast).toEqual(expect.objectContaining({ type: 'success' }));
+    await fireTarget('msg-chain-on-2');
+    expect(handled()).toBeGreaterThan(0);
+
+    // Isolation: the off state is per-chat. Another group still triggers.
+    clearHandled();
+    await capturedHandlers['card.action.trigger'](click('off'));
+    await fireTarget('msg-chain-other', otherChatId);
+    expect(handled()).toBeGreaterThan(0);
+
+    // Direct @bot is never affected by the per-chat substitute gate.
+    clearHandled();
+    const direct = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: `@BotA <at user_id="${MY_OPEN_ID}">BotA</at> help` }),
+      messageId: 'msg-chain-direct',
+      chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](direct);
+    await flushEventWork();
+    expect(handled()).toBeGreaterThan(0);
+  });
+
+  it('works for topic groups when topicGroups support is enabled', async () => {
+    const chatId = 'chat-subst-topic-chain';
+    const rootId = 'om_subst_topic_root';
+    const cardId = 'om_subst_topic_card';
+    const sid = 'sess-subst-topic-chain';
+    mockGetMessageDetail.mockResolvedValue({ items: [{ chat_id: chatId }] });
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'new-topic',
+      regularGroupMentionMode: 'never',
+      soloGroupMentionBypass: true,
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+        disclosure: 'prefix',
+        topicGroups: true,
+      },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatModeStrict.mockResolvedValue('topic');
+    mockGetCachedChatModeStrict.mockReturnValue('topic');
+    const handlers = makeHandlers();
+    const { handleCardAction } = await import('../src/im/lark/card-handler.js');
+    const { sessionKey } = await import('../src/core/types.js');
+    const ds: any = {
+      session: {
+        sessionId: sid, chatId, rootMessageId: rootId, title: 'topic substitute chain',
+        status: 'active', createdAt: new Date().toISOString(), scope: 'thread',
+        chatType: 'group', larkAppId: MY_APP_ID, ownerOpenId: USER_OPEN_ID,
+        workingDir: '/tmp', cliId: 'claude-code',
+      },
+      worker: { killed: false }, workerPort: null, workerToken: null,
+      larkAppId: MY_APP_ID, chatId, chatType: 'group', scope: 'thread',
+      spawnedAt: Date.now(), cliVersion: '1.0.0', lastMessageAt: Date.now(),
+      hasHistory: true, workingDir: '/tmp', streamCardId: cardId, displayMode: 'hidden',
+    };
+    const deps: any = {
+      activeSessions: new Map<string, any>([[sessionKey(rootId, MY_APP_ID), ds]]),
+      sessionReply: vi.fn(async () => 'om_reply'),
+      lastRepoScan: new Map(),
+    };
+    handlers.handleCardAction.mockImplementation((data: any, appId: string) => handleCardAction(data, deps, appId));
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    const fireTarget = async (messageId: string) => {
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@Sub Person help with this' }),
+        messageId, chatId, chatType: 'group',
+        mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+      });
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+    };
+    const click = (desired: 'on' | 'off') => ({
+      action: { value: { action: 'toggle_substitute', desired, root_id: rootId, session_id: sid } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: cardId },
+    });
+    const handled = () => handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length;
+    const clearHandled = () => { handlers.handleNewTopic.mockClear(); handlers.handleThreadReply.mockClear(); };
+
+    clearHandled();
+    await fireTarget('msg-topic-on-1');
+    expect(handled()).toBeGreaterThan(0);
+
+    clearHandled();
+    const off = await capturedHandlers['card.action.trigger'](click('off'));
+    expect(off?.toast).toEqual(expect.objectContaining({ type: 'success' }));
+    expect(isSubstituteEnabledForChat(MY_APP_ID, chatId)).toBe(false);
+    await fireTarget('msg-topic-off');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    clearHandled();
+    await capturedHandlers['card.action.trigger'](click('on'));
+    await fireTarget('msg-topic-on-2');
+    expect(handled()).toBeGreaterThan(0);
   });
 });

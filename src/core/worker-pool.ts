@@ -205,6 +205,7 @@ import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG } from '../im/lark/lark-errors.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
@@ -1926,6 +1927,8 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1982,6 +1985,8 @@ export function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   return scheduleCardPatch(ds, cardJson);
 }
@@ -2210,6 +2215,8 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2295,6 +2302,8 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2380,6 +2389,8 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -4066,6 +4077,8 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -5826,6 +5839,8 @@ function reconcilePostedStartingCard(
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -5943,6 +5958,8 @@ async function postTurnStartingStatusCard(
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
 
   ds.streamCardNonce = nonce;
@@ -6096,6 +6113,8 @@ export async function postFreshStreamingCard(
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -10128,6 +10147,18 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
   teardownAuthoritativePersistentBackingBeforeCloseImpl(target, false);
 }
 
+/** Live per-chat substitute toggle for a session's group, or undefined when the
+ *  button must not render. Reads the real toggle store + strict chat-mode cache
+ *  so every card re-render reflects the current state. */
+export function substituteCardControlFor(ds: DaemonSession): SubstituteCardControl | undefined {
+  return resolveSubstituteCardControl(
+    ds.larkAppId,
+    ds.chatId,
+    ds.chatType,
+    getBot(ds.larkAppId).config.substituteMode,
+  );
+}
+
 /** Render the live streaming-card JSON for `ds` (🖥️ header + usage line +
  *  显示输出/终端/关闭会话 buttons). Factored so callers outside the normal
  *  screen-update flow — notably the Lark 恢复会话 button — can restore the SAME
@@ -10159,6 +10190,8 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
 }
 
@@ -18081,6 +18114,8 @@ function setupWorkerHandlers(
               streamCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              substituteCardControlFor(ds),
             );
             if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             await updateMessage(restoredAppId, restoredCardId, streamCardJson, { beforeWrite: () => {
@@ -18207,6 +18242,8 @@ function setupWorkerHandlers(
             streamCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            substituteCardControlFor(ds),
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) break;
           const readyPost = scopedReplyTo(
@@ -19034,6 +19071,8 @@ function setupWorkerHandlers(
             streamCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            substituteCardControlFor(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -19165,6 +19204,8 @@ function setupWorkerHandlers(
             streamCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            substituteCardControlFor(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -19290,6 +19331,8 @@ function setupWorkerHandlers(
           streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         scheduleCardPatch(ds, cardJson, msg.turnId);
         break;
@@ -19794,6 +19837,8 @@ function setupWorkerHandlers(
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              substituteCardControlFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -19903,6 +19948,8 @@ function setupWorkerHandlers(
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              substituteCardControlFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
