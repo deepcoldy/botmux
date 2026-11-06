@@ -98,7 +98,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'steward',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
-    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardGuide'],
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardGuide'],
   },
   {
     id: 'substitute',
@@ -166,6 +166,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.streamingButton.output', 'botDefaults.streamingButton.terminal',
       'botDefaults.streamingButton.writeLink', 'botDefaults.streamingButton.compact',
       'botDefaults.streamingButton.stop', 'botDefaults.streamingButton.close',
+      'botDefaults.streamingButton.substitute',
       'quietPreset.title', 'quietPreset.switch',
     ],
   },
@@ -366,6 +367,8 @@ export type BotDefaultsRow = {
   sandboxCapable?: boolean | null;
   /** Worker spawn 实际生效的沙盒模式（含全局 env / legacy readIsolation；null = daemon 太旧）。 */
   effectiveSandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  /** daemon 环境变量 BOTMUX_SANDBOX 对所有 bot 的强制模式（null = 未强制 / daemon 太旧）。 */
+  sandboxEnvForce?: 'oncall' | 'scratch' | null;
   brandLabel?: string | null;
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;

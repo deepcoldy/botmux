@@ -107,6 +107,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_m: any, _k: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
+  substituteCardControlFor: vi.fn(() => undefined),
   idleCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
@@ -458,6 +459,17 @@ describe('reply_model_pick action', () => {
     const ds = makeDs();
     const deliver = vi.fn();
     const result = await handleCardAction(pickData('sonnet\nrm -rf /'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
+  it('keeps refusing #variant slugs on the PTY-injected session picker', async () => {
+    enableMenu();
+    const ds = makeDs();
+    const deliver = vi.fn();
+    // Even when the catalogue advertises it, the injected command stays strict.
+    detectModelsMock.mockResolvedValue(['sonnet', 'sonnet#thinking']);
+    const result = await handleCardAction(pickData('sonnet#thinking'), depsWith(ds, deliver), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
     expect(deliver).not.toHaveBeenCalled();
   });
@@ -964,6 +976,30 @@ describe('/models bot defaults at top level', () => {
     expect(select.options.length).toBeLessThanOrEqual(50);
     expect(select.initial_option).toBe('model-74');
     expect(select.options.map((o: any) => o.value)).toContain('model-74');
+  });
+
+  it('shows a stored #variant default as selected and lets it be re-submitted', async () => {
+    const stored = 'minimax/MiniMax-M3.1-Flash#thinking';
+    const card = JSON.parse(buildDefaultModelPickerCard(LARK_APP_ID, ['minimax/MiniMax-M3'], stored, 'zh', 'minimax', { cliId: 'minimax', effort: 'xhigh' }));
+    const [modelSelect, effortSelect] = card.elements.filter((e: any) => e.tag === 'action').map((e: any) => e.actions[0]);
+    expect(modelSelect.initial_option).toBe(stored);
+    expect(modelSelect.options.map((o: any) => o.value)).toContain(stored);
+    expect(effortSelect.initial_option).toBe('xhigh');
+
+    adminBot();
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: stored } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: true, newText: stored, effect: 'next-session' } as any);
+    await handleCardAction(defaultPick(stored), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, stored, expect.objectContaining({ requireLaunchModelSupport: true }));
+  });
+
+  it.each(['opus#', 'opus#a b', 'opus#x\n/clear', 'opus#a#b'])('still rejects a malformed default model value: %j', async model => {
+    adminBot();
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    const result = await handleCardAction(defaultPick(model), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.toast.type).not.toBe('success');
   });
 
   it('clears the default through the same model field', async () => {

@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/command-handler.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../src/services/feed-group-tagger.js', () => ({
@@ -82,6 +85,9 @@ vi.mock('../src/core/daemon-ipc-auth.js', async (importOriginal) => {
 
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
+  // The empty machine config has no raw secret names to redact. Keep title
+  // admission's real isolation checks active instead of failing on a missing mock export.
+  configuredProtectedMcpEnvKeys: vi.fn(() => []),
   isRemoteAccessEnabled: vi.fn(() => false),
   // Workflow feature defaults ON (production default) so /help renders the
   // workflow section as before; the gate itself is covered in workflow-feature-gate.test.ts.
@@ -1353,6 +1359,80 @@ describe('/botconfig canTalkDaemonCommands uses the field parser (not the passth
 });
 
 describe('/botconfig reasoningEffort compatibility validation', () => {
+  it('recovers a rejected MiniMax CLI switch through the command suggested in the reply', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-effort-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    const entry = {
+      larkAppId: 'app-1', larkAppSecret: 'fixture', cliId: 'codex',
+      reasoningEffort: 'high', allowedUsers: ['ou_sender'],
+    };
+    writeFileSync(configPath, JSON.stringify([entry]));
+    const before = readFileSync(configPath, 'utf8');
+    const bot = { config: { ...entry }, resolvedAllowedUsers: ['ou_sender'] };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+    const deps = makeDeps();
+    const run = (content: string) => handleCommand('/botconfig', ROOT_ID,
+      makeLarkMessage(content, { senderId: 'ou_sender' }), deps, 'app-1');
+    try {
+      await run('/botconfig set cli minimax');
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect(bot.config).toMatchObject({ cliId: 'codex', reasoningEffort: 'high' });
+      const reply = vi.mocked(deps.sessionReply).mock.calls.at(-1)?.[1] ?? '';
+      const recovery = reply.match(/\/botconfig unset reasoningEffort/)?.[0];
+      expect(recovery).toBeDefined();
+      await run(recovery!);
+      await run('/botconfig set cli minimax');
+      expect(bot.config.cliId).toBe('minimax');
+      expect(bot.config.reasoningEffort).toBeUndefined();
+      const saved = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(saved.cliId).toBe('minimax');
+      expect(saved.reasoningEffort).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+
+  it.each([
+    ['set model MiniMax-M3', 'set model MiniMax-M3', 'MiniMax-M3'],
+    ['unset model', 'unset model', undefined],
+  ])('recovers a rejected MiniMax model change (%s) through the command suggested in the reply', async (_label, change, expectedModel) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-effort-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    const entry = {
+      larkAppId: 'app-1', larkAppSecret: 'fixture', cliId: 'minimax',
+      model: 'MiniMax-M3.1-Flash', reasoningEffort: 'xhigh', allowedUsers: ['ou_sender'],
+    };
+    writeFileSync(configPath, JSON.stringify([entry]));
+    const before = readFileSync(configPath, 'utf8');
+    const bot = { config: { ...entry }, resolvedAllowedUsers: ['ou_sender'] };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+    const deps = makeDeps();
+    const run = (content: string) => handleCommand('/botconfig', ROOT_ID,
+      makeLarkMessage(content, { senderId: 'ou_sender' }), deps, 'app-1');
+    try {
+      await run(`/botconfig ${change}`);
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect(bot.config).toMatchObject({ model: 'MiniMax-M3.1-Flash', reasoningEffort: 'xhigh' });
+      const reply = vi.mocked(deps.sessionReply).mock.calls.at(-1)?.[1] ?? '';
+      expect(reply).not.toContain('reasoning_effort_not_supported_by_model');
+      const recovery = reply.match(/\/botconfig unset reasoningEffort/)?.[0];
+      expect(recovery).toBeDefined();
+      await run(recovery!);
+      await run(`/botconfig ${change}`);
+      const saved = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(saved.model).toBe(expectedModel);
+      expect(saved.reasoningEffort).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+
   it('rejects unsupported TraeX reasoning effort before writing bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-reasoning-'));
     const configPath = join(dir, 'bots.json');

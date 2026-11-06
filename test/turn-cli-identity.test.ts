@@ -1037,3 +1037,56 @@ it('does not begin another login when the bytedcli provider fails', async () => 
   expect(written).toContain('[reason=provider_unavailable]');
   expect(written).not.toContain('old-sender-credential');
 });
+
+// The governed tools are prepared side by side: a slow tool (a bytedcli mint
+// is several CLI runs) must not hold back the other one, and the turn is still
+// released only once BOTH have published or refused.
+describe('publishTurnCliIdentity — tools are prepared concurrently', () => {
+  const both = () => botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  it('starts the second tool while the first is still resolving, and keeps the outcome order', async () => {
+    const lark = deferred<string | null>();
+    resolveLarkCliHomeForTurn.mockImplementationOnce(() => lark.promise);
+    const provider = await import('../src/services/bytedcli-auth.js');
+    const minted = vi.mocked(provider.mintBytedcliJwts);
+    const before = minted.mock.calls.length;
+    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    const run = publish(both(), ALICE, 'turn-par');
+    await vi.waitFor(() => expect(minted.mock.calls.length).toBe(before + 1));
+    lark.resolve('/isolated/alice');
+    expect(await run).toEqual([{ tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'user' }]);
+    expect(identityBody('lark-cli', 'turn-par')).toContain('/isolated/alice');
+    expect(identityBody('bytedcli', 'turn-par')).toContain('alice-cloud');
+  });
+
+  it('settles the publication only after the slower tool has landed', async () => {
+    const provider = await import('../src/services/bytedcli-auth.js');
+    const slow = deferred<{ cloudJwt: string } | null>();
+    vi.mocked(provider.mintBytedcliJwts).mockImplementationOnce(() => slow.promise);
+    larkHomes.set(ALICE, '/isolated/alice');
+    let settled = false;
+    const run = publish(both(), ALICE, 'turn-slow').then(v => { settled = true; return v; });
+    await vi.waitFor(() => expect(published('lark-cli', 'turn-slow')).toBe(true));
+    await new Promise(r => setTimeout(r, 20));
+    expect(settled).toBe(false);
+    slow.resolve({ cloudJwt: 'late-cloud' });
+    await run;
+    expect(identityBody('bytedcli', 'turn-slow')).toContain('late-cloud');
+  });
+
+  it('one tool failing does not change what the other publishes', async () => {
+    const provider = await import('../src/services/bytedcli-auth.js');
+    vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('provider unavailable'));
+    larkHomes.set(ALICE, '/isolated/alice');
+    expect(await publish(both(), ALICE, 'turn-iso')).toEqual([
+      { tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'unavailable' },
+    ]);
+    expect(identityBody('lark-cli', 'turn-iso')).toContain('/isolated/alice');
+    expect(identityBody('bytedcli', 'turn-iso')).toContain('[reason=provider_unavailable]');
+  });
+});

@@ -130,6 +130,7 @@ import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, principalLaneRoutingAnchorId, markRepoCardConsumed } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { agentManagedNoteSuffix } from '../services/agent-managed-config-note.js';
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
@@ -1127,6 +1128,22 @@ async function handleScheduleCommand(
 
 // ─── Config command ──────────────────────────────────────────────────────────
 
+/** A config write rejected because the saved effort would no longer fit the
+ * resulting CLI/model pair has one recovery path — clear the effort first.
+ * Every /botconfig surface (text command, config card, text sub-card) maps the
+ * store's reason through here so none of them falls back to the raw code. */
+export function configWriteFailureText(
+  spec: { configKey: string },
+  reason: string,
+  loc: Locale,
+): { text: string; actionable: boolean } {
+  if (reason === 'reasoning_effort_not_supported_by_model') {
+    if (spec.configKey === 'cliId') return { text: t('cmd.config.cli_effort_incompatible', undefined, loc), actionable: true };
+    if (spec.configKey === 'model') return { text: t('cmd.config.model_effort_incompatible', undefined, loc), actionable: true };
+  }
+  return { text: t('cmd.config.write_failed', { reason }, loc), actionable: false };
+}
+
 function configEffectNote(effect: ConfigEffect, loc: Locale): string {
   return effect === 'immediate'
     ? t('cmd.config.effect_immediate', undefined, loc)
@@ -1395,8 +1412,9 @@ async function handleConfigCommand(
     if (sub === 'unset') {
       if (!spec.clearable) { await reply(t('cmd.config.not_clearable', { field: spec.key }, loc)); return; }
       const r = await applyConfigField(larkAppId, spec, null);
-      if (!r.ok) { await reply(t('cmd.config.write_failed', { reason: r.reason }, loc)); return; }
-      await reply(t('cmd.config.unset_ok', { field: spec.key, old: r.oldText, effect: configEffectNote(r.effect, loc) }, loc));
+      if (!r.ok) { await reply(configWriteFailureText(spec, r.reason, loc).text); return; }
+      await reply(t('cmd.config.unset_ok', { field: spec.key, old: r.oldText, effect: configEffectNote(r.effect, loc) }, loc)
+        + await agentManagedNoteSuffix(larkAppId, spec.key, loc));
       return;
     }
 
@@ -1474,8 +1492,9 @@ async function handleConfigCommand(
     }
 
     const r = await applyConfigField(larkAppId, spec, value);
-    if (!r.ok) { await reply(t('cmd.config.write_failed', { reason: r.reason }, loc)); return; }
-    await reply(t('cmd.config.set_ok', { field: spec.key, old: r.oldText, new: r.newText, effect: configEffectNote(r.effect, loc) }, loc));
+    if (!r.ok) { await reply(configWriteFailureText(spec, r.reason, loc).text); return; }
+    await reply(t('cmd.config.set_ok', { field: spec.key, old: r.oldText, new: r.newText, effect: configEffectNote(r.effect, loc) }, loc)
+      + await agentManagedNoteSuffix(larkAppId, spec.key, loc));
     return;
   }
 

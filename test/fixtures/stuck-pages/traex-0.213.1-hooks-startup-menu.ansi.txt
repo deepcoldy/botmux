@@ -1,0 +1,50 @@
+
+  [1mHooks need review
+[0m[39m[49m  [38;5;3m5 hooks are new or changed.
+[39m  [2mHooks can run outside the sandbox after you trust them.
+
+[0;1;7m[39m[49m❯ 1. Review hooks
+[0m[39m[49m  2. Trust all and continue
+  3. Continue without trusting (hooks won't run)
+
+  [1menter[0;2m[39m[49m confirm  |  [0;1m[39m[49mesc[0;2m[39m[49m go back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

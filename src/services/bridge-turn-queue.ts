@@ -303,6 +303,9 @@ export class BridgeTurnQueue {
      *  the strength of that binding. Durable receipts must only act on
      *  `fullContentMatch`. */
     private readonly onLarkTurnStarted?: (turn: BridgePendingTurn, evidence: BridgeTurnStartEvidence) => void,
+    /** Sees every batch {@link ingest} reads from a known transcript file,
+     *  before attribution. Read-only: must not touch the queue. */
+    private readonly onEventsRead?: (events: readonly TranscriptEvent[], sourceJsonlPath: string) => void,
   ) {}
   private seen = new Set<string>();
   /** Mirror of Claude's type-ahead queue, in order, from the queue-operation
@@ -577,6 +580,7 @@ export class BridgeTurnQueue {
      *  CoT message. Must never mutate the queue or influence attribution. */
     onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
   ): void {
+    if (sourceJsonlPath && events.length > 0) this.onEventsRead?.(events, sourceJsonlPath);
     for (const ev of events) {
       if (ev.type === 'queue-operation') {
         this.observeCliQueueOperation(ev);

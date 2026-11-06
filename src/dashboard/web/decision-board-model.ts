@@ -10,6 +10,8 @@ import type {
   BoardDraft,
   BoardEvent,
   BoardFile,
+  BoardHint,
+  BoardHintKind,
   BoardItem,
   BoardLinkKind,
   BoardState,
@@ -20,6 +22,8 @@ import type {
 
 export type {
   BoardBatch,
+  BoardHint,
+  BoardHintKind,
   BoardDecision,
   BoardDraft,
   BoardEvent,
@@ -291,6 +295,18 @@ export const BOARD_ACTOR_LABEL_KEYS: Readonly<Record<BoardEvent['actor'], string
   system: 'decisionBoard.actorSystem',
 };
 
+/** 巡检提示的标签：建议关闭 / 建议推进 / 该看一眼。 */
+export const BOARD_HINT_LABEL_KEYS: Readonly<Record<BoardHintKind, string>> = {
+  close: 'decisionBoard.hintClose',
+  advance: 'decisionBoard.hintAdvance',
+  stale: 'decisionBoard.hintStale',
+};
+
+/** 认得的提示才显示（新 daemon 加了别的类型、旧页面不认时不显示半截标签）。 */
+export function knownHint(hint: BoardHint | undefined): BoardHint | undefined {
+  return hint && Object.prototype.hasOwnProperty.call(BOARD_HINT_LABEL_KEYS, hint.kind) ? hint : undefined;
+}
+
 export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>> = {
   create: 'decisionBoard.eventCreate',
   note: 'decisionBoard.eventNote',
@@ -300,6 +316,7 @@ export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>>
   reply: 'decisionBoard.eventReply',
   attach: 'decisionBoard.eventAttach',
   link: 'decisionBoard.eventLink',
+  hint: 'decisionBoard.eventHint',
 };
 
 /** 「待拍板·在审」：状态 + 自由文本阶段。 */
@@ -540,6 +557,10 @@ export interface StewardForm {
   autoJoinNewGroups: boolean;
   /** 只有一个人和一个 bot 的新群也带上管家；默认关。 */
   autoJoinSoloGroups: boolean;
+  /** 待拍板时往管家群发能直接点选项的卡片；默认开。 */
+  decisionCards: boolean;
+  /** 后台巡检找出可以关 / 可以推进 / 该看一眼的事项；默认关。 */
+  closeHints: boolean;
 }
 
 export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardForm {
@@ -550,6 +571,8 @@ export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardF
     guideText: cfg?.guideText ?? '',
     autoJoinNewGroups: cfg?.autoJoinNewGroups !== false,
     autoJoinSoloGroups: cfg?.autoJoinSoloGroups === true,
+    decisionCards: cfg?.decisionCards !== false,
+    closeHints: cfg?.closeHints === true,
   };
 }
 
@@ -568,9 +591,12 @@ export function stewardPayload(form: StewardForm): StewardConfig | null {
     ...(guideText ? { guideText } : {}),
     ...(form.autoJoinNewGroups ? {} : { autoJoinNewGroups: false }),
     ...(form.autoJoinSoloGroups ? { autoJoinSoloGroups: true } : {}),
+    ...(form.decisionCards ? {} : { decisionCards: false }),
+    ...(form.closeHints ? { closeHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
-    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true) return null;
+    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
+    && value.decisionCards !== false) return null;
   return value;
 }
 

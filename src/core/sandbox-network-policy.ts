@@ -1,8 +1,15 @@
 /** Opt-in destination-address policy. Pure validation and nftables compilation. */
 import { isIP } from 'node:net';
+import type { ProtectedHttpEgressWorkerPolicy } from './protected-http-egress.js';
 
 export type NetworkMode = 'allow' | 'block' | 'allowlist' | 'denylist';
-export interface NetworkRule { cidr: string; protocol?: 'tcp' | 'udp'; ports?: number[] }
+export interface NetworkRule {
+  cidr: string;
+  protocol?: 'tcp' | 'udp';
+  ports?: number[];
+  /** Explicit fail-closed exception used ahead of allowlist grants. */
+  action?: 'drop';
+}
 export interface NetworkZone { mode: NetworkMode; rules?: NetworkRule[] }
 export interface SandboxNetworkPolicy {
   version: 1;
@@ -13,6 +20,14 @@ export interface SandboxNetworkPolicy {
   /** Explicitly delegate proxied business destinations to an approved exit.
    * Kernel rules still constrain the actual proxy endpoint; env is unchanged. */
   proxyMode?: 'reject' | 'trusted-egress';
+}
+
+export function privateBrokerContainmentEnabled(
+  policy: SandboxNetworkPolicy | undefined,
+): boolean {
+  return !!policy
+    && policy.private.mode === 'block'
+    && policy.proxyMode !== 'trusted-egress';
 }
 
 // Conservative non-public space, including transition/translation addresses.
@@ -80,12 +95,18 @@ export function parseSandboxNetworkPolicy(raw: unknown): SandboxNetworkPolicy {
     if (z.rules !== undefined && (!Array.isArray(z.rules) || z.rules.length > 256)) throw new Error(`${label}: rules must be an array (max 256)`);
     if ((mode === 'allow' || mode === 'block') && z.rules !== undefined) throw new Error(`${label}: rules require a list mode`);
     const rules = (z.rules as unknown[] | undefined)?.map(rawRule => {
-      const r = object(rawRule, ['cidr', 'protocol', 'ports'], `${label}.rule`);
+      const r = object(rawRule, ['cidr', 'protocol', 'ports', 'action'], `${label}.rule`);
       if (typeof r.cidr !== 'string') throw new Error('rule.cidr must be IP/CIDR');
       const cidr = parseAddress(r.cidr).cidr;
       if (r.protocol !== undefined && r.protocol !== 'tcp' && r.protocol !== 'udp') throw new Error('protocol must be tcp or udp');
       if (r.ports !== undefined && (!r.protocol || !Array.isArray(r.ports) || !r.ports.length || r.ports.length > 256 || !r.ports.every(p => Number.isInteger(p) && Number(p) >= 1 && Number(p) <= 65535))) throw new Error('ports require tcp/udp and integers 1..65535');
-      return { cidr, ...(r.protocol ? { protocol: r.protocol as 'tcp' | 'udp' } : {}), ...(r.ports ? { ports: [...new Set(r.ports as number[])] } : {}) };
+      if (r.action !== undefined && r.action !== 'drop') throw new Error('rule.action must be drop');
+      return {
+        cidr,
+        ...(r.protocol ? { protocol: r.protocol as 'tcp' | 'udp' } : {}),
+        ...(r.ports ? { ports: [...new Set(r.ports as number[])] } : {}),
+        ...(r.action === 'drop' ? { action: 'drop' as const } : {}),
+      };
     });
     return { mode, ...(rules ? { rules } : {}) };
   };
@@ -108,7 +129,7 @@ export function compileNetworkNft(raw: SandboxNetworkPolicy): string {
       const family = parseAddress(r.cidr).family === 4 ? 'ip' : 'ip6';
       const proto = r.protocol ? ` meta l4proto ${r.protocol}` : '';
       const ports = r.ports ? ` ${r.protocol} dport { ${r.ports.join(', ')} }` : '';
-      lines.push(`  ${family} daddr ${r.cidr}${proto}${ports} ${z.mode === 'allowlist' ? 'accept' : 'drop'}`);
+      lines.push(`  ${family} daddr ${r.cidr}${proto}${ports} ${r.action === 'drop' || z.mode !== 'allowlist' ? 'drop' : 'accept'}`);
     }
     lines.push(`  ${z.mode === 'allow' || z.mode === 'denylist' ? 'accept' : 'drop'}`, ' }');
     return lines;
@@ -135,10 +156,86 @@ export function compileNetworkNft(raw: SandboxNetworkPolicy): string {
   ].join('\n');
 }
 
+function sameNetworkRule(left: NetworkRule, right: NetworkRule): boolean {
+  return left.cidr === right.cidr
+    && left.protocol === right.protocol
+    && left.action === right.action
+    && JSON.stringify(left.ports ?? []) === JSON.stringify(right.ports ?? []);
+}
+
+/** Add exact frozen target denies without widening any operator policy. Public
+ * and private zones remain independent; block stays block, allow becomes a
+ * denylist, and allowlists receive an ordered explicit drop before grants. */
+export function mergeProtectedHttpEgressNetworkPolicy(
+  base: SandboxNetworkPolicy | undefined,
+  workerPolicy: ProtectedHttpEgressWorkerPolicy,
+  dnsServers: readonly string[],
+): SandboxNetworkPolicy {
+  const parsed = base
+    ? parseSandboxNetworkPolicy(base)
+    : parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'allow' },
+      ...(dnsServers.length > 0 ? { dnsServers: [...dnsServers] } : {}),
+    });
+  if (workerPolicy.policy.targets.length !== workerPolicy.frozenAddresses.length) {
+    throw new Error('protected_http_egress_target_not_frozen');
+  }
+  const merged: SandboxNetworkPolicy = structuredClone(parsed);
+  if (merged.proxyMode === 'trusted-egress') {
+    throw new Error('protected_http_egress_proxy_policy_conflict：受保护 HTTP 出站不能与通用代理委托策略共用；请移除任务代理变量并清除 proxyMode 的通用代理委托配置，模型连接请使用受保护模型桥');
+  }
+  workerPolicy.policy.targets.forEach((target, targetIndex) => {
+    const addresses = workerPolicy.frozenAddresses[targetIndex];
+    if (!addresses?.length) throw new Error('protected_http_egress_target_not_frozen');
+    for (const address of addresses) {
+      const cidr = parseAddress(address).cidr;
+      if (addressMatches(address, '127.0.0.0/8') || addressMatches(address, '::1/128')) {
+        throw new Error('protected_http_egress_target_collides_with_loopback');
+      }
+      if (target.port === 53 && (merged.dnsServers ?? []).some(server => (
+        parseAddress(server).cidr === cidr
+      ))) {
+        throw new Error('protected_http_egress_target_collides_with_dns');
+      }
+      const zoneName = networkZone(address);
+      const zone = merged[zoneName];
+      if (zone.mode === 'block') continue;
+      const directDeny: NetworkRule = {
+        cidr,
+        protocol: 'tcp',
+        ports: [target.port],
+        ...(zone.mode === 'allowlist' ? { action: 'drop' as const } : {}),
+      };
+      if (zone.mode === 'allow') {
+        zone.mode = 'denylist';
+        zone.rules = [directDeny];
+        continue;
+      }
+      zone.rules ??= [];
+      if (zone.rules.some(rule => sameNetworkRule(rule, directDeny))) continue;
+      if (zone.mode === 'allowlist') zone.rules.unshift(directDeny);
+      else zone.rules.push(directDeny);
+    }
+  });
+  return parseSandboxNetworkPolicy(merged);
+}
+
 function sandboxModeLabel(sandbox: unknown): string {
   if (sandbox === true || sandbox === 'oncall') return 'oncall';
   if (sandbox === 'scratch') return 'scratch';
   return '关闭';
+}
+
+/** Other CLIs do not yet have a protected model connection bridge. Reject
+ * before spawning rather than letting destination denies break model access. */
+export function protectedHttpEgressCliSupportError(
+  cliId: string,
+  policy: ProtectedHttpEgressWorkerPolicy | undefined,
+): string | undefined {
+  if (!policy || cliId === 'codex') return;
+  return `受保护 HTTP 出站目前只支持 codex CLI，当前 CLI 是 ${cliId}；该 CLI 尚未接入受保护模型桥，会话不会启动。请使用 codex CLI`;
 }
 
 /** Why this launch cannot enforce the policy, naming what the launch actually
@@ -165,10 +262,11 @@ const PROXY_KEYS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'htt
 /** Default to rejecting proxy configuration for restricted policies. An
  * explicit trusted-egress mode delegates business destination control to that
  * exit, while namespace rules continue to filter its actual endpoint IP. */
-export function networkProxyError(policy: SandboxNetworkPolicy | undefined, env: Record<string, string | undefined>): string | undefined {
+export function networkProxyError(policy: SandboxNetworkPolicy | undefined, env: Record<string, string | undefined>, protectedHttpEgress = false): string | undefined {
+  const keys = PROXY_KEYS.filter(key => !!env[key]);
+  if (protectedHttpEgress && keys.length) return `环境里设置了任务代理变量（${keys.join('、')}），通用代理可绕过受保护 HTTP 出站的目标限制，会话不会启动。请移除这些任务代理变量；模型连接请使用受保护模型桥`;
   if (!policy || policy.proxyMode === 'trusted-egress') return;
   if (policy.proxyMode === undefined && policy.public.mode === 'allow' && policy.private.mode === 'allow') return;
-  const keys = PROXY_KEYS.filter(key => !!env[key]);
   if (keys.length) return `环境里设置了代理变量（${keys.join('、')}），受限的目标 IP 网络策略约束不了代理转发后的目标地址，会话不会启动。请在策略里加上 "proxyMode": "trusted-egress"（把业务目标的控制交给这个代理出口，内核规则仍只放行到代理本身的地址），或去掉这些代理变量`;
 }
 
