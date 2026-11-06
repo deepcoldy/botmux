@@ -37,6 +37,22 @@ import {
   isBoardState,
   stateInView,
 } from '../core/decision-board/model.js';
+import {
+  appendKey,
+  closePrRefs,
+  hintRestsOnPrs,
+  closeWhenFromJson,
+  dependsOnFromJson,
+  evaluateHints,
+  formatCloseWhen,
+  hintEventText,
+  hintFromJson,
+  isEndedState,
+  keyListFromJson,
+  pickHint,
+  type HintFacts,
+} from '../core/decision-board/hints.js';
+import type { BoardCloseWhen, BoardHint } from '../core/decision-board/model.js';
 
 export const decisionBoardDbPath = (dataDir: string): string => join(dataDir, 'decision-board.sqlite');
 export const decisionBoardFilesDir = (dataDir: string, appId: string): string =>
@@ -47,6 +63,9 @@ export const decisionBoardFilesDir = (dataDir: string, appId: string): string =>
 // 群关联的四列（board_items.primary_chat / no_chat_reason、board_links.chat_check / chat_name）都可空、
 // 没有默认值约束，旧构建的 SELECT * 与显式列 INSERT 照常工作，所以不升版本号：回滚到旧构建
 // 看板仍能打开。补列见 migrateChatColumns，回滚期间旧构建留下的不一致见 healChatFields。
+// 「自动发现可以关的项」的六列（board_items.close_when / depends_on / next_check_at / hint_json /
+// hint_notified / hint_dismissed）同理：都可空，存量行全是 NULL = 没写条件、没有提示，不升版本号。
+// 补列见 migrateHintColumns。
 const SCHEMA_VERSION = 3;
 
 /** 管家写入的字段补丁。undefined = 不动；null = 清空（仅可选字段）。 */
@@ -70,6 +89,14 @@ export interface ItemPatch {
   primaryChat?: string;
   /** 无群原因：写完关联后这一项不能有 chat 关联；之后加了群自动清掉。 */
   noChatReason?: string;
+  /** 关闭条件；null = 去掉显式条件（回到默认）。 */
+  closeWhen?: BoardCloseWhen | null;
+  /** 依赖的事项编号，整组替换；空数组 = 清空。 */
+  dependsOn?: number[];
+  /** 下次复查时间；null = 清空。 */
+  nextCheckAt?: number | null;
+  /** 收起当前提示（记下它的 key，同一条提示之后不再出现）。只在 update 里生效。 */
+  dismissHint?: boolean;
   note?: string;
 }
 
@@ -116,6 +143,9 @@ interface ItemRow {
   steward_event_at: number | null; owner_seen_at: number | null;
   /** 旧库补列前读出来的行没有这两列（undefined），与 null 同样处理。 */
   primary_chat?: string | null; no_chat_reason?: string | null;
+  /** 同上：补列前的旧行没有这几列。 */
+  close_when?: string | null; depends_on?: string | null; next_check_at?: number | null;
+  hint_json?: string | null; hint_notified?: string | null; hint_dismissed?: string | null;
 }
 
 function rowToItem(r: ItemRow): BoardItem {
@@ -146,7 +176,15 @@ function rowToItem(r: ItemRow): BoardItem {
     ...(r.owner_seen_at ? { ownerSeenAt: r.owner_seen_at } : {}),
     ...(r.primary_chat ? { primaryChat: r.primary_chat } : {}),
     ...(r.no_chat_reason ? { noChatReason: r.no_chat_reason } : {}),
+    ...withOptional('closeWhen', closeWhenFromJson(r.close_when)),
+    ...withOptional('dependsOn', dependsOnFromJson(r.depends_on)),
+    ...(typeof r.next_check_at === 'number' ? { nextCheckAt: r.next_check_at } : {}),
+    ...withOptional('hint', hintFromJson(r.hint_json)),
   };
+}
+
+function withOptional<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
+  return value === undefined ? {} : { [key]: value } as Record<K, V>;
 }
 
 function parseIds(json: string | null): string[] {
@@ -209,6 +247,22 @@ function migrateChatColumns(db: DatabaseSyncLike): void {
 }
 
 /**
+ * 「自动发现可以关的项」的六列，照 migrateChatColumns 按「列在不在」补，幂等；全新库由 CREATE 建出。
+ * 都是可空列，存量行全是 NULL = 没写关闭条件、没有依赖和复查时间、没有提示，行为与之前相同。
+ */
+function migrateHintColumns(db: DatabaseSyncLike): void {
+  const have = new Set((db.prepare('PRAGMA table_info(board_items)').all() as Array<{ name?: unknown }>).map(c => c.name));
+  if (have.size === 0) return;
+  const columns: Array<[string, string]> = [
+    ['close_when', 'TEXT'], ['depends_on', 'TEXT'], ['next_check_at', 'INTEGER'],
+    ['hint_json', 'TEXT'], ['hint_notified', 'TEXT'], ['hint_dismissed', 'TEXT'],
+  ];
+  for (const [column, type] of columns) {
+    if (!have.has(column)) db.exec(`ALTER TABLE board_items ADD COLUMN ${column} ${type};`);
+  }
+}
+
+/**
  * 回滚到旧构建期间，旧构建删群关联不会清主群指定、挂群不会清无群原因。每次打开时在同一把写锁里
  * 收拾一遍（幂等，正常数据上什么都不改）：主群指向的群已不在关联里就清掉指定（否则那个群以后
  * 再挂回来会悄悄复位成主群）；已经有群的事项清掉无群原因（否则群删光后显示的是过期原因而不是缺群）。
@@ -245,6 +299,7 @@ export class DecisionBoardStore {
       // 与版本号无关（本身幂等），所以不加版本门槛。
       migrateBoardFilesOrd(db);
       migrateChatColumns(db);
+      migrateHintColumns(db);
       db.exec(`
         CREATE TABLE IF NOT EXISTS board_items (
           app_id TEXT NOT NULL,
@@ -269,6 +324,17 @@ export class DecisionBoardStore {
           owner_seen_at INTEGER,
           primary_chat TEXT,
           no_chat_reason TEXT,
+          -- 关闭条件（JSON，见 BoardCloseWhen）；NULL = 挂了 PR 就按 PR 全部合入判断。
+          close_when TEXT,
+          -- 依赖的事项编号（JSON 数组）。
+          depends_on TEXT,
+          next_check_at INTEGER,
+          -- 后台巡检当前的提示（JSON，见 BoardHint）；只提示，不改 state。
+          hint_json TEXT,
+          -- 已通知过管家的提示 key（JSON 数组）：同一个 key 只通知一次。
+          hint_notified TEXT,
+          -- 管家收起过的提示 key（JSON 数组）：之后不再标出。
+          hint_dismissed TEXT,
           PRIMARY KEY (app_id, seq)
         ) WITHOUT ROWID;
         CREATE UNIQUE INDEX IF NOT EXISTS board_items_key ON board_items(app_id, item_key) WHERE item_key IS NOT NULL;
@@ -437,6 +503,12 @@ export class DecisionBoardStore {
     if (patch.noChatReason !== undefined && patch.links?.some(l => l.kind === 'chat')) {
       throw new BoardError('no_chat_conflict', '同时给了群（--link chat=）和无群原因（--no-chat），只能二选一');
     }
+    if (patch.dependsOn && patch.dependsOn.length > BOARD_LIMITS.linksPerItem) {
+      throw new BoardError('too_many_depends', `依赖最多 ${BOARD_LIMITS.linksPerItem} 项`);
+    }
+    if (patch.nextCheckAt !== undefined && patch.nextCheckAt !== null && !Number.isSafeInteger(patch.nextCheckAt)) {
+      throw new BoardError('invalid_next_check', '复查时间不对');
+    }
     if (patch.options && patch.options.length > BOARD_LIMITS.optionCount) {
       throw new BoardError('too_many_options', `选项最多 ${BOARD_LIMITS.optionCount} 个`);
     }
@@ -553,6 +625,39 @@ export class DecisionBoardStore {
   }
 
   /**
+   * 关闭条件和依赖里引用的事项必须存在、且不是这一项自己（写错编号就拒，不留一个永远不会满足的条件）。
+   * 在写事务里调用；新建时 seq 是即将分配的编号。
+   */
+  private checkItemRefs(appId: string, seq: number, patch: ItemPatch): void {
+    const refs = [
+      ...(patch.closeWhen?.kind === 'item' ? [patch.closeWhen.seq] : []),
+      ...(patch.dependsOn ?? []),
+    ];
+    for (const ref of refs) {
+      if (ref === seq) throw new BoardError('self_reference', `#${seq} 不能依赖自己`);
+      if (!this.itemRow(appId, ref)) throw new BoardError('item_not_found', `没有 #${ref}（--close-when / --depends-on 里的编号）`);
+    }
+  }
+
+  /** 收起当前提示：记下它的 key（之后同一条提示不再标出），清掉提示。 */
+  private dismissCurrentHint(appId: string, seq: number, row: ItemRow): BoardHint | undefined {
+    const hint = hintFromJson(row.hint_json);
+    if (!hint) return undefined;
+    const dismissed = appendKey(keyListFromJson(row.hint_dismissed), hint.key);
+    this.stmt('UPDATE board_items SET hint_json = NULL, hint_dismissed = ? WHERE app_id = ? AND seq = ?')
+      .run(JSON.stringify(dismissed), appId, seq);
+    return hint;
+  }
+
+  /** 管家动了这一项（改字段、记历史）：「过了复查时间还没动」不再成立，清掉这类提示。 */
+  private clearStaleHint(appId: string, seq: number): void {
+    const row = this.itemRow(appId, seq);
+    if (hintFromJson(row?.hint_json)?.kind === 'stale') {
+      this.stmt('UPDATE board_items SET hint_json = NULL WHERE app_id = ? AND seq = ?').run(appId, seq);
+    }
+  }
+
+  /**
    * 新建一项；带 key 且已存在时按 update 处理（管家不用记编号，同一件事反复 add 不会重复建）。
    */
   addItem(appId: string, patch: ItemPatch & { title: string }, actorRef?: string, now = Date.now(), locale: Locale = 'zh'):
@@ -574,12 +679,17 @@ export class DecisionBoardStore {
     return this.tx(() => {
       const next = ((this.stmt('SELECT MAX(seq) AS m FROM board_items WHERE app_id = ?').get(appId) as { m: number | null }).m ?? 0) + 1;
       const state: BoardState = patch.state ?? (patch.question ? 'decide' : 'active');
+      this.checkItemRefs(appId, next, patch);
       this.stmt(`INSERT INTO board_items (app_id, seq, item_key, title, state, stage, kind, repo, summary, progress,
-        question, options_json, recommend, recommend_reason, rev, created_at, updated_at, state_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`).run(
+        question, options_json, recommend, recommend_reason, rev, created_at, updated_at, state_at,
+        close_when, depends_on, next_check_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`).run(
         appId, next, patch.key ?? null, patch.title.trim(), state, patch.stage ?? null, patch.kind ?? null,
         patch.repo ?? null, patch.summary ?? null, patch.progress ?? null, patch.question ?? null,
-        JSON.stringify(patch.options ?? []), patch.recommend ?? null, patch.recommendReason ?? null, now, now, now);
+        JSON.stringify(patch.options ?? []), patch.recommend ?? null, patch.recommendReason ?? null, now, now, now,
+        patch.closeWhen ? JSON.stringify(patch.closeWhen) : null,
+        patch.dependsOn?.length ? JSON.stringify(patch.dependsOn) : null,
+        patch.nextCheckAt ?? null);
       this.insertEvent(appId, next, now, 'steward', actorRef, 'create', patch.note?.trim() || patch.title.trim());
       if (patch.links?.length) this.addLinks(appId, next, patch.links, now, actorRef);
       this.applyChatFields(appId, next, patch, now, actorRef);
@@ -629,6 +739,30 @@ export class DecisionBoardStore {
       if (patch.state !== undefined && patch.state !== before.state) {
         set('state', patch.state); set('state_at', now); contentChanged = true; stateChanged = true;
       }
+      // 关闭条件 / 依赖 / 复查时间：不算待拍板内容（不升 rev），改了记一句历史。
+      this.checkItemRefs(appId, seq, patch);
+      const trackEdits: string[] = [];
+      let conditionChanged = false;
+      if (patch.closeWhen !== undefined) {
+        const value = patch.closeWhen ? JSON.stringify(patch.closeWhen) : null;
+        if (value !== (row.close_when ?? null)) {
+          set('close_when', value);
+          conditionChanged = true;
+          trackEdits.push(`关闭条件：${patch.closeWhen ? formatCloseWhen(patch.closeWhen) : '默认（挂的 PR 全部合入）'}`);
+        }
+      }
+      if (patch.dependsOn !== undefined) {
+        const value = patch.dependsOn.length ? JSON.stringify(patch.dependsOn) : null;
+        if (value !== (row.depends_on ?? null)) {
+          set('depends_on', value);
+          conditionChanged = true;
+          trackEdits.push(`依赖：${patch.dependsOn.length ? patch.dependsOn.map(n => `#${n}`).join('、') : '无'}`);
+        }
+      }
+      if (patch.nextCheckAt !== undefined && patch.nextCheckAt !== (row.next_check_at ?? null)) {
+        set('next_check_at', patch.nextCheckAt);
+        trackEdits.push(`复查时间：${patch.nextCheckAt === null ? '无' : new Date(patch.nextCheckAt).toISOString()}`);
+      }
       if (sets.length) {
         if (contentChanged) { sets.push('rev = rev + 1'); }
         set('updated_at', now);
@@ -644,10 +778,24 @@ export class DecisionBoardStore {
       } else if (progressChanged) {
         this.insertEvent(appId, seq, now, 'steward', actorRef, 'edit', '更新了当前进展');
       }
+      if (trackEdits.length) this.insertEvent(appId, seq, now, 'steward', actorRef, 'edit', trackEdits.join('；'));
       if (patch.unlinks?.length) this.removeLinks(appId, seq, patch.unlinks, now, actorRef);
       if (patch.links?.length) this.addLinks(appId, seq, patch.links, now, actorRef);
       this.applyChatFields(appId, seq, patch, now, actorRef);
       if (patch.note?.trim()) this.insertEvent(appId, seq, now, 'steward', actorRef, 'note', patch.note.trim());
+      // 提示：改了状态 = 管家已经处理了这条提示（收起，同一条不再出现）；--dismiss-hint 同理并记一句；
+      // 其它改动只让「该看一眼」失效。
+      if (stateChanged || patch.dismissHint) {
+        const dismissed = this.dismissCurrentHint(appId, seq, this.itemRow(appId, seq)!);
+        if (dismissed && patch.dismissHint) {
+          this.insertEvent(appId, seq, now, 'steward', actorRef, 'hint', `收起提示：${hintEventText(dismissed, locale)}`);
+        }
+      } else if (conditionChanged) {
+        // 条件换了，原来的提示不再作数：清掉（不算收起），下一轮巡检按新条件重算。
+        this.stmt('UPDATE board_items SET hint_json = NULL WHERE app_id = ? AND seq = ?').run(appId, seq);
+      } else if (sets.length || trackEdits.length) {
+        this.clearStaleHint(appId, seq);
+      }
       return rowToItem(this.itemRow(appId, seq)!);
     });
   }
@@ -674,7 +822,105 @@ export class DecisionBoardStore {
           .run(now, appId, seq, appId, seq).changes);
       }
       this.stmt('UPDATE board_items SET updated_at = ? WHERE app_id = ? AND seq = ?').run(now, appId, seq);
+      this.clearStaleHint(appId, seq);
       return { eventId, handled };
+    });
+  }
+
+  // ─── 自动发现可以关的项（后台巡检）──────────────────────────────────────
+
+  /** 没结束的事项判断关闭要看的 PR（去重）：巡检先把它们查好，再调 {@link sweepHints}。 */
+  hintPrRefs(appId: string): string[] {
+    const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ? ORDER BY seq').all(appId) as ItemRow[];
+    const refs = new Set<string>();
+    for (const row of rows) {
+      const item = rowToItem(row);
+      if (isEndedState(item.state)) continue;
+      for (const ref of closePrRefs(item, this.links(appId, item.seq))) refs.add(ref);
+    }
+    return [...refs];
+  }
+
+  /**
+   * 一个写事务里对每一项的最新内容求提示（判断与落库之间不会被管家的改动插队），只改提示，不改 state、
+   * updated_at 和 rev：
+   *   - 已结束的项：清掉提示；
+   *   - 判断要用的 PR 这轮没查到：保留现有提示；
+   *   - 新提示（与现有的 key 不同）：写上并记一条历史；条件不再成立：清掉（不记历史）；
+   *   - 管家收起过的 key 跳过，取下一个。
+   * 返回当前带提示、但这个 key 还没通知过管家的项（上一轮通知没送到的也在里面，下一轮重试）。
+   */
+  sweepHints(appId: string, facts: Omit<HintFacts, 'itemState'>, now = facts.now):
+    { marked: number; cleared: number; pending: Array<{ seq: number; title: string; hint: BoardHint }> } {
+    return this.tx(() => {
+      const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ? ORDER BY seq').all(appId) as ItemRow[];
+      const states = new Map(rows.map(r => [r.seq, isBoardState(r.state) ? r.state : 'active' as BoardState]));
+      const full: HintFacts = { ...facts, itemState: seq => states.get(seq) };
+      const setHint = this.stmt('UPDATE board_items SET hint_json = ? WHERE app_id = ? AND seq = ?');
+      let marked = 0;
+      let cleared = 0;
+      const pending: Array<{ seq: number; title: string; hint: BoardHint }> = [];
+      for (const row of rows) {
+        const item = rowToItem(row);
+        const current = item.hint;
+        let next: BoardHint | undefined = current;
+        if (isEndedState(item.state)) {
+          next = undefined;
+        } else {
+          const links = this.links(appId, item.seq);
+          const evaluation = evaluateHints(item, links, full);
+          // PR 这轮查不到：只保留靠这些 PR 得出的现有提示；其余照常重算（依赖重开了、条件改了就清掉）。
+          const keep = evaluation.unknown && !!current && hintRestsOnPrs(current.key, closePrRefs(item, links));
+          if (!keep) {
+            const pick = pickHint(evaluation, keyListFromJson(row.hint_dismissed));
+            if (!pick) next = undefined;
+            else if (current?.key !== pick.key) next = { ...pick, at: now };
+            // 同一个 key：原因文字可能因 PR 个数之类的写法微调，以第一次为准，不刷新。
+          }
+        }
+        if (next !== current) {
+          setHint.run(next ? JSON.stringify(next) : null, appId, item.seq);
+          if (next) {
+            marked++;
+            this.insertEvent(appId, item.seq, now, 'system', undefined, 'hint', hintEventText(next, facts.locale));
+          } else {
+            cleared++;
+          }
+        }
+        if (next && !keyListFromJson(row.hint_notified).includes(next.key)) {
+          pending.push({ seq: item.seq, title: item.title, hint: next });
+        }
+      }
+      return { marked, cleared, pending };
+    });
+  }
+
+  /**
+   * 通知送进管家会话之后记下这些 key（同一个 key 不再通知）；送达失败的回执到了再 {@link unmarkHintsNotified}，
+   * 下一轮重试。key 已经变了（期间换了提示）的项不动。
+   */
+  markHintsNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        this.stmt('UPDATE board_items SET hint_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(JSON.stringify(appendKey(keyListFromJson(row.hint_notified), e.key)), appId, e.seq);
+      }
+    });
+  }
+
+  unmarkHintsNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        const keys = keyListFromJson(row.hint_notified);
+        if (!keys.includes(e.key)) continue;
+        const next = keys.filter(k => k !== e.key);
+        this.stmt('UPDATE board_items SET hint_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(next.length ? JSON.stringify(next) : null, appId, e.seq);
+      }
     });
   }
 

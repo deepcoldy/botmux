@@ -920,6 +920,30 @@ describe('Codex CLI effort IPC', () => {
     return { worker, ds };
   }
 
+  it('delegates a reattached running CLI to worker admission before its first idle prompt', async () => {
+    const { worker, ds } = fixture();
+    ds.cliReady = false;
+    ds.lastScreenStatus = 'working';
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0]?.[0];
+    expect(request).toMatchObject({ type: 'codex_cli_effort', effort: 'max' });
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId,
+      status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toMatchObject({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(ds.session.reasoningEffort).toBe('max');
+    expect(ds.activeReasoningEffort).toBe('high');
+    expect(ds.cliReady).toBe(false);
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
+  it('still rejects an uninitialized worker before IPC', async () => {
+    const { worker, ds } = fixture();
+    ds.workerReady = false;
+    ds.cliReady = false;
+    expect(await updateCodexCliEffort(ds, 'max')).toMatchObject({ status: 'unavailable' });
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
   it('persists confirmed future effort without changing the running turn or killing it', async () => {
     const { worker, ds } = fixture();
     const pending = updateCodexCliEffort(ds, 'max');

@@ -11803,13 +11803,28 @@ export function updateCodexCliEffort(
   // codexRpcInput is a requested launch preference: legacy runtimes and failed
   // RPC startup can still use terminal input. The current worker checks its
   // actual codexRpcEngine before opening a menu and returns an explicit refusal.
+  // cliReady records an idle prompt in this worker generation. After a warm
+  // reattach, the native CLI may still be working and able to open /model
+  // without having emitted that prompt. Let its current screen and input
+  // ownership checks in the worker decide; do not manufacture prompt-ready.
   if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex'
-    || !worker || worker.killed || !ds.workerReady || !ds.cliReady
+    || !worker || worker.killed || !ds.workerReady
     || ds.session.status !== 'active' || isSessionTransferring(ds)
     || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli
     || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
-    || pendingCodexCliEffort.has(ds)) return Promise.resolve({ status: 'unavailable', reason: 'cli_menu_unavailable' });
+    || pendingCodexCliEffort.has(ds)) {
+    logger.info(`[${tag(ds)}] Codex CLI effort unavailable at daemon admission: ${JSON.stringify({
+      workerReady: !!ds.workerReady, cliReady: !!ds.cliReady,
+      workerAlive: !!worker && !worker.killed, status: ds.session.status,
+      backend: cfg.backendType, wrapped: !!cfg.wrapperCli,
+      sandbox: sandboxBoolValue(cfg.sandbox) || sandboxEnabled(),
+      isolated: !!ds.initConfig?.readIsolation,
+      adopted: !!(ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode),
+      transferring: isSessionTransferring(ds), pending: pendingCodexCliEffort.has(ds),
+    })}`);
+    return Promise.resolve({ status: 'unavailable', reason: 'cli_menu_unavailable' });
+  }
   if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) return Promise.resolve({ status: 'invalid' });
   const generation = ds.workerGeneration;
   const nativeId = ds.session.cliSessionId;
