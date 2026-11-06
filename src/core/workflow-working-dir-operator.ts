@@ -1,37 +1,55 @@
 /**
  * "May the run's initiator operate this bot?" for a workflow node's Gate-2
- * directory (design 2026-11-03 §15.4). The answer decides whether
+ * working dir (design 2026-11-03 §15.4). The answer decides whether
  * {@link checkNodeWorkingDir} only checks that the directory exists (yes) or
- * also holds it to the bot's configured range (no).
+ * also holds it to the bot's configured range (no / unknown).
  *
- * "Operate" means exactly what lets a person use `/cd` in a topic of that bot
- * ({@link humanCanRunDaemonCommand} with `/cd`), judged by the executing
- * bot's own daemon against its own configuration and grants.
+ * "Operate" means what lets a person use `/cd` in a topic of that bot in the
+ * run's chat: they pass the `/cd` command gate (`humanCanRunDaemonCommand`
+ * with `/cd`) AND are a member of that chat right now — someone who left the
+ * group cannot type `/cd` there, even if a chat-wide grant still names the
+ * chat. Judged by the executing bot's own daemon, with its own configuration,
+ * grants and Lark app.
  *
  * The initiator's open_id is app-scoped: it names them for the run's main bot
  * app only. For any other bot it is never used; their union_id is resolved to
- * that bot's own open_id first. Whenever that cannot be done — no union_id,
- * a failed or definitive lookup, an unreachable daemon — the answer is "no",
- * so the range rule applies and in-range directories keep working.
+ * that bot's own open_id first.
+ *
+ * Three answers: `yes`, `no`, or `unknown` (a lookup failed, timed out, or the
+ * identity could not be obtained). The caller treats `unknown` like `no` for
+ * the decision — the configured range applies — but says it could not be
+ * confirmed, since retrying later may help.
  */
 
-/** Gate-2 (approve-dag, a CLI process) → an executing bot's daemon: would the
- *  initiator be allowed to operate you in this chat? Trusted host IPC. */
+import type { TargetAppOpenIdResolution } from '../im/lark/client.js';
+import {
+  WorkflowSidebarMembershipCache,
+  checkWorkflowViewerChatMembership,
+} from './workflow-sidebar-membership.js';
+
+/** Gate-2 (approve-dag, a CLI process) → an executing bot's daemon: may the
+ *  initiator of this pending run operate you for this node? Trusted host IPC. */
 export const WORKFLOW_WORKING_DIR_OPERATOR_ROUTE = '/api/workflow/working-dir-operator-check';
 
 /** An executing bot's daemon → the run's main bot's daemon: the initiator's
- *  union_id, looked up through the main bot's app (the only app their frozen
- *  open_id belongs to). Only for runs with a Gate-2 working dir. */
+ *  union_id, looked up through the main bot's app (the only app their open_id
+ *  belongs to). Answered only for the main bot's own runs that pin (or, before
+ *  approval, may pin) a working dir, and only to one of their executing bots. */
 export const WORKFLOW_INITIATOR_UNION_ROUTE = '/api/workflow/initiator-union-id';
 
 const OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{1,128}$/;
 const UNION_ID_RE = /^on_[A-Za-z0-9_-]{1,128}$/;
-const CHAT_ID_RE = /^oc_[A-Za-z0-9_-]{1,128}$/;
+const NODE_ID_RE = /^[A-Za-z0-9_.:-]{1,256}$/;
 
 export const isWorkflowOpenId = (value: unknown): value is string => typeof value === 'string' && OPEN_ID_RE.test(value);
 export const isWorkflowUnionId = (value: unknown): value is string => typeof value === 'string' && UNION_ID_RE.test(value);
 
-/** The initiator as a check request names them. `openId` is valid for
+export type WorkflowOperateAnswer = 'yes' | 'no' | { unknown: string };
+
+export const isOperateUnknown = (answer: WorkflowOperateAnswer): answer is { unknown: string } =>
+  typeof answer === 'object' && answer !== null;
+
+/** The initiator as the operate check sees them. `openId` is valid for
  *  `sourceLarkAppId` (the run's main bot) only. */
 export interface WorkflowInitiatorIdentity {
   sourceLarkAppId: string;
@@ -39,77 +57,160 @@ export interface WorkflowInitiatorIdentity {
   unionId?: string;
 }
 
-export interface WorkflowWorkingDirOperatorRequest {
-  chatId: string;
-  initiator: WorkflowInitiatorIdentity;
-}
-
 export interface WorkflowInitiatorOperatesDeps {
-  /** union_id → the open_id `larkAppId`'s own app issues for that person;
-   *  undefined for any miss or failure. */
-  resolveTargetOpenId(larkAppId: string, unionId: string): Promise<string | undefined>;
-  /** The `/cd` gate of `larkAppId` for a human with this (own-app) open_id. */
+  /** union_id → the open_id `larkAppId`'s own app issues for that person. */
+  resolveTargetOpenId(larkAppId: string, unionId: string): Promise<TargetAppOpenIdResolution>;
+  /** The `/cd` command gate of `larkAppId` for a human with this (own-app)
+   *  open_id in `chatId`. */
   canUseCd(larkAppId: string, chatId: string, openId: string, unionId: string | undefined): boolean;
+  /** Is this (own-app) open_id a member of `chatId`, as `larkAppId` sees it? */
+  chatMembership(larkAppId: string, chatId: string, openId: string): Promise<'member' | 'not_member' | 'unavailable'>;
 }
 
-/** Whether the initiator may operate `larkAppId` in `chatId`; false when
- *  unsure. */
+/** Whether the initiator may operate `larkAppId` in `chatId`. */
 export async function workflowInitiatorOperates(
   deps: WorkflowInitiatorOperatesDeps,
   input: { larkAppId: string; chatId: string; initiator: WorkflowInitiatorIdentity },
-): Promise<boolean> {
+): Promise<WorkflowOperateAnswer> {
   const { initiator } = input;
-  try {
-    let openId: string | undefined;
-    if (input.larkAppId === initiator.sourceLarkAppId && isWorkflowOpenId(initiator.openId)) {
-      openId = initiator.openId;
-    } else if (isWorkflowUnionId(initiator.unionId)) {
-      // Never the main bot's open_id for another app: convert through the
-      // tenant-stable union_id, in the executing bot's own app.
-      openId = await deps.resolveTargetOpenId(input.larkAppId, initiator.unionId);
+  let openId: string;
+  if (input.larkAppId === initiator.sourceLarkAppId && isWorkflowOpenId(initiator.openId)) {
+    openId = initiator.openId;
+  } else if (isWorkflowUnionId(initiator.unionId)) {
+    // Never the main bot's open_id for another app: convert through the
+    // tenant-stable union_id, in the executing bot's own app.
+    let resolved: TargetAppOpenIdResolution;
+    try {
+      resolved = await deps.resolveTargetOpenId(input.larkAppId, initiator.unionId);
+    } catch {
+      return { unknown: '换算发起人在这个 Bot 下的身份时出错' };
     }
-    if (!isWorkflowOpenId(openId)) return false;
-    return deps.canUseCd(input.larkAppId, input.chatId, openId, isWorkflowUnionId(initiator.unionId) ? initiator.unionId : undefined);
-  } catch {
-    return false;
+    if (resolved.status === 'definitive') return 'no';
+    if (resolved.status !== 'resolved' || !isWorkflowOpenId(resolved.openId)) return { unknown: '暂时换算不出发起人在这个 Bot 下的身份' };
+    openId = resolved.openId;
+  } else {
+    return { unknown: '拿不到发起人的跨应用身份（union_id）' };
   }
+  const unionId = isWorkflowUnionId(initiator.unionId) ? initiator.unionId : undefined;
+  if (!deps.canUseCd(input.larkAppId, input.chatId, openId, unionId)) return 'no';
+  let membership: 'member' | 'not_member' | 'unavailable';
+  try {
+    membership = await deps.chatMembership(input.larkAppId, input.chatId, openId);
+  } catch {
+    membership = 'unavailable';
+  }
+  if (membership === 'not_member') return 'no';
+  if (membership !== 'member') return { unknown: '暂时查不到发起人是否还在群里' };
+  return 'yes';
+}
+
+/** The production I/O {@link createWorkflowWorkingDirOperatorWiring} needs. */
+export interface WorkflowWorkingDirOperatorIo {
+  resolveTargetAppOpenId(larkAppId: string, unionId: string): Promise<TargetAppOpenIdResolution>;
+  /** open_id → union_id through `larkAppId`'s own app (strict lookup). */
+  resolveUnionIdFromOpenId(larkAppId: string, openId: string): Promise<{ status: 'resolved'; unionId: string } | { status: 'unavailable' } | { status: 'retryable'; error: string }>;
+  /** The full member list of `chatId` as `larkAppId` sees it (throws when
+   *  incomplete). */
+  listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<readonly string[]>;
+  /** The daemon-command gate a typed command passes (`humanCanRunDaemonCommand`). */
+  canRunDaemonCommand(larkAppId: string, chatId: string, openId: string, unionId: string | undefined, cmd: string, chatType: 'group'): boolean;
+  /** This daemon's own bot app. */
+  selfLarkAppId(): string;
+  /** Membership verdict cache (default: a fresh one, as the sidebar uses). */
+  membershipCache?: WorkflowSidebarMembershipCache;
+}
+
+/** What a daemon's {@link createWorkflowNodeDaemon} gets for §15.4: the
+ *  operate check of its own bot, and its own app's union_id lookup. */
+export interface WorkflowWorkingDirOperatorWiring {
+  initiatorOperates(input: { larkAppId: string; chatId: string; initiator: WorkflowInitiatorIdentity }): Promise<WorkflowOperateAnswer>;
+  lookupOwnUnionId(openId: string): Promise<{ unionId: string } | { unknown: string }>;
+}
+
+/** The node gate is exactly the one a typed `/cd` passes. */
+const OPERATE_COMMAND = '/cd';
+
+export function createWorkflowWorkingDirOperatorWiring(io: WorkflowWorkingDirOperatorIo): WorkflowWorkingDirOperatorWiring {
+  const membershipCache = io.membershipCache ?? new WorkflowSidebarMembershipCache();
+  return {
+    initiatorOperates: (input) => workflowInitiatorOperates({
+      resolveTargetOpenId: io.resolveTargetAppOpenId,
+      canUseCd: (appId, chatId, openId, unionId) => io.canRunDaemonCommand(appId, chatId, openId, unionId, OPERATE_COMMAND, 'group'),
+      // The open_id was issued by (or converted into) this app: the sidebar's
+      // own-app principal, its cache and its "incomplete list = unavailable".
+      chatMembership: (appId, chatId, openId) => membershipCache.check(
+        { mainLarkAppId: appId, chatId, principal: { openId } },
+        () => checkWorkflowViewerChatMembership({ chatId, principal: { openId } }, {
+          resolveOpenIdByUnionId: async () => ({ status: 'transient' }),
+          listChatMemberOpenIds: (chat) => io.listChatMemberOpenIds(appId, chat),
+        }),
+      ),
+    }, input),
+    lookupOwnUnionId: async (openId) => {
+      try {
+        const resolved = await io.resolveUnionIdFromOpenId(io.selfLarkAppId(), openId);
+        if (resolved.status === 'resolved' && isWorkflowUnionId(resolved.unionId)) return { unionId: resolved.unionId };
+        return { unknown: resolved.status === 'unavailable' ? '主 Bot 查不到发起人的跨应用身份' : '主 Bot 查询发起人的跨应用身份失败' };
+      } catch {
+        return { unknown: '主 Bot 查询发起人的跨应用身份失败' };
+      }
+    },
+  };
 }
 
 /** How long one operate answer may take (Lark lookups + daemon IPC) before
- *  it counts as "no": an inbound handoff waits for it, and a stalled lookup
- *  must not hold the node — the range rule still lets in-range dirs start. */
+ *  it counts as unknown: an inbound handoff waits for it, and a stalled
+ *  lookup must not hold the node — the range rule still lets in-range
+ *  directories start. */
 export const WORKFLOW_OPERATOR_BUDGET_MS = 8_000;
 
-/** `answer`, or false once {@link WORKFLOW_OPERATOR_BUDGET_MS} passed or it
- *  failed. */
-export function withinOperatorBudget(answer: Promise<boolean>, budgetMs: number = WORKFLOW_OPERATOR_BUDGET_MS): Promise<boolean> {
+/** `answer`, or unknown once `budgetMs` passed or it failed — never `yes`
+ *  for an answer that did not arrive. */
+export function withinOperatorBudget(
+  answer: Promise<WorkflowOperateAnswer>,
+  budgetMs: number = WORKFLOW_OPERATOR_BUDGET_MS,
+): Promise<WorkflowOperateAnswer> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), budgetMs);
-    timer.unref?.();
-    answer.then((value) => resolve(value === true), () => resolve(false))
-      .finally(() => clearTimeout(timer));
+    const timer = setTimeout(() => resolve({ unknown: '查询超时' }), budgetMs);
+    (timer as { unref?: () => void }).unref?.();
+    answer.then(
+      (value) => resolve(value === 'yes' || value === 'no' || isOperateUnknown(value) ? value : { unknown: '查询结果无效' }),
+      () => resolve({ unknown: '查询出错' }),
+    ).finally(() => clearTimeout(timer));
   });
 }
 
-/** The request body of {@link WORKFLOW_WORKING_DIR_OPERATOR_ROUTE}, or
- *  undefined when malformed. */
+/** Gate-2's question names only the pending run and node; the executing
+ *  bot's daemon reads the initiator and chat itself. */
+export interface WorkflowWorkingDirOperatorRequest {
+  runId: string;
+  nodeId: string;
+}
+
 export function parseWorkflowWorkingDirOperatorRequest(raw: unknown): WorkflowWorkingDirOperatorRequest | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const body = raw as Record<string, unknown>;
-  const initiator = body.initiator && typeof body.initiator === 'object' && !Array.isArray(body.initiator)
-    ? body.initiator as Record<string, unknown>
-    : undefined;
-  if (typeof body.chatId !== 'string' || !CHAT_ID_RE.test(body.chatId) || !initiator) return undefined;
-  const source = initiator.sourceLarkAppId;
-  if (typeof source !== 'string' || source.length === 0 || source.length > 256) return undefined;
-  if (initiator.openId !== undefined && !isWorkflowOpenId(initiator.openId)) return undefined;
-  if (initiator.unionId !== undefined && !isWorkflowUnionId(initiator.unionId)) return undefined;
-  return {
-    chatId: body.chatId,
-    initiator: {
-      sourceLarkAppId: source,
-      ...(initiator.openId !== undefined ? { openId: initiator.openId as string } : {}),
-      ...(initiator.unionId !== undefined ? { unionId: initiator.unionId as string } : {}),
-    },
-  };
+  if (Object.keys(body).some((key) => key !== 'runId' && key !== 'nodeId')) return undefined;
+  if (typeof body.runId !== 'string' || body.runId.length === 0 || body.runId.length > 256) return undefined;
+  if (typeof body.nodeId !== 'string' || !NODE_ID_RE.test(body.nodeId)) return undefined;
+  return { runId: body.runId, nodeId: body.nodeId };
+}
+
+/** The executing bot asking the main bot for the initiator's union_id. */
+export interface WorkflowInitiatorUnionRequest {
+  runId: string;
+  /** The asking bot. The trusted-host IPC authenticates the host, not which
+   *  bot's daemon is asking; this is checked against the run's executing
+   *  bots so the route answers only for a run the asker takes part in. */
+  requesterLarkAppId: string;
+}
+
+export function parseWorkflowInitiatorUnionRequest(raw: unknown): WorkflowInitiatorUnionRequest | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const body = raw as Record<string, unknown>;
+  if (Object.keys(body).some((key) => key !== 'runId' && key !== 'requesterLarkAppId')) return undefined;
+  if (typeof body.runId !== 'string' || body.runId.length === 0 || body.runId.length > 256) return undefined;
+  const requester = body.requesterLarkAppId;
+  if (typeof requester !== 'string' || requester.length === 0 || requester.length > 256) return undefined;
+  return { runId: body.runId, requesterLarkAppId: requester };
 }

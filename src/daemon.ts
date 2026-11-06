@@ -759,7 +759,7 @@ import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplay
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3MainTopicAvailability, v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon, workflowNodePinnedStart } from './core/workflow-node-daemon.js';
-import { WORKFLOW_INITIATOR_UNION_ROUTE, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, workflowInitiatorOperates } from './core/workflow-working-dir-operator.js';
+import { WORKFLOW_INITIATOR_UNION_ROUTE, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, createWorkflowWorkingDirOperatorWiring } from './core/workflow-working-dir-operator.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
 import { isRemoteCliId } from './core/remote-cli-ids.js';
@@ -6928,6 +6928,16 @@ function workflowSelfAppId(): string {
   return selfDaemonLarkAppId;
 }
 
+/** §15.4 operate check of this daemon's bot (design 2026-11-03). */
+// Every import is read only when called (never at module load), as before.
+const workflowWorkingDirOperatorWiring = createWorkflowWorkingDirOperatorWiring({
+  resolveTargetAppOpenId: (appId, unionId) => resolveTargetAppOpenId(appId, unionId),
+  resolveUnionIdFromOpenId: (appId, openId) => resolveUnionIdFromOpenIdStrict(appId, openId),
+  listChatMemberOpenIds: (appId, chatId) => listChatMemberOpenIds(appId, chatId),
+  canRunDaemonCommand: (appId, chatId, openId, unionId, cmd, chatType) => humanCanRunDaemonCommand(appId, chatId, openId, unionId, cmd, chatType),
+  selfLarkAppId: () => workflowSelfAppId(),
+});
+
 const workflowNodeDaemon = createWorkflowNodeDaemon({
   selfLarkAppId: workflowSelfAppId,
   dataDir: () => config.session.dataDir,
@@ -6991,19 +7001,10 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   },
   daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
   // §15.4: the initiator operates this bot when they may use /cd in its
-  // topics — the same two gates a typed /cd passes, with their identity
-  // converted into this bot's own app first (never another app's open_id).
-  initiatorOperates: (input) => workflowInitiatorOperates({
-    resolveTargetOpenId: async (appId, unionId) => {
-      const resolved = await resolveTargetAppOpenId(appId, unionId);
-      return resolved.status === 'resolved' ? resolved.openId : undefined;
-    },
-    canUseCd: (appId, chatId, openId, unionId) => humanCanRunDaemonCommand(appId, chatId, openId, unionId, '/cd', 'group'),
-  }, input),
-  lookupOwnUnionId: async (openId) => {
-    const resolved = await resolveUnionIdFromOpenIdStrict(workflowSelfAppId(), openId);
-    return resolved.status === 'resolved' ? resolved.unionId : undefined;
-  },
+  // topics (the gate a typed /cd passes) and are in the run's chat now, with
+  // their identity converted into this bot's own app first.
+  ...workflowWorkingDirOperatorWiring,
+  currentBots: () => loadBotConfigs(),
   daemonHandlesMainPlacement: (appId) => findOnlineDaemon(appId)?.workflowMainPlacement === 'v1',
   // §5.5 board link: the main session's topic id (`omt_…`), display only.
   mainTopicThreadId: (binding) => {
@@ -28848,33 +28849,38 @@ async function handleThreadReplyAdmitted(
 
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
-  // Design §15.4: whether the run's Gate-2 directory may be used here can
-  // depend on the initiator's operate right on this bot (a Lark lookup, maybe
-  // the main bot's daemon). Settled before the session is looked up, so
-  // nothing read below goes stale across the wait.
-  const workflowNodeDir = workflowHandoff
-    ? await workflowNodeDaemon.resolveInboundWorkingDir(workflowHandoff, larkAppId)
+  // Design §15.4: a run approved with --working-dir runs its node in that
+  // directory only if it exists and — unless the initiator may operate this
+  // bot — lies in its configured range as it stands now. Otherwise the node
+  // blocks with the reason — never a silent fall back to the default dir.
+  // The node daemon's one gate decides the directory first (it may wait for
+  // lookups), then reads the session here, re-checks revocation and admits.
+  const workflowGate = workflowHandoff
+    ? await workflowNodeDaemon.admitInboundHandoff({
+      binding: workflowHandoff,
+      handoffMessageId: parsed.messageId,
+      executingLarkAppId: larkAppId,
+      currentSession: () => (effortSessionIsCurrent && !effortSessionIsCurrent()
+        ? 'stale' as const
+        : { current: activeSessions.get(runtimeSessionKey) }),
+      describeSession: ({ current }) => ({
+        ...(current ? { dir: getSessionWorkingDir(current) } : {}),
+        ...(current?.session.workflowNode ? { marker: current.session.workflowNode } : {}),
+      }),
+    })
     : undefined;
-  let ds = activeSessions.get(runtimeSessionKey);
-  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
-  // A retry / later round handed off into a node topic this bot already has
-  // a session in: the session now reports to the new handoff.
-  if (workflowHandoff && workflowNodeDaemon.isRevoked(workflowHandoff.nonce)) {
+  if (workflowGate?.kind === 'stale') return;
+  if (workflowGate?.kind === 'revoked') {
     // Stopped after it was recognized above: never start its turn.
     logger.info(`[${larkAppId}] dropped workflow handoff ${parsed.messageId}: revoked before its turn started`);
     markIngressAdmitted(ctx);
     return;
   }
-  // Design §15.4: a run approved with --working-dir runs its node in that
-  // directory only if it exists and — unless the initiator may operate this
-  // bot — lies in its configured range as it stands now. Otherwise the node
-  // blocks with the reason — never a silent fall back to the default dir.
-  const workflowAdmission = workflowHandoff
-    ? workflowNodeDaemon.admitInbound(
-      workflowHandoff, parsed.messageId, larkAppId, ds ? getSessionWorkingDir(ds) : undefined, ds?.session.workflowNode,
-      workflowNodeDir,
-    )
-    : undefined;
+  let ds = workflowGate ? workflowGate.session.current : activeSessions.get(runtimeSessionKey);
+  if (!workflowGate && effortSessionIsCurrent && !effortSessionIsCurrent()) return;
+  const workflowAdmission = workflowGate?.admission;
+  // A retry / later round handed off into a node topic this bot already has
+  // a session in: the session now reports to the new handoff (below).
   if (workflowHandoff && workflowAdmission && !workflowAdmission.start) {
     logger.info(`[${larkAppId}] workflow handoff ${parsed.messageId} not started (run ${workflowHandoff.workflow.runId}): ${workflowAdmission.reason}`);
     markIngressAdmitted(ctx);

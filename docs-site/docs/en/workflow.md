@@ -266,9 +266,10 @@ Every node's executing bot must be configured on this machine, already in this c
 
 `botmux workflow approve-dag <runId> --working-dir <dir>` makes every node run in the same directory. Nodes run in each executing bot's own session, so **every** executing bot (including the main bot) is checked on its own:
 
-- **The initiator can operate that bot** (could use `/cd` in its topics, e.g. they are its admin): the directory only has to exist, as with `/cd` and `/repo <path>`.
-- **The initiator can't operate that bot** (e.g. a colleague's bot): the directory must be in its allowed range — its default working directory (or Oncall directory), or its repo directories (`workingDir` / `workingDirs`) themselves or anything under them.
-- The executing bot decides "can operate" itself, from its own configuration and grants, after the initiator's identity is converted into that bot's Feishu app. If the conversion isn't possible, a lookup fails, or the answer is uncertain, it counts as "can't operate": directories inside the range still work.
+- **The initiator can operate that bot**: they could use `/cd` in its topics right now (e.g. they are its admin) **and are still in the group**. Then the directory only has to exist, as with `/cd` and `/repo <path>`.
+- **The initiator can't operate that bot** (e.g. a colleague's bot, or they have left the group): the directory must be in its allowed range — its default working directory (or Oncall directory), or its repo directories (`workingDir` / `workingDirs`) themselves or anything under them.
+- The executing bot decides "can operate" itself, from its own configuration, grants and group members, after the initiator's identity is converted into that bot's Feishu app.
+- **Can't be confirmed right now** (the identity conversion or member lookup fails or times out, a daemon is offline or too old): it decides like "can't operate" — directories inside the range still work; one outside is refused with "couldn't confirm" and the reason, so retrying later may help.
 
 Other rules:
 
