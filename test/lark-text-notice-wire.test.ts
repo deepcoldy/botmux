@@ -254,6 +254,45 @@ describe('dashboard resume notice reaches Feishu wrapped once', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('posts English resume notice when bot locale is configured to en (#2940)', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'text-notice-resume-en-'));
+    const prevDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    try {
+      config.session.dataDir = dataDir;
+      setLarkAppId(APP_ID);
+      sessionStore.init(APP_ID);
+      workerPool.setActiveSessionsRegistry(registry);
+      registerBot({
+        larkAppId: APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        lang: 'en',
+      });
+      const session = sessionStore.createSession('oc_chat_en', 'om_resume_root_en', 'resume notice en', 'group');
+      Object.assign(session, { larkAppId: APP_ID, scope: 'thread', cliId: 'codex', workingDir: '/tmp' });
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      const res = await ipc(`/api/sessions/${session.sessionId}/resume`);
+      expect(res.status).toBe(200);
+
+      await vi.waitFor(() => expect(textWrites()).toHaveLength(1));
+      const [w] = textWrites();
+      expect(w.api).toBe('reply');
+      const text = expectSingleWrap(w.data.content, '🔄');
+      expect(text).toContain('Session resumed from the command line');
+      expect(text).toContain('Codex');
+      expect(text).not.toContain('会话已通过命令行恢复');
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      setLarkAppId('');
+      sessionStore.init('test-app');
+      config.session.dataDir = prevDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('/introduce grant-restricted reply reaches Feishu wrapped once', () => {

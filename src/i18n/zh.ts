@@ -1395,6 +1395,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 已重新启动 {cliName}',
   'card.action.resume_missing_session_id': '⚠️ 缺少 session_id，无法恢复。',
   'card.action.resume_success': '✅ 会话已恢复，发条消息继续与 {cliName} 对话。',
+  'card.action.resume_success_cli': '🔄 会话已通过命令行恢复，发条消息继续与 {cliName} 对话。',
   'card.action.resume_started_remote': '🔄 {cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话；就绪后即可继续。',
   'card.action.resume_success_fresh': '✅ 话题路由已重新激活。{cliName} 没有可精确恢复的历史会话，下条消息将**新起干净会话**，旧上下文不会带回。',
   'card.action.resume_not_found': '⚠️ 找不到会话 {short}，可能已被清理。',

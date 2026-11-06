@@ -1396,6 +1396,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 Re-launched {cliName}',
   'card.action.resume_missing_session_id': '⚠️ Missing session_id, cannot resume.',
   'card.action.resume_success': '✅ Session resumed. Send a message to continue with {cliName}.',
+  'card.action.resume_success_cli': '🔄 Session resumed from the command line. Send a message to continue with {cliName}.',
   'card.action.resume_started_remote': '🔄 Remote recovery for {cliName} has started. A new runtime is being created for the original session; continue after it is ready.',
   'card.action.resume_success_fresh': '✅ Topic route reactivated. {cliName} has no precisely resumable history session — your next message starts a **fresh session** without the old context.',
   'card.action.resume_not_found': '⚠️ Session {short} not found — it may have been cleaned up.',
