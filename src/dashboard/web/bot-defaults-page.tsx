@@ -6563,6 +6563,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [autoJoin, setAutoJoin] = useState(savedForm.autoJoinNewGroups);
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
   const [decisionCards, setDecisionCards] = useState(savedForm.decisionCards);
+  const [closeHints, setCloseHints] = useState(savedForm.closeHints);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6582,6 +6583,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setAutoJoin(savedForm.autoJoinNewGroups); }, [appId, savedForm.autoJoinNewGroups]);
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
   useEffect(() => { setDecisionCards(savedForm.decisionCards); }, [appId, savedForm.decisionCards]);
+  useEffect(() => { setCloseHints(savedForm.closeHints); }, [appId, savedForm.closeHints]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6655,6 +6657,12 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     const previous = decisionCards;
     setDecisionCards(on);
     void save({ ...savedForm, decisionCards: on }, setStatus, () => setDecisionCards(previous));
+  }
+
+  function toggleCloseHints(on: boolean): void {
+    const previous = closeHints;
+    setCloseHints(on);
+    void save({ ...savedForm, closeHints: on }, setStatus, () => setCloseHints(previous));
   }
 
   function changeChat(next: string): void {
@@ -6736,6 +6744,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
             title={tr('botDefaults.stewardAutoJoinSolo')}
             help={tr('botDefaults.stewardAutoJoinSoloHelp')}
             onChange={toggleAutoJoinSolo}
+          />
+          <ToggleRow
+            checked={closeHints}
+            disabled={busy}
+            dataAction="toggle-steward-close-hints"
+            title={tr('botDefaults.stewardCloseHints')}
+            help={tr('botDefaults.stewardCloseHintsHelp')}
+            onChange={toggleCloseHints}
           />
           <div className="bd-row bd-steward-guide">
             <div className="bd-field">

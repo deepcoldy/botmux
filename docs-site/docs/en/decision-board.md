@@ -31,6 +31,7 @@ Settings in the Steward section:
 | Decision cards in Feishu | See "Deciding on a Feishu card" below | On |
 | Add the steward to new chats | See "Adding the steward to new chats" below | On |
 | Also add it to chats with only you and one bot | Same | Off |
+| Find items that are ready to close | See "Finding items that are ready to close" below | Off |
 | Instructions | The built-in rules are shown read-only; **append** your own (e.g. your progress standard or the path to your merge standard) or **replace** them entirely | Append |
 
 You can also use `/botconfig` in Feishu:
@@ -63,6 +64,22 @@ The rules are the "Scheduled patrol" section of `botmux board guide`; change the
 
 `botmux board add` with an existing dedupe key (`--key`) updates that item, but it is refused when the item is done or closed, so a patrol cannot bring old items back. To really reopen one, use `botmux board set`.
 
+### Finding items that are ready to close
+
+A PR merged long ago, or the work an item waited on is done, yet the board still says "In progress". Turn on **Steward → Find items that are ready to close** (or `"closeHints":true`) and the daemon checks the board every 5 minutes (no model calls):
+
+| Situation | Mark on the board |
+|---|---|
+| All linked PRs are merged (the default when no close condition is set), or the `--close-when` condition holds | Suggest closing |
+| Every item in `--depends-on` has ended, or the PR used to judge closing was closed without merging | Suggest moving on |
+| The `--next-check` time has passed with no update to the item since | Check in |
+
+- **Hints only, no state change**: the mark shows on the overview row and the item page, and one history entry is added. The steward verifies and changes the state itself.
+- **Steward notice**: new hints from one run are combined into **one** message in the steward chat and sent to the steward session; each hint is sent once. A failed delivery is retried on the next run.
+- **Dismissing**: changing the item's state, or `botmux board set <n> --dismiss-hint`, clears the hint; the same hint does not come back.
+- **Items without conditions are untouched**: an item with no linked PR, dependencies or check time is ignored.
+- PR checks use this machine's GitHub credentials (`GITHUB_TOKEN` / `GH_TOKEN`, `~/.botmux/.env`, or `gh auth login`), and fall back to anonymous requests (60 per hour, shared by the whole machine). Open or closed PRs are checked at most every 10 minutes (a closed PR may be reopened, so it keeps being rechecked); only a merged PR is final and is not checked again. PRs that cannot be checked (not on GitHub, no access, rate limited) are left undecided for that run.
+
 ## Deciding on the board
 
 ### Overview
@@ -76,6 +93,7 @@ Three views: **Needs you** (including "needs review") / **In progress** / **All*
 | Open chat | Opens the item's main chat in Feishu; "+N more" under the title when there are several |
 | No chat: (reason) | There really is no chat; the steward gave a reason |
 | ⚠ No chat linked | Neither a chat nor a reason |
+| 💡 Suggest closing / Suggest moving on / Check in | A hint from the board check (see "Finding items that are ready to close"), followed by the reason |
 
 ### Item page
 
@@ -165,11 +183,14 @@ botmux board set <n> --state decide --ask "question" \
 botmux board set <n> --unlink doc=https://old --link "doc=https://new|Board doc"   # remove / replace a link
 botmux board history <n> "what was done, result" --handled   # --handled: latest decision executed
 botmux board attach <n> shot.png --note "repro"
+botmux board set <n> --close-when "item:66 done" --depends-on 66,70 --next-check +2d   # when it can close
+botmux board set <n> --dismiss-hint                   # dismiss the board hint
 ```
 
 - `--link kind=ref|label`: everything after the last `|` is the label (write a literal `|` inside a URL as `%7C`).
 - `--link` only appends; remove a wrong one with `set <n> --unlink kind=ref`.
 - To write a chat that cannot be found, add `--allow-unverified-chat`.
+- `--close-when`: `"pr:owner/repo#12 merged"`, `"item:66 done"`, `manual` (only the steward decides; linked PRs no longer trigger the default hint) or `auto` (remove it, back to the default). `--depends-on` replaces the whole list; `none` clears it. `--next-check` takes `+2h` / `+3d` / `+1w` or a time with a timezone (`2026-11-10T09:30+08:00`); `none` clears it.
 - See `botmux board --help` for every option.
 
 ## Where the data lives
