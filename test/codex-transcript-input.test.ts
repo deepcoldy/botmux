@@ -31,9 +31,11 @@ afterEach(() => {
 function terminal(initial = OVERLAY, options: {
   closeDelay?: number; receiptDelay?: number; hiddenDraft?: string; close?: boolean;
   closeResult?: 'false' | 'throw'; enterResult?: 'false' | 'throw';
+  redrawFrames?: number;
 } = {}) {
   let overlay: string | undefined = initial || undefined;
   let draft = options.hiddenDraft ?? '';
+  let redrawLeft = options.redrawFrames ?? 0;
   const executed: string[] = [];
   let rewinds = 0;
   const receipt = (text: string) => appendFileSync(join(home, 'history.jsonl'), `${JSON.stringify({ session_id: SID, text })}\n`);
@@ -68,6 +70,10 @@ function terminal(initial = OVERLAY, options: {
     sendSpecialKeys: vi.fn(() => enter()),
     captureInputState: vi.fn(() => {
       if (overlay) return { viewport: overlay, cursor: { x: 0, y: 0 } };
+      if (redrawLeft > 0) {
+        redrawLeft--;
+        return { viewport: 'Previous conversation\n› mid-redraw residual glyphs\n\n  model · /tmp · Ready\n', cursor: { x: 27, y: 1 } };
+      }
       const lines = draft.split('\n');
       return { viewport: `Previous conversation\n› ${(draft || 'Ask Codex to do anything').replace(/\n/g, '\n  ')}\n  model · /tmp · Ready\n  ? for shortcuts\n`, cursor: { x: 2 + lines.at(-1)!.length, y: lines.length } };
     }),
@@ -128,6 +134,45 @@ describe('Codex transcript submission boundary', () => {
     expect(t.target.pasteText).not.toHaveBeenCalled();
     expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
     expect(t.target.sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
+  it.each([OVERLAY, OVERLAY_MODERN])('waits through transient draft frames during close and submits once', async screen => {
+    const t = terminal(screen, { redrawFrames: 2 });
+    expect(await submit(t.target)).toMatchObject({ submitted: true, ownershipProven: true });
+    expect(t.executed).toEqual([MESSAGE]);
+    expect(t.target.write).toHaveBeenCalledExactlyOnceWith('q');
+    expect(t.target.submitBracketedPaste).toHaveBeenCalledExactlyOnceWith(MESSAGE);
+    expect(t.target.sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
+  it('only observes a persistent draft until close settles and leaves it intact', async () => {
+    const t = terminal(OVERLAY_MODERN, { hiddenDraft: 'human draft' });
+    let settled = false;
+    const pending = createCodexAdapter().writeInput(t.target, MESSAGE).then(result => { settled = true; return result; });
+    await flushFakeTimers(200);
+    expect(settled).toBe(false);
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    await flushFakeTimers();
+    expect(await pending).toMatchObject({ submitted: false, failureReason: expect.any(String) });
+    expect(t.draft()).toBe('human draft');
+    expect(t.executed).toEqual([]);
+    expect(t.target.write).toHaveBeenCalledExactlyOnceWith('q');
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.target.sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
+  it('rejects an ordinary draft immediately without waiting for it to clear', async () => {
+    const t = terminal('', { hiddenDraft: 'human draft' });
+    let result: unknown;
+    const pending = createCodexAdapter().writeInput(t.target, MESSAGE).then(value => { result = value; });
+    setTimeout(() => t.setDraft(''), 500);
+    await flushFakeTimers(200);
+    expect(result).toMatchObject({ submitted: false, failureReason: expect.any(String) });
+    await pending;
+    await flushFakeTimers();
+    expect(t.target.write).not.toHaveBeenCalled();
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
   });
 
   it('does not guess a remapped close key', async () => {

@@ -52,11 +52,20 @@ export async function prepareCodexTranscriptInput(terminal: PtyHandle): Promise<
     if (state && transcriptFooter(state.viewport) === undefined) {
       const composer = codexNativeComposerState(state);
       if (composer === 'empty') { closing.delete(terminal); return undefined; }
-      if (composer === 'draft') return 'Codex has an existing draft; no message was written.';
+      // A close can expose a draft-looking redraw frame before the empty
+      // composer settles. Observe within the existing deadline; never write
+      // through a draft. Without a pending close, a draft is already final.
+      if (composer === 'draft' && !closing.has(terminal)) {
+        return 'Codex has an existing draft; no message was written.';
+      }
     }
     if (!closing.has(terminal)) return 'Codex is not at an empty input box; no message was written.';
     await delay(50);
     state = capture(terminal);
   } while (Date.now() < deadline);
+  if (state && transcriptFooter(state.viewport) === undefined
+    && codexNativeComposerState(state) === 'draft') {
+    return 'Codex has an existing draft; no message was written.';
+  }
   return 'Codex transcript did not return to an empty input box; no message was written.';
 }
