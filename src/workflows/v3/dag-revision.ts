@@ -757,6 +757,8 @@ export interface PlanV3DagRevisionInput {
   liftSpentRerunBudget?: boolean;
   /** Injected for tests; defaults to reading the done node's manifest. */
   readProducts?: (nodeId: string) => V3DoneNodeProducts | undefined;
+  /** Bot display names for the §5.2 refusals (default: the app id). */
+  nameOf?: (larkAppId: string) => string;
 }
 
 /** A rerun refused because the revisit budget is spent: the initiator can
@@ -1234,6 +1236,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       return (added.has(nodeId) ? undefined : snap.assignments.get(nodeId))
         ?? snapshotForSelector(knownBots, defined)?.larkAppId ?? defined ?? mainApp;
     },
+    ...(input.nameOf ? { nameOf: input.nameOf } : {}),
   });
   if (placementProblems.length > 0) return { ok: false, problems: placementProblems.map((problem) => problem.message) };
 

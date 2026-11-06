@@ -260,6 +260,7 @@ import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
+import { comparableSessionDir } from './core/working-dir-range.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
 
 export function useOrdinaryOutputDelivery(): void {
@@ -7153,6 +7154,17 @@ const workflowMainWake = createWorkflowMainWake({
   warn: (message) => logger.warn(message),
 });
 
+/** The directory a main-topic node the main bot runs itself would meet: its
+ *  main session's, found by the same lookup the node's delivery makes (the
+ *  main topic root × the main bot). Undefined = no live session there (the
+ *  node would start one in the frozen directory). Comparison form. */
+function v3MainSessionDirOf(binding: import('./workflows/v3/grill-state.js').RunChatBinding): string | undefined {
+  if (!binding.rootMessageId) return undefined;
+  const ds = activeSessions.get(sessionKey(binding.rootMessageId, binding.larkAppId));
+  if (!ds || ds.session.status === 'closed') return undefined;
+  return comparableSessionDir(getSessionWorkingDir(ds));
+}
+
 /** 「改派」 on bot-executed runs' blocked cards: the same live §6.1 probe the
  *  approval uses, against the run's chat. */
 const v3BlockedReassignDeps: V3BlockedReassignDeps = {
@@ -7164,6 +7176,7 @@ const v3BlockedReassignDeps: V3BlockedReassignDeps = {
   nameOf: (appId) => v3BotDisplayNameResolver()(appId),
   cliOf: (appId) => loadBotConfigs().find((bot) => bot.larkAppId === appId)?.cliId,
   executor: workflowNodeDaemon.executor,
+  mainSessionDir: v3MainSessionDirOf,
 };
 
 // v3 humanGate run-controller: drives daemon-side v3 runs, posts/​re-posts
@@ -8360,6 +8373,10 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
       },
       // §5.2 rule 3, for an edit that moves a node into the main topic.
       mainTopic: v3MainTopicAvailability(binding, binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined),
+      // §5.2 rule 2 × §15.4, for an edit that makes a node one the main bot
+      // runs in the main topic while the run has a frozen working dir.
+      ...(() => { const dir = v3MainSessionDirOf(binding); return dir !== undefined ? { mainSessionDir: dir } : {}; })(),
+      nameOf: v3BotDisplayNameResolver(),
     });
   } catch (err) {
     return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });

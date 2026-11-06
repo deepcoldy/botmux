@@ -789,7 +789,10 @@ export async function runWorkflow(
     );
   }
 
-  // First run only: stamp runStarted (idempotent on resume).
+  // First run only: stamp runStarted (idempotent on resume). A daemon-started
+  // run arrives with the journal already rooted by its start intent, which
+  // stamps `nodeExecutor` from the same run.json (start-intent.ts); a root
+  // written before that is never rewritten — readers fall back to run.json.
   if (readJournal(journalPath).length === 0) {
     appendEvent(journalPath, {
       type: 'runStarted',

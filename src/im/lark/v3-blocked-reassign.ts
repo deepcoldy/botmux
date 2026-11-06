@@ -31,7 +31,8 @@ import {
   type V3BotEligibilityProbe,
 } from '../../workflows/v3/node-executor-mode.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
-import { loadAuthorizedV3Run } from '../../workflows/v3/run-envelope.js';
+import { frozenNodeWorkingDir, loadAuthorizedV3Run } from '../../workflows/v3/run-envelope.js';
+import { v3MainSessionDirProblem, v3NodePlacement } from '../../workflows/v3/placement.js';
 import { materialize } from '../../workflows/v3/state.js';
 import {
   loadEffectiveV3Dag,
@@ -55,6 +56,9 @@ export interface V3BlockedReassignDeps {
   cliOf?: (larkAppId: string) => string | undefined;
   /** Stops an open attempt should the node be running (normally it is blocked). */
   executor?: V3ExternalNodeExecutor;
+  /** The run's main session directory in comparison form (undefined =
+   *  unknown): a main-topic node moved to the main bot runs in it. */
+  mainSessionDir?: (binding: RunChatBinding) => string | undefined;
 }
 
 interface V3BotRunView {
@@ -71,6 +75,8 @@ interface V3BotRunView {
   initiatorOpenId?: string;
   /** The approved bots' app ids, frozen ones first. */
   approved: string[];
+  /** The Gate-2 node working directory (§15.4), when one was frozen. */
+  workingDir?: string;
 }
 
 /** A validated bot-executed run, or `undefined` for every other run. */
@@ -95,6 +101,7 @@ function loadBotRun(runDir: string): V3BotRunView | undefined {
     binding: envelope.chatBinding,
     ...(initiatorOpenId ? { initiatorOpenId } : {}),
     approved: [...new Set([...snapshots.values()].map((snapshot) => snapshot.larkAppId))],
+    ...(frozenNodeWorkingDir(envelope) !== undefined ? { workingDir: frozenNodeWorkingDir(envelope) } : {}),
   };
 }
 
@@ -119,15 +126,26 @@ function labelOf(view: V3BotRunView, deps: V3BlockedReassignDeps, larkAppId: str
   return `${deps.nameOf(larkAppId)}${cli ? `（${cli}）` : ''}`;
 }
 
-/** Why `larkAppId` cannot take over a node now (`undefined` = it can). The
- *  main bot runs its nodes in-process and needs no probe. */
+/** Why `larkAppId` cannot take over `nodeId` now (`undefined` = it can).
+ *  The main bot runs its nodes in-process and needs no probe; a main-topic
+ *  node it takes over runs in the main session, so in that one's directory
+ *  (§5.2 rule 2 × §15.4). */
 async function unavailableReason(
   view: V3BotRunView,
   larkAppId: string,
   probe: () => Promise<V3BotEligibilityProbe>,
-  opts: { grant: boolean },
+  opts: { grant: boolean; nodeId: string; deps: V3BlockedReassignDeps },
 ): Promise<string | undefined> {
-  if (larkAppId === view.binding.larkAppId) return undefined;
+  if (larkAppId === view.binding.larkAppId) {
+    if (view.workingDir === undefined) return undefined;
+    const node = view.dag.nodes.find((candidate) => candidate.id === opts.nodeId);
+    return v3MainSessionDirProblem({
+      nodes: [{ nodeId: opts.nodeId, larkAppId, placement: v3NodePlacement(node) }],
+      mainLarkAppId: view.binding.larkAppId,
+      workingDir: view.workingDir,
+      mainSessionDir: opts.deps.mainSessionDir?.(view.binding),
+    });
+  }
   const problem = await judgeV3BotEligibility(larkAppId, await probe(), opts);
   return problem ? describeV3BotEligibilityCode(problem.code) + (problem.detail ? `（${problem.detail}）` : '') : undefined;
 }
@@ -152,7 +170,7 @@ async function reassignOffer(
     if (larkAppId === current) continue;
     const label = labelOf(view, deps, larkAppId);
     // Listing writes nothing: the chat grant is only made for the bot picked.
-    const why = await unavailableReason(view, larkAppId, probe, { grant: false });
+    const why = await unavailableReason(view, larkAppId, probe, { grant: false, nodeId, deps });
     if (why) offer.unavailable.push({ label, why });
     else offer.candidates.push({ larkAppId, label });
   }
@@ -343,7 +361,7 @@ export async function handleV3BlockedReassign(
 
   let why: string | undefined;
   try {
-    why = await unavailableReason(view, target, lazyProbe(reassignDeps, view.binding), { grant: true });
+    why = await unavailableReason(view, target, lazyProbe(reassignDeps, view.binding), { grant: true, nodeId: value.nodeId, deps: reassignDeps });
   } catch (err) {
     why = err instanceof Error ? err.message : String(err);
   }
