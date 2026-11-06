@@ -291,7 +291,9 @@ describe('巡检提示', () => {
   });
 
   it('同毫秒两次 sweep 或提示通知生成的回合 turnId 互不相同（防撞 id）', async () => {
-    const fixedNow = 1700000000000;
+    // 用未来时间：sweepHints 内 at = max(now, Date.now())，过去的注入值会被真实时钟顶掉，
+    // 两次 sweep 落到不同毫秒，同毫秒防撞 id 的后半段断言就不再咬回归。
+    const fixedNow = Date.now() + HOUR;
     const id1 = formatHintTurnId('app_test', fixedNow);
     const id2 = formatHintTurnId('app_test', fixedNow);
     expect(id1).not.toBe(id2);
