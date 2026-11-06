@@ -505,6 +505,112 @@ describe('tmux subcommand with stale $TMUX', () => {
     30_000,
   );
 
+  // 行为护栏：`tmux show-environment` 的渲染是有损的——值里的非 ASCII 字节按
+  // CLIENT 的 locale 变成 `_`（本机 fleet 的 daemon 没有 LANG/LC_*，即 C 语义），
+  // 多行值还会在第一条含 `=` 的续行处被截断。修复逻辑必须"读到什么写回什么"，
+  // 所以它只能走一条不会拿有损渲染去重新落盘的路；下面两条都在真 socket 上把
+  // 用户 git config 的**真实字节**（新 pane 里 printenv 的结果）作为判据。
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub keeps a non-ASCII user token byte-exact when it has to rewrite GIT_CONFIG_PARAMETERS',
+    () => {
+      // Trae 与用户 token 同在 PARAMETERS 里：过滤会让 PARAMETERS 变化，于是
+      // 该键必须被改写。若改写用的是 show-environment 读回的值，C locale 下
+      // "张三" 会变成 "____"。
+      const sock = `bmx-scrub-trae-unicode-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      const seededEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete seededEnv.TMUX;
+      delete seededEnv.TMUX_PANE;
+      // 本机 daemon 进程的真相：没有 LANG/LC_*（等价 C locale）。
+      delete seededEnv.LANG;
+      delete seededEnv.LANGUAGE;
+      delete seededEnv.LC_ALL;
+      delete seededEnv.LC_CTYPE;
+      seededEnv.GIT_CONFIG_PARAMETERS = `'user.email=张三@example.com' 'core.hooksPath=${traeHooks}'`;
+      const readParam = (tag: string): string => {
+        const out = join(tmpdir(), `bmx-trae-unicode-${process.pid}-${tag}.txt`);
+        const pane = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', tag, '--',
+          '/bin/sh', '-c', `printenv GIT_CONFIG_PARAMETERS > ${out}; sleep 2`,
+        ], { env: tmuxEnv(), encoding: 'utf-8', timeout: 10_000 });
+        expect(pane.status, pane.stderr).toBe(0);
+        spawnSync('sleep', ['0.6']);
+        const value = readFileSync(out, 'utf-8').replace(/\n$/, '');
+        rmSync(out, { force: true });
+        return value;
+      };
+      try {
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+        expect(readParam('before')).toBe(seededEnv.GIT_CONFIG_PARAMETERS);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.failed).toEqual([]);
+
+        const after = readParam('after');
+        expect(after).not.toContain('commit-attribution');
+        // 用户自己的那条必须逐字节保留。
+        expect(after).toBe("'user.email=张三@example.com'");
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub keeps user slot values byte-exact through a reindex (multi-line value)',
+    () => {
+      // Trae 占 slot 0、用户 slot 1 是多行 credential.helper：重排必然改写
+      // KEY_0/VALUE_0。show-environment 会把多行值截断成第一行，写回即毁掉
+      // 用户的 credential helper（git 之后直接解析失败）。
+      const sock = `bmx-scrub-trae-reindex-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      const helper = '!f() {\n  echo username=alice\n  echo password=s3cret\n  echo\n}; f';
+      const seededEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete seededEnv.TMUX;
+      delete seededEnv.TMUX_PANE;
+      Object.assign(seededEnv, {
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'core.hooksPath',
+        GIT_CONFIG_VALUE_0: traeHooks,
+        GIT_CONFIG_KEY_1: 'credential.helper',
+        GIT_CONFIG_VALUE_1: helper,
+      });
+      const readSlot = (tag: string, name: string): string => {
+        const out = join(tmpdir(), `bmx-trae-reindex-${process.pid}-${tag}.txt`);
+        const pane = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', tag, '--',
+          '/bin/sh', '-c', `printenv ${name} > ${out}; sleep 2`,
+        ], { env: tmuxEnv(), encoding: 'utf-8', timeout: 10_000 });
+        expect(pane.status, pane.stderr).toBe(0);
+        spawnSync('sleep', ['0.6']);
+        const value = readFileSync(out, 'utf-8').replace(/\n$/, '');
+        rmSync(out, { force: true });
+        return value;
+      };
+      try {
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+        expect(readSlot('before', 'GIT_CONFIG_VALUE_1')).toBe(helper);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.failed).toEqual([]);
+        expect(scrub.removed.some(name => /^GIT_CONFIG_(?:VALUE)_1$/.test(name))).toBe(true);
+
+        // 重排后用户的值落在 slot 0，必须与原来逐字节相同。
+        expect(readSlot('after', 'GIT_CONFIG_VALUE_0')).toBe(helper);
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+      }
+    },
+    30_000,
+  );
+
   // 源码结构护栏(K2)：这条守的是"daemon 启动修复不得改写用户自有共享 tmux
   // server 的通用 env 表"这一安全不变量。GIT_CONFIG_KEY_<n> 是用户可自有的
   // 变量名（与 GITHUB_TOKEN 同类），只能 pane 本地 unset，不能进 server-global

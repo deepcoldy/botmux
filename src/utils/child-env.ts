@@ -623,7 +623,13 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_WORKFLOW_NODE_SESSION',
 ] as const;
 
-const TRAE_GIT_ATTRIBUTION_PATH_RE = /(?:^|[\\/])\.trae[\\/]cli[\\/]hooks[\\/]commit-attribution(?:[\\/]|$)/i;
+/**
+ * Matches a git config value that points at Trae CLI's managed
+ * commit-attribution hook directory. Exported so the tmux server-global repair
+ * can tell, from the rendered table alone, whether a byte-exact re-read is
+ * worth its extra round-trips.
+ */
+export const TRAE_GIT_ATTRIBUTION_PATH_RE = /(?:^|[\\/])\.trae[\\/]cli[\\/]hooks[\\/]commit-attribution(?:[\\/]|$)/i;
 const TRAE_GIT_ATTRIBUTION_ENV_PREFIX = 'TRAE_GIT_ATTRIBUTION_';
 
 export interface TraeGitAttributionScrubResult {

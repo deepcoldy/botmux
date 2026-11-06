@@ -21,13 +21,15 @@
  * tmux command would fail. Functional probe + soft fallback fixes both.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
+import { readFileSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
 import {
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
   scrubTraeGitAttributionEnv,
+  TRAE_GIT_ATTRIBUTION_PATH_RE,
 } from '../utils/child-env.js';
 
 export interface TmuxResult {
@@ -436,6 +438,52 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
     if (separator <= 0) continue;
     serverEnv[line.slice(0, separator)] = line.slice(separator + 1);
   }
+  // `show-environment` is LOSSY: values render through the CLIENT locale
+  // (non-ASCII becomes '_' under C — which is what the fleet daemons actually
+  // run with, they carry no LANG/LC_*) and the loop above cuts a multi-line
+  // value at its first continuation line. Writing such a value back silently
+  // rewrites the user's own git config: a CJK user.name becomes '____', and a
+  // multi-line credential.helper is truncated into a script that no longer
+  // parses. So the values we are about to filter/reindex are re-read
+  // byte-exact out of the server's own environment.
+  //
+  // `tmux run-shell` executes in the server (synchronously) so the value never
+  // passes through the renderer. Variable names come from an arbitrary —
+  // possibly hostile — server table, so only strictly shell-safe names are
+  // interpolated, and the temp path is single-quoted after rejecting quotes.
+  const exactValue = (name: string): string | undefined => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return undefined;
+    const tmp = join(tmpdir(), `bmx-tmux-env-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    if (tmp.includes("'")) return undefined;
+    try {
+      execFileSync('tmux', [...socketArgs, 'run-shell',
+        `printf %s "$${name}" | base64 | tr -d '\\n' > '${tmp}'`,
+      ], { stdio: 'ignore', timeout: 2000, env: tmuxEnv() });
+      const encoded = readFileSync(tmp, 'utf-8').trim();
+      // An empty read cannot be told apart from an absent variable; report "no
+      // exact read" so the caller keeps the rendered value instead of blanking
+      // a real one.
+      return encoded ? Buffer.from(encoded, 'base64').toString('utf-8') : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      try { unlinkSync(tmp); } catch { /* best effort */ }
+    }
+  };
+  // Only pay for the byte-exact reads when the rendered table actually names a
+  // Trae hook. Without one this function must stay a no-op: a plain `git
+  // config` in the user's own tmux server costs zero extra tmux round-trips.
+  // The hook path itself is always ASCII, so a rendered match cannot be a
+  // locale artifact.
+  const maybeTrae = Object.keys(serverEnv).some(key =>
+    /^(?:GIT_CONFIG_|TRAE_GIT_ATTRIBUTION_)/.test(key) && TRAE_GIT_ATTRIBUTION_PATH_RE.test(String(serverEnv[key])));
+  if (maybeTrae) {
+    for (const key of Object.keys(serverEnv)) {
+      if (!/^(?:GIT_CONFIG_|TRAE_GIT_ATTRIBUTION_)/.test(key)) continue;
+      const exact = exactValue(key);
+      if (exact !== undefined) serverEnv[key] = exact;
+    }
+  }
   const cleanedServerEnv = { ...serverEnv };
   const gitScrub = scrubTraeGitAttributionEnv(cleanedServerEnv, () => {});
   const gitChanges = new Map(gitScrub.changedKeys.map(key => [key, cleanedServerEnv[key]]));
@@ -449,6 +497,11 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
     for (const key of new Set([...Object.keys(serverEnv), ...Object.keys(cleanedServerEnv)])) {
       if (/^GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+)$/.test(key)
         || key.startsWith('TRAE_GIT_ATTRIBUTION_')) {
+        // Re-publishing an unchanged key is NOT a no-op: its value may have
+        // been read through the lossy renderer, so only COUNT (whose set-vs-
+        // unset structure must be republished) and genuinely changed keys are
+        // written.
+        if (key !== 'GIT_CONFIG_COUNT' && serverEnv[key] === cleanedServerEnv[key]) continue;
         gitChanges.set(key, cleanedServerEnv[key]);
       }
     }
