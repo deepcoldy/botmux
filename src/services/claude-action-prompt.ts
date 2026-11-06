@@ -17,17 +17,20 @@ const FOOTER_RE = /^Esc to cancel\b/;
 /** A narrow terminal wraps a long question ("Do you want to make this edit to
  * <long path>?") over several rows, so no single row matches QUESTION_RE and the
  * dialog never reaches Lark. Re-join up to 3 continuation rows, only when the
- * joined text ends in "?" and a choice row follows directly. */
+ * joined text ends in "?" and a choice row follows directly.
+ *
+ * Scan BOTTOM-UP, deliberately: the real question always sits BELOW the dialog
+ * body, and a diff's last line is rendered directly above it with no blank row,
+ * so "the row above is blank" cannot anchor the join. When the body itself
+ * contains a row starting "Do you want" (the │ prefix is stripped away), the
+ * real question is joined first; the body row then meets the "already a
+ * complete question" stop and can never anchor a join that pulls body text —
+ * including command text — into the projection. splice() only removes rows at
+ * or below the current index, so decrementing indices stay valid. */
 function joinWrappedQuestion(lines: string[]): string[] {
   const out = [...lines];
-  for (let i = 0; i < out.length; i++) {
+  for (let i = out.length - 1; i >= 0; i--) {
     if (!/^Do you want\b/.test(out[i]) || out[i].endsWith('?')) continue;
-    // The real question always sits below a blank row (a box rule strips to
-    // blank too). A head row directly beneath body text would join the dialog
-    // body — e.g. a command line that happens to start "Do you want" — into
-    // the projection, which must never leave the terminal. i === 0 has no row
-    // above to inspect (it can be the top of the 35-row window).
-    if (i > 0 && out[i - 1] !== '') continue;
     for (let j = i + 1; j <= i + 3 && j < out.length; j++) {
       // A blank row, a choice row, or a row that is already a complete
       // question ends the search: never swallow a valid question line.

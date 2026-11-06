@@ -59,6 +59,25 @@ const WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER = [
   '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
 ].join('\n');
 
+// Same regression with the real Edit layout: the diff's last line sits
+// DIRECTLY above the wrapped question with no blank row.
+const WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER = [
+  RULE,
+  ' Edit file',
+  ' │ -  const x;',
+  ' │ +  const x = 1;',
+  ' Do you want to make this edit to a-very-long-component-file-name-for-the-',
+  ' settings-panel-of-account.tsx?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel',
+  RULE,
+  '❯ ',
+  RULE,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n');
+
 const ASK_USER_QUESTION = [
   RULE,
   ' ☐ Deploy',
@@ -98,6 +117,11 @@ describe('promptCacheKeepaliveRefusal', () => {
   it('refuses a wrapped permission dialog even with the composer box still painted', () => {
     expect(READY.test(WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER)).toBe(true);
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER })).toBe('action_prompt_open');
+  });
+
+  it('refuses a wrapped dialog whose last diff row is directly above the question', () => {
+    expect(READY.test(WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER })).toBe('action_prompt_open');
   });
 
   it('refuses an AskUserQuestion picker (prompt not inside an input box)', () => {
