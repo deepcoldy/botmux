@@ -26,6 +26,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { modelPinText } from '../../core/model-pin.js';
 import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import type { SubstituteCardControl } from './substitute-card-control.js';
@@ -524,6 +525,7 @@ export function buildSessionCard(
   localCliReady = false,
   runtimeDisplayName?: string,
   sessionSandbox?: SandboxMode,
+  modelPin?: CardUsageSnapshot['modelPin'],
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -561,6 +563,9 @@ export function buildSessionCard(
   } else {
     actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
+  if (modelPin && !adoptMode) actions.push(callbackButton('解除话题固定', 'default', {
+    action: 'session_model_unpin', ...actionBase, expected_pin_set_at: modelPin.setAt,
+  }));
   const card = wideCard({
     header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
@@ -573,6 +578,7 @@ export function buildSessionCard(
             text_size: 'notation',
           }]
         : []),
+      ...(modelPin ? [{ tag: 'div', text: { tag: 'plain_text', content: modelPinText(modelPin) } }] : []),
       { tag: 'action', actions },
     ],
   });
@@ -877,9 +883,18 @@ export function buildRelayedFrozenCard(
 
 /**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
- * Cap markdown content byte size with headroom for card JSON overhead.
+ * Budget is measured in JSON-serialized (escaped: `"`, `\`, control chars)
+ * UTF-8 bytes with headroom for the surrounding card JSON overhead.
  */
 const MAX_CONTENT_BYTES = 100_000;
+
+/**
+ * Estimates the UTF-8 byte length of a string once serialized inside JSON (accounting for
+ * escaping of `"`, `\`, control characters, etc.).
+ */
+export function jsonEscapedByteLength(str: string): number {
+  return Buffer.byteLength(JSON.stringify(str), 'utf-8') - 2;
+}
 
 /**
  * Truncate content to fit within `maxBytes`, keeping the tail (most recent
@@ -888,7 +903,7 @@ const MAX_CONTENT_BYTES = 100_000;
  * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
  */
 export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
-  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
+  if (jsonEscapedByteLength(content) <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -896,7 +911,7 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
+    if (jsonEscapedByteLength(candidate) <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
@@ -912,11 +927,26 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
     for (let i = lines.length - 1; i >= 0; i--) {
       if (lines[i].trim() !== '') { last = lines[i]; break; }
     }
-    const buf = Buffer.from(last, 'utf-8');
-    let start = Math.min(buf.length, Math.max(0, buf.length - budget));
-    // Step forward past UTF-8 continuation bytes so we never cut a character.
-    while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++;
-    tail = buf.subarray(start).toString('utf-8');
+    let loChar = 0;
+    let hiChar = last.length;
+    while (loChar < hiChar) {
+      const midChar = Math.floor((loChar + hiChar) / 2);
+      const sub = last.slice(midChar);
+      if (jsonEscapedByteLength(sub) <= budget) {
+        hiChar = midChar;
+      } else {
+        loChar = midChar + 1;
+      }
+    }
+    // Defensive: a paired surrogate costs 4 escaped bytes but a lone low
+    // surrogate costs 6, so on well-formed input the minimum always lands on a
+    // pair lead. Only input that already contains an unpaired surrogate can
+    // leave the cut on a trailing low one; skip it so the tail never opens with
+    // a lone low surrogate.
+    if (loChar < last.length && last.charCodeAt(loChar) >= 0xdc00 && last.charCodeAt(loChar) <= 0xdfff) {
+      loChar++;
+    }
+    tail = last.slice(loChar);
   }
   return `${t('card.status.truncated_prefix', undefined, locale)}\n${tail}`;
 }
@@ -1351,6 +1381,13 @@ export function buildStreamingCard(
   // Model auto-fallback notice — pinned as small yellow text at the very bottom of
   // the session card (never a separate message) for as long as the session
   // keeps running on the fallback model.
+  const pinNotice = modelPinText(usage?.modelPin);
+  if (pinNotice) {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: pinNotice } });
+    if (!adoptMode) elements.push({ tag: 'action', actions: [callbackButton('解除话题固定', 'default', {
+      action: 'session_model_unpin', ...actionBase, expected_pin_set_at: usage!.modelPin!.setAt,
+    })] });
+  }
   const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
   if (modelFallbackNotice) {
     elements.push({
@@ -1426,7 +1463,11 @@ export function buildPrivateSnapshotCard(
   if (!imageKey) {
     const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
     if (text) {
-      const body = truncateContent(text, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
+      // Cap backtick runs first: the fence grows with the longest run and is
+      // emitted twice, so a huge run (e.g. 36k backticks) would push the card
+      // past Feishu's size limit even though the body fits its own budget.
+      const capped = text.replace(/`{9,}/g, '`'.repeat(8));
+      const body = truncateContent(capped, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
       // Fence must be longer than the longest backtick run in the body, else
       // terminal output containing ``` would break out of the code block.
       const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);

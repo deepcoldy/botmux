@@ -3,6 +3,9 @@
  *
  * Run:  pnpm vitest run test/bot-registry.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
@@ -1452,6 +1455,24 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinGateRequired', () => {
       { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: false },
     ]));
     expect(disabled.autoStartOnGroupJoinGateRequired).toBeUndefined();
+  });
+});
+
+describe('parseBotConfigsFromText — autoStartOnGroupJoinAnchor', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves only the non-default latest-message value', () => {
+    const parse = (value: unknown) => mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinAnchor: value },
+    ]))[0].autoStartOnGroupJoinAnchor;
+    expect(parse('latest-message')).toBe('latest-message');
+    expect(parse('reply-mode')).toBeUndefined();
+    expect(parse('latestMessage')).toBeUndefined();
+    expect(parse(true)).toBeUndefined();
   });
 });
 

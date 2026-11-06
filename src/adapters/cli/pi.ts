@@ -369,6 +369,7 @@ export function createPiAdapter(
         larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
+        cliId: 'pi',
       });
 
       // Inject the Botmux routing prompt into the process environment so that

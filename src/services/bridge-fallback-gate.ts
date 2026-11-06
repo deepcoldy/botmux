@@ -343,6 +343,13 @@ export interface BridgeGateInput {
    *  local-typing suppression — while the NOTHING_TO_SEND check above and the
    *  send-marker dedup below still apply exactly as for ordinary turns. */
   isScheduled?: boolean;
+  /** Claude bridge queue only (Codex callers never set it): a headless turn
+   *  opened by a live background-task `<task-notification>` launched inside a
+   *  Lark turn. Under replyDelivery 'transcript' the final is the session's
+   *  only reply channel, so it bypasses the local-typing suppression exactly
+   *  like {@link isScheduled}; under 'send' it stays an ordinary local turn
+   *  (the model `botmux send`s what matters itself). */
+  isBackgroundWake?: boolean;
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
@@ -670,7 +677,8 @@ export function shouldSuppressBridgeEmit(
   // Built-in scheduled turns are isLocal but user-scheduled: their final
   // belongs in the Lark thread. The marker rules below still dedup an explicit
   // `botmux send` and the NOTHING_TO_SEND check above already ran.
-  if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled) return true;
+  const forwardedWake = turn.isBackgroundWake === true && replyDelivery === 'transcript';
+  if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled && !forwardedWake) return true;
   if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
     && turn.terminalStatus !== 'completed') return true;
   // Headless backends (notably Remote Runner) do not always own a transcript
@@ -733,7 +741,7 @@ export function shouldSuppressBridgeEmit(
   // can run. Defer — the caller re-evaluates WITH finalText. An explicit
   // responseKind:'final' marker above already returned true, so a declared
   // final send still dedups even pre-text.
-  if (turn.isScheduled && turn.finalText === undefined) return false;
+  if ((turn.isScheduled || forwardedWake) && turn.finalText === undefined) return false;
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:

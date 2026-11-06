@@ -8,7 +8,14 @@
  */
 
 import { ensureBotChatGrantMatrix } from '../../cli/exact-chat-grant-client.js';
-import { loadDaemonIpcSecret } from '../../core/daemon-ipc-auth.js';
+import { fetchDaemonIpc, loadDaemonIpcSecret } from '../../core/daemon-ipc-auth.js';
+import {
+  WORKFLOW_OPERATOR_BUDGET_MS,
+  WORKFLOW_WORKING_DIR_OPERATOR_ROUTE,
+  withinOperatorBudget,
+  type WorkflowOperateAnswer,
+  type WorkflowWorkingDirOperatorRequest,
+} from '../../core/workflow-working-dir-operator.js';
 import { config } from '../../config.js';
 import { findOnlineDaemon } from '../../utils/daemon-discovery.js';
 import { readBotsInfoJson } from '../../services/bots-info-cache.js';
@@ -110,6 +117,61 @@ export function createLiveV3HandoffIdentityPolicy(bots: readonly BotConfig[]): V
       return policy?.enabled ? [...policy.tools] : [];
     },
   };
+}
+
+/**
+ * Gate-2's §15.4 operate check (approve-dag, a CLI process): each executing
+ * bot's own daemon answers whether the pending run's initiator may operate it
+ * ({@link WORKFLOW_WORKING_DIR_OPERATOR_ROUTE}). The question names only the
+ * run and one node that bot executes; the daemon reads the initiator, the
+ * chat and the node's bot from the run itself, gets the initiator's union_id
+ * from the main bot's daemon when it is another bot (the same source it uses
+ * when the node starts), and judges with its own configuration and grants.
+ * An offline daemon, an older one without the route, or any failure is
+ * `unknown`.
+ */
+export interface LiveV3WorkingDirOperatorDeps {
+  /** The bot's online daemon IPC port (default: the daemon registry). */
+  daemonPort?(larkAppId: string): number | undefined;
+  /** POST over trusted host IPC (default: {@link fetchDaemonIpc}). */
+  post?(port: number, path: string, body: WorkflowWorkingDirOperatorRequest): Promise<{ status: number; body: unknown }>;
+  dataDir?: string;
+}
+
+export function createLiveV3WorkingDirOperator(
+  run: { runId: string },
+  deps: LiveV3WorkingDirOperatorDeps = {},
+): (target: { nodeId: string; larkAppId: string }) => Promise<WorkflowOperateAnswer> {
+  const dataDir = deps.dataDir ?? config.session.dataDir;
+  const daemonPort = deps.daemonPort ?? ((appId: string) => findOnlineDaemon(appId, dataDir)?.ipcPort);
+  const post = deps.post ?? (async (port: number, path: string, body: WorkflowWorkingDirOperatorRequest) => {
+    const response = await fetchDaemonIpc(port, path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }, loadDaemonIpcSecret());
+    return { status: response.status, body: await response.json().catch(() => undefined) };
+  });
+  async function ask(target: { nodeId: string; larkAppId: string }): Promise<WorkflowOperateAnswer> {
+    const port = daemonPort(target.larkAppId);
+    if (!port) return { unknown: '它的 daemon 不在线' };
+    const response = await post(port, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, { runId: run.runId, nodeId: target.nodeId });
+    // An older daemon has no such route: its generic 404 carries no `ok`.
+    if (response.status === 404 && (response.body as { ok?: unknown } | undefined)?.ok === undefined) {
+      return { unknown: '它的 daemon 版本过旧，无法确认' };
+    }
+    if (response.status === 404) return { unknown: '它的 daemon 认为这个节点不归它执行' };
+    if (response.status !== 200) return { unknown: `它的 daemon 无法确认（HTTP ${response.status}）` };
+    const answer = (response.body as { operate?: unknown } | undefined)?.operate;
+    if (answer === 'yes' || answer === 'no') return answer;
+    if (answer && typeof answer === 'object' && typeof (answer as { unknown?: unknown }).unknown === 'string') {
+      return { unknown: (answer as { unknown: string }).unknown.slice(0, 200) };
+    }
+    return { unknown: '它的 daemon 回答无效' };
+  }
+  // The bot's own answer is bounded by the same budget on its side (plus a
+  // union lookup at the main bot); past twice that it counts as unknown.
+  return (target) => withinOperatorBudget(ask(target), 2 * WORKFLOW_OPERATOR_BUDGET_MS);
 }
 
 /**

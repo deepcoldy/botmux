@@ -458,6 +458,15 @@ import {
   getVcMeetingHubCloseState,
   listVcMeetingHubMembers,
 } from '../src/services/vc-meeting-delivery-hub-store.js';
+import { listVcMeetingRuntimeSessionsByListenerAndAgent } from '../src/services/vc-meeting-runtime-store.js';
+
+const QUARANTINED_RUNTIME_STORE_ERROR =
+  'vc meeting runtime session store has quarantined evidence for /data/vc-meeting-runtime-sessions.json';
+function failNextRuntimeStoreRead(): void {
+  vi.mocked(listVcMeetingRuntimeSessionsByListenerAndAgent).mockImplementationOnce(() => {
+    throw new Error(QUARANTINED_RUNTIME_STORE_ERROR);
+  });
+}
 
 const APP_ID = 'cli_vc_daemon_test';
 const OTHER_APP_ID = 'cli_vc_other_test';
@@ -8566,6 +8575,40 @@ describe('VC meeting daemon session lifecycle', () => {
       },
     });
     expect(triggerSessionCalls).toHaveLength(0);
+
+    // The same chat now owns a dedicated receiver session. If the meeting store
+    // becomes unreadable, the @mention must be answered visibly and blocked —
+    // neither thrown away (the old behaviour) nor silently treated as ordinary.
+    failNextRuntimeStoreRead();
+    const sentBefore = sentMessages.length;
+    const unavailable = await __vcMeetingAgentTest.routeConsumerBeforeTurnForTest(
+      AGENT_APP_ID,
+      'oc_listener_1',
+    );
+    expect(unavailable.result).toEqual({ block: true });
+    expect(unavailable.ctx.vcMeetingImTurnOrigin).toBeUndefined();
+    const notices = sentMessages.slice(sentBefore);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ receiveId: 'oc_listener_1', msgType: 'text' });
+    expect(triggerSessionCalls).toHaveLength(0);
+  });
+
+  it('handles an ordinary group @mention normally when the meeting runtime store is unreadable', async () => {
+    registerConsumerAgentBot();
+    failNextRuntimeStoreRead();
+    const sentBefore = sentMessages.length;
+
+    // Before the fix this rejected, and the dispatcher dropped the whole
+    // message with only "Error handling message event" in the err log.
+    const routed = await __vcMeetingAgentTest.routeConsumerBeforeTurnForTest(
+      AGENT_APP_ID,
+      'oc_plain_group_without_meeting',
+    );
+
+    expect(routed.result).toBeUndefined();
+    expect(routed.ctx.vcMeetingImTurnOrigin).toBeUndefined();
+    expect(sentMessages.slice(sentBefore)).toHaveLength(0);
+    expect(vi.mocked(listVcMeetingRuntimeSessionsByListenerAndAgent)).toHaveBeenCalled();
   });
 
   it('routes consumer catch-up to the listener daemon even when its bot config is shared locally', async () => {

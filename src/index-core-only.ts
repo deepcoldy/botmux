@@ -15,9 +15,11 @@ import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, mkdirSync } from 'node:fs';
+import { installDaemonFatalErrorGuard } from './utils/daemon-fatal-error.js';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 
+installDaemonFatalErrorGuard();
 installStdioEpipeGuard();
 
 const globalEnv = join(homedir(), '.botmux', '.env');

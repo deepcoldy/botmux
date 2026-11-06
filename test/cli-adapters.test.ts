@@ -38,6 +38,7 @@ import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/curs
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
+import { statuslineHookCommand } from '../src/adapters/hook-command.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
@@ -339,7 +340,7 @@ describe('claude-code buildArgs', () => {
     const parsed = JSON.parse(args[idx + 1]);
     expect(Object.keys(parsed)).toEqual(['statusLine']);
     expect(parsed.statusLine.type).toBe('command');
-    expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
+    expect(parsed.statusLine.command).toBe(statuslineHookCommand());
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 

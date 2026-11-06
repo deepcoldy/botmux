@@ -1,3 +1,5 @@
+import { modelPinText } from '../../core/model-pin.js';
+import { resolveSessionModelPinView } from '../../core/session-model.js';
 import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
@@ -19,6 +21,8 @@ import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
+import { writeSessionModelPin } from '../../core/worker-pool.js';
+import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
@@ -76,7 +80,7 @@ import {
   type CompletionProposalCardHandlerDeps,
 } from './completion-proposal-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
-import { frozenSessionSandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { sessionCardSandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { cleanupSessionWorktree } from '../../core/session-worktree-cleanup.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION, handleSessionWorktreeCleanupAction } from './session-worktree-cleanup-card.js';
@@ -128,6 +132,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../cor
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
+import { agentManagedNoteSuffix } from '../../services/agent-managed-config-note.js';
 import { SCHEDULE_IDENTITY_ACTION_PREFIX } from './schedule-identity-claim-card.js';
 import {
   isLocalCliOpenCapable,
@@ -1486,7 +1491,8 @@ async function deliverMenuTerminalLink(
         loc,
         isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         sessionRuntimeDisplayName(ds),
-        frozenSessionSandboxMode(ds.session.sandbox),
+        sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+        ds.session.modelPin ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined,
       );
       // viewToken is read-only and already present on the in-chat streaming
       // card, so this card needs no private delivery; ephemeral just keeps it
@@ -1508,7 +1514,8 @@ async function deliverMenuTerminalLink(
       loc,
       isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
       sessionRuntimeDisplayName(ds),
-      frozenSessionSandboxMode(ds.session.sandbox),
+      sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+      ds.session.modelPin ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined,
     );
     void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
     return 'write-sent';
@@ -2609,7 +2616,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return { toast: { type: failure.actionable ? 'warning' : 'error', content: failure.text } };
       }
       logger.info(`[config:${larkAppId}] text field ${spec.key} saved via card`);
-      return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` } };
+      const textNote = await agentManagedNoteSuffix(larkAppId, spec.key, loc);
+      return { toast: { type: textNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText}${textNote}` } };
     }
 
     // 消息额度使用独立私信子卡自由输入，与 Dashboard 的 1–1000 语义一致。
@@ -2713,14 +2721,16 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const refreshKey = defaultModelSelectionKey(larkAppId);
       const { models: choices, load } = await defaultModelPickerData(larkAppId);
       const current = getBot(larkAppId);
+      const pickerNote = await agentManagedNoteSuffix(larkAppId, spec.key, loc);
       if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
         || !current.resolvedAllowedUsers.includes(operatorOpenId)) {
-        return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText} · ${t('card.models.changed', undefined, loc)}` } };
+        return { toast: { type: pickerNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText} · ${t('card.models.changed', undefined, loc)}${pickerNote}` } };
       }
-      return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` },
+      return { toast: { type: pickerNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText}${pickerNote}` },
         card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }, load)) } };
     }
-    return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...(await reRender()) };
+    const fieldNote = await agentManagedNoteSuffix(larkAppId, spec.key, loc);
+    return { toast: { type: fieldNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText}${fieldNote}` }, ...(await reRender()) };
   }
 
   // ─── /relay picker: confirm transfer (stage 2 → done) ──────────────────
@@ -3594,7 +3604,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           || value.expected_model !== control.model
           || value.expected_effort !== (ds.session.topicReasoningEffort?.effort ?? '')
           || value.expected_effort_model !== (ds.session.topicReasoningEffort?.model ?? '')) return 'stale' as const;
-        if (actionType === 'session_effort_pick') return setTopicReasoningEffort(ds, action?.option);
+        if (actionType === 'session_effort_pick') return setTopicReasoningEffort(ds, action?.option, { source: 'card', setBy: operatorOpenId });
         const selected = ds.session.topicReasoningEffort;
         if (!selected || value.effort !== selected.effort || !control.choices.includes(selected.effort)) return 'invalid' as const;
         if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds)) return 'busy' as const;
@@ -3643,7 +3653,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // A live Codex uses the same native, receipt-confirmed menu as /effort.
         const worker = ds.worker;
         if (!worker || worker.killed || (ds.initConfig ?? ds.session).wrapperCli) {
-          return setSessionReasoningEffort(ds, effort);
+          return setSessionReasoningEffort(ds, effort, { source: 'card', setBy: operatorOpenId });
         }
         const generation = ds.workerGeneration;
         const sessionGeneration = ds.session.workerGeneration;
@@ -3663,7 +3673,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         };
         // Native menu navigation may take seconds. Acknowledge the card callback
         // and release the bot mutation gate before waiting for the CLI receipt.
-        void updateCodexCliEffort(ds, effort).then(notify).catch(error => {
+        void updateCodexCliEffort(ds, effort, undefined, () => stillCurrent() && canOperate(ds.larkAppId, ds.chatId, operatorOpenId), { source: 'card', setBy: operatorOpenId }).then(notify).catch(error => {
           logger.warn(`[${tag(ds)}] Card effort update failed: ${String(error)}`);
         });
         return 'updating' as const;
@@ -4593,7 +4603,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
-          frozenSessionSandboxMode(ds.session.sandbox),
+          sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+          ds.session.modelPin ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined,
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -5170,6 +5181,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // Model pick from the reply-card menu. Passthrough `/model <slug>` into the
     // live session, gated like compact_session plus an idle boundary and a
     // strict slug whitelist (PTY injection must never carry free text).
+    if (actionType === 'session_model_unpin') {
+      if (!ds || !operatorOpenId || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) return { toast: { type: 'warning', content: '没有操作权限或会话已失效' } };
+      if (value.expected_pin_set_at !== ds.session.modelPin?.setAt) return { toast: { type: 'warning', content: '话题固定已变更，请刷新卡片后重试。' } };
+      try { if (writeSessionModelPin(ds, undefined) === false) return { toast: { type: 'info', content: '本话题未固定，无需解除。' } }; }
+      catch (error) { return { toast: { type: 'warning', content: String(error instanceof Error ? error.message : error) } }; }
+      return { toast: { type: 'success', content: '已解除话题固定，下次启动 CLI 生效；可空闲后 /restart。' } };
+    }
     if (actionType === 'reply_model_pick' || actionType === 'session_model_pick') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
@@ -5228,9 +5246,19 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         || cliHasNoRawPassthroughSurface(cliId, { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
         return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
       }
+      const pinError = validateModelPin({ model: slug }, { cliId, backendType: ds.session.backendType });
+      if (pinError || ds.adoptedFrom || isRemoteBackendSession(ds) || isSessionRestartInFlight(ds)) {
+        return { toast: { type: 'warning', content: pinError ?? '当前会话不能安全重启以应用话题固定' } };
+      }
+      try {
+        writeSessionModelPin(ds, { model: slug, source: 'card', setBy: operatorOpenId, setAt: new Date().toISOString() });
+      } catch (error) { return { toast: { type: 'warning', content: String(error instanceof Error ? error.message : error) } }; }
+      const view = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+      if (view?.shadowedBy) return { toast: { type: 'warning', content: modelPinText(view) + '；本次未透传或重启 CLI。' } };
+      const selectedEffort = ds.session.modelPin?.effort;
       let delivered = false;
       try {
-        const accepted = deps.deliverPassthroughCommand(ds, `/model ${slug}`, {
+        const accepted = deps.deliverPassthroughCommand(ds, `/model ${slug}${selectedEffort && cliId === 'codex' ? ` --reasoning=${selectedEffort}` : ''}`, {
           anchor: sessionAnchorId(ds),
           senderOpenId: operatorOpenId,
           senderIsBot: false,
@@ -5246,11 +5274,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       } catch (err) {
         logger.warn(`[${tag(ds)}] model command delivery failed: ${String(err)}`);
       }
-      if (!delivered) {
-        return { toast: { type: 'warning', content: t('card.reply_actions.model_failed', undefined, loc) } };
+      const restart = requestSessionRestart(ds, { source: 'card', notify: async status => {
+        if (status === 'failed' || status === 'timed_out') await deps.sessionReply(sessionAnchorId(ds), '话题固定已保存，但 CLI 重启未完成；请空闲后 /restart。', 'text', ds.larkAppId);
+      } });
+      if (!restart || restart.startFailure) {
+        return { toast: { type: 'warning', content: '已固定到本话题；CLI 应用失败，请空闲后 /restart。' } };
       }
+      if (!delivered) return { toast: { type: 'warning', content: '已固定到本话题；透传未入队，正在通过 CLI 重启应用。' } };
       logger.info(`[${tag(ds)}] reply-card menu: /model ${slug} passthrough sent`);
-      return { toast: { type: 'success', content: t('card.reply_actions.model_sent', { model: slug }, loc) } };
+      return { toast: { type: 'success', content: `已固定到本话题：${slug}${selectedEffort ? ` · ${selectedEffort}` : '（未固定推理强度）'}，正在重启 CLI 应用` } };
     }
 
     if (actionType === 'reply_menu_cancel') return {};
