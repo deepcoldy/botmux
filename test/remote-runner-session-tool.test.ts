@@ -69,10 +69,11 @@ describe('remote runner session tool host bridge', () => {
     expect(remoteRunnerSessionToolArgs({
       tool: 'schedule.update',
       taskId: 'deadbeef',
+      schedule: 'every 4h',
       prompt: '新提示',
       calendar: null,
     }, 'session-1', 'oc_current')).toEqual([
-      'schedule', 'update', 'deadbeef', '--prompt=新提示', '--calendar=none',
+      'schedule', 'update', 'deadbeef', '--schedule=every 4h', '--prompt=新提示', '--calendar=none',
       '--remote-runner-session-tool',
     ]);
     expect(remoteRunnerSessionToolArgs({
