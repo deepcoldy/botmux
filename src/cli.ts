@@ -11725,6 +11725,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // local parsing/card preparation cannot carry an old capability across a
   // worker restart, turn rotation, or Codex ledger settlement.
   let checkSendTopics: ((lookup?: TopicMessageLookup) => Promise<void>) | undefined;
+  let arbitraryMentionRequired = false;
   const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
@@ -11737,8 +11738,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     if (fresh.sessionId !== isolatedManagedOriginCtx.sessionId
       || fresh.turnId !== isolatedManagedOriginCtx.turnId
       || fresh.dispatchAttempt !== isolatedManagedOriginCtx.dispatchAttempt
+      || fresh.larkAppId !== isolatedManagedOriginCtx.larkAppId
       || fresh.requiresCodexAppLedger !== isolatedManagedOriginCtx.requiresCodexAppLedger) {
       throw new Error('managed origin changed before provider effect');
+    }
+    if (arbitraryMentionRequired && fresh.allowArbitraryMention !== true) {
+      throw new Error('allowArbitraryMention permission revoked before provider effect');
     }
     const currentOriginResolved = await resolveSessionById(fresh.sessionId, { dataDir: resolveDataDir() });
     const currentOriginSession = currentOriginResolved.ok
@@ -12820,7 +12825,14 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   //     can only @ people who are actually in that group.
   {
     const mentionChatId = overrideChatId ?? s.chatId;
+    arbitraryMentionRequired = rawMentions.some(mention => !mention.identifier.startsWith('ou_'));
     const arbitraryAllowed = (() => {
+      // Only the nonce-bound host proof carries policy into read isolation.
+      // Own credential files and child-selected env are not policy authority.
+      if (isolatedManagedOriginCtx) {
+        return isolatedManagedOriginCtx.larkAppId === s.larkAppId
+          && isolatedManagedOriginCtx.allowArbitraryMention === true;
+      }
       try { return getBot(s.larkAppId).config.allowArbitraryMention === true; }
       catch { return false; }
     })();

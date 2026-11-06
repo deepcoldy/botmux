@@ -1649,6 +1649,28 @@ describe('POST /api/session-origin/attest', () => {
     } finally { fixture.cleanup(); }
   });
 
+  it('attests only the owning bot mention permission and reflects same-turn revocation', async () => {
+    const fixture = installManagedOriginFixture();
+    try {
+      registerBot({ larkAppId: 'app-managed-origin', larkAppSecret: 'test-secret', allowArbitraryMention: true });
+      const bot = getBot('app-managed-origin');
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      for (const allowed of [true, false, undefined]) {
+        bot.config.allowArbitraryMention = allowed;
+        const nonce = randomBytes(32).toString('hex');
+        const response = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId, channelId: CHANNEL, originCapability: CAPABILITY, nonce,
+          allowArbitraryMention: true, larkAppId: 'cli_other',
+        });
+        expect(response.status).toBe(200);
+        const proof = JSON.parse(readFileSync(fixture.proofPath(nonce), 'utf8'));
+        expect(proof.allowArbitraryMention).toBe(allowed === true);
+        expect(proof.larkAppId).toBe('app-managed-origin');
+      }
+    } finally { fixture.cleanup(); }
+  });
+
   it('separates same-app open-id operation from union-id creator ownership', async () => {
     const fixture = installManagedOriginFixture();
     try {
