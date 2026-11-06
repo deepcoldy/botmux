@@ -201,8 +201,11 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
   /** 巡查投递中 / 在跑期间，该话题最近一次出现真人消息的时间（chatId\0threadRoot → 本机观察时刻）。
    *  只要巡查期间话题里来过真人，这个会话就当作正常对话会话保留，不自动关。 */
   const humanSeenInPatrol = new Map<string, number>();
-  const isPatrolling = (chatId: string, root: string): boolean => patrolInflight.has(patrolKey(chatId, root))
-    || [...patrols.values()].some(r => r.chatId === chatId && r.threadRoot === root);
+  const isPatrolling = (chatId: string, root: string): boolean => {
+    if (patrolInflight.has(patrolKey(chatId, root))) return true;
+    for (const p of patrols.values()) if (p.chatId === chatId && p.threadRoot === root) return true;
+    return false;
+  };
   /** 本拍 takeDigests 里已经放行的巡查数（投递是并行的，放行时就要占名额）。 */
   let reservedPatrols = 0;
   const patrolBusy = (chatId: string, root: string): boolean => {
@@ -603,6 +606,8 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         // 开启之前的消息（重放 / 补拉）不进秘书视野。
         const entry = getGroupSecretaryChat(deps.larkAppId, chatId);
         if (entry && message.createTime < entry.enabledAt) return;
+        // 「真人」是近似：listenerSenderType 把非 app/bot 的发送方都当 user，带 root_id 的系统通知
+        // 也会被算进来。误判只会让会话多保留一轮（交给空闲挂起），不会误关有人的会话。
         if (message.senderType === 'user' && message.rootId && isPatrolling(chatId, message.rootId)) {
           humanSeenInPatrol.set(patrolKey(chatId, message.rootId), now());
         }

@@ -393,6 +393,35 @@ describe('runtime split mode (patrol)', () => {
     h.rt.stop();
   });
 
+  it('keeps the patrol session when a human spoke while the patrol delivery was still pending', async () => {
+    const h = splitRuntime();
+    let release!: (v: { sessionId: string; created: boolean }) => void;
+    h.deliverPatrol.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    h.set([{ id: 's1', app: 'cli_alex', root: ROOT_A, turn: 'working' }]);
+    await h.rt.tick();
+    h.set([{ id: 's1', app: 'cli_alex', root: ROOT_A, turn: 'idle' }]);
+    // 推进到巡查投递发出；投递挂起时 tick 也挂着，所以每拍只等一小会儿
+    const pendingTicks: Promise<void>[] = [];
+    for (let i = 0; i < 4 && h.deliverPatrol.mock.calls.length === 0; i++) {
+      clock += 10_000;
+      const t = h.rt.tick();
+      pendingTicks.push(t);
+      await Promise.race([t, new Promise(r => setTimeout(r, 20))]);
+    }
+    expect(h.deliverPatrol).toHaveBeenCalledTimes(1);
+    // 投递还没返回（patrols 里尚未登记），真人此时在话题里说话
+    h.rt.observeMessageEvent(topicEvent('om_human_inflight', ROOT_A));
+    const sid = 'patrol-inflight';
+    release({ sessionId: sid, created: true });
+    await Promise.all(pendingTicks);
+    h.set([{ id: sid, app: SELF, root: ROOT_A, turn: 'working', lastMessageAt: clock }]);
+    await step(h.rt);
+    h.set([{ id: sid, app: SELF, root: ROOT_A, turn: 'idle', lastMessageAt: clock - 10_000 }]);
+    await step(h.rt);
+    expect(h.closePatrolSession).not.toHaveBeenCalled();
+    h.rt.stop();
+  });
+
   it('still closes the patrol session when only bots, or humans in another topic, spoke during the patrol', async () => {
     const h = splitRuntime();
     const sid = await startPatrol(h);
