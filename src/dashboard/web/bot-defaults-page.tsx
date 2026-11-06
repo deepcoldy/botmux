@@ -71,6 +71,7 @@ import {
   WorkingDirMock,
   type ModeOption,
 } from './mode-diagrams.js';
+import { BotModelPinSummary } from './model-pin.js';
 import { store } from './store.js';
 import { toast } from './toast.js';
 import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
@@ -3332,6 +3333,7 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
+      <BotModelPinSummary appId={bot.larkAppId} model={bot.model} />
       {selectedCliId === 'traex' && !bot.wrapperCli && !option?.cliLaunchMode ? (
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}

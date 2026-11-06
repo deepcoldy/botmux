@@ -1,3 +1,4 @@
+import { resolveSessionModelPinView } from './session-model.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
@@ -135,6 +136,8 @@ import { agentManagedNoteSuffix } from '../services/agent-managed-config-note.js
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
+import { modelPinText } from './model-pin.js';
+import { writeSessionModelPin, sessionAcceptsDirectCommand } from './worker-pool.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -1899,6 +1902,44 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/modelpin': {
+        if (!ds) { await replyNoSession(replyHere, loc); break; }
+        if (!message.senderId || !canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc)); break;
+        }
+        const args = message.content.trim().split(/\s+/).slice(1);
+        if (!args.length) {
+          await sessionReply(rootId, modelPinText(resolveSessionModelPinView(ds, getBot(ds.larkAppId).config)) ?? '未固定，跟随既有模型解析规则'); break;
+        }
+        if ((args[0] === '--follow-bot' && args.length !== 1) || args.length > 2) {
+          await sessionReply(rootId, '/modelpin <model> [effort] | /modelpin --follow-bot'); break;
+        }
+        // Do not interrupt a business turn just to change its next launch.
+        try {
+          const beforeView = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+          const changed = writeSessionModelPin(ds, args[0] === '--follow-bot' ? undefined : {
+            model: args[0]!, ...(args[1] ? { effort: args[1] as import('../services/codex-reasoning-effort.js').CodexReasoningEffort } : {}),
+            source: 'command', setBy: message.senderId, setAt: new Date().toISOString(),
+          });
+          if (changed === false) { await sessionReply(rootId, '本话题未固定，无需解除。'); break; }
+          const view = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+          if (!ds.session.modelPin && beforeView?.shadowedBy) {
+            await sessionReply(rootId, `已解除话题固定；当前启动仍优先使用 ${beforeView.shadowedBy}：${beforeView.launchModel ?? ''}，本次无需重启 CLI。`); break;
+          }
+          if (view?.shadowedBy || view?.inactiveReason) {
+            await sessionReply(rootId, modelPinText(view) + '；设置已保存，本次不为它重启 CLI。'); break;
+          }
+          const applyNow = ds.worker && !ds.worker.killed && sessionAcceptsDirectCommand(ds)
+            && !ds.adoptedFrom && !isRemoteBackendSession(ds);
+          const restart = applyNow ? requestSessionRestart(ds, { source: 'slash', notify: async status => {
+            if (status === 'failed' || status === 'timed_out') await sessionReply(rootId, '话题模型设置已保存，但 CLI 重启未完成；请空闲后 /restart。');
+          } }) : undefined;
+          await sessionReply(rootId, (ds.session.modelPin ? `已保存话题固定：${ds.session.modelPin.model}${ds.session.modelPin.effort ? ` · ${ds.session.modelPin.effort}` : '（未固定推理强度，沿用会话/CLI 默认）'}` : '已解除话题固定，恢复既有模型解析规则')
+            + (restart && !restart.startFailure ? '，正在重启 CLI 应用。' : '，下次启动 CLI 生效；可空闲后 /restart。'));
+        } catch (error) { await sessionReply(rootId, String(error instanceof Error ? error.message : error)); }
+        break;
+      }
+
       case '/models': {
         const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
         if (atTopLevel && larkAppId) {
@@ -1999,7 +2040,7 @@ export async function handleCommand(
         }
         const result: import('../types.js').CodexAppEffortResult = confirmation
           ? { status: 'future_only', reason: cliId === 'codex' ? 'cli_next_turn' : undefined }
-          : await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort);
+          : await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort, undefined, () => current() && canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId), { source: 'command', setBy: message.senderId });
         const saved = result.status === 'applied' || result.status === 'future_only';
         if (replay && saved && current()) {
           try {
@@ -4169,6 +4210,7 @@ export async function handleCommand(
           }));
           const lines = [
             `Session: ${ds.session.sessionId}`,
+            ...[modelPinText(resolveSessionModelPinView(ds, botCfg))].filter((s): s is string => !!s),
             ...(ds.session.cliInstanceBinding ? [`Codex instance: ${ds.session.cliInstanceBinding.instanceId ?? 'legacy'} (${ds.session.cliInstanceBinding.source}; ${ds.session.creationSource ?? 'legacy'})`] : []),
             `Status: ${alive ? t('cmd.status.running', undefined, loc) : t('cmd.status.waiting', undefined, loc)}`,
             `Terminal: ${termUrl}`,
@@ -6895,6 +6937,7 @@ export async function handleCommand(
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.models', undefined, loc),
+          t('help.modelpin', undefined, loc),
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
           t('help.idlecompact', undefined, loc),

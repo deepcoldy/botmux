@@ -1,3 +1,4 @@
+import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
@@ -565,7 +566,7 @@ import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
-import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
+import { applyTopicModelSpec, resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompactRuntime } from './core/auto-compact.js';
@@ -7617,10 +7618,9 @@ async function adoptCodexNotifierEvent(
     ds.session.cliPathOverride = botCfg.cliPathOverride;
     delete ds.session.wrapperCli;
     delete ds.session.cliLaunchMode;
-    delete ds.session.model;
-    ds.spawnModelOverride = undefined;
+    clearTakeoverModelSources(ds);
     ds.session.agentFrozen = true;
-    sessionStore.updateSession(ds.session);
+    sessionStore.updateSession(ds.session, { modelPinWrite: true });
 
     // 默认 flat DM(p2pMode=chat)下这条按钮回调复用同一私聊的现有会话。若该会话
     // 恰好停在「待选仓库」挂起态且已缓冲一条尚未提交的输入，接管会消费掉
@@ -24059,6 +24059,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;
+  if (source.modelPin) child.modelPin = structuredClone(source.modelPin);
   child.cliLaunchSnapshot = source.cliLaunchSnapshot
     ? {
         ...source.cliLaunchSnapshot,
@@ -24271,7 +24272,7 @@ async function prepareIndependentCrossPrincipalSession(
     if (isolatedWorktree) {
       child = sessionStore.createSession(sourceDs.chatId, rootMessageId, title, sourceDs.chatType, 'thread');
       initializeChild(child);
-      sessionStore.updateSession(child);
+      sessionStore.updateSession(child, { modelPinWrite: true });
     } else {
       const activeTurn = sourceDs.activeInteractiveTurn;
       const sourceGeneration = sourceDs.workerGeneration ?? sourceDs.session.workerGeneration;
@@ -26216,8 +26217,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   //
   // 指令头（`[标题] /t /repo … /model … 正文`）走的是同一个入口：解析前先剥掉对本 bot
   // 的**所有** @（路由判定按 mentions 数组、与 @ 在文本里的位置无关，见设计 D8），
-  // 解析出的规格在建会话时逐项落到 workingDir / title / spawnModelOverride /
-  // reasoningEffort。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
+  // 解析出的规格在建会话时逐项落到 workingDir / title / modelPin /
+  // reasoningEffort（仅 effort 的既有路径）。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
   // 于是拒绝路径不开新话题、不发选仓卡、不留会话记录（fail closed，D5）。
   const selfBotForHeader = getBot(larkAppId);
   const strippedTopicHeader = stripBotMentions(
@@ -26666,10 +26667,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // ——于是首次 spawn 就带上原生会话名，不必等一次 requestAgentSessionRename
   //（那条路在 worker 还没起时只会返回 not_running）。
   if (topicSpec?.title) updateSessionTitle(session, topicSpec.title, 'user');
-  // 推理强度与 trigger API 同款：持久化在会话上。sessionAgentConfig 首次冻结时用
-  // `ds.session.reasoningEffort ?? botCfg.reasoningEffort`，所以这里写的值会保留。
-  if (topicSpec?.reasoningEffort) session.reasoningEffort = topicSpec.reasoningEffort;
-  sessionStore.updateSession(session);
+  // Explicit header intent is durable; effort-only headers keep their old field.
+  applyTopicModelSpec(session, topicSpec, parsed.senderId, new Date(now).toISOString());
+  sessionStore.updateSession(session, { modelPinWrite: true });
 
   // Control card compensates for the card-less (avatar-style) chat-scope
   // substitute session. Topic-group substitute sessions (#475) are thread-scope
@@ -26737,9 +26737,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     ownerOpenId: ownerOpenIdForSession,
     currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
-    // 本次 spawn 的模型：内存态、不持久化，与 trigger API / 定时任务同一个字段，
-    // resolveSessionLaunchModel 把它排在最高优先级。
-    ...(topicSpec?.model ? { spawnModelOverride: topicSpec.model } : {}),
   };
   if (persistedWorkingDir) {
     ds.session.workingDir = persistedWorkingDir;

@@ -249,6 +249,8 @@ export interface DaemonSession {
    *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
    *  re-fork of the same session launches identically. */
   spawnModelOverride?: string;
+  /** Formerly pinned workers must also clear their effort launch snapshot. */
+  modelPinCleared?: boolean;
   /** True while this session's worker sits in the crash-loop park state: its CLI
    *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
    *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with

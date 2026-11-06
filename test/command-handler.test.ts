@@ -10842,7 +10842,7 @@ describe('Codex App /effort command', () => {
     Object.assign(deps, { submitEffortTask: submit });
     const message = makeLarkMessage(content);
     await handleCommand('/effort', ROOT_ID, message, deps, LARK_APP_ID);
-    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(submit).toHaveBeenCalledWith(ds, message, '检查输入投递', undefined);
     expect(vi.mocked(updateCodexCliEffort).mock.invocationCallOrder.at(-1))
       .toBeLessThan(submit.mock.invocationCallOrder[0]);
@@ -10855,7 +10855,7 @@ describe('Codex App /effort command', () => {
     Object.assign(deps, { submitEffortTask: submit });
     vi.mocked(updateCodexCliEffort).mockResolvedValueOnce({ status: 'unavailable', reason: 'cli_menu_unavailable' });
     await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort ultra 检查输入投递'), deps, LARK_APP_ID);
-    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(submit).not.toHaveBeenCalled();
   });
 
@@ -10910,7 +10910,7 @@ describe('Codex App /effort command', () => {
     const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }), lastScreenStatus: 'working' });
     const deps = makeDeps(ds);
     await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort max'), deps, LARK_APP_ID);
-    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'max');
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'max', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(updateCodexAppEffort).not.toHaveBeenCalled();
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
       t('cmd.effort.cli_next_turn', { effort: 'max', choices: '' }), undefined, LARK_APP_ID, 'msg_001');
@@ -10930,7 +10930,7 @@ describe('Codex App /effort command', () => {
     const deps = makeDeps(ds);
     vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status, choices: ['low', 'high'] });
     await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort HIGH'), deps, LARK_APP_ID);
-    expect(updateCodexAppEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(updateCodexAppEffort).toHaveBeenCalledWith(ds, 'high', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
       t(`cmd.effort.${status}`, { effort: 'high', choices: 'low, high' }), undefined, LARK_APP_ID, 'msg_001');
     expect(sendWorkerSessionInput).not.toHaveBeenCalled();

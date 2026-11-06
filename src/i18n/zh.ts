@@ -1096,6 +1096,7 @@ export const messages: Record<string, string> = {
   'help.rename': '/rename <标题> - 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名',
   'help.tabs': '/tabs - 查看与管理当前飞书群的标签页',
   'help.status': '/status     - 查看当前会话状态（含终端链接）',
+  'help.modelpin': '/modelpin <model> [effort] | --follow-bot — 固定话题模型 / 解除固定（下次启动生效）',
   'help.models': '/models     - 顶层选择默认模型和思考强度；话题内选择当前会话模型',
   'help.retry': '/retry      - 重试最近一个失败或被中断的 turn（10s 冷却）',
   'help.rewind': '/rewind [n|n confirm] - 回退会话上下文：不带参数列出最近检查点，`n` 预览、`n confirm` 回退到第 n 轮之前（仅 Claude Code，执行前自动备份 transcript）',

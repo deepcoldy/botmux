@@ -6491,6 +6491,16 @@ const server = createServer(async (req, res) => {
     }
 
     let m: RegExpMatchArray | null;
+    const pinSessionRoute = url.pathname.match(/^\/api\/sessions\/([^/]+)\/model-pin$/);
+    const pinBotRoute = url.pathname.match(/^\/api\/bots\/([^/]+)\/model-pins$/);
+    if ((pinSessionRoute && req.method === 'DELETE') || (pinBotRoute && ['GET', 'DELETE'].includes(req.method ?? ''))) {
+      if (!authed) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+      if (req.method !== 'GET' && !sessionWriteOriginAllowed(req, '/api/sessions/model-pins')) return jsonRes(res, 403, { ok: false, error: 'invalid_origin' });
+      const owner = pinBotRoute ? decodeURIComponent(pinBotRoute[1]) : aggregator.ownerOf(decodeURIComponent(pinSessionRoute![1]));
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, url.pathname, { method: req.method, signal: AbortSignal.timeout(15_000) });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
       // P1-11：locate 与接管/解锁同属工作台三项操作能力，同样是无 body POST。

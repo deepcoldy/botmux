@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
@@ -32408,6 +32409,7 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
       // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
       // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
+      applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
       // startupCommands / launchShell 同理，但只在**真的 parked**（下面那条恢复重启
       // 即将执行）时才收：daemon 的 crashDiagnosticParked 在 worker 内恢复后不会清
       // （只有 refork 的 ready 才清），之后每条消息都还捎带；而 runStartupCommands
@@ -32872,6 +32874,7 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
       // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
+      applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
       // 合并顺序约束：以下热更字段都放在合并守卫之前——被合并的重复 restart 也应
       // 带走更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
       //  - workingDir：角色切换 cwd-move respawn 先收敛目录（旧桶 transcript 由
