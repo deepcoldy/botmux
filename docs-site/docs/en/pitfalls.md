@@ -51,6 +51,17 @@ When you wrap the CLI in your own script (for example to go through an internal 
   - For supported CLIs (Claude Code, Codex, CoCo and others), turn on `replyDelivery: "transcript"`: botmux takes the last answer of the turn straight from the CLI's transcript and posts it to Lark, so it no longer depends on the model calling `botmux send`. See `replyDelivery` in [bots.json Configuration](/en/bots-json).
 - **`botmux send --images` with 6 or more images may fail silently**: → Send at most 4 at a time, in batches.
 
+### A message got no response: read the diagnosis card {#submit-failure-diagnosis}
+
+Automatic, nothing to configure. When a message handed to the CLI can't be confirmed for a while, botmux first looks at what the terminal is showing, then posts a card that names the cause (the error code is still `submit_unconfirmed`) instead of a generic "submit could not be confirmed":
+
+| What the card says | What to do |
+|---|---|
+| The CLI is stuck on a login / auth screen | Open the web terminal, finish the CLI's own login, then resend. CLI login and Lark authorization are separate |
+| The CLI is waiting on a keyboard choice (update, data migration, hooks review, a confirm box, …) | Open the web terminal and pick an option, or press Esc to dismiss it, then resend. botmux never chooses for you |
+| The text was pasted but is sitting in the input box, not submitted | Open the web terminal and press Enter; resend from Lark only if it really shouldn't run |
+| No clear cause | The card reminds you that a failed confirmation doesn't mean it didn't run; check the web terminal first and resend only if it really didn't |
+
 ## Processes / connections
 
 - **One Lark bot connected by two programs at once**: whichever grabs the long connection first wins, so botmux works on and off. → Give each bot to one program only.

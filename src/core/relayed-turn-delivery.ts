@@ -1,6 +1,8 @@
 import type { DaemonSession } from './types.js';
 import type { FeedbackWebhookDestination } from '../services/feedback-outbox.js';
 import type { CompatibleFeedbackStore } from '../services/feedback-storage-types.js';
+import type { FeedbackPolicy } from '../services/feedback-policy.js';
+import { buildFeedbackElement } from '../im/lark/skill-feedback-card.js';
 
 /**
  * Daemon-side half of `botmux send --response-kind final` for a CLI that
@@ -23,8 +25,8 @@ import type { CompatibleFeedbackStore } from '../services/feedback-storage-types
  * moved on to a queued turn, so a mismatch must not be indexed under it. The worst a
  * session can do is mis-index its own current turn, which a non-isolated CLI
  * can already do by writing the store directly. No feedback policy or base
- * card is accepted: an isolated CLI cannot read bot config, so its card never
- * carries a feedback control.
+ * card is accepted from the body. An opt-in separate surface may use a
+ * host-materialized policy while the original card remains without controls.
  */
 export const RELAYED_TURN_DELIVERY_ROUTE = 'turn-delivery';
 /** Larger than any Lark message body; the store keeps only a content hash. */
@@ -42,6 +44,7 @@ export async function recordRelayedTurnDelivery(input: {
   store: Pick<CompatibleFeedbackStore, 'findDeliveryByPlatformMessage' | 'recordTurnDelivery'>;
   webhookDestinations?: FeedbackWebhookDestination[];
   teamId?: string;
+  feedback?: { policy: FeedbackPolicy; requesterSubjectId?: string };
 }): Promise<RelayedTurnDeliveryResult> {
   const { ds, body, store } = input;
   if (!ds || ds.session.status === 'closed') return { ok: false, status: 404, error: 'session_not_active' };
@@ -85,6 +88,11 @@ export async function recordRelayedTurnDelivery(input: {
     cardMode: 'card',
     status: 'delivered',
     webhookDestinations: input.webhookDestinations,
+    ...(input.feedback ? {
+      policy: input.feedback.policy,
+      requesterSubjectId: input.feedback.requesterSubjectId,
+      baseCard: { schema: '2.0', body: { elements: [buildFeedbackElement(input.feedback.policy)] } },
+    } : {}),
     context: input.teamId ? { teamId: input.teamId } : {},
   });
   return { ok: true, deliveryId: delivery.deliveryId, duplicate: false };

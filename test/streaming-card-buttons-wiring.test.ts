@@ -36,6 +36,22 @@ describe('streaming-card button policy wiring', () => {
       expect(sites.length).toBeGreaterThan(0);
       const missing = sites.filter(s => !s.includes('resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config)'));
       expect(missing).toEqual([]);
+      // The per-chat substitute control must travel with every re-render too;
+      // otherwise a later screen update silently drops the toggle button.
+      const missingSubstitute = sites.filter(s => !s.includes('substituteCardControlFor(ds)'));
+      expect(missingSubstitute).toEqual([]);
     });
   }
+
+  it('the /card summon path (postFreshStreamingCard) forwards the substitute control', () => {
+    const workerPool = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+    const start = workerPool.indexOf('export async function postFreshStreamingCard');
+    expect(start).toBeGreaterThan(-1);
+    const next = workerPool.indexOf('\nexport ', start + 1);
+    const fn = workerPool.slice(start, next === -1 ? undefined : next);
+    expect(fn).toContain('substituteCardControlFor(ds)');
+
+    const commandHandler = readFileSync(resolve('src/core/command-handler.ts'), 'utf8');
+    expect(commandHandler).toContain('postFreshStreamingCard(ds, deps.sessionReply)');
+  });
 });

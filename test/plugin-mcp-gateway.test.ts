@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -34,6 +34,7 @@ import {
 } from '../src/core/plugins/mcp/environment.js';
 import { mcpGatewayAuthTokenPath } from '../src/core/plugins/mcp/socket-auth.js';
 import { buildSeatbeltProfile } from '../src/adapters/cli/read-isolation.js';
+import { prepareProtectedMcpWorkerProvisioning } from '../src/core/protected-mcp-capabilities.js';
 import { isBunRuntime, spawnSyncTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 describe('plugin MCP Gateway', () => {
@@ -184,7 +185,49 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
-  function installFixturePlugin(pluginId: string, fixtureName: string, env?: Record<string, string>) {
+  it('passes an explicit host-side egress socket only to the protected stdio plugin without ambient env mutation', async () => {
+    installFixturePlugin('plugin-egress', 'egress-env', undefined, 'fixture.write.v1', {
+      id: 'fixture.write.v1',
+      targets: [{
+        scheme: 'https',
+        host: 'fixture.internal.example',
+        port: 443,
+        denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+      }],
+    });
+    installFixturePlugin('plugin-plain', 'egress-env');
+    const priorProcessSocket = process.env.BOTMUX_PROTECTED_EGRESS_SOCKET;
+    delete process.env.BOTMUX_PROTECTED_EGRESS_SOCKET;
+    const gateway = new PluginMcpGateway(
+      ['plugin-egress', 'plugin-plain'],
+      { ...process.env, BOTMUX_PROTECTED_EGRESS_SOCKET: '/ambient/must-not-be-used.sock' },
+      { protectedEgressSocketPath: '/host/private/e.sock' },
+    );
+    const client = new Client({ name: 'gateway-egress-env-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const result = await client.callTool({ name: 'plugin-egress__echo', arguments: {} });
+      expect((result.content[0] as { text: string }).text)
+        .toBe('egress=/host/private/e.sock');
+      const plain = await client.callTool({ name: 'plugin-plain__echo', arguments: {} });
+      expect((plain.content[0] as { text: string }).text).toBe('egress=');
+      expect(process.env.BOTMUX_PROTECTED_EGRESS_SOCKET).toBeUndefined();
+    } finally {
+      await client.close();
+      await gateway.close();
+      if (priorProcessSocket === undefined) delete process.env.BOTMUX_PROTECTED_EGRESS_SOCKET;
+      else process.env.BOTMUX_PROTECTED_EGRESS_SOCKET = priorProcessSocket;
+    }
+  });
+
+  function installFixturePlugin(
+    pluginId: string,
+    fixtureName: string,
+    env?: Record<string, string>,
+    protectedCapability?: string,
+    protectedEgressPolicy?: Record<string, unknown>,
+  ) {
     const source = join(home, `${pluginId}-src`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
     writeFileSync(join(source, 'package.json'), JSON.stringify({
@@ -198,8 +241,19 @@ describe('plugin MCP Gateway', () => {
       transport: 'stdio',
       command: [process.execPath, fixture, fixtureName],
       ...(env ? { env } : {}),
+      ...(protectedCapability ? { protectedCapability } : {}),
+      ...(protectedEgressPolicy ? { protectedEgressPolicy } : {}),
     }));
     installLocalPlugin(source);
+  }
+
+  function openProtectedFixtureChannel() {
+    const secretPath = join(home, 'fixture-grant-secret');
+    writeFileSync(secretPath, 'grant-fixture-secret');
+    return createReadStream(secretPath, {
+      fd: openSync(secretPath, 'r'),
+      autoClose: true,
+    }) as any;
   }
 
   function mcpServeEnvironment(sessionId: string): Record<string, string> {
@@ -326,24 +380,236 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
-  it('injects host-owned per-turn trusted caller metadata and overrides caller supplied metadata', async () => {
-    installFixturePlugin('plugin-a', 'alpha');
+  it('delivers a protected secret only through an inherited one-shot fd', async () => {
+    installFixturePlugin('fixture-plugin', 'secret-fd', undefined, 'fixture.secret.v1');
+    const secretPath = join(home, 'fixture-secret');
+    writeFileSync(secretPath, 'fd-only-secret');
     const gateway = new PluginMcpGateway(
-      ['plugin-a'],
+      ['fixture-plugin'],
+      {
+        ...process.env,
+        FIXTURE_SECRET: 'generic-env-must-be-removed',
+      },
+      {
+        requestProtectedSecretChannel: async capabilityId => {
+          expect(capabilityId).toBe('fixture.secret.v1');
+          return createReadStream(secretPath, {
+            fd: openSync(secretPath, 'r'),
+            autoClose: true,
+          }) as any;
+        },
+        protectedMcpPolicy: {
+          capabilities: [{
+            id: 'fixture.secret.v1',
+            allowedPluginIds: ['fixture-plugin'],
+            principal: 'verified-human-email',
+            containmentProfile: 'local-stdio-secret-v1',
+          }],
+          protectedHomePaths: [],
+          redactEnv: ['FIXTURE_SECRET'],
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-secret-fd-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      expect((result.content[0] as { text: string }).text).toContain(
+        'secretFd=true:secretEnv=false:secretArgv=false',
+      );
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it('does not provision a protected secret fd to a plugin outside the capability allowlist', async () => {
+    installFixturePlugin('plugin-allowed', 'secret-fd', undefined, 'fixture.secret.v1');
+    installFixturePlugin('plugin-claimant', 'secret-fd', undefined, 'fixture.secret.v1');
+    const secretPath = join(home, 'fixture-shared-secret');
+    writeFileSync(secretPath, 'fd-only-secret');
+    const requestedCapabilities: string[] = [];
+    const gateway = new PluginMcpGateway(
+      ['plugin-allowed', 'plugin-claimant'],
+      { ...process.env, FIXTURE_SECRET: 'ambient-secret-must-be-redacted' },
+      {
+        requestProtectedSecretChannel: async capabilityId => {
+          requestedCapabilities.push(capabilityId);
+          return createReadStream(secretPath, {
+            fd: openSync(secretPath, 'r'),
+            autoClose: true,
+          }) as any;
+        },
+        protectedMcpPolicy: {
+          capabilities: [{
+            id: 'fixture.secret.v1',
+            allowedPluginIds: ['plugin-allowed'],
+            principal: 'verified-human-email',
+            containmentProfile: 'local-stdio-secret-v1',
+          }],
+          protectedHomePaths: [],
+          redactEnv: ['FIXTURE_SECRET'],
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-secret-allowlist-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const allowed = await client.callTool({ name: 'plugin-allowed__echo', arguments: {} });
+      expect((allowed.content[0] as { text: string }).text).toContain(
+        'secretFd=true:secretEnv=false:secretArgv=false',
+      );
+      const claimant = await client.callTool({ name: 'plugin-claimant__echo', arguments: {} });
+      expect((claimant.content[0] as { text: string }).text).toContain(
+        'secretFd=false:secretEnv=false:secretArgv=false',
+      );
+      expect((claimant.content[0] as { text: string }).text).not.toContain('botmuxTrustedPrincipal');
+      expect((claimant.content[0] as { text: string }).text).not.toContain('botmuxGrantedCapabilities');
+      expect(requestedCapabilities).toEqual(['fixture.secret.v1']);
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it.each([
+    { label: 'disabled', enabled: false, containmentConfigured: true },
+    { label: 'without static containment', enabled: true, containmentConfigured: false },
+  ])('starts a protected MCP as read-only when its capability is $label', async ({ enabled, containmentConfigured }) => {
+    installFixturePlugin('plugin-readonly', 'secret-fd', undefined, 'fixture.secret.v1');
+    const provisioning = prepareProtectedMcpWorkerProvisioning(
+      ['plugin-readonly'],
+      home,
+      {
+        'fixture.secret.v1': {
+          enabled,
+          allowedPluginIds: ['plugin-readonly'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          principal: 'verified-human-email',
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: { redactEnv: ['FIXTURE_SECRET'] },
+        },
+      },
+      containmentConfigured,
+    );
+    expect(provisioning.workerPolicy.capabilities).toEqual([]);
+    const requestProtectedSecretChannel = vi.fn(async () => {
+      throw new Error('secret channel must not be requested');
+    });
+    const gateway = new PluginMcpGateway(
+      ['plugin-readonly'],
+      { ...process.env, FIXTURE_SECRET: 'ambient-secret-must-be-redacted' },
+      {
+        requestProtectedSecretChannel,
+        protectedMcpPolicy: provisioning.workerPolicy,
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_reader',
+            verifiedEmail: 'reader@bytedance.com',
+            requestLarkAppId: 'cli_reader',
+            senderType: 'user',
+          },
+          turnId: 'om_readonly',
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
+        }),
+      },
+    );
+    const client = new Client({ name: 'gateway-readonly-capability-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain('secretFd=false:secretEnv=false:secretArgv=false');
+      expect(text).not.toContain('botmuxTrustedPrincipal');
+      expect(text).not.toContain('botmuxGrantedCapabilities');
+      expect(requestProtectedSecretChannel).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it('falls back to a read-only MCP when the daemon cannot provide an allowed secret channel', async () => {
+    installFixturePlugin('plugin-readonly', 'secret-fd', undefined, 'fixture.secret.v1');
+    const requestProtectedSecretChannel = vi.fn(async () => {
+      throw new Error('protected channel unavailable');
+    });
+    const gateway = new PluginMcpGateway(
+      ['plugin-readonly'],
+      { ...process.env, FIXTURE_SECRET: 'ambient-secret-must-be-redacted' },
+      {
+        requestProtectedSecretChannel,
+        protectedMcpPolicy: {
+          capabilities: [{
+            id: 'fixture.secret.v1',
+            allowedPluginIds: ['plugin-readonly'],
+            principal: 'verified-human-email',
+            containmentProfile: 'local-stdio-secret-v1',
+          }],
+          protectedHomePaths: [],
+          redactEnv: ['FIXTURE_SECRET'],
+        },
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_reader',
+            verifiedEmail: 'reader@bytedance.com',
+            requestLarkAppId: 'cli_reader',
+            senderType: 'user',
+          },
+          turnId: 'om_readonly',
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
+        }),
+      },
+    );
+    const client = new Client({ name: 'gateway-unavailable-secret-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain('secretFd=false:secretEnv=false:secretArgv=false');
+      expect(text).not.toContain('botmuxTrustedPrincipal');
+      expect(text).not.toContain('botmuxGrantedCapabilities');
+      expect(requestProtectedSecretChannel).toHaveBeenCalledOnce();
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it('injects a host-owned principal and one granted capability only for its protected stdio route', async () => {
+    installFixturePlugin('plugin-protected', 'alpha', undefined, 'fixture.secret.v1');
+    installFixturePlugin('plugin-plain', 'beta');
+    const gateway = new PluginMcpGateway(
+      ['plugin-protected', 'plugin-plain'],
       { ...process.env, BOTMUX_SESSION_ID: 'session-trusted' },
       {
         trustedTurnIdentity: () => ({
           caller: {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
+            verifiedEmail: 'alice@bytedance.com',
             requestLarkAppId: 'cli_trusted',
-            source: 'schedule_creator',
-            taskId: 'task_123',
             senderType: 'user',
           },
           turnId: 'om_turn',
           dispatchAttempt: 2,
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
         }),
+        requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
+        protectedMcpPolicy: {
+          capabilities: [{
+            id: 'fixture.secret.v1',
+            allowedPluginIds: ['plugin-protected'],
+            principal: 'verified-human-email',
+            containmentProfile: 'local-stdio-secret-v1',
+          }],
+          protectedHomePaths: [],
+          redactEnv: ['FIXTURE_SECRET'],
+        },
       },
     );
     const client = new Client({ name: 'gateway-test', version: '1.0.0' });
@@ -351,13 +617,15 @@ describe('plugin MCP Gateway', () => {
     await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
 
     const result = await client.callTool({
-      name: 'echo',
+      name: 'plugin-protected__echo',
       arguments: {},
       _meta: {
         botmuxTrustedCaller: {
           requestUserOpenId: 'ou_forged',
           requestUserUnionId: 'on_forged',
         },
+        botmuxTrustedPrincipal: { verifiedEmail: 'forged@example.test' },
+        botmuxGrantedCapabilities: ['fixture.other.v1'],
         botmuxImpersonatedUnionId: 'on_sibling_forged',
         customTrace: 'keep-me',
       },
@@ -366,16 +634,184 @@ describe('plugin MCP Gateway', () => {
     expect(text).toContain('"requestUserOpenId":"ou_trusted"');
     expect(text).toContain('"requestUserUnionId":"on_trusted"');
     expect(text).toContain('"requestLarkAppId":"cli_trusted"');
-    expect(text).toContain('"source":"schedule_creator"');
-    expect(text).toContain('"taskId":"task_123"');
     expect(text).toContain('"senderType":"user"');
     expect(text).toContain('"turnId":"om_turn"');
     expect(text).toContain('"dispatchAttempt":2');
+    expect(text).toContain('"botmuxTrustedPrincipal":{"type":"human","openId":"ou_trusted","unionId":"on_trusted","verifiedEmail":"alice@bytedance.com","appId":"cli_trusted","turnId":"om_turn","dispatchAttempt":2}');
+    expect(text).toContain('"botmuxGrantedCapabilities":["fixture.secret.v1"]');
+    expect(text).toContain('"sessionId":"session-trusted"');
     expect(text).toContain('"customTrace":"keep-me"');
     expect(text).not.toContain('ou_forged');
     expect(text).not.toContain('on_forged');
     expect(text).not.toContain('on_sibling_forged');
+    expect(text).not.toContain('forged@example.test');
+    expect(text).not.toContain('fixture.other.v1');
 
+    const plainResult = await client.callTool({ name: 'plugin-plain__echo', arguments: {} });
+    const plainText = (plainResult.content[0] as any).text;
+    expect(plainText).toContain('botmuxTrustedCaller');
+    expect(plainText).not.toContain('botmuxTrustedPrincipal');
+    expect(plainText).not.toContain('botmuxGrantedCapabilities');
+    expect(plainText).not.toContain('alice@bytedance.com');
+
+    const protectedRoute = (gateway as any).toolRoutes.get('plugin-protected__echo');
+    protectedRoute.connection.server = {
+      ...protectedRoute.connection.server,
+      transport: 'streamable-http',
+    };
+    const remoteResult = await client.callTool({ name: 'plugin-protected__echo', arguments: {} });
+    const remoteText = (remoteResult.content[0] as any).text;
+    expect(remoteText).not.toContain('botmuxTrustedPrincipal');
+    expect(remoteText).not.toContain('botmuxGrantedCapabilities');
+    expect(remoteText).not.toContain('alice@bytedance.com');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('uses capability-specific containment evidence instead of granting every provisioned capability', async () => {
+    installFixturePlugin('plugin-egress', 'alpha', undefined, 'fixture.write.v1');
+    installFixturePlugin('plugin-unrelated', 'beta', undefined, 'fixture.unrelated.v1');
+    const gateway = new PluginMcpGateway(
+      ['plugin-egress', 'plugin-unrelated'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-capability-specific' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            verifiedEmail: 'alice@bytedance.com',
+            requestLarkAppId: 'cli_trusted',
+            senderType: 'user',
+          },
+          turnId: 'om_capability_specific',
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.write.v1'],
+        }),
+        requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
+        protectedMcpPolicy: {
+          capabilities: [
+            {
+              id: 'fixture.write.v1',
+              allowedPluginIds: ['plugin-egress'],
+              principal: 'verified-human-email',
+              containmentProfile: 'local-stdio-secret-egress-guard-v1',
+            },
+            {
+              id: 'fixture.unrelated.v1',
+              allowedPluginIds: ['plugin-unrelated'],
+              principal: 'verified-human-email',
+              containmentProfile: 'local-stdio-secret-v1',
+            },
+          ],
+          protectedHomePaths: [],
+          redactEnv: [],
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-capability-specific-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const guarded = await client.callTool({ name: 'plugin-egress__echo', arguments: {} });
+      expect((guarded.content[0] as { text: string }).text)
+        .toContain('"botmuxGrantedCapabilities":["fixture.write.v1"]');
+
+      const unrelated = await client.callTool({ name: 'plugin-unrelated__echo', arguments: {} });
+      expect((unrelated.content[0] as { text: string }).text)
+        .not.toContain('botmuxGrantedCapabilities');
+      expect((unrelated.content[0] as { text: string }).text)
+        .not.toContain('botmuxTrustedPrincipal');
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it('withholds protected principal metadata when the turn envelope belongs to another caller', async () => {
+    installFixturePlugin('plugin-a', 'alpha', undefined, 'fixture.secret.v1');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-mismatched-actor' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_alice',
+            verifiedEmail: 'alice@bytedance.com',
+            requestLarkAppId: 'cli_trusted',
+            senderType: 'user',
+          },
+          turnId: 'om_bob',
+          identityTurnId: 'om_alice',
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
+        }),
+        requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
+        protectedMcpPolicy: {
+          capabilities: [{
+            id: 'fixture.secret.v1',
+            allowedPluginIds: ['plugin-a'],
+            principal: 'verified-human-email',
+            containmentProfile: 'local-stdio-secret-v1',
+          }],
+          protectedHomePaths: [],
+          redactEnv: [],
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-mismatched-actor-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    const result = await client.callTool({ name: 'echo', arguments: {} });
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('"requestUserOpenId":"ou_alice"');
+    expect(text).toContain('"turnId":"om_bob"');
+    expect(text).not.toContain('verifiedEmail');
+    expect(text).not.toContain('botmuxTrustedPrincipal');
+    expect(text).not.toContain('botmuxGrantedCapabilities');
+    await client.close();
+    await gateway.close();
+  });
+
+  it.each([
+    ['bot-authored turn', { senderType: 'bot' as const }],
+    ['scheduled turn', { senderType: 'user' as const, source: 'schedule_creator' as const, taskId: 'task_123' }],
+    ['failed-turn recovery', { senderType: 'user' as const, source: 'failed_turn_recovery' as const }],
+  ])('withholds protected principal metadata for a %s', async (_label, callerFields) => {
+    installFixturePlugin('plugin-a', 'alpha', undefined, 'fixture.secret.v1');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-non-human-action' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_sender',
+            requestUserUnionId: 'on_sender',
+            verifiedEmail: 'sender@bytedance.com',
+            requestLarkAppId: 'cli_trusted',
+            ...callerFields,
+          },
+          turnId: 'om_turn',
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
+        }),
+        requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
+        protectedMcpPolicy: {
+          capabilities: [{
+            id: 'fixture.secret.v1',
+            allowedPluginIds: ['plugin-a'],
+            principal: 'verified-human-email',
+            containmentProfile: 'local-stdio-secret-v1',
+          }],
+          protectedHomePaths: [],
+          redactEnv: [],
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-non-human-action-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    const result = await client.callTool({ name: 'echo', arguments: {} });
+    const text = (result.content[0] as any).text;
+    expect(text).not.toContain('botmuxTrustedPrincipal');
+    expect(text).not.toContain('botmuxGrantedCapabilities');
+    expect(text).not.toContain('sender@bytedance.com');
     await client.close();
     await gateway.close();
   });
@@ -391,6 +827,7 @@ describe('plugin MCP Gateway', () => {
           caller: {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
+            verifiedEmail: 'alice@bytedance.com',
             requestLarkAppId: 'cli_trusted',
             source: 'gateway_meta',
             senderType: 'user',
@@ -618,6 +1055,7 @@ describe('plugin MCP Gateway', () => {
     expect(trusted.get('x-botmux-trusted-open-id')).toBe('ou_trusted');
     expect(trusted.get('x-botmux-trusted-union-id')).toBe('on_trusted');
     expect(trusted.get('x-botmux-trusted-app-id')).toBe('cli_trusted');
+    expect(trusted.get('x-botmux-trusted-email')).toBeNull();
     expect(trusted.get('x-botmux-turn-id')).toBe('om_trusted');
     expect(trusted.get('x-botmux-dispatch-attempt')).toBe('2');
     // Provenance stays on the local `_meta` path only: these headers reach every

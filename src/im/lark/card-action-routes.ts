@@ -234,6 +234,10 @@ const NO_META: SensitiveCardActionMeta = {};
 // 不在本表、但有自己权限门的动作（别「顺手」补进来，会把合法点击者挡掉）：
 // - `retry_recovery_turn`（自动恢复失败卡的「重试」）：原发起人（仍能对话）或
 //   bot 管理员可点，门在 core/ordinary-recovery-retry.ts 的 handleOrdinaryRecoveryRetryClick。
+// - `stuck_key`（CLI 卡在阻塞页时卡片上的安全按键）：本轮发起人（仍能对话）可点
+//   只做拒绝/跳过的键，bot 管理员可点全部键；门在 core/stuck-warning-card.ts 的
+//   decideStuckKeyClick（键由服务端按页面类型 + 下标查 core/stuck-page-catalog.ts，
+//   卡片 value 不带键）。同卡的旧 `tui_keys` 按钮仍在本表里，只给管理员。
 
 export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta> = new Map<string, SensitiveCardActionMeta>([
   ['restart', NO_META],
@@ -268,6 +272,8 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['compact_session', NO_META],
   // 闲置自动压缩开关（core/idle-auto-compact.ts）：改的是会话持久设置，同样过 canOperate。
   ['toggle_idle_compact', { denyToastKey: 'card.idle_compact.no_permission' }],
+  // 本群替身模式开关：写 per-bot + per-chat 运行态设置，同样过 canOperate。
+  ['toggle_substitute', { denyToastKey: 'cmd.substitute.owner_only' }],
   ['quote_confirm', NO_META],
   ['set_reasoning_effort', NO_META],
   // 普通回复卡右下角操作菜单（#1877）：展开菜单与模型选择注入都必须过 canOperate。
