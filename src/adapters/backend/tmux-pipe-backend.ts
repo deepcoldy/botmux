@@ -128,6 +128,28 @@ const PANE_DEATH_STATUS_MAX_POLLS = 20; // ≈1s wall budget, matching the empir
  *  the kernel for a status tmux has not published (see unreaped-pane-exit). */
 const PANE_DEATH_FORMAT = '#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}';
 
+function parsePositivePid(raw: string | undefined): number | undefined {
+  const text = (raw ?? '').trim();
+  if (!/^\d+$/.test(text)) return undefined;
+  const pid = Number(text);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/**
+ * Whether an authoritative "pane gone" verdict came from losing the whole tmux
+ * server rather than from the CLI exiting: the pane was last seen alive on
+ * server `lastLivePid`, and now a server with a DIFFERENT pid answers on the
+ * same socket (it was killed or its socket was taken over and a fresh server
+ * started there). Both pids must be known; anything unreadable is "no", so a
+ * real CLI crash keeps counting toward the fresh-session fallback.
+ */
+export function paneLossWasServerReplacement(
+  lastLivePid: number | undefined,
+  answeringPid: number | undefined,
+): boolean {
+  return lastLivePid !== undefined && answeringPid !== undefined && lastLivePid !== answeringPid;
+}
+
 /**
  * Three-way verdict for a pane probed at teardown / reattach time.
  *
@@ -567,6 +589,12 @@ export class TmuxPipeBackend implements SessionBackend {
   private cols = 200;
   private rows = 50;
   private exited = false;
+  /** tmux server pid (`#{pid}`) seen by the last probe that found this pane
+   *  alive. Compared with the answering server at teardown time. */
+  private lastLiveServerPid: number | undefined;
+  /** Set when the pane was judged gone while a DIFFERENT tmux server answered
+   *  on the same socket — the whole server was lost, the CLI did not exit. */
+  private serverReplacedAtExit = false;
   /** Track the selected option, even if its reply is lost or the version refreshes. */
   private legacyRetention = false;
   /** Set after pipe-pane subscription is active so kill() knows to cancel it. */
@@ -1223,6 +1251,22 @@ export class TmuxPipeBackend implements SessionBackend {
    * pane by exit status alone. Misreading it as `missing` mass-tore-down every
    * live session across all bots at once (2026-08-20 incident).
    */
+  /** `#{pid}` of the server holding this pane; undefined when unreadable.
+   *  For an unknown target tmux 3.x exits 0 and still expands the server-level
+   *  `#{pid}`, so the pane id is read in the same answer and must be non-empty. */
+  private readPaneServerPid(timeoutMs: number): number | undefined {
+    try {
+      const answer = execFileSync(
+        'tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_id} #{pid}'],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: timeoutMs, env: tmuxEnv() },
+      );
+      const [paneId = '', pid] = String(answer).replace(/\r?\n$/, '').split(' ');
+      return paneId.trim() ? parsePositivePid(pid) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private probePaneAddressability(timeoutMs: number): { state: SessionProbe; reason?: string; serverLevel?: boolean } {
     try {
       // `#{pane_id}` alone is NOT a liveness verdict once `remain-on-exit`
@@ -1239,6 +1283,9 @@ export class TmuxPipeBackend implements SessionBackend {
       ).trim();
       if (paneId.length === 0) return { state: 'missing', reason: 'empty pane id' };
       if (this.isPaneDead()) return { state: 'missing', reason: 'pane is dead (remain-on-exit remnant)' };
+      // A live pane only ever lives on the server that created it, so its
+      // server pid needs reading once, not on every probe.
+      if (this.lastLiveServerPid === undefined) this.lastLiveServerPid = this.readPaneServerPid(timeoutMs);
       return { state: 'exists' };
     } catch (err: any) {
       // Deadline first: a timed-out probe can carry a clean numeric exit when
@@ -1356,6 +1403,15 @@ export class TmuxPipeBackend implements SessionBackend {
     process.stderr.write(
       `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive authoritative misses; detaching observer\n`,
     );
+    this.serverReplacedAtExit = paneLossWasServerReplacement(
+      this.lastLiveServerPid,
+      TmuxPipeBackend.answeringServerPid(3000, this.tmuxArgs),
+    );
+    if (this.serverReplacedAtExit) {
+      process.stderr.write(
+        `[tmux-pipe-backend] the tmux server on this socket was replaced (was pid ${this.lastLiveServerPid}); the CLI did not exit on its own\n`,
+      );
+    }
     this.handlePaneExit();
   }
 
@@ -1372,6 +1428,28 @@ export class TmuxPipeBackend implements SessionBackend {
    *  Uses the same connection-level classifier as the pane probe so both agree
    *  on what "the client never reached the server" looks like. Never
    *  destructive on its own. */
+  /** pid of the tmux server currently answering on this socket, or undefined
+   *  when nobody answers / the answer is unreadable. Read-only. */
+  private static answeringServerPid(timeoutMs: number, socketArgs: readonly string[]): number | undefined {
+    try {
+      const out = execFileSync('tmux', [...socketArgs, 'list-sessions', '-F', '#{pid}'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: timeoutMs,
+        env: tmuxEnv(),
+      });
+      return parsePositivePid(String(out).split('\n')[0]);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** True when the last pane exit was caused by losing the whole tmux server
+   *  (a different server now answers on the socket), not by the CLI exiting. */
+  exitedBecauseServerReplaced(): boolean {
+    return this.exited && this.serverReplacedAtExit;
+  }
+
   private static tmuxServerReachability(timeoutMs: number, socketArgs: readonly string[]): 'up' | 'down' | 'unreachable' {
     try {
       execFileSync('tmux', [...socketArgs, 'list-sessions'], {
