@@ -23,7 +23,7 @@ import { WORKFLOW_DRAFT_FILE } from './draft-store.js';
 import { join, resolve, sep } from 'node:path';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
-import { checkBotWorkingDir, realWorkingDir } from '../../core/working-dir-range.js';
+import { checkBotWorkingDir, comparableSessionDir, realWorkingDir } from '../../core/working-dir-range.js';
 import { resolveCurrentTurnProvenance } from '../../core/current-turn-provenance.js';
 import { isHumanInboundTurnId } from '../../core/reply-target.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -81,7 +81,7 @@ import {
   type V3BotRoster,
 } from './bot-assignment.js';
 import { isGoalNode, type V3Dag } from './dag.js';
-import { v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
+import { v3MainSessionDirProblem, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
 import {
   checkV3BotExecutorEligibility,
   decideV3NodeExecutor,
@@ -685,6 +685,12 @@ export interface AdHocNodeExecutorPlanInput {
   /** §5.2 rule 3, read only when some node is placed in the main topic
    *  (absent = unknown: such a dag is refused). */
   mainTopic?: (binding: RunChatBinding) => V3MainTopicAvailability;
+  /** The main session's directory in comparison form, read only with a
+   *  `--working-dir` and a main-bot main-topic node (absent / undefined =
+   *  unknown: not refused here, the runtime gate decides). */
+  mainSessionDir?: (binding: RunChatBinding) => string | undefined;
+  /** Bot display names for the placement refusals (default: the app id). */
+  nameOf?: (larkAppId: string) => string;
 }
 
 export type AdHocNodeExecutorPlan =
@@ -740,8 +746,23 @@ export async function planAdHocNodeExecutor(
       targets,
       orchestratorAppId: binding.larkAppId,
       mainTopic: input.mainTopic?.(binding) ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+      ...(input.nameOf ? { nameOf: input.nameOf } : {}),
     });
     if (placement.length > 0) return { kind: 'placementRefused', binding, targets, problems: placement };
+    // The main bot's own main-topic nodes run in the main session, i.e. in
+    // its directory: another frozen directory would block them at runtime.
+    if (workingDir !== undefined) {
+      const ownMain = targets.filter((target) => target.placement === 'main' && target.larkAppId === binding.larkAppId);
+      const problem = ownMain.length > 0
+        ? v3MainSessionDirProblem({
+            nodes: ownMain,
+            mainLarkAppId: binding.larkAppId,
+            workingDir,
+            mainSessionDir: input.mainSessionDir?.(binding),
+          })
+        : undefined;
+      if (problem) return { kind: 'placementRefused', binding, targets, problems: [problem] };
+    }
   }
   const withDir = workingDir !== undefined ? { workingDir } : {};
   if (workingDir !== undefined) {
@@ -1059,6 +1080,9 @@ export interface WorkflowHostCommandDeps {
   botRole?: () => (larkAppId: string) => string | undefined;
   /** §5.2 rule 3 (default: the run's persisted main session). */
   mainTopicAvailability?: (binding: RunChatBinding) => V3MainTopicAvailability | Promise<V3MainTopicAvailability>;
+  /** The main session's directory (default: its persisted row); undefined =
+   *  unknown. */
+  mainSessionWorkingDir?: (binding: RunChatBinding) => string | undefined | Promise<string | undefined>;
   /** Test seam for the architect worker (default: the real ephemeral pool). */
   runArchitect?: ArchitectDeps['runArchitect'];
 }
@@ -1119,6 +1143,31 @@ async function resolveMainTopic(
     availability = { available: false, why: `读不到主会话（${err instanceof Error ? err.message : String(err)}）` };
   }
   return () => availability;
+}
+
+async function liveMainSessionWorkingDir(binding: RunChatBinding): Promise<string | undefined> {
+  const { liveV3MainSessionWorkingDir } = await import('../../im/lark/v3-bot-eligibility.js');
+  return liveV3MainSessionWorkingDir(binding);
+}
+
+/** The main session's directory for the run in `runDir`, resolved once per
+ *  command and only when a `--working-dir` was given. Unreadable = unknown. */
+async function resolveMainSessionDir(
+  runDir: string,
+  workingDirOverride: string | undefined,
+  deps: WorkflowHostCommandDeps,
+): Promise<((binding: RunChatBinding) => string | undefined) | undefined> {
+  if (workingDirOverride === undefined) return undefined;
+  const binding = readGrillState(runDir)?.chatBinding;
+  if (!binding) return undefined;
+  let dir: string | undefined;
+  try {
+    const raw = await (deps.mainSessionWorkingDir ?? liveMainSessionWorkingDir)(binding);
+    dir = raw === undefined ? undefined : comparableSessionDir(raw);
+  } catch {
+    dir = undefined;
+  }
+  return () => dir;
 }
 
 async function liveBotDisplayName(): Promise<(larkAppId: string) => string> {
@@ -1266,12 +1315,16 @@ export async function cmdWorkflowHost(
       // (approve-dag re-decides and checks eligibility; this never blocks).
       if (switchMode === 'bot') {
         try {
+          const previewDir = argValue(rest, '--working-dir');
+          const mainSessionDir = await resolveMainSessionDir(runDir, previewDir, deps);
           const preview = await planAdHocNodeExecutor(runDir, bots, {
             switchMode: 'bot',
             multiTopicEnabled: multiTopicEnabled(),
-            workingDirOverride: argValue(rest, '--working-dir'),
+            workingDirOverride: previewDir,
             probe: () => PREVIEW_PROBE,
             ...(mainTopic ? { mainTopic } : {}),
+            ...(mainSessionDir ? { mainSessionDir } : {}),
+            ...(nameOf ? { nameOf } : {}),
           });
           if (preview.kind === 'ephemeral') {
             const fallback = describeV3EphemeralFallback(preview.decision);
@@ -1316,12 +1369,16 @@ export async function cmdWorkflowHost(
         const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
         if (switchMode === 'bot') {
           const mainTopic = await resolveMainTopic(runDir, deps);
+          const mainSessionDir = await resolveMainSessionDir(runDir, workingDirOverride, deps);
+          const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
           const plan = await planAdHocNodeExecutor(runDir, bots, {
             switchMode,
             multiTopicEnabled: (deps.multiTopicEnabled ?? (() => isMultiTopicOrchestrationEnabled()))(),
             workingDirOverride,
             probe: (binding) => (deps.botEligibilityProbe ?? liveBotEligibilityProbe)(binding, bots),
             ...(mainTopic ? { mainTopic } : {}),
+            ...(mainSessionDir ? { mainSessionDir } : {}),
+            nameOf,
           });
           // §5.2: a hard-rule violation refuses the approval, naming the rule.
           if (plan.kind === 'placementRefused') throw new HostGuardError(formatV3PlacementRefusal(plan.problems));
@@ -1331,7 +1388,6 @@ export async function cmdWorkflowHost(
             const ignored = describeIgnoredAssignees(runDir);
             if (ignored) summary.push(ignored);
           } else {
-            const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
             if (plan.kind === 'refused') {
               throw new HostGuardError(formatV3BotEligibilityRefusal(plan.problems, nameOf, {
                 ...(plan.workingDir !== undefined ? { workingDir: plan.workingDir } : {}),

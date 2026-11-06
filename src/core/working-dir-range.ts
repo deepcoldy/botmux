@@ -89,3 +89,9 @@ const REASON_TEXT: Record<Exclude<BotWorkingDirVerdict, { ok: true }>['reason'],
 export function describeBotWorkingDirRefusal(verdict: Exclude<BotWorkingDirVerdict, { ok: true }>): string {
   return REASON_TEXT[verdict.reason];
 }
+
+/** A session's working directory in the form a node's frozen directory is
+ *  compared with (`~` expanded, resolved, symlinks resolved). */
+export function comparableSessionDir(dir: string): string {
+  return realWorkingDir(resolve(expandHomePath(dir)));
+}

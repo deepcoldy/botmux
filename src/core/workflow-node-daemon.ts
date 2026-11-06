@@ -11,7 +11,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 
 import { V3_RUN_ENVELOPE_FILE, frozenNodeWorkingDir, readRunEnvelope } from '../workflows/v3/run-envelope.js';
 import type { V3Dag } from '../workflows/v3/dag.js';
@@ -74,8 +74,7 @@ import {
 import { createV3NodeCardSync } from '../im/lark/v3-node-card-sync.js';
 import { buildV3NodeReportCard } from '../im/lark/v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
-import { checkBotWorkingDir, describeBotWorkingDirRefusal, realWorkingDir, type BotWorkingDirConfig } from './working-dir-range.js';
-import { expandHome } from './working-dir.js';
+import { checkBotWorkingDir, comparableSessionDir, describeBotWorkingDirRefusal, type BotWorkingDirConfig } from './working-dir-range.js';
 
 /** Where a node session for one handoff starts on the executing bot
  *  (design §15.4). */
@@ -104,7 +103,7 @@ export function workflowNodePinnedStart(admission: WorkflowInboundAdmission | un
  *  bot's handoff and on the main bot's own node delivery, with one rule. */
 export function workflowNodeSessionDirConflicts(pinnedDir: string, existingSessionDir: string | undefined): boolean {
   return existingSessionDir !== undefined
-    && realWorkingDir(resolve(expandHome(existingSessionDir))) !== pinnedDir;
+    && comparableSessionDir(existingSessionDir) !== pinnedDir;
 }
 
 type WorkflowNodeWorkingDir =
