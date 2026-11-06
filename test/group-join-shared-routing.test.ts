@@ -140,6 +140,10 @@ beforeEach(() => {
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.deleteMessage.mockResolvedValue(true);
   mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
+  // mockReset 后再装默认实现：vi.clearAllMocks() 只清调用记录，不清上一个用例
+  // 遗留的 mockResolvedValueOnce 队列——遗留值会被下一个用例的第一次调用吃掉，
+  // 让"锚到哪条消息"的断言对着别的用例的夹具通过（顺序相关的假绿）。
+  mocks.listChatMessages.mockReset();
   mocks.listChatMessages.mockResolvedValue([]);
   mocks.replyMessage.mockResolvedValue('om_reply');
   mocks.scanMultipleProjects.mockReturnValue([]);
