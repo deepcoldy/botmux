@@ -16,6 +16,7 @@ import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { classifyLarkError } from './error-classify.js';
 import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
 import { logger } from '../../utils/logger.js';
+import type { FetchedBotProfile } from '../../services/bot-profile-refresh.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -175,9 +176,23 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
   if (bot.botOpenId) return; // already known
 
+  const info = await fetchBotProfileFromLark(larkAppId);
+  bot.botOpenId = info.openId;
+  if (info.name) bot.botName = info.name;
+  if (info.avatarUrl) bot.botAvatarUrl = info.avatarUrl;
+  logger.info(`Bot open_id: ${bot.botOpenId}`);
+}
+
+/**
+ * One read-only `/bot/v3/info` call with the bot's tenant_access_token: the
+ * authoritative Feishu name / avatar / open_id of this app. Throws on any
+ * failure; callers that refresh a cached name keep the old value on throw
+ * (see services/bot-profile-refresh.ts).
+ */
+export async function fetchBotProfileFromLark(larkAppId: string): Promise<FetchedBotProfile> {
+  const bot = getBot(larkAppId);
   const openApi = larkHosts(normalizeBrand(bot.config.brand)).openApi;
 
-  // Call /bot/v3/info to get the bot's open_id using tenant_access_token
   const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -197,15 +212,37 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   }
 
   const openId = botData.bot?.open_id;
+  if (typeof openId !== 'string' || !openId) throw new Error('No open_id in bot info response');
   const appName = botData.bot?.app_name;
   const avatarUrl = botData.bot?.avatar_url;
-  if (openId) {
-    bot.botOpenId = openId;
-    if (appName) bot.botName = appName;
-    if (avatarUrl) bot.botAvatarUrl = avatarUrl;
-    logger.info(`Bot open_id: ${bot.botOpenId}`);
-  } else {
-    throw new Error('No open_id in bot info response');
+  return {
+    openId,
+    ...(typeof appName === 'string' && appName.trim() ? { name: appName } : {}),
+    ...(typeof avatarUrl === 'string' && avatarUrl ? { avatarUrl } : {}),
+  };
+}
+
+/**
+ * Rename hint: an inbound @ of this bot whose mention name differs from the
+ * cached Feishu name. Only a *trigger* for an authoritative re-fetch — the
+ * mention name itself is never written anywhere.
+ */
+let selfMentionNameObserver: ((larkAppId: string, mentionName: string) => void) | null = null;
+
+export function setSelfMentionNameObserver(fn: ((larkAppId: string, mentionName: string) => void) | null): void {
+  selfMentionNameObserver = fn;
+}
+
+/** Exported for tests: report a self-mention whose name differs from the cached bot name. */
+export function noteSelfMentionNames(larkAppId: string, mentions: readonly any[], botOpenId: string, cachedName: string | undefined): void {
+  if (!selfMentionNameObserver) return;
+  for (const m of mentions) {
+    if (mentionOpenId(m) !== botOpenId) continue;
+    const name = typeof m?.name === 'string' ? m.name.trim() : '';
+    if (name && name !== cachedName) {
+      try { selfMentionNameObserver(larkAppId, name); } catch { /* display-only hint */ }
+    }
+    return;
   }
 }
 
@@ -1816,7 +1853,11 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
   }
 
   // Single source of truth shared with the poll + dashboard-preview legs.
-  return messageMentionsBot(message, larkAppId, botOpenId);
+  const mentioned = messageMentionsBot(message, larkAppId, botOpenId);
+  // Side channel only (never affects the return value): a name mismatch on our
+  // own @ asks the profile refresher to re-read /bot/v3/info early.
+  if (mentioned) noteSelfMentionNames(larkAppId, mentions, botOpenId, getBot(larkAppId).botName);
+  return mentioned;
 }
 
 /** Does this message @mention a *specific other member* (a person or bot that
