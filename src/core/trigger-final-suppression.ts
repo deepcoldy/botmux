@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import { cronPinnedTurnIds, pruneReplyTargets } from './reply-target.js';
+import { pruneReplyTargets, replyTargetPinnedTurnIds } from './reply-target.js';
 
 // Turn-exact suppression of the daemon-rendered final_output for loud external
 // triggers whose owner opted into "no trailing final notice" (connector
@@ -54,7 +54,7 @@ export function inheritTriggerReplyAnchor(
   ds.session.replyTargetsPrunedThrough = pruneReplyTargets(
     targets,
     ds.session.replyTargetsPrunedThrough,
-    cronPinnedTurnIds(ds.session.cronTaskReplyAnchors),
+    replyTargetPinnedTurnIds(ds),
   );
   ds.session.replyTargets = targets;
   return true;

@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:" />
+<title>Botmux</title>
+<style>
+  :root { color-scheme: light dark; --bg: #0d1117; --card: #161b22; --line: #2a313c; --text: #e6edf3; --muted: #8b949e; --accent: #4f8cff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; }
+  @media (prefers-color-scheme: light) { :root { --bg: #f6f8fa; --card: #fff; --line: #d0d7de; --text: #1f2328; --muted: #59636e; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--text);
+         font: 14px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+  main { width: min(560px, calc(100vw - 48px)); background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 28px 30px; }
+  h1 { margin: 0 0 4px; font-size: 20px; display: flex; align-items: center; gap: 10px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  .dot[data-s="running"] { background: var(--ok); } .dot[data-s="degraded"] { background: var(--warn); }
+  .dot[data-s="stopped"], .dot[data-s="not_configured"] { background: var(--bad); }
+  .meta { color: var(--muted); margin: 0 0 18px; word-break: break-all; }
+  .notice { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0 0 14px; }
+  .notice[hidden] { display: none; }
+  .notice.warn { border-color: var(--warn); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  button { font: inherit; border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 8px; padding: 6px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button[hidden] { display: none; }
+  button:disabled { opacity: .5; cursor: default; }
+  footer { margin-top: 20px; color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; }
+  label { display: inline-flex; align-items: center; gap: 6px; }
+  pre { max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 11px; white-space: pre-wrap; }
+  pre[hidden] { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="dot" id="dot"></span><span id="title">正在连接运行时…</span></h1>
+  <p class="meta" id="meta"></p>
+  <div class="notice warn" id="align" hidden></div>
+  <div class="notice" id="update" hidden></div>
+  <div class="notice warn" id="dash" hidden></div>
+  <div class="actions">
+    <button class="primary" id="start" hidden>启动 Botmux</button>
+    <button id="restart" hidden>重启</button>
+    <button id="takeover" hidden>对齐到 App 版本</button>
+    <button id="apply-update" hidden>更新运行时</button>
+    <button id="retry" hidden>重新打开控制台</button>
+    <button id="logs">查看日志</button>
+    <button id="open-logs">日志目录</button>
+  </div>
+  <pre id="log" hidden></pre>
+  <footer>
+    <span id="version"></span>
+    <label><input type="checkbox" id="login" /> 开机启动</label>
+  </footer>
+</main>
+<script>
+(() => {
+  const api = window.botmuxDesktop;
+  const $ = id => document.getElementById(id);
+  const labels = { running: '运行中', stopped: '已停止', starting: '启动中', degraded: '需要处理', not_configured: '还没有配置机器人' };
+  let busy = false;
+
+  function render(o) {
+    const s = (o && o.state) || {};
+    const a = (o && o.alignment) || {};
+    const u = (o && o.update) || {};
+    $('dot').dataset.s = s.status || '';
+    $('title').textContent = labels[s.status] || '正在检查运行时';
+    let meta = s.message || '';
+    if (s.status === 'running') meta = meta || `${s.onlineDaemonCount}/${s.botCount} 个 bot 在线，正在打开控制台…`;
+    if (s.status === 'stopped') meta = meta || 'fleet 未运行。启动后这里会切换为 Botmux 控制台。';
+    if (s.status === 'not_configured') meta = meta || '在终端运行 botmux setup 添加机器人，完成后点击启动。';
+    $('meta').textContent = meta;
+    $('version').textContent = `App 运行时 ${u.current || '?'}` + (s.runtimeSource === 'global-cli' ? ` · fleet 由 ${s.runtimePath || '外部 CLI'} 运行` : '');
+
+    $('align').hidden = !(a.kind === 'owner-older' || a.kind === 'owner-newer');
+    if (a.kind === 'owner-older') $('align').textContent = `当前 fleet 跑的是 ${a.ownerVersion}，比 App 的 ${a.appVersion} 旧。对齐后由 App 运行时接管 fleet。`;
+    if (a.kind === 'owner-newer') $('align').textContent = `当前 fleet 跑的是 ${a.ownerVersion}，比 App 的 ${a.appVersion} 新。建议先更新 App 运行时。`;
+    $('update').hidden = !u.available;
+    if (u.available) $('update').textContent = u.inProgress ? `正在更新到 ${u.latest}…`
+      : `botmux ${u.latest} 可用（当前 ${u.current}）。` + (u.policy === 'cli-auto' ? `已开启自动更新${u.autoUpdateTime ? `，daemon 将在每天 ${u.autoUpdateTime} 更新` : ''}。` : '');
+    if (!u.available && u.restartPending) { $('update').hidden = false; $('update').textContent = '运行时已更新，重启 fleet 后生效。'; }
+    $('dash').hidden = !o.dashboardError;
+    $('dash').textContent = o.dashboardError ? `控制台暂时打不开：${o.dashboardError}` : '';
+
+    const running = s.status === 'running' || s.status === 'degraded';
+    $('start').hidden = running || s.status === 'not_configured';
+    $('restart').hidden = !running;
+    $('takeover').hidden = a.kind !== 'owner-older';
+    $('apply-update').hidden = !u.available || u.inProgress;
+    $('retry').hidden = !(s.status === 'running' && o.dashboardError);
+    for (const id of ['start', 'restart', 'takeover', 'apply-update']) $(id).disabled = busy;
+  }
+
+  async function act(id, fn) {
+    if (!api || busy) return;
+    busy = true;
+    $(id).disabled = true;
+    try {
+      const r = await fn();
+      if (r && typeof r.code === 'number' && r.code !== 0) showLog((r.stderr || r.stdout || '').trim());
+      if (r && r.ok === false) showLog(r.message || '');
+    } catch (e) {
+      showLog(String(e && e.message || e));
+    } finally {
+      busy = false;
+      api.getOverview().then(render, () => {});
+    }
+  }
+
+  function showLog(text) {
+    if (!text) return;
+    $('log').hidden = false;
+    $('log').textContent = text;
+  }
+
+  window.botmuxStatus = { render };
+  if (!api) { $('title').textContent = '桌面桥接不可用'; return; }
+  $('start').onclick = () => act('start', api.start);
+  $('restart').onclick = () => act('restart', api.restart);
+  $('takeover').onclick = () => act('takeover', api.takeover);
+  $('apply-update').onclick = () => act('apply-update', api.applyUpdate);
+  $('retry').onclick = () => api.retryDashboard();
+  $('open-logs').onclick = () => api.openLogsDir();
+  $('logs').onclick = async () => {
+    const targets = await api.listLogTargets();
+    const all = targets.find(t => t.id === 'all') || targets[0];
+    if (!all) return showLog('暂无日志');
+    const tail = await api.tailLogs(all.id);
+    $('log').hidden = false;
+    $('log').textContent = tail.text.split('\n').slice(-120).join('\n');
+    $('log').scrollTop = $('log').scrollHeight;
+  };
+  api.getLoginItem().then(s => { $('login').checked = !!s.openAtLogin; }, () => {});
+  $('login').onchange = e => api.setLoginItem(e.target.checked).then(s => { $('login').checked = !!s.openAtLogin; }, () => {});
+  api.getOverview().then(render, () => {});
+})();
+</script>
+</body>
+</html>

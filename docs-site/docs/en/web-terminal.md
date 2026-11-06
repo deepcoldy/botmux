@@ -62,6 +62,10 @@ The Lark topic, the Web Terminal, and the host's tmux all show the **same** CLI 
 | This session is closed | The session has ended | Can't be viewed anymore; start a new topic if needed |
 | Session not found | The link is wrong, or the session was deleted | Check the link |
 
+## Works on networks without internet access {#self-hosted-xterm}
+
+Automatic, nothing to configure. The xterm.js library and its add-ons used by the terminal page are served by botmux itself from the same origin (bundled with botmux) instead of an external CDN, so the terminal opens fine on internal networks that can't reach the internet. They are public open-source library files and carry no session data. If the terminal page fails to start, only the first error is shown, which makes it easier to pin down.
+
 ## Remote access (when your phone is on another network)
 
 By default a terminal link looks like `http://<host LAN IP>:<port>/s/<session ID>` and only works from the same subnet. To open it from elsewhere, pick the option that fits:

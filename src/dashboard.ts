@@ -139,7 +139,7 @@ import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
-import { readBotsInfoJson } from './services/bots-info-cache.js';
+import { createBotDisplayNameLookup, readPersistedBotNameMap } from './services/bot-display-name.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -221,6 +221,7 @@ import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
 } from './services/durable-config-mutation.js';
+import { sessionWriteOriginAllowed } from './dashboard/session-write-origin.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import type { WorkspaceMetadata } from './core/workspace-metadata.js';
@@ -341,7 +342,7 @@ import {
   enrichPacksForDashboard,
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
-import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, loadBotConfigsCached, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findRetiredCliBots, retiredCli } from './adapters/cli/retired-cli.js';
 import {
   findQuotaFallbackCycles,
@@ -1058,7 +1059,8 @@ const hostTerminalManager = createHostTerminalManager({
     for (const s of aggregator.getSessions()) {
       if (!s.sessionId.startsWith(prefix)) continue;
       const row = s as { botName?: unknown; title?: unknown };
-      const parts = [row.botName, row.title].filter((v): v is string => typeof v === 'string' && !!v.trim());
+      const botName = (s.larkAppId ? dashboardBotNameLookup()(s.larkAppId) : undefined) ?? row.botName;
+      const parts = [botName, row.title].filter((v): v is string => typeof v === 'string' && !!v.trim());
       return parts.length ? parts.join(' · ') : undefined;
     }
     return undefined;
@@ -1251,6 +1253,8 @@ interface ResolvedDashboardSettings {
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
   cardBrandLabel: boolean;
+  /** Turn initiator may press the safe keys on stuck cards. Default ON. */
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1393,13 +1397,15 @@ async function validateCodexNotifierTargetBotAppId(
 function codexNotifierBotOptions(): ResolvedDashboardSettings['codexNotifier']['botOptions'] {
   try {
     const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
-    return loadBotConfigs()
+    const configs = loadBotConfigs();
+    const nameOf = dashboardBotNameLookup(configs);
+    return configs
       .filter(bot => bot.cliId === 'codex' || bot.cliId === 'codex-app')
       .map(bot => {
         const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
         return {
           larkAppId: bot.larkAppId,
-          botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+          botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
           ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
         };
@@ -1440,13 +1446,15 @@ async function validateHostOverloadAlertTargetBotAppId(
 function hostOverloadAlertBotOptions(): ResolvedDashboardSettings['hostOverloadAlert']['botOptions'] {
   try {
     const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
-    return loadBotConfigs()
+    const configs = loadBotConfigs();
+    const nameOf = dashboardBotNameLookup(configs);
+    return configs
       .filter(bot => bot.apiOnly !== true) // apiOnly bots can't send Feishu messages
       .map(bot => {
         const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
         return {
           larkAppId: bot.larkAppId,
-          botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+          botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
           apiOnly: bot.apiOnly === true,
           ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
@@ -1461,12 +1469,13 @@ function hostOverloadAlertBotOptions(): ResolvedDashboardSettings['hostOverloadA
  *  post into a chat, so they are neither source nor target). */
 function scheduleBotGrantBotOptions(): ResolvedDashboardSettings['scheduleBotGrants']['botOptions'] {
   try {
-    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
-    return loadBotConfigs()
+    const configs = loadBotConfigs();
+    const nameOf = dashboardBotNameLookup(configs);
+    return configs
       .filter(bot => bot.apiOnly !== true)
       .map(bot => ({
         larkAppId: bot.larkAppId,
-        botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+        botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
       }));
   } catch {
     return [];
@@ -1494,30 +1503,28 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   }
 }
 
-/** Workflow run view: live registry name first, then the persisted
- *  bots-info.json name (offline bots), read lazily once per request. */
-function v3RunBotNameResolver(): (larkAppId: string) => string | undefined {
-  let persisted: Map<string, string> | undefined;
-  return (appId) => registry.getByAppId(appId)?.botName
-    ?? (persisted ??= readPersistedBotNames()).get(appId);
+/**
+ * The dashboard's one appId → bot display-name lookup (services/bot-display-name.ts):
+ * bots.json displayName > live descriptor name > bots-info.json Feishu name.
+ * Built per request. It never invents a name from bots.json `name` (PM2
+ * suffix) or cliId; a few pickers / recovery rows still use `name` as their
+ * own last-resort label for a bot whose Feishu name was never learned.
+ */
+function dashboardBotNameLookup(configs?: readonly BotConfig[]): (larkAppId: string) => string | undefined {
+  let cfgs: readonly BotConfig[] = configs ?? [];
+  if (!configs) {
+    try { cfgs = loadBotConfigsCached(); } catch { /* setup can render before bots.json exists */ }
+  }
+  return createBotDisplayNameLookup({
+    configs: cfgs,
+    liveName: (appId) => registry.getByAppId(appId)?.botName,
+    dataDir: config.session.dataDir,
+  });
 }
 
-/** Map appId → persisted Feishu-probed botName from bots-info.json (offline
- *  bots keep a friendly name in the dashboard). Best-effort; empty on any error. */
-function readPersistedBotNames(): Map<string, string> {
-  const out = new Map<string, string>();
-  try {
-    const fp = join(config.session.dataDir, 'bots-info.json');
-    if (!existsSync(fp)) return out;
-    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{ larkAppId?: string; botName?: string | null }>;
-    if (!Array.isArray(entries)) return out;
-    for (const e of entries) {
-      if (typeof e?.larkAppId === 'string' && typeof e?.botName === 'string' && e.botName.trim()) {
-        out.set(e.larkAppId, e.botName.trim());
-      }
-    }
-  } catch { /* best-effort */ }
-  return out;
+/** Workflow run view names (online and offline bots alike). */
+function v3RunBotNameResolver(): (larkAppId: string) => string | undefined {
+  return dashboardBotNameLookup();
 }
 
 function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
@@ -1525,7 +1532,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
   // name in the agent dropdown instead of falling back to the raw appId. The
   // live registry only knows online bots; bots-info.json is written when a bot
   // is probed and survives across restarts. Built once per deps construction.
-  const persistedBotNames = readPersistedBotNames();
+  const nameOf = dashboardBotNameLookup();
   return {
     readCatalog: readVcMeetingSharedConsumerCatalogSnapshot,
     updateCatalog: input => runDurableConfigMutation({
@@ -1535,7 +1542,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
     }),
     loadBotConfigs,
     effectiveDefaultWorkingDir,
-    onlineBotName: appId => registry.getByAppId(appId)?.botName ?? persistedBotNames.get(appId),
+    onlineBotName: appId => nameOf(appId),
     isOnline: appId => !!registry.getByAppId(appId),
     adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
       if (!cliId) return false;
@@ -1924,6 +1931,8 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     // default ON — machine-wide footer brand signature switch; only an explicit
     // stored false suppresses brand rendering for every bot (matches bot-registry).
     cardBrandLabel: dashboard.cardBrandLabel !== false,
+    // default ON — only an explicit stored false disables (matches config.ts getter)
+    stuckCardInitiatorKeys: dashboard.stuckCardInitiatorKeys !== false,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,
@@ -2554,12 +2563,15 @@ const resourceMonitor = createResourceMonitorService({
   sessionHistoryMs: 3 * 60 * 60_000,
   aggregateHistoryMs: 24 * 60 * 60_000,
   listSessions: () => {
-    const names = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
+    const nameOf = dashboardBotNameLookup(monitorBotConfigs());
     return aggregator.getSessions()
       .filter(s => s.status !== 'closed')
-      .map(s => toResourceMonitorSessionSeed(s, names.get(String(s.larkAppId ?? ''))));
+      .map(s => toResourceMonitorSessionSeed(s, nameOf(String(s.larkAppId ?? ''))));
   },
-  listDaemons: () => buildResourceMonitorDaemonSeeds(monitorBotConfigs(), registry.list()),
+  listDaemons: () => {
+    const configs = monitorBotConfigs();
+    return buildResourceMonitorDaemonSeeds(configs, registry.list(), dashboardBotNameLookup(configs));
+  },
 });
 resourceMonitor.start();
 
@@ -2913,11 +2925,11 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
   const pinnedSet = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
   let botConfigs: BotConfig[] = [];
   try { botConfigs = loadBotConfigs(); } catch { /* setup can render before bots.json exists */ }
-  const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+  const nameOf = dashboardBotNameLookup(botConfigs);
   const bots = botConfigs.map((bot, index) => {
     return {
       id: bot.larkAppId,
-      name: bot.displayName || onlineByAppId.get(bot.larkAppId)?.botName || bot.name || `Bot ${index + 1}`,
+      name: nameOf(bot.larkAppId) || `Bot ${index + 1}`,
       plugins: resolveEffectivePluginIds(bot, { plugins: globalPlugins }),
     };
   });
@@ -3299,7 +3311,8 @@ async function configuredBotDefaultsRecoveryRows(
         blockByAppId.set(appId, { reason: 'quota_fallback_cycle', cycle });
       }
     }
-    const persistedNames = readPersistedBotNames();
+    const persistedNames = readPersistedBotNameMap(config.session.dataDir);
+    const nameOf = dashboardBotNameLookup(configs);
     // The loader leaves rows on a removed CLI (gemini) out of `configs`; show
     // them anyway so the owner sees why the Bot is down. They are parsed as
     // the replacement CLI only to fill the row, then carry their real cliId.
@@ -3326,7 +3339,7 @@ async function configuredBotDefaultsRecoveryRows(
         const rawEntry = rawByAppId.get(bot.larkAppId);
         const payload = botDefaultsPayload({
           larkAppId: bot.larkAppId,
-          botName: bot.displayName ?? bot.name ?? persistedNames.get(bot.larkAppId) ?? null,
+          botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: bot.cliId,
           brand: bot.brand,
           cliRuntime: bot.cliRuntime,
@@ -4553,6 +4566,12 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 会话写操作的跨站门禁（cookie 是 Lax，跨站 POST 仍会带上）。放在鉴权判决之后、
+    // 所有会话路由之前，按 /api/sessions/ 前缀加显式名单（/api/trigger、/api/asks/answer）拦截。
+    if (!sessionWriteOriginAllowed(req, url.pathname)) {
+      return dashboardControlJson(res, 403, { ok: false, error: 'control_origin_forbidden' });
+    }
+
     // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换，紧挨上面的 ?t= set-cookie
     // 流程——语义同款：验票通过就种同一个 legacy cookie，再 302 进工作台。票据由
     // /dashboard 卡片构建时现 mint（TTL 30 分钟、可多端重复打开，落盘只存 hash，
@@ -4844,7 +4863,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, result.status, result.body);
     }
 
-    if (await handleResourceMonitorApi(req, res, url, resourceMonitor)) {
+    if (await handleResourceMonitorApi(req, res, url, resourceMonitor, () => registry.list())) {
       return;
     }
 
@@ -4870,16 +4889,14 @@ const server = createServer(async (req, res) => {
           }
         }
       }
-      // Sessions spawned before a bot config carried a display name store the
-      // raw appId as botName — resolve through the live registry so consumers
-      // (dashboard) always see the human-facing name.
-      const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
+      // SessionRow.botName is a snapshot (closed rows keep whatever name the
+      // bot had back then; early rows even hold the raw appId). Display always
+      // re-resolves by larkAppId; the stored row is left untouched.
+      const nameOf = dashboardBotNameLookup();
       groupsMatrixSnapshot.warm();
       const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
-        const n = names.get(s.larkAppId);
-        return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
-          ? { ...s, botName: n }
-          : s;
+        const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
+        return n && n !== s.botName ? { ...s, botName: n } : s;
       }), groupsMatrixSnapshot.peekPresentation());
       const browserSessions = projectSessionPreviewsForBrowser(sessions);
       lazyTopicLinkBackfill.trigger(browserSessions);
@@ -6076,9 +6093,11 @@ const server = createServer(async (req, res) => {
       readJsonBody,
       bots: () => {
         const online = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
-        return monitorBotConfigs().map(cfg => ({
+        const configs = monitorBotConfigs();
+        const nameOf = dashboardBotNameLookup(configs);
+        return configs.map(cfg => ({
           larkAppId: cfg.larkAppId,
-          botName: online.get(cfg.larkAppId) || cfg.displayName || cfg.larkAppId,
+          botName: nameOf(cfg.larkAppId) || cfg.larkAppId,
           ...(cfg.steward ? { steward: cfg.steward } : {}),
           online: online.has(cfg.larkAppId),
         }));
@@ -6472,6 +6491,16 @@ const server = createServer(async (req, res) => {
     }
 
     let m: RegExpMatchArray | null;
+    const pinSessionRoute = url.pathname.match(/^\/api\/sessions\/([^/]+)\/model-pin$/);
+    const pinBotRoute = url.pathname.match(/^\/api\/bots\/([^/]+)\/model-pins$/);
+    if ((pinSessionRoute && req.method === 'DELETE') || (pinBotRoute && ['GET', 'DELETE'].includes(req.method ?? ''))) {
+      if (!authed) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+      if (req.method !== 'GET' && !sessionWriteOriginAllowed(req, '/api/sessions/model-pins')) return jsonRes(res, 403, { ok: false, error: 'invalid_origin' });
+      const owner = pinBotRoute ? decodeURIComponent(pinBotRoute[1]) : aggregator.ownerOf(decodeURIComponent(pinSessionRoute![1]));
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, url.pathname, { method: req.method, signal: AbortSignal.timeout(15_000) });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
       // P1-11：locate 与接管/解锁同属工作台三项操作能力，同样是无 body POST。
@@ -6913,17 +6942,12 @@ const server = createServer(async (req, res) => {
       canManageHost: authed,
       featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
       listBots: () => {
-        // Offline bots have no registry row: their name comes from bots-info.json.
-        const fileNames = new Map<string, string>();
-        try {
-          for (const entry of normalizeBotsInfoRouteEntries(readBotsInfoJson(config.session.dataDir))) {
-            if (entry.botName) fileNames.set(entry.larkAppId, entry.botName);
-          }
-        } catch { /* unreadable: ids */ }
+        const configs = loadBotConfigs();
+        const nameOf = dashboardBotNameLookup(configs);
         return workflowOrchestratorBotOptions(
-          loadBotConfigs(),
+          configs,
           (larkAppId) => !!registry.getByAppId(larkAppId),
-          (larkAppId) => registry.getByAppId(larkAppId)?.botName || fileNames.get(larkAppId) || larkAppId,
+          (larkAppId) => nameOf(larkAppId) || larkAppId,
         );
       },
     })) {
@@ -7518,6 +7542,27 @@ const server = createServer(async (req, res) => {
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const result = await addBotsToGroup(chatId, raw, groupsActionDeps);
       return writeHandlerResult(res, result);
+    }
+
+    let mGroupMessages: RegExpMatchArray | null;
+    if ((mGroupMessages = url.pathname.match(/^\/api\/groups\/([^/]+)\/messages\/([^/]+)(\/recall)?$/))) {
+      const chatId = decodeURIComponent(mGroupMessages[1]);
+      const appId = decodeURIComponent(mGroupMessages[2]);
+      const recall = !!mGroupMessages[3];
+      if (req.method !== (recall ? 'POST' : 'GET')) return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      let body: string | undefined;
+      if (recall) {
+        try { body = JSON.stringify(await readJsonBody(req)); }
+        catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      }
+      const upstream = await proxyToDaemon(appId,
+        `/api/groups/${encodeURIComponent(chatId)}/messages${recall ? '/recall' : url.search}`, {
+          method: req.method,
+          ...(body ? { headers: { 'content-type': 'application/json' }, body } : {}),
+        });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
     }
 
     // Disband a chat. Body: `{ larkAppId }` — the bot whose daemon should
@@ -8500,7 +8545,15 @@ const federationSync = setInterval(() => {
   // sessionsProvider：顺带把本部署在各团队协作群里的会话裁剪行上报给团队 host
   // （hub 在 sync 响应里下发协作群清单，详见 syncAllMemberships）。
   // aggregator Row 是宽松索引类型，实际为 SessionRow（含 chatId 等字段）
-  syncAllMemberships(config.session.dataDir, fetch, liveBots(), () => aggregator.getSessions() as unknown as TeamSessionRowLike[])
+  syncAllMemberships(config.session.dataDir, fetch, liveBots(), () => {
+    // Session rows carry a botName snapshot; the hub's team board shows the
+    // current name, re-resolved by appId like /api/sessions.
+    const nameOf = dashboardBotNameLookup();
+    return aggregator.getSessions().map(s => {
+      const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
+      return n && n !== s.botName ? { ...s, botName: n } : s;
+    }) as unknown as TeamSessionRowLike[];
+  })
     .catch(() => { /* best-effort */ });
 }, 2 * 60 * 1000);
 federationSync.unref();

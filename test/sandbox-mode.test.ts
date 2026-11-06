@@ -7,6 +7,7 @@ import {
   resolveSpawnNetworkShape,
   sandboxBoolValue,
   sandboxIsActive,
+  sessionCardSandboxMode,
 } from '../src/adapters/cli/sandbox-mode.js';
 
 describe('normalizeSandboxMode', () => {
@@ -146,5 +147,28 @@ describe('resolveSpawnNetworkShape (identity-model single source)', () => {
     expect(resolveSpawnNetworkShape({ mode: 'scratch', sandboxNetwork: true })).toEqual({
       sandboxEngaged: true, netEnabled: true, loopbackShared: true,
     });
+  });
+});
+
+describe('sessionCardSandboxMode (what the session card claims)', () => {
+  it('a session frozen off on a BOTMUX_SANDBOX-forced daemon is shown as the forced mode', () => {
+    expect(sessionCardSandboxMode(false, undefined, '1')).toBe('oncall');
+    expect(sessionCardSandboxMode(undefined, undefined, 'scratch')).toBe('scratch');
+    expect(sessionCardSandboxMode(true, undefined, 'scratch')).toBe('scratch');
+  });
+
+  it('without a force it shows the frozen decision', () => {
+    expect(sessionCardSandboxMode(true, undefined, undefined)).toBe('oncall');
+    expect(sessionCardSandboxMode('scratch', undefined, '0')).toBe('scratch');
+    expect(sessionCardSandboxMode(false, undefined, undefined)).toBe('off');
+  });
+
+  it("the worker's own engaged report wins: a bypassed sandbox is off, an unexplained engaged one is oncall", () => {
+    expect(sessionCardSandboxMode(true, false, '1')).toBe('off');
+    expect(sessionCardSandboxMode(false, true, undefined)).toBe('oncall');
+  });
+
+  it('a typo\'d env value (the worker refuses to start) falls back to the frozen mode instead of throwing', () => {
+    expect(sessionCardSandboxMode(false, undefined, 'yes')).toBe('off');
   });
 });

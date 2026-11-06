@@ -20,6 +20,10 @@ export interface PtyHandle {
   /** Deliver one explicit bracketed-paste frame, preserving embedded newlines.
    * Unlike pasteText, this capability guarantees the boundary markers. */
   sendBracketedPaste?(text: string): void | boolean;
+  /** Deliver bracketed paste plus its submit Enter in ONE backend operation. No
+   * adapter delay or separate transport call may separate them. false/throw is
+   * ambiguous and must never cause an automatic replay. Used by Codex's terminal submit path. */
+  submitBracketedPaste?(text: string): void | boolean;
   /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
   sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**
@@ -271,6 +275,10 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Process-scoped Codex-compatible provider origin override. Used when the
+     *  active model provider shares an origin with a protected business target
+     *  and must enter through the session loopback HTTP bridge. */
+    modelProviderBaseUrlOverride?: { providerId: string; baseUrl: string };
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
      *  (dsh / MiniMax). Forwarded as `--turn-timeout-ms`; semantics belong to the runner;
      *  adapters without a runner turn timeout ignore the field. */
@@ -844,6 +852,13 @@ export interface CliAdapter {
    *  The ambiguous item is never replayed by this fence; only later queued
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
+
+  /** This CLI renders the codex_core hook-review / migration pages recognised
+   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
+   *  the "CLI is stuck" card: queued input is held off any of those pages and
+   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
+   *  Undefined = only the legacy hook-review input hold, never a card. */
+  readonly stuckPageFamily?: 'codex-family';
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When

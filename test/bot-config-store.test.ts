@@ -187,6 +187,70 @@ describe('bot-config store', () => {
     expect(readConfig().reasoningEffort).toBeUndefined();
   });
 
+  it('saves MiniMax effort and requires clearing it before switching to a model without levels', async () => {
+    const { registry, store } = await loaded({ cliId: 'minimax', model: 'minimax/MiniMax-M3.1-Flash' });
+    const effort = store.findConfigField('reasoningEffort')!;
+    expect((await store.applyConfigField('app_default', effort, 'xhigh')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('xhigh');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('xhigh');
+    expect(await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readConfig()).toMatchObject({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'xhigh' });
+    expect((await store.applyConfigField('app_default', effort, null)).ok).toBe(true);
+    expect((await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it.each([
+    { cliId: 'codex', model: undefined },
+    { cliId: 'codex', model: 'gpt-5.5' },
+    { cliId: 'claude-code', model: undefined },
+    { cliId: 'claude-code', model: 'opus' },
+  ])('requires explicit effort clearing before switching $cliId / $model to MiniMax', async entry => {
+    const { registry, store } = await loaded({ ...entry, reasoningEffort: 'high' });
+    const cli = store.findConfigField('cli')!;
+    const before = readFileSync(configPath, 'utf8');
+    expect(await store.applyConfigField('app_default', cli, 'minimax'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(registry.getBot('app_default').config).toMatchObject({ cliId: entry.cliId, reasoningEffort: 'high' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ cliId: entry.cliId, reasoningEffort: 'high' });
+
+    expect((await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, null)).ok).toBe(true);
+    expect((await store.applyConfigField('app_default', cli, 'minimax')).ok).toBe(true);
+    expect(readConfig().cliId).toBe('minimax');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.cliId).toBe('minimax');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBeUndefined();
+  });
+
+  it('preserves a compatible effort when switching CLI to MiniMax', async () => {
+    const { registry, store } = await loaded({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('cli')!, 'minimax')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'minimax', reasoningEffort: 'high' });
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('high');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('high');
+  });
+
+  it('does not treat a compatible effort as validation of a retained model when leaving MiniMax', async () => {
+    const model = 'minimax/MiniMax-M3.1-Flash';
+    const { registry, store } = await loaded({ cliId: 'minimax', model, reasoningEffort: 'high' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('cli')!, 'codex')).ok).toBe(true);
+    // CLI switching retains the old model. Codex's unknown-model effort
+    // fallback permits high; it does not establish that Codex can run this model.
+    expect(readConfig()).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+  });
+
+  it.each([undefined, 'minimax/MiniMax-M3', 'other/MiniMax-M3.1-Flash'])('rejects MiniMax effort for an unverified model %s without persisting it', async model => {
+    const { store } = await loaded({ cliId: 'minimax', model });
+    expect(await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'xhigh'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
     const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
     const spec = store.findConfigField('envPolicy')!;

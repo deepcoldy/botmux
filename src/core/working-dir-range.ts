@@ -116,3 +116,41 @@ export function unpinnedSessionWorkingDir(cfg: BotConfig, autoWorktree: boolean 
   }
   return cfg.workingDir ?? '~';
 }
+
+/** The operate answer {@link checkNodeWorkingDir} is given (kept literal so
+ *  this module needs no workflow imports). */
+export type NodeWorkingDirOperate = 'yes' | 'no' | { unknown: string };
+
+/** A {@link checkBotWorkingDir} verdict for a workflow node; a range refusal
+ *  may carry why the initiator's operate right could not be confirmed. */
+export type NodeWorkingDirVerdict =
+  | Extract<BotWorkingDirVerdict, { ok: true }>
+  | (Extract<BotWorkingDirVerdict, { ok: false }> & { operateUnknown?: string });
+
+/**
+ * A workflow node's Gate-2 directory on its executing bot (design §15.4):
+ * when the run's initiator may operate that bot — may use `/cd` there, so
+ * could move a session anywhere themselves — the directory only has to exist
+ * (as for `/cd` and `/repo <路径>`); otherwise it must lie in the bot's
+ * configured range ({@link checkBotWorkingDir}). Gate-2 and the executing
+ * bot's daemon both decide through this one function.
+ *
+ * `initiatorOperates` is asked only when the range alone refuses an existing
+ * directory (it may need a Lark lookup or daemon IPC). An `unknown` answer
+ * decides like `no` (the range applies) but is kept on the refusal, so the
+ * message can say it could not be confirmed. An accepted directory is its
+ * realpath, as always.
+ */
+export async function checkNodeWorkingDir(
+  cfg: BotWorkingDirConfig,
+  dir: string,
+  initiatorOperates: () => Promise<NodeWorkingDirOperate>,
+): Promise<NodeWorkingDirVerdict> {
+  const verdict = checkBotWorkingDir(cfg, dir);
+  if (verdict.ok || verdict.reason === 'missing' || verdict.reason === 'not_directory') return verdict;
+  let operates: NodeWorkingDirOperate;
+  try { operates = await initiatorOperates(); } catch { operates = { unknown: '查询出错' }; }
+  if (operates === 'yes') return { ok: true, path: realWorkingDir(verdict.path) };
+  if (operates === 'no') return verdict;
+  return { ...verdict, operateUnknown: typeof operates === 'object' && operates?.unknown ? operates.unknown : '查询结果无效' };
+}

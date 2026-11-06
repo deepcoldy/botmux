@@ -19,6 +19,10 @@ const CLAUDE_ALL_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'm
 /** Exported for the adapter's arg filter: the widest set any Claude model takes. */
 export const CLAUDE_REASONING_EFFORTS = CLAUDE_ALL_REASONING_EFFORTS;
 
+/** MCode's thinkingEffort option advertises these levels for M3.1-Flash.
+ * `default` means no BotMux override; `ultra` is not an advertised level. */
+const MINIMAX_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
 /** Only Haiku is withheld: it takes no effort parameter at all, yet the adapter
  *  lists it in `modelChoices` (both `haiku` and the pinned `claude-haiku-4-5-…`),
  *  so it is the one selectable pairing that would be accepted and never honoured.
@@ -81,7 +85,7 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code' || cliId === 'kimi'
+    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax'
     // ZCode's per-model levels are declared in its own provider catalog and can
     // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
     // a switch). The launch path resolves the closest supported level, so the
@@ -140,6 +144,13 @@ export function reasoningEffortsForCliModel(
     // Kimi 的 effort 环境变量只作用于 kimi provider，不猜测自定义别名的能力。
     return model?.trim() === 'kimi-code/k3' || model?.trim() === 'kimi-code/k3-256k'
       ? ['low', 'high', 'max'] : [];
+  }
+  if (cliId === 'minimax') {
+    // Match only launchable names of the verified model/variant. An omitted
+    // model follows the user's MCode default, which may be M3 or a custom
+    // provider; neither an alias nor a substring proves effort support.
+    return /^(?:minimax\/)?MiniMax-M3\.1-Flash(?:#thinking)?$/.test(model?.trim() ?? '')
+      ? MINIMAX_REASONING_EFFORTS : [];
   }
   return [];
 }

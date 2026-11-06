@@ -164,6 +164,16 @@ describe('dispatch completion switch wiring', () => {
     expect(result).toContain('`\\n`');
   });
 
+  it('uses completed status for direct source replies and keeps a single result sink', () => {
+    const result = buildDispatchCompletionBrief({
+      brief: 'review the locked commit', dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: true, sameTopicSendEnabled: true, resultDelivery: 'reply',
+    });
+    expect(result).toContain('botmux report --dispatch-root om_seed_exact --status completed');
+    expect(result).not.toContain('--delivery reply');
+    expect(result).not.toContain('botmux send --no-mention');
+  });
+
   it.each(['publish', 'publish-and-relay'] as const)(
     'routes %s results directly without asking for a duplicate same-topic copy',
     (resultDelivery) => {

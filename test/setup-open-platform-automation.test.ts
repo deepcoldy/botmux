@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/setup-open-platform-automation.test.ts
  */
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -182,6 +182,125 @@ function openPlatformSubscriptionMock(appId: string, opts: {
   };
   return { state, updateBodies, redirectWrites, handle };
 }
+
+describe('redirect recovery after app review', () => {
+  const appId = 'cli_review_redirect';
+  const custom = 'https://custom.example.com/callback';
+  const added = 'https://added.example.com/callback';
+
+  async function run(opts: {
+    stayUnderReview?: boolean;
+    unreadableRecovery?: boolean;
+    firstWriteDenied?: boolean;
+    repairedByUser?: boolean;
+  } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'redirect-review-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock(appId, { initial: { redirectUrls: [custom] } });
+    const calls: string[] = [];
+    let redirectWrites = 0;
+    let capabilitiesReady = false;
+    let created = false;
+    let committed = false;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const href = String(input);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home');
+      if (href.endsWith(`/app/${appId}/auth`)) return new Response(openPlatformPage('review-csrf'));
+      const path = new URL(href).pathname;
+      calls.push(path);
+      if (path.endsWith(`/safe_setting/update/${appId}`)) {
+        redirectWrites++;
+        if (redirectWrites === 1) {
+          return opts.firstWriteDenied
+            ? Response.json({ code: 10003, msg: 'not owned' }, { status: 403 })
+            : Response.json({ code: 10046, msg: '审核中, 请刷新' });
+        }
+      }
+      if (path.endsWith(`/safe_setting/${appId}`) && capabilitiesReady && opts.unreadableRecovery) {
+        return Response.json({ code: 0, data: {} });
+      }
+      if (path.endsWith(`/robot/switch/${appId}`)) {
+        if (opts.stayUnderReview) return Response.json({ code: 10046, msg: '审核中, 请刷新' });
+        capabilitiesReady = true;
+        sub.state.redirectUrls.push(added);
+        if (opts.repairedByUser) sub.state.redirectUrls.push(...collectBotmuxRedirectUrls());
+        return Response.json({ code: 0 });
+      }
+      if (path.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (path.includes('/app_version/list/')) {
+        return Response.json({ code: 0, data: { versions: [
+          { appVersion: '1.0.0', versionId: 'live', versionStatus: opts.stayUnderReview ? 1 : 2 },
+          ...(created ? [{ appVersion: '1.0.1', versionId: 'created', versionStatus: committed ? 2 : 0 }] : []),
+        ] } });
+      }
+      if (path.includes('/app_version/create/')) {
+        created = true;
+        return Response.json({ code: 0, data: { versionId: 'created' } });
+      }
+      if (path.includes('/publish/commit/')) {
+        committed = true;
+        return Response.json({ code: 0 });
+      }
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+    try {
+      const result = await automateOpenPlatformSetup({
+        appId, sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+        disableBytedcliFallback: true, appJustCreated: true,
+        scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      });
+      return { result, calls, redirectWrites, urls: sub.state.redirectUrls };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('审核锁解除后补齐白名单并保留期间新增地址，且在发版前完成', async () => {
+    const out = await run();
+    expect(out.result.ok).toBe(true);
+    expect(out.result.redirectConfigured).toBe(true);
+    expect(out.result.redirectWarning).toBeUndefined();
+    expect(out.redirectWrites).toBe(2);
+    expect(out.urls).toEqual(expect.arrayContaining([custom, added, ...collectBotmuxRedirectUrls()]));
+    const repairedAt = out.calls.lastIndexOf(`/developers/v1/safe_setting/update/${appId}`);
+    expect(repairedAt).toBeLessThan(out.calls.indexOf(`/developers/v1/app_version/create/${appId}`));
+  });
+
+  it('审核仍未完成时不撤回版本、不重复写入或创建版本', async () => {
+    const out = await run({ stayUnderReview: true });
+    expect(out.result).toMatchObject({ ok: false, reason: 'app_under_review', redirectConfigured: false });
+    expect(out.redirectWrites).toBe(1);
+    expect(out.calls.some(path => path.includes('/publish/cancel_commit/'))).toBe(false);
+    expect(out.calls.some(path => path.includes('/app_version/create/'))).toBe(false);
+    expect(out.urls).toEqual([custom]);
+  });
+
+  it('恢复读回失败时不沿用新建应用的盲写权限', async () => {
+    const out = await run({ unreadableRecovery: true });
+    expect(out.result.ok).toBe(true);
+    expect(out.result.redirectConfigured).toBe(false);
+    expect(out.result.redirectWarning).toBeTruthy();
+    expect(out.redirectWrites).toBe(1);
+    expect(out.urls).toEqual([custom, added]);
+  });
+
+  it('权限拒绝不触发审核解除后的恢复写入', async () => {
+    const out = await run({ firstWriteDenied: true });
+    expect(out.result.redirectConfigured).toBe(false);
+    expect(out.redirectWrites).toBe(1);
+    expect(out.urls).toEqual([custom, added]);
+  });
+
+  it('用户已自行补齐时只读确认，不再重复提交', async () => {
+    const out = await run({ repairedByUser: true });
+    expect(out.result.redirectConfigured).toBe(true);
+    expect(out.result.redirectWarning).toBeUndefined();
+    expect(out.redirectWrites).toBe(1);
+  });
+});
 
 describe('parseSetupOpenPlatformAutoFlag', () => {
   it('is enabled by default, supports explicit skip, and keeps --open-platform-auto compatible', () => {
