@@ -283,6 +283,8 @@ import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
+import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
+import type { RestartObserver } from './restart-coordinator.js';
 
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -2764,37 +2766,54 @@ ipcRoute('POST', '/api/sessions/:sessionId/prune', async (_req, res, params) => 
   });
 });
 
-/** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
+/** Post a dashboard restart's status card into the session's Lark thread/chat,
  *  mirroring the /resume route — so a Feishu-side observer sees why the CLI just
- *  restarted under them (the IM `/restart` command and the card button notify
- *  too; the dashboard was the lone silent path). `fresh` = the worker was gone
- *  and we re-forked it (revive) rather than doing an in-place CLI restart.
- *  Best-effort and fire-and-forget; never blocks the HTTP response. */
-function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
-  if (!ds.larkAppId) return;
+ *  restarted under them and how it ended. Same card as IM `/restart` and the
+ *  card button; routing stays the dashboard's own (chat-scope: flat group →
+ *  chat message, topic group → threaded reply to the root; thread-scope →
+ *  threaded reply). Best-effort; never blocks the HTTP response. */
+function dashboardRestartObserver(ds: DaemonSession): RestartObserver {
+  const sessionId = ds.session.sessionId;
+  const warnUnsettled = (status: string) => {
+    if (status === 'failed' || status === 'timed_out') logger.warn(`[restart] dashboard restart of ${sessionId} ${status}`);
+  };
   // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
-  // to post a restart notice into — skip (the raw sendMessage/replyMessage below
-  // bypass sessionReply's gate). Best-effort path; a silent skip is correct.
-  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
-  const loc = localeForBot(ds.larkAppId);
-  const botCfg = getBot(ds.larkAppId).config;
+  // to post into — the raw sendMessage/replyMessage below bypass sessionReply's
+  // gate. Best-effort path; a silent skip is correct.
+  if (!ds.larkAppId
+    || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) {
+    return { source: 'dashboard', notify: warnUnsettled };
+  }
+  const larkAppId = ds.larkAppId;
+  const loc = localeForBot(larkAppId);
+  const botCfg = getBot(larkAppId).config;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime)
     ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId ?? 'claude-code');
-  // Plain text: sendMessage/replyMessage wrap msgType 'text' as {"text": …}
-  // themselves — pre-stringifying here posted a literal {"text":"…"} to Feishu.
-  const notice = fresh
-    ? t('card.action.restarted_fresh', { cliName }, loc)
-    : t('cmd.restart.in_progress', { cliName }, loc);
-  if (ds.scope === 'chat' && ds.chatId) {
-    getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-      .then((mode) => mode === 'topic' && ds.session.rootMessageId
-        ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-      .catch(err => logger.debug(`[restart] failed to post chat-scope restart notice: ${err}`));
-  } else if (ds.session.rootMessageId) {
-    replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-      .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
-  }
+  const post = async (card: string): Promise<string | undefined> => {
+    if (ds.scope === 'chat' && ds.chatId) {
+      const mode = await getChatMode(larkAppId, ds.chatId, { forceRefresh: true });
+      return mode === 'topic' && ds.session.rootMessageId
+        ? replyMessage(larkAppId, ds.session.rootMessageId, card, 'interactive', true)
+        : sendMessage(larkAppId, ds.chatId, card, 'interactive');
+    }
+    if (ds.session.rootMessageId) {
+      return replyMessage(larkAppId, ds.session.rootMessageId, card, 'interactive', true);
+    }
+    return undefined;
+  };
+  const notify = restartStatusCardNotifier({
+    larkAppId,
+    sessionId,
+    render: status => buildRestartStatusCard({ status, cliName, source: 'dashboard', locale: loc }),
+    post,
+  });
+  return {
+    source: 'dashboard',
+    notify: (status, attemptId) => {
+      warnUnsettled(status);
+      return notify(status, attemptId);
+    },
+  };
 }
 
 /** Privileged host recovery: worker capabilities and request actor claims do not authorize this route. */
@@ -2912,36 +2931,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
     });
   }
   const cliId = ds.session.cliId ?? 'unknown';
-  if (ds.worker && !ds.worker.killed) {
-    // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
-    // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
-    // Correlated through the restart coordinator like IM /restart: the
-    // in-worker respawn emits no second `ready`, so only the attemptId-matched
-    // restart_result lifts the workerReady fence (#1863).
-    const sessionId = params.sessionId;
-    const restart = requestSessionRestart(ds, {
-      source: 'dashboard',
-      notify: status => {
-        if (status === 'failed' || status === 'timed_out') {
-          logger.warn(`[restart] dashboard restart of ${sessionId} ${status}`);
-        }
-      },
-    });
-    if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
-    if (restart.startFailure) {
-      return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
-    }
-    postRestartNotice(ds, false);
-    return jsonRes(res, 200, { ok: true, sessionId, cliId, revived: false });
+  const sessionId = params.sessionId;
+  // Live worker → in-place CLI restart (kills the CLI, respawns with --resume);
+  // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
+  // Worker gone but the session still active (idle-suspended over the per-bot
+  // cap, lazy-restored after a daemon restart, crash-loop-stopped) → revive it,
+  // so the dashboard isn't a dead-end: the resume button only shows for closed
+  // sessions. Both go through the restart coordinator exactly like the Feishu
+  // card button and IM /restart: the in-worker respawn emits no second
+  // `ready`, so only the attemptId-matched restart_result lifts the
+  // workerReady fence (#1863); and a worker-less restart first tears down a
+  // still-alive pane, so the revive is a real relaunch rather than a reattach
+  // to the wedged CLI — and its result can update the status card.
+  const revived = !ds.worker || ds.worker.killed;
+  const restart = requestSessionRestart(ds, dashboardRestartObserver(ds));
+  if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+  if (restart.startFailure) {
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
   }
-  // Worker is gone but the session is still active — idle-suspended (over the
-  // per-bot cap), lazy-restored after a daemon restart, or crash-loop-stopped.
-  // Revive it the same way the Feishu card restart does (forkWorker), so the
-  // dashboard isn't a dead-end: a 409 here would leave NO working control to
-  // bring the CLI back (the resume button only shows for closed sessions).
-  forkWorker(ds, '', ds.hasHistory);
-  postRestartNotice(ds, true);
-  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
+  return jsonRes(res, 200, { ok: true, sessionId, cliId, revived });
   });
 });
 
