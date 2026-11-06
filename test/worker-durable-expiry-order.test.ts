@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { classifyRestartTeardown } from '../src/adapters/backend/destroy-result.js';
 import { isRemoteBackendType } from '../src/core/persistent-backend.js';
 import { decideRestartFollowup, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
+import { protectedMcpRedactedEnvKeys } from '../src/core/protected-mcp-capabilities.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 import { join } from 'node:path';
@@ -107,7 +108,9 @@ describe('worker restart input fence', () => {
       cliSpawnGeneration: 7,
       inputDeliveryEvidence,
       networkPolicySupportError: () => undefined,
-      networkProxyError: () => undefined,
+      networkProxyLaunchError: async () => undefined,
+      protectedHttpEgressCliSupportError: () => undefined,
+      protectedMcpRedactedEnvKeys,
       resetCodexModelMigrationState: vi.fn(),
       backgroundTaskTracker: { reset: vi.fn() },
       join,

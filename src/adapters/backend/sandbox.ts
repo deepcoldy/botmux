@@ -20,6 +20,7 @@
  */
 import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
+import type { ProtectedHttpEgressLoopbackPlan, ProtectedLocalServiceLoopbackPlan } from '../../core/protected-http-egress-loopback.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
 import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
@@ -37,6 +38,13 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import {
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+  PROTECTED_HTTP_EGRESS_PROTOCOL_ENV,
+  PROTECTED_HTTP_SHARED_READ_PROTOCOL,
+  protectedHttpEgressAuthTokenPath,
+} from '../../core/protected-http-egress-host.js';
+import { ensurePrivateGatewayDir } from '../../core/plugins/mcp/socket-dir.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
 import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
@@ -727,12 +735,32 @@ export function __testOnly_resetPidNamespaceProbe(): void {
  *      --unshare-pid MUST stay — hence this gate never fires there.
  *   2. The host actually can't unshare-pid (nested sandbox) — otherwise keep
  *      full isolation; there's no reason to weaken it when it works.
+ * A credential-bearing host channel (MCP socket or protected local-service
+ * bridge) independently forbids the degrade: sharing the runner's PID namespace
+ * would make its private broker descriptors reachable through `/proc/1/fd`.
  * The on-disk credential seal (fs-policy deny masks) is UNCHANGED regardless;
  * only the pid-namespace defense-in-depth is dropped, and only where it both
  * (a) can't work and (b) protects nothing.
  */
-export function coreOnlyPidNamespaceDegrade(): boolean {
-  return process.env.BOTMUX_CORE_ONLY === '1' && !bwrapCanUnsharePid();
+export function coreOnlyPidNamespaceDegradeDecision(input: {
+  coreOnly: boolean;
+  canUnsharePid: boolean;
+  credentialBearingHostChannel: boolean;
+}): boolean {
+  return !input.credentialBearingHostChannel && input.coreOnly && !input.canUnsharePid;
+}
+
+export function coreOnlyPidNamespaceDegrade(
+  opts: { credentialBearingHostChannel?: boolean } = {},
+): boolean {
+  if (opts.credentialBearingHostChannel) return false;
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  if (!coreOnly) return false;
+  return coreOnlyPidNamespaceDegradeDecision({
+    coreOnly,
+    canUnsharePid: bwrapCanUnsharePid(),
+    credentialBearingHostChannel: false,
+  });
 }
 
 /**
@@ -1162,6 +1190,14 @@ export function prepareDirectSandbox(opts: {
   trustedBotmuxCommandPaths?: readonly string[];
   /** Worker-owned Unix socket for the credential-bearing MCP Gateway. */
   mcpGatewaySocketPath?: string;
+  /** Worker-owned protected HTTP egress guard socket beside the MCP socket. */
+  protectedEgressSocketPath?: string;
+  /** Optional loopback bridge for a process control-plane origin that overlaps
+   *  a protected target. It is started by the network-namespace runner. */
+  protectedHttpBridge?: ProtectedHttpEgressLoopbackPlan;
+  /** Exact localhost services re-exposed inside an isolated network namespace.
+   *  Each declaration is route- and header-scoped at the trusted Unix guard. */
+  localServiceBridges?: ProtectedLocalServiceLoopbackPlan[];
   /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
    *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
    *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
@@ -1184,12 +1220,19 @@ export function prepareDirectSandbox(opts: {
   childTarOptions?: string;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
+  if (opts.protectedHttpBridge && (!opts.networkPolicy
+    || !opts.protectedEgressSocketPath
+    || resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath))) {
+    throw new Error('protected HTTP loopback bridge requires the matching guarded network sandbox');
+  }
+  if (opts.localServiceBridges?.length && !opts.networkPolicy) {
+    throw new Error('protected local service bridge requires a guarded network sandbox');
+  }
   const proxyError = networkProxyError(opts.networkPolicy, process.env);
   if (proxyError) throw new Error(proxyError);
   if (!ensureSandboxDeps()) return null;
   const bwrap = bwrapExecutable();
   if (!bwrap) return null;
-  if (opts.networkPolicy && opts.mcpGatewaySocketPath) throw new Error('sandboxNetworkPolicy cannot expose host MCP/Unix IPC; disable host MCP plugins for this session');
   // Validate all dependencies before creating files.
   if (opts.networkPolicy) sandboxNetworkLaunch(opts.networkPolicy, '/bin/true', []);
 
@@ -1257,10 +1300,24 @@ export function prepareDirectSandbox(opts: {
   const filePaths = new Set<string>();
   for (const r of policy.rules) {
     if (r.access !== 'deny') continue;
-    try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir-shaped mask */ }
+    try {
+      const entry = lstatSync(r.path);
+      // Never follow a denied leaf symlink to classify/mask its target. A
+      // symlink or other special leaf is file-shaped for the lexical mask.
+      if (!entry.isDirectory()) filePaths.add(r.path);
+    } catch { /* absent → dir-shaped mask */ }
   }
 
-  const compiled = compileToBwrap(policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
+  const compiled = compileToBwrap(policy, {
+    symlinks,
+    emptyDir,
+    emptiesDir: empties,
+    filePaths,
+    chdir: opts.chdir,
+    skipPidNamespace: coreOnlyPidNamespaceDegrade({
+      credentialBearingHostChannel: !!opts.mcpGatewaySocketPath || !!opts.localServiceBridges?.length,
+    }),
+  });
   if (minimaxAlias) {
     // After tmpfs setup and before any host binds. Parent directories are
     // empty namespace scaffolding; the alias grants no additional host path.
@@ -1378,14 +1435,39 @@ export function prepareDirectSandbox(opts: {
   }
 
   let sandboxMcpGatewaySocketPath: string | undefined;
-  if (opts.mcpGatewaySocketPath) {
+  let sandboxProtectedEgressSocketPath: string | undefined;
+  if (opts.mcpGatewaySocketPath || opts.protectedEgressSocketPath) {
     try {
-      const socketPath = resolve(opts.mcpGatewaySocketPath);
-      if (!lstatSync(socketPath).isSocket()) { rollbackSandboxSetup(sessionRoot, createdMasks); return null; }
-      const hostDir = realpathSync(dirname(socketPath));
+      if (!opts.mcpGatewaySocketPath) {
+        rollbackSandboxSetup(sessionRoot, createdMasks);
+        return null;
+      }
+      const mcpSocketPath = resolve(opts.mcpGatewaySocketPath);
+      if (!lstatSync(mcpSocketPath).isSocket()) {
+        rollbackSandboxSetup(sessionRoot, createdMasks);
+        return null;
+      }
+      const hostDir = realpathSync(dirname(mcpSocketPath));
       const sandboxDir = '/run/botmux-mcp';
       args.push('--dir', sandboxDir, '--ro-bind', hostDir, sandboxDir);
-      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(socketPath));
+      // Keep the rotating MCP socket directory live, but never expose the
+      // egress bridge's authentication to task processes. Mask BOTH aliases:
+      // another file-policy ancestor grant may also admit the canonical path.
+      // The outer network runner reads the real directory outside bwrap.
+      const egressAuthDir = dirname(protectedHttpEgressAuthTokenPath(join(hostDir, 'e.sock')));
+      ensurePrivateGatewayDir(egressAuthDir);
+      args.push('--tmpfs', join(sandboxDir, basename(egressAuthDir)),
+        '--dir', hostDir, '--tmpfs', egressAuthDir);
+      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(mcpSocketPath));
+      if (opts.protectedEgressSocketPath) {
+        const egressSocketPath = resolve(opts.protectedEgressSocketPath);
+        if (!lstatSync(egressSocketPath).isSocket()
+          || realpathSync(dirname(egressSocketPath)) !== hostDir) {
+          rollbackSandboxSetup(sessionRoot, createdMasks);
+          return null;
+        }
+        sandboxProtectedEgressSocketPath = join(sandboxDir, basename(egressSocketPath));
+      }
     } catch {
       // Spawn-setup failure AFTER mask mountpoints were pre-created: reclaim the
       // empty ones (from the in-memory list) and drop the tree so nothing leaks.
@@ -1443,6 +1525,10 @@ export function prepareDirectSandbox(opts: {
     env[MCP_GATEWAY_SOCKET_ENV] = sandboxMcpGatewaySocketPath;
     env[MCP_GATEWAY_REQUIRED_ENV] = '1';
   }
+  if (sandboxProtectedEgressSocketPath) {
+    env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] = sandboxProtectedEgressSocketPath;
+    env[PROTECTED_HTTP_EGRESS_PROTOCOL_ENV] = PROTECTED_HTTP_SHARED_READ_PROTOCOL;
+  }
   for (const k of PROXY_ENV_KEYS) {
     const v = process.env[k];
     if (typeof v === 'string' && v) env[k] = v;
@@ -1491,12 +1577,22 @@ export function prepareDirectSandbox(opts: {
     rollbackSandboxSetup(sessionRoot, createdMasks);
     throw error;
   }
+  // Carry the CLI boundary explicitly: the network runner receives shell +
+  // bwrap arguments, whose -c and -- have different meanings from Codex's.
+  const protectedHttpBridgeArgsOffset = launch.args.length + args.length + 2;
   if (!compactLaunch) args.push('--', ...command);
 
   let networkLaunch: ReturnType<typeof sandboxNetworkLaunch> | undefined;
   try {
     networkLaunch = opts.networkPolicy
-      ? sandboxNetworkLaunch(opts.networkPolicy, launch.bin, [...launch.args, ...args])
+      ? sandboxNetworkLaunch(
+        opts.networkPolicy,
+        launch.bin,
+        [...launch.args, ...args],
+        opts.protectedHttpBridge,
+        opts.localServiceBridges,
+        opts.protectedHttpBridge ? protectedHttpBridgeArgsOffset : undefined,
+      )
       : undefined;
   } catch (error) {
     rollbackSandboxSetup(sessionRoot, createdMasks);

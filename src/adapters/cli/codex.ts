@@ -296,7 +296,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, serviceTier, codexProfile, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, modelProviderBaseUrlOverride, reasoningEffort, serviceTier, codexProfile, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
       if (promptInjection === 'none') {
         assertNoGlobalBotmuxSkills(join(codexHome(), 'skills'));
       }
@@ -309,6 +309,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // independent of approval/sandbox bypass and leave user config untouched.
       const modelNudgeArgs = hideRateLimitModelNudge
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
+      const providerBaseUrlArgs = modelProviderBaseUrlOverride
+        ? (() => {
+            if (!/^[A-Za-z0-9_-]{1,128}$/.test(modelProviderBaseUrlOverride.providerId)) {
+              throw new Error('invalid Codex model provider id for process override');
+            }
+            return ['-c', `model_providers.${modelProviderBaseUrlOverride.providerId}.base_url=${JSON.stringify(modelProviderBaseUrlOverride.baseUrl)}`];
+          })()
         : [];
       if (remoteWsUrl && remoteThreadId) {
         if (codexProfile) throw new Error('Codex profile is not supported by the RPC app-server/viewer');
@@ -328,6 +336,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // `resume`; --no-alt-screen retains its original subcommand scope.
         return ['--remote', remoteWsUrl,
           '-c', 'check_for_update_on_startup=false',
+          ...providerBaseUrlArgs,
           ...modelNudgeArgs,
           ...(quietResume ? ['-c', 'tui.auto_recap=false'] : []),
           'resume', '--no-alt-screen', remoteThreadId];
@@ -363,6 +372,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // not); the host-side daily monitor reports newer versions to the owner.
         '-c',
         'check_for_update_on_startup=false',
+        ...providerBaseUrlArgs,
         // Codex 0.151+ opens a "Switch to <luna-tier model> for lower credit
         // usage?" selection view once the primary usage limit is >=90% used
         // (upstream RATE_LIMIT_SWITCH_PROMPT_THRESHOLD). Its first item is the

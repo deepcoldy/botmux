@@ -400,6 +400,64 @@ Details in [File sandbox](/en/sandbox).
 
 > The ZMX backend can't enforce the file sandbox; sandboxed combinations are refused at startup. See [ZMX backend](/en/zmx).
 
+### Protected local MCP capabilities
+
+A local stdio MCP server can request one optional protected capability in its plugin-private `mcp/index.json`. The capability ID is opaque to Botmux; use a non-business-specific fixture such as:
+
+```json
+{
+  "transport": "stdio",
+  "command": ["node", "./mcp/server.js"],
+  "protectedCapability": "fixture.secret.v1"
+}
+```
+
+`protectedCapability` is not supported for streamable HTTP MCP servers; a plugin descriptor that combines them is rejected. The descriptor does not supply the secret source, principal policy, or containment rules; those bindings come only from machine-level configuration.
+
+Within `bots.json`, the `plugins` array only enables installed plugins for that bot:
+
+```json
+{
+  "plugins": ["fixture-plugin"]
+}
+```
+
+Do not put protected capability bindings, secret sources, secret values, or rollout state in `bots.json`. Operators bind the opaque capability ID in the machine-level `~/.botmux/config.json`:
+
+```json
+{
+  "protectedMcpCapabilities": {
+    "fixture.secret.v1": {
+      "enabled": false,
+      "allowedPluginIds": ["fixture-plugin"],
+      "secret": {
+        "source": "file",
+        "path": ".botmux/secrets/fixture-protected-secret"
+      },
+      "principal": "verified-human-email",
+      "containmentProfile": "local-stdio-secret-v1",
+      "isolation": {
+        "protectedHomePaths": [".fixture-credential"],
+        "redactEnv": ["FIXTURE_AUTH_TOKEN"]
+      }
+    }
+  }
+}
+```
+
+Missing `enabled` defaults to disabled; only JSON boolean `true` enables the binding. Non-boolean values such as `"true"` or `1` reject the entire record. Secrets support only `{ "source": "file", "path": "<Home-relative path>" }`, rooted at the daemon account's trusted Home. Absolute paths, `.`/`..` components, and symlinks are rejected. Operators must preprovision a nonempty regular file owned by the current user with exact mode `0600`, at most 64 KiB. Botmux never repairs unsafe files and never captures or caches secrets at daemon startup. It reads the file before each new worker fork, pinning directory fds and opening each component without following symlinks so an intermediate replacement cannot redirect the read.
+
+The secret reaches an authorized MCP only through the one-shot fd channel, never argv, generic environments, or logs. Rotation takes effect on the next worker fork; an existing MCP retains its startup secret until that session is recreated. Every valid configured secret file is automatically denied in all relevant session sandboxes, including bots without the matching plugin and disabled capabilities. Additional `protectedHomePaths` remain scoped to matching plugins. Current configuration supplies the `redactEnv` names and recognizable valid names from rejected legacy `source: "env"` records for worker, model, and generic plugin environment redaction; legacy environment sources grant no write capability. Machine configuration changes follow the global configuration's short cache refresh rules.
+
+At MCP process startup, Botmux uses the ordinary stdio transport without a protected secret file descriptor if the capability is disabled or not provisioned, the plugin is outside `allowedPluginIds`, the configured containment prerequisites are not satisfied, or the daemon cannot provide the one-shot channel. The server can still start and expose read-only tools. A `tools/call` on that connection receives neither `botmuxTrustedPrincipal` nor `botmuxGrantedCapabilities`; the plugin must fail closed for protected writes.
+
+`principal` is evaluated for each `tools/call`, not when the MCP process starts. If the global binding, plugin allowlist, containment prerequisites, and daemon channel all succeeded at startup, the long-lived process may already hold the one-shot secret even when a later call lacks its required verified human principal or other call-time grant condition. Botmux omits `botmuxTrustedPrincipal` and `botmuxGrantedCapabilities` from that call, and the plugin must reject the protected write. For **every** protected write, the plugin must freshly validate `botmuxTrustedPrincipal` and confirm that `botmuxGrantedCapabilities` contains the exact capability ID. It must never cache or reuse a principal, capability, or authorization result from an earlier call; any missing, mismatched, or stale field must fail closed. Isolation paths and environment redaction remain active for a matching enabled plugin even while the capability itself is disabled.
+
+To migrate legacy environment secrets, provision the safe file and change the configuration to `source: "file"`, then remove the old variable from the daemon launch source and restart the daemon. Deleting `process.env` cannot erase an old process's `/proc/<pid>/environ`. Before adding or changing secret paths, terminate and recreate old CLI sessions so their file denies cover the new paths; a hot update cannot revoke access already granted to old processes. Prefer rotation via atomic replacement at a fixed protected path. Protected files or other isolation requirements disable bare-host one-shot title generation and retain placeholder titles; ordinary session reads are unaffected.
+
+A restarted stdio MCP process currently cannot receive the one-shot secret again and falls back to read-only; recreate the session to restore protected capabilities. User-visible errors from the different policy collection entry points remain a follow-up.
+
+||||||| 15acd8dde
 ### Run CLI calls as the message sender (`triggerUserAuth`) {#trigger-user-auth}
 
 **Off by default.** When on, `lark-cli` / `bytedcli` in this bot's sessions run with the authorization of whoever sent the current message, not whatever is logged in on the machine. Useful when several people share one bot: each message reads docs, checks calendars or calls internal platforms as its own sender.
@@ -849,6 +907,10 @@ Bad formats, unknown fields and reserved names are rejected outright, never sile
 | `proxyMode` unset and either zone is `block` / `allowlist` / `denylist` | Any non-empty proxy value refuses to start |
 | `proxyMode: "reject"` | Any non-empty proxy value refuses to start |
 | `proxyMode: "trusted-egress"` | Explicitly allowed proxies may stay; network rules must allow the proxy's IP and port, and the final targets are governed by the proxy's own ACL |
+
+General proxy delegation in this table applies only to ordinary sessions. A frozen protected HTTP egress policy explicitly rejects `trusted-egress` and task proxy variables; adding that mode repeatedly cannot resolve the error. Model connections must use the protected model bridge, currently supported only by Codex. See [network sandbox documentation](sandbox.md).
+
+`trusted-egress` neither creates a proxy, grants environment variables nor guarantees the CLI uses it. Authorizing an exit does not restrict destinations behind it. If a model requires a proxy, do not simply remove its `inherit` grant to pass validation: explicitly trust the exit and configure endpoint rules plus deployment-layer ACLs, or first establish direct model authentication, permitted destination CIDRs/ports and DNS. Persistent backends such as tmux, adopt and external App Servers remain rejected regardless of `trusted-egress` or `envPolicy`.
 
 The network policy itself requires Linux, the local PTY backend and `sandbox: "oncall"`. See [File and network sandbox](/en/sandbox).
 

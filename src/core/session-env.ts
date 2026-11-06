@@ -224,6 +224,15 @@ export function sessionEnvUnsetFlags(unset: readonly string[] | undefined): stri
   return out;
 }
 
+/** Host-authorized removals that may include otherwise reserved control names. */
+export function trustedSessionEnvUnsetFlags(unset: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const key of unset ?? []) {
+    if (isSessionEnvName(key)) out.push('-u', key);
+  }
+  return out;
+}
+
 // ─── Masking ────────────────────────────────────────────────────────────────
 
 /** Name fragments that mark a credential. Matched per `_` segment: a segment

@@ -4,7 +4,25 @@ import { deploymentContinuationTemplate } from './services/deployment-continuati
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
-import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import { FROZEN_NETWORK_POLICY_HINT, hostDnsServers, mergeProtectedHttpEgressNetworkPolicy, networkPolicySupportError, protectedHttpEgressCliSupportError } from './core/sandbox-network-policy.js';
+import { networkProxyLaunchError } from './core/sandbox-network-proxy.js';
+import {
+  protectedMcpContainmentActive,
+  protectedMcpHomeDenyPaths,
+  protectedMcpHomePaths,
+  protectedMcpRedactedEnvKeys,
+} from './core/protected-mcp-capabilities.js';
+import {
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+  PROTECTED_HTTP_EGRESS_PROTOCOL_ENV,
+  startSessionProtectedHttpEgressHost,
+  type SessionProtectedHttpEgressHost,
+} from './core/protected-http-egress-host.js';
+import {
+  readCodexProtectedProviderBridge,
+  type CodexProtectedProviderBridgeSelection,
+} from './core/protected-http-egress-loopback.js';
+import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
@@ -35,7 +53,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
-import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -267,6 +285,7 @@ import {
 } from './core/plugins/mcp/environment.js';
 import type {
   GatewayLinkRefRegistrationHandler,
+  GatewayTrustedTurnIdentity,
   GatewayTrustedResultDeliveryHandler,
 } from './core/plugins/mcp/gateway.js';
 import {
@@ -1266,10 +1285,11 @@ async function codexRolloutProbe(cliId: string, threadId: string, promptText: st
 
 function codexNativeTitleEnv(cfg: Extract<DaemonToWorker, { type: 'init' }>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset),
-    ...botInjectedEnv(cfg.env, cfg.envPolicy),
+    ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+    ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
   };
   env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
+  for (const key of protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy)) delete env[key];
   return env;
 }
 
@@ -1462,10 +1482,11 @@ async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexR
     }
     const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
     const env: NodeJS.ProcessEnv = {
-      ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset),
-      ...botInjectedEnv(cfg.env, cfg.envPolicy),
+      ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+      ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
     };
     env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
+    for (const key of protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy)) delete env[key];
     const abortController = new AbortController();
     nativeSessionTitleSyncAbortControllers.add(abortController);
     try {
@@ -1549,7 +1570,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     if (cfg.cliId === 'codex') {
       try { cliBin = realpathSync(resolvedCliBin); } catch { /* launch may resolve through engineEnv.PATH */ }
     }
-    const engineEnv: NodeJS.ProcessEnv = { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset) };
+    const engineEnv: NodeJS.ProcessEnv = {
+      ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+    };
     engineEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), engineEnv.PATH);
     engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;
     // In Codex/TraeX RPC mode the app-server, not the remote viewer TUI, runs
@@ -1574,7 +1597,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // per-bot provider env (base-url + token, proxy, feature flags) spawnCli
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
-    Object.assign(engineEnv, botInjectedEnv(cfg.env, cfg.envPolicy));
+    Object.assign(engineEnv, botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy));
     if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(engineEnv);
     applyCodexInstanceEnv(engineEnv, cfg.cliInstanceBinding);
     // Session identity is host-owned. Pin it after the config-controlled merge,
@@ -1619,6 +1642,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         : undefined);
     if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
       sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+    for (const key of protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy)) delete engineEnv[key];
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, serviceTier: cfg.serviceTier, log: (m: string) => log(m),
@@ -1947,6 +1971,8 @@ let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
+let sessionProtectedHttpEgressHost: SessionProtectedHttpEgressHost | null = null;
+let localProtectedMcpContainmentActiveCapabilityIds: string[] = [];
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
   reject: (error: Error) => void;
@@ -1963,6 +1989,51 @@ const pendingLinkRefModeRestores = new Map<string, {
   resolve: (mode: 'enabled' | undefined) => void;
   reject: (error: Error) => void;
 }>();
+const pendingProtectedSecretChannels = new Map<string, {
+  resolve: (channel: Duplex) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
+}>();
+
+function isDuplexHandle(value: unknown): value is Duplex {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<Duplex>;
+  return typeof candidate.write === 'function'
+    && typeof candidate.destroy === 'function'
+    && typeof candidate.on === 'function';
+}
+
+function requestProtectedSecretChannel(capabilityId: string): Promise<Duplex> {
+  const capabilityConfigured = lastInitConfig?.protectedMcpPolicy?.capabilities
+    .some(capability => capability.id === capabilityId) === true;
+  if (!capabilityConfigured || !process.send) {
+    return Promise.reject(new Error('protected MCP secret channel is unavailable'));
+  }
+  const requestId = randomUUID();
+  return new Promise<Duplex>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      const pending = pendingProtectedSecretChannels.get(requestId);
+      if (!pending) return;
+      pendingProtectedSecretChannels.delete(requestId);
+      pending.reject(new Error('protected MCP secret channel timed out'));
+    }, 10_000);
+    timeout.unref();
+    pendingProtectedSecretChannels.set(requestId, { resolve, reject, timeout });
+    process.send?.({
+      type: 'protected_mcp_secret_channel_request',
+      requestId,
+      capabilityId,
+    } satisfies WorkerToDaemon,
+      error => {
+        if (!error) return;
+        const pending = pendingProtectedSecretChannels.get(requestId);
+        if (!pending) return;
+        pendingProtectedSecretChannels.delete(requestId);
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+      });
+  });
+}
 
 function restoreLinkRefModeThroughHost(input: {
   turnId: string;
@@ -2216,9 +2287,23 @@ function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
   log('Attached refreshed plugin Skill catalog at the CLI write edge');
 }
 
+function stopSessionProtectedHttpEgressHost(): void {
+  const host = sessionProtectedHttpEgressHost;
+  sessionProtectedHttpEgressHost = null;
+  if (!host) return;
+  // close() unlinks the listener synchronously before draining connections.
+  // The sandbox child's frozen network namespace continues enforcing direct
+  // target denies until that child exits.
+  void host.close().catch((error) => {
+    log(`[protected-egress] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
+
 function stopSessionMcpGatewayHost(): void {
+  stopSessionProtectedHttpEgressHost();
   const host = sessionMcpGatewayHost;
   sessionMcpGatewayHost = null;
+  localProtectedMcpContainmentActiveCapabilityIds = [];
   if (!host) return;
   void host.close().catch((error) => {
     log(`[mcp-gateway] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -2347,6 +2432,49 @@ async function prepareCliPluginGenerationAndGateway(
   refreshCliPluginGeneration(cfg, adapter, preserveUnchangedCatalog);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
+  if (cfg.protectedHttpEgressPolicy) {
+    try {
+      const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
+      const loopbackServices = daemonIpcPort && usesLarkToolBinding(
+        cfg,
+        process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+        isWorkflowWorker(),
+      ) ? [larkToolLoopbackService(cfg.sessionId, daemonIpcPort)] : [];
+      sessionProtectedHttpEgressHost = await startSessionProtectedHttpEgressHost({
+        sessionId: cfg.sessionId,
+        dataDir: config.session.dataDir,
+        policy: cfg.protectedHttpEgressPolicy.policy,
+        policyDigest: cfg.protectedHttpEgressPolicy.policyDigest,
+        sharedRead: true,
+        frozenAddresses: cfg.protectedHttpEgressPolicy.frozenAddresses,
+        loopbackServices,
+        ...(cfg.protectedLoopbackProxyAttestation ? {
+          loopbackProxyAttestation: {
+            ...cfg.protectedLoopbackProxyAttestation,
+            sessionId: cfg.sessionId,
+            currentTurn: () => {
+              const active = activeTurnAuthority.identity();
+              const turnId = active.turnId ?? currentBotmuxTurnId;
+              const dispatchAttempt = active.dispatchAttempt ?? currentBotmuxDispatchAttempt;
+              return {
+                ...(turnId ? { turnId } : {}),
+                ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+              };
+            },
+          },
+        } : {}),
+        log: entry => log(`[protected-egress] request ${JSON.stringify(entry)}`),
+        warn: warning => log(`[protected-egress] warning ${JSON.stringify(warning)}`),
+        onError: error => log(`[protected-egress] host error: ${error.message}`),
+      });
+      log(`[protected-egress] guard listening for ${cfg.protectedHttpEgressPolicy.pluginId}`);
+    } catch (error) {
+      sessionProtectedHttpEgressHost = null;
+      // The child may continue only behind the already-frozen direct target
+      // denies. Active actor authorization remains false without this host.
+      log(`[protected-egress] guard unavailable; continuing deny-only: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   if (adapter.mcpGateway && manifest?.entries.length) {
     await startAndRecordSessionMcpGatewayHost(cfg.sessionId);
     log(`[mcp-gateway] trusted host listening for ${manifest.entries.length} plugin server(s)`);
@@ -2375,6 +2503,9 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
     linkRefRegistration: registerMcpLinkRefsThroughHost,
+    requestProtectedSecretChannel: requestProtectedSecretChannel,
+    protectedMcpPolicy: lastInitConfig?.protectedMcpPolicy,
+    protectedEgressSocketPath: sessionProtectedHttpEgressHost?.socketPath,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -2721,7 +2852,7 @@ function followBotTraeHome(cfg: Extract<DaemonToWorker, { type: 'init' }>): void
   pinWorkerTraeHome(process.env, {
     cliId: cfg.cliId,
     adoptMode: cfg.adoptMode === true,
-    perBotEnv: botInjectedEnv(cfg.env, cfg.envPolicy),
+    perBotEnv: botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
     bootTraeHome: workerBootTraeHome,
     envPolicy: cfg.envPolicy,
     envUnset: cfg.envUnset,
@@ -5431,8 +5562,8 @@ async function preflightTraexAutoModelBeforeSpawn(
       timeoutMs: controller.config.preflightTimeoutMs
         ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
       env: {
-        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset),
-        ...botInjectedEnv(cfg.env, cfg.envPolicy),
+        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+        ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
       },
     });
   } catch (error) {
@@ -5611,7 +5742,10 @@ function observeTraexAutoModelCapacity(screen: string): void {
     void readTraexModelLoadSnapshot({
       cliBin: cliAdapter!.resolvedBin,
       cwd: config.workingDir,
-      env: { ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset), ...botInjectedEnv(config.env, config.envPolicy) },
+      env: {
+        ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
+        ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
+      },
     }).then(snapshot => {
       const active = activeTurnAuthority.snapshot();
       if (backend !== target || generation !== cliSpawnGeneration
@@ -5667,8 +5801,8 @@ function currentTraexLoadSnapshot(timeoutMs: number): Promise<TraexModelLoadSnap
     cwd: config.workingDir,
     timeoutMs,
     env: {
-      ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset),
-      ...botInjectedEnv(config.env, config.envPolicy),
+      ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
+      ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
     },
   });
 }
@@ -5764,8 +5898,8 @@ function currentTraexQuotas() {
   if (!cliAdapter || !lastInitConfig) return Promise.resolve(null);
   const config = lastInitConfig;
   return readTraexModelQuotas({ cliBin: cliAdapter.resolvedBin, cwd: config.workingDir,
-    env: { ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset),
-      ...botInjectedEnv(config.env, config.envPolicy) } });
+    env: { ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
+      ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy) } });
 }
 
 function selectTraexQuotaModelBeforeTurn(head: PendingCliInput): boolean {
@@ -5981,10 +6115,13 @@ function releaseActiveTurnAuthority(
   return true;
 }
 
-function currentGatewayTrustedTurnIdentity() {
+function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
   const identity = activeTurnAuthority.identity();
   return {
     ...identity,
+    protectedMcpContainmentActiveCapabilityIds: [
+      ...localProtectedMcpContainmentActiveCapabilityIds,
+    ],
     ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
   };
 }
@@ -21975,6 +22112,19 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   followBotTraeHome(cfg);
+  const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
+  if (protectedCliError) throw new Error(protectedCliError + FROZEN_NETWORK_POLICY_HINT);
+  const protectedMcpEnvKeys = protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy);
+  // Freeze protected-target denies before ANY support/proxy/sandbox decision.
+  // The exact worker-init addresses also feed the egress host, so DNS cannot
+  // split the user-space forwarder from the kernel boundary.
+  const effectiveSandboxNetworkPolicy = cfg.protectedHttpEgressPolicy
+    ? mergeProtectedHttpEgressNetworkPolicy(
+      cfg.sandboxNetworkPolicy,
+      cfg.protectedHttpEgressPolicy,
+      hostDnsServers(path => readFileSync(path, 'utf8')),
+    )
+    : cfg.sandboxNetworkPolicy;
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
   // Probed once at the early gate and reused at the final child-env gate so a
@@ -22007,13 +22157,16 @@ async function spawnCli(
   }
   const networkError = networkPolicySupportError({
     platform: process.platform, backendType: cfg.backendType, sandbox: cfg.sandbox,
-    adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: cfg.sandboxNetworkPolicy,
+    adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: effectiveSandboxNetworkPolicy,
   });
   // cfg.sandboxNetworkPolicy is the session's creation-time snapshot.
   if (networkError) throw new Error(networkError + FROZEN_NETWORK_POLICY_HINT);
-  const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
+  const proxyError = await networkProxyLaunchError(effectiveSandboxNetworkPolicy, { ...process.env, ...cfg.env }, {
+    protectedHttpEgress: !!cfg.protectedHttpEgressPolicy,
+  });
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
+  localProtectedMcpContainmentActiveCapabilityIds = [];
   const spawnStartedAtMs = Date.now();
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
@@ -22098,9 +22251,26 @@ async function spawnCli(
       // Upgrade fail-safe: a pre-dedicated-directory credential still activates
       // mandatory confinement until the host explicitly removes/migrates it.
       || hostEntryExistsNoFollow(join(root, DEVICE_CREDENTIAL_FILE)));
+  const configuredProtectedHomePaths = protectedMcpHomePaths(hostHomeDir, cfg.protectedMcpPolicy);
+  const protectedPathsForHome = (home: string): string[] =>
+    protectedMcpHomeDenyPaths(home, cfg.protectedMcpPolicy);
+  const existingProtectedPathVariants = (paths: readonly string[]): string[] => {
+    const variants = new Set<string>();
+    for (const path of paths) {
+      const parent = dirname(path);
+      const prefix = `${basename(path)}.`;
+      try {
+        for (const name of readdirSync(parent)) {
+          if (name.startsWith(prefix)) variants.add(join(parent, name));
+        }
+      } catch { /* missing/unreadable parent: the declared leaf still stays denied */ }
+    }
+    return [...variants];
+  };
   const mandatoryCredentialIsolation = credentialIsolationRequired({
     markerExists: deviceIsolationMarkerExists,
     deviceCredentialExists,
+    protectedHomePaths: configuredProtectedHomePaths,
   });
   if (mandatoryCredentialIsolation && cfg.adoptMode) {
     throw new Error(
@@ -22570,7 +22740,7 @@ async function spawnCli(
       workingDir: cfg.workingDir,
       model: cfg.model,
       disableCliBypass: cfg.disableCliBypass,
-      env: cfg.env ? botInjectedEnv(cfg.env, cfg.envPolicy) : undefined,
+      env: cfg.env ? botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy) : undefined,
       // Resume the persisted lineage: daemon restart, /relay and worker rebuilds
       // all arrive with riffParentTaskId set (the shared remote-lineage channel —
       // see the riff_task_id IPC message, emitted by the generic
@@ -22607,6 +22777,7 @@ async function spawnCli(
       BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
+    for (const key of protectedMcpEnvKeys) delete (riffBackendConfig as EffectiveMojoConfig).env![key];
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
   }
@@ -22681,7 +22852,11 @@ async function spawnCli(
     // explicit riff config.env takes precedence over both. The workflow
     // kill-switch is a host-resolved snapshot and is re-frozen AFTER this merge
     // (see below), so it is intentionally NOT set in sessionEnv here.
-    const mergedEnv: Record<string, string> = { ...sessionEnv, ...botInjectedEnv(cfg.env, cfg.envPolicy), ...riffCfg.env };
+    const mergedEnv: Record<string, string> = {
+      ...sessionEnv,
+      ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+      ...riffCfg.env,
+    };
     // The effective policy is a host-resolved snapshot, not a user-overridable
     // backend env knob. Re-freeze it after config.env/per-bot env merge.
     if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
@@ -22735,6 +22910,7 @@ async function spawnCli(
     else delete mergedEnv.BOTMUX_RIFF_HOST_TOOLS;
     delete mergedEnv.BOTMUX_RIFF_HOST_BINDING;
     if (!noTransport && !isWorkflowWorker()) delete mergedEnv.BOTMUX_LARK_APP_SECRET;
+    for (const key of protectedMcpEnvKeys) delete mergedEnv[key];
     riffBackendConfig = Object.assign({}, riffCfg, {
       env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId,
       hostToolsBinding: noTransport || isWorkflowWorker() ? undefined : () => {
@@ -22850,7 +23026,7 @@ async function spawnCli(
     // locally, so the local sandbox stays on rather than being skipped.
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
-  const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: cfg.sandboxNetworkPolicy });
+  const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: effectiveSandboxNetworkPolicy });
   if (effectiveNetworkError) throw new Error(effectiveNetworkError + FROZEN_NETWORK_POLICY_HINT);
   // Single-source network facts for THIS spawn. These same values feed the
   // bwrap/Seatbelt constructors below (netEnabled) and the identity storage
@@ -22860,7 +23036,7 @@ async function spawnCli(
   const spawnNetworkShape = resolveSpawnNetworkShape({
     mode: sandboxMode,
     sandboxNetwork: cfg.sandboxNetwork,
-    sandboxNetworkPolicy: cfg.sandboxNetworkPolicy,
+    sandboxNetworkPolicy: effectiveSandboxNetworkPolicy,
   });
   const scratchRequested = sandboxMode === 'scratch';
   const sandboxRequested = sandboxMode !== 'off';
@@ -22962,6 +23138,7 @@ async function spawnCli(
   const credentialIsolationGate = evaluateCredentialOnlyIsolationGate({
     markerExists: deviceIsolationMarkerExists,
     deviceCredentialExists,
+    protectedHomePaths: configuredProtectedHomePaths,
     remoteBackend: riffRemoteBackend,
     platform: process.platform,
     mechanismAvailable: credentialMechanismAvailable,
@@ -24015,13 +24192,20 @@ async function spawnCli(
   // adapter probe below queries the exact DB Hermes will `--resume` against.
   const hermesResumeStateDbPath = cfg.cliId === 'hermes'
     ? resolveHermesStateDbPath(
-      { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...botInjectedEnv(cfg.env, cfg.envPolicy), BOTMUX_SESSION_ID: cfg.sessionId },
+      {
+        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+        ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+        BOTMUX_SESSION_ID: cfg.sessionId,
+      },
       { botmuxSessionProfile: basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session' },
     )
     : undefined;
   // Exact native identities survive worker/CLI replacement. No latest-session guessing.
   const zcodeResumeDbPath = cfg.cliId === 'zcode'
-    ? zcodeSessionDbPath({ ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...botInjectedEnv(cfg.env, cfg.envPolicy) }) : undefined;
+    ? zcodeSessionDbPath({
+        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+        ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+      }) : undefined;
   if (cfg.cliId === 'zcode' && !effectiveCliSessionId) {
     const marker = readZcodeSessionMarker(cfg.sessionId, { dataDir: config.session.dataDir });
     if (marker) { effectiveCliSessionId = marker.cliSessionId; persistCliSessionId(marker.cliSessionId); }
@@ -24043,7 +24227,10 @@ async function spawnCli(
       workingDir: cfg.workingDir,
       dataDir: claudeDataDir,
       stateDbPath: zcodeResumeDbPath ?? hermesResumeStateDbPath,
-      env: { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...botInjectedEnv(cfg.env, cfg.envPolicy) },
+      env: {
+        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+        ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+      },
     });
     if (probe === false) tier1ProbeFalse = true;
   }
@@ -24325,7 +24512,7 @@ async function spawnCli(
   let perBotSettingsEnv: Record<string, string> | undefined;
   let perBotSettingsFilePath: string | undefined;
   if (cliAdapter.claudeDataDir && cfg.env && process.env.SESSION_DATA_DIR) {
-    const sanitized = botInjectedEnv(cfg.env, cfg.envPolicy);
+    const sanitized = botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy);
     if (Object.keys(sanitized).length > 0) {
       perBotSettingsEnv = sanitized;
       const settingsDir = willRedirectCliData && claudeDataDir
@@ -24339,7 +24526,7 @@ async function spawnCli(
 
     }
   }
-  const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);
+  const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy);
   const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
   if (!boundLark && process.env.SESSION_DATA_DIR) {
     cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
@@ -24359,11 +24546,33 @@ async function spawnCli(
     if (sandboxRequested) throw new Error('ZCode provider bridge is not yet validated in the OS file sandbox');
     Object.assign(perBotInjectEnv, await prepareZcodeSessionModel({
       sessionId: cfg.sessionId, dataDir: config.session.dataDir,
-      env: { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...perBotInjectEnv },
+      env: {
+        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+        ...perBotInjectEnv,
+      },
       model: cfg.model, reasoningEffort: cfg.reasoningEffort, resume: effectiveResume,
     }));
   }
   const cliExtraArgs = resolveCliExtraArgs();
+  let codexProtectedProviderBridge: CodexProtectedProviderBridgeSelection | undefined;
+  if (cfg.cliId === 'codex' && cfg.protectedHttpEgressPolicy) {
+    const codexConfigHome = cfg.codexProfileHome
+      ?? (cfg.cliInstanceBinding?.source !== 'legacy' ? cfg.cliInstanceBinding?.codexHome : undefined)
+      ?? isolatedCodexHome
+      ?? process.env.CODEX_HOME?.trim()
+      ?? join(homedir(), '.codex');
+    codexProtectedProviderBridge = readCodexProtectedProviderBridge({
+      configPath: join(codexConfigHome, CODEX_CONFIG_FILE),
+      policy: cfg.protectedHttpEgressPolicy.policy,
+      socketPath: sessionProtectedHttpEgressHost?.socketPath ?? '/botmux/protected-egress-unavailable',
+    });
+    if (codexProtectedProviderBridge && !sessionProtectedHttpEgressHost) {
+      throw new Error('protected model provider bridge unavailable because the HTTP egress guard is not live');
+    }
+    if (codexProtectedProviderBridge && remoteWsUrl) {
+      throw new Error('protected model provider bridge requires model execution in the sandboxed Codex process');
+    }
+  }
 
   // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
   // runs. Computed here rather than in the wrapper-install block below because
@@ -24443,6 +24652,12 @@ async function spawnCli(
     solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
+    modelProviderBaseUrlOverride: codexProtectedProviderBridge
+      ? {
+          providerId: codexProtectedProviderBridge.providerId,
+          baseUrl: codexProtectedProviderBridge.baseUrlOverride,
+        }
+      : undefined,
     modelBackendVariant: cfg.modelBackendVariant,
     // dsh runner only; other adapters ignore the field.
     turnTimeoutMs: cfg.turnTimeoutMs,
@@ -24562,7 +24777,12 @@ async function spawnCli(
   // bots.json on disk (im/lark/client.ts), `botmux ask` routes via the
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
-  const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset);
+  const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy);
+  delete childEnv[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
+  delete childEnv[PROTECTED_HTTP_EGRESS_PROTOCOL_ENV];
+  // Older callers interpret this retired flag as a required socket contract.
+  // Never let a stale daemon environment poison an unprotected CLI launch.
+  delete childEnv.BOTMUX_PROTECTED_EGRESS_REQUIRED;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
   // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
   // The worker pin above is the single source for CLI and worker scratch.
@@ -25337,12 +25557,16 @@ async function spawnCli(
       );
     }
     if (credentialBoundaryActive) {
+      const sandboxProtectedPaths = protectedPathsForHome(sandboxHome);
+      const protectedDenyPaths = new Set(sandboxProtectedPaths);
       const credentialRules = buildCredentialIsolationRules({
         homeDir: sandboxHome,
         botmuxHome: canonical(configuredBotmuxHome),
         defaultBotmuxHome: canonical(defaultBotmuxHome),
-      });
-      mandatoryDenyPaths.push(...credentialRules.denyPaths.map(canonical));
+      }, sandboxProtectedPaths);
+      mandatoryDenyPaths.push(...credentialRules.denyPaths.map(path =>
+        protectedDenyPaths.has(path) ? path : canonical(path)));
+      mandatoryDenyPaths.push(...existingProtectedPathVariants(sandboxProtectedPaths));
       mandatoryDenyRegexes.push(...credentialRules.denyRegexes);
       // Materialize every existing atomic sidecar as a concrete Linux mask.
       // Seatbelt additionally keeps the regexes above for files created later.
@@ -25719,7 +25943,7 @@ async function spawnCli(
           + `use the default store. The real keystore is still denied/carve-out'd by policy (no leak).`);
       }
       const sbx = prepareDirectSandbox({
-        networkPolicy: cfg.sandboxNetworkPolicy,
+        networkPolicy: effectiveSandboxNetworkPolicy,
         sessionId: cfg.sessionId,
         dataDir,
         policy,
@@ -25733,6 +25957,19 @@ async function spawnCli(
         identityBin: childEnv.BOTMUX_IDENTITY_BIN,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        protectedEgressSocketPath: sessionMcpGatewayHost
+          ? sessionProtectedHttpEgressHost?.socketPath
+          : undefined,
+        protectedHttpBridge: codexProtectedProviderBridge?.bridge,
+        localServiceBridges: sessionProtectedHttpEgressHost?.loopbackServices.map(service => ({
+            socketPath: sessionProtectedHttpEgressHost!.socketPath,
+            serviceId: service.id,
+            listenPort: service.listenPort,
+            method: service.method,
+            path: service.path,
+            forwardHeaders: [...service.forwardHeaders],
+            ...(service.attestProcessPeer ? { attestProcessPeer: true } : {}),
+          })),
         larkCliDataDir: childLarkDataRoot,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
@@ -25751,6 +25988,26 @@ async function spawnCli(
       if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
+      localProtectedMcpContainmentActiveCapabilityIds = (
+        cfg.protectedMcpPolicy?.capabilities ?? []
+      ).filter(capability => protectedMcpContainmentActive({
+          platform: process.platform,
+          containmentProfile: capability.containmentProfile,
+          provisionedCapabilityCount: 1,
+          sandboxEngaged: true,
+          mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
+          egressSocketMounted: !!sessionMcpGatewayHost?.socketPath
+            && !!sessionProtectedHttpEgressHost?.socketPath,
+          guardLive: !!sessionProtectedHttpEgressHost,
+          expectedPolicyDigest: cfg.protectedHttpEgressPolicy?.policyDigest,
+          guardPolicyDigest: sessionProtectedHttpEgressHost?.policyDigest,
+          pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
+            credentialBearingHostChannel: !!sessionMcpGatewayHost?.socketPath
+              || !!sessionProtectedHttpEgressHost?.loopbackServices.length,
+          }),
+          networkPolicy: effectiveSandboxNetworkPolicy,
+        }))
+        .map(capability => capability.id);
       // session-id is FORCED here so a relayed send can't target another session.
       sandboxStopWatcher = startOutboxWatcher(
         sbx.outbox,
@@ -25798,11 +26055,13 @@ async function spawnCli(
 
     // Fixed transport-credential masks (bots.json + sidecars, dashboard
     // secret, …) + the per-session sandbox tree itself, plus user denies.
+    const scratchProtectedPaths = protectedPathsForHome(scratchHome);
+    const scratchProtectedPathSet = new Set(scratchProtectedPaths);
     const credentialRules = buildCredentialIsolationRules({
       homeDir: scratchHome,
       botmuxHome: scratchCanonical(configuredBotmuxHome),
       defaultBotmuxHome: scratchCanonical(defaultBotmuxHome),
-    });
+    }, scratchProtectedPaths);
     // Complete transport-credential mask. NOT just device files: enumerate
     // bots.json + sidecars, dashboard secret, per-bot send-cred.json, webhook
     // keys, external BOTS_CONFIG and the shared lark-cli keystore from the
@@ -25818,7 +26077,9 @@ async function spawnCli(
       sessionId: cfg.sessionId,
     });
     const scratchDeny = [...new Set<string>([
-      ...credentialRules.denyPaths.map(scratchCanonical),
+      ...credentialRules.denyPaths.map(path =>
+        scratchProtectedPathSet.has(path) ? path : scratchCanonical(path)),
+      ...existingProtectedPathVariants(scratchProtectedPaths),
       ...scratchSecrets.denyPaths,
       join(scratchCanonical(scratchDataDir), 'sandboxes', cfg.sessionId),
       ...(cfg.scratchDenyPaths ?? [])
@@ -26271,11 +26532,16 @@ async function spawnCli(
     const canonical = (path: string) => {
       try { return realpathSync(path); } catch { return path; }
     };
+    const seatbeltHome = canonical(hostHomeDir);
+    const seatbeltProtectedPaths = protectedPathsForHome(seatbeltHome);
+    const seatbeltProtectedPathSet = new Set(seatbeltProtectedPaths);
+    const canonicalCredentialPath = (path: string): string =>
+      seatbeltProtectedPathSet.has(path) ? path : canonical(path);
     const rules = buildCredentialIsolationRules({
-      homeDir: canonical(hostHomeDir),
+      homeDir: seatbeltHome,
       botmuxHome: canonical(configuredBotmuxHome),
       defaultBotmuxHome: canonical(defaultBotmuxHome),
-    });
+    }, seatbeltProtectedPaths);
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
     const originDirectory = managedOriginCapabilityDirectory(
@@ -26290,7 +26556,7 @@ async function spawnCli(
     );
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
-      [...rules.denyPaths.map(canonical), canonical(profileDir)],
+      [...rules.denyPaths.map(canonicalCredentialPath), canonical(profileDir)],
       [canonical(originDirectory), canonical(attestationDirectory)],
       [],
       [canonical(profileDir)],
@@ -26298,7 +26564,7 @@ async function spawnCli(
       undefined,
       {
         denyWritePaths: [...new Set([
-          ...rules.denyWritePaths.map(canonical),
+          ...rules.denyWritePaths.map(canonicalCredentialPath),
           canonical(profileDir),
         ])],
         denyWriteRegexes: rules.denyWriteRegexes,
@@ -26383,6 +26649,23 @@ async function spawnCli(
         }
       }
     }
+    const addProtectedCredentialMask = (path: string): void => {
+      try {
+        const entry = lstatSync(path);
+        if (entry.isDirectory() && !entry.isSymbolicLink()) hideDirectories.add(path);
+        else hideFiles.add(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        // Missing declared leaves stay directory-shaped so a child cannot
+        // create them later inside a writable Home and race credential setup.
+        hideDirectories.add(path);
+      }
+    };
+    const credentialOnlyProtectedPaths = protectedPathsForHome(hostHomeDir);
+    for (const path of [
+      ...credentialOnlyProtectedPaths,
+      ...existingProtectedPathVariants(credentialOnlyProtectedPaths),
+    ]) addProtectedCredentialMask(path);
     let credentialCliBin = spawnBin;
     try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
     // A credential-only pane has no sound in-pane send authority (see
@@ -26624,6 +26907,10 @@ async function spawnCli(
         log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
       }
     }
+    for (const key of protectedMcpEnvKeys) {
+      delete childEnv[key];
+      delete perBotInjectEnv[key];
+    }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
       cols: PTY_COLS,
@@ -26632,8 +26919,10 @@ async function spawnCli(
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
       gitConfigPairs,
       // Already removed from childEnv; shell-wrapped backends also `env -u`
-      // them after the pane's rcfile / terminal-server env (session env overlay).
+      // them after the pane's rcfile / terminal-server env. This includes both
+      // session-overlay removals and configured protected-MCP credential keys.
       unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
+      protectedUnsetEnv: protectedMcpEnvKeys,
       launchShell: lastInitConfig?.launchShell,
       // tmux reads the pane's launch argv from a private file here instead of
       // its ~16 KB command line (pane-launch.ts).
@@ -31312,10 +31601,25 @@ function unattendedRawInputRefusal(
 
 // ─── IPC Message Handler ─────────────────────────────────────────────────────
 
-process.on('message', async (raw: unknown) => {
+process.on('message', async (raw: unknown, handle: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'protected_mcp_secret_channel_result': {
+      const pending = pendingProtectedSecretChannels.get(msg.requestId);
+      if (!pending) {
+        if (isDuplexHandle(handle)) handle.destroy();
+        break;
+      }
+      pendingProtectedSecretChannels.delete(msg.requestId);
+      clearTimeout(pending.timeout);
+      if (msg.ok && isDuplexHandle(handle)) pending.resolve(handle);
+      else {
+        if (isDuplexHandle(handle)) handle.destroy();
+        pending.reject(new Error(msg.error ?? 'protected MCP secret channel is unavailable'));
+      }
+      break;
+    }
     case 'link_ref_register_result': {
       const pending = pendingLinkRefRegistrations.get(msg.requestId);
       if (!pending) break;
