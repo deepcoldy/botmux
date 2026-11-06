@@ -34,24 +34,30 @@ export function retainPinEffort(pin: ModelPin, previous: ModelPin | undefined): 
 }
 
 export function modelPinView(
-  session: { cliId?: string; modelPin?: ModelPin; dispatchLaunchSpec?: { effective: { model: string } } },
+  session: { cliId?: string; modelPin?: ModelPin; dispatchLaunchSpec?: { effective: { model: string } }; adoptedFrom?: unknown; existingAppServerEndpoint?: string },
   bot?: { cliId?: string },
-  launch: { spawnModelOverride?: string; model?: string; effort?: CodexReasoningEffort; currentModel?: string; currentEffort?: string } = {},
+  launch: { spawnModelOverride?: string; model?: string; effort?: CodexReasoningEffort; currentModel?: string; currentEffort?: string; adopted?: boolean } = {},
 ) {
   const pin = session.modelPin;
   if (!pin) return undefined;
   const matches = cliMatchesBot(session, bot);
+  // An adopted CLI (external pane or a --remote viewer of an App Server thread)
+  // is never relaunched with botmux launch args, so a pin cannot apply while
+  // adopted. `launch.adopted` carries the live DaemonSession's in-memory flags
+  // (ds.adoptedFrom / initConfig.adoptMode); a durable row falls back to its own.
+  const adopted = launch.adopted ?? (!!session.adoptedFrom || !!session.existingAppServerEndpoint);
   const shadowedBy = session.dispatchLaunchSpec ? 'dispatch' as const
     : launch.spawnModelOverride ? 'spawn-override' as const : undefined;
-  const inactiveReason = !matches ? '会话 CLI 与 bot 当前 CLI 不匹配，模型固定已停用' : undefined;
+  const inactiveReason = adopted ? '会话由外部 CLI 接管，模型固定暂不生效；断开接管后恢复'
+    : !matches ? '会话 CLI 与 bot 当前 CLI 不匹配，模型固定已停用' : undefined;
   const shadowNote = shadowedBy ? `模型固定已保存；当前启动优先使用 ${shadowedBy}：${launch.model ?? session.dispatchLaunchSpec?.effective.model ?? launch.spawnModelOverride}${launch.effort ? ` · ${launch.effort}` : ''}。重启仍遵循此优先级` : undefined;
-  const effortDowngradeNote = matches && shadowedBy !== 'dispatch' && (!shadowedBy || samePinModel(launch.model, pin.model)) && pin.effort && !cliModelSupportsReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
+  const effortDowngradeNote = !adopted && matches && shadowedBy !== 'dispatch' && (!shadowedBy || samePinModel(launch.model, pin.model)) && pin.effort && !cliModelSupportsReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
     ? `固定的推理强度 ${pin.effort} 不受支持，已降级；模型固定仍保留` : undefined;
-  const pendingEffortNote = matches && pin.effort && cliModelSupportsReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
+  const pendingEffortNote = !adopted && matches && pin.effort && cliModelSupportsReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
     && launch.currentModel && launch.currentEffort
     && !samePinModel(launch.currentModel, pin.model) && launch.currentEffort !== pin.effort
     ? `当前模型 ${launch.currentModel} 的推理强度选择为 ${launch.currentEffort}；固定模型 ${pin.model} 生效时使用 ${pin.effort}` : undefined;
-  return { ...pin, ...(pendingEffortNote ? { pendingEffortNote } : {}), active: matches && !shadowedBy, ...(inactiveReason ? { inactiveReason } : {}),
+  return { ...pin, ...(pendingEffortNote ? { pendingEffortNote } : {}), active: matches && !shadowedBy && !adopted, ...(inactiveReason ? { inactiveReason } : {}),
     ...(shadowedBy ? { shadowedBy, shadowNote } : {}), ...(effortDowngradeNote ? { effortDowngradeNote } : {}),
     launchModel: launch.model, launchEffort: launch.effort };
 }

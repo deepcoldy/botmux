@@ -1,4 +1,5 @@
 import { modelPinView, cliMatchesBot, type ModelPin } from './model-pin.js';
+import { isPinSuspendedForAdopt } from './shared-adopt.js';
 import { cliModelSupportsReasoningEffort, reasoningEffortsForCliModel, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -21,9 +22,13 @@ export type LaunchModelSession = {
     scope?: 'thread' | 'chat';
     chatType?: 'group' | 'p2p';
     adoptedFrom?: unknown;
+    existingAppServerEndpoint?: string;
     dispatchLaunchSpec?: { effective: { model: string; reasoningEffort?: CodexReasoningEffort } };
   };
   spawnModelOverride?: string;
+  /** Live in-memory adopt flag, present on a DaemonSession (not on a durable row). */
+  adoptedFrom?: unknown;
+  initConfig?: { adoptMode?: boolean };
 };
 
 /** Scope is checked at launch: some creation paths assign it after creating the row. */
@@ -63,7 +68,7 @@ export function resolveSessionLaunchModelChoice(
     logicalModel = ds.session.dispatchLaunchSpec.effective.model;
   } else if (ds.spawnModelOverride) {
     logicalModel = ds.spawnModelOverride;
-  } else if (ds.session.modelPin && cliMatchesBot(ds.session, botCfg)) {
+  } else if (ds.session.modelPin && cliMatchesBot(ds.session, botCfg) && !isPinSuspendedForAdopt(ds)) {
     logicalModel = ds.session.modelPin.model;
   } else {
     const groupModel = resolveSessionGroupSettings(ds, cliId).model;
@@ -102,9 +107,14 @@ export function resolveSessionLaunchModelChoice(
  * its original model.
  *
  * Precedence: dispatchLaunchSpec → spawnModelOverride → explicit modelPin
- * (only while cliMatchesBot) → captured group defaults → live bot model
+ * (only while cliMatchesBot and the session is not a shared adopt) → captured
+ * group defaults → live bot model
  * (only while cliMatchesBot) → session.model launch record. A pin is a user
  * action, never a frozen copy of a bot default (#773), and can be cleared.
+ *
+ * A shared-adopt session (external pane or codex --remote viewer) never gets
+ * relaunched with botmux args: its pin is retained but suspended for the whole
+ * resolution (model and effort), and reactivates when the adoption ends.
  *
  * `undefined` → botmux passes no model flag and the CLI resolves its own
  * default (for `claude --resume`, that means the model recorded in the
@@ -138,7 +148,7 @@ export function resolveSessionLaunchEffort(
   const prior = resolveTopicReasoningEffort(ds.session, cliId, model, fallback);
   const pin = ds.session.modelPin;
   if (pin && ds.session.dispatchLaunchSpec) return ds.session.dispatchLaunchSpec.effective.reasoningEffort;
-  if (!pin || !cliMatchesBot(ds.session, botCfg) || pin.model.toLowerCase() !== model?.toLowerCase() || !pin.effort) return prior;
+  if (!pin || !cliMatchesBot(ds.session, botCfg) || isPinSuspendedForAdopt(ds) || pin.model.toLowerCase() !== model?.toLowerCase() || !pin.effort) return prior;
   return cliModelSupportsReasoningEffort(cliId, model, pin.effort) ? pin.effort
     : prior && cliModelSupportsReasoningEffort(cliId, model, prior) ? prior : undefined;
 }
@@ -153,5 +163,5 @@ export function resolveSessionModelPinView(
   const currentEffort = resolveTopicReasoningEffort(ds.session, ds.session.cliId ?? botCfg?.cliId ?? '', ds.activeModel, undefined)
     ?? ds.session.reasoningEffort ?? ds.activeReasoningEffort;
   return modelPinView(ds.session, botCfg, { spawnModelOverride: ds.spawnModelOverride, model, effort,
-    currentModel: ds.activeModel, currentEffort });
+    currentModel: ds.activeModel, currentEffort, adopted: isPinSuspendedForAdopt(ds) });
 }

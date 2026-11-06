@@ -19,14 +19,43 @@ describe('explicit topic launch choice', () => {
     delete ds.session.groupDefaultModels; expect(resolveSessionLaunchModel(ds, bot)).toBe(bot.model);
     expect(resolveSessionLaunchModel(ds, { cliId: 'claude-code', model: 'opus' })).toBe('record');
   });
-  it('retains but deactivates a mismatched CLI pin, with a visible cause', () => {
-    const ds = subject(); delete (ds.session as any).groupDefaultModels;
+  it('retains but deactivates a mismatched CLI pin, with a visible cause', () => {    const ds = subject(); delete (ds.session as any).groupDefaultModels;
     const changed = { cliId: 'claude-code' as const, model: 'opus' };
     expect(resolveSessionLaunchModel(ds, changed)).toBe('record');
     expect(resolveSessionLaunchEffort(ds, changed, 'record', 'low')).toBe('low');
     const view = modelPinView(ds.session, changed)!;
     expect(view.active).toBe(false); expect(view.inactiveReason).toBeTruthy();
     expect(modelPinText(view)).toContain(pin.model); expect(ds.session.modelPin).toEqual(pin);
+  });
+  it.each([
+    [(s: any) => { s.adoptedFrom = { source: 'external' }; }, 'traditional adopt', bot.model],
+    [(s: any) => { s.existingAppServerEndpoint = 'ws://app-server.example:1234'; }, 'codex --remote viewer', 'group'],
+  ])('suspends a pinned choice for a shared-adopt session and reactivates it after disconnect (%s)', (mark, _label, fallbackModel: string) => {
+    const ds: any = subject();
+    mark(ds.session);
+    expect(resolveSessionLaunchModel(ds, bot)).toBe(fallbackModel);
+    expect(resolveSessionLaunchEffort(ds, bot, fallbackModel, 'low')).toBe('low');
+    const view = modelPinView(ds.session, bot, { model: fallbackModel, effort: 'low' })!;
+    expect(view.active).toBe(false);
+    expect(view.inactiveReason).toContain('接管');
+    expect(view.effortDowngradeNote).toBeUndefined();
+    expect(view.pendingEffortNote).toBeUndefined();
+    expect(ds.session.modelPin).toEqual(pin);
+    delete ds.session.adoptedFrom; delete ds.session.existingAppServerEndpoint;
+    expect(resolveSessionLaunchModel(ds, bot)).toBe(pin.model);
+    expect(modelPinView(ds.session, bot)?.active).toBe(true);
+  });
+  it('never applies a pinned effort during adopt even when the fallback launch model equals the pin model', () => {
+    // Without its own adopt gate, the model-bound effort check alone would let
+    // the pin effort through whenever the bot default happens to be the same
+    // model — the adopted CLI still does not consume it.
+    const sameModelBot = { cliId: 'codex' as const, model: pin.model };
+    const ds: any = subject();
+    ds.session.adoptedFrom = { source: 'external' };
+    delete ds.session.groupDefaultModels;
+    expect(resolveSessionLaunchModel(ds, sameModelBot)).toBe(pin.model);
+    expect(resolveSessionLaunchEffort(ds, sameModelBot, pin.model, 'low')).toBe('low');
+    expect(modelPinView(ds.session, sameModelBot, { adopted: true, model: pin.model, effort: 'low' })?.active).toBe(false);
   });
   it('applies pin effort only to its matching model and gates unsupported levels', () => {
     const ds = subject();

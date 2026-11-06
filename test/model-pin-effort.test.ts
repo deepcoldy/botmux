@@ -10,6 +10,7 @@ import { setSessionReasoningEffort, setTopicReasoningEffort, updateCodexCliEffor
   requestSessionRestart, __testOnly_resetRestartCoordinator, __testOnly_sessionAgentConfig, latestPinEffortForRespawn } from '../src/core/worker-pool.js';
 import { clearModelPins } from '../src/core/model-pin-store.js';
 import { ModelPinBusyError } from '../src/core/model-pin.js';
+import { resolveSessionModelPinView } from '../src/core/session-model.js';
 const app = 'pin-effort-app';
 const model = 'gpt-6.1-terra';
 let dir: string, previous: string;
@@ -203,13 +204,43 @@ it.each([
   ['ds.adoptedFrom', (ds: any) => { ds.adoptedFrom = { source: 'external' }; }],
   ['session.adoptedFrom', (ds: any) => { ds.session.adoptedFrom = { source: 'external' }; }],
   ['initConfig.adoptMode', (ds: any) => { ds.initConfig.adoptMode = true; }],
+  ['session.existingAppServerEndpoint', (ds: any) => { ds.session.existingAppServerEndpoint = 'ws://app-server.example:1234'; }],
 ])('refuses to set a pin in an adopted session (%s) but still allows clearing', (_name, mark) => {
   const { ds } = fixture();
   mark(ds);
   expect(() => writeSessionModelPin(ds, { model: 'gpt-6-astra', source: 'command', setBy: 'owner', setAt: new Date().toISOString() })).toThrow(/adopt|接管/);
   expect(ds.session.modelPin.model).toBe(model);
+  // Read and write sides agree on every shape: the stored pin is suspended, not active.
+  expect(resolveSessionModelPinView(ds, bot)?.active).toBe(false);
+  expect(resolveSessionModelPinView(ds, bot)?.inactiveReason).toContain('接管');
   store.init(app);
   expect(store.getOwnedSession(ds.session.sessionId)?.modelPin?.model).toBe(model);
   expect(writeSessionModelPin(ds, undefined)).toBe(true);
   expect(ds.session.modelPin).toBeUndefined();
+});
+
+it('a pin already stored when a shared adopt begins stays on the row but is suspended from launch, view and respawn', () => {
+  const { ds } = fixture();
+  ds.session.modelPin.effort = 'medium';
+  store.updateSession(ds.session, { modelPinWrite: true });
+  // Adopt arrives AFTER the pin (both traditional pane and --remote viewer shapes).
+  ds.session.adoptedFrom = { source: 'external' };
+  expect(__testOnly_sessionAgentConfig(ds, bot)).toMatchObject({ model: bot.model, reasoningEffort: 'high' });
+  ds.session.adoptedFrom = undefined;
+  ds.session.existingAppServerEndpoint = 'ws://app-server.example:1234';
+  const cfg = __testOnly_sessionAgentConfig(ds, bot);
+  expect(cfg.model).toBe(bot.model); expect(cfg.reasoningEffort).toBe('high');
+  expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'high' });
+  // A restart while adopted explicitly carries the bot-default launch, never the
+  // suspended pin (the --remote argv ignores it, but the wire must not pretend it applies).
+  requestSessionRestart(ds, { source: 'slash', notify: async () => {} });
+  expect(ds.worker.send.mock.calls.at(-1)[0]).toMatchObject({ type: 'restart', model: bot.model, reasoningEffort: 'high' });
+  const view = resolveSessionModelPinView(ds, bot);
+  expect(view).toMatchObject({ active: false, launchModel: bot.model, launchEffort: 'high' });
+  expect(view?.inactiveReason).toContain('接管');
+  // The durable pin is untouched; ending the adopt reactivates it without a rewrite.
+  store.init(app); expect(store.getOwnedSession(ds.session.sessionId)?.modelPin).toMatchObject({ model, effort: 'medium' });
+  delete ds.session.existingAppServerEndpoint;
+  expect(__testOnly_sessionAgentConfig(ds, bot)).toMatchObject({ model, reasoningEffort: 'medium' });
+  expect(resolveSessionModelPinView(ds, bot)?.active).toBe(true);
 });

@@ -48,6 +48,7 @@ live worker 的 restart 与 crash-park message 两条 IPC 通道同时携带模�
 | relay | `worker-pool.ts::transferSession` 修改同一个 session 的锚点、群和 scope，再持久化；不创建替代 session | 保留同一 pin，无额外继承来源 |
 | 独立启动姿态 / principal lane | 既有 `cloneIndependentLaunchPosture` / `PRINCIPAL_LANE_RUNTIME_KEYS` 复制启动配置 | 仅复制已有显式 pin，不从默认模型生成 pin |
 | Codex App 接管 | 强制 codex-app 并清理 model / spawn override | 同时清除 modelPin，持久化清理 |
+| 传统 /adopt 与 codex `--remote` 共享接管（`isSharedAdoptSession` 四形状：`ds.adoptedFrom` / `session.adoptedFrom` / `initConfig.adoptMode` / `session.existingAppServerEndpoint`） | 接管的 CLI 由外部所有，botmux 从不带启动参数重新 spawn；`codex --remote <ws> resume <thread>` 的 buildArgs remote 分支整段 early-return，不拼 `--model` / effort | 设置入口（命令/卡片）拒绝**新写** pin；已存在的 pin **保留但停用**——模型/effort resolver 与所有展示面把它视作与 CLI mismatch 同级的 `inactiveReason`，restart IPC 回落 bot 默认；断开接管后原 pin 自动恢复，无需重写。选 (b) 停用而非删除，因为接管是观察不是驱动，用户可能临时接管后断开 |
 
 ## 配置与兼容约定
 
