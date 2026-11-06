@@ -1,5 +1,10 @@
+import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
+import { isSessionEffortChangeInFlight } from './worker-pool.js';
+import { scheduleActiveRuntimePatch } from './worker-pool.js';
+import { botModelPins, clearModelPins } from './model-pin-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
+import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexConfigPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
@@ -110,7 +115,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
-import { resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { envSandboxMode, resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
@@ -266,6 +271,8 @@ import { knownBotAppIds } from '../services/known-bot-app-ids.js';
 import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
+import { createGroupMessageRecallService } from '../services/group-message-recall-lark.js';
+import { GroupRecallError } from '../services/group-message-recall.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { readProjectGroup } from '../services/project-group-store.js';
 import {
@@ -1537,7 +1544,7 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   // Opt-in, so a CLI with the original strict key check never sees new keys.
   const fields = (body as Record<string, unknown>).fields;
   const includeOrigin = Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_ORIGIN_FIELD);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1575,7 +1582,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
   if (!sessionId || !tool) return jsonRes(res, 400, blocked);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1669,7 +1676,7 @@ for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
       || (route === BACKGROUND_REVOKE_ROUTE && (typeof body.jobId !== 'string' || body.jobId.length > 128))) {
       return jsonRes(res, 400, { error: 'invalid_background_request' });
     }
-    const peer = resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
+    const peer = await resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
       remotePort: req.socket.remotePort, localPort: req.socket.localPort });
     if (!peer.ok) return jsonRes(res, 403, { error: 'current_execution_unverified' });
     const input = { sessionDataDir: config.session.dataDir, sessionId: body.sessionId, peer: peer.peer };
@@ -1706,7 +1713,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     && body.expectedScheduledTurnId.length <= 256
     ? body.expectedScheduledTurnId
     : undefined;
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
     localPort: req.socket.localPort,
@@ -2775,10 +2782,11 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
   const botCfg = getBot(ds.larkAppId).config;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime)
     ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId ?? 'claude-code');
-  const text = fresh
+  // Plain text: sendMessage/replyMessage wrap msgType 'text' as {"text": …}
+  // themselves — pre-stringifying here posted a literal {"text":"…"} to Feishu.
+  const notice = fresh
     ? t('card.action.restarted_fresh', { cliName }, loc)
     : t('cmd.restart.in_progress', { cliName }, loc);
-  const notice = JSON.stringify({ text });
   if (ds.scope === 'chat' && ds.chatId) {
     getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
       .then((mode) => mode === 'topic' && ds.session.rootMessageId
@@ -2818,6 +2826,50 @@ ipcRoute('POST', '/api/sessions/:sessionId/failure-recovery', async (req, res, p
   } catch {
     return jsonRes(res, 503, { ok: false, error: 'recovery_persistence_unavailable' });
   }
+});
+
+function clearDashboardModelPins(appId: string, sessionId?: string): string[] {
+  return clearModelPins(appId, sessionId, {
+    findActive: findActiveBySessionId,
+    assertMutable(ds) {
+      const reason = isSessionTransferring(ds) ? 'transferring' : isSessionRestartInFlight(ds) ? 'restarting'
+        : isSessionEffortChangeInFlight(ds) ? 'effort_change' : undefined;
+      if (reason) throw new ModelPinBusyError([{ sessionId: ds.session.sessionId, reason }]);
+    },
+    publish(id) {
+      dashboardEventBus.publish({ type: 'session.update', body: { sessionId: id, patch: { modelPin: null } } });
+      const ds = findActiveBySessionId(id);
+      if (ds) try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`Pin card refresh failed: ${String(error)}`); }
+    },
+  });
+}
+
+ipcRoute('GET', '/api/bots/:appId/model-pins', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  if (params.appId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false });
+  return jsonRes(res, 200, { ok: true, ...botModelPins(params.appId, findActiveBySessionId) });
+});
+ipcRoute('DELETE', '/api/bots/:appId/model-pins', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  if (params.appId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false });
+  return withBotTurnMutation(params.appId, () => {
+    try { return jsonRes(res, 200, { ok: true, cleared: clearDashboardModelPins(params.appId) }); }
+    catch (error) {
+      const body = modelPinClearError(error);
+      return jsonRes(res, body.error === 'session_not_found' ? 404 : 409, body);
+    }
+  });
+});
+ipcRoute('DELETE', '/api/sessions/:sessionId/model-pin', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  const appId = cachedLarkAppId;
+  return withBotTurnMutation(appId, () => {
+    try { return jsonRes(res, 200, { ok: true, cleared: clearDashboardModelPins(appId, params.sessionId) }); }
+    catch (error) {
+      const body = modelPinClearError(error);
+      return jsonRes(res, body.error === 'session_not_found' ? 404 : 409, body);
+    }
+  });
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
@@ -3427,7 +3479,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const peer = process.platform === 'linux'
     ? (proxyPeer
       ? { ok: true as const, peer: proxyPeer }
-      : resolveLoopbackPeerProcesses({
+      : await resolveLoopbackPeerProcesses({
           remoteAddress: req.socket.remoteAddress,
           remotePort: req.socket.remotePort,
           localPort: req.socket.localPort,
@@ -3625,7 +3677,7 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
     } else if (!boundTool) {
-      const peer = resolveLoopbackPeerProcesses({
+      const peer = await resolveLoopbackPeerProcesses({
         remoteAddress: req.socket.remoteAddress,
         remotePort: req.socket.remotePort,
         localPort: req.socket.localPort,
@@ -5869,11 +5921,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
-  const notice = JSON.stringify({
-    text: result.recoveryPending
-      ? `🔄 ${cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话。`
-      : `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。`,
-  });
+  const loc = localeForBot(ds.larkAppId);
+  // Plain text — the Lark client does the {"text": …} wrapping for 'text'.
+  // Mirror the card-button / /resume receipt wording: when the adapter can only
+  // resume a precise cliSessionId and none was persisted, the next spawn is a
+  // fresh CLI, so say so instead of claiming the old history is back.
+  const notice = result.recoveryPending
+    ? t('card.action.resume_started_remote', { cliName }, loc)
+    : resumeStartsFresh(ds.session)
+      ? t('card.action.resume_success_fresh', { cliName }, loc)
+      : t('cmd.resume.cli_success', { cliName }, loc);
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {
@@ -7568,6 +7625,33 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
   }
 }));
 
+// Host-only routes: deliberately absent from public and session-capability allowlists.
+ipcRoute('GET', '/api/groups/:chatId/messages', requireBoundBot(async (req, res, p) => {
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  try {
+    const result = await createGroupMessageRecallService(cachedLarkAppId).list(p.chatId, {
+      pageToken: query.get('pageToken') ?? undefined,
+      threadRootId: query.get('threadRootId') ?? undefined,
+    });
+    return jsonRes(res, 200, result);
+  } catch (error) {
+    return jsonRes(res, error instanceof GroupRecallError ? error.status : 502,
+      { ok: false, error: error instanceof Error ? error.message : 'message_list_failed' });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('POST', '/api/groups/:chatId/messages/recall', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (body === BAD_JSON) return;
+  try {
+    const result = await createGroupMessageRecallService(cachedLarkAppId).recall(p.chatId, body);
+    return jsonRes(res, 200, result);
+  } catch (error) {
+    return jsonRes(res, error instanceof GroupRecallError ? error.status : 502,
+      { ok: false, error: error instanceof Error ? error.message : 'message_recall_failed' });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, res, p) => {
   try {
     const inChat = await groupsStore.isInChat(cachedLarkAppId, p.chatId);
@@ -8871,6 +8955,11 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     askOptionLayout,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
+    // Machine-wide BOTMUX_SANDBOX force the worker applies over this bot's own
+    // selection (null = none). Lets the page say why "关闭" is not what runs.
+    sandboxEnvForce: (() => {
+      try { const m = envSandboxMode(process.env.BOTMUX_SANDBOX); return m === 'off' ? null : m; } catch { return null; }
+    })(),
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),

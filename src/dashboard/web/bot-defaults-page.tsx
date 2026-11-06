@@ -72,6 +72,7 @@ import {
   WorkingDirMock,
   type ModeOption,
 } from './mode-diagrams.js';
+import { BotModelPinSummary } from './model-pin.js';
 import { store } from './store.js';
 import { toast } from './toast.js';
 import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
@@ -113,7 +114,7 @@ import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
   strongestTraexModelSettings, strongestTraexPreflightModelSettings, type TraexAutoModelDraft,
 } from './traex-auto-model-preferences.js';
-import { AGENT_SECTIONS } from '../agent-profiles-model.js';
+import { AGENT_SECTIONS, parseStartupCommands, type AgentStartupConfig } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import { fetchStewardGuide } from './decision-board-api.js';
 import {
@@ -789,7 +790,7 @@ export function BotDefaultsPage() {
           .filter(([, id]) => byId.has(id))
           .map(([appId, id]) => {
             const agent = byId.get(id)!;
-            return [appId, { id, name: agent.name, sections: AGENT_SECTIONS.filter(section => agent[section] !== undefined) }];
+            return [appId, { id, name: agent.name, sections: AGENT_SECTIONS.filter(section => agent[section] !== undefined), startup: agent.startup }];
           })));
       }
       setLoadError(nextBots.error);
@@ -2423,8 +2424,25 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
   );
 }
 
-/** 关联到 Agent 的 Bot：哪些分组由该 Agent 统一管理（与 agent-profiles-model 的 AGENT_SECTIONS 同名）。 */
-export type AgentLockInfo = { id: string; name: string; sections: readonly string[] };
+/** 关联到 Agent 的 Bot：哪些分组由该 Agent 统一管理（与 agent-profiles-model 的 AGENT_SECTIONS 同名）。
+ *  `startup` 是 Agent 的启动命令分组原值，用来标出 Bot 实际值与 Agent 不一致。 */
+export type AgentLockInfo = { id: string; name: string; sections: readonly string[]; startup?: AgentStartupConfig };
+
+/**
+ * 启动命令由 Agent 统一、但 Bot 当前生效值（bots.json）与 Agent 不一致时的说明数据。
+ * 锁定区显示的是 Bot 实际生效的值（会话启动 / 重启时重放的就是它），不一致只会在
+ * Agent 页保存、关联或点同步时被改回 Agent 的值——daemon 不会自动对齐。
+ */
+export function startupCommandsAgentDrift(
+  lock: AgentLockInfo | null | undefined,
+  botStartupCommands: string | undefined,
+): { agent: string[]; bot: string[] } | null {
+  if (!lock || !lock.sections.includes('startup') || !lock.startup) return null;
+  const agent = lock.startup.commands;
+  const bot = parseStartupCommands(botStartupCommands ?? '');
+  if (agent.join('\n') === bot.join('\n')) return null;
+  return { agent: [...agent], bot };
+}
 
 /**
  * Agent 托管分组的锁：置灰并整体 inert（不可聚焦、不可点击），点击锁定区域时提示去
@@ -2435,6 +2453,8 @@ export function AgentManagedLock(props: {
   lock?: AgentLockInfo | null;
   section: string;
   quiet?: boolean;
+  /** 锁定区上方的补充说明（如 Bot 值与 Agent 不一致），不进 inert 区。 */
+  notice?: ReactNode;
   children: ReactNode;
 }) {
   const tr = useT();
@@ -2455,6 +2475,7 @@ export function AgentManagedLock(props: {
           <a href="#/agents" onClick={event => event.stopPropagation()}>{tr('botDefaults.agentLinkedOpen')}</a>
         </p>
       )}
+      {props.notice}
       <div className="bd-agent-lock-body" inert>{props.children}</div>
     </div>
   );
@@ -3384,6 +3405,7 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
+      <BotModelPinSummary appId={bot.larkAppId} model={bot.model} />
       {selectedCliId === 'traex' && !bot.wrapperCli && !option?.cliLaunchMode ? (
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}
@@ -4521,6 +4543,53 @@ export function CodexIsolatedConfigInfo(props: { bot: BotDefaultsRow }) {
   );
 }
 
+/**
+ * Why the mode a new session actually runs under differs from the selected one
+ * (null = it does not). The worker folds inputs the selector does not own:
+ * the machine-wide BOTMUX_SANDBOX force (wins over every bot on LOCAL
+ * backends), then the legacy `readIsolation` flag (implies the whitelist
+ * sandbox). Without this note "关闭" reads as off while every new session is
+ * still confined.
+ *
+ * Remote backends (riff / remote-runner / provably-remote mojo) run no local
+ * CLI: resolveLocalSandboxMode exempts the WHOLE resolution there, the env
+ * force included, so on those bots nothing overrides the selection. Old
+ * daemons send `localSandboxApplies: null` — keep their historical behaviour.
+ */
+export interface SandboxSelectionOverride {
+  /** BOTMUX_SANDBOX forces local spawns to this mode and it differs from the
+   *  selector. Absent when the force matches the selection. */
+  envMode?: 'oncall' | 'scratch';
+  /** Lingering readIsolation flag with no env force active, while the
+   *  selector is off/scratch (oncall is already what the flag means). Gives
+   *  the clear-legacy-flag repair. */
+  legacyReadIsolation?: true;
+  /** BOTMUX_SANDBOX=scratch × legacy readIsolation: the worker refuses to
+   *  START every new session (spawn guard in worker.ts), even when the
+   *  selector already shows scratch (where the env-mismatch note is silent).
+   *  Clearing readIsolation is the repair offered. */
+  rejectsCombo?: true;
+}
+
+export function sandboxSelectionOverride(
+  bot: Pick<BotDefaultsRow, 'readIsolation' | 'sandboxEnvForce' | 'localSandboxApplies'>,
+  selected: SandboxMode,
+): SandboxSelectionOverride | null {
+  if (bot.localSandboxApplies === false) return null;
+  const forced = bot.sandboxEnvForce;
+  const legacy = bot.readIsolation === true;
+  const result: SandboxSelectionOverride = {};
+  if ((forced === 'oncall' || forced === 'scratch') && forced !== selected) {
+    result.envMode = forced;
+  }
+  if (forced === 'scratch' && legacy) result.rejectsCombo = true;
+  // No env force: the lingering flag silently downgrades off/scratch to
+  // oncall. Under env=oncall clearing it changes nothing (the env still
+  // wins); env=scratch is already reported as rejectsCombo above.
+  if (legacy && selected !== 'oncall' && !forced) result.legacyReadIsolation = true;
+  return Object.keys(result).length > 0 ? result : null;
+}
+
 export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const { bot, patchBot } = props;
@@ -4569,6 +4638,18 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     await save(next, next === 'scratch' ? storage : 'tmpfs');
   }
 
+  async function clearLegacyReadIsolation(): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/read-isolation`, { enabled: false }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.sandboxSaved'),
+      errorText: res => configErrorText(res, tr),
+      onSaved: () => patchBot(bot.larkAppId, { readIsolation: false }),
+    });
+  }
+
+  const override = sandboxSelectionOverride(bot, selected);
   const readIsoSupported = bot.readIsolationSupported === true;
   const scratchSupported = bot.scratchSupported !== false;
   const capNote = selected === 'scratch' ? scratchCapabilityNote(bot.scratchCapability, storage, tr) : null;
@@ -4583,6 +4664,31 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
         scratchSupported={scratchSupported}
         onSelect={m => void selectMode(m)}
       />
+      {override ? (
+        <div className="bd-section-note bd-warn" role="note" data-sandbox-override>
+          {override.envMode ? (
+            <p data-sandbox-override-reason="env">
+              {tr('botDefaults.sandboxOverrideEnv', { mode: tr(override.envMode === 'scratch' ? 'botDefaults.sandboxModeScratch' : 'botDefaults.sandboxModeOncall') })}
+            </p>
+          ) : null}
+          {override.rejectsCombo ? (
+            <>
+              <p data-sandbox-override-reason="combo">{tr('botDefaults.sandboxOverrideScratchCombo')}</p>
+              <button type="button" className="btn" data-action="clear-legacy-read-isolation" disabled={busy} onClick={() => void clearLegacyReadIsolation()}>
+                {tr('botDefaults.sandboxOverrideReadIsolationClear')}
+              </button>
+            </>
+          ) : null}
+          {override.legacyReadIsolation ? (
+            <>
+              <p data-sandbox-override-reason="readIsolation">{tr('botDefaults.sandboxOverrideReadIsolation')}</p>
+              <button type="button" className="btn" data-action="clear-legacy-read-isolation" disabled={busy} onClick={() => void clearLegacyReadIsolation()}>
+                {tr('botDefaults.sandboxOverrideReadIsolationClear')}
+              </button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
       {selected === 'oncall' ? (
         <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
           {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
@@ -6636,6 +6742,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [chatId, setChatId] = useState(savedForm.chatId);
   const [autoJoin, setAutoJoin] = useState(savedForm.autoJoinNewGroups);
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
+  const [decisionCards, setDecisionCards] = useState(savedForm.decisionCards);
   const [closeHints, setCloseHints] = useState(savedForm.closeHints);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
@@ -6655,6 +6762,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setChatId(savedForm.chatId); }, [appId, savedForm.chatId]);
   useEffect(() => { setAutoJoin(savedForm.autoJoinNewGroups); }, [appId, savedForm.autoJoinNewGroups]);
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
+  useEffect(() => { setDecisionCards(savedForm.decisionCards); }, [appId, savedForm.decisionCards]);
   useEffect(() => { setCloseHints(savedForm.closeHints); }, [appId, savedForm.closeHints]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
@@ -6725,6 +6833,12 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     void save({ ...savedForm, autoJoinSoloGroups: on }, setStatus, () => setAutoJoinSolo(previous));
   }
 
+  function toggleDecisionCards(on: boolean): void {
+    const previous = decisionCards;
+    setDecisionCards(on);
+    void save({ ...savedForm, decisionCards: on }, setStatus, () => setDecisionCards(previous));
+  }
+
   function toggleCloseHints(on: boolean): void {
     const previous = closeHints;
     setCloseHints(on);
@@ -6786,6 +6900,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
               {selectedChat?.chatMode === 'topic' ? <p className="bd-section-note">{tr('botDefaults.stewardChatTopic')}</p> : null}
             </div>
           </div>
+          <ToggleRow
+            checked={decisionCards}
+            disabled={busy}
+            dataAction="toggle-steward-decision-cards"
+            title={tr('botDefaults.stewardDecisionCards')}
+            help={tr('botDefaults.stewardDecisionCardsHelp')}
+            onChange={toggleDecisionCards}
+          />
           <ToggleRow
             checked={autoJoin}
             disabled={busy}
@@ -8374,13 +8496,14 @@ function PromptCacheSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   );
 }
 
-function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
+export function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const [value, setValue] = useState(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : '');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => setValue(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : ''), [props.bot.startupCommands]);
+  const drift = startupCommandsAgentDrift(props.lock, props.bot.startupCommands);
 
   async function save(): Promise<void> {
     await saveBotField({
@@ -8399,7 +8522,15 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h3>
-      <AgentManagedLock lock={props.lock} section="startup">
+      <AgentManagedLock lock={props.lock} section="startup" notice={drift ? (
+        <p className="bd-agent-lock-drift" role="note" data-startup-agent-drift="">
+          {tr('botDefaults.startupCommandsAgentDrift', {
+            name: props.lock!.name,
+            bot: drift.bot.length ? drift.bot.join(' / ') : tr('agents.valueNone'),
+            agent: drift.agent.length ? drift.agent.join(' / ') : tr('agents.valueNone'),
+          })}
+        </p>
+      ) : null}>
       <textarea
         data-input="startupCommands"
         rows={3}

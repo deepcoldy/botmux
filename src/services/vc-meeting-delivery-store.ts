@@ -19,11 +19,18 @@ import { normalizeVcMeetingListenerPolicy, vcMeetingListenerPoliciesEqual, type 
  * read-modify-write 经 withFileLockSync 跨进程串行化。不引 SQLite。
  * 会议正文不落盘——这里只有位置、身份与 hash（§12.1）。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
+import {
+  StoreFileUnavailableError,
+  quarantineStoreFileIfUnchanged,
+  readStoreFileStrict,
+  readStoreFileTextStrict,
+  storeFileExistsStrict,
+} from '../utils/json-file.js';
 import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
@@ -316,10 +323,27 @@ function normalizePersistedProjectionPolicies(state: VcMeetingDeliveryStateFile)
   }
 }
 
-function readStateFile(fp: string): VcMeetingDeliveryStateFile | undefined {
-  if (!existsSync(fp)) return undefined;
+/**
+ * Soft read for read-only lookups. `ioErrors: 'throw'` lets a caller that must
+ * tell "no projection" from "could not read the state" (IM turn routing) see
+ * read failures as StoreFileUnavailableError; the default keeps the historical
+ * "unreadable → undefined" behaviour for every other caller.
+ */
+function readStateFile(
+  fp: string,
+  ioErrors: VcMeetingDeliveryReadIoErrors = 'skip',
+): VcMeetingDeliveryStateFile | undefined {
+  let text: string | undefined;
   try {
-    const raw = JSON.parse(readFileSync(fp, 'utf-8')) as VcMeetingDeliveryStateFile;
+    text = readStoreFileTextStrict(fp, 'vc meeting delivery state');
+  } catch (err) {
+    if (ioErrors === 'throw') throw err;
+    logger.warn(`[vc-meeting-delivery-store] failed to read ${fp}: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+  if (text === undefined) return undefined;
+  try {
+    const raw = JSON.parse(text) as VcMeetingDeliveryStateFile;
     if (!raw || typeof raw !== 'object' || typeof raw.schemaVersion !== 'number') return undefined;
     normalizePersistedProjectionPolicies(raw);
     return raw;
@@ -336,9 +360,12 @@ function readStateFile(fp: string): VcMeetingDeliveryStateFile | undefined {
  * 只会导致 at-least-once 重放，由 action gate 兜副作用；静默覆盖才是事故。
  */
 function readStateFileForMutation(fp: string): VcMeetingDeliveryStateFile | undefined {
-  if (!existsSync(fp)) return undefined;
+  // 读错误（EMFILE/EIO/EACCES…）不是损坏：既不隔离也不当缺失重建，按暂时失败
+  // 抛 StoreFileUnavailableError，否则一次 I/O 抖动就会把完好的 cursor 状态重置。
+  const read = readStoreFileStrict(fp, 'vc meeting delivery state');
+  if (read === undefined) return undefined;
   try {
-    const raw = JSON.parse(readFileSync(fp, 'utf-8')) as VcMeetingDeliveryStateFile;
+    const raw = JSON.parse(read.text) as VcMeetingDeliveryStateFile;
     if (!raw || typeof raw !== 'object' || typeof raw.schemaVersion !== 'number') {
       throw new Error('not a delivery state file');
     }
@@ -346,7 +373,12 @@ function readStateFileForMutation(fp: string): VcMeetingDeliveryStateFile | unde
     return raw;
   } catch (err) {
     const aside = `${fp}.corrupt.${Date.now()}`;
-    try { renameSync(fp, aside); } catch { /* 已被并发处理，容忍 */ }
+    let moved = false;
+    try { moved = quarantineStoreFileIfUnchanged(fp, read.ident, aside); } catch { /* 已被并发处理，容忍 */ }
+    if (!moved && existsSync(fp)) {
+      // 读完后文件被替换（如运维修复）：不能挪走新文件，也不能当缺失重建覆盖它。
+      throw new StoreFileUnavailableError('vc meeting delivery state', fp, 'quarantine', new Error('file was replaced after it was read'));
+    }
     logger.warn(
       `[vc-meeting-delivery-store] corrupt state at ${fp}, moved aside to ${aside}: `
       + `${err instanceof Error ? err.message : String(err)}`,
@@ -648,11 +680,14 @@ export function getVcMeetingMemberProjection(
   return state?.members[key.memberId]?.projections[String(key.memberEpoch)];
 }
 
+export type VcMeetingDeliveryReadIoErrors = 'skip' | 'throw';
+
 export function listVcMeetingMemberProjections(
   dataDir: string,
   scope: { listenerAppId: string; meetingId: string },
+  opts: { ioErrors?: VcMeetingDeliveryReadIoErrors } = {},
 ): VcMeetingMemberProjectionRecord[] {
-  const state = readStateFile(meetingFilePath(dataDir, scope.listenerAppId, scope.meetingId));
+  const state = readStateFile(meetingFilePath(dataDir, scope.listenerAppId, scope.meetingId), opts.ioErrors);
   if (!state) return [];
   const out: VcMeetingMemberProjectionRecord[] = [];
   for (const member of Object.values(state.members)) {
@@ -1423,15 +1458,26 @@ export function latestVcMeetingDeliveryForSession(
 export function listVcMeetingActiveProjectionsForReceiverSession(
   dataDir: string,
   receiverSessionId: string,
+  opts: { ioErrors?: VcMeetingDeliveryReadIoErrors } = {},
 ): VcMeetingMemberProjectionRecord[] {
   if (!receiverSessionId.trim()) return [];
   const dir = join(dataDir, DIR_NAME);
-  if (!existsSync(dir)) return [];
+  // A directory we cannot stat is not "no projections": for a caller that must
+  // tell them apart (IM turn routing) it surfaces like every other read error,
+  // instead of demoting a sealed receiver route to ordinary on a transient EIO.
+  // Other callers keep the historical "unreadable → []".
+  try {
+    if (!storeFileExistsStrict(dir, 'vc meeting delivery state')) return [];
+  } catch (err) {
+    if (opts.ioErrors === 'throw') throw err;
+    logger.warn(`[vc-meeting-delivery-store] failed to stat ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
 
   const out: VcMeetingMemberProjectionRecord[] = [];
   for (const name of readdirSync(dir)) {
     if (!name.endsWith('.json')) continue;
-    const state = readStateFile(join(dir, name));
+    const state = readStateFile(join(dir, name), opts.ioErrors);
     if (!state) continue;
     for (const member of Object.values(state.members)) {
       const current = member.projections[String(member.maxKnownEpoch)];

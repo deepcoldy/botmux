@@ -6,8 +6,15 @@
  * or chat body: only item identity, revision, semantic hash, and timestamps.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  StoreFileUnavailableError,
+  hasQuarantinedSibling,
+  quarantineStoreFileIfUnchanged,
+  readStoreFileStrict,
+  type StoreFileRead,
+} from '../utils/json-file.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import type { NormalizedVcMeetingItem, VcMeetingActivityType } from '../vc-agent/types.js';
@@ -235,32 +242,37 @@ function normalizeState(raw: unknown, key: VcMeetingFeedMetadataKey): VcMeetingF
   };
 }
 
-function quarantineCorrupt(path: string): string {
+function quarantineCorrupt(path: string, ident: StoreFileRead['ident']): string {
   const quarantined = `${path}.corrupt.${Date.now()}`;
-  renameSync(path, quarantined);
+  if (!quarantineStoreFileIfUnchanged(path, ident, quarantined)) {
+    // Replaced after it was judged (e.g. repaired): never move the new file.
+    throw new StoreFileUnavailableError('VC meeting feed metadata', path, 'quarantine', new Error('file was replaced after it was read'));
+  }
   return quarantined;
 }
 
 function readState(dataDir: string, key: VcMeetingFeedMetadataKey, now: number): VcMeetingFeedMetadataState {
   const path = statePath(dataDir, key);
-  if (!existsSync(path)) {
-    const prefix = `${basename(path)}.corrupt.`;
-    let quarantined = false;
-    try { quarantined = readdirSync(dirname(path)).some(name => name.startsWith(prefix)); }
-    catch { /* a genuinely new scope is initializable */ }
-    if (quarantined) throw new Error(`VC meeting feed metadata has quarantined evidence for ${path}`);
+  // Only bytes that were actually read can be judged corrupt; other read
+  // failures propagate as StoreFileUnavailableError without quarantine.
+  const read = readStoreFileStrict(path, 'VC meeting feed metadata');
+  if (read === undefined) {
+    // A genuinely new scope is initializable.
+    if (hasQuarantinedSibling(path, '.corrupt.', 'VC meeting feed metadata')) {
+      throw new Error(`VC meeting feed metadata has quarantined evidence for ${path}`);
+    }
     return emptyState(key, now);
   }
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(path, 'utf8'));
+    raw = JSON.parse(read.text);
   } catch (error) {
-    const quarantined = quarantineCorrupt(path);
+    const quarantined = quarantineCorrupt(path, read.ident);
     throw new Error(`VC meeting feed metadata was corrupt and moved to ${quarantined}: ${error instanceof Error ? error.message : String(error)}`);
   }
   const normalized = normalizeState(raw, key);
   if (normalized) return normalized;
-  const quarantined = quarantineCorrupt(path);
+  const quarantined = quarantineCorrupt(path, read.ident);
   throw new Error(`VC meeting feed metadata failed validation and moved to ${quarantined}`);
 }
 

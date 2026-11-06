@@ -50,6 +50,7 @@
     "test:midscene:nodes": "midscene-test nodes test/midscene && midscene-test nodes test/e2e-browser",
     "test:midscene:typecheck": "tsc -p test/midscene/tsconfig.json --noEmit && tsc -p test/e2e-browser/tsconfig.json --noEmit",
     "test:bun": "node scripts/run-bun-tests.mjs",
+    "probe:fenced": "bun scripts/fenced-run.ts",
     "test:bun:self-check": "node scripts/run-bun-tests.mjs --self-check",
     "test:bench": "tsx scripts/bench-tests.ts",
     "test:codex": "vitest run --project e2e test/codex-input.e2e.ts",
@@ -72,7 +73,7 @@
   "dependencies": {
     "pg": "8.23.1",
     "@base-ui/react": "1.9.0",
-    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "@larksuiteoapi/node-sdk": "1.73.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@xterm/headless": "^6.0.0",
     "croner": "^10.0.1",

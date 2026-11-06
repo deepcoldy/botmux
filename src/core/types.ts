@@ -249,6 +249,8 @@ export interface DaemonSession {
    *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
    *  re-fork of the same session launches identically. */
   spawnModelOverride?: string;
+  /** Formerly pinned workers must also clear their effort launch snapshot. */
+  modelPinCleared?: boolean;
   /** True while this session's worker sits in the crash-loop park state: its CLI
    *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
    *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
@@ -768,6 +770,14 @@ export interface DaemonSession {
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /** Lark turns that a still-running Claude background task was launched
+   *  from, as last reported by THIS worker generation
+   *  (`background_task_pins_sync`). Their replyTargets records are exempt from
+   *  eviction like a live CronCreate task's (see replyTargetPinnedTurnIds), so
+   *  the task's wake answer still finds its topic after many newer turns.
+   *  In-memory only and cleared when the worker exits: the anchors live in
+   *  the worker's memory, so a new worker never forwards an older one's wake. */
+  backgroundTaskPinnedTurnIds?: readonly string[];
   /** One-shot runtime flag set by the daemon when creating a substitute
    *  (分身) session. The worker-pool consumes and clears it once the worker
    *  reports ready, triggering a one-time substitute control card post so the

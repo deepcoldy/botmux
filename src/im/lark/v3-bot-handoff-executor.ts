@@ -159,7 +159,7 @@ export interface V3BotHandoffExecutorDeps {
    *  handed off in the run's Gate-2 working dir (the main bot's own range
    *  for its own node, or a target daemon that would not apply it), or
    *  undefined. A reason blocks the node with WORKING_DIR_REFUSED. */
-  workingDirPreflight?(request: V3ExternalDispatchRequest): string | undefined;
+  workingDirPreflight?(request: V3ExternalDispatchRequest): string | undefined | Promise<string | undefined>;
   /** §6.5: open the main bot's own node session; idempotent per handoff.
    *  `refused`: nothing was started and the node was blocked with the reason
    *  (the run's working dir is not in the main bot's range, §15.4). */
@@ -407,7 +407,7 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
         message: `${deps.botName(target)} 的 daemon 版本过旧，不支持在主话题里交接；把它升级到与主 Bot 相同的版本后重试，或改派，或把节点改成节点话题`,
       };
     }
-    const dirRefusal = deps.workingDirPreflight?.(request);
+    const dirRefusal = await deps.workingDirPreflight?.(request);
     if (dirRefusal) return { kind: 'rejected', code: 'WORKING_DIR_REFUSED', message: dirRefusal };
     let mention: V3HandoffCardInput['target'] = { kind: 'self' };
     if (!selfExecuted) {

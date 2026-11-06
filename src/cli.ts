@@ -32,7 +32,9 @@ import { buildReplyConsoleUrl } from './core/dashboard-url.js';
  */
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator,
   requireScheduleCreatorUnionId, requireScheduleOperatorAuthorization } from './core/schedule-creator-authorization.js';
-import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
+import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE, ScheduleUpdateHelpRequested, ScheduleUpdateUsageError, type ScheduleUpdateInput } from './cli/schedule-update.js';
+import { SCHEDULE_HELP_BODY } from './cli/schedule-help.js';
+import type { ManagedScheduleUpdateReceipt } from './core/schedule-managed-update.js';
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
@@ -3588,6 +3590,7 @@ async function cmdStatus(): Promise<void> {
   }
   warnIfLegacyBotmuxAlive();
   const { readFleetStatus } = await import('./core/fleet-runtime.js');
+  const { formatLarkConnectionStatus } = await import('./cli/lark-connection-status.js');
   const status = readFleetStatus();
   if (!status.supervisorAlive && status.rows.length === 0) {
     console.log('daemon 未在运行。（用 `botmux start` 启动）');
@@ -3603,13 +3606,12 @@ async function cmdStatus(): Promise<void> {
     if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
     return;
   }
-  // Fixed-width table: name | pid | status | ↺restarts | exit | version.
   const online = listOnlineDaemons();
-  const versionByApp = new Map(online.map(d => [d.larkAppId, d.botmuxVersion]));
+  const descriptorByApp = new Map(online.map(d => [d.larkAppId, d]));
   const nameW = Math.max(4, ...status.rows.map(r => r.name.length));
-  const verCells = status.rows.map(r => versionByApp.get(r.appId) ?? '-');
+  const verCells = status.rows.map(r => descriptorByApp.get(r.appId)?.botmuxVersion ?? '-');
   const verW = Math.max(7, ...verCells.map(v => v.length));
-  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}`;
+  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}  LARK WS`;
   console.log(header);
   for (const [i, r] of status.rows.entries()) {
     // A row recorded 'online' whose pid is actually dead is shown as such so
@@ -3617,7 +3619,8 @@ async function cmdStatus(): Promise<void> {
     const shown = r.status === 'online' && !r.alive ? 'dead?' : r.status;
     const pidCol = r.pid > 0 ? String(r.pid) : '-';
     const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
-    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}`);
+    const ws = r.appId ? formatLarkConnectionStatus(r, descriptorByApp.get(r.appId)) : '—';
+    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}  ${ws}`);
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
@@ -7898,27 +7901,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        current --create / list / read / update / write --yes
 
 定时任务（可在 CLI 会话内自动推断 chat）:
-  schedule list                        列出所有任务
-  schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
-       --calendar <name>               绑定内置或自定义工作日历；手动执行绕过
-       --calendar-day-type <type>      workday 仅工作日（默认）；restday 仅休息日
-       --model <id>                    本任务用指定模型跑（如 gpt-5.6-sol），不改 bot 配置
-       --reasoning-effort <level>      low|medium|high|xhigh|max|ultra（模型支持才生效）
-                                       两者都只在本任务新建会话那次执行生效；配 --new-topic 则每次生效
-       --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
-       --topic --root-msg-id <om_...>  固定在指定话题下执行
-       --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
-       --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题按任务时区支持 {{date:-1d}} / {{owner}}
-       --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
-       --until-done                    直到完成：没做完按计划继续执行，出错/错过自动补上，直到 schedule done
-       --deadline <time>               配合 --until-done：到点做最后一次收尾执行后关闭（如 2026-11-20 / 7d / 明天18:00）
-       --retry-every <duration>        配合 --until-done 的一次性任务：没做完隔多久再执行（默认 1d）
-       --notify failing,expired        按需通知创建人：连续失败 3 次 / 截止收尾时
-  schedule done [id|self] [--note 结果] 标记「直到完成」任务已完成（任务自己的执行会话里可省略 id）
-  schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
-  schedule remove <id>                 删除任务
-  schedule pause|resume <id>           暂停/恢复
-  schedule run <id>                    标记立即执行
+${SCHEDULE_HELP_BODY}
 
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
@@ -8697,9 +8680,35 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
   rest = rest.filter(arg => arg !== '--remote-runner-session-tool');
-  if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
-    console.log(SCHEDULE_UPDATE_USAGE);
+  if (['--help', '-h', 'help'].includes(sub)
+    || (sub !== 'update' && sub !== 'add' && ['--help', '-h'].includes(rest[0] ?? ''))) {
+    console.log(`用法:\n${SCHEDULE_HELP_BODY}`);
     return;
+  }
+  if (sub && !['list', 'ls', 'add', 'calendars', 'update', 'remove', 'rm', 'delete', 'del',
+    'pause', 'disable', 'resume', 'enable', 'done', 'run'].includes(sub)) {
+    console.error(`未知子命令: ${sub}\n\n用法:\n${SCHEDULE_HELP_BODY}`);
+    process.exit(2);
+  }
+  // Parse `update` before any session lookup or daemon contact: a typo or a
+  // `--help` must answer with the usage, and a bad frequency must be refused
+  // with the add parser's reason before anything is touched.
+  let scheduleUpdate: ScheduleUpdateInput | undefined;
+  if (sub === 'update') {
+    const { parseSchedule } = await import('./core/scheduler.js');
+    try {
+      scheduleUpdate = readScheduleUpdate(rest, { validateSchedule: parseSchedule });
+    } catch (error) {
+      if (error instanceof ScheduleUpdateHelpRequested) {
+        console.log(`用法: ${SCHEDULE_UPDATE_USAGE}`);
+        return;
+      }
+      if (error instanceof ScheduleUpdateUsageError) {
+        console.error(`botmux schedule update: ${error.message}\n\n用法: ${SCHEDULE_UPDATE_USAGE}`);
+        process.exit(2);
+      }
+      throw error;
+    }
   }
   // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
   // writes to the right file even when invoked outside the daemon env.
@@ -9143,7 +9152,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const managedMutation = async (
     action: 'update' | 'remove' | 'pause' | 'resume' | 'run' | 'done',
     extra: Record<string, unknown> = {},
-  ): Promise<{ replay?: boolean }> => {
+  ): Promise<{ replay?: boolean; task?: ManagedScheduleUpdateReceipt }> => {
     let mutationAppId = mutationSession?.larkAppId ?? cliScopeAppId
       ?? scheduleStore.getScheduleScope() ?? undefined;
     if (!mutationSession) {
@@ -9181,23 +9190,43 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     } catch (error) {
       throw new Error(`无法连接当前 Bot daemon；未执行任何定时任务修改：${error instanceof Error ? error.message : String(error)}`);
     }
-    const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean };
+    const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean; task?: ManagedScheduleUpdateReceipt };
     if (!response.ok || body.ok !== true) {
       throw new Error(scheduleIpcErrorMessage(body.error) ?? body.error ?? `HTTP ${response.status}`);
     }
-    return { replay: body.replay === true };
+    return { replay: body.replay === true, ...(body.task && typeof body.task === 'object' ? { task: body.task } : {}) };
   };
 
   switch (sub) {
     case 'update': {
       // All task mutations commit through the owning daemon route. The update
-      // payload may carry prompt and/or work-calendar fields; the daemon still
-      // refuses canonical updates for delegated tasks and for tasks bound to a
-      // protected precondition (which the CLI cannot rebind).
-      const updates = readScheduleUpdate(rest);
+      // payload may carry frequency, prompt and/or work-calendar fields; the
+      // daemon still refuses canonical updates for delegated tasks, and commits
+      // the rest through the Dashboard's compound edit, which rebinds a
+      // protected precondition host-side.
+      const updates = scheduleUpdate!;
       if (!trustedRemoteRunnerRelay) await detectAuthenticatedCurrentSession('operate');
-      await managedMutation('update', updates);
+      const { task } = await managedMutation('update', { ...updates });
+      if (updates.schedule !== undefined && task?.schedule !== updates.schedule) {
+        // A daemon from before frequency edits ignores the field it does not
+        // know; never report a frequency change that did not happen.
+        console.error(`⚠️ 当前 Bot daemon 版本过旧，未修改执行频率${updates.prompt !== undefined || updates.calendar !== undefined || updates.calendarDayType !== undefined ? '（其余字段已更新）' : ''}；请先重启/升级 daemon 再改频率。`);
+        process.exit(1);
+      }
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
+      if (task) {
+        const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
+        console.log(`   频率: ${task.display && task.display !== task.schedule ? `${task.display}（${task.schedule}）` : task.schedule}`);
+        const nextLine = task.enabled
+          ? (task.nextRunAt ? fmt(task.nextRunAt) : '—')
+          : task.disabledReason === 'once_completed'
+            ? '任务已结束，不会自动执行'
+            : '任务已暂停，恢复后按此频率执行';
+        console.log(`   下次执行: ${nextLine}`);
+        if (task.enabled && task.calendar !== undefined) {
+          console.log(`   日历 ${task.calendar} 允许的下次执行: ${task.nextEligibleRunAt ? fmt(task.nextEligibleRunAt) : '—'}`);
+        }
+      }
       break;
     }
     case 'remove':
@@ -9264,8 +9293,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       }
       break;
     default:
-      console.error(`未知子命令: ${sub}\n可用: list | add | update | remove | pause | resume | run`);
-      process.exit(1);
+      console.error(`未知子命令: ${sub}\n\n用法:\n${SCHEDULE_HELP_BODY}`);
+      process.exit(2);
   }
 }
 
@@ -9865,7 +9894,7 @@ import { applyCompanionStartupOptions } from './cli/companion-startup-options.js
 import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import { normalizeCardUsageSnapshot } from './cli/card-usage-normalize.js';
-import { parseStatuslinePayload, readStatuslineSnapshot, toCardQuota, writeStatuslineSnapshot } from './services/statusline-snapshot.js';
+import { readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
 import {
   resolveQuoteTarget,
   shouldSuppressImplicitReplyTarget,
@@ -15126,7 +15155,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --bot <spec>          兼容外部/旧链路；spec = open_id[:名字[:角色]]，不保证本机双向授权
   --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
-  --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay
+  --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay|reply（原话题直回）
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --delegate schedule:create
                         请求把当前真人回合的 schedule 创建权限委托给目标 Bot 当前派发 turn（需宿主策略开启）
@@ -15282,8 +15311,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('缺少简报。用 --brief 或 --brief-file 指定（仅 --standby 模式可省略）。');
     process.exit(1);
   }
-  if (!['relay', 'publish', 'publish-and-relay'].includes(resultDelivery)) {
-    console.error('--result-delivery 必须是 relay|publish|publish-and-relay。');
+  if (!['relay', 'publish', 'publish-and-relay', 'reply'].includes(resultDelivery)) {
+    console.error('--result-delivery 必须是 relay|publish|publish-and-relay|reply。');
     process.exit(1);
   }
   if (dispatchArgs.kind !== undefined && !['task', 'review'].includes(dispatchArgs.kind)) {
@@ -15425,6 +15454,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('公开结果投递需要使用 --bot-app 派发实际任务，目标须启用默认提示注入；零注入模式使用自动回传。');
     process.exit(1);
   }
+  if (resultDelivery === 'reply' && (intoRoot || repo || hasLaunchOverride || parsedBotApps.length !== 1
+    || (s.scope ?? 'thread') !== 'thread')) {
+    console.error('reply 仅支持从真人话题新建单个项目 Bot 的委托；已有派单继续使用原投递方式。');
+    process.exit(1);
+  }
 
   let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
@@ -15498,7 +15532,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     dispatchRootId,
     exactReportRootEnabled,
     sameTopicSendEnabled,
-    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay',
+    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay' | 'reply',
   });
   let built;
   try {
@@ -15740,6 +15774,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       originClaim: dispatchOriginClaim,
       body: {
         seedText: built.seedText,
+        ...(resultDelivery === 'reply' ? { resultDelivery: 'reply' } : {}),
         targetChatId,
         targetAppIds: parsedBotApps.map(item => item.appId),
         acceptanceRequested: !standby && parsedBotApps.length > 0,
@@ -16503,6 +16538,21 @@ async function cmdReport(rest: string[]): Promise<void> {
       process.exit(1);
     } else {
       const target = triggerBody.reportTarget;
+      if (triggerBody.delivery === 'reply') {
+        if (typeof triggerBody.publishedMessageId !== 'string' || !triggerBody.publicationTarget?.rootMessageId) {
+          console.error(JSON.stringify({ success: false, error: 'report_reply_receipt_incomplete' }));
+          process.exit(1);
+        }
+        recordSuccessfulReportMarker({ messageId: triggerBody.publishedMessageId,
+          targetChatId: triggerBody.publicationTarget.chatId,
+          targetRootMessageId: triggerBody.publicationTarget.rootMessageId,
+          dispatchRootId: dispatchRootCandidate });
+        console.log(JSON.stringify({ success: true, delivery: 'lark-message', viaRegistry: true,
+          reportedTo: triggerBody.publishedMessageId, deliveryMode: 'reply',
+          publishedMessageId: triggerBody.publishedMessageId, publicationTarget: triggerBody.publicationTarget,
+          messageTarget: triggerBody.publicationTarget, relayDelivered: false }));
+        return;
+      }
       recordSuccessfulReportMarker({
         ...(typeof triggerBody.publishedMessageId === 'string'
           ? { messageId: triggerBody.publishedMessageId }
@@ -18098,88 +18148,11 @@ async function cmdUserPromptHook(): Promise<void> {
 
 // ─── botmux statusline ───────────────────────────────────────────────────────
 //
-// Claude Code `statusLine.command` 客户端（由 claude-code.ts buildArgs 经进程级
-// --settings 注入）。Claude 在每条 assistant 消息后 / compact 后 / 到达 resets_at /
-// 每 refreshInterval 秒（300ms 防抖）把 JSON（context_window、rate_limits、model …）
-// 喂到 stdin。本命令做两件互不影响的事，各自 try/catch：
-//   1. 落盘：BOTMUX_SESSION_ID 非空且 payload 可解析 ⇒ 写
-//      `<DATA_DIR>/statusline/<sid>/latest.json`（daemon 合并进卡片用量段）。
-//   2. 转发：BOTMUX_STATUSLINE_CHAIN 非空（worker 找回的、被 --settings 遮蔽的用户
-//      statusLine 命令）⇒ `/bin/sh -c <chain>`，把**原始 stdin 字节**原样喂给它，
-//      stdout/stderr 直接继承（Claude 读的是本进程的 stdout），正常退出透传其退出码；
-//      10s 看门狗 SIGTERM → 1s 后 SIGKILL → exit 0；被信号杀 / spawn 失败 → exit 0。
-// 无 chain ⇒ stdout 空、exit 0（与用户没配 statusline 时一致：状态栏空）。
-// 诊断只走 stderr（stdout 是状态栏内容）；顶层兜底 exit 0——statusline 失败对 Claude
-// 只是「状态栏空」，绝不能让它挂住或刷错误。
-const STATUSLINE_STDIN_TIMEOUT_MS = 5000;
-const STATUSLINE_CHAIN_TIMEOUT_MS = 10_000;
-const STATUSLINE_CHAIN_KILL_GRACE_MS = 1000;
-
-function statuslineDiagnostic(message: string): void {
-  try { process.stderr.write(`[botmux statusline] ${message}\n`); } catch { /* */ }
-}
-
-/** 把原始 payload 转发给用户自己的 statusline 命令；本函数负责最终 process.exit。 */
-function forwardStatuslineChain(chain: string, raw: Buffer): void {
-  let child: ReturnType<typeof spawn>;
-  try {
-    // detached：让 sh 及其子进程独占一个进程组，看门狗按组杀——用户脚本常是
-    // `bash ~/.claude/statusline.sh`（内部再 spawn jq / git），只杀 sh 会留下握着
-    // stdout 管道的孤儿，Claude 读不到 EOF 会一直等。
-    child = spawn('/bin/sh', ['-c', chain], { stdio: ['pipe', 'inherit', 'inherit'], detached: true });
-  } catch (error) {
-    statuslineDiagnostic(`chain spawn failed: ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(0);
-  }
-  const killGroup = (signal: NodeJS.Signals) => {
-    if (child.pid) {
-      try { process.kill(-child.pid, signal); return; } catch { /* 组已不在 → 退回单进程 */ }
-    }
-    try { child.kill(signal); } catch { /* */ }
-  };
-  let killTimer: NodeJS.Timeout | undefined;
-  const watchdog = setTimeout(() => {
-    killGroup('SIGTERM');
-    killTimer = setTimeout(() => {
-      killGroup('SIGKILL');
-      process.exit(0);
-    }, STATUSLINE_CHAIN_KILL_GRACE_MS);
-  }, STATUSLINE_CHAIN_TIMEOUT_MS);
-  const finish = (code: number) => {
-    clearTimeout(watchdog);
-    if (killTimer) clearTimeout(killTimer);
-    process.exit(code);
-  };
-  child.once('error', (error) => {
-    statuslineDiagnostic(`chain failed: ${error instanceof Error ? error.message : String(error)}`);
-    finish(0);
-  });
-  // 被信号杀（含看门狗）⇒ 0；正常退出透传退出码。
-  child.once('exit', (code, signal) => finish(signal ? 0 : (code ?? 0)));
-  // 用户命令可能不读 stdin 就退出 → EPIPE，吞掉即可。
-  child.stdin?.on('error', () => { /* */ });
-  child.stdin?.end(raw);
-}
-
+// 实现在 services/statusline-command.ts。新会话的 statusLine.command 直接指向轻量入口
+// statusline-entry.js（不加载整张 CLI 模块图）；这里保留子命令，给命令里写死了
+// `cli.js statusline` 的老会话与编译版二进制用。
 async function cmdStatusline(): Promise<void> {
-  try {
-    const raw = await readStdinWithTimeout(STATUSLINE_STDIN_TIMEOUT_MS);
-    const sessionId = process.env.BOTMUX_SESSION_ID;
-    // env 缺失 ⇒ 非 botmux 会话（用户手跑 / adopt），不落盘，只做转发。
-    if (sessionId) {
-      try {
-        const snap = parseStatuslinePayload(JSON.parse(raw.toString('utf-8')));
-        if (snap) writeStatuslineSnapshot(resolveDataDir(), sessionId, snap);
-      } catch (error) {
-        statuslineDiagnostic(`snapshot not written: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    const chain = process.env.BOTMUX_STATUSLINE_CHAIN;
-    if (!chain) process.exit(0);
-    forwardStatuslineChain(chain, raw);
-  } catch {
-    process.exit(0);
-  }
+  await (await import('./services/statusline-command.js')).runStatusline();
 }
 
 // ─── botmux native-subagent-runtime-hook ─────────────────────────────────────
@@ -19176,6 +19149,14 @@ if (__entrySubcommand) {
   // core-only bind failure exits from within). Park here so the normal dispatch
   // below never runs. This awaits forever; the imported module owns exit().
   await new Promise<never>(() => {});
+}
+
+// Hidden: runtime host for the native Botmux.app shell (stdio JSON protocol,
+// see src/desktop/host/desktop-host.ts). Only the app spawns it.
+if (command === '__desktop-host') {
+  const { runDesktopHost } = await import('./desktop/host/desktop-host.js');
+  await runDesktopHost();
+  process.exit(0);
 }
 
 // Hidden: perform a compiled-binary self-replace and exit. Invoked by
@@ -20449,7 +20430,16 @@ switch (command) {
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'preview': await cmdPreview(process.argv.slice(3)); break;
   case 'continuation': await cmdContinuation(process.argv.slice(3)); break;
-  case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'schedule': {
+    // A refused or failed schedule operation is reported as one line, not as
+    // the runtime's uncaught-error stack.
+    try { await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); }
+    catch (error) {
+      console.error(`botmux schedule: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
   case 'interaction-context': {
     try {
       const { parseInteractionContextCommand } = await import('./cli/interaction-context.js');

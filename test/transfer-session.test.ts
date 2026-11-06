@@ -217,6 +217,16 @@ describe('transferSession', () => {
     expect(ds.chatId).toBe('oc_source');
   });
 
+  it('relay moves the same session and preserves explicit pin provenance', async () => {
+    const ds = makeDs();
+    ds.session.modelPin = { model: 'sonnet', source: 'command', setBy: 'owner', setAt: '2026-11-06T00:00:00Z' };
+    const pin = structuredClone(ds.session.modelPin);
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    expect((await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_topic', 'group', 'thread')).ok).toBe(true);
+    expect(ds.session.modelPin).toEqual(pin);
+    expect(forkWorkerSpy.mock.calls[0][0].session.modelPin).toEqual(pin);
+  });
+
   it('DM flat target (p2p, chat scope): rewrites chatType to p2p and anchors on the DM chatId', async () => {
     const ds = makeDs();  // thread-scope source in oc_source
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);

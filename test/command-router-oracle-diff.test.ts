@@ -88,6 +88,9 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  (input, legacy, next) => /^\s*\/modelpin(?:\s|$)/i.test(input.text)
+    && legacy.kind === 'forward' && next.kind === 'daemon' && next.cmd === '/modelpin'
+    && next.sessionPolicy === 'existing_only',
   // /models opens the existing session's model picker; it is no longer model text.
   (input, legacy, next) => legacy.kind === 'forward'
     && legacy.reason === 'unknown_slash'

@@ -14,6 +14,7 @@ import { decideRestartFollowup, restartLaunchSettings } from '../src/core/restar
 import { protectedMcpRedactedEnvKeys } from '../src/core/protected-mcp-capabilities.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { restartSpendsFreshBudget, exitMarksServerReplaced } from '../src/core/restart-fresh-budget.js';
 import { join } from 'node:path';
 
 type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean; restartCause?: 'traex-auto-model' }) => Promise<void>;
@@ -33,6 +34,8 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     restartWindowLaunch: undefined,
     rawInputRestartGate: false,
     consecutiveInWorkerRestarts: 0,
+    lastCliExitServerReplaced: false,
+    restartSpendsFreshBudget,
     tmuxRestartTimer: null,
     remoteThreadId: undefined,
     intentionalRestartBackend: undefined,
@@ -173,5 +176,58 @@ describe('worker restart input fence', () => {
     expect(h.scope.cliRestartInProgress).toBe(false);
     expect(h.scope.settleRestartAttemptOnReady).toHaveBeenCalledTimes(1);
     expect(h.scope.flushPending).toHaveBeenCalledTimes(1);
+  });
+
+  // 2026-11-06: a tmux server loss took respawned panes down a second time and
+  // tier-2 forced 71 sessions to a FRESH conversation.
+  it('does not spend the fresh-session budget when the previous exit was a tmux server loss', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.consecutiveInWorkerRestarts = 1;
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(h.scope.consecutiveInWorkerRestarts).toBe(1);
+    // consumed: the next restart is judged on its own exit
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+
+  it('still spends the budget for an ordinary CLI exit', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.consecutiveInWorkerRestarts = 1;
+    await h.restart('daemon request');
+    expect(h.scope.consecutiveInWorkerRestarts).toBe(2);
+  });
+
+  it('clears a stale server-loss marker when the restart is abandoned for a codex auto-upgrade', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const reject = vi.fn();
+    h.scope.codexAutoUpgrade = { reject };
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(reject).toHaveBeenCalledOnce();
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+
+  it('clears a stale server-loss marker when restart is ignored in adopt mode', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.lastInitConfig = { adoptMode: true };
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+});
+
+describe('restart fresh-budget policy', () => {
+  it('marks only an unintentional exit that the backend attributes to a server replacement', () => {
+    expect(exitMarksServerReplaced({ intentionalRestart: false, backendReportsServerReplaced: true })).toBe(true);
+    expect(exitMarksServerReplaced({ intentionalRestart: true, backendReportsServerReplaced: true })).toBe(false);
+    expect(exitMarksServerReplaced({ intentionalRestart: false, backendReportsServerReplaced: false })).toBe(false);
+    expect(exitMarksServerReplaced({ intentionalRestart: true, backendReportsServerReplaced: false })).toBe(false);
+  });
+
+  it('spends the budget for a normal exit but not for a server loss or a user-initiated respawn', () => {
+    expect(restartSpendsFreshBudget({ previousExitServerReplaced: false })).toBe(true);
+    expect(restartSpendsFreshBudget({ previousExitServerReplaced: true })).toBe(false);
+    expect(restartSpendsFreshBudget({ skipRestartBudget: true, previousExitServerReplaced: false })).toBe(false);
+    expect(restartSpendsFreshBudget({ skipRestartBudget: true, previousExitServerReplaced: true })).toBe(false);
   });
 });
