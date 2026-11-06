@@ -13,7 +13,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -153,6 +153,27 @@ describe('the start intent', () => {
     const run = authorizedRun('stamp-root-legacy', { nodeExecutor: 'bot', rootedBy: 'legacy' });
     expect(run.journal()).toHaveLength(1);
     expect(run.journal()[0]).not.toHaveProperty('nodeExecutor');
+  });
+});
+
+describe('a run.json that is not this run\'s', () => {
+  it('does not make the run bot-executed (the envelope must name this run directory)', async () => {
+    // An unstamped root, so only run.json could say "bot"; the run.json is
+    // another run's (copied into this directory).
+    const source = authorizedRun('stamp-source', { nodeExecutor: 'bot', rootedBy: 'legacy' });
+    const runDir = join(source.runDir, '..', 'stamp-copy');
+    mkdirSync(runDir);
+    for (const name of ['run.json', 'dag.json', 'spec.json', 'bots.snapshot.json']) {
+      copyFileSync(join(source.runDir, name), join(runDir, name));
+    }
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId: 'stamp-copy' });
+    expect(await reassignNode(runDir, { nodeId: 'a', toLarkAppId: 'cli_b', by: 'ou_initiator' }))
+      .toMatchObject({ kind: 'rejected', reason: 'not-bot-run' });
+    expect(await handNodeToHuman(runDir, { nodeId: 'a', reason: 'x', by: 'main_bot' }))
+      .toMatchObject({ kind: 'rejected', reason: 'not-bot-run' });
+    // The same files under their own run id are bot-executed (the contrast).
+    expect(await handNodeToHuman(source.runDir, { nodeId: 'a', reason: 'x', by: 'main_bot' }))
+      .not.toMatchObject({ reason: 'not-bot-run' });
   });
 });
 

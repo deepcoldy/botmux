@@ -45,7 +45,9 @@ import {
 } from '../src/im/lark/v3-blocked-card.js';
 import { handleV3BlockedAction } from '../src/im/lark/v3-blocked-card-handler.js';
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from '../src/im/lark/v3-blocked-reassign.js';
+import { liveV3MainSessionWorkingDir } from '../src/im/lark/v3-bot-eligibility.js';
 import { FakeExecutor } from './helpers/v3-external-harness.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -197,6 +199,46 @@ describe('Gate-2: a working dir for the main bot\'s own main-topic node', () => 
     expect(readRunEnvelope(runDir)).toMatchObject({ kind: 'ok', envelope: { nodeExecutor: 'bot' } });
   });
 
+  describe('read from the main session\'s persisted row (real session store)', () => {
+    /** The main session `s1` (GROUP.sessionId) persisted as `row`. */
+    function persistedMainSession(row: Record<string, unknown>): string {
+      const dataDir = tempDir('wf-main-session-store-');
+      seedPersistedSessionRows(dataDir, MAIN, {
+        s1: { sessionId: 's1', chatId: 'oc_g', rootMessageId: 'om_root', scope: 'thread', title: 's1', status: 'active', createdAt: '2026-11-06T00:00:00.000Z', ...row },
+      });
+      return dataDir;
+    }
+    const liveLookup = (dataDir: string): WorkflowHostCommandDeps['mainSessionWorkingDir'] =>
+      (binding, bots) => liveV3MainSessionWorkingDir(binding, bots, dataDir);
+
+    it('a session that never pinned its directory runs in the main bot\'s default: another dir is refused', async () => {
+      const { root, sessionDir, otherDir } = workspace();
+      const bots = botsIn(root).map((bot) => (bot.larkAppId === MAIN ? { ...bot, defaultWorkingDir: sessionDir } : bot));
+      const { base, runDir } = await dagReady(OWN_MAIN, bots);
+      const dataDir = persistedMainSession({});
+      await expect(host('approve-dag', base, ['--working-dir', otherDir], bots, { mainSessionWorkingDir: liveLookup(dataDir) }))
+        .rejects.toThrow(sessionDir);
+      expect(readRunEnvelope(runDir).kind).toBe('missing');
+    });
+
+    it('a pinned session decides by its own directory', async () => {
+      const { root, sessionDir, otherDir } = workspace();
+      const { base, runDir } = await dagReady(OWN_MAIN, botsIn(root));
+      const dataDir = persistedMainSession({ workingDir: sessionDir });
+      await expect(host('approve-dag', base, ['--working-dir', otherDir], botsIn(root), { mainSessionWorkingDir: liveLookup(dataDir) }))
+        .rejects.toThrow(sessionDir);
+      expect(readRunEnvelope(runDir).kind).toBe('missing');
+    });
+
+    it('a closed main session takes no part (the node would start a new session in the frozen dir)', async () => {
+      const { root, sessionDir, otherDir } = workspace();
+      const { base, runDir } = await dagReady(OWN_MAIN, botsIn(root));
+      const dataDir = persistedMainSession({ workingDir: sessionDir, status: 'closed' });
+      await host('approve-dag', base, ['--working-dir', otherDir], botsIn(root), { mainSessionWorkingDir: liveLookup(dataDir) });
+      expect(readRunEnvelope(runDir)).toMatchObject({ kind: 'ok', envelope: { nodeWorkingDir: otherDir } });
+    });
+  });
+
   it('a placement refusal names the bot by its display name', async () => {
     const { root } = workspace();
     const parallel = [goal('collect', { bot: 'cli_x', placement: 'main' }), goal('summary', { bot: 'cli_x', placement: 'main' })];
@@ -274,6 +316,21 @@ describe('a runtime edit that makes a node the main bot\'s own main-topic node',
     expect(edit(base, [{ op: 'updateNode', nodeId: 'b', set: { placement: 'main' } }], session)).toMatchObject({ kind: 'applied' });
   });
 
+  it('is refused when a later edit moves a node back to the main bot after an earlier one moved it away', () => {
+    const { sessionDir, otherDir } = workspace();
+    const { base, runDir } = seedRun([goal('a', { bot: 'cli_x' }), goal('b', { bot: MAIN, placement: 'main', depends: ['a'] })], otherDir);
+    const away = edit(base, [{ op: 'reassign', nodeId: 'b', bot: 'cli_x' }], sessionDir);
+    expect(away).toMatchObject({ kind: 'applied' });
+    const back = applyV3RunEdit({
+      baseDir: base, runId: 'r', patch: { ops: [{ op: 'reassign', nodeId: 'b', bot: MAIN }] }, baseRevision: (away as { revision: number }).revision,
+      caller: { openId: 'ou_owner', origin: 'human' },
+      resolveNewBotSnapshot: () => { throw new Error('no new bots'); },
+      mainTopic: { available: true }, nameOf, mainSessionDir: sessionDir,
+    });
+    expect(back).toMatchObject({ kind: 'invalid', problems: [expect.stringContaining(sessionDir)] });
+    expect(readJournal(join(runDir, 'journal.ndjson')).filter((event) => event.type === 'dagRevised')).toHaveLength(1);
+  });
+
   it('does not re-judge a node that already was one when something else changes', () => {
     const { sessionDir, otherDir } = workspace();
     const { base } = seedRun([goal('a', { bot: 'cli_x' }), goal('b', { bot: MAIN, placement: 'main', depends: ['a'] })], otherDir);
@@ -287,11 +344,11 @@ describe('a runtime edit that makes a node the main bot\'s own main-topic node',
   });
 });
 
-describe('a blocked-card reassignment of a main-topic node to the main bot', () => {
+describe('a blocked-card reassignment to the main bot', () => {
   const probe: V3BotEligibilityProbe = okProbe;
 
-  async function blockedMainTopicNode(frozen: string, mainSessionDir: string | undefined) {
-    const { base, runId } = seedRun([goal('w', { bot: 'cli_x', placement: 'main' })], frozen);
+  async function blockedNode(frozen: string, mainSessionDir: string | undefined, placement: 'main' | 'topic' = 'main') {
+    const { base, runId } = seedRun([goal('w', { bot: 'cli_x', ...(placement === 'main' ? { placement } : {}) })], frozen);
     const executor = new FakeExecutor();
     executor.onDispatch = (req) => (req.attemptNumber === 1
       ? { kind: 'rejected', code: 'BOT_OFFLINE' }
@@ -330,16 +387,24 @@ describe('a blocked-card reassignment of a main-topic node to the main bot', () 
 
   it('is not offered, and a click is refused, when the frozen dir is not the main session\'s', async () => {
     const { sessionDir, otherDir } = workspace();
-    const run = await blockedMainTopicNode(otherDir, sessionDir);
+    const run = await blockedNode(otherDir, sessionDir);
     expect(run.options).not.toContain(MAIN);
     const out = await run.click();
     expect(out.toast).toMatchObject({ type: 'warning', content: expect.stringContaining(sessionDir) });
     expect(run.reassigned()).toEqual([]);
   });
 
+  it('a node-topic node still goes to the main bot when the dirs differ (only main-topic nodes run in the main session)', async () => {
+    const { sessionDir, otherDir } = workspace();
+    const run = await blockedNode(otherDir, sessionDir, 'topic');
+    expect(run.options).toContain(MAIN);
+    await run.click();
+    expect(run.reassigned()).toEqual([expect.objectContaining({ nodeId: 'w', to: MAIN })]);
+  });
+
   it('goes through when the frozen dir is the main session\'s', async () => {
     const { sessionDir } = workspace();
-    const run = await blockedMainTopicNode(sessionDir, sessionDir);
+    const run = await blockedNode(sessionDir, sessionDir);
     expect(run.options).toContain(MAIN);
     await run.click();
     expect(run.reassigned()).toEqual([expect.objectContaining({ nodeId: 'w', to: MAIN })]);
