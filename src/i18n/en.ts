@@ -782,6 +782,7 @@ export const messages: Record<string, string> = {
   'cmd.vc.project_bound': '📂 Reusing the project bound to this session: {dir}',
   'cmd.vc.project_optional': 'No project directory is bound to this session. To let meeting Q&A use local code, send `/cd <project directory>`; otherwise answers will use this chat, watched documents, and meeting captions only.',
   'cmd.vc.replaced': 'Note: this group was also bound to meeting `{meetingNo}`. The old record remains; remove it with `/vc off {meetingNo}` if needed.',
+  'cmd.vc.store_unavailable': 'Meeting preparation records could not be read or written (file unreadable, corrupt, or busy); this operation did not complete. Please try again later.',
   'daemon.doc_mention_notify_title': '📄 Doc @bot trigger notification',
   'daemon.doc_mention_notify_body': 'User {requester} mentioned the bot in doc {token} and triggered a reply.',
   'daemon.doc_dropped_notify_title': '⚠️ Doc comment event not handled',

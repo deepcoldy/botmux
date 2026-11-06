@@ -52,6 +52,7 @@ import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
+import { isStoreFileUnavailableError } from '../utils/json-file.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
@@ -96,6 +97,7 @@ import {
   putVcMeetingPreparation,
   removeVcMeetingPreparation,
   removeVcMeetingPreparationsByChat,
+  removeVcMeetingPreparationsForApp,
 } from '../services/vc-meeting-preparations-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
@@ -5080,71 +5082,78 @@ export async function handleCommand(
           await sessionReply(rootId, prefix + t('cmd.vc.usage', undefined, loc));
           break;
         }
-        if (request.kind === 'status') {
-          const requestedRecord = request.meetingNo
-            ? getVcMeetingPreparation(dataDir, larkAppId, request.meetingNo)
-            : undefined;
-          const records = request.meetingNo
-            ? (requestedRecord ? [requestedRecord] : [])
-            : listVcMeetingPreparations(dataDir, larkAppId);
-          if (records.length === 0) {
-            await sessionReply(rootId, t('cmd.vc.none', undefined, loc));
+        // Every /vc read and write below reports an unreadable preparations
+        // file to the owner instead of answering "none" or failing silently.
+        const strictRead = { ioErrors: 'throw' } as const;
+        try {
+          if (request.kind === 'status') {
+            const requestedRecord = request.meetingNo
+              ? getVcMeetingPreparation(dataDir, larkAppId, request.meetingNo, strictRead)
+              : undefined;
+            const records = request.meetingNo
+              ? (requestedRecord ? [requestedRecord] : [])
+              : listVcMeetingPreparations(dataDir, larkAppId, strictRead);
+            if (records.length === 0) {
+              await sessionReply(rootId, t('cmd.vc.none', undefined, loc));
+              break;
+            }
+            const lines = records.map(record => [
+              `• ${record.topic || record.meetingNo}`,
+              `  meetingNo: \`${record.meetingNo}\``,
+              `  chat: \`${record.prepChatId}\``,
+              `  agent: \`${record.agentAppId}\``,
+              `  Q&A: ${record.qaMode}`,
+            ].join('\n'));
+            await sessionReply(rootId, [t('cmd.vc.status_title', undefined, loc), '', ...lines].join('\n'));
             break;
           }
-          const lines = records.map(record => [
-            `• ${record.topic || record.meetingNo}`,
-            `  meetingNo: \`${record.meetingNo}\``,
-            `  chat: \`${record.prepChatId}\``,
-            `  agent: \`${record.agentAppId}\``,
-            `  Q&A: ${record.qaMode}`,
-          ].join('\n'));
-          await sessionReply(rootId, [t('cmd.vc.status_title', undefined, loc), '', ...lines].join('\n'));
-          break;
-        }
-        if (request.kind === 'off') {
-          let count = 0;
-          if (request.all) {
-            for (const record of listVcMeetingPreparations(dataDir, larkAppId)) {
-              if (removeVcMeetingPreparation(dataDir, larkAppId, record.meetingNo)) count += 1;
+          if (request.kind === 'off') {
+            let count = 0;
+            if (request.all) {
+              count = removeVcMeetingPreparationsForApp(dataDir, larkAppId);
+            } else if (request.meetingNo) {
+              count = removeVcMeetingPreparation(dataDir, larkAppId, request.meetingNo) ? 1 : 0;
+            } else if (ds) {
+              count = removeVcMeetingPreparationsByChat(dataDir, larkAppId, ds.chatId);
             }
-          } else if (request.meetingNo) {
-            count = removeVcMeetingPreparation(dataDir, larkAppId, request.meetingNo) ? 1 : 0;
-          } else if (ds) {
-            count = removeVcMeetingPreparationsByChat(dataDir, larkAppId, ds.chatId);
+            await sessionReply(rootId, count > 0
+              ? t('cmd.vc.stopped', { count }, loc)
+              : t('cmd.vc.none', undefined, loc));
+            break;
           }
-          await sessionReply(rootId, count > 0
-            ? t('cmd.vc.stopped', { count }, loc)
-            : t('cmd.vc.none', undefined, loc));
-          break;
+          if (!ds || ds.chatType !== 'group' || ds.scope !== 'chat') {
+            await sessionReply(rootId, t('cmd.vc.need_group_chat', undefined, loc));
+            break;
+          }
+          const existingInChat = findVcMeetingPreparationByChat(dataDir, larkAppId, ds.chatId, strictRead);
+          const record = putVcMeetingPreparation(dataDir, {
+            larkAppId,
+            meetingNo: request.meetingNo,
+            ...(request.meetingLink ? { meetingLink: request.meetingLink } : {}),
+            prepChatId: ds.chatId,
+            agentAppId: larkAppId,
+            agentSessionId: ds.session.sessionId,
+            ownerOpenId: message.senderId,
+            qaMode: request.qaMode,
+          });
+          const replaced = existingInChat && existingInChat.meetingNo !== record.meetingNo
+            ? `\n${t('cmd.vc.replaced', { meetingNo: existingInChat.meetingNo }, loc)}`
+            : '';
+          let preparedText = t('cmd.vc.prepared', {
+            meetingNo: record.meetingNo,
+            qaMode: record.qaMode,
+          }, loc) + replaced;
+          const meetingProjectDir = ds.workingDir ?? ds.session.workingDir;
+          preparedText += meetingProjectDir
+            ? `\n\n${t('cmd.vc.project_bound', { dir: meetingProjectDir }, loc)}`
+            : `\n\n${t('cmd.vc.project_optional', undefined, loc)}`;
+          await sessionReply(rootId, preparedText);
+          logger.info(`[${logTag}] /vc prepare meetingNo=${record.meetingNo} chat=${record.prepChatId} agent=${record.agentAppId} qa=${record.qaMode}`);
+        } catch (err) {
+          if (!isStoreFileUnavailableError(err)) throw err;
+          logger.warn(`[${logTag}] /vc preparations store unavailable: ${err.message}`);
+          await sessionReply(rootId, t('cmd.vc.store_unavailable', undefined, loc));
         }
-        if (!ds || ds.chatType !== 'group' || ds.scope !== 'chat') {
-          await sessionReply(rootId, t('cmd.vc.need_group_chat', undefined, loc));
-          break;
-        }
-        const existingInChat = findVcMeetingPreparationByChat(dataDir, larkAppId, ds.chatId);
-        const record = putVcMeetingPreparation(dataDir, {
-          larkAppId,
-          meetingNo: request.meetingNo,
-          ...(request.meetingLink ? { meetingLink: request.meetingLink } : {}),
-          prepChatId: ds.chatId,
-          agentAppId: larkAppId,
-          agentSessionId: ds.session.sessionId,
-          ownerOpenId: message.senderId,
-          qaMode: request.qaMode,
-        });
-        const replaced = existingInChat && existingInChat.meetingNo !== record.meetingNo
-          ? `\n${t('cmd.vc.replaced', { meetingNo: existingInChat.meetingNo }, loc)}`
-          : '';
-        let preparedText = t('cmd.vc.prepared', {
-          meetingNo: record.meetingNo,
-          qaMode: record.qaMode,
-        }, loc) + replaced;
-        const meetingProjectDir = ds.workingDir ?? ds.session.workingDir;
-        preparedText += meetingProjectDir
-          ? `\n\n${t('cmd.vc.project_bound', { dir: meetingProjectDir }, loc)}`
-          : `\n\n${t('cmd.vc.project_optional', undefined, loc)}`;
-        await sessionReply(rootId, preparedText);
-        logger.info(`[${logTag}] /vc prepare meetingNo=${record.meetingNo} chat=${record.prepChatId} agent=${record.agentAppId} qa=${record.qaMode}`);
         break;
       }
 
