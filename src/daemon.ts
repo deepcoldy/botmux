@@ -98,7 +98,7 @@ import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
-import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
+import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
   loadBotConfigs,
@@ -108,6 +108,7 @@ import {
   getBot,
   getAllBots,
   getBotClient,
+  getBotOpenId,
   createDetachedLarkClient,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
@@ -27371,6 +27372,27 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
 }
 
 /**
+ * 场景① latest-message anchor lookup: the thread root of the newest usable
+ * message in the chat, or undefined (none / API error) so the caller falls back
+ * to reply-mode routing. Never throws.
+ */
+async function resolveLatestMessageJoinAnchor(larkAppId: string, chatId: string): Promise<string | undefined> {
+  try {
+    const messages = await listChatMessages(larkAppId, chatId, GROUP_JOIN_ANCHOR_SCAN_LIMIT);
+    const anchor = pickGroupJoinAnchorMessageId(messages, larkAppId, getBotOpenId(larkAppId));
+    if (anchor) {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚定最新消息 ${anchor.substring(0, 12)} 开话题会话`);
+    } else {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无可锚定的已有消息，回退 reply mode 路由`);
+    }
+    return anchor;
+  } catch (err: any) {
+    logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉取最新消息失败，回退 reply mode 路由：${err?.message ?? err}`);
+    return undefined;
+  }
+}
+
+/**
  * 主动开工 — 场景①: the bot was added to a chat. Auto-start a session when
  * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) at least one of its
  * allowedUsers is a member of the chat (D7). Working dir per D6: the bot's
@@ -27575,7 +27597,16 @@ async function handleBotAdded(
     const opensOwnTopic = externalEventOpensOwnTopic(mode, regularGroupMode);
     let scope: 'thread' | 'chat';
     let anchor: string;
-    if (opensOwnTopic) {
+    // 普通群 autoStartOnGroupJoinAnchor='latest-message'：不发 seed，直接以群里最新
+    // 一条已有消息为根开 thread-scope 会话（例：外部平台先发上下文卡片再拉 bot）。
+    // 找不到可用消息或拉取失败 → 回退到下面的 reply-mode 路由。forcePrompt 路径不读。
+    const latestMessageAnchor = !forced && !opensOwnTopic && botCfg.autoStartOnGroupJoinAnchor === 'latest-message'
+      ? await resolveLatestMessageJoinAnchor(larkAppId, chatId)
+      : undefined;
+    if (latestMessageAnchor) {
+      anchor = latestMessageAnchor;
+      scope = 'thread';
+    } else if (opensOwnTopic) {
       anchor = await sendMessage(larkAppId, chatId, joinSeedText, 'text');
       scope = 'thread';
     } else {
@@ -27597,7 +27628,8 @@ async function handleBotAdded(
       return;
     }
     const needsSharedReply = mode === 'group'
-      && regularGroupMode === 'shared';
+      && regularGroupMode === 'shared'
+      && scope === 'chat';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
