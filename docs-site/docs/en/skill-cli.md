@@ -1,7 +1,6 @@
 # Skill + CLI Interaction
 
-<video src="../img/video-v8-skills.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
-<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+<video src="../img/video-v8-skills-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
 Inside a botmux session, the AI talks to Lark (sending messages, reading history, creating scheduled tasks…) through two things:
 

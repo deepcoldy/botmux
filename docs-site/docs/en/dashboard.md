@@ -1,7 +1,6 @@
 # Dashboard Control Panel
 
-<video src="../img/video-v7-dashboard.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
-<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+<video src="../img/video-v7-dashboard-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
 The Dashboard is botmux's built-in web admin console. One page lets you manage sessions, groups, scheduled tasks, workflows, and configuration for **every bot** on this machine, without typing commands into each Lark group.
 
@@ -140,6 +139,15 @@ Common actions:
 | See what a session did | **Insight**: counts tool calls, failures, and time spent, with suggestions |
 | Reproduce how the CLI was launched | **Copy reproduce command**. It contains credentials such as tokens, so keep it private |
 
+### Run status, task status and TODOs {#session-status-todo}
+
+Automatic, nothing to configure. Session cards show status in two layers:
+
+- **Run status**: whether the CLI is idle or working right now (working, starting, analyzing, and so on).
+- **Task status**: whether the work is finished. When a Claude Code / Codex session record still has open TODOs, the card carries a "TODO done/total" badge. Hover to preview the list, click to pin it so you can select and copy.
+
+So a session whose CLI is already idle but still has unfinished TODOs lands in the board's **Todo** column instead of blending in with idle ones. CLIs whose TODOs can't be read are unaffected and are placed by run status. TODO contents are hidden in read-only mode without a login.
+
 ## Group Management
 
 ![Group Management: standard group list](/img/dashboard-groups-list.png)
@@ -229,6 +237,41 @@ Two things are not done in the Dashboard:
 
 - Human approval in a workflow (humanGate approve / reject) happens on a **Lark approval card**.
 - Triggering a workflow with parameters goes through [Connectors (Webhook)](/en/webhook).
+
+## Monitoring Board and Session Monitor Room {#monitoring}
+
+There by default, and visible in read-only mode too: **Analytics → Monitoring Board** in the sidebar (`#/monitoring`) shows botmux's runtime health on this machine (is the data fresh, is the daemon online, are sessions piling up), memory use and session pressure in real time. Memory is counted as PSS (`phys_footprint` on macOS) and split into botmux itself and external CLIs, so adding up processes doesn't double-count shared memory.
+
+To watch several sessions' terminals at once: select them in **Session Control**, click **Add to monitor room**, and they appear side by side in the **Session Monitor Room** (`#/monitor-room`).
+
+## Agents and the links graph {#agents}
+
+There by default, login required: **Digital Workforce → Agents** in the sidebar (`#/agents`). An Agent is a reusable run config (CLI, model, working directory, sandbox). One Agent can back many bots, and an edit syncs to new sessions of every linked bot.
+
+1. Click **New Agent** and start from **Copy from a Bot** (identical to that bot's config; you can tick **Also link this Bot**) or **Blank**.
+2. Switch between **Configure** and **Links** at the top of the page. In **Links**, drag from the dot on an Agent onto a bot to link them.
+3. Once linked, the bot's run config is managed by the Agent; to change it on its own, unlink it in the links graph first.
+
+Agents are optional: a single bot can still pick its CLI and model directly under **Bot Config → Common → Agent Config**.
+
+## Customizing built-in prompts and skills {#customization}
+
+There by default, login required: **Digital Workforce → Customization** in the sidebar (`#/customization`) lets you tune botmux's built-in framework prompt fragments and built-in skills. The page itself is in Chinese.
+
+- Every entry can be rewritten; changes **apply from the next session, with no daemon restart**.
+- Each entry can be reset on its own with **恢复出厂** (reset to factory), or all at once with **全部恢复出厂**. Every change stores a snapshot; **历史 / 回滚** (history / rollback) takes you back to any snapshot, and a rollback stores a snapshot too.
+- **导出 bundle** (export) downloads your changes as a bundle; a teammate brings them in with **导入 bundle** (import; a snapshot is taken before importing).
+- You can delete critical instructions (such as `botmux send`), but then the bot may be unable to post replies back to Lark; reset to factory if unsure.
+
+## Host web terminal {#host-terminal}
+
+There by default, **only for people who can manage this machine**: log in to the Dashboard with this machine's admin link, or open this machine's Dashboard from the central platform, and **Management → Terminal** (`#/terminal`) appears in the sidebar.
+
+- **New shell** opens a login shell on this machine; you can also connect to existing tmux / herdr sessions on it from the list, including sessions botmux manages.
+- Multiple tabs, full screen and font size are supported.
+- Closing a shell tab ends that shell and anything still running in it; closing a tmux / herdr tab only disconnects and leaves the session alone.
+
+It hands out a shell on this machine, which is a lot of power; don't share the admin link. This is not the same as the [web terminal](/en/web-terminal) on session cards, which only views and drives one session's CLI.
 
 ## Auto-start at boot
 

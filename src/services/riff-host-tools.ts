@@ -59,8 +59,8 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
   },
   board: {
     sub: ['guide', 'list', 'show', 'add', 'set', 'history', 'attach', 'pending'],
-    values: '--view --key --state --stage --kind --repo --summary --progress --ask --option --recommend --reason --link --unlink --note --title',
-    bools: '--json --handled --clear-ask',
+    values: '--view --key --state --stage --kind --repo --summary --progress --ask --option --recommend --reason --link --unlink --note --title --primary-chat --no-chat --close-when --depends-on --next-check',
+    bools: '--json --handled --clear-ask --allow-unverified-chat --dismiss-hint',
   },
   workflow: { sub: ['list', 'show', 'run', 'start', 'retry', 'cancel', 'grant'], values: '--param --reason --node', bools: '--json' },
   card: { sub: ['patch'], values: '--message-id --card-json --plugin-card-action', files: '--card-file' },

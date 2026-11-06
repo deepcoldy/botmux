@@ -1,7 +1,6 @@
 # Scheduled Tasks
 
-<video src="../img/video-v5-automation.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
-<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+<video src="../img/video-v5-automation-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
 Let a bot do work on a schedule: a daily morning report, a service check every 30 minutes, cleaning up a branch once a PR merges. When a task is due, the bot hands your prompt to its AI CLI and posts the result back to Feishu/Lark.
 
@@ -181,6 +180,18 @@ botmux schedule update <id> --prompt "new full prompt"
 The task ID, schedule, enabled state, execution position and run history are kept, and nothing is re-run. A run already in progress keeps the old prompt; the next run uses the new one.
 
 Tasks with a Bash precondition can't be changed with `update`; edit them in the Dashboard (the precondition is bound to a checksum of the task content, so changing the prompt directly would make every later run fail the check).
+
+## Run logs and multiple groups (Dashboard) {#logs-and-multi-chat}
+
+Like the [Bash precondition](#bash-precondition), these two are only available on the Dashboard's **Scheduled Tasks** page.
+
+**Run logs**: every row in the task list has a **Run logs** button. It shows recent runs: whether each one was submitted to the model, skipped because the precondition failed, or failed to schedule, plus the trigger (scheduler / Dashboard run now), start and end times and the precondition result. The log only covers the precondition check and the submission to the model; it does not include model output, terminal output or message delivery. Only runs recorded after the upgrade are shown, and viewing the log never triggers or changes the task.
+
+**One task, several groups**: when creating or editing a task, **Bound groups** accepts several groups, up to 5.
+
+- Each group calls the model independently, and a failure in one group doesn't stop the others; model usage grows with the number of groups.
+- The Bash precondition runs once per schedule, and its result applies to every group.
+- With the execution position set to **Dedicated topic for this task** or to a specific existing topic, only one group can be bound.
 
 ## Per-task model
 

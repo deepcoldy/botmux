@@ -400,6 +400,33 @@ Details in [File sandbox](/en/sandbox).
 
 > The ZMX backend can't enforce the file sandbox; sandboxed combinations are refused at startup. See [ZMX backend](/en/zmx).
 
+### Run CLI calls as the message sender (`triggerUserAuth`) {#trigger-user-auth}
+
+**Off by default.** When on, `lark-cli` / `bytedcli` in this bot's sessions run with the authorization of whoever sent the current message, not whatever is logged in on the machine. Useful when several people share one bot: each message reads docs, checks calendars or calls internal platforms as its own sender.
+
+Pick one way to turn it on. It **takes effect for new sessions** (`/restart` an existing one):
+
+- **Dashboard**: **Bot Config → Security → Trigger-user auth**, switch on **Run CLI calls as the message sender** and tick the tools it should cover.
+- **In Lark** (admins): `/botconfig set triggerUserAuth {"enabled":true,"tools":["lark-cli","bytedcli"]}`; turn it off with `/botconfig unset triggerUserAuth`.
+- **bots.json**:
+
+```json
+"triggerUserAuth": { "enabled": true, "tools": ["lark-cli", "bytedcli"] }
+```
+
+Rules:
+
+- Only `"enabled": true` turns it on. Leaving out `tools` covers every tool; an unknown tool name is an error rather than a silent downgrade.
+- When someone who hasn't authorized makes a call, the command is refused and the refusal carries an authorization link. The AI can also send that person a link itself with `botmux auth request` (see [Agent-initiated authorization](/en/cli-commands#agent-auth-request)), or ask them to send `/login` in the topic. Retry after authorizing.
+- It never falls back to running as the bot or as anyone else. `bytedcli` has no bot identity, so an unauthorized call simply fails.
+- Optional fields: `credentialSource` (`auto` by default / `platform` central platform only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
+
+#### Upgrade note: old-format authorizations need a fresh `/login` {#legacy-user-token}
+
+Since v3.20, the Lark user authorizations botmux stores itself are kept per app and per authorizing person (`~/.botmux/data/user-token-<appId>-<openId>.json`). The older files (`user-token-<appId>.json`, `user-token.json`) don't say who authorized them, so nothing that has to act as a specific person uses them any more.
+
+A bot that only has an old-format authorization loses those user-identity features. **Have the person send `/login` once in a topic** to restore them. `/login` only refreshes the stored authorization; running CLI calls as the sender still has to be turned on separately as described above.
+
 ## Cards and terminal
 
 What the cards look like and what each switch does: see [Live streaming cards](/en/cards).
@@ -686,6 +713,31 @@ botmux can estimate each bot's spend (in CNY) from token usage and send a DM whe
 | Field | Description |
 |------|------|
 | `voice` | This bot's voice engine config, merged field by field over the global `voice` in `~/.botmux/config.json`. With usable voice credentials, answer cards get a "🔊 Voice summary" button. See [Voice summary](/en/voice) |
+
+## Lark meeting agent {#vc-meeting-agent}
+
+A Lark-connected bot **can be invited into video meetings by default** (core-only `apiOnly` bots excepted). It listens in, syncs the transcript, and, depending on its meeting role, posts text or speaks in the meeting.
+
+**Prerequisites**: the app needs `vc:meeting.bot.join:write` (join / leave), `vc:meeting.meetingevent:read` (read meeting events) and `vc:meeting.message:write` (in-meeting text), plus `vc:meeting.bot.realtime:write` for realtime voice; the event subscription must include `vc.bot.meeting_invited_v1`, `vc.bot.meeting_activity_v1`, `vc.bot.meeting_ended_v1` and `vc.meeting.participant_meeting_joined_v1`. Missing scopes are logged as an error at startup and DMed to the admin; event subscriptions can't be queried through any Lark API, so the daemon only reminds you to check them, and a missing event just means no meeting pushes arrive, with no error.
+
+**How to use it**:
+
+1. Invite the bot from a Lark video meeting.
+2. The bot DMs the owner (or `vcMeetingAgent.attentionTargetOpenId`, if set) a confirmation card, valid for 30 minutes by default (`inviteTtlMs`).
+3. After confirmation the bot joins and creates a meeting listener group that syncs the transcript; set `vcMeetingAgent.listenerChatId` to use an existing group instead.
+4. What it does in the meeting is decided by meeting roles, see the next section. To let someone give the bot instructions while it listens to the meeting, use `/vc-auth @member` (`/vc-auth revoke @member` to undo, `/vc-auth list` to view).
+5. To prepare ahead: send `/vc prepare <meeting link or number>` in a regular group to make it the meeting prep group, add background and pre-read docs there, and the same Agent session is reused once the meeting starts (see [Slash commands](/en/slash-commands)).
+
+**Speaking in the meeting**:
+
+- Text and voice are **sent directly by default, without per-message approval**. For per-message approval, set `textOutputPolicy` / `voiceOutputPolicy` to `approval` under `vcMeetingAgent.meetingConsumer`; `deny` turns that channel off.
+- Realtime voice is on by default but only connects when the bot actually needs to speak; turn it off with `vcMeetingAgent.realtimeVoice.enabled: false`. Speaking also needs the realtime scope above and in-meeting AI speaking permission; without them it fails with a clear warning and never sends audio.
+- Speech is synthesized with the engine configured for [voice summaries](/en/voice) (MiniMax, Volcengine / Doubao, and others).
+
+**Turning it off**:
+
+- One bot: `"vcMeetingAgent": { "enabled": false }` in `bots.json`, or turn off **Receive meeting events** for that bot under **Global Settings → Meeting Agent → Meeting Listener → Meeting role presets → Per-bot meeting switches**.
+- The whole machine: Dashboard **Global Settings → Meeting Agent → Meeting Listener**, turn off **Allow meeting listener features on this machine** (`vcMeetingAgent.enabled: false` in `config.json`). Meetings already running usually finish naturally.
 
 ## Meeting roles
 

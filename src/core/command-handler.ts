@@ -108,7 +108,7 @@ import { setCardMode } from '../services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
-import { canOperate, isKnownPeerBot } from '../im/lark/event-dispatcher.js';
+import { canOperate, isKnownPeerBot, isPlatformTeamBotTrustedForReceiver } from '../im/lark/event-dispatcher.js';
 import { IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS, applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled, parseIdleAutoCompactCommand } from './idle-auto-compact.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
@@ -157,7 +157,7 @@ import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../serv
 import { readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
-import { isPlatformTeamBot, readPlatformTeamSync } from '../services/platform-team-store.js';
+import { readPlatformTeamSync } from '../services/platform-team-store.js';
 import { platformMachineOwner } from '../platform/binding.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
@@ -371,11 +371,13 @@ function closeWorktreeInlineDetail(items: string[], limit = 6): string {
   return `　${visible.join('　')}`;
 }
 
-function trustedTeamBotApp(larkAppId: string): boolean {
+/** 同 worktree 的另一个 Bot（`larkAppId`）是否是本 bot（`receiverAppId`）可信的团队 Bot。
+ *  平台 roster 腿与授权闸同口径（同队或同机），见 isPlatformTeamBotTrustedForReceiver。 */
+function trustedTeamBotApp(receiverAppId: string, larkAppId: string): boolean {
   const unionId = getBotUnionId(config.session.dataDir, larkAppId);
   return !!unionId && (
     isTeamBot(config.session.dataDir, unionId)
-    || isPlatformTeamBot(config.session.dataDir, unionId)
+    || isPlatformTeamBotTrustedForReceiver(config.session.dataDir, receiverAppId, unionId)
   );
 }
 
@@ -2509,7 +2511,7 @@ export async function handleCommand(
             const untrustedSibling = siblingSessions.find(sibling =>
               sibling.larkAppId
               && sibling.larkAppId !== ds.larkAppId
-              && !trustedTeamBotApp(sibling.larkAppId));
+              && !trustedTeamBotApp(ds.larkAppId, sibling.larkAppId));
             if (untrustedSibling) {
               logger.warn(
                 `[${logTag}] refusing worktree cleanup across untrusted bot app ${untrustedSibling.larkAppId}`,

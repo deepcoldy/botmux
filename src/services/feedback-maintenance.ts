@@ -192,7 +192,7 @@ export async function freezeFeedbackSource(dataDir: string, migrationId: string)
     }
     const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
     if (version < 1 || version > 8) throw new Error('feedback_source_schema_unsupported');
-    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations']);
+    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations', 'feedback_event_stream']);
     const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
     if (tables.some(table => !known.has(table.name))) throw new Error('feedback_source_schema_unsupported');
     if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_restorations'").get()

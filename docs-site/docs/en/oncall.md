@@ -1,7 +1,6 @@
 # On-Call Mode
 
-<video src="../img/video-v6-oncall-voice.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
-<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+<video src="../img/video-v6-oncall-voice-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
 Add a bot to a duty, alert, or Q&A group and bind it to a project directory. From then on **anyone in the group** can @ it with a question. No repo picker, no access request: the bot answers from that directory.
 

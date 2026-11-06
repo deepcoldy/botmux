@@ -169,6 +169,29 @@ A bot with a launch prefix (`wrapperCli`) can also be sandboxed (pty / tmux back
 - **Claude per-bot accounts (`credentialsSourceDir`)**: a sandboxed bot takes its OAuth credentials from this directory on every cold start, so sandboxed bots never share an account by accident. No effect on bots without a sandbox; cannot be combined with `codexAuthSync: "isolated"`.
 - **lark-cli**: the sandbox hides the shared `~/.lark-cli`. To use lark-cli inside the sandbox, the machine must first split lark-cli config per bot; see [lark-cli per-bot config](https://github.com/deepcoldy/botmux/blob/master/docs/lark-cli-per-bot.md) (Chinese).
 
+#### Several accounts on one machine: a separate account for a Claude bot {#credentials-source-dir}
+
+By default every sandboxed bot on a machine takes its credentials from the shared login (`~/.claude/.credentials.json` or the keychain), so they all run as one Claude account. To give one bot a different account:
+
+1. Prepare an account directory with one sub-directory per CLI, for example:
+
+   ```text
+   ~/accounts/acct-b/
+   └── claude/
+       └── .credentials.json
+   ```
+
+2. Set `credentialsSourceDir` for the bot: `"credentialsSourceDir": "~/accounts/acct-b"` in `bots.json`, or send `/botconfig set credentialsSourceDir ~/accounts/acct-b` in Lark.
+3. It takes effect for new sessions (`/restart` an existing one). From then on, every cold start copies the credentials from that directory into the bot's own data directory.
+
+Limits:
+
+- **Only `claude-code` is supported for now**, and the bot must have the file sandbox on. On a bot with no sandbox at all it has no effect (the global login is still used and a warning is logged); with the sandbox on but the data directory not redirectable (for example with `wrapperCli`), the session refuses to start.
+- If the source directory is missing, unreadable or holds invalid credentials, the session **refuses to start** instead of quietly falling back to the shared login.
+- Cannot be combined with `codexAuthSync: "isolated"`. For separate Codex accounts use `codexAuthSync: "isolated"`, see the item above.
+- botmux only copies on cold start and **does not refresh** the tokens in the source directory; keeping them valid is up to you (or an external script).
+- `/botconfig unset credentialsSourceDir` goes back to the shared login.
+
 ---
 
 ## scratch (throwaway sandbox)
