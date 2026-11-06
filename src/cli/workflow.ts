@@ -35,8 +35,9 @@ const RETIRED_TEMPLATE_SUBCOMMANDS = new Set([
 
 /**
  * Run one `botmux workflow …` command. A refusal the workflow code raises on
- * purpose (a guard, an illegal state transition, a caller that may not act
- * on the run) is a message for whoever typed the command — often the main
+ * purpose (a guard, a usage error — missing / invalid run id, a run that does
+ * not exist —, an illegal state transition, a caller that may not act on the
+ * run) is a message for whoever typed the command — often the main
  * bot, which relays it to the chat — so it is printed alone and the command
  * exits 1. Anything else is a bug and keeps its stack (rethrown).
  */
@@ -52,12 +53,13 @@ export async function runWorkflowCliCommand(run: () => Promise<void>): Promise<v
 
 async function isWorkflowRefusal(err: unknown): Promise<boolean> {
   if (!(err instanceof Error)) return false;
-  const [{ HostGuardError }, { GrillTransitionError }, { V3DaemonCommandAuthorityError }] = await Promise.all([
+  const [{ HostGuardError, WorkflowUsageError }, { GrillTransitionError }, { V3DaemonCommandAuthorityError }] = await Promise.all([
     import('../workflows/v3/host.js'),
     import('../workflows/v3/grill-state.js'),
     import('../workflows/v3/cli-daemon-command-authority.js'),
   ]);
-  return err instanceof HostGuardError || err instanceof GrillTransitionError || err instanceof V3DaemonCommandAuthorityError;
+  return err instanceof HostGuardError || err instanceof WorkflowUsageError
+    || err instanceof GrillTransitionError || err instanceof V3DaemonCommandAuthorityError;
 }
 
 export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {

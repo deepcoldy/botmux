@@ -1027,9 +1027,20 @@ export class HostGuardError extends Error {
   }
 }
 
+/** A `botmux workflow` command used wrongly: missing or malformed arguments,
+ *  an invalid run id, a run that does not exist. Like {@link HostGuardError}
+ *  the CLI prints only its message. Kept apart from it so callers that map
+ *  guard refusals (e.g. the Dashboard draft service) are unaffected. */
+export class WorkflowUsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkflowUsageError';
+  }
+}
+
 function mustRead(runDir: string): GrillState {
   const s = readGrillState(runDir);
-  if (!s) throw new Error(`grill.state.json 不存在于 ${runDir}`);
+  if (!s) throw new WorkflowUsageError(`grill.state.json 不存在于 ${runDir}`);
   return s;
 }
 
@@ -1080,9 +1091,10 @@ export interface WorkflowHostCommandDeps {
   botRole?: () => (larkAppId: string) => string | undefined;
   /** §5.2 rule 3 (default: the run's persisted main session). */
   mainTopicAvailability?: (binding: RunChatBinding) => V3MainTopicAvailability | Promise<V3MainTopicAvailability>;
-  /** The main session's directory (default: its persisted row); undefined =
+  /** The main session's directory (default: its persisted row, an unpinned
+   *  row falling back to the main bot's default from `bots`); undefined =
    *  unknown. */
-  mainSessionWorkingDir?: (binding: RunChatBinding) => string | undefined | Promise<string | undefined>;
+  mainSessionWorkingDir?: (binding: RunChatBinding, bots: readonly BotConfig[]) => string | undefined | Promise<string | undefined>;
   /** Test seam for the architect worker (default: the real ephemeral pool). */
   runArchitect?: ArchitectDeps['runArchitect'];
 }
@@ -1145,9 +1157,9 @@ async function resolveMainTopic(
   return () => availability;
 }
 
-async function liveMainSessionWorkingDir(binding: RunChatBinding): Promise<string | undefined> {
+async function liveMainSessionWorkingDir(binding: RunChatBinding, bots: readonly BotConfig[]): Promise<string | undefined> {
   const { liveV3MainSessionWorkingDir } = await import('../../im/lark/v3-bot-eligibility.js');
-  return liveV3MainSessionWorkingDir(binding);
+  return liveV3MainSessionWorkingDir(binding, bots);
 }
 
 /** The main session's directory for the run in `runDir`, resolved once per
@@ -1155,6 +1167,7 @@ async function liveMainSessionWorkingDir(binding: RunChatBinding): Promise<strin
 async function resolveMainSessionDir(
   runDir: string,
   workingDirOverride: string | undefined,
+  bots: readonly BotConfig[],
   deps: WorkflowHostCommandDeps,
 ): Promise<((binding: RunChatBinding) => string | undefined) | undefined> {
   if (workingDirOverride === undefined) return undefined;
@@ -1162,7 +1175,7 @@ async function resolveMainSessionDir(
   if (!binding) return undefined;
   let dir: string | undefined;
   try {
-    const raw = await (deps.mainSessionWorkingDir ?? liveMainSessionWorkingDir)(binding);
+    const raw = await (deps.mainSessionWorkingDir ?? liveMainSessionWorkingDir)(binding, bots);
     dir = raw === undefined ? undefined : comparableSessionDir(raw);
   } catch {
     dir = undefined;
@@ -1204,7 +1217,7 @@ export async function cmdWorkflowHost(
   switch (sub) {
     case 'new': {
       const goal = firstPositional(rest);
-      if (!goal) throw new Error('用法: botmux workflow new "<目标>" [--base-dir <dir>]');
+      if (!goal) throw new WorkflowUsageError('用法: botmux workflow new "<目标>" [--base-dir <dir>]');
       // grill 经 daemon worker 出生时，env 带话题上下文 → 落 chatBinding，供后续
       // daemon humanGate 发审批卡用（CLI/dev 出生无 env → undefined，不影响）。
       const chatBinding = (deps.resolveChatBinding ?? chatBindingFromEnv)();
@@ -1316,7 +1329,7 @@ export async function cmdWorkflowHost(
       if (switchMode === 'bot') {
         try {
           const previewDir = argValue(rest, '--working-dir');
-          const mainSessionDir = await resolveMainSessionDir(runDir, previewDir, deps);
+          const mainSessionDir = await resolveMainSessionDir(runDir, previewDir, bots, deps);
           const preview = await planAdHocNodeExecutor(runDir, bots, {
             switchMode: 'bot',
             multiTopicEnabled: multiTopicEnabled(),
@@ -1348,7 +1361,7 @@ export async function cmdWorkflowHost(
       assertWorkflowHostCaller(runDir, currentCaller);
       const workingDirOverride = argValue(rest, '--working-dir');
       if (rest.includes('--working-dir') && (!workingDirOverride?.trim() || workingDirOverride.startsWith('--'))) {
-        throw new Error('--working-dir requires a non-empty path');
+        throw new WorkflowUsageError('--working-dir requires a non-empty path');
       }
       const now = new Date();
       // An already-published replay must not depend on today's bots.json just
@@ -1369,7 +1382,7 @@ export async function cmdWorkflowHost(
         const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
         if (switchMode === 'bot') {
           const mainTopic = await resolveMainTopic(runDir, deps);
-          const mainSessionDir = await resolveMainSessionDir(runDir, workingDirOverride, deps);
+          const mainSessionDir = await resolveMainSessionDir(runDir, workingDirOverride, bots, deps);
           const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
           const plan = await planAdHocNodeExecutor(runDir, bots, {
             switchMode,
@@ -1555,12 +1568,12 @@ function firstPositional(args: string[]): string | undefined {
 
 function requireRunId(rest: string[]): string {
   const runId = firstPositional(rest);
-  if (!runId) throw new Error('用法: botmux workflow <sub> <runId> [--base-dir <dir>]');
+  if (!runId) throw new WorkflowUsageError('用法: botmux workflow <sub> <runId> [--base-dir <dir>]');
   // Reject anything that could escape baseDir (path separators, `..`, leading
   // dot) — these verbs are skill-driven shell commands, so harden the runId
   // before it reaches join/resolve (codex review 2026-06-02).
   if (!isValidRunId(runId)) {
-    throw new Error(`非法 runId（只允许字母数字与 . _ -、不得含路径分隔符）：${runId}`);
+    throw new WorkflowUsageError(`非法 runId（只允许字母数字与 . _ -、不得含路径分隔符）：${runId}`);
   }
   return runId;
 }

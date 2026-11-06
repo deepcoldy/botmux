@@ -65,6 +65,19 @@ describe('workflow CLI refusals', () => {
     expect(out.stderr).not.toMatch(STACK_OR_SOURCE);
   }, 90_000);
 
+  it.each([
+    ['a run that does not exist', (base: string) => ['no-such-run', '--base-dir', base], /no-such-run/],
+    ['no run id', () => [], /approve-dag|runId|用法/],
+    ['a run id that is not one', (base: string) => ['bad/../id', '--base-dir', base], /bad\/\.\.\/id/],
+  ])('approve-dag with %s: the usage message alone, exit non-zero', (_label, args, names) => {
+    const home = privateHome();
+    const out = botmux(home, ['workflow', 'approve-dag', ...args(join(home, 'runs'))]);
+    expect(out.status).not.toBe(0);
+    expect(out.status).not.toBeNull();
+    expect(out.stderr).toMatch(names);
+    expect(out.stderr).not.toMatch(STACK_OR_SOURCE);
+  }, 90_000);
+
   it('cancel of a run the caller cannot act on: the authority message alone, exit non-zero', () => {
     const home = privateHome();
     const out = botmux(home, ['workflow', 'cancel', 'no-such-run-261106-000000-000-deadbeef']);
