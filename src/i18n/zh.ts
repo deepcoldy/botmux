@@ -795,6 +795,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用。',
   'cmd.adopt.managed_other_topic': '⚠️ 该 ID 是另一个话题的 Botmux 会话，不能用 /adopt 搬到当前话题。请到原话题点击「恢复会话」，或在本机运行 `botmux resume {id}`。',
   'cmd.resume.none': '⚠️ 这里没有可恢复的已关闭会话。',
+  'cmd.resume.cli_success': '🔄 会话已通过命令行恢复，发条消息继续与 {cliName} 对话。',
   'cmd.resume.lane_unsupported': 'ℹ️ 该会话是并行车道的分身，不能用 /resume 恢复。请在原会话上继续。',
   'cmd.resume.primary_unsupported': 'ℹ️ 当前部署启用了持久协调（primary），暂不支持用 /resume 恢复。请点击原会话关闭卡上的「恢复会话」按钮。',
   'cmd.close.primary_unsupported': 'ℹ️ 当前部署启用了持久协调（primary），本次请求未进入持久关闭通道，已拒绝本地关闭。请在话题中重新发送不带参数的 `/close`；暂不支持 `/close wt` 或卡片确认删除 worktree。',

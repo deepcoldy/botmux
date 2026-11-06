@@ -5868,10 +5868,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
+  const loc = localeForBot(ds.larkAppId);
   // Plain text — the Lark client does the {"text": …} wrapping for 'text'.
   const notice = result.recoveryPending
-    ? `🔄 ${cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话。`
-    : `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。`;
+    ? t('card.action.resume_started_remote', { cliName }, loc)
+    : t('cmd.resume.cli_success', { cliName }, loc);
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {

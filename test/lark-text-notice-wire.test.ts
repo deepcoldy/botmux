@@ -224,11 +224,13 @@ describe('dashboard restart notice reaches Feishu wrapped once', () => {
 });
 
 describe('dashboard resume notice reaches Feishu wrapped once', () => {
-  it('thread-scope resume posts a single {"text"} layer', async () => {
+  it('thread-scope resume uses the bot locale and preserves the CLI name', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'text-notice-resume-'));
     const prevDataDir = config.session.dataDir;
     const registry = new Map<string, any>();
     try {
+      __testOnly_resetBotRegistry();
+      registerBot({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'codex', lang: 'en' });
       config.session.dataDir = dataDir;
       setLarkAppId(APP_ID);
       sessionStore.init(APP_ID);
@@ -245,8 +247,56 @@ describe('dashboard resume notice reaches Feishu wrapped once', () => {
       const [w] = textWrites();
       expect(w.api).toBe('reply');
       expect(w.path).toMatchObject({ message_id: 'om_resume_root' });
-      expect(expectSingleWrap(w.data.content, '🔄')).toContain('Codex');
+      const notice = expectSingleWrap(w.data.content, '🔄');
+      expect(notice).toContain('Session resumed through the command line');
+      expect(notice).toContain('Codex');
+      expect(notice).not.toMatch(/[一-鿿]/u);
     } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      setLarkAppId('');
+      sessionStore.init('test-app');
+      config.session.dataDir = prevDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('remote recovery uses the existing localized in-progress notice', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'text-notice-remote-resume-'));
+    const prevDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation((ds: any, _prompt, _resume, opts: any) => {
+      ds.worker = { killed: false };
+      opts?.onAdmission?.('accepted');
+      return true;
+    });
+    try {
+      __testOnly_resetBotRegistry();
+      registerBot({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'codex', lang: 'en' });
+      config.session.dataDir = dataDir;
+      setLarkAppId(APP_ID);
+      sessionStore.init(APP_ID);
+      workerPool.setActiveSessionsRegistry(registry);
+      const session = sessionStore.createSession('oc_chat', 'om_remote_resume_root', 'remote resume notice', 'group');
+      Object.assign(session, {
+        larkAppId: APP_ID,
+        scope: 'thread',
+        cliId: 'codex',
+        backendType: 'remote-runner',
+        workingDir: '/tmp',
+      });
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      const res = await ipc(`/api/sessions/${session.sessionId}/resume`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ recoveryPending: true });
+
+      await vi.waitFor(() => expect(textWrites()).toHaveLength(1));
+      const notice = expectSingleWrap(textWrites()[0].data.content, '🔄');
+      expect(notice).toContain('Remote recovery for Codex has started');
+      expect(notice).not.toMatch(/[一-鿿]/u);
+    } finally {
+      forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
       setLarkAppId('');
       sessionStore.init('test-app');
