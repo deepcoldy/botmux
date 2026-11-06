@@ -100,8 +100,11 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDi
  *  exact slug path when it exists (normal case), the unique glob hit for long
  *  slugs, or null when absent/ambiguous. */
 export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | null {
+  const isFile = (path: string): boolean => {
+    try { return statSync(path).isFile(); } catch { return false; }
+  };
   const exact = claudeJsonlPathForSession(sessionId, cwd, dataDir);
-  if (existsSync(exact)) return exact;
+  if (isFile(exact)) return exact;
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   if (projectHash.length <= 200) return null;
   const projectsDir = join(dataDir, 'projects');
@@ -112,7 +115,7 @@ export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: 
   const hits = entries
     .filter(name => name === projectHash || name.startsWith(`${prefix}-`))
     .map(name => join(projectsDir, name, target))
-    .filter(p => existsSync(p));
+    .filter(isFile);
   return hits.length === 1 ? hits[0]! : null;
 }
 
@@ -739,10 +742,11 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: s
     }
   }
   if (!procStartVerified && realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
-  return {
-    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir),
-    cliSessionId: parsed.sessionId,
-  };
+  // An in-session cwd change updates the pid record, not the transcript's original bucket.
+  const path = resolveClaudeJsonlPath(parsed.sessionId, parsed.cwd, dataDir)
+    ?? resolveClaudeJsonlPath(parsed.sessionId, expectedCwd, dataDir)
+    ?? claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir);
+  return { path, cliSessionId: parsed.sessionId };
 }
 
 /** Linux-only: probe `/proc/<pid>/fd` for any signal that reveals Claude's

@@ -40,6 +40,7 @@ import {
   removeSessionGroup,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV, oneShotTitleAllowed, oneShotProfileEnv } from '../src/services/session-group-title.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import {
   resolveTagMode,
   resolveSessionTagName,
@@ -187,6 +188,29 @@ describe('sanitizeTitleOutput', () => {
 });
 
 describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
+  it('uses the current config to redact legacy rejected sources after a live config change', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(tempDir, 'global.json'));
+    vi.stubEnv('CURRENT_SECRET', 'daemon-secret');
+    const bot = { env: { CURRENT_SECRET: 'bot-secret', NEXT_SECRET: 'next-secret', KEEP: 'visible' } };
+    try {
+      writeFileSync(join(tempDir, 'global.json'), JSON.stringify({ protectedMcpCapabilities: {
+        rejected: { secret: { source: 'env', name: 'CURRENT_SECRET' } },
+      } }));
+      invalidateGlobalConfigCache();
+      expect(buildOneShotEnv(bot).CURRENT_SECRET).toBeUndefined();
+      writeFileSync(join(tempDir, 'global.json'), JSON.stringify({ protectedMcpCapabilities: {
+        rejected: { secret: { source: 'env', name: 'NEXT_SECRET' } },
+      } }));
+      invalidateGlobalConfigCache();
+      const next = buildOneShotEnv(bot);
+      expect(next.NEXT_SECRET).toBeUndefined();
+      expect(next.KEEP).toBe('visible');
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+    }
+  });
+
   it('strips daemon-only secrets and session markers from the inherited env', () => {
     process.env.LARK_APP_SECRET = 'daemon-secret';
     process.env.GITHUB_TOKEN = 'daemon-gh-token';
@@ -219,6 +243,25 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
     // reserved BOTMUX_* identity keys are not.
     const env = buildOneShotEnv({ env: { BOTMUX_SESSION_ID: 'evil' } });
     expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+  });
+
+  it('strips configured protected MCP keys from inherited and per-bot env', () => {
+    process.env.FIXTURE_SECRET = 'daemon-secret';
+    try {
+      const env = buildOneShotEnv(
+        { env: { FIXTURE_TOKEN: 'configured-token', KEEP: 'visible' } },
+        {
+          capabilities: [],
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+        },
+      );
+      expect(env.FIXTURE_SECRET).toBeUndefined();
+      expect(env.FIXTURE_TOKEN).toBeUndefined();
+      expect(env.KEEP).toBe('visible');
+    } finally {
+      delete process.env.FIXTURE_SECRET;
+    }
   });
 });
 

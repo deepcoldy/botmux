@@ -16,6 +16,8 @@ export interface BotmuxCommand {
 
 export interface BuildExternalBotmuxCommandInput {
   binPath: string;
+  /** Run `<interpreterPath> <binPath> …` when binPath is a script (dist/cli.js). */
+  interpreterPath?: string;
   botmuxHome: string;
   args: string[];
   baseEnv: NodeJS.ProcessEnv;
@@ -24,7 +26,8 @@ export interface BuildExternalBotmuxCommandInput {
 
 export interface BuildBundledBotmuxCommandInput {
   nodePath: string;
-  cliPath: string;
+  /** Omitted for a compiled botmux binary, which dispatches its own subcommands. */
+  cliPath?: string;
   botmuxHome: string;
   args: string[];
   baseEnv: NodeJS.ProcessEnv;
@@ -61,7 +64,7 @@ export function buildBundledBotmuxCommand(input: BuildBundledBotmuxCommandInput)
 
   return {
     command: input.nodePath,
-    args: [input.cliPath, ...input.args],
+    args: input.cliPath ? [input.cliPath, ...input.args] : [...input.args],
     env,
   };
 }
@@ -76,11 +79,9 @@ export function buildExternalBotmuxCommand(input: BuildExternalBotmuxCommandInpu
   };
   delete env.ELECTRON_RUN_AS_NODE;
 
-  return {
-    command: input.binPath,
-    args: input.args,
-    env,
-  };
+  return input.interpreterPath
+    ? { command: input.interpreterPath, args: [input.binPath, ...input.args], env }
+    : { command: input.binPath, args: input.args, env };
 }
 
 /**

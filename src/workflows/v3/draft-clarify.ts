@@ -188,3 +188,24 @@ export function parseDraftClarifyOutput(content: string): ParsedClarifyOutput {
   }
   return { text, ...(question ? { question } : {}), ...(specMarkdown ? { specMarkdown } : {}) };
 }
+
+/**
+ * First turn of a copied draft's clarify session (design 2026-11-03 §6,
+ * 「按新目标重新编排」): the same rules, the new goal, and the spec it was
+ * copied with as a starting point — the flow is re-orchestrated afterwards.
+ */
+export function buildDraftCopyClarifyKickoff(input: { runId: string; goal: string; copiedSpecMarkdown?: string }): string {
+  return [
+    rules(input.runId),
+    '',
+    '## 用户的目标（新）',
+    input.goal.trim(),
+    '',
+    '这个草稿是从一个已有的工作流复制来的，用户改了目标，要按新目标重新澄清、重新编排。',
+    ...(input.copiedSpecMarkdown?.trim()
+      ? ['下面是复制来的 spec，只作参考：与新目标一致的部分可以沿用，不一致的要重新问。', '', '## 复制来的 spec', input.copiedSpecMarkdown.trim()]
+      : []),
+    '',
+    '现在开始：先用一句话复述你理解的新目标，然后问第一个问题。',
+  ].join('\n');
+}

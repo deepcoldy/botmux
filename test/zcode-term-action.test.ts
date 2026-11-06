@@ -66,7 +66,7 @@ function harness(
     codexBridgeIngest: vi.fn(),
     isPromptReady: false,
     // These are not quota pools; quota recovery must remain inert.
-    traexQuotaPending: undefined,
+    traexQuotaPending: undefined, traexAutoModelController: null,
     emitReadyCodexTurns: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
   };

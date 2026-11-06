@@ -19,6 +19,25 @@
  *   POST /drafts/:runId/revise-spec                                     退回改需求
  *   POST /drafts/:runId/abandon                                         放弃
  *   POST /drafts/:runId/delete                                          删除
+ *   POST /drafts/:runId/launch                  {groupName?, extraMembers?}  拉群开始（D4）
+ *   POST /drafts/:runId/launch/continue                                 断点续做
+ *   POST /drafts/:runId/launch/abandon                                  放弃（群保留）
+ *   POST /drafts/:runId/launch/resend-root      {confirmedAbsent: true} 人工确认群里没有根卡片后重发
+ *   POST /drafts/:runId/launch/resend-summary   {confirmedAbsent: true} 人工确认群里没有摘要后重发
+ *   POST /drafts/:runId/template/preview        {workflowId?, paramEdits?}   存为模板的确认框（D5）
+ *   POST /drafts/:runId/template/save           {flowSummarySha256, …}       存为模板（D5）
+ *   POST /drafts/from-source                    {source, larkAppId?}    复制为新工作流（D6）
+ *   POST /drafts/:runId/copy/goal               {goal, mode}            复制的草稿改目标（D6）
+ *   POST /drafts/:runId/nodes/:nodeId/text      {goal?, completion?}    复制的草稿改节点文字（D6）
+ *
+ * Templates (D5, under {@link WORKFLOW_LIBRARY_PATH}; reads are the
+ * Dashboard's own, from disk):
+ *
+ *   POST /library/runs/:runId/save/preview      {workflowId?, paramEdits?, allowDraft?}  保存为模板的确认框
+ *   POST /library/runs/:runId/save              {workflowId?, expectedLatestRevision?, displayName?, paramEdits?, requestKey?, …}
+ *   POST /library/:workflowId/run               {params, expectedRevisionId?}  运行模板 → 草稿
+ *
+ * The launch record is part of GET /drafts/:runId (`launch`).
  *
  * Every write body may carry `baseVersion` (CAS on the draft version).
  *
@@ -51,8 +70,24 @@ import type { WorkflowDraftInitiator } from '../workflows/v3/draft-store.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { DaemonSession } from './types.js';
 import { initiatorFailureBody, type WorkflowInitiatorResolution } from './workflow-initiator.js';
+import { joinLaunchInitiator, type DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
+import { createLiveV3BotEligibilityProbe } from '../im/lark/v3-bot-eligibility.js';
+import { buildV3LaunchRootCard, buildV3LaunchSummaryText, isLaunchRootCardOf } from '../im/lark/v3-launch-card.js';
+import { getMessageDetail, listChatMessagesUntil, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from '../im/lark/client.js';
+import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
+import { addBotToChat, addUsersToChatByOpenId, addUsersToChatByUnionId, getChatOwner, listChatMemberDisplays, listChats } from '../services/groups-store.js';
+import { requestExactChatGrant } from '../cli/exact-chat-grant-client.js';
+import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
+import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
+import { getBotBrand, getBotOpenId } from '../bot-registry.js';
 
 export const WORKFLOW_DRAFTS_PATH = '/api/v3/orchestration/drafts';
+export const WORKFLOW_LIBRARY_PATH = '/api/v3/orchestration/library';
+
+/** How far back (messages) / how many candidates are read in full when
+ *  looking for a root card past Feishu's uuid window. */
+const ROOT_CARD_SCAN_MAX = 500;
+const ROOT_CARD_DETAIL_MAX = 30;
 
 /** How often the daemon closes idle clarify processes (§4.2). */
 const IDLE_SWEEP_MS = 5 * 60_000;
@@ -165,6 +200,10 @@ export function registerWorkflowDraftIpcRoutes(
     return { draft: await service.create(initiator, { goal: body.goal }) };
   });
 
+  // 复制为新工作流（D6）: the copier is the new draft's initiator.
+  write(`${WORKFLOW_DRAFTS_PATH}/from-source`, async ({ service, initiator, body }) =>
+    ({ draft: await service.createFromSource(initiator, { source: body.source, ...(body.larkAppId !== undefined ? { larkAppId: body.larkAppId } : {}) }) }));
+
   route('GET', `${WORKFLOW_DRAFTS_PATH}/:runId`, async (req, res, params) => {
     const service = gate(req, res);
     if (!service) return;
@@ -194,6 +233,13 @@ export function registerWorkflowDraftIpcRoutes(
     if (!nodeId) throw new WorkflowDraftError('bad_request', 'nodeId 不合法');
     return { draft: await service.setNodeBot(runId, initiator, nodeId, { larkAppId: body.larkAppId, baseVersion }) };
   });
+  write(draftPath('nodes/:nodeId/text'), async ({ service, initiator, body, baseVersion, runId, params }) => {
+    const nodeId = decodeParam(params.nodeId);
+    if (!nodeId) throw new WorkflowDraftError('bad_request', 'nodeId 不合法');
+    return { draft: await service.setNodeText(runId, initiator, nodeId, { goal: body.goal, completion: body.completion, baseVersion }) };
+  });
+  write(draftPath('copy/goal'), async ({ service, initiator, body, baseVersion, runId }) =>
+    ({ draft: await service.editCopyGoal(runId, initiator, { goal: body.goal, mode: body.mode, baseVersion }) }));
   write(draftPath('approve-flow'), async ({ service, initiator, body, baseVersion, runId }) =>
     ({ draft: await service.approveFlow(runId, initiator, { flowSummarySha256: body.flowSummarySha256, baseVersion }) }));
   write(draftPath('revise-spec'), async ({ service, initiator, baseVersion, runId }) =>
@@ -204,6 +250,247 @@ export function registerWorkflowDraftIpcRoutes(
     await service.delete(runId, initiator);
     return { deleted: runId };
   });
+  write(draftPath('launch'), async ({ service, initiator, body, baseVersion, runId }) =>
+    ({ draft: await service.launch(runId, initiator, { groupName: body.groupName, extraMembers: body.extraMembers, baseVersion }) }));
+  write(draftPath('launch/continue'), async ({ service, initiator, baseVersion, runId }) =>
+    ({ draft: await service.continueLaunch(runId, initiator, { baseVersion }) }));
+  write(draftPath('launch/abandon'), async ({ service, initiator, runId }) =>
+    ({ draft: await service.abandonLaunch(runId, initiator) }));
+  write(draftPath('launch/resend-root'), async ({ service, initiator, body, baseVersion, runId }) =>
+    ({ draft: await service.resendRoot(runId, initiator, { confirmedAbsent: body.confirmedAbsent, baseVersion }) }));
+  write(draftPath('launch/resend-summary'), async ({ service, initiator, body, runId }) =>
+    ({ draft: await service.resendSummary(runId, initiator, { confirmedAbsent: body.confirmedAbsent }) }));
+
+  // ── 模板（D5）──
+  write(draftPath('template/preview'), async ({ service, initiator, body, runId }) =>
+    ({ preview: await service.previewTemplateSave(runId, initiator, { workflowId: body.workflowId, paramEdits: body.paramEdits }) }));
+  write(draftPath('template/save'), async ({ service, initiator, body, runId }) =>
+    ({ saved: await service.saveAsTemplate(runId, initiator, {
+      flowSummarySha256: body.flowSummarySha256,
+      workflowId: body.workflowId,
+      expectedLatestRevision: body.expectedLatestRevision,
+      displayName: body.displayName,
+      paramEdits: body.paramEdits,
+      requestKey: body.requestKey,
+      acknowledgeUnsafeLiterals: body.acknowledgeUnsafeLiterals,
+    }) }));
+  write(`${WORKFLOW_LIBRARY_PATH}/runs/:runId/save/preview`, async ({ service, initiator, body, runId }) =>
+    ({ preview: await service.previewRunSave(runId, initiator, { workflowId: body.workflowId, allowDraft: body.allowDraft, paramEdits: body.paramEdits }) }));
+  write(`${WORKFLOW_LIBRARY_PATH}/runs/:runId/save`, async ({ service, initiator, body, runId }) =>
+    ({ saved: await service.saveRunAsTemplate(runId, initiator, {
+      workflowId: body.workflowId,
+      expectedLatestRevision: body.expectedLatestRevision,
+      displayName: body.displayName,
+      paramEdits: body.paramEdits,
+      requestKey: body.requestKey,
+      allowDraft: body.allowDraft,
+      acknowledgeUnsafeLiterals: body.acknowledgeUnsafeLiterals,
+    }) }));
+  write(`${WORKFLOW_LIBRARY_PATH}/:workflowId/run`, async ({ service, initiator, body, params }) =>
+    ({ draft: await service.createFromTemplate(initiator, {
+      workflowId: decodeParam(params.workflowId),
+      params: body.params,
+      expectedRevisionId: body.expectedRevisionId,
+    }) }));
+}
+
+// ─── 拉群开始 collaborators (D4) ──────────────────────────────────────────
+
+export interface ProductionDraftLaunchInput {
+  appId: string;
+  /** The daemon's own `workflow start` path (daemon.ts). */
+  startRun: DraftLaunchDeps['startRun'];
+  /** Headless bind into the main topic (dashboard-ipc-server). */
+  bindSession: DraftLaunchDeps['bindSession'];
+  /** §5.2 rule 3: main-topic availability from the bound session. */
+  mainTopicAvailability: DraftLaunchDeps['mainTopicAvailability'];
+}
+
+/** Lark, sessions and grants for 拉群开始, all through the main bot's own app
+ *  (and each receiver's own daemon for its side of a grant). */
+export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInput): DraftLaunchDeps {
+  const { appId } = input;
+  const entry = (runId: string) => resolveWorkflowEntryLink({ mainLarkAppId: appId, runId, brand: getBotBrand(appId) });
+  const receiverDaemon = (larkAppId: string) => {
+    const daemon = findOnlineDaemon(larkAppId, config.session.dataDir);
+    if (!daemon) throw new Error(`receiver daemon offline: ${larkAppId}`);
+    return daemon;
+  };
+  return {
+    async resolveEmails(emails) {
+      const resolved = await resolveAllowedUsersWithMap(appId, emails);
+      const openIds = new Map<string, string>();
+      for (const email of emails) {
+        const openId = resolved.map.get(email);
+        if (openId?.startsWith('ou_')) openIds.set(email, openId);
+      }
+      if (openIds.size < emails.length && resolved.errored) {
+        return { ok: false, retryable: true, message: '通讯录查询暂时失败，请稍后重试' };
+      }
+      return { ok: true, openIds };
+    },
+    async createGroup(group) {
+      const owner = group.owner;
+      const result = await createGroupWithBots({
+        creatorLarkAppId: appId,
+        larkAppIds: group.botAppIds,
+        name: group.name,
+        chatMode: 'topic',
+        userOpenIds: [...(owner.channel === 'open_id' ? [owner.openId] : []), ...group.extraOpenIds],
+        ownerUnionIds: [...(owner.channel === 'union_id' ? [owner.unionId] : []), ...group.extraUnionIds],
+        ...(owner.channel === 'open_id' ? { transferOwnerTo: owner.openId } : { transferOwnerUnionId: owner.unionId }),
+        // No kickoff, no role bootstrap, no @-notice: the root card is the
+        // group's first top-level message, and nothing wakes a bot.
+        ownerNotice: false,
+        onChatCreated: group.onChatCreated,
+      });
+      const initiatorJoined = owner.channel === 'open_id'
+        ? !result.invalidUserIds.includes(owner.openId)
+        : !result.invalidOwnerUnionIds.includes(owner.unionId);
+      const warnings: string[] = [];
+      const extraUsers = result.invalidUserIds.filter((id) => owner.channel !== 'open_id' || id !== owner.openId);
+      const extraUnions = result.invalidOwnerUnionIds.filter((id) => owner.channel !== 'union_id' || id !== owner.unionId);
+      if (result.invalidBotIds.length) warnings.push(`这些 Bot 没拉进群：${result.invalidBotIds.join('、')}`);
+      if (extraUsers.length || extraUnions.length) warnings.push(`这些成员没拉进群：${[...extraUsers, ...extraUnions].join('、')}`);
+      return {
+        chatId: result.chatId,
+        ...(result.shareLink ? { shareLink: result.shareLink } : {}),
+        warnings,
+        initiatorJoined,
+        ...(initiatorJoined && result.transferError ? { ownerTransferError: result.transferError } : {}),
+      };
+    },
+    async joinInitiator(chatId, owner) {
+      const id = owner.channel === 'open_id' ? owner.openId : owner.unionId;
+      // The member list is read by open_id in the main bot's own app; a
+      // union_id is turned into that app's open_id there first (no open_id
+      // ever comes from another app).
+      const memberOpenId = async (): Promise<string> => {
+        if (owner.channel === 'open_id') return owner.openId;
+        const resolved = await resolveAllowedUsersWithMap(appId, [owner.unionId]);
+        const openId = resolved.map.get(owner.unionId);
+        if (!openId?.startsWith('ou_')) throw new Error('发起人的 union_id 在编排 Bot 的应用里换算不出 open_id');
+        return openId;
+      };
+      return joinLaunchInitiator(id, {
+        owner: () => getChatOwner(appId, chatId, owner.channel),
+        isMember: async () => {
+          const openId = await memberOpenId();
+          return (await listChatMemberDisplays(appId, chatId)).some((member) => member.openId === openId);
+        },
+        invite: async () => {
+          const added = owner.channel === 'open_id'
+            ? await addUsersToChatByOpenId(appId, chatId, [owner.openId])
+            : await addUsersToChatByUnionId(appId, chatId, [owner.unionId]);
+          return { invalid: added.invalidUserIds.length > 0 };
+        },
+        transferOwner: async () => {
+          const transferred = await transferGroupOwner({ creatorLarkAppId: appId, chatId, ownerId: id, ownerIdType: owner.channel });
+          return transferred.transferError ? { error: transferred.transferError } : {};
+        },
+      });
+    },
+    listChats: async () => (await listChats(appId)).map((chat) => ({
+      chatId: chat.chatId,
+      ...(chat.name ? { name: chat.name } : {}),
+      ...(chat.chatMode ? { chatMode: chat.chatMode } : {}),
+      ...(chat.ownerId ? { ownerId: chat.ownerId } : {}),
+    })),
+    isSelfOwner: (ownerId) => !!ownerId && (ownerId === appId || ownerId === getBotOpenId(appId)),
+    async findRootCards(chatId, runId, sinceIso) {
+      // Newest first, back to the first try (a minute of slack for clock
+      // skew), bounded. The list API gives schema-2.0 cards as a placeholder,
+      // so every candidate — the main bot's own top-level interactive
+      // message — is read in full and matched on its signature row.
+      const sinceMs = Date.parse(sinceIso) - 60_000;
+      if (!Number.isFinite(sinceMs)) throw new Error('inconclusive: 首次尝试时间不合法');
+      const timeOf = (message: any) => Number(message?.create_time);
+      const scanned = await listChatMessagesUntil(appId, chatId, {
+        pageSize: 50,
+        stopAfter: (message: any, seen: number) => !(timeOf(message) >= sinceMs) || seen >= ROOT_CARD_SCAN_MAX,
+      });
+      // Anything that makes "not found" unprovable is inconclusive — the
+      // caller then stops as for a failed lookup, never as "not there":
+      //   a time that is not a millisecond timestamp (missing, or seconds),
+      //   a scan cut by its cap before reaching the first try.
+      const oldest = scanned[0];
+      if (scanned.some((message: any) => !Number.isFinite(timeOf(message)) || timeOf(message) < 1e12)) {
+        throw new Error('inconclusive: 群消息的时间无法判断');
+      }
+      if (scanned.length >= ROOT_CARD_SCAN_MAX && oldest && timeOf(oldest) >= sinceMs) {
+        throw new Error(`inconclusive: 首次尝试之后的群消息超过 ${ROOT_CARD_SCAN_MAX} 条`);
+      }
+      const selfOpenId = getBotOpenId(appId);
+      const candidates = scanned
+        .filter((message: any) => message?.msg_type === 'interactive' && message.deleted !== true
+          && (message?.sender?.sender_type === 'app' || message?.sender?.sender_type === 'bot')
+          && (message.sender.id === appId || (!!selfOpenId && message.sender.id === selfOpenId))
+          && !message.root_id && !message.parent_id
+          && Number(message.create_time) >= sinceMs
+          && /^om_[A-Za-z0-9_-]{1,128}$/.test(String(message.message_id)))
+        .map((message: any) => String(message.message_id));
+      if (candidates.length > ROOT_CARD_DETAIL_MAX) {
+        throw new Error(`inconclusive: 首次尝试之后主 Bot 发的卡片超过 ${ROOT_CARD_DETAIL_MAX} 张`);
+      }
+      const found: string[] = [];
+      for (const messageId of candidates) {
+        const detail = await getMessageDetail(appId, messageId, { userCardContent: true });
+        if (isLaunchRootCardOf(detail?.items?.[0]?.body?.content, runId)) found.push(messageId);
+      }
+      return found;
+    },
+    async addBots(chatId, botAppIds) {
+      await addBotToChat(appId, chatId, botAppIds);
+    },
+    postRootCard: (chatId, view, uuid) => sendMessage(appId, chatId, buildV3LaunchRootCard(view, entry(view.runId)), 'interactive', uuid),
+    async updateRootCard(messageId, view) {
+      await updateMessage(appId, messageId, buildV3LaunchRootCard(view, entry(view.runId)));
+    },
+    postSummary: (rootMessageId, view, uuid) =>
+      replyMessage(appId, rootMessageId, buildV3LaunchSummaryText(view, entry(view.runId)?.url), 'text', true, uuid),
+    bindSession: input.bindSession,
+    probe: (chatId) => createLiveV3BotEligibilityProbe({ orchestratorAppId: appId, chatId, bots: loadBotConfigs() }),
+    async grant(chatId, receiver, subject) {
+      const body = await requestExactChatGrant({
+        daemon: receiverDaemon(receiver),
+        secret: loadDaemonIpcSecret(),
+        receiverLarkAppId: receiver,
+        chatId,
+        operation: 'grant',
+        subjectLarkAppIds: [subject],
+      });
+      const mapping = (body.subjectMappings as Array<{ larkAppId?: string; subjectOpenId?: string }> | undefined)
+        ?.find((item) => item.larkAppId === subject);
+      if (!mapping?.subjectOpenId) throw new Error('授权结果里没有对方的 open_id');
+      return { subjectOpenId: mapping.subjectOpenId };
+    },
+    async revoke(chatId, receiver, subjectOpenId) {
+      await requestExactChatGrant({
+        daemon: receiverDaemon(receiver),
+        secret: loadDaemonIpcSecret(),
+        receiverLarkAppId: receiver,
+        chatId,
+        operation: 'revoke',
+        subjectOpenIds: [subjectOpenId],
+      });
+    },
+    async resolveSubject(chatId, receiver, subjectAppId) {
+      const body = await requestExactChatGrant({
+        daemon: receiverDaemon(receiver),
+        secret: loadDaemonIpcSecret(),
+        receiverLarkAppId: receiver,
+        chatId,
+        operation: 'resolve',
+        subjectLarkAppIds: [subjectAppId],
+      });
+      const mapping = (body.subjectMappings as Array<{ larkAppId?: string; subjectOpenId?: string }> | undefined)
+        ?.find((item) => item.larkAppId === subjectAppId);
+      if (!mapping?.subjectOpenId) throw new Error('接收方没有给出对方的 open_id');
+      return mapping.subjectOpenId;
+    },
+    startRun: input.startRun,
+    mainTopicAvailability: input.mainTopicAvailability,
+  };
 }
 
 // ─── Production collaborators ─────────────────────────────────────────────
@@ -351,7 +638,11 @@ export function resetWorkflowDraftServiceForTests(): void {
   installed = undefined;
 }
 
-export function createProductionWorkflowDraftService(appId: string, clarifier: DraftClarifier): WorkflowDraftService {
+export function createProductionWorkflowDraftService(
+  appId: string,
+  clarifier: DraftClarifier,
+  launch?: DraftLaunchDeps,
+): WorkflowDraftService {
   return new WorkflowDraftService({
     appId,
     baseDir: defaultBaseDir(),
@@ -363,6 +654,7 @@ export function createProductionWorkflowDraftService(appId: string, clarifier: D
     },
     clarifier,
     runArchitect,
+    ...(launch ? { launch } : {}),
     log: (message) => logger.info(message),
   });
 }

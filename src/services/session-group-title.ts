@@ -24,7 +24,16 @@ import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE } from '../platform/device-paths.js';
 import { cliConfigDirEnvKey } from '../core/cli-config-dir.js';
 import { botOneShotEnv, type SessionEnvBotInput } from '../core/session-env-resolve.js';
+import { resolveEffectivePluginIds } from '../core/plugins/effective.js';
+import {
+  protectedMcpHomePaths,
+  protectedMcpCurrentRedactedEnvKeys,
+  protectedMcpIsolationPolicy,
+  protectedMcpRedactedEnvKeys,
+  type ProtectedMcpWorkerPolicy,
+} from '../core/protected-mcp-capabilities.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
+import { configuredProtectedMcpEnvKeys, readGlobalConfig } from '../global-config.js';
 import { renameChat } from './groups-store.js';
 import {
   getSessionGroup,
@@ -109,8 +118,27 @@ export function resolveOneShotCommand(
   return { argv: [...template] };
 }
 
-export function buildOneShotEnv(bot: SessionEnvBotInput = {}): NodeJS.ProcessEnv {
+type OneShotEnvBotInput = SessionEnvBotInput & { plugins?: string[] };
+
+function matchingProtectedMcpPolicy(plugins?: string[]): ProtectedMcpWorkerPolicy {
+  const global = readGlobalConfig();
+  const isolation = protectedMcpIsolationPolicy(
+    resolveEffectivePluginIds({ plugins }, global),
+    global.protectedMcpCapabilities,
+  );
+  return {
+    capabilities: [],
+    protectedHomePaths: isolation.protectedHomePaths,
+    redactEnv: protectedMcpCurrentRedactedEnvKeys(global.protectedMcpCapabilities, configuredProtectedMcpEnvKeys()),
+  };
+}
+
+export function buildOneShotEnv(
+  bot: OneShotEnvBotInput = {},
+  protectedMcpPolicy: ProtectedMcpWorkerPolicy = matchingProtectedMcpPolicy(bot.plugins),
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = botOneShotEnv(process.env, bot);
+  for (const key of protectedMcpRedactedEnvKeys(protectedMcpPolicy)) delete env[key];
   // Never let the one-shot inherit a botmux session identity (redundant with
   // the marker scrub above, kept as an explicit invariant).
   delete env.BOTMUX_SESSION_ID;
@@ -186,8 +214,10 @@ export function supportsOneShotTitle(cliId: string): boolean {
 
 /** Mandatory device-credential isolation on this host — the same marker /
  *  device-credential probe worker.ts runs before every local spawn. */
-function hostRequiresCredentialIsolation(): boolean {
+function hostRequiresCredentialIsolation(plugins?: string[]): boolean {
   const home = homedir();
+  const protectedPolicy = matchingProtectedMcpPolicy(plugins);
+  const protectedHomePaths = protectedMcpHomePaths(home, protectedPolicy);
   const exists = (path: string): boolean => {
     try { lstatSync(path); return true; } catch { return false; }
   };
@@ -197,6 +227,7 @@ function hostRequiresCredentialIsolation(): boolean {
     markerExists: exists(deviceCredentialIsolationMarkerPath(home)),
     deviceCredentialExists: [...roots].some(root => exists(join(root, DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE))
       || exists(join(root, DEVICE_CREDENTIAL_FILE))),
+    protectedHomePaths,
   });
 }
 
@@ -217,6 +248,7 @@ export function oneShotTitleAllowed(cfg: {
   cliLaunchMode?: string;
   codexAuthSync?: string;
   codexInstancePool?: unknown;
+  plugins?: string[];
 }): boolean {
   if (!supportsOneShotTitle(cfg.cliId)) return false;
   if (cfg.cliLaunchMode || cfg.codexAuthSync === 'isolated' || cfg.codexInstancePool) return false;
@@ -226,7 +258,7 @@ export function oneShotTitleAllowed(cfg: {
       readIsolation: cfg.readIsolation === true,
       envValue: process.env.BOTMUX_SANDBOX,
     }) !== 'off') return false;
-    return !hostRequiresCredentialIsolation();
+    return !hostRequiresCredentialIsolation(cfg.plugins);
   } catch {
     return false;
   }
@@ -265,6 +297,10 @@ export async function generateOneShotTitle(opts: {
 }): Promise<string | null> {
   const { larkAppId, chatId, userText, maxLen, logTag } = opts;
   const cfg = getBot(larkAppId).config;
+  // Both title schedulers and CLI launch paths share this host-process
+  // boundary. A caller-side check or isolated CODEX_HOME cannot replace the
+  // mandatory host credential-isolation gate.
+  if (!oneShotTitleAllowed(cfg)) return null;
   if (cfg.cliId === 'codex') {
     const model = opts.model?.trim() || cfg.model;
     const { argv, env: wrapperEnv } = resolveOneShotCommand({ ...cfg, model }, ['codex']);
@@ -287,7 +323,13 @@ export async function generateOneShotTitle(opts: {
   const { argv, env: wrapperEnv } = resolveOneShotCommand(cfg, template);
   const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
-  const runOnce = () => new Promise<string>((resolve, reject) => {
+  const runOnce = () => new Promise<string | null>((resolve, reject) => {
+    // Re-read before each exec, including the retry after its wait: operator
+    // changes during the first call must not open a second bare-host process.
+    if (!oneShotTitleAllowed(getBot(larkAppId).config)) {
+      resolve(null);
+      return;
+    }
     const env = { ...buildOneShotEnv(cfg), ...wrapperEnv, ...oneShotProfileEnv(cfg) };
     const child = execFile(argv[0], [...argv.slice(1), prompt], {
       timeout: TITLE_TIMEOUT_MS,
@@ -313,7 +355,7 @@ export async function generateOneShotTitle(opts: {
   });
   // One-shot CLI calls fail transiently (API hiccups, cold start races) —
   // a single spaced retry recovers most of them without delaying much.
-  let stdout: string;
+  let stdout: string | null;
   try {
     stdout = await runOnce();
   } catch (firstErr) {
@@ -321,6 +363,7 @@ export async function generateOneShotTitle(opts: {
     await new Promise(r => setTimeout(r, 3000));
     stdout = await runOnce();
   }
+  if (stdout === null) return null;
 
   const title = sanitizeTitleOutput(stdout, maxLen);
   if (!title) {

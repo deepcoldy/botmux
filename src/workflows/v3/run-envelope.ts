@@ -267,6 +267,13 @@ const savedDefinitionEnvelopeSchema = z.object({
     specSha256: sha256Schema,
     handoffIdentity: handoffIdentitySchema.optional(),
     initiator: runInitiatorSchema.optional(),
+    /** The second confirmation a version saved from a Dashboard draft
+     *  carries (its provenance): who confirmed the flow, when, the summary —
+     *  recorded as is on every run of that version, Dashboard or Feishu (I13,
+     *  11-05: such versions run without a new confirmation). Absent for every
+     *  other version. Older readers reject the key, so an older daemon never
+     *  drives such a run. */
+    flowConfirmation: flowConfirmationSchema.optional(),
   }).strict(),
 }).strict();
 
@@ -347,7 +354,10 @@ export const V3RunEnvelopeSchema = z.union([
   // like handoffIdentity, and must agree with the identities already on the run.
   const authorization = envelope.authorization as { initiator?: V3RunInitiator; flowConfirmation?: V3FlowConfirmation; handoffIdentity?: V3HandoffIdentityRecord };
   const botExecuted = 'nodeExecutor' in envelope && envelope.nodeExecutor === 'bot';
-  for (const key of ['initiator', 'flowConfirmation'] as const) {
+  const gate2 = envelope.authorization.kind === 'gate2';
+  // A published revision's confirmation is the version's own (who saved it),
+  // checked against the definition snapshot on load; it binds no initiator.
+  for (const key of gate2 ? ['initiator', 'flowConfirmation'] as const : ['initiator'] as const) {
     if (authorization[key] !== undefined && !botExecuted) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['authorization', key], message: 'requires nodeExecutor "bot"' });
     }
@@ -380,15 +390,24 @@ export const V3RunEnvelopeSchema = z.union([
       });
     }
   }
-  if (authorization.flowConfirmation && !authorization.initiator) {
+  if (gate2 && authorization.flowConfirmation && !authorization.initiator) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['authorization', 'flowConfirmation'],
       message: 'requires authorization.initiator',
     });
   }
+  // A template version's confirmation always names who confirmed.
+  if (envelope.authorization.kind === 'published_revision' && authorization.flowConfirmation
+    && authorization.flowConfirmation.confirmedByOpenId === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['authorization', 'flowConfirmation', 'confirmedByOpenId'],
+      message: 'is required on a published_revision run',
+    });
+  }
   const confirmer = authorization.flowConfirmation?.confirmedByOpenId;
-  if (confirmer !== undefined && confirmer !== authorization.initiator?.openId) {
+  if (gate2 && confirmer !== undefined && confirmer !== authorization.initiator?.openId) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['authorization', 'flowConfirmation', 'confirmedByOpenId'],
@@ -939,6 +958,24 @@ export function loadAuthorizedV3Run(
       );
     }
     const snapshot = definitionSnapshot as Record<string, unknown>;
+    // The recorded confirmation is exactly the one the version carries, and
+    // a version that carries one never runs without it.
+    const provenance = (snapshot.definition as { provenance?: { kind?: unknown; confirmation?: Record<string, unknown> } } | undefined)?.provenance;
+    const saved = provenance?.kind === 'dashboard_draft' ? provenance.confirmation : undefined;
+    const recorded = (envelope.authorization as { flowConfirmation?: V3FlowConfirmation }).flowConfirmation;
+    const expected = saved ? {
+      confirmedByOpenId: saved.confirmedByOpenId,
+      confirmedAt: saved.confirmedAt,
+      flowSummary: saved.flowSummary,
+      flowSummarySha256: saved.flowSummarySha256,
+    } : undefined;
+    if (JSON.stringify(canonicalize(expected)) !== JSON.stringify(canonicalize(recorded))) {
+      throw new RunEnvelopeIntegrityError(
+        'artifact_invalid_content',
+        'run.json flowConfirmation does not match the confirmation of its definition snapshot',
+        'definition.snapshot.json',
+      );
+    }
     if (
       snapshot.workflowId !== envelope.source.workflowId ||
       snapshot.revisionId !== envelope.source.revisionId ||
@@ -1104,6 +1141,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
   nodeExecutor?: 'bot';
   handoffIdentity?: V3HandoffIdentityRecord;
   initiator?: V3RunInitiator;
+  flowConfirmation?: V3FlowConfirmation;
 }): V3SavedDefinitionRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -1129,6 +1167,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
       specSha256: input.artifacts.spec.sha256,
       ...(input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
       ...(input.initiator ? { initiator: input.initiator } : {}),
+      ...(input.flowConfirmation ? { flowConfirmation: input.flowConfirmation } : {}),
     },
   }) as V3SavedDefinitionRunEnvelope;
 }

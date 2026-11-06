@@ -16,16 +16,22 @@ import { basename, join } from 'node:path';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import type { RawParamInput } from '../shared/params.js';
 import {
+  compileDashboardSavedWorkflowFromRun,
   compileSavedWorkflowFromRun,
   materializeSavedWorkflowRun,
+  resolveSavedWorkflowRunParams,
   type CompileSavedWorkflowFromRunOptions,
   type MaterializedSavedWorkflowRun,
 } from './library-materialize.js';
 import {
   SAVED_WORKFLOW_ID_RE,
   canonicalJsonStringify,
+  compareSavedWorkflowGates,
   normalizeSavedWorkflowLookupKey,
   validateSavedWorkflowRevisionPayload,
+  type SavedWorkflowBotChange,
+  type SavedWorkflowGateComparisonAgainst,
+  type SavedWorkflowRevisionDraft,
   type SavedWorkflowMetadata,
   type SavedWorkflowOwner,
   type SavedWorkflowScope,
@@ -37,7 +43,9 @@ import {
   appendSavedWorkflowRevision,
   createSavedWorkflow,
   listSavedWorkflows,
+  listSavedWorkflowRevisions,
   loadCurrentSavedWorkflow,
+  readSavedWorkflowRevision,
   readSavedWorkflowMetadata,
   savedWorkflowDir,
   workflowLibraryRoot,
@@ -53,6 +61,7 @@ import {
   type LoadedAuthorizedV3Run,
 } from './run-envelope.js';
 import { isValidRunId } from './ops-projection.js';
+import { applySavedWorkflowParamEdits, type SavedWorkflowParamEdit } from './library-params.js';
 import { readJournal } from './journal.js';
 import { materialize } from './state.js';
 import { readGrillState, type RunChatBinding } from './grill-state.js';
@@ -917,4 +926,335 @@ function notFound(ref: string): SavedWorkflowServiceError {
     'not_found',
     `Saved Workflow ${JSON.stringify(ref)} was not found in the current scope`,
   );
+}
+
+// ─── Dashboard: the four entries without a chat (design 2026-11-03
+//     workflow-dashboard-orchestration §5, §7.2, D5) ─────────────────────────
+//
+// The Feishu forms above all need the invoking chat (visibility, the source
+// run's chat, the new run's binding). The Dashboard has none: a Dashboard run
+// lives in a group of its own, and the group of a template run only exists
+// after 拉群开始. These forms keep every non-chat rule — the owning app, the
+// owner (I9), published-only runs — and replace the chat ones:
+//   - save / append: the source is the caller's own run (its bound owner and
+//     main bot), never a chat match; new templates are global; a chat-scoped
+//     template is not appended to from here (its chat rule stays);
+//   - list: the whole catalog of every bot (I9: an admin sees all, chat ones
+//     labelled) — see `listSavedWorkflowCatalog`;
+//   - run: a global, published template only; the binding comes later from
+//     拉群开始 (`commitSavedWorkflowRunInPlace`).
+// None of the Feishu functions above changes.
+
+export interface DashboardSavePlan {
+  displayName: string;
+  revision: SavedWorkflowRevisionDraft;
+  publish: boolean;
+  sourceStatus?: 'succeeded' | 'failed' | 'blocked';
+  lintWarnings: string[];
+  runtimeRevisions?: number;
+  botChanges?: SavedWorkflowBotChange[];
+}
+
+/** 「设为参数」 (§5.2) on a plan, then the full revision rules, so the
+ *  confirm dialog reports what a save would refuse. */
+export function withDashboardParamEdits(
+  plan: DashboardSavePlan,
+  actor: SavedWorkflowOwner,
+  edits: readonly SavedWorkflowParamEdit[],
+): DashboardSavePlan {
+  const revision = applySavedWorkflowParamEdits(plan.revision, edits);
+  validateSavedWorkflowRevisionPayload({
+    workflowId: `wf_${'0'.repeat(32)}`,
+    humanVersion: 1,
+    createdAt: new Date(0).toISOString(),
+    createdBy: actor,
+    ...revision,
+  });
+  return { ...plan, revision };
+}
+
+/** Gates of the revision being saved against the latest version and, when
+ *  that is another one, the published version (I10) — both shown. */
+export interface DashboardSaveTarget {
+  metadata: SavedWorkflowMetadata;
+  latest: SavedWorkflowWriteResult['revision'];
+  comparisons: SavedWorkflowGateComparisonAgainst[];
+}
+
+/** A terminal run of `actor` (its bound owner on this bot), compiled the
+ *  Dashboard way (final flow + bots that ran, E10). */
+export function planDashboardRunSave(input: {
+  runDir: string;
+  actor: SavedWorkflowOwner;
+  allowDraft?: boolean;
+}): DashboardSavePlan {
+  const actor = requireActorContext({ actor: input.actor }).actor;
+  const runId = basename(input.runDir);
+  if (!isValidRunId(runId)) throw new SavedWorkflowServiceError('invalid_context', `Invalid source runId ${JSON.stringify(runId)}`);
+  let loaded: LoadedAuthorizedV3Run;
+  try {
+    loaded = loadAuthorizedV3Run(input.runDir, { allowedSources: ['ad_hoc', 'saved_definition', 'legacy_v3'] });
+  } catch (error) {
+    throw new SavedWorkflowServiceError('invalid_context', `Run '${runId}' cannot be read as an authorized run: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const binding = loaded.envelope.chatBinding;
+  // I9: only the caller's own run, on the bot that orchestrated it.
+  if (!binding?.ownerOpenId || binding.larkAppId !== actor.larkAppId || binding.ownerOpenId !== actor.openId) {
+    throw new SavedWorkflowServiceError('source_not_owned', `Source run '${runId}' belongs to a different actor`);
+  }
+  terminalSourceStatus(input.runDir, runId);
+  const opts = exactCompileOptions(loaded, input.allowDraft === true, true);
+  const compiled = compileDashboardSavedWorkflowFromRun(input.runDir, opts);
+  return {
+    displayName: compiled.displayName,
+    revision: {
+      ...compiled.revision,
+      provenance: {
+        kind: 'dashboard_run',
+        runId,
+        runtimeRevisions: compiled.runtimeRevisions,
+        botChanges: compiled.botChanges,
+      },
+    },
+    publish: compiled.publish,
+    sourceStatus: compiled.sourceStatus,
+    lintWarnings: compiled.lintWarnings,
+    runtimeRevisions: compiled.runtimeRevisions,
+    botChanges: compiled.botChanges,
+  };
+}
+
+/** The template a Dashboard save would append to: the caller's own, global,
+ *  not archived — and how its gates compare (I10). */
+export async function loadDashboardAppendTarget(input: {
+  dataDir: string;
+  workflowId: string;
+  actor: SavedWorkflowOwner;
+  revision: SavedWorkflowRevisionDraft;
+}): Promise<DashboardSaveTarget> {
+  const actor = requireActorContext({ actor: input.actor }).actor;
+  if (!SAVED_WORKFLOW_ID_RE.test(input.workflowId)) throw notFound(input.workflowId);
+  let current: SavedWorkflowWriteResult;
+  try {
+    current = await loadCurrentSavedWorkflow(input.dataDir, input.workflowId, { revision: 'latest', requireActive: false });
+  } catch (err) {
+    if (err instanceof SavedWorkflowNotFoundError) throw notFound(input.workflowId);
+    throw err;
+  }
+  const metadata = current.metadata;
+  if (metadata.owner.larkAppId !== actor.larkAppId || metadata.status === 'archived') throw notFound(input.workflowId);
+  if (!sameOwner(metadata.owner, actor)) throw new SavedWorkflowPermissionError(metadata.workflowId);
+  if (metadata.scope.kind === 'chat') {
+    throw new SavedWorkflowServiceError('scope_mismatch', `Saved Workflow '${metadata.workflowId}' is chat-scoped: append to it in its chat`);
+  }
+  const comparisons: SavedWorkflowGateComparisonAgainst[] = [{
+    base: { kind: 'previous', revisionId: current.revision.revisionId, humanVersion: current.revision.payload.humanVersion },
+    gates: compareSavedWorkflowGates(current.revision.payload.dagTemplate, input.revision.dagTemplate),
+  }];
+  // The published version is what runs today: a draft-only latest must not
+  // hide that the new one weakens it. Both comparisons are shown.
+  if (metadata.publishedRevision && metadata.publishedRevision !== current.revision.revisionId) {
+    const published = await readSavedWorkflowRevision(input.dataDir, input.workflowId, metadata.publishedRevision);
+    comparisons.push({
+      base: { kind: 'published', revisionId: published.revisionId, humanVersion: published.payload.humanVersion },
+      gates: compareSavedWorkflowGates(published.payload.dagTemplate, input.revision.dagTemplate),
+    });
+  }
+  return { metadata, latest: current.revision, comparisons };
+}
+
+/**
+ * What a retried Dashboard save (new template or append) must match to be
+ * answered with what it already wrote: the definition and where it came from
+ * — not the moment of confirming (a draft save re-stamps `confirmedAt` on
+ * every request) nor the request id. Anything else differing is another save.
+ */
+function comparableDashboardSave(payload: Pick<SavedWorkflowRevisionDraft, 'sourceRunId' | 'inputs' | 'contextRefs' | 'specTemplate' | 'specStatus' | 'dagTemplate' | 'safety' | 'provenance'>): unknown {
+  const provenance = payload.provenance;
+  return {
+    ...(comparableRevisionDraft(payload as SavedWorkflowWriteResult['revision']['payload']) as Record<string, unknown>),
+    ...(provenance?.kind === 'dashboard_draft'
+      ? { provenance: {
+          kind: provenance.kind,
+          draftRunId: provenance.draftRunId,
+          flowSummarySha256: provenance.confirmation.flowSummarySha256,
+          confirmedByOpenId: provenance.confirmation.confirmedByOpenId,
+          flowConfirmedAt: provenance.confirmation.flowConfirmedAt,
+        } }
+      : provenance?.kind === 'dashboard_run'
+        ? { provenance: { kind: provenance.kind, runId: provenance.runId, runtimeRevisions: provenance.runtimeRevisions, botChanges: provenance.botChanges } }
+        : {}),
+  };
+}
+
+/** sha256 of one append request (P3-6): the same dialog retried finds the
+ *  version it wrote. */
+export function dashboardAppendRequestId(input: { workflowId: string; actor: SavedWorkflowOwner; sourceKind: 'run' | 'draft'; sourceId: string; requestKey: string }): string {
+  return `sha256:${createHash('sha256')
+    .update(['v3-dashboard-append:v1', input.workflowId, input.actor.larkAppId, input.actor.openId, input.sourceKind, input.sourceId, input.requestKey].join('\0'))
+    .digest('hex')}`;
+}
+
+/** Deterministic id of a new template from one Dashboard save request: a
+ *  retried / double-clicked save lands on the same template. */
+export function dashboardSavedWorkflowId(input: { sourceKind: 'run' | 'draft'; sourceId: string; actor: SavedWorkflowOwner; requestKey: string }): string {
+  const digest = createHash('sha256')
+    .update(['v3-dashboard-save:v1', input.sourceKind, input.sourceId, input.actor.larkAppId, input.actor.openId, input.requestKey].join('\0'))
+    .digest('hex')
+    .slice(0, 32);
+  return `wf_${digest}`;
+}
+
+export interface CommitDashboardSaveInput {
+  dataDir: string;
+  actor: SavedWorkflowOwner;
+  plan: DashboardSavePlan;
+  /** Append to this template (the caller's own); else a new global one. */
+  workflowId?: string;
+  /** Append only: the latest revision the confirm dialog compared with. */
+  expectedLatestRevision?: string;
+  displayName?: string;
+  /** New template only: makes a repeated request idempotent. */
+  newWorkflowId?: string;
+  /** Append only: the request this append belongs to (P3-6). */
+  appendRequest?: { sourceKind: 'run' | 'draft'; sourceId: string; requestKey: string };
+  now?: Date;
+}
+
+export async function commitDashboardSave(input: CommitDashboardSaveInput): Promise<SavedWorkflowWriteResult & { created: boolean; replayed?: boolean }> {
+  const actor = requireActorContext({ actor: input.actor }).actor;
+  if (input.workflowId !== undefined) {
+    const workflowId = input.workflowId;
+    // Re-checked under the store's lock by appendSavedWorkflowRevision (owner,
+    // archived, expected latest); scope and app here.
+    await loadDashboardAppendTarget({ dataDir: input.dataDir, workflowId, actor, revision: input.plan.revision });
+    const requestId = input.appendRequest ? dashboardAppendRequestId({ workflowId, actor, ...input.appendRequest }) : undefined;
+    const provenance = input.plan.revision.provenance;
+    const revision = requestId && provenance ? { ...input.plan.revision, provenance: { ...provenance, requestId } } : input.plan.revision;
+    const append = async () => {
+      if (requestId) {
+        // Already written by this very request (a retry, a second tab).
+        for (const existing of await listSavedWorkflowRevisions(input.dataDir, workflowId)) {
+          if (existing.payload.provenance?.requestId === requestId && sameOwner(existing.payload.createdBy, actor)) {
+            // Same request, same content — a retry. The same key with other
+            // content is a different save, never silently answered with the old.
+            if (canonicalJsonStringify(comparableDashboardSave(existing.payload)) !== canonicalJsonStringify(comparableDashboardSave(revision))) {
+              throw new SavedWorkflowConflictError(`Saved workflow '${workflowId}' already has a version from this request with different content`);
+            }
+            return { metadata: await readSavedWorkflowMetadata(input.dataDir, workflowId), revision: existing, created: false, replayed: true };
+          }
+        }
+      }
+      const written = await appendSavedWorkflowRevision(input.dataDir, workflowId, {
+        actor,
+        revision,
+        publish: input.plan.publish,
+        ...(input.expectedLatestRevision ? { expectedLatestRevision: input.expectedLatestRevision } : {}),
+        now: input.now,
+      });
+      return { ...written, created: false };
+    };
+    if (!requestId) return append();
+    return withFileLock(join(workflowLibraryRoot(input.dataDir), `.dashboard-append-${workflowId}`), append);
+  }
+  const workflowId = input.newWorkflowId;
+  const create = () => createSavedWorkflow(input.dataDir, {
+    ...(workflowId ? { workflowId } : {}),
+    displayName: input.displayName ?? input.plan.displayName,
+    owner: actor,
+    // Dashboard runs each live in a group of their own: 「本群」 means nothing (I9).
+    scope: { kind: 'global' },
+    revision: input.plan.revision,
+    publish: input.plan.publish,
+    now: input.now,
+  });
+  if (!workflowId) return { ...await create(), created: true };
+  const root = workflowLibraryRoot(input.dataDir);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  return withFileLock(join(root, `.dashboard-save-${workflowId}`), async () => {
+    const existing = await loadExistingDashboardSave(input.dataDir, workflowId, actor, input.plan.revision, input.displayName ?? input.plan.displayName);
+    if (existing) return { ...existing, created: false };
+    const dir = savedWorkflowDir(input.dataDir, workflowId);
+    // Same remnant rule as the card save: our deterministic lock owns it.
+    if (existsSync(dir) && !existsSync(join(dir, 'metadata.json'))) await fs.rm(dir, { recursive: true, force: true });
+    return { ...await create(), created: true };
+  });
+}
+
+async function loadExistingDashboardSave(
+  dataDir: string,
+  workflowId: string,
+  actor: SavedWorkflowOwner,
+  revision: SavedWorkflowRevisionDraft,
+  displayName: string,
+): Promise<SavedWorkflowWriteResult | undefined> {
+  let current: SavedWorkflowWriteResult;
+  try {
+    current = await loadCurrentSavedWorkflow(dataDir, workflowId, { revision: 'latest', requireActive: false });
+  } catch (err) {
+    if (err instanceof SavedWorkflowNotFoundError) return undefined;
+    throw err;
+  }
+  // Same request key, same save — or a conflict: never answer a changed
+  // confirmation, source or name with what an earlier request wrote.
+  if (!sameOwner(current.metadata.owner, actor) || current.revision.payload.humanVersion !== 1
+    || current.metadata.displayName !== displayName.trim().normalize('NFC')
+    || canonicalJsonStringify(comparableDashboardSave(current.revision.payload)) !== canonicalJsonStringify(comparableDashboardSave(revision))) {
+    throw new SavedWorkflowConflictError(`Saved workflow '${workflowId}' already exists with different content`);
+  }
+  return current;
+}
+
+export interface DashboardSavedWorkflowRun {
+  metadata: SavedWorkflowMetadata;
+  revision: SavedWorkflowWriteResult['revision'];
+  resolvedParams: Record<string, unknown>;
+}
+
+/**
+ * 「运行」 from the Dashboard (§5.3): the published revision of a global
+ * template of this bot, with the parameters checked and converted by the
+ * `/workflow run` rules. A chat-scoped template stays runnable only in its
+ * chat (I9). Nothing is written here.
+ */
+export async function prepareDashboardSavedWorkflowRun(input: {
+  dataDir: string;
+  workflowId: string;
+  actor: SavedWorkflowOwner;
+  rawParams: Record<string, RawParamInput>;
+}): Promise<DashboardSavedWorkflowRun> {
+  const actor = requireActorContext({ actor: input.actor }).actor;
+  if (!SAVED_WORKFLOW_ID_RE.test(input.workflowId)) throw notFound(input.workflowId);
+  let metadata: SavedWorkflowMetadata;
+  try {
+    metadata = await readSavedWorkflowMetadata(input.dataDir, input.workflowId);
+  } catch (err) {
+    if (err instanceof SavedWorkflowNotFoundError) throw notFound(input.workflowId);
+    throw err;
+  }
+  if (metadata.owner.larkAppId !== actor.larkAppId || metadata.status === 'archived') throw notFound(input.workflowId);
+  if (metadata.scope.kind === 'chat') {
+    throw new SavedWorkflowServiceError('scope_mismatch', `Saved Workflow '${metadata.workflowId}' is chat-scoped: run it in its chat with /workflow run`);
+  }
+  if (metadata.status !== 'active' || !metadata.publishedRevision) {
+    throw new SavedWorkflowServiceError('not_published', `Saved Workflow '${metadata.workflowId}' has no published revision`);
+  }
+  let current: SavedWorkflowWriteResult;
+  try {
+    current = await loadCurrentSavedWorkflow(input.dataDir, input.workflowId, { revision: 'published', requireActive: true });
+  } catch (err) {
+    if (err instanceof SavedWorkflowNotFoundError) throw notFound(input.workflowId);
+    if (err instanceof SavedWorkflowConflictError) {
+      throw new SavedWorkflowServiceError('not_published', `Saved Workflow '${input.workflowId}' no longer has an active published revision`);
+    }
+    throw err;
+  }
+  // Metadata may have moved between the two reads.
+  if (current.metadata.scope.kind !== 'global' || current.metadata.owner.larkAppId !== actor.larkAppId) throw notFound(input.workflowId);
+  const resolvedParams = resolveSavedWorkflowRunParams(current.revision, input.rawParams);
+  return {
+    metadata: current.metadata,
+    revision: current.revision,
+    resolvedParams,
+  };
 }

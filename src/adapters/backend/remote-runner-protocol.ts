@@ -129,6 +129,20 @@ export interface RemoteRunnerTrustedCaller {
   };
 }
 
+export function projectRemoteRunnerTrustedCaller(
+  caller: RemoteRunnerTrustedCaller & Record<string, unknown>,
+): RemoteRunnerTrustedCaller {
+  return {
+    ...(caller.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
+    ...(caller.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
+    ...(caller.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
+    ...(caller.source ? { source: caller.source } : {}),
+    ...(caller.taskId ? { taskId: caller.taskId } : {}),
+    ...(caller.senderType ? { senderType: caller.senderType } : {}),
+    ...(caller.botOwner ? { botOwner: { ...caller.botOwner } } : {}),
+  };
+}
+
 export interface RemoteRunnerRecoveredTurn {
   turnId: string;
   generation: number;

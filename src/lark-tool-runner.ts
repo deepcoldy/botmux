@@ -29,8 +29,8 @@ async function main(): Promise<void> {
       body: payload, signal: AbortSignal.timeout(15_000),
     });
     const raw = await response.text();
-    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; error?: string; issuer?: string };
-    if (!response.ok || result.ok !== true) throw new Error(result.error ?? 'lark_tool_identity_unavailable');
+    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; error?: string; code?: string; issuer?: string };
+    if (!response.ok || result.ok !== true) throw new Error(result.error ?? result.code ?? 'lark_tool_identity_unavailable');
     const credentialType = invocation.mode === 'bot' ? 'tenant_access_token' : 'user_access_token';
     // A user grant issued by the botmux platform belongs to the platform's own
     // application; the daemon says so explicitly. Bot calls and every other user

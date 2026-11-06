@@ -190,9 +190,14 @@ export function isTerminalRunStatus(status: RunView['runStatus'] | undefined): b
   return status === 'succeeded' || status === 'failed' || status === 'cancelled';
 }
 
+/** Segments under `#/workflows/` that name a page, not a run (design
+ *  2026-11-03 workflow-dashboard-orchestration E13); matched before run detail. */
+const V3_RESERVED_WORKFLOW_SEGMENTS = new Set(['new', 'drafts', 'library']);
+
 export function v3RunIdFromHash(hash = typeof location !== 'undefined' ? location.hash : ''): string | null {
   const m = hash.match(/^#\/workflows\/([^?#]+)/);
   if (!m) return null;
+  if (V3_RESERVED_WORKFLOW_SEGMENTS.has(m[1]!.split('/')[0]!)) return null;
   try {
     return decodeURIComponent(m[1]!);
   } catch {

@@ -25,7 +25,7 @@ import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/pr
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
-  IDLE_CLEANUP_HOUR_OPTIONS,
+  AUTO_CLEANUP_HOUR_OPTIONS as IDLE_CLEANUP_HOUR_OPTIONS,
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
@@ -55,6 +55,7 @@ interface DashboardSettings {
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -228,6 +229,8 @@ function parseSettings(s: any): DashboardSettings {
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
     // default ON — only an explicit persisted false disables (server snapshot)
     cardBrandLabel: s?.cardBrandLabel !== false,
+    // default ON — only an explicit persisted false disables (server snapshot)
+    stuckCardInitiatorKeys: s?.stuckCardInitiatorKeys !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -898,7 +901,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -992,6 +995,13 @@ export function SettingsBody(props: {
             checked={settings.openTerminalInFeishu}
             disabled={dis || savingKey === 'openTerminalInFeishu'}
             onChange={value => saveBoolean('openTerminalInFeishu', value)}
+          />
+          <ToggleRow
+            title={tr('settings.stuckCardInitiatorKeys')}
+            help={tr('settings.stuckCardInitiatorKeysHelp')}
+            checked={settings.stuckCardInitiatorKeys}
+            disabled={dis || savingKey === 'stuckCardInitiatorKeys'}
+            onChange={value => saveBoolean('stuckCardInitiatorKeys', value)}
           />
           <ToggleRow
             title={tr('settings.enableLocalCliOpen')}
@@ -1800,7 +1810,7 @@ function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleCompo
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
 
-/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+/** 定时自动清理空闲会话：开关 + 空闲阈值（自动清理仅 24H/72H/7d；手动清理另有 1H 与全部）+ 检查频率。 */
 function SessionCleanupRow(props: {
   value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   disabled: boolean;

@@ -1,0 +1,50 @@
+
+  PreToolUse hooks
+  1 hook needs review before it can run.
+❯ [!] Hook 1 · new
+  Event     PreToolUse
+  Source    Plugin - ai-contribution@traex-bd-plugins
+  Command   node "__PLUGIN_DIR__/ai_contribution_sdk_hook.js"
+  Mode      Sync
+  Timeout   30s
+  Trust     New hook - review required
+
+
+  t trust  |  esc go back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
