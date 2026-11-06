@@ -22,7 +22,7 @@ import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, reso
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
-import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -6353,7 +6353,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
-      frozenSessionSandboxMode(ds.session.sandbox),
+      sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
     );
   }
   const port = ds.workerPort ?? ds.session.webPort;
@@ -6371,7 +6371,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
-    frozenSessionSandboxMode(ds.session.sandbox),
+    sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
   );
 }
 
@@ -6461,7 +6461,7 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
-    frozenSessionSandboxMode(ds.session.sandbox),
+    sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
   );
 }
 
@@ -18344,7 +18344,7 @@ function setupWorkerHandlers(
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
-              frozenSessionSandboxMode(ds.session.sandbox),
+              sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
             );
             const fallbackPost = scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
               'interactive', cardReplyTarget.turnId, { replyTarget: cardReplyTarget.target, beforeWrite: beforeFallbackWrite });
@@ -18367,7 +18367,7 @@ function setupWorkerHandlers(
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
-                frozenSessionSandboxMode(ds.session.sandbox),
+                sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
               );
               try {
                 await updateMessage(postingAppId, fallbackCardId, readyCardJson, { beforeWrite: beforeFallbackWrite });

@@ -76,7 +76,7 @@ import {
   type CompletionProposalCardHandlerDeps,
 } from './completion-proposal-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
-import { frozenSessionSandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { sessionCardSandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { cleanupSessionWorktree } from '../../core/session-worktree-cleanup.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION, handleSessionWorktreeCleanupAction } from './session-worktree-cleanup-card.js';
@@ -1486,7 +1486,7 @@ async function deliverMenuTerminalLink(
         loc,
         isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         sessionRuntimeDisplayName(ds),
-        frozenSessionSandboxMode(ds.session.sandbox),
+        sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
       );
       // viewToken is read-only and already present on the in-chat streaming
       // card, so this card needs no private delivery; ephemeral just keeps it
@@ -1508,7 +1508,7 @@ async function deliverMenuTerminalLink(
       loc,
       isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
       sessionRuntimeDisplayName(ds),
-      frozenSessionSandboxMode(ds.session.sandbox),
+      sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
     );
     void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
     return 'write-sent';
@@ -4593,7 +4593,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
-          frozenSessionSandboxMode(ds.session.sandbox),
+          sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
