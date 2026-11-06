@@ -139,14 +139,26 @@ export const GROUP_JOIN_ANCHOR_SCAN_LIMIT = 20;
  * anchor). A message already inside a native topic (root_id + thread_id)
  * resolves to that topic's root. Returns undefined when nothing qualifies so
  * the caller falls back to the reply-mode routing.
+ *
+ * `selfOpenId` is the bot's own open_id in this app. In the im/v1/messages
+ * history listing, a message sent by THIS bot comes back with sender.id in
+ * EITHER the app_id form (`cli_…`, id_type=app_id) OR the bot's per-app
+ * open_id form (`ou_…`) — both shapes occur in real listings (same dual match
+ * as workflow-draft-daemon's findRootCards). Matching only the app_id lets the
+ * bot's own earlier top-level message win the anchor on a re-add.
  */
-export function pickGroupJoinAnchorMessageId(messages: readonly any[], larkAppId: string): string | undefined {
+export function pickGroupJoinAnchorMessageId(
+  messages: readonly any[],
+  larkAppId: string,
+  selfOpenId?: string,
+): string | undefined {
   const newestFirst = [...messages].sort((a, b) => (Number(b?.create_time) || 0) - (Number(a?.create_time) || 0));
   for (const m of newestFirst) {
     if (typeof m?.message_id !== 'string' || !m.message_id) continue;
     if (m.deleted === true) continue;
     if ((m.msg_type ?? m.message_type) === 'system') continue;
-    if (m.sender?.id === larkAppId) continue;
+    const senderId = m.sender?.id;
+    if (senderId === larkAppId || (!!selfOpenId && senderId === selfOpenId)) continue;
     if (typeof m.root_id === 'string' && m.root_id && typeof m.thread_id === 'string' && m.thread_id) return m.root_id;
     return m.message_id;
   }

@@ -106,6 +106,7 @@ import {
   getBot,
   getAllBots,
   getBotClient,
+  getBotOpenId,
   createDetachedLarkClient,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
@@ -27329,7 +27330,7 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
 async function resolveLatestMessageJoinAnchor(larkAppId: string, chatId: string): Promise<string | undefined> {
   try {
     const messages = await listChatMessages(larkAppId, chatId, GROUP_JOIN_ANCHOR_SCAN_LIMIT);
-    const anchor = pickGroupJoinAnchorMessageId(messages, larkAppId);
+    const anchor = pickGroupJoinAnchorMessageId(messages, larkAppId, getBotOpenId(larkAppId));
     if (anchor) {
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚定最新消息 ${anchor.substring(0, 12)} 开话题会话`);
     } else {

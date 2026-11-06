@@ -195,6 +195,20 @@ describe('pickGroupJoinAnchorMessageId (场景① latest-message anchor)', () =>
     ], appId)).toBe('om_card');
   });
 
+  it('skips the bot\'s own message when the listing uses its per-app open_id sender shape', () => {
+    // Real im/v1/messages listings return THIS bot's own messages with either
+    // sender.id = app_id (id_type=app_id) or sender.id = the bot's own open_id
+    // (ou_…). The ou_ form must be skipped only when selfOpenId is supplied.
+    const selfOpenId = 'ou_self_bot';
+    const listing = [
+      msg('om_context', 100),
+      msg('om_self_open_id', 400, { sender: { id: selfOpenId, id_type: 'open_id', sender_type: 'app' } }),
+    ];
+    expect(pickGroupJoinAnchorMessageId(listing, appId, selfOpenId)).toBe('om_context');
+    // Without the open-id hint the ou_ shape is unknowable and stays eligible.
+    expect(pickGroupJoinAnchorMessageId(listing, appId)).toBe('om_self_open_id');
+  });
+
   it('resolves a message inside a native topic to its root', () => {
     expect(pickGroupJoinAnchorMessageId([msg('om_reply', 200, { root_id: 'om_root', thread_id: 'omt_1' })], appId)).toBe('om_root');
   });

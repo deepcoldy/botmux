@@ -631,7 +631,7 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 | `autoStartOnGroupJoinPrompt` | 入群自动开工时的第一轮任务。不填时，bot 会先看看群里的上下文；没人派活就报告自己已就绪 |
 | `autoStartOnGroupJoinSeed` | 入群时先发的那条开场消息的文字，不填用内置文案 |
 | `autoStartOnGroupJoinGateRequired` | `true` 时，入群自动开工还必须有一条匹配的 `chat.bot_added` 同步 [Hook](/hooks) 明确放行，否则静默不开工。适合只让特定的群自动开工 |
-| `autoStartOnGroupJoinAnchor` | 普通群里入群会话挂在哪。默认 `"reply-mode"`，跟随群的回复模式；`"latest-message"` 时不发开场消息，直接在群里最新一条已有消息（跳过系统消息、已撤回消息和本 bot 自己的消息）的话题里开会话，适合外部平台先发一条上下文消息再拉 bot 的群。没有可用消息或读取失败时按默认处理。话题群和 `new-topic` 模式不受影响 |
+| `autoStartOnGroupJoinAnchor` | 普通群里入群会话挂在哪。默认 `"reply-mode"`，跟随群的回复模式；`"latest-message"` 时不发开场消息，直接在群里最新一条已有消息（跳过系统消息、已撤回消息和本 bot 自己的消息）的话题里开会话，适合外部平台先发一条上下文消息再拉 bot 的群。没有可用消息或读取失败时按默认处理。话题群和 `new-topic` 模式不受影响。若要锚定其他机器人发的消息（如平台卡片），还需授权 `im:message.group_msg.include_bot:read`，否则列表里只有用户消息 |
 | `autoStartExcludedChats` | 这些群里不自动开工（入群和新话题都算），被 @ 时照常响应 |
 | `groupJoinCommandEnabled` / `groupJoinCommand` | 被拉进任意群时，直接在本机执行一条命令，不起会话、不经过模型。和 `autoStartOnGroupJoin` 互不影响，也不要求群里有管理员。同样需要订阅 `im.chat.member.bot.added_v1` |
 

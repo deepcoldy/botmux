@@ -1753,6 +1753,31 @@ describe('handleBotAdded — autoStartOnGroupJoinAnchor', () => {
     expect(mocks.listChatMessages).not.toHaveBeenCalled();
     expect(daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))?.scope).toBe('chat');
   });
+
+  it('latest-message 跳过本 bot 自己 open_id 形态的最新消息，锚到次新消息', async () => {
+    // 历史消息列表里本 bot 自己的消息 sender.id 可能是 bot 的 open_id（ou_…）
+    // 而非 app_id；重复拉入等场景下最新一条恰是本 bot 早先的消息，它不能成为锚点。
+    const { daemon, types } = modules;
+    const appId = 'app_join_anchor_self_ou';
+    const chatId = 'oc_join_anchor_self_ou';
+    register(appId, { autoStartOnGroupJoinAnchor: 'latest-message', regularGroupReplyMode: 'chat' });
+    modules.registry.getBot(appId)!.botOpenId = 'ou_join_anchor_self';
+    const selfCard = {
+      message_id: 'om_self_card',
+      create_time: '1700000002000',
+      msg_type: 'interactive',
+      sender: { id: 'ou_join_anchor_self', id_type: 'open_id', sender_type: 'app' },
+    };
+    mocks.listChatMessages.mockResolvedValueOnce([contextCard, selfCard]);
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey('om_self_card', appId))).toBeUndefined();
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_context_card', appId));
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.rootMessageId).toBe('om_context_card');
+  });
 });
 
 describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () => {
