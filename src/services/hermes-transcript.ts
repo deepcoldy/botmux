@@ -18,6 +18,12 @@ import type { CodexBridgeEvent } from './codex-transcript.js';
 const HERMES_STATE_DB = join(homedir(), '.hermes', 'state.db');
 const CONTENT_JSON_PREFIX = String.fromCharCode(0) + 'json:';
 
+// Every python3 invocation below uses `python3 -I`. The worker process runs
+// with cwd = the user-controlled session working directory; without isolated
+// mode `python3 -c` prepends cwd to sys.path, so a project-planted
+// json.py/sqlite3.py executes inside the unsandboxed worker. -I also ignores
+// PYTHON* env and user site-packages. All embedded scripts import stdlib only.
+
 // Keep lookup beneath a pinned home/pastes directory, not a path supplied by
 // transcript text. Python is already required by this reader; dir_fd gives
 // POSIX openat semantics without adding a native dependency. Unsupported hosts
@@ -157,7 +163,7 @@ export function restoreFilteredHermesUserEvents(
     ? [{ index, text: event.text }] : []);
   if (users.length === 0) return events;
   try {
-    const proc = spawnSync('python3', ['-c', PASTE_RECOVERY_SCRIPT, dirname(dbPath)], {
+    const proc = spawnSync('python3', ['-I', '-c', PASTE_RECOVERY_SCRIPT, dirname(dbPath)], {
       // Recovered UTF-8 budgets do not count JSON escaping (up to 6x).
       input: JSON.stringify(users), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
       timeout: 1_000, killSignal: 'SIGKILL', windowsHide: true,
@@ -251,7 +257,7 @@ rows = conn.execute(
 ).fetchall()
 print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
 `;
-  const proc = spawnSync('python3', ['-c', script], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+  const proc = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
   if (proc.status !== 0) throw new Error((proc.stderr || proc.error?.message || 'python3 sqlite query failed').trim());
   const stdout = proc.stdout.trim();
   if (!stdout) return [];
@@ -287,7 +293,7 @@ conn = sqlite3.connect(${JSON.stringify(dbPath)})
 row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()
 print(row[0] or 0)
 `;
-  const proc = spawnSync('python3', ['-c', script], { encoding: 'utf8' });
+  const proc = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8' });
   if (proc.status !== 0) return 0;
   return Number.parseInt(proc.stdout.trim(), 10) || 0;
 }
@@ -330,7 +336,7 @@ if has_table('messages'):
 
 print('unknown')
 `;
-  const proc = spawnSync('python3', ['-c', script], { encoding: 'utf8' });
+  const proc = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8' });
   if (proc.status !== 0) return undefined;
   const out = proc.stdout.trim();
   if (out === '1') return true;

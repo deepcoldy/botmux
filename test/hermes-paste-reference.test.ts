@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, linkSync, chmodSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, linkSync, chmodSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -276,6 +276,39 @@ describe('Hermes: raw source authorization precedes paste recovery', () => {
     expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.finalText, turn.sourceSessionId])).toEqual([
       ['synthetic-turn-a', 'answer a', 'native-a'], ['synthetic-rotated', 'answer c', 'native-c'],
     ]);
+  });
+
+  posixTest('does not execute modules planted in the session working directory (python -I)', () => {
+    const f = fixture();
+    const h = worker(f, initialBinding(f));
+    const hostile = mkdtempSync(join(tmpdir(), 'hermes-paste-hostile-'));
+    dirs.push(hostile);
+    const canary = join(hostile, 'pwned');
+    // The worker runs with cwd = the user-controlled session project dir.
+    // A shadow stdlib module there must never execute inside the unsandboxed
+    // recovery process. It stays transparent (re-exports the real json) so a
+    // regression reaches the canary without a different failure shape.
+    writeFileSync(join(hostile, 'json.py'), [
+      'import os, sys',
+      `open(${JSON.stringify(canary)}, 'w').write('executed ' + __file__)`,
+      "sys.path[:] = [p for p in sys.path if p not in ('', os.getcwd())]",
+      "del sys.modules['json']",
+      'import json as _real_json',
+      'loads, dumps = _real_json.loads, _real_json.dumps',
+      '',
+    ].join('\n'));
+    insert(f.db, [{ session: 'native-a', role: 'user', content: paste(f.home, request), timestamp: epoch / 1000 }]);
+    const previousCwd = process.cwd();
+    process.chdir(hostile);
+    try {
+      h.run();
+    } finally {
+      process.chdir(previousCwd);
+    }
+    expect(existsSync(canary)).toBe(false);
+    // Positive control: isolated mode must not break normal recovery.
+    expect(h.ingest.mock.calls.at(-1)?.[0][0]?.text).toBe(request);
+    expect(h.queue.peek()[0]?.started).toBe(true);
   });
 
   posixTest('does not recursively restore recovered references or read assistant references', () => {

@@ -93,6 +93,7 @@ describe('hermes transcript reader', () => {
     const { currentHermesStateOffset } = await import('../src/services/hermes-transcript.js');
 
     expect(currentHermesStateOffset('/tmp/state.db')).toBe(42);
+    expect(spawnSyncMock.mock.calls[0]?.[1]).toEqual(['-I', '-c', expect.stringContaining('MAX(id)')]);
   });
 
   it('checks whether a Hermes native session exists', async () => {
@@ -101,7 +102,9 @@ describe('hermes transcript reader', () => {
     const { hermesSessionExists } = await import('../src/services/hermes-transcript.js');
 
     expect(hermesSessionExists('20260716_163643_7782fd', '/tmp/state.db')).toBe(true);
-    expect(spawnSyncMock.mock.calls[0]?.[1]).toEqual(['-c', expect.stringContaining('SELECT 1 FROM sessions WHERE id = ? LIMIT 1')]);
+    // -I is part of the spawn contract: the worker cwd is user-controlled and
+    // must never contribute modules to these embedded stdlib-only scripts.
+    expect(spawnSyncMock.mock.calls[0]?.[1]).toEqual(['-I', '-c', expect.stringContaining('SELECT 1 FROM sessions WHERE id = ? LIMIT 1')]);
   });
 
   it('returns false when Hermes session is provably absent', async () => {
