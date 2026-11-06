@@ -882,13 +882,21 @@ export function buildRelayedFrozenCard(
 const MAX_CONTENT_BYTES = 100_000;
 
 /**
+ * Estimates the UTF-8 byte length of a string once serialized inside JSON (accounting for
+ * escaping of `"`, `\`, control characters, etc.).
+ */
+export function jsonEscapedByteLength(str: string): number {
+  return Buffer.byteLength(JSON.stringify(str), 'utf-8') - 2;
+}
+
+/**
  * Truncate content to fit within `maxBytes`, keeping the tail (most recent
  * output). Defaults to {@link MAX_CONTENT_BYTES}; callers that wrap the content
  * in additional card JSON (e.g. the private snapshot's code fence) pass a
  * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
  */
 export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
-  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
+  if (jsonEscapedByteLength(content) <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -896,7 +904,7 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
+    if (jsonEscapedByteLength(candidate) <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
@@ -912,11 +920,21 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
     for (let i = lines.length - 1; i >= 0; i--) {
       if (lines[i].trim() !== '') { last = lines[i]; break; }
     }
-    const buf = Buffer.from(last, 'utf-8');
-    let start = Math.min(buf.length, Math.max(0, buf.length - budget));
-    // Step forward past UTF-8 continuation bytes so we never cut a character.
-    while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++;
-    tail = buf.subarray(start).toString('utf-8');
+    let loChar = 0;
+    let hiChar = last.length;
+    while (loChar < hiChar) {
+      const midChar = Math.floor((loChar + hiChar) / 2);
+      const sub = last.slice(midChar);
+      if (jsonEscapedByteLength(sub) <= budget) {
+        hiChar = midChar;
+      } else {
+        loChar = midChar + 1;
+      }
+    }
+    if (loChar < last.length && last.charCodeAt(loChar) >= 0xdc00 && last.charCodeAt(loChar) <= 0xdfff) {
+      loChar++;
+    }
+    tail = last.slice(loChar);
   }
   return `${t('card.status.truncated_prefix', undefined, locale)}\n${tail}`;
 }

@@ -2998,6 +2998,22 @@ describe('buildPrivateSnapshotCard', () => {
     expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
   });
 
+  it('bounds whole card size under Feishu limit when content is densely packed with quotes or backslashes (#2929)', () => {
+    // 50,000 quotes or backslashes: before fix, raw byte length was ~50 KB but
+    // JSON escaping doubled it to ~100 KB, pushing the whole card to ~101 KB (near the ~109 KB limit).
+    // With JSON-escaped budgeting, whole card size stays safely bounded.
+    for (const denseChar of ['"', '\\']) {
+      const dense = denseChar.repeat(50_000);
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+        dense,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      const byteLen = Buffer.byteLength(json, 'utf-8');
+      expect(byteLen).toBeLessThanOrEqual(60_000);
+    }
+  });
+
   it('does not opt private one-shot snapshots into shared PATCH updates', () => {
     expect(build().config.update_multi).toBeUndefined();
   });
@@ -3198,5 +3214,14 @@ describe('truncateContent single oversized line', () => {
     const out = truncateContent('y'.repeat(3000) + '\n   ', 'zh', 1000);
     expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
     expect(out.split('\n')[1]).toBe('y'.repeat(970));
+  });
+
+  it('budget accounts for JSON escape expansion for quote- and backslash-dense input (#2929)', async () => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    for (const denseChar of ['"', '\\']) {
+      const out = truncateContent(denseChar.repeat(5000), 'zh', maxBytes);
+      expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    }
   });
 });
