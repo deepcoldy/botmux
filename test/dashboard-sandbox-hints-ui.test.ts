@@ -22,6 +22,7 @@ import {
   CodexIsolatedConfigInfo,
   PromptInjectionSection,
   SandboxSection,
+  sandboxSelectionOverride,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import type { BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 import { SandboxDriftChip } from '../src/dashboard/web/session-sandbox-drift-chip.js';
@@ -62,12 +63,17 @@ const sandboxPuts = () => calls.filter(c => c.method === 'PUT' && c.url === '/ap
 describe('SandboxSection — says when the selection is not what new sessions run', () => {
   const overrideNote = (view: TestRenderer.ReactTestRenderer) =>
     view.root.findAll(n => typeof n.type === 'string' && n.props['data-sandbox-override'] !== undefined);
+  const overrideReasons = (view: TestRenderer.ReactTestRenderer) =>
+    view.root.findAll(n => typeof n.type === 'string' && typeof n.props['data-sandbox-override-reason'] === 'string')
+      .map(n => n.props['data-sandbox-override-reason']);
+  const clearButtons = (view: TestRenderer.ReactTestRenderer) =>
+    view.root.findAll(n => typeof n.type === 'string' && n.props['data-action'] === 'clear-legacy-read-isolation');
 
   it('legacy readIsolation keeps "off" confined: the page says so and offers to clear it', async () => {
     const patchBot = vi.fn();
     responder = () => ({ body: { ok: true, readIsolation: false } });
     const view = mount(React.createElement(SandboxSection, { bot: bot({ sandboxMode: 'off', readIsolation: true }), patchBot }));
-    expect(overrideNote(view).map(n => n.props['data-sandbox-override'])).toEqual(['readIsolation']);
+    expect(overrideReasons(view)).toEqual(['readIsolation']);
     await act(async () => { await view.root.findByProps({ 'data-action': 'clear-legacy-read-isolation' }).props.onClick(); });
     expect(calls.filter(c => c.method === 'PUT').map(c => [c.url, c.body])).toEqual([
       ['/api/bots/app_a/read-isolation', JSON.stringify({ enabled: false })],
@@ -77,7 +83,7 @@ describe('SandboxSection — says when the selection is not what new sessions ru
 
   it('a daemon-wide BOTMUX_SANDBOX force is named; no note when it matches the selection', () => {
     const forced = mount(React.createElement(SandboxSection, { bot: bot({ sandboxMode: 'off', sandboxEnvForce: 'oncall' }), patchBot: vi.fn() }));
-    expect(overrideNote(forced).map(n => n.props['data-sandbox-override'])).toEqual(['env']);
+    expect(overrideReasons(forced)).toEqual(['env']);
     const same = mount(React.createElement(SandboxSection, { bot: bot({ sandboxMode: 'oncall', sandboxEnvForce: 'oncall' }), patchBot: vi.fn() }));
     expect(overrideNote(same)).toEqual([]);
   });
@@ -86,6 +92,85 @@ describe('SandboxSection — says when the selection is not what new sessions ru
     for (const row of [bot({ sandboxMode: 'off' }), bot({ sandboxMode: 'oncall', readIsolation: true })]) {
       expect(overrideNote(mount(React.createElement(SandboxSection, { bot: row, patchBot: vi.fn() })))).toEqual([]);
     }
+  });
+
+  it('remote backends (localSandboxApplies=false) never show a force/legacy override — worker exempts the whole resolution', () => {
+    // remote-runner / provably-remote mojo run no local CLI; BOTMUX_SANDBOX is
+    // bypassed there and the page must not claim the selection does not apply.
+    for (const row of [
+      bot({ sandboxMode: 'off', sandboxEnvForce: 'oncall', localSandboxApplies: false }),
+      bot({ sandboxMode: 'off', readIsolation: true, localSandboxApplies: false }),
+      bot({ sandboxMode: 'scratch', sandboxEnvForce: 'scratch', readIsolation: true, localSandboxApplies: false }),
+    ]) {
+      expect(overrideNote(mount(React.createElement(SandboxSection, { bot: row, patchBot: vi.fn() })))).toEqual([]);
+    }
+  });
+
+  it('old daemons sending localSandboxApplies=null keep the historical local-backend behaviour', () => {
+    const view = mount(React.createElement(SandboxSection, {
+      bot: bot({ sandboxMode: 'off', sandboxEnvForce: 'oncall', localSandboxApplies: null }), patchBot: vi.fn(),
+    }));
+    expect(overrideReasons(view)).toEqual(['env']);
+  });
+
+  it('BOTMUX_SANDBOX=scratch + legacy readIsolation, scratch selected: warns new sessions refuse to START (no force-mismatch line) and clears', async () => {
+    responder = () => ({ body: { ok: true, readIsolation: false } });
+    const view = mount(React.createElement(SandboxSection, {
+      bot: bot({ sandboxMode: 'scratch', sandboxEnvForce: 'scratch', readIsolation: true }), patchBot: vi.fn(),
+    }));
+    expect(overrideReasons(view)).toEqual(['combo']);
+    expect(clearButtons(view)).toHaveLength(1);
+    await act(async () => { await clearButtons(view)[0].props.onClick(); });
+    expect(calls.filter(c => c.method === 'PUT').map(c => c.url)).toEqual(['/api/bots/app_a/read-isolation']);
+  });
+
+  it('env=scratch + readIsolation, off selected: shows the force line and the fatal combo, one clear button', () => {
+    const view = mount(React.createElement(SandboxSection, {
+      bot: bot({ sandboxMode: 'off', sandboxEnvForce: 'scratch', readIsolation: true }), patchBot: vi.fn(),
+    }));
+    expect(overrideReasons(view)).toEqual(['env', 'combo']);
+    expect(clearButtons(view)).toHaveLength(1);
+  });
+
+  it('env=oncall + readIsolation: force line only — clearing the legacy flag would change nothing while the env wins', () => {
+    const view = mount(React.createElement(SandboxSection, {
+      bot: bot({ sandboxMode: 'off', sandboxEnvForce: 'oncall', readIsolation: true }), patchBot: vi.fn(),
+    }));
+    expect(overrideReasons(view)).toEqual(['env']);
+    expect(clearButtons(view)).toEqual([]);
+  });
+});
+
+describe('sandboxSelectionOverride (pure resolver)', () => {
+  const resolve = (over: Partial<BotDefaultsRow>, selected: 'off' | 'oncall' | 'scratch') =>
+    sandboxSelectionOverride(bot(over), selected);
+
+  it('localSandboxApplies=false silences every override (incl. the scratch combo); null keeps old behaviour', () => {
+    expect(resolve({ sandboxEnvForce: 'oncall', localSandboxApplies: false }, 'off')).toBeNull();
+    expect(resolve({ readIsolation: true, localSandboxApplies: false }, 'off')).toBeNull();
+    expect(resolve({ sandboxEnvForce: 'scratch', readIsolation: true, localSandboxApplies: false }, 'scratch')).toBeNull();
+    expect(resolve({ sandboxEnvForce: 'oncall', localSandboxApplies: null }, 'off')).toEqual({ envMode: 'oncall' });
+  });
+
+  it('env force shows only when it differs from the selection', () => {
+    expect(resolve({ sandboxEnvForce: 'oncall' }, 'off')).toEqual({ envMode: 'oncall' });
+    expect(resolve({ sandboxEnvForce: 'scratch' }, 'oncall')).toEqual({ envMode: 'scratch' });
+    expect(resolve({ sandboxEnvForce: 'oncall' }, 'oncall')).toBeNull();
+    expect(resolve({ sandboxEnvForce: 'scratch' }, 'scratch')).toBeNull();
+  });
+
+  it('legacy readIsolation is offered without an env force and hidden under oncall', () => {
+    expect(resolve({ readIsolation: true }, 'off')).toEqual({ legacyReadIsolation: true });
+    expect(resolve({ readIsolation: true }, 'scratch')).toEqual({ legacyReadIsolation: true });
+    expect(resolve({ readIsolation: true }, 'oncall')).toBeNull();
+    expect(resolve({}, 'off')).toBeNull();
+  });
+
+  it('env=oncall does not offer the useless clear; env=scratch × readIsolation is the start-refusing combo', () => {
+    expect(resolve({ sandboxEnvForce: 'oncall', readIsolation: true }, 'off')).toEqual({ envMode: 'oncall' });
+    expect(resolve({ sandboxEnvForce: 'scratch', readIsolation: true }, 'scratch')).toEqual({ rejectsCombo: true });
+    expect(resolve({ sandboxEnvForce: 'scratch', readIsolation: true }, 'off'))
+      .toEqual({ envMode: 'scratch', rejectsCombo: true });
   });
 });
 

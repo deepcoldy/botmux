@@ -42,10 +42,15 @@ export function frozenSessionSandboxMode(raw: unknown): SandboxMode {
  * not the whole truth: the worker also honours the machine-wide BOTMUX_SANDBOX
  * force (never materialised into the session), so a session frozen "off" on a
  * forced daemon still runs inside a sandbox and must not render as unsandboxed.
- * When the current worker has already reported whether a local sandbox wraps
- * the CLI (`engaged`, e.g. a remote backend bypasses it), that fact wins.
- * Display only — never feeds a spawn decision. A typo'd env value (which makes
- * the worker refuse to start) falls back to the frozen mode.
+ * The latest worker spawn report (`engaged`, e.g. a remote backend bypasses
+ * it) is treated as the strongest signal, but it describes the spawn that
+ * reported it, not the live pane at render time: between worker generations
+ * (before the new generation reports) the previous generation's value lingers,
+ * and a persistent pane that warm-reconnects may keep a different profile
+ * than a fresh spawn would resolve. Undefined until the first report of this
+ * daemon process — then the env/frozen inference stands. Display only — never
+ * feeds a spawn decision. A typo'd env value (which makes the worker refuse
+ * to start) falls back to the frozen mode.
  */
 export function sessionCardSandboxMode(
   frozen: unknown,

@@ -4449,20 +4449,49 @@ export function CodexIsolatedConfigInfo(props: { bot: BotDefaultsRow }) {
 
 /**
  * Why the mode a new session actually runs under differs from the selected one
- * (null = it does not). The worker folds two inputs the selector does not own:
- * the machine-wide BOTMUX_SANDBOX force (wins over every bot), then the legacy
- * `readIsolation` flag (implies the whitelist sandbox). Without this note
- * "关闭" reads as off while every new session is still confined.
+ * (null = it does not). The worker folds inputs the selector does not own:
+ * the machine-wide BOTMUX_SANDBOX force (wins over every bot on LOCAL
+ * backends), then the legacy `readIsolation` flag (implies the whitelist
+ * sandbox). Without this note "关闭" reads as off while every new session is
+ * still confined.
+ *
+ * Remote backends (riff / remote-runner / provably-remote mojo) run no local
+ * CLI: resolveLocalSandboxMode exempts the WHOLE resolution there, the env
+ * force included, so on those bots nothing overrides the selection. Old
+ * daemons send `localSandboxApplies: null` — keep their historical behaviour.
  */
+export interface SandboxSelectionOverride {
+  /** BOTMUX_SANDBOX forces local spawns to this mode and it differs from the
+   *  selector. Absent when the force matches the selection. */
+  envMode?: 'oncall' | 'scratch';
+  /** Lingering readIsolation flag with no env force active, while the
+   *  selector is off/scratch (oncall is already what the flag means). Gives
+   *  the clear-legacy-flag repair. */
+  legacyReadIsolation?: true;
+  /** BOTMUX_SANDBOX=scratch × legacy readIsolation: the worker refuses to
+   *  START every new session (spawn guard in worker.ts), even when the
+   *  selector already shows scratch (where the env-mismatch note is silent).
+   *  Clearing readIsolation is the repair offered. */
+  rejectsCombo?: true;
+}
+
 export function sandboxSelectionOverride(
-  bot: Pick<BotDefaultsRow, 'readIsolation' | 'sandboxEnvForce'>,
+  bot: Pick<BotDefaultsRow, 'readIsolation' | 'sandboxEnvForce' | 'localSandboxApplies'>,
   selected: SandboxMode,
-): { cause: 'env'; mode: 'oncall' | 'scratch' } | { cause: 'readIsolation' } | null {
+): SandboxSelectionOverride | null {
+  if (bot.localSandboxApplies === false) return null;
   const forced = bot.sandboxEnvForce;
-  if (forced === 'oncall' || forced === 'scratch') return forced === selected ? null : { cause: 'env', mode: forced };
-  // oncall: readIsolation adds nothing; scratch: the worker refuses the combination.
-  if (bot.readIsolation === true && selected !== 'oncall') return { cause: 'readIsolation' };
-  return null;
+  const legacy = bot.readIsolation === true;
+  const result: SandboxSelectionOverride = {};
+  if ((forced === 'oncall' || forced === 'scratch') && forced !== selected) {
+    result.envMode = forced;
+  }
+  if (forced === 'scratch' && legacy) result.rejectsCombo = true;
+  // No env force: the lingering flag silently downgrades off/scratch to
+  // oncall. Under env=oncall clearing it changes nothing (the env still
+  // wins); env=scratch is already reported as rejectsCombo above.
+  if (legacy && selected !== 'oncall' && !forced) result.legacyReadIsolation = true;
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
@@ -4540,16 +4569,27 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
         onSelect={m => void selectMode(m)}
       />
       {override ? (
-        <div className="bd-section-note bd-warn" role="note" data-sandbox-override={override.cause}>
-          <p>
-            {override.cause === 'env'
-              ? tr('botDefaults.sandboxOverrideEnv', { mode: tr(override.mode === 'scratch' ? 'botDefaults.sandboxModeScratch' : 'botDefaults.sandboxModeOncall') })
-              : tr('botDefaults.sandboxOverrideReadIsolation')}
-          </p>
-          {override.cause === 'readIsolation' ? (
-            <button type="button" className="btn" data-action="clear-legacy-read-isolation" disabled={busy} onClick={() => void clearLegacyReadIsolation()}>
-              {tr('botDefaults.sandboxOverrideReadIsolationClear')}
-            </button>
+        <div className="bd-section-note bd-warn" role="note" data-sandbox-override>
+          {override.envMode ? (
+            <p data-sandbox-override-reason="env">
+              {tr('botDefaults.sandboxOverrideEnv', { mode: tr(override.envMode === 'scratch' ? 'botDefaults.sandboxModeScratch' : 'botDefaults.sandboxModeOncall') })}
+            </p>
+          ) : null}
+          {override.rejectsCombo ? (
+            <>
+              <p data-sandbox-override-reason="combo">{tr('botDefaults.sandboxOverrideScratchCombo')}</p>
+              <button type="button" className="btn" data-action="clear-legacy-read-isolation" disabled={busy} onClick={() => void clearLegacyReadIsolation()}>
+                {tr('botDefaults.sandboxOverrideReadIsolationClear')}
+              </button>
+            </>
+          ) : null}
+          {override.legacyReadIsolation ? (
+            <>
+              <p data-sandbox-override-reason="readIsolation">{tr('botDefaults.sandboxOverrideReadIsolation')}</p>
+              <button type="button" className="btn" data-action="clear-legacy-read-isolation" disabled={busy} onClick={() => void clearLegacyReadIsolation()}>
+                {tr('botDefaults.sandboxOverrideReadIsolationClear')}
+              </button>
+            </>
           ) : null}
         </div>
       ) : null}
