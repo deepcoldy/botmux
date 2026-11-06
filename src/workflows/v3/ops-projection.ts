@@ -30,6 +30,7 @@ import { v3CheckpointMarkedSince, v3CheckpointSuccesses } from './checkpoint-hol
 import { loadDag } from './dag-loader.js';
 import { foldV3ExternalAttempts } from './external-attempt-ledger.js';
 import { attemptNumber } from './attempt-numbering.js';
+import { readRunEnvelope } from './run-envelope.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
  *  caller-supplied runId, so it can't escape runsDir via traversal. */
@@ -387,8 +388,9 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
   const botSnapshots = readBotSnapshots(runDir);
   const revisions = projectRevisions(runDir, events, approvedNodes, botSnapshots);
   const interventions = foldV3NodeInterventions(events, readInitiatorOpenId(runDir));
-  const checkpoints = projectCheckpoints(runDir, events);
-  const handoffs = projectHandoffs(runDir, events);
+  const botExecuted = isBotExecutedRunDir(runDir, events);
+  const checkpoints = botExecuted ? projectCheckpoints(runDir, events) : undefined;
+  const handoffs = botExecuted ? projectHandoffs(runDir, events) : undefined;
   const dagNodes = revisions?.effectiveNodes ?? approvedNodes;
 
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
@@ -673,13 +675,29 @@ interface ProjectedRevisions {
   pendingChanges: Map<string, 'add' | 'remove' | 'change'>;
 }
 
+/**
+ * Whether the run hands its goal nodes to bot sessions. The validated
+ * run.json decides (`nodeExecutor: "bot"` is frozen there at approval); the
+ * journal's `runStarted` stamp only adds runs without one. Runs started
+ * through `workflow start` before the stamp moved into the start intent have
+ * an unstamped `runStarted` (the start intent roots the journal before the
+ * runtime could stamp it), so the journal alone misses them. Defensive: an
+ * unreadable envelope falls back to the stamp.
+ */
+function isBotExecutedRunDir(runDir: string, events: ReturnType<typeof readJournal>): boolean {
+  try {
+    const read = readRunEnvelope(runDir);
+    if (read.kind === 'ok' && 'nodeExecutor' in read.envelope && read.envelope.nodeExecutor === 'bot') return true;
+  } catch { /* fall through to the journal stamp */ }
+  return events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot');
+}
+
 /** The latest handoff of every node of a bot-executed run (§5.5; display
  *  only; degrades to none). Keyed like RunView nodes (dispatch nodeId). */
 function projectHandoffs(
   runDir: string,
   events: ReturnType<typeof readJournal>,
 ): Map<string, NonNullable<RunNodeView['handoff']>> | undefined {
-  if (!events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot')) return undefined;
   let attempts: ReturnType<typeof foldV3ExternalAttempts>;
   try {
     attempts = foldV3ExternalAttempts(events);
@@ -722,7 +740,6 @@ function projectCheckpoints(
   runDir: string,
   events: ReturnType<typeof readJournal>,
 ): { states: Map<string, 'holding' | 'reviewed' | 'notReviewed'>; waiting: Map<string, string[]> } | undefined {
-  if (!events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot')) return undefined;
   try {
     const authorized = loadDag(join(runDir, 'dag.json'));
     const effective = tryLoadEffectiveV3Dag(runDir, authorized, events)?.dag ?? authorized;
