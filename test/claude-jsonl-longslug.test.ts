@@ -64,6 +64,16 @@ describe('long-cwd truncated project slug (Claude opaque hash suffix)', () => {
     mkdirSync(fileBucket, { recursive: true });
     writeFileSync(join(fileBucket, jsonl), '{}');
     expect(resolveClaudeJsonlPath(sid, longCwd, dataDir)).toBe(join(fileBucket, jsonl));
+    expect(getClaudeSessionJsonlPath(sid, longCwd, dataDir)).toBe(join(fileBucket, jsonl));
+  });
+
+  it('does not treat a same-named directory in exact path as a transcript', () => {
+    const dataDir = join(root, 'exact-dir-shadow');
+    const cwd = '/home/u/proj';
+    const d = join(projects(dataDir), '-home-u-proj');
+    mkdirSync(join(d, jsonl), { recursive: true }); // <sid>.jsonl as a directory
+    expect(resolveClaudeJsonlPath(sid, cwd, dataDir)).toBeNull();
+    expect(getClaudeSessionJsonlPath(sid, cwd, dataDir)).toBeNull();
   });
 
   it('keeps the exact-path fast path for normal short cwds', () => {

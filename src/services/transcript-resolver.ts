@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from '../adapters/cli/types.js';
@@ -77,6 +77,10 @@ export function cachedTranscriptPathLookup(
   return path;
 }
 
+function isRegularFile(path: string): boolean {
+  try { return statSync(path).isFile(); } catch { return false; }
+}
+
 /** cwd → the path Claude Code keys its project dir by: the REALPATH (symlinks
  *  resolved), falling back to a lexical resolve only when the path isn't on disk.
  *  Claude keys projects by realpath, so a symlinked cwd (e.g. /home/x →
@@ -84,7 +88,7 @@ export function cachedTranscriptPathLookup(
  *  resolve() would point at a project key Claude never writes to. */
 function realCwd(cwd: string): string {
   const expanded = expandHome(cwd);
-  try { return realpathSync(expanded); } catch { return resolve(expanded); }
+  try { return realpathSync(expanded); } catch { return expanded; }
 }
 
 /** Claude truncates a long (over 200-char) project slug and appends an opaque
@@ -100,7 +104,7 @@ function findClaudeJsonlByGlob(projectsDir: string, slug: string, sessionId: str
   const hits = entries
     .filter(name => name === prefix || name.startsWith(`${prefix}-`))
     .map(name => join(projectsDir, name, target))
-    .filter(p => existsSync(p));
+    .filter(isRegularFile);
   return hits.length === 1 ? hits[0]! : null;
 }
 
@@ -121,7 +125,7 @@ export function getClaudeSessionJsonlPath(
   const projectDir = join(projectsDir, projectKey);
   const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
   if (!opts?.noFollow) {
-    if (existsSync(jsonlPath)) return jsonlPath;
+    if (isRegularFile(jsonlPath)) return jsonlPath;
     return findClaudeJsonlByGlob(projectsDir, projectKey, sessionId);
   }
   if (isDirectoryNoFollow(dataDir)
