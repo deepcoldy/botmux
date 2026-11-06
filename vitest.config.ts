@@ -1,6 +1,13 @@
 import { defineConfig } from 'vitest/config';
 import { BaseSequencer, type TestSpecification } from 'vitest/node';
 import { selectShard } from './scripts/duration-shards.mjs';
+import { gateVitestRun, resolveTestConcurrency } from './scripts/test-concurrency.mjs';
+
+/**
+ * 本机整机并发闸 + 默认 worker 数（scripts/test-concurrency.mjs）。CI 上为
+ * `{ maxWorkers: undefined, gated: false }`，行为与之前一致。
+ */
+const concurrency = resolveTestConcurrency();
 
 /**
  * `--shard=i/N` (CI's unit matrix) splits by recorded duration instead of
@@ -10,6 +17,13 @@ import { selectShard } from './scripts/duration-shards.mjs';
 class DurationShardSequencer extends BaseSequencer {
   override async shard(files: TestSpecification[]): Promise<TestSpecification[]> {
     return selectShard(files, this.ctx.config);
+  }
+
+  // 排序发生在任何测试文件启动之前，且拿得到本次真正要跑的文件数（分片之后）：
+  // 大批量运行在这里排队等整机名额。
+  override async sort(files: TestSpecification[]): Promise<TestSpecification[]> {
+    await gateVitestRun(files.length, concurrency);
+    return super.sort(files);
   }
 }
 
@@ -36,6 +50,7 @@ export default defineConfig({
     hookTimeout: 360_000,
     // Root-level on purpose: vitest builds one sequencer for the whole run.
     sequence: { sequencer: DurationShardSequencer },
+    ...(concurrency.maxWorkers !== undefined ? { maxWorkers: concurrency.maxWorkers } : {}),
     projects: [
       {
         test: {
