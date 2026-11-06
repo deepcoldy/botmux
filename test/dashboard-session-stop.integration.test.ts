@@ -143,6 +143,17 @@ describe('Dashboard session stop HTTP integration', () => {
 
     for (const route of [suspendPath, interruptPath]) expect((await post(route, false)).status).toBe(401);
     expect(writes).toEqual([]);
+    // 跨站门禁位于鉴权判决之后：匿名请求即使带着明确的跨站 Origin，也先收到 401
+    // （SPA 凭 401 的 login-url 头走登录引导），而不是 403 control_origin_forbidden。
+    for (const route of [suspendPath, interruptPath]) {
+      const res = await request(base + route, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+        body: '{}',
+      });
+      expect(res.status).toBe(401);
+    }
+    expect(writes).toEqual([]);
     expect(await post(suspendPath), logs).toEqual(suspendReply);
     expect(writes).toEqual([{ owner: 'owner', path: suspendPath, body: '{}', authenticated: true }]);
     expect(await post(interruptPath)).toEqual(interruptReply);

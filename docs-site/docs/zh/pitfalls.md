@@ -51,6 +51,17 @@
   - 对支持的 CLI（Claude Code、Codex、CoCo 等）打开 `replyDelivery: "transcript"`：botmux 直接从 CLI 记录里取本轮最后一段回答发到飞书，不再依赖模型调用 `botmux send`。配置方法见 [bots.json 配置](/bots-json) 里的 `replyDelivery`。
 - **`botmux send --images` 一次 6 张以上可能静默失败**：→ 一次最多 4 张，分批发。
 
+### 消息发出去没反应：看诊断卡 {#submit-failure-diagnosis}
+
+自动的，不用配置。消息交给 CLI 后迟迟确认不了，botmux 会先看一眼终端现场，再发一张说清原因的卡片（错误码仍是 `submit_unconfirmed`），而不是笼统的「提交确认失败」：
+
+| 卡片说的情况 | 怎么处理 |
+|---|---|
+| CLI 停在登录 / 鉴权页面 | 打开 Web 终端完成 CLI 自己的登录，再重发。CLI 登录和飞书授权是两回事 |
+| CLI 停在等键盘选择的界面（更新、数据迁移、hooks review、确认框等） | 打开 Web 终端选一项，或按 Esc 取消后再重发。botmux 不会替你选 |
+| 正文已粘贴但停在输入框没提交 | 打开 Web 终端按 Enter 提交；确认不需要执行再回飞书重发 |
+| 看不出原因 | 卡片会提醒：确认失败不等于没执行，先去 Web 终端核对，确实没执行再重发 |
+
 ## 进程 / 连接
 
 - **同一个飞书机器人被两个程序同时连着**：飞书长连接谁先抢到归谁，botmux 就会时好时坏。→ 一个机器人只给一个程序用。

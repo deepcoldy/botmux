@@ -235,7 +235,7 @@ describe('clearSessionIdentity', () => {
 describe('tmux env passthrough covers the identity vars', () => {
   it('forwards the shim and git-attribution vars into a pane', async () => {
     const { BOTMUX_INJECTED_ENV_KEYS } = await import('../src/utils/child-env.js');
-    for (const key of ['BOTMUX_IDENTITY_BIN', 'ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS', 'GIT_CONFIG_COUNT']) {
+    for (const key of ['BOTMUX_IDENTITY_BIN', 'BOTMUX_WRAPPER_BIN', 'ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS', 'GIT_CONFIG_COUNT']) {
       expect(BOTMUX_INJECTED_ENV_KEYS).toContain(key);
     }
   });
@@ -510,6 +510,32 @@ describe('installLoginShellPathShim', () => {
       BASH_ENV: bashEnv,
     });
     expect(resolved).toBe(join(wrapperDir, 'faketool'));
+  });
+
+  it.each(SHELLS)('keeps the botmux wrapper directory after a %s login shell rebuilds PATH', shell => {
+    const wrapperDir = fakeWrapperDir();
+    const botmuxBinDir = join(dir, 'botmux-bin');
+    mkdirSync(botmuxBinDir, { recursive: true });
+    const botmuxProbe = join(botmuxBinDir, 'botmux-probe');
+    writeFileSync(botmuxProbe, '#!/bin/sh\nprintf botmux\n');
+    chmodSync(botmuxProbe, 0o755);
+    writeFileSync(join(dir, '.zprofile'), 'export PATH=/usr/bin:/bin\n');
+    writeFileSync(join(dir, '.bash_profile'), 'export PATH=/usr/bin:/bin\n');
+    const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
+
+    const resolved = execFileSync(shell, ['-lc', 'command -v botmux-probe'], {
+      encoding: 'utf8',
+      env: {
+        PATH: loginShellPath(wrapperDir, botmuxBinDir),
+        HOME: dir,
+        BOTMUX_IDENTITY_BIN: wrapperDir,
+        BOTMUX_WRAPPER_BIN: botmuxBinDir,
+        ZDOTDIR: zdotdir,
+        BASH_ENV: bashEnv,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    expect(resolved).toBe(botmuxProbe);
   });
 
   // Proves the test above is actually testing something: without the shim the

@@ -24,7 +24,7 @@ afterEach(async () => {
   await new Promise<void>(r => server.close(() => r()));
 });
 
-const writes = ['trigger-result/supersede', 'close', 'restart', 'rename', 'suspend', 'resume', 'start', 'lock', 'board', 'live-stage', 'turns/t1/interrupt'];
+const writes = ['trigger-result/supersede', 'close', 'restart', 'rename', 'suspend', 'resume', 'start', 'locate', 'lock', 'board', 'live-stage', 'turns/t1/interrupt'];
 const post = (path: string, headers: Record<string, string> = {}) =>
   fetch(`${base}/api/sessions/s1/${path}`, { method: 'POST', headers });
 

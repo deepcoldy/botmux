@@ -1225,7 +1225,11 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
       }
       if (typeof result.afterAck === 'function') {
         setTimeout(() => {
-          void Promise.resolve(result.afterAck())
+          // Pass the REAL ACK-timeout state observed by this wrapper. Existing
+          // afterAck callbacks ignore the extra argument; callbacks that must
+          // decide between a synchronous toast and a visible fallback (e.g. the
+          // substitute toggle) use it instead of estimating elapsed time.
+          void Promise.resolve(result.afterAck(timedOut))
             .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
         }, 0);
       }
@@ -5672,6 +5676,23 @@ export function createLarkEventDispatcherRuntime(
           && resolveSubstituteTrigger(larkAppId, message)) {
         logger.info(
           `[substitute:${larkAppId}] excluded chat — dropping @target message ` +
+          `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+        );
+        return;
+      }
+      // 运行态 per-chat off：同上，只 @配置替身对象、未直接 @本 bot 的消息必须让路。
+      // 仅清 substituteTrigger 不够——通用 relax 仍可能因 mentionMode=never/ambient/topic、
+      // 已有活跃会话或 solo-group bypass 放行，导致用户在本群关掉替身后，@替身对象
+      // 仍被送进会话并产生可见回复。这里只丢弃这一类消息，不做全群静音；直接 @本 bot
+      // 不受影响（explicitlyMentionedThisBot 为真时不进入本 gate）。
+      if (substituteCfg?.enabled === true
+          && chatType === 'group'
+          && !explicitlyMentionedThisBot
+          && isSubstituteAllowedChat(substituteCfg, chatId)
+          && !isSubstituteEnabledForChat(larkAppId, chatId)
+          && resolveSubstituteTrigger(larkAppId, message)) {
+        logger.info(
+          `[substitute:${larkAppId}] per-chat off — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
         );
         return;

@@ -37,6 +37,11 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
   --allow-unverified-chat 查不到的群也写上，看板上标「未核实」
   --unlink kind=ref       可重复，仅 set：删掉一条关联（照 show 里的 kind=ref 写）；
                           先删后加，--unlink 旧 --link 新 = 替换
+  --close-when <条件>     什么时候可以关："pr:owner/repo#12 merged" | "item:66 done" | manual（只由你判断）
+                          | auto（去掉，回到默认）。没写时挂了 PR 的项按「挂的 PR 全部合入」判断
+  --depends-on <编号…>    依赖的事项，如 66,70（整组替换；none 清空）。都结束后提示推进
+  --next-check <时间>     下次复查：+2h / +3d / +1w，或带时区的 2026-11-10T09:30+08:00；none 清空
+  --dismiss-hint          仅 set：收起这一项当前的提示（「建议关闭 / 建议推进 / 该看一眼」），同一条不再出现
   --note <一句话>         同时往历史里记一句
   --title <新标题>        仅 set
 
@@ -45,9 +50,9 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
 const VALUE_FLAGS = new Set([
   '--view', '--key', '--state', '--stage', '--kind', '--repo', '--summary', '--progress', '--ask',
   '--option', '--recommend', '--reason', '--link', '--unlink', '--note', '--title', '--session-id',
-  '--primary-chat', '--no-chat',
+  '--primary-chat', '--no-chat', '--close-when', '--depends-on', '--next-check',
 ]);
-const BOOL_FLAGS = new Set(['--json', '--handled', '--clear-ask', '--allow-unverified-chat', '--help', '-h']);
+const BOOL_FLAGS = new Set(['--json', '--handled', '--clear-ask', '--allow-unverified-chat', '--dismiss-hint', '--help', '-h']);
 
 /** 字段 flag → daemon 侧 patch 字段名。 */
 const FIELD_FLAGS: Record<string, string> = {
@@ -175,8 +180,19 @@ export function parseBoardArgs(argv: string[]): { ok: true; help: true } | { ok:
         request.noChat = noChat;
       }
       if (t.bools.has('--allow-unverified-chat')) request.allowUnverifiedChat = true;
+      const closeWhen = single('--close-when');
+      if (closeWhen !== undefined) request.closeWhen = closeWhen;
+      const dependsOn = single('--depends-on');
+      if (dependsOn !== undefined) request.dependsOn = dependsOn;
+      const nextCheck = single('--next-check');
+      if (nextCheck !== undefined) request.nextCheck = nextCheck;
+      if (t.bools.has('--dismiss-hint')) {
+        if (action === 'add') return { ok: false, error: 'add 不支持 --dismiss-hint，收起提示用 set <编号> --dismiss-hint' };
+        request.dismissHint = true;
+      }
       if (action === 'set' && Object.keys(request.fields as object).length === 0 && !request.options && !request.links && !request.unlinks
-        && !request.clearAsk && request.primaryChat === undefined && request.noChat === undefined) {
+        && !request.clearAsk && request.primaryChat === undefined && request.noChat === undefined
+        && request.closeWhen === undefined && request.dependsOn === undefined && request.nextCheck === undefined && !request.dismissHint) {
         return { ok: false, error: 'set 至少要改一个字段' };
       }
       break;
@@ -203,6 +219,7 @@ export function parseBoardArgs(argv: string[]): { ok: true; help: true } | { ok:
   }
   if (t.bools.has('--handled') && action !== 'history') return { ok: false, error: `${action} 不支持 --handled` };
   if (t.bools.has('--clear-ask') && action !== 'set') return { ok: false, error: `${action} 不支持 --clear-ask` };
+  if (t.bools.has('--dismiss-hint') && action !== 'set') return { ok: false, error: `${action} 不支持 --dismiss-hint` };
   if (t.bools.has('--allow-unverified-chat') && action !== 'add' && action !== 'set') {
     return { ok: false, error: `${action} 不支持 --allow-unverified-chat` };
   }
@@ -232,6 +249,15 @@ interface MainChat { text: string; url?: string; chatCheck?: 'verified' | 'unver
 interface ListItem {
   seq: number; title: string; stateLabel?: string; stage?: string; pendingDecisions?: number; appLink?: string; url?: string;
   mainChat?: MainChat; chatCount?: number; noChatReason?: string; missingChat?: boolean;
+  hint?: { kind?: string; reason?: string };
+}
+
+const HINT_TAGS: Record<string, string> = { close: '建议关闭', advance: '建议推进', stale: '该看一眼' };
+
+/** 巡检给的提示：「💡建议关闭：PR owner/repo#12 已合入」。没有提示（或旧 daemon）时空串。 */
+function hintTag(i: ListItem): string {
+  if (!i.hint?.kind || !HINT_TAGS[i.hint.kind]) return '';
+  return `💡${HINT_TAGS[i.hint.kind]}${i.hint.reason ? `：${i.hint.reason}` : ''}`;
 }
 
 /** 一项的群：「💬 主群名（+2 个群）」/「无群：原因」/「⚠缺群」。旧 daemon 不给这些字段时返回空串。 */
@@ -262,8 +288,9 @@ export function formatBoardResult(action: BoardAction, body: Record<string, unkn
       return [head, ...items.map(i => {
         const pending = i.pendingDecisions ? ` ⏳${i.pendingDecisions} 个决定待执行` : '';
         const chat = chatTag(i);
+        const hint = hintTag(i);
         const link = linkOf(i);
-        return `#${i.seq} ${i.stateLabel ?? ''}${i.stage ? `·${i.stage}` : ''} ${i.title}${pending}${chat ? `  ${chat}` : ''}${link ? `  ${link}` : ''}`;
+        return `#${i.seq} ${i.stateLabel ?? ''}${i.stage ? `·${i.stage}` : ''} ${i.title}${pending}${hint ? `  ${hint}` : ''}${chat ? `  ${chat}` : ''}${link ? `  ${link}` : ''}`;
       })].filter(Boolean).join('\n');
     }
     case 'add':
@@ -273,8 +300,9 @@ export function formatBoardResult(action: BoardAction, body: Record<string, unkn
       const verb = action === 'add' ? (body.created === false ? '已存在，已更新' : '已创建') : '已更新';
       const link = linkOf(item);
       const chat = chatTag(item);
+      const hint = hintTag(item);
       return `#${item.seq} ${verb}：${item.title}（${item.stateLabel ?? ''}${item.stage ? `·${item.stage}` : ''}）`
-        + `${chat ? `\n${chat}${item.mainChat?.url ? ` ${item.mainChat.url}` : ''}` : ''}${link ? `\n${link}` : ''}`;
+        + `${chat ? `\n${chat}${item.mainChat?.url ? ` ${item.mainChat.url}` : ''}` : ''}${hint ? `\n${hint}` : ''}${link ? `\n${link}` : ''}`;
     }
     case 'history': {
       const handled = Number(body.handledDecisions ?? 0);
