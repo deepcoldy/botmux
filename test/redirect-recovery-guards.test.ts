@@ -62,6 +62,30 @@ describe('redirect recovery persistence guards', () => {
     expect(writes).toBe(1);
   });
 
+  it('never carries the new-app blind-write grant into internal recovery attempts', async () => {
+    let reads = 0;
+    let writes = 0;
+    const api = await client((async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === '/app') return new Response('<script>window.csrfToken="fixture"</script>');
+      if (path.includes('/safe_setting/update/')) {
+        writes++;
+        // ACK 丢失：可能已落地。随后每一轮恢复都必须重新读现值；读不回就零写入，
+        // 绝不能把「本次刚建应用」的盲写许可延伸到第二次写入。
+        throw resetError();
+      }
+      if (path.includes('/safe_setting/')) {
+        reads++;
+        throw resetError();
+      }
+      throw new Error('Unexpected fixture endpoint');
+    }) as typeof fetch);
+    const result = await writeRedirectWhitelist(api.postJson, appId, wanted, { allowBlindWrite: true });
+    expect(result).toMatchObject({ status: 'skipped_unreadable', mutationSubmitted: true });
+    expect(writes).toBe(1);
+    expect(reads).toBe(2);
+  });
+
   it('does not confirm success or rewrite when readback lost an original custom URL', async () => {
     let writes = 0;
     let reads = 0;
