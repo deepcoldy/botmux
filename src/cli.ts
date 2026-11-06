@@ -32,7 +32,9 @@ import { buildReplyConsoleUrl } from './core/dashboard-url.js';
  */
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator,
   requireScheduleCreatorUnionId, requireScheduleOperatorAuthorization } from './core/schedule-creator-authorization.js';
-import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
+import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE, ScheduleUpdateHelpRequested, ScheduleUpdateUsageError, type ScheduleUpdateInput } from './cli/schedule-update.js';
+import { SCHEDULE_HELP_BODY } from './cli/schedule-help.js';
+import type { ManagedScheduleUpdateReceipt } from './core/schedule-managed-update.js';
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
@@ -7899,27 +7901,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        current --create / list / read / update / write --yes
 
 定时任务（可在 CLI 会话内自动推断 chat）:
-  schedule list                        列出所有任务
-  schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
-       --calendar <name>               绑定内置或自定义工作日历；手动执行绕过
-       --calendar-day-type <type>      workday 仅工作日（默认）；restday 仅休息日
-       --model <id>                    本任务用指定模型跑（如 gpt-5.6-sol），不改 bot 配置
-       --reasoning-effort <level>      low|medium|high|xhigh|max|ultra（模型支持才生效）
-                                       两者都只在本任务新建会话那次执行生效；配 --new-topic 则每次生效
-       --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
-       --topic --root-msg-id <om_...>  固定在指定话题下执行
-       --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
-       --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题按任务时区支持 {{date:-1d}} / {{owner}}
-       --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
-       --until-done                    直到完成：没做完按计划继续执行，出错/错过自动补上，直到 schedule done
-       --deadline <time>               配合 --until-done：到点做最后一次收尾执行后关闭（如 2026-11-20 / 7d / 明天18:00）
-       --retry-every <duration>        配合 --until-done 的一次性任务：没做完隔多久再执行（默认 1d）
-       --notify failing,expired        按需通知创建人：连续失败 3 次 / 截止收尾时
-  schedule done [id|self] [--note 结果] 标记「直到完成」任务已完成（任务自己的执行会话里可省略 id）
-  schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
-  schedule remove <id>                 删除任务
-  schedule pause|resume <id>           暂停/恢复
-  schedule run <id>                    标记立即执行
+${SCHEDULE_HELP_BODY}
 
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
@@ -8698,9 +8680,35 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
   rest = rest.filter(arg => arg !== '--remote-runner-session-tool');
-  if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
-    console.log(SCHEDULE_UPDATE_USAGE);
+  if (['--help', '-h', 'help'].includes(sub)
+    || (sub !== 'update' && sub !== 'add' && ['--help', '-h'].includes(rest[0] ?? ''))) {
+    console.log(`用法:\n${SCHEDULE_HELP_BODY}`);
     return;
+  }
+  if (sub && !['list', 'ls', 'add', 'calendars', 'update', 'remove', 'rm', 'delete', 'del',
+    'pause', 'disable', 'resume', 'enable', 'done', 'run'].includes(sub)) {
+    console.error(`未知子命令: ${sub}\n\n用法:\n${SCHEDULE_HELP_BODY}`);
+    process.exit(2);
+  }
+  // Parse `update` before any session lookup or daemon contact: a typo or a
+  // `--help` must answer with the usage, and a bad frequency must be refused
+  // with the add parser's reason before anything is touched.
+  let scheduleUpdate: ScheduleUpdateInput | undefined;
+  if (sub === 'update') {
+    const { parseSchedule } = await import('./core/scheduler.js');
+    try {
+      scheduleUpdate = readScheduleUpdate(rest, { validateSchedule: parseSchedule });
+    } catch (error) {
+      if (error instanceof ScheduleUpdateHelpRequested) {
+        console.log(`用法: ${SCHEDULE_UPDATE_USAGE}`);
+        return;
+      }
+      if (error instanceof ScheduleUpdateUsageError) {
+        console.error(`botmux schedule update: ${error.message}\n\n用法: ${SCHEDULE_UPDATE_USAGE}`);
+        process.exit(2);
+      }
+      throw error;
+    }
   }
   // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
   // writes to the right file even when invoked outside the daemon env.
@@ -9144,7 +9152,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const managedMutation = async (
     action: 'update' | 'remove' | 'pause' | 'resume' | 'run' | 'done',
     extra: Record<string, unknown> = {},
-  ): Promise<{ replay?: boolean }> => {
+  ): Promise<{ replay?: boolean; task?: ManagedScheduleUpdateReceipt }> => {
     let mutationAppId = mutationSession?.larkAppId ?? cliScopeAppId
       ?? scheduleStore.getScheduleScope() ?? undefined;
     if (!mutationSession) {
@@ -9182,23 +9190,43 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     } catch (error) {
       throw new Error(`无法连接当前 Bot daemon；未执行任何定时任务修改：${error instanceof Error ? error.message : String(error)}`);
     }
-    const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean };
+    const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean; task?: ManagedScheduleUpdateReceipt };
     if (!response.ok || body.ok !== true) {
       throw new Error(scheduleIpcErrorMessage(body.error) ?? body.error ?? `HTTP ${response.status}`);
     }
-    return { replay: body.replay === true };
+    return { replay: body.replay === true, ...(body.task && typeof body.task === 'object' ? { task: body.task } : {}) };
   };
 
   switch (sub) {
     case 'update': {
       // All task mutations commit through the owning daemon route. The update
-      // payload may carry prompt and/or work-calendar fields; the daemon still
-      // refuses canonical updates for delegated tasks and for tasks bound to a
-      // protected precondition (which the CLI cannot rebind).
-      const updates = readScheduleUpdate(rest);
+      // payload may carry frequency, prompt and/or work-calendar fields; the
+      // daemon still refuses canonical updates for delegated tasks, and commits
+      // the rest through the Dashboard's compound edit, which rebinds a
+      // protected precondition host-side.
+      const updates = scheduleUpdate!;
       if (!trustedRemoteRunnerRelay) await detectAuthenticatedCurrentSession('operate');
-      await managedMutation('update', updates);
+      const { task } = await managedMutation('update', { ...updates });
+      if (updates.schedule !== undefined && task?.schedule !== updates.schedule) {
+        // A daemon from before frequency edits ignores the field it does not
+        // know; never report a frequency change that did not happen.
+        console.error(`⚠️ 当前 Bot daemon 版本过旧，未修改执行频率${updates.prompt !== undefined || updates.calendar !== undefined || updates.calendarDayType !== undefined ? '（其余字段已更新）' : ''}；请先重启/升级 daemon 再改频率。`);
+        process.exit(1);
+      }
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
+      if (task) {
+        const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
+        console.log(`   频率: ${task.display && task.display !== task.schedule ? `${task.display}（${task.schedule}）` : task.schedule}`);
+        const nextLine = task.enabled
+          ? (task.nextRunAt ? fmt(task.nextRunAt) : '—')
+          : task.disabledReason === 'once_completed'
+            ? '任务已结束，不会自动执行'
+            : '任务已暂停，恢复后按此频率执行';
+        console.log(`   下次执行: ${nextLine}`);
+        if (task.enabled && task.calendar !== undefined) {
+          console.log(`   日历 ${task.calendar} 允许的下次执行: ${task.nextEligibleRunAt ? fmt(task.nextEligibleRunAt) : '—'}`);
+        }
+      }
       break;
     }
     case 'remove':
@@ -9265,8 +9293,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       }
       break;
     default:
-      console.error(`未知子命令: ${sub}\n可用: list | add | update | remove | pause | resume | run`);
-      process.exit(1);
+      console.error(`未知子命令: ${sub}\n\n用法:\n${SCHEDULE_HELP_BODY}`);
+      process.exit(2);
   }
 }
 
@@ -20381,7 +20409,16 @@ switch (command) {
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'preview': await cmdPreview(process.argv.slice(3)); break;
   case 'continuation': await cmdContinuation(process.argv.slice(3)); break;
-  case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'schedule': {
+    // A refused or failed schedule operation is reported as one line, not as
+    // the runtime's uncaught-error stack.
+    try { await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); }
+    catch (error) {
+      console.error(`botmux schedule: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
   case 'interaction-context': {
     try {
       const { parseInteractionContextCommand } = await import('./cli/interaction-context.js');

@@ -130,6 +130,7 @@ import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, principalLaneRoutingAnchorId, markRepoCardConsumed } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { agentManagedNoteSuffix } from '../services/agent-managed-config-note.js';
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
@@ -1412,7 +1413,8 @@ async function handleConfigCommand(
       if (!spec.clearable) { await reply(t('cmd.config.not_clearable', { field: spec.key }, loc)); return; }
       const r = await applyConfigField(larkAppId, spec, null);
       if (!r.ok) { await reply(configWriteFailureText(spec, r.reason, loc).text); return; }
-      await reply(t('cmd.config.unset_ok', { field: spec.key, old: r.oldText, effect: configEffectNote(r.effect, loc) }, loc));
+      await reply(t('cmd.config.unset_ok', { field: spec.key, old: r.oldText, effect: configEffectNote(r.effect, loc) }, loc)
+        + await agentManagedNoteSuffix(larkAppId, spec.key, loc));
       return;
     }
 
@@ -1491,7 +1493,8 @@ async function handleConfigCommand(
 
     const r = await applyConfigField(larkAppId, spec, value);
     if (!r.ok) { await reply(configWriteFailureText(spec, r.reason, loc).text); return; }
-    await reply(t('cmd.config.set_ok', { field: spec.key, old: r.oldText, new: r.newText, effect: configEffectNote(r.effect, loc) }, loc));
+    await reply(t('cmd.config.set_ok', { field: spec.key, old: r.oldText, new: r.newText, effect: configEffectNote(r.effect, loc) }, loc)
+      + await agentManagedNoteSuffix(larkAppId, spec.key, loc));
     return;
   }
 

@@ -734,12 +734,17 @@ async function mintJwts(openId: string, epoch: number, durableEpoch: number): Pr
   // every token cached for this person, regional ones included.
   if (!same && prior) forgetCachedJwts(openId);
   else if (!same) turnJwtCache.delete(openId);
+  // A cached token was JWT-shaped when stored (only claims-parsed tokens enter
+  // the cache below), so the whitespace guard protects fresh mints only.
   let cloudJwt = same ? reusable(prior.cloud) : undefined;
   if (!cloudJwt) {
     const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     cloudJwt = cloud.stdout.trim();
-    if (!cloud.ok || !cloudJwt) {
+    // A JWT never contains whitespace. Anything else on stdout (an auto-upgrade
+    // notice, a half-installed package's stack trace) would otherwise be injected
+    // verbatim as the person's token and every call would read "not logged in".
+    if (!cloud.ok || !cloudJwt || /\s/.test(cloudJwt)) {
       throw new BytedcliAuthUnavailableError('mint personal JWT');
     }
   }
@@ -749,7 +754,8 @@ async function mintJwts(openId: string, epoch: number, durableEpoch: number): Pr
   if (!codeJwt) {
     const code = await runAsUser(openId, ['auth', 'get-codebase-jwt-token']);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
-    codeJwt = code.ok ? code.stdout.trim() : '';
+    const mintedCodeJwt = code.ok ? code.stdout.trim() : '';
+    codeJwt = /\s/.test(mintedCodeJwt) ? '' : mintedCodeJwt;
   }
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);

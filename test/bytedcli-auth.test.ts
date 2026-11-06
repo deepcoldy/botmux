@@ -635,6 +635,29 @@ describe('authorization loop regressions', () => {
     expect(calls).toEqual([]);
   });
 
+  // Seen live while bytedcli upgraded itself mid-call: stdout carried a notice
+  // (or a stack trace) next to the token. Injecting that as the JWT makes every
+  // call in the turn read "not logged in", so the mint must fail as transient.
+  it.each([
+    '✓ bytedcli global package auto-upgraded: 0.185.0 -> 0.186.0.\ncloud.jwt.value\n',
+    'cloud.jwt.value\nReload bytedcli-related agent skills in existing sessions.\n',
+    'cloud.jwt value\n',
+  ])('refuses a ByteCloud JWT mixed with other output: %j', async stdout => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    replies = [{ code: 0, stdout }, { code: 0, stdout: 'code.jwt.value\n' }];
+    await expect(mod.mintBytedcliJwts(ALICE)).rejects.toThrow('service unavailable');
+  });
+
+  it('drops a Codebase JWT mixed with other output but keeps the ByteCloud identity', async () => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    replies = [
+      { code: 0, stdout: 'cloud.jwt.value\n' },
+      { code: 0, stdout: 'Update available\ncode.jwt.value\n' },
+      { code: 1 }, { code: 1 }, { code: 1 },
+    ];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt.value' });
+  });
+
   it('reports a failed JWT mint as unavailable instead of asking for another login', async () => {
     const mod = await fresh(); authorize(mod, ALICE);
     replies = [{ code: 1, stderr: 'network down' }];
@@ -872,5 +895,42 @@ describe('mintBytedcliJwts — reuse across turns, never past an authority chang
     replies = [{ code: 0, stdout: `${again}\n` }, { code: 0, stdout: `${token('', 86400, 'b')}\n` }, ...noRegional()];
     expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe(again);
     expect(calls).toHaveLength(5);
+  });
+
+  it('refuses a polluted ByteCloud mint without poisoning the cache, then re-mints clean next turn', async () => {
+    const mod = await fresh();
+    loggedIn(mod, ALICE);
+    // Turn 1: an upgrade notice rides along on stdout. The throw happens before
+    // the Codebase/regional calls and before the only cache write, so the
+    // polluted string can neither be published nor cached.
+    replies = [{ code: 0, stdout: `✓ bytedcli global package auto-upgraded\n${token('cn', 7200, 'polluted')}\n` }];
+    await expect(mod.mintBytedcliJwts(ALICE)).rejects.toThrow('service unavailable');
+    // Turn 2: same login, nothing cached — a full mint runs and succeeds.
+    calls.length = 0;
+    const clean = token('cn', 7200, 'clean');
+    const code = token('', 86400, 'k1');
+    replies = [{ code: 0, stdout: `${clean}\n` }, { code: 0, stdout: `${code}\n` }, ...noRegional()];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: clean, codeJwt: code });
+    expect(mintedArgs()).toContain('auth get-bytecloud-jwt-token');
+  });
+
+  it('drops a polluted Codebase mint without caching it; next turn reuses cloud and re-mints only code', async () => {
+    const mod = await fresh();
+    loggedIn(mod, ALICE);
+    const cloud = token('cn', 7200, 'c1');
+    // Turn 1: clean cloud (cached), polluted code (dropped, not cached).
+    replies = [
+      { code: 0, stdout: `${cloud}\n` },
+      { code: 0, stdout: `Update available\n${token('', 86400, 'polluted')}\n` },
+      ...noRegional(),
+    ];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: cloud });
+    // Turn 2: cloud comes from the cache and the regions keep their definite
+    // miss; only the Codebase token is asked for again, now clean.
+    calls.length = 0;
+    const code = token('', 86400, 'k2');
+    replies = [{ code: 0, stdout: `${code}\n` }];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: cloud, codeJwt: code });
+    expect(mintedArgs()).toEqual(['auth get-codebase-jwt-token']);
   });
 });

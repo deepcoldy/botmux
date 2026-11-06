@@ -156,6 +156,7 @@ import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
 import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
+import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -183,6 +184,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
+import { applyRespawnConfigPatch } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
@@ -719,6 +721,7 @@ import {
   type TraexModelLoadSnapshot,
 } from './services/traex-model-load.js';
 import { readTraexModelQuotas, TRAEX_QUOTA_ERROR_CODE } from './services/traex-quota.js';
+import { TRAEX_MODEL_ACCESS_ERROR_CODE } from './services/traex-model-access.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
@@ -2237,6 +2240,8 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
  *  (non-forced) config, so healthy restarts (e.g. user `/restart`) are
  *  unaffected. */
 let consecutiveInWorkerRestarts = 0;
+/** The last CLI exit was the tmux server being lost, not the CLI (see restart-fresh-budget.ts). */
+let lastCliExitServerReplaced = false;
 let tmuxRestartTimer: NodeJS.Timeout | null = null;
 /** Guard: user_notify for "resume → fresh fallback" is sent once per worker
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
@@ -3170,7 +3175,12 @@ let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let traexAutoModelController: TraexAutoModelController | null = null;
 let traexAutoModelSwitching = false;
 let traexAutoModelTurnReplayForbidden = false;
-let traexQuotaPending: { turnId: string; failedTurn?: CodexPendingTurn } | undefined;
+type TraexPendingRecovery = { turnId: string; failedTurn?: CodexPendingTurn; stopRequested?: boolean };
+let traexQuotaPending: TraexPendingRecovery | undefined;
+let traexModelAccessSwitchNotice: {
+  action: Extract<TraexAutoModelAction, { kind: 'switch' }>;
+  nativeSessionId: string;
+} | undefined;
 let traexAutoModelPreflightPending: { item: PendingCliInput; generation: number; startedAtMs: number } | undefined;
 let traexAutoModelReasoningEfforts = new Map<string, readonly import('./services/codex-reasoning-effort.js').CodexReasoningEffort[]>();
 
@@ -5518,6 +5528,9 @@ function configureTraexAutoModel(
     cfg.codexRpcInput = false;
     if (lastInitConfig) lastInitConfig.codexRpcInput = false;
   }
+  if (!restoreRuntime || traexModelAccessSwitchNotice?.nativeSessionId !== cfg.cliSessionId) {
+    traexModelAccessSwitchNotice = undefined;
+  }
   traexAutoModelController = managedAuto && cfg.traexAutoModel
     ? new TraexAutoModelController(cfg.traexAutoModel, restoreRuntime, sharedSettings)
     : null;
@@ -5620,6 +5633,28 @@ function enqueueTraexAutoModelRecovery(turnId: string): boolean {
   return true;
 }
 
+/** A proposed restart is not proof that a candidate is executing or queued. */
+function notifyTraexModelAccessSwitchActivity(turnId: string, queued: boolean, progressing: boolean, completed = false): void {
+  const notice = traexModelAccessSwitchNotice;
+  if (!notice || (!queued && !progressing) || !backend
+    || (!completed && (cliRestartInProgress || traexAutoModelSwitching))
+    || notice.action.turnId !== turnId || currentBotmuxTurnId !== turnId
+    || notice.nativeSessionId !== lastInitConfig?.cliSessionId
+    || notice.action.toModel !== traexAutoModelController?.currentModel()
+    || (!queued && !completed && !traexAutoModelController.modelProgressConfirmed())) return;
+  traexModelAccessSwitchNotice = undefined;
+  const action = notice.action;
+  const waiting = traexAutoModelController!.runtimeState(notice.nativeSessionId).waitingOnFinalModel;
+  const threshold = traexAutoModelController!.config.overloadThresholdPercent
+    ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+  send({ type: 'user_notify', turnId, message: t(queued
+    ? waiting ? 'worker.traex_auto_model.access_wait' : 'worker.traex_auto_model.access_queued_model'
+    : !waiting && action.loadPercent !== undefined && action.loadPercent <= threshold
+      ? 'worker.traex_auto_model.access_available_model' : 'worker.traex_auto_model.access_selected_model', {
+    fromModel: action.fromModel, toModel: action.toModel, model: action.toModel, load: action.loadPercent ?? '?',
+  }) });
+}
+
 function executeTraexAutoModelSwitch(
   action: Extract<TraexAutoModelAction, { kind: 'switch' }>,
   opts: { resumeCurrentTurn: boolean; dispatchAttempt?: number },
@@ -5651,7 +5686,12 @@ function executeTraexAutoModelSwitch(
     || action.reason === 'preflight_lowest_load'
     ? action as Extract<TraexAutoModelPreflightDecision, { kind: 'switch' }>
     : undefined;
-  send({
+  if (action.restrictionRecovery) {
+    traexModelAccessSwitchNotice = { action, nativeSessionId };
+    send({ type: 'user_notify', turnId: action.turnId, message: t('worker.traex_auto_model.access_search', {
+      fromModel: action.fromModel, toModel: action.toModel,
+    }) });
+  } else send({
     type: 'user_notify',
     turnId: action.turnId,
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
@@ -5713,7 +5753,7 @@ function executeTraexAutoModelSwitch(
 function observeTraexAutoModelCapacity(screen: string): void {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()) return;
-  if (traexAutoModelSwitching || cliRestartInProgress || isFlushing
+  if (traexAutoModelSwitching || cliRestartInProgress || isFlushing || traexQuotaPending
     || isPromptReady || traexAutoModelTurnReplayForbidden
     || !lastInitConfig?.cliSessionId) return;
 
@@ -5725,13 +5765,18 @@ function observeTraexAutoModelCapacity(screen: string): void {
   }
   const awaitingActivity = controller.awaitingModelActivity();
   const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
+  const queued = traexCapacityQueueVisible(screen);
   const action = controller.observeCapacityQueue({
     turnId: active.turnId,
-    queued: traexCapacityQueueVisible(screen),
+    queued,
     nowMs: Date.now(),
     queuePosition: traexCapacityQueuePosition(screen),
     progressing,
   });
+  if (queued && controller.modelAccessRecoveryActive()) {
+    publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig.reasoningEffort });
+  }
+  if (traexModelAccessSwitchNotice && active.turnId) notifyTraexModelAccessSwitchActivity(active.turnId, queued, progressing);
   if (awaitingActivity && !controller.awaitingModelActivity() && progressing) {
     void flushPending();
   }
@@ -5753,7 +5798,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
         || !active?.started || active.turnId !== action.turnId
         || active.dispatchAttempt !== undefined || isPromptReady
         || currentBotmuxTurnId !== action.turnId || commandLineWritesPending > 0
-        || isFlushing || traexAutoModelTurnReplayForbidden) {
+        || isFlushing || traexQuotaPending || controller.recoveryStopped(action.turnId)
+        || traexAutoModelTurnReplayForbidden) {
         // A rejected reply must not strand the controller's pending check.
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
         return;
@@ -5764,7 +5810,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
       else if (choice.kind === 'exhausted') {
         publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
         send({ type: 'user_notify', turnId: choice.turnId,
-          message: t('worker.traex_auto_model.lowest_load_hold', {
+          message: t(choice.restrictionRecovery ? 'worker.traex_auto_model.access_wait'
+            : 'worker.traex_auto_model.lowest_load_hold', {
             model: choice.model, load: choice.loadPercent ?? '?',
           }) });
       } else {
@@ -5781,7 +5828,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
     send({
       type: 'user_notify',
       turnId: action.turnId,
-      message: t('worker.traex_auto_model.exhausted', {
+      message: t(action.restrictionRecovery ? 'worker.traex_auto_model.access_wait'
+        : 'worker.traex_auto_model.exhausted', {
         count: action.modelCount,
         model: action.model,
       }),
@@ -5938,35 +5986,55 @@ function selectTraexQuotaModelBeforeTurn(head: PendingCliInput): boolean {
   return true;
 }
 
-/** Hold a confirmed quota terminal before it is settled. The same native
- * session and ordinary turn must still own the result after async IO. */
+/** Hold only confirmed quota/access failures before settlement. The same
+ * native session and ordinary turn must still own recovery after async IO. */
 function recoverTraexQuotaTurn(turn: CodexPendingTurn): boolean {
   const controller = traexAutoModelController;
   const active = activeTurnAuthority.snapshot();
-  if (!traexAutoModelRuntimeEligible() || controller?.config.trigger !== 'quota'
-    || turn.terminalStatus !== 'failed' || turn.terminalErrorCode !== TRAEX_QUOTA_ERROR_CODE
+  const accessFailure = turn.terminalErrorCode === TRAEX_MODEL_ACCESS_ERROR_CODE;
+  const capacityRecovery = accessFailure || (turn.terminalErrorCode === TRAEX_QUOTA_ERROR_CODE
+    && controller?.modelAccessRecoveryActive() === true);
+  if (!controller || !traexAutoModelRuntimeEligible()
+    || (!capacityRecovery && (controller.config.trigger !== 'quota' || turn.terminalErrorCode !== TRAEX_QUOTA_ERROR_CODE))
+    || turn.terminalStatus !== 'failed'
     || turn.isLocal || turn.dispatchAttempt !== undefined || turn.supersededTurns?.length
     || !turn.sourceTurnId || !lastInitConfig?.cliSessionId
     || traexAutoModelTurnReplayForbidden || traexAutoModelSwitching || cliRestartInProgress
     || !active?.started || active.turnId !== turn.turnId || active.dispatchAttempt !== undefined
-    || currentBotmuxTurnId !== turn.turnId || controller.currentTurnId() !== turn.turnId) return false;
+    || currentBotmuxTurnId !== turn.turnId || controller.currentTurnId() !== turn.turnId
+    || controller.recoveryStopped(turn.turnId)) return false;
   if (traexQuotaPending) return traexQuotaPending.turnId === turn.turnId;
-  const token = { turnId: turn.turnId, failedTurn: turn };
+  const token: TraexPendingRecovery = { turnId: turn.turnId, failedTurn: turn };
   const generation = cliSpawnGeneration;
   const nativeSessionId = lastInitConfig.cliSessionId;
+  const target = backend;
   traexQuotaPending = token;
-  void currentTraexQuotas().catch(() => null).then(quotas => {
-    if (traexQuotaPending !== token) return;
+  if (capacityRecovery) {
+    // Invalidate older capacity proposals and persist the refusal before IO.
+    controller.recordUnavailableModel(turn.turnId);
+    publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig.reasoningEffort });
+    if (traexModelAccessSwitchNotice?.action.turnId === turn.turnId) traexModelAccessSwitchNotice = undefined;
+  }
+  const evidence = capacityRecovery
+    ? currentTraexLoadSnapshot(TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS).catch(() => null)
+      .then(snapshot => ({ kind: 'access' as const, snapshot }))
+    : currentTraexQuotas().catch(() => null).then(quotas => ({ kind: 'quota' as const, quotas }));
+  void evidence.then(result => {
+    if (traexQuotaPending !== token || token.stopRequested) return;
     traexQuotaPending = undefined;
     const active = activeTurnAuthority.snapshot();
-    if (generation !== cliSpawnGeneration || lastInitConfig?.cliSessionId !== nativeSessionId
+    if (generation !== cliSpawnGeneration || backend !== target || lastInitConfig?.cliSessionId !== nativeSessionId
       || !active?.started || active.turnId !== turn.turnId) return;
     if (controller === traexAutoModelController && traexAutoModelRuntimeEligible()
-      && !traexAutoModelTurnReplayForbidden) {
-      const action = controller.observeQuotaFailure(turn.turnId, quotas);
+      && !traexAutoModelTurnReplayForbidden && !cliRestartInProgress && !traexAutoModelSwitching) {
+      if (result.kind === 'access') rememberTraexModelLoadSnapshot(result.snapshot);
+      const action = result.kind === 'access'
+        ? controller.observeModelAccessFailure(turn.turnId, result.snapshot?.loads ?? null)
+        : controller.observeQuotaFailure(turn.turnId, result.quotas);
       publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
       if (action.kind === 'switch' && executeTraexAutoModelSwitch(action, { resumeCurrentTurn: true })) return;
-      if (action.kind === 'exhausted') turn.terminalErrorSummary = t('worker.traex_auto_model.quota_exhausted');
+      if (action.kind === 'exhausted') turn.terminalErrorSummary = t(capacityRecovery
+        ? 'worker.traex_auto_model.access_exhausted' : 'worker.traex_auto_model.quota_exhausted');
     }
     emitReadyCodexTurns([turn]);
     idleDetector?.fireIdle();
@@ -13773,6 +13841,9 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
+    if (turnOutcome === 'answered' && traexModelAccessSwitchNotice) {
+      notifyTraexModelAccessSwitchActivity(turn.turnId, false, true, true);
+    }
     notifyExplicitRepliesObserved(
       turn.turnId,
       attributableExplicitReplyMarkersForTurnWindow(
@@ -15388,6 +15459,30 @@ function retireDoubaoBridgeTurnOnInterrupt(turnId: string | undefined, dispatchA
   return true;
 }
 
+function holdTraexRecoveryForStop(turnId: string | undefined): void {
+  if (!turnId) return;
+  const pending = traexQuotaPending;
+  if (pending?.failedTurn && pending.turnId === turnId) {
+    pending.stopRequested = true;
+    // This native turn already failed; do not replay it if key delivery retries.
+    inflightInputs.retireTurn(turnId);
+    for (let i = pendingMessages.length - 1; i >= 0; i--) {
+      if (pendingMessages[i]!.turnId === turnId && pendingMessages[i]!.traexAutoModelRecovery) pendingMessages.splice(i, 1);
+    }
+  }
+  if (traexAutoModelController?.requestRecoveryStop?.(turnId)) {
+    publishActiveRuntime({ model: traexAutoModelController.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
+  }
+  if (traexModelAccessSwitchNotice?.action.turnId === turnId) traexModelAccessSwitchNotice = undefined;
+}
+
+function settleStoppedTraexRecovery(turnId: string | undefined): void {
+  const pending = traexQuotaPending;
+  if (!turnId || !pending?.failedTurn || pending.turnId !== turnId || !pending.stopRequested) return;
+  traexQuotaPending = undefined;
+  emitReadyCodexTurns([pending.failedTurn]);
+}
+
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (nativeSessionForkPending()) return;
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
@@ -15408,6 +15503,11 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     return;
   }
   if (!backend) return;
+  const criticalInterrupt = isCriticalInterruptKey(key);
+  if (criticalInterrupt && (traexQuotaPending?.failedTurn
+    || (requestedKey === 'ctrlc' && traexAutoModelController))) {
+    holdTraexRecoveryForStop(currentBotmuxTurnId);
+  }
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
@@ -15441,7 +15541,6 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // Any non-scroll key cancels active scroll first so the live view returns.
   if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
 
-  const criticalInterrupt = isCriticalInterruptKey(key);
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(
@@ -15483,6 +15582,8 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
         }),
       });
     }
+    // The failed native turn can settle without claiming the stop key arrived.
+    if (criticalInterrupt && traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(currentBotmuxTurnId);
     // Refresh the card from real output, but do not clear prompt blocking or
     // claim that the CLI stopped when the key never reached it.
     scheduleOneShotAfterAction();
@@ -15491,11 +15592,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // The provider has already ended a quota-failed turn, so Ctrl-C may not
   // produce another native terminal. A confirmed user stop must revoke the
   // pending recovery itself rather than waiting for that nonexistent event.
-  if (criticalInterrupt && traexQuotaPending?.failedTurn) {
-    const failedTurn = traexQuotaPending.failedTurn;
-    traexQuotaPending = undefined;
-    emitReadyCodexTurns([failedTurn]);
-  }
+  if (criticalInterrupt && traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(currentBotmuxTurnId);
   // A delivered ctrlc is an explicit STOP (card ⏹ / ^C quick key / `/stop`):
   // retire doubao's record-less interrupted mark, the same retirement
   // handleExactTurnInterrupt runs for an exact-turn stop. A bare terminal
@@ -15547,6 +15644,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'unsupported' });
     return;
   }
+  if (traexQuotaPending?.failedTurn || traexAutoModelController) holdTraexRecoveryForStop(turnId);
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
@@ -15574,6 +15672,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
+  if (traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(turnId);
   if (delivered) {
     // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
     // only this exact turn BEFORE acknowledging interruption to the daemon;
@@ -28020,6 +28119,10 @@ async function spawnCli(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    lastCliExitServerReplaced = exitMarksServerReplaced({
+      intentionalRestart,
+      backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
+    });
     if (codexAutoUpgrade) {
       backend = null;
       isPromptReady = false;
@@ -28644,10 +28747,15 @@ async function restartCliProcess(
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
+    // This restart is abandoned; the server-loss marker must not survive to be
+    // consumed by a later, unrelated restart.
+    lastCliExitServerReplaced = false;
     codexAutoUpgrade.reject?.(new Error(reason));
     return;
   }
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
+    // Adopt workers never restart in place; no restart consumes the marker.
+    lastCliExitServerReplaced = false;
     log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
   }
@@ -28679,9 +28787,15 @@ async function restartCliProcess(
   // adapter probing is still re-run on every spawn. skipRestartBudget（角色
   // 切换的 cwd-move respawn）不计入：那是用户主动迁移不是崩溃恢复，计进去
   // 会让「切角色 + 一次无关重启」无故触发强制 FRESH 丢上下文。
-  if (!opts.skipRestartBudget) {
+  // 上一次退出是整个 tmux server 丢失（另一个 server 接管了 socket）时同样不计：
+  // CLI 本身没有失败，计进去会让 server 重建期间的二次波及把会话打成 FRESH。
+  const previousExitServerReplaced = lastCliExitServerReplaced;
+  lastCliExitServerReplaced = false;
+  if (restartSpendsFreshBudget({ skipRestartBudget: opts.skipRestartBudget, previousExitServerReplaced })) {
     consecutiveInWorkerRestarts++;
     log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  } else if (previousExitServerReplaced) {
+    log(`Restart count stays ${consecutiveInWorkerRestarts}: previous exit was a tmux server loss, not a CLI failure`);
   }
   const restart = async (): Promise<void> => {
     try {
@@ -31252,6 +31366,7 @@ function emitTurnTerminal(
 ): void {
   if (!sessionId || !turnId) return;
   if (traexQuotaPending?.turnId === turnId) traexQuotaPending = undefined;
+  if (traexModelAccessSwitchNotice?.action.turnId === turnId) traexModelAccessSwitchNotice = undefined;
   cancelSubmitFailureChainForTerminal(
     submitFailureChains,
     { turnId, dispatchAttempt },
@@ -32252,11 +32367,18 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
       // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
       // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
-      if (msg.model !== undefined && lastInitConfig) {
-        lastInitConfig.model = msg.model === null ? undefined : msg.model;
-      }
-      if (msg.larkToolBinding !== undefined && lastInitConfig) {
-        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      // startupCommands / launchShell 同理，但只在**真的 parked**（下面那条恢复重启
+      // 即将执行）时才收：daemon 的 crashDiagnosticParked 在 worker 内恢复后不会清
+      // （只有 refork 的 ready 才清），之后每条消息都还捎带；而 runStartupCommands
+      // 在当前 spawn 的启动序列里实时读 lastInitConfig.startupCommands——若在启动
+      // 命令待确认时被换掉，正在跑的 CLI 会拿新列表配旧游标，两份都敲不全。
+      const parkedRespawnPending = !backend && crashDiagnosticStopped && !lastInitConfig?.adoptMode;
+      if (lastInitConfig) {
+        applyRespawnConfigPatch(lastInitConfig, {
+          model: msg.model,
+          larkToolBinding: msg.larkToolBinding,
+          ...(parkedRespawnPending ? { startupCommands: msg.startupCommands, launchShell: msg.launchShell } : {}),
+        });
       }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
@@ -32709,45 +32831,33 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
       // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
-      if (msg.updateWorkingDir && lastInitConfig) {
-        lastInitConfig.workingDir = msg.updateWorkingDir;
-      }
-      // per-bot env 热更：daemon 发 restart 时捎带 bots.json `env` 的最新值
-      // （live-worker restart 不 refork，没有 init 重发这条通道），respawn 前
-      // 全量覆盖 lastInitConfig.env —— spawnCli 的 botInjectedEnv(cfg.env, cfg.envPolicy)
-      // 每次 spawn 都重跑，覆盖即在重启出的 CLI 上生效。undefined=不携带（旧
-      // daemon / 兜底）保持快照；null=dashboard 已清空 → 移除快照。与上面的
-      // cwd merge 一样放在合并守卫之前：被合并的重复 restart 也应带走 env
-      // 更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
-      if (msg.env !== undefined && lastInitConfig) {
-        lastInitConfig.env = msg.env === null ? undefined : msg.env;
-      }
-      // Session-env removals + fingerprint ride the same channel and tri-state.
-      if (msg.envUnset !== undefined && lastInitConfig) {
-        lastInitConfig.envUnset = msg.envUnset === null ? undefined : msg.envUnset;
-      }
-      if (msg.envFingerprint !== undefined && lastInitConfig) {
-        lastInitConfig.envFingerprint = msg.envFingerprint;
-      }
-      // model 热更，与 env 同一条通道、同一套三分态。model 不进冻结集合、每次
-      // spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），但 live-worker
-      // restart 不 refork，没有 init 重发这条通道——不覆盖的话，改完模型再重启
-      // 起来的还是快照里的旧模型。undefined=不携带（旧 daemon / 取不到）保持快照；
-      // null=当前不该传模型（bot 未配 / 已清空）→ 移除快照。同样放在合并守卫之前。
-      if (msg.model !== undefined && lastInitConfig) {
-        lastInitConfig.model = msg.model === null ? undefined : msg.model;
-      }
-      if (lastInitConfig && msg.codexRpcInput !== undefined) {
-        lastInitConfig.codexRpcInput = msg.codexRpcInput;
-      }
-      if (lastInitConfig && msg.traexAutoModel !== undefined) {
-        lastInitConfig.traexAutoModel = msg.traexAutoModel ?? undefined;
-        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
-      } else if (lastInitConfig && msg.codexRpcInput !== undefined) {
-        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
-      }
-      if (msg.larkToolBinding !== undefined && lastInitConfig) {
-        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      // 合并顺序约束：以下热更字段都放在合并守卫之前——被合并的重复 restart 也应
+      // 带走更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
+      //  - workingDir：角色切换 cwd-move respawn 先收敛目录（旧桶 transcript 由
+      //    resume 预检 syncClaudeResumeTargetToCwd 接住）。
+      //  - env / envUnset / envFingerprint、model、traexAutoModel、codexRpcInput、
+      //    larkToolBinding、startupCommands、launchShell：live-worker restart 不
+      //    refork，没有 init 重发这条通道；不覆盖的话，改完 Bot 配置再重启起来的
+      //    还是 fork 时的旧快照（startupCommands 曾因此重放旧的 /effort）。
+      //    三分态：undefined = 不携带（旧 daemon / 取不到）保持快照；null = 明确清空。
+      //  语义与不可覆盖项（/rename、per-session 冻结选择）见 core/respawn-config-patch.ts。
+      if (lastInitConfig) {
+        const patched = applyRespawnConfigPatch(lastInitConfig, {
+          workingDir: msg.updateWorkingDir,
+          env: msg.env,
+          envUnset: msg.envUnset,
+          envFingerprint: msg.envFingerprint,
+          model: msg.model,
+          codexRpcInput: msg.codexRpcInput,
+          traexAutoModel: msg.traexAutoModel,
+          larkToolBinding: msg.larkToolBinding,
+          startupCommands: msg.startupCommands,
+          launchShell: msg.launchShell,
+        });
+        if (patched.traexReconfigure) configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
+        if (patched.startupCommandsChanged) {
+          log(`Startup commands updated from current bot config for the next spawn (${lastInitConfig.startupCommands?.length ?? 0} command(s))`);
+        }
       }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、

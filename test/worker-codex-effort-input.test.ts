@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
+import { isCriticalInterruptKey } from '../src/adapters/backend/critical-control-key.js';
 import { hasEmptyCodexComposer, parseCodexEffortMenu } from '../src/utils/codex-effort-menu.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 
@@ -19,8 +20,14 @@ function evaluate<T>(name: string, state: Record<string, any>): T {
 }
 
 describe('Codex effort menu input ownership', () => {
-  it.each(['handleTuiKeys', 'handleTuiTextInput', 'handleTermAction'])(
-    '%s never forwards input to a CLI replaced during menu cancellation', async name => {
+  it.each([
+    { name: 'handleTuiKeys', args: [['Enter'], true] },
+    { name: 'handleTuiTextInput', args: [['Enter'], 'user input'] },
+    { name: 'handleTermAction', args: ['enter'] },
+    { name: 'handleTermAction', args: ['ctrlc'] },
+    { name: 'handleTermAction', args: ['esc'] },
+  ])(
+    '$name ($args) never forwards input to a CLI replaced during menu cancellation', async ({ name, args }) => {
       let release!: () => void;
       const cancelled = new Promise<void>(resolve => { release = resolve; });
       const state = {
@@ -28,9 +35,10 @@ describe('Codex effort menu input ownership', () => {
         backend: {}, cliAdapter: {}, cliLifetimeNonce: 1,
         codexCliEffortOperation: {}, cancelCodexCliEffort: vi.fn(() => cancelled),
         effectiveBackendType: 'pty', isRemoteBackendType: () => false,
+        isCriticalInterruptKey, traexQuotaPending: undefined, traexAutoModelController: null,
       };
       const handler = evaluate<(...args: any[]) => Promise<unknown>>(name, state);
-      const result = handler(...(name === 'handleTermAction' ? ['enter'] : [['Enter'], 'user input']));
+      const result = handler(...args);
       expect(state.cancelCodexCliEffort).toHaveBeenCalledOnce();
       // No replacement write functions are supplied: reaching one fails the test.
       state.backend = {};
