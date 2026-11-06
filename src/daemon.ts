@@ -407,6 +407,7 @@ import {
 } from './core/dispatch-output-sink.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
+import { applyManagedScheduleUpdate, readManagedScheduleUpdate } from './core/schedule-managed-update.js';
 import {
   buildUntilDoneRunPrompt,
   isAutoCompletedSchedule,
@@ -9737,9 +9738,6 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (action === 'update' && authority.kind === 'delegated') {
     return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_reauthorization_required' });
   }
-  if (action === 'update' && authority.task.preconditionRef) {
-    return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
-  }
   // A capability-only caller borrows the current human administrator's
   // authority, but the request bytes come from the (untrusted) agent. Keep it
   // to the tasks this conversation could have created: same chat, and a
@@ -9773,29 +9771,17 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     });
   }
   if (action === 'update') {
-    const hasPrompt = typeof body.prompt === 'string' && body.prompt.trim();
-    const hasCalendar = body.calendar !== undefined || body.calendarDayType !== undefined;
-    if (!hasPrompt && !hasCalendar) {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_update' });
-    }
-    if (body.prompt !== undefined && !hasPrompt) {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_prompt' });
-    }
-    if (body.calendar !== undefined && body.calendar !== null && typeof body.calendar !== 'string') {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_calendar' });
-    }
-    if (body.calendarDayType !== undefined
-      && body.calendarDayType !== 'workday' && body.calendarDayType !== 'restday') {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_calendar_day_type' });
-    }
-    const result = scheduler.updateTask(id, {
-      ...(hasPrompt ? { prompt: body.prompt } : {}),
-      ...(body.calendar !== undefined ? { calendar: body.calendar } : {}),
-      ...(body.calendarDayType !== undefined ? { calendarDayType: body.calendarDayType } : {}),
-    });
-    ok = result.ok;
-    error = result.error;
-  } else if (action === 'remove') ok = scheduler.removeTask(id);
+    // Same compound operation as the Dashboard PATCH: a changed schedule is
+    // re-parsed with nextRunAt recomputed from now, and a configured
+    // precondition is kept and rebound to the edited task input.
+    const parsedUpdate = readManagedScheduleUpdate(body);
+    if (!parsedUpdate.ok) return jsonRes(res, 400, { ok: false, error: parsedUpdate.error });
+    const result = applyManagedScheduleUpdate(id, appId, parsedUpdate.updates);
+    return result.ok
+      ? jsonRes(res, 200, { ok: true, task: result.task })
+      : jsonRes(res, 409, { ok: false, error: result.error });
+  }
+  if (action === 'remove') ok = scheduler.removeTask(id);
   else if (action === 'pause') ok = scheduler.disableTask(id);
   else if (action === 'resume') ok = scheduler.enableTask(id);
   else if (action === 'run') {

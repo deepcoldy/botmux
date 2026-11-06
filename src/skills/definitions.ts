@@ -67,16 +67,18 @@ prompt 是到点时会被执行的内容，就像用户新开一个话题向你�
 botmux schedule list
 \`\`\`
 
-### 修改提示词
+### 修改任务（频率 / 提示词 / 日历）
 
-修改已有任务的 prompt 必须原地更新，不要先删除再创建：
+修改已有任务必须原地更新，不要先删除再创建（删了重建会丢掉任务 ID、执行记录和前置条件）：
 
 \`\`\`
+botmux schedule update <id> --schedule "every 4h"          # 改执行频率，写法同 schedule add
 botmux schedule update <id> --prompt-file <UTF-8 文件路径>
 botmux schedule update <id> --prompt "新的完整提示词"
+botmux schedule update <id> --schedule "0 9 * * 1-5" --prompt-file <文件>   # 可组合
 \`\`\`
 
-两种输入方式只能选一种。更新成功保留任务 ID、执行时间、启停状态、每次新话题设置和运行记录；已开始的执行沿用原 prompt，后续执行使用新版，不会自动补跑。文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 时先升级，不要把修改降级为先删后建。若提示任务绑定了守护前置条件（precondition），说明该任务只能在 Dashboard 修改，不要删除重建，告知用户去 Dashboard 的定时任务页编辑。
+\`--schedule\` 的写法与 \`schedule add\` 完全相同（上面的表格）；改频率后按新频率从现在起重新计算下次执行时间，不补跑、不立即触发，输出里会显示新规则和下次执行时间；任务正在执行时改频率会被拒绝（schedule_run_in_flight），等这次执行结束再改即可，不要删除重建。\`--prompt\` 与 \`--prompt-file\` 只能选一种。更新成功保留任务 ID、静默设置、执行位置、前置条件（precondition）、日历规则、创建人身份、启停状态和运行记录；已开始的执行沿用原配置，后续执行使用新版。频率解析失败、文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 或不认 \`--schedule\` 时先升级，不要把修改降级为先删后建。完整字段见 \`botmux schedule update --help\`。
 
 ### 管理
 
