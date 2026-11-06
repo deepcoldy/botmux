@@ -11,12 +11,168 @@
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type { CodexBridgeEvent } from './codex-transcript.js';
 
 const HERMES_STATE_DB = join(homedir(), '.hermes', 'state.db');
 const CONTENT_JSON_PREFIX = String.fromCharCode(0) + 'json:';
+
+// Keep lookup beneath a pinned home/pastes directory, not a path supplied by
+// transcript text. Python is already required by this reader; dir_fd gives
+// POSIX openat semantics without adding a native dependency. Unsupported hosts
+// fail closed. Recovery is one-pass and all-or-nothing per user, with budgets
+// independent of the queue's attribution leases.
+const PASTE_RECOVERY_SCRIPT = String.raw`
+import json, os, re, stat, sys
+
+REF = re.compile(r'\[Pasted text #([1-9][0-9]{0,8}): ([1-9][0-9]{0,6}) lines → ([^\]\r\n\x00]+)\]')
+NAME = re.compile(r'paste_([1-9][0-9]{0,8})_([01][0-9]|2[0-3])[0-5][0-9][0-5][0-9]\.txt')
+FILE_CAP = 1024 * 1024
+USER_CAP = 4 * FILE_CAP
+DRAIN_CAP = 8 * FILE_CAP
+ATTEMPT_CAP = 128
+used = attempts = 0
+
+def owned(info, directory=False):
+    kind = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    return kind and info.st_uid == os.getuid() and not (info.st_mode & 0o022) and (directory or info.st_nlink == 1)
+
+def identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_uid,
+            info.st_nlink, info.st_mtime_ns, info.st_ctime_ns)
+
+def paste_directory(home):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(os.sep, flags)
+    try:
+        # Canonicalize the trusted configured home only, never a reference path.
+        # Each subsequent component is opened relative to the previous FD.
+        for component in os.path.realpath(home).split(os.sep):
+            if not component:
+                continue
+            child = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if not owned(os.fstat(fd), True):
+            raise ValueError('untrusted home')
+        child = os.open('pastes', flags, dir_fd=fd)
+        os.close(fd)
+        fd = child
+        if not owned(os.fstat(fd), True):
+            raise ValueError('untrusted paste directory')
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+def read_paste(directory, name):
+    global used, attempts
+    attempts += 1
+    if attempts > ATTEMPT_CAP or used >= DRAIN_CAP:
+        raise ValueError('read budget')
+    before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    cap = min(FILE_CAP, DRAIN_CAP - used)
+    if not owned(before) or before.st_size > cap:
+        raise ValueError('untrusted file')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fd = os.open(name, flags, dir_fd=directory)
+    try:
+        if identity(os.fstat(fd)) != identity(before):
+            raise ValueError('replaced file')
+        data = bytearray()
+        while len(data) <= cap:
+            chunk = os.read(fd, min(65536, cap + 1 - len(data)))
+            if not chunk:
+                break
+            used += len(chunk)
+            data.extend(chunk)
+        if len(data) > cap or len(data) != before.st_size or identity(os.fstat(fd)) != identity(before):
+            raise ValueError('changed or oversized file')
+        return data.decode('utf-8-sig')
+    finally:
+        os.close(fd)
+
+def restore(text, home, directory):
+    matches = list(REF.finditer(text))
+    if not matches or len(matches) > 8 or len(matches) != text.count('[Pasted text #'):
+        raise ValueError('reference format')
+    pieces = []
+    size = cursor = 0
+    for match in matches:
+        number, lines, path = match.groups()
+        name = os.path.basename(path)
+        shape = NAME.fullmatch(name)
+        if (len(path.encode('utf-8')) > 4096 or not shape or shape.group(1) != number
+                or path != os.path.join(home, 'pastes', name)):
+            raise ValueError('reference boundary')
+        recovered = read_paste(directory, name)
+        if recovered.count('\n') + 1 != int(lines):
+            raise ValueError('line count')
+        prefix = text[cursor:match.start()]
+        size += len(prefix.encode('utf-8')) + len(recovered.encode('utf-8'))
+        if size > USER_CAP:
+            raise ValueError('user budget')
+        pieces.extend((prefix, recovered))
+        cursor = match.end()
+    suffix = text[cursor:]
+    if size + len(suffix.encode('utf-8')) > USER_CAP:
+        raise ValueError('user budget')
+    pieces.append(suffix)
+    return ''.join(pieces)
+
+result = {}
+directory = None
+try:
+    if (os.name != 'posix' or os.open not in os.supports_dir_fd
+            or os.stat not in os.supports_dir_fd or os.getuid() != os.geteuid()):
+        raise ValueError('unsupported host')
+    home = os.path.abspath(sys.argv[1])
+    rows = json.load(sys.stdin)
+    directory = paste_directory(home)
+    for row in rows:
+        try:
+            result[str(row['index'])] = restore(row['text'], home, directory)
+        except (OSError, ValueError, UnicodeError):
+            # Preserve the original whole user on any failed reference. Never
+            # publish partial recovery or reflect paths/content into diagnostics.
+            continue
+except (OSError, ValueError, AttributeError):
+    pass
+finally:
+    if directory is not None:
+        os.close(directory)
+print(json.dumps(result, ensure_ascii=False))
+`;
+
+/** Restore matching text ONLY after the caller's raw session filter.
+ * Recovered markers must never authorize or rebind a native source. A wholly
+ * folded unbound first turn deliberately remains unbound. */
+export function restoreFilteredHermesUserEvents(
+  events: CodexBridgeEvent[],
+  dbPath: string,
+): CodexBridgeEvent[] {
+  const users = events.flatMap((event, index) => event.kind === 'user'
+    && event.sourceSessionId && event.text?.includes('[Pasted text #')
+    ? [{ index, text: event.text }] : []);
+  if (users.length === 0) return events;
+  try {
+    const proc = spawnSync('python3', ['-c', PASTE_RECOVERY_SCRIPT, dirname(dbPath)], {
+      input: JSON.stringify(users), encoding: 'utf8', maxBuffer: 10 * 1024 * 1024,
+      timeout: 1_000, killSignal: 'SIGKILL', windowsHide: true,
+    });
+    if (proc.status !== 0 || proc.error) return events;
+    const recovered: unknown = JSON.parse(proc.stdout);
+    if (!recovered || typeof recovered !== 'object' || Array.isArray(recovered)) return events;
+    const eligible = new Set(users.map(user => user.index));
+    return events.map((event, index) => {
+      const text = (recovered as Record<string, unknown>)[String(index)];
+      return eligible.has(index) && typeof text === 'string' ? { ...event, text: text.trim() } : event;
+    });
+  } catch {
+    return events;
+  }
+}
 
 interface HermesMessageRow {
   id: number;
