@@ -271,6 +271,10 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Process-scoped Codex-compatible provider origin override. Used when the
+     *  active model provider shares an origin with a protected business target
+     *  and must enter through the session loopback HTTP bridge. */
+    modelProviderBaseUrlOverride?: { providerId: string; baseUrl: string };
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
      *  (dsh / MiniMax). Forwarded as `--turn-timeout-ms`; semantics belong to the runner;
      *  adapters without a runner turn timeout ignore the field. */

@@ -9,10 +9,28 @@ import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
 import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir, sessionVisiblePath } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
+import type { ProtectedLoopbackService } from './protected-http-egress-host.js';
 
 export const LARK_TOOL_BINDING_FILE = 'lark-tool-binding.json';
 export const LARK_TOOL_ROUTE = 'lark-tool-identity';
+
+export function larkToolLoopbackService(sessionId: string, ipcPort: number): ProtectedLoopbackService {
+  if (!/^[A-Za-z0-9._-]{1,200}$/.test(sessionId) || /^\.+$/.test(sessionId)
+    || !Number.isSafeInteger(ipcPort) || ipcPort < 1 || ipcPort > 65535) {
+    throw new Error('invalid_lark_tool_loopback_service');
+  }
+  return {
+    id: LARK_TOOL_ROUTE,
+    listenPort: ipcPort,
+    upstreamPort: ipcPort,
+    method: 'POST',
+    path: `/api/sessions/${sessionId}/${LARK_TOOL_ROUTE}`,
+    forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+    attestProcessPeer: true,
+  };
+}
 export interface LarkToolBinding {
   version: 2;
   sessionId: string;
@@ -242,6 +260,7 @@ export function prepareLarkToolEnv(input: {
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');
   input.env.BOTMUX_IDENTITY_BIN = binDir;
+  input.env.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(input.env);
   input.env.ZDOTDIR = zdotdir;
   input.env.BASH_ENV = bashEnv;
   input.env.SESSION_DATA_DIR = rootDir;

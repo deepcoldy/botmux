@@ -166,6 +166,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.streamingButton.output', 'botDefaults.streamingButton.terminal',
       'botDefaults.streamingButton.writeLink', 'botDefaults.streamingButton.compact',
       'botDefaults.streamingButton.stop', 'botDefaults.streamingButton.close',
+      'botDefaults.streamingButton.substitute',
       'quietPreset.title', 'quietPreset.switch',
     ],
   },

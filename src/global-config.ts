@@ -29,6 +29,11 @@ import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, typ
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
+import {
+  normalizeProtectedMcpCapabilities,
+  protectedMcpConfiguredEnvKeys,
+  type ProtectedMcpCapabilityConfigMap,
+} from './core/protected-mcp-capabilities.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -345,6 +350,8 @@ export interface GlobalConfig {
   skills?: GlobalSkillConfig;
   /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
   plugins?: string[];
+  /** Operator-owned bindings for optional protected local MCP capabilities. */
+  protectedMcpCapabilities?: ProtectedMcpCapabilityConfigMap;
   /** Host-wide ceiling for per-plugin MCP tool calls. Missing defaults to 10 minutes. */
   mcpGatewayMaxToolTimeoutMs?: number;
   /** 远程访问. When true (and this machine is bound to the central platform),
@@ -1002,6 +1009,11 @@ function readRawConfig(): Record<string, unknown> {
 const READ_CACHE_TTL_MS = 2_000;
 let readCache: { path: string; value: GlobalConfig; at: number } | null = null;
 let vcMeetingAgentLiveCache: { path: string; mtimeMs: number; config: VcMeetingAgentGlobalConfig } | null = null;
+let lastConfiguredProtectedMcpEnvKeys: string[] = [];
+
+export function configuredProtectedMcpEnvKeys(): string[] {
+  return [...lastConfiguredProtectedMcpEnvKeys];
+}
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
@@ -1011,6 +1023,7 @@ export function readGlobalConfig(): GlobalConfig {
     return readCache.value;
   }
   const raw = readRawConfig();
+  lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
   const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
@@ -1052,6 +1065,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
   if (plugins) out.plugins = plugins;
+  const protectedMcpCapabilities = normalizeProtectedMcpCapabilities(raw.protectedMcpCapabilities);
+  if (protectedMcpCapabilities) out.protectedMcpCapabilities = protectedMcpCapabilities;
   const mcpGatewayMaxToolTimeoutMs = normalizeMcpGatewayMaxToolTimeoutMs(raw.mcpGatewayMaxToolTimeoutMs);
   if (mcpGatewayMaxToolTimeoutMs !== undefined) out.mcpGatewayMaxToolTimeoutMs = mcpGatewayMaxToolTimeoutMs;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;

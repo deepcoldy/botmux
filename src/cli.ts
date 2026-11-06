@@ -80,6 +80,8 @@ import {
   disableAutostart,
   autostartStatus,
   refreshAutostart,
+  resolveLoginShellPath,
+  autostartHookFileExists,
   clearWatchdogStopped,
   markWatchdogStopped,
   watchdogStopRequested,
@@ -2916,7 +2918,18 @@ async function startConfiguredFleet(
   // and `daemon-reload`ing the very unit that is mid-transaction is at best
   // pointless and at worst makes the start fail.
   if (!options.bootHookStart
-      && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+      && refreshAutostart({
+        pkgRoot: PKG_ROOT,
+        configDir: CONFIG_DIR,
+        logDir: LOG_DIR,
+        // The boot hook's PATH must reflect the user's LOGIN shell, not the
+        // environment of whoever happens to run this command — a CLI session's
+        // PATH is narrower than the user's shell and would strip tool dirs
+        // from the unit. Resolved here (not in autostart.ts) so the boot-hook
+        // path stays a pure function of its inputs. Skip the (multi-shell,
+        // synchronous) probe when no boot hook exists: refresh would no-op.
+        loginShellPath: autostartHookFileExists() ? resolveLoginShellPath() : undefined,
+      })) {
     console.log(`   autostart 主 unit 已同步到当前启动路径`);
   }
   // NOT UNDER systemd. Nobody reads a dashboard link at boot, and this poll waits
@@ -3031,6 +3044,12 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   clearWatchdogStopped(CONFIG_DIR);
+  // Resolved BEFORE taking the fleet mutation lock. `resolveLoginShellPath`
+  // spawns up to eight shells with a 5s timeout each, and the lock is acquired
+  // with a 5s max wait — probing inside it could make a concurrent `stop` /
+  // `start-bot` time out and fail. The value is a login shell's PATH, so
+  // reading it a moment earlier is harmless.
+  const restartAutostartLoginPath = autostartHookFileExists() ? resolveLoginShellPath() : undefined;
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     // Report recovery guidance before any live-fleet mutation. The locked
     // check below repeats against the exact generation used for restart.
@@ -3114,7 +3133,15 @@ async function cmdRestart(): Promise<void> {
     }, { maxWaitMs: 5_000 });
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
-    if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+    if (refreshAutostart({
+      pkgRoot: PKG_ROOT,
+      configDir: CONFIG_DIR,
+      logDir: LOG_DIR,
+      // Same reason as the start path: the unit's PATH must come from the
+      // user's login shell, not from this process's (possibly narrowed) PATH.
+      // Probed above, outside this lock.
+      loginShellPath: restartAutostartLoginPath,
+    })) {
       console.log(`autostart 主 unit 已同步到当前启动路径`);
     }
     console.log('✅ daemon 已重启');
@@ -12466,6 +12493,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     let dir: string | undefined;
     let voiceDurationMs: number | undefined;
     try {
+      // Attribute the send to its start, not a delayed synthesis/provider ACK
+      // that may arrive after another input was folded into the native turn.
+      const sentAtMs = Date.now();
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
@@ -12566,13 +12596,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         return deliveredMessageId;
       });
       const messageId = voiceDelivery.messageId;
-      const sentAtMs = Date.now();
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
-      if ((!sendTopLevel && !overrideChatId && !sendInto)
+      if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput) {
+        || !!deferredTopicRootMessageIdForOutput)) {
         try {
           const markerSessionId = originSessionId ?? sid;
           const markerTurnId = originTurnId ?? currentTurnId;
@@ -12657,6 +12686,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
       const docMessageId = `doc:${exactDocTarget.commentId}`;
+      const sentAtMs = Date.now();
       const docDelivery = turnSendKey
         ? await turnSendLedger.executeNonIdempotentSequence(
             turnSendKey,
@@ -12709,20 +12739,22 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
-      try {
-        recordBridgeReplyMarker({
-          dataDir: resolveDataDir(),
-          sessionId: originSessionId!,
-          sentAtMs: Date.now(),
-          messageId: docDelivery.messageId,
-          deliveryKind: 'current_session_send',
-          content,
-          responseKind: effectiveResponseKind,
-          turnId: originTurnId ?? exactDocTarget.turnId,
-          dispatchAttempt: originDispatchAttempt,
-          targetSessionId: originSessionId,
-        });
-      } catch { /* best-effort：漏记只多一条兜底 */ }
+      if (!docDelivery.replayed) {
+        try {
+          recordBridgeReplyMarker({
+            dataDir: resolveDataDir(),
+            sessionId: originSessionId!,
+            sentAtMs,
+            messageId: docDelivery.messageId,
+            deliveryKind: 'current_session_send',
+            content,
+            responseKind: effectiveResponseKind,
+            turnId: originTurnId ?? exactDocTarget.turnId,
+            dispatchAttempt: originDispatchAttempt,
+            targetSessionId: originSessionId,
+          });
+        } catch { /* best-effort：漏记只多一条兜底 */ }
+      }
       if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
           sendDataDir,
@@ -14004,16 +14036,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
-      if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
-        recordBridgeSendMarker(
-          Date.now(),
-          messageId,
-          text,
-          (customCard && !customFinal) || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
-            ? 'non_patchable'
-            : 'standard_reply_card',
-        );
-      }
+      // Reusing a receipt is not a new send. Preserve the original marker's
+      // time, including when another input arrived while we waited on the lock.
       await removeScheduleSelfAfterFinal();
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
@@ -14190,7 +14214,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     const trailingCarrierMessageId = videoMessageIds.at(-1) ?? attachmentMessageIds.at(-1);
     if (trailingCarrierMessageId
       && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
-      recordBridgeSendMarker(Date.now(), trailingCarrierMessageId, '', 'non_patchable');
+      recordBridgeSendMarker(sentAtMs, trailingCarrierMessageId, '', 'non_patchable');
     }
     for (const f of failedAttachments) {
       console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);
@@ -20808,7 +20832,15 @@ switch (command) {
       break;
     }
     ensureConfigDir();
-    const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
+    const opts = {
+      pkgRoot: PKG_ROOT,
+      configDir: CONFIG_DIR,
+      logDir: LOG_DIR,
+      // The boot hook must carry the user's LOGIN-shell PATH — the CLI's own
+      // PATH may be narrower (a session), and a narrower PATH would delete
+      // the user's tool dirs from the unit.
+      loginShellPath: resolveLoginShellPath(),
+    };
     if (sub === 'enable' || sub === 'install') enableAutostart(opts);
     else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
     else autostartStatus(opts);
