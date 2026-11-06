@@ -65,6 +65,16 @@ function isAskPost(req: IncomingMessage): boolean {
   return req.method === 'POST' && (req.url === '/api/asks' || req.url === '/api/asks/form-v1');
 }
 
+/**
+ * A stray CLI POST is a POST into the daemon API namespace that the form fake
+ * does not serve (e.g. an old client posting /api/asks). Host scanner probes
+ * hit arbitrary off-namespace paths such as /probe with non-JSON bodies; those
+ * must drain with 404 without failing the contract assertion.
+ */
+function isStrayFormApiPost(req: IncomingMessage): boolean {
+  return req.method === 'POST' && req.url !== '/api/asks/form-v1' && (req.url ?? '').startsWith('/api/');
+}
+
 describe('botmux ask — CLI boundary', () => {
   it('normalizes literal paragraph separators in a positional prompt', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-newlines-'));
@@ -487,7 +497,7 @@ describe('botmux ask — atomic input form CLI', () => {
     const requests: any[] = [];
     const strayPosts: string[] = [];
     const server = createServer(async (req, res) => {
-      if (!(req.method === 'POST' && req.url === '/api/asks/form-v1')) { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
+      if (!(req.method === 'POST' && req.url === '/api/asks/form-v1')) { if (isStrayFormApiPost(req)) strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
       requests.push(await readRequestBodyJson(req, { strict: true }));
       res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(response));
     });
@@ -511,7 +521,7 @@ describe('botmux ask — atomic input form CLI', () => {
     let calls = 0;
     const strayPosts: string[] = [];
     const server = createServer(async (req, res) => {
-      if (!(req.method === 'POST' && req.url === '/api/asks/form-v1')) { if (req.method === 'POST') strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
+      if (!(req.method === 'POST' && req.url === '/api/asks/form-v1')) { if (isStrayFormApiPost(req)) strayPosts.push(req.url ?? ''); req.resume(); res.writeHead(404).end(); return; }
       await readRequestBodyJson(req, { strict: true }); calls++;
       res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' }));
     });
