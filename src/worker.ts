@@ -479,7 +479,7 @@ import {
 } from './services/codex-session-upgrade.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
 import { buildForgeTraexLaunch, validateCliLaunchModeConfig } from './core/cli-launch-mode.js';
-import { cliUnavailableMessage } from './setup/cli-availability.js';
+import { cliUnavailableMessageAfterRetry, createAdapterAfterMissingCliWait } from './setup/cli-availability.js';
 import {
   findLaunchedCliPid,
   findCliProcess,
@@ -22484,7 +22484,28 @@ async function spawnCli(
   const effectiveCliId: CliId = cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'
     ? 'dsh-tui'
     : cfg.cliId as CliId;
-  cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  // A CLI reinstalling itself (Claude Code's auto-update) is absent for a
+  // moment. Wait that out before anything resolves or caches its path —
+  // resolvedBin, launcher args, the macOS policy digest — with the adapter
+  // built again afterwards. The launch check before the spawn reports a
+  // command still missing, and waits itself only if this did not.
+  const launchAvailabilityInput = {
+    cliId: cfg.cliId as CliId,
+    cliPathOverride: cfg.cliPathOverride,
+    wrapperCli: cfg.wrapperCli,
+    cliLaunchMode: cfg.cliLaunchMode,
+  };
+  const createAdapter = () => createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  cliAdapter = createAdapter();
+  let waitedForMissingCli = false;
+  if (!cfg.adoptMode && cfg.backendType !== 'riff') {
+    const launchAdapter = await createAdapterAfterMissingCliWait(launchAvailabilityInput, cliAdapter, createAdapter, {
+      log: line => log(`[cli-launch] ${line}`),
+    });
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+    cliAdapter = launchAdapter.adapter;
+    waitedForMissingCli = launchAdapter.waited;
+  }
   if (effectiveCliId === 'traex' && cfg.resume === true && cfg.cliSessionId && cfg.adoptMode !== true) {
     // The native resume target is host-owned. A resumed transcript can occupy
     // the entire viewport while a nonblocking repository notice hides both
@@ -24745,26 +24766,29 @@ async function spawnCli(
   if (willReattachPersistent) {
     log(`Re-attaching to existing ${effectiveBackendType} session: ${persistentSessionName} (requested CLI: ${cliAdapter.resolvedBin})`);
   } else {
-    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
-
     // Pre-flight the ACTUAL launch dependency, not merely adapter.resolvedBin:
     // wrapperCli replaces that binary, while Codex App / Mir use a bundled Node
     // runner that starts codex / mircli one level later.  Returning here used to
     // make init continue and emit a false `ready`; throwing routes the failure
     // through the daemon's user-visible init-error path and prevents an orphaned
     // "starting" card with no CLI behind it.
+    //
+    // A command that went missing after the check at adapter creation (it was
+    // there then) is waited for here, once per launch. A path the adapter
+    // resolved in between, while it was already gone, is not resolved again:
+    // that launch can still fail, as it would have without the retry.
     const unavailable = effectiveBackendType === 'riff'
       ? undefined
-      : cliUnavailableMessage({
-          cliId: cfg.cliId as CliId,
-          cliPathOverride: cfg.cliPathOverride,
-          wrapperCli: cfg.wrapperCli,
-          cliLaunchMode: cfg.cliLaunchMode,
-        }, cliName());
+      : await cliUnavailableMessageAfterRetry(launchAvailabilityInput, cliName(), {
+          log: line => log(`[cli-launch] ${line}`),
+          alreadyWaited: waitedForMissingCli,
+        });
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     if (unavailable) {
       log(`${unavailable} (PATH=${process.env.PATH ?? ''})`);
       throw new Error(unavailable);
     }
+    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
   }
 
   // Build the child env. redactChildEnv() DELETES the keys that must not leak
