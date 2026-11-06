@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDispatchReportBinding, verifyDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
-import { deliverReportSourceReply, buildReportReplyContext } from '../src/core/report-source-reply.js';
+import {
+  deliverReportSourceReply,
+  buildReportReplyContext,
+  appendReportReplyReference,
+  MAX_REPORT_REPLY_REFERENCES,
+} from '../src/core/report-source-reply.js';
 
 const secret = 'test-binding-secret';
 const dirs: string[] = [];
@@ -106,5 +111,44 @@ describe('source topic result delivery', () => {
     });
     expect(result).toMatchObject({ status: 409, body: { error: 'report_reply_source_changed' } });
     expect(f.posted).toEqual([]);
+  });
+  it('does not direct-post into a thread whose session is no longer active', async () => {
+    const f = fixture(); f.session.status = 'closed';
+    expect(await deliverReportSourceReply(f.request, f.deps)).toMatchObject({
+      status: 409, body: { error: 'report_reply_source_changed' },
+    });
+    expect(f.posted).toEqual([]);
+  });
+});
+
+describe('report reply reference list', () => {
+  const ref = (messageId: string) => ({ messageId, dispatchRoot: `om_${messageId}` });
+  it('appends new references and reports the change', () => {
+    const result = appendReportReplyReference([ref('om_a')], ref('om_b'));
+    expect(result.changed).toBe(true);
+    expect(result.references.map(item => item.messageId)).toEqual(['om_a', 'om_b']);
+  });
+  it('treats a duplicate messageId as unchanged and does not grow the list', () => {
+    const existing = [ref('om_a')];
+    const result = appendReportReplyReference(existing, ref('om_a'));
+    expect(result.changed).toBe(false);
+    expect(result.references.map(item => item.messageId)).toEqual(['om_a']);
+    expect(result.references).not.toBe(existing);
+  });
+  it('accepts an undefined list and never writes back an identical list as changed', () => {
+    const empty = appendReportReplyReference(undefined, ref('om_a'));
+    expect(empty.changed).toBe(true);
+    expect(appendReportReplyReference(empty.references, ref('om_a')).changed).toBe(false);
+  });
+  it('keeps only the newest references at the bound so long sessions cannot grow the prompt forever', () => {
+    let list: readonly { messageId: string; dispatchRoot: string }[] = [];
+    for (let i = 0; i < MAX_REPORT_REPLY_REFERENCES + 5; i++) {
+      const result = appendReportReplyReference(list, ref(`om_${i}`));
+      expect(result.changed).toBe(true);
+      list = result.references;
+    }
+    expect(list).toHaveLength(MAX_REPORT_REPLY_REFERENCES);
+    expect(list[0]!.messageId).toBe('om_5');
+    expect(list.at(-1)!.messageId).toBe(`om_${MAX_REPORT_REPLY_REFERENCES + 4}`);
   });
 });

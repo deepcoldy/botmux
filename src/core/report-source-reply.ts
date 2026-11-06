@@ -91,3 +91,16 @@ export function markReportReplyInput(session: { reportReplyInputId?: string }, i
   session.reportReplyInputId = inputId;
   return true;
 }
+
+/** 直投引用随会话持久并注入后续每一轮提示；长会话需要有界，避免持久数据与提示无限增长。 */
+export const MAX_REPORT_REPLY_REFERENCES = 20;
+export function appendReportReplyReference(
+  references: readonly ReportReplyReference[] | undefined,
+  reference: ReportReplyReference,
+): { references: ReportReplyReference[]; changed: boolean } {
+  const current = references ?? [];
+  if (current.some(item => item.messageId === reference.messageId)) {
+    return { references: current.slice(), changed: false };
+  }
+  return { references: [...current, reference].slice(-MAX_REPORT_REPLY_REFERENCES), changed: true };
+}

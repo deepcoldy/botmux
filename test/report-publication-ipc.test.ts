@@ -179,6 +179,50 @@ describe('source reply IPC', () => {
     expect(paths).toEqual([REPORT_SOURCE_REPLY_ROUTE]);
     expect(mocks.reply).toHaveBeenCalledTimes(1);
   });
+  it('keeps an unknown publication outcome at the direct sink and never falls through to a model trigger', async () => {
+    // 结果未知（pending 账本、响应丢失）时禁止切换出口：既不能重发，也不能改走 /api/trigger
+    // 再启动一个来源模型回合（那会造成同一结果既直投又回注）。
+    const body = request();
+    const decide = () => authorizeReportSessionRelayRequest({
+      trustedHost: true, selfLarkAppId: 'cli_project',
+      session: { sessionId: 'project', larkAppId: 'cli_project', chatId: 'oc_project', receiver: false,
+        scope: 'thread', rootMessageId: 'om_child', liveOrigin: { capability: CAP, turnId: 'om_work' } },
+      raw: { sessionId: 'project', dispatchRoot: 'om_child', content: body.content,
+        originCapability: CAP, status: 'completed' },
+      registry: { om_child: { reportBinding: body.binding } },
+      bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(root)),
+    });
+    const authorized = decide();
+    expect(authorized.ok).toBe(true);
+    if (!authorized.ok) throw new Error(authorized.error);
+    const paths: string[] = [];
+    const unknown = await deliverReportSessionRelay({ decision: authorized,
+      triggerMeta: { requestId: 'r2', receivedAt: new Date().toISOString() },
+      fetchTarget: vi.fn(async (path: string) => {
+        paths.push(path);
+        return { ok: false, status: 409,
+          json: async () => ({ ok: false, error: 'report_publication_unknown', deliveryKey: 'k' }) } as any;
+      }),
+      postProjectUpdate: vi.fn(async () => ({ projectSynced: false })),
+    });
+    expect(unknown).toMatchObject({ status: 409, body: { error: 'report_publication_unknown' } });
+    expect(paths).toEqual([REPORT_SOURCE_REPLY_ROUTE]);
+
+    // 只有「确定未发送」的 source_changed 409 才回退到原 relay，触发来源模型回合。
+    const changedPaths: string[] = [];
+    const changed = await deliverReportSessionRelay({ decision: decide() as any,
+      triggerMeta: { requestId: 'r3', receivedAt: new Date().toISOString() },
+      fetchTarget: vi.fn(async (path: string) => {
+        changedPaths.push(path);
+        return path === REPORT_SOURCE_REPLY_ROUTE
+          ? { ok: false, status: 409, json: async () => ({ ok: false, error: 'report_reply_source_changed' }) } as any
+          : { ok: true, status: 200, json: async () => ({ ok: true, triggerId: 't1' }) } as any;
+      }),
+      postProjectUpdate: vi.fn(async () => ({ projectSynced: false })),
+    });
+    expect(changed.status).toBe(200);
+    expect(changedPaths).toEqual([REPORT_SOURCE_REPLY_ROUTE, '/api/trigger']);
+  });
 });
 
 describe('report publication IPC', () => {

@@ -17,7 +17,13 @@ import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
-import { REPORT_SOURCE_REPLY_ROUTE, deliverReportSourceReply, buildReportReplyContext, markReportReplyInput } from './core/report-source-reply.js';
+import {
+  REPORT_SOURCE_REPLY_ROUTE,
+  deliverReportSourceReply,
+  buildReportReplyContext,
+  markReportReplyInput,
+  appendReportReplyReference,
+} from './core/report-source-reply.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -9945,8 +9951,9 @@ ipcRoute('POST', REPORT_SOURCE_REPLY_ROUTE, async (req, res) => {
       const session = findActiveBySessionId(id)?.session ?? sessionStore.getSession(id);
       if (!session) throw new Error('report_reply_source_changed');
       session.reportReplyReferences ??= [];
-      if (!session.reportReplyReferences.some(item => item.messageId === reference.messageId)) {
-        session.reportReplyReferences.push(reference);
+      const appended = appendReportReplyReference(session.reportReplyReferences, reference);
+      if (appended.changed) {
+        session.reportReplyReferences = appended.references;
         sessionStore.updateSession(session);
       }
     },
