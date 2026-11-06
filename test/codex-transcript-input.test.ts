@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
 const SID = '019dd80d-d922-7a11-8339-0208d8c5b4ee';
 const MESSAGE = 'Inspect the pending change\nand run its tests.';
@@ -76,7 +77,7 @@ function terminal(initial = OVERLAY, options: {
 }
 async function submit(target: PtyHandle) {
   const pending = createCodexAdapter().writeInput(target, MESSAGE);
-  await vi.runAllTimersAsync();
+  await flushFakeTimers();
   return pending;
 }
 
@@ -177,12 +178,12 @@ describe('Codex transcript submission boundary', () => {
   it('deferred rechecks only read receipts; neither timeout nor recheck can execute again', async () => {
     const t = terminal('', { receiptDelay: 10_000 });
     const pending = createCodexAdapter().writeInput(t.target, MESSAGE);
-    await vi.advanceTimersByTimeAsync(4000);
+    await flushFakeTimers(4000);
     const result = await pending;
     expect(result).toMatchObject({ submitted: false });
     expect(await result?.recheck?.()).toBe(false);
     t.setDraft('next draft');
-    await vi.advanceTimersByTimeAsync(10_000);
+    await flushFakeTimers(10_000);
     expect(await result?.recheck?.()).toMatchObject({ submitted: true, cliSessionId: SID });
     expect(await result?.recheck?.()).toMatchObject({ submitted: true });
     expect(t.executed).toEqual([MESSAGE]);
@@ -202,7 +203,7 @@ describe('Codex transcript submission boundary', () => {
       const t = terminal('');
       delete t.target.submitBracketedPaste;
       const pending = createCodexAdapter().writeInput(t.target, message);
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       expect(await pending).toMatchObject({ submitted: true });
       expect(t.executed).toEqual([message]);
       expect(t.target.write).toHaveBeenCalledExactlyOnceWith(`\x1b[200~${message}\x1b[201~\r`);
@@ -226,10 +227,10 @@ describe('Codex transcript submission boundary', () => {
     const t = terminal(OVERLAY, { closeResult: 'false', closeDelay: 2100 });
     const adapter = createCodexAdapter();
     const first = adapter.writeInput(t.target, MESSAGE);
-    await vi.advanceTimersByTimeAsync(2000);
+    await flushFakeTimers(2000);
     expect(await first).toMatchObject({ submitted: false });
     const second = adapter.writeInput(t.target, MESSAGE);
-    await vi.runAllTimersAsync();
+    await flushFakeTimers();
     expect(await second).toMatchObject({ submitted: true });
     expect(t.target.write).toHaveBeenCalledExactlyOnceWith('q');
     expect(t.draft()).toBe('');

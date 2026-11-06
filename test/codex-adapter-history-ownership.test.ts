@@ -21,6 +21,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'n
 import { join } from 'node:path';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
 import { codexHistorySidIsOwned, findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
@@ -156,7 +157,7 @@ describe('codex writeInput history ownership filter', () => {
         setTimeout(() => appendFileSync(historyPath, historyLine(SID_B, 'ping')), 15);
       };
       const pending = adapter.writeInput!(fakePty(ownerChild.pid!, onEnter), 'ping');
-      await vi.runAllTimersAsync();
+      await flushFakeTimers(100, 1);
       const result = await pending;
       expect((result as any)?.cliSessionId).toBe(SID_B);
       expect(enterCount).toBe(1);

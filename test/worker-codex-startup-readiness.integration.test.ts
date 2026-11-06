@@ -29,6 +29,8 @@ async function runStartupScenario(mode: string, backendType: 'tmux' | 'pty'): Pr
   const botmuxDir = join(homedir(), '.botmux');
   mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
   chmodSync(botmuxDir, 0o700);
+  // The runner owns this disposable HOME; do not open zsh-newuser-install.
+  writeFileSync(join(homedir(), '.zshrc'), '# isolated worker test\n');
   const root = mkdtempSync(join(backendType === 'tmux' ? '/tmp' : tmpdir(), 'bmx-startup-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
@@ -73,6 +75,8 @@ const poll = setInterval(() => {
       ? '\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\r\n\x1b[0m\x1b[39m\x1b[49m\r\n  \x1b[36mcustom-model\x1b[0m · \x1b[32m/tmp\x1b[0m'
       : '› Ask Codex to do anything\r\n\r\n  custom-model · /tmp')
     : '\x1b[2J\x1b[H│ model: custom-model /model to change │\r\n│ directory: /tmp │\r\n› Ask Codex to do anything\r\n  custom-model · /tmp')});
+  // Native Codex leaves the cursor at the empty composer, not at the footer.
+  process.stdout.write(${JSON.stringify('\x1b[' + (mode === 'banner' ? '3' : mode === 'resumed-context' ? '1' : '2') + ';3H')});
 }, 50);
 setInterval(() => {}, 1000);
 `);
