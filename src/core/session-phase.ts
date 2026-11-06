@@ -1,7 +1,7 @@
 /**
  * 会话相位 —— 命令合法性矩阵的行坐标（设计 docs/design/2026-09-11-command-router.md R6 / §5）。
  *
- * **由现有状态推导，不新增持久化字段。** 输入分两层：
+ * 兼容相位由持久契约生命周期及原有展示旗标投影。输入分两层：
  *   - 内存 `DaemonSession` 上的运行旗标：`worker`、`pendingRepo`、`pendingRepoCommitInFlight`、
  *     `worktreeCreating`、`cliReady`（后者由 worker 的 `prompt_ready` IPC 置位，见 types.ts）；
  *   - 持久化 `Session` 上刻意落盘以扛 daemon 重启的状态：`status`、`queued`、
@@ -54,6 +54,8 @@ export function phaseHasLiveWorker(phase: SessionPhase): boolean {
 export function deriveSessionPhase(ds: DaemonSession | undefined | null): SessionPhase {
   if (!ds) return 'none';
   if (ds.session.status === 'closed') return 'closed';
+  if (ds.session.sessionLifecycle === 'suspended') return 'dormant';
+  if (['closing', 'suspending', 'resuming'].includes(ds.session.sessionLifecycle ?? '')) return 'spawning';
   if (ds.worktreeCreating || ds.pendingRepoCommitInFlight) return 'worktreeCreating';
   if (ds.pendingRepo) return 'pendingRepo';
   if (ds.session.queued) return 'queued';

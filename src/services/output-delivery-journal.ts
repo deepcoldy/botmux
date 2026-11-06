@@ -224,6 +224,9 @@ export class OutputDeliveryJournal {
     return (this.db.prepare("SELECT id FROM outputs WHERE session_id=? AND turn_id=? AND state='settled' ORDER BY created_at")
       .all(sessionId, turnId) as Array<{ id: string }>).map(row => this.read(row.id)!);
   }
+  forTurn(sessionId: string, turnId: string): OutputDeliveryRecord[] {
+    return (this.db.prepare('SELECT id FROM outputs WHERE session_id=? AND turn_id=? ORDER BY created_at,id').all(sessionId, turnId) as Array<{ id: string }>).map(row => this.read(row.id)!).filter(Boolean);
+  }
   /** A still-self-healing row (pending/processing/blocked) for a session.
    *  Terminal `rejected` rows are NOT counted: their answer can never be
    *  delivered to the frozen target and they no longer churn recovery; they

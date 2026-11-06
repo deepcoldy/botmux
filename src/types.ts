@@ -543,6 +543,9 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
+  sessionContractRevision?: number;
+  sessionRuntimeContract?: import('./services/session-contract-store.js').SessionContractSnapshot;
   /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
   topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
@@ -2057,6 +2060,10 @@ export interface CodexAppEffortResult {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
+  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
+  | { type: 'runtime_binding_aborted_ack'; bindingId: string }
+  | { type: 'runtime_contract_assigned'; bindingId: string; runtime: import('./services/session-contract.js').RuntimeRef; mayExecute: boolean; executions?: import('./services/session-contract.js').ExecutionRef[]; admissionStates?: import('./services/session-contract.js').ExecutionAdmissionState[] }
+  | { type: 'execution_contract_assigned'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   | import('./services/universal-output-handoff.js').OutputHandoffReceipt
   | import('./services/final-output-handoff.js').FinalOutputAccepted
   | { type: 'deployment_continuation_cancelled'; requestId: string; ok: boolean }
@@ -2196,7 +2203,9 @@ type DaemonToWorkerBase =
     dispatchAttempt?: number;
   };
 
-export type DaemonToWorker = DaemonToWorkerBase extends infer Message
+export type DaemonToWorker = DaemonToWorkerTransport & { sessionCommand?: import('./services/session-contract.js').SessionCommandContext };
+
+type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
     ? Omit<Message, 'loadedBotsConfigPath' | 'adoptSource'> & {
         adoptSource?: 'tmux' | 'herdr' | 'zellij' | 'orca';
@@ -2212,6 +2221,7 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
          *  suppress a failure notice after an exact acknowledged final. */
         suppressDeliveredFinalFailureNotice?: boolean;
         /** Explicit, off-by-default ordinary bridge handoff negotiation. */
+        sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
       }
     : Message
@@ -2276,6 +2286,7 @@ export interface ModelFallbackState {
 }
 
 export interface WorkerFinalOutput {
+  sessionOutputOrigin?: import('./services/session-contract.js').SessionEventContext;
   type: 'final_output';
   /** Worker-side botmux session identity. Daemon validates this before
    *  routing the reply so a stale/wrongly-bound worker cannot post into
@@ -2352,15 +2363,21 @@ export interface WorkerFinalOutput {
     cacheCreateTokens: number;
   };
   handoff?: import('./services/universal-output-handoff.js').OutputHandoffClaim;
+  sessionContract?: import('./services/session-contract.js').SessionEventContext;
 }
 
 /** Messages sent from Worker to Daemon */
-export type WorkerToDaemon =
+export type WorkerToDaemon = WorkerToDaemonBase & { sessionContract?: import('./services/session-contract.js').SessionEventContext };
+
+export type WorkerToDaemonBase =
   | import('./services/final-output-handoff.js').FinalOutputOffer
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
+  | { type: 'runtime_binding_started'; bindingId: string; operationId?: string }
+  | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
+  | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string }
   | { type: 'worker_ipc_ready' }
   | ({ type: 'link_ref_register'; requestId: string } & import('./core/link-ref-ipc.js').McpLinkRefRegistrationRequest)
   | ({ type: 'link_ref_resolve'; requestId: string } & import('./core/link-ref-ipc.js').McpHostDeliveryLinkRefRequest)

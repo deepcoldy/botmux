@@ -719,6 +719,11 @@ export class MojoBackend implements SessionBackend {
         this.taskIdCb = cb;
         if (this.cliSessionId) cb(this.cliSessionId);
     }
+    getRuntimeIdentity(): import('../../services/session-contract.js').RuntimeIdentity | undefined {
+        if (!this.cliSessionId) return undefined;
+        return { backend: 'mojo', physicalId: `${this.config.baseUrl ?? 'default'}:${this.cliSessionId}`,
+            nativeSessionId: this.cliSessionId, proof: 'persistent_lineage' };
+    }
 
     captureCurrentScreen(): string { return this.outputBuffer; }
     captureViewport(): string { return this.outputBuffer; }
