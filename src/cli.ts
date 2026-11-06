@@ -3044,6 +3044,12 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   clearWatchdogStopped(CONFIG_DIR);
+  // Resolved BEFORE taking the fleet mutation lock. `resolveLoginShellPath`
+  // spawns up to eight shells with a 5s timeout each, and the lock is acquired
+  // with a 5s max wait — probing inside it could make a concurrent `stop` /
+  // `start-bot` time out and fail. The value is a login shell's PATH, so
+  // reading it a moment earlier is harmless.
+  const restartAutostartLoginPath = autostartHookFileExists() ? resolveLoginShellPath() : undefined;
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     // Report recovery guidance before any live-fleet mutation. The locked
     // check below repeats against the exact generation used for restart.
@@ -3133,8 +3139,8 @@ async function cmdRestart(): Promise<void> {
       logDir: LOG_DIR,
       // Same reason as the start path: the unit's PATH must come from the
       // user's login shell, not from this process's (possibly narrowed) PATH.
-      // No boot hook installed → refresh is a no-op, so don't pay the probe.
-      loginShellPath: autostartHookFileExists() ? resolveLoginShellPath() : undefined,
+      // Probed above, outside this lock.
+      loginShellPath: restartAutostartLoginPath,
     })) {
       console.log(`autostart 主 unit 已同步到当前启动路径`);
     }

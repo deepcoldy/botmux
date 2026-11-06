@@ -23,9 +23,9 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const calls: { cmd: string; args: string[] }[] = [];
 vi.mock('node:child_process', () => ({
@@ -39,6 +39,7 @@ vi.mock('node:child_process', () => ({
 
 import {
   AUTOSTART_UNIT_ENV,
+  autostartHookFileExists,
   autostartPath,
   bootHookPath,
   enableAutostart,
@@ -119,37 +120,64 @@ describe('boot hook PATH merge', () => {
     expect(merged).toContain('/usr/bin');
   });
 
-  it('bootHookPath drops fnm per-shell shims but keeps the durable node dir', () => {
+  it('bootHookPath rewrites fnm per-shell shims to the durable install dir', () => {
     // fnm gives every shell its own pid/timestamp-stamped shim directory in
-    // tmpfs (/run/user/<uid>/...) or under ~/.local/state; those are dead by
-    // the next boot and unique per probe, so they must never be persisted.
-    const ephemeral = [
-      '/run/user/0/fnm_multishells/1023401_1793928310595/bin',
-      '/home/u/.local/state/fnm_multishells/1082415_1793915768618/bin',
-    ];
-    const durable = '/home/u/.local/share/fnm/node-versions/v22.21.1/installation/bin';
+    // tmpfs (/run/user/<uid>/...) or under ~/.local/state, and that directory
+    // is a symlink to the version's installation. Persisting the shim path is
+    // useless twice over: it is gone by the next boot and it makes every
+    // render differ. But on a stock fnm install it is ALSO the only entry that
+    // provides `node`, so it must be rewritten, never dropped.
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    const installation = join(home, 'share/fnm/node-versions/v22.21.1/installation');
+    mkdirSync(join(installation, 'bin'), { recursive: true });
+    const shims = ['run', 'state'].map((kind, i) => {
+      const multishell = join(home, kind, 'fnm_multishells', `${1000 + i}_179392831059${i}`);
+      mkdirSync(dirname(multishell), { recursive: true });
+      // fnm symlinks the pid/timestamp directory itself to the installation.
+      symlinkSync(installation, multishell);
+      return join(multishell, 'bin');
+    });
+
     const merged = bootHookPath({
-      callerPath: `${ephemeral[0]}:${ephemeral[1]}:${durable}:/usr/bin`,
+      callerPath: `${shims[0]}:${shims[1]}:/usr/bin`,
       targetPlatform: 'linux',
     });
     expect(merged).not.toContain('fnm_multishells');
-    expect(merged).toContain(durable);
-    // Sanitizing is terminal: such an entry must be dropped no matter which
-    // tier (login / existing / caller) brought it in.
+    // The rewrite is what keeps `node` reachable at boot: the durable dir is
+    // the shim's own target (realpath'd, hence the tmpdir symlink resolution),
+    // and both shims collapse onto it.
+    const durable = join(realpathSync(installation), 'bin');
+    expect(merged).toBe(`${durable}:/usr/bin`);
+
+    // Sanitizing is terminal: a shim is rewritten no matter which tier
+    // (login / existing / caller) brought it in.
     const fromExisting = bootHookPath({
       callerPath: '/usr/bin',
-      existingPath: `${ephemeral[0]}:/keep`,
+      existingPath: `${shims[0]}:/keep`,
       targetPlatform: 'linux',
     });
     expect(fromExisting).not.toContain('fnm_multishells');
+    expect(fromExisting).toContain(durable);
     expect(fromExisting).toContain('/keep');
   });
 
-  it('autostartPath strips backslash-form multishell entries too', () => {
-    const out = autostartPath(
-      'C:\\Users\\u\\AppData\\Local\\state\\fnm_multishells\\42_1\\bin;C:\\Windows',
-      'win32',
-    );
+  it('drops an fnm shim that no longer resolves', () => {
+    // A shim whose target was removed (fnm GC, uninstalled version) has no
+    // durable directory to point at; keeping the dead path only accumulates.
+    const out = autostartPath('/nonexistent/fnm_multishells/42_1/bin:/usr/bin', 'linux');
+    expect(out).not.toContain('fnm_multishells');
+    expect(out).toBe('/usr/bin');
+  });
+
+  it('rewrites backslash-form multishell entries too', () => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    const installation = join(home, 'share\\fnm\\node-versions\\v22.21.1\\installation');
+    mkdirSync(installation, { recursive: true });
+    const multishell = join(home, 'state\\fnm_multishells\\42_1');
+    mkdirSync(dirname(multishell), { recursive: true });
+    symlinkSync(installation, multishell);
+
+    const out = autostartPath(`${multishell}\\bin;C:\\Windows`, 'win32');
     expect(out).not.toContain('fnm_multishells');
     expect(out).toContain('C:\\Windows');
   });
@@ -308,5 +336,42 @@ describe('refreshAutostart keeps the unit PATH', () => {
 
     expect(refreshAutostart(stableOpts())).toBe(false);
     expect(readFileSync(unitFile, 'utf-8')).toBe(afterFirst);
+  });
+});
+
+describe('login-shell probe gate', () => {
+  it('reports whether a boot hook file exists without spawning anything', () => {
+    // This is the \"is the probe worth paying for\" gate used by start/restart:
+    // refresh is a no-op when no hook file exists, so eight synchronous shell
+    // probes there would be pure latency for users who never enabled autostart.
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    vi.stubEnv('HOME', home);
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+
+    expect(autostartHookFileExists()).toBe(false);
+    expect(calls).toHaveLength(0);
+
+    mkdirSync(unitDir(), { recursive: true });
+    writeFileSync(join(unitDir(), 'botmux.service'), '[Service]\nEnvironment=PATH=/usr/bin\n');
+    expect(autostartHookFileExists()).toBe(true);
+    // File checks only: the answer must never cost a child process.
+    expect(calls).toHaveLength(0);
+  });
+
+  it('reports a launchd plist on macOS', () => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    vi.stubEnv('HOME', home);
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+
+    expect(autostartHookFileExists()).toBe(false);
+    const agents = join(home, 'Library', 'LaunchAgents');
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, 'com.botmux.daemon.plist'), '<plist/>');
+    expect(autostartHookFileExists()).toBe(true);
+  });
+
+  it('reports nothing installable on an unsupported platform', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('aix');
+    expect(autostartHookFileExists()).toBe(false);
   });
 });

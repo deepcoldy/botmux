@@ -18,7 +18,7 @@
  * starts us with a minimal environment.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { join, dirname } from 'node:path';
 import { isStandaloneBinary } from './core/self-spawn.js';
@@ -327,6 +327,23 @@ export function resolveLoginShellPath(timeoutMs = 5_000): string | undefined {
   return collected.reduce((acc, value) => mergePathEntries(acc, value, separator), '');
 }
 
+const FNM_MULTISHELL_SEGMENT = '/fnm_multishells/';
+
+/** Rewrite an fnm per-shell shim to the durable directory it resolves to, or
+ *  drop it when it names no such directory. Non-shim entries pass through
+ *  unchanged. See {@link autostartPath} for why the entries cannot simply be
+ *  filtered out. */
+function durableFnmPath(entry: string): string | undefined {
+  if (!entry.replace(/\\/g, '/').includes(FNM_MULTISHELL_SEGMENT)) return entry;
+  try {
+    // fnm's shim is a symlink to `<installation>` (or, on Windows, a directory
+    // of copies — that resolves to itself and is dropped below).
+    const resolved = realpathSync(entry).replace(/\\/g, '/');
+    if (!resolved.includes(FNM_MULTISHELL_SEGMENT)) return resolved;
+  } catch { /* dead shim: no durable directory behind it */ }
+  return undefined;
+}
+
 export function autostartPath(
   pathValue: string = process.env.PATH || '',
   targetPlatform: NodeJS.Platform = process.platform,
@@ -338,25 +355,32 @@ export function autostartPath(
   // a boot hook.
   //
   // fnm's per-shell shims (`/run/user/<uid>/fnm_multishells/<pid>_<ts>/bin`,
-  // and under `~/.local/state/...` on systems without XDG_RUNTIME_DIR) are in
-  // the same class, for two independent reasons:
-  //   1. they are gone before the next boot (tmpfs) or simply abandoned when
-  //      the shell that created them exits, so persisting them into a BOOT hook
-  //      only ever writes dead entries;
-  //   2. the pid/timestamp suffix is unique on every shell invocation, so once
-  //      a login-shell probe feeds the merge, each `botmux start`/`restart`
-  //      would append fresh entries forever — and, worse, make the rendered
-  //      unit differ on every single refresh, so refreshAutostart rewrites the
-  //      file and triggers daemon-reload / launchctl reload on every run.
-  // The durable fnm directory (`…/fnm/node-versions/<ver>/installation/bin`)
-  // does not match and is kept.
+  // and under `~/.local/state/...` on systems without XDG_RUNTIME_DIR) are
+  // ephemeral for two reasons: the directory is gone before the next boot
+  // (tmpfs) or abandoned when the shell that created it exits, and the
+  // pid/timestamp suffix is unique per shell invocation — so persisting the
+  // shim path verbatim would both write dead entries and make every render
+  // differ, defeating refreshAutostart's content comparison (a rewrite plus
+  // daemon-reload / launchctl reload on every single start).
+  //
+  // DROPPING THEM IS NOT AN OPTION, though: on a stock fnm install (`eval
+  // "$(fnm env)"` in the rc file) that shim is the ONLY directory providing
+  // `node` on the login-shell PATH — the durable install dir appears there only
+  // if the user separately exported it. Deleting the entry would recreate
+  // exactly the failure this whole change is about: a boot unit without
+  // `node`, every `#!/usr/bin/env node` CLI dead at 127. So each shim is
+  // REWRITTEN to the durable directory it points at
+  // (`…/fnm/node-versions/<ver>/installation/bin`), and only dropped when it no
+  // longer resolves. Resolution is stable across runs (the alias target does
+  // not carry the pid/timestamp), so renders stay idempotent.
   const separator = targetPlatform === 'win32' ? ';' : ':';
   const entries = pathValue
     .split(separator)
     .filter(Boolean)
     .filter(entry => !isCliIdentityPath(entry))
     .filter(entry => !entry.replace(/\\/g, '/').includes('/tmp/arg0/'))
-    .filter(entry => !entry.replace(/\\/g, '/').includes('/fnm_multishells/'));
+    .map(durableFnmPath)
+    .filter((entry): entry is string => !!entry);
   const stable = [...new Set(entries)].join(separator);
   if (stable) return stable;
   if (targetPlatform === 'win32') {
