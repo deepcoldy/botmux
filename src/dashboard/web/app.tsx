@@ -9,6 +9,7 @@ import {
   attentionReason,
   attentionWaitSince,
   botDisplayName,
+  botNameForAppId,
   escapeHtml,
   loadNameMaps,
   reloadNameMaps,
@@ -1991,7 +1992,12 @@ void (async () => {
   }
   void loadNameMaps().then(renderShell);
   // Bot 改名后名称映射跟着 roster 变化重拉（见 ui.ts reloadNameMaps）。
-  store.onBotsChanged(() => { void reloadNameMaps().then(renderShell); });
+  store.onBotsChanged(() => {
+    void reloadNameMaps().then(() => {
+      store.relabelBots(botNameForAppId);
+      renderShell();
+    });
+  });
   void loadGroupsSnapshot().then(renderShell);
   // 空闲时预取 ⌘K 面板 chunk，首次唤起不等网络；无边框工作台壳不挂面板，不白取。
   if (!framelessWorkbenchSurface(location.hash || '#/')) {

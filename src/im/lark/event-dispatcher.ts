@@ -183,6 +183,8 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   logger.info(`Bot open_id: ${bot.botOpenId}`);
 }
 
+const BOT_PROFILE_FETCH_TIMEOUT_MS = 20_000;
+
 /**
  * One read-only `/bot/v3/info` call with the bot's tenant_access_token: the
  * authoritative Feishu name / avatar / open_id of this app. Throws on any
@@ -193,10 +195,13 @@ export async function fetchBotProfileFromLark(larkAppId: string): Promise<Fetche
   const bot = getBot(larkAppId);
   const openApi = larkHosts(normalizeBrand(bot.config.brand)).openApi;
 
+  // Bounded: a stalled connection must fail (old name kept, next period
+  // retries) instead of wedging the refresher / the open_id gate forever.
   const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
+    signal: AbortSignal.timeout(BOT_PROFILE_FETCH_TIMEOUT_MS),
   });
   const tokenData = await tokenRes.json() as any;
   if (tokenData.code !== 0) {
@@ -205,6 +210,7 @@ export async function fetchBotProfileFromLark(larkAppId: string): Promise<Fetche
 
   const botRes = await fetch(`${openApi}/open-apis/bot/v3/info/`, {
     headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
+    signal: AbortSignal.timeout(BOT_PROFILE_FETCH_TIMEOUT_MS),
   });
   const botData = await botRes.json() as any;
   if (botData.code !== 0) {

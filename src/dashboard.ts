@@ -340,7 +340,7 @@ import {
   enrichPacksForDashboard,
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
-import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, loadBotConfigsCached, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findRetiredCliBots, retiredCli } from './adapters/cli/retired-cli.js';
 import {
   findQuotaFallbackCycles,
@@ -1057,7 +1057,8 @@ const hostTerminalManager = createHostTerminalManager({
     for (const s of aggregator.getSessions()) {
       if (!s.sessionId.startsWith(prefix)) continue;
       const row = s as { botName?: unknown; title?: unknown };
-      const parts = [row.botName, row.title].filter((v): v is string => typeof v === 'string' && !!v.trim());
+      const botName = (s.larkAppId ? dashboardBotNameLookup()(s.larkAppId) : undefined) ?? row.botName;
+      const parts = [botName, row.title].filter((v): v is string => typeof v === 'string' && !!v.trim());
       return parts.length ? parts.join(' · ') : undefined;
     }
     return undefined;
@@ -1400,7 +1401,7 @@ function codexNotifierBotOptions(): ResolvedDashboardSettings['codexNotifier']['
         const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
         return {
           larkAppId: bot.larkAppId,
-          botName: nameOf(bot.larkAppId) ?? null,
+          botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
           ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
         };
@@ -1449,7 +1450,7 @@ function hostOverloadAlertBotOptions(): ResolvedDashboardSettings['hostOverloadA
         const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
         return {
           larkAppId: bot.larkAppId,
-          botName: nameOf(bot.larkAppId) ?? null,
+          botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
           apiOnly: bot.apiOnly === true,
           ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
@@ -1470,7 +1471,7 @@ function scheduleBotGrantBotOptions(): ResolvedDashboardSettings['scheduleBotGra
       .filter(bot => bot.apiOnly !== true)
       .map(bot => ({
         larkAppId: bot.larkAppId,
-        botName: nameOf(bot.larkAppId) ?? null,
+        botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
       }));
   } catch {
     return [];
@@ -1501,12 +1502,14 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
 /**
  * The dashboard's one appId → bot display-name lookup (services/bot-display-name.ts):
  * bots.json displayName > live descriptor name > bots-info.json Feishu name.
- * Built per request; never falls back to bots.json `name` (PM2 suffix) or cliId.
+ * Built per request. It never invents a name from bots.json `name` (PM2
+ * suffix) or cliId; a few pickers / recovery rows still use `name` as their
+ * own last-resort label for a bot whose Feishu name was never learned.
  */
 function dashboardBotNameLookup(configs?: readonly BotConfig[]): (larkAppId: string) => string | undefined {
   let cfgs: readonly BotConfig[] = configs ?? [];
   if (!configs) {
-    try { cfgs = loadBotConfigs(); } catch { /* setup can render before bots.json exists */ }
+    try { cfgs = loadBotConfigsCached(); } catch { /* setup can render before bots.json exists */ }
   }
   return createBotDisplayNameLookup({
     configs: cfgs,
@@ -3330,7 +3333,7 @@ async function configuredBotDefaultsRecoveryRows(
         const rawEntry = rawByAppId.get(bot.larkAppId);
         const payload = botDefaultsPayload({
           larkAppId: bot.larkAppId,
-          botName: nameOf(bot.larkAppId) ?? null,
+          botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: bot.cliId,
           brand: bot.brand,
           cliRuntime: bot.cliRuntime,
@@ -8490,7 +8493,15 @@ const federationSync = setInterval(() => {
   // sessionsProvider：顺带把本部署在各团队协作群里的会话裁剪行上报给团队 host
   // （hub 在 sync 响应里下发协作群清单，详见 syncAllMemberships）。
   // aggregator Row 是宽松索引类型，实际为 SessionRow（含 chatId 等字段）
-  syncAllMemberships(config.session.dataDir, fetch, liveBots(), () => aggregator.getSessions() as unknown as TeamSessionRowLike[])
+  syncAllMemberships(config.session.dataDir, fetch, liveBots(), () => {
+    // Session rows carry a botName snapshot; the hub's team board shows the
+    // current name, re-resolved by appId like /api/sessions.
+    const nameOf = dashboardBotNameLookup();
+    return aggregator.getSessions().map(s => {
+      const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
+      return n && n !== s.botName ? { ...s, botName: n } : s;
+    }) as unknown as TeamSessionRowLike[];
+  })
     .catch(() => { /* best-effort */ });
 }, 2 * 60 * 1000);
 federationSync.unref();

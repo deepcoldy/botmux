@@ -360,6 +360,12 @@ export function loadNameMaps(options: { force?: boolean } = {}): Promise<void> {
       // botName，Bot 配置页优先用它），头像则由 overrideBotAvatar() 在改完后
       // 就地写内存+localStorage 生效，都不依赖本函数重跑。
       const data = await fetchGroupsNamesSnapshot(options.force ? { force: true } : {});
+      // localStorage 回灌的名字只是首屏占位：服务端这次没确认的（下线 bot、已删
+      // bot）一律丢掉，免得一个旧名永远盖过服务端按 appId 现查好的行内名字。
+      const confirmed = new Set((data.bots ?? []).map(b => String(b.larkAppId ?? '')).filter(Boolean));
+      for (const appId of [...botNameByAppId.keys()]) {
+        if (!confirmed.has(appId)) botNameByAppId.delete(appId);
+      }
       for (const b of data.bots ?? []) {
         if (b.larkAppId) registryBotAppIds.add(String(b.larkAppId));
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {

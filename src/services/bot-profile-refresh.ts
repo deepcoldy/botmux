@@ -15,7 +15,11 @@
  * 不变量：
  *  - 只改展示字段 `botName` / `botAvatarUrl`。`botOpenId` 只在**尚未知道**时补上，绝不
  *    覆盖——它是 @ 判定与路由身份，刷新不应改变任何鉴权/路由输入的身份部分。
- *  - 拉取失败（网络 / token / 飞书错误）时保留旧值，不抛出，只记 debug。
+ *  - 拉取失败（网络 / token / 飞书错误 / 超时）时保留旧值，不抛出，只记 debug。
+ *  - 本进程自己改了名/头像（dashboard ✎，`noteLocalWrite()`）后的两个周期内，
+ *    拉回来的值若与本地写入不同就不采信：要么是改名前就已发出的在途请求，要么是
+ *    新版本还没传播到 `/bot/v3/info`。窗口过后以开放平台为准。
+ *  - 派生写（onChange）抛错时，下一次拉取成功会再派生一次，直到成功为止。
  */
 import { logger } from '../utils/logger.js';
 
@@ -48,6 +52,8 @@ export interface BotProfileRefresherDeps {
   onChange: (change: BotProfileChange) => void;
   intervalMs?: number;
   minTriggerGapMs?: number;
+  /** noteLocalWrite 之后不采信不同拉取值的时长，默认两个周期。 */
+  localWriteHoldMs?: number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
   now?: () => number;
@@ -60,6 +66,8 @@ export interface BotProfileRefresher {
   refreshNow(reason: string): Promise<boolean>;
   /** 有改名迹象时请求提前刷新；距上次尝试不足 minTriggerGapMs 时忽略。 */
   requestRefresh(reason: string): void;
+  /** 本进程刚在开放平台改了名/头像并已写入 state：在 holdMs 内不让拉取结果覆盖它。 */
+  noteLocalWrite(): void;
 }
 
 export const BOT_PROFILE_REFRESH_INTERVAL_MS = 10 * 60_000;
@@ -82,12 +90,18 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
   });
   const clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
   const now = deps.now ?? Date.now;
+  // Two periods: covers the in-flight read plus the next scheduled one.
+  const holdMs = deps.localWriteHoldMs ?? 2 * intervalMs;
 
   let timer: unknown = null;
   let stopped = true;
   let inflight: Promise<boolean> | null = null;
   let lastAttemptAt = -Infinity;
   let succeededOnce = false;
+  /** 首次派生（或之后某次派生）还没成功落地：下一次成功拉取无论有无变化都要再派生。 */
+  let fanOutPending = true;
+  let localWriteEpoch = 0;
+  let localHoldUntil = -Infinity;
 
   const schedule = (): void => {
     if (stopped) return;
@@ -100,6 +114,7 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
 
   const attempt = async (reason: string): Promise<boolean> => {
     lastAttemptAt = now();
+    const epochAtStart = localWriteEpoch;
     let profile: FetchedBotProfile;
     try {
       profile = await deps.fetchProfile();
@@ -107,10 +122,14 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
       logger.debug(`[${deps.larkAppId}] bot profile refresh (${reason}) failed, keeping cached name: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     }
+    if (stopped) return false;
     const state = deps.state();
     const previousName = state.botName;
-    const name = profile.name?.trim() ? profile.name : undefined;
-    const avatar = profile.avatarUrl || undefined;
+    // A local rename/avatar change that happened during this fetch, or so
+    // recently that the published version may not be visible yet, wins.
+    const holdLocal = epochAtStart !== localWriteEpoch || now() < localHoldUntil;
+    const name = !holdLocal && profile.name?.trim() ? profile.name : undefined;
+    const avatar = !holdLocal && profile.avatarUrl ? profile.avatarUrl : undefined;
     const nameChanged = !!name && name !== state.botName;
     const avatarChanged = !!avatar && avatar !== state.botAvatarUrl;
     if (!state.botOpenId && profile.openId) state.botOpenId = profile.openId;
@@ -121,11 +140,13 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
     if (nameChanged && previousName) {
       logger.info(`[${deps.larkAppId}] bot renamed on open platform: ${previousName} → ${name} (${reason})`);
     }
-    if (first || nameChanged || avatarChanged) {
+    if (fanOutPending || nameChanged || avatarChanged) {
       try {
         deps.onChange({ first, nameChanged, avatarChanged, ...(previousName ? { previousName } : {}) });
+        fanOutPending = false;
       } catch (err) {
-        logger.warn(`[${deps.larkAppId}] bot profile fan-out failed: ${err instanceof Error ? err.message : String(err)}`);
+        fanOutPending = true;
+        logger.warn(`[${deps.larkAppId}] bot profile fan-out failed (retried on next refresh): ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     return true;
@@ -156,6 +177,10 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
       if (stopped || inflight) return;
       if (now() - lastAttemptAt < minGapMs) return;
       void refreshNow(reason);
+    },
+    noteLocalWrite() {
+      localWriteEpoch += 1;
+      localHoldUntil = now() + holdMs;
     },
   };
 }

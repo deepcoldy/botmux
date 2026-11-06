@@ -201,6 +201,76 @@ describe('bot profile refresher', () => {
     refresher.stop();
   });
 
+  it('a dashboard rename is not reverted by an in-flight or not-yet-propagated fetch', async () => {
+    const feishu = fakeFeishu('旧名Bot');
+    const state: BotProfileState = {};
+    const { refresher, changes } = wire(feishu, state);
+    refresher.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // A periodic fetch is in flight when the renamer writes the new name.
+    let release!: (p: FetchedBotProfile) => void;
+    feishu.fetchProfile.mockImplementationOnce(() => new Promise(r => { release = r; }));
+    await onePeriod();
+    state.botName = '新名Bot';
+    refresher.noteLocalWrite();
+    release({ openId: 'ou_self', name: '旧名Bot' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.botName).toBe('新名Bot');
+
+    // Next read still serves the old version (publish not propagated) → held.
+    await onePeriod();
+    expect(state.botName).toBe('新名Bot');
+    expect(changes.filter(c => c.nameChanged && c.previousName === '新名Bot')).toEqual([]);
+
+    // After the hold window the open platform is authoritative again.
+    feishu.rename('再改Bot');
+    await onePeriod();
+    await onePeriod();
+    expect(state.botName).toBe('再改Bot');
+    refresher.stop();
+  });
+
+  it('a failed derived write is retried on the next successful fetch even if nothing changed', async () => {
+    const feishu = fakeFeishu('Bot');
+    const state: BotProfileState = {};
+    let failWrites = true;
+    const written: string[] = [];
+    const refresher = createBotProfileRefresher({
+      larkAppId: APP,
+      fetchProfile: feishu.fetchProfile,
+      state: () => state,
+      onChange: () => {
+        if (failWrites) throw new Error('EACCES bots-info');
+        written.push(state.botName ?? '');
+      },
+      intervalMs: INTERVAL,
+    });
+    refresher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(written).toEqual([]);
+    failWrites = false;
+    await onePeriod();
+    expect(written).toEqual(['Bot']);
+    await onePeriod();
+    expect(written).toEqual(['Bot']); // settled: no further rewrites
+    refresher.stop();
+  });
+
+  it('a fetch that settles after stop() changes nothing', async () => {
+    const feishu = fakeFeishu('旧名Bot');
+    let release!: (p: FetchedBotProfile) => void;
+    feishu.fetchProfile.mockImplementationOnce(() => new Promise(r => { release = r; }));
+    const state: BotProfileState = {};
+    const { refresher, changes } = wire(feishu, state);
+    refresher.start();
+    refresher.stop();
+    release({ openId: 'ou_self', name: '新名Bot' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state).toEqual({});
+    expect(changes).toEqual([]);
+  });
+
   it('stop() cancels further periodic fetches', async () => {
     const feishu = fakeFeishu('Bot');
     const { refresher } = wire(feishu, {});

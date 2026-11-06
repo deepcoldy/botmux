@@ -905,6 +905,9 @@ let selfDaemonLarkAppId: string | undefined;
 export function __testOnly_setDaemonLarkAppId(appId: string | undefined): void {
   selfDaemonLarkAppId = appId;
 }
+/** Set once the profile refresher exists: dashboard ✎ rename / avatar writes
+ *  tell it so an in-flight or not-yet-propagated /bot/v3/info read cannot revert them. */
+let noteLocalBotProfileWrite: (() => void) | undefined;
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -32573,6 +32576,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (!r.ok) return r;
     const bot = getBot(cfg.larkAppId);
     bot.botName = newName;
+    noteLocalBotProfileWrite?.();
     const spec = findConfigField('displayName');
     if (spec && bot.config.displayName) {
       // applyConfigField 的 displayName 钩子会顺带触发 refreshBotNameState。
@@ -32593,6 +32597,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (!r.ok) return r;
     const bot = getBot(cfg.larkAppId);
     bot.botAvatarUrl = r.avatarUrl;
+    noteLocalBotProfileWrite?.();
     if (desc.botAvatarUrl !== r.avatarUrl) {
       desc.botAvatarUrl = r.avatarUrl;
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
@@ -33793,15 +33798,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       fetchProfile: () => fetchBotProfileFromLark(cfg.larkAppId),
       state: () => getBot(cfg.larkAppId),
       onChange: () => {
-        writeBotInfoFile(config.session.dataDir);
+        // Descriptor / SessionRow first so a failing bots-info write cannot
+        // hold them back; the bots-info error is rethrown so the refresher
+        // re-derives on its next successful fetch.
         refreshBotNameState();
         const avatar = getBot(cfg.larkAppId).botAvatarUrl;
         if (avatar && avatar !== desc.botAvatarUrl) {
           desc.botAvatarUrl = avatar;
           try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
         }
+        writeBotInfoFile(config.session.dataDir);
       },
     });
+    noteLocalBotProfileWrite = () => profileRefresher.noteLocalWrite();
     setSelfMentionNameObserver((appId) => {
       if (appId === cfg.larkAppId) profileRefresher.requestRefresh('self-mention name mismatch');
     });
