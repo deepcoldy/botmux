@@ -3561,6 +3561,7 @@ async function cmdStatus(): Promise<void> {
   }
   warnIfLegacyBotmuxAlive();
   const { readFleetStatus } = await import('./core/fleet-runtime.js');
+  const { formatLarkConnectionStatus } = await import('./cli/lark-connection-status.js');
   const status = readFleetStatus();
   if (!status.supervisorAlive && status.rows.length === 0) {
     console.log('daemon 未在运行。（用 `botmux start` 启动）');
@@ -3576,13 +3577,12 @@ async function cmdStatus(): Promise<void> {
     if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
     return;
   }
-  // Fixed-width table: name | pid | status | ↺restarts | exit | version.
   const online = listOnlineDaemons();
-  const versionByApp = new Map(online.map(d => [d.larkAppId, d.botmuxVersion]));
+  const descriptorByApp = new Map(online.map(d => [d.larkAppId, d]));
   const nameW = Math.max(4, ...status.rows.map(r => r.name.length));
-  const verCells = status.rows.map(r => versionByApp.get(r.appId) ?? '-');
+  const verCells = status.rows.map(r => descriptorByApp.get(r.appId)?.botmuxVersion ?? '-');
   const verW = Math.max(7, ...verCells.map(v => v.length));
-  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}`;
+  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}  LARK WS`;
   console.log(header);
   for (const [i, r] of status.rows.entries()) {
     // A row recorded 'online' whose pid is actually dead is shown as such so
@@ -3590,7 +3590,8 @@ async function cmdStatus(): Promise<void> {
     const shown = r.status === 'online' && !r.alive ? 'dead?' : r.status;
     const pidCol = r.pid > 0 ? String(r.pid) : '-';
     const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
-    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}`);
+    const ws = r.appId ? formatLarkConnectionStatus(r, descriptorByApp.get(r.appId)) : '—';
+    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}  ${ws}`);
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);

@@ -8,7 +8,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
-import { startLarkConnection } from './transport/connection.js';
+import { startLarkConnection, type LarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
@@ -4827,9 +4827,9 @@ async function processCommentEvent(
 }
 
 export interface LarkEventDispatcherRuntime {
-  connect(): Lark.WSClient;
+  connect(): LarkConnection;
   connectPrimary(input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   };
   close(): void;
@@ -6894,7 +6894,7 @@ export function createLarkEventDispatcherRuntime(
     };
   }
 
-  let wsClient: Lark.WSClient | undefined;
+  let wsClient: LarkConnection | undefined;
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
@@ -7037,6 +7037,9 @@ export function createLarkEventDispatcherRuntime(
     primaryTransportReady = false;
     if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
         || primaryLeadershipSignal.aborted) return;
+    // A replacement during the same outage must keep the first scan's
+    // history cutoff and ready promise, including during initial leadership.
+    if (pendingTransportReady?.leadershipSignal === primaryLeadershipSignal) return;
     const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
     void ready.catch(error => {
       if (primaryLeadershipSignal?.aborted) return;
@@ -7047,7 +7050,7 @@ export function createLarkEventDispatcherRuntime(
     });
   };
 
-  const connect = (): Lark.WSClient => {
+  const connect = (): LarkConnection => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
       onReady: settlePrimaryTransportReady,
@@ -7085,7 +7088,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const connectPrimary = (input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
@@ -7198,7 +7201,7 @@ export function startLarkEventDispatcher(
   handlers: EventHandlers,
   brand: Brand = 'feishu',
   durableInboxShadow?: DurableInboxStore,
-): Lark.WSClient {
+): LarkConnection {
   return createLarkEventDispatcherRuntime(
     larkAppId,
     larkAppSecret,
