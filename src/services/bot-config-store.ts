@@ -47,6 +47,7 @@ import { applyEnvOps, botEnvLayer, envLayerWithinBudget, isSessionEnvName, parse
 import { sessionEnvLockContextForBot } from '../core/session-env-resolve.js';
 import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
+import { normalizeFeedbackPresentation } from './feedback-presentation.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
 import { normalizeNoProgressNotifyPolicy } from './no-progress-notify-policy.js';
 import { normalizePromptCacheConfig } from './prompt-cache-policy.js';
@@ -147,6 +148,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'botActorOwnerBindings', configKey: 'botActorOwnerBindings', kind: 'json', effect: 'immediate', clearable: true, hint: 'Bot 调用者双 ID 到 Owner union/email 的严格 JSON 绑定；只用于 developer_default 凭据选择' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
+  { key: 'feedbackPresentation', configKey: 'feedbackPresentation', kind: 'json', effect: 'immediate', clearable: true, hint: '反馈卡展示规则 JSON；按群和问题配置轮次、模板与动作；默认关闭' },
   { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off；unset 恢复默认' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
@@ -457,6 +459,10 @@ async function applyConfigFieldInternal(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const expectedAllowedUsers = precondition?.actorOpenId ? JSON.stringify(bot.config.allowedUsers ?? []) : undefined;
+  if (spec.configKey === 'feedbackPresentation' && value !== null) {
+    try { value = normalizeFeedbackPresentation(value); }
+    catch (error) { return { ok: false, reason: `invalid_feedback_presentation: ${error instanceof Error ? error.message : String(error)}` }; }
+  }
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
   }
@@ -1048,7 +1054,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1188,6 +1194,10 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
+        }
+        if (spec.configKey === 'feedbackPresentation') {
+          try { return { ok: true, value: normalizeFeedbackPresentation(parsed) }; }
+          catch (error) { return { ok: false, reason: `invalid_feedback_presentation: ${error instanceof Error ? error.message : String(error)}` }; }
         }
         if (spec.configKey === 'feedback') {
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };

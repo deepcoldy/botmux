@@ -32323,6 +32323,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
   );
   process.once('exit', stopFeedbackMaintenanceParticipant);
+  let feedbackExtensionBusy = false;
+  const feedbackExtensionTimer = setInterval(() => {
+    if (feedbackExtensionBusy) return;
+    feedbackExtensionBusy = true;
+    void import('./services/feedback-extension-host.js')
+      .then(module => module.tickFeedbackExtensions(config.session.dataDir, cfg.larkAppId))
+      .catch(error => logger.warn(`[feedback-extension] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { feedbackExtensionBusy = false; });
+  }, 2000);
+  feedbackExtensionTimer.unref();
+  process.once('exit', () => clearInterval(feedbackExtensionTimer));
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.

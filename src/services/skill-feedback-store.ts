@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
+import { SQLITE_FEEDBACK_STREAM_SCHEMA, validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
 
 /** True when a node:sqlite error is the recoverable write-lock contention that
  *  a burst of concurrent cold-start opens against a shared dataDir produces. */
@@ -728,6 +729,29 @@ export class SkillFeedbackStore {
   listFeedbackEvents(): Array<FeedbackEventEnvelope> {
     return (this.db.prepare('SELECT payload_json FROM feedback_events ORDER BY created_at,event_id').all() as Array<{ payload_json: string }>)
       .map(row => JSON.parse(row.payload_json) as FeedbackEventEnvelope);
+  }
+
+  readFeedbackEventsAfter(input: FeedbackEventCursor): SequencedFeedbackEvent[] {
+    validateFeedbackEventCursor(input);
+    if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name='feedback_event_stream_insert'").get()) {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.exec(SQLITE_FEEDBACK_STREAM_SCHEMA);
+        this.db.exec('COMMIT');
+      } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    }
+    const rows = this.db.prepare(`SELECT s.sequence,e.payload_json FROM feedback_event_stream s
+      JOIN feedback_events e ON e.event_id=s.event_id WHERE s.sequence>? ORDER BY s.sequence LIMIT ?`)
+      .all(input.after, input.limit) as Array<{ sequence: number; payload_json: string }>;
+    return rows.map(row => ({ sequence: Number(row.sequence), event: JSON.parse(row.payload_json) as FeedbackEventEnvelope }));
+  }
+  findDeliveryById(deliveryId: string): ReturnType<SkillFeedbackStore['mapDelivery']> | undefined {
+    const row = this.db.prepare('SELECT * FROM deliveries WHERE delivery_id=?').get(deliveryId) as DeliveryRow | undefined;
+    return row ? this.mapDelivery(row) : undefined;
+  }
+  listSubjectDeliveries(appId: string, chatId: string, subjectId: string): Array<ReturnType<SkillFeedbackStore['mapDelivery']>> {
+    return (this.db.prepare(`SELECT * FROM deliveries WHERE bot_app_id=? AND chat_id=? AND topic_root_id=?
+      ORDER BY created_at,rowid`).all(appId, chatId, subjectId) as DeliveryRow[]).map(row => this.mapDelivery(row));
   }
 
   listFeedbackOutbox(): Array<any> {

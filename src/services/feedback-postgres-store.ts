@@ -6,6 +6,7 @@ import type { FeedbackStore, PostgresTarget } from './feedback-storage-types.js'
 import type { RecordTurnDeliveryInput, RecordTurnTerminalInput, TurnCompletionEventPayload } from './skill-feedback-store.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination } from './feedback-outbox.js';
+import { validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
 
 type Input<Method extends keyof FeedbackStore> = Parameters<FeedbackStore[Method]>[0];
 type Output<Method extends keyof FeedbackStore> = Awaited<ReturnType<FeedbackStore[Method]>>;
@@ -44,10 +45,11 @@ function cardTemplate(value: Record<string, unknown> | undefined): Record<string
 class PostgresFeedbackStore implements FeedbackStore {
   constructor(private readonly pool: Pool) {}
   async close(): Promise<void> { await this.pool.end(); }
-  private async transaction<Result>(operation: (client: PoolClient) => Promise<Result>): Promise<Result> {
+  private async transaction<Result>(operation: (client: PoolClient) => Promise<Result>, ordered = true): Promise<Result> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      if (ordered) await client.query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':feedback-write-order',0))");
       const result = await operation(client);
       await client.query('COMMIT');
       return result;
@@ -235,6 +237,51 @@ class PostgresFeedbackStore implements FeedbackStore {
   }
   async listFeedbackEvents(): Promise<FeedbackEventEnvelope[]> {
     return (await this.pool.query('SELECT payload_json FROM feedback_events ORDER BY created_at,event_id')).rows.map(row => decode(row.payload_json));
+  }
+  async findDeliveryById(deliveryId: string): Promise<Output<'findDeliveryById'>> {
+    const row = (await this.pool.query('SELECT * FROM deliveries WHERE delivery_id=$1', [deliveryId])).rows[0];
+    return row ? this.delivery(this.pool, row) : undefined;
+  }
+  async listSubjectDeliveries(appId: string, chatId: string, subjectId: string): Promise<Output<'listSubjectDeliveries'>> {
+    const rows = (await this.pool.query(`SELECT * FROM deliveries WHERE bot_app_id=$1 AND chat_id=$2 AND topic_root_id=$3
+      ORDER BY created_at,delivery_id`, [appId, chatId, subjectId])).rows;
+    return Promise.all(rows.map(row => this.delivery(this.pool, row)));
+  }
+  async readFeedbackEventsAfter(input: FeedbackEventCursor): Promise<SequencedFeedbackEvent[]> {
+    validateFeedbackEventCursor(input);
+    await this.transaction(async client => {
+      const ready = await client.query(`SELECT 1 FROM pg_trigger WHERE tgrelid='feedback_events'::regclass
+        AND tgname='feedback_event_stream_insert' AND NOT tgisinternal`);
+      if (ready.rowCount) return;
+      await client.query('LOCK TABLE feedback_events IN ACCESS EXCLUSIVE MODE');
+      const recheck = await client.query(`SELECT 1 FROM pg_trigger WHERE tgrelid='feedback_events'::regclass
+        AND tgname='feedback_event_stream_insert' AND NOT tgisinternal`);
+      if (recheck.rowCount) return;
+      await client.query(`
+        CREATE TABLE feedback_event_stream_counter(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value BIGINT NOT NULL);
+        INSERT INTO feedback_event_stream_counter VALUES(1,0);
+        CREATE TABLE feedback_event_stream(sequence BIGINT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE REFERENCES feedback_events(event_id));
+        INSERT INTO feedback_event_stream SELECT ROW_NUMBER() OVER(ORDER BY created_at,event_id),event_id FROM feedback_events;
+        UPDATE feedback_event_stream_counter SET value=(SELECT COALESCE(MAX(sequence),0) FROM feedback_event_stream);
+        CREATE FUNCTION append_feedback_event_stream() RETURNS trigger LANGUAGE plpgsql AS $$
+          DECLARE next_sequence BIGINT;
+          BEGIN
+            PERFORM pg_advisory_xact_lock(hashtextextended(current_schema() || ':feedback-write-order',0));
+            UPDATE feedback_event_stream_counter SET value=value+1 WHERE singleton=1 RETURNING value INTO next_sequence;
+            INSERT INTO feedback_event_stream(sequence,event_id) VALUES(next_sequence,NEW.event_id);
+            RETURN NEW;
+          END;
+        $$;
+        CREATE TRIGGER feedback_event_stream_insert AFTER INSERT ON feedback_events FOR EACH ROW EXECUTE FUNCTION append_feedback_event_stream();
+      `);
+    }, false);
+    const rows = (await this.pool.query(`SELECT s.sequence,e.payload_json FROM feedback_event_stream s
+      JOIN feedback_events e USING(event_id) WHERE s.sequence>$1 ORDER BY s.sequence LIMIT $2`, [input.after, input.limit])).rows;
+    return rows.map(row => {
+      const sequence = Number(row.sequence);
+      if (!Number.isSafeInteger(sequence)) throw new Error('feedback_event_sequence_overflow');
+      return { sequence, event: decode(row.payload_json) as FeedbackEventEnvelope };
+    });
   }
   private outbox(row: Row): Row {
     return { outboxId: row.outbox_id, eventId: row.event_id, destinationId: row.destination_id, destination: decode(row.destination_json), status: row.status, attempts: row.attempts, nextAttemptAt: numeric(row.next_attempt_at), claimToken: row.claim_token ?? undefined, claimedAt: numeric(row.claimed_at), lastHttpStatus: row.last_http_status ?? undefined, lastError: row.last_error ?? undefined, event: decode(row.payload_json) };

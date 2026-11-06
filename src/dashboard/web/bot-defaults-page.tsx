@@ -1,4 +1,5 @@
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
+import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
@@ -1403,6 +1404,7 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       <div className="bd-feedback-controls">
         <ToggleRow checked={on} disabled={busy} title={tr('botDefaults.sectionFeedback')} help={null} description={tr('botDefaults.sectionFeedbackDesc')} onChange={checked => { setOn(checked); void save(checked); }} />
         <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} active={props.active} />
+        {props.active && <FeedbackExtensionPanel appId={props.bot.larkAppId} />}
       </div>
       <StatusSpan status={status} />
       {on ? (
