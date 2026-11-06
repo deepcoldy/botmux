@@ -72,6 +72,7 @@ describe('cmdSend member display-name fallback', () => {
  * cannot read the full host registry. No external Lark request is performed. */
 async function isolatedSend(permission: boolean | undefined, opts: {
   revoke?: boolean; proofAppId?: string; shiftAppOnRevalidation?: boolean;
+  omitPermissionOnRevalidation?: boolean;
   scenario?: 'unique' | 'duplicate' | 'missing' | 'outsider';
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-isolated-mention-'));
@@ -94,7 +95,13 @@ async function isolatedSend(permission: boolean | undefined, opts: {
         domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce: request.nonce,
         channelId, sessionId: 'test-member-mention', turnId: 'om_isolated_turn',
         larkAppId: opts.shiftAppOnRevalidation && challenges > 1 ? 'cli_other' : (opts.proofAppId ?? 'cli_test'),
-        ...(permission === undefined ? {} : { allowArbitraryMention: opts.revoke && challenges > 1 ? false : permission }),
+        // A revalidation proof from an older daemon (or one that lost the
+        // field mid-turn) must keep default-deny, not silently allow.
+        ...(opts.omitPermissionOnRevalidation && challenges > 1
+          ? {}
+          : permission === undefined
+            ? {}
+            : { allowArbitraryMention: opts.revoke && challenges > 1 ? false : permission }),
         requiresCodexAppLedger: false, issuedAtMs: Date.now(),
       } as any });
       // Even an apparently allowing HTTP body is not permission authority.
@@ -170,6 +177,14 @@ describe.skipIf(process.getuid?.() === 0 || process.platform === 'win32')('cmdSe
 
   it('refuses a same-turn permission revocation before the provider sends', async () => {
     const result = await isolatedSend(true, { revoke: true });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain('allowArbitraryMention permission revoked before provider effect');
+    expect(result.stdout).not.toContain('CAPTURE_MESSAGE=');
+    expect(result.challenges).toBeGreaterThan(1);
+  }, 40_000);
+
+  it('refuses when a revalidation proof omits the permission field (default-deny)', async () => {
+    const result = await isolatedSend(true, { omitPermissionOnRevalidation: true });
     expect(result.status, result.stderr).toBe(1);
     expect(result.stderr).toContain('allowArbitraryMention permission revoked before provider effect');
     expect(result.stdout).not.toContain('CAPTURE_MESSAGE=');
