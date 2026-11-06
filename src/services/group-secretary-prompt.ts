@@ -181,7 +181,7 @@ export function renderMainSecretaryPrompt(
   options: { enabledByOpenId: string; groupContextInjected?: boolean; ledger?: LedgerEntry[] },
 ): string {
   const owner = options.enabledByOpenId;
-  renderOpts = { includeMessages: !options.groupContextInjected };
+  const renderOpts: RenderOptions = { includeMessages: !options.groupContextInjected };
   const ledger = options.ledger ?? [];
   return [
     '<group_secretary role="main">',
@@ -209,7 +209,7 @@ export function renderMainSecretaryPrompt(
     '7. 你是全群唯一的秘书：active_sessions / 台账里包括 federation 里其它机器上的 bot，一视同仁。',
     '  </instruction>',
     '  <events>',
-    ...digest.events.map(renderEvent),
+    ...digest.events.map(event => renderEvent(event, renderOpts)),
     '  </events>',
     ...(ledger.length ? ['  <ledger>', ...ledger.slice(0, 30).map(e => renderLedgerEntry(e)), '  </ledger>'] : []),
     ...(digest.activeSessions?.length ? ['  <active_sessions>', ...digest.activeSessions.map(v => `    ${renderSession(v)}`), '  </active_sessions>'] : []),
@@ -229,7 +229,7 @@ export function renderPatrolPrompt(
 ): string {
   const owner = options.enabledByOpenId;
   const root = options.threadRoot;
-  renderOpts = { includeMessages: true };
+  const renderOpts: RenderOptions = { includeMessages: true };
   const entry = options.ledgerEntry;
   return [
     `<group_secretary role="patrol" thread_root="${escapeXml(root)}">`,
@@ -253,7 +253,7 @@ export function renderPatrolPrompt(
     '只有 leader 需要知道、且不在这个话题里能看到的事才 --escalate；正常进展不要上报。',
     '  </instruction>',
     '  <events>',
-    ...digest.events.map(renderEvent),
+    ...digest.events.map(event => renderEvent(event, renderOpts)),
     '  </events>',
     ...(entry ? [
       '  <previous>',
