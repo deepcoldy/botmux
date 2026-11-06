@@ -341,6 +341,93 @@ describe('workflow edit', () => {
     const { base } = seedRun(FLOW);
     expect(edit(base, [{ op: 'removeNode', nodeId: 'b' }])).toMatchObject({ kind: 'applied' });
   });
+
+  // ── Terminal checkpoints in the rerun cone: only a node the edit really
+  // re-dispatches (the rerun cone's supersede finds a live effective
+  // instance) can complete again and needs a dependant. ──
+
+  /**
+   * `u → c(checkpoint)`, `o` independent, `j` joins `[c, o]` with one_success.
+   * `u`/`o` finish; `j` is released by `o` and the losing source `c` is
+   * cancelled as an early-release loser. `c`'s only dependant is `j`.
+   * Without dispatch the cancel carries no instance and `c` stays a node that
+   * was never dispatched (skipped likewise never has one).
+   */
+  function seedEarlyReleaseRun(opts: { c: 'cancelled-with-instance' | 'cancelled-no-instance' | 'skipped' }): { base: string; runDir: string } {
+    const { base, runDir } = seedRun([
+      goal('u', { bot: 'cli_x' }),
+      goal('c', { bot: 'cli_x', checkpoint: true, depends: ['u'] }),
+      goal('o', { bot: 'cli_x' }),
+      goal('j', { bot: 'cli_x', depends: ['c', 'o'], triggerRule: 'one_success' }),
+    ], 'bot');
+    const journal = join(runDir, 'journal.ndjson');
+    for (const nodeId of ['u', 'o']) {
+      appendEvent(journal, { type: 'nodeDispatched', nodeId, instanceId: `${nodeId}#001`, attemptId: `${nodeId}#001/attempts/001`, nodeExecutor: 'bot' });
+      appendEvent(journal, { type: 'nodeSucceeded', nodeId, instanceId: `${nodeId}#001`, attemptId: `${nodeId}#001/attempts/001`, manifestPath: join(runDir, 'm.json') });
+    }
+    if (opts.c === 'cancelled-with-instance') {
+      appendEvent(journal, { type: 'nodeDispatched', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', nodeExecutor: 'bot' });
+    }
+    // j is dispatched early on o's success; the losing source is then settled
+    // (cancelled with its running instance, or skipped before dispatch).
+    appendEvent(journal, { type: 'nodeDispatched', nodeId: 'j', instanceId: 'j#001', attemptId: 'j#001/attempts/001', nodeExecutor: 'bot' });
+    if (opts.c === 'skipped') {
+      appendEvent(journal, { type: 'nodeSkipped', nodeId: 'c', reason: 'triggerRuleUnsatisfied', detail: 'probe' });
+    } else {
+      appendEvent(journal, opts.c === 'cancelled-with-instance'
+        ? { type: 'nodeCancelled', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', reason: 'earlyReleaseLoser', byNodeId: 'j' }
+        : { type: 'nodeCancelled', nodeId: 'c', reason: 'earlyReleaseLoser', byNodeId: 'j' });
+    }
+    return { base, runDir };
+  }
+
+  /** After the edit, the supersede effects the journal records and c's
+   *  materialized node state. */
+  function revisedState(base: string, runDir: string) {
+    const events = readJournal(join(runDir, 'journal.ndjson'));
+    const revised = [...events].reverse().find((event) => event.type === 'dagRevised') as
+      | { effects?: { supersede?: Array<{ nodeId: string }> } }
+      | undefined;
+    return { supersede: revised?.effects?.supersede ?? [], state: materialize(events).nodes.get('c')?.status };
+  }
+
+  it('refuses a cancelled-with-instance sink the rerun cone revives (early-release loser)', () => {
+    const { base } = seedEarlyReleaseRun({ c: 'cancelled-with-instance' });
+    expect(edit(base, [
+      { op: 'removeNode', nodeId: 'j' },
+      { op: 'rerunNode', nodeId: 'u' },
+    ])).toEqual({ kind: 'invalid', problems: [`节点 c：${REFUSAL}`] });
+  });
+
+  it('allows a cancelled sink outside the rerun cone to lose its dependant (nothing re-dispatches it)', () => {
+    const { base, runDir } = seedEarlyReleaseRun({ c: 'cancelled-with-instance' });
+    expect(edit(base, [{ op: 'removeNode', nodeId: 'j' }])).toMatchObject({ kind: 'applied' });
+    const after = revisedState(base, runDir);
+    expect(after.supersede.some((item) => item.nodeId === 'c')).toBe(false);
+    expect(after.state).toBe('cancelled');
+  });
+
+  it('a cancelled sink with no instance in the cone is allowed and stays cancelled (no false refusal)', () => {
+    const { base, runDir } = seedEarlyReleaseRun({ c: 'cancelled-no-instance' });
+    expect(edit(base, [
+      { op: 'removeNode', nodeId: 'j' },
+      { op: 'rerunNode', nodeId: 'u' },
+    ])).toMatchObject({ kind: 'applied' });
+    const after = revisedState(base, runDir);
+    expect(after.supersede.some((item) => item.nodeId === 'c')).toBe(false);
+    expect(after.state).toBe('cancelled');
+  });
+
+  it('a skipped sink in the cone is allowed and stays skipped (it was never dispatched)', () => {
+    const { base, runDir } = seedEarlyReleaseRun({ c: 'skipped' });
+    expect(edit(base, [
+      { op: 'removeNode', nodeId: 'j' },
+      { op: 'rerunNode', nodeId: 'u' },
+    ])).toMatchObject({ kind: 'applied' });
+    const after = revisedState(base, runDir);
+    expect(after.supersede.some((item) => item.nodeId === 'c')).toBe(false);
+    expect(after.state).toBe('skipped');
+  });
 });
 
 describe('a run approved before the rule, with a checkpoint nothing depends on', () => {

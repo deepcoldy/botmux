@@ -1241,15 +1241,25 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   if (placementProblems.length > 0) return { ok: false, problems: placementProblems.map((problem) => problem.message) };
   // §13.6: an edit may not leave a checkpoint that nothing depends on (newly
   // marked, its last dependant removed or rewired away, or one the flow
-  // already had). Only one that may still complete counts: a checkpoint that
-  // is done (and not redone by this edit's reruns, itself or downstream of
-  // one), skipped or cancelled has nothing left to wake anybody about — the
-  // main bot reviewing it may well drop the rest of the flow.
+  // already had). Only one that may still (re)complete counts. "May redo it"
+  // must match the supersede effects computed below exactly: the rerun cone
+  // re-dispatches a node only while it still has an effective instance.
+  //  - done: redone by this edit's reruns (itself or downstream of one) runs
+  //    again as a new instance;
+  //  - cancelled: an early-release loser is cancelled WITH its instance, so a
+  //    cone supersede revives it; one cancelled before dispatch has no
+  //    instance and stays cancelled;
+  //  - skipped: never dispatched (skip only applies to a pending node), so no
+  //    cone supersede can bring it back.
   if (input.nodeExecutor === 'bot') {
     const redone = new Set([...rerun].flatMap((nodeId) => affectedNodesFrom(next, nodeId)));
     const settled = (nodeId: string): boolean => {
-      const status = added.has(nodeId) ? undefined : snap.nodes.get(nodeId)?.status;
-      return (status === 'done' && !redone.has(nodeId)) || status === 'skipped' || status === 'cancelled';
+      if (added.has(nodeId)) return false;
+      const state = snap.nodes.get(nodeId);
+      if (state?.status === 'skipped') return true;
+      if (state?.status === 'done') return !redone.has(nodeId);
+      if (state?.status === 'cancelled') return !redone.has(nodeId) || !state.effectiveInstanceId;
+      return false;
     };
     const sinks = v3CheckpointsWithoutDependants(next).filter((nodeId) => !settled(nodeId));
     if (sinks.length > 0) return { ok: false, problems: v3CheckpointProblems(sinks) };
