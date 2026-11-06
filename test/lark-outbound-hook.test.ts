@@ -331,17 +331,40 @@ describe('Lark send gate retry keeps one dedupe uuid', () => {
     expect(uuids[0]).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
   });
 
-  it('separate sends without a caller uuid do not share one', async () => {
+  // A per-operation constant would also satisfy the retry tests above, so each
+  // primitive that mints a token needs its own cross-call independence check.
+  it.each(['send', 'reply', 'forward', 'dm'] as const)('separate %s calls without a caller uuid do not share one', async operation => {
     mocks.create.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
-    await sendMessage('app-retry-uuid', 'oc_chat', 'a');
-    await sendMessage('app-retry-uuid', 'oc_chat', 'a');
-    const [a, b] = mocks.create.mock.calls.map(c => c[0].data.uuid);
-    expect(a).not.toBe(b);
+    mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    mocks.forward.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    const call = operation === 'send' ? () => sendMessage('app-retry-uuid', 'oc_chat', 'a')
+      : operation === 'reply' ? () => replyMessage('app-retry-uuid', 'om_root', 'a')
+        : operation === 'forward' ? () => forwardMessage('app-retry-uuid', 'om_src', 'oc_dest')
+          : () => sendUserMessage('app-retry-uuid', 'ou_user', 'a');
+    await call();
+    await call();
+    const uuids = operation === 'forward'
+      ? mocks.forward.mock.calls.map(c => c[0].params.uuid)
+      : operation === 'reply'
+        ? mocks.reply.mock.calls.map(c => c[0].data.uuid)
+        : mocks.create.mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[1]).not.toBe(uuids[0]);
   });
 
-  it('does not leak the generated uuid into the outbound hook', async () => {
+  it.each(['send', 'reply'] as const)('%s does not leak the generated uuid into the outbound hook', async operation => {
     mocks.create.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
-    await sendMessage('app-retry-uuid', 'oc_chat', 'a', 'text', undefined, { sessionId: 's' });
+    mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    if (operation === 'send') {
+      await sendMessage('app-retry-uuid', 'oc_chat', 'a', 'text', undefined, { sessionId: 's' });
+    } else {
+      await replyMessage('app-retry-uuid', 'om_root', 'a', 'text', false, undefined, { sessionId: 's' });
+    }
+    // The wire must still carry a token; only the hook payload stays clean.
+    const wire = operation === 'send'
+      ? mocks.create.mock.calls[0][0].data.uuid
+      : mocks.reply.mock.calls[0][0].data.uuid;
+    expect(wire).toEqual(expect.any(String));
     expect(mocks.emitHookEvent).toHaveBeenCalledOnce();
     expect(mocks.emitHookEvent.mock.calls[0][1].uuid).toBeUndefined();
   });
