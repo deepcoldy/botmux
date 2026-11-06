@@ -98,4 +98,7 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
   'codem': undefined,
   // Personal providers are discovered on demand; never perform I/O here.
   zcode: undefined,
+  // Display names accepted by `doubao --model` (2.31). The live list is
+  // account-dependent; detectModels() reads it from the CLI on demand.
+  doubao: ['Auto', 'Doubao 2.1 Pro', 'Doubao 2.1 Turbo', 'Doubao 2.1 Lite'],
 };

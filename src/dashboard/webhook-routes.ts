@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { getConnector, listConnectors, type ConnectorDefinition } from '../services/connector-store.js';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { connectorPayloadTrustBlocker, getConnector, listConnectors, type ConnectorDefinition } from '../services/connector-store.js';
 import { getWebhookSecret } from '../services/webhook-key.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import {
@@ -39,6 +39,17 @@ import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerA
 const replayNonces = new Map<string, number>();
 const rateBuckets = new Map<string, { windowStart: number; count: number }>();
 let lastRetentionPruneAt = 0;
+
+
+/** `payloadTrusted` for a turn this connector fires. Re-checks the
+ *  verification precondition at dispatch (not only at save) so a hand-edited
+ *  store cannot trust bytes from an unverified connector; workflow targets
+ *  never render through the turn prompt and stay untrusted. */
+export function payloadTrustFields(connector: ConnectorDefinition): { payloadTrusted?: true } {
+  if (connector.promptEnvelope.trustPayload !== true || connector.target.kind !== 'turn') return {};
+  if (connectorPayloadTrustBlocker(connector, !!getWebhookSecret(connector.verify.secretRef))) return {};
+  return { payloadTrusted: true };
+}
 
 function pruneExpiredWebhookLogs(): void {
   const now = Date.now();
@@ -545,6 +556,10 @@ async function handleWebhookRouteImpl(
       fail(400, 'bad_request', 'async polling is only supported for turn connectors');
       return true;
     }
+    if (url.searchParams.get('capabilities') === '1') {
+      jsonRes(res, 200, { ok: true, capabilities: { async: true, durableAsync: connector.verify.type === 'token' && connector.target.mode === 'dynamic' && !connector.idempotency?.disabled } });
+      return true;
+    }
     const sessionId = url.searchParams.get('sessionId') ?? undefined;
     const triggerId = url.searchParams.get('triggerId') ?? undefined;
     if (!sessionId) {
@@ -662,6 +677,21 @@ async function handleWebhookRouteImpl(
   const idempotencyKey = connector.idempotency?.disabled
     ? undefined
     : idempotencyKeyOf(req, url, parsed.payload, connector);
+  // Opt-in service contract: a fresh virtual async turn uses the daemon's
+  // durable at-most-once lease, not the legacy process-local webhook window.
+  const durableAsync = url.searchParams.get('durable') === '1';
+  if (durableAsync && (connector.verify.type !== 'token'
+    || connector.target.kind !== 'turn' || connector.target.mode !== 'dynamic'
+    || !responseOptions.asyncReturnSessionId || responseOptions.waitForFinalOutput || responseOptions.dryRun
+    || dynamicChatId(req, url, parsed.payload) || dynamicSessionId(req, url, parsed.payload)
+    || dynamicRootMessageId(req, url, parsed.payload)
+    || !idempotencyKey || idempotencyKey.length > 200)) {
+    fail(400, 'bad_request', 'durable async requires token auth, a dynamic turn, async=1, an idempotency key, and no chat/session target');
+    return true;
+  }
+  const durableKey = durableAsync
+    ? `whapi:${createHash('sha256').update(JSON.stringify([connector.id, idempotencyKey])).digest('hex')}`
+    : undefined;
   let idempotency: WebhookIdempotencyDecision = { kind: 'disabled' };
   const suppressDuplicate = (key: string, firstTriggerId?: string): true => {
     // 200 + action:'ignored', never 4xx: an at-least-once sender treats a non-2xx
@@ -675,7 +705,7 @@ async function handleWebhookRouteImpl(
     });
     return true;
   };
-  if (idempotencyKey && !responseOptions.dryRun) {
+  if (idempotencyKey && !responseOptions.dryRun && !durableAsync) {
     // Resolve to a terminal verdict. An `in_flight` verdict means a delivery of
     // this same event is mid-flight and its outcome is unknown; we must not ACK
     // that as handled (if it then fails, a sender that stopped retrying has lost
@@ -824,8 +854,9 @@ async function handleWebhookRouteImpl(
       source: {
         type: 'webhook',
         connectorId: connector.id,
-        requestId,
-        receivedAt: new Date().toISOString(),
+        // These volatile fields participate in daemon request hashing. Keep
+        // the service request identical across retries and Dashboard restarts.
+        ...(!durableAsync ? { requestId, receivedAt: new Date().toISOString() } : {}),
       },
       target: {
         kind: connector.target.kind,
@@ -838,17 +869,23 @@ async function handleWebhookRouteImpl(
         format: 'botmux.webhook.v1',
         sourceName: connector.promptEnvelope.sourceName || connector.name,
         trusted: false,
-        headers: pickAllowedHeaders(req, connector.promptEnvelope.headerAllowlist),
+        // Durable retries must hash identically at the daemon. Allowlisted
+        // headers are connector-owner configured for tracing and can vary on
+        // every delivery (x-request-id, gateway delivery ids), which would make
+        // the same-key retry collide as idempotency_conflict there; the edge
+        // dedup gate is intentionally off in this mode, so it cannot fold them.
+        headers: durableAsync ? {} : pickAllowedHeaders(req, connector.promptEnvelope.headerAllowlist),
         payload: parsed.payload,
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      ...payloadTrustFields(connector),
       ...(presentation ? { presentation } : {}),
-      options: responseOptions,
+      options: { ...responseOptions, ...(durableKey ? { idempotencyKey: durableKey } : {}) },
     };
 
     const result = await dispatchWithIdempotency(trigger);
-    jsonRes(res, result.status, withIdempotencyEcho(result.body));
+    jsonRes(res, result.status, { ...withIdempotencyEcho(result.body), ...(durableAsync ? { durableAsync: true } : {}) });
     return true;
   }
   if (connector.target.mode === 'new-group') {
@@ -982,6 +1019,7 @@ async function handleWebhookRouteImpl(
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      ...payloadTrustFields(connector),
       ...(presentation ? { presentation } : {}),
       options: {
         ...(dedupKey ? { dedupKey } : {}),
@@ -1037,6 +1075,7 @@ async function handleWebhookRouteImpl(
       ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
     },
     ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+    ...payloadTrustFields(connector),
     ...(presentation ? { presentation } : {}),
     options: {
       ...responseOptions,

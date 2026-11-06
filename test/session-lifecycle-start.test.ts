@@ -1,6 +1,12 @@
 import { EventEmitter, once } from 'node:events';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
+import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
+
+vi.mock('../src/services/session-group-title.js', () => ({
+  acceptSessionGroupTitle: vi.fn(),
+  scheduleSessionGroupTitle: vi.fn(),
+}));
 
 const {
   emitHookEventMock,
@@ -515,6 +521,71 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
       denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
     }],
   };
+
+  it('rejects feedback maintenance before reading bot configuration or starting protected DNS', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-maintenance-before-freeze-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      writeFileSync(join(dataDir, 'feedback-maintenance.json'), JSON.stringify({
+        migrationId: 'fixture', state: 'draining', generation: 1,
+        participants: [], blockers: [],
+      }));
+      const ds = makeDs();
+      const onAdmission = vi.fn();
+
+      expect(forkWorker(ds, 'maintenance opening', false, { onAdmission })).toBe(false);
+
+      expect(onAdmission.mock.calls).toEqual([['rejected']]);
+      expect(getBot).not.toHaveBeenCalled();
+      expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+      expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rechecks feedback maintenance after DNS before persisting a policy or creating a worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-maintenance-during-freeze-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    let resolveDns!: (addresses: string[][]) => void;
+    const dns = new Promise<string[][]>(resolve => { resolveDns = resolve; });
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(dns);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    try {
+      const ds = makeDs();
+      const onAdmission = vi.fn();
+
+      expect(forkWorker(ds, 'opening before maintenance', false, { onAdmission })).toBe(true);
+      expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+      expect(forkMock).not.toHaveBeenCalled();
+      writeFileSync(join(dataDir, 'feedback-maintenance.json'), JSON.stringify({
+        migrationId: 'fixture', state: 'draining', generation: 1,
+        participants: [], blockers: [],
+      }));
+      resolveDns([['10.20.30.40']]);
+      await vi.waitFor(() => expect(onAdmission.mock.calls).toEqual([['rejected']]));
+
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    } finally {
+      resolveDns([['10.20.30.40']]);
+      await dns;
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 
   it('freezes the enabled plugin policy into worker init even when no actor capability is enabled', async () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
@@ -7680,6 +7751,20 @@ describe('session.start lifecycle integration', () => {
     expect(ds.initConfig?.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
     expect(ds.initConfig?.nativeSessionTitlePrompt).toBeUndefined();
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('forwards the current Codex chat resident semantic title to group naming', () => {
+    const ds = makeDs({ scope: 'chat' });
+    ds.session.scope = 'chat';
+    forkWorker(ds, '<user_message>排查超时</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(acceptSessionGroupTitle).mockClear();
+    worker.emit('message', { type: 'native_session_title_generated', title: '[BotMux·Lark] 排查超时' });
+    expect(acceptSessionGroupTitle).toHaveBeenCalledWith(ds.larkAppId, ds.session, '[BotMux·Lark] 排查超时');
+    vi.mocked(acceptSessionGroupTitle).mockClear();
+    ds.session.nativeSessionTitleUserDefined = true;
+    worker.emit('message', { type: 'native_session_title_generated', title: '[BotMux·Lark] 迟到标题' });
+    expect(acceptSessionGroupTitle).not.toHaveBeenCalled();
   });
 
   it('ignores a late generated title after the user explicitly renames the session', () => {

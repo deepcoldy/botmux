@@ -416,6 +416,17 @@ jobs:
   #
   # Free for this repo: macOS runners bill 10× minutes on private repos, but
   # public repos consume no included minutes at all.
+  #
+  # TROUBLESHOOTING a `cancelled` conclusion with ZERO steps and an empty
+  # runner_name: that is NOT a build failure. macos-15 is the arm64 hosted pool,
+  # and under capacity pressure GitHub gives up acquiring a runner after ~15
+  # minutes and marks the job `cancelled` before any step runs (annotation:
+  # "The job was not acquired by Runner of type hosted"). This job is NOT in the
+  # master ruleset (which requires only `build` + `test`), so let a later run
+  # cover it naturally. Do NOT re-run a non-tip older master SHA to rescue it:
+  # all master push runs share concurrency group `ci-<workflow>-<ref>`, and a
+  # freshly created re-run supersedes a newer run that is still queued
+  # (cancel-in-progress:false protects only the run that already started).
   bun-binary-darwin:
     runs-on: macos-15
     timeout-minutes: 30
@@ -447,7 +458,15 @@ jobs:
       # manifest, and BEFORE the compile that bakes the value in.
       - run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
 
+      # macos-15 runners have 7 GB RAM, so Node's default old-space cap is
+      # smaller than on the 16 GB linux runners, and the whole-repo `tsc` in
+      # `bun run build` (~2.4 GB used locally, `tsc --extendedDiagnostics`)
+      # now sits right at it: a PR adding ~30 MB of types aborted with
+      # "Reached heap limit … JavaScript heap out of memory" (exit 134) while
+      # its base passed. Give it explicit headroom instead of riding the edge.
       - run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
 
       - name: Compile both darwin binaries
         # BOTH arches, because the shipped set is both and the defect lives in

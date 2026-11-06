@@ -15,6 +15,8 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
+import { v3OrderedAncestorSets, v3OrderingBreak, v3ReachableAncestorSets, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
+import type { V3HandoffIdentityRecord, V3HandoffIdentityTool, V3HandoffIdentityUnavailableReason } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
 
@@ -64,6 +66,30 @@ export function describeV3EphemeralFallback(decision: V3NodeExecutorDecision): s
   return `「节点交给群里的 Bot 执行」已开启，但本次仍用临时进程执行节点：${EPHEMERAL_REASON_TEXT[decision.reason]}。`;
 }
 
+/**
+ * §5.2 hard rule 3: can this run's main topic host `main` nodes? Only when
+ * the run is anchored at a topic root AND its main session is that topic's
+ * own session. A normal group whose main bot keeps one chat-wide session
+ * (P4) has a root to reply under, but its main session is not in it: every
+ * node there gets a node topic. `mainSession` is the persisted row of
+ * `binding.sessionId` (undefined = not found / unreadable).
+ */
+export function v3MainTopicAvailability(
+  binding: RunChatBinding | undefined,
+  mainSession: { scope?: 'thread' | 'chat'; rootMessageId?: string | null } | undefined,
+): V3MainTopicAvailability {
+  if (!binding?.chatId || !binding.rootMessageId) return { available: false, why: '这个 run 没有主话题根' };
+  if (binding.chatType !== 'group') return { available: false, why: '这个 run 不在群聊里' };
+  if (!binding.sessionId || !mainSession) return { available: false, why: '查不到主会话，无法确认它在不在话题里' };
+  if ((mainSession.scope ?? 'thread') !== 'thread') {
+    return { available: false, why: '主 Bot 在本群是「整群一个会话」，主会话不在话题里' };
+  }
+  if (mainSession.rootMessageId !== binding.rootMessageId) {
+    return { available: false, why: '主会话不在这个 run 的主话题里' };
+  }
+  return { available: true };
+}
+
 export interface V3NodeExecutorTarget {
   /** Authored goal node id, or `<loopId>.<bodyNodeId>` for a loop body. */
   nodeId: string;
@@ -75,6 +101,14 @@ export interface V3NodeExecutorTarget {
    *  (`botmux report --output` carries files), so such a node can never
    *  complete when handed to a bot. */
   directoryOutputs?: string[];
+  /** §5.1: set only for a top-level goal node handed off in the main topic. */
+  placement?: 'main';
+  /** With `placement`: why a `depends` ancestor is NOT among `ancestors`
+   *  (a one_success / quorum join lets the node start before it ends). */
+  unorderedAncestors?: Array<{ nodeId: string; joinId: string; rule: string }>;
+  /** With `placement`: the node's transitive `depends` ancestors (top-level
+   *  ids), so the §5.2 hard rules can be checked from the targets alone. */
+  ancestors?: string[];
 }
 
 function directoryOutputsOf(outputs: Record<string, { kind: string }> | undefined): string[] | undefined {
@@ -101,8 +135,35 @@ export function v3BotExecutorTargets(
     const directoryOutputs = directoryOutputsOf(outputs);
     return directoryOutputs ? { ...target, directoryOutputs } : target;
   };
+  // §5.2: only ancestors guaranteed to finish first (all_success joins on
+  // the whole path) order two main-topic nodes; the same rule as placement.ts.
+  const ordered = v3OrderedAncestorSets(dag);
+  const main = dag.nodes.filter((node) => isGoalNode(node) && node.placement === 'main');
+  // The explanation is only needed for a pair that conflicts (same executor,
+  // linked by `depends` yet unordered); computed once per DAG, not per pair.
+  const executorOfMain = new Map(main.map((node) => [node.id, isGoalNode(node) ? targetOf(node.bot, node.id) : undefined]));
+  let reach: Map<string, Set<string>> | undefined;
   for (const node of dag.nodes) {
-    if (isGoalNode(node)) out.push(withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs));
+    if (isGoalNode(node)) {
+      const target = withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs);
+      if (node.placement !== 'main') {
+        out.push(target);
+        continue;
+      }
+      const unorderedAncestors = main.flatMap(({ id: other }) => {
+        if (other === node.id || ordered.get(node.id)?.has(other)) return [];
+        if (executorOfMain.get(other) !== executorOfMain.get(node.id)) return [];
+        reach ??= v3ReachableAncestorSets(dag);
+        const why = v3OrderingBreak(dag, other, node.id, reach);
+        return why ? [{ nodeId: other, ...why }] : [];
+      });
+      out.push({
+        ...target,
+        placement: 'main',
+        ancestors: [...(ordered.get(node.id) ?? [])].sort(),
+        ...(unorderedAncestors.length > 0 ? { unorderedAncestors } : {}),
+      });
+    }
     if (isLoopNode(node)) {
       for (const body of node.body.nodes) {
         const nodeId = `${node.id}.${body.id}`;
@@ -117,6 +178,57 @@ export function v3BotExecutorTargets(
   return out;
 }
 
+/**
+ * §5.2 hard rules over the frozen targets (who executes each node is already
+ * resolved): rules 1–2 from the `ancestors` the main targets carry, rule 3
+ * against `mainTopic`. Messages say which rule; empty = fine.
+ */
+export function v3TargetPlacementProblems(input: {
+  targets: readonly V3NodeExecutorTarget[];
+  orchestratorAppId: string;
+  mainTopic: V3MainTopicAvailability;
+  nameOf?: (larkAppId: string) => string;
+}): string[] {
+  const main = input.targets.filter((target) => target.placement === 'main' && !target.loop);
+  if (main.length === 0) return [];
+  const executor = new Map(main.map((target) => [target.nodeId, target.larkAppId]));
+  return v3PlacementProblems({
+    dag: {
+      runId: 'placement-check',
+      nodes: main.map((target) => ({
+        id: target.nodeId,
+        type: 'goal' as const,
+        goal: target.nodeId,
+        placement: 'main' as const,
+        // Ancestors are already transitive: direct edges to them suffice.
+        depends: (target.ancestors ?? []).map((from) => ({ from })),
+        inputs: [],
+      })),
+    },
+    mainLarkAppId: input.orchestratorAppId,
+    executorOf: (nodeId) => executor.get(nodeId) ?? input.orchestratorAppId,
+    explainUnordered: (a, b) => {
+      const find = (later: string, first: string) =>
+        main.find((target) => target.nodeId === later)?.unorderedAncestors?.find((entry) => entry.nodeId === first);
+      const ab = find(b, a);
+      if (ab) return { joinId: ab.joinId, rule: ab.rule, first: a };
+      const ba = find(a, b);
+      return ba ? { joinId: ba.joinId, rule: ba.rule, first: b } : undefined;
+    },
+    mainTopic: input.mainTopic,
+    ...(input.nameOf ? { nameOf: input.nameOf } : {}),
+  }).map((problem) => problem.message);
+}
+
+/** The refusal text when placements break the §5.2 hard rules. */
+export function formatV3PlacementRefusal(problems: readonly string[]): string {
+  return [
+    '节点落点不满足硬规则，已拒绝批准：',
+    ...problems.map((problem) => `- ${problem}`),
+    '把相关节点改成节点话题或调整依赖后重试（即兴 run 可用 revise-dag 让 Architect 重排）。',
+  ].join('\n');
+}
+
 export type V3BotEligibilityCode =
   | 'BOT_NOT_CONFIGURED'
   | 'BOT_NOT_IN_CHAT'
@@ -128,7 +240,12 @@ export type V3BotEligibilityCode =
   | 'NO_TOPIC_SESSION'
   | 'TOPIC_SESSION_UNKNOWN'
   /** The node declares a directory output, which a bot cannot submit. */
-  | 'DIRECTORY_OUTPUT';
+  | 'DIRECTORY_OUTPUT'
+  /** `approve-dag --working-dir` lies outside this bot's configured
+   *  directory range (design §15.4). */
+  | 'WORKING_DIR_OUT_OF_RANGE'
+  /** `approve-dag --working-dir`, but this bot configures no directory. */
+  | 'WORKING_DIR_NO_RANGE';
 
 export interface V3BotEligibilityProblem {
   nodeId: string;
@@ -233,26 +350,58 @@ const PROBLEM_TEXT: Record<V3BotEligibilityCode, string> = {
   NO_TOPIC_SESSION: '它在本群设成了「整群一个会话」（chat / shared），节点话题里的交接会并进群会话，无法提交；请把它在本群的回复模式改成 new-topic 或 chat-topic，或改派',
   TOPIC_SESSION_UNKNOWN: '暂时查不到本群是话题群还是普通群，请稍后重试',
   DIRECTORY_OUTPUT: '节点声明了目录型产出，交给 Bot 执行时无法提交目录；请改成文件产出，或在 Dashboard 关闭该开关改用临时进程执行',
+  WORKING_DIR_OUT_OF_RANGE: '指定的工作目录不在它配置的目录范围内（默认工作目录 / 仓库目录）',
+  WORKING_DIR_NO_RANGE: '它没有配置目录范围（默认工作目录 / 仓库目录），不能给它指定工作目录',
 };
+
+const WORKING_DIR_CODES: ReadonlySet<V3BotEligibilityCode> = new Set(['WORKING_DIR_OUT_OF_RANGE', 'WORKING_DIR_NO_RANGE']);
 
 /** One user-facing reason for an eligibility code. */
 export function describeV3BotEligibilityCode(code: V3BotEligibilityCode): string {
   return PROBLEM_TEXT[code];
 }
 
-/** "Node → bot: reason" lines for a refused approval. */
+/** "Node → bot: reason" lines for a refused approval. `workingDir`: the
+ *  directory `approve-dag --working-dir` asked for, named once when a node
+ *  was refused for it. */
 export function formatV3BotEligibilityRefusal(
   problems: readonly V3BotEligibilityProblem[],
   nameOf: (larkAppId: string) => string,
+  opts: { workingDir?: string } = {},
 ): string {
   const lines = problems.map((problem) =>
     `- ${problem.nodeId} → ${nameOf(problem.larkAppId)}：${PROBLEM_TEXT[problem.code]}` +
     (problem.detail ? `（${problem.detail}）` : ''));
+  const dirRefused = opts.workingDir !== undefined && problems.some((problem) => WORKING_DIR_CODES.has(problem.code));
   return [
     '「节点交给群里的 Bot 执行」已开启，但以下节点的执行 Bot 不满足条件，已拒绝批准：',
+    ...(dirRefused ? [`指定的工作目录：${opts.workingDir}`] : []),
     ...lines,
+    ...(dirRefused
+      ? ['节点在执行 Bot 自己的会话里跑，指定的目录必须落在每个执行 Bot 配置的默认工作目录或仓库目录之内；'
+        + '可换一个目录、给这些 Bot 的默认工作目录或仓库目录补上它，或去掉 --working-dir 让各 Bot 用自己的默认目录。']
+      : []),
     '处理后重新批准；或用 revise-dag 改派节点，或在 Dashboard 关闭该开关改用临时进程执行。',
   ].join('\n');
+}
+
+/** The Gate-2 summary line for a bot run approved with `--working-dir`. */
+export function describeV3NodeWorkingDir(workingDir: string): string {
+  return `工作目录：${workingDir}（每个执行 Bot 起节点会话时会按它当时的配置再核对一次；`
+    + '到时不在它的目录范围内，该节点会受阻并写明原因，不会改用它的默认目录）';
+}
+
+/** The summary heading of a bot run: unchanged while every node gets its own
+ *  topic; a run that also hands nodes off in the main topic says so. */
+export function v3BotExecutorPlanHeading(targets: readonly Pick<V3NodeExecutorTarget, 'placement'>[]): string {
+  return targets.some((target) => target.placement === 'main')
+    ? '执行方式：节点交给群里的 Bot 执行（按节点在主话题交接或开节点话题，见每行括号）'
+    : '执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）';
+}
+
+/** 「主话题」/「节点话题」for one target. */
+export function v3PlacementLabel(target: Pick<V3NodeExecutorTarget, 'placement'>): string {
+  return target.placement === 'main' ? '主话题' : '节点话题';
 }
 
 /** "Node → executing bot" lines for the Gate-2 summary of a bot run. */
@@ -262,11 +411,100 @@ export function formatV3BotExecutorPlan(
   nameOf: (larkAppId: string) => string,
 ): string {
   return [
-    '执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）',
-    ...targets.map((target) =>
-      `- ${target.nodeId} → ${nameOf(target.larkAppId)}` +
-      (target.larkAppId === orchestratorAppId ? '（主 Bot 自己）' : '')),
+    v3BotExecutorPlanHeading(targets),
+    ...targets.map((target) => {
+      const detail = [
+        target.larkAppId === orchestratorAppId ? '主 Bot 自己' : undefined,
+        // Named only when some node goes to the main topic (lines unchanged otherwise).
+        targets.some((other) => other.placement === 'main') ? v3PlacementLabel(target) : undefined,
+      ].filter(Boolean).join('，');
+      return `- ${target.nodeId} → ${nameOf(target.larkAppId)}${detail ? `（${detail}）` : ''}`;
+    }),
   ].join('\n');
+}
+
+// ─── 交接带发起人身份 (design §10.2, D5): frozen at authorization ─────────
+
+/** open_id → union_id through the main bot's own app (`resolveUnionIdFromOpenIdStrict`). */
+export type V3InitiatorUnionLookup =
+  | { status: 'resolved'; unionId: string }
+  /** Definitive: the app may not see this person's union_id (scope / visibility). */
+  | { status: 'unavailable' }
+  | { status: 'retryable'; error: string };
+
+/** Live seams for freezing the initiator; present only while the switch is on. */
+export interface V3HandoffIdentityPolicy {
+  lookupUnionId(larkAppId: string, openId: string): Promise<V3InitiatorUnionLookup>;
+  /** The tools a sender runs as themselves on this bot right now
+   *  (`triggerUserAuth.tools` when enabled, else none). */
+  botTools(larkAppId: string): V3HandoffIdentityTool[];
+}
+
+export type V3HandoffIdentityResolution = {
+  /** What run.json records: the frozen initiator, or why there is none. */
+  record: V3HandoffIdentityRecord;
+  /** A line for the Gate-2 / command reply; empty when there is nothing a
+   *  person needs to know (no node bot runs a tool as its trigger user). */
+  summary: string;
+};
+
+/** Plain-language reason a run carries no initiator identity. */
+export const V3_HANDOFF_IDENTITY_UNAVAILABLE_TEXT: Record<V3HandoffIdentityUnavailableReason, string> = {
+  not_human_turn: '这次批准不是发起人本人在群里发来的消息（定时任务、事件唤醒等自动回合）',
+  no_initiator: '这个 run 没有经过认证的发起人',
+  lookup_unavailable: '主 Bot 查不到发起人的跨应用身份（通常是缺少通讯录权限，或发起人对本应用不可见）',
+  lookup_failed: '批准时查询发起人的跨应用身份失败',
+  no_tools: '主 Bot 没开「按触发人鉴权」，发起人没有可交出的工具',
+};
+
+/**
+ * Freeze the initiator of a bot-executed run (design §10.2 item 1): the
+ * authenticated person of the authorizing turn (`binding.ownerOpenId`, the
+ * main bot's view), their union_id resolved now through the main bot's app,
+ * and the tools they had on the main bot now — the ceiling every later
+ * handoff's delegation is narrowed from (§10.2 item 5).
+ *
+ * Never refuses the authorization (design §10 principle: permission is asked
+ * for only when a tool really needs it). When the identity cannot be frozen —
+ * a scheduled task's or other synthetic turn (ADR dispatch-user-delegation §7:
+ * such turns carry no delegation), no authenticated initiator, the lookup
+ * unavailable or failing, no tool to hand on — the run records why and is
+ * approved without it; the summary names the nodes whose bot runs tools as
+ * its trigger user, since only those will ask for authorization later.
+ */
+export async function resolveV3HandoffIdentity(
+  binding: RunChatBinding,
+  policy: V3HandoffIdentityPolicy,
+  /** The authorizing turn was opened by a human message (`om_…` / `join_…`). */
+  turn: { humanTurn: boolean },
+  plan: { targets: readonly V3NodeExecutorTarget[]; nameOf: (larkAppId: string) => string },
+): Promise<V3HandoffIdentityResolution> {
+  const unavailable = (reason: V3HandoffIdentityUnavailableReason): V3HandoffIdentityResolution => {
+    const governing = plan.targets.filter((target) => policy.botTools(target.larkAppId).length > 0);
+    return {
+      record: { unavailable: reason },
+      summary: governing.length === 0 ? '' : `这个 run 不带发起人身份：${V3_HANDOFF_IDENTITY_UNAVAILABLE_TEXT[reason]}；`
+        + `开了「按触发人鉴权」的 Bot（${governing.map((target) => `${target.nodeId} → ${plan.nameOf(target.larkAppId)}`).join('、')}）`
+        + '调用需要个人授权的工具时，会提示授权',
+    };
+  };
+  if (!turn.humanTurn) return unavailable('not_human_turn');
+  if (!binding.ownerOpenId) return unavailable('no_initiator');
+  let lookup: V3InitiatorUnionLookup;
+  try {
+    lookup = await policy.lookupUnionId(binding.larkAppId, binding.ownerOpenId);
+  } catch (err) {
+    lookup = { status: 'retryable', error: err instanceof Error ? err.message : String(err) };
+  }
+  if (lookup.status === 'retryable') return unavailable('lookup_failed');
+  if (lookup.status === 'unavailable') return unavailable('lookup_unavailable');
+  const tools = [...new Set(policy.botTools(binding.larkAppId))];
+  if (tools.length === 0) return unavailable('no_tools');
+  return {
+    record: { unionId: lookup.unionId, tools },
+    summary: `交接带发起人身份：开。开了「按触发人鉴权」的子 Bot 以发起人本人的身份执行，可委托工具不超过：${tools.join('、')}；`
+      + '某个节点交接时带不上身份的，照常交接，用到需要个人授权的工具时会提示授权',
+  };
 }
 
 /** Everything an authorization entry point needs to decide the executor. */
@@ -276,13 +514,19 @@ export interface V3NodeExecutorPolicy {
   /** Built only for a `bot` decision (it may talk to Lark / daemons). */
   probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
   nameOf: (larkAppId: string) => string;
+  /** 交接带发起人身份 switch: present only while it is on. */
+  handoffIdentity?: V3HandoffIdentityPolicy;
+  /** §5.2 rule 3 (read only when some node is placed in the main topic):
+   *  absent = unknown, and such a run is refused rather than guessed. */
+  mainTopic?: (binding: RunChatBinding) => V3MainTopicAvailability;
 }
 
 export type V3NodeExecutorResolution =
   /** `note` explains a fallback when the switch is on (P4 / §6.1 item 5). */
   | { kind: 'ephemeral'; note?: string }
-  /** `summary` lists node → executing bot for the Gate-2 / command reply. */
-  | { kind: 'bot'; targets: V3NodeExecutorTarget[]; summary: string }
+  /** `summary` lists node → executing bot for the Gate-2 / command reply;
+   *  `handoffIdentity` is the initiator to freeze when that switch is on. */
+  | { kind: 'bot'; targets: V3NodeExecutorTarget[]; summary: string; handoffIdentity?: V3HandoffIdentityRecord }
   /** Refuse the authorization; `message` lists node → bot: reason. */
   | { kind: 'refused'; problems: V3BotEligibilityProblem[]; message: string };
 
@@ -295,6 +539,8 @@ export async function resolveV3NodeExecutor(input: {
   policy: V3NodeExecutorPolicy;
   binding: RunChatBinding | undefined;
   targetsFor: (binding: RunChatBinding) => V3NodeExecutorTarget[];
+  /** See {@link resolveV3HandoffIdentity}; absent = not proven human. */
+  humanTurn?: boolean;
 }): Promise<V3NodeExecutorResolution> {
   const decision = decideV3NodeExecutor({
     switchMode: input.policy.switchMode,
@@ -307,6 +553,16 @@ export async function resolveV3NodeExecutor(input: {
   }
   const binding = input.binding!;
   const targets = input.targetsFor(binding);
+  // §5.2 hard rules first: pure, and a refusal needs no live probe.
+  if (targets.some((target) => target.placement === 'main')) {
+    const placement = v3TargetPlacementProblems({
+      targets,
+      orchestratorAppId: binding.larkAppId,
+      mainTopic: input.policy.mainTopic?.(binding) ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+      nameOf: input.policy.nameOf,
+    });
+    if (placement.length > 0) return { kind: 'refused', problems: [], message: formatV3PlacementRefusal(placement) };
+  }
   const checked = await checkV3BotExecutorEligibility({
     orchestratorAppId: binding.larkAppId,
     targets,
@@ -319,7 +575,16 @@ export async function resolveV3NodeExecutor(input: {
       message: formatV3BotEligibilityRefusal(checked.problems, input.policy.nameOf),
     };
   }
-  return { kind: 'bot', targets, summary: formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf) };
+  const summary = formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf);
+  if (!input.policy.handoffIdentity) return { kind: 'bot', targets, summary };
+  const identity = await resolveV3HandoffIdentity(binding, input.policy.handoffIdentity,
+    { humanTurn: input.humanTurn === true }, { targets, nameOf: input.policy.nameOf });
+  return {
+    kind: 'bot',
+    targets,
+    summary: identity.summary ? `${summary}\n${identity.summary}` : summary,
+    handoffIdentity: identity.record,
+  };
 }
 
 /**

@@ -516,9 +516,35 @@ export interface WorkflowNodeSessionMarker {
    *  Any of them ending without a submission shows the node as stopped; a
    *  turn already in flight before registration never does. */
   turnIds?: string[];
+  /** Main-topic placement (design §5.5): the handoff went into this bot's
+   *  ordinary session in the run's main topic, which outlives the attempt.
+   *  Such a marker never makes the session a node session (its kind, skills
+   *  and plugin dir stay those of an ordinary session) and counts only while
+   *  its attempt is in progress — see `workflowNodeMarkerActive`. */
+  placement?: 'main';
+  /** Main-topic placement: the attempt ended without this session handing
+   *  in work (stopped, revoked, reported blocked). */
+  closedAt?: string;
+  /** Main-topic placement: the handoff's own turn reached the CLI. Persisted
+   *  so a stop after a restart still knows the node's turn may be running. */
+  handoffStartedAt?: string;
+  /** Main-topic placement: the CLI turn the handoff started in (with any
+   *  messages folded into it) went idle again. */
+  handoffSettledAt?: string;
+  /** Main-topic placement: the worker generation the handoff turn started
+   *  in. Another generation (daemon restart, respawned worker) means that
+   *  CLI turn is over, whatever idle signal was missed. */
+  handoffWorkerGeneration?: number;
+  /** Main-topic placement: the latest turn that started in the session
+   *  while the attempt was in progress, and when the session next went idle
+   *  — persisted so a stop after a restart still finds the node's later
+   *  turn (a CLI kept by a persistent backend may still be running it). */
+  lastTurn?: { turnId: string; settledAt?: string };
 }
 
 export interface Session {
+  /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
+  topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
@@ -1047,6 +1073,8 @@ export interface Session {
   modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
@@ -1881,6 +1909,9 @@ export type FrozenSessionReplyTarget =
 
 export interface FrozenSessionReplyContext {
   target: FrozenSessionReplyTarget;
+  /** Actual authenticated inbound requester; distinct from the quoted author. */
+  requesterOpenId?: string;
+  requesterIsBot?: boolean;
   sourceMessageId?: string;
   quoteTargetId?: string;
   replyTargetSenderOpenId?: string;
@@ -2026,6 +2057,8 @@ export interface CodexAppEffortResult {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
+  | import('./services/universal-output-handoff.js').OutputHandoffReceipt
+  | import('./services/final-output-handoff.js').FinalOutputAccepted
   | { type: 'deployment_continuation_cancelled'; requestId: string; ok: boolean }
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
@@ -2081,7 +2114,7 @@ type DaemonToWorkerBase =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
+  | { type: 'restart'; topicEffort?: import('./utils/traex-session-effort.js').TraexTopicEffortRestart; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
       traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
@@ -2178,6 +2211,8 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
         /** Experimental, off by default: only an explicit true lets the worker
          *  suppress a failure notice after an exact acknowledged final. */
         suppressDeliveredFinalFailureNotice?: boolean;
+        /** Explicit, off-by-default ordinary bridge handoff negotiation. */
+        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
       }
     : Message
   : never;
@@ -2240,8 +2275,88 @@ export interface ModelFallbackState {
   claudeSessionId?: string;
 }
 
+export interface WorkerFinalOutput {
+  type: 'final_output';
+  /** Worker-side botmux session identity. Daemon validates this before
+   *  routing the reply so a stale/wrongly-bound worker cannot post into
+   *  another Lark thread. Optional for one release to accept older workers. */
+  sessionId?: string;
+  /** Native Hermes messages.session_id that actually produced this
+   *  content. Daemon uses it as a second consistency check after the
+   *  worker-side Hermes state.db filter, catching stale/missing stamps
+   *  without making this field the sole source-binding mechanism. */
+  sourceHermesSessionId?: string;
+  content: string;
+  lastUuid: string;
+  turnId: string;
+  replyTurnId?: string;
+  /** Zero-injection terminal input uses normal final rendering, with the
+   * reply context captured by terminal_turn_started. */
+  terminalLocal?: boolean;
+  /** Measured native execution time for this exact turn/attempt, excluding queueing. */
+  durationMs?: number;
+  /** Literal CLI input time, from the same execution window as durationMs. */
+  executionStartedAtMs?: number;
+  /** Durable receiver attempt attribution. Final output suppression is
+   *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
+  dispatchAttempt?: number;
+  /** Admission-frozen mode for this exact turn. Absence is disabled. */
+  linkRefMode?: 'observe' | 'enabled';
+  // Discriminator for the daemon-side renderer. Default ('bridge' /
+  // omitted) renders `content` through the regular markdown card. The
+  // local-turn variants ship the user prompt as a separate field so
+  // the daemon can lay it out in a quoted block (rather than the
+  // worker stitching label + user + assistant into one markdown blob,
+  // which mixes presentation with payload).
+  kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
+  /** True when `content` is the worker's FAILED-turn fallback notice (a
+   *  provider/gateway error card), not a model answer. The daemon uses it
+   *  to @mention a human on the failure card when the session has no human
+   *  recipient (bot-to-bot dispatch), so model-service outages don't pass
+   *  silently. Presentation-only — never affects turn settlement. */
+  turnFailed?: boolean;
+  /** Structured failed terminal accompanying the diagnostic; never model text. */
+  turnFailureCode?: string;
+  /** Redacted terminal diagnostic only, without partial model text. May
+   * surface as auxiliary failure UI when a loud trigger hides its answer. */
+  turnFailureNotice?: string;
+  userText?: string;
+  /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
+  codexAppSettlement?: {
+    requestId: string;
+    generation: string;
+    seq: number;
+    dispatchId: string;
+    /** Real completion instant / native execution span for the terminal the
+     *  daemon synthesizes from this settlement. The daemon persists that
+     *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
+     *  the store's INSERT OR IGNORE keeps whichever lands first — so without
+     *  these the durable path would durably win with a timing-less row and
+     *  permanently mask the worker's real numbers. Same optional-means-
+     *  unknown contract as `turn_terminal`. */
+    completedAtMs?: number;
+    durationMs?: number;
+  };
+  /** The model already delivered through botmux send; settle without fallback output. */
+  suppressDelivery?: boolean;
+  /** Ordered-steer N-final expansion (codex-app): a `steer_superseded` member
+   *  is durably settled (advances the FIFO) but never delivered and carries no
+   *  usage — only the group's final real member delivers. Absent = ordinary final. */
+  disposition?: 'steer_superseded';
+  /** Per-turn token usage (codex-app). Daemon persists it with the async
+   *  trigger result so trigger-result's completed state can report it. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
+  handoff?: import('./services/universal-output-handoff.js').OutputHandoffClaim;
+}
+
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
+  | import('./services/final-output-handoff.js').FinalOutputOffer
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
@@ -2404,6 +2519,8 @@ export type WorkerToDaemon =
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';
+      untouched?: true;
+      topicEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort; variant: 'standard' | 'max' };
       attemptId: string;
       status: 'succeeded' | 'failed' | 'timed_out';
       category: 'prompt_ready' | 'spawn_failed' | 'runner_exited' | 'readiness_timeout';
@@ -2464,7 +2581,7 @@ export type WorkerToDaemon =
          *  working→idle edge PATCH may have been lost, and nothing else would
          *  ever correct a card still claiming the unsubmitted turn runs. */
         | 'input_not_submitted' }
-  | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' }
+  | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' | 'fork_pending' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */
@@ -2523,83 +2640,7 @@ export type WorkerToDaemon =
       entries: Array<Pick<CodexAppDispatchLedgerEntry, 'dispatchId' | 'turnId' | 'dispatchAttempt'>>;
     }
   | { type: 'codex_app_generation_active'; sessionId: string; generation: string; fresh: boolean }
-  | {
-      type: 'final_output';
-      /** Worker-side botmux session identity. Daemon validates this before
-       *  routing the reply so a stale/wrongly-bound worker cannot post into
-       *  another Lark thread. Optional for one release to accept older workers. */
-      sessionId?: string;
-      /** Native Hermes messages.session_id that actually produced this
-       *  content. Daemon uses it as a second consistency check after the
-       *  worker-side Hermes state.db filter, catching stale/missing stamps
-       *  without making this field the sole source-binding mechanism. */
-      sourceHermesSessionId?: string;
-      content: string;
-      lastUuid: string;
-      turnId: string;
-      replyTurnId?: string;
-      /** Zero-injection terminal input uses normal final rendering, with the
-       * reply context captured by terminal_turn_started. */
-      terminalLocal?: boolean;
-      /** Measured native execution time for this exact turn/attempt, excluding queueing. */
-      durationMs?: number;
-      /** Literal CLI input time, from the same execution window as durationMs. */
-      executionStartedAtMs?: number;
-      /** Durable receiver attempt attribution. Final output suppression is
-       *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
-      dispatchAttempt?: number;
-      /** Admission-frozen mode for this exact turn. Absence is disabled. */
-      linkRefMode?: 'observe' | 'enabled';
-      // Discriminator for the daemon-side renderer. Default ('bridge' /
-      // omitted) renders `content` through the regular markdown card. The
-      // local-turn variants ship the user prompt as a separate field so
-      // the daemon can lay it out in a quoted block (rather than the
-      // worker stitching label + user + assistant into one markdown blob,
-      // which mixes presentation with payload).
-      kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
-      /** True when `content` is the worker's FAILED-turn fallback notice (a
-       *  provider/gateway error card), not a model answer. The daemon uses it
-       *  to @mention a human on the failure card when the session has no human
-       *  recipient (bot-to-bot dispatch), so model-service outages don't pass
-       *  silently. Presentation-only — never affects turn settlement. */
-      turnFailed?: boolean;
-      /** Structured failed terminal accompanying the diagnostic; never model text. */
-      turnFailureCode?: string;
-      /** Redacted terminal diagnostic only, without partial model text. May
-       * surface as auxiliary failure UI when a loud trigger hides its answer. */
-      turnFailureNotice?: string;
-      userText?: string;
-      /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
-      codexAppSettlement?: {
-        requestId: string;
-        generation: string;
-        seq: number;
-        dispatchId: string;
-        /** Real completion instant / native execution span for the terminal the
-         *  daemon synthesizes from this settlement. The daemon persists that
-         *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
-         *  the store's INSERT OR IGNORE keeps whichever lands first — so without
-         *  these the durable path would durably win with a timing-less row and
-         *  permanently mask the worker's real numbers. Same optional-means-
-         *  unknown contract as `turn_terminal`. */
-        completedAtMs?: number;
-        durationMs?: number;
-      };
-      /** The model already delivered through botmux send; settle without fallback output. */
-      suppressDelivery?: boolean;
-      /** Ordered-steer N-final expansion (codex-app): a `steer_superseded` member
-       *  is durably settled (advances the FIFO) but never delivered and carries no
-       *  usage — only the group's final real member delivers. Absent = ordinary final. */
-      disposition?: 'steer_superseded';
-      /** Per-turn token usage (codex-app). Daemon persists it with the async
-       *  trigger result so trigger-result's completed state can report it. */
-      usage?: {
-        inputTokens: number;
-        outputTokens: number;
-        cacheReadTokens: number;
-        cacheCreateTokens: number;
-      };
-    }
+  | WorkerFinalOutput
   | {
       type: 'turn_terminal';
       /** Worker-side botmux session identity. Unlike the temporary

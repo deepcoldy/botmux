@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   appendDurablePrimaryInputCommit,
   durablePrimaryExistingTurnDisposition,
+  durablePrimaryLiveWorkerProgressToken,
+  durablePrimaryRejectedLiveSendDisposition,
+  shouldPersistTriggeredMessage,
 } from '../src/services/durable-primary-turn-admission.js';
 
 function state(overrides: Record<string, unknown> = {}) {
@@ -72,6 +75,29 @@ describe('durable primary existing-turn admission', () => {
     expect(durablePrimaryExistingTurnDisposition(state(), 'om_next')).toBe('ready');
   });
 
+  it('retries a primary live send until the worker proves acceptance', () => {
+    expect(durablePrimaryRejectedLiveSendDisposition(true)).toBe('retry');
+    expect(durablePrimaryRejectedLiveSendDisposition(false)).toBe('ignored');
+  });
+
+  it('does not persist triggered-message dedupe for an unadmitted primary retry', () => {
+    expect(shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: true,
+      handlerCompleted: true,
+      admitted: false,
+    })).toBe(false);
+    expect(shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: true,
+      handlerCompleted: true,
+      admitted: true,
+    })).toBe(true);
+    expect(shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: false,
+      handlerCompleted: true,
+      admitted: false,
+    })).toBe(true);
+  });
+
   it('dedupes commit markers and retains only the newest bounded history', () => {
     const first = appendDurablePrimaryInputCommit([], {
       turnId: 'om_1', workerGeneration: 1, dispatchAttempt: 1,
@@ -94,5 +120,15 @@ describe('durable primary existing-turn admission', () => {
     expect(duplicate.added).toBe(false);
     expect(duplicate.history[0]).toMatchObject({ workerGeneration: 1, dispatchAttempt: 1 });
     expect(third.history.map(item => item.turnId)).toEqual(['om_2', 'om_3']);
+  });
+});
+
+describe('durablePrimaryLiveWorkerProgressToken (#2062 F7)', () => {
+  it('stays equal while the same worker keeps refusing and changes on respawn or replacement', () => {
+    const same = durablePrimaryLiveWorkerProgressToken({ workerGeneration: 3, worker: { pid: 4100 } });
+    expect(durablePrimaryLiveWorkerProgressToken({ workerGeneration: 3, worker: { pid: 4100 } })).toBe(same);
+    expect(durablePrimaryLiveWorkerProgressToken({ workerGeneration: 4, worker: { pid: 4100 } })).not.toBe(same);
+    expect(durablePrimaryLiveWorkerProgressToken({ workerGeneration: 3, worker: { pid: 4200 } })).not.toBe(same);
+    expect(durablePrimaryLiveWorkerProgressToken({ worker: null })).not.toBe(same);
   });
 });

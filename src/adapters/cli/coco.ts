@@ -7,7 +7,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson } from './model-catalog-json.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from '../../services/coco-transcript.js';
-import { traeCliStatePath, traeConfigPath, traeHistoryPath } from '../../services/traex-paths.js';
+import { traeCliStatePath, traeConfigPath, traeHistoryPath, traeInstallationIdPath } from '../../services/traex-paths.js';
 import { traexHistoryMatchDelta } from '../../services/traex-transcript.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
@@ -165,6 +165,10 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     get authPaths(): string[] { return [traeCliStatePath(), '~/.cache/coco']; },
     // CoCo reads the same Gateway entry without widening shared config writes.
     sandboxReadonlyPaths: env => [traeConfigPath(env), ...traeMigrationDoneMarkers(env)],
+    // The embedded app server opens <TRAE_HOME>/installation_id read-write on every
+    // start and aborts on EROFS (e.g. when the TRAE root sits under a read-only
+    // bind such as a relocated /opt -> /data00 baseline). Only that one file.
+    sandboxWritableFiles: env => [traeInstallationIdPath(env)],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass, hideRateLimitModelNudge }) {

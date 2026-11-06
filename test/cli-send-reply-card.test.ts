@@ -230,6 +230,14 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'codex', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'grok', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'traex', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'traex', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
+    { cliId: 'traex', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
+    { cliId: 'traex', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
+    { cliId: 'pi', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'pi', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
+    { cliId: 'pi', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
+    { cliId: 'pi', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
     { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
     { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_requester'], senderIsBot: false, merged: true },
@@ -571,6 +579,109 @@ describe('real CLI send into a running reply card', () => {
       expect(String(blocked.stderr)).toContain('durable primary 当前只支持单条文本/卡片消息');
       expect(String(blocked.stdout)).not.toContain('CAPTURE_DURABLE=');
       expect(String(blocked.stdout)).not.toContain('CAPTURE_REPLY=');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  it.each([
+    { choice: 'independent', token: 'botmux-as:v1:independent' },
+    { choice: 'suggestion', token: 'botmux-as:v1:suggestion' },
+  ] as const)('sends a bare --as $choice with empty stdin: the body is synthesized downstream', ({ choice, token }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-as-empty-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId: key.turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId,
+        larkAppSecret: 'test-secret',
+        cliId: 'claude-code',
+        replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId,
+        status: 'active',
+        cliId: 'claude-code',
+        larkAppId: key.larkAppId,
+        chatId: 'oc_test',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        chatType: 'group',
+        workingDir: root,
+      } });
+      const result = spawnSyncTsScript(
+        fixture,
+        ['send', '--as', choice, '--no-mention'],
+        {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          env: {
+            PATH: process.env.PATH,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTS_CONFIG: join(root, 'bots.json'),
+            BOTMUX_SESSION_ID: key.sessionId,
+            BOTMUX_TURN_ID: key.turnId,
+            BOTMUX_LARK_APP_ID: key.larkAppId,
+          },
+          input: '',
+          encoding: 'utf8',
+          timeout: 30_000,
+        },
+      );
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(requests).toHaveLength(1);
+      expect(requests[0].body.content).toContain(token);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  it('reports the --as usage error (not the empty-body error) for a bad --as with empty stdin', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-as-bad-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId: key.turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'claude-code', replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId: 'claude-code', larkAppId: key.larkAppId,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const result = spawnSyncTsScript(
+        fixture,
+        ['send', '--as', 'bogus', '--no-mention'],
+        {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          env: {
+            PATH: process.env.PATH,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTS_CONFIG: join(root, 'bots.json'),
+            BOTMUX_SESSION_ID: key.sessionId,
+            BOTMUX_TURN_ID: key.turnId,
+            BOTMUX_LARK_APP_ID: key.larkAppId,
+          },
+          input: '',
+          encoding: 'utf8',
+          timeout: 30_000,
+        },
+      );
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('--as 仅支持 independent|suggestion');
+      expect(result.stderr).not.toContain('正文为空');
+      expect(String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_'))).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

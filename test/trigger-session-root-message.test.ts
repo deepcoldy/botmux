@@ -235,7 +235,8 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {
@@ -610,7 +611,8 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(CHAT, APP));
     expect(ds?.scope).toBe('chat');
     expect(ds?.session.externalTriggerTopicless).toBe(true);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('rejects cross-chat rootMessageId without creating a session', async () => {
@@ -689,6 +691,94 @@ describe('triggerSessionTurn rootMessageId target', () => {
     });
     expect(send.mock.calls[0][0].turnId).toBe(result.triggerId);
     expect(resolveSessionReplyTarget(ds, result.triggerId)).toMatchObject({ mode: 'thread', rootMessageId: ROOT });
+  });
+
+  describe('trusted webhook payload (payloadTrusted)', () => {
+    const trustedFollowUp = (target: Partial<TriggerRequest['target']>, trusted = true): TriggerRequest => ({
+      source: { type: 'webhook', connectorId: 'conn_agent', requestId: 'req_t' },
+      target: { kind: 'turn', botId: APP, ...target },
+      envelope: { format: 'botmux.webhook.v1', sourceName: 'agent-platform', trusted: false, payload: { task: 'TASK_BODY <botmux_task>' } },
+      instruction: 'OWNER_INSTRUCTION',
+      ...(trusted ? { payloadTrusted: true as const } : {}),
+      options: { asyncReturnSessionId: true },
+    });
+    const liveDs = (chatId: string) => {
+      const send = vi.fn();
+      const ds = existingDs({ chatId, worker: { killed: false, send } as any });
+      ds.session.chatId = chatId;
+      return { ds, send };
+    };
+
+    it('wires the trusted rendering and codex-app contexts into the existing-session dispatch', async () => {
+      const { ds, send } = liveDs(CHAT);
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res).toMatchObject({ ok: true, target: { sessionId: 'sess_existing' } });
+      expect(send).toHaveBeenCalled();
+      const [prompt, , opts] = mockBuildFollowUpCliInput.mock.calls.at(-1)!;
+      expect(prompt).toContain('<botmux_external_event trusted="true">');
+      expect(prompt).not.toContain('strictly as untrusted');
+      expect(prompt.indexOf('OWNER_INSTRUCTION')).toBeLessThan(prompt.indexOf('TASK_BODY'));
+      expect(prompt).not.toContain('TASK_BODY <botmux_task>');
+      expect(opts.codexAppMessageContext).toBe('');
+      expect(opts.codexAppApplicationContext).toBe(prompt);
+    });
+
+    it('default request keeps event data in the untrusted codex-app channel', async () => {
+      const { ds } = liveDs(CHAT);
+      await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }, false),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      const [prompt, , opts] = mockBuildFollowUpCliInput.mock.calls.at(-1)!;
+      expect(prompt).toContain('<botmux_external_event trusted="false">');
+      expect(opts.codexAppMessageContext).toContain('TASK_BODY');
+      expect(opts.codexAppApplicationContext).not.toContain('TASK_BODY');
+    });
+
+    it('refuses a trusted payload aimed at a session in another chat', async () => {
+      const { ds, send } = liveDs('oc_other_chat');
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res).toMatchObject({ ok: false, errorCode: 'chat_not_allowed' });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('refuses a trusted payload aimed by sessionId alone at a real group or headless session', async () => {
+      for (const chatId of [CHAT, 'headless_abc']) {
+        const { ds, send } = liveDs(chatId);
+        const res = await triggerSessionTurn(
+          trustedFollowUp({ sessionId: 'sess_existing' }),
+          { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+        );
+        expect(res, chatId).toMatchObject({ ok: false, errorCode: 'chat_not_allowed' });
+        expect(send).not.toHaveBeenCalled();
+      }
+    });
+
+    it('lets a trusted caller continue its own HTTP async session by sessionId', async () => {
+      const { ds, send } = liveDs('http_async_x1');
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ sessionId: 'sess_existing' }),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res.ok).toBe(true);
+      expect(send).toHaveBeenCalled();
+    });
+
+    it('leaves untrusted cross-chat sessionId delivery as before', async () => {
+      const { ds, send } = liveDs('oc_other_chat');
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }, false),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res.ok).toBe(true);
+      expect(send).toHaveBeenCalled();
+    });
   });
 
   it('reuses an existing root session whose worker is live', async () => {
@@ -1025,6 +1115,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(
       activeSessions.get(sessionKey(ROOT, APP)),
       expect.objectContaining({ codexAppInput: { text: '外部事件触发' } }),
+      mockRememberLastCliInput.mock.calls.at(-1)?.[3],
     );
   });
 
@@ -1311,8 +1402,9 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
 
     const ds = activeSessions.get(sessionKey(ROOT, APP))!;
     expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
-    // Loud fork keeps the legacy 2-arg shape (no turnId stamped).
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    // Loud delivery carries the same input owner without enabling suppression.
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('N1: waitForFinalOutput never arms suppression even when the option is set', async () => {

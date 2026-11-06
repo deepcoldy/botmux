@@ -62,6 +62,11 @@ export interface CreateGroupOpts {
   transferOwnerUnionId?: string;
   transferOwnerTo?: string;
   notifyOwnerOpenId?: string;
+  /** `false`: no @-the-new-owner notice at all, not even the one a
+   *  `transferOwnerUnionId` transfer posts by default. A Dashboard workflow
+   *  launch (design 2026-11-03 workflow-dashboard-orchestration §4.5) builds a
+   *  topic group whose first top-level message must be its root card. */
+  ownerNotice?: false;
   /** Users to grant group manager permissions to. Added while the creator bot is owner. */
   managerUserIds?: string[];
   /** Optional working directory to bind the newly created chat to oncall for
@@ -332,10 +337,11 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
-  const notifyOwnerOpenId = opts.notifyOwnerOpenId?.trim()
-    || (transferOwnerUnionId ? transferOwnerTo : null);
+  const notifyOwnerOpenId = opts.ownerNotice === false
+    ? null
+    : opts.notifyOwnerOpenId?.trim() || (transferOwnerUnionId ? transferOwnerTo : null);
   let notifyMessageId: string | null = null;
-  let notifyError: string | null = !notifyOwnerOpenId && transferOwnerUnionId ? transferError : null;
+  let notifyError: string | null = !notifyOwnerOpenId && transferOwnerUnionId && opts.ownerNotice !== false ? transferError : null;
   if (notifyOwnerOpenId) {
     if (r.invalidUserIds.includes(notifyOwnerOpenId)) {
       notifyError = 'invitee_rejected';

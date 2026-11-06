@@ -21,12 +21,16 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 20+ CLI / agent adapters">
+  <a href="https://deepcoldy.github.io/botmux/img/video-promo-en.mp4"><img src="docs/assets/botmux-promo-poster-en.jpg" width="900" alt="botmux promo video: click to play"></a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 30+ CLI / agent adapters">
 </p>
 
 ---
 
-A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**20+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
+A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**30+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
 
 ## What it solves
 
@@ -91,7 +95,7 @@ Designed for multi-agent dispatch pipelines (lead-bot delegating tasks to sub-bo
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents:
 
-`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) · `doubao` ([Doubao CLI setup and usage](docs/doubao.en.md)) …
 
 - **Session-level CLI Selection**: Select a registered CLI for an upcoming session with `/cli <cliId>`.
 - **Codex Multi-Account & Instances**: Configure multiple login homes and distribution strategies via [Session-level Codex Instances](docs/codex-instances.md).
@@ -99,6 +103,22 @@ Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (proce
 - **Shared Memory (Optional)**: Enable cross-agent persistent memory with [OpenViking Shared Memory](examples/openviking-memory/README.md).
 
 Authoritative `cliId` list and wrapper setups are documented in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+
+### Doubao CLI quickstart
+
+Use a Botmux build containing the `doubao` adapter. Install Doubao and finish native login as the same OS user that will run Botmux, then configure the Bot:
+
+```bash
+npm install -g '@bytedance/doubao-cli' --registry=https://registry.npmjs.org
+doubao --version
+doubao                      # finish login, verify the composer, then /exit
+botmux setup                # select Doubao and the actual project directory
+botmux start
+```
+
+For an existing Bot, select Doubao in Dashboard or merge `"cliId": "doubao"` and the actual `workingDir` into its existing `bots.json` entry, preserving credentials and other settings. Restart after saving and create a new session. Omit `model` for the default, or use a display name available to the account in native `/model`.
+
+Multiline tasks are submitted once; **Esc** interrupts through the Web terminal. Final answers are collected automatically from native logs, and restart resumes by the exact native decimal ID, never the “latest” conversation. Default permissions pass `--permission-mode always_allow`; restrict access to trusted users/projects. **The Botmux binary needs no Node; Doubao's npm installation and launcher still need Node/npm.** See the [Doubao guide](docs/doubao.en.md) for enterprise installation, local HTTP trials, permissions, and limits. Native Linux execution/sandbox and the existing-terminal `/adopt` bridge are not acceptance-tested; ordinary chat support does not imply every capability is supported.
 
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 

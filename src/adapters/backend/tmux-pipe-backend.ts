@@ -7,9 +7,10 @@
  *
  * Architecture (no PTY, no attach):
  *   - mkfifo a unique fifo under /tmp
- *   - `${this.tmuxCmd} pipe-pane -O -t <pane> 'cat > <fifo>'` — tmux replicates every
+ *   - `${this.tmuxCmd} pipe-pane -O -t <pane> '<copy> > <fifo>'` — tmux replicates every
  *     byte the pane writes into the fifo (append-only, '-O' overwrites any
- *     existing pipe).
+ *     existing pipe). `<copy>` is `cat`, or a botmux relay where `cat` holds
+ *     short writes (see tmux-pipe-relay.ts).
  *   - fs.createReadStream(<fifo>) — we read tmux's verbatim ANSI stream.
  *   - All writes (sendText / sendSpecialKeys / pasteText / copy-mode keys)
  *     go through `tmux send-keys / paste-buffer -t <pane>` — so the pane's
@@ -49,6 +50,7 @@ import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
+import { pipePaneShellCommand } from './tmux-pipe-relay.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -769,7 +771,9 @@ export class TmuxPipeBackend implements SessionBackend {
     // Retrying is idempotent (-O overwrites any prior subscription); a
     // deterministic server-answered rejection (pane genuinely gone) is
     // re-thrown at once instead of delaying the same failure.
-    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(`cat > ${shellescape(this.fifoPath)}`)}`;
+    // The copier must forward short writes at once, or a quiet CLI's ready /
+    // final bytes never reach the worker and its next input queues forever.
+    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(pipePaneShellCommand(this.fifoPath))}`;
     // Same-boundary decision as the applied remain-on-exit value: it was
     // resolved against the RUNNING server (serverTmuxVersion) in
     // createDetachedSession/applySessionOptions before this attach. Guard
@@ -794,7 +798,7 @@ export class TmuxPipeBackend implements SessionBackend {
           }
         } else {
           execSync(
-            `${this.tmuxCmd} pipe-pane -O -t ${shellescape(this.paneTarget)} 'cat > ${shellescape(this.fifoPath)}'`,
+            `${this.tmuxCmd} ${pipePaneCommand}`,
             { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv() },
           );
         }

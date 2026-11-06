@@ -61,7 +61,12 @@ if (process.env.TITLE_FIXTURE_RETRY === '1' && !previousAttempt) {
   process.stderr.write('temporary title failure');
   process.exit(1);
 }
-console.log('FixtureTitle');
+if (process.argv[2] === 'app-server') {
+  process.env.FAKE_CODEX_FINAL_TEXT = JSON.stringify({ title: 'FixtureTitle' });
+  await import(${JSON.stringify(join(process.cwd(), 'test/fixtures/fake-codex-app-server.mjs'))});
+} else {
+  console.log('FixtureTitle');
+}
 `, { mode: 0o700 });
     bot = { cliId: 'codex', cliPathOverride: fixture, sandbox: 'off' };
   });
@@ -76,12 +81,17 @@ console.log('FixtureTitle');
     maxLen: 12, logTag: 'title-fixture',
   });
 
-  it('generates a title through the real CLI when the host has no mandatory isolation policy', async () => {
+  it.each(['codex', 'traex'])('generates a title through the real %s CLI when the host has no mandatory isolation policy', async cliId => {
+    bot.cliId = cliId;
     await expect(generate()).resolves.toBe('FixtureTitle');
     expect(readFileSync(evidence, 'utf8')).toBe('title-private-credential\n');
   });
 
-  it.each([{ plugins: [] }, { plugins: ['fixture-plugin'] }])('prevents host secret reads with a global file binding and plugins=$plugins', async ({ plugins }) => {
+  it.each([
+    { cliId: 'codex', plugins: [] }, { cliId: 'codex', plugins: ['fixture-plugin'] },
+    { cliId: 'traex', plugins: [] }, { cliId: 'traex', plugins: ['fixture-plugin'] },
+  ])('prevents $cliId host secret reads with a global file binding and plugins=$plugins', async ({ cliId, plugins }) => {
+    bot.cliId = cliId;
     bot.plugins = plugins;
     writeFileSync(configFile, JSON.stringify(protectedConfig));
     invalidateGlobalConfigCache();
@@ -91,6 +101,7 @@ console.log('FixtureTitle');
   });
 
   it('rechecks current isolation before retrying after the first CLI updates the protected file policy', async () => {
+    bot.cliId = 'traex';
     bot.env = { TITLE_FIXTURE_RETRY: '1' };
     const title = await generate();
     expect(readFileSync(evidence, 'utf8')).toBe('title-private-credential\n');

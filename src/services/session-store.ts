@@ -944,6 +944,81 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
   }
 }
 
+/** Rows (active OR closed) of every store whose root_message_id is in the set,
+ *  in one IN-scan per store. Unlike findActiveSessionsByRoot this keeps closed
+ *  rows (the dispatch task tree renders a ⚫ closed node) and batches all roots
+ *  so N roots cost one scan per store, not N — and never parses unrelated rows
+ *  the way loadAllSessionsSnapshot does. Best-effort: an unreadable store is
+ *  skipped, but a missing SQLite engine still throws. */
+export function readSessionsByRoots(
+  rootMessageIds: ReadonlySet<string>,
+  options: { dataDir?: string } = {},
+): Session[] {
+  const roots = [...rootMessageIds].filter(id => typeof id === 'string' && id.length > 0);
+  if (roots.length === 0) return [];
+  const rootSet = new Set(roots);
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const out: Session[] = [];
+  const seen = new Set<string>();
+  // This app's live in-memory rows are freshest than its store (closed rows are
+  // evicted from memory, so they come only from disk below).
+  load();
+  for (const session of sessions.values()) {
+    if (session.rootMessageId && rootSet.has(session.rootMessageId) && !seen.has(session.sessionId)) {
+      // readOwnStoreAllRows only JSON.parses rows (no column backfill), so a
+      // live row missing the copy must inherit this process's own app id. This
+      // branch wins the dedup, so without it it would mask the corrected disk
+      // value. Project a copy: a read API must not mutate the live registry row.
+      seen.add(session.sessionId);
+      out.push(session.larkAppId ? session : { ...session, larkAppId: currentAppId });
+    }
+  }
+  let refs: StoreFileRef[];
+  try {
+    refs = listStoreRefs(dataDir);
+  } catch {
+    return out;
+  }
+  const CHUNK = 400; // stay well under SQLite's bound-parameter limit
+  for (const ref of refs) {
+    for (let start = 0; start < roots.length; start += CHUNK) {
+      const batch = roots.slice(start, start + CHUNK);
+      let rows: { row: string }[];
+      try {
+        const db = openDbForRead(ref.path);
+        try {
+          const placeholders = batch.map(() => '?').join(',');
+          rows = db.prepare(`SELECT row FROM sessions WHERE root_message_id IN (${placeholders})`).all(...batch) as { row: string }[];
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+        continue; /* absent/old-schema/unreadable store → skip for this view */
+      }
+      for (const r of rows) {
+        try {
+          const session = JSON.parse(r.row) as Session;
+          if (session && typeof session === 'object' && typeof session.sessionId === 'string'
+            && !seen.has(session.sessionId)) {
+            // Backfill the owning bot from the store directory, exactly like
+            // loadAllSessionsSnapshot's readInto: rows written before the
+            // column copy existed omit larkAppId, and the task tree matches
+            // child sessions by it (a missing value drops a cross-bot closed
+            // child back to dispatched/running). No repairMissingChatScope
+            // here: it only repairs chat-scope rows (rootMessageId === chatId),
+            // these are always thread rows, and the task tree never reads scope.
+            if (!session.larkAppId) session.larkAppId = ref.appId;
+            seen.add(session.sessionId);
+            out.push(session);
+          }
+        } catch { /* skip malformed row */ }
+      }
+    }
+  }
+  return out;
+}
+
 /** The active rows of one store, optionally narrowed by an indexed hint. */
 function readStoreActiveRows(
   ref: StoreFileRef,

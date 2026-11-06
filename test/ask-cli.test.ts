@@ -204,6 +204,31 @@ describe('botmux ask — CLI boundary', () => {
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   });
 
+  it('emits mixed per-question custom answers through JSON stdout and acknowledges only after delivery', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'ask-custom-cli-')); tempDirs.push(dataDir);
+    const requests: Record<string, unknown>[] = [];
+    const server = createServer(async (req, res) => {
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (!body) { res.writeHead(400).end(); return; }
+      requests.push(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [[], ['yes']], customAnswers: ['社区 C\n隔离造数', null], by: 'human', comment: null, timedOut: false }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      mkdirSync(join(dataDir, 'dashboard-daemons'));
+      writeFileSync(join(dataDir, 'dashboard-daemons/cli_test.json'), JSON.stringify({ larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now() }));
+      const file = join(dataDir, 'questions.json');
+      writeFileSync(file, JSON.stringify(['environment', 'scope'].map(prompt => ({ prompt, multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }))));
+      const out = await runAsk(dataDir, ['ask', 'buttons', '--json', '--questions-file', file]);
+      expect(out.status).toBe(0);
+      expect(JSON.parse(out.stdout)).toMatchObject({ selected: null, answers: [[], ['yes']], customAnswers: ['社区 C\n隔离造数', null], comment: null });
+      expect(requests).toHaveLength(2);
+      expect(requests[1].acknowledge).toBe(true);
+      expect(requests[1].requestId).toBe(requests[0].requestId);
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
   it('--multi 发送多选问题并输出逗号分隔的 keys', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
     tempDirs.push(dataDir);

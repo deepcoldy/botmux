@@ -1,5 +1,6 @@
 import { getBot, type GroupMessageListenerOverride, type MessageListenerConfig } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
+import { normalizeListenerContentPolicy } from './message-listener-content-policy.js';
 
 export type MessageListenerUpdate = {
   enabled: boolean;
@@ -83,22 +84,10 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
   const rawContent = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
     ? entry.contentPolicy as Record<string, unknown>
     : undefined;
-  let contentPolicy: MessageListenerConfig['contentPolicy'];
+  const contentPolicy = normalizeListenerContentPolicy(rawContent);
   const rawReply = entry.replyPolicy && typeof entry.replyPolicy === 'object' && !Array.isArray(entry.replyPolicy)
     ? entry.replyPolicy as Record<string, unknown>
     : {};
-  if (rawContent) {
-    const includeKeywords = stringList(rawContent.includeKeywords);
-    // V1 is keyword-substring only (no regexes on the daemon main loop — see
-    // the contentPolicy type doc in bot-registry).
-    if (includeKeywords) {
-      contentPolicy = {
-        includeKeywords,
-        ...(rawContent.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
-        ...(rawContent.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
-      };
-    }
-  }
 
   return {
     enabled,
@@ -118,6 +107,9 @@ export function validateMessageListenerUpdate(update: MessageListenerUpdate | un
   if (!update) return { ok: false, reason: 'invalid_listener' };
   if (!update.enabled) return { ok: true };
   if (!update.prompt.trim()) return { ok: false, reason: 'prompt_required' };
+  if (update.contentPolicy?.includeMentionedOpenIds !== undefined && update.contentPolicy.includeMentionedOpenIds.length === 0) {
+    return { ok: false, reason: 'keyword_identity_required' };
+  }
   const mode = update.senderPolicy?.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   if (mode === 'include_only' && (update.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
     return { ok: false, reason: 'sender_required' };

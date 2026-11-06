@@ -16,6 +16,11 @@
  */
 
 import { appendReplyCardFooterToV2Card } from './md-card.js';
+import {
+  attachWorkflowSidebarEntry,
+  workflowSignatureRow,
+  type WorkflowSidebarEntryLink,
+} from './workflow-sidebar-entry.js';
 
 /** Stands in for the handoff's own message id, which Lark assigns only after
  *  the card is sent. The sender patches the posted card with the real id and
@@ -26,7 +31,9 @@ export type V3NodeCardStatus =
   | { kind: 'handing_off' }
   | { kind: 'acceptance_unknown'; since: number }
   /** `stalledAt` is shown only when no later turn started (`activeAt`). */
-  | { kind: 'running'; acceptedAt: number; deadlineAt?: number; stalledAt?: number; activeAt?: number }
+  /** `queued`: a main-topic handoff waiting behind another turn of the
+   *  target's session (§5.5); `startedAt`: when its own turn started. */
+  | { kind: 'running'; acceptedAt: number; deadlineAt?: number; stalledAt?: number; activeAt?: number; queued?: true; startedAt?: number }
   | { kind: 'done'; elapsedMs?: number }
   | { kind: 'blocked'; errorCode?: string; message?: string }
   | { kind: 'cancelled' }
@@ -48,6 +55,14 @@ export interface V3NodeCardView {
   status: V3NodeCardStatus;
   upstream: Array<{ nodeId: string; done: boolean }>;
   now: number;
+  /** §11: the「工作流 ›」sidebar entry at the signature row's right end. */
+  entry?: WorkflowSidebarEntryLink;
+  /** §13.6: the latest automatic handling or hand-over of this attempt,
+   *  shown as one line（「主 Bot 自动重试：<理由>」/「交给人决定：<理由>」）. */
+  intervention?: string;
+  /** §13.6: a completed checkpoint node — whether its dependants wait for
+   *  the main bot, or went on (and why). */
+  checkpoint?: string;
 }
 
 function plain(content: string): Record<string, unknown> {
@@ -63,9 +78,12 @@ function escapeMarkdown(text: string): string {
   return text.replace(/[\\*_~`[\]<>]/g, (c) => `\\${c}`);
 }
 
-/** "Stopped without submitting" until a later turn starts in the session. */
+/** "Stopped without submitting" until a later turn starts in the session.
+ *  A stall before a main-topic handoff's own turn started (§5.5: someone
+ *  else's turn ahead of it in the queue) is not the node's. */
 export function v3NodeStalled(status: Extract<V3NodeCardStatus, { kind: 'running' }>): boolean {
   if (status.stalledAt === undefined || status.stalledAt < status.acceptedAt) return false;
+  if (status.startedAt !== undefined && status.stalledAt < status.startedAt) return false;
   return status.activeAt === undefined || status.activeAt <= status.stalledAt;
 }
 
@@ -94,10 +112,13 @@ const BLOCKED_REASON_TEXT: Record<string, string> = {
   HANDOFF_NOT_ACCEPTED: '执行 Bot 没有在期限内接单',
   HANDOFF_UNCERTAIN: '无法确认交接是否送达，请看一眼群消息再重试',
   BOT_REPORTED_BLOCKED: '执行 Bot 报告做不了',
+  WORKING_DIR_REFUSED: '执行 Bot 不能在指定的工作目录里执行',
+  MAIN_TOPIC_BUSY: '执行 Bot 在主话题里正在执行另一个工作流节点',
   NODE_TIMEOUT: '超时未提交有效结果',
+  HANDED_TO_HUMAN: '主 Bot 交给人决定',
 };
 
-function statusLine(view: V3NodeCardView): { text: string; template: string } {
+function statusLine(view: Pick<V3NodeCardView, 'attemptNumber' | 'status'>): { text: string; template: string } {
   const attempt = `（第 ${view.attemptNumber} 次）`;
   const status = view.status;
   switch (status.kind) {
@@ -106,9 +127,13 @@ function statusLine(view: V3NodeCardView): { text: string; template: string } {
     case 'acceptance_unknown':
       return { text: `交接中 · 暂时查不到是否接单，正在重试 ${attempt}`, template: 'blue' };
     case 'running': {
+      if (status.queued) {
+        // §5.5: accepted into a busy main-topic session's queue.
+        return { text: `已接单，排队中：等执行 Bot 在主话题里的当前一轮结束后开始 ${attempt}`, template: 'blue' };
+      }
       // A start time, not a running "已用 X 分钟": the card is patched on
       // state changes only, so an elapsed figure would go stale silently.
-      const started = `${formatV3StartTime(status.acceptedAt)} 开始`;
+      const started = `${formatV3StartTime(status.startedAt ?? status.acceptedAt)} 开始`;
       return v3NodeStalled(status)
         ? { text: `进行中 · Bot 已停下，未提交 · ${started} ${attempt}`, template: 'orange' }
         : { text: `进行中 · ${started} ${attempt}`, template: 'blue' };
@@ -119,6 +144,7 @@ function statusLine(view: V3NodeCardView): { text: string; template: string } {
         template: 'green',
       };
     case 'blocked': {
+      if (status.errorCode === 'HANDED_TO_HUMAN') return { text: `等人工确认：主 Bot 交给人决定 ${attempt}`, template: 'blue' };
       const reason = (status.errorCode && BLOCKED_REASON_TEXT[status.errorCode]) ?? '受阻';
       return { text: `已停下：${reason} ${attempt}`, template: status.errorCode === 'NODE_TIMEOUT' ? 'red' : 'orange' };
     }
@@ -131,6 +157,29 @@ function statusLine(view: V3NodeCardView): { text: string; template: string } {
   }
 }
 
+/** The status block a main-topic handoff card carries in place of the node
+ *  card (P2): the same status line, reason, hand-over and checkpoint lines. */
+export interface V3HandoffCardStatusView {
+  text: string;
+  template: string;
+  lines?: string[];
+}
+
+export function v3HandoffCardStatus(
+  status: V3NodeCardStatus,
+  attemptNumber: number,
+  extra: { intervention?: string; checkpoint?: string } = {},
+): V3HandoffCardStatusView {
+  const { text, template } = statusLine({ status, attemptNumber });
+  const lines: string[] = [];
+  if (status.kind === 'blocked' && status.message && !(status.errorCode === 'HANDED_TO_HUMAN' && extra.intervention)) {
+    lines.push(`原因：${status.message.slice(0, 500)}`);
+  }
+  if (extra.intervention) lines.push(extra.intervention);
+  if (extra.checkpoint) lines.push(extra.checkpoint);
+  return { text, template, ...(lines.length > 0 ? { lines } : {}) };
+}
+
 /** The node topic's root card (no mention; patched in place). */
 export function buildV3NodeCard(view: V3NodeCardView): string {
   const position = view.nodeIndex && view.nodeCount ? ` ${view.nodeIndex}/${view.nodeCount}` : '';
@@ -140,14 +189,17 @@ export function buildV3NodeCard(view: V3NodeCardView): string {
     plain(`执行：${view.botName}${view.selfExecuted ? '（主 Bot 自己）' : ''}`),
     plain(`状态：${text}`),
   ];
-  if (view.status.kind === 'blocked' && view.status.message) {
+  // A hand-over's reason is the intervention line below, not repeated here.
+  if (view.status.kind === 'blocked' && view.status.message && !(view.status.errorCode === 'HANDED_TO_HUMAN' && view.intervention)) {
     elements.push(plain(`原因：${view.status.message.slice(0, 500)}`));
   }
+  if (view.intervention) elements.push(plain(view.intervention));
+  if (view.checkpoint) elements.push(plain(view.checkpoint));
   if (view.upstream.length > 0) {
     elements.push(plain(`上游：${view.upstream.map((up) => `${up.nodeId} ${up.done ? '✅' : '⏳'}`).join('  ')}`));
   }
   elements.push({ tag: 'hr' });
-  elements.push(md(`<font color='grey'>botmux · 工作流 ${escapeMarkdown(view.runId)}</font>`));
+  elements.push(workflowSignatureRow(md(`<font color='grey'>botmux · 工作流 ${escapeMarkdown(view.runId)}</font>`), view.entry));
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },
@@ -185,6 +237,17 @@ export interface V3HandoffCardInput {
   reassignedFrom?: string;
   /** Mention target, or the main bot itself (§6.5: no mention). */
   target: { kind: 'bot'; openId: string } | { kind: 'self' };
+  /** 交接带发起人身份 (design §10): why this handoff goes out without the
+   *  initiator's identity, in plain words. Absent = nothing to say. */
+  identityNote?: string;
+  /** §11: the「工作流 ›」sidebar entry at the signature row's right end. */
+  entry?: WorkflowSidebarEntryLink;
+  /** Main-topic placement (§5.4): the deadline counts from when the turn
+   *  starts, which may be after a queue. */
+  mainTopic?: true;
+  /** Main-topic placement only (P2): the node's status, shown at the top
+   *  and patched in place. Absent = a node topic's handoff card, unchanged. */
+  status?: V3HandoffCardStatusView;
 }
 
 /** The exact `botmux report` command lines for a handoff (also used in the
@@ -224,6 +287,7 @@ export function v3HandoffBodyText(input: V3HandoffCardInput): string {
     lines.push(`上次的情况：${reason}${input.retryOf.message ? `（${input.retryOf.message.slice(0, 300)}）` : ''}`, '');
   }
   if (input.reassignedFrom) lines.push('本节点已改派给你。', '');
+  if (input.identityNote) lines.push(`未带发起人身份：${input.identityNote}；需要个人授权的工具会在调用时提示授权，用不到就照常做。`, '');
   const preview = (text: string) => (input.overflowAttachment ? clip(text, OVERFLOW_PREVIEW_CHARS) : text);
   if (input.overflowAttachment) {
     lines.push(`要求较长，完整内容见附件 ${input.overflowAttachment}（已放进你的会话），以附件为准。`, '');
@@ -253,7 +317,9 @@ export function v3HandoffBodyText(input: V3HandoffCardInput): string {
     lines.push(`· 需要返工上游时，result.json 写 {"status":"revisit","revisitTo":"<${input.revisitTo.join('|')}>"}`);
   }
   lines.push('');
-  lines.push(`期限：接单后 ${formatV3Elapsed(input.timeoutSec * 1000)}。`, '');
+  lines.push(input.mainTopic
+    ? `期限：这一轮开始后 ${formatV3Elapsed(input.timeoutSec * 1000)}（你在主话题里正忙时先排队，从轮到这一轮开始算）。`
+    : `期限：接单后 ${formatV3Elapsed(input.timeoutSec * 1000)}。`, '');
   const commands = v3HandoffReportCommands(input);
   lines.push('怎么交：', '做完运行', `  ${commands.completed}`, `做不了：${commands.blocked}`);
   lines.push('提交被拒时命令会列出缺什么，补齐后在本轮重新提交即可。');
@@ -310,25 +376,28 @@ export function planV3HandoffCard(input: V3HandoffCardInput, overflowName: strin
 /** The handoff card (first reply in the node topic). */
 export function buildV3HandoffCard(input: V3HandoffCardInput): string {
   const loop = input.loopIteration ? ` · 第 ${input.loopIteration} 轮` : '';
+  const statusBlock = input.status
+    ? [plain([`状态：${input.status.text}`, ...(input.status.lines ?? [])].join('\n')), { tag: 'hr' }]
+    : [];
   const card: Record<string, unknown> = {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },
     header: {
-      template: 'indigo',
+      template: input.status?.template ?? 'indigo',
       title: { tag: 'plain_text', content: `【工作流任务】${input.runTitle} · ${input.nodeId}（第 ${input.attemptNumber} 次${loop}）` },
     },
-    body: { direction: 'vertical', elements: [plain(v3HandoffBodyText(input))] },
+    body: { direction: 'vertical', elements: [...statusBlock, plain(v3HandoffBodyText(input))] },
   };
   if (input.target.kind === 'self') {
     (card.body as { elements: unknown[] }).elements.push(
       { tag: 'hr' },
-      md("<font color='grey'>botmux · 执行：主 Bot 自己</font>"),
+      workflowSignatureRow(md("<font color='grey'>botmux · 执行：主 Bot 自己</font>"), input.entry),
     );
     return JSON.stringify(card);
   }
   const withFooter = appendReplyCardFooterToV2Card(card, { recipientOpenIds: [input.target.openId], locale: 'zh' });
   if (!withFooter) throw new Error('v3 handoff card: cannot attach the mention footer');
-  return JSON.stringify(withFooter);
+  return attachWorkflowSidebarEntry(JSON.stringify(withFooter), input.entry);
 }
 
 export interface V3NodeReportCardInput {
@@ -337,6 +406,8 @@ export interface V3NodeReportCardInput {
   summary: string;
   files: Array<{ key: string; name: string; bytes: number }>;
   elapsedMs?: number;
+  /** §11: the「工作流 ›」sidebar entry at the signature row's right end. */
+  entry?: WorkflowSidebarEntryLink;
 }
 
 function formatBytes(bytes: number): string {
@@ -355,7 +426,10 @@ export function buildV3NodeReportCard(input: V3NodeReportCardInput): string {
     elements.push(plain(['产出：', ...input.files.map((file) => `· ${file.key}：${file.name}（${formatBytes(file.bytes)}）`)].join('\n')));
   }
   elements.push({ tag: 'hr' });
-  elements.push(md(`<font color='grey'>botmux · ${escapeMarkdown(input.botName)} 已提交${input.elapsedMs !== undefined ? ` · 用时 ${formatV3Elapsed(input.elapsedMs)}` : ''}</font>`));
+  elements.push(workflowSignatureRow(
+    md(`<font color='grey'>botmux · ${escapeMarkdown(input.botName)} 已提交${input.elapsedMs !== undefined ? ` · 用时 ${formatV3Elapsed(input.elapsedMs)}` : ''}</font>`),
+    input.entry,
+  ));
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },

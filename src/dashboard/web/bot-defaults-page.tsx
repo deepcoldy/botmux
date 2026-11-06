@@ -1,3 +1,4 @@
+import { SessionGroupNamingRow } from './session-group-naming-row.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
@@ -6469,6 +6470,7 @@ function SessionModeSection(props: {
         <div className="bd-mode-group-side"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
         {p2p === 'group' ? (
           <>
+            <SessionGroupNamingRow key={props.bot.larkAppId} appId={props.bot.larkAppId} cliId={props.bot.cliId} />
             <SessionGroupTagRow bot={props.bot} />
             <p className="bd-section-note" data-session-group-lifecycle>{tr('botDefaults.sgLifecycleHint')}</p>
           </>

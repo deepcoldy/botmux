@@ -25,6 +25,7 @@ import {
   type IdleCleanupHours,
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { DocCommentFailures } from './doc-comment-failures.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
@@ -181,6 +182,7 @@ type IdleCleanupBarProps = {
 type IdleCleanupHoursValue = `${IdleCleanupHours}`;
 
 const idleCleanupThresholdOptions = IDLE_CLEANUP_HOUR_OPTIONS.map(hours => ({
+  hours,
   value: String(hours) as IdleCleanupHoursValue,
   label: idleCleanupHoursLabel(hours),
 }));
@@ -718,8 +720,7 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
               aria-label={t('sessions.idleCleanupThreshold')}
             >
               {idleCleanupThresholdOptions.map(option => {
-                const hours = parseIdleCleanupHours(option.value)!;
-                const active = hours === draftHours;
+                const active = option.hours === draftHours;
                 return (
                   <button
                     type="button"
@@ -727,9 +728,9 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
                     className={active ? 'active' : undefined}
                     aria-pressed={active ? 'true' : 'false'}
                     disabled={props.busy}
-                    onClick={() => setDraftHours(hours)}
+                    onClick={() => setDraftHours(option.hours)}
                   >
-                    {option.label}
+                    {option.hours === 0 ? t('sessions.idleCleanupAll') : option.label}
                   </button>
                 );
               })}
@@ -2478,11 +2479,12 @@ function SessionsPage(): React.JSX.Element {
 
   const runIdleCleanup = useCallback(async (hours: IdleCleanupHours): Promise<void> => {
     const nextHours = parseIdleCleanupHours(hours);
-    if (!nextHours) return;
+    if (nextHours === null) return;
     const groups = idleCleanupCandidatesFor(nextHours);
     const candidates = [...groups.idle, ...groups.dormant];
     if (candidates.length === 0) return;
-    setIdleCleanupHours(nextHours);
+    // 「全部」是一次性的极端档位，不参与下次开层的默认值记忆，回落为上一次的非 0 档。
+    setIdleCleanupHours(prev => (nextHours === 0 ? prev : nextHours));
     setIdleCleanupBusy(true);
     setIdleCleanupStatus(t('sessions.idleCleanupRunning'));
     try {
@@ -2701,6 +2703,8 @@ function SessionsPage(): React.JSX.Element {
           ) : null}
         </div>
       </div>
+
+      <DocCommentFailures />
 
       <div className="session-runtime-stats" aria-live="polite">
         <span><b>{runtimeCounts.logical}</b>{t('sessions.runtime.logical')}</span>

@@ -19,7 +19,7 @@ let session: any;
 beforeEach(async () => {
   session = {
     session: { sessionId: 'auth-session', status: 'active' },
-    larkAppId: 'cli_test', chatId: 'oc_test',
+    larkAppId: 'cli_test', chatId: 'oc_test', chatType: 'p2p',
     worker: { killed: false }, workerGeneration: 4,
     managedTurnOrigin: { capability: CAP, turnId: 'om_turn', callerOpenId: 'ou_sender' },
   };

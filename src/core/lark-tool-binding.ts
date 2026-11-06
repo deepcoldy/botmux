@@ -177,6 +177,33 @@ export function isLarkToolBound(
   return botConfig?.larkToolBinding !== false && hasLarkToolBinding(dataDir, sessionId);
 }
 
+/**
+ * Which lark-cli identity a session's `/login` should authorize.
+ *
+ * The binding file is written when the worker spawns, but `/login` is often the
+ * very first message of a new topic — no worker yet. Keying on the file alone
+ * sent that first `/login` down the legacy device-code flow (an issuer app the
+ * person may not even be allowed to use), and the same command answered with
+ * the bot-app OAuth a message later. Before the first spawn, decide from the
+ * same session facts the worker will use (usesLarkToolBinding). A live worker
+ * without the file is a session that runs the legacy wrapper: keep it there.
+ */
+export function sessionLarkToolBound(input: {
+  botConfig: { larkToolBinding?: boolean } | undefined;
+  dataDir: string;
+  sessionId: string;
+  /** A worker process is running for this session right now. */
+  workerLive: boolean;
+  /** The facts the worker's own usesLarkToolBinding decision reads. */
+  spawnFacts: Parameters<typeof usesLarkToolBinding>[0];
+  workflow?: boolean;
+}): boolean {
+  if (input.botConfig?.larkToolBinding === false) return false;
+  if (hasLarkToolBinding(input.dataDir, input.sessionId)) return true;
+  if (input.workerLive) return false;
+  return usesLarkToolBinding(input.spawnFacts, input.dataDir, input.workflow ?? false);
+}
+
 /** Bind only this session's tool. No global profile, account or user token is read. */
 export function prepareLarkToolEnv(input: {
   env: NodeJS.ProcessEnv;
@@ -249,8 +276,8 @@ export function hasLarkToolBinding(dataDir: string, sessionId: string): boolean 
 
 export function larkToolPrompt(appId: string, locale?: string): string {
   return locale === 'en'
-    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user to act as the current user; botmux picks that person's authorization (their grant to this application, or their botmux platform authorization). To use a different application or profile, specify --profile <profile>. When a read with --as user lacks a permission but the data is in a chat or document this bot can access (for example messages of a group the bot is in), retry that read with --as bot; never switch a write to --as bot. If the read also fails as bot, or the action must be done as the user, run botmux auth request --scope "<required scopes>" --json for the user's authorization and pass the link or platform page it returns to the user. Do not repeat writes whose result is uncertain.`
-    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 以当前用户身份调用，用谁的哪份授权由 botmux 决定（该用户对本应用的授权，或其在 botmux 中心化平台的授权）；若需使用其他应用或 profile，可显式指定 --profile <profile>。以 --as user 读取时缺权限、但数据在本机器人能访问的群或文档里（例如本机器人所在群的消息），改用 --as bot 重试这次读取；写操作不得改用 --as bot。bot 身份也读不到、或这件事必须以用户身份完成时，再运行 botmux auth request --scope "<所需权限>" --json 申请用户授权，把返回的链接或平台页面发给用户。不要重复执行结果尚不确定的写操作。`;
+    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user to act as the current user; botmux picks that person's authorization (their grant to this application, or their botmux platform authorization). To use a different application or profile, specify --profile <profile>. When a read with --as user lacks a permission but the data is in a chat or document this bot can access (for example messages of a group the bot is in), retry that read with --as bot; never switch a write to --as bot. If the read also fails as bot, or the action must be done as the user, run botmux auth request --scope "<required scopes>" --json for the user's authorization and pass the link or platform page it returns to the user (in a group botmux sends authorization links privately to the requester itself; never post one in the group). Do not repeat writes whose result is uncertain.`
+    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 以当前用户身份调用，用谁的哪份授权由 botmux 决定（该用户对本应用的授权，或其在 botmux 中心化平台的授权）；若需使用其他应用或 profile，可显式指定 --profile <profile>。以 --as user 读取时缺权限、但数据在本机器人能访问的群或文档里（例如本机器人所在群的消息），改用 --as bot 重试这次读取；写操作不得改用 --as bot。bot 身份也读不到、或这件事必须以用户身份完成时，再运行 botmux auth request --scope "<所需权限>" --json 申请用户授权，把返回的链接或平台页面发给用户（群聊里 botmux 会自己私聊发起人发授权链接，不要在群里贴授权链接）。不要重复执行结果尚不确定的写操作。`;
 }
 
 export function larkToolPromptFromEnv(

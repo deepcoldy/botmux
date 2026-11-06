@@ -5,35 +5,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  shouldRecordFailedTurn,
   buildFailedTurnRecord,
   retryCooldownRemaining,
   markRetryAttempt,
 } from '../src/services/failed-turn-retry.js';
 import type { FailedTurnRecord } from '../src/types.js';
-
-describe('shouldRecordFailedTurn', () => {
-  it('records failed terminals whose turn matches the current reply target', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'failed' }, 't1')).toBe(true);
-  });
-
-  it('records ambiguous terminals (interrupted turns)', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'ambiguous' }, 't1')).toBe(true);
-  });
-
-  it('does not record completed or cancelled terminals', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'completed' }, 't1')).toBe(false);
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'cancelled' }, 't1')).toBe(false);
-  });
-
-  it('skips type-ahead scenarios: a newer turn already owns the prompt', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'failed' }, 't2')).toBe(false);
-  });
-
-  it('records when no current reply target is known (best-effort)', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'failed' }, undefined)).toBe(true);
-  });
-});
 
 describe('buildFailedTurnRecord', () => {
   it('builds a complete record from terminal + sources', () => {

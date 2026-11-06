@@ -5,7 +5,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import type { Duplex } from 'node:stream';
-import { requestLiteralLoopback } from '../core/loopback-target.js';
+import { requestLiteralIp, requestLiteralLoopback } from '../core/loopback-target.js';
 import { TERMINAL_VIEW_FORWARD_HEADER, TERMINAL_WAKE_HEADER } from '../core/terminal-control-grant.js';
 import { TERMINAL_PLATFORM_READONLY_HINT_HEADER } from '../core/terminal-write-auth.js';
 import type {
@@ -15,6 +15,7 @@ import type {
 } from './terminal-control.js';
 
 export const TERMINAL_CONTROL_HEADER = 'x-botmux-terminal-control';
+export const TERMINAL_ROUTE_HOP_HEADER = 'x-botmux-terminal-route-hop';
 export { TERMINAL_VIEW_FORWARD_HEADER };
 /** Covers a daemon wake-up plus a bounded worker handshake. Cleared as soon as
  * response/upgrade headers arrive, so live streams stay unbounded.
@@ -43,6 +44,16 @@ export const MAX_TERMINAL_UPGRADE_REJECTION_BYTES = 64 * 1024;
 
 export interface TerminalFrontProxyOptions {
   resolvePort(sessionId: string): number | undefined;
+  /** #2062: resolve a live terminal owned by another replica. The returned
+   * literal-IP endpoint is that replica's Dashboard port, not a raw worker port.
+   * Only primary multi-replica deployments install it; without it every request
+   * takes the synchronous local-only path, exactly as before cross-Pod routing. */
+  resolveRemoteTarget?(sessionId: string): Promise<{ host: string; port: number } | undefined>;
+  /** #2062: whether this replica's own row has a live worker for the Session.
+   * Consulted only together with resolveRemoteTarget: a live local worker is
+   * served locally without a shared-store read, while a dormant local row first
+   * yields to a live owner elsewhere and otherwise still cold-starts locally. */
+  isLocalTerminalLive?(sessionId: string): boolean;
   resolveActor(req: IncomingMessage): TerminalDashboardActor | null;
   control: TerminalControlManager;
   /** P1-5: resolve which auth session a bound `?viewToken=` read capability
@@ -64,6 +75,19 @@ export interface TerminalFrontProxyOptions {
    * terminal proxy needs before it wakes a suspended session. Only attached for
    * a signed-in actor; the worker never reads it. */
   wakeProof?(sessionId: string): string | null | undefined;
+}
+
+function terminalRemoteHeaders(headers: IncomingHttpHeaders): OutgoingHttpHeaders {
+  const forwarded: OutgoingHttpHeaders = {};
+  for (const [name, value] of Object.entries(headers)) {
+    // A peer Dashboard has a different machine-local management/auth secret.
+    // Forward only protocol headers plus the URL capability; ambient browser
+    // credentials must never cross the replica boundary.
+    if (value === undefined || sensitiveBrowserHeader(name)) continue;
+    forwarded[name] = value;
+  }
+  forwarded[TERMINAL_ROUTE_HOP_HEADER] = '1';
+  return forwarded;
 }
 
 function safeDecodeSessionId(raw: string): string | undefined {
@@ -270,22 +294,30 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     return { ...parsed, port, revoked: false, actor, proxyGrant, readAuthSessionId, headers };
   };
 
-  const handleHttp = (req: IncomingMessage, res: ServerResponse, url: URL): boolean => {
-    if (!(url.pathname === '/s' || url.pathname.startsWith('/s/'))) return false;
-    const prepared = prepare(req, url);
-    if (!prepared?.port) {
-      plainError(res, 404, 'session terminal not available');
-      return true;
+  /** #2062 routing decision. `local` is the pre-#2062 behaviour and the only
+   * outcome when no remote resolver is installed (single-replica deployments)
+   * or when the request already crossed one replica hop (no second hop). */
+  type TerminalRoutePlan =
+    | { kind: 'none' }
+    | { kind: 'local'; port: number }
+    | { kind: 'remote-first'; fallbackPort?: number };
+  const planRoute = (req: IncomingMessage, prepared: PreparedTerminalRequest | null): TerminalRoutePlan => {
+    if (!prepared) return { kind: 'none' };
+    const canRouteRemote = options.resolveRemoteTarget !== undefined
+      && req.headers[TERMINAL_ROUTE_HOP_HEADER] !== '1';
+    if (!canRouteRemote) return prepared.port ? { kind: 'local', port: prepared.port } : { kind: 'none' };
+    if (prepared.port && options.isLocalTerminalLive?.(prepared.sessionId) !== false) {
+      return { kind: 'local', port: prepared.port };
     }
-    if (prepared.revoked) {
-      plainError(res, 403, 'view capability revoked');
-      return true;
-    }
-    const upstream = requestLiteralLoopback({ host: '127.0.0.1', port: prepared.port }, {
-      method: req.method,
-      path: req.url,
-      headers: prepared.headers,
-    }, up => {
+    return { kind: 'remote-first', ...(prepared.port ? { fallbackPort: prepared.port } : {}) };
+  };
+
+  const pipeHttp = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    open: (onResponse: (up: IncomingMessage) => void) => ReturnType<typeof requestLiteralLoopback>,
+  ): void => {
+    const upstream = open(up => {
       upstream.setTimeout(0);
       res.writeHead(up.statusCode ?? 502, up.headers);
       // P1-2：浏览器提前断开时把上游一起收掉。`up.pipe(res)` 在 dest 关闭时只做
@@ -302,6 +334,54 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     });
     req.on('aborted', () => upstream.destroy());
     req.pipe(upstream);
+  };
+
+  const handleHttp = (req: IncomingMessage, res: ServerResponse, url: URL): boolean => {
+    if (!(url.pathname === '/s' || url.pathname.startsWith('/s/'))) return false;
+    const prepared = prepare(req, url);
+    const plan = planRoute(req, prepared);
+    if (!prepared || plan.kind === 'none') {
+      plainError(res, 404, 'session terminal not available');
+      return true;
+    }
+    if (prepared.revoked) {
+      plainError(res, 403, 'view capability revoked');
+      return true;
+    }
+    const localOptions = { method: req.method, path: req.url, headers: prepared.headers };
+    if (plan.kind === 'local') {
+      pipeHttp(req, res, onResponse => requestLiteralLoopback(
+        { host: '127.0.0.1', port: plan.port },
+        localOptions,
+        onResponse,
+      ));
+      return true;
+    }
+    // Hold the body while the shared route store is consulted.
+    req.pause();
+    void (async () => {
+      const remote = await options.resolveRemoteTarget!(prepared.sessionId);
+      if (remote) {
+        pipeHttp(req, res, onResponse => requestLiteralIp(remote, {
+          method: req.method,
+          path: req.url,
+          headers: terminalRemoteHeaders(req.headers),
+        }, onResponse));
+      } else if (plan.fallbackPort) {
+        pipeHttp(req, res, onResponse => requestLiteralLoopback(
+          { host: '127.0.0.1', port: plan.fallbackPort! },
+          localOptions,
+          onResponse,
+        ));
+      } else {
+        plainError(res, 404, 'session terminal not available');
+        return;
+      }
+      req.resume();
+    })().catch(() => {
+      if (!res.headersSent) plainError(res, 502, 'terminal proxy error');
+      else res.end();
+    });
     return true;
   };
 
@@ -320,7 +400,8 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       if (!clientSocket.destroyed) clientSocket.destroy();
     });
     const prepared = prepare(req, url);
-    if (!prepared?.port) {
+    const plan = planRoute(req, prepared);
+    if (!prepared || plan.kind === 'none') {
       socketError(clientSocket, 404, 'session terminal not available');
       return true;
     }
@@ -329,15 +410,13 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       return true;
     }
 
-    let responded = false;
-    const upstream = requestLiteralLoopback({ host: '127.0.0.1', port: prepared.port }, {
-      method: req.method,
-      path: req.url,
-      headers: prepared.headers,
-    });
-    upstreamRequest = upstream;
-    upstream.setTimeout(TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
-    upstream.on('upgrade', (upRes, upstreamSocket, upstreamHead) => {
+    const startUpgrade = (
+      upstream: ReturnType<typeof requestLiteralLoopback>,
+    ) => {
+      let responded = false;
+      upstreamRequest = upstream;
+      upstream.setTimeout(TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
+      upstream.on('upgrade', (upRes, upstreamSocket, upstreamHead) => {
       responded = true;
       bridgedSocket = upstreamSocket;
       upstream.setTimeout(0);
@@ -436,8 +515,8 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       upstreamSocket.on('error', cleanup);
       upstreamSocket.on('close', () => { releaseOnDisconnect(); clientSocket.destroy(); });
       clientSocket.on('close', () => { releaseOnDisconnect(); upstreamSocket.destroy(); });
-    });
-    upstream.on('response', upRes => {
+      });
+      upstream.on('response', upRes => {
       responded = true;
       // P1-2：拒绝体必须在限期内读完，且有上限（见常量注释）。
       let settled = false;
@@ -490,12 +569,39 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         clientSocket.end();
       });
       upRes.on('error', () => { disarm(); clientSocket.destroy(); });
-    });
-    upstream.on('error', () => {
+      });
+      upstream.on('error', () => {
       if (!responded) socketError(clientSocket, 502, 'terminal proxy error');
       else clientSocket.destroy();
+      });
+      upstream.end();
+    };
+
+    const localUpgrade = (port: number) => requestLiteralLoopback({ host: '127.0.0.1', port }, {
+      method: req.method,
+      path: req.url,
+      headers: prepared.headers,
     });
-    upstream.end();
+    if (plan.kind === 'local') {
+      startUpgrade(localUpgrade(plan.port));
+      return true;
+    }
+    void (async () => {
+      const remote = await options.resolveRemoteTarget!(prepared.sessionId);
+      if (remote) {
+        startUpgrade(requestLiteralIp(remote, {
+          method: req.method,
+          path: req.url,
+          headers: terminalRemoteHeaders(req.headers),
+        }));
+        return;
+      }
+      if (plan.fallbackPort) {
+        startUpgrade(localUpgrade(plan.fallbackPort));
+        return;
+      }
+      socketError(clientSocket, 404, 'session terminal not available');
+    })().catch(() => socketError(clientSocket, 502, 'terminal proxy error'));
     return true;
   };
 

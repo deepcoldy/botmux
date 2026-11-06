@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, larkToolLoopbackService } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, larkToolLoopbackService, sessionLarkToolBound } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
@@ -46,6 +46,24 @@ describe('managed lark-cli binding', () => {
     expect(usesLarkToolBinding({ ...config, backendType: 'riff' }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, apiOnly: true }, dir)).toBe(false);
     expect(usesLarkToolBinding(config, dir, true)).toBe(false);
+  });
+
+  it('/login routing: decided from configuration before the first spawn, from the file once a worker runs', () => {
+    const sessionId = 'session-login';
+    const spawnFacts = { sessionId, larkAppId: 'cli_current', chatId: 'oc_chat', backendType: 'pty' as const };
+    const bound = (o: Partial<Parameters<typeof sessionLarkToolBound>[0]> = {}) => sessionLarkToolBound({
+      botConfig: {}, dataDir: dir, sessionId, workerLive: false, spawnFacts, ...o,
+    });
+    // New topic, no worker, no file yet: same answer the worker will give.
+    expect(bound()).toBe(true);
+    expect(bound({ botConfig: { larkToolBinding: false } })).toBe(false);
+    expect(bound({ spawnFacts: { ...spawnFacts, adoptMode: true } })).toBe(false);
+    expect(bound({ workflow: true })).toBe(false);
+    // A live worker without the file runs the legacy wrapper.
+    expect(bound({ workerLive: true })).toBe(false);
+    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId, appId: defaults.appId });
+    expect(bound({ workerLive: true })).toBe(true);
+    expect(bound({ workerLive: true, botConfig: { larkToolBinding: false } })).toBe(false);
   });
 
   it('cleans up binding files and managed wrapper when turned off, leaving trigger-user wrappers intact', () => {

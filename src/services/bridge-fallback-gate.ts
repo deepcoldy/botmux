@@ -65,6 +65,23 @@ import type { TurnSendKind } from './turn-send-ledger.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
+/** Upper bound for the narrow "I already sent the final via botmux" status
+ *  line. A self-report beyond this length is treated as a real answer. */
+const SEND_COMPLETION_NARRATION_MAX_CHARS = 180;
+
+/** A negation — including English contractions the bare `\bnot\b` misses
+ *  (haven't / wasn't / …) and Chinese 没/未 — means the line is NOT a
+ *  successful-delivery self-report. */
+const SEND_COMPLETION_NEGATION = /\b(?:not|no|never|none|without)\b|n't|未|没|尚未|还没|并未/i;
+
+/** A reported delivery failure must always fail open: a line that says the
+ *  send errored / was rejected / returned a 4xx-5xx / 未送达 is an alert, not
+ *  a harmless "already sent" status — suppressing it would hide the failure. */
+const SEND_COMPLETION_FAILURE = new RegExp([
+  '\\b(?:fail(?:ed|s|ure)?|failure|error|errored|denied|rejected|refused|undelivered|bounced|exception)\\b',
+  '失败|报错|出错|异常|被拒|拒绝|未送达|没送达|无法送达|送达失败|投递失败|发送失败',
+  '(?:返回|returned|status|http|code)[^0-9]{0,8}[45]\\d{2}',
+].join('|'), 'i');
 
 export const BRIDGE_NOTHING_TO_SEND_SENTINEL = 'BOTMUX_NOTHING_TO_SEND';
 /** Superseded token name. Instructions no longer teach it, but the matcher
@@ -255,6 +272,40 @@ export interface BridgeSendMarker {
  *  and legacy markers without responseKind must not retire a pending turn. */
 export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'responseKind'>): boolean {
   return marker.responseKind === 'final';
+}
+
+/** Recognize the narrow self-report a model appends after it has already
+ *  delivered a folded execution's answer through `botmux send`
+ *  ("已通过 botmux 发出最终结论…" / "I have sent the final answer via botmux
+ *  send."). It is deliberately strict — a short answer merely *about* botmux
+ *  must not match:
+ *   - ≤180 visible chars and literally mentions `botmux`;
+ *   - a denial ("not / no / never / -n't contraction / 未 / 没 / 尚未 / …")
+ *     or a reported delivery failure (failed/error/denied/…、失败/报错/未送达、
+ *     a 4xx-5xx status) rules it out and fails open — a failed-send alert must
+ *     never be swallowed as a successful-delivery status;
+ *   - a final-meaning word (最终/结论/答复/回复/final/answer/reply);
+ *   - an explicit-send construction placing botmux between the delivery verb
+ *     and its target — Chinese 已/已经 … botmux … 发出/发送/投递/送达, or
+ *     English sent/delivered/posted … via/through/with/using botmux, or
+ *     called/used botmux send.
+ *  This text shape alone never suppresses anything; callers must additionally
+ *  prove a folded predecessor final via {@link supersededFinalMarkerExplainsCompletionNarration}. */
+export function isBridgeSendCompletionNarration(finalText: string | undefined): boolean {
+  if (finalText === undefined) return false;
+  const visible = normaliseForFingerprint(bridgePostText(finalText, false));
+  if (!visible || visible.length > SEND_COMPLETION_NARRATION_MAX_CHARS) return false;
+  if (!visible.toLowerCase().includes('botmux')) return false;
+  // Fail open on any negation or delivery-failure report.
+  if (SEND_COMPLETION_NEGATION.test(visible) || SEND_COMPLETION_FAILURE.test(visible)) return false;
+  const mentionsFinal = /(?:最终|结论|答复|回复|final(?:\s+(?:answer|reply|response))?|answer|reply)/i
+    .test(visible);
+  const mentionsExplicitSend = /(?:已|已经).{0,12}botmux.{0,16}(?:发出|发送|投递|送达)/i
+      .test(visible)
+    || /(?:sent|delivered|posted).{0,32}(?:via|through|with|using)\s+botmux(?:\s+send)?/i
+      .test(visible)
+    || /(?:called|used)\s+botmux\s+send/i.test(visible);
+  return mentionsFinal && mentionsExplicitSend;
 }
 
 export interface BridgeGateInput {
@@ -491,6 +542,57 @@ function markerMatchesSupersededFinal(turn: BridgeGateInput, marker: BridgeSendM
       && identity.dispatchAttempt === undefined) === true;
 }
 
+/** Whether a folded predecessor's explicit final marker explains a successor
+ *  turn's terminal that is ONLY a short "already sent the final via botmux"
+ *  self-report.
+ *
+ *  Type-ahead can fold several IM inputs into one native execution: the model
+ *  delivers that execution's answer with `botmux send --response-kind final`,
+ *  and the live turn identity then advances to a queued successor whose input
+ *  was folded into the same execution. The transcript terminal attributed to
+ *  that successor may then be merely the post-send status line — it is not the
+ *  successor input's own answer, so the transcript fallback must not re-post it.
+ *
+ *  This is deliberately narrower than borrowing a neighbouring timestamp:
+ *   - the queue must PROVE the folding relation (`turn.supersededTurns`, built
+ *     only from a matched native turn id) — a headless turn without
+ *     markTimeMs, or a turn with no proven predecessors, never suppresses;
+ *   - the marker must be an explicit final delivery for one of those exact
+ *     predecessors (turn id + dispatch attempt), in this session/thread, and
+ *     must not be this turn's own exact marker;
+ *   - the marker lands at/after the successor input was marked and before the
+ *     next own-turn boundary.
+ *  Unlike {@link markerMatchesSupersededFinal}, the terminal body need not
+ *  equal the delivered final — but it must match the strict self-report shape,
+ *  which keeps an arbitrary successor answer visible. */
+function supersededFinalMarkerExplainsCompletionNarration(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  marker: BridgeSendMarker,
+): boolean {
+  if (!isBridgeSendCompletionNarration(turn.finalText)) return false;
+  if (!turn.turnId || !turn.supersededTurns?.length || turn.markTimeMs === undefined) return false;
+  if (marker.terminalIndependent === true
+    || !isFinalBridgeSendMarker(marker)
+    || !markerMatchesSession(turn, marker)
+    || !markerCoversOwnThread(turn, marker)
+    || (marker.replyCardResponseKind !== undefined && marker.replyCardResponseKind !== 'final')) {
+    return false;
+  }
+  // A marker for this exact turn/attempt is the successor's own delivery, not a
+  // folded predecessor's.
+  if (markerMatchesExactTurn(turn, marker)) return false;
+  // Only a proven predecessor (exact turn + dispatch-attempt identity) can
+  // explain the narration — never an unrelated neighbouring turn.
+  if (!marker.turnId
+    || turn.supersededTurns.some(identity => marker.turnId === identity.turnId
+      && marker.dispatchAttempt === identity.dispatchAttempt) !== true) {
+    return false;
+  }
+  const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
+  return marker.sentAtMs >= turn.markTimeMs && marker.sentAtMs < upper;
+}
+
 /** Whether this delivery can replace the non-empty answer expected here.
  *
  * A cross-chat / cross-thread delivery still explains an EMPTY terminal, but
@@ -579,6 +681,14 @@ export function shouldSuppressBridgeEmit(
       && isFinalBridgeSendMarker(marker)
       && (marker.replyCardResponseKind === undefined
         || marker.replyCardResponseKind === 'final'))) {
+    return true;
+  }
+  // A folded predecessor's explicit final already delivered the merged
+  // execution's answer; a short post-send self-report attributed to the queued
+  // successor is not a new answer. Requires the queue-proven supersededTurns
+  // folding relation — neighbouring timestamps alone never qualify.
+  if (turn.turnId
+    && markers.some(marker => supersededFinalMarkerExplainsCompletionNarration(turn, nextBoundaryMs, marker))) {
     return true;
   }
   const attributable = attributableBridgeReplyMarkers(turn, nextBoundaryMs, markers);
