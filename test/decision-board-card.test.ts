@@ -555,6 +555,20 @@ describe('半途失败与恢复', () => {
     service.cards!.stop();
   });
 
+  it('启动对账时 owner 还没解析出来：待发占位留着，owner 回来后的对账照常补发', async () => {
+    sendImpl = async () => { throw new Error('timeout'); };
+    const seq = await addDecide();
+    service.cards!.stop();
+    sendImpl = async () => {};
+    owner = undefined;
+    await service.reconcileCards();
+    expect(sent).toHaveLength(0);
+    expect(service.store().getCard(APP, seq)?.messageId).toBe('');
+    owner = OWNER;
+    await service.reconcileCards();
+    expect(sent).toHaveLength(1);
+  });
+
   it('启动对账：补发上次没发出去的卡；已经发出去的不再发', async () => {
     sendImpl = async () => { throw new Error('timeout'); };
     await addDecide();

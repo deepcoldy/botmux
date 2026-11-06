@@ -460,8 +460,10 @@ export class DecisionCards {
     }
     // 发卡前落的占位：上次没发出去（失败 / 进程死在中间），仍在待拍板就补发，否则丢掉。
     if (!rec.messageId) {
-      if (item.state === 'decide' && this.deps.hasOwner()) await this.post(seq, steward.chatId, rec);
-      else store.deleteCard(app, seq);
+      // owner 暂时认不出来（启动时还没解析完、或解析瞬断）只是先不发，占位留着等下次同步；
+      // 不在待拍板了才丢掉占位。
+      if (item.state !== 'decide') store.deleteCard(app, seq);
+      else if (this.deps.hasOwner()) await this.post(seq, steward.chatId, rec);
       return;
     }
     // 管家群换过：重新进入待拍板时在新群发，旧群那张收成「已移到新群」。
