@@ -39,6 +39,84 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  it.each(['recover', 'stopped', 'retiring', 'different_pid', 'different_sid', 'middle_attempt', 'confirmed_binding', 'foreign_binding', 'history_gap', 'historical_switch', 'candidate_switch'] as const)(
+    'repairs only a proven uninterrupted unresolved runtime through a bare observation: %s', condition => {
+    const s = fixture(); const old = s.store.runtime(s.ref)!;
+    const execution = s.controller.admitInput('old-active'); s.store.bindQueuedExecution(s.ref, execution, old.ref);
+    s.store.apply(s.ref, { type: 'execution_terminal', execution, runtime: old.ref, status: 'reconciling', evidence: 'observer_loss' });
+    if (condition !== 'retiring') s.store.apply(s.ref, { type: 'runtime_lost', runtime: old.ref, confirmed: condition === 'stopped' });
+    if (condition === 'candidate_switch') {
+      const current = s.store.runtime(s.ref)!;
+      s.store.apply(s.ref, { type: 'runtime_bound', runtime: { ...current, identity: { ...current.identity!, nativeSessionId: 'native-other' } } });
+      s.store.apply(s.ref, { type: 'runtime_bound', runtime: current });
+    }
+    let worker = s.controller.bindWorker(2).worker;
+    if (condition === 'different_sid') {
+      s.controller.reserveBinding('known-transition', worker);
+      s.controller.bindRuntime('known-transition', worker, { ...old.identity!, nativeSessionId: 'native-other' });
+    }
+    const middle = s.controller.reserveBinding('middle-bare', worker);
+    s.controller.bindRuntime('middle-bare', worker, { backend: 'tmux', physicalId: condition === 'different_pid' ? '222:start2' : '111:start1', proof: 'process_start' });
+    if (condition === 'historical_switch') {
+      const current = s.store.runtime(s.ref)!;
+      s.store.apply(s.ref, { type: 'runtime_bound', runtime: { ...current, identity: { ...current.identity!, nativeSessionId: 'native-other' } } });
+      s.store.apply(s.ref, { type: 'runtime_bound', runtime: current });
+    }
+    if (condition === 'history_gap') {
+      const checkpoint = s.store.snapshot(s.ref);
+      checkpoint.tables.events = checkpoint.tables.events.filter(row => {
+        const event = JSON.parse(row.value as string);
+        return event.type !== 'runtime_reserved' || event.runtime.ref.runtimeId !== middle.runtimeId;
+      });
+      s.store.restore(checkpoint);
+    }
+    if (condition === 'middle_attempt') {
+      const active = s.controller.admitInput('middle-active'); s.store.bindQueuedExecution(s.ref, active, middle);
+    }
+    if (condition === 'foreign_binding') worker = s.controller.bindWorker(3).worker;
+    const bindingId = ['confirmed_binding', 'foreign_binding'].includes(condition) ? 'middle-bare' : 'new-proof';
+    if (!['confirmed_binding', 'foreign_binding'].includes(condition)) s.controller.reserveBinding(bindingId, worker);
+    if (condition === 'middle_attempt' || condition === 'foreign_binding') {
+      expect(() => s.controller.bindRuntime(bindingId, worker, old.identity!)).toThrow(condition === 'middle_attempt' ? 'runtime_recovery_has_active_execution' : 'runtime_binding_producer_mismatch');
+      expect(s.store.runtime(s.ref)?.ref).toEqual(middle);
+      expect(s.store.binding(s.ref, 'middle-bare')?.ref).toEqual(middle);
+      return;
+    }
+    const result = s.controller.bindRuntime(bindingId, worker, old.identity!);
+    if (condition === 'recover') expect(result.ref).toEqual(old.ref);
+    else expect(result.ref).not.toEqual(old.ref);
+    if (condition === 'confirmed_binding') expect(result.ref).toEqual(middle);
+    expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'reconciling', runtime: old.ref });
+    expect(s.store.binding(s.ref, 'middle-bare')?.ref).toEqual(middle);
+    if (condition === 'recover') expect(s.store.read(s.ref)?.runtimeEpoch).toBe(3);
+  });
+  it('uses fresh unambiguous PID-owned native identity on a busy reattach before granting the binding', () => {
+    const s = fixture(); const old = s.store.runtime(s.ref)!;
+    const replacementWorker = s.controller.bindWorker(2).worker;
+    const scope = new WorkerSessionEventScope(s.ref, replacementWorker); const binding = scope.beginRuntime();
+    const env: any = { backend: { cliPid: 111 }, codexRpcEngine: undefined, effectiveBackendType: 'tmux',
+      lastInitConfig: { cliId: 'traex', cliSessionId: 'untrusted-config-id' },
+      readProcessStartIdentity: () => 'start1', findTraexRolloutSetByPid: () => new Set(['native1']),
+      findTraexRolloutByPid: () => ({ path: '/owned', cliSessionId: 'native1' }) };
+    const identity = loadWorkerFunction<(binding: any) => any>('runtimeIdentityForContract', env);
+    s.controller.reserveBinding(binding.bindingId, replacementWorker);
+    const restored = s.controller.bindRuntime(binding.bindingId, replacementWorker, identity(binding));
+    expect(restored.ref).toEqual(old.ref); expect(restored.identity?.nativeSessionId).toBe('native1');
+    env.findTraexRolloutSetByPid = () => new Set(['native1', 'native2']);
+    expect(identity(scope.beginRuntime()).nativeSessionId).toBeUndefined();
+    env.findTraexRolloutSetByPid = () => new Set(['native2']);
+    env.findTraexRolloutByPid = () => ({ path: '/new-owned', cliSessionId: 'native2' });
+    const rotated = scope.beginRuntime(); s.controller.reserveBinding(rotated.bindingId, replacementWorker);
+    expect(s.controller.bindRuntime(rotated.bindingId, replacementWorker, identity(rotated)).ref).not.toEqual(old.ref);
+    env.findTraexRolloutByPid = () => { env.backend = { cliPid: 222 }; return { path: '/new-owned', cliSessionId: 'native2' }; };
+    expect(identity(scope.beginRuntime()).proof).toBe('opaque');
+    env.backend = { cliPid: 111 }; env.workerSessionEventScope = scope;
+    env.findTraexRolloutByPid = () => { scope.beginRuntime(); return { path: '/new-owned', cliSessionId: 'native2' }; };
+    expect(identity(scope.beginRuntime()).proof).toBe('opaque');
+    env.findTraexRolloutByPid = () => ({ path: '/new-owned', cliSessionId: 'native2' });
+    env.readProcessStartIdentity = vi.fn().mockReturnValueOnce('start1').mockReturnValueOnce('start2');
+    expect(identity(scope.beginRuntime()).proof).toBe('opaque');
+  });
   it('keeps delayed predecessor exits out of legacy consumers while preserving scoped runtime evidence', () => {
     const s = fixture(); const original = { write: vi.fn() }; const replacement = { write: vi.fn() };
     const callback = vi.fn(); const wire: any[] = [];

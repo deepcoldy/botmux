@@ -1977,14 +1977,30 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
-  const nativeIdentity = backend?.getRuntimeIdentity?.();
-  if (nativeIdentity) return nativeIdentity;
-  const remote = (backend as { getBackendState?(): { provider?: string; generation?: number; remoteSessionId?: string; agentThreadId?: string } } | null)?.getBackendState?.();
-  if (remote?.generation !== undefined) return { backend: effectiveBackendType, physicalId: `${remote.provider ?? 'remote'}:${remote.remoteSessionId ?? binding.physicalId}`, nativeSessionId: remote.agentThreadId, nativeGeneration: String(remote.generation), proof: remote.remoteSessionId ? 'native_generation' : 'opaque' };
-  const childPid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.() ?? codexRpcEngine?.appServerPid;
+  const observedBackend = backend; const observedScope = workerSessionEventScope;
+  const observedBinding = observedScope?.currentBinding(); const backendType = effectiveBackendType;
+  const owned = () => backend === observedBackend && workerSessionEventScope === observedScope
+    && observedScope?.currentBinding() === observedBinding;
+  const opaque = (): RuntimeIdentity => ({ backend: backendType, physicalId: binding.physicalId, proof: 'opaque' });
+  const nativeIdentity = observedBackend?.getRuntimeIdentity?.();
+  if (nativeIdentity) return owned() ? nativeIdentity : opaque();
+  const remote = (observedBackend as { getBackendState?(): { provider?: string; generation?: number; remoteSessionId?: string; agentThreadId?: string } } | null)?.getBackendState?.();
+  if (remote?.generation !== undefined) return owned() ? { backend: backendType, physicalId: `${remote.provider ?? 'remote'}:${remote.remoteSessionId ?? binding.physicalId}`, nativeSessionId: remote.agentThreadId, nativeGeneration: String(remote.generation), proof: remote.remoteSessionId ? 'native_generation' : 'opaque' } : opaque();
+  const childPid = (observedBackend as { cliPid?: number } | null)?.cliPid ?? observedBackend?.getChildPid?.() ?? codexRpcEngine?.appServerPid;
   const start = childPid ? readProcessStartIdentity(childPid) : undefined;
-  if (childPid && start) return { backend: effectiveBackendType, physicalId: `${childPid}:${start}`, proof: 'process_start', ...(binding.identity?.nativeSessionId ? { nativeSessionId: binding.identity.nativeSessionId } : {}) };
-  return { backend: effectiveBackendType, physicalId: binding.physicalId, proof: 'opaque' };
+  if (childPid && start) {
+    let nativeSessionId = binding.identity?.nativeSessionId;
+    if (lastInitConfig?.cliId === 'traex') {
+      // A restored busy CLI may emit no new cli_session_id. Only a fresh,
+      // unambiguous top-level rollout held by this PID supplies its identity;
+      // a configured resume target cannot prove the live conversation.
+      const owned = findTraexRolloutSetByPid(childPid);
+      const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
+      if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    }
+    if (owned() && readProcessStartIdentity(childPid) === start) return { backend: backendType, physicalId: `${childPid}:${start}`, proof: 'process_start', ...(nativeSessionId ? { nativeSessionId } : {}) };
+  }
+  return opaque();
 }
 async function publishRuntimeContract(binding: RuntimeEventBinding): Promise<void> {
   if (!workerSessionEventScope || workerSessionEventScope.currentBinding() !== binding) return;

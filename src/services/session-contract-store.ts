@@ -309,9 +309,46 @@ export class SessionContractStore {
           || (old.nativeSessionId !== undefined && old.nativeSessionId !== identity.nativeSessionId)
           || (old.nativeGeneration !== undefined && old.nativeGeneration !== identity.nativeGeneration)) throw new Error('runtime_identity_changed');
       }
-      const reuse = previous && !['retiring', 'stopped'].includes(previous.phase) && reusableRuntimeIdentity(previous.identity, identity);
       const enriching = !!reserved.identity && reserved.worker.workerId === worker.workerId;
-      const runtime: RuntimeContract = { ...(reuse ? previous : reserved), worker, identity,
+      let reuse = previous && !['retiring', 'stopped'].includes(previous.phase) && reusableRuntimeIdentity(previous.identity, identity) ? previous : undefined;
+      if (!reuse && !reserved.identity && identity.proof === 'process_start' && identity.nativeSessionId
+        && previous?.identity && previous.identity.nativeSessionId === undefined
+        && samePhysicalRuntimeIdentity(previous.identity, identity)) {
+        // Repair an unbound/bare intermediate observation only on a NEW binding.
+        // Proven transitions or outstanding work in that interval prevent reuse.
+        const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as RuntimeContract);
+        const executions = this.executions(ref);
+        if (executions.some(execution => !terminalPhase(execution.phase) && sameRuntime(execution.runtime, previous.ref))) {
+          throw new Error('runtime_recovery_has_active_execution');
+        }
+        const records = (this.db.prepare("SELECT value FROM events WHERE session_key=? AND type IN ('runtime_bound','runtime_reserved')").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as Extract<ContractEvent, { type: 'runtime_bound' | 'runtime_reserved' }>);
+        const candidates = history.filter(runtime => runtime.phase === 'unresolved'
+          && runtime.ref.epoch < previous.ref.epoch && reusableRuntimeIdentity(runtime.identity, identity));
+        if (candidates.length === 1) {
+          const candidate = candidates[0];
+          const interval = history.filter(runtime => runtime.ref.epoch > candidate.ref.epoch
+            && runtime.ref.epoch < proposed.epoch);
+          const proven = records.filter(event => event.type === 'runtime_bound').map(event => event.runtime)
+            .filter(runtime => runtime.ref.epoch > candidate.ref.epoch && runtime.ref.epoch < proposed.epoch);
+          const uncertainOnly = [...interval, ...proven].every(runtime => !runtime.identity || (samePhysicalRuntimeIdentity(runtime.identity, identity)
+            && runtime.identity.nativeSessionId === undefined && runtime.identity.nativeGeneration === undefined));
+          const outstanding = executions.some(execution => !terminalPhase(execution.phase)
+            && interval.some(runtime => sameRuntime(runtime.ref, execution.runtime)));
+          if (outstanding) throw new Error('runtime_recovery_has_active_execution');
+          const candidateProofs = records.filter(event => event.type === 'runtime_bound' && sameRuntime(event.runtime.ref, candidate.ref));
+          const complete = interval.length === proposed.epoch - candidate.ref.epoch - 1
+            && new Set(interval.map(runtime => runtime.ref.epoch)).size === interval.length
+            && interval.every(runtime => Number.isSafeInteger(runtime.ref.epoch)
+              && records.some(event => event.type === 'runtime_reserved' && sameRuntime(event.runtime.ref, runtime.ref)))
+            && candidateProofs.some(event => reusableRuntimeIdentity(event.runtime.identity, identity))
+            && candidateProofs.every(event => !event.runtime.identity || event.runtime.identity.proof === 'opaque'
+              || (samePhysicalRuntimeIdentity(event.runtime.identity, identity)
+                && (event.runtime.identity.nativeSessionId === undefined || event.runtime.identity.nativeSessionId === identity.nativeSessionId)
+                && (event.runtime.identity.nativeGeneration === undefined || event.runtime.identity.nativeGeneration === identity.nativeGeneration)));
+          if (uncertainOnly && complete) reuse = candidate;
+        }
+      }
+      const runtime: RuntimeContract = { ...(reuse ?? reserved), worker, identity,
         ...(!enriching ? { phase: 'starting' as const, promptReady: false } : {}) };
       const result = this.applyInside(ref, { type: 'runtime_bound', runtime, ...(operationId ? { operationId } : {}) }, randomUUID());
       if (!['applied', 'historical'].includes(result.decision)) throw new Error(`runtime_binding_${result.decision}`);

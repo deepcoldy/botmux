@@ -13,6 +13,13 @@ epoch. `ExecutionRef` identifies an admitted turn/dispatch attempt. A physical
 process can have several semantic bindings after a native conversation change.
 Reattachment reuses a runtime only with matching process-start, native generation
 or persistent lineage evidence. Opaque identities are not reused across boots.
+Busy Traex reattachment can obtain the native ID before the first binding from
+a fresh, unambiguous user rollout held by the actual CLI PID. A configured resume
+ID is not evidence; lookup rechecks process birth and backend/scope ownership.
+If an earlier incomplete observation already became selected, a new binding can
+recover only a unique unresolved runtime with the same complete fresh identity.
+The interval must contain no proven identity transition or unfinished execution;
+confirmed bindings and stopped/retired runtimes are never reassigned or revived.
 
 The host persists a runtime reservation before granting `mayStart`. A worker
 awaits that receipt before starting its CLI. Once the backend exists, it reports

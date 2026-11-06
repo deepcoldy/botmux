@@ -73,7 +73,9 @@ export class SessionController {
     const value = this.store.reserveRuntime(this.ref, worker, bindingId); this.refresh(); return value;
   }
   bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string): RuntimeContract {
-    const proposed = this.store.binding(this.ref, bindingId) ?? { ref: this.reserveBinding(bindingId, worker) };
+    const existing = this.store.binding(this.ref, bindingId);
+    if (existing && !this.store.bindingProducer(this.ref, bindingId, worker)) throw new Error('runtime_binding_producer_mismatch');
+    const proposed = existing ?? { ref: this.reserveBinding(bindingId, worker) };
     const runtime = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operationId); this.refresh(); return runtime;
   }
   admitsRegistration(type: string, bindingId: string, context: SessionEventContext | undefined, worker: WorkerRef): boolean {
