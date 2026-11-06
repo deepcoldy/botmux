@@ -1,33 +1,12 @@
 # Architecture overview
 
+<video src="../img/video-v9-architecture-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 What botmux does fits in one sentence: **it turns Lark messages into input for an AI coding CLI, and turns the CLI's output back into Lark cards.** This page covers which processes make up botmux, how a message flows through them, and what happens on restart. You don't need any of this for day-to-day use; come back when you're troubleshooting or contributing.
 
 ## The big picture
 
-```
-                    botmux start
-                         │
-                         ▼
-               ┌───────────────────┐
-               │    supervisor     │  Long-lived "caretaker": starts and watches every member below
-               └─────────┬─────────┘
-       ┌─────────────────┼─────────────────┬──────────────┐
-       ▼                 ▼                 ▼              ▼
-  ┌──────────┐     ┌──────────┐      ┌───────────┐   ┌──────────┐
-  │ daemon 0 │     │ daemon 1 │ ...  │ dashboard │   │ plugin   │ (optional)
-  │ (bot A)  │     │ (bot B)  │      │ admin UI  │   │ services │
-  └────┬─────┘     └──────────┘      └───────────┘   └──────────┘
-       │ one worker per topic
-       ▼
-  ┌──────────┐   Reads terminal output → updates Lark cards
-  │  worker  │   Receives Lark messages → types them into the CLI
-  └────┬─────┘   Also serves this session's web terminal
-       │ connected through a "session backend" (tmux by default)
-       ▼
-  ┌──────────┐
-  │ CLI proc │   Claude Code / Codex / Cursor / ... running natively
-  └──────────┘
-```
+![botmux processes: the supervisor starts a daemon per bot, the Dashboard and plugin services; each daemon runs a worker per topic, which reaches the CLI through a session backend such as tmux](/img/arch-overview-en.png)
 
 ## What each process does
 
@@ -47,6 +26,8 @@ Key points:
 
 ## How a message flows
 
+![How a message flows: Lark push, daemon filtering, command classification, find or create the session, output to cards](/img/arch-message-flow-en.png)
+
 Take "@ the bot in a topic and say something" as an example:
 
 1. **Lark pushes the message to the daemon.** The daemon first decides whether to handle it: was the bot @-mentioned, is this a topic it owns, does the sender have permission.
@@ -56,6 +37,8 @@ Take "@ the bot in a topic and say something" as an example:
 5. **The CLI can also send messages on its own.** botmux injects a set of built-in Skills into the CLI (such as `botmux-send`, `botmux-schedule`, `botmux-history`), which it uses to post to the topic, create scheduled tasks, read chat history and more. See [Skills and CLI commands](/en/skill-cli).
 
 ## What happens on restart
+
+![What survives a restart per session backend: tmux and other persistent backends keep the CLI, pty restarts it](/img/arch-restart-en.png)
 
 `botmux restart` restarts the daemon and workers. Whether the CLI restarts too depends on the session backend:
 

@@ -400,6 +400,91 @@ Details in [File sandbox](/en/sandbox).
 
 > The ZMX backend can't enforce the file sandbox; sandboxed combinations are refused at startup. See [ZMX backend](/en/zmx).
 
+### Protected local MCP capabilities
+
+A local stdio MCP server can request one optional protected capability in its plugin-private `mcp/index.json`. The capability ID is opaque to Botmux; use a non-business-specific fixture such as:
+
+```json
+{
+  "transport": "stdio",
+  "command": ["node", "./mcp/server.js"],
+  "protectedCapability": "fixture.secret.v1"
+}
+```
+
+`protectedCapability` is not supported for streamable HTTP MCP servers; a plugin descriptor that combines them is rejected. The descriptor does not supply the secret source, principal policy, or containment rules; those bindings come only from machine-level configuration.
+
+Within `bots.json`, the `plugins` array only enables installed plugins for that bot:
+
+```json
+{
+  "plugins": ["fixture-plugin"]
+}
+```
+
+Do not put protected capability bindings, secret sources, secret values, or rollout state in `bots.json`. Operators bind the opaque capability ID in the machine-level `~/.botmux/config.json`:
+
+```json
+{
+  "protectedMcpCapabilities": {
+    "fixture.secret.v1": {
+      "enabled": false,
+      "allowedPluginIds": ["fixture-plugin"],
+      "secret": {
+        "source": "file",
+        "path": ".botmux/secrets/fixture-protected-secret"
+      },
+      "principal": "verified-human-email",
+      "containmentProfile": "local-stdio-secret-v1",
+      "isolation": {
+        "protectedHomePaths": [".fixture-credential"],
+        "redactEnv": ["FIXTURE_AUTH_TOKEN"]
+      }
+    }
+  }
+}
+```
+
+Missing `enabled` defaults to disabled; only JSON boolean `true` enables the binding. Non-boolean values such as `"true"` or `1` reject the entire record. Secrets support only `{ "source": "file", "path": "<Home-relative path>" }`, rooted at the daemon account's trusted Home. Absolute paths, `.`/`..` components, and symlinks are rejected. Operators must preprovision a nonempty regular file owned by the current user with exact mode `0600`, at most 64 KiB. Botmux never repairs unsafe files and never captures or caches secrets at daemon startup. It reads the file before each new worker fork, pinning directory fds and opening each component without following symlinks so an intermediate replacement cannot redirect the read.
+
+The secret reaches an authorized MCP only through the one-shot fd channel, never argv, generic environments, or logs. Rotation takes effect on the next worker fork; an existing MCP retains its startup secret until that session is recreated. Every valid configured secret file is automatically denied in all relevant session sandboxes, including bots without the matching plugin and disabled capabilities. Additional `protectedHomePaths` remain scoped to matching plugins. Current configuration supplies the `redactEnv` names and recognizable valid names from rejected legacy `source: "env"` records for worker, model, and generic plugin environment redaction; legacy environment sources grant no write capability. Machine configuration changes follow the global configuration's short cache refresh rules.
+
+At MCP process startup, Botmux uses the ordinary stdio transport without a protected secret file descriptor if the capability is disabled or not provisioned, the plugin is outside `allowedPluginIds`, the configured containment prerequisites are not satisfied, or the daemon cannot provide the one-shot channel. The server can still start and expose read-only tools. A `tools/call` on that connection receives neither `botmuxTrustedPrincipal` nor `botmuxGrantedCapabilities`; the plugin must fail closed for protected writes.
+
+`principal` is evaluated for each `tools/call`, not when the MCP process starts. If the global binding, plugin allowlist, containment prerequisites, and daemon channel all succeeded at startup, the long-lived process may already hold the one-shot secret even when a later call lacks its required verified human principal or other call-time grant condition. Botmux omits `botmuxTrustedPrincipal` and `botmuxGrantedCapabilities` from that call, and the plugin must reject the protected write. For **every** protected write, the plugin must freshly validate `botmuxTrustedPrincipal` and confirm that `botmuxGrantedCapabilities` contains the exact capability ID. It must never cache or reuse a principal, capability, or authorization result from an earlier call; any missing, mismatched, or stale field must fail closed. Isolation paths and environment redaction remain active for a matching enabled plugin even while the capability itself is disabled.
+
+To migrate legacy environment secrets, provision the safe file and change the configuration to `source: "file"`, then remove the old variable from the daemon launch source and restart the daemon. Deleting `process.env` cannot erase an old process's `/proc/<pid>/environ`. Before adding or changing secret paths, terminate and recreate old CLI sessions so their file denies cover the new paths; a hot update cannot revoke access already granted to old processes. Prefer rotation via atomic replacement at a fixed protected path. Protected files or other isolation requirements disable bare-host one-shot title generation and retain placeholder titles; ordinary session reads are unaffected.
+
+A restarted stdio MCP process currently cannot receive the one-shot secret again and falls back to read-only; recreate the session to restore protected capabilities. User-visible errors from the different policy collection entry points remain a follow-up.
+
+||||||| 15acd8dde
+### Run CLI calls as the message sender (`triggerUserAuth`) {#trigger-user-auth}
+
+**Off by default.** When on, `lark-cli` / `bytedcli` in this bot's sessions run with the authorization of whoever sent the current message, not whatever is logged in on the machine. Useful when several people share one bot: each message reads docs, checks calendars or calls internal platforms as its own sender.
+
+Pick one way to turn it on. It **takes effect for new sessions** (`/restart` an existing one):
+
+- **Dashboard**: **Bot Config → Security → Trigger-user auth**, switch on **Run CLI calls as the message sender** and tick the tools it should cover.
+- **In Lark** (admins): `/botconfig set triggerUserAuth {"enabled":true,"tools":["lark-cli","bytedcli"]}`; turn it off with `/botconfig unset triggerUserAuth`.
+- **bots.json**:
+
+```json
+"triggerUserAuth": { "enabled": true, "tools": ["lark-cli", "bytedcli"] }
+```
+
+Rules:
+
+- Only `"enabled": true` turns it on. Leaving out `tools` covers every tool; an unknown tool name is an error rather than a silent downgrade.
+- When someone who hasn't authorized makes a call, the command is refused and the refusal carries an authorization link. The AI can also send that person a link itself with `botmux auth request` (see [Agent-initiated authorization](/en/cli-commands#agent-auth-request)), or ask them to send `/login` in the topic. Retry after authorizing.
+- It never falls back to running as the bot or as anyone else. `bytedcli` has no bot identity, so an unauthorized call simply fails.
+- Optional fields: `credentialSource` (`auto` by default / `platform` central platform only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
+
+#### Upgrade note: old-format authorizations need a fresh `/login` {#legacy-user-token}
+
+Since v3.20, the Lark user authorizations botmux stores itself are kept per app and per authorizing person (`~/.botmux/data/user-token-<appId>-<openId>.json`). The older files (`user-token-<appId>.json`, `user-token.json`) don't say who authorized them, so nothing that has to act as a specific person uses them any more.
+
+A bot that only has an old-format authorization loses those user-identity features. **Have the person send `/login` once in a topic** to restore them. `/login` only refreshes the stored authorization; running CLI calls as the sender still has to be turned on separately as described above.
+
 ## Cards and terminal
 
 What the cards look like and what each switch does: see [Live streaming cards](/en/cards).
@@ -687,6 +772,31 @@ botmux can estimate each bot's spend (in CNY) from token usage and send a DM whe
 |------|------|
 | `voice` | This bot's voice engine config, merged field by field over the global `voice` in `~/.botmux/config.json`. With usable voice credentials, answer cards get a "🔊 Voice summary" button. See [Voice summary](/en/voice) |
 
+## Lark meeting agent {#vc-meeting-agent}
+
+A Lark-connected bot **can be invited into video meetings by default** (core-only `apiOnly` bots excepted). It listens in, syncs the transcript, and, depending on its meeting role, posts text or speaks in the meeting.
+
+**Prerequisites**: the app needs `vc:meeting.bot.join:write` (join / leave), `vc:meeting.meetingevent:read` (read meeting events) and `vc:meeting.message:write` (in-meeting text), plus `vc:meeting.bot.realtime:write` for realtime voice; the event subscription must include `vc.bot.meeting_invited_v1`, `vc.bot.meeting_activity_v1`, `vc.bot.meeting_ended_v1` and `vc.meeting.participant_meeting_joined_v1`. Missing scopes are logged as an error at startup and DMed to the admin; event subscriptions can't be queried through any Lark API, so the daemon only reminds you to check them, and a missing event just means no meeting pushes arrive, with no error.
+
+**How to use it**:
+
+1. Invite the bot from a Lark video meeting.
+2. The bot DMs the owner (or `vcMeetingAgent.attentionTargetOpenId`, if set) a confirmation card, valid for 30 minutes by default (`inviteTtlMs`).
+3. After confirmation the bot joins and creates a meeting listener group that syncs the transcript; set `vcMeetingAgent.listenerChatId` to use an existing group instead.
+4. What it does in the meeting is decided by meeting roles, see the next section. To let someone give the bot instructions while it listens to the meeting, use `/vc-auth @member` (`/vc-auth revoke @member` to undo, `/vc-auth list` to view).
+5. To prepare ahead: send `/vc prepare <meeting link or number>` in a regular group to make it the meeting prep group, add background and pre-read docs there, and the same Agent session is reused once the meeting starts (see [Slash commands](/en/slash-commands)).
+
+**Speaking in the meeting**:
+
+- Text and voice are **sent directly by default, without per-message approval**. For per-message approval, set `textOutputPolicy` / `voiceOutputPolicy` to `approval` under `vcMeetingAgent.meetingConsumer`; `deny` turns that channel off.
+- Realtime voice is on by default but only connects when the bot actually needs to speak; turn it off with `vcMeetingAgent.realtimeVoice.enabled: false`. Speaking also needs the realtime scope above and in-meeting AI speaking permission; without them it fails with a clear warning and never sends audio.
+- Speech is synthesized with the engine configured for [voice summaries](/en/voice) (MiniMax, Volcengine / Doubao, and others).
+
+**Turning it off**:
+
+- One bot: `"vcMeetingAgent": { "enabled": false }` in `bots.json`, or turn off **Receive meeting events** for that bot under **Global Settings → Meeting Agent → Meeting Listener → Meeting role presets → Per-bot meeting switches**.
+- The whole machine: Dashboard **Global Settings → Meeting Agent → Meeting Listener**, turn off **Allow meeting listener features on this machine** (`vcMeetingAgent.enabled: false` in `config.json`). Meetings already running usually finish naturally.
+
 ## Meeting roles
 
 When the bot is invited into a Feishu video meeting, it can act in a "meeting role", such as syncing key information, taking minutes or facilitating. Manage roles in Dashboard "Global Settings → Meeting role presets":
@@ -797,6 +907,10 @@ Bad formats, unknown fields and reserved names are rejected outright, never sile
 | `proxyMode` unset and either zone is `block` / `allowlist` / `denylist` | Any non-empty proxy value refuses to start |
 | `proxyMode: "reject"` | Any non-empty proxy value refuses to start |
 | `proxyMode: "trusted-egress"` | Explicitly allowed proxies may stay; network rules must allow the proxy's IP and port, and the final targets are governed by the proxy's own ACL |
+
+General proxy delegation in this table applies only to ordinary sessions. A frozen protected HTTP egress policy explicitly rejects `trusted-egress` and task proxy variables; adding that mode repeatedly cannot resolve the error. Model connections must use the protected model bridge, currently supported only by Codex. See [network sandbox documentation](sandbox.md).
+
+`trusted-egress` neither creates a proxy, grants environment variables nor guarantees the CLI uses it. Authorizing an exit does not restrict destinations behind it. If a model requires a proxy, do not simply remove its `inherit` grant to pass validation: explicitly trust the exit and configure endpoint rules plus deployment-layer ACLs, or first establish direct model authentication, permitted destination CIDRs/ports and DNS. Persistent backends such as tmux, adopt and external App Servers remain rejected regardless of `trusted-egress` or `envPolicy`.
 
 The network policy itself requires Linux, the local PTY backend and `sandbox: "oncall"`. See [File and network sandbox](/en/sandbox).
 

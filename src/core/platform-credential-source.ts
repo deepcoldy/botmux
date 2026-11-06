@@ -71,11 +71,16 @@ const realDeps: Deps = {
   now: () => Date.now(),
 };
 let deps: Deps = realDeps;
+/** Bumped when deps are swapped, so a lookup started under the old ones
+ *  cannot write its answer into the fresh cache. */
+let depsGeneration = 0;
 
 /** @internal test-only */
 export function __setPlatformCredentialDepsForTest(override: Partial<Deps> | null): void {
   deps = override ? { ...realDeps, ...override } : realDeps;
+  depsGeneration++;
   unionIdCache.clear();
+  unionIdLookups.clear();
 }
 
 /** open_id → union_id is stable for a person within an app; cache it so a
@@ -133,6 +138,14 @@ export function noteSenderUnionId(larkAppId: string, openId: unknown, unionId: u
   rememberUnionId(`${larkAppId}|${openId}`, unionId);
 }
 
+/** Lookups in flight, so the tools of one turn (prepared side by side) share
+ *  one contact call. Only the call is shared; a failure is still not cached.
+ *  The contact call has no deadline of its own, so sharing ends after
+ *  {@link UNION_ID_SHARE_MS}: a hung call can hold up the turns that joined it,
+ *  never the ones that come later. */
+const unionIdLookups = new Map<string, Promise<string | null>>();
+export const UNION_ID_SHARE_MS = 5_000;
+
 async function unionIdFor(larkAppId: string, openId: string): Promise<string | null> {
   const key = `${larkAppId}|${openId}`;
   const hit = unionIdCache.get(key);
@@ -142,10 +155,24 @@ async function unionIdFor(larkAppId: string, openId: string): Promise<string | n
     unionIdCache.set(key, hit);
     return hit.unionId;
   }
+  const inFlight = unionIdLookups.get(key);
+  if (inFlight) return inFlight;
+  const lookup = lookupUnionId(larkAppId, openId, key, depsGeneration);
+  unionIdLookups.set(key, lookup);
+  const stopSharing = () => { if (unionIdLookups.get(key) === lookup) unionIdLookups.delete(key); };
+  const timer = setTimeout(stopSharing, UNION_ID_SHARE_MS);
+  timer.unref?.();
+  try { return await lookup; } finally {
+    clearTimeout(timer);
+    stopSharing();
+  }
+}
+
+async function lookupUnionId(larkAppId: string, openId: string, key: string, generation: number): Promise<string | null> {
   let unionId: string | null = null;
   try { unionId = await deps.resolveUnionId(larkAppId, openId); } catch { unionId = null; }
   if (unionId && UNION_ID_RE.test(unionId)) {
-    rememberUnionId(key, unionId);
+    if (generation === depsGeneration) rememberUnionId(key, unionId);
     return unionId;
   }
   return null;

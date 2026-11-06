@@ -1,5 +1,5 @@
 {
-  "source": "GitHub Actions run 40930629817",
+  "source": "GitHub Actions run 40930629817; missing files over 60s measured in run 42043781286",
   "perFileOverhead": 0.49,
   "files": {
     "test/accept-slash-from-bots.test.ts": 1.03,
@@ -256,10 +256,12 @@
     "test/cli-runtime-display.test.ts": 0.01,
     "test/cli-runtime-update.test.ts": 0.1,
     "test/cli-runtime.test.ts": 0.02,
+    "test/cli-sandbox-host-hint.test.ts": 66.18,
     "test/cli-selection.test.ts": 0.03,
     "test/cli-self-update-direction.test.ts": 12,
     "test/cli-send-custom-final.test.ts": 60.07,
     "test/cli-send-deferred-topic-isolated.test.ts": 5.15,
+    "test/cli-send-diff.test.ts": 98.79,
     "test/cli-send-dispatch.test.ts": 0.03,
     "test/cli-send-doc-comment.test.ts": 65.1,
     "test/cli-send-dry-run.test.ts": 20.88,
@@ -2043,6 +2045,7 @@
     "test/worker-restart-policy-capability.test.ts": 13.9,
     "test/worker-restart-race.test.ts": 0.44,
     "test/worker-restart-scan.test.ts": 0.5,
+    "test/worker-restart-stale-turn.integration.test.ts": 190.84,
     "test/worker-riff-env.integration.test.ts": 9,
     "test/worker-screenshot-upload-hardening.test.ts": 0.92,
     "test/worker-startup-retry-wiring.test.ts": 0.05,

@@ -39,6 +39,7 @@ describe('SQLite to PostgreSQL migration', () => {
         webhookDestinations: [{ id: 'pending', enabled: true, url: 'https://example.com/hook', secretRef: 'secret-reference', eventTypes: ['turn.completed'] }],
       });
       const before = source.listFeedbackRevisions(delivery.deliveryId, 'user');
+      const sourceEvents = source.readFeedbackEventsAfter({ after: 0, limit: 100 });
       process.env.BOTMUX_MIGRATION_TEST_PASSWORD = decodeURIComponent(url.password) || 'unused';
       const config = await readFeedbackStorageConfig(directory);
       const candidate = await saveFeedbackStorageCandidate(directory, config.generation, {
@@ -95,13 +96,15 @@ describe('SQLite to PostgreSQL migration', () => {
         }
       }
       const result = await startFeedbackMigration(directory, { requestId: 'migration-test', expectedGeneration: candidate.generation, maintenanceConfirmed: true });
-      expect(result.phase).toBe('complete');
+      expect(result.phase, JSON.stringify(result.blockers)).toBe('complete');
       expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('postgresql');
       const target = await getFeedbackStorage(directory);
       expect(await target.store.listFeedbackRevisions(delivery.deliveryId, 'user')).toEqual(before);
       expect(await target.store.getResponse(response.responseId)).toMatchObject({ responseId: response.responseId });
       expect(await target.store.listTurnCompletionEvents()).toHaveLength(1);
       expect(await target.store.listFeedbackOutbox()).toMatchObject([{ status: 'pending' }]);
+      const migratedEvents = await target.store.readFeedbackEventsAfter({ after: 0, limit: 100 });
+      expect(migratedEvents.map(item => item.event.eventId).sort()).toEqual(sourceEvents.map(item => item.event.eventId).sort());
       expect((await resumeFeedbackMigration(directory, result.migrationId)).phase).toBe('complete');
       const jobPath = join(directory, 'feedback-migrations', `${result.migrationId}.json`);
       const saved = JSON.parse(await readFile(jobPath, 'utf8'));

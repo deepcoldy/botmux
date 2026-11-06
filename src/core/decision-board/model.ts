@@ -62,7 +62,36 @@ export interface BoardLink {
 export type BoardChatCheck = 'verified' | 'unverified';
 
 export type BoardActor = 'steward' | 'owner' | 'system';
-export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link';
+export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link' | 'hint';
+
+/**
+ * 这一项什么时候可以关：
+ *   - pr：这个 PR 合入（`pr:owner/repo#12 merged`）；
+ *   - item：看板上另一项完成（`item:66 done`）；
+ *   - manual：只由管家判断，巡检不提示（挂了 PR 也不按默认规则判）。
+ * 没写时：挂了 PR 关联的项按「挂的 PR 全部合入」判断，没挂的不判断。
+ */
+export type BoardCloseWhen =
+  | { kind: 'pr'; ref: string }
+  | { kind: 'item'; seq: number }
+  | { kind: 'manual' };
+
+/**
+ * 后台巡检（不调模型）给这一项打的提示。只提示、不改状态：
+ *   - close：关闭条件满足，建议关闭；
+ *   - advance：依赖的项都结束了 / 挂的 PR 没合就关了，建议推进；
+ *   - stale：过了复查时间还没动。
+ * key 由提示类型和触发它的事实拼成，同一个 key 只通知管家一次。
+ */
+export type BoardHintKind = 'close' | 'advance' | 'stale';
+
+export interface BoardHint {
+  kind: BoardHintKind;
+  key: string;
+  /** 给人读的一句话原因（中文 / 英文按看板语言），如「PR owner/repo#12 已合入」。 */
+  reason: string;
+  at: number;
+}
 
 export interface BoardItem {
   seq: number;
@@ -88,6 +117,14 @@ export interface BoardItem {
   primaryChat?: string;
   /** 确实没有群时管家写的原因；只在这一项没有 chat 关联时生效。 */
   noChatReason?: string;
+  /** 什么时候可以关；缺省 = 挂了 PR 就按「PR 全部合入」判断，见 {@link BoardCloseWhen}。 */
+  closeWhen?: BoardCloseWhen;
+  /** 依赖的事项编号：都结束（完成 / 关闭）后提示推进。 */
+  dependsOn?: number[];
+  /** 下次复查时间（毫秒）；过了还没动（这之后没有更新）就标「该看一眼」。 */
+  nextCheckAt?: number;
+  /** 后台巡检当前给的提示；没有提示时缺省。 */
+  hint?: BoardHint;
 }
 
 export interface BoardEvent {
@@ -384,6 +421,11 @@ export interface StewardConfig {
    * 管家。默认关：带上后群里有两个 bot，原 bot 不再按单人单 bot 免 @ 续话。只在打开时写 `true`。
    */
   autoJoinSoloGroups?: boolean;
+  /**
+   * 后台巡检（几分钟一次，不调模型）找出可以关 / 可以推进 / 过了复查时间的事项：在这一项上标提示、
+   * 记一条历史，并给管家会话发一条合并的短通知。只提示，不改状态。默认关，只在打开时写 `true`。
+   */
+  closeHints?: boolean;
 }
 
 export const STEWARD_GUIDE_TEXT_MAX = 20_000;
@@ -398,7 +440,7 @@ export function normalizeStewardConfig(raw: unknown):
   if (raw === null || raw === undefined) return { ok: true, value: null };
   if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'steward 必须是对象' };
   const r = raw as Record<string, unknown>;
-  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups']);
+  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups', 'closeHints']);
   const unknown = Object.keys(r).filter(k => !known.has(k));
   if (unknown.length) return { ok: false, reason: `steward 有未知字段：${unknown.join(', ')}` };
   if (r.enabled !== undefined && typeof r.enabled !== 'boolean') return { ok: false, reason: 'steward.enabled 必须是布尔值' };
@@ -407,6 +449,9 @@ export function normalizeStewardConfig(raw: unknown):
   }
   if (r.autoJoinSoloGroups !== undefined && r.autoJoinSoloGroups !== null && typeof r.autoJoinSoloGroups !== 'boolean') {
     return { ok: false, reason: 'steward.autoJoinSoloGroups 必须是布尔值' };
+  }
+  if (r.closeHints !== undefined && r.closeHints !== null && typeof r.closeHints !== 'boolean') {
+    return { ok: false, reason: 'steward.closeHints 必须是布尔值' };
   }
   let chatId: string | undefined;
   if (r.chatId !== undefined && r.chatId !== null && r.chatId !== '') {
@@ -437,9 +482,10 @@ export function normalizeStewardConfig(raw: unknown):
     ...(guideText ? { guideText } : {}),
     ...(r.autoJoinNewGroups === false ? { autoJoinNewGroups: false } : {}),
     ...(r.autoJoinSoloGroups === true ? { autoJoinSoloGroups: true } : {}),
+    ...(r.closeHints === true ? { closeHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
-    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true) {
+    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true) {
     return { ok: true, value: null };
   }
   return { ok: true, value };
@@ -457,6 +503,11 @@ export function isStewardBot(cfg: StewardConfig | undefined): boolean {
 /** 管家可用 = 开关开 + 选了管家群。只开开关没选群时，看板可读写，但批次无处投递。 */
 export function stewardReady(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
   return !!cfg?.enabled && !!cfg.chatId;
+}
+
+/** 后台巡检开着：管家开着、选了管家群（通知要有地方投）、且打开了 closeHints。 */
+export function stewardCloseHintsOn(cfg: StewardConfig | undefined): boolean {
+  return stewardReady(cfg) && cfg.closeHints === true;
 }
 
 /**
@@ -569,11 +620,51 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 ## Standard
 (The owner has not written one. Only report and nudge; take no irreversible action.)`;
 
+// 「自动发现可以关的项」打开时才插进规则（closeHints 默认关：没开的管家读到的 guide 与之前逐字相同）。
+// 一行插在「推进」一节写回进展那一行后面，一节插在「定时巡检」前面。
+const HINT_RULES: Record<Locale, { afterLine: string; line: string; beforeSection: string; section: string }> = {
+  zh: {
+    afterLine: '一句话用 `--note` 进历史。\n',
+    line: `- 写清什么时候能收：挂了 PR 的默认按「PR 全部合入」判断；别的写 \`--close-when "item:66 done"\` / \`"pr:owner/repo#12 merged"\`，只能你判断的写 \`manual\`。等别的事项的写 \`--depends-on 66,70\`；要过一阵再看的写 \`--next-check +2d\`（或带时区的时间）。
+`,
+    beforeSection: '## 定时巡检（',
+    section: `## 收到提示（收到「决策看板 · 提示」消息时）
+- 这是后台巡检按关闭条件、依赖和复查时间自动发现的，只是提示，状态没改。
+- 逐项 \`botmux board show <编号>\` 核对现状：确实可以了就照常 \`set --state …\`（改状态会收起提示）；核对后不改的用 \`botmux board set <编号> --dismiss-hint\` 收起，同一条提示不会再出现。
+- 「该看一眼」= 过了 \`--next-check\` 还没更新：看一下现状，回写进展，需要的话重设复查时间。
+
+`,
+  },
+  en: {
+    afterLine: 'add a one-line `--note` for the history.\n',
+    line: `- Say when an item can close: items with linked PRs default to "all linked PRs merged"; otherwise use \`--close-when "item:66 done"\` / \`"pr:owner/repo#12 merged"\`, or \`manual\` if only you can judge. Items waiting on others get \`--depends-on 66,70\`; items to revisit later get \`--next-check +2d\` (or a time with a timezone).
+`,
+    beforeSection: '## Scheduled patrol (',
+    section: `## Board hints (when a "Decision board · hint" message arrives)
+- These come from a background check of close conditions, dependencies and next check times. They are hints only; no state was changed.
+- For each item, \`botmux board show <n>\` and verify: if it really is ready, \`set --state …\` as usual (changing the state clears the hint); if you keep it as is, \`botmux board set <n> --dismiss-hint\` and the same hint will not come back.
+- "Check in" means the item passed its \`--next-check\` with no update: look at it, write back progress, and set a new check time if needed.
+
+`,
+  },
+};
+
+function withHintRules(text: string, locale: Locale): string {
+  const rules = HINT_RULES[locale];
+  let out = text;
+  const at = out.indexOf(rules.afterLine);
+  if (at >= 0) out = out.slice(0, at + rules.afterLine.length) + rules.line + out.slice(at + rules.afterLine.length);
+  const sec = out.indexOf(rules.beforeSection);
+  if (sec >= 0) out = out.slice(0, sec) + rules.section + out.slice(sec);
+  return out;
+}
+
 const STANDARD_HEADING: Record<Locale, string> = { zh: '## 推进标准', en: '## Standard' };
 const CUSTOM_HEADING: Record<Locale, string> = { zh: '## owner 的自定义规则（与上文冲突时以这里为准）', en: '## Owner custom rules (these win over anything above)' };
 
-export function stewardGuidePreset(locale: Locale): string {
-  return locale === 'en' ? GUIDE_PRESET_EN : GUIDE_PRESET_ZH;
+export function stewardGuidePreset(locale: Locale, cfg?: StewardConfig): string {
+  const preset = locale === 'en' ? GUIDE_PRESET_EN : GUIDE_PRESET_ZH;
+  return stewardCloseHintsOn(cfg) ? withHintRules(preset, locale) : preset;
 }
 
 /**
@@ -581,7 +672,7 @@ export function stewardGuidePreset(locale: Locale): string {
  * 占位正文，让自定义整段接在后面——通常自定义里写的就是推进标准。
  */
 export function composeStewardGuide(cfg: StewardConfig | undefined, locale: Locale): string {
-  const preset = stewardGuidePreset(locale);
+  const preset = stewardGuidePreset(locale, cfg);
   const custom = cfg?.guideText?.trim();
   if (!custom) return preset;
   if (cfg?.guideMode === 'replace') return custom;

@@ -32,6 +32,7 @@ import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
+import { stuckPageSpec } from '../../core/stuck-page-catalog.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -2499,6 +2500,108 @@ export function buildTuiPromptFailedCard(message: string, locale?: Locale): stri
     div: escapeMd(message),
   });
   return JSON.stringify(card);
+}
+
+// ─── Stuck-page cards ────────────────────────────────────────────────────────
+
+/** Code block for terminal text: the fence is longer than any backtick run in
+ *  the body, so screen content cannot close it early. */
+function fencedTerminalText(body: string): string {
+  const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+  const fence = '`'.repeat(Math.max(3, maxRun + 1));
+  return `${fence}\n${body}\n${fence}`;
+}
+
+function pushScreenTail(elements: unknown[], screenTail: string | undefined, locale?: Locale): void {
+  if (!screenTail) return;
+  elements.push(larkMdDiv(t('card.stuck.screen_tail', undefined, locale)));
+  elements.push({ tag: 'markdown', content: fencedTerminalText(screenTail) });
+}
+
+/**
+ * The "CLI is stuck on a blocking page" card. Buttons come from
+ * STUCK_PAGE_CATALOG for `pageType`, one per option, and carry only the
+ * button index and the warning nonce — the daemon maps (page, index) back to
+ * a key on click. An unknown page gets the same card without buttons. There
+ * is no input box: nobody can type through this card.
+ */
+export function buildStuckPageCard(o: {
+  rootId: string;
+  sessionId: string;
+  nonce: number;
+  pageType: string | undefined;
+  cliName: string;
+  /** Already-localised context line (e.g. the notice this card replaces). */
+  noticeText?: string;
+  /** Set for the StuckDetector path: how long the written turn has stalled. */
+  stalledSecs?: number;
+  screenTail?: string;
+  /** Whether a turn initiator was identified (changes who-may-press hint). */
+  hasInitiator: boolean;
+  /** Global switch `stuckCardInitiatorKeys` at build time; false = the hint
+   *  says operators only, whoever started the turn. Absent = on. */
+  initiatorKeysEnabled?: boolean;
+  locale?: Locale;
+}): string {
+  const locale = o.locale;
+  const spec = stuckPageSpec(o.pageType);
+  const lines: string[] = [];
+  if (o.noticeText) lines.push(escapeMd(o.noticeText));
+  if (o.stalledSecs !== undefined) lines.push(escapeMd(t('card.stuck.stalled', { secs: String(o.stalledSecs) }, locale)));
+  lines.push(escapeMd(t(spec ? spec.descriptionKey : 'card.stuck.page.unknown', undefined, locale)));
+  const elements: unknown[] = [larkMdDiv(lines.join('\n\n'))];
+  pushScreenTail(elements, o.screenTail, locale);
+  if (spec && spec.options.length > 0) {
+    elements.push({ tag: 'hr' });
+    const hintKey = o.initiatorKeysEnabled === false
+      ? 'card.stuck.hint.operators_only'
+      : o.hasInitiator ? 'card.stuck.hint.initiator' : 'card.stuck.hint.admin_only';
+    elements.push(larkMdDiv(escapeMd(t(hintKey, undefined, locale))));
+    const buttons = spec.options.map((option, index) => callbackButton(
+      t(option.labelKey, undefined, locale)
+        + (option.audience === 'admin' ? t('card.stuck.admin_suffix', undefined, locale) : ''),
+      option.audience === 'initiator' ? 'primary' : 'default',
+      {
+        action: 'stuck_key',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        selected_index: String(index),
+        nonce: String(o.nonce),
+      },
+    ));
+    elements.push({ tag: 'action', actions: buttons });
+  }
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.title', { cliName: o.cliName }, locale), 'orange'),
+    elements,
+  }));
+}
+
+/** Result of a stuck-card key press: what was sent and what the screen showed
+ *  afterwards (bounded plain-text tail when the worker could read it). */
+export function buildStuckKeyResultCard(
+  resultText: string,
+  afterScreenTail: string | undefined,
+  stillBlocked: boolean,
+  locale?: Locale,
+): string {
+  const elements: unknown[] = [larkMdDiv(`**${escapeMd(resultText)}**`)];
+  pushScreenTail(elements, afterScreenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.result_title', undefined, locale), stillBlocked ? 'orange' : 'green'),
+    elements,
+  }));
+}
+
+/** An `input_not_submitted` notice together with the bottom of the terminal,
+ *  so the reader sees why the message did not go in without opening it. */
+export function buildInputNotSubmittedCard(message: string, screenTail: string, locale?: Locale): string {
+  const elements: unknown[] = [larkMdDiv(escapeMd(message))];
+  pushScreenTail(elements, screenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.notice_title', undefined, locale), 'orange'),
+    elements,
+  }));
 }
 
 // ─── Adopt cards ─────────────────────────────────────────────────────────────
