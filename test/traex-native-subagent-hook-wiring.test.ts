@@ -1,10 +1,11 @@
-import { type ChildProcess } from 'node:child_process';
+import { spawnSync, type ChildProcess } from 'node:child_process';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -38,7 +39,10 @@ interface WorkerHarness {
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
-const tmuxSessions = new Set<string>();
+/** tmux session → the env its worker ran with (so cleanup reaches the same private server). */
+const tmuxSessions = new Map<string, NodeJS.ProcessEnv>();
+/** Private TMUX_TMPDIR roots created for workers; their servers are killed via -S before removal. */
+const tmuxRoots = new Set<string>();
 let sequence = 0;
 
 const tmuxAvailable = probeTmuxFunctional().ok;
@@ -154,8 +158,16 @@ if (argv[0] === 'app-server') {
   const sessionId = `h${(++sequence).toString(36)}${process.pid.toString(36)}${Date.now().toString(36)}`;
   const logs: string[] = [];
   const messages: WorkerToDaemon[] = [];
-  const workerEnv = {
+  // 自带私有 tmux 目录，不依赖全局 tmux 围栏。没有它时，TMUX_TMPDIR 为空的运行（例如绕过
+  // setupFiles 的全量）会让 worker 的 `-L botmux` 落到宿主 /tmp/tmux-<uid>/botmux，和线上
+  // fleet 共用同一个 server：2026-11-06 本文件的 worker 就在宿主 socket 上起了 server，线上
+  // 会话被迁到它上面，测试结束 server 退出，又断了一次。目录必须预先存在（tmux 对不存在的
+  // TMUX_TMPDIR 会静默回落 /tmp），路径要短（unix socket 路径上限约 104 字节）。
+  const tmuxRoot = mkdtempSync('/tmp/bmx-tx-');
+  tmuxRoots.add(tmuxRoot);
+  const workerEnv: NodeJS.ProcessEnv = {
     ...process.env,
+    TMUX_TMPDIR: tmuxRoot,
     HOME: root,
     USERPROFILE: root,
     NODE_ENV: 'test',
@@ -165,6 +177,8 @@ if (argv[0] === 'app-server') {
     LARK_APP_ID: 'ambient-app-id-must-be-redacted',
     LARK_APP_SECRET: 'ambient-secret-must-be-redacted',
   };
+  delete workerEnv.TMUX;
+  delete workerEnv.TMUX_PANE;
   const child = spawnTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: workerEnv,
@@ -215,7 +229,7 @@ if (argv[0] === 'app-server') {
   };
   child.send(init);
 
-  if (options.backendType === 'tmux') tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+  if (options.backendType === 'tmux') tmuxSessions.set(`bmx-${sessionId.slice(0, 8)}`, workerEnv);
   return {
     child, capturePath, globalHooksPath, globalHooksBefore, logs, messages,
     projectHooksPath, projectHooksBefore, root, sessionId,
@@ -250,10 +264,21 @@ function expectHookFilesUnchanged(harness: WorkerHarness): void {
 afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   children.clear();
-  for (const session of tmuxSessions) {
-    killWorkerTmuxSession(session);
+  for (const [session, env] of tmuxSessions) {
+    killWorkerTmuxSession(session, env);
   }
   tmuxSessions.clear();
+  // Only this file's own servers: every socket lives under a root it created.
+  const uidDir = `tmux-${process.getuid?.() ?? 0}`;
+  for (const tmuxRoot of tmuxRoots) {
+    let sockets: string[] = [];
+    try { sockets = readdirSync(join(tmuxRoot, uidDir)); } catch { /* no server was ever started */ }
+    for (const socket of sockets) {
+      spawnSync('tmux', ['-S', join(tmuxRoot, uidDir, socket), 'kill-server'], { stdio: 'ignore', timeout: 3_000 });
+    }
+    rmSync(tmuxRoot, { recursive: true, force: true });
+  }
+  tmuxRoots.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.clear();
 });
