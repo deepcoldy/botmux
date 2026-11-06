@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, copyFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { SessionContractStore, SessionContractConflict } from '../src/services/session-contract-store.js';
+import { SessionContractStore, SessionContractConflict, sessionContractStore } from '../src/services/session-contract-store.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { contractReadiness } from '../src/services/session-contract.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 const ref = { appId: 'cli_contract_test', sessionId: 'session_test' };
@@ -13,6 +14,79 @@ function open(directory = mkdtempSync(join(tmpdir(), 'session-contract-'))) { if
 function bind(store: SessionContractStore, owner = worker, physical = identity) { store.bindWorker(ref, owner); const runtime = store.reserveRuntime(ref, owner); return store.bindRuntime(ref, runtime, owner, physical); }
 afterEach(() => { vi.useRealTimers(); for (const store of stores.splice(0)) try { store.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 describe('session identity and state contract', () => {
+  it('carries allocated epoch floors when an older checkpoint replaces the database file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'contract-replacement-')); directories.push(dir);
+    const original = sessionContractStore(dir, ref.appId); stores.push(original); original.ensure(ref);
+    const first = bind(original); const checkpoint = original.snapshot(ref);
+    expect(original.reserveRuntime(ref, worker).epoch).toBe(2);
+    const backupDir = mkdtempSync(join(tmpdir(), 'contract-checkpoint-')); directories.push(backupDir);
+    const backup = open(backupDir); backup.restore(checkpoint);
+    const backupWriter = openDatabaseSyncOrThrow(backup.filename);
+    backupWriter.exec('PRAGMA wal_checkpoint(TRUNCATE)'); backupWriter.close(); backup.close();
+    const writer = openDatabaseSyncOrThrow(original.filename);
+    writer.exec('PRAGMA wal_checkpoint(TRUNCATE)'); writer.close();
+    copyFileSync(backup.filename, original.filename + '.replacement');
+    renameSync(original.filename + '.replacement', original.filename);
+    const current = sessionContractStore(dir, ref.appId); stores.push(current);
+    expect(current.read(ref)?.runtimeEpoch).toBe(2);
+    expect(current.runtime(ref)?.ref).toEqual(first.ref);
+    expect(current.reserveRuntime(ref, worker).epoch).toBe(3);
+    current.close();
+    const reopened = sessionContractStore(dir, ref.appId); stores.push(reopened);
+    expect(reopened.read(ref)?.runtimeEpoch).toBe(3);
+    expect(reopened.reserveRuntime(ref, worker).epoch).toBe(4);
+  });
+  it('retains the predecessor high watermark when replacement persistence fails before cache publication', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'contract-floor-retry-')); directories.push(dir);
+    const original = sessionContractStore(dir, ref.appId); stores.push(original); original.ensure(ref);
+    bind(original); const checkpoint = original.snapshot(ref); original.reserveRuntime(ref, worker);
+    const backupDir = mkdtempSync(join(tmpdir(), 'contract-floor-backup-')); directories.push(backupDir);
+    const backup = open(backupDir); backup.restore(checkpoint);
+    const trigger = openDatabaseSyncOrThrow(backup.filename);
+    trigger.exec("CREATE TRIGGER reject_floor BEFORE UPDATE ON contracts BEGIN SELECT RAISE(ABORT,'floor blocked'); END");
+    trigger.exec('PRAGMA wal_checkpoint(TRUNCATE)'); trigger.close(); backup.close();
+    const writer = openDatabaseSyncOrThrow(original.filename);
+    writer.exec('PRAGMA wal_checkpoint(TRUNCATE)'); writer.close();
+    copyFileSync(backup.filename, original.filename + '.replacement');
+    renameSync(original.filename + '.replacement', original.filename);
+    expect(() => sessionContractStore(dir, ref.appId)).toThrow('floor blocked');
+    const retry = openDatabaseSyncOrThrow(original.filename); retry.exec('DROP TRIGGER reject_floor'); retry.close();
+    const current = sessionContractStore(dir, ref.appId); stores.push(current);
+    expect(current.read(ref)?.runtimeEpoch).toBe(2);
+    expect(current.reserveRuntime(ref, worker).epoch).toBe(3);
+  });
+  it('reopens a cached store after close and fences an instance whose database was replaced', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'contract-cache-')); directories.push(dir);
+    const first = sessionContractStore(dir, ref.appId); stores.push(first); first.ensure(ref);
+    first.close();
+    const reopened = sessionContractStore(dir, ref.appId); stores.push(reopened);
+    expect(reopened).not.toBe(first); expect(reopened.read(ref)?.lifecycle).toBe('active');
+    rmSync(dir, { recursive: true, force: true });
+    expect(() => reopened.read(ref)).toThrow('session_contract_database_replaced');
+    const replacement = sessionContractStore(dir, ref.appId); stores.push(replacement);
+    expect(replacement).not.toBe(reopened); expect(replacement.read(ref)).toBeUndefined();
+    expect(() => reopened.read(ref)).toThrow('session_contract_store_closed');
+    replacement.ensure(ref); expect(replacement.read(ref)?.revision).toBe(0);
+  });
+  it('creates borrowed schema inside the owned transaction and retries after schema rollback', () => {
+    const store = open(); const target = openDatabaseSyncOrThrow(join(directories[0], 'borrowed.db'));
+    try {
+      target.exec('CREATE TABLE sessions(session_id TEXT PRIMARY KEY,status TEXT,row TEXT)');
+      target.prepare('INSERT INTO sessions VALUES(?,?,?)').run(ref.sessionId, 'active', JSON.stringify({ sessionId: ref.sessionId, status: 'active' }));
+      const close = () => store.usingDatabase(target, () => {
+        store.ensure(ref);
+        const { operation } = store.beginOperation(ref, 'close');
+        store.apply(ref, { type: 'control_started', operationId: operation.operationId });
+        store.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+      });
+      target.exec('BEGIN IMMEDIATE'); close(); target.exec('ROLLBACK');
+      expect(target.prepare("SELECT count(*) AS total FROM sqlite_master WHERE name='contracts'").get()).toMatchObject({ total: 0 });
+      expect(target.prepare('SELECT status FROM sessions').get()).toMatchObject({ status: 'active' });
+      target.exec('BEGIN IMMEDIATE'); close(); target.exec('COMMIT');
+      expect(target.prepare('SELECT status FROM sessions').get()).toMatchObject({ status: 'closed' });
+      expect(store.read(ref)?.lifecycle).toBe('active');
+    } finally { target.close(); }
+  });
   it('ignores old ready while retaining the old runtime exit fact', () => {
     const store = open(); const old = bind(store); const candidate = store.reserveRuntime(ref, worker); const current = store.bindRuntime(ref, candidate, worker, { ...identity, physicalId: 'pid:456:start:200' });
     store.apply(ref, { type: 'runtime_ready', runtime: current.ref });

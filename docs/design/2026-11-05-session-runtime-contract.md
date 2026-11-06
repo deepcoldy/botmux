@@ -49,6 +49,12 @@ deferred events live in the application's existing `sessions.db`. The reducer
 commits the Session lifecycle/revision projection in the same SQLite transaction.
 Owned and offline close paths borrow the owned row transaction; a failed row
 write rolls back the contract, operation and dedup record together.
+Lifecycle initialization and schema creation also use that borrowed transaction.
+The cached store checks its open state and database file identity; replacement
+invalidates it, and retained old instances reject further reads and writes.
+Observed allocator high watermarks survive that cache refresh and are persisted
+into restored rows without restoring old executor authority. Older checkpoint
+files cannot make a known allocated epoch available for a new reservation.
 
 Readiness has separate worker-online and prompt-ready facets. `workerReady`,
 `cliReady` and `cliReadyGeneration` are compatible read projections. Screen idle,

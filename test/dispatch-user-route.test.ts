@@ -90,6 +90,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
   const released = Symbol('released');
   const release = vi.fn(() => { throw released; });
   const scope = {
+    workerSessionEventScope: undefined,
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
     idleDetector: { isStartupPending: () => false, reset: vi.fn(), isReadyEvidenceWeak: () => false },

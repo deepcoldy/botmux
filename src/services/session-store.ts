@@ -2762,8 +2762,8 @@ function commitContractLifecycle(session: Session, kind: ControlKind, write: () 
   if (!sessionContractsEnabled() || !appId || !ownStore) { write(); return; }
   const contract = sessionContractStore(config.session.dataDir, appId);
   const ref = { appId, sessionId: session.sessionId };
-  contract.ensure(ref, { closed: session.status === 'closed', suspended: session.suspendedColdResume });
   runOwnedWriteTransaction(ownStore, false, () => contract.usingDatabase(ownStore!.db, () => {
+    contract.ensure(ref, { closed: session.status === 'closed', suspended: session.suspendedColdResume });
     if (kind === 'close' && contract.read(ref)?.lifecycle === 'closed') { write(); return; }
     const { operation } = contract.beginOperation(ref, kind);
     contract.apply(ref, { type: 'control_started', operationId: operation.operationId });

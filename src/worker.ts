@@ -1934,7 +1934,10 @@ function bindSessionBackendExit<T extends (...args: any[]) => any>(callback: T):
   return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
     if (backend !== observed) {
       if (intentionalRestartBackend === observed) intentionalRestartBackend = null;
-      send({ type: 'claude_exit', code: args[0], signal: args[1] });
+      // Only a scoped host can retain an old runtime's exit as history. Legacy
+      // consumers interpret claude_exit as the current CLI and must not receive
+      // a delayed exit from the planned replacement's predecessor.
+      if (workerSessionEventScope) send({ type: 'claude_exit', code: args[0], signal: args[1] });
       return;
     }
     return callback(...args);

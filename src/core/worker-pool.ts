@@ -21045,7 +21045,11 @@ function setupWorkerHandlers(
     if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
   };
   worker.on('message', msg => {
-    void handleWorkerMessage(msg as WorkerToDaemon).catch(error => logger.warn(`[${t}] Session event not confirmed: ${String(error)}`));
+    const pending = handleWorkerMessage(msg as WorkerToDaemon);
+    // EventEmitter ignores the return value, so keep an explicit rejection
+    // observer. Direct callers can still await the actual admission/effect.
+    void pending.catch(error => logger.warn(`[${t}] Session event not confirmed: ${String(error)}`));
+    return pending;
   });
 
   worker.on('exit', (code, signal) => {

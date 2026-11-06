@@ -148,6 +148,14 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSessionPid: vi.fn(),
 }));
 
+// These synthetic workers model unscoped legacy IPC. Keep contract storage out
+// of this unit fixture; v2 bootstrap/admission runs through real components in
+// session-contract-gateway and the real Worker integration tests.
+vi.mock('../src/core/session-controller.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/core/session-controller.js')>(),
+  controllerForSession: () => undefined,
+}));
+
 vi.mock('../src/services/frozen-card-store.js', () => ({
   loadFrozenCards: vi.fn(() => new Map()),
   saveFrozenCards: vi.fn(),

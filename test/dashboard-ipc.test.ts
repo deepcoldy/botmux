@@ -5585,7 +5585,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       adoptedFrom: undefined,
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-susp/suspend`, { method: 'POST' });
@@ -5621,7 +5621,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       adoptedFrom: undefined,
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-owned/suspend`, { method: 'POST' });
@@ -5634,7 +5634,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
   });
 
   it('rejects adopt/observed sessions (suspending would kill the user pane)', async () => {
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-adopt-susp', cliId: 'codex' },
       worker: { send: vi.fn(), killed: false },
@@ -5652,7 +5652,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
   });
 
   it('is idempotent when the worker is already gone (idle-suspended earlier)', async () => {
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-gone', cliId: 'codex' },
       worker: null,
@@ -5675,7 +5675,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: undefined,
     } as any);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(false);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(false);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-pty/suspend`, { method: 'POST' });
@@ -5722,7 +5722,7 @@ describe('PUT /api/bot-read-isolation', () => {
       } as any]);
       const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
       const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget');
-      const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+      const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
       try {
         handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
         const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
@@ -5775,7 +5775,7 @@ describe('PUT /api/bot-read-isolation', () => {
     const previousRegistry = workerPool.getActiveSessionsRegistry();
     workerPool.setActiveSessionsRegistry(new Map([['owned', owned]]));
     setLarkAppId(appId);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
     try {
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {

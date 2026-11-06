@@ -1,4 +1,4 @@
-import { mkdirSync, chmodSync } from 'node:fs';
+import { mkdirSync, chmodSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
@@ -38,17 +38,7 @@ function eventRuntime(event: ContractEvent): RuntimeRef | undefined {
 }
 function terminalPhase(phase: string): boolean { return ['succeeded', 'failed', 'cancelled'].includes(phase); }
 
-/** One transaction commits identity/state facts and the compatible read model.
- * Historic entities remain separate from the current runtime selection. */
-export class SessionContractStore {
-  readonly filename: string;
-  private db: DatabaseSyncLike;
-  private transactionDepth = 0;
-  constructor(dataDir: string, readonly appId: string) {
-    sessionKey({ appId, sessionId: 'check' });
-    const dir = join(dataDir, 'session-stores', appId); mkdirSync(dir, { recursive: true, mode: 0o700 });
-    this.filename = join(dir, 'sessions.db'); this.db = openDatabaseSyncOrThrow(this.filename);
-    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+const contractSchema = `
       CREATE TABLE IF NOT EXISTS contracts(session_key TEXT PRIMARY KEY, revision INTEGER NOT NULL, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS entities(session_key TEXT NOT NULL,kind TEXT NOT NULL,id TEXT NOT NULL,phase TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(session_key,kind,id));
       CREATE INDEX IF NOT EXISTS contract_entities_phase ON entities(session_key,kind,phase);
@@ -56,15 +46,69 @@ export class SessionContractStore {
       CREATE TABLE IF NOT EXISTS observation_watermarks(session_key TEXT NOT NULL,producer TEXT NOT NULL,runtime_id TEXT NOT NULL,sequence INTEGER NOT NULL,PRIMARY KEY(session_key,producer,runtime_id));
       CREATE TABLE IF NOT EXISTS events(session_key TEXT NOT NULL,event_id TEXT NOT NULL,type TEXT NOT NULL,decision TEXT NOT NULL,value TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(session_key,event_id));
       CREATE TABLE IF NOT EXISTS runtime_bindings(session_key TEXT NOT NULL,binding_id TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,binding_id));
-      CREATE TABLE IF NOT EXISTS runtime_producers(session_key TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,runtime_id,worker_id,generation));`);
-    chmodSync(this.filename, 0o600);
+      CREATE TABLE IF NOT EXISTS runtime_producers(session_key TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,runtime_id,worker_id,generation));`;
+
+/** One transaction commits identity/state facts and the compatible read model.
+ * Historic entities remain separate from the current runtime selection. */
+export class SessionContractStore {
+  readonly filename: string;
+  private connection: DatabaseSyncLike;
+  private readonly ownedDatabase: DatabaseSyncLike;
+  private databaseIdentity?: { device: bigint; inode: bigint };
+  private closed = false;
+  private readonly epochFloors = new Map<string, number>();
+  private get db(): DatabaseSyncLike {
+    if (this.closed) throw new Error('session_contract_store_closed');
+    if (this.connection === this.ownedDatabase && this.databaseIdentity && !this.isCurrentDatabase()) {
+      throw new Error('session_contract_database_replaced');
+    }
+    return this.connection;
   }
-  close(): void { this.db.close(); }
+  private set db(value: DatabaseSyncLike) { this.connection = value; }
+  private transactionDepth = 0;
+  constructor(dataDir: string, readonly appId: string) {
+    sessionKey({ appId, sessionId: 'check' });
+    const dir = join(dataDir, 'session-stores', appId); mkdirSync(dir, { recursive: true, mode: 0o700 });
+    this.filename = join(dir, 'sessions.db');
+    this.connection = this.ownedDatabase = openDatabaseSyncOrThrow(this.filename);
+    this.db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+    this.db.exec(contractSchema);
+    chmodSync(this.filename, 0o600);
+    const identity = statSync(this.filename, { bigint: true });
+    this.databaseIdentity = { device: identity.dev, inode: identity.ino };
+  }
+  isCurrentDatabase(): boolean {
+    if (this.closed || !this.databaseIdentity) return false;
+    try {
+      const current = statSync(this.filename, { bigint: true });
+      return current.dev === this.databaseIdentity.device && current.ino === this.databaseIdentity.inode;
+    } catch { return false; }
+  }
+  close(): void { if (!this.closed) { this.closed = true; this.ownedDatabase.close(); } }
+  knownEpochFloors(): ReadonlyMap<string, number> { return new Map(this.epochFloors); }
+  private rememberEpoch(ref: ContractSessionRef, epoch: number): void {
+    if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error('invalid_contract_epoch');
+    const key = sessionKey(ref);
+    this.epochFloors.set(key, Math.max(epoch, this.epochFloors.get(key) ?? 0));
+  }
+  retainEpochFloors(floors: ReadonlyMap<string, number>): void {
+    // Carry allocator knowledge only, never an old worker, binding or attempt.
+    for (const [key, epoch] of floors) {
+      const [appId, sessionId] = JSON.parse(key) as [string, string];
+      if (appId !== this.appId) throw new Error('contract_app_mismatch');
+      const ref = { appId, sessionId }; this.rememberEpoch(ref, epoch);
+      const state = this.read(ref);
+      const floor = this.epochFloors.get(key)!;
+      if (state && state.runtimeEpoch < floor) this.apply(ref, { type: 'runtime_epoch_floor', epoch: floor });
+    }
+  }
   /** Borrow the owned Session transaction so row, event, revision and intent
    * commit together. The callback is synchronous and never crosses an await. */
   usingDatabase<T>(db: DatabaseSyncLike, work: () => T): T {
     const previous = this.db; this.db = db; this.transactionDepth++;
-    try { return work(); } finally { this.transactionDepth--; this.db = previous; }
+    // A borrowed Session connection may have been recreated. Schema creation
+    // participates in the caller's transaction and is retried after rollback.
+    try { this.db.exec(contractSchema); return work(); } finally { this.transactionDepth--; this.db = previous; }
   }
   atomic<T>(work: () => T): T { return this.transaction(work); }
   snapshot(ref: ContractSessionRef): SessionContractSnapshot {
@@ -79,7 +123,7 @@ export class SessionContractStore {
     const ref = snapshot.session.ref; const key = sessionKey(ref);
     if (snapshot.version !== 2 || ref.appId !== this.appId) throw new Error('invalid_contract_checkpoint');
     this.transaction(() => {
-      const allocatedEpoch = this.read(ref)?.runtimeEpoch ?? 0;
+      const allocatedEpoch = Math.max(this.read(ref)?.runtimeEpoch ?? 0, this.epochFloors.get(key) ?? 0);
       for (const table of snapshotTables) {
         this.db.prepare(`DELETE FROM ${table} WHERE session_key=?`).run(key);
         for (const row of snapshot.tables[table] ?? []) {
@@ -91,6 +135,7 @@ export class SessionContractStore {
       }
       const restored = { ...snapshot.session, runtimeEpoch: Math.max(allocatedEpoch, snapshot.session.runtimeEpoch) };
       this.db.prepare('INSERT INTO contracts VALUES(?,?,?) ON CONFLICT(session_key) DO UPDATE SET revision=excluded.revision,value=excluded.value').run(key, restored.revision, JSON.stringify(restored));
+      this.rememberEpoch(ref, restored.runtimeEpoch);
     });
   }
   resultRevision(ref: ContractSessionRef, turnId: string, dispatchAttempt: number | undefined, value: unknown): number {
@@ -113,13 +158,15 @@ export class SessionContractStore {
   }
   read(ref: ContractSessionRef): SessionContract | undefined {
     const row = this.db.prepare('SELECT value,revision FROM contracts WHERE session_key=?').get(sessionKey(ref)) as { value: string; revision: number } | undefined;
-    return row ? { ...JSON.parse(row.value), revision: Number(row.revision) } : undefined;
+    if (!row) return undefined;
+    const value = { ...JSON.parse(row.value), revision: Number(row.revision) } as SessionContract;
+    this.rememberEpoch(ref, value.runtimeEpoch); return value;
   }
   ensure(ref: ContractSessionRef, legacy?: { closed?: boolean; suspended?: boolean; readinessSequence?: number }): SessionContract {
     if (ref.appId !== this.appId) throw new Error('contract_app_mismatch');
     return this.transaction(() => {
       const current = this.read(ref); if (current) return current;
-      const state: SessionContract = { ref, revision: 0, lifecycle: legacy?.closed ? 'closed' : legacy?.suspended ? 'suspended' : 'active', workerOnline: false, runtimeEpoch: 0, readinessSequence: legacy?.readinessSequence ?? 0 };
+      const state: SessionContract = { ref, revision: 0, lifecycle: legacy?.closed ? 'closed' : legacy?.suspended ? 'suspended' : 'active', workerOnline: false, runtimeEpoch: this.epochFloors.get(sessionKey(ref)) ?? 0, readinessSequence: legacy?.readinessSequence ?? 0 };
       this.db.prepare('INSERT INTO contracts(session_key,revision,value) VALUES(?,?,?)').run(sessionKey(ref), 0, JSON.stringify(state)); return state;
     });
   }
@@ -222,6 +269,7 @@ export class SessionContractStore {
       }
     }
     this.db.prepare('INSERT INTO events(session_key,event_id,type,decision,value,revision) VALUES(?,?,?,?,?,?)').run(sessionKey(ref), eventId, event.type, result.decision, JSON.stringify(event), result.session.revision);
+    this.rememberEpoch(ref, result.session.runtimeEpoch);
     return result;
   }
   bindWorker(ref: ContractSessionRef, worker: WorkerRef): SessionContract {
@@ -241,7 +289,8 @@ export class SessionContractStore {
       const bound = bindingId ? this.binding(ref, bindingId) : undefined;
       if (bound) return bound.ref;
       const state = this.read(ref); if (!state) throw new Error('contract_session_missing');
-      const runtime: RuntimeContract = { ref: { runtimeId: randomUUID(), epoch: state.runtimeEpoch + 1 }, worker, phase: 'starting', promptReady: false, promptReadySequence: 0 };
+      const epoch = Math.max(state.runtimeEpoch, this.epochFloors.get(sessionKey(ref)) ?? 0) + 1;
+      const runtime: RuntimeContract = { ref: { runtimeId: randomUUID(), epoch }, worker, phase: 'starting', promptReady: false, promptReadySequence: 0 };
       const result = this.applyInside(ref, { type: 'runtime_reserved', runtime }, randomUUID(), state.revision);
       if (result.decision !== 'applied') throw new Error('runtime_reservation_failed');
       if (bindingId) this.db.prepare('INSERT INTO runtime_bindings(session_key,binding_id,runtime_id,worker_id,generation) VALUES(?,?,?,?,?)').run(sessionKey(ref), bindingId, runtime.ref.runtimeId, worker.workerId, worker.generation);
@@ -335,5 +384,18 @@ export class SessionContractStore {
 const stores = new Map<string, SessionContractStore>();
 export function sessionContractStore(dataDir: string, appId: string): SessionContractStore {
   const key = `${dataDir}:${appId}`;
-  let store = stores.get(key); if (!store) { store = new SessionContractStore(dataDir, appId); stores.set(key, store); } return store;
+  const previous = stores.get(key);
+  if (previous?.isCurrentDatabase()) return previous;
+  const floors = previous?.knownEpochFloors();
+  previous?.close();
+  const store = new SessionContractStore(dataDir, appId);
+  try {
+    if (floors) store.retainEpochFloors(floors);
+  } catch (error) {
+    try { store.close(); } catch { /* preserve the failed refresh cause */ }
+    // Keep the closed predecessor's allocator knowledge for the next retry.
+    throw error;
+  }
+  stores.set(key, store);
+  return store;
 }

@@ -39,6 +39,31 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  it('keeps delayed predecessor exits out of legacy consumers while preserving scoped runtime evidence', () => {
+    const s = fixture(); const original = { write: vi.fn() }; const replacement = { write: vi.fn() };
+    const callback = vi.fn(); const wire: any[] = [];
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    const env: any = { backend: original, workerSessionEventScope: undefined, intentionalRestartBackend: original,
+      fenceContractBackendWrites: vi.fn(), send: (message: any) => wire.push(message) };
+    env.bindSessionRuntimeCallback = loadWorkerFunction('bindSessionRuntimeCallback', env);
+    const bindExit = loadWorkerFunction<(callback: (...args: any[]) => void) => (...args: any[]) => void>('bindSessionBackendExit', env);
+    const legacyExit = bindExit(callback); env.backend = replacement; legacyExit(0, null);
+    expect(wire).toHaveLength(0); expect(callback).not.toHaveBeenCalled();
+    expect(env.intentionalRestartBackend).toBeNull();
+    env.backend = original; env.workerSessionEventScope = scope;
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
+    env.send = (message: any) => wire.push(metadata(message));
+    const scopedExit = scope.run(binding, () => bindExit(callback));
+    const nextBinding = scope.beginRuntime();
+    const next = s.controller.reserveBinding(nextBinding.bindingId, s.worker); scope.assign(nextBinding.bindingId, next);
+    s.controller.bindRuntime(nextBinding.bindingId, s.worker, { backend: 'tmux', physicalId: '222:start2', proof: 'process_start' });
+    env.backend = replacement; scopedExit(0, null);
+    expect(wire).toHaveLength(1); expect(wire[0].sessionContract.scope.runtime).toEqual(s.runtime);
+    expect(s.controller.ingest(wire[0], s.worker).kind).toBe('historical');
+    expect(s.store.runtime(s.ref, next.runtimeId)?.phase).toBe('starting');
+    expect(callback).not.toHaveBeenCalled();
+  });
   it('rejects an invalid old event before it can bind a queued attempt', () => {
     const s = fixture(); const execution = s.controller.admitInput('turnA');
     const next = s.controller.reserveBinding('binding-next', s.worker);

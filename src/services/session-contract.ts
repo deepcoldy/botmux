@@ -92,6 +92,7 @@ export type ContractEvent =
   | { type: 'worker_online'; worker: WorkerRef }
   | { type: 'worker_lost'; worker: WorkerRef }
   | { type: 'runtime_reserved'; runtime: RuntimeContract }
+  | { type: 'runtime_epoch_floor'; epoch: number }
   | { type: 'runtime_bound'; runtime: RuntimeContract; operationId?: string }
   | { type: 'runtime_ready'; runtime: RuntimeRef }
   | { type: 'runtime_busy'; runtime: RuntimeRef }
@@ -151,6 +152,10 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
     case 'runtime_reserved':
       if (event.runtime.ref.epoch <= session.runtimeEpoch) return finish('conflict', 'runtime_epoch_reused');
       session.runtimeEpoch = event.runtime.ref.epoch; state.runtime = event.runtime; return finish('applied');
+    case 'runtime_epoch_floor':
+      if (!Number.isSafeInteger(event.epoch) || event.epoch < 0) return finish('conflict', 'invalid_runtime_epoch');
+      if (event.epoch <= session.runtimeEpoch) return finish('duplicate');
+      session.runtimeEpoch = event.epoch; return finish('applied');
     case 'runtime_bound': {
       if (!sameWorker(session.worker, event.runtime.worker)) return finish('stale');
       if (session.lifecycle === 'closed' || session.lifecycle === 'closing') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
