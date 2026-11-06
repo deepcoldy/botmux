@@ -279,7 +279,30 @@ export function linuxListeningServerPids(socketPath: string): number[] | null {
  * proven parseLsofSocketBindings shape shipped in #2149. Callers needing the
  * exact listen/connected split should run on Linux (strong /proc evidence).
  */
-export function parseLsofListeners(stdout: string, socketPath: string): number[] {
+export interface LsofListenerResult {
+  /** Pids bound to a named socket at one of the socket path spellings. */
+  pids: number[];
+  /**
+   * True when the output had at least one recognizable lsof -F process/name
+   * record (`p<pid>` + `n…`). FALSE means the dialect produced no parseable
+   * structure at all (unknown/older/newer lsof, garbage) — the caller must
+   * treat that census as UNREADABLE (null) and wait, not as "zero listeners".
+   * A parseable run that simply has no socket at THIS path still yields
+   * recognized=true with an empty pid list (a valid cold/residual-file read).
+   */
+  recognized: boolean;
+}
+
+/** Normalise an lsof -F `n` field: strip a trailing ` type=STREAM` (and any
+ *  fields after it). macOS lsof emits the bare path, but some other lsof
+ *  builds (notably Linux procps lsof, which this code path does not normally
+ *  use) append ` type=STREAM`; stripping it is harmless defensive parsing. */
+function normalizeLsofName(raw: string): string {
+  const idx = raw.indexOf(' type=');
+  return idx >= 0 ? raw.slice(0, idx) : raw;
+}
+
+export function parseLsofListenerResult(stdout: string, socketPath: string): LsofListenerResult {
   // Exact path spellings lsof may report (macOS /tmp is a symlink to
   // /private/tmp). Never match by basename suffix: labels like "botmux" and
   // "botmux2" share a directory and must not cross-match.
@@ -289,16 +312,27 @@ export function parseLsofListeners(stdout: string, socketPath: string): number[]
 
   const pids = new Set<number>();
   let pid: number | null = null;
+  let recognized = false;
   for (const line of stdout.split('\n')) {
     if (line.startsWith('p')) {
-      pid = Number(line.slice(1));
+      const n = Number(line.slice(1));
+      if (Number.isInteger(n) && n > 0) { pid = n; recognized = true; }
     } else if (line.startsWith('n') && pid !== null) {
-      const name = line.slice(1);
-      // Bound named socket: an exact spelling, not a connected-peer "->" record.
+      recognized = true;
+      const name = normalizeLsofName(line.slice(1));
+      // Bound named socket: a recognized spelling, not a connected-peer
+      // "->" record (connected ends render n->0x… or bare ntype=STREAM).
       if (!name.startsWith('->') && spellings.has(name)) pids.add(pid);
     }
   }
-  return [...pids];
+  return { pids: [...pids], recognized };
+}
+
+/** Back-compat wrapper: just the matching pids. Use parseLsofListenerResult
+ *  when the caller must distinguish "no socket on this path" from an
+ *  unparseable/unknown lsof dialect. */
+export function parseLsofListeners(stdout: string, socketPath: string): number[] {
+  return parseLsofListenerResult(stdout, socketPath).pids;
 }
 
 function macListeningServerPids(socketPath: string): number[] | null {
@@ -306,7 +340,11 @@ function macListeningServerPids(socketPath: string): number[] | null {
     encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
   });
   if (r.status !== 0 || typeof r.stdout !== 'string') return null;
-  return parseLsofListeners(r.stdout, socketPath);
+  // lsof ran but spoke an unrecognized dialect → census UNREADABLE → wait.
+  // A recognized run with no bound socket on this path is a legitimate empty
+  // list (cold/residual file), so return [] and allow the cold boot.
+  const result = parseLsofListenerResult(r.stdout, socketPath);
+  return result.recognized ? result.pids : null;
 }
 
 export function listeningServersOnPath(socketPath: string, platform: NodeJS.Platform = process.platform): number[] | null {

@@ -51,10 +51,17 @@ export function parseProcStat(stat: string): { state: string; ppid: number; pgid
 }
 
 /**
- * Enumerate the pane roots of an unreachable orphan tmux server: its direct
- * non-zombie children (tmux forks one shell per pane; the server itself is the
- * parent). Session name / instance binding come from the pane shell's
- * /proc/<pid>/environ (the orphan cannot be queried with tmux). All read-only.
+ * Enumerate the pane roots of an unreachable orphan tmux server.
+ *
+ * A pane root is a direct, non-zombie child of the server that is its OWN
+ * process-group leader (tmux puts each pane shell in a fresh pgid/sid):
+ * `pgid === pid` AND `pgid !== orphanPid`. This is essential because the
+ * server also direct-forks pipe-pane/status helpers (`sh … cat`) which live in
+ * the SERVER's own process group (pgid === orphanPid) and, measured, can even
+ * carry BOTMUX_CODEX_INSTANCE_BINDING in their environment. Treating such a
+ * helper as a pane would aim SIGHUP at a group that contains the orphan
+ * server pid — the one process this sweep must never signal. Nested tmux
+ * servers and any child sharing the server's pgid are excluded.
  */
 export function enumerateOrphanPanes(
   orphanPid: number,
@@ -66,6 +73,9 @@ export function enumerateOrphanPanes(
     if (p.ppid !== orphanPid || isZombieState(p.state)) continue;
     // A child that is itself a tmux process (nested server) is not a managed pane.
     if (p.comm === 'tmux') continue;
+    // Pane shells lead their own pgid distinct from the server; helpers stay in
+    // the server's pgid and must never be treated as panes.
+    if (p.pgid === orphanPid || p.pgid !== p.pid) continue;
     const env = readEnviron(p.pid);
     let binding: string | undefined;
     let sessionName: string | undefined;
@@ -263,6 +273,17 @@ export function classifyOrphanPanes(inputs: ReapInputs): ReapResult {
       }
       for (const pid of subtree) if (inputs.lockHolderPids.has(pid)) return 'lock-held';
 
+      // GLOBAL, escape-aware veto for the bare-wrapper case. A killable pane is,
+      // by construction, one whose CLI has FULLY exited — so there must be no
+      // live thread-writer-lock holder anywhere attributable to a displaced
+      // server on this label. A setsid/double-forked/reparented-to-init live CLI
+      // leaves the pane's pgid AND ppid subtree, but its lock is still held; if
+      // ANY thread-lock holder exists host-wide in a kill pass, do not signal a
+      // bare-wrapper pane (the residual holder would strand the new session on
+      // "open in another app"). This is conservative by design and only gates
+      // the opt-in kill; report-only is unaffected.
+      if (inputs.lockHolderPids.size > 0) return 'lock-held';
+
       // 1. proven takeover: a live reachable session owns the same binding.
       const dup = pane.instanceBinding !== undefined && inputs.reachableBindings.has(pane.instanceBinding);
       if (!dup) return 'not-a-duplicate-no-reachable-binding';
@@ -311,17 +332,26 @@ export function enumerateThreadLockHolders(): Set<number> | null {
   } catch { return null; }
 
   // Source 2: fd readlink (authoritative for path + catches deleted files).
+  // A process that vanishes mid-scan (ENOENT/ESRCH) is benign; an EPERM/
+  // EACCES boundary means we could be HIDING a holder (root/setuid), so the
+  // whole lock census is unreadable → caller fails closed and signals nothing.
   let sawAnyProc = false;
   const fdHolders = new Set<number>();
+  const isBenignExit = (err: unknown): boolean => {
+    const code = (err as { code?: string } | null)?.code;
+    return code === 'ENOENT' || code === 'ESRCH';
+  };
   for (const e of entries) {
     if (!/^\d+$/.test(e)) continue;
     sawAnyProc = true;
     const pid = Number(e);
     let fds: string[];
-    try { fds = readdirSync(`/proc/${e}/fd`); } catch { continue; }
+    try { fds = readdirSync(`/proc/${e}/fd`); }
+    catch (err) { if (!isBenignExit(err)) return null; continue; }
     for (const fd of fds) {
       let target: string;
-      try { target = readlinkSync(`/proc/${e}/fd/${fd}`); } catch { continue; }
+      try { target = readlinkSync(`/proc/${e}/fd/${fd}`); }
+      catch (err) { if (!isBenignExit(err)) return null; continue; }
       if (/[\\/]thread-writer-locks[\\/][0-9a-fA-F-]{36}\.lock(?: \(deleted\))?$/i.test(target)) {
         fdHolders.add(pid);
         break;
@@ -329,7 +359,10 @@ export function enumerateThreadLockHolders(): Set<number> | null {
     }
   }
   if (!sawAnyProc) return null;
-  // fd paths are the specific, correct signal — use them directly.
+  // fd paths are the specific, correct signal — use them directly. The
+  // /proc/locks WRITE-holder set computed above is cross-checked by the caller
+  // against the plan (same pids); keeping both sources consistent is what lets
+  // a POSIX lockf-only holder not be mistaken for a thread-lock holder.
   return fdHolders;
 }
 
@@ -510,12 +543,26 @@ export function runPeriodicOrphanSessionSweep(seam: PeriodicSweepSeam): Periodic
       continue;
     }
     const reachable = seam.reachablePid(socketName);
+    // A single listening server (even if the owner probe is briefly null) is a
+    // slow/current server, NEVER an orphan. We need a positive reachable owner
+    // AND >=2 distinct listening pids on the label before labelling anything;
+    // an owner probe timeout on a saturated server must not turn the only live
+    // server into a "displaced" one.
+    if (reachable === null) {
+      seam.log?.(`[orphan-session-sweep] ${socketName ?? 'default'}: owner unknown (probe timed out / slow server); not classifying orphans`);
+      continue;
+    }
+    if (listeners.length < 2 || !listeners.includes(reachable)) {
+      // One listener (or the owner vanished from the census between calls):
+      // nothing provably displaced. Skip.
+      continue;
+    }
     // Orphans = other botmux listeners that are not the reachable owner.
     const orphans = listeners.filter(p => p !== reachable && seam.isBotmuxPid(p));
     if (orphans.length === 0) continue;
 
     result.orphanServers += orphans.length;
-    seam.log?.(`[orphan-session-sweep] ${socketName ?? 'default'}: reachable owner=${reachable ?? 'none'}, ${orphans.length} displaced botmux listener(s) ${orphans.join(',')}`);
+    seam.log?.(`[orphan-session-sweep] ${socketName ?? 'default'}: reachable owner=${reachable}, ${orphans.length} displaced botmux listener(s) ${orphans.join(',')}`);
 
     // Destructive mode is opt-in and Linux-only. Report-only never enumerates
     // the process table / locks (keeps the default periodic pass cheap).
@@ -538,6 +585,42 @@ export function runPeriodicOrphanSessionSweep(seam: PeriodicSweepSeam): Periodic
     });
     result.panesEvaluated += plan.panesEvaluated;
     if (!plan.censusComplete) { result.censusComplete = false; continue; }
+
+    // Owner stability TOCTOU guard: re-probe the reachable owner right before
+    // signalling. If it changed (or is gone) the topology moved mid-pass — abort
+    // this label rather than act on a stale classification.
+    const ownerAfter = seam.reachablePid(socketName);
+    if (ownerAfter !== reachable) {
+      result.censusComplete = false;
+      seam.log?.(`[orphan-session-sweep] ${socketName ?? 'default'}: owner changed mid-pass (${reachable} → ${ownerAfter ?? 'null'}); aborting`);
+      continue;
+    }
+    const listenersAfter = seam.listeningPids(socketPath, platform);
+    if (listenersAfter === null || !listenersAfter.includes(reachable)) {
+      result.censusComplete = false;
+      seam.log?.(`[orphan-session-sweep] ${socketName ?? 'default'}: listener census changed mid-pass; aborting`);
+      continue;
+    }
+
+    // HARD GUARD: never signal an orphan server pid or any process sharing an
+    // orphan server's process group (pipe-pane/status helpers live there). A
+    // bare-wrapper pane leads its OWN pgid, so an approved member can never be
+    // in one of these groups. If the plan somehow contains such a pid, abort
+    // signalling for the whole label rather than risk taking down a server.
+    const forbiddenPids = new Set<number>();
+    for (const orphanPid of orphans) {
+      forbiddenPids.add(orphanPid);
+      const serverProc = procs.find(p => p.pid === orphanPid);
+      const serverPgid = serverProc?.pgid ?? orphanPid;
+      for (const p of procs) if (p.pgid === serverPgid) forbiddenPids.add(p.pid);
+    }
+    const dangerous = plan.killablePgroups.filter(p => forbiddenPids.has(p));
+    if (dangerous.length > 0) {
+      result.censusComplete = false;
+      seam.log?.(`[orphan-session-sweep] ${socketName ?? 'default'}: refusing to signal server/helper pid(s) ${dangerous.join(',')}; aborting this label`);
+      continue;
+    }
+
     for (const pid of plan.killablePgroups) {
       try { signalPid(pid); result.signalled.push(pid); }
       catch (err) { seam.log?.(`[orphan-session-sweep] failed to signal pid ${pid}: ${String(err)}`); }

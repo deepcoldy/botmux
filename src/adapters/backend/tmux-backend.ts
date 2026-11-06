@@ -557,7 +557,9 @@ export class TmuxBackend {
       // owner rather than booting a competing server (default ON;
       // BOTMUX_DISABLE_TMUX_ANTI_FORK=1 opts out). A blocked boot reads as a
       // failed park (retried later), never as a second tmux server.
-      const bootLeading = createTmuxBootGate(opts.socketName).leadingArgs();
+      // Ambient process.env on both sides (this exec uses tmuxEnv()); pass it
+      // explicitly so the gate's probe/-N/socket-path cannot silently diverge.
+      const bootLeading = createTmuxBootGate(opts.socketName, { env: process.env }).leadingArgs();
       const shellSpec = resolveUserShell();
       const shellKind = shellKindForPath(shellSpec.shell);
       execFileSync('tmux', [

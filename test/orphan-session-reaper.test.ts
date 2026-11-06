@@ -130,6 +130,31 @@ describe('enumerateOrphanPanes', () => {
     expect(panes.find(p => p.panePid === 100)?.instanceBinding).toBe('inst-A');
     expect(panes.find(p => p.panePid === 100)?.sessionName).toBe('bmx-aaaaaaaa');
   });
+
+  it('excludes a pipe-pane helper that lives in the SERVER pgid even when it carries the binding', () => {
+    // Measured topology: the server (9000) direct-forks BOTH a real pane shell
+    // (own pgid 100) and a pipe-pane `sh … cat` helper (101) that stays in the
+    // server's pgid (pgid=9000) and can carry BOTMUX_CODEX_INSTANCE_BINDING.
+    // Only the self-pgid pane may be enumerated; the helper must never become
+    // a kill target whose group contains the server pid.
+    const procs = [
+      proc('9000:1:9000:S:tmux', 'tmux: server'),
+      SHELL(100),                                              // real pane: pgid 100
+      proc('101:9000:9000:S:sh', 'sh -c cat'),                // helper: in server pgid
+    ];
+    const env = (pid: number) => 'BOTMUX_CODEX_INSTANCE_BINDING=inst-A\0';
+    const panes = enumerateOrphanPanes(9000, procs, env);
+    expect(panes.map(p => p.panePid)).toEqual([100]);
+  });
+
+  it('excludes a child that is not its own pgid leader (pgid != pid)', () => {
+    const procs = [
+      proc('9000:1:9000:S:tmux', 'tmux: server'),
+      SHELL(100),
+      proc('103:9000:100:S:cat', 'cat'), // shares pane 100's pgid; not a pane root
+    ];
+    expect(enumerateOrphanPanes(9000, procs, () => null).map(p => p.panePid)).toEqual([100]);
+  });
 });
 
 describe('planOrphanSessionSweep fail-closed', () => {
@@ -155,9 +180,12 @@ describe('planOrphanSessionSweep fail-closed', () => {
 });
 
 describe.skipIf(process.platform !== 'linux')('enumerateThreadLockHolders (real /proc)', () => {
-  it('returns a set (possibly empty) and never throws', () => {
+  it('returns a Set on a complete census, or null when an EPERM boundary makes it unreadable; never throws', () => {
     const holders = enumerateThreadLockHolders();
-    expect(holders).toBeInstanceOf(Set);
+    // On a shared host another-uid process can make /proc/<pid>/fd unreadable;
+    // that must surface as null (fail closed → caller signals nothing), not as
+    // an empty Set that would read as "no holders".
+    if (holders !== null) expect(holders).toBeInstanceOf(Set);
   });
 });
 
@@ -216,5 +244,70 @@ describe('runPeriodicOrphanSessionSweep (daemon periodic wiring)', () => {
     } as any);
     expect(r.orphanServers).toBe(1);
     expect(signalled).toBe(false);
+  });
+
+  it('a SINGLE listener is never an orphan even when the owner probe is null (slow server)', () => {
+    const r = runPeriodicOrphanSessionSweep({
+      ...baseSeam,
+      listeningPids: () => [100],
+      reachablePid: () => null, // probe timed out against the saturated only server
+    } as any);
+    expect(r.orphanServers).toBe(0);
+  });
+
+  it('null owner with several listeners is NOT classified (must not label the slow current server orphan)', () => {
+    const r = runPeriodicOrphanSessionSweep({
+      ...baseSeam,
+      listeningPids: () => [100, 200],
+      reachablePid: () => null,
+    } as any);
+    expect(r.orphanServers).toBe(0);
+    expect(r.signalled).toEqual([]);
+  });
+
+  it('destructive pass aborts if the reachable owner changes mid-pass (TOCTOU)', () => {
+    let probe = 0;
+    let signalled = false;
+    const r = runPeriodicOrphanSessionSweep({
+      ...baseSeam,
+      listeningPids: () => [100, 200],
+      reachablePid: () => { probe += 1; return probe === 1 ? 100 : 999; },
+      permitBareWrapperReap: true,
+      loadProcs: () => [],
+      lockHolders: () => new Set<number>(),
+      enumeratePanes: () => [],
+      signal: () => { signalled = true; },
+    } as any);
+    expect(signalled).toBe(false);
+    expect(r.censusComplete).toBe(false);
+  });
+
+  it('HARD GUARD: never signals the orphan server pid or a process in its pgid', () => {
+    // Orphan server 200 (pgid 200) direct-forks a self-pgid bare pane 210 AND
+    // a same-server-pgid helper 211. Even if a buggy plan listed 211, the guard
+    // must suppress ALL signalling for the label.
+    const procs = [
+      proc('100:1:100:S:tmux', 'tmux: server'),
+      proc('200:1:200:S:tmux', 'tmux -L botmux new-session -s bmx-dup'),
+      proc('210:200:210:S:bash', '-bash'), // real pane, own pgid
+      proc('211:200:200:S:sh', 'sh -c cat'), // helper in server pgid
+    ];
+    const signalled: number[] = [];
+    const r = runPeriodicOrphanSessionSweep({
+      ...baseSeam,
+      listeningPids: () => [100, 200],
+      reachablePid: () => 100,
+      isBotmuxPid: (p: number) => p === 200,
+      permitBareWrapperReap: true,
+      loadProcs: () => procs,
+      lockHolders: () => new Set<number>(),
+      enumeratePanes: () => [{ panePid: 210, sessionName: 'bmx-dup', instanceBinding: 'inst-A' }, { panePid: 211, sessionName: 'x', instanceBinding: 'inst-A' }],
+      reachableBindings: () => new Set(['inst-A']),
+      ownUid: 1000,
+      signal: (pid: number) => { signalled.push(pid); },
+    } as any);
+    // 211 (server pgid) reaching the plan is enough to trip the hard guard.
+    expect(signalled).toEqual([]);
+    expect(r.signalled).toEqual([]);
   });
 });

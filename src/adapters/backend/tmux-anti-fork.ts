@@ -48,6 +48,12 @@ export interface CreateBootGateOptions {
   budgetMs?: number;
   pollMs?: number;
   platform?: NodeJS.Platform;
+  /** The EXACT environment the new-session exec will use. The gate must probe
+   *  the owner, resolve the -N capability and compute the socket path from the
+   *  same PATH/TMUX_TMPDIR the spawn uses — the daemon ambient env can resolve
+   *  a different tmux binary/socket than the pane launch. Defaults to
+   *  process.env (the diagnostic/attach paths are ambient on both sides). */
+  env?: NodeJS.ProcessEnv;
   resolve?: (socketName: string | undefined) => BootDirective;
   sleep?: (ms: number) => void;
   now?: () => number;
@@ -67,7 +73,10 @@ export function createTmuxBootGate(
   const pollMs = opts.pollMs ?? (platform === 'darwin' ? BOOT_GATE_POLL_MS_DARWIN : BOOT_GATE_POLL_MS);
   const sleep = opts.sleep ?? sleepSyncMs;
   const now = opts.now ?? (() => Date.now());
-  const resolve = opts.resolve ?? ((name) => resolveBootDirective(name));
+  // Resolve under the spawn env so owner probe / -N capability / socket path
+  // all describe the same tmux the launch will actually exec.
+  const gateEnv = opts.env ?? process.env;
+  const resolve = opts.resolve ?? ((name) => resolveBootDirective(name, { env: gateEnv }));
   const label = socketName ? `-L ${socketName}` : 'default server';
   const deadline = now() + budgetMs;
   let loggedWaiting = false;

@@ -3,6 +3,7 @@ import {
   decideBootDirective,
   parseProcNetUnix,
   parseLsofListeners,
+  parseLsofListenerResult,
   tmuxSocketPath,
   newestBotmuxListener,
   type TmuxOwnerProbe,
@@ -150,6 +151,26 @@ describe('parseLsofListeners (macOS)', () => {
       'p64048', 'f3', 'n->0x6f343834',
     ].join('\n');
     expect(parseLsofListeners(out, '/tmp/probeX/tmux-501/probeX')).toEqual([64032]);
+  });
+  it('defensively strips a trailing " type=STREAM" produced by other lsof builds', () => {
+    // Native macOS lsof emits the bare path; some other lsof builds append
+    // ` type=STREAM`. The parser must still match the listener either way.
+    const out = 'p555\nn/private/tmp/u/tmux-501/botmux type=STREAM\n';
+    expect(parseLsofListeners(out, '/tmp/u/tmux-501/botmux')).toEqual([555]);
+  });
+  it('recognized run with records but no socket ON THIS PATH → empty (valid cold/residual read)', () => {
+    // P0 guard: a parseable lsof output that simply lists other sockets must be
+    // a legitimate empty list, NOT an unreadable census — otherwise a residual
+    // socket file after kill-server/SIGKILL would block cold boot forever.
+    const out = 'p7\nn/private/tmp/u/tmux-501/other-label\np8\nn->0xdead\n';
+    expect(parseLsofListenerResult(out, '/tmp/u/tmux-501/botmux'))
+      .toEqual({ pids: [], recognized: true });
+  });
+  it('output with no recognizable p/n records at all → recognized=false (dialect unknown)', () => {
+    expect(parseLsofListenerResult('some unexpected lsof dialect\n???\n', '/tmp/u/tmux-501/botmux'))
+      .toEqual({ pids: [], recognized: false });
+    expect(parseLsofListenerResult('', '/tmp/u/tmux-501/botmux'))
+      .toEqual({ pids: [], recognized: false });
   });
 });
 

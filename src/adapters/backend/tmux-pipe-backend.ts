@@ -1830,8 +1830,11 @@ export class TmuxPipeBackend implements SessionBackend {
     // is not answering (slow, or its socket file was unlinked under it). The
     // very first new-session already forks the orphan in that state (measured),
     // so this cannot live in the retry branch. One gate spans all attempts so
-    // its bounded wait is not reset per attempt.
-    const bootGate = createTmuxBootGate(this.socketName);
+    // its bounded wait is not reset per attempt. Pass the SAME env the
+    // new-session exec below uses, so the owner probe, -N capability and socket
+    // path resolve against the launch's PATH/TMUX_TMPDIR (not daemon ambient).
+    const bootSpawnEnv = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env;
+    const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv });
     for (let attempt = 0; ; attempt++) {
       // [] = normal spawn (attach, or a proven cold boot); ['-N'] = attach
       // only, never fork (tmux ≥ 3.2), closing the client-internal macOS
@@ -1852,7 +1855,7 @@ export class TmuxPipeBackend implements SessionBackend {
           cwd: opts.cwd,
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 5000,
-          env: tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env),
+          env: tmuxEnv(bootSpawnEnv),
         });
         createdIdentity = parseSessionIdentity(String(printed ?? ''));
         break;
