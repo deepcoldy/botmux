@@ -76,6 +76,8 @@ const FILE_FLAG_CMDS = [
   "botmux dispatch --brief-file /etc/shadow",
   "botmux dispatch --brief-file=/etc/shadow",
   "botmux send --prompt-file p",
+  "botmux send --diff p",
+  "botmux send --diff=/tmp/x.patch",
   "botmux send --'content'-file x",
   "botmux send '--file=x'",
 ];
@@ -86,6 +88,10 @@ const ALLOWED_CMDS = [
   'botmux manager status',
   'botmux manager lead-only off',
   'botmux history',
+  'botmux bots list',
+  'botmux bots ls',
+  'botmux bots list --scope chat',
+  'botmux bots',
   'botmux --help',
 ];
 
@@ -106,6 +112,16 @@ describe('subcommand + flag allowlist', () => {
     expect(leadOnlyArgvViolation(parsePlainBotmuxArgv(cmd)!)).toMatch(/inline/);
     expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } })).toBe(false);
   });
+  it('narrows bots to roster reads: invite (membership change, no human gate) is denied', () => {
+    for (const cmd of [
+      'botmux bots invite --chat oc_x --team t --agent cli_x',
+      'botmux bots create-group --chat oc_x',
+    ]) {
+      expect(isPlainBotmuxCommand(cmd)).toBe(true);
+      expect(leadOnlyArgvViolation(parsePlainBotmuxArgv(cmd)!)).toMatch(/membership|群成员/);
+      expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } })).toBe(false);
+    }
+  });
 });
 
 describe('guard + real bash with a dummy botmux (no side effects for bypasses)', () => {
@@ -122,6 +138,7 @@ describe('guard + real bash with a dummy botmux (no side effects for bypasses)',
     'botmux setup add',
     'botmux upgrade',
     'botmux delete all',
+    'botmux bots invite --chat oc_x --team t --agent cli_x',
   ];
   it.each([...BYPASS, ...ALLOWED_CMDS])('%j', (cmd) => {
     const dir = mkdtempSync(join(tmpdir(), 'lead-bash-'));

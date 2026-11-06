@@ -20,7 +20,12 @@ botmux manager lead-only off
 
 可选的 lead-only（默认关闭）：本机器人是负责人时，可让它在本群的非执行者会话里只能执行 botmux 命令，
 读写文件、搜索、联网、子 agent、MCP 以及非 botmux 的 Bash 都会被拦截，具体工作须用 botmux dispatch 派给执行 bot。
+botmux 子命令也按名单放行（dispatch/send/status/manager/history/quoted/bots list/capabilities/skill/help），
+读本地文件的参数（--content-file/--file/--brief-file/--diff 等）、fleet 与配置类子命令（setup/upgrade/restart/delete/mcp 等）、
+以及 botmux bots invite 这类变更群成员的操作都会被拦——拉人进群请真人或在 dashboard 操作。
 由 botmux dispatch 派出的会话和 workflow 节点会话（执行者）不受限；私聊不生效；仅对 claude-code 生效，其他 CLI 忽略该开关。
+守卫在文件沙箱/读隔离下也生效（守卫插件目录在沙箱内只读可见）；源码（非编译）运行时，若安装目录被删/移动，
+钩子命令路径失效，工具调用会被持续拦截（fail-closed），重开话题即可恢复。
 接管（adopt）的会话补不上启动期参数，不会生效。
 仅当前负责人可开关，取消负责人时一并关闭；对已运行的会话不生效，下次会话（重新）启动时才生效；已运行会话内的 /restart、dashboard 重启和崩溃自动重启不会重新读取该开关，需重开话题。status 输出含 leadOnly（只反映群配置，不代表某个运行中会话已生效）。
 关闭 bot 的负责人开关后，lead-only off 仍可执行（不会连带撤掉负责人）；lead-only on 需要开关开启。

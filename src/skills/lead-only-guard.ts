@@ -104,14 +104,25 @@ export const LEAD_ALLOWED_BOTMUX_SUBCOMMANDS = new Set([
   'help', '--help', '-h', '--version', '-v',
 ]);
 
-/** Flags that make botmux read a local file (or upload a local path) and so bypass the Read-tool ban. */
-const LEAD_DENIED_FLAG = /^--(?:[a-z0-9-]*file[a-z0-9-]*|files|images?|videos?|video-covers?|voice|card-json)$/;
+/**
+ * Flags that make botmux read a local file (or upload a local path) and so bypass the Read-tool ban.
+ * `--diff` has no "file" in its name but readSendDiffFile() renders the file's unified-diff content
+ * into the outbound card, so it belongs here too.
+ */
+const LEAD_DENIED_FLAG = /^--(?:[a-z0-9-]*file[a-z0-9-]*|files|images?|videos?|video-covers?|voice|card-json|diff)$/;
+
+/** Second-level `bots` words a lead may use. `invite` changes group membership (pulls agents and
+ *  their human owners into the chat with no human-turn gate), so a lead may only read the roster. */
+const LEAD_ALLOWED_BOTS_SUBS = new Set(['list', 'ls', 'help', '--help', '-h']);
 
 /** Returns a bilingual reason when the parsed argv uses a subcommand/flag a lead may not use, else undefined. */
 export function leadOnlyArgvViolation(argv: string[]): string | undefined {
   const sub = argv[1];
   if (sub !== undefined && !LEAD_ALLOWED_BOTMUX_SUBCOMMANDS.has(sub)) {
     return `子命令 \`${sub}\` 不允许 / subcommand \`${sub}\` is not allowed`;
+  }
+  if (sub === 'bots' && argv[2] !== undefined && !LEAD_ALLOWED_BOTS_SUBS.has(argv[2])) {
+    return `子命令 \`bots ${argv[2]}\` 会变更群成员，不允许；负责人只能查看花名册（bots list） / \`bots ${argv[2]}\` changes group membership and is not allowed; a lead may only run \`bots list\``;
   }
   for (const tok of argv.slice(2)) {
     if (!tok.startsWith('--')) continue;
