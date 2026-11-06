@@ -7555,6 +7555,13 @@ export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefine
   if (pin) pin = retainPinEffort(pin, ds.session.modelPin);
   if (isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) throw new Error('会话正在迁移、重启或修改推理强度，请稍后重试');
   if (ds.session.dispatchLaunchSpec) throw new Error('dispatch 会话使用冻结的启动规格，不支持话题固定');
+  // An adopted CLI is owned by the user outside BotMux: it is never respawned
+  // with launch args, so a saved pin could never apply while presenting as
+  // active. Clearing stays allowed (a row may already carry one). Remote
+  // backends are NOT blocked — their cold spawn really consumes --model.
+  if (pin && (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode)) {
+    throw new Error('接管（adopt）的会话由外部 CLI 自己管理模型，不能设置话题固定');
+  }
   const cfg = getBot(ds.larkAppId).config;
   if (pin) {
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
@@ -7567,6 +7574,7 @@ export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefine
   try { sessionStore.updateSession(ds.session, { modelPinWrite: true }); }
   catch (error) { ds.session.modelPin = before; throw error; }
   if (!pin) ds.modelPinCleared = true;
+  else delete ds.modelPinCleared;
   dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
     patch: { modelPin: resolveSessionModelPinView(ds, cfg) ?? null } } });
   try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`[${tag(ds)}] Pin card refresh failed: ${String(error)}`); }

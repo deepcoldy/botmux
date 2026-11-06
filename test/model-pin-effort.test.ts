@@ -198,3 +198,18 @@ it('shows the current TraeX topic selection separately from a waiting model pin'
   for (const value of ['gpt-5.2', 'low', 'gpt-5.4', 'high']) expect(note).toContain(value);
   expect(ds.session.modelPin.effort).toBe('high');
 });
+
+it.each([
+  ['ds.adoptedFrom', (ds: any) => { ds.adoptedFrom = { source: 'external' }; }],
+  ['session.adoptedFrom', (ds: any) => { ds.session.adoptedFrom = { source: 'external' }; }],
+  ['initConfig.adoptMode', (ds: any) => { ds.initConfig.adoptMode = true; }],
+])('refuses to set a pin in an adopted session (%s) but still allows clearing', (_name, mark) => {
+  const { ds } = fixture();
+  mark(ds);
+  expect(() => writeSessionModelPin(ds, { model: 'gpt-6-astra', source: 'command', setBy: 'owner', setAt: new Date().toISOString() })).toThrow(/adopt|接管/);
+  expect(ds.session.modelPin.model).toBe(model);
+  store.init(app);
+  expect(store.getOwnedSession(ds.session.sessionId)?.modelPin?.model).toBe(model);
+  expect(writeSessionModelPin(ds, undefined)).toBe(true);
+  expect(ds.session.modelPin).toBeUndefined();
+});

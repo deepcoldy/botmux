@@ -2982,7 +2982,10 @@ export function updateSession(session: Session, options: { modelPinWrite?: true 
   if (durable) {
     const row = JSON.parse(durable.row) as Session;
     Object.assign(session, row);
-    session.modelPin = row.modelPin;
+    // Object.assign does not remove a key the durable row lacks; drop an
+    // in-memory pin explicitly instead of leaving a lingering own `undefined`.
+    if (row.modelPin === undefined) delete session.modelPin;
+    else session.modelPin = row.modelPin;
   }
   sessions.set(session.sessionId, session);
 }
