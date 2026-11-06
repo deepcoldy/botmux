@@ -4855,7 +4855,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, result.status, result.body);
     }
 
-    if (await handleResourceMonitorApi(req, res, url, resourceMonitor)) {
+    if (await handleResourceMonitorApi(req, res, url, resourceMonitor, () => registry.list())) {
       return;
     }
 
