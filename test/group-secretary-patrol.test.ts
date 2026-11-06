@@ -360,6 +360,50 @@ describe('runtime split mode (patrol)', () => {
     h.rt.stop();
   });
 
+  /** 话题里的一条消息事件（不 @ 任何人）。 */
+  function topicEvent(id: string, root: string, senderType: 'user' | 'app' = 'user') {
+    return {
+      sender: { sender_type: senderType, sender_id: { open_id: senderType === 'user' ? HUMAN : 'ou_bot' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: id, root_id: root, parent_id: root,
+        create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '我来看一下' }), mentions: [] },
+    };
+  }
+
+  /** 跑到巡查会话开始执行，返回它的 sessionId。 */
+  async function startPatrol(h: ReturnType<typeof splitRuntime>): Promise<string> {
+    h.set([{ id: 's1', app: 'cli_alex', root: ROOT_A, turn: 'working' }]);
+    await h.rt.tick();
+    h.set([{ id: 's1', app: 'cli_alex', root: ROOT_A, turn: 'idle' }]);
+    await step(h.rt); await step(h.rt);
+    const sid = `patrol-${ROOT_A}-1`;
+    expect(h.deliverPatrol).toHaveBeenCalledTimes(1);
+    h.set([{ id: sid, app: SELF, root: ROOT_A, turn: 'working', lastMessageAt: clock }]);
+    await step(h.rt);
+    return sid;
+  }
+
+  it('keeps the patrol session when a human spoke in the topic within the first 30s, even without @', async () => {
+    const h = splitRuntime();
+    const sid = await startPatrol(h);
+    // 会话自己的 lastActivityAt 还在 30 秒宽限内：只靠旁听到的真人消息判断
+    h.rt.observeMessageEvent(topicEvent('om_human_early', ROOT_A));
+    h.set([{ id: sid, app: SELF, root: ROOT_A, turn: 'idle', lastMessageAt: clock - 10_000 }]);
+    await step(h.rt);
+    expect(h.closePatrolSession).not.toHaveBeenCalled();
+    h.rt.stop();
+  });
+
+  it('still closes the patrol session when only bots, or humans in another topic, spoke during the patrol', async () => {
+    const h = splitRuntime();
+    const sid = await startPatrol(h);
+    h.rt.observeMessageEvent(topicEvent('om_bot', ROOT_A, 'app'));
+    h.rt.observeMessageEvent(topicEvent('om_other_topic', ROOT_B));
+    h.set([{ id: sid, app: SELF, root: ROOT_A, turn: 'idle', lastMessageAt: clock - 10_000 }]);
+    await step(h.rt);
+    expect(h.closePatrolSession).toHaveBeenCalledWith(sid);
+    h.rt.stop();
+  });
+
   it('does not let more patrols run than the cap', async () => {
     const h = splitRuntime({ maxConcurrentPatrols: 1 });
     h.set([{ id: 'a', app: 'cli_alex', root: ROOT_A, turn: 'working' }, { id: 'b', app: 'cli_alex', root: ROOT_B, turn: 'working' }]);

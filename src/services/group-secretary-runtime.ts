@@ -198,6 +198,11 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
   const notedEscalations = new Set<string>();
   const patrolKey = (chatId: string, root: string) => `${chatId}\u0000${root}`;
   const runningPatrolCount = () => patrols.size + patrolInflight.size;
+  /** 巡查投递中 / 在跑期间，该话题最近一次出现真人消息的时间（chatId\0threadRoot → 本机观察时刻）。
+   *  只要巡查期间话题里来过真人，这个会话就当作正常对话会话保留，不自动关。 */
+  const humanSeenInPatrol = new Map<string, number>();
+  const isPatrolling = (chatId: string, root: string): boolean => patrolInflight.has(patrolKey(chatId, root))
+    || [...patrols.values()].some(r => r.chatId === chatId && r.threadRoot === root);
   /** 本拍 takeDigests 里已经放行的巡查数（投递是并行的，放行时就要占名额）。 */
   let reservedPatrols = 0;
   const patrolBusy = (chatId: string, root: string): boolean => {
@@ -442,6 +447,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         timeout,
       ]);
       if (result === 'timeout') {
+        humanSeenInPatrol.delete(key);
         deps.log('warn', `[group-secretary] patrol deliver timed out chat=${digest.chatId.slice(0, 12)} root=${threadRoot.slice(0, 16)}; dropped ${events.length} event(s)`);
         return;
       }
@@ -453,6 +459,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
       deps.log('info', `[group-secretary] patrol started chat=${digest.chatId.slice(0, 12)} root=${threadRoot.slice(0, 16)} `
         + `session=${result.sessionId.slice(0, 8)}${result.created ? ' (new)' : ''} kinds=${events.map(e => e.kind).join(',')}`);
     } catch (err) {
+      humanSeenInPatrol.delete(key);
       const requeued = engine.requeue(patrolDigest);
       deps.log('warn', `[group-secretary] patrol deliver failed chat=${digest.chatId.slice(0, 12)} root=${threadRoot.slice(0, 16)}`
         + `${requeued ? ' (will retry)' : `; dropped ${events.length} event(s) after retries`}: `
@@ -466,6 +473,8 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
   /** 巡查回合结束：没写台账就兜底一行；会话是为巡查新建、期间也没有真人来过，就关掉（一次性）。 */
   const finishPatrol = async (sessionId: string, run: PatrolRun, lastActivityAt: number | undefined): Promise<void> => {
     patrols.delete(sessionId);
+    const humanSeenAt = humanSeenInPatrol.get(patrolKey(run.chatId, run.threadRoot));
+    humanSeenInPatrol.delete(patrolKey(run.chatId, run.threadRoot));
     try {
       const cur = getLedgerEntry(deps.larkAppId, run.chatId, run.threadRoot, undefined, now());
       if (!cur || cur.updatedAt < run.startedAt) {
@@ -483,7 +492,10 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
       deps.log('warn', `[group-secretary] patrol ledger fallback failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     // 巡查期间有人在话题里 @ 了秘书（会话有新的真人活动）：这已经是一个正常对话会话，不关。
-    const humanCameIn = lastActivityAt !== undefined && lastActivityAt > run.startedAt + 30_000;
+    // 两路信号任一成立就不关：旁听到巡查期间话题里有真人发言（不论是否 @ 秘书）；
+    // 或会话本身在投递之后又收到了消息（30 秒内的那次是巡查投递自己）。
+    const humanCameIn = (humanSeenAt !== undefined && humanSeenAt >= run.startedAt)
+      || (lastActivityAt !== undefined && lastActivityAt > run.startedAt + 30_000);
     if (!run.created || humanCameIn || !deps.closePatrolSession) return;
     try {
       await deps.closePatrolSession(sessionId);
@@ -591,6 +603,9 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         // 开启之前的消息（重放 / 补拉）不进秘书视野。
         const entry = getGroupSecretaryChat(deps.larkAppId, chatId);
         if (entry && message.createTime < entry.enabledAt) return;
+        if (message.senderType === 'user' && message.rootId && isPatrolling(chatId, message.rootId)) {
+          humanSeenInPatrol.set(patrolKey(chatId, message.rootId), now());
+        }
         engine.observeMessage(message);
       } catch (err) {
         deps.log('warn', `[group-secretary] observe failed: ${err instanceof Error ? err.message : String(err)}`);
