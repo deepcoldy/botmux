@@ -56,6 +56,7 @@ import {
 } from './workflow-handoff-routes.js';
 import {
   WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE,
+  approvedWorkflowBots,
   deliverWorkflowHandoffWithUser,
   handleWorkflowHandoffIdentityCheck,
   loadWorkflowHandoffIdentityRun,
@@ -85,10 +86,10 @@ import {
   type WorkflowInitiatorIdentity,
   type WorkflowOperateAnswer,
 } from './workflow-working-dir-operator.js';
-import { readFileSync } from 'node:fs';
 import { readGrillState } from '../workflows/v3/grill-state.js';
 import { loadDag } from '../workflows/v3/dag-loader.js';
-import { freezeDagBotSnapshots, parseFrozenBotSnapshots } from '../workflows/v3/bot-resolve.js';
+import { freezeDagBotSnapshots } from '../workflows/v3/bot-resolve.js';
+import { loadAuthorizedV3Run } from '../workflows/v3/run-envelope.js';
 import { v3BotExecutorTargets } from '../workflows/v3/node-executor-mode.js';
 import { classifyExternalAttempt } from '../workflows/v3/external-control.js';
 import { readJournal } from '../workflows/v3/journal.js';
@@ -216,7 +217,14 @@ export interface WorkflowNodeDaemonDeps {
    *  with the identity converted into that bot's app
    *  (`createWorkflowWorkingDirOperatorWiring`). Absent = no one is taken to
    *  operate it: the configured range applies. */
-  initiatorOperates?(input: { larkAppId: string; chatId: string; initiator: WorkflowInitiatorIdentity }): Promise<WorkflowOperateAnswer>;
+  initiatorOperates?(input: {
+    larkAppId: string;
+    chatId: string;
+    initiator: WorkflowInitiatorIdentity;
+    /** Read the chat's members now, not from the short-lived cache (node
+     *  start: someone who just left the chat must not count). */
+    freshMembership?: boolean;
+  }): Promise<WorkflowOperateAnswer>;
   /** The run's main bot side of {@link WORKFLOW_INITIATOR_UNION_ROUTE}: the
    *  union_id of a person this daemon's own app knows by `openId`. */
   lookupOwnUnionId?(openId: string): Promise<{ unionId: string } | { unknown: string }>;
@@ -440,14 +448,42 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
   }
 
   /** A run as the §15.4 operate check needs it: who started it (open_id
-   *  for the main bot's app only), where, and which bot executes which node.
+   *  for the main bot's app only), where, and which bots take part.
    *  `pending`: not yet approved (Gate-2 is asking) — read from the grill
-   *  state and today's bots.json, exactly as Gate-2 freezes it. */
+   *  state and today's bots.json, exactly as Gate-2 freezes it; only then is
+   *  each node's executor known (`executorOf`). */
   interface OperateRun {
     initiator: { sourceLarkAppId: string; openId: string; unionId?: string };
     chatId: string;
-    executorOf(nodeId: string): string | undefined;
-    executors(): Set<string>;
+    /** Every bot that may execute a node of this run. */
+    executors: ReadonlySet<string>;
+    /** Pending runs only: the bot that will execute `nodeId`. */
+    executorOf?(nodeId: string): string | undefined;
+  }
+
+  /**
+   * An approved run that pins a working dir. Its bots are the run's approved
+   * scope — the frozen snapshot plus every bot an applied revision brought in
+   * and the initiator's own reassignments ({@link approvedWorkflowBots}, the
+   * scope 交接带发起人身份 uses) — plus any bot a node was reassigned to by
+   * anyone, since that bot then executes it. Unreadable artifacts: no run.
+   */
+  function frozenOperateRun(runDir: string, runId: string): OperateRun | undefined {
+    const read = readRunEnvelope(runDir, runId);
+    if (read.kind !== 'ok' || frozenNodeWorkingDir(read.envelope) === undefined) return undefined;
+    const initiator = runInitiatorRef(read.envelope);
+    const chatId = read.envelope.chatBinding?.chatId;
+    if (!initiator || !chatId) return undefined;
+    let executors: Set<string>;
+    try {
+      const loaded = loadAuthorizedV3Run(runDir, { expectedRunId: runId });
+      const events = readJournal(join(runDir, 'journal.ndjson'));
+      executors = approvedWorkflowBots(runDir, loaded, events, initiator.openId);
+      for (const event of events) if (event.type === 'nodeReassigned') executors.add(event.to);
+    } catch {
+      return undefined;
+    }
+    return { initiator, chatId, executors };
   }
 
   function targetsMap(build: () => Array<{ nodeId: string; larkAppId: string }>): Map<string, string> | undefined {
@@ -456,25 +492,6 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     } catch {
       return undefined;
     }
-  }
-
-  /** An approved run that pins a working dir. */
-  function frozenOperateRun(runDir: string, runId: string): OperateRun | undefined {
-    const read = readRunEnvelope(runDir, runId);
-    if (read.kind !== 'ok' || frozenNodeWorkingDir(read.envelope) === undefined) return undefined;
-    const initiator = runInitiatorRef(read.envelope);
-    const chatId = read.envelope.chatBinding?.chatId;
-    if (!initiator || !chatId) return undefined;
-    const dag = deps.loadRun(runDir)?.dag;
-    const targets = dag ? targetsMap(() => v3BotExecutorTargets(dag, parseFrozenBotSnapshots(
-      JSON.parse(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')) as unknown, dag,
-    ))) : undefined;
-    return {
-      initiator,
-      chatId,
-      executorOf: (nodeId) => targets?.get(nodeId),
-      executors: () => new Set(targets?.values() ?? []),
-    };
   }
 
   /** A run waiting at Gate-2 (no run.json yet). */
@@ -495,7 +512,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       initiator: { sourceLarkAppId: binding.larkAppId, openId: binding.ownerOpenId },
       chatId: binding.chatId,
       executorOf: (nodeId) => targets.get(nodeId),
-      executors: () => new Set(targets.values()),
+      executors: new Set(targets.values()),
     };
   }
 
@@ -525,7 +542,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
    *  run's chat? Their open_id is used for the main bot's own app only; for
    *  another bot their union_id — frozen on the run, else from the main bot —
    *  is converted in that bot's app. Bounded by the operator budget. */
-  function initiatorOperates(run: OperateRun, runId: string, executingLarkAppId: string): Promise<WorkflowOperateAnswer> {
+  function initiatorOperates(run: OperateRun, runId: string, executingLarkAppId: string, opts: { freshMembership?: boolean } = {}): Promise<WorkflowOperateAnswer> {
     return withinOperatorBudget((async (): Promise<WorkflowOperateAnswer> => {
       if (!deps.initiatorOperates) return 'no';
       let unionId = run.initiator.unionId;
@@ -540,6 +557,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         larkAppId: executingLarkAppId,
         chatId: run.chatId,
         initiator: { ...run.initiator, ...(unionId ? { unionId } : {}) },
+        ...(opts.freshMembership ? { freshMembership: true } : {}),
       });
     })());
   }
@@ -586,7 +604,8 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     if (input.kind === 'decided') return input.dir;
     const verdict = await checkNodeWorkingDir(input.config, input.workingDir, async () => {
       const run = frozenOperateRun(input.runDir, runId);
-      return run ? initiatorOperates(run, runId, executingLarkAppId) : 'no';
+      // The node is about to start: read the chat's members now.
+      return run ? initiatorOperates(run, runId, executingLarkAppId, { freshMembership: true }) : 'no';
     });
     return nodeWorkingDirFrom(verdict, input.botName);
   }
@@ -1069,7 +1088,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       // Bound to a run waiting at Gate-2 whose node this bot executes: the
       // asker names no person or chat, this daemon reads both from the run.
       const run = pendingOperateRun(runDir, request.runId);
-      if (!run || run.executorOf(request.nodeId) !== self) return { status: 404, body: { ok: false, error: 'no_such_node' } };
+      if (!run || run.executorOf?.(request.nodeId) !== self) return { status: 404, body: { ok: false, error: 'no_such_node' } };
       const operate = await initiatorOperates(run, request.runId, self);
       return { status: 200, body: { ok: true, operate } };
     },
@@ -1081,7 +1100,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       // where one may be asked for), and only to one of their executing bots.
       const run = frozenOperateRun(runDir, request.runId) ?? pendingOperateRun(runDir, request.runId);
       if (!run || run.initiator.sourceLarkAppId !== deps.selfLarkAppId()
-        || !run.executors().has(request.requesterLarkAppId) || request.requesterLarkAppId === deps.selfLarkAppId()) {
+        || !run.executors.has(request.requesterLarkAppId) || request.requesterLarkAppId === deps.selfLarkAppId()) {
         return { status: 404, body: { ok: false, error: 'run_not_eligible' } };
       }
       if (run.initiator.unionId) return { status: 200, body: { ok: true, unionId: run.initiator.unionId } };

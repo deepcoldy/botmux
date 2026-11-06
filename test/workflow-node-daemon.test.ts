@@ -12,7 +12,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createWorkflowNodeDaemon, workflowNodePinnedStart, type WorkflowNodeDaemonDeps } from '../src/core/workflow-node-daemon.js';
-import { BotRun, cleanupBotRuns, expectTerminal, reportDag, trackTempDir } from './helpers/v3-external-harness.js';
+import { BotRun, cleanupBotRuns, expectTerminal, reportDag, snapshotFor, trackTempDir } from './helpers/v3-external-harness.js';
+import { applyV3RunEdit } from '../src/workflows/v3/run-edit.js';
+import { WorkflowSidebarMembershipCache } from '../src/core/workflow-sidebar-membership.js';
 import { CHAT, MAIN, SECRET, handoffWorld, nonceOf } from './helpers/workflow-handoff-harness.js';
 import { activeSessionKey, sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkflowNodeSessionMarker } from '../src/types.js';
@@ -716,6 +718,7 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
   function operateDeps(cdUsers: Record<string, string[]>, opts: {
     directory?: 'up' | 'down' | 'definitive';
     members?: Record<string, string[] | Error>;
+    membershipCache?: WorkflowSidebarMembershipCache;
   } = {}) {
     const seen: string[] = [];
     const conversions: string[] = [];
@@ -737,6 +740,7 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
         return cmd === '/cd' && (cdUsers[appId]?.includes(openId) ?? false);
       },
       selfLarkAppId: () => MAIN,
+      ...(opts.membershipCache ? { membershipCache: opts.membershipCache } : {}),
     };
     return { initiatorOperates: createWorkflowWorkingDirOperatorWiring(io).initiatorOperates, seen, conversions };
   }
@@ -1026,10 +1030,82 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
     expect(delivered).toEqual([]);
   });
 
+  it('a revision brought in a new bot: the main bot still answers the original executor (and the new one), from the real journal', async () => {
+    const d = dirs();
+    const { run, world, attempt, binding } = await pinnedRun('wdo-revised', d.lab, null);
+    // A real runtime edit by the initiator: a node on cli_d, a bot outside
+    // the frozen bots.snapshot.json (recorded as the revision's bot additions).
+    const edited = applyV3RunEdit({
+      baseDir: run.base, runId: run.dag.runId, baseRevision: 1,
+      caller: { openId: INITIATOR_MAIN_OU, origin: 'human' },
+      patch: [{ op: 'addNode', node: { id: 'extra', type: 'goal', goal: 'more', bot: 'cli_d', depends: [], inputs: [] } }],
+      resolveNewBotSnapshot: (selector) => snapshotFor(selector),
+    });
+    expect(edited).toMatchObject({ kind: 'applied' });
+    expect(readFileSync(join(run.runDir, 'journal.ndjson'), 'utf-8')).toContain('dagRevised');
+    const main = daemon(MAIN, world.dataDir, run.base, run, { lookupOwnUnionId: async () => ({ unionId: INITIATOR_UNION }) });
+    for (const requester of ['cli_a', 'cli_d']) {
+      expect(await main.wiring.initiatorUnionRoute({ runId: run.dag.runId, requesterLarkAppId: requester }))
+        .toEqual({ status: 200, body: { ok: true, unionId: INITIATOR_UNION } });
+    }
+    expect(await main.wiring.initiatorUnionRoute({ runId: run.dag.runId, requesterLarkAppId: 'cli_b' })).toMatchObject({ status: 404 });
+    // And so her own bot cli_a still starts the original node outside its range.
+    const op = operateDeps({ cli_a: [INITIATOR_OU_IN.cli_a!] });
+    const target = daemon('cli_a', world.dataDir, run.base, run, {
+      botWorkingDirConfig: () => ({ workingDirs: [d.repos] }),
+      initiatorOperates: op.initiatorOperates,
+      postDaemon: async (_port, path, body) => (path === WORKFLOW_INITIATOR_UNION_ROUTE
+        ? main.wiring.initiatorUnionRoute(body)
+        : { status: 200, body: { ok: true } }),
+    });
+    expect(await admit(target, binding, attempt.handoffMessageId!)).toEqual({ start: true, workingDir: realpathSync(d.lab) });
+  });
+
+  it('node start reads the chat members fresh: she left 1 s ago, inside the cache window, and no longer counts', async () => {
+    const d = dirs();
+    const { run, world, attempt, binding } = await pinnedRun('wdo-fresh-members', d.lab, FROZEN_UNION);
+    let now = 1_000_000;
+    const members: Record<string, string[]> = { cli_a: [INITIATOR_OU_IN.cli_a!] };
+    const cache = new WorkflowSidebarMembershipCache({ now: () => now });
+    const op = operateDeps({ cli_a: [INITIATOR_OU_IN.cli_a!] }, { members, membershipCache: cache });
+    const target = daemon('cli_a', world.dataDir, run.base, run, {
+      botWorkingDirConfig: () => ({ workingDirs: [d.repos] }),
+      initiatorOperates: op.initiatorOperates,
+    });
+    const gate2Ask = () => op.initiatorOperates({ larkAppId: 'cli_a', chatId: CHAT, initiator: { sourceLarkAppId: MAIN, unionId: INITIATOR_UNION } });
+    // Gate-2 asked while she was in the chat: its verdict is cached.
+    expect(await gate2Ask()).toBe('yes');
+    expect(await admit(target, binding, attempt.handoffMessageId!)).toEqual({ start: true, workingDir: realpathSync(d.lab) });
+    members.cli_a = ['ou_bob_in_a'];
+    now += 1_000;
+    // Node start ignores the cache: refused at once.
+    expect(await admit(target, binding, attempt.handoffMessageId!)).toMatchObject({ start: false });
+    // Gate-2 still reads the cache within its window (the documented
+    // trade-off), and sees the change once it expires.
+    expect(await gate2Ask()).toBe('yes');
+    now += 60_000;
+    expect(await gate2Ask()).toBe('no');
+  });
+
+  it('a non-200 answer from the main bot is never taken as the union_id, even when it carries one', async () => {
+    const d = dirs();
+    const { run, world, attempt, binding } = await pinnedRun('wdo-union-non200', d.lab, null);
+    const op = operateDeps({ cli_a: [INITIATOR_OU_IN.cli_a!] });
+    const target = daemon('cli_a', world.dataDir, run.base, run, {
+      botWorkingDirConfig: () => ({ workingDirs: [d.repos] }),
+      initiatorOperates: op.initiatorOperates,
+      postDaemon: async () => ({ status: 503, body: { ok: false, unionId: INITIATOR_UNION, error: 'busy' } }),
+    });
+    const refused = await admit(target, binding, attempt.handoffMessageId!);
+    expect(refused).toMatchObject({ start: false });
+    expect((refused as { reason: string }).reason).toContain('暂时无法确认');
+    expect(op.conversions).toEqual([]);
+  });
+
   describe('Gate-2 asks the executing bot about a run still waiting for approval', () => {
     /** A run at Gate-2 (grill state dag_ready, no run.json), its node on cli_a. */
-    function pendingRun(runId: string) {
-      const base = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-pending-')));
+    function pendingRun(runId: string, inBase?: string) {
+      const base = inBase ?? trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-pending-')));
       const runDir = join(base, runId);
       mkdirSync(runDir, { recursive: true });
       const dagPath = join(runDir, 'dag.json');
@@ -1089,6 +1165,27 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
       expect(await target.wiring.workingDirOperatorRoute({ runId, nodeId: 'nope' })).toMatchObject({ status: 404 });
       expect(await target.wiring.workingDirOperatorRoute({ runId: 'missing-run', nodeId: 'write' })).toMatchObject({ status: 404 });
       expect(await target.wiring.workingDirOperatorRoute({ runId, nodeId: 'write', chatId: CHAT })).toMatchObject({ status: 400 });
+    });
+
+    it('only a run still waiting at Gate-2: approved already (dag_approved), or run.json published in the crash window, gets no answer', async () => {
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-g2c-data-')));
+      const op = operateDeps({ cli_a: [INITIATOR_OU_IN.cli_a!] });
+      // Approved: the grill moved on.
+      const approved = pendingRun('wdo-g2-approved');
+      const approvedDir = join(approved.base, approved.runId);
+      const grill = JSON.parse(readFileSync(join(approvedDir, 'grill.state.json'), 'utf-8')) as Record<string, unknown>;
+      writeGrillState(approvedDir, { ...grill, status: 'dag_approved' } as never);
+      expect(await hosts(approved.runId, approved.base, dataDir, op).target.wiring.workingDirOperatorRoute({ runId: approved.runId, nodeId: 'write' }))
+        .toMatchObject({ status: 404 });
+      // Crash window: run.json is published, the grill still says dag_ready.
+      const windowRun = new BotRun(reportDag('wdo-g2-window'));
+      const window = pendingRun(windowRun.dag.runId, windowRun.base);
+      expect(await hosts(window.runId, window.base, dataDir, op).target.wiring.workingDirOperatorRoute({ runId: window.runId, nodeId: 'write' }))
+        .toMatchObject({ status: 200 });
+      authorizeRun(windowRun, { identity: null, nodeWorkingDir: trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-g2w-dir-'))) });
+      expect(readFileSync(join(window.base, window.runId, 'grill.state.json'), 'utf-8')).toContain('dag_ready');
+      expect(await hosts(window.runId, window.base, dataDir, op).target.wiring.workingDirOperatorRoute({ runId: window.runId, nodeId: 'write' }))
+        .toMatchObject({ status: 404 });
     });
   });
 });

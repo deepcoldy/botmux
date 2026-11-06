@@ -63,14 +63,15 @@ export interface WorkflowInitiatorOperatesDeps {
   /** The `/cd` command gate of `larkAppId` for a human with this (own-app)
    *  open_id in `chatId`. */
   canUseCd(larkAppId: string, chatId: string, openId: string, unionId: string | undefined): boolean;
-  /** Is this (own-app) open_id a member of `chatId`, as `larkAppId` sees it? */
-  chatMembership(larkAppId: string, chatId: string, openId: string): Promise<'member' | 'not_member' | 'unavailable'>;
+  /** Is this (own-app) open_id a member of `chatId`, as `larkAppId` sees it?
+   *  `fresh`: read now, not from a cache. */
+  chatMembership(larkAppId: string, chatId: string, openId: string, fresh: boolean): Promise<'member' | 'not_member' | 'unavailable'>;
 }
 
 /** Whether the initiator may operate `larkAppId` in `chatId`. */
 export async function workflowInitiatorOperates(
   deps: WorkflowInitiatorOperatesDeps,
-  input: { larkAppId: string; chatId: string; initiator: WorkflowInitiatorIdentity },
+  input: { larkAppId: string; chatId: string; initiator: WorkflowInitiatorIdentity; freshMembership?: boolean },
 ): Promise<WorkflowOperateAnswer> {
   const { initiator } = input;
   let openId: string;
@@ -95,7 +96,7 @@ export async function workflowInitiatorOperates(
   if (!deps.canUseCd(input.larkAppId, input.chatId, openId, unionId)) return 'no';
   let membership: 'member' | 'not_member' | 'unavailable';
   try {
-    membership = await deps.chatMembership(input.larkAppId, input.chatId, openId);
+    membership = await deps.chatMembership(input.larkAppId, input.chatId, openId, input.freshMembership === true);
   } catch {
     membership = 'unavailable';
   }
@@ -123,7 +124,7 @@ export interface WorkflowWorkingDirOperatorIo {
 /** What a daemon's {@link createWorkflowNodeDaemon} gets for §15.4: the
  *  operate check of its own bot, and its own app's union_id lookup. */
 export interface WorkflowWorkingDirOperatorWiring {
-  initiatorOperates(input: { larkAppId: string; chatId: string; initiator: WorkflowInitiatorIdentity }): Promise<WorkflowOperateAnswer>;
+  initiatorOperates(input: { larkAppId: string; chatId: string; initiator: WorkflowInitiatorIdentity; freshMembership?: boolean }): Promise<WorkflowOperateAnswer>;
   lookupOwnUnionId(openId: string): Promise<{ unionId: string } | { unknown: string }>;
 }
 
@@ -137,14 +138,16 @@ export function createWorkflowWorkingDirOperatorWiring(io: WorkflowWorkingDirOpe
       resolveTargetOpenId: io.resolveTargetAppOpenId,
       canUseCd: (appId, chatId, openId, unionId) => io.canRunDaemonCommand(appId, chatId, openId, unionId, OPERATE_COMMAND, 'group'),
       // The open_id was issued by (or converted into) this app: the sidebar's
-      // own-app principal, its cache and its "incomplete list = unavailable".
-      chatMembership: (appId, chatId, openId) => membershipCache.check(
-        { mainLarkAppId: appId, chatId, principal: { openId } },
-        () => checkWorkflowViewerChatMembership({ chatId, principal: { openId } }, {
+      // own-app principal and its "incomplete list = unavailable". Gate-2
+      // reads through the sidebar's short cache; node start reads fresh, so
+      // someone who just left the chat no longer counts.
+      chatMembership: (appId, chatId, openId, fresh) => {
+        const ask = () => checkWorkflowViewerChatMembership({ chatId, principal: { openId } }, {
           resolveOpenIdByUnionId: async () => ({ status: 'transient' }),
           listChatMemberOpenIds: (chat) => io.listChatMemberOpenIds(appId, chat),
-        }),
-      ),
+        });
+        return fresh ? ask() : membershipCache.check({ mainLarkAppId: appId, chatId, principal: { openId } }, ask);
+      },
     }, input),
     lookupOwnUnionId: async (openId) => {
       try {
