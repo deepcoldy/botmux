@@ -89,9 +89,13 @@ describe('feedback maintenance participant with runtime health', () => {
     await expect(freezeFeedbackSource(f.directory, 'participant-test')).rejects.toThrow('active_turns');
 
     f.session.finalOutputDeliveriesInFlight.clear();
+    // A live worker with background tasks stays busy; a stale count left behind
+    // after local worker loss must not wedge the drain.
+    f.session.worker = { killed: false } as DaemonSession['worker'];
     f.session.backgroundTaskCount = 1;
     await f.checkpoint(false, ['active_turns']);
     f.session.backgroundTaskCount = 0;
+    f.session.worker = null;
     f.persistence.pending = 1;
     await f.checkpoint(false, ['pending_terminal_writes']);
     f.persistence.pending = 0;
@@ -147,7 +151,9 @@ describe('feedback maintenance participant with runtime health', () => {
   it('blocks a partially recorded turn after a real SQLite write failure and drains after recovery', async () => {
     __testOnly_reopenTurnTerminalAdmission();
     const f = await fixture(undefined, {
-      session: { session: { status: 'active', backendType: 'tmux' }, worker: null, backgroundTaskCount: 1 } as DaemonSession,
+      // A live worker with no idle screen keeps the session busy during setup,
+      // so the first ticks never stop the outbox before the failed write.
+      session: { session: { status: 'active', backendType: 'tmux' }, worker: { killed: false }, backgroundTaskCount: 1 } as DaemonSession,
       persistence: getTurnTerminalPersistenceHealth,
     });
     cleanups.push(async () => {
@@ -177,6 +183,10 @@ describe('feedback maintenance participant with runtime health', () => {
       blocker.exec('ROLLBACK');
       blocker.close();
     }
+    // The failed write drained: simulate the worker going away (crash/lazy
+    // refork) — with no live local worker and no stale signal, the participant
+    // is allowed to finish.
+    f.session.worker = null;
     await enqueueTurnTerminal(terminal);
     expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 0 });
     expect(await store.listTurnCompletionEvents()).toHaveLength(1);

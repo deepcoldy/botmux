@@ -51,15 +51,42 @@ describe('feedback maintenance session activity', () => {
     expect(hasFeedbackMaintenanceSessionWork(session({ lastScreenStatus: 'idle' }, { cliId, backendType: undefined }))).toBe(false);
   });
 
-  // Dropping either independent drain guard must fail even after worker removal/close.
-  it.each(['active', 'closed'])('waits for final delivery and background work on %s sessions', status => {
+  // Final deliveries are daemon-owned promises that settle even after the
+  // worker is gone, so their guard must stay independent of worker liveness.
+  it.each(['active', 'closed'])('waits for final delivery on %s sessions even without a worker', status => {
     expect(hasFeedbackMaintenanceSessionWork(session({
       finalOutputDeliveriesInFlight: new Set([Promise.resolve()]),
     }, { status }))).toBe(true);
-    expect(hasFeedbackMaintenanceSessionWork(session({ backgroundTaskCount: 1 }, { status }))).toBe(true);
     expect(hasFeedbackMaintenanceSessionWork(session({
       finalOutputDeliveriesInFlight: new Set(), backgroundTaskCount: 0,
     }, { status }))).toBe(false);
+  });
+
+  it('keeps a live worker busy while a background task runs against an idle screen', () => {
+    expect(hasFeedbackMaintenanceSessionWork(session({
+      worker: { killed: false }, lastScreenStatus: 'idle', backgroundTaskCount: 1,
+    }))).toBe(true);
+  });
+
+  it('treats a stale background-task count after local worker loss as dormant', () => {
+    // Regression: the background leg ignored worker liveness, so a worker that
+    // crashed while background tasks were running wedged maintenance until the
+    // daemon restarted (nothing resets the stale count without a screen_update).
+    expect(hasFeedbackMaintenanceSessionWork(session({
+      backgroundTaskCount: 1, lastScreenStatus: 'idle',
+    }))).toBe(false);
+    expect(hasFeedbackMaintenanceSessionWork(session({
+      worker: { killed: true }, backgroundTaskCount: 1, lastScreenStatus: 'working',
+    }))).toBe(false);
+  });
+
+  it.each(['riff', 'mojo', 'remote-runner'])('keeps a stale background count conservative for workerless remote %s', cliId => {
+    expect(hasFeedbackMaintenanceSessionWork(session({
+      backgroundTaskCount: 1, lastScreenStatus: 'idle',
+    }, { cliId }))).toBe(true);
+    expect(hasFeedbackMaintenanceSessionWork(session({
+      backgroundTaskCount: 1, lastScreenStatus: 'idle',
+    }, { backendType: cliId, cliId: 'some-local-cli' }))).toBe(true);
   });
 
   it.each(['initialStartPending', 'worktreeCreating', 'pendingRepoCommitInFlight'])(
