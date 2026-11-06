@@ -16,11 +16,19 @@ const FOOTER_RE = /^Esc to cancel\b/;
 /** A "Do you want" row that is NOT a complete question — a wrapped question's
  * head row, or dialog body text that happens to start the same way. */
 const QUESTION_HEAD_RE = /^Do you want\b/;
-/** Rows between an unresolved head and the footer: a dialog is compact (head +
- * a few continuations + up to 4 choices + blank), so bound the scan. */
-const UNRESOLVED_HEAD_WINDOW = 10;
+/** Rows between an unresolved head and the footer that still read as one
+ * compact permission dialog. At the 80-col adopt floor a ~340-char question
+ * wraps to 5 rows and the 4-choice variant's option 3 wraps to 2 rows, putting
+ * the footer 11 rows under the head — 13 covers that with a one-row margin.
+ * Deliberately far smaller than the 35-row viewport window in
+ * projectDialogLines: the two bounds serve different questions (is the dialog
+ * on screen vs. is this one compact block), keep them apart on purpose and
+ * change both together if the dialog layout ever grows. */
+const UNRESOLVED_HEAD_WINDOW = 13;
 
-/** Last 35 viewport rows with box-drawing characters blanked and ends trimmed. */
+/** Last 35 viewport rows with box-drawing characters blanked and ends trimmed.
+ * This is the projection's "dialog fully on screen" bound; the gate-only
+ * compact-block bound lives at UNRESOLVED_HEAD_WINDOW. */
 function projectDialogLines(screen: string): string[] {
   return screen.trimEnd().split('\n').slice(-35)
     .map(line => line.replace(/[│┃╭╮╰╯┌┐└┘─━╌]/g, ' ').trim());
@@ -66,7 +74,14 @@ function joinWrappedQuestion(lines: string[]): string[] {
  * evidence as the projection (a "1." + "2." pair and the Esc footer, in a
  * compact block below an unresolved "Do you want" head row). The notification
  * path must NOT use this: a false positive there would send a false alarm,
- * while here it only skips one cache keep-alive. */
+ * while here it only skips one cache keep-alive.
+ *
+ * This window and the projection's 35-row viewport (projectDialogLines) answer
+ * different questions and are intentionally not shared: 35 rows = "is the
+ * dialog fully on screen" (for readable projection), UNRESOLVED_HEAD_WINDOW =
+ * "is this one compact block" (for the gate). When one changes, re-check the
+ * other so the gate cannot stay refused on a dialog the notification can never
+ * send (or vice versa). */
 export function screenHasUnresolvedPermissionQuestion(screen: string): boolean {
   const lines = projectDialogLines(screen);
   for (let i = 0; i < lines.length; i++) {

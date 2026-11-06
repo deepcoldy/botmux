@@ -439,10 +439,39 @@ describe('screenHasUnresolvedPermissionQuestion', () => {
     ].join('\n'))).toBe(false);
   });
 
-  it('does not flag when the footer is beyond the compact-dialog window', () => {
+  it('flags the 4-choice variant at 80 cols: 5 question rows + a wrapped option 3', () => {
+    // At the 80-col adopt floor a ~340-char question wraps to 5 physical rows
+    // and option 3's long text wraps, pushing the footer 11 rows under the
+    // head. This is still one compact dialog, so the gate must refuse.
+    const question = `Do you want to make this edit to ${'a'.repeat(200)}/really-long-directory-path-to-a-component-file-in-a-monorepo/packages/editor/src/components/panel.tsx?`;
+    expect(question.length).toBeGreaterThan(300);
+    const wrapAt78 = (s: string): string[] => {
+      const out: string[] = [];
+      for (let i = 0; i < s.length; i += 78) out.push(` ${s.slice(i, i + 78)}`);
+      return out;
+    };
+    const qRows = wrapAt78(question);
+    expect(qRows.length).toBe(5);
+    const screen = overComposer([
+      ' Edit file',
+      ...qRows,
+      ' ❯ 1. Yes',
+      '   2. No, skip for now',
+      "   3. Yes, and don't ask again for Bash(rm -rf /home/tiger/work/monorepo/packages)",
+      '      editor/src/components',
+      '   4. No, and tell Claude what to do differently (esc)',
+      '',
+      ' Esc to cancel',
+    ]);
+    expect(screenHasUnresolvedPermissionQuestion(screen)).toBe(true);
+  });
+
+  it('does not flag when the footer is far outside any compact dialog block', () => {
+    // 18 rows between the head and the choices: no single dialog spans that,
+    // regardless of the exact compact-block bound.
     expect(screenHasUnresolvedPermissionQuestion(overComposer([
       ' Do you want to run something long',
-      ...Array.from({length: 8}, (_, k) => ` filler line ${k}`),
+      ...Array.from({length: 18}, (_, k) => ` unrelated transcript line ${k}`),
       ' ❯ 1. Yes',
       '   2. No',
       '',

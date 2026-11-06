@@ -149,6 +149,33 @@ describe('promptCacheKeepaliveRefusal', () => {
     expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
   });
 
+  it('refuses the 80-col 4-choice variant with a 5-row wrapped question', () => {
+    // Head -> footer spans 11 rows (5 question rows, a wrapped option 3); the
+    // compact-block gate window must still cover it.
+    const question = `Do you want to make this edit to ${'a'.repeat(200)}/really-long-directory-path-to-a-component-file-in-a-monorepo/packages/editor/src/components/panel.tsx?`;
+    const qRows: string[] = [];
+    for (let i = 0; i < question.length; i += 78) qRows.push(` ${question.slice(i, i + 78)}`);
+    const screen = [
+      RULE,
+      ' Edit file',
+      ...qRows,
+      ' ❯ 1. Yes',
+      '   2. No, skip for now',
+      "   3. Yes, and don't ask again for Bash(rm -rf /home/tiger/work/monorepo/packages)",
+      '      editor/src/components',
+      '   4. No, and tell Claude what to do differently (esc)',
+      '',
+      ' Esc to cancel',
+      RULE,
+      '❯ ',
+      RULE,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n');
+    expect(qRows.length).toBe(5);
+    expect(READY.test(screen)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+  });
+
   it('refuses an AskUserQuestion picker (prompt not inside an input box)', () => {
     expect(READY.test(ASK_USER_QUESTION)).toBe(true);
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: ASK_USER_QUESTION })).toBe('prompt_not_framed');
