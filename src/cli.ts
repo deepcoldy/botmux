@@ -88,7 +88,7 @@ import {
   markWatchdogStopped,
   watchdogStopRequested,
 } from './autostart.js';
-import { tmuxEnv } from './setup/ensure-tmux.js';
+import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
@@ -5528,9 +5528,16 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           }
           cleanup();
           applyTmuxWindowSizeLargest(target.sessionName, target.socketName);
-          spawnSync('tmux', [...tmuxSocketArgs(target.socketName), 'attach-session', '-t', `=${target.sessionName}`], {
+          // attach must never BOOT a server: the target was just selected as
+          // existing. On tmux >= 3.2 pass -N so a busy/refusing listener cannot
+          // make the attach client fork a competing server. Older clients have
+          // no -N; attach-session to a missing server errors there rather than
+          // silently creating a managed session.
+          const cliEnv = tmuxEnv();
+          const attachNoFork = tmuxVersionAtLeast(clientTmuxVersionForEnv(cliEnv), 3, 2) ? ['-N'] : [];
+          spawnSync('tmux', [...tmuxSocketArgs(target.socketName), ...attachNoFork, 'attach-session', '-t', `=${target.sessionName}`], {
             stdio: 'inherit',
-            env: tmuxEnv(),
+            env: cliEnv,
           });
         }
         resolve();

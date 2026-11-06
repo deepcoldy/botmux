@@ -36,6 +36,23 @@ vi.mock('node:child_process', () => {
   };
 });
 
+// This file mocks node:child_process, so the anti-fork gate's darwin lsof
+// census would get null (spawnSync mocked) and fail closed for the full 8 s
+// budget on every spawn (Linux reads /proc and is unaffected). The gate is
+// unit-tested separately; here default it to a pass-through, and override it
+// per-case (mockedLeadingArgs) for the two wiring tests below. vi.hoisted
+// keeps the mock fn alive when the factory is hoisted above the import.
+const { mockedLeadingArgs } = vi.hoisted(() => ({
+  mockedLeadingArgs: vi.fn((): string[] => []),
+}));
+vi.mock('../src/adapters/backend/tmux-anti-fork.js', () => ({
+  createTmuxBootGate: vi.fn(() => ({ leadingArgs: () => mockedLeadingArgs() })),
+  TmuxCompetingServerBlockedError: class TmuxCompetingServerBlockedError extends Error {
+    code = 'ETIMEDOUT';
+    constructor(label: string) { super(`blocked ${label}`); this.name = 'TmuxCompetingServerBlockedError'; }
+  },
+}));
+
 vi.mock('node:fs', () => {
   const actual: any = require('node:fs');
   return {
@@ -65,6 +82,7 @@ vi.mock('node:fs', () => {
 import { execSync, execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { unlinkSync, createReadStream, openSync, closeSync, writeSync } from 'node:fs';
+import * as nodeFs from 'node:fs';
 import {
   TmuxPipeBackend,
   normaliseCaptureLineEndings,
@@ -3084,5 +3102,39 @@ describe('reattach remain-on-exit reapply vs tmux version', () => {
     expect(vCalls).toBe(2);
     expect(roeReapplyCalls()).toEqual([expect.stringContaining('remain-on-exit on')]);
     expect(roeReapplyCalls().some(c => c.includes('failed'))).toBe(false);
+  });
+});
+
+describe('TmuxPipeBackend anti-fork gate wiring', () => {
+  const creatingBackend = () => new TmuxPipeBackend('bmx-gate01', { createSession: true, ownsSession: true });
+
+  it('prepends -N to new-session argv when the gate returns the never-start flag', () => {
+    mockedLeadingArgs.mockReturnValueOnce(['-N']);
+    const be = creatingBackend();
+    expect(() => be.spawn('/bin/echo', [], spawnOpts())).not.toThrow();
+    expect(newSessionArgs().slice(0, 3)).toEqual(['-N', 'new-session', '-d']);
+  });
+
+  it('omits -N when the gate allows a normal (cold/attach) spawn', () => {
+    mockedLeadingArgs.mockReturnValueOnce([]);
+    const be = creatingBackend();
+    expect(() => be.spawn('/bin/echo', [], spawnOpts())).not.toThrow();
+    expect(newSessionArgs().slice(0, 2)).toEqual(['new-session', '-d']);
+  });
+
+  it('a gate block surfaces the startup failure and discards the secret-bearing launch file', () => {
+    // launchFile.discard() removes the file via rmSync (not unlinkSync).
+    const rmSpy = vi.spyOn(nodeFs, 'rmSync').mockImplementation(() => undefined);
+    mockedLeadingArgs.mockImplementationOnce(() => {
+      throw Object.assign(new Error('blocked -L botmux'), { code: 'ETIMEDOUT' });
+    });
+    try {
+      const be = creatingBackend();
+      expect(() => be.spawn('/bin/echo', [], spawnOpts())).toThrow(/创建会话失败/);
+      // The pane launch file written before the gate must be removed on the way out.
+      expect(rmSpy).toHaveBeenCalled();
+    } finally {
+      rmSpy.mockRestore();
+    }
   });
 });
