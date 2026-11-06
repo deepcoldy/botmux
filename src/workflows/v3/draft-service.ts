@@ -103,6 +103,7 @@ import {
   judgeV3BotEligibility,
   v3BotExecutorTargets,
   v3TargetPlacementProblems,
+  v3TargetsHaveFlowRules,
   type V3BotEligibilityProbe,
   type V3BotEligibilityProblem,
   type V3NodeExecutorTarget,
@@ -3731,7 +3732,7 @@ export class WorkflowDraftService {
     targets: readonly V3NodeExecutorTarget[],
     binding: RunChatBinding,
   ): string[] {
-    if (!targets.some((target) => target.placement === 'main' && !target.loop)) return [];
+    if (!v3TargetsHaveFlowRules(targets)) return [];
     const unavailable: V3MainTopicAvailability = { available: false, why: '无法确认主会话是不是话题里的会话' };
     const mainTopic = this.deps.launch?.mainTopicAvailability?.(binding) ?? unavailable;
     return v3TargetPlacementProblems({

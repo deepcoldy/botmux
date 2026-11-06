@@ -237,6 +237,11 @@ interface LoadedEditableRun {
   initiatorOpenId?: string;
 }
 
+/** The run's frozen executor, as {@link planV3DagRevision} takes it. */
+function revisionExecutor(run: LoadedEditableRun): { nodeExecutor?: 'bot' } {
+  return 'nodeExecutor' in run.envelope && run.envelope.nodeExecutor === 'bot' ? { nodeExecutor: 'bot' } : {};
+}
+
 function runDirFor(baseDir: string, runId: string): string {
   if (!isValidRunId(runId)) throw new Error(`v3: invalid runId "${runId}"`);
   return join(baseDir, runId);
@@ -560,6 +565,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
       knownBots,
       // The initiator's own edit lifts a spent rerun budget itself (M2 乙).
       liftSpentRerunBudget: turn === 'initiator',
+      ...revisionExecutor(run),
     });
     if (!planned.ok) {
       return { kind: 'invalid', problems: planned.problems, ...(planned.rerunBudget ? { rerunBudget: planned.rerunBudget } : {}) };
@@ -846,6 +852,7 @@ function carryPendingProposal(input: {
     snap: before.snap,
     patch: pinned.patch,
     knownBots: before.knownBots,
+    ...revisionExecutor(run),
   });
   if (!shown.ok || v3RevisionDigest(dagFileBytes(shown.plan.dag)) !== pending.sha256) return { ok: false, cause: 'notApplicable' };
   const ours = v3RevisionInvolvedNodes(direct.plan);
@@ -857,6 +864,7 @@ function carryPendingProposal(input: {
     snap: materialize([...direct.events]),
     patch: pinned.patch,
     knownBots: direct.knownBots,
+    ...revisionExecutor(run),
   });
   if (!rebased.ok) return { ok: false, cause: 'notApplicable' };
   const reasons = v3ConfirmReasonsForTurn(proposalTurnClass(pending.by, run.initiatorOpenId), rebased.plan.reasons);
@@ -1070,6 +1078,7 @@ function replanProposal(
     snap,
     patch,
     knownBots,
+    ...revisionExecutor(run),
   });
   if (!planned.ok) return { ok: false, detail: planned.problems.join('; ') };
   const dagBytes = dagFileBytes(planned.plan.dag);

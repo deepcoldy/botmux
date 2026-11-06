@@ -50,7 +50,7 @@ import { latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
 import { materialize } from './state.js';
 import { withJournalMutationSync } from './journal.js';
 import { affectedNodesFrom } from './revisit-plan.js';
-import { v3NodePlacement, v3PlacementProblems } from './placement.js';
+import { v3CheckpointProblems, v3CheckpointsWithoutDependants, v3NodePlacement, v3PlacementProblems } from './placement.js';
 import type { V3RunSnapshot } from './state.js';
 
 // ─── Files ────────────────────────────────────────────────────────────────
@@ -757,6 +757,9 @@ export interface PlanV3DagRevisionInput {
   liftSpentRerunBudget?: boolean;
   /** Injected for tests; defaults to reading the done node's manifest. */
   readProducts?: (nodeId: string) => V3DoneNodeProducts | undefined;
+  /** The run's frozen executor. Checkpoints only take effect when goal nodes
+   *  run on bots, so only then is a checkpoint nothing depends on refused. */
+  nodeExecutor?: 'bot';
 }
 
 /** A rerun refused because the revisit budget is spent: the initiator can
@@ -1236,6 +1239,21 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
     },
   });
   if (placementProblems.length > 0) return { ok: false, problems: placementProblems.map((problem) => problem.message) };
+  // §13.6: an edit may not leave a checkpoint that nothing depends on (newly
+  // marked, its last dependant removed or rewired away, or one the flow
+  // already had). Only one that may still complete counts: a checkpoint that
+  // is done (and not redone by this edit's reruns, itself or downstream of
+  // one), skipped or cancelled has nothing left to wake anybody about — the
+  // main bot reviewing it may well drop the rest of the flow.
+  if (input.nodeExecutor === 'bot') {
+    const redone = new Set([...rerun].flatMap((nodeId) => affectedNodesFrom(next, nodeId)));
+    const settled = (nodeId: string): boolean => {
+      const status = added.has(nodeId) ? undefined : snap.nodes.get(nodeId)?.status;
+      return (status === 'done' && !redone.has(nodeId)) || status === 'skipped' || status === 'cancelled';
+    };
+    const sinks = v3CheckpointsWithoutDependants(next).filter((nodeId) => !settled(nodeId));
+    if (sinks.length > 0) return { ok: false, problems: v3CheckpointProblems(sinks) };
+  }
 
   // Updates that turned out to be no-ops do not count as changes.
   const changed = [...updated].filter((nodeId) => {

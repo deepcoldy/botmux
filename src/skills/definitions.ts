@@ -1801,7 +1801,7 @@ run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做�
 1. \`botmux workflow status <runId> --json\` 读当前版本（\`revision\`）、各节点状态、尝试次数和待确认的修改。
 2. 写 patch 文件（一组操作，整体生效或整体拒绝）：\`{"ops":[...],"note":"为什么改"}\`。操作：
    - \`{"op":"addNode","node":{...完整节点，同 dag.json}}\` · \`{"op":"removeNode","nodeId":"x"}\`
-   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改；\`"checkpoint":true\` 标检查点：节点完成后依赖它的节点先暂停、唤醒你看结果；不作废正在跑的执行）
+   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改；\`"checkpoint":true\` 标检查点：节点完成后依赖它的节点先暂停、唤醒你看结果；不作废正在跑的执行；检查点必须有节点依赖它，没有下游的检查点会被拒绝）
    - \`{"op":"setDepends","nodeId":"x","depends":[...],"inputs":[...]}\` · \`{"op":"reassign","nodeId":"x","bot":"<larkAppId>"}\` · \`{"op":"rerunNode","nodeId":"x"}\`
 3. \`botmux workflow edit <runId> --patch-file <文件> --base <revision> [--reason "<为什么改>"]\`。版本冲突就重新 status 再改，不要硬重试。
 

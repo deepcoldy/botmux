@@ -14,6 +14,11 @@
  *    root, or its main session is the chat-wide session of a normal group
  *    (P4). Private chats never reach bot execution at all.
  *
+ * The same three entry points also refuse a checkpoint nothing depends on
+ * (design §13.6, {@link v3CheckpointsWithoutDependants}): the main bot is
+ * woken only while the run still goes on, so a checkpoint that is the last
+ * node to finish would end the run without anybody looking at it.
+ *
  * Pure: the caller resolves who executes each node and whether the run has a
  * main topic. Part of workflow-core (no IO, no daemon imports).
  */
@@ -40,6 +45,30 @@ export interface V3PlacementProblem {
   /** The executing bot the conflict is about (rules 1 and 2). */
   larkAppId?: string;
   message: string;
+}
+
+/** Why a checkpoint without dependants is refused, and what to do instead. */
+const V3_CHECKPOINT_WITHOUT_DEPENDANTS = '检查点后面没有节点，主 Bot 不会被叫来；去掉这个标记，或在后面加一个汇总节点';
+
+/**
+ * Top-level goal nodes marked `checkpoint: true` that no top-level node
+ * depends on. Such a checkpoint holds nothing: when it is the last node to
+ * finish the run ends at once, and the main bot is only woken while a run is
+ * still running or blocked — the mark would silently do nothing. Checked
+ * after the Architect, at approval and on runtime edits of bot-executed runs
+ * only (the mark has no effect on temporary workers), never when an existing
+ * run, journal or saved template is read.
+ */
+export function v3CheckpointsWithoutDependants(dag: Pick<V3Dag, 'nodes'>): string[] {
+  const dependedOn = new Set(dag.nodes.flatMap((node) => node.depends.map((dep) => dep.from)));
+  return dag.nodes
+    .filter((node) => isGoalNode(node) && node.checkpoint === true && !dependedOn.has(node.id))
+    .map((node) => node.id);
+}
+
+/** One refusal line per checkpoint without dependants. */
+export function v3CheckpointProblems(nodeIds: Iterable<string>): string[] {
+  return [...nodeIds].map((nodeId) => `节点 ${nodeId}：${V3_CHECKPOINT_WITHOUT_DEPENDANTS}`);
 }
 
 /** Does `node` start only after EVERY node it depends on has finished?

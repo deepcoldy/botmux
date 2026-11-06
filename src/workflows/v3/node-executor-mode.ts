@@ -15,7 +15,15 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
-import { v3OrderedAncestorSets, v3OrderingBreak, v3ReachableAncestorSets, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
+import {
+  v3CheckpointProblems,
+  v3CheckpointsWithoutDependants,
+  v3OrderedAncestorSets,
+  v3OrderingBreak,
+  v3ReachableAncestorSets,
+  v3PlacementProblems,
+  type V3MainTopicAvailability,
+} from './placement.js';
 import type { V3HandoffIdentityRecord, V3HandoffIdentityTool, V3HandoffIdentityUnavailableReason } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
@@ -109,6 +117,9 @@ export interface V3NodeExecutorTarget {
   /** With `placement`: the node's transitive `depends` ancestors (top-level
    *  ids), so the §5.2 hard rules can be checked from the targets alone. */
   ancestors?: string[];
+  /** A top-level checkpoint nothing depends on (refused at approval, see
+   *  placement.ts {@link v3CheckpointsWithoutDependants}). */
+  checkpointWithoutDependants?: true;
 }
 
 function directoryOutputsOf(outputs: Record<string, { kind: string }> | undefined): string[] | undefined {
@@ -143,9 +154,14 @@ export function v3BotExecutorTargets(
   // linked by `depends` yet unordered); computed once per DAG, not per pair.
   const executorOfMain = new Map(main.map((node) => [node.id, isGoalNode(node) ? targetOf(node.bot, node.id) : undefined]));
   let reach: Map<string, Set<string>> | undefined;
+  const checkpointSinks = new Set(v3CheckpointsWithoutDependants(dag));
   for (const node of dag.nodes) {
     if (isGoalNode(node)) {
-      const target = withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs);
+      const target: V3NodeExecutorTarget = withOutputs({
+        nodeId: node.id,
+        larkAppId: targetOf(node.bot, node.id),
+        ...(checkpointSinks.has(node.id) ? { checkpointWithoutDependants: true as const } : {}),
+      }, node.outputs);
       if (node.placement !== 'main') {
         out.push(target);
         continue;
@@ -189,10 +205,13 @@ export function v3TargetPlacementProblems(input: {
   mainTopic: V3MainTopicAvailability;
   nameOf?: (larkAppId: string) => string;
 }): string[] {
+  const checkpoints = v3CheckpointProblems(input.targets
+    .filter((target) => target.checkpointWithoutDependants && !target.loop)
+    .map((target) => target.nodeId));
   const main = input.targets.filter((target) => target.placement === 'main' && !target.loop);
-  if (main.length === 0) return [];
+  if (main.length === 0) return checkpoints;
   const executor = new Map(main.map((target) => [target.nodeId, target.larkAppId]));
-  return v3PlacementProblems({
+  return [...checkpoints, ...v3PlacementProblems({
     dag: {
       runId: 'placement-check',
       nodes: main.map((target) => ({
@@ -217,15 +236,21 @@ export function v3TargetPlacementProblems(input: {
     },
     mainTopic: input.mainTopic,
     ...(input.nameOf ? { nameOf: input.nameOf } : {}),
-  }).map((problem) => problem.message);
+  }).map((problem) => problem.message)];
+}
+
+/** Whether {@link v3TargetPlacementProblems} has anything to check (callers
+ *  skip resolving the main topic otherwise). */
+export function v3TargetsHaveFlowRules(targets: readonly V3NodeExecutorTarget[]): boolean {
+  return targets.some((target) => !target.loop && (target.placement === 'main' || target.checkpointWithoutDependants));
 }
 
 /** The refusal text when placements break the §5.2 hard rules. */
 export function formatV3PlacementRefusal(problems: readonly string[]): string {
   return [
-    '节点落点不满足硬规则，已拒绝批准：',
+    '流程不满足硬规则，已拒绝批准：',
     ...problems.map((problem) => `- ${problem}`),
-    '把相关节点改成节点话题或调整依赖后重试（即兴 run 可用 revise-dag 让 Architect 重排）。',
+    '按上面的说明改节点落点、依赖或检查点后重试（即兴 run 可用 revise-dag 让 Architect 重排）。',
   ].join('\n');
 }
 
@@ -553,8 +578,9 @@ export async function resolveV3NodeExecutor(input: {
   }
   const binding = input.binding!;
   const targets = input.targetsFor(binding);
-  // §5.2 hard rules first: pure, and a refusal needs no live probe.
-  if (targets.some((target) => target.placement === 'main')) {
+  // §5.2 hard rules (and checkpoints without dependants) first: pure, and a
+  // refusal needs no live probe.
+  if (v3TargetsHaveFlowRules(targets)) {
     const placement = v3TargetPlacementProblems({
       targets,
       orchestratorAppId: binding.larkAppId,
