@@ -476,7 +476,7 @@ import {
   readProcessStartTime,
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
-import { delay } from './utils/timing.js';
+import { delay, scaleMs } from './utils/timing.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
@@ -492,7 +492,7 @@ import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
-import { detectCliStartupBlocker, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
+import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -625,9 +625,12 @@ import {
 } from './utils/pty-input-policy.js';
 import {
   StuckDetector,
-  matchHookReviewScreen,
+  classifyStuckPage,
   shouldHoldInputForHookReview,
+  shouldHoldInputForStuckPage,
+  type StuckPageType,
 } from './utils/stuck-detector.js';
+import { isAllowedStuckKeySequence, redactStuckPageTail, stuckScreenTail } from './core/stuck-page-catalog.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
@@ -658,7 +661,7 @@ import {
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
 import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
-import { decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, shouldWaitThroughBusyTurn } from './services/submit-failure-diagnosis.js';
+import { decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, diagnoseSubmitFailure, shouldWaitThroughBusyTurn, type SubmitFailureDiagnosisReason } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -3569,6 +3572,34 @@ function probeStartupBlocker(source: string): CliStartupBlocker | null {
   return blocker;
 }
 
+/** First-prompt timeout veto for the codex-family blocking pages
+ *  (classifyStuckPage: hook review startup menu / browser / detail, TRAE
+ *  legacy-data migration picker). Without it the hard cap clears
+ *  awaitingFirstPrompt and force-flushes the queued prompt; on these pages the
+ *  paste is consumed as keystrokes and its Enter drives the menu (traex L0:
+ *  Enter = "Review hooks"; migration picker: `n`/`4`/Enter change or persist
+ *  the selection), the submit is never confirmed and the generation ends up
+ *  quarantined. Read from the authoritative backend viewport (same scope as
+ *  probeStartupBlocker); when a page is on screen the queued input stays held
+ *  by the hook-review hold, which raises the stuck card, and the caller keeps
+ *  re-checking on its bounded schedule. Returns whether such a page is on
+ *  screen. */
+function holdFirstPromptForStuckPage(source: string): boolean {
+  const be = backend;
+  if (!be || !lastInitConfig || !adapterRendersCodexFamilyStuckPages()) return false;
+  if (isRemoteBackendType(lastInitConfig.backendType)) return false;
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  let screen = '';
+  try { screen = captureBackendScreen(be); } catch { return false; }
+  const pageType = screen ? classifyStuckPage(screen) : undefined;
+  if (!pageType) return false;
+  const wasHeld = hookReviewInputHold;
+  refreshHookReviewInputHold(screen);
+  if (!wasHeld) log(`${source}: ${cliName()} is showing ${pageType}; keeping queued input off it`);
+  if (hookReviewInputHold && hasPendingInputForFlush()) notifyHookReviewInputHold(screen);
+  return true;
+}
+
 /** A startup blocker is on screen right now in this CLI generation. */
 function startupBlockerVisibleNow(): boolean {
   return startupBlocker?.generation === cliSpawnGeneration && startupBlocker.visible;
@@ -3762,31 +3793,333 @@ let postSessionStartPromptEvidenceInFlight = false;
  * “Trust all” or get consumed as menu navigation. */
 let hookReviewInputHold = false;
 let hookReviewInputHoldNotified = false;
+/** Last snapshot that set or kept the hold — the page the held input is
+ *  waiting behind, classified again when the hold is reported. */
+let hookReviewInputHoldSnapshot = '';
 
-function refreshHookReviewInputHold(snapshot: string): void {
+/** The adapter declares the codex_core blocking pages (hook review flow and
+ *  the TRAE legacy-data migration picker) that classifyStuckPage recognises,
+ *  and the stuck card that offers their safe keys. */
+function adapterRendersCodexFamilyStuckPages(): boolean {
+  return cliAdapter?.stuckPageFamily === 'codex-family';
+}
+
+/** Whether `snapshot` shows a page the hold applies to. Codex-family
+ *  adapters hold on every recognised blocking page (a pasted message is
+ *  consumed as keystrokes by the migration picker as well); every other CLI
+ *  keeps the hook-review-only hold it always had. */
+function hookReviewHoldBlocks(snapshot: string): boolean {
+  return adapterRendersCodexFamilyStuckPages()
+    ? shouldHoldInputForStuckPage(snapshot)
+    : shouldHoldInputForHookReview(snapshot);
+}
+
+/** Pending bounded re-capture that decides whether a codex-family hold may be
+ *  released (see refreshHookReviewInputHold). */
+let hookReviewReleaseProbeTimer: ReturnType<typeof setTimeout> | null = null;
+/** When the current run of release probes started (bounds the settle wait). */
+let hookReviewReleaseProbeSinceMs: number | null = null;
+/** A release needs the PTY quiet this long: a TUI redrawing its page clears
+ *  and repaints rows, and a capture taken mid-redraw shows neither the page
+ *  nor the composer. */
+const HOOK_REVIEW_RELEASE_SETTLE_MS = 150;
+/** A screen that keeps changing without showing a blocking page is not one. */
+const HOOK_REVIEW_RELEASE_SETTLE_CAP_MS = 2_000;
+/** Past the cap with no usable capture, keep re-checking at this cadence. */
+const HOOK_REVIEW_RELEASE_STALLED_PROBE_MS = 5_000;
+
+/** Screen the hook-review hold is evaluated on right before input is
+ *  admitted. Codex-family adapters read the authoritative backend viewport:
+ *  `lastAnalyzerSnapshot` is only refreshed by the screen-update tick and can
+ *  still show a page the CLI already left, and the PTY renderer lags the
+ *  stream. Every other CLI (and ZMX history / remote backends) keeps the
+ *  rendered snapshot it always used. */
+function hookReviewAdmissionScreen(): string {
+  return hookReviewAdmissionCapture().screen;
+}
+
+/** hookReviewAdmissionScreen, plus whether a fresh backend capture was due
+ *  but unusable (threw or came back blank) so `screen` fell back to the
+ *  cached screens — which can still show a page the CLI already left, or the
+ *  composer over a page that is still up. */
+function hookReviewAdmissionCapture(): { screen: string; freshCaptureFailed: boolean } {
+  const be = backend;
+  let freshCaptureFailed = false;
+  // A fresh (synchronous) capture is only worth its cost when a page is in
+  // play: a hold to confirm/release, or a cached screen that shows a page
+  // (possibly stale). The ordinary composer path — nothing held, no page on
+  // either cached screen — decides on the cached screens as before, with no
+  // capture per flush.
+  const cachedShowsPage = (): boolean => {
+    if (hookReviewHoldBlocks(lastAnalyzerSnapshot)) return true;
+    try { return hookReviewHoldBlocks(renderer?.rawSnapshot() ?? ''); } catch { return false; }
+  };
+  if (be && adapterRendersCodexFamilyStuckPages() && (hookReviewInputHold || cachedShowsPage())
+    && backendScreenEvidenceIsAuthoritativeForMutation()
+    && !(lastInitConfig && isRemoteBackendType(lastInitConfig.backendType))) {
+    try {
+      const screen = captureBackendScreen(be);
+      if (screen.trim()) return { screen, freshCaptureFailed: false };
+    } catch { /* fall back to the cached screens */ }
+    freshCaptureFailed = true;
+  }
+  if (adapterRendersCodexFamilyStuckPages()) {
+    // No fresh capture: the tick cache can lag the renderer and vice versa —
+    // a page on either one holds.
+    let rendered = '';
+    try { rendered = renderer?.rawSnapshot() ?? ''; } catch { rendered = ''; }
+    const blocking = [lastAnalyzerSnapshot, rendered].find(screen => screen.trim() && hookReviewHoldBlocks(screen));
+    if (blocking) return { screen: blocking, freshCaptureFailed };
+  }
+  return { screen: lastAnalyzerSnapshot || renderer?.rawSnapshot() || '', freshCaptureFailed };
+}
+
+/** flushPending's last screen check before a literal write: re-evaluate the
+ *  hold on the admission screen and, while it holds, make sure the held
+ *  input's card / notice is out (once per page). A hold that only waits for
+ *  its release probe — the admission screen no longer shows the page — keeps
+ *  the input parked silently: the page is (probably) gone, so a card or a
+ *  "finish the hook review" notice for it would be spurious. */
+function hookReviewHoldsQueuedWrite(): boolean {
+  const screen = hookReviewAdmissionScreen();
+  refreshHookReviewInputHold(screen);
+  if (!hookReviewInputHold) return false;
+  if (hookReviewAdmissionShowsPage(screen)) notifyHookReviewInputHold(screen);
+  return true;
+}
+
+/** The admission screen itself shows the page the hold is for (as opposed to
+ *  a hold kept up only until the release probe settles). */
+function hookReviewAdmissionShowsPage(screen: string): boolean {
+  return !!screen.trim() && hookReviewHoldBlocks(screen);
+}
+
+function cancelHookReviewReleaseProbe(): void {
+  if (hookReviewReleaseProbeTimer) clearTimeout(hookReviewReleaseProbeTimer);
+  hookReviewReleaseProbeTimer = null;
+  hookReviewReleaseProbeSinceMs = null;
+}
+
+/** A codex-family hold saw a frame without its page. That frame may be a PTY
+ *  chunk spliced onto a lagging render, or a page mid-redraw — never proof the
+ *  page is gone. Re-capture the screen once the PTY has settled and release
+ *  only on that capture. One probe at a time, so a burst of redraw chunks
+ *  costs at most one capture per settle window. */
+function scheduleHookReviewReleaseProbe(delayMs: number = HOOK_REVIEW_RELEASE_SETTLE_MS): void {
+  if (hookReviewReleaseProbeTimer) return;
+  const target = backend;
+  const lifetime = cliLifetimeNonce;
+  hookReviewReleaseProbeSinceMs ??= Date.now();
+  hookReviewReleaseProbeTimer = setTimeout(() => {
+    hookReviewReleaseProbeTimer = null;
+    if (!hookReviewInputHold || backend !== target || cliLifetimeNonce !== lifetime) {
+      hookReviewReleaseProbeSinceMs = null;
+      return;
+    }
+    const capped = Date.now() - (hookReviewReleaseProbeSinceMs ?? Date.now()) >= HOOK_REVIEW_RELEASE_SETTLE_CAP_MS;
+    const { screen, freshCaptureFailed } = hookReviewAdmissionCapture();
+    if (freshCaptureFailed || !screen.trim()) {
+      // No usable screen: the fresh capture threw / came back blank (the
+      // cached fallback may show a page the CLI already left, or the composer
+      // over a page still up), or there is nothing to read at all. Neither
+      // keeps nor releases the hold. Keep probing — at the settle cadence
+      // until the cap, then slower — so a capture that recovers still
+      // releases the held input instead of leaving it parked forever.
+      scheduleHookReviewReleaseProbe(capped ? HOOK_REVIEW_RELEASE_STALLED_PROBE_MS : HOOK_REVIEW_RELEASE_SETTLE_MS);
+      return;
+    }
+    if (hookReviewHoldBlocks(screen)) {
+      // Still on a blocking page: keep holding; a later frame re-arms. Input
+      // that arrived on a mid-redraw admission frame was held without its
+      // card (hookReviewHoldsQueuedWrite only notifies on a page) — raise it
+      // now that the page is confirmed, or it would wait silently.
+      hookReviewReleaseProbeSinceMs = null;
+      refreshHookReviewInputHold(screen, { settled: true });
+      if (hookReviewInputHold && !hookReviewInputHoldNotified && hasPendingInputForFlush()) {
+        notifyHookReviewInputHold(screen);
+      }
+      return;
+    }
+    if (!capped && Date.now() - lastPtyActivityAtMs < HOOK_REVIEW_RELEASE_SETTLE_MS) {
+      scheduleHookReviewReleaseProbe();
+      return;
+    }
+    hookReviewReleaseProbeSinceMs = null;
+    refreshHookReviewInputHold(screen, { settled: true });
+  }, delayMs);
+  hookReviewReleaseProbeTimer.unref?.();
+}
+
+/** Update the hook-review input hold from `snapshot`.
+ *
+ *  Any frame showing a blocking page sets the hold. Releasing differs:
+ *  non-codex-family CLIs release on any frame without the page (unchanged
+ *  behaviour). A codex-family hold is released only by a settled screen —
+ *  `settled: true` from a post-key / probe capture — because the per-chunk and
+ *  admission callers see transient frames; for those a bounded re-capture is
+ *  scheduled instead. The stuck card is therefore raised once per page and
+ *  only re-armed (hookReviewInputHoldNotified) by a confirmed release or by a
+ *  delivered stuck-card key (reevaluateHoldAfterStuckKey). */
+function refreshHookReviewInputHold(snapshot: string, opts: { settled?: boolean } = {}): void {
   if (!snapshot.trim()) return;
-  const blocked = shouldHoldInputForHookReview(snapshot);
+  const blocked = hookReviewHoldBlocks(snapshot);
+  if (blocked) hookReviewInputHoldSnapshot = snapshot;
   if (blocked === hookReviewInputHold) return;
+  if (!blocked && adapterRendersCodexFamilyStuckPages() && !opts.settled) {
+    scheduleHookReviewReleaseProbe();
+    return;
+  }
   hookReviewInputHold = blocked;
   if (blocked) {
     log('Hook review menu visible — holding queued input until the menu is resolved');
     return;
   }
+  cancelHookReviewReleaseProbe();
   hookReviewInputHoldNotified = false;
+  hookReviewInputHoldSnapshot = '';
   log('Hook review menu cleared — releasing queued input');
   if (hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
 }
 
-function notifyHookReviewInputHold(): void {
+/** Turn identity of the oldest held input: the card raised for a hold belongs
+ *  to the message that is waiting, not to whatever turn ran last. */
+function heldInputTurnIdentity(): { turnId: string | undefined; dispatchAttempt: number | undefined } {
+  const head = pendingMessages[0] ?? pendingAdoptMessages[0];
+  if (head?.turnId) return { turnId: head.turnId, dispatchAttempt: head.dispatchAttempt };
+  const raw = pendingRawInputs[0];
+  if (raw?.turnId) return { turnId: raw.turnId, dispatchAttempt: undefined };
+  return { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
+}
+
+/** Which recognised blocking page the held input waits behind, read from an
+ *  authoritative screen only (a ZMX history render can show a stale page just
+ *  above the real viewport — it may hold input, never drive a key card).
+ *  `freshScreen` is a backend capture the caller just took; otherwise the
+ *  rendered screen, then the snapshot that last set the hold (a PTY chunk
+ *  appended to the render). */
+function heldStuckPage(freshScreen?: string): { pageType: StuckPageType; snapshot: string } | undefined {
+  if (!adapterRendersCodexFamilyStuckPages() || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
+  let rendered = '';
+  if (!freshScreen) {
+    try { rendered = lastAnalyzerSnapshot || renderer?.rawSnapshot() || ''; } catch { rendered = ''; }
+  }
+  const candidates = freshScreen ? [freshScreen] : [rendered, hookReviewInputHoldSnapshot];
+  for (const snapshot of candidates) {
+    const pageType = snapshot ? classifyStuckPage(snapshot) : undefined;
+    if (pageType) return { pageType, snapshot };
+  }
+  return undefined;
+}
+
+function notifyHookReviewInputHold(freshScreen?: string): void {
   if (hookReviewInputHoldNotified) return;
   hookReviewInputHoldNotified = true;
+  const held = heldStuckPage(freshScreen);
+  if (held) {
+    const { turnId, dispatchAttempt } = heldInputTurnIdentity();
+    log(`Holding queued input behind ${held.pageType} — raising stuck card`);
+    send({
+      type: 'stuck_warning',
+      reason: 'input_held',
+      elapsedMs: 0,
+      snapshot: held.snapshot.slice(-3000),
+      screenTail: shareableStuckScreenTail(held.snapshot),
+      matchedPattern: held.pageType,
+      turnId,
+      dispatchAttempt,
+      cliLifetime: cliLifetimeNonce,
+    });
+    return;
+  }
   send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
     message:
-      '⚠️ Codex 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，'
+      `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
       + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。',
   });
+}
+
+/** A stuck-card key landed: the page it left may have been replaced by the
+ *  next blocking page (traex L1 Esc → startup menu). Re-evaluate the hold on
+ *  the post-key capture — releasing held input promptly when the composer is
+ *  back, or raising a fresh card for the next page while input stays held. */
+function reevaluateHoldAfterStuckKey(freshScreen: string | undefined): void {
+  hookReviewInputHoldNotified = false;
+  if (!freshScreen) {
+    // Nothing observed after the key: the held input's card is re-raised
+    // from what the hold last saw.
+    if (hookReviewInputHold && hasPendingInputForFlush()) notifyHookReviewInputHold();
+    return;
+  }
+  if (hookReviewAdmissionShowsPage(freshScreen)) {
+    // A page (the same one, or the next) is up after the settle: keep the
+    // hold on it and raise its card for the held input.
+    refreshHookReviewInputHold(freshScreen, { settled: true });
+    if (hookReviewInputHold && hasPendingInputForFlush()) notifyHookReviewInputHold(freshScreen);
+    return;
+  }
+  // No page on the post-key capture. It is one frame taken a fixed time after
+  // the key — the TUI may still be repainting — so it goes through the same
+  // release path as any other frame without the page (the bounded probe
+  // releases once the PTY is quiet). No card: the page is (probably) gone.
+  refreshHookReviewInputHold(freshScreen);
+}
+
+/** Post-key follow-up for a delivered stuck-card key. Besides the hold
+ *  re-evaluation: when the key led to another recognised blocking page and no
+ *  held input raised its card (the turn_stalled card — e.g. traex L1 Esc →
+ *  startup menu), re-arm the StuckDetector so that page gets its own card
+ *  after the usual quiet window instead of leaving the user without one. */
+function afterStuckKeyObserved(after: { screen?: string; pageType?: string }): void {
+  reevaluateHoldAfterStuckKey(after.screen);
+  if (after.pageType && !(hookReviewInputHold && hasPendingInputForFlush())) stuckDetector?.arm();
+}
+
+/** A stuck-card click expired because the screen no longer shows the card's
+ *  page (the owner answered it in the web terminal, or it moved on to the next
+ *  page). `screen` is the guard's fresh capture. On another recognised page,
+ *  raise the card for it (the held input's card, or a re-armed StuckDetector);
+ *  otherwise only let the hold re-check it — one capture is not a settled
+ *  screen, so a release still goes through the bounded probe. */
+function afterStuckKeyExpired(screen: string | undefined): void {
+  if (!screen || !adapterRendersCodexFamilyStuckPages()) return;
+  const pageType = classifyStuckPage(screen);
+  if (!pageType) {
+    refreshHookReviewInputHold(screen);
+    return;
+  }
+  hookReviewInputHoldNotified = false;
+  refreshHookReviewInputHold(screen);
+  if (hookReviewInputHold && hasPendingInputForFlush()) notifyHookReviewInputHold(screen);
+  else stuckDetector?.arm();
+}
+
+/** A login / API-key page can show a device code, a sign-in link or a key
+ *  prompt: its text never leaves the terminal as a screen tail. Deliberately
+ *  broader than the startup-blocker hold (screenMayShowCredential: any
+ *  sign-in / key wording or credential-shaped value), plus whatever the
+ *  submit diagnosis reads as a login gate. Outbound only — it never changes
+ *  whether input is held. */
+function screenShowsCredentialPage(screen: string): boolean {
+  if (screenMayShowCredential(screen)) return true;
+  return diagnoseSubmitFailure({ screenText: screen }).reason === 'logged_out';
+}
+
+/** Screen tail for a stuck card. The terminal can show anything (a `cat .env`,
+ *  a hook command with a literal token), and enumerating secret shapes never
+ *  ends — so text only leaves the terminal for a page classifyStuckPage
+ *  positively recognises on a codex-family CLI (fixed TUI chrome), with that
+ *  page's free-form value rows masked (redactStuckPageTail). Any other screen,
+ *  and any credential page, yields '' and the notice stays plain text. */
+function shareableStuckScreenTail(screen: string): string {
+  if (!screen || !adapterRendersCodexFamilyStuckPages()) return '';
+  if (!classifyStuckPage(screen)) return '';
+  if (screenShowsCredentialPage(screen)) return '';
+  // Redact the whole page before bounding it: the line / char cut can drop a
+  // row's label and leave its value (or a wrapped continuation) unmasked.
+  const unbounded = stuckScreenTail(screen, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+  return stuckScreenTail(redactStuckPageTail(unbounded));
 }
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
@@ -14537,6 +14870,29 @@ let stuckDetector: StuckDetector | null = null;
 // stuck-warning card click still targets the same CLI instance that was stuck —
 // a restart within the same Node worker must invalidate outstanding cards.
 let cliLifetimeNonce = 0;
+/** After a stuck-card key lands, let the TUI repaint before reading what it
+ *  shows now (reported back on the card; re-evaluates the input hold). */
+const STUCK_KEY_AFTER_WRITE_SETTLE_MS = 800;
+
+/** The StuckDetector's turn_stalled card for the screen on display now.
+ *  Prefers lastAnalyzerSnapshot (the capture-pane authoritative current
+ *  screen) over the long-lived renderer, which can drift under tmux.
+ *  isActuallyStuck already required an authoritative screen; the screen tail
+ *  is still dropped for a credential page (the daemon then posts no
+ *  unrecognised-page card at all). */
+function stuckDetectorWarning(elapsedMs: number, matchedLabel: string | undefined): WorkerToDaemon {
+  const snapshot = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+  return {
+    type: 'stuck_warning',
+    elapsedMs,
+    snapshot: snapshot.slice(-3000),
+    screenTail: shareableStuckScreenTail(snapshot),
+    matchedPattern: matchedLabel,
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    cliLifetime: cliLifetimeNonce,
+  };
+}
 
 function startStuckDetector(): void {
   const sd = config.stuckDetector;
@@ -14548,11 +14904,11 @@ function startStuckDetector(): void {
       // resize. A stale hook-review screen may sit just above the real viewport,
       // so never raise a key-driving stuck card from this observer.
       if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
-      // Scope gate: this PR only handles the Codex PreToolUse hook-review
-      // screen. Other CLIs (Claude Code, Kimi, ...) must never see the
-      // Codex-specific t/Enter/Esc card, even if their output happens to
-      // contain the same strings.
-      if (lastInitConfig?.cliId !== 'codex') return false;
+      // Scope gate: only adapters that declare the codex_core blocking pages
+      // (Codex, TRAE CLI, CoCo). Other CLIs (Claude Code, Kimi, ...) must
+      // never see the codex-family t/Enter/Esc card, even if their output
+      // happens to contain the same strings.
+      if (!adapterRendersCodexFamilyStuckPages()) return false;
       // Only warn if the CLI is not at its idle prompt AND no TUI prompt card
       // is already posted. A long legitimate turn (model thinking, tool calls)
       // must not trigger this.
@@ -14571,19 +14927,8 @@ function startStuckDetector(): void {
       return true;
     },
     onStuck: (elapsedMs, matchedLabel) => {
-      // Prefer lastAnalyzerSnapshot (the capture-pane authoritative current
-      // screen) over the long-lived renderer, which can drift under tmux.
-      const snapshot = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
       log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''}`);
-      send({
-        type: 'stuck_warning',
-        elapsedMs,
-        snapshot: snapshot.slice(-3000),
-        matchedPattern: matchedLabel,
-        turnId: currentBotmuxTurnId,
-        dispatchAttempt: currentBotmuxDispatchAttempt,
-        cliLifetime: cliLifetimeNonce,
-      });
+      send(stuckDetectorWarning(elapsedMs, matchedLabel));
     },
     getSnapshot: () => lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
   });
@@ -18886,6 +19231,54 @@ function dropFailedBridgeMark(bridgeTurnId?: string, dispatchAttempt?: number): 
   }
 }
 
+/** The non-durable "input not confirmed" notice, enriched with the screen it
+ *  was diagnosed on. The screen tail is only attached from an authoritative
+ *  capture (never ZMX history) and never for a login page, which may show a
+ *  device code or a sign-in link. When the CLI declares the codex-family
+ *  blocking pages and one of them is on screen, the notice becomes the stuck
+ *  card for that page (its text travels as `noticeText`) instead of a plain
+ *  message — the card then offers the page's safe keys. */
+function submitUnconfirmedNotice(input: {
+  screen: string;
+  diagnosisReason: SubmitFailureDiagnosisReason;
+  turnId: string | undefined;
+  message: string;
+}): WorkerToDaemon {
+  const screenUsable = !!input.screen
+    && effectiveBackendType !== 'zmx'
+    && backendScreenEvidenceIsAuthoritativeForMutation();
+  // A credential-looking screen still gets its key card when it is a
+  // recognised page (e.g. a hook command quoting a key) — only its text stays
+  // in the terminal.
+  const screenTail = screenUsable && input.diagnosisReason !== 'logged_out'
+    ? shareableStuckScreenTail(input.screen)
+    : '';
+  const pageType = screenUsable && adapterRendersCodexFamilyStuckPages()
+    ? classifyStuckPage(input.screen)
+    : undefined;
+  if (pageType) {
+    return {
+      type: 'stuck_warning',
+      reason: 'submit_unconfirmed',
+      elapsedMs: 0,
+      snapshot: input.screen.slice(-3000),
+      screenTail,
+      noticeText: input.message,
+      matchedPattern: pageType,
+      turnId: input.turnId,
+      dispatchAttempt: undefined,
+      cliLifetime: cliLifetimeNonce,
+    };
+  }
+  return {
+    type: 'user_notify',
+    kind: 'input_not_submitted',
+    turnId: input.turnId,
+    message: input.message,
+    ...(screenTail ? { screenTail } : {}),
+  };
+}
+
 /** Worker-side handler for `submitted: false`. Defers the user-facing
  *  warning and runs the adapter-supplied `recheck` closure first; if the
  *  message has shown up in the transcript by then (slow path, hook delay),
@@ -19132,9 +19525,9 @@ function scheduleSubmitFailureNotify(
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     emitDurableTerminal('submit_unconfirmed');
     if (turnIdentity?.dispatchAttempt === undefined) {
-      send({
-        type: 'user_notify',
-        kind: 'input_not_submitted',
+      const notice = submitUnconfirmedNotice({
+        screen: submitDiagnosisScreen,
+        diagnosisReason: submitDiagnosis.reason,
         turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
         message: t(
           effectiveBackendType === 'zmx'
@@ -19156,6 +19549,7 @@ function scheduleSubmitFailureNotify(
           },
         ),
       });
+      send(notice);
     }
   };
   const armDeferredRecheck = (): void => {
@@ -19515,13 +19909,9 @@ async function flushPending(): Promise<void> {
   if (shouldDeferUserFlush(pendingInjections)) return;
   if (bareShellLaunchBlocked) return;  // launch is held at a bare shell — don't type prompts into it
   // A Hook-review page has an active selection and consumes Enter/arrow keys.
-  // Re-check the rendered viewport right before a literal write; PTY chunks
-  // can arrive between idle detection and this queue drain.
-  refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
-  if (hookReviewInputHold) {
-    notifyHookReviewInputHold();
-    return;
-  }
+  // Re-check the screen right before a literal write; PTY chunks can arrive
+  // between idle detection and this queue drain.
+  if (hookReviewHoldsQueuedWrite()) return;
   // Screen-idle is not a durable receipt. A permission/AskUser prompt can look
   // idle while the logical delivery is unresolved, so no following IM or
   // meeting turn may cross this boundary until an explicit terminal releases
@@ -23538,6 +23928,8 @@ async function spawnCli(
   bareShellCheckInProgress = false;
   hookReviewInputHold = false;
   hookReviewInputHoldNotified = false;
+  hookReviewInputHoldSnapshot = '';
+  cancelHookReviewReleaseProbe();
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 0 (adapter capability): adapters whose buildArgs can only resume a
@@ -27545,7 +27937,8 @@ async function spawnCli(
   // the Web terminal. One re-check chain at a time.
   let startupBlockerRecheckTimer: ReturnType<typeof setTimeout> | null = null;
   const holdFirstPromptForStartupBlocker = (elapsedMs: number, forced: boolean): boolean => {
-    if (!probeStartupBlocker('First prompt timeout')) return false;
+    if (!probeStartupBlocker('First prompt timeout')
+      && !holdFirstPromptForStuckPage('First prompt timeout')) return false;
     if (!startupBlockerRecheckTimer && elapsedMs < STARTUP_BLOCKER_HOLD_MAX_MS) {
       const nextElapsedMs = elapsedMs + STARTUP_BLOCKER_RECHECK_MS;
       startupBlockerRecheckTimer = setTimeout(() => {
@@ -31890,7 +32283,8 @@ process.on('message', async (raw: unknown) => {
       // Hook-review menus are another direct-write hazard: raw_input normally
       // preserves busy delivery, but its Enter/arrow sequence must never drive
       // the menu's current selection.
-      refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+      const hookReviewAdmission = hookReviewAdmissionScreen();
+      refreshHookReviewInputHold(hookReviewAdmission);
       // The daemon sends a passthrough as soon as a worker exists, so on a cold
       // start it can arrive while the CLI is still booting — before any flush
       // has proven the input box.
@@ -31904,7 +32298,9 @@ process.on('message', async (raw: unknown) => {
         || hookReviewInputHold || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);
         if (hookReviewInputHold) {
-          notifyHookReviewInputHold();
+          // Card / notice only when the admission screen itself shows the
+          // page — not for a hold that only awaits its release probe.
+          if (hookReviewAdmissionShowsPage(hookReviewAdmission)) notifyHookReviewInputHold(hookReviewAdmission);
           log(`Deferred passthrough slash command while Hook review is visible: ${msg.content}`);
         } else {
           log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
@@ -32247,15 +32643,27 @@ process.on('message', async (raw: unknown) => {
             turnId: currentBotmuxTurnId,
             dispatchAttempt: currentBotmuxDispatchAttempt,
             capture: snapshotToText,
-            match: matchHookReviewScreen,
+            match: classifyStuckPage,
             writeKeys: handleTuiKeys,
             sendExpired: (nonce, turnId, dispatchAttempt) => send({ type: 'stuck_warning_expired', nonce, turnId, dispatchAttempt }),
-            sendDelivered: (nonce, turnId, dispatchAttempt) => send({ type: 'tui_keys_delivered', nonce, turnId, dispatchAttempt }),
+            sendDelivered: (nonce, turnId, dispatchAttempt, details) => send({
+              type: 'tui_keys_delivered', nonce, turnId, dispatchAttempt, ...details,
+            }),
             sendFailed: (nonce, turnId, dispatchAttempt) => send({ type: 'tui_prompt_submit_failed', stuckNonce: nonce, turnId, dispatchAttempt }),
             log,
+            // The daemon already maps the click to one catalog key; re-check
+            // it here against the page the fresh capture shows.
+            allowKeys: isAllowedStuckKeySequence,
+            afterWrite: {
+              settleMs: scaleMs(STUCK_KEY_AFTER_WRITE_SETTLE_MS),
+              sleep: delay,
+              screenTail: shareableStuckScreenTail,
+              onObserved: afterStuckKeyObserved,
+            },
           },
         );
         wroteKeys = result.wroteKeys;
+        if (result.sent === 'expired') afterStuckKeyExpired(result.expiredScreen);
       } else {
         wroteKeys = await handleTuiKeys(msg.keys, msg.isFinal);
         if (msg.cardMessageId) {

@@ -1,0 +1,50 @@
+
+  >_ OpenAI Codex (v0.164.0)
+     /tmp/repo
+
+  Tip: Maximize usage with GPT-6.1 Sol. Try it on complex work for near-Astra performance at a lower cost.
+
+
+  PreToolUse hooks
+  Turn hooks on or off. Your changes are saved automatically.
+
+› [x]  1  Unnamed hook
+
+  Event     PreToolUse
+  Matcher   *
+  Source    User config - /tmp/home/.codex/hooks.json
+  Command   echo kiro-ptu
+  Mode      Sync
+  Timeout   10s
+  Trust     Trusted
+
+
+  space/enter toggle · esc back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
