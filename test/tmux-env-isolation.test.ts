@@ -445,4 +445,63 @@ describe('tmux subcommand with stale $TMUX', () => {
     },
     30_000,
   );
+
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub preserves complete user numbered slots when only GIT_CONFIG_PARAMETERS carries the Trae hook',
+    () => {
+      // The promotion block in scrubTmuxServerGlobalEnv has one job no other
+      // branch covers: when the Trae entry arrives ONLY via GIT_CONFIG_PARAMETERS
+      // while the numbered slots are the user's own complete config, COUNT's
+      // value is unchanged and therefore absent from changedKeys — but COUNT
+      // rides BOTMUX_INJECTED_ENV_KEYS into the generic unset list. Without the
+      // promotion it is unset while KEY_0..n survive, orphaning the user's
+      // config (git only reads slots below COUNT).
+      const sock = `bmx-scrub-trae-params-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      try {
+        const seededEnv = { ...process.env };
+        delete seededEnv.TMUX;
+        delete seededEnv.TMUX_PANE;
+        Object.assign(seededEnv, {
+          GIT_CONFIG_COUNT: '2',
+          GIT_CONFIG_KEY_0: 'user.name',
+          GIT_CONFIG_VALUE_0: 'Example User',
+          GIT_CONFIG_KEY_1: 'user.email',
+          GIT_CONFIG_VALUE_1: 'dev@example.com',
+          GIT_CONFIG_PARAMETERS: `'core.hooksPath=${traeHooks}'`,
+          TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+        });
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.failed).toEqual([]);
+        expect(scrub.removed).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_PARAMETERS', 'TRAE_GIT_ATTRIBUTION_HELPER',
+        ]));
+        expect(scrub.removed.some(name => /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(name))).toBe(false);
+        expect(scrub.updated).toContain('GIT_CONFIG_COUNT');
+
+        const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
+          env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
+        });
+        expect(globalEnv.status, globalEnv.stderr).toBe(0);
+        // The complete user-owned numbered contract survives intact.
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_COUNT=2');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_KEY_0=user.name');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_VALUE_0=Example User');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_KEY_1=user.email');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_VALUE_1=dev@example.com');
+        // …while every trace of the Trae hook contract is repaired out.
+        expect(globalEnv.stdout).not.toContain('commit-attribution');
+        expect(globalEnv.stdout).not.toMatch(/(?:^|\n)-?TRAE_GIT_ATTRIBUTION_HELPER(?:=|\n|$)/);
+        expect(globalEnv.stdout).not.toMatch(/(?:^|\n)-?GIT_CONFIG_PARAMETERS(?:=|\n|$)/);
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+      }
+    },
+    30_000,
+  );
 });
