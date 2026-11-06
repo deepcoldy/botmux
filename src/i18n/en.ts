@@ -852,6 +852,7 @@ export const messages: Record<string, string> = {
   'cmd.config.effect_immediate': '↳ Takes effect immediately (next message/event reads the new value).',
   'cmd.config.effect_next_session': '↳ Applies to new sessions; running sessions pick it up after /restart.',
   'cmd.config.write_failed': '⚠️ Write failed: {reason}',
+  'cmd.config.agent_managed_note': 'ℹ️ This field is managed by Agent “{agent}”: the change is applied now, but saving or syncing on the Dashboard Agent page will replace it with the Agent value. To change it for good, edit it on the Agent page.',
   'cmd.config.unknown_sub': 'Unknown subcommand: {sub}\nSupported: /botconfig get | set | unset | help',
   'cmd.config.card_dmd': '⚙️ Config card sent to your DM (only you can see it) → open our 1:1 chat to view / edit.',
   'card.config.title': '⚙️ {name} · config',

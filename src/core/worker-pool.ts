@@ -3226,7 +3226,7 @@ export function ensureReadonlyTaskContinuationAttached(
           content: dispatch.prompt,
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
-          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestLaunchCommandsForRespawn(ds) } : {}),
           trustedCaller: current.trustedCaller,
           ...(turnCallerOpenIdFor(ds, dispatch.turnId)
             ? { turnCallerOpenId: turnCallerOpenIdFor(ds, dispatch.turnId)! }
@@ -7466,6 +7466,49 @@ export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | nu
   }
 }
 
+/**
+ * Live-worker respawn 携带的最新 startupCommands / launchShell（与 env / model 同一条
+ * 通道、同一套三分态，worker 侧语义见 core/respawn-config-patch.ts）。
+ *
+ * 两者都是「下次 spawn 生效」的 Bot 配置，fork 时由 sessionAgentConfig 实时取，
+ * 但 `/restart`、卡片 / Dashboard 重启、CLI 崩溃自动重启都**不 refork**：worker 用
+ * fork 时刻的 `lastInitConfig` 原地 respawn。不捎带的话，Dashboard 改完启动命令再
+ * 重启，重放的还是旧命令。
+ *
+ * 与 sessionAgentConfig 同口径：per-session `/cli` 选择（cliLaunchSnapshot）冻结了
+ * 自己的启动命令与 shell，原样返回快照，不被 Bot 级改动覆盖。adopt 会话只观察不驱动
+ * （forkAdoptWorker 本就不下发），不携带。
+ * Codex profile 会话也不携带（见函数内注释）。
+ * 三分态：值 = 用它；null = 明确清空；undefined = 不携带 / 取不到，worker 保持快照。
+ */
+export function latestLaunchCommandsForRespawn(ds: DaemonSession): {
+  startupCommands: string[] | null | undefined;
+  launchShell: string | null | undefined;
+} {
+  if (ds.session.adoptedFrom) return { startupCommands: undefined, launchShell: undefined };
+  // Codex profile launches reject startup commands outright (assertCodexProfileRuntime
+  // → unsupported_launch) and the session froze its profile at creation. A later
+  // bot edit must not turn a working session's restart into a fatal launch: keep
+  // the fork-time snapshot, which already passed that gate.
+  if (ds.session.codexProfile) return { startupCommands: undefined, launchShell: undefined };
+  const selected = ds.session.cliLaunchSnapshot;
+  if (selected) {
+    return {
+      startupCommands: selected.startupCommands.length ? [...selected.startupCommands] : null,
+      launchShell: selected.launchShell || null,
+    };
+  }
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    return {
+      startupCommands: botCfg.startupCommands?.length ? [...botCfg.startupCommands] : null,
+      launchShell: botCfg.launchShell || null,
+    };
+  } catch {
+    return { startupCommands: undefined, launchShell: undefined };
+  }
+}
+
 export interface SessionRestartOptions {
   topicEffort?: import('../utils/traex-session-effort.js').TraexTopicEffortRestart;
   /**
@@ -7557,7 +7600,8 @@ export function requestSessionRestart(
           ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
           traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
           ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
-            larkToolBinding: latestLarkToolBindingForRespawn(ds) }) } as DaemonToWorker);
+            larkToolBinding: latestLarkToolBindingForRespawn(ds),
+            ...latestLaunchCommandsForRespawn(ds) }) } as DaemonToWorker);
         return;
       }
       // No live worker but the persistent pane may still be alive (e.g. after a
@@ -13699,6 +13743,7 @@ export function sendWorkerInput(
     // an unconditional field would be pure noise on every message.
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
@@ -14127,6 +14172,7 @@ export function promoteQueuedActivationTail(
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
       ...(admittedLinkRefs.mode !== 'disabled'
         ? { linkRefMode: admittedLinkRefs.mode }

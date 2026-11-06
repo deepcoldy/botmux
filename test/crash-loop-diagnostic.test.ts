@@ -235,7 +235,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(worker.send).toHaveBeenCalledWith({
       type: 'restart', attemptId: expect.any(String), reason: 'cli_crash',
       env: null, envUnset: null, envFingerprint: expect.any(String), model: null, larkToolBinding: true,
-      codexRpcInput: false, traexAutoModel: null,
+      codexRpcInput: false, traexAutoModel: null, startupCommands: null, launchShell: null,
     });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
@@ -260,7 +260,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // The user changes the bot's model while the session sits parked.
     vi.mocked(getBot).mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', model: 'opus' },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', model: 'opus', startupCommands: ['/effort xhigh'], launchShell: 'bash' },
       resolvedAllowedUsers: [],
       botOpenId: 'ou_bot',
       botName: 'TestBot',
@@ -271,6 +271,10 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     const message = worker.send.mock.calls.map((c: any[]) => c[0]).find((m: any) => m.type === 'message');
     expect(message?.model).toBe('opus');
+    // Same for the startup commands / shell edited while parked (the recovery
+    // spawn replays them).
+    expect(message?.startupCommands).toEqual(['/effort xhigh']);
+    expect(message?.launchShell).toBe('bash');
 
     // Once a CLI is live again the refresh stops riding along on every turn.
     worker.emit('message', { type: 'ready', port: 1234, token: 't' });

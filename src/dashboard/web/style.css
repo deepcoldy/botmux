@@ -10934,6 +10934,16 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   font-size: 12px;
   line-height: 1.5;
 }
+.bd-agent-lock-drift {
+  margin: 6px 0 2px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 42%, transparent);
+  border-radius: var(--radius-md);
+  background: var(--warning-soft);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .bd-agent-lock-note a {
   flex: none;
   margin-left: auto;

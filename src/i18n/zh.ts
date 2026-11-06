@@ -849,6 +849,7 @@ export const messages: Record<string, string> = {
   'cmd.config.effect_immediate': '↳ 立即生效（下条消息/事件起读取新值）。',
   'cmd.config.effect_next_session': '↳ 新会话生效；运行中的会话发 /restart 重启后换用新值。',
   'cmd.config.write_failed': '⚠️ 写入失败：{reason}',
+  'cmd.config.agent_managed_note': 'ℹ️ 该字段由 Agent「{agent}」统一管理：本次修改已生效，但下次在 Dashboard 的 Agent 页保存或同步时会被改回 Agent 的值。要长期修改请到 Agent 页改。',
   'cmd.config.unknown_sub': '未知子命令：{sub}\n支持：/botconfig get | set | unset | help',
   'cmd.config.card_dmd': '⚙️ 配置卡片已私信给你（仅你可见）→ 去和我的私聊里查看 / 操作。',
   'card.config.title': '⚙️ {name} · 配置',
