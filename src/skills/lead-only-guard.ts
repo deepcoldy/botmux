@@ -3,15 +3,16 @@
  * PreToolUse guard. It lives in a DEDICATED plugin dir (`<claude-plugin>-lead-only`) that the
  * claude-code adapter mounts ONLY for lead-only sessions, so no other session ever runs it.
  * It matches every tool: Bash is limited to a single plain `botmux …` command, a small set of
- * bookkeeping tools is allowed, and everything else (file/web/agent/MCP tools) is denied.
+ * bookkeeping tools is allowed, file tools may only touch the lead's own auto-memory files, and
+ * everything else (other file/web/agent/MCP tools) is denied.
  * (claude-code only; other CLIs ignore the lead-only flag.)
  *
  * The hook command is `botmux hook lead-only-guard` (built like every other hook via
  * botmuxShellCommand, so compiled single-binary installs need no node). The Bash check is a strict
  * whitelist lexer, not a regex blacklist: see {@link isPlainBotmuxCommand}.
  */
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, normalize } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { botmuxShellCommand } from '../adapters/hook-command.js';
@@ -25,10 +26,24 @@ export function leadOnlyPluginDir(pluginDir: string): string {
 /** Non-Bash tools a lead may still use: planning/bookkeeping only, no file/web/MCP access. */
 export const LEAD_ALLOWED_TOOLS = ['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'Skill', 'ToolSearch', 'BashOutput', 'KillShell', 'KillBash'];
 
-export const LEAD_ONLY_BLOCK_MESSAGE =
-  '负责人只转发模式：本会话只能执行单条普通 botmux 命令（不能用 heredoc、重定向、管道、; & $ 反引号、括号、# 注释；多行正文请整体放进单引号），具体工作请 botmux dispatch 给执行 bot。 / Lead-only manager mode: only a single plain `botmux ...` command is allowed (no heredoc, redirects, pipes, ; & $ backticks, parentheses or # comments; put multi-line text wholly inside single quotes); dispatch the work to an executor bot with `botmux dispatch`.';
+/**
+ * File tools a lead may use, and only on its own Claude auto-memory files (see {@link isLeadMemoryFileAllowed}):
+ * without them a lead forgets every user rule and bot skill it learned as soon as the session ends.
+ * Read is included because Claude Code requires a Read before Edit/overwrite.
+ */
+export const LEAD_MEMORY_TOOLS = ['Read', 'Write', 'Edit', 'MultiEdit'];
 
-const BARE_WORD_CHAR = /[A-Za-z0-9_@%+=:,./-]/;
+export const LEAD_ONLY_BLOCK_MESSAGE =
+  '负责人只转发模式：本会话只能执行单条普通 botmux 命令（不能用重定向、管道、; & $ 反引号、括号、# 注释；多行正文请整体放进单引号，或在命令末尾用带引号定界符的 heredoc <<\'EOF\'），文件工具只能读写自己记忆目录 memory/ 下的 .md 文件，具体工作请 botmux dispatch 给执行 bot。 / Lead-only manager mode: only a single plain `botmux ...` command is allowed (no redirects, pipes, ; & $ backticks, parentheses or # comments; put multi-line text wholly inside single quotes, or end the command with a quoted-delimiter heredoc <<\'EOF\'); file tools may only touch .md files in your own memory/ dir; dispatch the work to an executor bot with `botmux dispatch`.';
+
+// Non-ASCII letters/digits (e.g. a Chinese role in `--bot-app cli_x:执行`) are never shell syntax.
+const BARE_WORD_CHAR = /[A-Za-z0-9_@%+=:,./\p{L}\p{N}-]/u;
+
+/**
+ * The one heredoc form a lead may use: `<<'DELIM'` or `<<"DELIM"` as the LAST thing on the first line.
+ * A quoted delimiter means bash does no expansion in the body, so the body is plain stdin data.
+ */
+const QUOTED_HEREDOC = /^(.*?)[ \t]+<<(['"])([A-Za-z_][A-Za-z0-9_]*)\2[ \t]*$/;
 
 /**
  * Strict whitelist lexer for a Bash command line. Accepts only when ALL hold:
@@ -38,9 +53,25 @@ const BARE_WORD_CHAR = /[A-Za-z0-9_@%+=:,./-]/;
  *    `\` and `!`);
  *  - any other unquoted char (`< > ( ) # ; & | ~ * ? [ { $ !`, backslash, newline, …) rejects;
  *  - argv[0] is exactly the bare word `botmux`.
- * No heredoc support. Only trailing whitespace (incl. a final newline) is tolerated.
+ * Only trailing whitespace (incl. a final newline) is tolerated.
+ *
+ * One heredoc is allowed, the form botmux's own rules tell agents to use for multi-line text
+ * (`botmux send <<'EOF'`): the first line must be a plain command (as above) followed by
+ * `<<'DELIM'` / `<<"DELIM"`, the body must end at a line that is exactly DELIM (bash's own rule),
+ * and nothing but whitespace may follow. An unquoted, `<<-` or mid-line heredoc is rejected.
  */
 export function parsePlainBotmuxArgv(command: string): string[] | null {
+  const nl = command.indexOf('\n');
+  const heredoc = nl >= 0 ? QUOTED_HEREDOC.exec(command.slice(0, nl)) : null;
+  if (!heredoc) return lexPlainBotmuxArgv(command);
+  // If `<<` sat inside a quote, the head has an unbalanced quote and the lexer rejects it.
+  const lines = command.slice(nl + 1).split('\n');
+  const end = lines.indexOf(heredoc[3]);
+  if (end < 0 || lines.slice(end + 1).join('\n').trim() !== '') return null;
+  return lexPlainBotmuxArgv(heredoc[1]);
+}
+
+function lexPlainBotmuxArgv(command: string): string[] | null {
   const cmd = command.replace(/\s+$/, '');
   let i = 0;
   const argv: string[] = [];
@@ -101,6 +132,9 @@ export function isPlainBotmuxCommand(command: string): boolean {
  */
 export const LEAD_ALLOWED_BOTMUX_SUBCOMMANDS = new Set([
   'dispatch', 'send', 'status', 'manager', 'history', 'quoted', 'bots', 'capabilities', 'skill',
+  // Read-only views the lead rules themselves point to: the task board and `observe` (did a
+  // dispatched session start?). `task` is narrowed to `list` below.
+  'task', 'observe',
   'help', '--help', '-h', '--version', '-v',
 ]);
 
@@ -115,6 +149,9 @@ const LEAD_DENIED_FLAG = /^--(?:[a-z0-9-]*file[a-z0-9-]*|files|images?|videos?|v
  *  their human owners into the chat with no human-turn gate), so a lead may only read the roster. */
 const LEAD_ALLOWED_BOTS_SUBS = new Set(['list', 'ls', 'help', '--help', '-h']);
 
+/** Second-level `task` words a lead may use: the board is maintained by dispatch/report, a lead only reads it. */
+const LEAD_ALLOWED_TASK_SUBS = new Set(['list', 'help', '--help', '-h']);
+
 /** Returns a bilingual reason when the parsed argv uses a subcommand/flag a lead may not use, else undefined. */
 export function leadOnlyArgvViolation(argv: string[]): string | undefined {
   const sub = argv[1];
@@ -124,6 +161,9 @@ export function leadOnlyArgvViolation(argv: string[]): string | undefined {
   if (sub === 'bots' && argv[2] !== undefined && !LEAD_ALLOWED_BOTS_SUBS.has(argv[2])) {
     return `子命令 \`bots ${argv[2]}\` 会变更群成员，不允许；负责人只能查看花名册（bots list） / \`bots ${argv[2]}\` changes group membership and is not allowed; a lead may only run \`bots list\``;
   }
+  if (sub === 'task' && argv[2] !== undefined && !LEAD_ALLOWED_TASK_SUBS.has(argv[2])) {
+    return `子命令 \`task ${argv[2]}\` 会改任务看板，不允许；负责人只能查看（task list） / \`task ${argv[2]}\` changes the task board and is not allowed; a lead may only run \`task list\``;
+  }
   for (const tok of argv.slice(2)) {
     if (!tok.startsWith('--')) continue;
     const name = tok.split('=')[0];
@@ -132,11 +172,48 @@ export function leadOnlyArgvViolation(argv: string[]): string | undefined {
   return undefined;
 }
 
+const MEMORY_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.md$/;
+
+/**
+ * The lead's Claude auto-memory dir: `<dir of the session transcript>/memory`
+ * (`~/.claude/projects/<project>/memory`). Taken from the hook payload's `transcript_path`, which
+ * Claude Code sets, not the model.
+ */
+export function leadMemoryDir(transcriptPath: unknown): string | undefined {
+  if (typeof transcriptPath !== 'string' || !isAbsolute(transcriptPath) || !transcriptPath.endsWith('.jsonl')) return undefined;
+  if (normalize(transcriptPath) !== transcriptPath) return undefined;
+  return join(dirname(transcriptPath), 'memory');
+}
+
+/**
+ * A file tool may run only on a `.md` file DIRECTLY inside the lead's memory dir: absolute, already
+ * normalised (no `..`), no subdirectory, no dotfile, and neither the dir nor the file may be a
+ * symlink (so it cannot point outside). A missing file is fine (Write creates it).
+ */
+export function isLeadMemoryFileAllowed(filePath: unknown, transcriptPath: unknown): boolean {
+  const dir = leadMemoryDir(transcriptPath);
+  if (!dir || typeof filePath !== 'string' || !isAbsolute(filePath) || normalize(filePath) !== filePath) return false;
+  if (dirname(filePath) !== dir || !MEMORY_FILE_NAME.test(basename(filePath))) return false;
+  const notSymlink = (p: string, mustBe: 'file' | 'dir'): boolean => {
+    try {
+      const st = lstatSync(p);
+      return mustBe === 'file' ? st.isFile() : st.isDirectory();
+    } catch (err: any) { return err?.code === 'ENOENT'; }
+  };
+  return notSymlink(dir, 'dir') && notSymlink(filePath, 'file');
+}
+
 /** True when the PreToolUse payload may proceed in a lead-only session. */
 export function isLeadOnlyToolCallAllowed(input: unknown): boolean {
-  const obj = (input && typeof input === 'object' ? input : {}) as { tool_name?: unknown; tool_input?: { command?: unknown } };
+  const obj = (input && typeof input === 'object' ? input : {}) as {
+    tool_name?: unknown; tool_input?: { command?: unknown; file_path?: unknown }; transcript_path?: unknown;
+  };
   const tool = String(obj.tool_name || 'Bash');
-  if (tool !== 'Bash') return LEAD_ALLOWED_TOOLS.includes(tool);
+  if (tool !== 'Bash') {
+    if (LEAD_ALLOWED_TOOLS.includes(tool)) return true;
+    if (LEAD_MEMORY_TOOLS.includes(tool)) return isLeadMemoryFileAllowed(obj.tool_input?.file_path, obj.transcript_path);
+    return false;
+  }
   const command = obj.tool_input?.command;
   if (typeof command !== 'string') return false;
   const argv = parsePlainBotmuxArgv(command);

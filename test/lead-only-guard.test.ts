@@ -1,9 +1,9 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensureLeadOnlyPluginDir, isPlainBotmuxCommand, leadOnlyArgvViolation, parsePlainBotmuxArgv, isLeadOnlyToolCallAllowed, leadOnlyHooksJson } from '../src/skills/lead-only-guard.js';
+import { ensureLeadOnlyPluginDir, isPlainBotmuxCommand, leadOnlyArgvViolation, parsePlainBotmuxArgv, isLeadOnlyToolCallAllowed, leadOnlyHooksJson, leadMemoryDir } from '../src/skills/lead-only-guard.js';
 
 describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
   it.each([
@@ -16,6 +16,13 @@ describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
     'botmux dispatch --brief "处理 <<x>>"',
     "botmux send 'a'\"b\"c",
     'botmux x --a=b@c:d,e/f%g+h\t-i\n',
+    // non-ASCII letters are never shell syntax
+    'botmux dispatch --title t --bot-app cli_x:执行 --brief 目标',
+    // quoted-delimiter heredoc at the end of the first line: the body is never expanded
+    "botmux send --stdin <<'EOF'\nhi\nEOF",
+    "botmux send --no-mention <<'EOF'\n多行 $(id) `id` ; | & > x\nEOF\n",
+    'botmux send <<"EOF"\n$HOME\nEOF',
+    "botmux send 'a b' <<'EOF'\n\nEOF\n\n",
   ])('allows %j', (cmd) => { expect(isPlainBotmuxCommand(cmd)).toBe(true); });
 
   it.each([
@@ -53,7 +60,6 @@ describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
     "botmux x # <<'EOF'\ntouch pwned\nEOF",
     'botmux x #c',
     'botmux x <<EOF\n$\\\n(touch pwned)\nEOF',
-    "botmux send --stdin <<'EOF'\nhi\nEOF",
     'botmux send "$(rm x)"',
     'botmux send "a `id`"',
     'botmux send "a\\"; rm y"',
@@ -61,10 +67,25 @@ describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
     'botmux send "unterminated; rm y',
     "botmux send 'unterminated",
     'botmux x (id)',
+    'botmux x ；',
+    // heredoc forms other than a quoted delimiter that ends the first line
+    "botmux send <<'EOF'\nhi\nEOF\ntouch pwned",
+    "botmux send <<'EOF'\nhi\n",
+    "botmux send <<'EOF'\nhi\nEOF \n",
+    "botmux send <<'EOF'\nhi\n EOF\ntouch pwned",
+    "botmux send <<-'EOF'\n\thi\n\tEOF",
+    "botmux send <<'EOF' --mention-back\nhi\nEOF",
+    "botmux send <<'EOF' <<'G'\nhi\nEOF\nG",
+    "botmux send <<'EOF'; touch pwned\nhi\nEOF",
+    "botmux x; touch pwned <<'EOF'\nhi\nEOF",
+    "ls <<'EOF'\nhi\nEOF",
+    "botmux send 'x <<'EOF'\nhi\nEOF",
+    "botmux send $(id) <<'EOF'\nhi\nEOF",
+    "botmux send <<'E-F'\nhi\nE-F",
   ])('denies %j', (cmd) => { expect(isPlainBotmuxCommand(cmd)).toBe(false); });
 });
 
-const DENIED_SUBCOMMANDS = ['mcp serve', 'setup add', 'upgrade', 'restart', 'delete all', 'plugin init', 'schedule update x', 'workflow run', 'hook lead-only-guard', 'ask', 'daemon'];
+const DENIED_SUBCOMMANDS = ['task register t1', 'task start t1', 'task update t1 status=done', 'mcp serve', 'setup add', 'upgrade', 'restart', 'delete all', 'plugin init', 'schedule update x', 'workflow run', 'hook lead-only-guard', 'ask', 'daemon'];
 const FILE_FLAG_CMDS = [
   "botmux send --content-file secret.txt",
   "botmux send --content-file=secret.txt",
@@ -80,6 +101,7 @@ const FILE_FLAG_CMDS = [
   "botmux send --diff=/tmp/x.patch",
   "botmux send --'content'-file x",
   "botmux send '--file=x'",
+  "botmux send --content-file /etc/passwd <<'EOF'\nx\nEOF",
 ];
 const ALLOWED_CMDS = [
   "botmux dispatch --brief 'goal: a; check: b'",
@@ -93,6 +115,13 @@ const ALLOWED_CMDS = [
   'botmux bots list --scope chat',
   'botmux bots',
   'botmux --help',
+  'botmux task list',
+  'botmux task',
+  'botmux observe',
+  'botmux observe --session s1',
+  "botmux send --no-mention <<'EOF'\n进度 $(touch pwned) `touch pwned2`\nEOF",
+  'botmux send <<"EOF"\n$(touch pwned)\nEOF',
+  "botmux dispatch --into om_x --bot-app 'cli_x:执行' --brief '先 grep 再改; 结果回报'",
 ];
 
 describe('subcommand + flag allowlist', () => {
@@ -139,6 +168,10 @@ describe('guard + real bash with a dummy botmux (no side effects for bypasses)',
     'botmux upgrade',
     'botmux delete all',
     'botmux bots invite --chat oc_x --team t --agent cli_x',
+    "botmux send <<'EOF'\nhi\nEOF\ntouch pwned",
+    "botmux send <<'EOF'\nhi\n EOF\ntouch pwned",
+    'botmux send <<EOF\n$(touch pwned)\nEOF',
+    "botmux send <<'EOF'; touch pwned\nhi\nEOF",
   ];
   it.each([...BYPASS, ...ALLOWED_CMDS])('%j', (cmd) => {
     const dir = mkdtempSync(join(tmpdir(), 'lead-bash-'));
@@ -167,6 +200,55 @@ describe('isLeadOnlyToolCallAllowed', () => {
     expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: 'ls' } })).toBe(false);
     expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: {} })).toBe(false);
     expect(isLeadOnlyToolCallAllowed({ tool_input: { command: 'botmux status' } })).toBe(true);
+  });
+});
+
+describe('lead memory files (Read/Write/Edit only inside <transcript dir>/memory)', () => {
+  const proj = mkdtempSync(join(tmpdir(), 'lead-mem-'));
+  const transcript = join(proj, 'sid.jsonl');
+  const mem = join(proj, 'memory');
+  mkdirSync(mem);
+  writeFileSync(join(mem, 'MEMORY.md'), '- x\n');
+  const outside = join(proj, 'outside.md');
+  writeFileSync(outside, 'secret');
+  symlinkSync(outside, join(mem, 'link.md'));
+  const call = (tool: string, file_path: unknown, transcript_path: unknown = transcript) =>
+    isLeadOnlyToolCallAllowed({ tool_name: tool, tool_input: { file_path }, transcript_path });
+
+  it('derives the memory dir from the transcript path', () => {
+    expect(leadMemoryDir(transcript)).toBe(mem);
+    expect(leadMemoryDir('rel/sid.jsonl')).toBeUndefined();
+    expect(leadMemoryDir(`${proj}/a/../sid.jsonl`)).toBeUndefined();
+    expect(leadMemoryDir(join(proj, 'sid.txt'))).toBeUndefined();
+    expect(leadMemoryDir(undefined)).toBeUndefined();
+  });
+  it.each(['Read', 'Write', 'Edit', 'MultiEdit'])('%s allowed on memory .md files (existing or new)', (tool) => {
+    expect(call(tool, join(mem, 'MEMORY.md'))).toBe(true);
+    expect(call(tool, join(mem, 'user-prefs.md'))).toBe(true);
+  });
+  it.each([
+    ['outside the memory dir', () => outside],
+    ['a .. escape', () => `${mem}/../outside.md`],
+    ['a subdirectory', () => join(mem, 'sub', 'x.md')],
+    ['a non-.md file', () => join(mem, 'x.txt')],
+    ['a dotfile', () => join(mem, '.x.md')],
+    ['a relative path', () => 'memory/x.md'],
+    ['a symlink inside the dir', () => join(mem, 'link.md')],
+    ['the dir itself', () => mem],
+    ['a non-string path', () => 42],
+  ])('denies %s', (_name, path) => {
+    for (const tool of ['Read', 'Write', 'Edit']) expect(call(tool, path())).toBe(false);
+  });
+  it('denies without a usable transcript_path, and for other file tools', () => {
+    expect(call('Write', join(mem, 'x.md'), null)).toBe(false);
+    expect(call('Write', join(mem, 'x.md'), 'sid.jsonl')).toBe(false);
+    expect(call('Write', join(mem, 'x.md'), join(mkdtempSync(join(tmpdir(), 'lead-other-')), 'sid.jsonl'))).toBe(false);
+    for (const tool of ['Grep', 'Glob', 'NotebookEdit']) expect(call(tool, join(mem, 'MEMORY.md'))).toBe(false);
+  });
+  it('denies when the memory dir is a symlink', () => {
+    const p2 = mkdtempSync(join(tmpdir(), 'lead-mem2-'));
+    symlinkSync(mkdtempSync(join(tmpdir(), 'lead-elsewhere-')), join(p2, 'memory'));
+    expect(call('Write', join(p2, 'memory', 'x.md'), join(p2, 'sid.jsonl'))).toBe(false);
   });
 });
 

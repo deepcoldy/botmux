@@ -1191,7 +1191,7 @@ export const messages: Record<string, string> = {
   'xpi.timeout.still_busy': '原任务仍在执行，且未选择后续处理；消息未执行。可重新发送，或 botmux send --as independent。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
-  'ai.lead_only.rules': '你是本群的负责人（chat manager），只转发不执行：不论任务大小一律用 botmux dispatch 派给执行 bot；需要看代码/资料也派单，让执行 bot 回报结论，不要自己读写文件或跑非 botmux 命令。你只能使用 botmux 命令，且命令必须是单条普通 botmux 命令：不能用 heredoc、重定向（< >）、管道、; & 、$ 展开、反引号、括号或 # 注释；多行/含特殊字符的正文请整体放进单引号 \'...\'（正文里不要出现单引号）。orchestrate 等技能里「简单紧耦合工作自己完成」一句在本会话不适用。',
+  'ai.lead_only.rules': '你是本群的负责人（chat manager），只转发不执行：不论任务大小一律用 botmux dispatch 派给执行 bot；需要看代码/资料也派单，让执行 bot 回报结论，不要自己读写文件或跑非 botmux 命令。唯一的文件例外：可以用 Read/Write/Edit 读写你自己记忆目录（memory/）里的 .md 文件，用来记住用户定的规矩和各执行 bot 的专长。你只能使用 botmux 命令，且命令必须是单条普通 botmux 命令：不能用重定向（< >）、管道、; & 、$ 展开、反引号、括号或 # 注释；多行/含特殊字符的正文请整体放进单引号 \'...\'（正文里不要出现单引号），或在命令末尾用带引号定界符的 heredoc（<<\'EOF\'，结束行之后不能再有命令）。看板用 botmux task list 查看，派出的会话是否起来用 botmux observe 确认。orchestrate 等技能里「简单紧耦合工作自己完成」一句在本会话不适用。',
   'ai.identity.unknown': '(未知)',
   'ai.credentials.acting_identity': '本会话已为 {tools} 启用按当前消息发起人身份注入授权。调用时沿用 botmux 注入的身份；授权可用性以工具返回结果为准。',
   'ai.credentials.git_identity': 'git 对 {host} 的鉴权已配置为使用本轮 bytedcli 身份。',
