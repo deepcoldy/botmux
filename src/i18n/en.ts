@@ -1206,6 +1206,7 @@ export const messages: Record<string, string> = {
   'xpi.timeout.still_busy': 'The original task is still running and no follow-up was chosen, so the message was not executed. Resend it, or run botmux send --as independent.',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
+  'ai.lead_only.rules': "You are this chat's manager and only forward, never execute: always `botmux dispatch` work to an executor bot regardless of size; if you need to read code or material, dispatch that too and let the executor report back. Do not read or write files or run non-botmux commands yourself. Use botmux commands only, each a single plain `botmux ...` command: no heredoc, redirects (< >), pipes, ; &, $ expansion, backticks, parentheses or # comments; put multi-line or special-character text wholly inside single quotes '...' (the text itself must not contain a single quote). The \"do simple tightly-coupled work yourself\" line in the orchestrate skill does NOT apply in this session.",
   'ai.identity.unknown': '(unknown)',
   'ai.credentials.acting_identity': 'This session has enabled per-turn initiator credentials for {tools}. Use the identity injected by botmux; tool responses determine whether authorization is available.',
   'ai.credentials.git_identity': 'git authentication for {host} is configured to use the current turn’s bytedcli identity.',

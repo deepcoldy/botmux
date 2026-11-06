@@ -1,3 +1,4 @@
+import { isLeadOnlySession } from './lead-only.js';
 import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
 import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
 import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
@@ -15719,6 +15720,9 @@ export function forkWorker(
       return ttl ? { promptCacheTtl: ttl } : {};
     })(),
     solo: ds.soloSession === true,
+    // Lead-only chat manager: frozen at spawn. /restart, dashboard restart and crash respawn reuse
+    // lastInitConfig in place and do NOT re-read it; only a reopened topic does (documented in the chat-manager skill).
+    ...(isLeadOnlySession(ds.larkAppId, ds.chatId, ds.chatType, ds.session) ? { leadOnly: true as const } : {}),
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.

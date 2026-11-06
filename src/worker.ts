@@ -24049,6 +24049,7 @@ async function spawnCli(
     promptInjection: cfg.promptInjection,
     promptCacheTtl: cfg.promptCacheTtl,
     solo: cfg.solo,
+    leadOnly: cfg.leadOnly,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,

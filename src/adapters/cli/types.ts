@@ -265,6 +265,9 @@ export interface CliAdapter {
      *  the identity routing_rules (no other bot to route to). Ignored for
      *  'send'. */
     solo?: boolean;
+    /** Lead-only chat manager session (claude-code only; ignored by other CLIs): block
+     *  file/web/agent tools, mount the dedicated lead-only guard plugin dir, append the lead-only prompt. */
+    leadOnly?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a

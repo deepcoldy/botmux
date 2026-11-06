@@ -382,6 +382,10 @@ function commonHomeBaseline(h: string): FsRule[] {
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
     ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`), ro(`${h}/.botmux/cursor-plugin`),
+    // Dedicated lead-only guard plugin (skills/lead-only-guard.ts), claude-code only.
+    // Must stay readable inside the sandbox: an invisible --plugin-dir makes Claude skip
+    // the hook entirely (not even onFailure fires), silently leaving Bash unrestricted.
+    ro(`${h}/.botmux/claude-plugin-lead-only`),
     // Their workflow-node-session copies (skills/workflow-node-plugin-dir.ts).
     ro(`${h}/.botmux/claude-plugin-workflow-node`), ro(`${h}/.botmux/cursor-plugin-workflow-node`),
     // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
@@ -978,6 +982,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/.dashboard-port`,    // dashboard port (owner term-link; harmless port int)
     `${bh}/bin`,                // the daemon-written `botmux` wrapper (head of PATH)
     `${bh}/claude-plugin`,      // skill/plugin dir (claude --plugin-dir); no secrets
+    `${bh}/claude-plugin-lead-only`, // lead-only PreToolUse guard (lead-only-guard.ts); invisible dir = guard silently not loaded
     `${bh}/cursor-plugin`,      // skill/plugin dir (cursor --plugin-dir); no secrets
     `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
     `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets

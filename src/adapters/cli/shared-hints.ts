@@ -335,8 +335,10 @@ export function buildBotmuxSystemPromptText(opts: {
   /** transcript-only: solo chat (owner + this bot). The identity block keeps
    *  name/open_id but drops routing_rules — there is no other bot to route to. */
   solo?: boolean;
+  /** Lead-only chat manager: append the lead-only role block. */
+  leadOnly?: boolean;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -450,6 +452,7 @@ export function buildBotmuxSystemPromptText(opts: {
     '</botmux_routing>',
     ...identityBlock,
     ...(credentialBoundaryBlock ? ['', credentialBoundaryBlock] : []),
+    ...(leadOnly ? ['', '<lead_only_manager>', escapeXmlTagLikeTokens(t('ai.lead_only.rules', undefined, locale)), '</lead_only_manager>'] : []),
     ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
   ].join('\n');
 }
