@@ -10,6 +10,7 @@ const SID = '019dd80d-d922-7a11-8339-0208d8c5b4ee';
 const MESSAGE = 'Inspect the pending change\nand run its tests.';
 const OVERLAY = '/ T R A N S C R I P T / / / / / / / / / /\nPrevious conversation\n──────────────────── 100% ─\n↑/↓ to scroll   PgUp/PgDn to page   Home/End to jump\nq to quit   esc to edit prev\n';
 const PREVIEW = OVERLAY.replace('esc to edit prev', 'esc/← to edit prev   → to edit next   enter to edit message');
+const OVERLAY_MODERN = OVERLAY.replace('q to quit   esc to edit prev', 'q close · f3 find · esc browse prompts');
 let home: string;
 
 beforeEach(() => {
@@ -82,7 +83,7 @@ async function submit(target: PtyHandle) {
 }
 
 describe('Codex transcript submission boundary', () => {
-  it.each([OVERLAY, PREVIEW])('closes the native viewer before paste and executes once', async screen => {
+  it.each([OVERLAY, PREVIEW, OVERLAY_MODERN])('closes the native viewer before paste and executes once', async screen => {
     const t = terminal(screen);
     expect(await submit(t.target)).toMatchObject({ submitted: true, cliSessionId: SID, ownershipProven: true });
     expect(t.executed).toEqual([MESSAGE]);
@@ -110,8 +111,8 @@ describe('Codex transcript submission boundary', () => {
     expect(t.executed).toEqual([MESSAGE]);
   });
 
-  it('preserves a draft hidden behind the viewer without submitting or appending', async () => {
-    const t = terminal(OVERLAY, { hiddenDraft: 'human draft' });
+  it.each([OVERLAY, OVERLAY_MODERN])('preserves a draft hidden behind the viewer without submitting or appending', async screen => {
+    const t = terminal(screen, { hiddenDraft: 'human draft' });
     expect(await submit(t.target)).toMatchObject({ submitted: false, failureReason: expect.any(String) });
     expect(t.draft()).toBe('human draft');
     expect(t.executed).toEqual([]);
@@ -135,6 +136,20 @@ describe('Codex transcript submission boundary', () => {
     expect(t.target.write).not.toHaveBeenCalled();
     expect(t.target.pasteText).not.toHaveBeenCalled();
     expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    OVERLAY_MODERN.replace(' · esc browse prompts', ''),
+    OVERLAY_MODERN.replace('to scroll', 'unknown navigation'),
+    OVERLAY_MODERN.replace('/ T R A N S C R I P T', '/ ANOTHER VIEW'),
+    OVERLAY_MODERN.replace('q close', 'x close'),
+  ])('rejects an incomplete or unsupported modern viewer without writing', async screen => {
+    const t = terminal(screen);
+    expect(await submit(t.target)).toMatchObject({ submitted: false, failureReason: expect.any(String) });
+    expect(t.target.write).not.toHaveBeenCalled();
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.target.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
   });
 
   it('aborts if the process is replaced while the close is settling', async () => {

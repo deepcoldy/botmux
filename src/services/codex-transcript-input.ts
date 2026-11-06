@@ -4,14 +4,18 @@ import { stripAnsiScreenText } from '../utils/idle-detector.js';
 import { delay, scaleMs } from '../utils/timing.js';
 
 /** Native full-screen pager chrome, not a mention in conversation/scrollback.
- * Codex 0.153.4 renders the spaced title in row zero and hints at the bottom.
- * Both normal transcript and backtrack preview share this surface. */
+ * Codex renders the spaced title in row zero and hints at the bottom.
+ * The viewer advertises either `q to quit / esc to edit prev` (also used by
+ * the older backtrack preview) or `q close / esc browse prompts`. */
 function transcriptFooter(viewport: string): string | undefined {
   const rows = stripAnsiScreenText(viewport).replace(/\r/g, '').trimEnd().split('\n');
   if (!/^\s*\/ T R A N S C R I P T(?:\s|\/|$)/.test(rows[0] ?? '')) return undefined;
   const footer = rows.at(-1) ?? '';
   const navigation = rows.at(-2) ?? '';
-  if (!/to scroll/.test(navigation) || !/to quit/.test(footer) || !/to edit prev/.test(footer)) return undefined;
+  if (!/to scroll/.test(navigation)) return undefined;
+  const modern = /^\s*q\s+close(?:\s|$)/.test(footer) && /esc browse prompts/.test(footer);
+  const legacy = /to quit/.test(footer) && /to edit prev/.test(footer);
+  if (!modern && !legacy) return undefined;
   return footer;
 }
 
@@ -36,7 +40,7 @@ export async function prepareCodexTranscriptInput(terminal: PtyHandle): Promise<
   if (closing.has(terminal) && closing.get(terminal)!.pid !== pid) closing.delete(terminal);
   const footer = transcriptFooter(state.viewport);
   if (footer !== undefined && !closing.has(terminal)) {
-    if (!/^\s*q\s+to quit(?:\s|$)/.test(footer)) {
+    if (!/^\s*q\s+(?:to quit|close)(?:\s|$)/.test(footer)) {
       return 'Codex transcript is open with an unsupported close binding; no message was written.';
     }
     closing.set(terminal, { pid });
