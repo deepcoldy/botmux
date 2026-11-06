@@ -35827,3 +35827,10 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfc-needs-bot p { margin: 0 0 4px; }
 .wfc-needs-bot ul { margin: 0; padding-left: 18px; font-size: 13px; }
 .wfc-stale { margin: 0; }
+
+.model-pin-chip { display: inline-flex; flex-wrap: wrap; align-items: center; gap: .35rem; font-size: .8rem; max-width: 100%; overflow-wrap: anywhere; }
+.model-pin-chip button { padding: .15rem .4rem; font-size: inherit; }
+.model-pin-summary { margin: .65rem 0; padding: .75rem; border: 1px solid var(--border); border-radius: 8px; }
+.model-pin-summary p { margin: 0 0 .5rem; }
+
+.model-pin-chip > span { white-space: normal; min-width: 0; overflow-wrap: anywhere; }

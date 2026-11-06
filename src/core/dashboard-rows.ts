@@ -1,3 +1,5 @@
+import { resolveSessionModelPinView } from './session-model.js';
+import type { modelPinView } from './model-pin.js';
 import type { WorkspaceMetadata } from './workspace-metadata.js';
 // src/core/dashboard-rows.ts
 //
@@ -30,6 +32,7 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  modelPin?: ReturnType<typeof modelPinView>;
   /** Present only when the session's frozen sandbox mode differs from what the
    *  bot's CURRENT config would give a new session (dashboard badge). */
   sandboxDrift?: { session: SandboxMode; current: SandboxMode };
@@ -302,6 +305,13 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
+function modelPinField(s: Session, ds?: DaemonSession): Pick<SessionRow, 'modelPin'> {
+  if (!s.modelPin) return {};
+  let cfg: { cliId?: string } | undefined;
+  try { cfg = getBot(s.larkAppId!).config; } catch { /* orphan */ }
+  return { modelPin: resolveSessionModelPinView(ds ?? { session: s }, cfg as Parameters<typeof resolveSessionModelPinView>[1]) };
+}
+
 function sandboxDriftField(s: Session): Pick<SessionRow, 'sandboxDrift'> {
   if (s.sandbox === undefined || !s.larkAppId) return {};
   let botCfg: Parameters<typeof sessionSandboxDrift>[1];
@@ -350,6 +360,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     cliInstanceSource: ds.session.cliInstanceBinding?.source,
     creationSource: ds.session.creationSource,
     ...sessionRuntimeFields(ds.session),
+    ...modelPinField(ds.session, ds),
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
     // For every other session, process residency is authoritative: suspension
@@ -434,6 +445,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
+    ...modelPinField(s),
     status: 'closed',
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),
@@ -495,6 +507,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
+    ...modelPinField(s),
     status: s.queued ? 'idle' : 'dormant',
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),

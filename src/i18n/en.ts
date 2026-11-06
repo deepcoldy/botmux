@@ -1098,6 +1098,7 @@ export const messages: Record<string, string> = {
   'help.rename': '/rename <title> - Rename this Botmux session and sync the running Codex/Claude session name',
   'help.tabs': '/tabs - List and manage tabs in the current Lark chat',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
+  'help.modelpin': '/modelpin <model> [effort] | --follow-bot — Pin or unpin this topic model (applies on next CLI launch)',
   'help.models': '/models     - At top level select the default model and reasoning effort; in a topic select the session model',
   'help.retry': '/retry      - Retry the most recent failed or interrupted turn (10s cooldown)',
   'help.rewind': '/rewind [n|n confirm] - Roll the session context back: no args lists recent checkpoints, `n` previews, `n confirm` truncates the context to before turn n (Claude Code only; the transcript is backed up first)',

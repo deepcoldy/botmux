@@ -26,6 +26,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { modelPinText } from '../../core/model-pin.js';
 import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import type { SubstituteCardControl } from './substitute-card-control.js';
@@ -524,6 +525,7 @@ export function buildSessionCard(
   localCliReady = false,
   runtimeDisplayName?: string,
   sessionSandbox?: SandboxMode,
+  modelPin?: CardUsageSnapshot['modelPin'],
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -561,6 +563,9 @@ export function buildSessionCard(
   } else {
     actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
+  if (modelPin && !adoptMode) actions.push(callbackButton('解除话题固定', 'default', {
+    action: 'session_model_unpin', ...actionBase, expected_pin_set_at: modelPin.setAt,
+  }));
   const card = wideCard({
     header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
@@ -573,6 +578,7 @@ export function buildSessionCard(
             text_size: 'notation',
           }]
         : []),
+      ...(modelPin ? [{ tag: 'div', text: { tag: 'plain_text', content: modelPinText(modelPin) } }] : []),
       { tag: 'action', actions },
     ],
   });
@@ -1351,6 +1357,13 @@ export function buildStreamingCard(
   // Model auto-fallback notice — pinned as small yellow text at the very bottom of
   // the session card (never a separate message) for as long as the session
   // keeps running on the fallback model.
+  const pinNotice = modelPinText(usage?.modelPin);
+  if (pinNotice) {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: pinNotice } });
+    if (!adoptMode) elements.push({ tag: 'action', actions: [callbackButton('解除话题固定', 'default', {
+      action: 'session_model_unpin', ...actionBase, expected_pin_set_at: usage!.modelPin!.setAt,
+    })] });
+  }
   const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
   if (modelFallbackNotice) {
     elements.push({

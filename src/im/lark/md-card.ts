@@ -400,6 +400,7 @@ export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
  * latest context-window measurement; tokens are cumulative for the Session.
  * Missing facts are omitted independently and must never be estimated. */
 export interface CardUsageSnapshot {
+  modelPin?: ReturnType<typeof import('../../core/model-pin.js').modelPinView>;
   context: {
     usedTokens: number;
     windowTokens?: number;

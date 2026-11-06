@@ -1,3 +1,7 @@
+import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
+import { isSessionEffortChangeInFlight } from './worker-pool.js';
+import { scheduleActiveRuntimePatch } from './worker-pool.js';
+import { botModelPins, clearModelPins } from './model-pin-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
@@ -2817,6 +2821,50 @@ ipcRoute('POST', '/api/sessions/:sessionId/failure-recovery', async (req, res, p
   } catch {
     return jsonRes(res, 503, { ok: false, error: 'recovery_persistence_unavailable' });
   }
+});
+
+function clearDashboardModelPins(appId: string, sessionId?: string): string[] {
+  return clearModelPins(appId, sessionId, {
+    findActive: findActiveBySessionId,
+    assertMutable(ds) {
+      const reason = isSessionTransferring(ds) ? 'transferring' : isSessionRestartInFlight(ds) ? 'restarting'
+        : isSessionEffortChangeInFlight(ds) ? 'effort_change' : undefined;
+      if (reason) throw new ModelPinBusyError([{ sessionId: ds.session.sessionId, reason }]);
+    },
+    publish(id) {
+      dashboardEventBus.publish({ type: 'session.update', body: { sessionId: id, patch: { modelPin: null } } });
+      const ds = findActiveBySessionId(id);
+      if (ds) try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`Pin card refresh failed: ${String(error)}`); }
+    },
+  });
+}
+
+ipcRoute('GET', '/api/bots/:appId/model-pins', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  if (params.appId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false });
+  return jsonRes(res, 200, { ok: true, ...botModelPins(params.appId, findActiveBySessionId) });
+});
+ipcRoute('DELETE', '/api/bots/:appId/model-pins', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  if (params.appId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false });
+  return withBotTurnMutation(params.appId, () => {
+    try { return jsonRes(res, 200, { ok: true, cleared: clearDashboardModelPins(params.appId) }); }
+    catch (error) {
+      const body = modelPinClearError(error);
+      return jsonRes(res, body.error === 'session_not_found' ? 404 : 409, body);
+    }
+  });
+});
+ipcRoute('DELETE', '/api/sessions/:sessionId/model-pin', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  const appId = cachedLarkAppId;
+  return withBotTurnMutation(appId, () => {
+    try { return jsonRes(res, 200, { ok: true, cleared: clearDashboardModelPins(appId, params.sessionId) }); }
+    catch (error) {
+      const body = modelPinClearError(error);
+      return jsonRes(res, body.error === 'session_not_found' ? 404 : 409, body);
+    }
+  });
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
