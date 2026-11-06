@@ -13,7 +13,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const ROOT = resolve(__dirname, '..');
-const CONFIG_RE = /^vitest(?:\.[\w-]+)?\.config\.ts$/;
+const CONFIG_RE = /^vitest(?:\.[\w-]+)?\.config\.(?:ts|mts|cts|js|mjs|cjs)$/;
 
 interface TestOptions { name?: string; setupFiles?: string | string[]; globalSetup?: string | string[] }
 

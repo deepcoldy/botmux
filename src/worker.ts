@@ -156,7 +156,7 @@ import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
 import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
-import { restartSpendsFreshBudget } from './core/restart-fresh-budget.js';
+import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -28023,8 +28023,10 @@ async function spawnCli(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
-    lastCliExitServerReplaced = !intentionalRestart
-      && observedBackend.exitedBecauseServerReplaced?.() === true;
+    lastCliExitServerReplaced = exitMarksServerReplaced({
+      intentionalRestart,
+      backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
+    });
     if (codexAutoUpgrade) {
       backend = null;
       isPromptReady = false;
@@ -28649,10 +28651,15 @@ async function restartCliProcess(
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
+    // This restart is abandoned; the server-loss marker must not survive to be
+    // consumed by a later, unrelated restart.
+    lastCliExitServerReplaced = false;
     codexAutoUpgrade.reject?.(new Error(reason));
     return;
   }
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
+    // Adopt workers never restart in place; no restart consumes the marker.
+    lastCliExitServerReplaced = false;
     log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
   }

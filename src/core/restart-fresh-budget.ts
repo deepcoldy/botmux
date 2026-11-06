@@ -20,3 +20,16 @@ export function restartSpendsFreshBudget(input: {
 }): boolean {
   return !input.skipRestartBudget && !input.previousExitServerReplaced;
 }
+
+/**
+ * Whether an observed backend exit should latch the "server was replaced"
+ * marker. A user/worker-intentional restart (respawn, role-switch cwd move)
+ * never marks: that exit was caused by botmux itself, regardless of what the
+ * backend reports.
+ */
+export function exitMarksServerReplaced(input: {
+  intentionalRestart: boolean;
+  backendReportsServerReplaced: boolean;
+}): boolean {
+  return !input.intentionalRestart && input.backendReportsServerReplaced;
+}

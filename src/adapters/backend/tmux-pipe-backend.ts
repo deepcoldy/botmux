@@ -589,8 +589,9 @@ export class TmuxPipeBackend implements SessionBackend {
   private cols = 200;
   private rows = 50;
   private exited = false;
-  /** tmux server pid (`#{pid}`) seen by the last probe that found this pane
-   *  alive. Compared with the answering server at teardown time. */
+  /** tmux server pid (`#{pid}`) holding this pane. Anchored at attach time; the
+   *  first probe that finds the pane alive fills it only if the attach-time
+   *  read failed. Compared with the answering server at teardown time. */
   private lastLiveServerPid: number | undefined;
   /** Set when the pane was judged gone while a DIFFERENT tmux server answered
    *  on the same socket — the whole server was lost, the CLI did not exit. */
@@ -1018,6 +1019,7 @@ export class TmuxPipeBackend implements SessionBackend {
         if (tail) {
           process.stderr.write(`[tmux-pipe-backend] CLI last output before exit (tail):\n${tail}\n`);
         }
+        this.noteServerReplacedAtPaneLoss();
         this.handlePaneExit();
       }
       return false;
@@ -1193,6 +1195,14 @@ export class TmuxPipeBackend implements SessionBackend {
     this.livenessGate.reset();
     this.probeSetbackStreak = 0;
     this.serverUnreachableSince = null;
+    // Anchor the server pid at ATTACH time: pipe-pane succeeding just proved
+    // this server is alive and holds the pane. The first poll is delayed
+    // 1.0–1.75s; waiting for it left a window in which a server replaced right
+    // after a resume was indistinguishable from a CLI crash and still spent the
+    // fresh-session fallback budget (the second-hit window in the 2026-11-06
+    // fleet loss). An unreadable answer stays undefined and the first
+    // successful probe below fills it later — same conservative semantics.
+    if (this.lastLiveServerPid === undefined) this.lastLiveServerPid = this.readPaneServerPid(2000);
     const poll = () => {
       if (this.exited) return;
       // The watched CLI pid (adopt mode) is a pure process.kill(pid,0) syscall —
@@ -1236,21 +1246,6 @@ export class TmuxPipeBackend implements SessionBackend {
     return Math.min(1000 * 3 ** this.probeSetbackStreak, 9000);
   }
 
-  /**
-   * Tri-state pane probe. A clean tmux rejection that the SERVER actually
-   * answered is `missing`; timeout, signal, EMFILE/ENFILE and spawn failures
-   * are `unknown`, because the shared server never answered. Collapsing those
-   * into false caused every worker to destroy a live bmx-* session when the
-   * default server had a short outage.
-   *
-   * CONNECTION-level clean failures ("error connecting to <socket>", "lost
-   * server" — see isTmuxServerLevelErrorText) are `unknown` too, flagged
-   * `serverLevel` so the caller can run the dead-server escalation clock: a
-   * briefly stalled server refuses connects instantly (unix-socket backlog
-   * overflow ⇒ clean ECONNREFUSED), which is indistinguishable from a missing
-   * pane by exit status alone. Misreading it as `missing` mass-tore-down every
-   * live session across all bots at once (2026-08-20 incident).
-   */
   /** `#{pid}` of the server holding this pane; undefined when unreadable.
    *  For an unknown target tmux 3.x exits 0 and still expands the server-level
    *  `#{pid}`, so the pane id is read in the same answer and must be non-empty. */
@@ -1267,6 +1262,21 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Tri-state pane probe. A clean tmux rejection that the SERVER actually
+   * answered is `missing`; timeout, signal, EMFILE/ENFILE and spawn failures
+   * are `unknown`, because the shared server never answered. Collapsing those
+   * into false caused every worker to destroy a live bmx-* session when the
+   * default server had a short outage.
+   *
+   * CONNECTION-level clean failures ("error connecting to <socket>", "lost
+   * server" — see isTmuxServerLevelErrorText) are `unknown` too, flagged
+   * `serverLevel` so the caller can run the dead-server escalation clock: a
+   * briefly stalled server refuses connects instantly (unix-socket backlog
+   * overflow ⇒ clean ECONNREFUSED), which is indistinguishable from a missing
+   * pane by exit status alone. Misreading it as `missing` mass-tore-down every
+   * live session across all bots at once (2026-08-20 incident).
+   */
   private probePaneAddressability(timeoutMs: number): { state: SessionProbe; reason?: string; serverLevel?: boolean } {
     try {
       // `#{pane_id}` alone is NOT a liveness verdict once `remain-on-exit`
@@ -1339,6 +1349,7 @@ export class TmuxPipeBackend implements SessionBackend {
           process.stderr.write(
             `[tmux-pipe-backend] tmux server continuously unreachable for ${Math.round((Date.now() - this.serverUnreachableSince) / 1000)}s; declaring ${this.ownsSession ? 'managed' : 'adopted'} pane dead (${probe.reason ?? 'connection error'})\n`,
           );
+          this.noteServerReplacedAtPaneLoss();
           this.handlePaneExit();
           return;
         }
@@ -1403,31 +1414,10 @@ export class TmuxPipeBackend implements SessionBackend {
     process.stderr.write(
       `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive authoritative misses; detaching observer\n`,
     );
-    this.serverReplacedAtExit = paneLossWasServerReplacement(
-      this.lastLiveServerPid,
-      TmuxPipeBackend.answeringServerPid(3000, this.tmuxArgs),
-    );
-    if (this.serverReplacedAtExit) {
-      process.stderr.write(
-        `[tmux-pipe-backend] the tmux server on this socket was replaced (was pid ${this.lastLiveServerPid}); the CLI did not exit on its own\n`,
-      );
-    }
+    this.noteServerReplacedAtPaneLoss();
     this.handlePaneExit();
   }
 
-  /** Three-state server reachability cross-check. A running server always has
-   *  at least one session (tmux exits when its last session closes), so a clean
-   *  `list-sessions` success ⇒ 'up'. The two failure modes must NOT be
-   *  collapsed, or the pre-teardown cross-check hangs a sole-session worker:
-   *   - 'down': the server answered that it is not running ("no server
-   *     running"). Authoritative; for a sole-session socket this happens
-   *     because the pane died. Teardown is safe.
-   *   - 'unreachable': connect refused / lost server / timeout / spawn failure
-   *     — the client never got an answer, so the server may be live-but-stalled.
-   *     Stay attached.
-   *  Uses the same connection-level classifier as the pane probe so both agree
-   *  on what "the client never reached the server" looks like. Never
-   *  destructive on its own. */
   /** pid of the tmux server currently answering on this socket, or undefined
    *  when nobody answers / the answer is unreadable. Read-only. */
   private static answeringServerPid(timeoutMs: number, socketArgs: readonly string[]): number | undefined {
@@ -1450,6 +1440,34 @@ export class TmuxPipeBackend implements SessionBackend {
     return this.exited && this.serverReplacedAtExit;
   }
 
+  /** Before a probe-confirmed teardown, latch whether a DIFFERENT server now
+   *  answers on the socket. Idempotent and skipped when no live-server pid was
+   *  ever anchored: an unreadable verdict stays "CLI exit", the conservative
+   *  answer that keeps the crash-loop FRESH fallback. The adopt pid-death path
+   *  does not call this — there the CLI process itself was observed gone. */
+  private noteServerReplacedAtPaneLoss(): void {
+    if (this.serverReplacedAtExit || this.lastLiveServerPid === undefined) return;
+    const answeringPid = TmuxPipeBackend.answeringServerPid(3000, this.tmuxArgs);
+    if (!paneLossWasServerReplacement(this.lastLiveServerPid, answeringPid)) return;
+    this.serverReplacedAtExit = true;
+    process.stderr.write(
+      `[tmux-pipe-backend] the tmux server on this socket was replaced (was pid ${this.lastLiveServerPid}); the CLI did not exit on its own\n`,
+    );
+  }
+
+  /** Three-state server reachability cross-check. A running server always has
+   *  at least one session (tmux exits when its last session closes), so a clean
+   *  `list-sessions` success ⇒ 'up'. The two failure modes must NOT be
+   *  collapsed, or the pre-teardown cross-check hangs a sole-session worker:
+   *   - 'down': the server answered that it is not running ("no server
+   *     running"). Authoritative; for a sole-session socket this happens
+   *     because the pane died. Teardown is safe.
+   *   - 'unreachable': connect refused / lost server / timeout / spawn failure
+   *     — the client never got an answer, so the server may be live-but-stalled.
+   *     Stay attached.
+   *  Uses the same connection-level classifier as the pane probe so both agree
+   *  on what "the client never reached the server" looks like. Never
+   *  destructive on its own. */
   private static tmuxServerReachability(timeoutMs: number, socketArgs: readonly string[]): 'up' | 'down' | 'unreachable' {
     try {
       execFileSync('tmux', [...socketArgs, 'list-sessions'], {

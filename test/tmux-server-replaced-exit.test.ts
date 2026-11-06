@@ -93,6 +93,20 @@ describe.skipIf(!realTmux)('TmuxPipeBackend tells a lost tmux server apart from 
     expect(backend.exitedBecauseServerReplaced()).toBe(true);
   }, EXIT_TIMEOUT_MS + 30_000);
 
+  it('anchors the server pid at attach, so a server replaced before the first delayed liveness poll is still detected', async () => {
+    const { backend, exited } = launch('exec sleep 600');
+    // spawn() returns right after pipe-pane attach; the pid must already be
+    // anchored there because the first lifecycle poll is delayed 1.0–1.75s.
+    expect((backend as unknown as { lastLiveServerPid?: number }).lastLiveServerPid)
+      .toEqual(expect.any(Number));
+    // Replace the server well inside the first-poll delay window.
+    await new Promise(r => setTimeout(r, 200));
+    tmux('kill-server');
+    expect(tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'replacement-early', 'sleep 600').status).toBe(0);
+    await exited;
+    expect(backend.exitedBecauseServerReplaced()).toBe(true);
+  }, EXIT_TIMEOUT_MS + 30_000);
+
   it('does not mark a CLI that exits on its own while the server stays', async () => {
     expect(tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'keepalive', 'sleep 600').status).toBe(0);
     const { backend, exited } = launch('sleep 4; exit 0');

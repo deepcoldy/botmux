@@ -24,7 +24,7 @@ describe.skipIf(!bun)('fenced-run', () => {
 
   it('gives the probe a temp HOME (even under Bun) and no user bus by default', () => {
     const home = process.env.HOME ?? '';
-    const probe = 'const os=require("os");console.log(JSON.stringify({home:os.homedir(),bus:process.env.XDG_RUNTIME_DIR??null,dbus:process.env.DBUS_SESSION_BUS_ADDRESS??null}))';
+    const probe = 'const os=require("os");console.log(JSON.stringify({home:os.homedir(),bus:process.env.XDG_RUNTIME_DIR??null,dbus:process.env.DBUS_SESSION_BUS_ADDRESS??null,fenced:process.env.BOTMUX_FENCED_RUN??null}))';
     const r = run(['--', bun!, '-e', probe], { ...process.env, XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' });
     expect(r.status).toBe(0);
     const seen = JSON.parse(r.stdout.trim().split('\n').pop()!);
@@ -32,6 +32,8 @@ describe.skipIf(!bun)('fenced-run', () => {
     expect(seen.home).toMatch(/bmx-fenced-home-/);
     expect(seen.bus).toBeNull();
     expect(seen.dbus).toBeNull();
+    // Marker a probe can check to know it is running behind the fences.
+    expect(seen.fenced).toBe('1');
   });
 
   it('keeps the user bus only when asked', () => {
