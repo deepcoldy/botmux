@@ -2956,6 +2956,24 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
+  it('keeps the card under the size budget when the screen holds a huge backtick run', () => {
+    for (const screen of ['`'.repeat(36_000), 'a\n' + '`'.repeat(200_000) + '\nb']) {
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined, screen,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+    }
+  });
+
+  it('still fences output containing a backtick run so it cannot break out of the code block', () => {
+    const card = build({ screen: 'x\n```\n# not a heading\n```\ny' });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes('not a heading')).content;
+    const fence = md.match(/^`+/)![0];
+    expect(fence.length).toBeGreaterThan(3);
+    expect(md.endsWith(fence)).toBe(true);
+  });
+
   it('does not opt private one-shot snapshots into shared PATCH updates', () => {
     expect(build().config.update_multi).toBeUndefined();
   });
@@ -3105,4 +3123,56 @@ describe('remote backends get no PTY quick-action keys', () => {
       expect(keysIn(cliId)).toEqual([]);
     });
   }
+});
+
+describe('truncateContent single oversized line', () => {
+  it('keeps the tail of a newline-free blob within budget', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('a'.repeat(900) + 'END')).toBe(true);
+  });
+
+  it.each(['\n', '\r\n', '\n\n'])('still keeps content when the blob ends with %j', async (eol) => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END' + eol, 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).toContain('a'.repeat(900) + 'END');
+  });
+
+  it('keeps the oversized last line even when short lines precede it', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('head\nmid\n' + 'b'.repeat(5000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('b'.repeat(900) + 'END')).toBe(true);
+    expect(out).not.toContain('head');
+  });
+
+  it('does not split multibyte characters when cutting a long line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('中'.repeat(5000) + '尾', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).not.toContain('\uFFFD');
+    expect(out.endsWith('尾')).toBe(true);
+  });
+
+  it('keeps the whole fitted last non-blank line pushed out by trailing newlines', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // The 600-byte non-blank line fits within the 970-byte body budget, but the
+    // 401 trailing newlines push total size to 1001, so line bisection leaves
+    // only blank lines. The line must be kept in full: a negative byte offset
+    // (600 - 970) must clamp to 0, not slice off the line's head.
+    const out = truncateContent('x'.repeat(600) + '\n'.repeat(401), 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('x'.repeat(600));
+  });
+
+  it('skips whitespace-only (not just empty) lines when picking the tail line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // After split('\n') the final element is spaces, not an empty string. The
+    // reverse scan must trim() candidates, otherwise the body is blank again.
+    const out = truncateContent('y'.repeat(3000) + '\n   ', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('y'.repeat(970));
+  });
 });

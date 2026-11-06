@@ -1,0 +1,50 @@
+
+  Hooks
+  Lifecycle hooks from config and enabled plugins.
+
+  ⚠ 6 hooks need review before they can run.
+
+  Event                 Installed   Active      Review      Description
+▲
+  SubagentStart         0           0           0           When a subagent starts
+  SubagentStop          0           0           0           When a subagent stops
+  PreCompact            0           0           0           Before context compaction
+  PostCompact           0           0           0           After context compaction
+  SessionStart          1           0           1           When a new session starts
+  SessionEnd            0           0           0           When a session ends
+  UserPromptSubmit      1           0           1           When the user submits a prompt
+❯ Stop                  1           0           1           Right before TRAE CLI ends its turn
+▼
+
+  t trust all  |  enter review hooks  |  esc close
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

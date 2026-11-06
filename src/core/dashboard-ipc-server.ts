@@ -58,6 +58,7 @@ import {
 import * as sessionStore from '../services/session-store.js';
 import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { parseHookCommand } from '../services/hook-runner.js';
 import {
   cliModelSupportsReasoningEffort,
@@ -154,6 +155,10 @@ import {
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
+import {
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+  verifyProtectedLoopbackProxyAttestation,
+} from './protected-loopback-attestation.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -985,13 +990,21 @@ async function readBoundedJsonBody<T = unknown>(
   maxBytes: number,
   timeoutMs: number,
 ): Promise<T> {
+  return (await readBoundedJsonBodyWithRaw<T>(req, maxBytes, timeoutMs)).body;
+}
+
+async function readBoundedJsonBodyWithRaw<T = unknown>(
+  req: IncomingMessage,
+  maxBytes: number,
+  timeoutMs: number,
+): Promise<{ body: T; raw: Buffer }> {
   const contentLength = req.headers['content-length'];
   if (typeof contentLength === 'string') {
     if (!/^\d+$/.test(contentLength) || Number(contentLength) > maxBytes) {
       throw new IpcBodyTooLargeError('request body too large');
     }
   }
-  return await new Promise<T>((resolve, reject) => {
+  return await new Promise<{ body: T; raw: Buffer }>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
@@ -1023,9 +1036,11 @@ async function readBoundedJsonBody<T = unknown>(
       settled = true;
       cleanup();
       try {
-        resolve(chunks.length === 0
-          ? {} as T
-          : JSON.parse(Buffer.concat(chunks, total).toString('utf8')) as T);
+        const raw = Buffer.concat(chunks, total);
+        resolve({
+          body: raw.length === 0 ? {} as T : JSON.parse(raw.toString('utf8')) as T,
+          raw,
+        });
       } catch (err) {
         reject(err);
       }
@@ -1200,7 +1215,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -2230,11 +2245,21 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
     try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
+    const origin = ds?.managedTurnOrigin;
+    const turnId = origin?.turnId;
+    const { feedbackPolicyForRelayedDelivery } = await import('../services/feedback-relay-policy.js');
+    const feedback = ds ? await feedbackPolicyForRelayedDelivery({
+      dataDir: config.session.dataDir, appId: ds.larkAppId, chatId: ds.chatId, callerOpenId: origin?.callerOpenId,
+    }) : undefined;
+    if (ds && (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin !== origin || origin?.turnId !== turnId)) {
+      return jsonRes(res, 409, { ok: false, error: 'turn_mismatch' });
+    }
     const result = await recordRelayedTurnDelivery({
       ds,
       body,
       store: await getSkillFeedbackStore(config.session.dataDir),
       webhookDestinations,
+      feedback,
       teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
     });
     return result.ok
@@ -2243,6 +2268,40 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
+  catch { return jsonRes(res, 400, { error: 'bad_json' }); }
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok || !ds) return jsonRes(res, 403, { error: 'feedback_binding_forbidden' });
+  const turnId = ds.managedTurnOrigin?.turnId;
+  if (body.expectedTurnId !== turnId) return jsonRes(res, 409, { error: 'feedback_binding_turn_mismatch' });
+  if (!turnId || typeof body.sourceMessageId !== 'string' || !/^om_[A-Za-z0-9_-]+$/.test(body.sourceMessageId)
+    || !['substantive', 'clarification', 'progress', 'failed'].includes(String(body.answerKind))) {
+    return jsonRes(res, 400, { error: 'feedback_binding_invalid' });
+  }
+  const detail = await getMessageDetail(ds.larkAppId, body.sourceMessageId, { userCardContent: false });
+  const message = detail?.items?.[0] ?? detail;
+  if (message?.chat_id !== ds.chatId) return jsonRes(res, 403, { error: 'feedback_binding_wrong_chat' });
+  if (ds.session.rootMessageId && ds.session.rootMessageId !== ds.chatId && body.sourceMessageId !== ds.session.rootMessageId) {
+    const sourceThread = await getMessageThreadId(ds.larkAppId, body.sourceMessageId);
+    const rootThread = await getMessageThreadId(ds.larkAppId, ds.session.rootMessageId);
+    if (!sourceThread || sourceThread !== rootThread) return jsonRes(res, 403, { error: 'feedback_binding_wrong_topic' });
+  }
+  const { FeedbackExtensionStore } = await import('../services/feedback-extension-store.js');
+  const store = await FeedbackExtensionStore.open(config.session.dataDir);
+  try {
+    if (ds.managedTurnOrigin?.turnId !== turnId || findActiveBySessionId(params.sessionId) !== ds) {
+      return jsonRes(res, 409, { error: 'feedback_binding_turn_mismatch' });
+    }
+    store.bindSubject(ds.larkAppId, ds.session.sessionId, turnId, {
+      sourceMessageId: body.sourceMessageId, answerKind: body.answerKind as 'substantive' | 'clarification' | 'progress' | 'failed',
+    });
+    return jsonRes(res, 200, { ok: true, turnId, sourceMessageId: body.sourceMessageId });
+  } finally { store.close(); }
 });
 
 const deferredTopicClaims = new DeferredTopicClaimRegistry({
@@ -3326,12 +3385,54 @@ function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: s
 
 ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
   let body: Record<string, unknown>;
-  try { body = await readBoundedJsonBody(req, 4096, 1000); }
+  let rawBody: Buffer;
+  try {
+    const parsed = await readBoundedJsonBodyWithRaw<Record<string, unknown>>(req, 4096, 1000);
+    body = parsed.body;
+    rawBody = parsed.raw;
+  }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
   const ds = findActiveBySessionId(params.sessionId);
-  const peer = process.platform === 'linux' ? resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
-  }) : undefined;
+  const proxyToken = req.headers[PROTECTED_LOOPBACK_ATTESTATION_HEADER];
+  let proxyPeer: ReturnType<typeof verifyProtectedLoopbackProxyAttestation> = null;
+  if (proxyToken !== undefined) {
+    const proxyKey = ds?.protectedLoopbackProxyAttestation;
+    const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    const contentType = req.headers['content-type'];
+    const sessionAccessKey = req.headers['x-botmux-lark-session'];
+    proxyPeer = typeof proxyToken === 'string' && proxyKey
+      && typeof contentType === 'string' && typeof sessionAccessKey === 'string'
+      && ds?.workerGeneration === proxyKey.workerGeneration
+      ? verifyProtectedLoopbackProxyAttestation(proxyKey.secret, proxyToken, {
+          sessionId: params.sessionId,
+          serviceId: 'lark-tool-identity',
+          workerGeneration: proxyKey.workerGeneration,
+          ...(ds.managedTurnOrigin?.turnId ? { turnId: ds.managedTurnOrigin.turnId } : {}),
+          ...(ds.managedTurnOrigin?.dispatchAttempt !== undefined
+            ? { dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt }
+            : {}),
+          method: 'POST',
+          path,
+          headers: {
+            'content-type': contentType,
+            'x-botmux-lark-session': sessionAccessKey,
+          },
+          body: rawBody,
+        })
+      : null;
+    if (!proxyPeer) {
+      return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
+    }
+  }
+  const peer = process.platform === 'linux'
+    ? (proxyPeer
+      ? { ok: true as const, peer: proxyPeer }
+      : resolveLoopbackPeerProcesses({
+          remoteAddress: req.socket.remoteAddress,
+          remotePort: req.socket.remotePort,
+          localPort: req.socket.localPort,
+        }))
+    : undefined;
   const backgroundInput = peer?.ok ? { sessionDataDir: config.session.dataDir,
     sessionId: params.sessionId, peer: peer.peer } : undefined;
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
@@ -6195,9 +6296,8 @@ type ScheduleModelWriteResult =
  * Unlike fire time — which degrades a stale pairing to the bot's configuration
  * so a run is never skipped — a dashboard write is a human sitting in front of
  * the form, so an unusable pairing is rejected outright and they can fix it.
- * The gate mirrors the trigger API: only CLIs implementing the per-turn model
- * contract may be steered, and the effort must exist on the model the run will
- * actually use.
+ * The gate mirrors the trigger API and schedule execution policy, independently
+ * of bot-level effort controls. The effort must exist on the model the run uses.
  *
  * `''` / `null` clears the override (`update` only); absent leaves it alone.
  */
@@ -6240,7 +6340,7 @@ function parseScheduleModelWrite(
 
   let botCfg: BotConfig | undefined;
   try { botCfg = getBot(larkAppId).config; } catch { botCfg = undefined; }
-  if (!isConfigurableReasoningCliId(botCfg?.cliId)) {
+  if (!allowsTaskModelOverride(botCfg?.cliId)) {
     return {
       ok: false,
       field: 'model',

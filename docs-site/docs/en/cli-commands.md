@@ -75,6 +75,12 @@ botmux lang en       # Switch to English (zh / en)
 botmux lang en --bot 0   # Change only bot #0 in bots.json
 ```
 
+#### Switching languages in the setup wizard {#setup-lang}
+
+While running `botmux setup`, press **L** on the first step's selection menu (with the search box empty) and the UI switches between Chinese and English right away; the choice is also saved as this machine's global language. In the simple numbered-input mode, typing `L` and Enter does the same.
+
+You can also pick the language at launch: `botmux setup --lang en` (or `zh`), which is saved as the global language too. To change the UI language later, use `botmux lang` above.
+
 ## Start and stop the daemon
 
 | Command | Description |
@@ -244,6 +250,17 @@ When run inside a botmux session, these commands detect the current session and 
 | `botmux auth request [--scope "<scope1 scope2>"] [--json]` | Generate a Lark authorization link for the person who sent this turn, returned as JSON. The AI sends the link to the user to click |
 | `botmux auth wait --request-id <id> [--json]` | Wait for that authorization to finish, up to 5 minutes. On success, retry the original action |
 
+#### Agent-initiated authorization {#agent-auth-request}
+
+**Nothing to set up on the user's side.** When the AI calls a Lark API with `lark-cli --as user` in a session and finds your authorization missing, it runs `botmux auth request` itself (asking for all the scopes it needs in one `--scope`) and sends the link to **the person who sent this turn**:
+
+- in a direct chat, the AI replies with the link;
+- in a group, botmux sends the link to you in a private message, never into the group.
+
+After you authorize, the AI waits for it with `botmux auth wait` in the same turn (up to 5 minutes) and retries the original action. If the turn has already ended, that's fine: authorize while the link is valid, then send another message to continue. You can also skip the wait and send `/login` (or `/login --scope <scope>`) in the topic yourself.
+
+Prerequisite: this bot's `lark-cli` goes through botmux's app binding (`larkToolBinding`, on by default), or the bot has [Run CLI calls as the message sender](/en/bots-json#trigger-user-auth) on with `lark-cli` covered. With both off, the daemon refuses with `lark_user_auth_disabled`. The link only goes to the verified human of the current turn; the AI cannot request it on someone else's behalf.
+
 ### Read-only queries
 
 These commands only read state; they change nothing.
@@ -268,6 +285,24 @@ These commands only read state; they change nothing.
 | `botmux whiteboard ...` | Local project whiteboard | [Whiteboard](/en/whiteboard) |
 
 For how the AI discovers and uses these commands, see [Skill + CLI](/en/skill-cli).
+
+### Create a group that starts working, or a topic group {#create-group}
+
+`botmux create-group` runs from a host terminal or inside a session; there is no switch to turn on:
+
+```bash
+botmux create-group --bot reviewer-a --bot reviewer-b --name "PR #123 review" \
+  --chat-mode topic \
+  --kickoff-bot ou_xxx --kickoff-prompt "Please review PR #123"
+```
+
+- `--bot`: at least one, repeatable. Prefer the bot's display name or full AppID. **The first one is the creator.**
+- `--chat-mode topic`: create a topic group (each top-level message is its own topic); `group` or leaving it out makes a regular group. The group type can only be chosen at creation and cannot be changed later.
+- `--kickoff-bot` + `--kickoff-prompt`: once the group exists, the creator @mentions that bot with this prompt so it starts working right away (for example, a PR review). Give both together. `--kickoff-bot` is that bot's open_id (look it up with `botmux bots list` in a session); it must be in the `--bot` list and cannot be the first one.
+- `--working-dir <path>`: binds the new group to this directory for every bot that joined, so new topics skip the repo picker.
+- `--json-status`: prints a structured status line after the chatId. With or without it, the command exits non-zero when a requested kickoff wasn't sent.
+
+See `botmux create-group --help` for every flag, including cross-machine team groups (`--team` / `--agent`).
 
 ## Other configuration commands
 

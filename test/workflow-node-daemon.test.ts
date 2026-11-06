@@ -208,8 +208,7 @@ describe('workflow node daemon wiring', () => {
     target.wiring.onTurnSettled(fakeSession('sess-a', marker), { turnId: marker.handoffMessageId, at: 5 });
     target.wiring.onTurnSettled(fakeSession('sess-a', { ...marker, submittedAt: new Date().toISOString() }), { turnId: marker.handoffMessageId, at: 6 });
     target.wiring.onTurnSettled(fakeSession('sess-plain'), { turnId: marker.handoffMessageId, at: 7 });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(target.posted.map((post) => post.body.kind)).toEqual(['accepted', 'stalled']);
+    await eventually(() => expect(target.posted.map((post) => post.body.kind)).toEqual(['accepted', 'stalled']));
     expect(target.posted[0]!.body).toMatchObject({ nonce: marker.nonce, sessionId: 'sess-a', acceptedAt: Date.parse(marker.registeredAt) });
   });
 
@@ -221,8 +220,7 @@ describe('workflow node daemon wiring', () => {
     // A human replied in the topic: a new turn starts.
     target.wiring.onInputCommitted(fakeSession('sess-a', marker), { turnId: 'om_human_reply', committedAt: 9 });
     target.wiring.onInputCommitted(fakeSession('sess-a', marker), { turnId: marker.handoffMessageId, committedAt: 4 });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(target.posted.map((post) => post.body.kind)).toEqual(['active', 'accepted']);
+    await eventually(() => expect(target.posted.map((post) => post.body.kind)).toEqual(['active', 'accepted']));
   });
 
   it('node-card sync skips runs without an envelope entirely', async () => {
