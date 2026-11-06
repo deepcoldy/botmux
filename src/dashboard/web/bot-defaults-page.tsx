@@ -1,4 +1,5 @@
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
+import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
@@ -99,7 +100,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
 import { allowlistSandboxVerifiedClis, sharedBotSandboxAdvice } from '../../core/shared-bot-sandbox-advice.js';
@@ -148,9 +149,9 @@ function selectedAgentCliId(cliKey: string): string {
 
 function reasoningCatalogKey(cliKey: string): string | undefined {
   const cliId = selectedAgentCliId(cliKey);
-  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code' || cliId === 'kimi') return cliId;
-  if (cliId === 'codex' || cliId === 'codex-app') return 'codex';
-  return undefined;
+  // Share the write handler's capability gate: a second CLI list can hide the
+  // control and turn an otherwise unchanged save into an explicit clear.
+  return isConfigurableReasoningCliId(cliId) ? cliId : undefined;
 }
 
 function cliSupportsReasoningEffort(cliKey: string): boolean {
@@ -1403,6 +1404,7 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       <div className="bd-feedback-controls">
         <ToggleRow checked={on} disabled={busy} title={tr('botDefaults.sectionFeedback')} help={null} description={tr('botDefaults.sectionFeedbackDesc')} onChange={checked => { setOn(checked); void save(checked); }} />
         <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} active={props.active} />
+        {props.active && <FeedbackExtensionPanel appId={props.bot.larkAppId} />}
       </div>
       <StatusSpan status={status} />
       {on ? (
@@ -6646,6 +6648,8 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [chatId, setChatId] = useState(savedForm.chatId);
   const [autoJoin, setAutoJoin] = useState(savedForm.autoJoinNewGroups);
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
+  const [decisionCards, setDecisionCards] = useState(savedForm.decisionCards);
+  const [closeHints, setCloseHints] = useState(savedForm.closeHints);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6664,6 +6668,8 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setChatId(savedForm.chatId); }, [appId, savedForm.chatId]);
   useEffect(() => { setAutoJoin(savedForm.autoJoinNewGroups); }, [appId, savedForm.autoJoinNewGroups]);
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
+  useEffect(() => { setDecisionCards(savedForm.decisionCards); }, [appId, savedForm.decisionCards]);
+  useEffect(() => { setCloseHints(savedForm.closeHints); }, [appId, savedForm.closeHints]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6733,6 +6739,18 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     void save({ ...savedForm, autoJoinSoloGroups: on }, setStatus, () => setAutoJoinSolo(previous));
   }
 
+  function toggleDecisionCards(on: boolean): void {
+    const previous = decisionCards;
+    setDecisionCards(on);
+    void save({ ...savedForm, decisionCards: on }, setStatus, () => setDecisionCards(previous));
+  }
+
+  function toggleCloseHints(on: boolean): void {
+    const previous = closeHints;
+    setCloseHints(on);
+    void save({ ...savedForm, closeHints: on }, setStatus, () => setCloseHints(previous));
+  }
+
   function changeChat(next: string): void {
     const previous = chatId;
     setChatId(next);
@@ -6789,6 +6807,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
             </div>
           </div>
           <ToggleRow
+            checked={decisionCards}
+            disabled={busy}
+            dataAction="toggle-steward-decision-cards"
+            title={tr('botDefaults.stewardDecisionCards')}
+            help={tr('botDefaults.stewardDecisionCardsHelp')}
+            onChange={toggleDecisionCards}
+          />
+          <ToggleRow
             checked={autoJoin}
             disabled={busy}
             dataAction="toggle-steward-auto-join"
@@ -6804,6 +6830,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
             title={tr('botDefaults.stewardAutoJoinSolo')}
             help={tr('botDefaults.stewardAutoJoinSoloHelp')}
             onChange={toggleAutoJoinSolo}
+          />
+          <ToggleRow
+            checked={closeHints}
+            disabled={busy}
+            dataAction="toggle-steward-close-hints"
+            title={tr('botDefaults.stewardCloseHints')}
+            help={tr('botDefaults.stewardCloseHintsHelp')}
+            onChange={toggleCloseHints}
           />
           <div className="bd-row bd-steward-guide">
             <div className="bd-field">

@@ -27,7 +27,9 @@ import { registerBot } from '../src/bot-registry.js';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { config } from '../src/config.js';
 import type { DashboardRequestIdentity } from '../src/dashboard/request-identity.js';
-import { MAIN, SKETCHES, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
+import { DOC, MAIN, SKETCHES, STEWARD, PI, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
+import { fakeLaunch } from './helpers/workflow-launch-fakes.js';
+import { readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 
 const SECRET = 'wf-drafts-host-key';
 const OWNER_OPEN = 'ou_owner';
@@ -43,6 +45,7 @@ describe('Dashboard → daemon workflow drafts', () => {
   let dashboardPort = 0;
   let allowed: string[];
   let h: ReturnType<typeof makeService>;
+  let launch: ReturnType<typeof fakeLaunch>;
   let deps: { identity: DashboardRequestIdentity | null; canManageHost: boolean; featureEnabled: boolean };
   let proxied: string[];
   const forgetBridges: Array<() => void> = [];
@@ -71,7 +74,9 @@ describe('Dashboard → daemon workflow drafts', () => {
       union === ALICE.union ? { status: 'resolved', openId: ALICE.open }
         : union === OWNER_UNION ? { status: 'resolved', openId: OWNER_OPEN }
           : { status: 'definitive' });
-    h = makeService(runsDir);
+    launch = fakeLaunch(runsDir);
+    launch.setOnline([MAIN, DOC, STEWARD, PI]);
+    h = makeService(runsDir, { launch: launch.deps });
     installWorkflowDraftService(h.service, { sweep: false });
     setIpcAuthSecret(SECRET);
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -277,6 +282,87 @@ describe('Dashboard → daemon workflow drafts', () => {
     expect(await call('POST', WORKFLOW_DRAFTS_PATH, { larkAppId: 'cli_other', goal: 'g' }))
       .toMatchObject({ status: 409, body: { error: 'bot_mismatch' } });
     expect((await call('GET', WORKFLOW_DRAFTS_PATH)).body.drafts).toEqual([]);
+  });
+
+  /** A draft through both confirmations, over HTTP. */
+  async function confirmedOverHttp(opts: { viaTunnel?: boolean; actor?: string } = {}): Promise<string> {
+    const runId = (await create(opts)).body.draft.runId;
+    h.clarify.reply(`<botmux-spec>\n${specMarkdown()}\n</botmux-spec>`);
+    await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/spec`, {}, opts);
+    await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/approve-spec`, {}, opts);
+    await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/architect`, {}, opts);
+    const draft = await waitPhase(runId, 'dag_ready');
+    const confirmedFlow = await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/approve-flow`, { flowSummarySha256: draft.flow.flowSummarySha256 }, opts);
+    expect(confirmedFlow.body.draft.phase).toBe('flow_confirmed');
+    return runId;
+  }
+
+  it('拉群开始 over HTTP: launch, poll to started, the run is bound to the new group; launch calls keep answering after the start', async () => {
+    const runId = await confirmedOverHttp();
+    const launched = await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, { groupName: '风险报告' });
+    expect(launched).toMatchObject({ status: 200, body: { ok: true, draft: { phase: 'launching', launch: { marker: `#${runId.slice(-8)}` } } } });
+    const started = await waitPhase(runId, 'started');
+    expect(started.launch).toMatchObject({ state: 'started', groupName: `风险报告 #${runId.slice(-8)}`, grantedBots: [DOC] });
+    const chat = launch.onlyChat();
+    const run = (readRunEnvelope(join(runsDir, runId), runId) as any).envelope;
+    expect(run.chatBinding).toMatchObject({ larkAppId: MAIN, chatId: chat.chatId, chatType: 'group', ownerOpenId: OWNER_OPEN });
+    expect(run.authorization.initiator).toEqual({ openId: OWNER_OPEN, source: 'dashboard-local' });
+    expect((await call('GET', WORKFLOW_DRAFTS_PATH)).body.drafts).toEqual([]);
+    expect((await call('GET', '/api/v3/runs')).body.runs.map((r: any) => r.runId)).toEqual([runId]);
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch/continue`, {})).toMatchObject({ status: 200, body: { draft: { phase: 'started' } } });
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, {})).toMatchObject({ status: 409, body: { error: 'launch_exists' } });
+    expect(launch.starts).toEqual([runId]);
+  });
+
+  it('run.json written, start failed: still a draft (not a run), 「继续」 over HTTP starts it', async () => {
+    const runId = await confirmedOverHttp();
+    launch.failNext('startRun', new Error('daemon busy'));
+    await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, {});
+    let draft: any;
+    for (let i = 0; i < 400; i++) {
+      draft = (await call('GET', `${WORKFLOW_DRAFTS_PATH}/${runId}`)).body.draft;
+      if (draft.launch?.error) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(draft).toMatchObject({ phase: 'launching', launch: { nextStep: 'start', error: { step: 'start' } } });
+    expect((await call('GET', `/api/v3/runs/${runId}`)).status).toBe(404);
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/abandon`, {})).toMatchObject({ status: 409, body: { error: 'run_committed' } });
+    expect((await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch/continue`, {})).status).toBe(200);
+    await waitPhase(runId, 'started');
+  });
+
+  it('platform login over the tunnel: the initiator goes in by union_id; another person cannot launch or abandon', async () => {
+    const runId = await confirmedOverHttp(alice);
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, {})).toMatchObject({ status: 403, body: { error: 'not_initiator' } });
+    expect(launch.count('createGroup')).toBe(0);
+    expect((await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, {}, alice)).status).toBe(200);
+    await waitPhase(runId, 'started');
+    expect(launch.onlyChat().owner).toEqual({ channel: 'union_id', id: ALICE.union });
+    expect(launch.onlyChat().users).toEqual([]);
+  });
+
+  it('manual resend routes: need confirmedAbsent, the initiator, and the matching stop', async () => {
+    const runId = await confirmedOverHttp();
+    await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, {});
+    await waitPhase(runId, 'started');
+    for (const tail of ['resend-root', 'resend-summary']) {
+      const path = `${WORKFLOW_DRAFTS_PATH}/${runId}/launch/${tail}`;
+      expect(await call('POST', path, {})).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+      expect(await call('POST', path, { confirmedAbsent: true }, alice)).toMatchObject({ status: 403, body: { error: 'not_initiator' } });
+      expect(await call('POST', path, { confirmedAbsent: true })).toMatchObject({ status: 409, body: { error: 'state_conflict' } });
+    }
+    expect(launch.count('postRootCard')).toBe(1);
+    expect(launch.count('postSummary')).toBe(1);
+  });
+
+  it('launch writes need a body; feature off refuses them and builds nothing', async () => {
+    const runId = await confirmedOverHttp();
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, null)).toMatchObject({ status: 400, body: { error: 'json_body_required' } });
+    writeWorkflowConfig({ enabled: true });
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch`, {})).toMatchObject({ status: 409, body: { error: 'feature_disabled' } });
+    deps.featureEnabled = false;
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/launch/continue`, {})).toMatchObject({ status: 409, body: { error: 'feature_disabled' } });
+    expect(launch.calls).toEqual([]);
   });
 
   it('Feishu H5 and anonymous logins cannot reach drafts', async () => {

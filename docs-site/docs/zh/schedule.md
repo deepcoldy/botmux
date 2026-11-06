@@ -1,140 +1,274 @@
 # 定时任务
 
-支持三种调度类型 + 中文自然语言，到点按任务配置的执行位置运行。**群内默认在群消息顶层执行，即使从话题内创建也不会自动继承原话题。** 要在当前话题继续，请在 CLI 创建时显式传 `--topic`，或在 Dashboard 将「执行位置」设为原话题。
+<video src="img/video-v5-automation.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
-执行位置共有四种：**群消息顶层**（默认，一群内所有顶层任务共享群级会话上下文）、**指定话题**（`--topic`，绑定一个已有话题）、**每次新话题**（`--new-topic`，每次触发各自独立）、**任务独立话题**（opt-in，每个任务拥有自己的专属话题会话，见下文）。
+让 Bot 到点自动干活：每天早上出日报、每 30 分钟巡检一次服务、PR 合入后再去清理分支……到点时，Bot 会把你写好的提示词（prompt）交给 AI CLI 执行，结果发回飞书群。
 
-## 两种创建方式
+## 一分钟上手
 
-- **斜杠命令**（快捷）：`/schedule 每日17:50 帮我看看AI圈有什么新闻`
-- **对话触发**（灵活）：直接跟 agent 说「帮我加个每天 18:00 检查部署的定时任务」，自动触发 `botmux-schedule` Skill。
-
-在话题会话中创建一个留在当前话题的任务：
-
-```bash
-botmux schedule add "每日18:00" "检查部署状态" --topic
-```
-
-`--topic` 可从当前话题会话推断锚点，也可用 `--root-msg-id <om_...>` 指定目标话题。
-
-真人管理员直接在当前对话中要求创建或管理任务，不依赖 `scheduleDelegation.createEnabled`。daemon 从当前有效回合的发送者证据确定操作者；即使 CLI 就绪时清除了忙闲状态中的临时 caller，也只恢复同一条真人消息的身份，并继续校验实时回合授权。会话 Owner、历史消息、机器人发送者和复制上下文的自动续跑不能代替本轮真人授权。
-
-## 跨 Bot 委托创建
-
-当真人在 Bot A 的当前回合中明确要求 Bot B 建立定时任务时，A 必须在受管派发中显式请求：
-
-```bash
-botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并维护状态轮询" \
-  --delegate schedule:create
-```
-
-宿主还必须在 `~/.botmux/config.json` 显式开启新签发（默认关闭）：
-
-```json
-{
-  "scheduleDelegation": {
-    "createEnabled": true,
-    "runEnabled": true,
-    "maxTasksPerTurn": 64,
-    "runScopes": ["bytedcli"],
-    "selfManageEnabled": true
-  }
-}
-```
-
-来源 orchestrator 与目标 generalist 的 `bots.json` 均应启用身份 wrapper；为保证
-scheduled turn 不从未受管工具继承机器登录态，目标 Bot 必须同时覆盖两种工具：
-
-```json
-"triggerUserAuth": {
-  "enabled": true,
-  "tools": ["lark-cli", "bytedcli"]
-}
-```
-
-首版委托严格单跳，并绑定目标 Bot 的当前 dispatch turn；不设固定的 5 分钟期限，turn 存活期间可创建多个不同任务，turn 结束即失效。每个 turn 默认最多创建 64 个任务，可通过 `maxTasksPerTurn` 在 1–1024 间调整。每个 canonical request 会得到确定性 task ID，相同请求重试返回原任务且不重复计数。任务只允许落在原派发群的顶层或当前话题；不支持 `--new-topic`、`--follow-active`、多群或继续转委托。dispatch grant 只允许创建任务；可选的 task-local 自管理权限见下文。
-
-若某个 orchestrator 的所有受管 dispatch 都应默认附带该能力，可按来源 Bot 配置，无需修改每条 SOP：
-
-```json
-{
-  "scheduleDelegation": {
-    "createEnabled": true,
-    "defaultOnDispatchFromBotAppIds": ["cli_spu_orchestrator"],
-    "runScopes": ["bytedcli"],
-    "selfManageEnabled": true
-  }
-}
-```
-
-单次派发可用 `--no-delegate schedule:create` 明确降权。
-
-`runScopes` 默认空；配置为 `["bytedcli"]` 后，委托任务可在未来每次触发时使用原真人的 bytedcli 授权。来源 Bot 和目标 Bot 都必须启用 `triggerUserAuth`，且目标 Bot 应让 `lark-cli`、`bytedcli` 都经过隔离 wrapper，以保证复用会话不会继承历史身份；否则创建或执行会 fail-closed。该能力不会让 scheduled turn 变成通用真人 current actor，也不会持久化 lark-cli 权限。
-
-真人当前回合创建的 direct 任务，其 scheduled turn 可用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务；每次都会重新确认创建它的真人仍是该 Bot 管理员、仍在当前群里。不记录任何真人创建者字段的 direct 任务（结构条件：open_id 与 union_id 都未记录；例如在宿主终端用 `botmux schedule add` 建的任务，创建者就是宿主管理员）同样可以停止自己，不做这项真人复核。跨 Bot delegated 任务仍需 `selfManageEnabled:true`。这几类任务都只能管理当前精确 task，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回 delegated task 的对应持久权限。
-
-需要先发送最终结果再删除自身时，使用一个单一收口命令：
-
-```bash
-botmux send --response-kind final --schedule-remove-self --no-mention "任务已完成"
-```
-
-BotMux 会先确认 final 已成功投递并落账，再通过 owning daemon 删除当前 scheduled task，最后推进长驻 CLI 的排队 turn。不要拆成“先发 final、再执行 `schedule remove self`”，因为 final 之后当前进程可能已经切到下一排队 turn，旧身份会被安全拒绝。该 flag 只接受当前 scheduled turn 的标准 final，task ID 由 daemon 绑定的 turn 推导，调用方不能指定或删除其他任务。若结构化结果中的 `scheduleSelfCleanup.removed` 为 `false`，原样重试同一命令即可：BotMux 会复用已投递的 final，只补做自删，不会重复发消息。
-
-任务定义、授权、启停/完成状态和运行 claim 以宿主侧 SQLite 为准，`schedules.json` 只是可重建投影。首次升级会把当时已有任务清单一次性登记为 legacy；之后新增、复制或改写 JSON 记录不会获得执行资格。该边界保护受管 CLI 与文件沙盒，不承诺抵御能以同一系统用户任意读取宿主密钥和授权库的进程。
-
-因此 `schedule add/update/remove/pause/resume/run` 的写操作必须到达所属 Bot daemon；daemon 不可用或权威库初始化失败时命令会明确报错，不会只改写 `schedules.json` 后制造一个看似存在但永不执行的任务。
-
-## 支持的格式
-
-```bash
-# 中文自然语言
-/schedule 每日17:50 帮我看看AI圈有什么新闻
-/schedule 工作日每天9:00 检查服务状态
-/schedule 每周一10:00 生成周报
-
-# 一次性任务
-/schedule 30分钟后 检查部署状态
-/schedule 明天9:00 发早会提醒
-
-# 英文 duration / interval / cron
-/schedule every 2h 巡检服务
-/schedule 30m 提醒我喝水
-/schedule 0 9 * * * 早安问候
-
-# ISO 时间戳
-/schedule 2026-05-01T10:00 ...
-```
-
-## Bash 前置条件（Dashboard）
-
-需要先检查外部状态、仅在满足条件时调用模型，可以在 Dashboard 新建或编辑定时任务时启用「Bash 前置条件」。关闭开关会停用前置条件，但定时任务仍按原计划执行，已填写的脚本也会保留；清空脚本或文件路径并保存，才会移除配置。
-
-可选择两种配置方式：
-
-- **直接填写 Bash**：脚本内容保存在任务配置中。
-- **Bash 文件路径**：文件必须是 daemon 主机上可读的普通 UTF-8 Bash 文件，并位于 Dashboard 为当前 Bot 显示的 `<dataDir>/schedule-preconditions/trusted-files/` 目录中。页面同时显示可直接填写的完整绝对路径示例。相对路径、使用 `~` 展开的路径、目录本身、目录外文件和任一路径段中的符号链接均会被拒绝。
-
-### 文件路径配置 Demo
-
-假设 Dashboard 为当前 Bot 显示以下内容：
+最快的方式是直接在群里或话题里发：
 
 ```text
-受信目录：/home/alice/.botmux/data/schedule-preconditions/trusted-files/
-完整示例：/home/alice/.botmux/data/schedule-preconditions/trusted-files/check-ready.sh
+/schedule 每日17:50 帮我看看AI圈有什么新闻
 ```
 
-这是 Linux 示例；实际 `dataDir` 可能不同，请使用 Dashboard 显示的值，不要照抄示例用户名。然后：
+Bot 会回一条确认，里面有任务 ID、下次执行时间和执行位置。之后可以用 `/schedule list` 查看、`/schedule remove <id>` 删除。
 
-1. 在**运行 daemon 的同一台主机**上，将普通 UTF-8 Bash 文件创建或复制到 Dashboard 显示的目录中。该目录由 daemon 创建。
-2. 将完整绝对路径粘贴到「Bash 文件路径」。本例应填写 `/home/alice/.botmux/data/schedule-preconditions/trusted-files/check-ready.sh`，不能写成 `~/...`。
-3. 点击「测试前置条件」。测试通过后再保存任务。
+也可以直接跟 Agent 说「帮我加个每天 18:00 检查部署的定时任务」，它会调用内置的 `botmux-schedule` 技能帮你建好。
 
-`check-ready.sh` 可以从这个最小内容开始：
+## 四种创建方式
+
+| 方式 | 适合 | 示例 |
+| --- | --- | --- |
+| 跟 Agent 对话 | 不想记语法 | 「每个工作日 9 点帮我汇总告警」 |
+| 斜杠命令 `/schedule` | 群里快速建一个 | `/schedule 工作日每天9:00 检查服务状态` |
+| CLI `botmux schedule add` | 需要更多选项（话题、模型、直到完成等） | `botmux schedule add "every 2h" "检查构建"` |
+| Dashboard「定时任务」页 | 图形界面编辑、看执行日志、配前置条件和日历 | 点「新建定时任务」 |
+
+在 Bot 的会话里运行 `botmux schedule add` 时，所在群会自动推断；在会话外运行要加 `--chat-id <群 ID>`。
+
+<img src="/img/schedule-dashboard-list.png" alt="Dashboard 定时任务列表：每个任务显示类型、目标群、执行位置、下次执行时间，以及立即运行、启用、编辑、删除按钮" />
+
+## 时间怎么写
+
+**斜杠命令 `/schedule` 只认中文写法**（时间写在最前，后面跟提示词）：
+
+| 写法 | 含义 |
+| --- | --- |
+| `每日17:50` / `每天9点` / `每天9点30分` | 每天定点 |
+| `工作日每天9:00` / `每个工作日9:00` | 周一到周五（不看法定节假日，要看节假日请用[工作日历](#工作日历)） |
+| `每周一10:00` | 每周某天 |
+| `每月1号9:00` | 每月某天 |
+| `每小时` / `每2小时` | 整点对齐 |
+| `每30分钟` | 按分钟对齐 |
+| `30分钟后` / `2小时后` / `明天9:00` | 一次性 |
+
+**CLI 和 Dashboard 还支持更多格式**：
+
+```bash
+botmux schedule add "每日9:00" "早安"            # 上面的中文写法都能用
+botmux schedule add "every 2h" "巡检服务"         # 固定间隔
+botmux schedule add "30m" "提醒我喝水"            # 30 分钟后执行一次
+botmux schedule add "0 9 * * *" "早安问候"        # 5 段 cron 表达式
+botmux schedule add "2026-12-01T10:00" "发版提醒" # 指定时间执行一次
+```
+
+### 时区
+
+cron 和「每天 9 点」这类写法的触发时间、「明天 9:00」怎么解析、卡片和 Dashboard 上显示的时间，都按同一个时区算。默认跟随主机时区。
+
+服务器和你不在同一个时区时（比如主机在海外、人在北京），在 Dashboard「通用设置 → 定时任务 → 时区」里选 `Asia/Shanghai`（对应 `config.json` 的 `scheduleTimeZone`），或者设环境变量 `BOTMUX_SCHEDULE_TIMEZONE`。环境变量优先，详见[全局设置：定时任务时区](/global-settings#定时任务时区)。
+
+例外是直接写日期时间：不带偏移的 `2026-12-01T10:00` 按主机时区理解，不跟这个设置。想固定时区就带上偏移，比如 `2026-12-01T10:00+08:00`。
+
+## 结果发到哪：执行位置
+
+**默认在群消息顶层执行**，即使你是在某个话题里建的任务，也不会自动回到这个话题。想换位置，选下面这几种：
+
+| 执行位置 | 效果 | 怎么设置 |
+| --- | --- | --- |
+| 群消息顶层（默认） | 按 Bot / 群的会话模式执行；一个群里的顶层任务共用群级会话 | 默认；CLI `--top-level` |
+| 指定话题 | 每次都投到同一个已有话题，接着那里的上下文 | CLI `--topic`（在话题会话里自动取当前话题，或用 `--root-msg-id <om_...>` 指定） |
+| 每次新话题 | 每次触发都开一个全新话题、独立会话，适合日报 | prompt 前加「新话题」；CLI `--new-topic` |
+| 任务独立话题 | 这个任务专属一个话题，每次都在里面续上；不同任务互不串 | prompt 前加「独立话题」或「专属话题」 |
+
+Dashboard 的「执行位置」下拉框可以直接改。管理员发 `/dashboard schedules` 会收到一张私信卡片，在任务详情里也能暂停、恢复或切换执行位置。
+
+### 每次新话题
+
+```bash
+# 斜杠命令：prompt 前加「新话题」
+/schedule 每日17:30 新话题 生成今天的群讨论日报
+
+# CLI
+botmux schedule add "每日17:30" "生成日报" --new-topic
+```
+
+新话题的首条消息默认是「任务开始」提示。想自定义标题用 `--topic-title`（最多 200 字），非静默任务还能用模板：
+
+| 占位符 | 替换为 |
+| --- | --- |
+| `{{date}}` | 触发当天的日期（按定时任务时区），如 `2026-11-05` |
+| `{{date:-1d}}` / `{{date:+2d}}` | 往前 / 往后若干天的日期 |
+| `{{owner}}` | @ 任务创建人（任务要记录了创建人才能用） |
+
+```bash
+botmux schedule add "每日9:00" "汇总昨天的告警" --new-topic --topic-title "{{date:-1d}} 告警日报 {{owner}}"
+```
+
+静默任务只支持固定标题，用模板会在保存时被拒绝。
+
+### 任务独立话题
+
+- 同一任务每次触发都在**同一个话题**里，上下文连续；
+- 同一个群的不同任务各用各的话题，巡检和日报不会混进同一段会话；
+- 话题在**第一次触发时才创建**：非静默任务先发一条「任务开始」消息当话题开头；静默任务等 Bot 第一次 `botmux send` 发言时才建。
+- 只支持单个群的任务。
+
+```text
+/schedule 每日18:00 独立话题 汇总今天的服务巡检结果
+/schedule 每个工作日9:00 静默 专属话题 生成晨报，有异常才说话
+```
+
+「静默」和「独立话题」等关键字可以组合，先后顺序随意。
+
+### 跟随活跃话题
+
+固定话题的任务有个问题：话题关了、大家搬到别的话题聊了，提醒就落在没人看的地方。加 `--follow-active`，任务每次触发都会重新挑地方：
+
+```bash
+# 在话题会话里建：起点就是当前话题
+botmux schedule add "every 30m" "检查服务状态，异常才报警" --follow-active
+
+# 或者指定起点
+botmux schedule add "每日9:00" "晨会提醒" --follow-active --root-msg-id om_xxx
+```
+
+每次触发按顺序判断：
+
+1. 上次投的话题还开着，而且有真人在里面说过话 → 继续投那里。
+2. 否则 → 投到本群里**真人最近说话**的话题，并记成新落点（Bot 自己的回复不算）。这时任务在别人的会话里执行，任务自己的 `--workdir` 不生效。
+3. 群里没有任何有真人发言的开着的话题，但上次落点还开着 → 留在原地。
+4. 什么都没开着 → 新开一个顶层话题，记成新落点。
+
+读不到会话记录时（比如数据库暂时不可用）不移动。`--follow-active` 不能和 `--top-level` / `--new-topic` 一起用，`schedule list` 里带 `↷跟随活跃话题` 标记。
+
+## 静默执行
+
+适合「没事别说话，有事才报警」的巡检：
+
+```text
+/schedule 每30分钟 静默 检查服务，挂了才报警
+```
+
+CLI 用 `--silent`。静默任务不发「任务开始」提示，由模型判断要不要用 `botmux send` 发消息；配合新话题时，只有真的要发言才会建话题。
+
+## 管理任务
+
+群里：
+
+```text
+/schedule list               # 查看任务（也可以写「列表」）
+/schedule remove <id>        # 删除（删除）
+/schedule disable <id>       # 暂停（禁用）
+/schedule enable <id>        # 恢复（启用）
+/schedule run <id>           # 立即执行一次（执行）
+```
+
+CLI：
+
+```bash
+botmux schedule list
+botmux schedule pause <id>
+botmux schedule resume <id>
+botmux schedule run <id>
+botmux schedule remove <id>
+```
+
+群里的 `/schedule list` 会显示每个任务的执行身份（`runAs`），没有可用身份的任务会提示「按身份鉴权的工具会 fail-closed」，见[执行身份](#执行身份与权限)。
+
+### 只改提示词
+
+不用删了重建，用 `update` 原地改：
+
+```bash
+botmux schedule update <id> --prompt-file report-prompt.md
+# 短提示词也可以直接传（两种二选一）
+botmux schedule update <id> --prompt "新的完整提示词"
+```
+
+任务 ID、定时规则、启停状态、执行位置和运行记录都保留，也不会补跑。正在跑的那次继续用旧 prompt，下一次用新的。
+
+配置了 Bash 前置条件的任务不能用 `update` 改，请到 Dashboard 修改（前置条件绑定了任务内容的校验值，直接改 prompt 会让之后每次触发都校验失败）。
+
+## 执行日志与多群绑定（Dashboard） {#logs-and-multi-chat}
+
+这两项和 [Bash 前置条件](#bash-前置条件)一样，只在 Dashboard「定时任务」页里操作。
+
+**看执行日志**：任务列表每一行都有「执行日志」按钮，点开能看到最近的执行记录：每次是「已提交模型」「前置条件未通过」还是「调度失败」，触发方式（调度器 / Dashboard 立即运行）、开始和结束时间、前置条件的结果。日志只记录前置检查和提交模型这一段，不包含模型生成的内容、终端输出和消息投递结果；只展示升级后产生的记录，查看日志不会触发或修改任务。
+
+**一个任务绑多个群**：新建或编辑任务时，「绑定群聊」可以多选，最多 5 个群。
+
+- 每个群各自独立调用一次模型，一个群失败不影响其他群；模型调用量会随群数增加。
+- Bash 前置条件每次调度只跑一次，结果对所有群共用。
+- 执行位置选「本任务专属话题」或指定某个已有话题时，只能绑一个群。
+
+## 按任务指定模型
+
+高频哨兵用便宜模型就够，每天一次的深度审查才需要最强的。`--model` / `--reasoning-effort` 只影响这一个任务，不改 Bot 配置：
+
+```bash
+# 高频哨兵：便宜模型 + 低思考强度
+botmux schedule add "every 30m" "检查服务状态，异常才报警" \
+  --silent --model gpt-5.2 --reasoning-effort low
+
+# 每天一次的深度任务
+botmux schedule add "每日9:00" "审查昨天合入 master 的所有 PR" \
+  --new-topic --model gpt-5.6-sol --reasoning-effort ultra
+```
+
+Dashboard 表单里也有「模型」和「思考强度」，留空就跟随 Bot 配置。
+
+**注意：只有新建会话的那次执行能换模型。** 模型是 CLI 进程的启动参数，进程起来后改不了：
+
+| 执行位置 | 效果 |
+| --- | --- |
+| 每次新话题 | 每次都新起会话，模型**每次生效** |
+| 任务独立话题 / 指定话题 / 群消息顶层 | 只有创建会话那次生效，之后沿用会话启动时的模型 |
+
+思考强度可选 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`，具体能用哪几档看模型。支持按任务换模型的 CLI 有 Codex、Codex App、Claude Code、Grok、TRAE（TraeX）、Kimi、ZCode 和 Remote Runner。到点时如果 Bot 已换成不支持的 CLI，或模型不再支持该档位，会丢掉这一项照常执行并记一条警告，不会因此跳过。
+
+## 直到完成：有状态的跟进任务
+
+「等 PR 合入后切回主干」「10 月 30 日之后删掉备份」这类事，用 `--until-done`：没做完就按计划继续，执行它的会话确认做完后标记完成，任务才结束。
+
+```bash
+# 每天 10:07 检查一次，最晚到 11 月 20 日
+botmux schedule add "7 10 * * *" "PR #123 合入后，把集群切回 upstream 并清理临时 worktree" \
+  --until-done --deadline 2026-11-20 --silent
+
+# 某天之后去做；没做成每 6 小时再试（一次性任务默认隔 1 天）
+botmux schedule add "2026-10-30T10:00" "删除升级前的备份目录" --until-done --retry-every 6h
+
+# 执行会话确认做完后标记（先标记，再发最终答复）
+botmux schedule done self --note "已切回 upstream，worktree 已清理"
+```
+
+`--deadline` 可以写日期、`7d`、`明天18:00` 等。
+
+| 情况 | 普通任务 | `--until-done` 任务 |
+| --- | --- | --- |
+| 执行成功 | 一次性任务随即停用 | 不停用；一次性任务隔 `--retry-every` 再执行 |
+| 执行出错 / daemon 重启打断 | 一次性任务随即停用 | 不停用；一次性任务最迟 1 小时后重试，循环任务等下一次 |
+| 错过准点（daemon 停机等） | 跳到下一次 | 立即补跑一次，再接上正常节奏 |
+| 到达 `--deadline` | — | 做最后一次收尾执行，之后关闭为「已到期」；收尾失败每 60 分钟重试，最多 3 次 |
+| `botmux schedule done` | 不适用 | 关闭为「已完成」，记下结果说明 |
+
+每次执行时，prompt 末尾会自动附上第几次执行、截止时间和标记完成的方法，你只需写清「等什么、做什么」。已完成或已到期的任务不能恢复，要继续就新建。跨 Bot 委托创建的任务暂不支持 `--until-done`。
+
+**执行账本**：所有任务都会记执行、跳过、失败、错过的次数，`botmux schedule list` 里每个任务多两行：
+
+```text
+   状态: 直到完成 · 进行中 · 已执行 3 次 · 截止 2026/11/20 00:00:00
+   账本: 执行 3 · 跳过 0 · 失败 1 · 错过 1（最近 2026/10/26 10:07:00）
+```
+
+**失败通知**：
+
+- `--notify failing,expired`：在创建任务的话题（没有就在执行群）@ 创建人。`failing` 是连续失败 3 次时（每轮连败只通知一次），`expired` 是到期关闭时。默认不通知。
+- 管理员兜底：不管有没有配 `--notify`，任一任务连续失败 3 次都会私信一位管理员一次，恢复成功后解除。
+
+## Bash 前置条件
+
+想先检查外部状态、满足条件才调用模型（省钱、少打扰），在 Dashboard 新建或编辑任务时打开「启用 Bash 前置条件」。
+
+<img src="/img/schedule-bash-precondition.jpg" alt="Dashboard 任务表单中的 Bash 前置条件区域：启用开关、配置方式（直接填写 Bash / Bash 文件路径）和脚本输入框" width="520" />
+
+**规则只有一条**：脚本退出码为 `0`，且标准输出去掉首尾空白后**正好是 `1`**，才继续调用模型。输出 `0`、别的内容、空输出或报错，都会跳过这一次。
 
 ```bash
 #!/usr/bin/env bash
-# 请替换为 daemon 主机上实际要检查的状态路径
+# 换成 daemon 主机上你要检查的东西
 if test -f /srv/my-service/ready.flag; then
   printf '1\n'
 else
@@ -142,11 +276,7 @@ else
 fi
 ```
 
-Botmux 会在每次测试和每次定时触发时重新校验并读取该文件；修改文件后无需重新保存任务。
-
-两种配置方式使用同一个执行协议：脚本退出码必须为 `0`，且标准输出去除首尾空白后必须严格等于 `1`，任务才会继续调用模型。输出 `0`、其他内容、空输出或脚本报错都会停止本次任务。
-
-如需给本次模型调用追加 Prompt，将内容写入文件描述符 3（FD 3）：
+想给这次模型调用补充信息，写到文件描述符 3（FD 3），内容会追加到 prompt：
 
 ```bash
 printf '1\n'
@@ -155,199 +285,41 @@ cat >&3 <<'PROMPT'
 PROMPT
 ```
 
-点击「测试前置条件」会在 daemon 主机真实执行当前表单中**尚未保存**的内容，并显示通过、未通过，或完整错误码与退出码。测试不会保存配置、调用模型、写入任务执行日志或计入重复次数；但脚本产生的文件、网络等副作用仍会真实发生。
+FD 3 的内容会发给模型、可能进入会话记录，不要输出密钥或令牌。
 
-> **存量配置迁移**：升级前保存在受信目录外的文件路径会继续保留，但启用该前置条件时，测试和定时执行都会 fail closed，不会调用模型。Botmux 不会自动复制文件或修改任务；请手动把文件移入当前 Bot 的受信目录，更新为新的完整绝对路径，测试通过后保存。FD 3 的内容会发送给模型并可能进入会话记录，不要输出密钥或令牌。
+**两种配置方式**：
 
-## 每次开新话题
+- **直接填写 Bash**：脚本存在任务配置里。
+- **Bash 文件路径**：文件必须放在 Dashboard 显示的受信目录 `<dataDir>/schedule-preconditions/trusted-files/` 下（daemon 主机上），填**完整绝对路径**。相对路径、`~`、目录本身、目录外文件、路径中带符号链接都会被拒绝。每次测试和触发都会重新读文件，改了文件不用重新保存任务。
 
-群顶层执行时，消息如何组织由 Bot / 群的会话模式决定。若要明确让每次执行都落在同群的一个**全新话题**、起一个独立会话（适合日报这类"每天一篇、各自独立"的任务），有三种写法：
+配好后点「测试前置条件」：它会在 daemon 主机上真实运行当前表单里（还没保存的）内容，显示通过、未通过或错误码。测试不会保存配置、不调用模型、不计入执行次数，但脚本本身的副作用（写文件、发请求）会真实发生。
 
-```bash
-# 斜杠命令：prompt 前加"新话题"关键字
-/schedule 每日17:30 新话题 生成今天的群讨论日报
+开关关掉时只是暂停前置条件，任务照常执行，脚本保留；清空脚本或路径再保存才会删掉。
 
-# CLI：--new-topic 旗标
-botmux schedule add "每日17:30" "生成日报" --new-topic
+> 升级前保存在受信目录外的旧文件路径会保留，但启用时测试和执行都会拒绝（不调用模型）。请手动把文件移进受信目录，改成新的完整路径，测试通过后保存。
 
-# CLI：等价的 --deliver 写法
-botmux schedule add "每日17:30" "生成日报" --deliver new-topic
-```
+## 工作日历
 
-也可以在 Dashboard 的「定时任务」页编辑任务，通过「执行位置」切换原话题、群消息顶层、每次新话题或任务独立话题。
-
-## 任务独立话题
-
-「每次新话题」让同一任务的每次触发都互不相干；群消息顶层则反过来，一群里所有顶层任务共用同一个群级会话。**任务独立话题**给每个任务一个只属于它自己的话题会话：
-
-- 同一任务的每次触发都落在**同一个话题**里，上下文连续，和固定话题任务一样；
-- 同一群里的不同任务各用各的话题，**彼此隔离、互不共享上下文**——巡检任务和日报任务不会串进同一段会话历史；
-- 话题在**首次触发时才创建**：非静默任务先发一条种子消息（任务开始横幅），并以这条消息作为话题 root；静默任务则延迟到机器人首次 `botmux send` 发言时才物化话题，与「每次新话题 + 静默」的行为一致。
-
-设置方式：
-
-- **自然语言**：在 prompt 前加「独立话题」或「专属话题」关键字（英文用 dedicated topic），可与「静默」组合、先后顺序不限，例如：
+「工作日 9 点」按周一到周五算，遇到法定节假日和调休补班就不准了。给任务绑定工作日历，调度器会按日历过滤：
 
 ```bash
-/schedule 每日18:00 独立话题 汇总今天的服务巡检结果
-/schedule 工作日9:00 静默 专属话题 生成晨报，有异常才说话
+botmux schedule add "0 9 * * *" "生成日报" --calendar cn    # 仅法定工作日执行
+botmux schedule calendars                                  # 查看可用日历
 ```
 
-- **飞书定时卡片 / Dashboard**：卡片上点执行位置按钮循环切换，顺序为 **群消息顶层 → 每次新话题 → 任务独立话题 → 群消息顶层**；Dashboard「定时任务」表单的「执行位置」可直接选择。
+> 想按中国法定工作日跑，用 **每天的 cron + 日历**（如 `0 9 * * *`）。`0 9 * * 1-5` 本身没有周末触发，绑定日历也变不出周末补班那天。
 
-限制与注意：
+### 内置中国法定工作日历
 
-- 仅支持**单群任务**；多群任务不能选择任务独立话题。
-- 每任务模型与 `--topic` 相同：只有首次触发（创建该会话那次）生效，之后复用会话启动时的模型，详见下节。
+ID 为 `cn`，显示为「中国法定工作日历」，时区 `Asia/Shanghai`，包含放假和周末补班。**目前已核实覆盖 2026-01-01 至 2026-12-31**，依据是[国务院办公厅关于2026年部分节假日安排的通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)（国办发明电〔2025〕7号）。`schedule calendars` 会显示来源信息。
 
-## 跟随活跃话题
+它表示全国统一的放假调休，不代表每个单位的实际排班；地方节日、企业排班、港澳台及其他国家不在内置范围。超出覆盖范围的日期（比如还没核实的 2027 年）不会推算，任务会停止自动执行并记录 `calendar_out_of_coverage`，跨年前请升级到包含下一年数据的版本。
 
-显式设置 `--topic` 的固定话题任务会一直投到指定的话题里；如果那个话题已经关了、讨论搬到了别的话题，提醒就落在没人看的地方——而且一个已关的话题被重新点亮，等于又多开了一个话题会话。`--follow-active` 让任务在**每次触发时**按三级回退重新选目标。
+### 自定义日历
 
-```bash
-# 从话题会话里创建：起点就是当前话题
-botmux schedule add "every 30m" "检查服务状态，异常才报警" --follow-active
+公司排班等情况，可以给 Bot 加自己的日历。默认路径是 `~/.botmux/bots/<appId>/work-calendars.json`（和该 Bot 的 `schedules.json` 同目录），各 Bot 互相独立。改完文件无需重启，下次检查就会读到新内容。
 
-# 也可以显式给起点
-botmux schedule add "每日9:00" "晨会提醒" --follow-active --root-msg-id om_xxx
-```
-
-每次触发依次判：
-
-1. **上次落点的话题没关，且有真人在里面说过话**（任一 bot 在那个话题下还有活的会话，且该会话见过真人消息）⇒ 投那里，哪怕人最近在别的话题说了话。第一次触发前，上次落点就是创建时的话题。
-2. **否则**（关了；或还开着但只有 bot 在里面写）⇒ 投本群里**人最近说话**的那个话题，并把它记成新的落点。只按真人消息判，bot 自己的回复和定时任务的输出不算——否则一个每 30 分钟开火的任务会把自己所在的话题一直刷成「最活跃」，从此跟着自己走；且跨 bot 判定，人在哪个话题是人的属性，不是某个 bot 的属性。注意这时任务是投进人正在用的那个会话里执行的，任务自己的 `--workdir` 在那里不生效，沿用那个会话的工作目录。
-3. **本群里一个有真人发言的开着的话题都没有，但上次落点还开着**（比如第 4 条新开的那个话题，只有任务自己在写）⇒ 留在原地，不再开新话题。
-4. **什么都没开着** ⇒ 这次触发像 `--new-topic` 一样新开一个顶层话题，并把它记成新的落点——下一次触发按第 3 条留在这个话题；人一旦在里面回话，就按第 1 条固定在这里。
-
-第 1 条要求「有真人说过话」是故意的：任务自己开的话题不能把任务钉死在里面，所以只有 bot 在写的落点会让位给任何有人在的话题。会话记录读不到（比如 sqlite 暂不可用）时不移动，沿用上次落点。静默任务走到第 4 条时话题是延迟创建的（首次 `botmux send` 才建），那次不记落点，下次触发重新判。
-
-跨话题提醒：普通固定话题的任务如果投到了不是创建它的那个话题，会往创建话题回一条「已投到 xx」的提示。跟随活跃话题的任务落点本来就会变，所以只在投到**别的群**时才回这条提示；在同一个群里移动，直接在落点话题里发「任务开始」横幅。
-
-`--follow-active` 只对「话题下执行」有意义，不能和 `--top-level` / `--new-topic` 同时用。`schedule list` 里带 `↷跟随活跃话题` 标记的就是这类任务。
-
-## 按任务指定模型
-
-同一个 Bot 下，不同任务往往值得用不同等级的模型：每 30 分钟一次的哨兵用便宜模型就够，每天一次的代码审查才需要最强的。`--model` / `--reasoning-effort` 让任务带上自己的模型，不动 Bot 配置、不影响别的任务。
-
-```bash
-# 高频哨兵：便宜模型 + 低思考强度
-botmux schedule add "every 30m" "检查服务状态，异常才报警" \
-  --silent --model gpt-5.2 --reasoning-effort low
-
-# 每天一次的深度任务：换最强的模型和最高强度
-botmux schedule add "每日9:00" "审查昨天合入 master 的所有 PR" \
-  --new-topic --model gpt-5.6-sol --reasoning-effort ultra
-```
-
-Dashboard 的「定时任务」页也有这两个字段，留空即跟随 Bot 配置。
-
-**只有新建会话的那次执行能应用模型。** 模型和思考强度是 CLI 的**进程启动参数**（`codex --model X -c model_reasoning_effort=Y`），进程起来之后改不了。所以：
-
-| 执行位置 | 效果 |
-| --- | --- |
-| `--new-topic` | 每次触发都新起会话，模型**每次生效** |
-| 任务独立话题 / `--topic` / `--top-level` | 只有创建该会话的那次触发生效；之后复用同一会话时，沿用它启动时的模型 |
-
-需要每次都生效就用 `--new-topic`。CLI 和 Dashboard 在保存时都会按执行位置提示这一点。
-
-支持的 CLI 是 Codex、Claude Code、Grok、TraeX（与 Trigger API `options.model` 同一套门禁）；其它 CLI 的任务会在触发时忽略这两个字段并记一条 warn。思考强度的可选等级取决于模型（如 `gpt-5.6-sol` 六档到 `ultra`，`gpt-5.5` 只到 `xhigh`），Dashboard 保存时会直接拒绝不支持的组合；如果任务存好之后 Bot 换了 CLI、或模型不再支持该等级，触发时会**丢掉这一项照常执行**并记 warn——不会因为配置过期就跳过一次执行。
-
-## 跟进任务：直到完成
-
-「等 PR 合入后切回主干」「10 月 30 日之后删掉备份」这类事，用 `--until-done` 建一个**有状态**的任务：没做完就按计划继续执行，执行它的会话确认做完后标记完成，任务才结束。
-
-```bash
-# 每天 10:07 检查一次，最晚到 11 月 20 日
-botmux schedule add "7 10 * * *" "PR #123 合入后，把集群切回 upstream 并清理临时 worktree" \
-  --until-done --deadline 2026-11-20 --silent
-
-# 某天之后去做；没做成每 6 小时再试（一次性任务默认 1 天）
-botmux schedule add "2026-10-30T10:00" "删除升级前的备份目录" --until-done --retry-every 6h
-
-# 执行会话确认做完后（先标记，再发最终答复）
-botmux schedule done self --note "已切回 upstream，worktree 已清理"
-```
-
-| 情况 | 普通任务 | `--until-done` 任务 |
-| --- | --- | --- |
-| 执行成功投递 | 一次性任务随即停用 | 不停用；一次性任务隔 `--retry-every` 再执行 |
-| 执行出错 / daemon 重启打断 | 一次性任务随即停用 | 不停用；一次性任务最迟 1 小时后重试，循环任务等下一次 |
-| 错过准点（daemon 停机等） | 跳到下一次 | 立即补跑一次，再接上正常节奏 |
-| 到达 `--deadline` | — | 立即做最后一次收尾执行（prompt 会注明），之后关闭为「已到期」。收尾失败会按 60 分钟重试（最多 3 次，之后仍关闭为「已到期」），重试期间常规计划暂停 |
-| `botmux schedule done` | 不适用 | 关闭为「已完成」，记下结果说明 |
-
-每次执行时，prompt 末尾会自动附上第几次执行、截止时间和标记完成的方法，任务 prompt 只需写清「等什么、做什么」。已完成或已到期的任务不能 `resume`，需要继续就新建。机器人代为创建的委托任务暂不支持 `--until-done`。
-
-**执行账本**：所有定时任务都会记录执行、跳过（前置条件 / 工作日历）、失败、错过准点的次数以及连续失败次数，`botmux schedule list` 每个任务下多两行：
-
-```
-   状态: 直到完成 · 进行中 · 已执行 3 次 · 截止 2026/11/20 00:00:00
-   账本: 执行 3 · 跳过 0 · 失败 1 · 错过 1（最近 2026/10/26 10:07:00）
-```
-
-日历读取失败（如日历文件损坏）按一次失败执行记账（跳过仅指前置条件不满足或日历标注的休息日），连续 3 次会计入连败并触发 `--notify failing` 通知。
-
-**按需通知**：`--notify failing,expired` 在创建任务的话题（没有话题则在执行群）@ 创建人——`failing` 是连续失败 3 次时（每轮连续失败只通知一次），`expired` 是任务到期关闭时。默认不通知。
-
-**管理员兜底告警**：与上面的按需通知相互独立——任一定时任务（无论是否配置 `--notify`）连续失败 3 次时，系统还会私信一位管理员一次（成功恢复后自动解除）；日历连续读取失败计入同一条连败串，也会触发该告警。
-
-## 管理
-
-```bash
-/schedule list
-/schedule remove|enable|disable|run <id>
-```
-
-> 执行行为：任务先按执行位置确定目标。显式设置 `--topic` 时，若目标话题的会话还活着，prompt 直接注入现有会话（不另起 worker）；否则新拉一个 worker，使用任务保存的工作目录。群顶层任务按 Bot / 群的会话模式选择会话。`--new-topic` 每次使用全新会话；配合 `--silent` 时，仅在首次 `botmux send` 需要发送内容时创建话题。任务独立话题在首次触发时创建该任务专属话题（非静默先发种子消息并以其为话题 root，静默延迟到首次 `botmux send` 才物化），此后每次触发都续入这同一个会话。
-
-## 原地修改提示词
-
-修改已有任务时使用 `update`，无需先删除再创建：
-
-```bash
-botmux schedule update <id> --prompt-file report-prompt.md
-# 短提示词也可以直接传入（两种方式只能选一种）
-botmux schedule update <id> --prompt "新的完整提示词"
-```
-
-文件按 UTF-8 读取，保留换行。更新只修改 prompt，保留任务 ID、定时规则、启停状态、执行位置和运行记录；不触发补跑。已经开始的执行继续使用原 prompt，后续执行采用新版。输入或权限校验失败不会删除旧任务；更新使用与其他任务操作相同的加锁原子存储。
-
-在定时任务创建的无 owner 话题中，Botmux 通过宿主 daemon 验证当前操作者，无需向沙盒开放机器人配置或凭据。CLI 与 daemon 应配套升级；旧 daemon 缺少此授权能力时会明确拒绝，而不会删除任务或绕过验证。
-
-操作已有任务（运行、暂停、恢复、删除或更新）按当前机器人内的授权判断：宿主从有效回合取得发起人的 `open_id`，并核对本机器人实时允许的操作者；不要求白名单另有 `union_id` 映射。任务所属 Bot、当前会话、轮次和权限仍须匹配。此检查与新建任务的稳定归属绑定分离；不会让机器人消息、旧回合、跨 Bot 的 `open_id` 或调用方自报身份获得权限。新建任务和跨 Bot 委托原有的归属规则不变。
-
-绑定了守护前置条件（precondition）的任务不能用 `update` 修改：前置条件记录了任务输入的校验哈希，而其定义文件保存在宿主侧、沙盒内无法重绑；直接改 prompt 会让任务之后每次触发都校验失败、静默停止。这类任务请在 Dashboard 的定时任务页修改。
-
-## 自定义工作日历
-
-发布、日报和提醒可以按任务绑定工作日历。未绑定的存量任务保持原有行为；调度 tick 读取本地数据，不访问网络，也不让模型判断节假日。
-
-每份日历是独立实体，以稳定的 ID 绑定任务；界面显示名称与 ID 分开。任务可选择“仅工作日”或“仅休息日”，未选择日历则沿用原计划。未指定执行日期类型的已有绑定保持“仅工作日”。“休息日”包含该日历确认的非工作日期，例如未补班的周末和放假日；未知日期不属于可执行的休息日。内置 `cn`、未来增加的地区日历以及用户定义的 `company-shifts` 等日历，都使用相同的时区、覆盖区间、工作星期和日期覆盖规则。地区只是描述日历的可选元数据，不是调度器的分支或全局开关；不要求用户自定义日历归属于某个地区。同一 Bot 可拥有多份日历，不同任务可分别选择。
-
-新增内置日历只需添加数据并在 `src/services/work-calendars/catalog.ts` 注册实体，随后核实来源、日期及测试；解析与调度逻辑无需增加地区分支。用户自定义日历只需在本 Bot 的 `work-calendars.json` 添加命名数据，然后按名称绑定，不需要修改代码。
-
-### 中国大陆全国统一工作日历
-
-首期内置的法定日历显示为“中国法定工作日历 / China Statutory Work Calendar”（ID 为 `cn`）：中国大陆全国统一放假调休安排，时区为 `Asia/Shanghai`，包含平日放假和周末补班。**当前已核实覆盖 2026-01-01 至 2026-12-31**，无需创建 Bot 本地日历文件即可使用：
-
-```bash
-botmux schedule add "0 9 * * *" "生成日报" --calendar cn
-botmux schedule calendars
-```
-
-2026 年的权威依据是[国务院办公厅关于2026年部分节假日安排的通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)（国办发明电〔2025〕7号，2025-11-04 发布）；也可通过[北京市政府转载全文](https://www.beijing.gov.cn/zhengce/zhengcefagui/202511/t20251104_4258873.html)逐项核对。仓库的 `src/services/work-calendars/cn-2026.json` 保存日期、地区、适用范围、来源链接、文号、发布日期和数据版本；`schedule calendars` 输出这些来源信息。
-
-这里的“工作日”采用周一至周五基准，应用官方年度通知中的放假和补班覆盖，表示全国统一调休日历，不是所有单位、人员的实际出勤安排。地方额外节日、部分人群半日假、企业排班、港澳台及其他国家日历均不在首期内置范围内；通用本地 profile 保留为扩展能力，时区不能代替地区选择。
-
-年度数据通过读取官方通知、核对全部放假区间和补班日期、更新仓库快照及日期测试后随版本发布。更新入口与调度执行分开，不将网页抓取或第三方在线 API 放进 tick。覆盖范围外（包括尚未核实的 2027 年）返回 `calendar_out_of_coverage` 并停止自动执行，不推算或沿用上一年的安排；跨年前需升级包含下一年已核实数据的版本。
-
-`cn` 是保留的内置名称，Bot 本地文件无法覆盖它。缺失或损坏的本地扩展文件不会影响 `cn`，也不会把其他缺失名称自动降级成 `cn`。
-
-### 用户自定义日历
-
-在默认配置下，将下面格式的文件保存到 `~/.botmux/bots/<appId>/work-calendars.json`（与该 Bot 的 `schedules.json` 同目录）。自定义数据目录时仍使用任务存储所在目录；不同 Bot 的日历各自隔离，可以使用相同名称。建议将源文件纳入自己的版本管理，通过原子替换更新部署文件；下一次自动检查会读取新内容，无需重启 daemon。
-
-以下是**虚构演示数据，不是任何年份的法定放假或调休安排**：
+下面是**虚构的演示数据**：
 
 ```json
 {
@@ -365,63 +337,130 @@ botmux schedule calendars
 }
 ```
 
-可在同一 `calendars` 对象中继续添加自己的日历，例如 `company-shifts`；每份定义独立设置时区、工作星期、休息和补班日期，任务通过 `--calendar company-shifts` 选择。内置日历的 ID 保留，自定义公司日历应使用自己的 ID，避免与内置官方数据混淆。
-
 | 字段 | 含义 |
 | --- | --- |
-| `version` | 文件 schema 版本，目前为 `1` |
-| `calendars` | 日历名到定义的映射，名称为 1–64 个字母、数字、`_` 或 `-`，首字符须为字母或数字 |
-| `displayNames` | 可选的中英文显示名称（`zh`、`en`）；未提供时显示日历 ID，界面语言切换不会改变绑定 |
-| `timeZone` | 日历使用的 IANA 时区；按实际执行瞬间换算当地日期，与 cron 的 `scheduleTimeZone` 分开配置 |
-| `coverage.start/end` | 已确认数据覆盖的闭区间，必须是有效 `YYYY-MM-DD` 日期 |
-| `workWeek` | 默认工作星期，`0` 是周日、`1` 是周一，以此类推；可为空数组 |
-| `restDates` | 覆盖默认星期的明确休息日期 |
-| `workDates` | 覆盖默认星期的明确工作日期（如周末补班） |
+| `version` | 文件格式版本，目前为 `1` |
+| `calendars` | 日历名 → 定义；名称 1–64 位字母、数字、`_` 或 `-`，首字符须为字母或数字 |
+| `displayNames` | 可选，中英文显示名；不填就显示日历 ID |
+| `timeZone` | 判断「当天是哪天」用的 IANA 时区 |
+| `coverage.start/end` | 数据已确认覆盖的日期区间（含首尾），`YYYY-MM-DD` |
+| `workWeek` | 默认工作星期，`0` 是周日、`1` 是周一…… |
+| `restDates` | 额外的休息日 |
+| `workDates` | 额外的工作日（如周末补班） |
 
-除可选 `displayNames` 外，所有定义字段均必填；日期必须有效且处于覆盖范围内。重复日期、同一天同时列入休息和工作、重复星期、非法时区或反向覆盖区间都会拒绝该定义。文件最大 1 MiB。某个定义损坏不影响其他有效定义，但整个文件格式损坏会阻止所有绑定该文件的自动任务；内置 `cn` 不受影响。
+除 `displayNames` 外都必填。日期重复、同一天既休息又上班、时区非法、区间反了，都会让这份定义无效；文件最大 1 MiB。一份定义坏了不影响其它定义，但整个文件格式损坏时，绑定它的任务都不会自动执行。`cn` 是保留名，本地文件不能覆盖。
 
-### 绑定和回读
+### 绑定、修改与解绑
 
 ```bash
-# 每天产生 9:00 的候选触发，再按日历过滤
 botmux schedule add "0 9 * * *" "生成日报" --calendar cn
-
-# 读取本 Bot 日历定义与任务的日历预览
-botmux schedule calendars
-botmux schedule list
-
-# 更新或移除绑定，保留原来的 prompt、投递位置和 owner
-botmux schedule update <task-id> --calendar cn
-# 仅在休息日执行（工作日任务的默认值为 workday）
-botmux schedule update <task-id> --calendar-day-type restday
-botmux schedule update <task-id> --calendar none
+botmux schedule update <task-id> --calendar cn                # 改绑
+botmux schedule update <task-id> --calendar-day-type restday  # 改为仅休息日执行（默认 workday）
+botmux schedule update <task-id> --calendar none              # 解绑
 ```
 
-CLI 的 `--calendar none` 是移除绑定的保留值，不作为日历名使用。绑定了受保护 Bash precondition 的任务需在 Dashboard 编辑，以便同时更新其 canonical input 绑定。
+Dashboard 表单的「自定义工作日历」下拉框选日历，「执行日期」选「仅工作日」或「仅休息日」，选「不使用工作日历」即解绑。任务行会显示「日历允许的下次触发」和判断原因。
 
-Dashboard 的“自定义工作日历”区域通过下拉框选择日历，内置日历显示正式中英文名称；“执行日期”可选“仅工作日 / Workdays only”或“仅休息日 / Rest days only”。选择“不使用工作日历”取消绑定。日历列表按所属 Bot 加载，包含本地自定义日历。任务行显示原始“下次”触发、日历名称、日历判断原因和“日历允许的下次触发”。API 的创建/更新 DTO 使用 `calendar: "cn"` 和 `calendarDayType: "workday" | "restday"`（默认 `workday`），更新时 `calendar: null` 清除；列表回读包含 `calendar`、`calendarCheck`、`nextEligibleRunAt`，以及最近一次检查的 `lastCalendarCheck`。
+### 日历怎么影响执行
 
-日历允许的下次触发是预览：它只过滤已有 cron/interval 候选，不保证 Bash precondition 通过、模型成功或消息投递成功。原始 `nextRunAt` 保留原调度语义。扫描最多 10,000 个候选本地日期；无法确认时返回 `null` 和明确原因（如 `search_limit` / `calendar_out_of_coverage`），不退化成周一至周五，也不会把未知日期当作休息日。
-
-### 自动、一次性和手动执行语义
-
-| 触发方式 | 日历行为 |
+| 触发方式 | 行为 |
 | --- | --- |
-| 自动 cron | 在执行入口判断实际当地日期；只有所选的工作日或休息日允许执行，其他日期跳过，继续等待原 cron 的下一次候选 |
-| 自动 interval | 同样过滤；跳过后继续原 interval 调度，不累积补跑；预览从当前计划保持间隔相位 |
-| once | 本 MVP 不支持绑定；创建或更新时拒绝，损坏/外部写入的 once 绑定也不会自动执行 |
-| Dashboard“立即执行” / `schedule run` | 显式手动执行绕过日历，保留原有 precondition 和执行规则；记录 `manual_bypass`。CLI 请求意图持久化并由所属 Bot 消费；停机超过补偿窗口后重启仍执行一次并消费意图，后续自动到期重新检查日历 |
+| 自动 cron / interval | 到点先查日历，不符合所选日期类型就跳过，等下一次；不补跑 |
+| 一次性任务 | 不支持绑定日历 |
+| Dashboard「立即运行」/ `schedule run` | 手动执行绕过日历（前置条件照常检查） |
 
-暂停任务会取消尚未消费的 CLI 手动执行请求；暂停态的 `schedule run` 会拒绝并提示先恢复任务。恢复暂停任务时也清理历史残留请求，随后按原计划和日历判断，不会继承暂停前的日历绕过。对已启用任务重复恢复，不会延后它已有的有效手动请求。修改调度规则会取消旧规则下尚未消费的手动请求，新规则的自动触发重新检查日历；仅修改名称等字段或保存相同规则会保留有效请求。Dashboard“立即执行”仍是当次直接执行，不排队到未来，也不恢复任务的自动计划。
+- 日历判断在前置条件、模型调用、建话题之前。被跳过记为「跳过」，不算失败，也不消耗重复次数。
+- 日历缺失、损坏或超出覆盖范围时不执行，记录原因，但不会自动停用任务；修好数据后后续触发恢复正常。日历读取失败按一次失败记账，连续 3 次会触发失败通知。
+- 暂停的任务不能 `schedule run`，先恢复。暂停会取消还没执行的手动执行请求。
 
-自动判断先于可能产生宿主副作用的 Bash precondition、模型调用、话题创建和消息通知。不符合所选日期类型时记录 `lastStatus: skipped`、执行日志 `calendar_skipped`、`schedule.fired` hook 的 `status: skipped`，不会被计作执行失败，也不消耗有限重复次数。日历缺失、损坏、Bot scope 缺失或日期超覆盖时不执行，记录错误原因，不扣重复次数、不自动禁用任务；修复数据后可在后续候选继续执行。未绑定任务不受这些错误影响。
+常见原因码：`work_date` / `work_week` 允许执行，`rest_date` / `rest_week` 跳过；`calendar_missing`（日历不存在）、`calendar_invalid`（格式错误）、`calendar_out_of_coverage`（超出覆盖范围）。
 
-常见原因：`work_date` / `work_week` 表示允许，`rest_date` / `rest_week` 表示跳过；`calendar_missing`、`calendar_invalid`、`calendar_out_of_coverage` 分别表示定义不存在、不可解析/验证、日期没有已确认覆盖。实际日期类型、所选执行日期、是否匹配、显示名称、日期和时区随执行日志记录，正常允许与手动绕过也保留检查结果。
+如果你的业务脚本里自己也写了「周一到周五才干活」，记得去掉，否则日历放行的周末补班仍会被脚本跳过。
 
-### 业务迁移
+## 执行身份与权限
 
-要按中国大陆全国统一工作日运行，核对内置 `cn` 的覆盖年份，再用 **daily cron + calendar**。本地扩展需自行核实来源和日期。`0 9 * * 1-5` 本身没有周末候选，绑定日历不能创造周末触发。
+任务到点运行时，以谁的身份调用 `lark-cli --as user`、`bytedcli` 这类按用户鉴权的工具？规则是：
 
-如果业务 worker 自己硬编码 `weekday < 5`，后续还需去除重复的星期过滤，否则调度器允许的周末补班仍会被 worker 跳过。本功能不会修改业务 worker。
+1. 有人认领过 → 认领人；
+2. 否则 → 创建人（真人在飞书里建任务时自动记录）。
 
-发布后的延迟补偿、既有版本验收或其他需要跨非工作日继续的流程，使用另一个**不绑定日历**的任务表达。日历按任务选择，不引入全局工作日开关或重试框架。
+每次触发都会重新确认这个人还能操作本 Bot。
+
+| 在哪建的任务 | 记录的创建人 |
+| --- | --- |
+| 飞书里真人发 `/schedule` 或让 Agent 建 | 发消息的人 |
+| Dashboard 经平台飞书登录 | 登录的人（此人须能操作本 Bot，否则按 Bot 主人记录） |
+| Dashboard 本地令牌链接 | Bot 主人（Owner） |
+| 宿主终端 `botmux schedule add` | 不记个人；可用 `--run-as <ou_... 或飞书邮箱>` 指定执行身份，此人必须能操作本 Bot |
+
+`--run-as` 只能在宿主终端用；在会话里建的任务一律以当前发起人身份运行。
+
+### 认领卡片
+
+如果 Bot 开启了用户身份鉴权（`bots.json` 的 `triggerUserAuth`），而任务没有可用身份（没记录创建人，或创建人/认领人已无权限），到点时 Bot 会在任务所在群（或话题）发一张认领卡片，不会让任务一直悄悄失败：
+
+<img src="/img/schedule-identity-claim-card.jpg" alt="定时任务认领卡片的四种状态：待认领（没有创建人）、待认领（创建人已无权限）、已认领、已不需要认领" />
+
+- 点「认领，以我的身份执行」：之后每次到点都以你的身份运行。身份取自飞书回传的点击人，不能伪造。
+- 已认领后可以「改为我认领」或「重新执行」。
+- 只有能操作本 Bot 的成员能点；每个任务只有一张卡，之后到点会原地刷新。
+
+### 谁能管理任务
+
+- 新建、运行、暂停、恢复、删除、更新任务，都按**本轮真人发送者**是否是本 Bot 的操作者来判断。机器人消息、历史消息、自动续跑都不能代替真人授权。
+- 任务的执行回合可以用 `botmux schedule pause self` / `remove self` 停掉自己（每次会复核创建人仍是管理员、仍在群里；宿主终端建的无创建人任务同样可以）。它只能管当前这一个任务，不能改 prompt、恢复或强制运行。
+- 想「发完最终结果再删掉自己」，用一条命令完成，不要拆成两步：
+
+```bash
+botmux send --response-kind final --schedule-remove-self --no-mention "任务已完成"
+```
+
+BotMux 会先确认结果发出去了，再删除当前任务。如果返回里 `scheduleSelfCleanup.removed` 为 `false`，原样重试即可，不会重复发消息。
+
+任务的权威记录保存在宿主侧的 SQLite 数据库里，`schedules.json` 只是可重建的副本，手动往里加记录不会让任务生效。所以所有写操作都要送到所属 Bot 的 daemon；daemon 不可用时命令会直接报错，而不是只改 JSON 留下一个永远不跑的任务。
+
+## 高级：跨 Bot 委托创建
+
+当真人在 Bot A 的当前回合里明确要 Bot B 建定时任务，A 需要在受管派发里显式申请：
+
+```bash
+botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并维护状态轮询" \
+  --delegate schedule:create
+```
+
+宿主还要在 `~/.botmux/config.json` 打开（默认关闭）：
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "runEnabled": true,
+    "maxTasksPerTurn": 64,
+    "runScopes": ["bytedcli"],
+    "selfManageEnabled": true
+  }
+}
+```
+
+| 配置 | 作用 |
+| --- | --- |
+| `createEnabled` | 允许签发新委托，默认关；关掉后不再签发，靠 `botGrants` 建的任务也会停止后续执行 |
+| `runEnabled` | 已委托的任务能否继续运行，不写即开；急停开关 |
+| `maxTasksPerTurn` | 一个派发回合最多建几个任务，默认 64，上限 1024 |
+| `runScopes` | 委托任务以后每次运行可沿用原真人的哪些个人凭据，目前只有 `bytedcli`，默认空 |
+| `selfManageEnabled` | 委托任务能否在自己的回合里暂停/删除自己，默认关 |
+| `defaultOnDispatchFromBotAppIds` | 这些来源 Bot 的受管派发默认带上 `schedule:create`；单次可用 `--no-delegate schedule:create` 取消 |
+| `botGrants` | 机器人调度授权：按「来源 Bot + 目标 Bot + 群」预先授权，非管理员触发的派单也能以「控制管理员」名义建任务；需同时打开 `createEnabled` |
+
+这几项也可以在 Dashboard 的「全局设置 → 实验性配置」里改（「跨 Bot 委托创建定时任务」「委托任务自管理」「机器人调度授权」）。
+
+使用 `runScopes` 时，来源和目标 Bot 都要开启 `triggerUserAuth`，并让目标 Bot 的 `lark-cli`、`bytedcli` 都走身份隔离：
+
+```json
+"triggerUserAuth": {
+  "enabled": true,
+  "tools": ["lark-cli", "bytedcli"]
+}
+```
+
+限制：委托只能一跳，绑定目标 Bot 当前这次派发回合，回合结束即失效；任务只能落在原派发群的顶层或当前话题，不支持 `--new-topic`、`--follow-active`、多群或再转委托。相同请求重试会返回原任务，不会重复创建。

@@ -392,9 +392,42 @@ export function resolveSendTarget(opts: {
 }
 
 let finalOutputOriginRecorder: ((ds: DaemonSession, turnId: string, context: FrozenSessionReplyContext) => void) | undefined;
+const TURN_REPLY_CONTEXTS_MAX = 256;
 
 export function setFinalOutputOriginRecorder(recorder: typeof finalOutputOriginRecorder): void {
   finalOutputOriginRecorder = recorder;
+}
+
+/** Copy only the exact prior turn's destination, never its execution identity.
+ * The returned rollback must run synchronously on dispatch refusal, before any
+ * await. Restore evicted entries too; deleting only the new turn loses history.
+ * The caller must persist the restored row because fork may have written it. */
+export function inheritTurnReplyRouting(ds: DaemonSession, sourceTurnId: string | undefined, turnId: string): () => void {
+  if (!sourceTurnId) return () => {};
+  const previous = structuredClone({
+    turnReplyContexts: ds.session.turnReplyContexts,
+    replyTargets: ds.session.replyTargets,
+    replyTargetsPrunedThrough: ds.session.replyTargetsPrunedThrough,
+  });
+  const prior = pickTurnReplyTarget(ds.session, sourceTurnId);
+  const context = frozenReplyContextForTurn(ds, sourceTurnId);
+  ds.session.turnReplyContexts = { ...ds.session.turnReplyContexts,
+    [turnId]: { target: structuredClone(context.target),
+      ...(context.quoteTargetId ? { quoteTargetId: context.quoteTargetId } : {}) } };
+  for (const stale of Object.keys(ds.session.turnReplyContexts).slice(0,
+    Math.max(0, Object.keys(ds.session.turnReplyContexts).length - TURN_REPLY_CONTEXTS_MAX))) {
+    delete ds.session.turnReplyContexts[stale];
+  }
+  const targets = { ...ds.session.replyTargets, [turnId]: {
+    ...(context.target.mode !== 'plain' ? { rootMessageId: context.target.rootMessageId } : {}),
+    ...(context.target.mode === 'quote' ? { quoteOnly: true } : {}),
+    ...(prior?.substitute ? { substitute: true } : {}),
+    updatedAt: new Date().toISOString(),
+  } };
+  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets,
+    ds.session.replyTargetsPrunedThrough, cronPinnedTurnIds(ds.session.cronTaskReplyAnchors));
+  ds.session.replyTargets = targets;
+  return () => { Object.assign(ds.session, previous); };
 }
 
 export function beginReplyTargetTurn(
@@ -446,7 +479,7 @@ export function beginReplyTargetTurn(
   // The output owner records the authenticated origin before bounded UI
   // projections can prune it. Failure prevents admission, not a forged ACK.
   finalOutputOriginRecorder?.(ds, turnId, exactContexts[turnId]);
-  const overflow = Object.keys(exactContexts).length - 256;
+  const overflow = Object.keys(exactContexts).length - TURN_REPLY_CONTEXTS_MAX;
   if (overflow > 0) {
     for (const staleTurnId of Object.keys(exactContexts).slice(0, overflow)) {
       delete exactContexts[staleTurnId];

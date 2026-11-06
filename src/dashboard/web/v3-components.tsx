@@ -41,6 +41,11 @@ import {
   V3_CHECKPOINT_LABEL,
 } from './v3-model.js';
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
+import { NewWorkflowEntry, WorkflowDraftPage, WorkflowDraftsSection, WorkflowNewPage, useWorkflowSwitches } from './workflow-draft-page.js';
+import { parseWorkflowsRoute, workflowEntryMode } from './workflow-draft-model.js';
+import { SaveTemplateDialog, WorkflowLibraryEntry, WorkflowLibraryPage, WorkflowTemplatePage } from './workflow-library-page.js';
+import { fetchOrchestratorBots } from './workflow-draft-api.js';
+import { CopyWorkflowButton, CopyWorkflowDialog } from './workflow-copy.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
 
 function isDocumentHidden(): boolean {
@@ -132,9 +137,14 @@ function useV3RunDetail(runId: string): DetailPollState {
 function V3ListPage(): React.JSX.Element {
   const tr = useT();
   const runs = useV3RunsList();
+  // Dashboard orchestration (design 2026-11-03 §4.1, §4.6): no new entry at
+  // all while the workflow switch is off (or not known yet).
+  const entryMode = workflowEntryMode(useWorkflowSwitches());
   const headingActions = (
     <div className="page-heading-actions v3r-run-toolbar">
       <span className="v3r-run-count">{runs.length}</span>
+      {entryMode === 'ready' ? <WorkflowLibraryEntry /> : null}
+      {entryMode !== 'hidden' ? <NewWorkflowEntry mode={entryMode} /> : null}
     </div>
   );
 
@@ -164,6 +174,7 @@ function V3ListPage(): React.JSX.Element {
           )}
         </div>
       </section>
+      {entryMode === 'ready' ? <WorkflowDraftsSection /> : null}
     </>
   );
 }
@@ -177,8 +188,21 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
   const [cancelBusy, setCancelBusy] = useState(false);
   const [cancelSubmitted, setCancelSubmitted] = useState(false);
   const [cancelNotice, setCancelNotice] = useState<string | null>(null);
+  // 「保存为模板」(D5): only with Dashboard orchestration on, on a finished run.
+  const entryMode = workflowEntryMode(useWorkflowSwitches());
+  const [saving, setSaving] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [botNames, setBotNames] = useState<Map<string, string>>(() => new Map());
+  useEffect(() => {
+    if (!saving || botNames.size) return;
+    void fetchOrchestratorBots().then((result) => {
+      if (result.ok) setBotNames(new Map(result.bots.map((bot) => [bot.larkAppId, bot.name])));
+    });
+  }, [botNames.size, saving]);
 
   useEffect(() => {
+    setSaving(false);
+    setCopying(false);
     setSelectedId(null);
     setInstanceId(null);
     setInstancePinned(false);
@@ -261,6 +285,11 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           <span className={`${statusClass} v3r-run-status-pill`}>{statusText}</span>
         </div>
         <div className="page-heading-actions">
+          {entryMode === 'ready' && ui.authed && terminal && !saving ? (
+            <button type="button" onClick={() => setSaving(true)}>{tr('workflow.library.saveFromRun')}</button>
+          ) : null}
+          {/* 「复制为新工作流」(D6): any run, finished or not. */}
+          {entryMode === 'ready' && ui.authed ? <CopyWorkflowButton active={copying} onOpen={() => setCopying(true)} /> : null}
           <V3CancelButton
             runStatus={view?.runStatus}
             busy={cancelBusy || cancelSubmitted}
@@ -273,6 +302,8 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           {cancelNotice}
         </div>
       ) : null}
+      {saving ? <SaveTemplateDialog source={{ kind: 'run', runId: props.runId }} botNames={botNames} onClose={() => setSaving(false)} /> : null}
+      {copying && entryMode === 'ready' ? <CopyWorkflowDialog source={{ kind: 'run', runId: props.runId }} onClose={() => setCopying(false)} /> : null}
       <div className="v3r-wrap">
         <section className="overview-block v3r-graph-section">
           <SectionHeader
@@ -349,10 +380,16 @@ export function V3Legend(): React.JSX.Element {
   );
 }
 
-function DagGraph(props: {
+/** The run-detail flow graph. Also the draft page's (design 2026-11-03
+ *  workflow-dashboard-orchestration §4.4): `statusLineOf` replaces the third
+ *  row, `interactive` makes boxes keyboard-focusable buttons. */
+export function DagGraph(props: {
   view: RunView | null;
   selectedId: string | null;
   onSelect: (nodeId: string) => void;
+  statusLineOf?: (node: RunNodeView) => string;
+  interactive?: boolean;
+  nodeLabelOf?: (node: RunNodeView) => string;
 }): React.JSX.Element {
   const layout = useMemo(() => props.view ? buildGraphLayout(props.view) : null, [props.view]);
   const topologyKey = layout
@@ -412,6 +449,8 @@ function DagGraph(props: {
                 generatedAt={props.view?.generatedAt}
                 selected={box.node.id === props.selectedId}
                 onSelect={props.onSelect}
+                {...(props.statusLineOf ? { statusLine: props.statusLineOf(box.node) } : {})}
+                {...(props.interactive ? { ariaLabel: props.nodeLabelOf?.(box.node) ?? box.node.id } : {})}
               />
             ))}
           </svg>
@@ -426,11 +465,15 @@ export function DagNode(props: {
   generatedAt: number | undefined;
   selected: boolean;
   onSelect: (nodeId: string) => void;
+  /** Third row override (draft flow graph). */
+  statusLine?: string;
+  /** Set: the box is a focusable button with this accessible name. */
+  ariaLabel?: string;
 }): React.JSX.Element {
   const { box, selected } = props;
   const node = box.node;
   if (node.isLoop) {
-    return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} />;
+    return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} statusLine={props.statusLine} ariaLabel={props.ariaLabel} />;
   }
   const botLine = nodeBoxBotLine(node);
   const fit = boxTextFit(box.width);
@@ -440,6 +483,7 @@ export function DagNode(props: {
       className={`v3r-node st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}${node.pendingChange ? ` pending pending-${node.pendingChange}` : ''}${node.revisionMark ? ` rev-${node.revisionMark}` : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
+      {...nodeButtonProps(props.ariaLabel, selected, () => props.onSelect(node.id))}
     >
       {heading.badgeTitle ? <title>{heading.badgeTitle}</title> : null}
       <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.plainHeight} rx="10" />
@@ -451,10 +495,26 @@ export function DagNode(props: {
         {botLine ? trunc(botLine, fit(24)) : '—'}
       </text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 55}>
-        {trunc(nodeStatusLine(node, props.generatedAt), fit(22))}
+        {trunc(props.statusLine ?? nodeStatusLine(node, props.generatedAt), fit(22))}
       </text>
     </g>
   );
+}
+
+/** Keyboard affordance of a graph box (draft page only; run detail keeps its markup). */
+function nodeButtonProps(ariaLabel: string | undefined, selected: boolean, activate: () => void): React.SVGProps<SVGGElement> {
+  if (ariaLabel === undefined) return {};
+  return {
+    role: 'button',
+    tabIndex: 0,
+    'aria-label': ariaLabel,
+    'aria-pressed': selected,
+    onKeyDown: (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      activate();
+    },
+  };
 }
 
 /** Truncation budget for a box narrower than the standard width (the sidebar's
@@ -468,6 +528,8 @@ function LoopGraphNode(props: {
   generatedAt: number | undefined;
   selected: boolean;
   onSelect: (nodeId: string) => void;
+  statusLine?: string;
+  ariaLabel?: string;
 }): React.JSX.Element {
   const { box, selected } = props;
   const node = box.node;
@@ -475,7 +537,7 @@ function LoopGraphNode(props: {
   const budget = loopBudget(node);
   const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
   const elapsed = props.generatedAt !== undefined ? nodeElapsedMs(node, props.generatedAt) : undefined;
-  const statusLine = [
+  const statusLine = props.statusLine ?? [
     label,
     ls ? `第${ls.iteration}${budget !== undefined ? `/${budget}` : ''}轮` : 'loop',
     ...(elapsed !== undefined ? [formatV3Duration(elapsed)] : []),
@@ -487,6 +549,7 @@ function LoopGraphNode(props: {
       className={`v3r-node v3r-loopnode st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
+      {...nodeButtonProps(props.ariaLabel, selected, () => props.onSelect(node.id))}
     >
       <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={box.width + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
       <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.loopHeight} rx="10" />
@@ -868,11 +931,27 @@ export function TerminalSlot(props: { runId: string; node: RunNodeView | null })
   return <div id="v3-term-slot" className="v3r-term-slot" ref={ref} />;
 }
 
+/** The template pages exist only with Dashboard orchestration on (§10). */
+function LibraryGate(props: { children: React.ReactNode }): React.JSX.Element {
+  const mode = workflowEntryMode(useWorkflowSwitches());
+  return mode === 'ready' ? <>{props.children}</> : <V3ListPage />;
+}
+
 export function V3RunsPage(): React.JSX.Element {
-  const runId = v3RunIdFromHash();
+  // Route table (E13): new / drafts / library before run detail.
+  const route = parseWorkflowsRoute(typeof location !== 'undefined' ? location.hash : '');
+  const runId = route.kind === 'run' ? v3RunIdFromHash() : null;
   return (
     <section className="page workflows-page v3-page">
-      {runId ? <V3DetailPage runId={runId} /> : <V3ListPage />}
+      {route.kind === 'new'
+        ? <WorkflowNewPage />
+        : route.kind === 'draft'
+          ? <WorkflowDraftPage runId={route.runId} />
+          : route.kind === 'library'
+            ? <LibraryGate><WorkflowLibraryPage /></LibraryGate>
+            : route.kind === 'template'
+              ? <LibraryGate><WorkflowTemplatePage workflowId={route.workflowId} /></LibraryGate>
+              : runId ? <V3DetailPage runId={runId} /> : <V3ListPage />}
     </section>
   );
 }

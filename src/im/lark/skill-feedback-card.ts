@@ -267,6 +267,12 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
   let end = feedbackIndex + 1;
   while (end < elements.length && FEEDBACK_ELEMENT_IDS.has(String((elements[end] as any)?.element_id ?? ''))) end++;
   const updated = feedbackStateElements(policy, state);
+  const originalColumns = (elements[feedbackIndex] as { columns?: Array<{ width?: string; elements?: unknown[] }> }).columns;
+  if (originalColumns?.length === 1 && originalColumns[0].width === 'weighted') {
+    const columns = updated[0].columns as Array<{ elements: unknown[] }>;
+    updated[0].columns = [{ tag: 'column', width: 'weighted', weight: 1, elements: columns.flatMap(column => column.elements) }];
+    updated[0].flex_mode = 'none';
+  }
   const oncall = (elements[feedbackIndex] as any).columns?.find((column: any) => column.element_id === 'botmux_oncall_group_column');
   // Lark's message read API omits behaviors, so restore the callback definition.
   if (oncall) { (updated[0] as any).columns.push(buildOncallGroupColumn()); updated[0].flex_mode = 'flow'; }
@@ -280,6 +286,7 @@ function callbackKey(input: Record<string, unknown>): string { return createHash
 export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: string, deps: {
   store: CompatibleFeedbackStore;
   loadBaseCard?: (platformMessageId: string) => Promise<Record<string, unknown> | undefined>;
+  renderCard?: (policy: FeedbackPolicy, state: FeedbackCardState) => Record<string, unknown>;
 }): Promise<any> {
   const data = normalizeCardActionData(input);
   const platformMessageId = data.context?.open_message_id;
@@ -324,7 +331,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
 
   const previous = await deps.store.getLatestFeedback(delivery.deliveryId, operatorSubjectId);
   if (previous && !delivery.policy.allowReselect && action === 'feedback_submit') {
-    return { card: { type: 'raw', data: renderFeedbackCard(baseCard, delivery.policy, previous) } };
+    return { card: { type: 'raw', data: deps.renderCard?.(delivery.policy, previous) ?? renderFeedbackCard(baseCard, delivery.policy, previous) } };
   }
   let result: string;
   let reasonKey: string | undefined;
@@ -376,7 +383,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
     }
     throw error;
   }
-  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
+  const renderedCard = deps.renderCard?.(delivery.policy, recorded.feedback) ?? renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
   const toast = recorded.status === 'stale'
     ? { type: 'warning', content: '反馈状态已更新，请基于最新卡片重试' }
     : undefined;

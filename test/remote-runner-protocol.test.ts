@@ -8,11 +8,28 @@ import {
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
   parseRemoteRunnerEventLine,
+  projectRemoteRunnerTrustedCaller,
   remoteRunnerCommand,
   type RemoteRunnerEvent,
 } from '../src/adapters/backend/remote-runner-protocol.js';
 
 describe('remote runner protocol', () => {
+  it('never serializes a verified local principal or capability to a remote provider', () => {
+    expect(projectRemoteRunnerTrustedCaller({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      verifiedEmail: 'actor@bytedance.com',
+      botmuxGrantedCapabilities: ['fixture.secret.v1'],
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    })).toEqual({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    });
+  });
+
   it('keeps remote compute and native agent lineage as separate state', () => {
     expect(normalizeRemoteRunnerBackendState({
       version: 1,

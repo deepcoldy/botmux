@@ -80,6 +80,8 @@ import {
   disableAutostart,
   autostartStatus,
   refreshAutostart,
+  resolveLoginShellPath,
+  autostartHookFileExists,
   clearWatchdogStopped,
   markWatchdogStopped,
   watchdogStopRequested,
@@ -2916,7 +2918,18 @@ async function startConfiguredFleet(
   // and `daemon-reload`ing the very unit that is mid-transaction is at best
   // pointless and at worst makes the start fail.
   if (!options.bootHookStart
-      && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+      && refreshAutostart({
+        pkgRoot: PKG_ROOT,
+        configDir: CONFIG_DIR,
+        logDir: LOG_DIR,
+        // The boot hook's PATH must reflect the user's LOGIN shell, not the
+        // environment of whoever happens to run this command — a CLI session's
+        // PATH is narrower than the user's shell and would strip tool dirs
+        // from the unit. Resolved here (not in autostart.ts) so the boot-hook
+        // path stays a pure function of its inputs. Skip the (multi-shell,
+        // synchronous) probe when no boot hook exists: refresh would no-op.
+        loginShellPath: autostartHookFileExists() ? resolveLoginShellPath() : undefined,
+      })) {
     console.log(`   autostart 主 unit 已同步到当前启动路径`);
   }
   // NOT UNDER systemd. Nobody reads a dashboard link at boot, and this poll waits
@@ -3031,6 +3044,12 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   clearWatchdogStopped(CONFIG_DIR);
+  // Resolved BEFORE taking the fleet mutation lock. `resolveLoginShellPath`
+  // spawns up to eight shells with a 5s timeout each, and the lock is acquired
+  // with a 5s max wait — probing inside it could make a concurrent `stop` /
+  // `start-bot` time out and fail. The value is a login shell's PATH, so
+  // reading it a moment earlier is harmless.
+  const restartAutostartLoginPath = autostartHookFileExists() ? resolveLoginShellPath() : undefined;
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     // Report recovery guidance before any live-fleet mutation. The locked
     // check below repeats against the exact generation used for restart.
@@ -3114,7 +3133,15 @@ async function cmdRestart(): Promise<void> {
     }, { maxWaitMs: 5_000 });
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
-    if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+    if (refreshAutostart({
+      pkgRoot: PKG_ROOT,
+      configDir: CONFIG_DIR,
+      logDir: LOG_DIR,
+      // Same reason as the start path: the unit's PATH must come from the
+      // user's login shell, not from this process's (possibly narrowed) PATH.
+      // Probed above, outside this lock.
+      loginShellPath: restartAutostartLoginPath,
+    })) {
       console.log(`autostart 主 unit 已同步到当前启动路径`);
     }
     console.log('✅ daemon 已重启');
@@ -3561,6 +3588,7 @@ async function cmdStatus(): Promise<void> {
   }
   warnIfLegacyBotmuxAlive();
   const { readFleetStatus } = await import('./core/fleet-runtime.js');
+  const { formatLarkConnectionStatus } = await import('./cli/lark-connection-status.js');
   const status = readFleetStatus();
   if (!status.supervisorAlive && status.rows.length === 0) {
     console.log('daemon 未在运行。（用 `botmux start` 启动）');
@@ -3576,13 +3604,12 @@ async function cmdStatus(): Promise<void> {
     if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
     return;
   }
-  // Fixed-width table: name | pid | status | ↺restarts | exit | version.
   const online = listOnlineDaemons();
-  const versionByApp = new Map(online.map(d => [d.larkAppId, d.botmuxVersion]));
+  const descriptorByApp = new Map(online.map(d => [d.larkAppId, d]));
   const nameW = Math.max(4, ...status.rows.map(r => r.name.length));
-  const verCells = status.rows.map(r => versionByApp.get(r.appId) ?? '-');
+  const verCells = status.rows.map(r => descriptorByApp.get(r.appId)?.botmuxVersion ?? '-');
   const verW = Math.max(7, ...verCells.map(v => v.length));
-  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}`;
+  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}  LARK WS`;
   console.log(header);
   for (const [i, r] of status.rows.entries()) {
     // A row recorded 'online' whose pid is actually dead is shown as such so
@@ -3590,7 +3617,8 @@ async function cmdStatus(): Promise<void> {
     const shown = r.status === 'online' && !r.alive ? 'dead?' : r.status;
     const pidCol = r.pid > 0 ? String(r.pid) : '-';
     const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
-    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}`);
+    const ws = r.appId ? formatLarkConnectionStatus(r, descriptorByApp.get(r.appId)) : '—';
+    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}  ${ws}`);
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
@@ -6095,7 +6123,7 @@ async function cmdMaintenance(args: string[]): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -7792,7 +7820,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   execution background-revoke <任务ID> --json
               撤销本会话原执行人启动的后台任务凭据登记
   auth request [--scope "<scope1 scope2,...>"] [--json]
-              为本轮发起人生成飞书授权链接，返回 JSON；由 Agent 将链接发给用户
+              为本轮发起人生成飞书授权链接，返回 JSON；单聊由 Agent 发给用户，群聊由 botmux 私聊发起人
   auth wait --request-id <id> [--json]
               等待当前授权请求就绪，最多 5 分钟；成功后可重试原操作
   mojo-containment list|revoke
@@ -9838,7 +9866,7 @@ import { applyCompanionStartupOptions } from './cli/companion-startup-options.js
 import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import { normalizeCardUsageSnapshot } from './cli/card-usage-normalize.js';
-import { parseStatuslinePayload, readStatuslineSnapshot, toCardQuota, writeStatuslineSnapshot } from './services/statusline-snapshot.js';
+import { readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
 import {
   resolveQuoteTarget,
   shouldSuppressImplicitReplyTarget,
@@ -12466,6 +12494,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     let dir: string | undefined;
     let voiceDurationMs: number | undefined;
     try {
+      // Attribute the send to its start, not a delayed synthesis/provider ACK
+      // that may arrive after another input was folded into the native turn.
+      const sentAtMs = Date.now();
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
@@ -12566,13 +12597,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         return deliveredMessageId;
       });
       const messageId = voiceDelivery.messageId;
-      const sentAtMs = Date.now();
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
-      if ((!sendTopLevel && !overrideChatId && !sendInto)
+      if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput) {
+        || !!deferredTopicRootMessageIdForOutput)) {
         try {
           const markerSessionId = originSessionId ?? sid;
           const markerTurnId = originTurnId ?? currentTurnId;
@@ -12657,6 +12687,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
       const docMessageId = `doc:${exactDocTarget.commentId}`;
+      const sentAtMs = Date.now();
       const docDelivery = turnSendKey
         ? await turnSendLedger.executeNonIdempotentSequence(
             turnSendKey,
@@ -12709,20 +12740,22 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
-      try {
-        recordBridgeReplyMarker({
-          dataDir: resolveDataDir(),
-          sessionId: originSessionId!,
-          sentAtMs: Date.now(),
-          messageId: docDelivery.messageId,
-          deliveryKind: 'current_session_send',
-          content,
-          responseKind: effectiveResponseKind,
-          turnId: originTurnId ?? exactDocTarget.turnId,
-          dispatchAttempt: originDispatchAttempt,
-          targetSessionId: originSessionId,
-        });
-      } catch { /* best-effort：漏记只多一条兜底 */ }
+      if (!docDelivery.replayed) {
+        try {
+          recordBridgeReplyMarker({
+            dataDir: resolveDataDir(),
+            sessionId: originSessionId!,
+            sentAtMs,
+            messageId: docDelivery.messageId,
+            deliveryKind: 'current_session_send',
+            content,
+            responseKind: effectiveResponseKind,
+            turnId: originTurnId ?? exactDocTarget.turnId,
+            dispatchAttempt: originDispatchAttempt,
+            targetSessionId: originSessionId,
+          });
+        } catch { /* best-effort：漏记只多一条兜底 */ }
+      }
       if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
           sendDataDir,
@@ -14004,16 +14037,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
-      if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
-        recordBridgeSendMarker(
-          Date.now(),
-          messageId,
-          text,
-          (customCard && !customFinal) || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
-            ? 'non_patchable'
-            : 'standard_reply_card',
-        );
-      }
+      // Reusing a receipt is not a new send. Preserve the original marker's
+      // time, including when another input arrived while we waited on the lock.
       await removeScheduleSelfAfterFinal();
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
@@ -14190,7 +14215,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     const trailingCarrierMessageId = videoMessageIds.at(-1) ?? attachmentMessageIds.at(-1);
     if (trailingCarrierMessageId
       && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
-      recordBridgeSendMarker(Date.now(), trailingCarrierMessageId, '', 'non_patchable');
+      recordBridgeSendMarker(sentAtMs, trailingCarrierMessageId, '', 'non_patchable');
     }
     for (const f of failedAttachments) {
       console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);
@@ -18074,88 +18099,11 @@ async function cmdUserPromptHook(): Promise<void> {
 
 // ─── botmux statusline ───────────────────────────────────────────────────────
 //
-// Claude Code `statusLine.command` 客户端（由 claude-code.ts buildArgs 经进程级
-// --settings 注入）。Claude 在每条 assistant 消息后 / compact 后 / 到达 resets_at /
-// 每 refreshInterval 秒（300ms 防抖）把 JSON（context_window、rate_limits、model …）
-// 喂到 stdin。本命令做两件互不影响的事，各自 try/catch：
-//   1. 落盘：BOTMUX_SESSION_ID 非空且 payload 可解析 ⇒ 写
-//      `<DATA_DIR>/statusline/<sid>/latest.json`（daemon 合并进卡片用量段）。
-//   2. 转发：BOTMUX_STATUSLINE_CHAIN 非空（worker 找回的、被 --settings 遮蔽的用户
-//      statusLine 命令）⇒ `/bin/sh -c <chain>`，把**原始 stdin 字节**原样喂给它，
-//      stdout/stderr 直接继承（Claude 读的是本进程的 stdout），正常退出透传其退出码；
-//      10s 看门狗 SIGTERM → 1s 后 SIGKILL → exit 0；被信号杀 / spawn 失败 → exit 0。
-// 无 chain ⇒ stdout 空、exit 0（与用户没配 statusline 时一致：状态栏空）。
-// 诊断只走 stderr（stdout 是状态栏内容）；顶层兜底 exit 0——statusline 失败对 Claude
-// 只是「状态栏空」，绝不能让它挂住或刷错误。
-const STATUSLINE_STDIN_TIMEOUT_MS = 5000;
-const STATUSLINE_CHAIN_TIMEOUT_MS = 10_000;
-const STATUSLINE_CHAIN_KILL_GRACE_MS = 1000;
-
-function statuslineDiagnostic(message: string): void {
-  try { process.stderr.write(`[botmux statusline] ${message}\n`); } catch { /* */ }
-}
-
-/** 把原始 payload 转发给用户自己的 statusline 命令；本函数负责最终 process.exit。 */
-function forwardStatuslineChain(chain: string, raw: Buffer): void {
-  let child: ReturnType<typeof spawn>;
-  try {
-    // detached：让 sh 及其子进程独占一个进程组，看门狗按组杀——用户脚本常是
-    // `bash ~/.claude/statusline.sh`（内部再 spawn jq / git），只杀 sh 会留下握着
-    // stdout 管道的孤儿，Claude 读不到 EOF 会一直等。
-    child = spawn('/bin/sh', ['-c', chain], { stdio: ['pipe', 'inherit', 'inherit'], detached: true });
-  } catch (error) {
-    statuslineDiagnostic(`chain spawn failed: ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(0);
-  }
-  const killGroup = (signal: NodeJS.Signals) => {
-    if (child.pid) {
-      try { process.kill(-child.pid, signal); return; } catch { /* 组已不在 → 退回单进程 */ }
-    }
-    try { child.kill(signal); } catch { /* */ }
-  };
-  let killTimer: NodeJS.Timeout | undefined;
-  const watchdog = setTimeout(() => {
-    killGroup('SIGTERM');
-    killTimer = setTimeout(() => {
-      killGroup('SIGKILL');
-      process.exit(0);
-    }, STATUSLINE_CHAIN_KILL_GRACE_MS);
-  }, STATUSLINE_CHAIN_TIMEOUT_MS);
-  const finish = (code: number) => {
-    clearTimeout(watchdog);
-    if (killTimer) clearTimeout(killTimer);
-    process.exit(code);
-  };
-  child.once('error', (error) => {
-    statuslineDiagnostic(`chain failed: ${error instanceof Error ? error.message : String(error)}`);
-    finish(0);
-  });
-  // 被信号杀（含看门狗）⇒ 0；正常退出透传退出码。
-  child.once('exit', (code, signal) => finish(signal ? 0 : (code ?? 0)));
-  // 用户命令可能不读 stdin 就退出 → EPIPE，吞掉即可。
-  child.stdin?.on('error', () => { /* */ });
-  child.stdin?.end(raw);
-}
-
+// 实现在 services/statusline-command.ts。新会话的 statusLine.command 直接指向轻量入口
+// statusline-entry.js（不加载整张 CLI 模块图）；这里保留子命令，给命令里写死了
+// `cli.js statusline` 的老会话与编译版二进制用。
 async function cmdStatusline(): Promise<void> {
-  try {
-    const raw = await readStdinWithTimeout(STATUSLINE_STDIN_TIMEOUT_MS);
-    const sessionId = process.env.BOTMUX_SESSION_ID;
-    // env 缺失 ⇒ 非 botmux 会话（用户手跑 / adopt），不落盘，只做转发。
-    if (sessionId) {
-      try {
-        const snap = parseStatuslinePayload(JSON.parse(raw.toString('utf-8')));
-        if (snap) writeStatuslineSnapshot(resolveDataDir(), sessionId, snap);
-      } catch (error) {
-        statuslineDiagnostic(`snapshot not written: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    const chain = process.env.BOTMUX_STATUSLINE_CHAIN;
-    if (!chain) process.exit(0);
-    forwardStatuslineChain(chain, raw);
-  } catch {
-    process.exit(0);
-  }
+  await (await import('./services/statusline-command.js')).runStatusline();
 }
 
 // ─── botmux native-subagent-runtime-hook ─────────────────────────────────────
@@ -19152,6 +19100,14 @@ if (__entrySubcommand) {
   // core-only bind failure exits from within). Park here so the normal dispatch
   // below never runs. This awaits forever; the imported module owns exit().
   await new Promise<never>(() => {});
+}
+
+// Hidden: runtime host for the native Botmux.app shell (stdio JSON protocol,
+// see src/desktop/host/desktop-host.ts). Only the app spawns it.
+if (command === '__desktop-host') {
+  const { runDesktopHost } = await import('./desktop/host/desktop-host.js');
+  await runDesktopHost();
+  process.exit(0);
 }
 
 // Hidden: perform a compiled-binary self-replace and exit. Invoked by
@@ -20732,6 +20688,21 @@ switch (command) {
     break;
   }
   case 'feedback': {
+    if (process.argv[3] === 'bind') {
+      const filename = argValue(process.argv.slice(4), '--file');
+      if (!filename) throw new Error('Usage: botmux feedback bind --file binding.json');
+      const binding = JSON.parse(readFileSync(filename, 'utf8'));
+      const { sid, larkAppId } = await resolveSessionAppId(undefined);
+      const currentTurn = resolveSessionContext(resolveDataDir(), sid)?.turnId;
+      if (!currentTurn) throw new Error('feedback_binding_turn_unavailable');
+      const port = resolveDaemonIpcPort(findDaemon(larkAppId)?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+      if (!port) throw new Error('feedback_binding_daemon_unavailable');
+      const response = await postSessionCliIpc(port, sid, 'feedback-bind', { ...binding, expectedTurnId: currentTurn });
+      const body = await response.json() as { ok?: boolean; error?: string };
+      if (!response.ok || body.ok !== true) throw new Error(body.error ?? 'feedback_binding_failed');
+      console.log(JSON.stringify(body));
+      break;
+    }
     if (process.argv[3] !== 'storage') throw new Error('feedback_storage_command_required');
     const { runFeedbackStorageCommand } = await import('./cli/feedback-storage.js');
     process.exitCode = await runFeedbackStorageCommand(process.argv.slice(4), { input: process.stdin, output: process.stdout, error: process.stderr }, resolveDataDir());
@@ -20793,7 +20764,15 @@ switch (command) {
       break;
     }
     ensureConfigDir();
-    const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
+    const opts = {
+      pkgRoot: PKG_ROOT,
+      configDir: CONFIG_DIR,
+      logDir: LOG_DIR,
+      // The boot hook must carry the user's LOGIN-shell PATH — the CLI's own
+      // PATH may be narrower (a session), and a narrower PATH would delete
+      // the user's tool dirs from the unit.
+      loginShellPath: resolveLoginShellPath(),
+    };
     if (sub === 'enable' || sub === 'install') enableAutostart(opts);
     else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
     else autostartStatus(opts);
