@@ -6,6 +6,9 @@
  *   - off / 不支持的 CLI / preflight 失败 → inline（历史行为）
  * Run: pnpm vitest run test/prompt-hook-injection.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks（与 prompt-builder.test.ts 同一套） ─────────────────────────────
