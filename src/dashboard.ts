@@ -221,6 +221,7 @@ import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
 } from './services/durable-config-mutation.js';
+import { sessionWriteOriginAllowed } from './dashboard/session-write-origin.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import type { WorkspaceMetadata } from './core/workspace-metadata.js';
@@ -4555,6 +4556,12 @@ const server = createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    // 会话写操作的跨站门禁（cookie 是 Lax，跨站 POST 仍会带上）。放在鉴权判决之后、
+    // 所有会话路由之前，按 /api/sessions/ 前缀默认拦截，新增写接口自动覆盖。
+    if (!sessionWriteOriginAllowed(req, url.pathname)) {
+      return dashboardControlJson(res, 403, { ok: false, error: 'control_origin_forbidden' });
     }
 
     // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换，紧挨上面的 ?t= set-cookie
