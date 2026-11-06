@@ -32,6 +32,11 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
+import {
+  parseBotSessionDirective, findLatestClosedTopicSession, topicResumeBlockReason,
+  type TopicContinuityRecord,
+} from './core/topic-session-continuity.js';
+import { describeCloseResidual as describeTopicCloseResidual } from './core/close-residual.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -28382,6 +28387,13 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
+  // `@session resume|fresh` (botmux dispatch --into … --session-mode): a peer
+  // bot's explicit choice for a topic whose session may have been closed.
+  // Transport-only like @steer; a human's text is left as written.
+  const botSessionDirective = isForeignBot
+    ? parseBotSessionDirective(parsed.content)
+    : { content: parsed.content };
+  if (botSessionDirective.mode) parsed.content = botSessionDirective.content;
   // Workflow node handoff (design 2026-11-03 §5.4): only a bot message whose
   // exact id carries a host-signed binding for this bot, chat and topic. It
   // marks the session as a node session, stages the node's inputs and shows
@@ -28777,6 +28789,66 @@ async function handleThreadReplyAdmitted(
 
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
+  // Topic session continuity (core/topic-session-continuity.ts). A topic whose
+  // session was closed used to get a brand-new CLI session on the next message,
+  // so a lead's `dispatch --into` follow-up reached an executor with no memory
+  // of the earlier work. Resume the topic's last closed session instead, unless
+  // a human closed it or the sender asked for `@session fresh`; record and
+  // announce whichever happened.
+  let pendingTopicContinuity: Omit<TopicContinuityRecord, 'at'> | undefined;
+  if (scope === 'thread' && ctxChatId && !workflowHandoff && !ctx.completionProposalContinuation) {
+    const continuityLocale = localeForBot(larkAppId);
+    const liveDs = activeSessions.get(runtimeSessionKey);
+    if (liveDs && botSessionDirective.mode === 'fresh') {
+      if (hasProtectedSessionMutationOwnership(liveDs) || liveDs.initialStartPending) {
+        await sessionReply(anchor, tr('daemon.topic_continuity.fresh_refused_busy', undefined, continuityLocale), 'text', larkAppId);
+      } else {
+        const previousSessionId = liveDs.session.sessionId;
+        const closeResult = await closeSessionHelper(previousSessionId);
+        if (!closeResult.ok) {
+          // Not proven closed (e.g. remote cancellation unverified): keep it and
+          // let it handle this message rather than run two sessions in one topic.
+          await sessionReply(anchor, tr('daemon.topic_continuity.fresh_close_refused', {
+            error: closeResult.error,
+            taskId: 'taskId' in closeResult && closeResult.taskId ? String(closeResult.taskId) : '-',
+          }, continuityLocale), 'text', larkAppId);
+        } else {
+          if (closeResult.outcome === 'closed_with_residual') {
+            await sessionReply(anchor, tr('daemon.topic_continuity.fresh_close_residual', {
+              detail: describeTopicCloseResidual(closeResult.residual),
+            }, continuityLocale), 'text', larkAppId);
+          }
+          if (!activeSessions.has(runtimeSessionKey)) pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId };
+        }
+      }
+    } else if (!liveDs) {
+      const previous = findLatestClosedTopicSession(sessionStore.listSessions(), {
+        larkAppId, chatId: ctxChatId, anchor,
+      });
+      if (previous) {
+        const blocked = botSessionDirective.mode === 'fresh' ? 'fresh_requested' : topicResumeBlockReason(previous);
+        if (blocked === 'fresh_requested') {
+          pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId: previous.sessionId };
+        } else if (blocked) {
+          pendingTopicContinuity = { mode: 'fresh-after-close', previousSessionId: previous.sessionId, reason: blocked };
+        } else {
+          const resumed = await resumeSession(previous.sessionId, activeSessions);
+          if (resumed.ok) {
+            resumed.ds.session.continuity = { mode: 'resumed', previousSessionId: previous.sessionId, at: new Date().toISOString() };
+            sessionStore.updateSession(resumed.ds.session);
+            logger.info(`[${larkAppId}] topic ${anchor.substring(0, 12)}: resumed closed session ${previous.sessionId.substring(0, 8)} for incoming message`);
+            await sessionReply(anchor, tr('daemon.topic_continuity.resumed', { id: previous.sessionId.substring(0, 8) }, continuityLocale), 'text', larkAppId);
+          } else {
+            pendingTopicContinuity = { mode: 'fresh-after-close', previousSessionId: previous.sessionId, reason: resumed.error };
+          }
+        }
+        if (pendingTopicContinuity) {
+          logger.info(`[${larkAppId}] topic ${anchor.substring(0, 12)}: not continuing closed session ${previous.sessionId.substring(0, 8)} (${pendingTopicContinuity.reason ?? pendingTopicContinuity.mode}); starting fresh`);
+        }
+      }
+    }
+  }
   let ds = activeSessions.get(runtimeSessionKey);
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // A retry / later round handed off into a node topic this bot already has
@@ -29396,6 +29468,20 @@ async function handleThreadReplyAdmitted(
     //                   (used as audit trail; routing key is chatId).
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
     const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType, undefined, { source: 'ordinary-feishu' });
+    if (pendingTopicContinuity) {
+      session.continuity = { ...pendingTopicContinuity, at: new Date().toISOString() };
+      sessionStore.updateSession(session);
+      const id = (pendingTopicContinuity.previousSessionId ?? '').substring(0, 8);
+      const continuityLocale = localeForBot(larkAppId);
+      const notice = pendingTopicContinuity.mode === 'fresh-requested'
+        ? tr('daemon.topic_continuity.fresh_requested', { id }, continuityLocale)
+        : tr(pendingTopicContinuity.reason === 'user_closed'
+          ? 'daemon.topic_continuity.fresh_after_user_close'
+          : 'daemon.topic_continuity.fresh_after_close', {
+          id, reason: pendingTopicContinuity.reason ?? 'unknown',
+        }, continuityLocale);
+      void sessionReply(anchor, notice, 'text', larkAppId).catch(() => undefined);
+    }
     const now = Date.now();
     // Bot-started handoff sessions have no human owner; keeping the bot as
     // owner makes daemon-generated footers wake that bot again.

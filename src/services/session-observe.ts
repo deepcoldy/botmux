@@ -119,6 +119,13 @@ export interface ObserveSession {
   parkedOrSuspended: ObserveBoolean;
   /** boolean | 'unknown'; use strict equality, never truthiness. */
   closed: ObserveBoolean;
+  /** Closed sessions only: a new message in the topic resumes this session
+   *  (true) or starts a fresh one (false, see resumeBlockedReason). */
+  resumable?: boolean;
+  resumeBlockedReason?: string;
+  /** How this session relates to an earlier closed one in the same topic:
+   *  resumed it, or started fresh (and why). Absent for a first session. */
+  continuity?: { mode: string; previousSessionId?: string; reason?: string; at?: string };
   /** Present only for a single-session probe (`--session`) of a Claude Code or
    *  Codex session whose transcript has a usable measurement; bulk listings skip
    *  transcript scans and therefore never carry it. */
@@ -298,6 +305,21 @@ export function normalizeSessionRow(
     const context = normalizeContext(row.contextUsage);
     if (context) observe.context = context;
   }
+  if (closed === true && typeof row.resumable === 'boolean') {
+    observe.resumable = row.resumable;
+    if (!row.resumable && typeof row.resumeBlockedReason === 'string') observe.resumeBlockedReason = row.resumeBlockedReason;
+  }
+  if (row.continuity && typeof row.continuity === 'object') {
+    const c = row.continuity as { mode?: unknown; previousSessionId?: unknown; reason?: unknown; at?: unknown };
+    if (typeof c.mode === 'string') {
+      observe.continuity = {
+        mode: c.mode,
+        ...(typeof c.previousSessionId === 'string' ? { previousSessionId: c.previousSessionId } : {}),
+        ...(typeof c.reason === 'string' ? { reason: c.reason } : {}),
+        ...(typeof c.at === 'string' ? { at: c.at } : {}),
+      };
+    }
+  }
   if (hasRuntimeFacts && status) observe.rawStatus = status;
   if (hasRuntimeFacts && options.includeRaw) observe.raw = row;
 
@@ -333,5 +355,8 @@ export interface RawSessionRow {
   lastMessageAt?: unknown;
   workingDir?: unknown;
   contextUsage?: unknown;
+  resumable?: unknown;
+  resumeBlockedReason?: unknown;
+  continuity?: unknown;
   [key: string]: unknown;
 }

@@ -213,6 +213,12 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Admission failure cleanup; wrapper logs both.',
     count: 4,
   },
+  'daemon.ts::handleThreadReplyAdmitted::closeSession': {
+    category: 'user_surface',
+    why: '`@session fresh` (dispatch --into --session-mode fresh) on a live topic session: a refusal '
+      + 'keeps the session and replies error + remote taskId in the topic; a residual is replied with '
+      + 'describeCloseResidual before the fresh session starts (topic-session-continuity).',
+  },
   'daemon.ts::closeSession::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Deferred-schedule settlement injection: settlement returns close_refused '

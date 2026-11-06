@@ -809,6 +809,21 @@ export interface Session {
    *  a bot's own output. */
   lastHumanMessageAt?: string;
   closedAt?: string;
+  /** Set when a HUMAN closed this session explicitly (`/close`, the card's close
+   *  button). Such a session is not resumed automatically when the topic gets a
+   *  new message (core/topic-session-continuity.ts); cleared on reactivation. */
+  userClosedAt?: string;
+  /** How this session relates to an earlier closed session of the same bot in
+   *  the same topic (core/topic-session-continuity.ts). Absent for a first
+   *  session. Shown in `botmux observe` so a lead can tell a continued
+   *  conversation from one that started over. */
+  continuity?: {
+    mode: 'resumed' | 'fresh-after-close' | 'fresh-requested';
+    previousSessionId?: string;
+    /** Why the previous session was not continued (fresh-* only). */
+    reason?: string;
+    at: string;
+  };
   /** Owning-daemon automatic scratch cleanup, tied to this exact close. It
    * preserves existing registered jobs, never permission to admit a new turn. */
   backgroundExecutionCleanupClosedAt?: string;

@@ -1191,7 +1191,7 @@ export const messages: Record<string, string> = {
   'xpi.timeout.still_busy': '原任务仍在执行，且未选择后续处理；消息未执行。可重新发送，或 botmux send --as independent。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
-  'ai.lead_only.rules': '你是本群的负责人（chat manager），只转发不执行：不论任务大小一律用 botmux dispatch 派给执行 bot；需要看代码/资料也派单，让执行 bot 回报结论，不要自己读写文件或跑非 botmux 命令。唯一的文件例外：可以用 Read/Write/Edit 读写你自己记忆目录（memory/）里的 .md 文件，用来记住用户定的规矩和各执行 bot 的专长。你只能使用 botmux 命令，且命令必须是单条普通 botmux 命令：不能用重定向（< >）、管道、; & 、$ 展开、反引号、括号或 # 注释；多行/含特殊字符的正文请整体放进单引号 \'...\'（正文里不要出现单引号），或在命令末尾用带引号定界符的 heredoc（<<\'EOF\'，结束行之后不能再有命令）。看板用 botmux task list 查看，派出的会话是否起来用 botmux observe 确认。orchestrate 等技能里「简单紧耦合工作自己完成」一句在本会话不适用。',
+  'ai.lead_only.rules': '你是本群的负责人（chat manager），只转发不执行：不论任务大小一律用 botmux dispatch 派给执行 bot；需要看代码/资料也派单，让执行 bot 回报结论，不要自己读写文件或跑非 botmux 命令。唯一的文件例外：可以用 Read/Write/Edit 读写你自己记忆目录（memory/）里的 .md 文件，用来记住用户定的规矩和各执行 bot 的专长。你只能使用 botmux 命令，且命令必须是单条普通 botmux 命令：不能用重定向（< >）、管道、; & 、$ 展开、反引号、括号或 # 注释；多行/含特殊字符的正文请整体放进单引号 \'...\'（正文里不要出现单引号），或在命令末尾用带引号定界符的 heredoc（<<\'EOF\'，结束行之后不能再有命令）。看板用 botmux task list 查看，派出的会话是否起来用 botmux observe 确认。同一条线、同一个执行者的后续活用 botmux dispatch --into 派回原话题：话题里的会话即使已关闭也会自动接上原会话（人手动 /close 的除外），上下文都在；换一件不相干的事、或想要不受之前思路影响的独立评审时加 --session-mode fresh 另开新会话。orchestrate 等技能里「简单紧耦合工作自己完成」一句在本会话不适用。',
   'ai.identity.unknown': '(未知)',
   'ai.credentials.acting_identity': '本会话已为 {tools} 启用按当前消息发起人身份注入授权。调用时沿用 botmux 注入的身份；授权可用性以工具返回结果为准。',
   'ai.credentials.git_identity': 'git 对 {host} 的鉴权已配置为使用本轮 bytedcli 身份。',
@@ -1777,6 +1777,13 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_unsupported_model': '模型 {model} 不支持推理档位 {effort}',
   'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
+  'daemon.topic_continuity.resumed': '↩️ 本话题之前的会话（{id}）已关闭，这条消息接着它继续处理，之前的上下文都在。',
+  'daemon.topic_continuity.fresh_after_close': '⚠️ 本话题之前的会话（{id}）已关闭且无法恢复（{reason}），这条消息由新开的会话处理，之前的上下文不在了。',
+  'daemon.topic_continuity.fresh_after_user_close': '🆕 本话题之前的会话（{id}）是手动关闭的，按关闭时的意图新开会话处理这条消息；要接着原会话请先发 /resume。',
+  'daemon.topic_continuity.fresh_requested': '🆕 按派单要求（@session fresh）新开了会话，本话题之前的会话（{id}）不再续用。',
+  'daemon.topic_continuity.fresh_close_refused': '⚠️ 按 @session fresh 要关掉当前会话，但关闭被拒绝（{error}，远端任务 {taskId}），当前会话保留并处理这条消息。',
+  'daemon.topic_continuity.fresh_close_residual': '⚠️ 按 @session fresh 关掉了当前会话，但有残留需要人工核查：{detail}。',
+  'daemon.topic_continuity.fresh_refused_busy': '⚠️ 当前会话正在启动或交接，没有按 @session fresh 新开，这条消息交给当前会话处理。',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 

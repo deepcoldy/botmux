@@ -9,6 +9,7 @@ import type { WorkspaceMetadata } from './workspace-metadata.js';
 import type { DaemonSession } from './types.js';
 import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { topicResumeBlockReason } from './topic-session-continuity.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBot, getBotBrand } from '../bot-registry.js';
@@ -30,6 +31,12 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  /** Closed rows only: whether a new message in the topic will resume this session. */
+  resumable?: boolean;
+  /** Closed rows only: why it will not be resumed (e.g. user_closed). */
+  resumeBlockedReason?: string;
+  /** See Session.continuity. */
+  continuity?: Session['continuity'];
   /** Present only when the session's frozen sandbox mode differs from what the
    *  bot's CURRENT config would give a new session (dashboard badge). */
   sandboxDrift?: { session: SandboxMode; current: SandboxMode };
@@ -291,6 +298,11 @@ function backendSessionNameForRow(s: Session): string | undefined {
   ).sessionName;
 }
 
+function closedResumabilityFields(s: Session): Pick<SessionRow, 'resumable' | 'resumeBlockedReason'> {
+  const blocked = s.scope === 'chat' ? 'chat_scope' : topicResumeBlockReason(s);
+  return blocked ? { resumable: false, resumeBlockedReason: blocked } : { resumable: true };
+}
+
 function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runtimeDisplayName'> {
   if (s.cliRuntime) {
     return { runtimeId: s.cliRuntime.id, runtimeDisplayName: s.cliRuntime.displayName };
@@ -340,6 +352,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...(ds.session.continuity ? { continuity: ds.session.continuity } : {}),
     ...(ds.session.dispatchLaunchSpec ? {
       requestedLaunch: ds.session.dispatchLaunchSpec.requested,
       ...(ds.session.dispatchLaunchSpec.effectiveRuntime
@@ -435,6 +448,8 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
     status: 'closed',
+    ...closedResumabilityFields(s),
+    ...(s.continuity ? { continuity: s.continuity } : {}),
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),
     lastMessageAt: s.closedAt ? (parseSessionTime(s.closedAt) ?? sessionLastActivityAtMs(s)) : sessionLastActivityAtMs(s),
