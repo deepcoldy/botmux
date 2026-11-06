@@ -346,7 +346,7 @@ describe('routeHasNarrowUntrustedAuth session-route set invariant', () => {
   const sessionRoutes = [
     'slash', 'cd', 'close', 'preview', 'chat-rename', 'chat-manager', 'rename',
     'project', 'decision-board', 'project-dispatch-policy', 'continuation', 'durable-send',
-    'turn-delivery', 'deferred-topic', 'link-refs/register', 'link-refs/resolve',
+    'turn-delivery', 'feedback-bind', 'deferred-topic', 'link-refs/register', 'link-refs/resolve',
     'auth-request', 'auth-status',
   ] as const;
 

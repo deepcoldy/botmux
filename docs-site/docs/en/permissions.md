@@ -146,6 +146,17 @@ How it decides:
 
 To turn it off: Dashboard **Bot Config → Authorization & Quota → Trust bots on this machine with the same owner**, `trustSameOwnerBots: false` in `bots.json`, or `/botconfig set trustSameOwnerBots off`. When off, every bot on this machine can only talk (picking a repository with `/repo` is not affected). If you turn it off for existing groups, a bot pair that was never recognized has no earlier chat grant to fall back on and needs a new `/grant`.
 
+### Carry the sender over on @ handoffs (`delegateOnMention`) {#delegate-on-mention}
+
+The trust above decides whether bots on this machine may operate each other; this setting decides whose identity the work runs under after a handoff.
+
+When this bot hands work to another bot on the same machine with `botmux send --mention` in **a turn a person started directly**, the receiving bot runs `lark-cli` / `bytedcli` **as that person**, not as itself or as whatever is logged in on the machine.
+
+- **On by default**, but it only takes effect when the handing-off bot itself has [Run CLI calls as the message sender](/en/bots-json#trigger-user-auth) on (`enabled` is `true` and `tools` is not empty): a bot that doesn't run its own tools as the sender has no verified sender to hand over.
+- The receiving bot must have that setting on too, and it still checks that this person may talk to it and is in the chat.
+- Only between bots on the same machine; bots on other machines never receive it. Handing work out with `botmux dispatch` is not affected by this switch; see [whose identity a dispatch carries](/en/multi-topic#advanced-whose-identity-a-dispatch-carries).
+- To turn it off: untick **Hand the sender over on @ handoffs to bots on this machine** under Dashboard **Bot Config → Security → Trigger-user auth**, or add `"delegateOnMention": false` to `triggerUserAuth`. When off, the receiving turn of an @ handoff has no usable sender.
+
 ## Grant-delegate bots `grantDelegateBots`
 
 This is the **second delegation source** besides same-owner bots on this machine: a list of external bots the owner explicitly trusts. The two don't affect each other. The delegated grant works exactly as in the previous section — only "who counts as a delegate" differs.

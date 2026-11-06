@@ -2452,7 +2452,8 @@ describe('card behavior defaults', () => {
 
     const grid = renderer.root.findByProps({ 'data-card-button-grid': true });
     const toggles = grid.findAllByProps({ className: 'toggle-row bd-card-button-toggle' });
-    expect(toggles).toHaveLength(6);
+    // 紧凑网格逐一枚举 STREAMING_CARD_BUTTON_IDS（output/terminal/writeLink/compact/stop/close/substitute）。
+    expect(toggles).toHaveLength(7);
     expect(toggles.every(toggle => toggle.findAllByType('small').length === 0)).toBe(true);
   });
 

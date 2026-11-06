@@ -24,6 +24,7 @@ const settings: Settings = {
   bypassCodexHookTrust: false,
   hideCodexRateLimitModelNudge: false,
   cardBrandLabel: false,
+  stuckCardInitiatorKeys: true,
   codexNotifier: {
     enabled: false, targetBotAppId: null, notifyWhen: 'always', platformSupported: true, hookInstalled: false,
     botOptions: [], targetDaemonOnline: false, pendingCount: 0, workerOnline: false, lastError: null,
@@ -50,7 +51,7 @@ const settings: Settings = {
   effectiveScheduleTimeZone: 'UTC',
 };
 
-function renderSettingsPageParts() {
+function renderSettingsPageParts(onSave: ComponentProps<typeof SettingsBody>['onSave'] = async () => {}) {
   // 会话环境变量编辑器挂载时会去读接口；这里只看区块顺序，给个空响应即可。
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 503, json: async () => ({ error: 'daemon_offline' }) }) as Response));
   const noop = () => {};
@@ -71,7 +72,7 @@ function renderSettingsPageParts() {
     feishuLoginQr: null,
     onCloseFeishuLoginQr: noop,
     onFeishuLoginQr: noop,
-    onSave: async () => {},
+    onSave,
   }));
   return body;
 }
@@ -107,5 +108,24 @@ describe('settings page navigation', () => {
     expect(SETTINGS_SECTIONS.map(section => section.id)).toEqual(pageOrder);
     // 导航文字是译文，不是漏翻的 key。
     expect(labels.filter(label => /^[a-z]+\.[A-Za-z]/.test(label))).toEqual([]);
+  });
+});
+
+describe('stuck-card initiator switch', () => {
+  it('sits in the cards block and saves its own key', async () => {
+    const onSave = vi.fn(async () => {});
+    let body!: TestRenderer.ReactTestRenderer;
+    await act(async () => { body = renderSettingsPageParts(onSave); });
+    const titles = new Set(['zh', 'en'].map(locale => createDashboardTranslator(locale as 'zh' | 'en')('settings.stuckCardInitiatorKeys')));
+    const block = body.root.find(node => isBlock(node) && node.props.id === 'settings-cards');
+    const [row] = block.findAll(node => titles.has(node.props.title) && typeof node.props.onChange === 'function');
+    expect(row.props.checked).toBe(true);
+    act(() => row.props.onChange(false));
+    act(() => body.unmount());
+    expect(onSave).toHaveBeenCalledTimes(1);
+    const [key, patch, update] = onSave.mock.calls[0] as unknown as [string, unknown, (s: Settings) => Settings];
+    expect(key).toBe('stuckCardInitiatorKeys');
+    expect(patch).toEqual({ stuckCardInitiatorKeys: false });
+    expect(update(settings).stuckCardInitiatorKeys).toBe(false);
   });
 });

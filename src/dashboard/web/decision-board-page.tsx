@@ -47,6 +47,7 @@ import {
   BOARD_EMPTY_VIEW_KEYS,
   BOARD_EVENT_KIND_KEYS,
   BOARD_FILES_PER_DRAFT,
+  BOARD_HINT_LABEL_KEYS,
   BOARD_IMAGE_TYPES,
   BOARD_VIEW_LABEL_KEYS,
   BOARD_VIEW_ORDER,
@@ -61,6 +62,7 @@ import {
   draftNeedsReview,
   isDraftEmpty,
   itemChatView,
+  knownHint,
   newSubmitNonce,
   nonChatLinks,
   orderSubmitCandidates,
@@ -77,6 +79,7 @@ import {
   type BoardDetailResponse,
   type BoardDraft,
   type BoardEvent,
+  type BoardHint,
   type BoardItem,
   type BoardListResponse,
   type BoardRoute,
@@ -186,6 +189,31 @@ function JoinChatLink(props: { link: RenderedLink; className: string; children: 
 function UnverifiedTag() {
   const tr = useT();
   return <span className="dboard-chat-tag is-warn" title={tr('decisionBoard.chatUnverifiedTitle')}>{tr('decisionBoard.chatUnverified')}</span>;
+}
+
+/** 汇总行里的巡检提示：标签 + 原因（触屏上没有悬停，原因直接写出来）。 */
+function HintChip(props: { hint: BoardHint | undefined }) {
+  const tr = useT();
+  const hint = knownHint(props.hint);
+  if (!hint) return null;
+  return (
+    <span className="dboard-hint-row" data-hint={hint.kind}>
+      <span className={`dboard-hint-chip is-${hint.kind}`}>💡 {tr(BOARD_HINT_LABEL_KEYS[hint.kind])}</span>
+      <span className="dboard-hint-reason">{hint.reason}</span>
+    </span>
+  );
+}
+
+/** 详情页标题下的一行：「建议关闭：PR … 已合入（巡检发现，状态没改…）」。 */
+function HintBanner(props: { hint: BoardHint | undefined }) {
+  const tr = useT();
+  const hint = knownHint(props.hint);
+  if (!hint) return null;
+  return (
+    <p className={`dboard-hint-banner is-${hint.kind}`} data-hint={hint.kind} role="note">
+      💡 {tr('decisionBoard.hintDetail', { label: tr(BOARD_HINT_LABEL_KEYS[hint.kind]), reason: hint.reason })}
+    </p>
+  );
 }
 
 /** 汇总行标题下的一行：主群名（+N 个群）/ 无群：原因 / ⚠ 缺群。 */
@@ -521,6 +549,7 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
             </span>
           ) : null}
           {item.pendingDecisions > 0 ? <span className="dboard-row-pending">{tr('decisionBoard.pendingShort')}</span> : null}
+          <HintChip hint={item.hint} />
           <RowChatLine view={chat} />
         </span>
         <span className="dboard-row-meta">
@@ -1175,6 +1204,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <StateChip state={item.state} stage={item.stage} />
       </header>
       <p className="dboard-detail-meta">{meta}</p>
+      <HintBanner hint={item.hint} />
       <ChatPanel seq={item.seq} view={itemChatView(item, detail.links)} />
       <LinkChips links={nonChatLinks(detail.links)} />
       {item.summary?.trim() ? (

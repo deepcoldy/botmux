@@ -8,7 +8,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
-import { startLarkConnection } from './transport/connection.js';
+import { startLarkConnection, type LarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
@@ -1225,7 +1225,11 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
       }
       if (typeof result.afterAck === 'function') {
         setTimeout(() => {
-          void Promise.resolve(result.afterAck())
+          // Pass the REAL ACK-timeout state observed by this wrapper. Existing
+          // afterAck callbacks ignore the extra argument; callbacks that must
+          // decide between a synchronous toast and a visible fallback (e.g. the
+          // substitute toggle) use it instead of estimating elapsed time.
+          void Promise.resolve(result.afterAck(timedOut))
             .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
         }, 0);
       }
@@ -1742,9 +1746,7 @@ export async function tryHandleIntroduceCommand(
 
   if (grantCommandRestriction(larkAppId, message.chat_id, senderOpenId).blocked) {
     const loc = localeForBot(larkAppId);
-    await replyMessage(larkAppId, message.message_id, JSON.stringify({
-      text: t('cmd.grant_restricted', { cmd: '/introduce' }, loc),
-    })).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
+    await replyMessage(larkAppId, message.message_id, t('cmd.grant_restricted', { cmd: '/introduce' }, loc)).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
     return true;
   }
 
@@ -4827,9 +4829,9 @@ async function processCommentEvent(
 }
 
 export interface LarkEventDispatcherRuntime {
-  connect(): Lark.WSClient;
+  connect(): LarkConnection;
   connectPrimary(input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   };
   close(): void;
@@ -5672,6 +5674,23 @@ export function createLarkEventDispatcherRuntime(
           && resolveSubstituteTrigger(larkAppId, message)) {
         logger.info(
           `[substitute:${larkAppId}] excluded chat — dropping @target message ` +
+          `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+        );
+        return;
+      }
+      // 运行态 per-chat off：同上，只 @配置替身对象、未直接 @本 bot 的消息必须让路。
+      // 仅清 substituteTrigger 不够——通用 relax 仍可能因 mentionMode=never/ambient/topic、
+      // 已有活跃会话或 solo-group bypass 放行，导致用户在本群关掉替身后，@替身对象
+      // 仍被送进会话并产生可见回复。这里只丢弃这一类消息，不做全群静音；直接 @本 bot
+      // 不受影响（explicitlyMentionedThisBot 为真时不进入本 gate）。
+      if (substituteCfg?.enabled === true
+          && chatType === 'group'
+          && !explicitlyMentionedThisBot
+          && isSubstituteAllowedChat(substituteCfg, chatId)
+          && !isSubstituteEnabledForChat(larkAppId, chatId)
+          && resolveSubstituteTrigger(larkAppId, message)) {
+        logger.info(
+          `[substitute:${larkAppId}] per-chat off — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
         );
         return;
@@ -6894,7 +6913,7 @@ export function createLarkEventDispatcherRuntime(
     };
   }
 
-  let wsClient: Lark.WSClient | undefined;
+  let wsClient: LarkConnection | undefined;
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
@@ -7037,6 +7056,9 @@ export function createLarkEventDispatcherRuntime(
     primaryTransportReady = false;
     if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
         || primaryLeadershipSignal.aborted) return;
+    // A replacement during the same outage must keep the first scan's
+    // history cutoff and ready promise, including during initial leadership.
+    if (pendingTransportReady?.leadershipSignal === primaryLeadershipSignal) return;
     const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
     void ready.catch(error => {
       if (primaryLeadershipSignal?.aborted) return;
@@ -7047,7 +7069,7 @@ export function createLarkEventDispatcherRuntime(
     });
   };
 
-  const connect = (): Lark.WSClient => {
+  const connect = (): LarkConnection => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
       onReady: settlePrimaryTransportReady,
@@ -7085,7 +7107,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const connectPrimary = (input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
@@ -7198,7 +7220,7 @@ export function startLarkEventDispatcher(
   handlers: EventHandlers,
   brand: Brand = 'feishu',
   durableInboxShadow?: DurableInboxStore,
-): Lark.WSClient {
+): LarkConnection {
   return createLarkEventDispatcherRuntime(
     larkAppId,
     larkAppSecret,

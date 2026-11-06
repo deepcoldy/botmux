@@ -915,7 +915,7 @@ export interface RedirectWhitelistWriteResult {
    * • `unchanged`          — 幂等短路没发写请求
    * • `updated`            — 写了全集
    * • `updated_fallback`   — 全集被拒、退到最小集
-   * • `skipped_unreadable` — 读不到线上现值且未获盲写授权 → **一次写请求都没发**
+   * • `skipped_unreadable` — 本轮读不到现值，未继续写入；早前可能已提交，见 mutationSubmitted
    */
   status: 'unchanged' | 'updated' | 'updated_fallback' | 'skipped_unreadable';
   /** 线上现有白名单（读不出来时为 null）。 */
@@ -924,6 +924,8 @@ export interface RedirectWhitelistWriteResult {
   redirectUrls: string[];
   /** `skipped_unreadable` 时的人话说明，由调用方记成 warning。 */
   warning?: string;
+  /** 已有写入 ACK，或写入结果未知；不能据此走「无变更」发版短路。 */
+  mutationSubmitted?: boolean;
 }
 
 /**
@@ -940,9 +942,9 @@ export interface RedirectWhitelistWriteResult {
  * `updated_fallback` 会漏条（最小集 = 线上现值 ∪ 本机回调，超出这个范围的 wanted 都被
  * 丢了），但兜底集的构成一旦调整，只有「拿 wanted 对一遍实际结果」这条判据不会跟着错。
  *
- * ⚠️ `skipped_unreadable`（读不到线上现值 → 一次写请求都没发）**不走这条路**：它是
- * 「没写」而不是「写漏了」，两者的下一步完全不同（前者要先修登录态/权限，后者去后台
- * 补地址），由两个调用方各自单独特判并给出区分开的措辞。
+ * ⚠️ `skipped_unreadable`（本轮读不到线上现值）**不走这条路**：不能从空数组推断
+ * 地址缺失。它可能来自零写入，也可能是先前已提交却无法确认；调用方以
+ * `mutationSubmitted` 保留发版判断，并用 warning 区分下一步。
  */
 export function missingRedirectUrls(wanted: string[], written: string[]): string[] {
   const live = new Set(written);
@@ -1001,10 +1003,34 @@ export async function writeRedirectWhitelist(
   const timeoutMs = options.timeoutMs ?? 15_000;
   const deadline = setTimeout(() => controller.abort(new Error('回调白名单配置超时')), timeoutMs);
   deadline.unref?.();
+  const wantedSet = new Set(uniqueStrings(wanted));
+  const preserved = new Set<string>();
+  let mutationSubmitted = false;
   const boundedPostJson: OpenPlatformPostJson = async (path, body) => {
     controller.signal.throwIfAborted();
-    const result = await postJson(path, body, { signal: controller.signal });
+    const update = path === `/developers/v1/safe_setting/update/${appId}`;
+    if (update) {
+      const urls = asRecord(body).redirectURL;
+      for (const url of uniqueStrings(Array.isArray(urls) ? urls.filter((item): item is string => typeof item === 'string') : [])) {
+        if (!wantedSet.has(url)) preserved.add(url);
+      }
+    }
+    let result: unknown;
+    try {
+      result = await postJson(path, body, { signal: controller.signal });
+      if (update) mutationSubmitted = true;
+    } catch (err) {
+      // ACK 丢失或请求在途被取消时可能已经落地；明确的审核/权限/URL 拒绝不算变更。
+      if (update && (controller.signal.aborted || isRetryableRedirectWriteError(err))) mutationSubmitted = true;
+      throw err;
+    }
     controller.signal.throwIfAborted();
+    if (path === `/developers/v1/safe_setting/${appId}`) {
+      const live = extractOpenPlatformRedirectUrls(result);
+      if (live !== null && missingRedirectUrls([...preserved], live).length > 0) {
+        throw new RedirectWhitelistPreservationError('回调白名单回读缺少原有自定义地址，可能存在并发修改；本次不继续覆盖写入');
+      }
+    }
     return result;
   };
   try {
@@ -1017,10 +1043,14 @@ export async function writeRedirectWhitelist(
           allowBlindWrite: attempt === 0 && options.allowBlindWrite === true,
         });
         controller.signal.throwIfAborted();
-        if (result.status === 'skipped_unreadable') return result;
+        const mutation = mutationSubmitted ? { mutationSubmitted: true } : {};
+        if (result.status === 'skipped_unreadable') {
+          return mutationSubmitted
+            ? { ...result, ...mutation, warning: '白名单写入已提交或结果未知，但恢复时无法读回现值；为避免覆盖自定义地址，未继续写入' }
+            : result;
+        }
         if (result.status === 'unchanged') {
-          // 前一轮可能已写入、但响应丢失；保守计作变更，避免调用方跳过发版。
-          return attempt === 0 ? result : { ...result, status: 'updated' };
+          return mutationSubmitted ? { ...result, ...mutation, status: 'updated' } : result;
         }
         const live = extractOpenPlatformRedirectUrls(
           await boundedPostJson(`/developers/v1/safe_setting/${appId}`, {}),
@@ -1029,21 +1059,43 @@ export async function writeRedirectWhitelist(
         if (missingRedirectUrls(result.redirectUrls, live).length > 0) {
           throw new RedirectWhitelistNotConfirmedError('回调白名单写入已提交，但回读仍缺少地址');
         }
-        return { ...result, redirectUrls: live };
+        return { ...result, ...mutation, redirectUrls: live };
       } catch (err) {
         if (controller.signal.aborted) throw controller.signal.reason;
         if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isRetryableRedirectWriteError(err)) throw err;
         await waitForRedirectRetry(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt], controller.signal);
       }
     }
+  } catch (err) {
+    if (mutationSubmitted) {
+      const tracked = err instanceof Error ? err : new Error(safeErrorMessage(err), { cause: err });
+      submittedRedirectMutationErrors.add(tracked);
+      throw tracked;
+    }
+    throw err;
   } finally {
     clearTimeout(deadline);
   }
 }
 
+const submittedRedirectMutationErrors = new WeakSet<Error>();
 class RedirectWhitelistNotConfirmedError extends Error {}
+class RedirectWhitelistPreservationError extends Error {}
+class RedirectWhitelistFallbackError extends Error {
+  constructor(originalError: unknown, latestError: unknown) {
+    super(`全集与最小集兜底两次写入均失败（最小集: ${safeErrorMessage(latestError)}）`, { cause: latestError });
+    this.originalError = originalError;
+  }
+  readonly originalError: unknown;
+}
+
+function latestRedirectWriteError(error: unknown): unknown {
+  for (let depth = 0; depth < 4 && error instanceof RedirectWhitelistFallbackError; depth++) error = error.cause;
+  return error;
+}
 
 function isRetryableRedirectWriteError(err: unknown): boolean {
+  err = latestRedirectWriteError(err);
   if (openPlatformWebSessionExpired(err) || openPlatformOwnerAccessDenied(err)) return false;
   if (err instanceof OpenPlatformApiError) {
     if (err.status === 401 || err.status === 403) return false;
@@ -1083,7 +1135,7 @@ async function writeRedirectWhitelistOnce(
     // 开放平台首页仍可能返回 csrf，但具体 console 接口才报
     // Code=4101 / "please log in again"。这不是「白名单读不出」，而是
     // 「需要重新扫码」；保留结构化错误给调用方分流，不要压成 warning。
-    if (openPlatformWebSessionExpired(err)) throw err;
+    if (err instanceof RedirectWhitelistPreservationError || openPlatformWebSessionExpired(err)) throw err;
     // 端点不存在 / 网络抖动 / 403 → 当作读不出来。
     existing = null;
     readError = safeErrorMessage(err);
@@ -1123,14 +1175,8 @@ async function writeRedirectWhitelistOnce(
     try {
       await postJson(`/developers/v1/safe_setting/update/${appId}`, minimalPayload);
     } catch (fallbackErr: any) {
-      // `cause` 挂首次失败的**原始错误对象**（而不是只把它拼进字符串）：批量修复
-      // 要靠 `OpenPlatformApiError` 的 status/code 把「这个 app 不属于当前登录账号」
-      // （403 / code=10003）与普通写失败分开，字符串里拿不到状态码。首次失败的文案
-      // 不重复拼进 message，交给 safeErrorMessage 顺 cause 链取——否则同一句会出现两遍。
-      throw new Error(
-        `全集与最小集兜底两次写入均失败（最小集: ${safeErrorMessage(fallbackErr)}）`,
-        { cause: err },
-      );
+      // 最新失败决定恢复、登录和审核状态；首次 URL 拒绝另存，不能遮住兜底的真实错误。
+      throw new RedirectWhitelistFallbackError(err, fallbackErr);
     }
     return { status: 'updated_fallback', existing, redirectUrls: minimalPayload.redirectURL };
   }
@@ -1550,6 +1596,8 @@ export async function automateOpenPlatformSetup(
   // 不了)。这一步独立 try/catch:失败只记 redirectWarning,不 return、不阻断后续。
   let redirectConfigured = false;
   let redirectWarning: string | undefined;
+  let retryRedirectAfterReview = false;
+  let wantedRedirectUrls: string[] = [];
   // 「本次自动化到底改没改过线上配置」。只有确实落地过写操作（redirect 白名单、
   // scope、事件、回调、接收模式）才置 true。用来在流程末尾判断是否值得再
   // create+publish 一个新版本——权限/事件全都本就齐全时，历史实现仍会无条件
@@ -1563,20 +1611,18 @@ export async function automateOpenPlatformSetup(
     // wanted 显式算一次并原样传下去：`redirectConfigured` 要靠「wanted 是否全部落盘」
     // 判定（见 {@link missingRedirectUrls}），拿不到这份 wanted 就只能退回按 status
     // 猜——那正是 `updated_fallback` 被假报成成功的原因。
-    const wantedRedirectUrls = collectBotmuxRedirectUrls();
+    wantedRedirectUrls = collectBotmuxRedirectUrls();
     const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
       allowBlindWrite: options.appJustCreated === true,
       timeoutMs: options.redirectWriteTimeoutMs,
     });
-    // 只有真的发了写请求（updated / updated_fallback）才算改过；unchanged（幂等
-    // 短路）与 skipped_unreadable（一次都没写）都不置位。
-    if (written.status === 'updated' || written.status === 'updated_fallback') {
+    // 写入 ACK 或结果未知都计作变更；只有未提交写请求的幂等/不可读短路不置位。
+    if (written.mutationSubmitted || written.status === 'updated' || written.status === 'updated_fallback') {
       mutated = true;
     }
     if (written.status === 'skipped_unreadable') {
-      // 「读不到线上现值 → 一次写请求都没发」。与下面的「写了但没写全」是两回事：
-      // 这里连线上有什么都不知道，谈不上缺哪几条，措辞也要分开。
+      // 本轮读不到现值，不猜缺哪几条；先前的写入 ACK 由 mutationSubmitted 保留。
       redirectWarning = written.warning;
     } else {
       const missing = missingRedirectUrls(wantedRedirectUrls, written.redirectUrls);
@@ -1591,7 +1637,9 @@ export async function automateOpenPlatformSetup(
       }
     }
   } catch (err: any) {
+    if (err instanceof Error && submittedRedirectMutationErrors.has(err)) mutated = true;
     redirectWarning = `写入 redirect 白名单失败: ${safeErrorMessage(err)}`;
+    retryRedirectAfterReview = openPlatformUnderReview(err);
   }
 
   let allScopesPayload: unknown;
@@ -1745,6 +1793,29 @@ export async function automateOpenPlatformSetup(
       redirectConfigured,
       redirectWarning,
     };
+  }
+
+  // 首次白名单写入被审核锁拒绝、但机器人能力写入已经成功，说明锁已解除。
+  // 在发版前补一次；恢复阶段始终读回现值，不能沿用新应用的盲写权限。
+  if (retryRedirectAfterReview) {
+    try {
+      const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
+        timeoutMs: options.redirectWriteTimeoutMs,
+      });
+      if (written.mutationSubmitted || written.status === 'updated' || written.status === 'updated_fallback') mutated = true;
+      if (written.status === 'skipped_unreadable') {
+        redirectWarning = written.warning;
+      } else {
+        const missing = missingRedirectUrls(wantedRedirectUrls, written.redirectUrls);
+        redirectConfigured = missing.length === 0;
+        redirectWarning = redirectConfigured
+          ? undefined
+          : `审核锁解除后回调白名单仍缺少地址: ${missing.join('、')}`;
+      }
+    } catch (err: any) {
+      if (err instanceof Error && submittedRedirectMutationErrors.has(err)) mutated = true;
+      redirectWarning = `审核锁解除后补写 redirect 白名单失败: ${safeErrorMessage(err)}`;
+    }
   }
 
   // 事件与回调都走 console 前端同款「增量」契约:先读现状 → operation:add 只补
@@ -3103,9 +3174,11 @@ class MutableCookieJar {
       let response: Response;
       for (let attempt = 0; ; attempt += 1) {
         try {
+          init.signal?.throwIfAborted();
           response = await fetcher(current, { ...init, headers, redirect: 'manual' });
           break;
         } catch (err) {
+          if (init.signal?.aborted) throw init.signal.reason;
           // 可重试 = 幂等方法遇任意瞬态错误，或任意方法遇「可证明未送达」的
           // pre-TLS 断连。后者对写操作也安全（零字节送达 ⟹ 无副作用）。
           const mayRetry = retryable
@@ -3114,7 +3187,8 @@ class MutableCookieJar {
           if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !mayRetry) {
             throw err;
           }
-          await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
+          if (init.signal) await waitForRedirectRetry(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt], init.signal);
+          else await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
         }
       }
       this.loadFromResponse(current, response.headers);
@@ -3187,6 +3261,7 @@ export function openPlatformWebSessionExpired(error: unknown): boolean {
 }
 
 function openPlatformOwnerAccessDenied(error: unknown): boolean {
+  error = latestRedirectWriteError(error);
   if (!(error instanceof OpenPlatformApiError)) return false;
   const payload = asRecord(error.payload);
   return error.status === 403 && payload.code === 10003;
@@ -3206,6 +3281,7 @@ function openPlatformOwnerAccessDenied(error: unknown): boolean {
  * 真实原因。识别出来单独给个 reason，让调用方能说人话、并且**不必反复重试**。
  */
 export function openPlatformUnderReview(error: unknown): boolean {
+  error = latestRedirectWriteError(error);
   if (!(error instanceof OpenPlatformApiError)) return false;
   return asRecord(error.payload).code === 10046;
 }

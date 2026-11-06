@@ -1785,6 +1785,15 @@ type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: s
  * Split a markdown body into segments, pulling out lines that consist solely of
  * 2+ image tokens as `imgrow` segments (→ side-by-side row). Fence-aware: lines
  * inside ``` / ~~~ code blocks are never treated as image rows.
+ *
+ * A line can also be image-looking while being *code*: an inline code span
+ * (`` ` `` … `` ` ``) may run across lines, and markdown-it then reads the
+ * `![](…)` text in between as literal characters, not attachment tokens. The
+ * pre-pass is line-based, so it has no such notion on its own; promote a line
+ * only when the parser agrees those `![` occurrences are real image tokens.
+ * Otherwise the row would carry a key-shaped-but-unusable src as a native
+ * `img_key`, Feishu rejects the whole card (230099/200570), and the card falls
+ * back to dropping every image — including its valid ones.
  */
 function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): BodySegment[] {
   const segs: BodySegment[] = [];
@@ -1796,7 +1805,19 @@ function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): Bod
   // after the run (no info string).
   let fenceChar = '';
   let fenceLen = 0;
+  // Positions of the `![` occurrences markdown-it actually parses as images.
+  // Parsed lazily: only a line that already looks like image-only needs it, so
+  // ordinary prose pays nothing.
+  let realImagePositions: Set<number> | null = null;
+  const allImagesAreRealTokens = (line: string, lineOffset: number): boolean => {
+    const positions = (realImagePositions ??= new Set(cardMarkdownImageReferences(input).map(r => r.position)));
+    return Array.from(line.matchAll(IMG_TOKEN_SRC))
+      .every(m => positions.has(lineOffset + (m.index ?? 0)));
+  };
+  let lineOffset = 0;
   for (const line of input.split('\n')) {
+    const lineStart = lineOffset;
+    lineOffset += line.length + 1;                  // + the '\n' we split on
     const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (fence) {
       const run = fence[1];
@@ -1815,7 +1836,7 @@ function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): Bod
     // legacy Markdown output, inline prose, code blocks, and image grids intact.
     if (!fenceChar && imageMode !== 'fit_horizontal') {
       const single = line.match(/^ {0,3}!\[([^\]]*)\]\(([^)\s]+)\)\s*$/);
-      if (single && FEISHU_IMG_KEY.test(single[2])) {
+      if (single && FEISHU_IMG_KEY.test(single[2]) && allImagesAreRealTokens(line, lineStart)) {
         flush();
         segs.push({ type: 'img', key: single[2], alt: single[1] });
         continue;
@@ -1823,7 +1844,7 @@ function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): Bod
     }
     if (!fenceChar && IMG_ROW_LINE.test(line)) {
       const keys = Array.from(line.matchAll(IMG_TOKEN_SRC), m => m[1]);
-      if (keys.every(k => FEISHU_IMG_KEY.test(k))) {
+      if (keys.every(k => FEISHU_IMG_KEY.test(k)) && allImagesAreRealTokens(line, lineStart)) {
         flush();
         segs.push({ type: 'imgrow', keys });
         continue;

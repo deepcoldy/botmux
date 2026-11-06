@@ -130,7 +130,7 @@ it.each([
     lastWrittenCliInput: { turnId: 'om_old' }, pendingRestartInterruption: { turnOpen: true, tasks: [] },
     pendingMessages: [{ turnId: 'om_old', content: 'old note' }, newer], pendingInjections: [],
     inflightInputs: { retireTurn: vi.fn() }, restartInterruptionScanBeforeMs: 1,
-    refreshHookReviewInputHold: vi.fn(), firstWriteLivenessConfirmed: false, cliRestartInProgress: true,
+    refreshHookReviewInputHold: vi.fn(), hookReviewAdmissionScreen: () => '', firstWriteLivenessConfirmed: false, cliRestartInProgress: true,
     freshnessInputQueue: { enqueueRaw: vi.fn() }, flushPending: vi.fn(), log: vi.fn(),
     flushPendingInjections: vi.fn(), handleTuiTextInput: vi.fn(async () => true),
     unattendedRawInputRefusal: () => undefined,

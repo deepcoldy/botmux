@@ -55,6 +55,7 @@ interface DashboardSettings {
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -228,6 +229,8 @@ function parseSettings(s: any): DashboardSettings {
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
     // default ON — only an explicit persisted false disables (server snapshot)
     cardBrandLabel: s?.cardBrandLabel !== false,
+    // default ON — only an explicit persisted false disables (server snapshot)
+    stuckCardInitiatorKeys: s?.stuckCardInitiatorKeys !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -898,7 +901,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -992,6 +995,13 @@ export function SettingsBody(props: {
             checked={settings.openTerminalInFeishu}
             disabled={dis || savingKey === 'openTerminalInFeishu'}
             onChange={value => saveBoolean('openTerminalInFeishu', value)}
+          />
+          <ToggleRow
+            title={tr('settings.stuckCardInitiatorKeys')}
+            help={tr('settings.stuckCardInitiatorKeysHelp')}
+            checked={settings.stuckCardInitiatorKeys}
+            disabled={dis || savingKey === 'stuckCardInitiatorKeys'}
+            onChange={value => saveBoolean('stuckCardInitiatorKeys', value)}
           />
           <ToggleRow
             title={tr('settings.enableLocalCliOpen')}

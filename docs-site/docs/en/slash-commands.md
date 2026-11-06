@@ -13,7 +13,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/cd <path>` | Switch the working directory and restart the CLI process |
 | `/status` | View session info (uptime, terminal address, etc.) |
 | `/models` | Top-level messages select the bot default model and supported reasoning effort for new sessions (admins only). Effort follows the model and can be reset to the CLI default. Incompatible pairs preserve the previous settings. Within an existing topic, select the current session model when idle. Managed local TraeX topics also save model-specific session effort; use Apply and reload session when idle to restore the original conversation with that effort. This leaves bot/CLI defaults intact and stops the session background terminal tasks. Each model option displays load: native local TRAE CLI uses the catalog percentage, including values above 100%. Missing data, failed queries, and other CLIs show unknown load. This is a snapshot; reopen /models to refresh. Load does not affect model or effort validation. |
-| `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available when the existing bot-level XPI switch enables principal lanes) |
+| `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available once the [XPI experimental switch](/en/global-settings#xpi) is on) |
 | `/lane close` | Safely close your isolated principal lane: refuses while work is running/queued or files are uncommitted, pushes unpublished commits before cleanup, and never auto-merges or deletes the branch |
 | `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |
 | `/rewind [n\|n confirm]` | Roll the session context back: no args lists recent checkpoints; `n` previews and `n confirm` truncates the context to before turn n. Claude Code only; the transcript is backed up first and the next message cold-starts from the rolled-back context |
@@ -91,6 +91,13 @@ A few boundaries:
 - A standalone mid-session `/repo` still takes the rest of the line, unlike the single-token rule inside the header.
 
 Codex capacity recovery is **off by default**. Administrators can enable it with `/botconfig set codexCapacityRecovery on` and disable it with `/botconfig set codexCapacityRecovery off`. When enabled, managed Codex and Codex App Lark sessions automatically continue explicit model-capacity failures (`server_overloaded`) after 15 seconds and, if needed, another 45 seconds. Each continuation appends a recovery input to the native session (at most two per task); these inputs may remain in model context, and disabling recovery does not delete history. An opted-out pending recovery is saved as cancelled with one notice, so re-enabling recovery or restarting does not revive that old task. Detection is not specific to modelhub and does not guarantee a quick recovery. Continuations resume existing progress instead of replaying the original task. New input, `/stop`, or closing the session cancels the previous recovery. After a process restart, pending or unconfirmed recovery stops and requires manual continuation. Already running work can still deliver a successful result, but a late capacity failure will not trigger another automatic continuation, avoiding replay of a cancellation that could not be saved. After two unsuccessful continuations, the failure card offers a manual retry. Generic 503, stream, authentication and rate-limit errors retain their existing behavior, as do adopted, HTTP and meeting-receiver sessions.
+
+### Rename a session, pick a CLI for a new session (`/rename`, `/cli`) {#rename-cli}
+
+Both are available by default and need operate permission (admins / `allowedUsers`, or opened up through `canTalkDaemonCommands`).
+
+- **`/rename <title>`**: send it in an existing session to rename the Botmux session (the Dashboard and the `/sessions` list follow); a running Codex / Claude Code session also gets its native session name updated. The Lark group and topic names don't change.
+- **`/cli <cliId>`**: picks the CLI only for a session **whose CLI hasn't started yet** — for example, send `/cli codex` as the first message of a new topic, then send the task, and that session runs on Codex while the bot's default CLI stays the same. For `cliId` values see [Supported CLIs](/en/adapters#supported-clis--agents). It is refused when the session already has history or a running CLI, for adopted sessions, for queued sessions, when the bot sets `env`, when it uses the Riff backend, when you pick `riff`, or when the chosen CLI doesn't work with the bot's zero prompt injection (`promptInjection: "none"`) or `codexRpcInput`. `/cli` is not listed in `/help`.
 
 ## Group manager (Agent tool)
 
@@ -204,6 +211,10 @@ Now go through the review comments on PR #1361
 
 Rules: only a leading run of passthrough lines forms a cascade (a botmux command such as `/cd` or an unknown `/xxx` inside that run makes the whole message ordinary text, as today); the body starts at the first line not beginning with `/`, and any later `/xxx` is part of the body; a single line such as `/model opus then continue` is still sent verbatim as one line. The idle wait is capped at 120 s, after which the remaining items are sent immediately with a notice. Remote sandbox backends (riff / mojo) and adopted external sessions do not support cascades and reply "send them one by one"; messages with attachments are not split either.
 
+### Claude Code's `/btw`: side answers come back to the topic {#claude-btw}
+
+Send `/btw <question>` in a Claude Code session and the command goes to Claude Code as is; the side answer it shows in a terminal overlay is read by botmux, posted back to the topic as "💬 /btw side answer", and the overlay is closed so the main task carries on. On by default, nothing to configure. Claude Code only, and not for adopted sessions or remote backends such as Riff / Mojo; long answers are truncated, with the full text in the web terminal.
+
 ## 🧩 View Available Commands
 
 `/list-slash-command` (alias `/slash`): lists the currently available slash commands in a card, in four sections —
@@ -215,9 +226,24 @@ Rules: only a leading run of passthrough lines forms a cascade (a botmux command
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
-Dashboard's **Bot Defaults → Security → Slash Commands** section also has an optional **native Lark command panel**. It lists botmux's own commands (including aliases, derived directly from the command registry) as candidates and marks each entry as synced, missing, or outdated on Lark; users decide what to register with each row's **Sync** action. Commands that only exist remotely are shown too and can be deleted one at a time. **Sync all to Lark** is an explicit additive operation: it creates missing entries and updates descriptions, but never deletes implicitly. CLI passthrough commands (`/compact`, `/model`, …) are not candidates yet, because support differs across CLIs and input backends.
+Dashboard's **Bot Config → Security → Slash commands** section also has an optional **native Lark command panel** (see the next section, [Get botmux commands when you type / in Lark](#native-slash-panel), for how to turn it on). It lists botmux's own commands (including aliases, derived directly from the command registry) as candidates and marks each entry as synced, missing, or outdated on Lark; users decide what to register with each row's **Sync** action. Commands that only exist remotely are shown too and can be deleted one at a time. **Sync all to Lark** is an explicit additive operation: it creates missing entries and updates descriptions, but never deletes implicitly. CLI passthrough commands (`/compact`, `/model`, …) are not candidates yet, because support differs across CLIs and input backends.
 
 The panel needs the optional scopes `application:app_slash_command:read` / `application:app_slash_command:write`. They are **not** part of the default scope manifest and the startup self-check never tops them up automatically; when they are missing, or the tenant is not in Lark's gated rollout (desktop 7.70+ and the FG allowlist), the panel only shows "unavailable" plus grant links, and every other bot feature keeps working. The native `/` panel may take about five minutes to refresh in Lark clients. Working-directory `.claude` discoveries, skills, plugins, and MCP prompts are not stable app-wide capabilities, so they remain visible only in botmux's `/slash` card and are not registered remotely.
+
+## ⌨️ Get botmux commands when you type / in Lark {#native-slash-panel}
+
+Typing `/` in a Lark chat can show botmux's commands with hints and completion. This is **off by default**: the commands first have to be registered on the Lark app, one bot at a time.
+
+1. **Grant the app two optional scopes**: Lark developer console → (this bot's app) → Permissions, request `application:app_slash_command:read` and `application:app_slash_command:write`, then **publish an app version**. They aren't in botmux's default scope manifest, and the startup self-check won't add them for you.
+2. **Sync the commands in the Dashboard**: **Bot Config** → pick the bot → **Security** → **Slash commands** → **Native Lark command panel**. It lists botmux's own commands (aliases included), each marked synced / missing / outdated. Click **Sync all to Lark** to register everything, or **Sync** on individual rows.
+3. **Wait for the client to refresh**: Lark clients take about five minutes to pick up the change; after that, typing `/` in a chat with this bot shows them.
+
+Notes:
+
+- This is a gated Lark capability: it needs **desktop 7.70 or later** and the tenant on Lark's FG allowlist. Without the scopes or outside the rollout, the panel only shows "unavailable" plus grant links, and the bot's other features keep working.
+- Only botmux's own commands are registered. Passthrough commands such as `/compact` and `/model`, and custom commands or skills discovered under `.claude`, are not; use the `/slash` card for those.
+- **Sync all to Lark** only adds and updates, never deletes. Commands that exist only on Lark are marked as remote-only; delete them one by one with **Delete** if needed.
+- core-only (`apiOnly`) bots have no Lark connection and can't use the panel.
 
 ## 📡 Session Onboarding
 
