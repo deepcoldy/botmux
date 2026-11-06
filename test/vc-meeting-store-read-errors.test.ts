@@ -420,22 +420,24 @@ describe('turn-entry meeting routing with unreadable meeting state', () => {
 });
 
 describe('data-dir fence guard for fs-faking test files', () => {
-  it('accepts only directories strictly inside the temp root', async () => {
-    const { isFencedTestDataDir } = await import('./helpers/require-fenced-data-dir.js');
-    expect(isFencedTestDataDir('/tmp/x/botmux-unit-1/file-2/data', '/tmp/x')).toBe(true);
-    expect(isFencedTestDataDir('/root/.botmux/data', '/tmp/x')).toBe(false);
-    expect(isFencedTestDataDir('/tmp/x', '/tmp/x')).toBe(false);
-    expect(isFencedTestDataDir('/tmp/x/../y/data', '/tmp/x')).toBe(false);
-    expect(isFencedTestDataDir(undefined, '/tmp/x')).toBe(false);
+  it('accepts only directories strictly inside the fence root', async () => {
+    const { isInsideDir } = await import('./helpers/require-fenced-data-dir.js');
+    expect(isInsideDir('/tmp/x/botmux-unit-1/file-2/data', '/tmp/x/botmux-unit-1/file-2')).toBe(true);
+    expect(isInsideDir('/root/.botmux/data', '/tmp/x')).toBe(false);
+    expect(isInsideDir('/tmp/x', '/tmp/x')).toBe(false);
+    expect(isInsideDir('/tmp/xy/data', '/tmp/x')).toBe(false);
+    expect(isInsideDir('/tmp/x/../y/data', '/tmp/x')).toBe(false);
+    expect(isInsideDir('/tmp/x/data', 'relative/root')).toBe(false);
+    expect(isInsideDir(undefined, '/tmp/x')).toBe(false);
   });
 
-  it('also requires the marker that only the fence itself sets', async () => {
+  it('requires SESSION_DATA_DIR inside the root that only the fence itself publishes', async () => {
     const { fencedTestDataDirProblem } = await import('./helpers/require-fenced-data-dir.js');
-    const dataDir = '/tmp/x/botmux-unit-1/file-2/data';
-    expect(fencedTestDataDirProblem({ SESSION_DATA_DIR: dataDir, __TEST_DATA_DIR_FENCE: '1' }, '/tmp/x')).toBeUndefined();
+    const root = '/tmp/x/botmux-unit-1/file-2';
+    expect(fencedTestDataDirProblem({ SESSION_DATA_DIR: `${root}/data`, __TEST_DATA_DIR_FENCE: root })).toBeUndefined();
     // Incident shape: a temp-looking data dir picked by hand, fence never ran.
-    expect(fencedTestDataDirProblem({ SESSION_DATA_DIR: dataDir }, '/tmp/x')).toMatch(/refusing to run/);
-    expect(fencedTestDataDirProblem({ SESSION_DATA_DIR: '/root/.botmux/data', __TEST_DATA_DIR_FENCE: '1' }, '/tmp/x'))
+    expect(fencedTestDataDirProblem({ SESSION_DATA_DIR: `${root}/data` })).toMatch(/refusing to run/);
+    expect(fencedTestDataDirProblem({ SESSION_DATA_DIR: '/root/.botmux/data', __TEST_DATA_DIR_FENCE: root }))
       .toMatch(/refusing to run/);
   });
 });

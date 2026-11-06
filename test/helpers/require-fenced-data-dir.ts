@@ -13,28 +13,35 @@
  * fleet's `vc-meeting-runtime-sessions.json` aside. Importing this module first
  * turns that into an immediate, harmless failure.
  *
- * Uses only node:path/node:os (never node:fs) so it stays correct even when the
- * importing file mocks node:fs.
+ * Imports nothing: the importing file may mock node:fs, node:os or node:path
+ * (vi.mock is hoisted above this import), so the check is plain string work on
+ * two env vars the fence itself sets.
  */
-import { tmpdir } from 'node:os';
-import { isAbsolute, relative, resolve } from 'node:path';
 
-export function isFencedTestDataDir(dataDir: string | undefined, tempRoot: string): boolean {
-  if (!dataDir) return false;
-  const rel = relative(resolve(tempRoot), resolve(dataDir));
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+/** `child` is strictly inside the absolute directory `root` (no `..` segments). */
+export function isInsideDir(child: string | undefined, root: string | undefined): boolean {
+  if (!child || !root) return false;
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '');
+  const c = norm(child);
+  const r = norm(root);
+  if (!r.startsWith('/') && !/^[A-Za-z]:\//.test(r)) return false;
+  if (c.split('/').includes('..') || r.split('/').includes('..')) return false;
+  return c.startsWith(`${r}/`);
 }
 
-// __TEST_DATA_DIR_FENCE is set by the fence itself (unit-setup.ts / bun-test-fence.ts):
-// a hand-picked temp SESSION_DATA_DIR without the fence still leaves HOME and
-// friends pointing at the real machine, so the path check alone is not enough.
-export function fencedTestDataDirProblem(env: NodeJS.ProcessEnv, tempRoot: string): string | undefined {
-  if (env.__TEST_DATA_DIR_FENCE === '1' && isFencedTestDataDir(env.SESSION_DATA_DIR, tempRoot)) return undefined;
+/**
+ * The fence (unit-setup.ts / bun-test-fence.ts) publishes its disposable root in
+ * __TEST_DATA_DIR_FENCE. Requiring SESSION_DATA_DIR to sit inside THAT root —
+ * not merely somewhere under a temp dir — rejects a hand-picked data dir from a
+ * run where the fence never executed (HOME and friends would still be real).
+ */
+export function fencedTestDataDirProblem(env: NodeJS.ProcessEnv): string | undefined {
+  if (isInsideDir(env.SESSION_DATA_DIR, env.__TEST_DATA_DIR_FENCE)) return undefined;
   return `refusing to run: data-dir fence not active (__TEST_DATA_DIR_FENCE=${env.__TEST_DATA_DIR_FENCE ?? '<unset>'}, `
-    + `SESSION_DATA_DIR=${env.SESSION_DATA_DIR ?? '<unset>'}, expected under ${tempRoot}). `
+    + `SESSION_DATA_DIR=${env.SESSION_DATA_DIR ?? '<unset>'}). `
     + 'This file fakes node:fs and must run behind the data-dir fence '
     + '(vitest --project unit / bun test from the repo root), never against live botmux data.';
 }
 
-const problem = fencedTestDataDirProblem(process.env, tmpdir());
+const problem = fencedTestDataDirProblem(process.env);
 if (problem) throw new Error(problem);
