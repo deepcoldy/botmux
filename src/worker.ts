@@ -11045,6 +11045,12 @@ function codexBridgeStartTimer(): void {
         // Tier-1/Tier-2 demotion to fresh would still baseline the empty
         // hermes store as "existing" and swallow the first turn.
         if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty');
+        // Hermes can expose a busy screen before its user row is persisted.
+        // Share Cursor's bounded refresh policy, before ingest's own prune;
+        // ready/adopt sessions retain their ordinary attribution timing.
+        if (!isPromptReady && !lastInitConfig?.adoptMode) {
+          codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS);
+        }
         hermesBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
