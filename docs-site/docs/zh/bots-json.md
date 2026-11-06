@@ -400,6 +400,33 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 > ZMX 后端没法执行文件沙盒，开着沙盒的配置组合会直接拒绝启动，见 [ZMX 后端](/zmx)。
 
+### 按触发人身份调用 CLI（`triggerUserAuth`） {#trigger-user-auth}
+
+**默认关闭。** 打开后，这个 Bot 会话里的 `lark-cli` / `bytedcli` 用「发这条消息的人」自己的授权调用，而不是本机的登录态。适合多人共用一个 Bot：谁发的消息，就以谁的身份读文档、查日程、调内部平台。
+
+三种开法任选一种，**新会话生效**（已有会话 `/restart` 后生效）：
+
+- **Dashboard**：「Bot 配置 → 权限与安全 → 按触发人鉴权」，打开「按触发人身份调用 CLI」，勾选要覆盖的工具。
+- **飞书里**（管理员）：`/botconfig set triggerUserAuth {"enabled":true,"tools":["lark-cli","bytedcli"]}`；关闭用 `/botconfig unset triggerUserAuth`。
+- **bots.json**：
+
+```json
+"triggerUserAuth": { "enabled": true, "tools": ["lark-cli", "bytedcli"] }
+```
+
+规则：
+
+- 只有 `enabled` 写成 `true` 才算开。`tools` 不写表示覆盖全部工具；写了不认识的工具名会直接报错，不会悄悄降级。
+- 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
+- 绝不会退回到 Bot 或其他人的身份代跑。`bytedcli` 没有 Bot 身份，没授权就是失败。
+- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用中心化平台 / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+
+#### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
+
+v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」分文件存（`~/.botmux/data/user-token-<appId>-<openId>.json`）。之前的旧文件（`user-token-<appId>.json`、`user-token.json`）看不出是谁授权的，凡是需要「以某个具体的人」调用飞书接口的地方都不再使用它。
+
+只剩旧格式授权的 Bot，这些用户身份能力会失效。**由本人在话题里重新发一次 `/login`** 即可恢复。注意 `/login` 只是补上授权文件，按触发人身份调用 CLI 仍要按上面的方法单独打开。
+
 ## 卡片与终端
 
 卡片长什么样、每个开关的效果见[实时流式卡片](/cards)。
@@ -686,6 +713,31 @@ botmux 可以按 token 用量估算每个 bot 的花费（人民币），并在�
 | 字段 | 说明 |
 |------|------|
 | `voice` | 这个 bot 的语音引擎配置，会按字段覆盖 `~/.botmux/config.json` 里的全局 `voice`。有可用的语音凭据时，答复卡上会出现「🔊 语音总结」按钮。见[语音总结](/voice) |
+
+## 飞书会议智能体 {#vc-meeting-agent}
+
+连着飞书的 Bot **默认就能被拉进视频会议**（core-only 的 `apiOnly` Bot 除外），旁听会议、同步转写，按会议角色在会中发文字或说话。
+
+**准备**：应用要开通 `vc:meeting.bot.join:write`（入会 / 离会）、`vc:meeting.meetingevent:read`（读会中事件）、`vc:meeting.message:write`（会中发文字），实时语音另需 `vc:meeting.bot.realtime:write`；事件订阅里要有 `vc.bot.meeting_invited_v1`、`vc.bot.meeting_activity_v1`、`vc.bot.meeting_ended_v1`、`vc.meeting.participant_meeting_joined_v1`。权限缺了，daemon 启动时会在日志里报错并私聊通知管理员；事件订阅飞书没有接口可查，daemon 只会提醒你核对，缺事件时只是收不到会议推送、不会报错。
+
+**怎么用**：
+
+1. 在飞书视频会议里邀请这个 Bot 入会。
+2. Bot 私聊给 owner（配了 `vcMeetingAgent.attentionTargetOpenId` 时发给这个人）发一张确认卡，默认 30 分钟内有效（`inviteTtlMs` 可调）。
+3. 确认后 Bot 入会，自动建一个会议监听群同步转写；想用现有群就配 `vcMeetingAgent.listenerChatId`。
+4. 会中做什么由会议角色决定，见下一节。会议监听期间要临时让某人能给 Bot 下指令，用 `/vc-auth @成员`（`/vc-auth revoke @成员` 撤销，`/vc-auth list` 查看）。
+5. 想提前准备：在普通群发 `/vc prepare <会议链接或会议号>`，把这个群设成会议准备群，可以先补背景、预读文档，开会后复用同一个 Agent 会话（见[斜杠命令](/slash-commands)）。
+
+**会中发言**：
+
+- 文字和语音默认**直接发出，不逐条审批**。想逐条审批，在 `vcMeetingAgent.meetingConsumer` 里把 `textOutputPolicy` / `voiceOutputPolicy` 设成 `approval`；设成 `deny` 则禁止。
+- 实时语音默认开着，但只在 Bot 真要说话时才建连；关掉用 `vcMeetingAgent.realtimeVoice.enabled: false`。说话还需要上面的实时权限和会中的 AI 发言权限，缺了会明确报错、不会发出声音。
+- 语音用[语音总结](/voice)里配置的引擎合成（MiniMax、火山引擎 / 豆包等）。
+
+**关闭**：
+
+- 单个 Bot：`bots.json` 里写 `"vcMeetingAgent": { "enabled": false }`，或在「全局设置 → 会议 Agent → 会议监听 → 会议角色预设 → 按 Bot 的会议开关」里关掉这个 Bot 的「接收会议事件」。
+- 整台机器：Dashboard「全局设置 → 会议 Agent → 会议监听」关掉「允许本机使用会议监听能力」（`config.json` 的 `vcMeetingAgent.enabled: false`）。已经在开的会通常会自然结束。
 
 ## 会议角色
 

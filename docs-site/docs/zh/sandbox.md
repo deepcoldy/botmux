@@ -169,6 +169,29 @@ Claude Code、Codex、Antigravity、OpenCode、Pi、oh-my-pi、Grok、Kimi。
 - **Claude 按 Bot 分账号（`credentialsSourceDir`）**：沙盒 Bot 每次冷启动都从这个目录取 OAuth 凭证，多个沙盒 Bot 互不串号。对没开沙盒的 Bot 无效；不能和 `codexAuthSync: "isolated"` 同时配。
 - **lark-cli**：沙盒遮住了共享的 `~/.lark-cli`。想在沙盒里用 lark-cli，机器要先按 Bot 拆分配置，见 [lark-cli 按 bot 隔离配置](https://github.com/deepcoldy/botmux/blob/master/docs/lark-cli-per-bot.md)。
 
+#### 一机多账号：给 Claude Bot 配独立账号 {#credentials-source-dir}
+
+默认情况下，同一台机器上的沙盒 Bot 都从本机共享登录（`~/.claude/.credentials.json` 或钥匙串）取凭证，等于大家用同一个 Claude 账号。想让某个 Bot 用另一个账号：
+
+1. 准备一个账号目录，按 CLI 分子目录放凭证，例如：
+
+   ```text
+   ~/accounts/acct-b/
+   └── claude/
+       └── .credentials.json
+   ```
+
+2. 给这个 Bot 配 `credentialsSourceDir`：`bots.json` 里写 `"credentialsSourceDir": "~/accounts/acct-b"`，或在飞书里发 `/botconfig set credentialsSourceDir ~/accounts/acct-b`。
+3. 新会话生效（已有会话 `/restart`）。之后每次冷启动，botmux 都把这个目录里的凭证复制进 Bot 自己的数据目录。
+
+限制：
+
+- **目前只支持 `claude-code`**，而且 Bot 必须开着文件沙盒。完全没开沙盒的 Bot 配了也不生效（仍用全局登录，日志里会告警）；开了沙盒但数据目录重定向不了（比如配了 `wrapperCli`）会拒绝启动。
+- 来源目录不存在、不可读或凭证无效时**拒绝启动**，不会悄悄退回共享登录。
+- 不能和 `codexAuthSync: "isolated"` 同时配。Codex 分账号用 `codexAuthSync: "isolated"`，见上一条。
+- botmux 只在冷启动时复制，**不负责刷新**来源目录里的 token。来源目录要由你自己（或外部脚本）保持有效。
+- `/botconfig unset credentialsSourceDir` 恢复用共享登录。
+
 ---
 
 ## scratch 一次性沙盒

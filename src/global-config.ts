@@ -521,6 +521,11 @@ export interface DashboardGlobalConfig {
    *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
    *  Live 读取（见 bot-registry.ts `isCardBrandLabelEnabled`），Settings 翻转后无需重启。 */
   cardBrandLabel?: boolean;
+  /** 「CLI 卡住」卡片上，本轮发起人能否按只做拒绝/跳过的安全键（core/stuck-page-catalog.ts
+   *  里 audience='initiator' 的键，如 Esc 不信任继续 / 暂不迁移）。缺省 ON（absent ⇒ 允许）；
+   *  显式 `false` 时只有 Bot 管理员（canOperate）能按卡片上的任何键。与默认值相同的 `true`
+   *  不落盘（Dashboard 写入时删键）。点击时 live 读取（见 config.ts `stuckCardInitiatorKeys`）。 */
+  stuckCardInitiatorKeys?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -681,6 +686,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored
   // `false` must be preserved to let an operator suppress footer brands fleet-wide.
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
+  // Default ON: only an explicit stored false disables (config.ts getter).
+  if (typeof d.stuckCardInitiatorKeys === 'boolean') out.stuckCardInitiatorKeys = d.stuckCardInitiatorKeys;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

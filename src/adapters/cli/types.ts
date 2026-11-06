@@ -845,6 +845,13 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
+  /** This CLI renders the codex_core hook-review / migration pages recognised
+   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
+   *  the "CLI is stuck" card: queued input is held off any of those pages and
+   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
+   *  Undefined = only the legacy hook-review input hold, never a card. */
+  readonly stuckPageFamily?: 'codex-family';
+
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
    *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit

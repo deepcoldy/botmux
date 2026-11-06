@@ -246,6 +246,24 @@ Remote Runner 通过 JSONL 协议接任意远端 Agent 平台。botmux 起一个
 
 ## 各 CLI 的补充说明
 
+### 新接入的 CLI 怎么用 {#new-clis}
+
+Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniMax Code（mcode）、MiMoCode、CodeM、ZCode、Doubao 都是内置适配器，不用额外开关。启用步骤和换别的 CLI 一样（见上文[怎么给机器人换 CLI](#怎么给机器人换-cli)）：先在 daemon 的系统用户下装好对应命令并登录，然后把 Bot 的 `cliId` 设成下表的值。
+
+| CLI | `cliId` | 默认命令 |
+|---|---|---|
+| Grok Build | `grok` | `grok` |
+| Reasonix | `reasonix` | `reasonix` |
+| OpenCode 2（beta） | `opencode2` | `opencode2` |
+| DeepSeek Harness | `dsh` | `dsh`（全屏 TUI 版另设 `dshRuntime: "tui"`，启动 `dsh-tui`，见下文） |
+| MiniMax Code | `minimax` | `mcode` |
+| MiMoCode | `mimocode` | `mimo` |
+| CodeM | `codem` | `codem` |
+| ZCode | `zcode` | `zcode` |
+| Doubao | `doubao` | `doubao` |
+
+**Forge × TraeX**：想经 Forge 启动 TraeX，在 `botmux setup` 或 Dashboard 的 CLI 菜单里选「Forge x TraeX」，或在 `bots.json` 写 `"cliId": "traex", "cliLaunchMode": "forge-traex"`。botmux 会改用 `forge run --agent traex --agent-args ...` 启动，所以 `forge` 要在 PATH 上。这种启动方式只能配 `cliId: "traex"`，而且不能和 `wrapperCli`、`cliRuntime`、`cliPathOverride`、文件沙盒或 `readIsolation` 一起用，否则配置会被拒绝。
+
 ### TraeX 自动模型切换（实验性） {#traex-auto-model}
 
 TraeX 机器人可以把 `model` 设成 `auto`，再给一个有序的模型池。会话从第一个模型开始，遇到排队或额度用完时按顺序换到池里后面的模型。换模型会重启 TraeX 并恢复原会话，不重放已发的输入。
@@ -403,6 +421,18 @@ botmux setup    # CLI 选 Doubao，再选项目目录
 **不走这套桥接的场景**：Workflow 子任务（用 `humanGate` / decision 节点）、没有飞书通道的 API-only 会话、普通终端粘贴模式、App 历史查看服务。原生工具能不能用，最终取决于 Codex 的版本和运行模式。
 
 自测方法：在普通 Codex App 会话里让模型用 `request_user_input` 问一道选择题，确认飞书收到卡片，提交后同一轮继续，并能复述你选的答案。
+
+### Codex App 运行中插话 {#codex-app-steer}
+
+只对 `cliId: "codex-app"` 会话有效，默认可用、飞书侧不用配置：Codex App 正在跑一轮时，你在话题里再发一条消息，它会直接注入**当前这一轮**（Codex 的 turn/steer），而不是排队等这轮做完。插入成功时 Bot 会回一句「收到，引导成功」。适合中途补一句「顺便处理 X」或「别做那个了，改成 Y」。
+
+- 只对真人直接发的消息生效。其它 Bot 发来的消息默认照常排队，要插话得把 `@steer` 写在正文的第一个语义行（可以放在 @ 收件人那一行后面）。
+- 插不进去时（比如这一轮刚好在收尾）按普通消息排队，消息不会丢。
+- 通过 HTTP API 触发的任务要在 `options` 里显式传 `steer: true`，而且第一轮就要带，见 [API 任务触发](/api-task-trigger)。
+
+### Claude Code 忙闲判定（OSC 7501） {#claude-osc-7501}
+
+自动生效，不用配置。Claude Code 适配器支持 OSC 7501 程序状态协议：CLI 一旦报来第一条合法的状态，「工作中 / 空闲」就以它为准，不再只靠猜终端屏幕内容，卡片状态和「本轮已结束」的判断更准。还没收到状态时仍按屏幕内容判断。Pi、Kimi 适配器也用同一套协议。
 
 ## 添加新适配器（贡献者）
 

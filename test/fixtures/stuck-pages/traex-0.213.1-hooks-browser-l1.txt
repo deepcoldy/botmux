@@ -1,0 +1,50 @@
+
+  Hooks
+  Lifecycle hooks from config and enabled plugins.
+
+  ⚠ 5 hooks need review before they can run.
+
+  Event                 Installed   Active      Review      Description
+
+❯ PreToolUse            1           0           1           Before a tool executes
+  PermissionRequest     0           0           0           When permission is requested
+  PostToolUse           1           0           1           After a tool executes
+  PostToolUseFailure    1           0           1           After a tool execution fails
+  Notification          0           0           0           When TRAE CLI sends a notification
+  SubagentStart         0           0           0           When a subagent starts
+  SubagentStop          0           0           0           When a subagent stops
+  PreCompact            0           0           0           Before context compaction
+▼
+
+  t trust all  |  enter review hooks  |  esc close
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -930,6 +930,11 @@ export interface DaemonSession {
    *  Forwarded back to the worker in tui_keys so it can verify the backend
    *  hasn't been replaced within the same worker process. */
   stuckWarningCliLifetime?: number;
+  /** Turn initiator frozen when the active stuck-warning card was posted
+   *  (same rule as the recovery-retry card: daemon-authenticated caller or a
+   *  reply-registry entry proving a human sender). They may press the card's
+   *  `initiator` keys; undefined = operators only. */
+  stuckWarningInitiatorOpenId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

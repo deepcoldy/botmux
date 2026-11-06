@@ -79,7 +79,7 @@ import {
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
+import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildStuckPageCard, buildStuckKeyResultCard, buildInputNotSubmittedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
@@ -130,6 +130,9 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { isStuckPageType } from './stuck-page-catalog.js';
+import { stuckCardFallbackText, stuckCardInitiatorOpenId, stuckCardPostErrorMeansUnsent, stuckKeyResultText } from './stuck-warning-card.js';
+
 import { sandboxNamespaceNotice } from './system-bwrap.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
@@ -230,6 +233,18 @@ const restartCoordinator = new RestartCoordinator();
 const topicEffortRestartReadiness = new Map<string, { attemptId: string; worker: DaemonSession['worker']; workerGeneration?: number; workerReady: boolean; cliReady: boolean; requested: import('../utils/traex-session-effort.js').TraexTopicEffortRestart }>();
 const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
+
+/** Nonce of the keyed stuck card whose POST is in flight for a session (no
+ *  card id yet). A second warning for the same page while it is in flight is
+ *  deduped instead of posting a second card. Kept beside — not derived from —
+ *  ds.stuckWarningNonce: that nonce also stays set when the card was
+ *  suppressed (managedAuxUiSuppressed) and nothing is in flight. */
+const stuckCardPostInFlight = new WeakMap<DaemonSession, {
+  nonce: number;
+  /** Same-page warnings folded into this POST: if it is refused, each still
+   *  owes its own text notice (the worker will not re-send them). */
+  deduped: Array<Extract<WorkerToDaemon, { type: 'stuck_warning' }>>;
+}>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
 type WorkerIpcBootstrapState = {
@@ -15962,6 +15977,7 @@ export function clearStuckWarningAuthority(ds: DaemonSession): void {
   ds.stuckWarningPageType = undefined;
   ds.stuckWarningProcessing = false;
   ds.stuckWarningCliLifetime = undefined;
+  ds.stuckWarningInitiatorOpenId = undefined;
 }
 
 /**
@@ -18769,12 +18785,49 @@ function setupWorkerHandlers(
         // Ignore stuck_warning from a stale worker generation — the CLI may have
         // been replaced and a new worker owns the session now.
         if (ds.worker !== worker) break;
-        // AI-free StuckDetector fired: a written input hasn't produced a
-        // completed turn within the timeout AND the PTY has been quiet, AND the
-        // snapshot matches a known Codex hook-review screen. The detector only
-        // emits when it matches level 1 or level 2 — there is no "unknown
-        // stall" path, so we always build an interactive card with the exact
-        // keys the screen documents.
+        // Plain-text stand-in when no card carries this warning's news.
+        //  - 'deduped': a keyed card for the page is already on screen (or
+        //    being posted); only an unconfirmed submit is news of its own.
+        //  - 'refused_unknown': the button-less card for an unrecognised page
+        //    was refused; the worker's notice (if any) still lands.
+        //  - 'refused_keyed': the keyed card was refused; every reason gets a
+        //    text notice without the screen tail (stuckCardFallbackText).
+        // A refusal only counts when the card did not reach the chat
+        // (stuckCardPostErrorMeansUnsent) — otherwise the text would duplicate it.
+        const deliverStuckNoticeAsText = async (
+          m: typeof msg,
+          why: 'deduped' | 'refused_unknown' | 'refused_keyed',
+          postErr?: unknown,
+        ): Promise<void> => {
+          if (why !== 'deduped' && !stuckCardPostErrorMeansUnsent(postErr)) {
+            logger.warn(`[${t}] Stuck card POST failed after the card was sent — no text fallback`);
+            return;
+          }
+          const text = why === 'refused_keyed'
+            ? stuckCardFallbackText(m, sessionCliDisplayName(ds, botCfg), loc)
+            : (m.reason === 'submit_unconfirmed' ? m.noticeText : undefined);
+          if (!text) return;
+          if (managedAuxUiSuppressed(m.turnId, m.dispatchAttempt)) return;
+          try {
+            await scopedReply(text, 'text', m.turnId);
+          } catch (fallbackErr: any) {
+            logger.error(`[${t}] Failed to deliver stuck notice text fallback: ${fallbackErr?.message ?? fallbackErr}`);
+          }
+        };
+        // A submit_unconfirmed card replaces the worker's input_not_submitted
+        // user_notify, so it owes the same status-card re-render: a single
+        // working→idle PATCH may have been lost while the input never landed.
+        if (msg.reason === 'submit_unconfirmed'
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+          && ownsLifecycleMutation()
+          && (!msg.turnId || !ds.currentTurnId || ds.currentTurnId === msg.turnId)) {
+          scheduleActiveRuntimePatch(ds);
+        }
+        // The worker saw the CLI sit on a blocking page: the AI-free
+        // StuckDetector (a written turn stalled on a classified page), a
+        // message held off such a page, or an unconfirmed submit whose screen
+        // explains why. The keyed card is built from STUCK_PAGE_CATALOG for
+        // the classified page type; the buttons carry only an index + nonce.
         // Dedup: skip if we already posted a warning for THIS turn, OR if a
         // stuck-warning card is already active (covers the no-turnId case where
         // a second stall fires before the first card is resolved).
@@ -18782,6 +18835,54 @@ function setupWorkerHandlers(
         const hasActiveCard = !!ds.stuckWarningCardId;
         if (isDuplicateTurn || hasActiveCard) {
           logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
+          // The keyed card already on screen covers the page, but an
+          // unconfirmed submit is news of its own: never drop the notice the
+          // worker would otherwise have sent as text.
+          await deliverStuckNoticeAsText(msg, 'deduped');
+          break;
+        }
+        const secs = Math.round(msg.elapsedMs / 1000);
+        const knownPage = isStuckPageType(msg.matchedPattern);
+        if (!knownPage) {
+          // Not a page we have safe keys for: never register key authority.
+          // When the worker sent something to show, post the same card
+          // WITHOUT buttons (informational, not tracked); otherwise drop.
+          logger.info(`[${t}] Stuck warning for unrecognised page (${msg.matchedPattern ?? 'none'}, reason=${msg.reason ?? 'turn_stalled'}) — no keyed card`);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'stuck_warning',
+            elapsedMs: msg.elapsedMs,
+            matchedPattern: msg.matchedPattern,
+          });
+          if (!msg.screenTail && !msg.noticeText) break;
+          if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+          try {
+            await scopedReply(buildStuckPageCard({
+              rootId: sessionAnchorId(ds),
+              sessionId: ds.session.sessionId,
+              nonce: 0,
+              pageType: undefined,
+              cliName: sessionCliDisplayName(ds, botCfg),
+              ...(msg.noticeText ? { noticeText: msg.noticeText } : {}),
+              ...(!msg.reason || msg.reason === 'turn_stalled' ? { stalledSecs: secs } : {}),
+              ...(msg.screenTail ? { screenTail: msg.screenTail } : {}),
+              hasInitiator: false,
+              locale: loc,
+            }), 'interactive', msg.turnId);
+          } catch (err: any) {
+            logger.warn(`[${t}] Failed to post unrecognised-page stuck card: ${err}`);
+            await deliverStuckNoticeAsText(msg, 'refused_unknown', err);
+          }
+          break;
+        }
+        // A keyed card for this very page is being POSTed (another turn, or no
+        // turn id, so the turn dedup above missed it): one card per page, not two.
+        const inFlight = stuckCardPostInFlight.get(ds);
+        if (inFlight && inFlight.nonce === ds.stuckWarningNonce
+          && ds.stuckWarningNonce !== undefined
+          && ds.stuckWarningPageType === msg.matchedPattern) {
+          logger.debug(`[${t}] Stuck warning dedup skipped (card POST in flight for ${msg.matchedPattern}, nonce=${ds.stuckWarningNonce})`);
+          inFlight.deduped.push(msg);
+          await deliverStuckNoticeAsText(msg, 'deduped');
           break;
         }
         // Allocate a daemon-side nonce for this warning (NOT the worker's
@@ -18804,7 +18905,17 @@ function setupWorkerHandlers(
         ds.stuckWarningCliLifetime = msg.cliLifetime;
         const pageType = msg.matchedPattern;
         ds.stuckWarningPageType = pageType;
-        const secs = Math.round(msg.elapsedMs / 1000);
+        // Freeze who may press the card's `initiator` keys now, from the exact
+        // turn the warning names — the in-memory caller may be cleared by the
+        // turn's terminal before anyone clicks. Same rule as the recovery-retry
+        // card; no turn id → operators only.
+        const initiatorOpenId = stuckCardInitiatorOpenId({
+          turnId: msg.turnId,
+          larkAppId: ds.larkAppId,
+          activeTurn: ds.activeInteractiveTurn,
+          replyTarget: msg.turnId ? pickTurnReplyTarget(ds.session, msg.turnId) : undefined,
+        });
+        ds.stuckWarningInitiatorOpenId = initiatorOpenId;
         logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s (${pageType}) nonce=${nonce}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'stuck_warning',
@@ -18813,35 +18924,36 @@ function setupWorkerHandlers(
         });
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
 
-        let description: string;
-        let options: Array<{ label: string; text: string; selected: boolean; type: 'confirm' | 'select'; keys: string[] }>;
-        if (pageType === 'hook review level 2') {
-          // Level 2 — per-hook review: t=trust, Esc=go back. No Enter here.
-          description = `⚠️ Codex 卡在单项 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
-          options = [
-            { label: 't', text: '信任 (trust)', selected: false, type: 'confirm' as const, keys: ['t'] },
-            { label: 'Esc', text: '返回 (go back)', selected: false, type: 'select' as const, keys: ['Escape'] },
-          ];
-        } else {
-          // Level 1 — hooks browser: t=trust all, Enter=review hooks, Esc=close.
-          description = `⚠️ Codex 卡在 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
-          options = [
-            { label: 't', text: '信任全部 (trust all)', selected: false, type: 'confirm' as const, keys: ['t'] },
-            { label: 'Enter', text: '逐项审核 (review hooks)', selected: false, type: 'select' as const, keys: ['Enter'] },
-            { label: 'Esc', text: '关闭 (close)', selected: false, type: 'select' as const, keys: ['Escape'] },
-          ];
-        }
         try {
-          const cardJson = buildTuiPromptCard(
-            sessionAnchorId(ds),
-            ds.session.sessionId,
-            description,
-            options,
-            false,
-            undefined,
-            loc,
-          );
-          const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          const cardJson = buildStuckPageCard({
+            rootId: sessionAnchorId(ds),
+            sessionId: ds.session.sessionId,
+            nonce,
+            pageType,
+            cliName: sessionCliDisplayName(ds, botCfg),
+            ...(msg.noticeText ? { noticeText: msg.noticeText } : {}),
+            ...(!msg.reason || msg.reason === 'turn_stalled' ? { stalledSecs: secs } : {}),
+            ...(msg.screenTail ? { screenTail: msg.screenTail } : {}),
+            hasInitiator: !!initiatorOpenId,
+            initiatorKeysEnabled: config.stuckCardInitiatorKeys !== false,
+            locale: loc,
+          });
+          const flight = { nonce, deduped: [] as Array<typeof msg> };
+          stuckCardPostInFlight.set(ds, flight);
+          let cardMsgId: string;
+          try {
+            cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          } catch (postErr) {
+            // Warnings folded into this POST would otherwise never be told:
+            // give each its own text notice ('deduped' already sent the
+            // submit_unconfirmed ones).
+            for (const folded of flight.deduped) {
+              if (folded.reason !== 'submit_unconfirmed') await deliverStuckNoticeAsText(folded, 'refused_keyed', postErr);
+            }
+            throw postErr;
+          } finally {
+            if (stuckCardPostInFlight.get(ds) === flight) stuckCardPostInFlight.delete(ds);
+          }
           // Authority check: if the warning was invalidated (prompt_ready,
           // CLI exit, worker replace) OR the worker was replaced while the POST
           // was in flight, resolve the card immediately and do NOT register it
@@ -18851,7 +18963,7 @@ function setupWorkerHandlers(
           if (ds.worker !== worker || ds.workerGeneration !== workerGeneration || ds.stuckWarningNonce !== nonce) {
             logger.debug(`[${t}] Stuck warning card POSTed but authority stale (nonce=${nonce}, current=${ds.stuckWarningNonce ?? 'none'}, workerGen=${workerGeneration}) — resolving`);
             const locDs = localeForBot(ds.larkAppId);
-            const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+            const resolvedCard = buildTuiPromptResolvedCard(tr('card.stuck.expired', undefined, locDs), locDs);
             updateMessage(ds.larkAppId, cardMsgId, resolvedCard).catch(err =>
               logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
             );
@@ -18861,6 +18973,9 @@ function setupWorkerHandlers(
           publishAttentionPatch(ds);
         } catch (err: any) {
           logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+          // The card replaced the worker's plain-text submit notice: if the
+          // card is refused (content audit, size), the notice must still land.
+          await deliverStuckNoticeAsText(msg, 'refused_keyed', err);
           // Card send failed — clear markers ONLY if this nonce is still
           // current AND we still own the worker. A newer warning (nonce+1) may
           // have started while this POST was in flight; we must not wipe the
@@ -18881,7 +18996,7 @@ function setupWorkerHandlers(
         // action was NOT performed, then clear the authority.
         if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
           const locDs = localeForBot(ds.larkAppId);
-          const resolvedCard = buildTuiPromptResolvedCard('页面已变化，未发送按键', locDs);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.stuck.expired', undefined, locDs), locDs);
           updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
           );
@@ -18899,7 +19014,17 @@ function setupWorkerHandlers(
         // falsely report success.
         if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
           const locDs = localeForBot(ds.larkAppId);
-          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          // Report what was sent and what the worker's post-key capture saw.
+          // Still on a blocking page → the worker raises a fresh card (this
+          // one's authority is cleared below, so the dedup lets it through).
+          const resolvedCard = msg.key
+            ? buildStuckKeyResultCard(
+              stuckKeyResultText(msg, locDs),
+              msg.afterObserved === false ? undefined : msg.afterScreenTail,
+              !!msg.afterPageType || msg.afterObserved === false,
+              locDs,
+            )
+            : buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
           updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
           );
@@ -19747,7 +19872,20 @@ function setupWorkerHandlers(
           }
         }
         try {
-          await scopedReply(msg.message, 'text', msg.turnId);
+          // An unsubmitted input with a readable screen goes out as a card with
+          // the bottom of the terminal; everything else stays plain text.
+          if (msg.kind === 'input_not_submitted' && msg.screenTail) {
+            try {
+              await scopedReply(buildInputNotSubmittedCard(msg.message, msg.screenTail, loc), 'interactive', msg.turnId);
+            } catch (err: any) {
+              // A refused card (content audit on the screen text, size) must
+              // not swallow the notice the text path always delivered.
+              logger.warn(`[${t}] input_not_submitted card refused, falling back to text: ${err?.message ?? err}`);
+              await scopedReply(msg.message, 'text', msg.turnId);
+            }
+          } else {
+            await scopedReply(msg.message, 'text', msg.turnId);
+          }
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
         }

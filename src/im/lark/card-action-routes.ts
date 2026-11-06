@@ -244,6 +244,10 @@ const NO_META: SensitiveCardActionMeta = {};
 // - `retry_recovery_turn`（自动恢复失败卡的「重试」）：原发起人（仍能对话）或
 //   bot 管理员可点，门在 core/ordinary-recovery-retry.ts 的 handleOrdinaryRecoveryRetryClick。
 // - `board_card_*`（决策看板拍板卡片）：只认管家 bot 的 owner，门在 DecisionBoardService.cardClick。
+// - `stuck_key`（CLI 卡在阻塞页时卡片上的安全按键）：本轮发起人（仍能对话）可点
+//   只做拒绝/跳过的键，bot 管理员可点全部键；门在 core/stuck-warning-card.ts 的
+//   decideStuckKeyClick（键由服务端按页面类型 + 下标查 core/stuck-page-catalog.ts，
+//   卡片 value 不带键）。同卡的旧 `tui_keys` 按钮仍在本表里，只给管理员。
 
 export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta> = new Map<string, SensitiveCardActionMeta>([
   ['restart', NO_META],
