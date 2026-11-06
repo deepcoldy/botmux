@@ -696,6 +696,13 @@ export class BridgeTurnQueue {
         // with the retryable failure the classifier produced. The exit is
         // shared; the assignment below is NOT - see the two branches.
         if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
+          // A wake turn this record cut before any visible text has failed,
+          // exactly as the record fails a turn already collecting below (the
+          // error outranks a later answer). Its wake ends here, whether or not
+          // a duration marker follows: left armed it would claim whatever
+          // headless text comes next — a continuation of the failed turn or
+          // an unrelated turn — for the launching topic.
+          this.pendingBackgroundWake = undefined;
           if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
             // The two signals that share this exit are NOT of equal authority,
             // so they do not share an assignment operator (maintainer ruling on
@@ -845,23 +852,48 @@ export class BridgeTurnQueue {
    *  turn (nothing collecting, or the last turn closed by its duration marker)
    *  for a task with a known launch anchor arms a background wake for the
    *  headless turn its reply synthesises. A notice folded into a running turn,
-   *  a sidechain one, one written before this queue existed, or one for a task
-   *  without an anchor arms nothing — and, since Claude may answer every notice
-   *  that piled up in one turn, also disarms any wake already pending: a mixed
-   *  or cross-topic answer has no single safe destination. */
+   *  a sidechain one, one written before this queue existed, one not written
+   *  by Claude Code itself (`promptSource` other than `system`: a typed
+   *  message that merely starts with the tag), or one for a task without an
+   *  anchor arms nothing — and, since Claude may answer every notice that piled
+   *  up in one turn, also disarms any wake already pending: a mixed or
+   *  cross-topic answer has no single safe destination.
+   *
+   *  The `attachment(queued_command, commandMode:'task-notification')` form is
+   *  deliberately not read here: current Claude Code writes it only for a
+   *  notice absorbed into a turn already running (never one that opens a
+   *  turn), and a folded notice must not arm. Should a future build open a
+   *  wake turn with that form, the wake stays an ordinary local turn — the
+   *  pre-forwarding behaviour — rather than being routed on a shape no real
+   *  transcript has shown yet. */
   private notePendingBackgroundWake(ev: TranscriptEvent): void {
     if (ev.isSidechain === true || ev.type !== 'user') return;
     const notice = parseTaskNotification(ev);
     if (!notice) return;
     const opensTurn = !this.collecting || this.collecting.closedByDurationMarker === true;
     const atMs = eventTimeMs(ev);
-    const anchor = opensTurn && atMs !== undefined && atMs >= this.liveSinceMs
+    const anchor = opensTurn && ev.promptSource === 'system' && atMs !== undefined && atMs >= this.liveSinceMs
       ? this.backgroundTaskAnchors.get(notice.taskId)
       : undefined;
     const pending = this.pendingBackgroundWake;
     this.pendingBackgroundWake = anchor !== undefined && (pending === undefined || pending === anchor)
       ? anchor
       : null;
+  }
+
+  /** Distinct Lark turns that the given (still running) background tasks
+   *  were launched from, in launch order. The worker reports them to the
+   *  daemon, which keeps their reply-routing records past its bounded
+   *  eviction while the task can still wake the session — the same pin a
+   *  CronCreate task holds on its create-time topic. Tasks without an anchor
+   *  contribute nothing. */
+  backgroundTaskAnchorTurnIds(liveTaskIds: Iterable<string>): string[] {
+    const live = new Set(liveTaskIds);
+    const out = new Set<string>();
+    for (const [taskId, anchor] of this.backgroundTaskAnchors) {
+      if (live.has(taskId)) out.add(anchor);
+    }
+    return [...out];
   }
 
   /** Restore task→anchor pairs from the worker's durable store after a

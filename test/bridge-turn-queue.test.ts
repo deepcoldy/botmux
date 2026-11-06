@@ -2360,7 +2360,7 @@ describe('Claude background-task wake turns', () => {
     ] as TranscriptEvent[];
   }
   function notification(uuid: string, taskId: string, atMs: number): TranscriptEvent {
-    return { type: 'user', uuid, timestamp: new Date(atMs).toISOString(), isSidechain: false,
+    return { type: 'user', uuid, timestamp: new Date(atMs).toISOString(), isSidechain: false, promptSource: 'system',
       message: { role: 'user', content: `<task-notification>\n<task-id>${taskId}</task-id>\n<status>completed</status>\n</task-notification>` } } as TranscriptEvent;
   }
   /** Ingest the fixture with `extra` notifications delivered right after (or,
@@ -2426,5 +2426,105 @@ describe('Claude background-task wake turns', () => {
     const wake = readyWake(q).ready.find(turn => turn.assistantUuids.includes('wake-a-final'));
     expect(wake?.turnId).toBe('local-headless-wake-a-final');
     expect(wake?.isBackgroundWake).toBeFalsy();
+  });
+
+  /** Claude Code's API-error record (`isApiErrorMessage`, `<synthetic>` model). */
+  function apiError(uuid: string, atMs: number, text = 'API Error: 500 {"type":"error","error":{"type":"api_error"}}'): TranscriptEvent {
+    return { type: 'assistant', uuid, timestamp: new Date(atMs).toISOString(), isSidechain: false, isApiErrorMessage: true,
+      message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text }] } } as TranscriptEvent;
+  }
+  /** Visible assistant text with no user record before it (a headless turn). */
+  function laterText(uuid: string, atMs: number): TranscriptEvent {
+    return { type: 'assistant', uuid, timestamp: new Date(atMs).toISOString(), isSidechain: false,
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: '无关的后续输出' }] } } as TranscriptEvent;
+  }
+
+  it('a typed message that merely starts with the notification tag arms nothing', () => {
+    // Bare (solo transcript) delivery puts a human's text into the CLI as-is;
+    // only Claude Code's own notice record carries promptSource "system".
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() })
+      .map(ev => ev.uuid === 'wake-user' ? { ...ev, promptSource: 'user' } : ev);
+    q.ingest(events);
+    const { wake } = readyWake(q);
+    expect(wake?.turnId).toBe('local-headless-wake-a-final');
+    expect(wake?.isBackgroundWake).toBeFalsy();
+  });
+
+  it('without turn_duration markers, an API error ends the wake: a later headless turn stays local', () => {
+    // A transcript that never writes `turn_duration` (older Claude JSONL).
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() })
+      .filter(ev => ev.subtype !== 'turn_duration');
+    const byId = (id: string) => events.find(ev => ev.uuid === id)!;
+    q.ingest(['lark-user-1', 'lark-a-launch', 'lark-ack', 'lark-a-final'].map(byId));
+    q.noteDurationMarkerWaitExpired();
+    expect(q.drainEmittable({ explicitTerminalOnly: true, releaseHeldTerminals: true }).map(turn => turn.turnId))
+      .toEqual(['lark-t1']);
+    const wakeAt = Date.parse(byId('wake-user').timestamp!);
+    q.ingest([byId('wake-user'), apiError('wake-api-error', wakeAt + 2_000), laterText('later-a', wakeAt + 60_000)]);
+    const later = readyWake(q).ready.find(turn => turn.assistantUuids.includes('later-a'));
+    expect(later?.turnId).toBe('local-headless-later-a');
+    expect(later?.isBackgroundWake).toBeFalsy();
+    expect(later?.replyAnchorTurnId).toBeUndefined();
+  });
+
+  it('a wake cut by a provider error before any text lends nothing to a later headless turn (marker-writing transcript)', () => {
+    // The Lark turn closed with its duration marker; the wake turn is cut by a
+    // server error and writes no marker of its own; later assistant text
+    // arrives with no user record before it.
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const wakeAt = events.findIndex(ev => ev.uuid === 'wake-user');
+    const wakeAtMs = Date.parse(events[wakeAt].timestamp!);
+    q.ingest([...events.slice(0, wakeAt + 1),
+      apiError('wake-api-error', wakeAtMs + 2_000),
+      laterText('later-a', wakeAtMs + 60_000)]);
+    const later = readyWake(q).ready.find(turn => turn.assistantUuids.includes('later-a'));
+    expect(later?.turnId).toBe('local-headless-later-a');
+    expect(later?.isBackgroundWake).toBeFalsy();
+    expect(later?.replyAnchorTurnId).toBeUndefined();
+  });
+
+  it('a wake cut by an API error before any text is not forwarded even if Claude carries on in the same turn', () => {
+    // "Connection lost mid-response" is written as an API-error record, after
+    // which Claude Code may keep going. The error fails the wake the same way
+    // it fails a turn that is already collecting: no forwarded answer.
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const wakeAt = events.findIndex(ev => ev.uuid === 'wake-user');
+    const cut = apiError('wake-api-error', Date.parse(events[wakeAt].timestamp!) + 1_000,
+      'API Error: Connection lost mid-response. The response above may be incomplete.');
+    q.ingest([...events.slice(0, wakeAt + 1), cut, ...events.slice(wakeAt + 1)]);
+    const { wake } = readyWake(q);
+    expect(wake?.turnId).toBe('local-headless-wake-a-final');
+    expect(wake?.isBackgroundWake).toBeFalsy();
+  });
+
+  it('a wake that ends without visible text is closed by its own duration marker', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const byId = (id: string) => events.find(ev => ev.uuid === id)!;
+    const wakeAtMs = Date.parse(byId('wake-user').timestamp!);
+    q.ingest([...events.slice(0, events.findIndex(ev => ev.uuid === 'wake-user') + 1),
+      byId('wake-a-thinking'), byId('wake-duration'),
+      laterText('later-a', wakeAtMs + 60_000)]);
+    const later = readyWake(q).ready.find(turn => turn.assistantUuids.includes('later-a'));
+    expect(later?.turnId).toBe('local-headless-later-a');
+    expect(later?.isBackgroundWake).toBeFalsy();
+  });
+
+  it('reports the launching turn of each running background task, once', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    q.ingest(events.slice(0, events.findIndex(ev => ev.uuid === 'wake-user')));
+    expect(q.backgroundTaskAnchorTurnIds(['bxfr0j2hg', 'bxfr0j2hg', 'unknown-task'])).toEqual(['lark-t1']);
+    expect(q.backgroundTaskAnchorTurnIds([])).toEqual([]);
   });
 });

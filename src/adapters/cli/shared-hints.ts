@@ -106,8 +106,10 @@ function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean,
 
 /** Claude Code-only, transcript delivery only: a background-task wake turn's
  *  final is forwarded to Lark there (send mode leaves it to `botmux send`), so
- *  the model needs to know to stay silent on routine task events. Returns []
- *  for every other CLI and for send mode. */
+ *  the model needs to know to stay silent on routine task events. Claude Code
+ *  is an injectsSessionContext adapter — session-manager never gives it shell
+ *  hints — so this rides {@link buildBotmuxSystemPromptText}'s transcript
+ *  branch (its `--append-system-prompt`). Returns [] for every other CLI. */
 function claudeBackgroundTaskNote(cliId: CliId | undefined, locale?: Locale): string[] {
   if (cliId !== 'claude-code') return [];
   return [t('ai.claude.background_task_note_transcript', undefined, locale)];
@@ -160,7 +162,6 @@ export function buildBotmuxShellHints(
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       ...cursorBackgroundTaskNote(cliId, true, locale),
-      ...claudeBackgroundTaskNote(cliId, locale),
       ...zcodeProgressReportNote(cliId, locale),
       hiddenContextDefense(locale),
     ]
@@ -345,8 +346,14 @@ export function buildBotmuxSystemPromptText(opts: {
   /** transcript-only: solo chat (owner + this bot). The identity block keeps
    *  name/open_id but drops routing_rules — there is no other bot to route to. */
   solo?: boolean;
+  /** The adapter building this prompt. Required (not optional) so every
+   *  producer states it: CLI-specific lines key off it, and a producer that
+   *  left it out would silently lose them. Today only `claude-code` adds one
+   *  (the transcript-mode background-task note); every other id renders the
+   *  same text as before the field existed. */
+  cliId: CliId | undefined;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, cliId } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -419,6 +426,8 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
+      // Follows the sentinel line it relies on (BOTMUX_NOTHING_TO_SEND).
+      ...claudeBackgroundTaskNote(cliId, locale).map(escapeXmlTagLikeTokens),
       ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
       hiddenContextDefense(locale),
       ...whiteboardRouting,

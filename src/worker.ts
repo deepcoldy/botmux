@@ -8150,6 +8150,34 @@ function refreshBackgroundWait(): void {
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
   if (next === 0) backgroundStopScanOffsets.clear();
   backgroundWaitTasks = next;
+  syncBackgroundTaskPinsToDaemon();
+}
+
+/** Last `background_task_pins_sync` snapshot sent; undefined until this
+ *  worker's first one, which is sent even when empty: it replaces whatever an
+ *  earlier worker generation left pinned (a takeover installs the new worker
+ *  before the old one's exit, so the daemon's exit cleanup skips it). */
+let backgroundTaskPinsSent: string | undefined;
+
+/** Tell the daemon which Lark turns this worker's running Claude background
+ *  tasks were launched from. A wake answer is forwarded to that turn's topic
+ *  (emitReadyTurns), and the daemon resolves the topic from a replyTargets
+ *  record it would otherwise evict once newer turns pile up — so it keeps
+ *  these records while the task runs, as it does for a live CronCreate task.
+ *  Only where a wake is forwarded at all (transcript delivery, not adopt /
+ *  zero-injection), so send-mode sessions keep their eviction unchanged; sent
+ *  only when the set changes. The daemon drops the pins when this worker exits. */
+function syncBackgroundTaskPinsToDaemon(): void {
+  if (lastInitConfig?.adoptMode === true || zeroPromptTerminalSync() || replyDeliveryMode() !== 'transcript') return;
+  const turnIds = bridgeQueue.backgroundTaskAnchorTurnIds(backgroundTaskTracker.liveTaskIds());
+  const key = turnIds.join('\n');
+  if (key === backgroundTaskPinsSent) return;
+  try {
+    send({ type: 'background_task_pins_sync', turnIds });
+    backgroundTaskPinsSent = key;
+  } catch (err: any) {
+    log(`Background task pin sync failed (${err.message})`);
+  }
 }
 
 /** Sibling Claude transcripts already read for background-task stops, and
@@ -11392,6 +11420,10 @@ function emitReadyTurns(opts: {
       const notice = localTurnFailureNotice(turn, {
         liveSinceMs: WORKER_STARTED_AT_MS,
         zeroPromptTerminalSync: zeroPromptTerminalSync(),
+        // Same condition as the forwarding above: a wake whose answer would
+        // have gone to its launching topic reports its failure there too.
+        backgroundWakeForwarded: turn.isBackgroundWake === true && !adoptMode
+          && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript',
       });
       if (notice) {
         log(`Bridge terminal for synthesised local turn ${turn.turnId.substring(0, 8)} `

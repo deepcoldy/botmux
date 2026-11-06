@@ -565,6 +565,59 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
   });
 });
 
+describe('background task reply pins', () => {
+  /** A topic-A turn launches a background task, then `newer` turns run in
+   *  topic B before the task's wake answer is routed back to the launch turn. */
+  function routeAfter(newer: number, pins?: string[]) {
+    const ds = makeDs(pins ? { backgroundTaskPinnedTurnIds: pins } : {}) as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-launch', new Date(t0).toISOString());
+    for (let i = 1; i <= newer; i++) {
+      beginReplyTargetTurn(ds, 'om_topicB', `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    // The resolver a worker final_output with replyTurnId goes through.
+    return frozenReplyContextForTurn(ds, 'turn-launch').target;
+  }
+
+  it('keeps the launching turn routable while its task runs, however many turns follow', () => {
+    expect(routeAfter(300, ['turn-launch'])).toEqual({ mode: 'thread', rootMessageId: 'om_topicA' });
+    // Control: unpinned, the launch turn's records are evicted and the answer
+    // would land at the group top level.
+    expect(routeAfter(300)).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('the daemon takes the pin set from its current worker and drops it when that worker exits', async () => {
+    const { __testOnly_setupWorkerHandlers, initWorkerPool } = await import('../src/core/worker-pool.js');
+    const { registerBot, __testOnly_resetBotRegistry } = await import('../src/bot-registry.js');
+    const sessionStore = await import('../src/services/session-store.js');
+    registerBot({ larkAppId: 'cli_bgpin', larkAppSecret: 'secret', cliId: 'claude-code' });
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_card'), getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const persist = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    try {
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false, send: vi.fn(), kill: vi.fn(), pid: 4343, stdout: new EventEmitter(), stderr: new EventEmitter(),
+      });
+      const ds = {
+        session: { sessionId: 'bg-pin-sync', rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group', status: 'active' },
+        worker, larkAppId: 'cli_bgpin', chatId: 'oc_chat', chatType: 'group', scope: 'chat',
+      } as unknown as DaemonSession;
+      __testOnly_setupWorkerHandlers(ds, worker as any);
+      worker.emit('message', { type: 'background_task_pins_sync', turnIds: ['om_A', 'om_A', 7, '', 'om_B'] });
+      expect(ds.backgroundTaskPinnedTurnIds).toEqual(['om_A', 'om_B']);
+      worker.emit('message', { type: 'background_task_pins_sync', turnIds: [] });
+      expect(ds.backgroundTaskPinnedTurnIds).toBeUndefined();
+      worker.emit('message', { type: 'background_task_pins_sync', turnIds: ['om_C'] });
+      expect(ds.backgroundTaskPinnedTurnIds).toEqual(['om_C']);
+      worker.emit('exit', 0, null);
+      expect(ds.backgroundTaskPinnedTurnIds).toBeUndefined();
+    } finally {
+      persist.mockRestore();
+      __testOnly_resetBotRegistry();
+    }
+  });
+});
+
 describe('cron task reply anchors (daemon-side mirror)', () => {
   it('cronPinnedTurnIds collects distinct non-null turn ids', () => {
     expect(cronPinnedTurnIds(undefined).size).toBe(0);
