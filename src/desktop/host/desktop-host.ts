@@ -25,6 +25,7 @@ import { withFileLock } from '../../utils/file-lock.js';
 import { readFleetState } from '../../core/fleet-state-store.js';
 import { pidAlive } from '../../core/fleet-supervisor.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
+import { appRuntimeBinaryPath } from '../../core/binary-install-shape.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { botmuxVersion } from '../../utils/install-info.js';
 import { ensurePathEntry } from '../../../scripts/install-path-entry.mjs';
@@ -148,6 +149,38 @@ export function bundledRuntimeForHost(input: {
   };
 }
 
+export type LaunchOutcome = 'started' | 'restarted' | 'restart-failed' | 'aligned' | 'none';
+
+/**
+ * Only the runtime properly seeded at `~/.botmux/app-runtime/botmux` may be
+ * replaced in place by an in-app update. When `RuntimeInstaller.ensure` could not
+ * seed it (disk full, permissions, AV) the Swift shell falls back to the binary
+ * INSIDE the signed .app bundle; replacing that file would invalidate the code
+ * signature (the next launch is killed by the OS) or fail with an opaque error.
+ * Such a state is only recoverable by reinstalling the app, so every update
+ * entry point must refuse instead of writing into the bundle. Dev mode (a
+ * non-compiled runtime) has its own earlier gate and is never self-updatable.
+ */
+export function runtimeSelfUpdateAllowed(input: { standalone: boolean; runtimePath: string; home: string }): boolean {
+  return input.standalone && input.runtimePath === appRuntimeBinaryPath(input.home);
+}
+
+/**
+ * What to do with the persisted `.restart-needed` marker after launch policy
+ * runs. A failed restart onto the reseeded runtime KEEPS it so the next launch
+ * retries; every other outcome (including a stopped fleet, for which there is no
+ * old-build fleet to restart) removes it.
+ */
+export function settleRestartMarker(outcome: LaunchOutcome): 'keep' | 'remove' {
+  return outcome === 'restart-failed' ? 'keep' : 'remove';
+}
+
+/** The shell PATH line is written at most once per seeded runtime, and never
+ *  when a login shell already resolves `botmux`. */
+export function shouldWritePathEntry(input: { markerExists: boolean; shellProvidesBotmux: boolean }): boolean {
+  return !input.markerExists && !input.shellProvidesBotmux;
+}
+
 export interface DesktopUpdateStatus {
   current: string;
   latest: string | null;
@@ -206,11 +239,20 @@ export async function runDesktopHost(): Promise<void> {
   };
   /** Only a supervisor whose entry IS the app runtime counts as the app's fleet. */
   const ownedByApp = () => ownership().kind === 'app';
-  const runtimeDir = dirname(bundled.cliPath);
+  // Markers always live next to the Swift-seeded runtime
+  // (~/.botmux/app-runtime), never derived from bundled.cliPath: in the
+  // reseed-failure fallback that path is INSIDE the signed .app bundle, and the
+  // restart marker is written by RuntimeInstaller only beside the out-of-bundle
+  // runtime it actually replaced.
+  const runtimeDir = dirname(appRuntimeBinaryPath(home));
   // Persisted (not a one-shot env): survives host crashes/relaunches until the
   // restart onto the reseeded runtime actually succeeds.
   const restartMarker = join(runtimeDir, '.restart-needed');
   const pathMarker = join(runtimeDir, '.path-entry-written');
+  // False only when the runtime could not be seeded outside the bundle — every
+  // update entry point must then refuse rather than write into the signed .app.
+  const selfUpdateAllowed = runtimeSelfUpdateAllowed({ standalone: isStandaloneBinary(), runtimePath, home });
+  const RESEED_FAILED_MESSAGE = '运行时未成功植入到 App 运行时目录（~/.botmux/app-runtime），请重新安装 Botmux App 后再更新';
   const runtime = createRuntimeService({
     paths,
     appVersion: version,
@@ -279,6 +321,16 @@ export async function runDesktopHost(): Promise<void> {
 
   async function checkForUpdate(): Promise<DesktopUpdateStatus> {
     if (!bundled.selfDispatching) return { ...update };
+    if (!selfUpdateAllowed) {
+      // Reseed failure fallback: the runtime is the binary inside the signed
+      // bundle. Do not offer or silently apply an update that would overwrite it.
+      update.available = false;
+      update.latest = null;
+      update.error = RESEED_FAILED_MESSAGE;
+      update.checkedAt = Date.now();
+      publish();
+      return { ...update };
+    }
     try {
       const lookup = await fetchReleaseLatestVersion();
       update.latest = lookup.version;
@@ -322,6 +374,7 @@ export async function runDesktopHost(): Promise<void> {
 
   async function applyUpdate(opts: { restartFleet?: boolean } = {}): Promise<{ ok: boolean; message: string }> {
     if (!bundled.selfDispatching) return { ok: false, message: '开发模式运行，不支持应用内更新' };
+    if (!selfUpdateAllowed) return { ok: false, message: RESEED_FAILED_MESSAGE };
     if (update.inProgress) return { ok: false, message: '更新已在进行中' };
     update.inProgress = true;
     publish();
@@ -385,7 +438,7 @@ export async function runDesktopHost(): Promise<void> {
       let pathProfiles: string[] = [];
       // Once per machine: a user who removes the line again has decided, and
       // the host relaunches often (after every runtime update).
-      if (!existsSync(pathMarker) && !pathProvidesBotmux(probeShellPathEnv())) {
+      if (shouldWritePathEntry({ markerExists: existsSync(pathMarker), shellProvidesBotmux: pathProvidesBotmux(probeShellPathEnv()) })) {
         const result = ensurePathEntry({ installDir: binDir });
         pathProfiles = result.written;
         for (const failure of result.failed) log(`PATH entry not written to ${failure.file}: ${failure.error}`);
@@ -417,7 +470,10 @@ export async function runDesktopHost(): Promise<void> {
       ownedByApp,
       log,
     });
-    if (outcome !== 'restart-failed') rmSync(restartMarker, { force: true });
+    // A stopped fleet + marker + background relaunch returns 'none' here: there
+    // is no old-build fleet to restart, so removing the marker is the correct
+    // outcome (settleRestartMarker), not a conflict with restart-failed keeping it.
+    if (settleRestartMarker(outcome) === 'remove') rmSync(restartMarker, { force: true });
   } catch (error) {
     log(`launch policy failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -434,9 +490,14 @@ export async function runDesktopHost(): Promise<void> {
 
 /**
  * What the app does to the fleet when it starts:
- *  · nothing runs                          → start the app runtime
- *  · the app runtime was reseeded          → restart a fleet it owns, so the
- *    (marker persists until that succeeds)   fleet runs the app's version
+ *  · the app runtime was reseeded and its fleet runs → restart it onto the new
+ *    (marker persists until that succeeds)            build. The ONLY action a
+ *                                                         background host relaunch
+ *                                                         may take.
+ *  · nothing runs                          → start the app runtime — APP LAUNCH
+ *                                             ONLY, so a fleet the user explicitly
+ *                                             stopped is never resurrected by a
+ *                                             host crash / self-update exit / mtime swap
  *  · an older PACKAGED install owns it     → take over (align to the app version),
  *    — on app launch only                    never on a background host relaunch
  *  · a git checkout, a newer install, or   → leave it; offered in the menu only
@@ -450,22 +511,32 @@ export async function launchPolicy(input: {
   appLaunch: boolean;
   ownedByApp: () => boolean;
   log: (message: string) => void;
-}): Promise<'started' | 'restarted' | 'restart-failed' | 'aligned' | 'none'> {
+}): Promise<LaunchOutcome> {
   const report = (label: string, result: { code: number; stdout: string; stderr: string }) => {
     if (result.code !== 0) input.log(`${label} failed: ${(result.stderr || result.stdout).trim()}`);
     return result.code === 0;
   };
-  if (shouldAutoStartCliRuntime(input.state) && input.state.runtimeSource === 'bundled') {
-    report('auto-start', await input.runtime.start());
-    return 'started';
-  }
   const running = input.state.status === 'running' || input.state.status === 'degraded';
-  if (!running) return 'none';
-  if (input.ownedByApp()) {
-    if (!input.runtimeReplaced) return 'none';
+  // Before the app-launch gate on purpose: restarting an app-owned fleet onto a
+  // runtime the app just reseeded must also happen when the host merely
+  // relaunched (that is exactly when a self-update/reseed lands).
+  if (running && input.ownedByApp() && input.runtimeReplaced) {
     return report('restart onto the new app runtime', await input.runtime.restartBundled()) ? 'restarted' : 'restart-failed';
   }
+  // Everything else is an app-launch decision. A background host relaunch never
+  // starts or takes over anything — the fleet outlives the app by design, and a
+  // fleet the user stopped stays stopped.
   if (!input.appLaunch) return 'none';
+  if (!running) {
+    // The runtimeSource === 'bundled' guard stays: on a first app launch where a
+    // separately installed CLI owns a stopped fleet, auto-starting the app
+    // runtime would hijack that install's fleet.
+    if (shouldAutoStartCliRuntime(input.state) && input.state.runtimeSource === 'bundled') {
+      report('auto-start', await input.runtime.start());
+      return 'started';
+    }
+    return 'none';
+  }
   const alignment = await input.alignment();
   if (alignment.kind === 'owner-older' && alignment.auto) {
     input.log(`aligning fleet ${alignment.ownerVersion} → app ${alignment.appVersion}`);

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRuntimeService, type BundledRuntimeCandidate } from '../../src/desktop/main/runtime-service.js';
 import { ensureBotmuxShim, inspectBotmuxShim, pathProvidesBotmux } from '../../src/desktop/host/cli-shim.js';
 import { classifyFleetOwnership, interpreterFromCommand, resolveFleetOwner } from '../../src/desktop/host/fleet-owner.js';
-import { bundledRuntimeForHost, dispatchHostLine, FRAME_PREFIX, launchPolicy } from '../../src/desktop/host/desktop-host.js';
+import { bundledRuntimeForHost, dispatchHostLine, FRAME_PREFIX, launchPolicy, runtimeSelfUpdateAllowed, settleRestartMarker, shouldWritePathEntry } from '../../src/desktop/host/desktop-host.js';
 import { computeFleetAlignment } from '../../src/desktop/host/alignment.js';
 import { decideUpdateAction, isRestartPending, isShellUpdateAvailable, updatePolicyFromConfig } from '../../src/desktop/host/update-policy.js';
 import { appRuntimeBinaryPath, classifyBinaryInstall } from '../../src/core/binary-install-shape.js';
@@ -390,6 +390,16 @@ describe('fleet ownership is three-way', () => {
     expect(computeFleetAlignment({ appVersion: '3.55.0', owner: { version: owner!.version, isCheckout: false }, fleetRunning: true }))
       .toMatchObject({ kind: 'owner-older', auto: true });
   });
+
+  it('never offers a deleted compiled-binary owner (uninstalled install.sh binary) as a drivable external owner', () => {
+    // No script suffix: this is the compiled-binary branch. Without the exists
+    // guard the mutation below classifies it as external{version:''} (a drivable
+    // owner of unknown version) and resolveFleetOwner no longer returns null.
+    const gone = join(dir, 'gone-botmux');
+    const deps = { bundledExecPath: appBinary, readState: () => state(gone), pidAlive: live };
+    expect(classifyFleetOwnership(deps)).toEqual({ kind: 'unknown-external', entry: gone });
+    expect(resolveFleetOwner(deps)).toBeNull();
+  });
 });
 
 describe('launch policy edges', () => {
@@ -418,11 +428,81 @@ describe('launch policy edges', () => {
       alignment: async () => ({ kind: 'unknown' }) })).toBe('none');
     expect(rt.start).not.toHaveBeenCalled();
   });
+
+  it('never auto-starts an explicitly stopped fleet on a background host relaunch (self-update exit / crash / mtime swap)', async () => {
+    const rt = { start: vi.fn().mockResolvedValue(ok), takeover: vi.fn(), restartBundled: vi.fn() };
+    // The stopped + bundled state that the pre-fix policy started unconditionally,
+    // even though this is a relaunch, not an app launch.
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('stopped', 'bundled'), runtimeReplaced: false, appLaunch: false, ownedByApp: () => false,
+      alignment: async () => ({ kind: 'unknown' }) })).toBe('none');
+    expect(rt.start).not.toHaveBeenCalled();
+  });
+
+  it('a stopped fleet with a reseed marker on a background relaunch is left stopped and the marker settles to remove', async () => {
+    const rt = { start: vi.fn().mockResolvedValue(ok), takeover: vi.fn(), restartBundled: vi.fn() };
+    const outcome = await launchPolicy({ ...base, runtime: rt, state: state('stopped', 'bundled'), runtimeReplaced: true, appLaunch: false, ownedByApp: () => true,
+      alignment: async () => ({ kind: 'aligned' }) });
+    expect(outcome).toBe('none');
+    expect(rt.start).not.toHaveBeenCalled();
+    expect(rt.restartBundled).not.toHaveBeenCalled();
+    // No old-build fleet is running, so the marker must not linger.
+    expect(settleRestartMarker(outcome)).toBe('remove');
+  });
+
+  it('still restarts its own reseeded fleet on a BACKGROUND relaunch (the one relaunch action that survives the gate)', async () => {
+    const rt = { start: vi.fn(), takeover: vi.fn(), restartBundled: vi.fn().mockResolvedValue(ok) };
+    expect(await launchPolicy({ ...base, runtime: rt, state: state('running', 'bundled'), runtimeReplaced: true, appLaunch: false, ownedByApp: () => true,
+      alignment: async () => ({ kind: 'aligned' }) })).toBe('restarted');
+    expect(rt.restartBundled).toHaveBeenCalledTimes(1);
+    expect(rt.takeover).not.toHaveBeenCalled();
+  });
 });
 
 describe('restart-pending boundary', () => {
   it('ignores mtime jitter right around the supervisor start', () => {
     const started = '2026-11-05T10:00:00.000Z';
     expect(isRestartPending({ fleetOwnedByApp: true, fleetRunning: true, supervisorStartedAt: started, runtimeMtimeMs: Date.parse(started) + 500 })).toBe(false);
+  });
+});
+
+describe('launch marker settlement', () => {
+  it('keeps the marker only for restart-failed, removes it for every other outcome', () => {
+    expect(settleRestartMarker('restart-failed')).toBe('keep');
+    for (const outcome of ['started', 'restarted', 'aligned', 'none'] as const) {
+      expect(settleRestartMarker(outcome)).toBe('remove');
+    }
+  });
+});
+
+describe('shell PATH entry is written at most once', () => {
+  it.each([
+    [{ markerExists: false, shellProvidesBotmux: false }, true],
+    [{ markerExists: true, shellProvidesBotmux: false }, false],
+    [{ markerExists: false, shellProvidesBotmux: true }, false],
+    [{ markerExists: true, shellProvidesBotmux: true }, false],
+  ])('%j => %s', (input, expected) => {
+    expect(shouldWritePathEntry(input)).toBe(expected);
+  });
+});
+
+describe('in-app self-update only targets the seeded app runtime', () => {
+  const home = '/Users/u';
+  const seeded = appRuntimeBinaryPath(home);
+
+  it('allows the compiled binary at ~/.botmux/app-runtime', () => {
+    expect(runtimeSelfUpdateAllowed({ standalone: true, runtimePath: seeded, home })).toBe(true);
+  });
+
+  it('refuses the binary inside the signed .app bundle (reseed-failure fallback)', () => {
+    expect(runtimeSelfUpdateAllowed({ standalone: true, runtimePath: '/Applications/Botmux.app/Contents/Resources/bin/botmux', home })).toBe(false);
+  });
+
+  it('refuses dev mode (non-compiled runtime)', () => {
+    expect(runtimeSelfUpdateAllowed({ standalone: false, runtimePath: process.execPath, home })).toBe(false);
+    expect(runtimeSelfUpdateAllowed({ standalone: false, runtimePath: seeded, home })).toBe(false);
+  });
+
+  it('does not pass a sibling-looking directory by prefix', () => {
+    expect(runtimeSelfUpdateAllowed({ standalone: true, runtimePath: `${seeded}-old`, home })).toBe(false);
   });
 });
