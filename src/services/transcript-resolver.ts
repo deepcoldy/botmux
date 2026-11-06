@@ -85,10 +85,15 @@ function isRegularFile(path: string): boolean {
  *  resolved), falling back to a lexical resolve only when the path isn't on disk.
  *  Claude keys projects by realpath, so a symlinked cwd (e.g. /home/x →
  *  /data00/home/x) must resolve to the same string the CLI used — a lexical
- *  resolve() would point at a project key Claude never writes to. */
+ *  resolve() would point at a project key Claude never writes to.
+ *  The fallback keeps resolve() (a weak realpath): oncall bindings persist the
+ *  owner's raw string (a trailing slash, '.', '..' are common), and after that
+ *  directory is deleted realpathSync throws. A raw-string fallback would then
+ *  hash the un-normalized spelling to a key that never matches; resolve() keeps
+ *  POSIX lexical normalization for free. */
 function realCwd(cwd: string): string {
   const expanded = expandHome(cwd);
-  try { return realpathSync(expanded); } catch { return expanded; }
+  try { return realpathSync(expanded); } catch { return resolve(expanded); }
 }
 
 /** Claude truncates a long (over 200-char) project slug and appends an opaque
