@@ -64,6 +64,24 @@ describe.skipIf(!realTmux)('TmuxPipeBackend tells a lost tmux server apart from 
     }
   };
 
+  /**
+   * Kill this test's own private server and start a different one on the same
+   * socket. `kill-server` returns before the old server has let go of the
+   * socket, so an immediate `new-session` can reach the dying server and fail
+   * with "server exited unexpectedly" (about 1 in 11 back-to-back attempts in a
+   * loop), so retry until the replacement is up.
+   */
+  const replaceServer = async (session: string) => {
+    tmux('kill-server');
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const r = tmux('-f', '/dev/null', 'new-session', '-d', '-s', session, 'sleep 600');
+      if (r.status === 0 || /duplicate session/.test(r.stderr ?? '')) return;
+      if (Date.now() > deadline) throw new Error(`replacement server never started: ${r.stderr}`);
+      await new Promise(res => setTimeout(res, 50));
+    }
+  };
+
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'tmux-replaced-'));
     for (const key of ['TMUX_TMPDIR', 'SHELL', 'TMUX', 'TMUX_PANE']) saved[key] = process.env[key];
@@ -86,9 +104,8 @@ describe.skipIf(!realTmux)('TmuxPipeBackend tells a lost tmux server apart from 
   it('marks the exit when a different server took over the socket', async () => {
     const { backend, exited } = launch('exec sleep 600');
     await waitSeenAlive(backend);
-    // Only this test's own private server (-S inside its temp dir) is killed.
-    tmux('kill-server');
-    expect(tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'replacement', 'sleep 600').status).toBe(0);
+    // Only this test's own private server (TMUX_TMPDIR is its temp dir) is killed.
+    await replaceServer('replacement');
     await exited;
     expect(backend.exitedBecauseServerReplaced()).toBe(true);
   }, EXIT_TIMEOUT_MS + 30_000);
@@ -101,8 +118,7 @@ describe.skipIf(!realTmux)('TmuxPipeBackend tells a lost tmux server apart from 
       .toEqual(expect.any(Number));
     // Replace the server well inside the first-poll delay window.
     await new Promise(r => setTimeout(r, 200));
-    tmux('kill-server');
-    expect(tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'replacement-early', 'sleep 600').status).toBe(0);
+    await replaceServer('replacement-early');
     await exited;
     expect(backend.exitedBecauseServerReplaced()).toBe(true);
   }, EXIT_TIMEOUT_MS + 30_000);
