@@ -477,15 +477,32 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
   // locale artifact.
   const maybeTrae = Object.keys(serverEnv).some(key =>
     /^(?:GIT_CONFIG_|TRAE_GIT_ATTRIBUTION_)/.test(key) && TRAE_GIT_ATTRIBUTION_PATH_RE.test(String(serverEnv[key])));
+  // Fail CLOSED. A value we could not read byte-exact (run-shell unavailable,
+  // base64/tr missing from the server's PATH, timeout) must never be written
+  // back from the rendered copy — that is exactly the corruption this block
+  // exists to prevent. If any Git-channel value is unreadable, leave the whole
+  // Git/attribution group untouched and report it: a stale Trae hook is loud
+  // (`fatal: ref updates aborted by hook`) and recoverable, while a silently
+  // rewritten credential helper or user.name is neither. The other boundaries
+  // (tmuxEnv for a new server, redactChildEnv for CLI children) still clean
+  // their own copies in that case.
+  let gitValuesUnreadable = false;
   if (maybeTrae) {
     for (const key of Object.keys(serverEnv)) {
-      if (!/^(?:GIT_CONFIG_|TRAE_GIT_ATTRIBUTION_)/.test(key)) continue;
+      // TRAE_GIT_ATTRIBUTION_* keys are only ever deleted, so they need no value.
+      if (!/^GIT_CONFIG_/.test(key)) continue;
       const exact = exactValue(key);
-      if (exact !== undefined) serverEnv[key] = exact;
+      if (exact === undefined) gitValuesUnreadable = true;
+      else serverEnv[key] = exact;
     }
   }
+  const unsafeGitKeys = gitValuesUnreadable
+    ? new Set(Object.keys(serverEnv).filter(key => /^(?:GIT_CONFIG_|TRAE_GIT_ATTRIBUTION_)/.test(key)))
+    : new Set<string>();
   const cleanedServerEnv = { ...serverEnv };
-  const gitScrub = scrubTraeGitAttributionEnv(cleanedServerEnv, () => {});
+  const gitScrub = unsafeGitKeys.size > 0
+    ? { changedKeys: [] as string[], warnings: [] as string[] }
+    : scrubTraeGitAttributionEnv(cleanedServerEnv, () => {});
   const gitChanges = new Map(gitScrub.changedKeys.map(key => [key, cleanedServerEnv[key]]));
   if (gitScrub.changedKeys.length > 0) {
     // GIT_CONFIG_{COUNT,KEY_n,VALUE_n} also belong to Botmux's per-turn
@@ -509,8 +526,12 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
 
   const removed: string[] = [];
   const updated: string[] = [];
-  const failed: string[] = [];
+  // Keys deliberately left untouched because their exact value was unreadable.
+  // Reported through `failed` (the daemon already logs that) so the degraded
+  // condition is observable rather than silent.
+  const failed: string[] = [...unsafeGitKeys];
   for (const name of new Set([...names, ...gitChanges.keys()])) {
+    if (unsafeGitKeys.has(name)) continue;
     try {
       const replacement = gitChanges.get(name);
       const args = replacement === undefined

@@ -611,6 +611,72 @@ describe('tmux subcommand with stale $TMUX', () => {
     30_000,
   );
 
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub fails closed (writes nothing) when a git value cannot be read byte-exact',
+    () => {
+      // The exact-value read runs `base64`/`tr` inside the server's own shell.
+      // When that is unavailable the fix must NOT fall back to the rendered
+      // value: doing so re-introduces the very corruption it prevents (a CJK
+      // user.name would be written back as '____'). Leaving the group alone and
+      // reporting it is the safe side — a stale Trae hook is loud and
+      // recoverable, a silently rewritten git config is not.
+      const sock = `bmx-scrub-trae-failclosed-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      const seededEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete seededEnv.TMUX;
+      delete seededEnv.TMUX_PANE;
+      delete seededEnv.LANG;
+      delete seededEnv.LANGUAGE;
+      delete seededEnv.LC_ALL;
+      delete seededEnv.LC_CTYPE;
+      Object.assign(seededEnv, {
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'core.hooksPath',
+        GIT_CONFIG_VALUE_0: traeHooks,
+        GIT_CONFIG_KEY_1: 'user.name',
+        GIT_CONFIG_VALUE_1: '张三',
+      });
+      const readSlot = (tag: string, name: string): string => {
+        const out = join(tmpdir(), `bmx-trae-failclosed-${process.pid}-${tag}.txt`);
+        const pane = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', tag, '--',
+          '/bin/sh', '-c', `printenv ${name} > ${out}; sleep 2`,
+        ], { env: tmuxEnv(), encoding: 'utf-8', timeout: 10_000 });
+        expect(pane.status, pane.stderr).toBe(0);
+        spawnSync('sleep', ['0.6']);
+        const value = readFileSync(out, 'utf-8').replace(/\n$/, '');
+        rmSync(out, { force: true });
+        return value;
+      };
+      try {
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+        // Make `base64`/`tr` unresolvable INSIDE the server, without breaking
+        // the tmux client the test itself spawns.
+        const pathOverride = spawnSync('tmux', ['-L', sock, 'set-environment', '-g', 'PATH', '/nonexistent-only'], {
+          env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
+        });
+        expect(pathOverride.status, pathOverride.stderr).toBe(0);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+
+        // Reported, not silently degraded...
+        expect(scrub.failed).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
+        ]));
+        expect(scrub.updated).toEqual([]);
+        // ...and the user's value is untouched rather than rewritten as '____'.
+        expect(readSlot('after-1', 'GIT_CONFIG_VALUE_1')).toBe('张三');
+        expect(readSlot('after-2', 'GIT_CONFIG_COUNT')).toBe('2');
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+      }
+    },
+    30_000,
+  );
+
   // 源码结构护栏(K2)：这条守的是"daemon 启动修复不得改写用户自有共享 tmux
   // server 的通用 env 表"这一安全不变量。GIT_CONFIG_KEY_<n> 是用户可自有的
   // 变量名（与 GITHUB_TOKEN 同类），只能 pane 本地 unset，不能进 server-global
