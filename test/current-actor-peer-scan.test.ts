@@ -5,7 +5,7 @@
  *
  * Run:  npx vitest run --project unit test/current-actor-peer-scan.test.ts
  */
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -94,16 +94,100 @@ describe('socket owner scan', () => {
     expect(b).toEqual({ ok: true, peer: { pid: 1_005, procStart: '10050' } });
   });
 
-  it('a request that arrives mid-scan sees a holder the running pass had already walked past', async () => {
-    // The pass walks in directory order, one process per turn here: the
-    // process 5th in that order is behind the pass after 50 turns.
-    const late = Number(readdirSync(procRoot).filter(e => /^\d+$/.test(e))[4]);
-    const first = resolve(50_001, { sliceMs: 0 });
-    for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r));
+  it('a request that arrives after the running pass swept its holder is resolved by a fresh pass', async () => {
+    // Wait by observed yield count, not by a fixed number of turns: with
+    // sliceMs 0 the pass yields on every check, so the process that is first
+    // in readdir order is provably behind the scan head after a few processes
+    // worth of checks. Its fd dir has already been read, so the new socket is
+    // invisible to the running pass and MUST be picked up by a second pass.
+    const order = readdirSync(procRoot).filter(e => /^\d+$/.test(e)).map(Number);
+    const behind = order[0];
+    let yields = 0;
+    const running = resolve(50_001, { sliceMs: 0, onYield: () => { yields++; } });
+    while (yields < (FDS_PER_PID + 1) * 6) await new Promise(r => setImmediate(r));
     connection(50_004, 9_000_004);
-    holdSocket(late, 103, 9_000_004);
-    const second = resolve(50_004, { sliceMs: 0 });
-    expect((await first).ok).toBe(true);
-    expect(await second).toEqual({ ok: true, peer: { pid: late, procStart: String(late * 10) } });
+    holdSocket(behind, 103, 9_000_004);
+    const late = resolve(50_004, { sliceMs: 0 });
+    expect(await running).toEqual({ ok: true, peer: { pid: 1_200, procStart: '12000' } });
+    expect(await late).toEqual({ ok: true, peer: { pid: behind, procStart: String(behind * 10) } });
+  });
+
+  it('refuses a late request whose socket has one holder behind the scan head and one ahead', async () => {
+    // If a mid-scan request were squeezed into the running pass, the holder
+    // that pass already swept would never be re-checked: a socket passed to or
+    // inherited by that process would look uniquely owned by the second one.
+    const order = readdirSync(procRoot).filter(e => /^\d+$/.test(e)).map(Number);
+    const behind = order[0];
+    const ahead = order[20];
+    let yields = 0;
+    const running = resolve(50_001, { sliceMs: 0, onYield: () => { yields++; } });
+    while (yields < (FDS_PER_PID + 1) * 6) await new Promise(r => setImmediate(r));
+    connection(50_006, 9_000_006);
+    holdSocket(behind, 107, 9_000_006);
+    holdSocket(ahead, 107, 9_000_006);
+    const late = resolve(50_006, { sliceMs: 0 });
+    expect((await running).ok).toBe(true);
+    expect(await late).toEqual({ ok: false, reason: 'peer_unresolved' });
+  });
+
+  it('accepts a single process that holds the socket through two duplicated fds', async () => {
+    // dup()/dup2() of a socket fd is normal (two event loops, an inherited
+    // stdio slot). Two fds in ONE process are still one holder; counting them
+    // twice would reject an unambiguous peer.
+    connection(50_007, 9_000_007);
+    holdSocket(1_030, 108, 9_000_007);
+    holdSocket(1_030, 109, 9_000_007);
+    expect(await resolve(50_007)).toEqual({ ok: true, peer: { pid: 1_030, procStart: '10300' } });
+  });
+
+  it('pins the holder start time at the moment the fd is seen, not when the pass ends', async () => {
+    // The pass spans many event-loop turns: a pid read only at the end could
+    // already belong to a recycled process. Simulate PID reuse by rewriting
+    // the holder's stat start time after the pass has swept it.
+    const order = readdirSync(procRoot).filter(e => /^\d+$/.test(e)).map(Number);
+    const holder = order[0];
+    connection(50_008, 9_000_008);
+    holdSocket(holder, 110, 9_000_008);
+    const statPath = join(procRoot, String(holder), 'stat');
+    const original = readFileSync(statPath, 'utf8');
+    try {
+      let yields = 0;
+      const promise = resolve(50_008, { sliceMs: 0, onYield: () => { yields++; } });
+      while (yields < (FDS_PER_PID + 1) * 6) await new Promise(r => setImmediate(r));
+      writeFileSync(statPath, original.replace(`${holder * 10}`, '999999'));
+      expect(await promise).toEqual({ ok: true, peer: { pid: holder, procStart: String(holder * 10) } });
+    } finally {
+      writeFileSync(statPath, original);
+    }
+  });
+
+  it('coalesces requests queued in the same tick into one host-wide pass', async () => {
+    // Sharing one pass across queued requests is the mechanism that keeps a
+    // burst of attestation calls from paying one full /proc walk each. Count
+    // yields (check points): one request costs one pass; six requests queued
+    // before the runner's first splice cost two passes (the first request
+    // starts a pass immediately, the remaining five ride the next one), never
+    // six. Wall-clock free.
+    let singlePassYields = 0;
+    await resolve(50_001, { sliceMs: 0, onYield: () => { singlePassYields++; } });
+    let totalYields = 0;
+    const tuning = { sliceMs: 0, onYield: () => { totalYields++; } };
+    const pending: Array<Promise<unknown>> = [];
+    for (let k = 0; k < 6; k++) {
+      const clientPort = 50_010 + k;
+      const inode = 9_000_010 + k;
+      const pid = 1_300 + k;
+      connection(clientPort, inode);
+      holdSocket(pid, 120 + k, inode);
+      pending.push(resolve(clientPort, tuning));
+    }
+    const results = await Promise.all(pending);
+    expect(results.every(r => (r as { ok?: boolean }).ok)).toBe(true);
+    // The first request starts a pass synchronously (1 pass); the other five
+    // are queued before it resumes and ride the next pass (2 passes). Neither
+    // one pass (late requests wrongly squeezed in) nor six (no sharing) is
+    // acceptable; a few extra fds from earlier cases must not move the band.
+    expect(totalYields).toBeGreaterThan(singlePassYields * 1.5);
+    expect(totalYields).toBeLessThan(singlePassYields * 3);
   });
 });

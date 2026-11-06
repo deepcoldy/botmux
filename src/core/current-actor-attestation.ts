@@ -120,11 +120,13 @@ export interface PeerScanTuning { sliceMs?: number; budgetMs?: number; onYield?:
 
 const yieldToEventLoop = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
 
-async function runPeerScanPass(procRoot: string, jobs: PeerScanJob[], tuning: PeerScanTuning): Promise<boolean> {
+type PeerScanOutcome = 'completed' | 'budget_exceeded' | 'scan_failed';
+
+async function runPeerScanPass(procRoot: string, jobs: PeerScanJob[], tuning: PeerScanTuning): Promise<PeerScanOutcome> {
   const sliceMs = tuning.sliceMs ?? PEER_SCAN_SLICE_MS;
   const budgetMs = tuning.budgetMs ?? PEER_SCAN_BUDGET_MS;
   let entries: string[];
-  try { entries = readdirSync(procRoot); } catch { return false; }
+  try { entries = readdirSync(procRoot); } catch { return 'scan_failed'; }
   const byNeedle = new Map<string, PeerScanJob[]>();
   for (const job of jobs) {
     const list = byNeedle.get(job.needle);
@@ -147,7 +149,7 @@ async function runPeerScanPass(procRoot: string, jobs: PeerScanJob[], tuning: Pe
     return true;
   };
   for (const entry of entries) {
-    if (!await keepGoing()) return false;
+    if (!await keepGoing()) return 'budget_exceeded';
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
     // One listing per process is a single syscall batch (~50ms for the 73k-fd
@@ -157,7 +159,7 @@ async function runPeerScanPass(procRoot: string, jobs: PeerScanJob[], tuning: Pe
     try { fds = readdirSync(join(procRoot, entry, 'fd')); } catch { continue; }
     let matched: Set<string> | undefined;
     for (const fd of fds) {
-      if (!await keepGoing()) return false;
+      if (!await keepGoing()) return 'budget_exceeded';
       let link: string;
       try { link = readlinkSync(join(procRoot, entry, 'fd', fd)); } catch { continue; /* raced away */ }
       if (!byNeedle.has(link) || matched?.has(link)) continue;
@@ -168,7 +170,7 @@ async function runPeerScanPass(procRoot: string, jobs: PeerScanJob[], tuning: Pe
       for (const job of byNeedle.get(link)!) job.holders.push({ pid, procStart });
     }
   }
-  return true;
+  return 'completed';
 }
 
 function scanSocketHolders(procRoot: string, inode: string, tuning: PeerScanTuning): Promise<PeerScanJob['holders'] | undefined> {
@@ -182,11 +184,22 @@ function scanSocketHolders(procRoot: string, inode: string, tuning: PeerScanTuni
     q.running = true;
     void (async () => {
       try {
+        // A pass runs with the tuning of whichever request started it; requests
+        // coalesced into that pass share it. Production callers never pass
+        // scanTuning, so it only differs via the internal test seam.
         while (q.jobs.length > 0) {
           const jobs = q.jobs.splice(0);
-          let complete = false;
-          try { complete = await runPeerScanPass(procRoot, jobs, tuning); } catch { complete = false; }
-          for (const job of jobs) job.resolve(complete ? job.holders : undefined);
+          let outcome: PeerScanOutcome = 'scan_failed';
+          try { outcome = await runPeerScanPass(procRoot, jobs, tuning); } catch { outcome = 'scan_failed'; }
+          // One log line per batch, with a distinct reason: a procfs read error
+          // is not a timeout, and N coalesced jobs must not log N identical lines.
+          if (outcome !== 'completed') {
+            const budget = tuning.budgetMs ?? PEER_SCAN_BUDGET_MS;
+            logger.warn(outcome === 'budget_exceeded'
+              ? `[current-actor] socket owner scan exceeded ${budget}ms; refusing ${jobs.length} request(s)`
+              : `[current-actor] socket owner scan failed while reading procfs; refusing ${jobs.length} request(s)`);
+          }
+          for (const job of jobs) job.resolve(outcome === 'completed' ? job.holders : undefined);
         }
       } finally {
         q.running = false;
@@ -226,10 +239,7 @@ export async function resolveLoopbackPeerProcesses(input: {
   if (!inodes || inodes.size !== 1) return { ok: false, reason: 'peer_unresolved' };
   const inode = [...inodes][0];
   const holders = await scanSocketHolders(procRoot, inode, input.scanTuning ?? {});
-  if (!holders) {
-    logger.warn(`[current-actor] socket owner scan did not finish within ${input.scanTuning?.budgetMs ?? PEER_SCAN_BUDGET_MS}ms; refusing the request`);
-    return { ok: false, reason: 'peer_unresolved' };
-  }
+  if (!holders) return { ok: false, reason: 'peer_unresolved' };
   // Exactly one holder, whose start time can be read: anything else is ambiguous.
   const [holder] = holders;
   if (holders.length !== 1 || !holder?.procStart) return { ok: false, reason: 'peer_unresolved' };
