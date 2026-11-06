@@ -902,7 +902,23 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
       lo = mid + 1;
     }
   }
-  return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
+  let tail = lines.slice(lo).join('\n');
+  if (!tail.trim() && content.trim()) {
+    // Only blank trailing lines fit: the last non-blank line alone exceeds the
+    // budget (e.g. a minified blob with no newline, optionally ending in \n).
+    // Keep that line's byte tail instead of returning an empty body.
+    const budget = Math.max(0, maxBytes - 30);
+    let last = '';
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() !== '') { last = lines[i]; break; }
+    }
+    const buf = Buffer.from(last, 'utf-8');
+    let start = Math.min(buf.length, Math.max(0, buf.length - budget));
+    // Step forward past UTF-8 continuation bytes so we never cut a character.
+    while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++;
+    tail = buf.subarray(start).toString('utf-8');
+  }
+  return `${t('card.status.truncated_prefix', undefined, locale)}\n${tail}`;
 }
 
 /** Byte budget for the private snapshot's text fallback. Well under the ~109 KB
