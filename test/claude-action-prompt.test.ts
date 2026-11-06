@@ -1,5 +1,5 @@
-import {expect, it} from 'vitest';
-import {claudeActionPrompt} from '../src/services/claude-action-prompt.js';
+import {describe, expect, it} from 'vitest';
+import {claudeActionPrompt, screenHasUnresolvedPermissionQuestion} from '../src/services/claude-action-prompt.js';
 
 /** 2026-10-02 incident screen (paths swapped for placeholders): a background
  * fork agent's Bash permission dialog sat on a session the main turn had
@@ -317,4 +317,136 @@ it('does not truncate a question at or below the 180-char display budget', () =>
     ' Esc to cancel',
   ].join('\n'));
   expect(prompt).toContain(`：${question}\n`);
+});
+
+it('does not project a body question when the real wrapped question is un-rejoinable (5 rows)', () => {
+  // The real question wraps over head + 4 continuations, beyond the join
+  // window, so no single line is the question. A complete question-shaped
+  // line in the body must then NOT be projected in its place — it carries
+  // command text. Fail closed: no notification beats a body leak.
+  const screen = [
+    ' Edit file',
+    ' │ Do you want to delete all customer records under /var/private-secret?',
+    ' │ const x = 1;',
+    ` Do you want to make this edit to components-${'a'.repeat(40)}`,
+    ` panel-${'b'.repeat(40)}`,
+    ` section-${'c'.repeat(40)}`,
+    ` view-${'d'.repeat(40)}`,
+    ' final.tsx?',
+    ' ❯ 1. Yes',
+    '   2. No',
+    '',
+    ' Esc to cancel',
+  ].join('\n');
+  const prompt = claudeActionPrompt(screen);
+  expect(prompt).toBeUndefined();
+});
+
+it('does not project a body question when the joined real question exceeds the 400-char cap', () => {
+  const screen = [
+    ' Edit file',
+    ' │ Do you want to drop the table named /var/secret-customer-db?',
+    ` Do you want to make this edit to ${'a'.repeat(200)}`,
+    ` ${'b'.repeat(190)}/file.tsx?`,
+    ' ❯ 1. Yes',
+    '   2. No',
+    '',
+    ' Esc to cancel',
+  ].join('\n');
+  expect(claudeActionPrompt(screen)).toBeUndefined();
+});
+
+it('cuts the display budget by code point so no lone surrogate reaches the notification', () => {
+  // Place the emoji so that, under a UTF-16-unit slice(-179), its LOW surrogate
+  // is the very first retained unit (a lone surrogate); a code-point cut keeps
+  // the pair intact.
+  const question = `Do you want to a😀${'b'.repeat(177)}?`;
+  expect(Array.from(question).length).toBe(195);
+  expect(question.length).toBe(196);
+  const prompt = claudeActionPrompt([
+    ' Edit file', '', ` ${question}`, ' ❯ 1. Yes', '   2. No', '', ' Esc to cancel',
+  ].join('\n'));
+  const displayed = prompt!.split('\n')[0].split('：')[1];
+  expect(Array.from(displayed).length).toBe(180);
+  // Every non-BMP code point in the output is represented by a full surrogate pair.
+  for (let i = 0; i < displayed.length; i++) {
+    const code = displayed.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = displayed.charCodeAt(i + 1);
+      expect(low >= 0xdc00 && low <= 0xdfff).toBe(true);
+      i++;
+    } else {
+      expect(code >= 0xdc00 && code <= 0xdfff).toBe(false);
+    }
+  }
+});
+
+describe('screenHasUnresolvedPermissionQuestion', () => {
+  const overComposer = (rows: string[]) => [
+    '─'.repeat(80), ...rows,
+    '─'.repeat(80), '❯ ', '─'.repeat(80), '  ⏵⏵ x',
+  ].join('\n');
+
+  it('flags a 5-row wrapped dialog the parser cannot reconstruct', () => {
+    const screen = overComposer([
+      ' Edit file',
+      ` Do you want to make this edit to components-${'a'.repeat(40)}`,
+      ` panel-${'b'.repeat(40)}`,
+      ` section-${'c'.repeat(40)}`,
+      ` view-${'d'.repeat(40)}`,
+      ' final.tsx?',
+      ' ❯ 1. Yes',
+      '   2. No',
+      '',
+      ' Esc to cancel',
+    ]);
+    expect(screenHasUnresolvedPermissionQuestion(screen)).toBe(true);
+  });
+
+  it('does not flag without the Esc footer', () => {
+    expect(screenHasUnresolvedPermissionQuestion(overComposer([
+      ' Do you want to run something long',
+      ' wrapped onto more rows',
+      ' ❯ 1. Yes',
+      '   2. No',
+    ]))).toBe(false);
+  });
+
+  it('does not flag a head + footer without the numbered choices', () => {
+    expect(screenHasUnresolvedPermissionQuestion(overComposer([
+      ' Do you want to run something long',
+      ' wrapped onto more rows',
+      ' (press enter to confirm)',
+      '',
+      ' Esc to cancel',
+    ]))).toBe(false);
+  });
+
+  it('does not flag choices numbered other than 1 then 2', () => {
+    expect(screenHasUnresolvedPermissionQuestion(overComposer([
+      ' Do you want to run something long',
+      ' wrapped onto more rows',
+      '   3. Maybe later',
+      '   4. Never',
+      '',
+      ' Esc to cancel',
+    ]))).toBe(false);
+  });
+
+  it('does not flag an empty framed composer', () => {
+    expect(screenHasUnresolvedPermissionQuestion([
+      '⏺ done', '', '─'.repeat(80), '❯ ', '─'.repeat(80), '  ⏵⏵ x',
+    ].join('\n'))).toBe(false);
+  });
+
+  it('does not flag when the footer is beyond the compact-dialog window', () => {
+    expect(screenHasUnresolvedPermissionQuestion(overComposer([
+      ' Do you want to run something long',
+      ...Array.from({length: 8}, (_, k) => ` filler line ${k}`),
+      ' ❯ 1. Yes',
+      '   2. No',
+      '',
+      ' Esc to cancel',
+    ]))).toBe(false);
+  });
 });

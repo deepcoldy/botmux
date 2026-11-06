@@ -13,6 +13,18 @@ const TITLES = ['Bash command', 'Multi Edit file', 'Edit file', 'Create file', '
 const QUESTION_RE = /^Do you want to [^?]{0,400}\?$/;
 const CHOICE_RE = /^[>❯●]?\s*([1-4])\.\s+(.{1,100})$/;
 const FOOTER_RE = /^Esc to cancel\b/;
+/** A "Do you want" row that is NOT a complete question — a wrapped question's
+ * head row, or dialog body text that happens to start the same way. */
+const QUESTION_HEAD_RE = /^Do you want\b/;
+/** Rows between an unresolved head and the footer: a dialog is compact (head +
+ * a few continuations + up to 4 choices + blank), so bound the scan. */
+const UNRESOLVED_HEAD_WINDOW = 10;
+
+/** Last 35 viewport rows with box-drawing characters blanked and ends trimmed. */
+function projectDialogLines(screen: string): string[] {
+  return screen.trimEnd().split('\n').slice(-35)
+    .map(line => line.replace(/[│┃╭╮╰╯┌┐└┘─━╌]/g, ' ').trim());
+}
 
 /** A narrow terminal wraps a long question ("Do you want to make this edit to
  * <long path>?") over several rows, so no single row matches QUESTION_RE and the
@@ -30,7 +42,7 @@ const FOOTER_RE = /^Esc to cancel\b/;
 function joinWrappedQuestion(lines: string[]): string[] {
   const out = [...lines];
   for (let i = out.length - 1; i >= 0; i--) {
-    if (!/^Do you want\b/.test(out[i]) || out[i].endsWith('?')) continue;
+    if (!QUESTION_HEAD_RE.test(out[i]) || out[i].endsWith('?')) continue;
     for (let j = i + 1; j <= i + 3 && j < out.length; j++) {
       // A blank row, a choice row, or a row that is already a complete
       // question ends the search: never swallow a valid question line.
@@ -45,10 +57,33 @@ function joinWrappedQuestion(lines: string[]): string[] {
   return out;
 }
 
+/** Conservative permission-dialog signal for the keep-alive gate.
+ *
+ * claudeActionPrompt only recognises a question it could fully reconstruct; a
+ * dialog wrapped beyond the join window (or past the 400-char cap) stays
+ * silent there — but the gate must fail closed regardless: an unattended Enter
+ * on that screen selects the highlighted choice. Require the same hard
+ * evidence as the projection (a "1." + "2." pair and the Esc footer, in a
+ * compact block below an unresolved "Do you want" head row). The notification
+ * path must NOT use this: a false positive there would send a false alarm,
+ * while here it only skips one cache keep-alive. */
+export function screenHasUnresolvedPermissionQuestion(screen: string): boolean {
+  const lines = projectDialogLines(screen);
+  for (let i = 0; i < lines.length; i++) {
+    if (!QUESTION_HEAD_RE.test(lines[i]) || lines[i].endsWith('?')) continue;
+    const tail = lines.slice(i + 1, i + 1 + UNRESOLVED_HEAD_WINDOW);
+    const footerIndex = tail.findIndex(line => FOOTER_RE.test(line));
+    if (footerIndex < 0) continue;
+    const choices = tail.slice(0, footerIndex)
+      .map(line => CHOICE_RE.exec(line))
+      .filter((match): match is RegExpExecArray => !!match);
+    if (choices.length >= 2 && choices[0][1] === '1' && choices[1][1] === '2') return true;
+  }
+  return false;
+}
+
 export function claudeActionPrompt(screen: string): string | undefined {
-  const lines = joinWrappedQuestion(
-    screen.trimEnd().split('\n').slice(-35).map(line => line.replace(/[│┃╭╮╰╯┌┐└┘─━╌]/g, ' ').trim()),
-  );
+  const lines = joinWrappedQuestion(projectDialogLines(screen));
   let questionIndex = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (QUESTION_RE.test(lines[i])) {
@@ -60,6 +95,11 @@ export function claudeActionPrompt(screen: string): string | undefined {
   const tail = lines.slice(questionIndex + 1);
   const footerIndex = tail.findIndex(line => FOOTER_RE.test(line));
   if (footerIndex < 0) return;
+  // An unresolved "Do you want" head between the selected question and the
+  // footer means a real (wrapped, un-rejoinable) question sits BELOW the
+  // selected one — the selected line is dialog body, never the question.
+  // Projecting it would leak the command body into Lark; refuse instead.
+  if (tail.slice(0, footerIndex).some(line => QUESTION_HEAD_RE.test(line) && !line.endsWith('?'))) return;
   const choices = tail.slice(0, footerIndex)
     .map(line => CHOICE_RE.exec(line))
     .filter((match): match is RegExpExecArray => !!match);
@@ -84,8 +124,11 @@ export function claudeActionPrompt(screen: string): string | undefined {
   // cutting the head hides precisely the long path this projection exists to
   // surface (issue #2879).
   const fullQuestion = lines[questionIndex];
-  const question = fullQuestion.length > 180
-    ? `…${fullQuestion.slice(-179)}`
+  // Slice by code points, not UTF-16 units: a unit-based slice can leave a
+  // lone surrogate at the ellipsis boundary.
+  const questionChars = Array.from(fullQuestion);
+  const question = questionChars.length > 180
+    ? `…${questionChars.slice(-179).join('')}`
     : fullQuestion;
   return `Claude 正等待你确认「${title}」：${question}\n${choices.slice(0, 4).map(match => `${match[1]}. ${match[2]}`).join('\n')}\n请在原终端核对具体操作后选择。`;
 }

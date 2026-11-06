@@ -124,6 +124,31 @@ describe('promptCacheKeepaliveRefusal', () => {
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER })).toBe('action_prompt_open');
   });
 
+  it('refuses a dialog wrapped beyond the join window (the notification parser stays silent)', () => {
+    // Head + 4 continuations: claudeActionPrompt deliberately does not
+    // reconstruct it, but the hard choices+footer evidence is on screen.
+    // Failing closed here is what keeps the keep-alive Enter off the dialog.
+    const screen = [
+      RULE,
+      ' Edit file',
+      ` Do you want to make this edit to components-${'a'.repeat(40)}`,
+      ` panel-${'b'.repeat(40)}`,
+      ` section-${'c'.repeat(40)}`,
+      ` view-${'d'.repeat(40)}`,
+      ' final.tsx?',
+      ' ❯ 1. Yes',
+      '   2. No',
+      '',
+      ' Esc to cancel',
+      RULE,
+      '❯ ',
+      RULE,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n');
+    expect(READY.test(screen)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+  });
+
   it('refuses an AskUserQuestion picker (prompt not inside an input box)', () => {
     expect(READY.test(ASK_USER_QUESTION)).toBe(true);
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: ASK_USER_QUESTION })).toBe('prompt_not_framed');
