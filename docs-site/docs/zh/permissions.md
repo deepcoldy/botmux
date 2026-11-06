@@ -146,6 +146,17 @@ botmux 的权限只回答两个问题：
 
 关闭方式：Dashboard「Bot 配置 → 授权与额度 → 信任同一 owner 的同机 Bot」、`bots.json` 写 `trustSameOwnerBots: false`，或 `/botconfig set trustSameOwnerBots off`。关闭后所有同机 bot 都只能对话（用 `/repo` 选仓库不受影响）。如果在已有群里关掉它，之前没被认出的那对 bot 没有历史本群授权可用，需要重新 `/grant`。
 
+### @ 交接时带上发起人身份（`delegateOnMention`） {#delegate-on-mention}
+
+上面的互信解决「同机 Bot 能不能互相操作」；这一项解决「交接过去以后用谁的身份干活」。
+
+本 Bot 在**真人直接发起的一轮**里用 `botmux send --mention` 把活交给同一台机器上的另一个 Bot 时，对方调用 `lark-cli` / `bytedcli` 会以**这位发起人**的身份进行，而不是对方 Bot 自己或本机登录态。
+
+- **默认开**，但只有发起方 Bot 自己开了[按触发人身份调用 CLI](/bots-json#trigger-user-auth)（`enabled` 为 `true` 且 `tools` 不为空）才生效：自己都不按发起人身份调用，就没有经过验证的发起人可以交出去。
+- 接收方也要开按触发人身份调用 CLI，并且仍会校验这个人能不能和它对话、是不是在群里。
+- 只在同机 Bot 之间生效，跨机器的 Bot 拿不到。`botmux dispatch` 派活不受这个开关影响，见[派活时用谁的身份](/multi-topic#进阶派活时用谁的身份)。
+- 关闭：Dashboard「Bot 配置 → 权限与安全 → 按触发人鉴权」里取消「@ 同机 Bot 交接时带上发起人身份」，或在 `triggerUserAuth` 里加 `"delegateOnMention": false`。关掉后，@ 交接的那一轮对方没有可用的发起人。
+
 ## 委托授权 bot `grantDelegateBots`
 
 这是同机 Bot 之外的**第二种委托来源**：owner 手动列出信任的外部 bot。两者互不影响。点名授权的效果和上一节完全一样，区别只在「谁算委托方」。

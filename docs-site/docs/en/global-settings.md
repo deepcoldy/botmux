@@ -159,6 +159,21 @@ botmux's built-in skills (sending messages, creating schedules, and so on) need 
 
 This is the machine-wide default. Change it with `botmux skills injection [global|prompt|off|unset]`; no argument shows the current value. If a bot sets `skillInjection` in bots.json, the bot's own value wins. See [Skill](/en/skill-cli).
 
+## Separate sessions for each person in a group (XPI, experimental) {#xpi}
+
+**Off by default.** While it's off, everyone in a group shares one session: a message someone sends while the bot is busy is queued as usual and handled after the current task.
+
+When on, **each human in the same group gets their own CLI context and git worktree**, so people can work in parallel without interrupting each other:
+
+- Messages are still public in the group; each person's just go to their own "lane".
+- Quoting a task someone else is running goes through a suggestion / confirmation flow instead of jumping into their task; other messages continue in the sender's own lane.
+- Send `/lane status` in a topic to see your lane's branch, worktree, uncommitted changes and unpushed commits; `/lane close` closes your lane safely (it refuses while a task is running or files are uncommitted, pushes unpublished commits before reclaiming, and never merges or deletes branches on its own).
+- When an agent messages another bot, it has to say whether that's a separate task or input for the current one with `botmux send --as independent|suggestion`.
+
+To turn it on: Dashboard **Global Settings → General → Experimental → Cross-principal interruption isolation (XPI)**, which is `dashboard.crossPrincipalInterruption: true` in `config.json`. It applies to every bot on this machine and **takes effect from the next message, no restart needed**. To force it on or off for a single daemon process, set `BOTMUX_XPI_ENABLED=true` / `false` in its environment; that wins over the Dashboard switch.
+
+Keep it off when people need to share one context and set of files; turn it on when their tasks are fully independent.
+
 ## FAQ
 
 **Do I need to restart after editing config.json?**
