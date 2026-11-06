@@ -131,20 +131,21 @@ describe('worker emitReadyTurns: Claude background-task wake', () => {
 });
 
 describe('worker syncBackgroundTaskPinsToDaemon', () => {
-  function pinSync(replyDelivery: 'send' | 'transcript', initConfig: Record<string, unknown> = {}) {
+  function pinSync(replyDelivery: 'send' | 'transcript', initConfig: Record<string, unknown> = {}, zeroInjection = false) {
     const sent: Array<Record<string, unknown>> = [];
     const queue = new queueModule.BridgeTurnQueue();
     const tracker = new transcriptModule.BackgroundTaskTracker();
     const scope: Record<string, unknown> = {
       bridgeQueue: queue,
       backgroundTaskTracker: tracker,
-      backgroundTaskPinsSent: undefined,
+      // The production change detector, in its initial ("never sent") state.
+      backgroundTaskPins: new queueModule.BackgroundTaskPinSnapshot(),
       backgroundWaitTasks: 0,
       backgroundStopScanSinceMs: 0,
       backgroundStopScanOffsets: new Map(),
       lastInitConfig: { cliId: 'claude-code', ...initConfig },
       replyDeliveryMode: () => replyDelivery,
-      zeroPromptTerminalSync: () => false,
+      zeroPromptTerminalSync: () => zeroInjection,
       send: (msg: Record<string, unknown>) => { sent.push(msg); },
       log: () => {},
     };
@@ -176,11 +177,12 @@ describe('worker syncBackgroundTaskPinsToDaemon', () => {
   });
 
   it('sends nothing where a wake is never forwarded', () => {
-    for (const { mode, cfg } of [
-      { mode: 'send' as const, cfg: {} },
-      { mode: 'transcript' as const, cfg: { adoptMode: true } },
+    for (const { mode, cfg, zero } of [
+      { mode: 'send' as const, cfg: {}, zero: false },
+      { mode: 'transcript' as const, cfg: { adoptMode: true }, zero: false },
+      { mode: 'transcript' as const, cfg: {}, zero: true },
     ]) {
-      const { sent, feed, launch, wake } = pinSync(mode, cfg);
+      const { sent, feed, launch, wake } = pinSync(mode, cfg, zero);
       feed(launch);
       feed(wake);
       expect(sent).toEqual([]);

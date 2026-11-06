@@ -22,6 +22,7 @@ import {
   CRON_TASK_ANCHORS_MAX,
   fallbackTurnId,
   frozenReplyContextForTurn,
+  inheritTurnReplyRouting,
   isSubstituteTurn,
   pickTurnReplyTarget,
   reconcileCronTaskReplyAnchors,
@@ -30,6 +31,7 @@ import {
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { inheritTriggerReplyAnchor } from '../src/core/trigger-final-suppression.js';
 
 const NOW = new Date().toISOString();
 
@@ -585,6 +587,35 @@ describe('background task reply pins', () => {
     // would land at the group top level.
     expect(routeAfter(300)).toEqual({ mode: 'plain', chatId: 'oc_chat' });
   });
+
+  // The other two replyTargets writers prune through the same pin set: with
+  // the bound already reached, their new record must evict an unpinned turn,
+  // never the launch turn of a running task.
+  function boundReached(pins?: string[]): DaemonSession {
+    const ds = makeDs({
+      ...(pins ? { backgroundTaskPinnedTurnIds: pins } : {}),
+      currentReplyTarget: { rootMessageId: 'om_topicB', turnId: 'turn-31', updatedAt: NOW },
+    }) as DaemonSession;
+    const t0 = Date.parse(NOW);
+    ds.session.replyTargets = { 'turn-launch': { rootMessageId: 'om_topicA', updatedAt: new Date(t0).toISOString() } };
+    for (let i = 1; i <= 31; i++) {
+      ds.session.replyTargets[`turn-${i}`] = { rootMessageId: 'om_topicB', updatedAt: new Date(t0 + i * 1000).toISOString() };
+    }
+    return ds;
+  }
+  for (const [writer, write] of [
+    ['inheritTurnReplyRouting', (ds: DaemonSession) => { inheritTurnReplyRouting(ds, 'turn-31', 'turn-recovered'); }],
+    ['inheritTriggerReplyAnchor', (ds: DaemonSession) => { inheritTriggerReplyAnchor(ds, 'trg-1', new Date(Date.parse(NOW) + 60_000).toISOString()); }],
+  ] as const) {
+    it(`${writer} keeps a pinned launch turn when it prunes`, () => {
+      const pinned = boundReached(['turn-launch']);
+      write(pinned);
+      expect(Object.keys(pinned.session.replyTargets ?? {})).toContain('turn-launch');
+      const control = boundReached();
+      write(control);
+      expect(Object.keys(control.session.replyTargets ?? {})).not.toContain('turn-launch');
+    });
+  }
 
   it('the daemon takes the pin set from its current worker and drops it when that worker exits', async () => {
     const { __testOnly_setupWorkerHandlers, initWorkerPool } = await import('../src/core/worker-pool.js');

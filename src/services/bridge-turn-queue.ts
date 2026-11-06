@@ -214,6 +214,26 @@ const CLI_QUEUE_MARK_SKEW_MS = 5_000;
 /** Background-task launch anchors kept per queue (oldest evicted first). */
 const BACKGROUND_TASK_ANCHORS_MAX = 256;
 
+/** Change detector for the worker's `background_task_pins_sync` snapshots
+ *  (see BridgeTurnQueue.backgroundTaskAnchorTurnIds). It starts as "never
+ *  sent", so a worker's first snapshot goes out even when empty: a takeover
+ *  installs the new worker before the old one's exit is handled, and the
+ *  daemon's exit cleanup then skips the pins the old worker left — this first
+ *  snapshot replaces them. */
+export class BackgroundTaskPinSnapshot {
+  private sent: string | undefined;
+
+  /** Whether `turnIds` differs from the last snapshot marked sent. */
+  changed(turnIds: readonly string[]): boolean {
+    return turnIds.join('\n') !== this.sent;
+  }
+
+  /** Record `turnIds` as delivered to the daemon. */
+  markSent(turnIds: readonly string[]): void {
+    this.sent = turnIds.join('\n');
+  }
+}
+
 /** Minimum gap between the worker's sibling-jsonl fingerprint fallback scans
  *  for one mark. 10s is far wider than the milliseconds Claude needs to write
  *  a normal user line, and the fallback only runs after the primary jsonl scan
@@ -633,6 +653,7 @@ export class BridgeTurnQueue {
         }
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+        this.noteAbsorbedBackgroundNotice(ev);
         // Type-ahead path: Claude writes `attachment(queued_command)` the
         // moment it dequeues a queued submit, immediately before the
         // assistant text for that turn starts streaming. Equivalent to
@@ -685,6 +706,9 @@ export class BridgeTurnQueue {
         // Its structured terminal outcome is retained below; user visibility
         // and bounded retry are owned by the worker/daemon, respectively.
         if (isTranscriptRateLimitEvent(ev)) {
+          // Ends a wake cut before any visible text, like the API-error
+          // records below.
+          this.pendingBackgroundWake = undefined;
           if (this.collecting) this.collecting.rateLimited = true;
           continue;
         }
@@ -830,14 +854,19 @@ export class BridgeTurnQueue {
   }
 
   /** File the Lark anchor of the running turn under each background task a
-   *  main-thread tool_result just acked as launched. */
+   *  main-thread tool_result just acked as launched. A wake turn that has not
+   *  said anything yet has no headless turn collecting; the wake it armed is
+   *  what is running, so its launches inherit that anchor (never an ambiguous
+   *  one). */
   private recordBackgroundTaskLaunches(ev: TranscriptEvent): void {
     const launches = backgroundTaskLaunches(ev);
     if (launches.length === 0) return;
     const running = this.collecting;
     const anchor = running && !running.isLocal
       ? running.turnId
-      : running?.isScheduled || running?.isBackgroundWake ? running.replyAnchorTurnId : undefined;
+      : running?.isScheduled || running?.isBackgroundWake ? running.replyAnchorTurnId
+      : !running && typeof this.pendingBackgroundWake === 'string' ? this.pendingBackgroundWake
+      : undefined;
     if (anchor === undefined) return;
     for (const launch of launches) {
       this.backgroundTaskAnchors.delete(launch.taskId);
@@ -859,18 +888,15 @@ export class BridgeTurnQueue {
    *  up in one turn, also disarms any wake already pending: a mixed or
    *  cross-topic answer has no single safe destination.
    *
-   *  The `attachment(queued_command, commandMode:'task-notification')` form is
-   *  deliberately not read here: current Claude Code writes it only for a
-   *  notice absorbed into a turn already running (never one that opens a
-   *  turn), and a folded notice must not arm. Should a future build open a
-   *  wake turn with that form, the wake stays an ordinary local turn — the
-   *  pre-forwarding behaviour — rather than being routed on a shape no real
-   *  transcript has shown yet. */
+   *  The `attachment(queued_command, commandMode:'task-notification')` form
+   *  never arms (see {@link noteAbsorbedBackgroundNotice}): current Claude Code
+   *  writes it only for a notice absorbed into a turn already running. */
   private notePendingBackgroundWake(ev: TranscriptEvent): void {
     if (ev.isSidechain === true || ev.type !== 'user') return;
     const notice = parseTaskNotification(ev);
     if (!notice) return;
     const opensTurn = !this.collecting || this.collecting.closedByDurationMarker === true;
+    if (!opensTurn) this.unrouteCollectingWake(this.backgroundTaskAnchors.get(notice.taskId));
     const atMs = eventTimeMs(ev);
     const anchor = opensTurn && ev.promptSource === 'system' && atMs !== undefined && atMs >= this.liveSinceMs
       ? this.backgroundTaskAnchors.get(notice.taskId)
@@ -879,6 +905,35 @@ export class BridgeTurnQueue {
     this.pendingBackgroundWake = anchor !== undefined && (pending === undefined || pending === anchor)
       ? anchor
       : null;
+  }
+
+  /** A `<task-notification>` Claude Code folded into a turn already under way
+   *  (`attachment(queued_command)`, commandMode `task-notification`): the
+   *  turn's answer now covers that task too. It only ever DISARMS — a wake
+   *  armed or collecting for another topic, or for a task this notice cannot
+   *  vouch for (no anchor), has no single safe destination any more and stays
+   *  an ordinary local turn. A notice of a task from the same launching turn
+   *  changes nothing. */
+  private noteAbsorbedBackgroundNotice(ev: TranscriptEvent): void {
+    if (ev.isSidechain === true || ev.attachment?.commandMode !== 'task-notification') return;
+    const notice = parseTaskNotification(ev);
+    if (!notice) return;
+    const anchor = this.backgroundTaskAnchors.get(notice.taskId);
+    if (typeof this.pendingBackgroundWake === 'string' && this.pendingBackgroundWake !== anchor) {
+      this.pendingBackgroundWake = null;
+    }
+    this.unrouteCollectingWake(anchor);
+  }
+
+  /** A notice folded into the collecting wake turn whose launch anchor differs
+   *  (or is unknown): the merged answer no longer belongs to one topic, so the
+   *  turn falls back to an ordinary local turn (logged as unrouted). */
+  private unrouteCollectingWake(noticeAnchor: string | undefined): void {
+    const running = this.collecting;
+    if (!running?.isBackgroundWake || running.replyAnchorTurnId === noticeAnchor) return;
+    delete running.isBackgroundWake;
+    delete running.replyAnchorTurnId;
+    running.backgroundWakeUnrouted = true;
   }
 
   /** Distinct Lark turns that the given (still running) background tasks

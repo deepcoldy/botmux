@@ -2527,4 +2527,95 @@ describe('Claude background-task wake turns', () => {
     expect(q.backgroundTaskAnchorTurnIds(['bxfr0j2hg', 'bxfr0j2hg', 'unknown-task'])).toEqual(['lark-t1']);
     expect(q.backgroundTaskAnchorTurnIds([])).toEqual([]);
   });
+
+  /** A main-thread `run_in_background` launch (tool_use + its ack) at `atMs`. */
+  function launchRecords(prefix: string, taskId: string, atMs: number): TranscriptEvent[] {
+    return [
+      { type: 'assistant', uuid: `${prefix}-launch`, timestamp: new Date(atMs).toISOString(), isSidechain: false,
+        message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: `call_${taskId}`, name: 'Bash', input: { command: 'watch-ci', run_in_background: true } }] } },
+      { type: 'user', uuid: `${prefix}-ack`, timestamp: new Date(atMs + 50).toISOString(), isSidechain: false,
+        toolUseResult: { backgroundTaskId: taskId },
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `call_${taskId}`, content: `Command running in background with ID: ${taskId}.` }] } },
+    ] as TranscriptEvent[];
+  }
+  /** The notice Claude Code folds into a turn already under way. */
+  function absorbedNotice(uuid: string, taskId: string, atMs: number): TranscriptEvent {
+    return { type: 'attachment', uuid, timestamp: new Date(atMs).toISOString(), isSidechain: false,
+      attachment: { type: 'queued_command', commandMode: 'task-notification',
+        prompt: `<task-notification>\n<task-id>${taskId}</task-id>\n<status>completed</status>\n</task-notification>` } } as TranscriptEvent;
+  }
+  function duration(uuid: string, atMs: number): TranscriptEvent {
+    return { type: 'system', subtype: 'turn_duration', uuid, timestamp: new Date(atMs).toISOString(), isSidechain: false } as TranscriptEvent;
+  }
+
+  it('a task the wake turn launches before it says anything inherits the wake\'s anchor', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const wakeAt = events.findIndex(ev => ev.uuid === 'wake-user');
+    const t = Date.parse(events[wakeAt].timestamp!);
+    q.ingest([...events.slice(0, wakeAt + 1), ...launchRecords('relaunch', 'task2', t + 1_000), ...events.slice(wakeAt + 1)]);
+    expect(q.backgroundTaskAnchorTurnIds(['task2'])).toEqual(['lark-t1']);
+    q.ingest([notification('wake2-user', 'task2', t + 120_000), laterText('wake2-final', t + 125_000), duration('wake2-duration', t + 126_000)]);
+    const wake2 = readyWake(q).ready.find(turn => turn.assistantUuids.includes('wake2-final'));
+    expect(wake2).toMatchObject({ isBackgroundWake: true, replyAnchorTurnId: 'lark-t1' });
+  });
+
+  for (const [form, position] of [['attachment', 'before'], ['attachment', 'after'], ['user record', 'after']] as const) {
+    it(`a folded notice of another topic's task fails the wake closed (${form}, absorbed ${position} its first text)`, () => {
+      const q = new BridgeTurnQueue();
+      markLark(q, 'om_topicA');
+      const events = fixtureEvents({ liveAfterMs: Date.now() });
+      const wakeAt = events.findIndex(ev => ev.uuid === 'wake-user');
+      const t = Date.parse(events[wakeAt].timestamp!);
+      q.ingest(events.slice(0, wakeAt));
+      q.ingest(secondLarkLaunch(q, events, 'om_topicB', 'taskB'));
+      const foldAt = events.findIndex(ev => ev.uuid === (position === 'before' ? 'wake-a-thinking' : 'wake-duration'));
+      const fold = form === 'attachment' ? absorbedNotice('fold-b', 'taskB', t + 3_000) : notification('fold-b', 'taskB', t + 3_000);
+      q.ingest([...events.slice(wakeAt, foldAt), fold, ...events.slice(foldAt)]);
+      const wake = readyWake(q).ready.find(turn => turn.assistantUuids.includes('wake-a-final'));
+      expect(wake?.turnId).toBe('local-headless-wake-a-final');
+      expect(wake?.isBackgroundWake).toBeFalsy();
+      expect(wake?.replyAnchorTurnId).toBeUndefined();
+    });
+  }
+
+  it('a folded notice of a task without an anchor fails the wake closed', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const foldAt = events.findIndex(ev => ev.uuid === 'wake-duration');
+    const t = Date.parse(events[foldAt].timestamp!);
+    q.ingest([...events.slice(0, foldAt), absorbedNotice('fold-z', 'taskZ', t - 100), ...events.slice(foldAt)]);
+    expect(readyWake(q).wake?.isBackgroundWake).toBeFalsy();
+  });
+
+  it('a folded notice of a task from the same Lark turn keeps the wake forwarded', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() });
+    const launchB = { ...events.find(ev => ev.uuid === 'lark-ack')!, uuid: 'lark-ack-b',
+      toolUseResult: { backgroundTaskId: 'taskB' } } as TranscriptEvent;
+    const withB = events.flatMap(ev => ev.uuid === 'lark-ack' ? [ev, launchB] : [ev]);
+    const foldAt = withB.findIndex(ev => ev.uuid === 'wake-duration');
+    const t = Date.parse(withB[foldAt].timestamp!);
+    q.ingest([...withB.slice(0, foldAt), absorbedNotice('fold-b', 'taskB', t - 100), ...withB.slice(foldAt)]);
+    expect(readyWake(q).wake).toMatchObject({ isBackgroundWake: true, replyAnchorTurnId: 'lark-t1' });
+  });
+
+  it('without turn_duration markers, a rate-limit record also ends the wake', () => {
+    const q = new BridgeTurnQueue();
+    markLark(q);
+    const events = fixtureEvents({ liveAfterMs: Date.now() })
+      .filter(ev => ev.subtype !== 'turn_duration');
+    const byId = (id: string) => events.find(ev => ev.uuid === id)!;
+    q.ingest(['lark-user-1', 'lark-a-launch', 'lark-ack', 'lark-a-final'].map(byId));
+    q.noteDurationMarkerWaitExpired();
+    q.drainEmittable({ explicitTerminalOnly: true, releaseHeldTerminals: true });
+    const wakeAt = Date.parse(byId('wake-user').timestamp!);
+    const limited = { ...apiError('wake-limited', wakeAt + 2_000, 'API Error: Rate limit reached'), error: 'rate_limit' } as TranscriptEvent;
+    q.ingest([byId('wake-user'), limited, laterText('later-a', wakeAt + 60_000)]);
+    const later = readyWake(q).ready.find(turn => turn.assistantUuids.includes('later-a'));
+    expect(later?.isBackgroundWake).toBeFalsy();
+  });
 });

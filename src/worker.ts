@@ -131,7 +131,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -8134,6 +8134,8 @@ const bridgeQueue = new BridgeTurnQueue(
  *  - `backgroundWait()`: the count the card shows while the main turn has
  *    ended but background work is still running (see backgroundWaitTasks). */
 const backgroundTaskTracker = new BackgroundTaskTracker();
+/** What this worker last reported as pinned (syncBackgroundTaskPinsToDaemon). */
+const backgroundTaskPins = new BackgroundTaskPinSnapshot();
 /** Background tasks shown on the card as 「主回合已结束 · 后台子任务运行中（N）」;
  *  0 otherwise. Mirrors backgroundTaskTracker.backgroundWait(), re-read after
  *  every transcript drain and sampler tick; the sampler publishes a change.
@@ -8153,12 +8155,6 @@ function refreshBackgroundWait(): void {
   syncBackgroundTaskPinsToDaemon();
 }
 
-/** Last `background_task_pins_sync` snapshot sent; undefined until this
- *  worker's first one, which is sent even when empty: it replaces whatever an
- *  earlier worker generation left pinned (a takeover installs the new worker
- *  before the old one's exit, so the daemon's exit cleanup skips it). */
-let backgroundTaskPinsSent: string | undefined;
-
 /** Tell the daemon which Lark turns this worker's running Claude background
  *  tasks were launched from. A wake answer is forwarded to that turn's topic
  *  (emitReadyTurns), and the daemon resolves the topic from a replyTargets
@@ -8170,11 +8166,11 @@ let backgroundTaskPinsSent: string | undefined;
 function syncBackgroundTaskPinsToDaemon(): void {
   if (lastInitConfig?.adoptMode === true || zeroPromptTerminalSync() || replyDeliveryMode() !== 'transcript') return;
   const turnIds = bridgeQueue.backgroundTaskAnchorTurnIds(backgroundTaskTracker.liveTaskIds());
-  const key = turnIds.join('\n');
-  if (key === backgroundTaskPinsSent) return;
+  // The first snapshot always goes out, even empty (see BackgroundTaskPinSnapshot).
+  if (!backgroundTaskPins.changed(turnIds)) return;
   try {
     send({ type: 'background_task_pins_sync', turnIds });
-    backgroundTaskPinsSent = key;
+    backgroundTaskPins.markSent(turnIds);
   } catch (err: any) {
     log(`Background task pin sync failed (${err.message})`);
   }
