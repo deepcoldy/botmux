@@ -2956,6 +2956,24 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
+  it('keeps the card under the size budget when the screen holds a huge backtick run', () => {
+    for (const screen of ['`'.repeat(36_000), 'a\n' + '`'.repeat(200_000) + '\nb']) {
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined, screen,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+    }
+  });
+
+  it('still fences output containing a backtick run so it cannot break out of the code block', () => {
+    const card = build({ screen: 'x\n```\n# not a heading\n```\ny' });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes('not a heading')).content;
+    const fence = md.match(/^`+/)![0];
+    expect(fence.length).toBeGreaterThan(3);
+    expect(md.endsWith(fence)).toBe(true);
+  });
+
   it('does not opt private one-shot snapshots into shared PATCH updates', () => {
     expect(build().config.update_multi).toBeUndefined();
   });

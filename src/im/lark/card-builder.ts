@@ -1426,7 +1426,11 @@ export function buildPrivateSnapshotCard(
   if (!imageKey) {
     const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
     if (text) {
-      const body = truncateContent(text, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
+      // Cap backtick runs first: the fence grows with the longest run and is
+      // emitted twice, so a huge run (e.g. 36k backticks) would push the card
+      // past Feishu's size limit even though the body fits its own budget.
+      const capped = text.replace(/`{9,}/g, '`'.repeat(8));
+      const body = truncateContent(capped, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
       // Fence must be longer than the longest backtick run in the body, else
       // terminal output containing ``` would break out of the code block.
       const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
