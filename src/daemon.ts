@@ -19,6 +19,13 @@ import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
+import {
+  REPORT_SOURCE_REPLY_ROUTE,
+  deliverReportSourceReply,
+  buildReportReplyContext,
+  markReportReplyInput,
+  appendReportReplyReference,
+} from './core/report-source-reply.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -8703,6 +8710,23 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       .map(item => item.trim()).filter(Boolean).slice(0, 64)
     : [];
   const targetAppIds = stringArray(body?.targetAppIds);
+  const replyRequested = body?.resultDelivery === 'reply';
+  if (body?.resultDelivery !== undefined && !replyRequested) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_result_delivery' });
+  }
+  if (replyRequested && (targetAppIds.length !== 1 || body?.hasLegacyBots === true || !acceptanceRequested
+    || (ds.scope ?? ds.session.scope) !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')
+    || !ds.managedTurnOrigin?.turnId?.startsWith('om_') || body?.requestedLaunch !== undefined
+    || ds.session.principalLane || getBot(ds.larkAppId).config.privateCard
+    || !dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, ds.managedTurnOrigin?.turnId))
+    || (ds.session.reportReplyInputId !== undefined && ds.session.reportReplyInputId !== ds.managedTurnOrigin?.turnId))) {
+    return jsonRes(res, 400, { ok: false, error: 'reply_requires_single_human_topic_dispatch' });
+  }
+  const sourceReply = replyRequested ? { rootMessageId: ds.session.rootMessageId!,
+    sourceTurnId: ds.managedTurnOrigin!.turnId!, reporterLarkAppId: targetAppIds[0]! } : undefined;
+  if (sourceReply && markReportReplyInput(ds.session, sourceReply.sourceTurnId)) {
+    sessionStore.updateSession(ds.session);
+  }
   const rawRequestedLaunch = body?.requestedLaunch;
   const rawEffectiveRuntime = body?.effectiveRuntime;
   const hasLaunchSpec = rawRequestedLaunch !== undefined || rawEffectiveRuntime !== undefined;
@@ -8793,6 +8817,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     targetScope: ds.scope ?? ds.session.scope ?? 'thread',
     sourceName: title || 'dispatched subtask',
     issuedAt,
+    ...(sourceReply ? { reply: sourceReply } : {}),
   });
   const botOpenIds = stringArray(body?.bots);
   try {
@@ -9966,6 +9991,42 @@ ipcRoute('POST', WORKFLOW_NODE_REPORT_ROUTE, async (req, res) => {
         } : {}),
       },
     };
+  });
+  return jsonRes(res, result.status, result.body);
+});
+
+ipcRoute('POST', REPORT_SOURCE_REPLY_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!selfDaemonLarkAppId || getBot(selfDaemonLarkAppId).config.privateCard) {
+    return jsonRes(res, 403, { ok: false, error: 'report_publication_unavailable' });
+  }
+  const result = await deliverReportSourceReply(raw, {
+    dataDir: config.session.dataDir,
+    secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    selfLarkAppId: selfDaemonLarkAppId,
+    session: id => findActiveBySessionId(id)?.session ?? sessionStore.getSession(id),
+    publish: async (content, target) => {
+      const ds = findActiveBySessionId(target.sessionId);
+      if (!ds || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) {
+        throw Object.assign(new Error('report_reply_source_changed'), { name: 'ReportReplySourceChangedError' });
+      }
+      return sessionReply(sessionAnchorId(ds), buildMarkdownCard(content, undefined, ''), 'interactive',
+        ds.larkAppId, undefined, { sourceSessionId: ds.session.sessionId, uuid: target.uuid,
+          replyTarget: { mode: 'thread', rootMessageId: target.rootMessageId }, beforeWrite: target.beforeWrite });
+    },
+    remember: async (reference, id) => {
+      const session = findActiveBySessionId(id)?.session ?? sessionStore.getSession(id);
+      if (!session) throw new Error('report_reply_source_changed');
+      session.reportReplyReferences ??= [];
+      const appended = appendReportReplyReference(session.reportReplyReferences, reference);
+      if (appended.changed) {
+        session.reportReplyReferences = appended.references;
+        sessionStore.updateSession(session);
+      }
+    },
   });
   return jsonRes(res, result.status, result.body);
 });
@@ -28567,7 +28628,8 @@ async function handleThreadReplyAdmitted(
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
   const initialCodexAppMessageContext = zeroInjection ? ''
-    : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix;
+    : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix
+      + buildReportReplyContext(inputSession?.session.reportReplyReferences);
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
   const initialPromptContent = zeroInjection
     ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
@@ -28674,7 +28736,12 @@ async function handleThreadReplyAdmitted(
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
     const ds = activeSessions.get(runtimeSessionKey);
-    if (ds) clearAgentAttention(ds);
+    if (ds) {
+      if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, parsed.messageId)) {
+        sessionStore.updateSession(ds.session);
+      }
+      clearAgentAttention(ds);
+    }
   };
   // Any human-authored reply means the user has seen/touched the raised-hand
   // blocker. Do this before command, callback, workflow, and ask-custom early

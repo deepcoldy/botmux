@@ -543,6 +543,10 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** 已在来源话题直投的项目结果；下次输入携带引用，不额外启动模型。 */
+  reportReplyReferences?: import('./core/report-source-reply.js').ReportReplyReference[];
+  /** 最近一次真人输入/停止，用于使旧委托的自动直投失效。 */
+  reportReplyInputId?: string;
   /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
   topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;

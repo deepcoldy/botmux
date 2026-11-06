@@ -24,6 +24,7 @@ import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } fro
 import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
+import { markReportReplyInput } from './report-source-reply.js';
 import { findEffortTaskConfirmation, recordEffortTaskConfirmation } from '../services/codex-effort-task-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -2965,6 +2966,7 @@ export async function handleCommand(
           await replyNoSession(replyHere, loc);
           break;
         }
+        if (markReportReplyInput(ds.session, message.messageId)) sessionStore.updateSession(ds.session);
         if (isSessionTransferring(ds)) {
           await replyTransferInProgress(replyHere, loc);
           break;
