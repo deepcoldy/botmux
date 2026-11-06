@@ -118,3 +118,37 @@ export async function waitForAllowedUserInChat(opts: {
     await sleep(delays[attempt]);
   }
 }
+
+/**
+ * 场景①: where a group-join session anchors in a 普通群 whose reply mode would
+ * otherwise keep it chat-scope (BotConfig.autoStartOnGroupJoinAnchor).
+ *   - 'reply-mode' (default): follow the group's reply mode, unchanged.
+ *   - 'latest-message': open a thread-scope session on the newest existing
+ *     message in the chat, so replies land in that message's thread.
+ */
+export type GroupJoinAnchorMode = 'reply-mode' | 'latest-message';
+
+/** How many newest chat messages the latest-message anchor inspects. */
+export const GROUP_JOIN_ANCHOR_SCAN_LIMIT = 20;
+
+/**
+ * 场景① latest-message anchor: pick the thread root for the newest message the
+ * bot can thread under, from a chat-container listing (any order — sorted by
+ * create_time here). Skips system events (e.g. "X added the bot"), recalled
+ * messages and this bot's own messages (an earlier greeting must not become the
+ * anchor). A message already inside a native topic (root_id + thread_id)
+ * resolves to that topic's root. Returns undefined when nothing qualifies so
+ * the caller falls back to the reply-mode routing.
+ */
+export function pickGroupJoinAnchorMessageId(messages: readonly any[], larkAppId: string): string | undefined {
+  const newestFirst = [...messages].sort((a, b) => (Number(b?.create_time) || 0) - (Number(a?.create_time) || 0));
+  for (const m of newestFirst) {
+    if (typeof m?.message_id !== 'string' || !m.message_id) continue;
+    if (m.deleted === true) continue;
+    if ((m.msg_type ?? m.message_type) === 'system') continue;
+    if (m.sender?.id === larkAppId) continue;
+    if (typeof m.root_id === 'string' && m.root_id && typeof m.thread_id === 'string' && m.thread_id) return m.root_id;
+    return m.message_id;
+  }
+  return undefined;
+}

@@ -1455,6 +1455,24 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinGateRequired', () => {
   });
 });
 
+describe('parseBotConfigsFromText — autoStartOnGroupJoinAnchor', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves only the non-default latest-message value', () => {
+    const parse = (value: unknown) => mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinAnchor: value },
+    ]))[0].autoStartOnGroupJoinAnchor;
+    expect(parse('latest-message')).toBe('latest-message');
+    expect(parse('reply-mode')).toBeUndefined();
+    expect(parse('latestMessage')).toBeUndefined();
+    expect(parse(true)).toBeUndefined();
+  });
+});
+
 describe('parseBotConfigsFromText — replyStyle', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
 
