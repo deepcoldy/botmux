@@ -2773,10 +2773,11 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
   const botCfg = getBot(ds.larkAppId).config;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime)
     ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId ?? 'claude-code');
-  const text = fresh
+  // Plain text: sendMessage/replyMessage wrap msgType 'text' as {"text": …}
+  // themselves — pre-stringifying here posted a literal {"text":"…"} to Feishu.
+  const notice = fresh
     ? t('card.action.restarted_fresh', { cliName }, loc)
     : t('cmd.restart.in_progress', { cliName }, loc);
-  const notice = JSON.stringify({ text });
   if (ds.scope === 'chat' && ds.chatId) {
     getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
       .then((mode) => mode === 'topic' && ds.session.rootMessageId
@@ -5867,11 +5868,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
-  const notice = JSON.stringify({
-    text: result.recoveryPending
-      ? `🔄 ${cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话。`
-      : `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。`,
-  });
+  // Plain text — the Lark client does the {"text": …} wrapping for 'text'.
+  const notice = result.recoveryPending
+    ? `🔄 ${cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话。`
+    : `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。`;
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {

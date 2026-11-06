@@ -1746,9 +1746,7 @@ export async function tryHandleIntroduceCommand(
 
   if (grantCommandRestriction(larkAppId, message.chat_id, senderOpenId).blocked) {
     const loc = localeForBot(larkAppId);
-    await replyMessage(larkAppId, message.message_id, JSON.stringify({
-      text: t('cmd.grant_restricted', { cmd: '/introduce' }, loc),
-    })).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
+    await replyMessage(larkAppId, message.message_id, t('cmd.grant_restricted', { cmd: '/introduce' }, loc)).catch(err => logger.debug(`introduce grant_restricted reply failed: ${err}`));
     return true;
   }
 
