@@ -9875,7 +9875,7 @@ import { applyCompanionStartupOptions } from './cli/companion-startup-options.js
 import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import { normalizeCardUsageSnapshot } from './cli/card-usage-normalize.js';
-import { parseStatuslinePayload, readStatuslineSnapshot, toCardQuota, writeStatuslineSnapshot } from './services/statusline-snapshot.js';
+import { readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
 import {
   resolveQuoteTarget,
   shouldSuppressImplicitReplyTarget,
@@ -18172,88 +18172,11 @@ async function cmdUserPromptHook(): Promise<void> {
 
 // ─── botmux statusline ───────────────────────────────────────────────────────
 //
-// Claude Code `statusLine.command` 客户端（由 claude-code.ts buildArgs 经进程级
-// --settings 注入）。Claude 在每条 assistant 消息后 / compact 后 / 到达 resets_at /
-// 每 refreshInterval 秒（300ms 防抖）把 JSON（context_window、rate_limits、model …）
-// 喂到 stdin。本命令做两件互不影响的事，各自 try/catch：
-//   1. 落盘：BOTMUX_SESSION_ID 非空且 payload 可解析 ⇒ 写
-//      `<DATA_DIR>/statusline/<sid>/latest.json`（daemon 合并进卡片用量段）。
-//   2. 转发：BOTMUX_STATUSLINE_CHAIN 非空（worker 找回的、被 --settings 遮蔽的用户
-//      statusLine 命令）⇒ `/bin/sh -c <chain>`，把**原始 stdin 字节**原样喂给它，
-//      stdout/stderr 直接继承（Claude 读的是本进程的 stdout），正常退出透传其退出码；
-//      10s 看门狗 SIGTERM → 1s 后 SIGKILL → exit 0；被信号杀 / spawn 失败 → exit 0。
-// 无 chain ⇒ stdout 空、exit 0（与用户没配 statusline 时一致：状态栏空）。
-// 诊断只走 stderr（stdout 是状态栏内容）；顶层兜底 exit 0——statusline 失败对 Claude
-// 只是「状态栏空」，绝不能让它挂住或刷错误。
-const STATUSLINE_STDIN_TIMEOUT_MS = 5000;
-const STATUSLINE_CHAIN_TIMEOUT_MS = 10_000;
-const STATUSLINE_CHAIN_KILL_GRACE_MS = 1000;
-
-function statuslineDiagnostic(message: string): void {
-  try { process.stderr.write(`[botmux statusline] ${message}\n`); } catch { /* */ }
-}
-
-/** 把原始 payload 转发给用户自己的 statusline 命令；本函数负责最终 process.exit。 */
-function forwardStatuslineChain(chain: string, raw: Buffer): void {
-  let child: ReturnType<typeof spawn>;
-  try {
-    // detached：让 sh 及其子进程独占一个进程组，看门狗按组杀——用户脚本常是
-    // `bash ~/.claude/statusline.sh`（内部再 spawn jq / git），只杀 sh 会留下握着
-    // stdout 管道的孤儿，Claude 读不到 EOF 会一直等。
-    child = spawn('/bin/sh', ['-c', chain], { stdio: ['pipe', 'inherit', 'inherit'], detached: true });
-  } catch (error) {
-    statuslineDiagnostic(`chain spawn failed: ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(0);
-  }
-  const killGroup = (signal: NodeJS.Signals) => {
-    if (child.pid) {
-      try { process.kill(-child.pid, signal); return; } catch { /* 组已不在 → 退回单进程 */ }
-    }
-    try { child.kill(signal); } catch { /* */ }
-  };
-  let killTimer: NodeJS.Timeout | undefined;
-  const watchdog = setTimeout(() => {
-    killGroup('SIGTERM');
-    killTimer = setTimeout(() => {
-      killGroup('SIGKILL');
-      process.exit(0);
-    }, STATUSLINE_CHAIN_KILL_GRACE_MS);
-  }, STATUSLINE_CHAIN_TIMEOUT_MS);
-  const finish = (code: number) => {
-    clearTimeout(watchdog);
-    if (killTimer) clearTimeout(killTimer);
-    process.exit(code);
-  };
-  child.once('error', (error) => {
-    statuslineDiagnostic(`chain failed: ${error instanceof Error ? error.message : String(error)}`);
-    finish(0);
-  });
-  // 被信号杀（含看门狗）⇒ 0；正常退出透传退出码。
-  child.once('exit', (code, signal) => finish(signal ? 0 : (code ?? 0)));
-  // 用户命令可能不读 stdin 就退出 → EPIPE，吞掉即可。
-  child.stdin?.on('error', () => { /* */ });
-  child.stdin?.end(raw);
-}
-
+// 实现在 services/statusline-command.ts。新会话的 statusLine.command 直接指向轻量入口
+// statusline-entry.js（不加载整张 CLI 模块图）；这里保留子命令，给命令里写死了
+// `cli.js statusline` 的老会话与编译版二进制用。
 async function cmdStatusline(): Promise<void> {
-  try {
-    const raw = await readStdinWithTimeout(STATUSLINE_STDIN_TIMEOUT_MS);
-    const sessionId = process.env.BOTMUX_SESSION_ID;
-    // env 缺失 ⇒ 非 botmux 会话（用户手跑 / adopt），不落盘，只做转发。
-    if (sessionId) {
-      try {
-        const snap = parseStatuslinePayload(JSON.parse(raw.toString('utf-8')));
-        if (snap) writeStatuslineSnapshot(resolveDataDir(), sessionId, snap);
-      } catch (error) {
-        statuslineDiagnostic(`snapshot not written: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    const chain = process.env.BOTMUX_STATUSLINE_CHAIN;
-    if (!chain) process.exit(0);
-    forwardStatuslineChain(chain, raw);
-  } catch {
-    process.exit(0);
-  }
+  await (await import('./services/statusline-command.js')).runStatusline();
 }
 
 // ─── botmux native-subagent-runtime-hook ─────────────────────────────────────
@@ -19250,6 +19173,14 @@ if (__entrySubcommand) {
   // core-only bind failure exits from within). Park here so the normal dispatch
   // below never runs. This awaits forever; the imported module owns exit().
   await new Promise<never>(() => {});
+}
+
+// Hidden: runtime host for the native Botmux.app shell (stdio JSON protocol,
+// see src/desktop/host/desktop-host.ts). Only the app spawns it.
+if (command === '__desktop-host') {
+  const { runDesktopHost } = await import('./desktop/host/desktop-host.js');
+  await runDesktopHost();
+  process.exit(0);
 }
 
 // Hidden: perform a compiled-binary self-replace and exit. Invoked by

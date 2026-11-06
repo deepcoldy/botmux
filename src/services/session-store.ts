@@ -3,6 +3,7 @@ import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { pidExistsEpermAlive } from '../utils/process-alive.js';
@@ -2187,6 +2188,22 @@ function persistRow(session: Session): void {
     if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
       session = { ...session, serviceTier: durable.serviceTier };
     }
+    if (durable.protectedHttpEgressPolicy !== undefined) {
+      if (session.protectedHttpEgressPolicy !== undefined
+        && !isDeepStrictEqual(
+          session.protectedHttpEgressPolicy,
+          durable.protectedHttpEgressPolicy,
+        )) {
+        throw new Error('Protected HTTP egress policy is immutable');
+      }
+      // The first successful freeze owns this field permanently. Whole-row
+      // metadata writers created before that freeze must carry it forward,
+      // while later writers may only replay the exact durable value.
+      session = {
+        ...session,
+        protectedHttpEgressPolicy: durable.protectedHttpEgressPolicy,
+      };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -3933,6 +3950,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+  'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {

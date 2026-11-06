@@ -1655,7 +1655,13 @@ export class TmuxPipeBackend implements SessionBackend {
         script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
         argv: [
           opts.cwd,
-          ...buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv, opts.gitConfigPairs),
+          ...buildBotmuxEnvAssignments(
+            opts.env,
+            opts.injectEnv,
+            opts.unsetEnv,
+            opts.gitConfigPairs,
+            opts.protectedUnsetEnv,
+          ),
           bin, ...args,
         ],
       });

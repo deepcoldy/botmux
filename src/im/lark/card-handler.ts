@@ -21,7 +21,7 @@ import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
-import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -95,7 +95,7 @@ import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -140,6 +140,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { setSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -1574,6 +1575,35 @@ function cardClickTurnToastKey(reason: string): string {
     case 'cross_principal': return 'card.click_turn.cross_principal';
     default: return 'card.click_turn.rejected';
   }
+}
+
+interface SubstituteToggleNoticeContext {
+  appId: string;
+  operatorOpenId?: string;
+}
+
+/**
+ * Rejection result for the per-group substitute toggle.
+ *
+ * A toast only rides the synchronous callback response. The ACK wrapper passes
+ * the REAL timeout state to `afterAck(timedOut)`; only when it already ACKed
+ * (the handler exceeded the deadline) do we send one visible DM from the
+ * receiving bot to the operator. Fast results never duplicate the toast as a DM.
+ */
+function substituteToggleRejection(content: string, ctx: SubstituteToggleNoticeContext): any {
+  return {
+    toast: { type: 'warning', content },
+    afterAck: async (ackTimedOut?: boolean) => {
+      if (!ackTimedOut || !ctx.operatorOpenId) return;
+      try {
+        await sendUserMessage(ctx.appId, ctx.operatorOpenId, content, 'text');
+      } catch (err) {
+        logger.warn(
+          `[substitute-card] slow rejection notice failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
+  };
 }
 
 export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
@@ -3387,6 +3417,130 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
     }
 
+    // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关。按钮值携带目标
+    // desired，写入按目标而不是翻转；重复点击/重投幂等。权限由 SENSITIVE_CARD_ACTIONS
+    // 的 canOperate 门在入口执行，最终写入段再核对一次。
+    if (actionType === 'toggle_substitute') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds || !larkAppId || !cardMessageId) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+      }
+      const receivedAppId = larkAppId;
+      const receivedChatId = ds.chatId;
+      const receivedSessionId = ds.session.sessionId;
+      const reject = (content: string) => substituteToggleRejection(content, {
+        appId: receivedAppId,
+        operatorOpenId,
+      });
+
+      if (receivedAppId !== ds.larkAppId) {
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+      const desired = value?.desired;
+      if (desired !== 'on' && desired !== 'off') {
+        // Missing/invalid desired means an old or crafted card. Never blind-toggle.
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+      if (cardMessageId !== ds.streamCardId) {
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+
+      // Trusted card placement: action.value is client-roundtripped data, so ask
+      // Lark which chat actually contains the clicked message.
+      let actualChatId: string | undefined;
+      try {
+        const detail = await getMessageDetail(receivedAppId, cardMessageId);
+        actualChatId = detail?.items?.[0]?.chat_id;
+      } catch (err) {
+        logger.warn(`[substitute-card] message detail probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (actualChatId !== receivedChatId) {
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+
+      // Strict chat mode only. getChatMode()'s lenient unknown→group fallback is
+      // NOT proof that this is a flat group, so it cannot authorize the write.
+      const strictMode = await getChatModeStrict(receivedAppId, receivedChatId);
+      if (strictMode === 'unknown') {
+        return reject(t('card.substitute.mode_unknown', undefined, loc));
+      }
+      if (strictMode === 'p2p') {
+        return reject(t('cmd.substitute.unsupported', undefined, loc));
+      }
+      if (strictMode === 'topic' && getBot(receivedAppId).config.substituteMode?.topicGroups === false) {
+        return reject(t('cmd.substitute.topic_disabled', undefined, loc));
+      }
+
+      // Final write section: no awaits inside. All external lookups above may
+      // have raced a card replacement, session transfer/close, permission change
+      // or live config edit — re-verify everything against the captured identity.
+      const mutation = await tryWithBotTurnMutation(receivedAppId, 1000, ():
+        | { ok: true }
+        | { ok: false; key: string } => {
+        const current = [...activeSessions.values()].find(
+          candidate => candidate.session.sessionId === receivedSessionId
+            && candidate.larkAppId === receivedAppId,
+        );
+        if (!current || current !== ds) return { ok: false, key: 'card.substitute.stale_card' };
+        if (activeSessions.get(activeSessionKey(current)) !== current) {
+          return { ok: false, key: 'card.substitute.stale_card' };
+        }
+        if (current.session.status !== 'active') return { ok: false, key: 'card.substitute.stale_card' };
+        if (current.chatId !== receivedChatId) return { ok: false, key: 'card.substitute.stale_card' };
+        if (current.streamCardId !== cardMessageId) return { ok: false, key: 'card.substitute.stale_card' };
+        if (isSessionTransferring(current)) return { ok: false, key: 'card.substitute.stale_card' };
+        if (!canOperate(receivedAppId, receivedChatId, operatorOpenId)) {
+          return { ok: false, key: 'cmd.substitute.owner_only' };
+        }
+        const liveCfg = getBot(receivedAppId).config.substituteMode;
+        if (liveCfg?.enabled !== true) return { ok: false, key: 'cmd.substitute.unsupported' };
+        if (liveCfg.excludedChats?.includes(receivedChatId)) {
+          return { ok: false, key: 'cmd.substitute.blocked' };
+        }
+        if (liveCfg.chats?.length && !liveCfg.chats.includes(receivedChatId)) {
+          return { ok: false, key: 'card.substitute.out_of_scope' };
+        }
+        // Final strict-mode evidence: the earlier query is only a fast reject.
+        // Another confirmed chat.get may have changed the shared cache while we
+        // waited for the mutation gate, so re-read the current strict source and
+        // never write based on the pre-await snapshot.
+        const liveStrictMode = getCachedChatModeStrict(receivedAppId, receivedChatId);
+        if (!liveStrictMode) return { ok: false, key: 'card.substitute.mode_unknown' };
+        if (liveStrictMode === 'p2p') return { ok: false, key: 'cmd.substitute.unsupported' };
+        if (liveStrictMode === 'topic' && liveCfg.topicGroups === false) {
+          return { ok: false, key: 'cmd.substitute.topic_disabled' };
+        }
+        try {
+          setSubstituteEnabledForChat(receivedAppId, receivedChatId, desired === 'on');
+        } catch (err) {
+          logger.warn(
+            `[substitute-card] save failed: app=${receivedAppId} chat=${receivedChatId} `
+            + `desired=${desired}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return { ok: false, key: 'card.substitute.save_failed' };
+        }
+        return { ok: true };
+      });
+      if (!mutation.acquired) {
+        return reject(t('card.substitute.busy', undefined, loc));
+      }
+      if (!mutation.value.ok) {
+        return reject(t(mutation.value.key, undefined, loc));
+      }
+
+      logger.info(
+        `[substitute-card] ${desired === 'on' ? 'enabled' : 'disabled'} by ${operatorOpenId ?? '?'} `
+        + `app=${receivedAppId} chat=${receivedChatId} card=${cardMessageId.substring(0, 12)}`,
+      );
+      return {
+        toast: {
+          type: 'success',
+          content: t(desired === 'on' ? 'cmd.substitute.updated_on' : 'cmd.substitute.updated_off', undefined, loc),
+        },
+        card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds)) },
+      };
+    }
+
     // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in（core/idle-auto-compact.ts）。按钮值带目标
     // 状态 desired，旧卡片重复点击幂等；设置落在会话行上，daemon 重启后仍生效。
     if (actionType === 'toggle_idle_compact') {
@@ -3996,6 +4150,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -4606,6 +4762,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           unavailable,
+          substituteCardControlFor(ds),
         );
         return { cardJson, unavailable };
       };
@@ -4803,6 +4960,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           cachedStreamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -4884,6 +5043,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -5143,6 +5304,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           cachedStreamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

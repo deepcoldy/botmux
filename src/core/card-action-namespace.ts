@@ -25,6 +25,7 @@ const BOTMUX_CARD_ACTION_EXACT = new Set([
 const BOTMUX_CARD_ACTION_PREFIXES = [
   'adopt_',
   'ask_',
+  'board_card_',
   'clean_',
   'close_',
   'codex_',

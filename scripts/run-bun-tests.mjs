@@ -37,6 +37,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { availableParallelism, tmpdir as realTmpdir } from 'node:os';
+import { acquireTestSlot, resolveTestConcurrency } from './test-concurrency.mjs';
 
 const TEST_DIR = 'test';
 
@@ -261,6 +262,13 @@ const envConcurrency = Number.parseInt(process.env.BOTMUX_BUN_TEST_CONCURRENCY ?
 const concurrency = Number.isFinite(envConcurrency) && envConcurrency > 0
   ? envConcurrency
   : Math.max(4, Math.min(8, Math.floor(availableParallelism() / 4)));
+
+// 本机整机并发闸（scripts/test-concurrency.mjs）：全量 bun test 与 vitest 大批量运行
+// 共用同一组名额；CI 与 self-check 不排队。名额随本进程退出释放。
+const gate = resolveTestConcurrency();
+if (gate.gated && !selfCheck) {
+  await acquireTestSlot({ slots: gate.slots, slotDir: gate.slotDir, label: `bun test ${runnable.length} files` });
+}
 
 console.log(
   selfCheck

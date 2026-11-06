@@ -587,8 +587,11 @@ If there was no result before closing, polling afterwards returns `state: "faile
 | 400 | `bad_json` | Malformed JSON, or the body exceeds 512 KiB |
 | 400 | `target_required` | Missing `target.botId` |
 | 400 | others | Field validation failed (see §4) |
+| 403 | `control_origin_forbidden` | Cross-site write request from a browser rejected (see note below) |
 | 502 | `daemon_offline` | Forwarding to the daemon failed |
 | 503 | `daemon_offline` | Target daemon isn't online |
+
+> **About 403 `control_origin_forbidden`**: only non-read requests initiated by a browser that carry `Origin` or `Sec-Fetch-Site` and are judged cross-site (including a different port on the same host, sibling subdomains, and `Origin: null`) get it; it is a by-design rejection and retrying won't help. This gate applies both to this endpoint and to the session write endpoints under `/api/sessions/`. Non-browser callers such as curl, scripts, and CI that send neither of these source headers are unaffected and can call the API as before.
 
 **Daemon layer**
 

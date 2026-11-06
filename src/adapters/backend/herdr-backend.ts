@@ -6,7 +6,7 @@ import * as pty from '../../utils/pty.js';
 import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe, HerdrBackendConfig, HerdrBackendPlacement } from './types.js';
 import { logger } from '../../utils/logger.js';
-import { sessionChildEnvWithInject } from '../../core/session-env.js';
+import { sessionChildEnvWithInject, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
 import { herdrExecutable } from '../../utils/herdr-executable.js';
 import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/herdr-pane-grid.js';
 
@@ -265,10 +265,16 @@ function createPaneAgentLauncher(
   bin: string,
   args: string[],
   originalPath: string,
+  protectedUnsetEnv?: readonly string[],
 ): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-herdr-launch-'));
   const path = join(dir, canonicalExecutable);
-  const command = [bin, ...args].map(shellSingleQuote).join(' ');
+  const protectedUnsetFlags = trustedSessionEnvUnsetFlags(protectedUnsetEnv);
+  const command = [
+    ...(protectedUnsetFlags.length > 0 ? ['/usr/bin/env', ...protectedUnsetFlags] : []),
+    bin,
+    ...args,
+  ].map(shellSingleQuote).join(' ');
   writeFileSync(path, [
     '#!/bin/sh',
     // Minimise the lifetime of the mode-0700 file containing the exact argv.
@@ -679,6 +685,10 @@ export class HerdrBackend implements SessionBackend {
     this.childEnv = this.opts.externalTarget
       ? undefined
       : sessionChildEnvWithInject(opts);
+    const protectedUnsetFlags = trustedSessionEnvUnsetFlags(opts.protectedUnsetEnv);
+    for (let index = 1; index < protectedUnsetFlags.length; index += 2) {
+      delete this.childEnv?.[protectedUnsetFlags[index]!];
+    }
     this.ensureServer();
 
     const external = this.opts.externalTarget;
@@ -721,13 +731,16 @@ export class HerdrBackend implements SessionBackend {
         const envArgs = this.opts.ownsSession === false
           ? envCommandArgs(this.childEnv ?? {})
           : [];
+        const protectedCommand = protectedUnsetFlags.length > 0
+          ? ['/usr/bin/env', ...protectedUnsetFlags, bin, ...args]
+          : [bin, ...args];
         const started = requiredJsonCommand(
           `herdr agent start ${this.agentName} in ${this.sessionName}`,
           herdrSessionArgs(this.sessionName, [
           'agent', 'start', this.agentName,
           '--cwd', opts.cwd,
           ...envArgs,
-          '--', bin, ...args,
+          '--', ...protectedCommand,
           ]),
           { timeout: 10_000, env: this.childEnv },
         );
@@ -1196,7 +1209,7 @@ export class HerdrBackend implements SessionBackend {
       }
       this.paneId = paneId;
 
-      launcher = createPaneAgentLauncher(kind, bin, args, originalPath);
+      launcher = createPaneAgentLauncher(kind, bin, args, originalPath, opts.protectedUnsetEnv);
       requiredJsonCommand(
         `herdr pane run ${paneId} in ${this.sessionName}`,
         // One quoted COMMAND argument reaches the shell verbatim, even while

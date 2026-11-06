@@ -492,12 +492,14 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Trigger-user CLI identity. The pane inherits PATH from the user's rcfile,
   // NOT from childEnv, so the worker's PATH prepend never reaches it — these
-  // three are how the wrapper dir gets back in front, via the login-shell shim
-  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN after path_helper.
+  // these are how the wrapper dirs get back in front, via the login-shell shim
+  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN and
+  // BOTMUX_WRAPPER_BIN after path_helper.
   // Without them on this allowlist the whole feature is inert in a tmux pane:
   // every governed call silently resolves the real tool and runs as the machine
   // account.
   'BOTMUX_IDENTITY_BIN',
+  'BOTMUX_WRAPPER_BIN',
   'BOTMUX_LARK_TOOL_BINDING',
   'ZDOTDIR',
   'BASH_ENV',
@@ -776,9 +778,13 @@ export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
  *
  * Returns a fresh object; the input env is not mutated.
  */
-export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function redactChildEnv(
+  base: NodeJS.ProcessEnv,
+  additionalKeys: readonly string[] = [],
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
+  for (const key of additionalKeys) delete env[key];
   // Minimum-exposure sweep for the Dashboard-only H5 login family: the named
   // keys above are already gone, this also catches any BOTMUX_DASHBOARD_FEISHU_H5_*
   // knob added later. No CLI child ever consumes one, so a prefix-wide strip
