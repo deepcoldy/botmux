@@ -719,6 +719,7 @@ import {
   type TraexModelLoadSnapshot,
 } from './services/traex-model-load.js';
 import { readTraexModelQuotas, TRAEX_QUOTA_ERROR_CODE } from './services/traex-quota.js';
+import { TRAEX_MODEL_ACCESS_ERROR_CODE } from './services/traex-model-access.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
@@ -3170,7 +3171,12 @@ let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let traexAutoModelController: TraexAutoModelController | null = null;
 let traexAutoModelSwitching = false;
 let traexAutoModelTurnReplayForbidden = false;
-let traexQuotaPending: { turnId: string; failedTurn?: CodexPendingTurn } | undefined;
+type TraexPendingRecovery = { turnId: string; failedTurn?: CodexPendingTurn; stopRequested?: boolean };
+let traexQuotaPending: TraexPendingRecovery | undefined;
+let traexModelAccessSwitchNotice: {
+  action: Extract<TraexAutoModelAction, { kind: 'switch' }>;
+  nativeSessionId: string;
+} | undefined;
 let traexAutoModelPreflightPending: { item: PendingCliInput; generation: number; startedAtMs: number } | undefined;
 let traexAutoModelReasoningEfforts = new Map<string, readonly import('./services/codex-reasoning-effort.js').CodexReasoningEffort[]>();
 
@@ -5518,6 +5524,9 @@ function configureTraexAutoModel(
     cfg.codexRpcInput = false;
     if (lastInitConfig) lastInitConfig.codexRpcInput = false;
   }
+  if (!restoreRuntime || traexModelAccessSwitchNotice?.nativeSessionId !== cfg.cliSessionId) {
+    traexModelAccessSwitchNotice = undefined;
+  }
   traexAutoModelController = managedAuto && cfg.traexAutoModel
     ? new TraexAutoModelController(cfg.traexAutoModel, restoreRuntime, sharedSettings)
     : null;
@@ -5620,6 +5629,28 @@ function enqueueTraexAutoModelRecovery(turnId: string): boolean {
   return true;
 }
 
+/** A proposed restart is not proof that a candidate is executing or queued. */
+function notifyTraexModelAccessSwitchActivity(turnId: string, queued: boolean, progressing: boolean, completed = false): void {
+  const notice = traexModelAccessSwitchNotice;
+  if (!notice || (!queued && !progressing) || !backend
+    || (!completed && (cliRestartInProgress || traexAutoModelSwitching))
+    || notice.action.turnId !== turnId || currentBotmuxTurnId !== turnId
+    || notice.nativeSessionId !== lastInitConfig?.cliSessionId
+    || notice.action.toModel !== traexAutoModelController?.currentModel()
+    || (!queued && !completed && !traexAutoModelController.modelProgressConfirmed())) return;
+  traexModelAccessSwitchNotice = undefined;
+  const action = notice.action;
+  const waiting = traexAutoModelController!.runtimeState(notice.nativeSessionId).waitingOnFinalModel;
+  const threshold = traexAutoModelController!.config.overloadThresholdPercent
+    ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+  send({ type: 'user_notify', turnId, message: t(queued
+    ? waiting ? 'worker.traex_auto_model.access_wait' : 'worker.traex_auto_model.access_queued_model'
+    : !waiting && action.loadPercent !== undefined && action.loadPercent <= threshold
+      ? 'worker.traex_auto_model.access_available_model' : 'worker.traex_auto_model.access_selected_model', {
+    fromModel: action.fromModel, toModel: action.toModel, model: action.toModel, load: action.loadPercent ?? '?',
+  }) });
+}
+
 function executeTraexAutoModelSwitch(
   action: Extract<TraexAutoModelAction, { kind: 'switch' }>,
   opts: { resumeCurrentTurn: boolean; dispatchAttempt?: number },
@@ -5651,7 +5682,12 @@ function executeTraexAutoModelSwitch(
     || action.reason === 'preflight_lowest_load'
     ? action as Extract<TraexAutoModelPreflightDecision, { kind: 'switch' }>
     : undefined;
-  send({
+  if (action.restrictionRecovery) {
+    traexModelAccessSwitchNotice = { action, nativeSessionId };
+    send({ type: 'user_notify', turnId: action.turnId, message: t('worker.traex_auto_model.access_search', {
+      fromModel: action.fromModel, toModel: action.toModel,
+    }) });
+  } else send({
     type: 'user_notify',
     turnId: action.turnId,
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
@@ -5713,7 +5749,7 @@ function executeTraexAutoModelSwitch(
 function observeTraexAutoModelCapacity(screen: string): void {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()) return;
-  if (traexAutoModelSwitching || cliRestartInProgress || isFlushing
+  if (traexAutoModelSwitching || cliRestartInProgress || isFlushing || traexQuotaPending
     || isPromptReady || traexAutoModelTurnReplayForbidden
     || !lastInitConfig?.cliSessionId) return;
 
@@ -5725,13 +5761,18 @@ function observeTraexAutoModelCapacity(screen: string): void {
   }
   const awaitingActivity = controller.awaitingModelActivity();
   const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
+  const queued = traexCapacityQueueVisible(screen);
   const action = controller.observeCapacityQueue({
     turnId: active.turnId,
-    queued: traexCapacityQueueVisible(screen),
+    queued,
     nowMs: Date.now(),
     queuePosition: traexCapacityQueuePosition(screen),
     progressing,
   });
+  if (queued && controller.modelAccessRecoveryActive()) {
+    publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig.reasoningEffort });
+  }
+  if (traexModelAccessSwitchNotice && active.turnId) notifyTraexModelAccessSwitchActivity(active.turnId, queued, progressing);
   if (awaitingActivity && !controller.awaitingModelActivity() && progressing) {
     void flushPending();
   }
@@ -5753,7 +5794,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
         || !active?.started || active.turnId !== action.turnId
         || active.dispatchAttempt !== undefined || isPromptReady
         || currentBotmuxTurnId !== action.turnId || commandLineWritesPending > 0
-        || isFlushing || traexAutoModelTurnReplayForbidden) {
+        || isFlushing || traexQuotaPending || controller.recoveryStopped(action.turnId)
+        || traexAutoModelTurnReplayForbidden) {
         // A rejected reply must not strand the controller's pending check.
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
         return;
@@ -5764,7 +5806,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
       else if (choice.kind === 'exhausted') {
         publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
         send({ type: 'user_notify', turnId: choice.turnId,
-          message: t('worker.traex_auto_model.lowest_load_hold', {
+          message: t(choice.restrictionRecovery ? 'worker.traex_auto_model.access_wait'
+            : 'worker.traex_auto_model.lowest_load_hold', {
             model: choice.model, load: choice.loadPercent ?? '?',
           }) });
       } else {
@@ -5781,7 +5824,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
     send({
       type: 'user_notify',
       turnId: action.turnId,
-      message: t('worker.traex_auto_model.exhausted', {
+      message: t(action.restrictionRecovery ? 'worker.traex_auto_model.access_wait'
+        : 'worker.traex_auto_model.exhausted', {
         count: action.modelCount,
         model: action.model,
       }),
@@ -5938,35 +5982,55 @@ function selectTraexQuotaModelBeforeTurn(head: PendingCliInput): boolean {
   return true;
 }
 
-/** Hold a confirmed quota terminal before it is settled. The same native
- * session and ordinary turn must still own the result after async IO. */
+/** Hold only confirmed quota/access failures before settlement. The same
+ * native session and ordinary turn must still own recovery after async IO. */
 function recoverTraexQuotaTurn(turn: CodexPendingTurn): boolean {
   const controller = traexAutoModelController;
   const active = activeTurnAuthority.snapshot();
-  if (!traexAutoModelRuntimeEligible() || controller?.config.trigger !== 'quota'
-    || turn.terminalStatus !== 'failed' || turn.terminalErrorCode !== TRAEX_QUOTA_ERROR_CODE
+  const accessFailure = turn.terminalErrorCode === TRAEX_MODEL_ACCESS_ERROR_CODE;
+  const capacityRecovery = accessFailure || (turn.terminalErrorCode === TRAEX_QUOTA_ERROR_CODE
+    && controller?.modelAccessRecoveryActive() === true);
+  if (!controller || !traexAutoModelRuntimeEligible()
+    || (!capacityRecovery && (controller.config.trigger !== 'quota' || turn.terminalErrorCode !== TRAEX_QUOTA_ERROR_CODE))
+    || turn.terminalStatus !== 'failed'
     || turn.isLocal || turn.dispatchAttempt !== undefined || turn.supersededTurns?.length
     || !turn.sourceTurnId || !lastInitConfig?.cliSessionId
     || traexAutoModelTurnReplayForbidden || traexAutoModelSwitching || cliRestartInProgress
     || !active?.started || active.turnId !== turn.turnId || active.dispatchAttempt !== undefined
-    || currentBotmuxTurnId !== turn.turnId || controller.currentTurnId() !== turn.turnId) return false;
+    || currentBotmuxTurnId !== turn.turnId || controller.currentTurnId() !== turn.turnId
+    || controller.recoveryStopped(turn.turnId)) return false;
   if (traexQuotaPending) return traexQuotaPending.turnId === turn.turnId;
-  const token = { turnId: turn.turnId, failedTurn: turn };
+  const token: TraexPendingRecovery = { turnId: turn.turnId, failedTurn: turn };
   const generation = cliSpawnGeneration;
   const nativeSessionId = lastInitConfig.cliSessionId;
+  const target = backend;
   traexQuotaPending = token;
-  void currentTraexQuotas().catch(() => null).then(quotas => {
-    if (traexQuotaPending !== token) return;
+  if (capacityRecovery) {
+    // Invalidate older capacity proposals and persist the refusal before IO.
+    controller.recordUnavailableModel(turn.turnId);
+    publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig.reasoningEffort });
+    if (traexModelAccessSwitchNotice?.action.turnId === turn.turnId) traexModelAccessSwitchNotice = undefined;
+  }
+  const evidence = capacityRecovery
+    ? currentTraexLoadSnapshot(TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS).catch(() => null)
+      .then(snapshot => ({ kind: 'access' as const, snapshot }))
+    : currentTraexQuotas().catch(() => null).then(quotas => ({ kind: 'quota' as const, quotas }));
+  void evidence.then(result => {
+    if (traexQuotaPending !== token || token.stopRequested) return;
     traexQuotaPending = undefined;
     const active = activeTurnAuthority.snapshot();
-    if (generation !== cliSpawnGeneration || lastInitConfig?.cliSessionId !== nativeSessionId
+    if (generation !== cliSpawnGeneration || backend !== target || lastInitConfig?.cliSessionId !== nativeSessionId
       || !active?.started || active.turnId !== turn.turnId) return;
     if (controller === traexAutoModelController && traexAutoModelRuntimeEligible()
-      && !traexAutoModelTurnReplayForbidden) {
-      const action = controller.observeQuotaFailure(turn.turnId, quotas);
+      && !traexAutoModelTurnReplayForbidden && !cliRestartInProgress && !traexAutoModelSwitching) {
+      if (result.kind === 'access') rememberTraexModelLoadSnapshot(result.snapshot);
+      const action = result.kind === 'access'
+        ? controller.observeModelAccessFailure(turn.turnId, result.snapshot?.loads ?? null)
+        : controller.observeQuotaFailure(turn.turnId, result.quotas);
       publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
       if (action.kind === 'switch' && executeTraexAutoModelSwitch(action, { resumeCurrentTurn: true })) return;
-      if (action.kind === 'exhausted') turn.terminalErrorSummary = t('worker.traex_auto_model.quota_exhausted');
+      if (action.kind === 'exhausted') turn.terminalErrorSummary = t(capacityRecovery
+        ? 'worker.traex_auto_model.access_exhausted' : 'worker.traex_auto_model.quota_exhausted');
     }
     emitReadyCodexTurns([turn]);
     idleDetector?.fireIdle();
@@ -13773,6 +13837,9 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
+    if (turnOutcome === 'answered' && traexModelAccessSwitchNotice) {
+      notifyTraexModelAccessSwitchActivity(turn.turnId, false, true, true);
+    }
     notifyExplicitRepliesObserved(
       turn.turnId,
       attributableExplicitReplyMarkersForTurnWindow(
@@ -15388,6 +15455,30 @@ function retireDoubaoBridgeTurnOnInterrupt(turnId: string | undefined, dispatchA
   return true;
 }
 
+function holdTraexRecoveryForStop(turnId: string | undefined): void {
+  if (!turnId) return;
+  const pending = traexQuotaPending;
+  if (pending?.failedTurn && pending.turnId === turnId) {
+    pending.stopRequested = true;
+    // This native turn already failed; do not replay it if key delivery retries.
+    inflightInputs.retireTurn(turnId);
+    for (let i = pendingMessages.length - 1; i >= 0; i--) {
+      if (pendingMessages[i]!.turnId === turnId && pendingMessages[i]!.traexAutoModelRecovery) pendingMessages.splice(i, 1);
+    }
+  }
+  if (traexAutoModelController?.requestRecoveryStop?.(turnId)) {
+    publishActiveRuntime({ model: traexAutoModelController.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
+  }
+  if (traexModelAccessSwitchNotice?.action.turnId === turnId) traexModelAccessSwitchNotice = undefined;
+}
+
+function settleStoppedTraexRecovery(turnId: string | undefined): void {
+  const pending = traexQuotaPending;
+  if (!turnId || !pending?.failedTurn || pending.turnId !== turnId || !pending.stopRequested) return;
+  traexQuotaPending = undefined;
+  emitReadyCodexTurns([pending.failedTurn]);
+}
+
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (nativeSessionForkPending()) return;
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
@@ -15408,6 +15499,11 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     return;
   }
   if (!backend) return;
+  const criticalInterrupt = isCriticalInterruptKey(key);
+  if (criticalInterrupt && (traexQuotaPending?.failedTurn
+    || (requestedKey === 'ctrlc' && traexAutoModelController))) {
+    holdTraexRecoveryForStop(currentBotmuxTurnId);
+  }
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
@@ -15441,7 +15537,6 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // Any non-scroll key cancels active scroll first so the live view returns.
   if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
 
-  const criticalInterrupt = isCriticalInterruptKey(key);
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(
@@ -15483,6 +15578,8 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
         }),
       });
     }
+    // The failed native turn can settle without claiming the stop key arrived.
+    if (criticalInterrupt && traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(currentBotmuxTurnId);
     // Refresh the card from real output, but do not clear prompt blocking or
     // claim that the CLI stopped when the key never reached it.
     scheduleOneShotAfterAction();
@@ -15491,11 +15588,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // The provider has already ended a quota-failed turn, so Ctrl-C may not
   // produce another native terminal. A confirmed user stop must revoke the
   // pending recovery itself rather than waiting for that nonexistent event.
-  if (criticalInterrupt && traexQuotaPending?.failedTurn) {
-    const failedTurn = traexQuotaPending.failedTurn;
-    traexQuotaPending = undefined;
-    emitReadyCodexTurns([failedTurn]);
-  }
+  if (criticalInterrupt && traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(currentBotmuxTurnId);
   // A delivered ctrlc is an explicit STOP (card ⏹ / ^C quick key / `/stop`):
   // retire doubao's record-less interrupted mark, the same retirement
   // handleExactTurnInterrupt runs for an exact-turn stop. A bare terminal
@@ -15547,6 +15640,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'unsupported' });
     return;
   }
+  if (traexQuotaPending?.failedTurn || traexAutoModelController) holdTraexRecoveryForStop(turnId);
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
@@ -15574,6 +15668,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
+  if (traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(turnId);
   if (delivered) {
     // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
     // only this exact turn BEFORE acknowledging interruption to the daemon;
@@ -31252,6 +31347,7 @@ function emitTurnTerminal(
 ): void {
   if (!sessionId || !turnId) return;
   if (traexQuotaPending?.turnId === turnId) traexQuotaPending = undefined;
+  if (traexModelAccessSwitchNotice?.action.turnId === turnId) traexModelAccessSwitchNotice = undefined;
   cancelSubmitFailureChainForTerminal(
     submitFailureChains,
     { turnId, dispatchAttempt },
