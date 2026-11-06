@@ -106,7 +106,7 @@ describe('group message recall', () => {
     expect(transport.recall).toHaveBeenCalledExactlyOnceWith('om_expired');
     expect(retry.results[0]).toMatchObject({ ok: true, alreadyRecalled: true });
   });
-  it.each([{}, null, [], { messageIds: [] }, { messageIds: ['bad'] }, { messageIds: Array(51).fill('om_x') }, { messageIds: ['om_good'], appId: 'cli_other' }])('rejects invalid batches before any external IO: %j', async input => {
+  it.each([{}, null, [[]], { messageIds: [] }, { messageIds: ['bad'] }, { messageIds: Array(51).fill('om_x') }, { messageIds: ['om_good'], appId: 'cli_other' }])('rejects invalid batches before any external IO: %j', async input => {
     await expect(service.recall('oc_group', input)).rejects.toMatchObject({ status: 400 });
     expect(transport.isInChat).not.toHaveBeenCalled();
     expect(transport.read).not.toHaveBeenCalled();

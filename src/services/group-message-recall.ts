@@ -109,7 +109,8 @@ export class GroupMessageRecallService {
           results.push({ messageId, ok: true });
         }
       } catch (error) {
-        // 已撤回消息的回读可能直接报 230011；此时不再执行删除，重试也应收敛为成功。
+        // 回读本身抛 230011（消息已被别处撤回）时拿不到记录，无法再核 chat 归属与 own；
+        // 有意按幂等成功收敛：此处不删除、不读内容，仅留下一个极弱的"该 om_ id 是否已撤回"探测面。
         if (extractLarkBusinessCode(error) === LARK_CODE_MESSAGE_WITHDRAWN) {
           results.push({ messageId, ok: true, alreadyRecalled: true });
         } else {
