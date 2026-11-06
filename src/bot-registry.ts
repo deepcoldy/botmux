@@ -1,4 +1,5 @@
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
+import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
@@ -1869,6 +1870,8 @@ export interface BotConfig {
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
+  /** Opt-in cards for still-running native turns, with separate first/repeat windows. */
+  longTaskReminder?: LongTaskReminderConfig;
   /**
    * Optional daemon-side handoff when this bot's CLI enters a trusted usage or
    * rate-limit state. The stable target App ID is resolved to a live,
@@ -4292,6 +4295,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.idleSuspendMinutes
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
+      longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,

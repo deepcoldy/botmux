@@ -711,6 +711,10 @@ import {
   saveSessionOwnerReminderRecords,
 } from './services/session-owner-reminder-store.js';
 import { buildSessionOwnerMention, sendSessionOwnerThreadNotification } from './services/session-owner-notification.js';
+import { LongTaskReminderController } from './core/long-task-reminder.js';
+import { canSendLongTaskReminder } from './core/long-task-reminder-eligibility.js';
+import { DEFAULT_LONG_TASK_REMINDER } from './services/long-task-reminder-policy.js';
+import { sendLongTaskReminder } from './services/long-task-reminder-notification.js';
 import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
@@ -34657,6 +34661,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   sessionOwnerReminderTimer.unref?.();
   void scanSessionOwnerReminders();
 
+  /** Per-bot controller tracks only positively observed native execution clocks. */
+  const longTaskReminder = new LongTaskReminderController({
+    config: () => getBot(cfg.larkAppId).config.longTaskReminder ?? DEFAULT_LONG_TASK_REMINDER,
+    sessions: () => activeSessions.values(),
+    canSend: canSendLongTaskReminder,
+    send: sendLongTaskReminder,
+    now: Date.now,
+    onError: error => logger.warn(`[long-task-reminder] ${error instanceof Error ? error.message : String(error)}`),
+  });
+  /** A 30-second scan bounds notification latency without spawning agent turns. */
+  const longTaskReminderTimer = setInterval(() => {
+    void longTaskReminder.scan().catch(error => logger.warn(`[long-task-reminder] scan failed: ${String(error)}`));
+  }, 30_000);
+  longTaskReminderTimer.unref?.();
+
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
   // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
   // mountpoints + per-session tree of a killed-but-still-active sandboxed session
@@ -35275,6 +35294,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
@@ -35544,6 +35564,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     clearInterval(docCommentPollTimer);

@@ -319,6 +319,14 @@ Requirements and limits:
 
 ### Waiting and no-progress reminders {#reminders}
 
+**`longTaskReminder`** sends an independent status card to the original chat or topic while an executing task remains unfinished. Configure it in **Bot Defaults → Message cards → Long-running task cards**; saves apply immediately.
+
+```json
+{"longTaskReminder": {"enabled": true, "thresholdMinutes": 10, "intervalMinutes": 10}}
+```
+
+Disabled by default. Both windows default to 10 minutes and accept integers from 1 to 10080. Timing starts at the observed native execution write, excluding queued and idle time. Progress and follow-up messages do not reset the running turn. Scans run every 30 seconds; repeats start at the previous successful delivery and missed cycles are not replayed. Failed sends retry after one minute using the same delivery ID. Completion, cancellation, worker exit or session closure stops reminders. Chat, DM and topic sessions are supported; document comments and headless sessions are excluded. Silent, meeting-driven and suppressed replay turns keep their auxiliary-UI restrictions; reminder cards do not invoke `outbound.send` hooks. Preferences persist, but execution timing requires a current worker observation and is never inferred across daemon restarts.
+
 **`sessionOwnerReminder`**: when a session sits in a state that needs a person and nothing changes, it @-mentions the session owner in the original topic at a fixed interval.
 
 ```json

@@ -1,4 +1,5 @@
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
+import { DEFAULT_LONG_TASK_REMINDER, normalizeLongTaskReminderConfig } from '../../services/long-task-reminder-policy.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
@@ -1194,6 +1195,7 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('card-behavior')}><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('long-task-reminder')}><LongTaskReminderSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('feedback')}><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('reply-style')}><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('ask-option-layout')}><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
@@ -1584,6 +1586,76 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
             onEnvSaved: props.refreshBot,
           }}
         />
+      </div>
+    </section>
+  );
+}
+
+/** Edit the bot's independent first-reminder and repeated-card windows. */
+export function LongTaskReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  /** Labels follow the console locale; defaults are shared with the daemon. */
+  const tr = useT();
+  /** Effective stored preferences, including the initial opt-in defaults. */
+  const initial = props.bot.longTaskReminder ?? DEFAULT_LONG_TASK_REMINDER;
+  /** Draft toggle is applied only when the user saves this form. */
+  const [enabled, setEnabled] = useState(initial.enabled);
+  /** Text input preserves an empty or invalid draft until validation. */
+  const [threshold, setThreshold] = useState(String(initial.thresholdMinutes));
+  /** Repeat minutes are independent of the first notification threshold. */
+  const [interval, setIntervalValue] = useState(String(initial.intervalMinutes));
+  /** Inline save/validation feedback belongs to this settings section. */
+  const [status, setStatus] = useState<StatusMessage>(null);
+  /** Disable duplicate submissions while persistence is pending. */
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    /** Refresh the draft when switching bots or receiving saved preferences. */
+    const next = props.bot.longTaskReminder ?? DEFAULT_LONG_TASK_REMINDER;
+    setEnabled(next.enabled);
+    setThreshold(String(next.thresholdMinutes));
+    setIntervalValue(String(next.intervalMinutes));
+  }, [props.bot.larkAppId, props.bot.longTaskReminder]);
+
+  /** Validate with the daemon's parser before atomically saving the preferences. */
+  async function save(): Promise<void> {
+    /** The common parser rejects blanks, fractions and out-of-range minutes. */
+    const payload = normalizeLongTaskReminderConfig({
+      enabled,
+      thresholdMinutes: Number(threshold),
+      intervalMinutes: Number(interval),
+    });
+    if (!payload) {
+      setStatus({ text: `✗ ${tr('botDefaults.longTaskReminderInvalid')}` });
+      return;
+    }
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/long-task-reminder`, payload),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => props.patchBot(props.bot.larkAppId, { longTaskReminder: body.longTaskReminder ?? payload }),
+    });
+  }
+
+  return (
+    <section className="bd-section bd-long-task-reminder">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.longTaskReminderHelp')}>{tr('botDefaults.longTaskReminderTitle')}</FieldTitle></h3>
+      <ToggleRow checked={enabled} disabled={busy} dataAction="toggle-long-task-reminder" title={tr('botDefaults.longTaskReminderEnabled')} help={tr('botDefaults.longTaskReminderHelp')} onChange={setEnabled} />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.longTaskReminderThreshold')}</span>
+          <input type="number" min={1} max={10080} step={1} data-input="longTaskReminderThreshold" value={threshold} disabled={busy} onChange={event => setThreshold(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.longTaskReminderInterval')}</span>
+          <input type="number" min={1} max={10080} step={1} data-input="longTaskReminderInterval" value={interval} disabled={busy} onChange={event => setIntervalValue(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-long-task-reminder" disabled={busy} onClick={() => void save()}>{tr('botDefaults.longTaskReminderSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-long-task-reminder-status': '' }} />
       </div>
     </section>
   );
