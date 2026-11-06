@@ -5351,9 +5351,11 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
       expect(res.status).toBe(200);
       await vi.waitFor(() => expect(replySpy).toHaveBeenCalled());
-      const notice = JSON.parse(replySpy.mock.calls[0]![2]);
-      expect(notice.text).toContain('Frozen Vendor Codex');
-      expect(notice.text).not.toContain('New Live Name');
+      // Plain text: sendMessage/replyMessage perform the {"text": …} wrap.
+      const notice = replySpy.mock.calls[0]![2] as string;
+      expect(notice.trimStart().startsWith('{')).toBe(false);
+      expect(notice).toContain('Frozen Vendor Codex');
+      expect(notice).not.toContain('New Live Name');
     } finally {
       replySpy.mockRestore();
       findSpy.mockRestore();
