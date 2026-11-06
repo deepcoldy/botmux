@@ -7671,11 +7671,11 @@ export function requestSessionRestart(
   let settingAttempt: string | undefined;
   const restartObserver: RestartObserver = opts.topicEffort ? {
     source: observer.source,
-    notify: async status => {
+    notify: async (status, attemptId) => {
       if (status !== 'in_progress' && topicEffortRestartReadiness.get(ds.session.sessionId)?.attemptId === settingAttempt) {
         topicEffortRestartReadiness.delete(ds.session.sessionId);
       }
-      await observer.notify(status);
+      await observer.notify(status, attemptId);
     },
   } : observer;
   const result = restartCoordinator.request(ds.session.sessionId, restartObserver, attemptId => {
@@ -7698,8 +7698,11 @@ export function requestSessionRestart(
       // No live worker but the persistent pane may still be alive (e.g. after a
       // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
       // fresh CLI instead of reattaching the old one and falsely reporting a
-      // successful restart.
-      destroyLivePaneBeforeRestart(ds);
+      // successful restart. Not when the working directory is gone: forkWorker
+      // refuses that start (and offers recovery), so killing the CLI first
+      // would only lose it for nothing.
+      const restartCwd = callbacks?.getSessionWorkingDir(ds);
+      if (!restartCwd || existsSync(restartCwd)) destroyLivePaneBeforeRestart(ds);
       forkWorker(ds, '', {
         resume: ds.hasHistory,
         restartAttemptId: attemptId,
@@ -9773,6 +9776,9 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
     clearLifecycleRetirement(ds, w);
     return false;
   }
+  // This worker generation is being retired: an in-flight restart of it can
+  // no longer report a result. Same as killWorker / retireWorkerProcessOnly.
+  restartCoordinator.cancelSession(ds.session.sessionId);
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
