@@ -29,6 +29,7 @@ import {
   quarantineStoreFileIfUnchanged,
   readStoreFileStrict,
   readStoreFileTextStrict,
+  storeFileExistsStrict,
 } from '../utils/json-file.js';
 import type {
   VcMeetingConsumerManagedSink,
@@ -1461,7 +1462,17 @@ export function listVcMeetingActiveProjectionsForReceiverSession(
 ): VcMeetingMemberProjectionRecord[] {
   if (!receiverSessionId.trim()) return [];
   const dir = join(dataDir, DIR_NAME);
-  if (!existsSync(dir)) return [];
+  // A directory we cannot stat is not "no projections": for a caller that must
+  // tell them apart (IM turn routing) it surfaces like every other read error,
+  // instead of demoting a sealed receiver route to ordinary on a transient EIO.
+  // Other callers keep the historical "unreadable → []".
+  try {
+    if (!storeFileExistsStrict(dir, 'vc meeting delivery state')) return [];
+  } catch (err) {
+    if (opts.ioErrors === 'throw') throw err;
+    logger.warn(`[vc-meeting-delivery-store] failed to stat ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
 
   const out: VcMeetingMemberProjectionRecord[] = [];
   for (const name of readdirSync(dir)) {

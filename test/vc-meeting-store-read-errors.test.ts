@@ -79,6 +79,7 @@ import {
 import {
   applyVcMeetingMemberProjection,
   getVcMeetingMemberProjection,
+  listVcMeetingActiveProjectionsForReceiverSession,
   listVcMeetingMemberProjections,
   type VcMeetingMemberProjectionInput,
 } from '../src/services/vc-meeting-delivery-store.js';
@@ -409,6 +410,31 @@ describe('turn-entry meeting routing with unreadable meeting state', () => {
       .toMatchObject({ kind: 'unavailable', fallback: 'block' });
     // Read-only callers outside turn routing keep the historical soft read.
     expect(listVcMeetingMemberProjections(dataDir, { listenerAppId: 'cli_listener', meetingId: 'm1' })).toEqual([]);
+  });
+
+  // The sealed (post-meeting) route only reaches the delivery store through this
+  // per-session scan. A delivery DIRECTORY that cannot be stat'ed must surface
+  // as unavailable, not read as "no projections" — the latter demotes a chat
+  // that still owns a receiver session to an ordinary turn (silent mis-route).
+  it('reports an unreadable delivery directory as unavailable on the sealed scan', () => {
+    const deliveryDir = join(dataDir, 'vc-meeting-delivery');
+    mkdirSync(deliveryDir, { recursive: true });
+    fsFaults.stat.set(deliveryDir, 'EIO');
+
+    // Turn routing passes ioErrors: 'throw' — it must not read as "no projections".
+    const err = thrown(() => listVcMeetingActiveProjectionsForReceiverSession(
+      dataDir,
+      'receiver-m1',
+      { ioErrors: 'throw' },
+    ));
+    expect(isStoreFileUnavailableError(err)).toBe(true);
+    expect((err as { code?: string }).code).toBe('EIO');
+
+    // Every other read-only caller keeps the historical soft behaviour.
+    expect(listVcMeetingActiveProjectionsForReceiverSession(dataDir, 'receiver-m1')).toEqual([]);
+
+    fsFaults.stat.clear();
+    expect(listVcMeetingActiveProjectionsForReceiverSession(dataDir, 'receiver-m1', { ioErrors: 'throw' })).toEqual([]);
   });
 
   it('routes normally when the stores are readable', () => {
