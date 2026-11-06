@@ -759,6 +759,7 @@ import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplay
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3MainTopicAvailability, v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon, workflowNodePinnedStart } from './core/workflow-node-daemon.js';
+import { WORKFLOW_INITIATOR_UNION_ROUTE, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, workflowInitiatorOperates } from './core/workflow-working-dir-operator.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
 import { isRemoteCliId } from './core/remote-cli-ids.js';
@@ -958,7 +959,7 @@ function startAdminUnionsPublisher(larkAppId: string): void {
   void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
@@ -6989,6 +6990,20 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
     try { return getBot(appId).config; } catch { return undefined; }
   },
   daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
+  // §15.4: the initiator operates this bot when they may use /cd in its
+  // topics — the same two gates a typed /cd passes, with their identity
+  // converted into this bot's own app first (never another app's open_id).
+  initiatorOperates: (input) => workflowInitiatorOperates({
+    resolveTargetOpenId: async (appId, unionId) => {
+      const resolved = await resolveTargetAppOpenId(appId, unionId);
+      return resolved.status === 'resolved' ? resolved.openId : undefined;
+    },
+    canUseCd: (appId, chatId, openId, unionId) => humanCanRunDaemonCommand(appId, chatId, openId, unionId, '/cd', 'group'),
+  }, input),
+  lookupOwnUnionId: async (openId) => {
+    const resolved = await resolveUnionIdFromOpenIdStrict(workflowSelfAppId(), openId);
+    return resolved.status === 'resolved' ? resolved.unionId : undefined;
+  },
   daemonHandlesMainPlacement: (appId) => findOnlineDaemon(appId)?.workflowMainPlacement === 'v1',
   // §5.5 board link: the main session's topic id (`omt_…`), display only.
   mainTopicThreadId: (binding) => {
@@ -9819,6 +9834,34 @@ ipcRoute('POST', WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE, async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
   }
   const result = await workflowNodeDaemon.identityCheckRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Executing bot's daemon ← Gate-2 (approve-dag): may the run's initiator
+// operate this bot here, i.e. use /cd (design §15.4)?
+ipcRoute('POST', WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = await workflowNodeDaemon.workingDirOperatorRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Main bot's daemon ← executing bot's daemon: the initiator's union_id for a
+// run of this bot that pins a working dir (design §15.4).
+ipcRoute('POST', WORKFLOW_INITIATOR_UNION_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = await workflowNodeDaemon.initiatorUnionRoute(raw);
   return jsonRes(res, result.status, result.body);
 });
 
@@ -28805,6 +28848,13 @@ async function handleThreadReplyAdmitted(
 
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
+  // Design §15.4: whether the run's Gate-2 directory may be used here can
+  // depend on the initiator's operate right on this bot (a Lark lookup, maybe
+  // the main bot's daemon). Settled before the session is looked up, so
+  // nothing read below goes stale across the wait.
+  const workflowNodeDir = workflowHandoff
+    ? await workflowNodeDaemon.resolveInboundWorkingDir(workflowHandoff, larkAppId)
+    : undefined;
   let ds = activeSessions.get(runtimeSessionKey);
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // A retry / later round handed off into a node topic this bot already has
@@ -28815,12 +28865,14 @@ async function handleThreadReplyAdmitted(
     markIngressAdmitted(ctx);
     return;
   }
-  // Design §15.4: a run approved with --working-dir runs its node only inside
-  // this bot's configured directory range as it stands now. Out of range, the
-  // node blocks with the reason — never a silent fall back to the default dir.
+  // Design §15.4: a run approved with --working-dir runs its node in that
+  // directory only if it exists and — unless the initiator may operate this
+  // bot — lies in its configured range as it stands now. Otherwise the node
+  // blocks with the reason — never a silent fall back to the default dir.
   const workflowAdmission = workflowHandoff
     ? workflowNodeDaemon.admitInbound(
       workflowHandoff, parsed.messageId, larkAppId, ds ? getSessionWorkingDir(ds) : undefined, ds?.session.workflowNode,
+      workflowNodeDir,
     )
     : undefined;
   if (workflowHandoff && workflowAdmission && !workflowAdmission.start) {

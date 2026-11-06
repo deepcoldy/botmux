@@ -8,7 +8,14 @@
  */
 
 import { ensureBotChatGrantMatrix } from '../../cli/exact-chat-grant-client.js';
-import { loadDaemonIpcSecret } from '../../core/daemon-ipc-auth.js';
+import { fetchDaemonIpc, loadDaemonIpcSecret } from '../../core/daemon-ipc-auth.js';
+import {
+  WORKFLOW_OPERATOR_BUDGET_MS,
+  WORKFLOW_WORKING_DIR_OPERATOR_ROUTE,
+  isWorkflowOpenId,
+  withinOperatorBudget,
+  type WorkflowWorkingDirOperatorRequest,
+} from '../../core/workflow-working-dir-operator.js';
 import { config } from '../../config.js';
 import { findOnlineDaemon } from '../../utils/daemon-discovery.js';
 import { readBotsInfoJson } from '../../services/bots-info-cache.js';
@@ -23,6 +30,7 @@ import {
   v3OpensTopicSessions,
   type V3BotEligibilityProbe,
   type V3HandoffIdentityPolicy,
+  type V3InitiatorUnionLookup,
   type V3NodeExecutorPolicy,
 } from '../../workflows/v3/node-executor-mode.js';
 import { getChatModeStrict, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveUnionIdFromOpenIdStrict } from './client.js';
@@ -110,6 +118,75 @@ export function createLiveV3HandoffIdentityPolicy(bots: readonly BotConfig[]): V
       return policy?.enabled ? [...policy.tools] : [];
     },
   };
+}
+
+/**
+ * Gate-2's §15.4 operate check (approve-dag, a CLI process): each executing
+ * bot's own daemon answers whether the run's initiator may operate it in the
+ * run's chat ({@link WORKFLOW_WORKING_DIR_OPERATOR_ROUTE}), judged with its
+ * own configuration and grants. The initiator's open_id goes only to the main
+ * bot (whose app issued it); any other bot gets their union_id, looked up once
+ * through the main bot's app, and converts it in its own app. No owner, no
+ * union_id, an offline or older daemon (no such route), any failure → false.
+ */
+export interface LiveV3WorkingDirOperatorDeps {
+  /** open_id → union_id through `larkAppId`'s app (default: Lark, strict). */
+  lookupUnionId?(larkAppId: string, openId: string): Promise<V3InitiatorUnionLookup>;
+  /** The bot's online daemon IPC port (default: the daemon registry). */
+  daemonPort?(larkAppId: string): number | undefined;
+  /** POST over trusted host IPC (default: {@link fetchDaemonIpc}). */
+  post?(port: number, path: string, body: WorkflowWorkingDirOperatorRequest): Promise<{ status: number; body: unknown }>;
+  dataDir?: string;
+}
+
+export function createLiveV3WorkingDirOperator(
+  binding: RunChatBinding,
+  deps: LiveV3WorkingDirOperatorDeps = {},
+): (larkAppId: string) => Promise<boolean> {
+  const dataDir = deps.dataDir ?? config.session.dataDir;
+  const lookupUnionId = deps.lookupUnionId ?? resolveUnionIdFromOpenIdStrict;
+  const daemonPort = deps.daemonPort ?? ((appId: string) => findOnlineDaemon(appId, dataDir)?.ipcPort);
+  const post = deps.post ?? (async (port: number, path: string, body: WorkflowWorkingDirOperatorRequest) => {
+    const response = await fetchDaemonIpc(port, path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }, loadDaemonIpcSecret());
+    return { status: response.status, body: await response.json().catch(() => undefined) };
+  });
+  const owner = isWorkflowOpenId(binding.ownerOpenId) ? binding.ownerOpenId : undefined;
+  let union: Promise<string | undefined> | undefined;
+  const unionId = (): Promise<string | undefined> => {
+    union ??= owner
+      ? lookupUnionId(binding.larkAppId, owner)
+        .then((lookup) => (lookup.status === 'resolved' ? lookup.unionId : undefined), () => undefined)
+      : Promise.resolve(undefined);
+    return union;
+  };
+  // The union lookup and the bot's own answer (itself bounded by the same
+  // budget on its side) together; past that it counts as "no".
+  return (larkAppId) => withinOperatorBudget(ask(larkAppId), 2 * WORKFLOW_OPERATOR_BUDGET_MS);
+  async function ask(larkAppId: string): Promise<boolean> {
+    if (!owner) return false;
+    try {
+      const port = daemonPort(larkAppId);
+      if (!port) return false;
+      let request: WorkflowWorkingDirOperatorRequest;
+      if (larkAppId === binding.larkAppId) {
+        request = { chatId: binding.chatId, initiator: { sourceLarkAppId: binding.larkAppId, openId: owner } };
+      } else {
+        // Never the main bot's open_id for another app: only the union_id.
+        const resolved = await unionId();
+        if (!resolved) return false;
+        request = { chatId: binding.chatId, initiator: { sourceLarkAppId: binding.larkAppId, unionId: resolved } };
+      }
+      const response = await post(port, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, request);
+      const body = response.body as { canOperate?: unknown } | undefined;
+      return response.status === 200 && body?.canOperate === true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 /**

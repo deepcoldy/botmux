@@ -89,3 +89,27 @@ const REASON_TEXT: Record<Exclude<BotWorkingDirVerdict, { ok: true }>['reason'],
 export function describeBotWorkingDirRefusal(verdict: Exclude<BotWorkingDirVerdict, { ok: true }>): string {
   return REASON_TEXT[verdict.reason];
 }
+
+/**
+ * A workflow node's Gate-2 directory on its executing bot (design §15.4):
+ * when the run's initiator may operate that bot — may use `/cd` there, so
+ * could move a session anywhere themselves — the directory only has to exist
+ * (as for `/cd` and `/repo <路径>`); otherwise it must lie in the bot's
+ * configured range ({@link checkBotWorkingDir}). Gate-2 and the executing
+ * bot's daemon both decide through this one function.
+ *
+ * `initiatorOperates` is asked only when the range alone refuses an existing
+ * directory (it may need a Lark lookup or daemon IPC), and must answer false
+ * whenever it is unsure. An accepted directory is its realpath, as always.
+ */
+export async function checkNodeWorkingDir(
+  cfg: BotWorkingDirConfig,
+  dir: string,
+  initiatorOperates: () => Promise<boolean>,
+): Promise<BotWorkingDirVerdict> {
+  const verdict = checkBotWorkingDir(cfg, dir);
+  if (verdict.ok || verdict.reason === 'missing' || verdict.reason === 'not_directory') return verdict;
+  let operates = false;
+  try { operates = await initiatorOperates(); } catch { operates = false; }
+  return operates ? { ok: true, path: realWorkingDir(verdict.path) } : verdict;
+}

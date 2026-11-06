@@ -263,9 +263,13 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
     return { root, repos, project, lab, bots };
   }
 
-  async function approveWithDir(dir: string, bots: any[], opts: { switchMode?: 'bot' | 'ephemeral'; nodes?: unknown[] } = {}) {
+  /** `operates`: whether the initiator may operate each bot, as that bot's
+   *  daemon would answer (default: no one operates anything). */
+  async function approveWithDir(dir: string, bots: any[], opts: { switchMode?: 'bot' | 'ephemeral'; nodes?: unknown[]; operates?: Record<string, boolean> } = {}) {
     const { base, runDir } = await dagReadyRun(GROUP_TOPIC, opts.nodes);
     const probeFactory = vi.fn(() => tableProbe({}).probe);
+    const asked: string[] = [];
+    const operatorFor: RunChatBinding[] = [];
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     let error: unknown;
     try {
@@ -276,13 +280,17 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
         multiTopicEnabled: () => true,
         botEligibilityProbe: probeFactory,
         botDisplayName: () => (appId) => `bot(${appId})`,
+        workingDirOperator: (binding) => {
+          operatorFor.push(binding);
+          return async (appId) => { asked.push(appId); return opts.operates?.[appId] === true; };
+        },
       });
     } catch (err) {
       error = err;
     }
     const output = log.mock.calls.flat().join('\n');
     log.mockRestore();
-    return { error, output, runDir, probeFactory, envelope: readRunEnvelope(runDir) };
+    return { error, output, runDir, probeFactory, asked, operatorFor, envelope: readRunEnvelope(runDir) };
   }
 
   const snapshotDirs = (runDir: string) => Object.values(
@@ -353,6 +361,51 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
     expect((result.error as Error).message).toMatch(/--working-dir.*(目录不存在|does not exist)/);
     expect((result.error as Error).message).not.toMatch(/→/);
     expect(result.probeFactory).not.toHaveBeenCalled();
+    expect(result.envelope.kind).toBe('missing');
+  });
+
+  it('a bot the initiator may operate (their own) takes any existing directory, outside its range too', async () => {
+    const d = dirs();
+    // cli_test may only work under lab; the initiator operates it.
+    const result = await approveWithDir(d.project, d.bots, { operates: { cli_test: true } });
+    expect(result.error).toBeUndefined();
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    const real = realpathSync(d.project);
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(real);
+    expect(snapshotDirs(result.runDir)).toEqual([real, real, real]);
+    // Only the bot whose range refuses it is asked, about the run's own initiator.
+    expect(result.asked).toEqual(['cli_test']);
+    expect(result.operatorFor).toEqual([GROUP_TOPIC]);
+  });
+
+  it('a colleague\'s bot (the initiator may not operate it) keeps the range: outside it the approval is refused as before', async () => {
+    const d = dirs();
+    const result = await approveWithDir(d.project, d.bots, { operates: { [MAIN]: true, cli_doc: true, cli_test: false } });
+    expect((result.error as Error).message).toMatch(/verify → bot\(cli_test\)：指定的工作目录不在它配置的目录范围内/);
+    expect((result.error as Error).message).not.toMatch(/inspect →|write →/);
+    expect(result.probeFactory).not.toHaveBeenCalled();
+    expect(result.envelope.kind).toBe('missing');
+  });
+
+  it('a colleague\'s bot takes a directory inside its range without being asked; the main bot\'s own nodes follow the same rule', async () => {
+    const d = dirs();
+    // lab: in cli_test's range only; main and doc are operated by the initiator.
+    const result = await approveWithDir(d.lab, d.bots, { operates: { [MAIN]: true, cli_doc: true } });
+    expect(result.error).toBeUndefined();
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(realpathSync(d.lab));
+    expect(result.asked.sort()).toEqual(['cli_doc', MAIN].sort());
+    // The main bot is not exempt: not operating it, its range decides.
+    const mainNot = await approveWithDir(d.lab, d.bots, { operates: { cli_doc: true } });
+    expect((mainNot.error as Error).message).toMatch(/inspect → bot\(cli_main\)：指定的工作目录不在/);
+    expect((mainNot.error as Error).message).not.toMatch(/write →|verify →/);
+  });
+
+  it('a directory that does not exist is refused even for bots the initiator operates, without asking', async () => {
+    const d = dirs();
+    const result = await approveWithDir(join(d.lab, 'missing'), d.bots, { operates: { [MAIN]: true, cli_doc: true, cli_test: true } });
+    expect((result.error as Error).message).toMatch(/--working-dir.*(目录不存在|does not exist)/);
+    expect(result.asked).toEqual([]);
     expect(result.envelope.kind).toBe('missing');
   });
 
