@@ -545,6 +545,27 @@ export function frozenNodeWorkingDir(envelope: V3RunEnvelope): string | undefine
   return envelope.nodeWorkingDir;
 }
 
+/** Who started a bot-executed run, as the §15.4 working-dir rule asks
+ *  whether they may operate a node's bot: the authenticated initiator's
+ *  open_id — valid for the run's main bot app (`sourceLarkAppId`) ONLY —
+ *  and their union_id when the authorization already froze one. Read-only;
+ *  nothing here is (or may be) frozen for this purpose. */
+export interface V3RunInitiatorRef {
+  sourceLarkAppId: string;
+  openId: string;
+  unionId?: string;
+}
+
+export function runInitiatorRef(envelope: V3RunEnvelope): V3RunInitiatorRef | undefined {
+  const sourceLarkAppId = envelope.chatBinding?.larkAppId;
+  const openId = initiatorOpenIdOf(envelope);
+  if (!sourceLarkAppId || !openId || !openIdSchema.safeParse(openId).success) return undefined;
+  const authorization = envelope.authorization as { initiator?: V3RunInitiator };
+  const frozen = handoffIdentityRecordOf(envelope);
+  const unionId = authorization.initiator?.unionId ?? (frozen && 'unionId' in frozen ? frozen.unionId : undefined);
+  return { sourceLarkAppId, openId, ...(unionId ? { unionId } : {}) };
+}
+
 /** The run's 交接带发起人身份 record (frozen or why not), or undefined when
  *  the switch was off at authorization. */
 export function handoffIdentityRecordOf(envelope: V3RunEnvelope): V3HandoffIdentityRecord | undefined {

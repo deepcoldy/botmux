@@ -105,7 +105,7 @@ import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
-import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
+import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
   loadBotConfigs,
@@ -115,6 +115,7 @@ import {
   getBot,
   getAllBots,
   getBotClient,
+  getBotOpenId,
   createDetachedLarkClient,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
@@ -780,6 +781,7 @@ import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplay
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3MainTopicAvailability, v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon, workflowNodePinnedStart } from './core/workflow-node-daemon.js';
+import { WORKFLOW_INITIATOR_UNION_ROUTE, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, createWorkflowWorkingDirOperatorWiring } from './core/workflow-working-dir-operator.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
 import { isRemoteCliId } from './core/remote-cli-ids.js';
@@ -982,7 +984,7 @@ function startAdminUnionsPublisher(larkAppId: string): void {
   void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
@@ -6969,6 +6971,16 @@ function workflowSelfAppId(): string {
   return selfDaemonLarkAppId;
 }
 
+/** §15.4 operate check of this daemon's bot (design 2026-11-03). */
+// Every import is read only when called (never at module load), as before.
+const workflowWorkingDirOperatorWiring = createWorkflowWorkingDirOperatorWiring({
+  resolveTargetAppOpenId: (appId, unionId) => resolveTargetAppOpenId(appId, unionId),
+  resolveUnionIdFromOpenId: (appId, openId) => resolveUnionIdFromOpenIdStrict(appId, openId),
+  listChatMemberOpenIds: (appId, chatId) => listChatMemberOpenIds(appId, chatId),
+  canRunDaemonCommand: (appId, chatId, openId, unionId, cmd, chatType) => humanCanRunDaemonCommand(appId, chatId, openId, unionId, cmd, chatType),
+  selfLarkAppId: () => workflowSelfAppId(),
+});
+
 const workflowNodeDaemon = createWorkflowNodeDaemon({
   selfLarkAppId: workflowSelfAppId,
   dataDir: () => config.session.dataDir,
@@ -7031,6 +7043,11 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
     try { return getBot(appId).config; } catch { return undefined; }
   },
   daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
+  // §15.4: the initiator operates this bot when they may use /cd in its
+  // topics (the gate a typed /cd passes) and are in the run's chat now, with
+  // their identity converted into this bot's own app first.
+  ...workflowWorkingDirOperatorWiring,
+  currentBots: () => loadBotConfigs(),
   daemonHandlesMainPlacement: (appId) => findOnlineDaemon(appId)?.workflowMainPlacement === 'v1',
   // §5.5 board link: the main session's topic id (`omt_…`), display only.
   mainTopicThreadId: (binding) => {
@@ -9864,6 +9881,34 @@ ipcRoute('POST', WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE, async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
   }
   const result = await workflowNodeDaemon.identityCheckRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Executing bot's daemon ← Gate-2 (approve-dag): may the run's initiator
+// operate this bot here, i.e. use /cd (design §15.4)?
+ipcRoute('POST', WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = await workflowNodeDaemon.workingDirOperatorRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Main bot's daemon ← executing bot's daemon: the initiator's union_id for a
+// run of this bot that pins a working dir (design §15.4).
+ipcRoute('POST', WORKFLOW_INITIATOR_UNION_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = await workflowNodeDaemon.initiatorUnionRoute(raw);
   return jsonRes(res, result.status, result.body);
 });
 
@@ -27388,6 +27433,27 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
 }
 
 /**
+ * 场景① latest-message anchor lookup: the thread root of the newest usable
+ * message in the chat, or undefined (none / API error) so the caller falls back
+ * to reply-mode routing. Never throws.
+ */
+async function resolveLatestMessageJoinAnchor(larkAppId: string, chatId: string): Promise<string | undefined> {
+  try {
+    const messages = await listChatMessages(larkAppId, chatId, GROUP_JOIN_ANCHOR_SCAN_LIMIT);
+    const anchor = pickGroupJoinAnchorMessageId(messages, larkAppId, getBotOpenId(larkAppId));
+    if (anchor) {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚定最新消息 ${anchor.substring(0, 12)} 开话题会话`);
+    } else {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无可锚定的已有消息，回退 reply mode 路由`);
+    }
+    return anchor;
+  } catch (err: any) {
+    logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉取最新消息失败，回退 reply mode 路由：${err?.message ?? err}`);
+    return undefined;
+  }
+}
+
+/**
  * 主动开工 — 场景①: the bot was added to a chat. Auto-start a session when
  * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) at least one of its
  * allowedUsers is a member of the chat (D7). Working dir per D6: the bot's
@@ -27592,7 +27658,16 @@ async function handleBotAdded(
     const opensOwnTopic = externalEventOpensOwnTopic(mode, regularGroupMode);
     let scope: 'thread' | 'chat';
     let anchor: string;
-    if (opensOwnTopic) {
+    // 普通群 autoStartOnGroupJoinAnchor='latest-message'：不发 seed，直接以群里最新
+    // 一条已有消息为根开 thread-scope 会话（例：外部平台先发上下文卡片再拉 bot）。
+    // 找不到可用消息或拉取失败 → 回退到下面的 reply-mode 路由。forcePrompt 路径不读。
+    const latestMessageAnchor = !forced && !opensOwnTopic && botCfg.autoStartOnGroupJoinAnchor === 'latest-message'
+      ? await resolveLatestMessageJoinAnchor(larkAppId, chatId)
+      : undefined;
+    if (latestMessageAnchor) {
+      anchor = latestMessageAnchor;
+      scope = 'thread';
+    } else if (opensOwnTopic) {
       anchor = await sendMessage(larkAppId, chatId, joinSeedText, 'text');
       scope = 'thread';
     } else {
@@ -27614,7 +27689,8 @@ async function handleBotAdded(
       return;
     }
     const needsSharedReply = mode === 'group'
-      && regularGroupMode === 'shared';
+      && regularGroupMode === 'shared'
+      && scope === 'chat';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -28892,24 +28968,38 @@ async function handleThreadReplyAdmitted(
 
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
-  let ds = activeSessions.get(runtimeSessionKey);
-  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
-  // A retry / later round handed off into a node topic this bot already has
-  // a session in: the session now reports to the new handoff.
-  if (workflowHandoff && workflowNodeDaemon.isRevoked(workflowHandoff.nonce)) {
+  // Design §15.4: a run approved with --working-dir runs its node in that
+  // directory only if it exists and — unless the initiator may operate this
+  // bot — lies in its configured range as it stands now. Otherwise the node
+  // blocks with the reason — never a silent fall back to the default dir.
+  // The node daemon's one gate decides the directory first (it may wait for
+  // lookups), then reads the session here, re-checks revocation and admits.
+  const workflowGate = workflowHandoff
+    ? await workflowNodeDaemon.admitInboundHandoff({
+      binding: workflowHandoff,
+      handoffMessageId: parsed.messageId,
+      executingLarkAppId: larkAppId,
+      currentSession: () => (effortSessionIsCurrent && !effortSessionIsCurrent()
+        ? 'stale' as const
+        : { current: activeSessions.get(runtimeSessionKey) }),
+      describeSession: ({ current }) => ({
+        ...(current ? { dir: getSessionWorkingDir(current) } : {}),
+        ...(current?.session.workflowNode ? { marker: current.session.workflowNode } : {}),
+      }),
+    })
+    : undefined;
+  if (workflowGate?.kind === 'stale') return;
+  if (workflowGate?.kind === 'revoked') {
     // Stopped after it was recognized above: never start its turn.
     logger.info(`[${larkAppId}] dropped workflow handoff ${parsed.messageId}: revoked before its turn started`);
     markIngressAdmitted(ctx);
     return;
   }
-  // Design §15.4: a run approved with --working-dir runs its node only inside
-  // this bot's configured directory range as it stands now. Out of range, the
-  // node blocks with the reason — never a silent fall back to the default dir.
-  const workflowAdmission = workflowHandoff
-    ? workflowNodeDaemon.admitInbound(
-      workflowHandoff, parsed.messageId, larkAppId, ds ? getSessionWorkingDir(ds) : undefined, ds?.session.workflowNode,
-    )
-    : undefined;
+  let ds = workflowGate ? workflowGate.session.current : activeSessions.get(runtimeSessionKey);
+  if (!workflowGate && effortSessionIsCurrent && !effortSessionIsCurrent()) return;
+  const workflowAdmission = workflowGate?.admission;
+  // A retry / later round handed off into a node topic this bot already has
+  // a session in: the session now reports to the new handoff (below).
   if (workflowHandoff && workflowAdmission && !workflowAdmission.start) {
     logger.info(`[${larkAppId}] workflow handoff ${parsed.messageId} not started (run ${workflowHandoff.workflow.runId}): ${workflowAdmission.reason}`);
     markIngressAdmitted(ctx);

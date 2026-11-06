@@ -264,11 +264,18 @@ Every node's executing bot must be configured on this machine, already in this c
 <details>
 <summary>Set a working directory: approve-dag --working-dir</summary>
 
-`botmux workflow approve-dag <runId> --working-dir <dir>` makes every node run in the same directory. Since nodes run in each executing bot's own session, the directory must be allowed for **every** executing bot (including the main bot): its default working directory (or Oncall directory), or its repo directories (`workingDir` / `workingDirs`) themselves or anything under them.
+`botmux workflow approve-dag <runId> --working-dir <dir>` makes every node run in the same directory. Nodes run in each executing bot's own session, so **every** executing bot (including the main bot) is checked on its own:
+
+- **The initiator can operate that bot**: they could use `/cd` in its topics right now (e.g. they are its admin) **and are still in the group**. Then the directory only has to exist, as with `/cd` and `/repo <path>`.
+- **The initiator can't operate that bot** (e.g. a colleague's bot, or they have left the group): the directory must be in its allowed range — its default working directory (or Oncall directory), or its repo directories (`workingDir` / `workingDirs`) themselves or anything under them.
+- The executing bot decides "can operate" itself, from its own configuration, grants and group members, after the initiator's identity is converted into that bot's Feishu app.
+- **Can't be confirmed right now** (the identity conversion or member lookup fails or times out, a daemon is offline or too old): it decides like "can't operate" — directories inside the range still work; one outside is refused with "couldn't confirm" and the reason, so retrying later may help.
+
+Other rules:
 
 - The directory must already exist; it isn't created. Before comparing, `~` is expanded, a trailing `/` removed and symlinks resolved, so a symlink inside the allowed range pointing outside doesn't count.
 - If not allowed, approval is refused with "node → bot: reason" for each one. Without the flag, each bot uses its own default directory.
-- The directory is fixed at approval. Before an executing bot opens a node session it checks again against its configuration **at that time**: if the configuration changed and the directory is no longer allowed, the node becomes blocked (it never silently falls back to the default directory). Add the directory to its configuration and click "Retry", or reassign.
+- The directory is fixed at approval. Before an executing bot opens a node session it checks again against its configuration and grants **at that time**: if the directory is gone, or the initiator can no longer operate it and the directory is outside its range, the node becomes blocked (it never silently falls back to the default directory). Add the directory to its configuration and click "Retry", or reassign.
 - New bots brought in by mid-run edits are checked the same way when they open a session.
 - If the node topic already has a session of that bot running in another directory (someone @-mentioned it earlier, or ran `/cd`), the node is blocked too; close that session and retry.
 - If the executing bot's daemon is older than the main bot's and doesn't understand the directory, the node is blocked with "version too old".
