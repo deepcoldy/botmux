@@ -16,12 +16,11 @@ const COOKIE_WRITE_PATHS: ReadonlySet<string> = new Set(['/api/trigger', '/api/a
  * `COOKIE_WRITE_PATHS` 里显式列出的非 sessions 写接口；后者新增时要手工补进名单。
  * takeover / preview-interaction / locate 另有更严的 CSRF 票据校验，这里的拒绝对它们是叠加。
  */
-export function isSessionWriteRequest(method: string | undefined, pathname: string): boolean {
+function isSessionWriteRequest(method: string | undefined, pathname: string): boolean {
   const m = (method ?? 'GET').toUpperCase();
   if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return false;
   return pathname.startsWith('/api/sessions/') || COOKIE_WRITE_PATHS.has(pathname);
 }
-
 
 /** 返回 true 表示放行；false 表示应回 403 `control_origin_forbidden`。 */
 export function sessionWriteOriginAllowed(req: Pick<IncomingMessage, 'method' | 'headers'>, pathname: string): boolean {
