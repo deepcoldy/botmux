@@ -10,6 +10,9 @@ import * as scheduleStore from '../src/services/schedule-store.js';
 import * as preconditionStore from '../src/services/schedule-precondition-store.js';
 import { createTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
 import { executeScheduledTaskWithPrecondition } from '../src/services/schedule-precondition-gate.js';
+import { prepareScheduledRecoveryRun, recordScheduledSessionRun } from '../src/core/scheduled-send.js';
+import type { Session } from '../src/types.js';
+import { isManualScheduledTurn } from '../src/core/scheduled-turn-provenance.js';
 
 const APP = 'cli_authority';
 let dataDir: string;
@@ -26,6 +29,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   scheduler.stopScheduler();
   scheduler.setScheduleAuthorityStore(null);
@@ -53,6 +57,123 @@ describe('scheduler host authority integration', () => {
     id: 'direct01', name: 'poll', schedule: 'every 30m', prompt: 'check',
     workingDir: '/repo', chatId: 'oc_chat', larkAppId: APP,
   };
+
+  it('runs a paused task once, preserves pause, and revokes the exact permit on another pause', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    scheduler.setEnabled(task.id, false);
+    let runId = '';
+    let finish!: () => void;
+    scheduler.setExecuteCallback(async (_task, context) => {
+      runId = context.runId;
+      await new Promise<void>(resolve => { finish = resolve; });
+    });
+    expect(scheduler.runNow(task.id)).toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.getRecord(APP, task.id)).toMatchObject({ state: 'paused', task: {
+      enabled: false, manualRunAuthorization: { runId, turnIds: [] } } });
+    expect(scheduler.admitManualRunTurn(task.id, runId,
+      `schedule:${task.id}:12345678-1234-1234-1234-123456789abc`, APP)).toBe(true);
+    scheduler.setEnabled(task.id, false);
+    expect(scheduler.admitManualRunTurn(task.id, runId,
+      `schedule:${task.id}:aaaaaaaa-1234-1234-1234-123456789abc`, APP)).toBe(false);
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.getRecord(APP, task.id)?.task.enabled).toBe(false);
+    expect(store.getRecord(APP, task.id)?.task.manualRunAuthorization).toBeUndefined();
+  });
+
+  it('queues a paused task for its owning tick without enabling regular scheduling', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    scheduler.setEnabled(task.id, false);
+    const fires: string[] = [];
+    scheduler.setExecuteCallback(async (_task, context) => { fires.push(context.trigger); });
+    scheduler.startScheduler();
+    expect(scheduler.runTaskNow(task.id)).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fires).toEqual(['dashboard']);
+    expect(store.getRecord(APP, task.id)?.state).toBe('paused');
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(fires).toEqual(['dashboard']);
+  });
+
+  it('records late send failure once without consuming a repeat or changing a manual pause', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask({ ...params, repeat: { times: 3 } });
+    let runId = '';
+    scheduler.setExecuteCallback(async (_task, context) => { runId = context.runId; });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    scheduler.setEnabled(task.id, false);
+    scheduler.recordDeliveryFailure(task.id, runId, 'send rejected', APP);
+    scheduler.recordDeliveryFailure(task.id, runId, 'send rejected', APP);
+    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ enabled: false,
+      lastStatus: 'error', lastDeliveryError: 'send rejected', repeat: { completed: 1 },
+      runStats: { dispatched: 1, failed: 1, consecutiveFailures: 1 } });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    const latest = store.getRecord(APP, task.id)?.task;
+    scheduler.recordDeliveryFailure(task.id, 'stale-run', 'old send rejected', APP);
+    expect(store.getRecord(APP, task.id)?.task).toEqual(latest);
+  });
+
+  it('binds only the coordinator-owned continuation to a paused manual run', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    scheduler.setEnabled(task.id, false);
+    let runId = '';
+    scheduler.setExecuteCallback(async (_task, context) => { runId = context.runId; });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    const originalTurn = `schedule:${task.id}:12345678-1234-1234-1234-123456789abc`;
+    const nextTurn = `schedule:${task.id}:aaaaaaaa-1234-1234-1234-123456789abc`;
+    expect(scheduler.admitManualRunTurn(task.id, runId, originalTurn, APP)).toBe(true);
+    const s = { sessionId: 'schedule-recovery', larkAppId: APP, chatId: 'oc_chat' } as Session;
+    recordScheduledSessionRun(s, { taskId: task.id, runId, turnId: originalTurn });
+    s.ordinaryTurnRecovery = { logicalTurnId: originalTurn, currentTurnId: nextTurn,
+      status: 'dispatching', continuationsStarted: 1 };
+    const deps = { getAuthority: (id: string) => store.getRecord(APP, id),
+      admitManualTurn: (id: string, run: string, turn: string) => scheduler.admitManualRunTurn(id, run, turn, APP),
+      persist: vi.fn() };
+    prepareScheduledRecoveryRun(s, 'schedule:direct01:bbbbbbbb-1234-1234-1234-123456789abc', deps);
+    expect(deps.persist).not.toHaveBeenCalled();
+    prepareScheduledRecoveryRun(s, nextTurn, deps);
+    expect(s.scheduledRuns?.[nextTurn]).toEqual({ taskId: task.id, runId, turnId: nextTurn });
+    expect(isManualScheduledTurn(store.getRecord(APP, task.id)!.task, nextTurn)).toBe(true);
+    expect(store.getRecord(APP, task.id)?.state).toBe('paused');
+    scheduler.setEnabled(task.id, false);
+    expect(() => prepareScheduledRecoveryRun(s, nextTurn, deps)).toThrow('scheduled recovery');
+  });
+
+  it('preserves an underlying dispatch error when its delivery failure later gets a receipt', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    let runId = '';
+    scheduler.setExecuteCallback(async (_task, context) => {
+      runId = context.runId;
+      scheduler.recordDeliveryFailure(task.id, runId, 'send timeout', APP);
+      throw new Error('another target dispatch failed');
+    });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    scheduler.recordDeliverySuccess(task.id, runId, APP);
+    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
+      lastError: 'another target dispatch failed', runStats: { failed: 1, consecutiveFailures: 1 } });
+    expect(store.getRecord(APP, task.id)?.task.lastDeliveryError).toBeUndefined();
+  });
+
+  it('retains a send failure that arrives before dispatch completes and still consumes exactly one repeat', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask({ ...params, repeat: { times: 3 } });
+    scheduler.setExecuteCallback(async (_task, context) => {
+      scheduler.recordDeliveryFailure(task.id, context.runId, 'send rejected', APP);
+    });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
+      repeat: { completed: 1 }, runStats: { dispatched: 1, failed: 1 } });
+  });
 
   it('rejects reuse of a deleted direct id without leaving an enabled projection', () => {
     scheduler.addTask(params);

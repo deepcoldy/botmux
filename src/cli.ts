@@ -216,6 +216,7 @@ import { TurnReplyCardStore } from './services/turn-reply-card.js';
 import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from './services/group-context-publication.js';
 import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
+import { feedbackPolicyForScheduledSend, ScheduleSendAttempt, scheduledSessionRun } from './core/scheduled-send.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import {
@@ -4109,6 +4110,8 @@ interface SessionData {
     boundScope?: 'thread' | 'chat';
   };
   deferredScheduleRun?: DeferredScheduleRunData;
+  scheduledRun?: import('./types.js').Session['scheduledRun'];
+  scheduledRuns?: import('./types.js').Session['scheduledRuns'];
   vcMeetingReceiver?: {
     listenerAppId: string;
     meetingId: string;
@@ -11054,6 +11057,23 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const originSession = originSessionId
     ? sessionsForOrigin.get(originSessionId)
     : undefined;
+  let effectiveResponseKind: TurnSendKind = argValue(rest, '--response-kind') === 'final' ? 'final' : 'progress';
+  const scheduledOrigin = authoritativeOriginTurnCtx?.sessionId === originSession?.sessionId
+    ? originSession : undefined;
+  const scheduledOriginRun = scheduledSessionRun(scheduledOrigin, authoritativeOriginTurnCtx?.turnId);
+  const scheduledSendAttempt = authoritativeOriginTurnCtx?.turnId && scheduledOrigin
+    && scheduledOriginRun
+    ? new ScheduleSendAttempt(resolveDataDir(), scheduledOrigin, authoritativeOriginTurnCtx.turnId)
+    : undefined;
+  if (scheduledSendAttempt) {
+    // Once the origin is authenticated, also observe process.exit-based
+    // preflight refusals. Possible provider effects remain unknown, never retried.
+    process.once('exit', code => {
+      if (code === 0 || effectiveResponseKind !== 'final') return;
+      try { scheduledSendAttempt.fail(new Error(`botmux send exited ${code} without a final delivery receipt`)); }
+      catch { /* observability cannot change a send's outcome */ }
+    });
+  }
   const hostRelayRequiresCodexAppLedger = !!trustedRelayCtx
     && process.env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1';
   // The live worker authorizes a Codex App relay only while an exact durable
@@ -11221,7 +11241,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // Only an explicit `final` may opt into feedback controls and indexing;
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
-  let effectiveResponseKind: TurnSendKind = responseKind ?? 'progress';
+  effectiveResponseKind = responseKind ?? 'progress';
   let expectedLinks = argValues(rest, '--expected-link');
   if (rest.some((token, index) => token === '--expected-link='
     || (token === '--expected-link'
@@ -12364,9 +12384,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-  ): Promise<{ messageId: string; replayed: boolean }> => turnSendKey
-    ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch)
-    : { messageId: await dispatch(), replayed: false };
+  ): Promise<{ messageId: string; replayed: boolean }> => {
+    const observedDispatch = (uuid?: string) => {
+      scheduledSendAttempt?.providerRequestStarted();
+      return dispatch(uuid);
+    };
+    return turnSendKey
+      ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, observedDispatch)
+      : { messageId: await observedDispatch(), replayed: false };
+  };
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
     existingTurnPrimary = turnSendKey
@@ -12928,7 +12954,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       feedbackPolicy = undefined;
     }
   }
-  const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  // A reused session's owner or last sender is not this automatic turn's
+  // requester. Only the identity frozen on the host-written run may claim it.
+  const feedbackRequesterSubjectId = scheduledOriginRun
+    ? scheduledOriginRun.requesterSubjectId : replyTargetSenderOpenId ?? s.ownerOpenId;
+  feedbackPolicy = feedbackPolicyForScheduledSend({ policy: feedbackPolicy,
+    requesterSubjectId: feedbackRequesterSubjectId,
+    authenticatedTurnId: authoritativeOriginTurnCtx?.turnId, session: scheduledOrigin });
   const withOncallGroup = (card: string): string => {
     if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
     const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
@@ -12956,6 +12988,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // turn sender is another bot. Only the `requester` audience needs a resolvable
   // human recipient to make its control clickable.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId) {
+    try { scheduledSendAttempt?.fail(new Error('requester identity missing for final feedback')); } catch { /* best-effort */ }
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
@@ -14362,6 +14395,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }));
   } catch (err: any) {
     if (err instanceof TopicSendError) throw err;
+    try { if (effectiveResponseKind === 'final') scheduledSendAttempt?.fail(err); } catch { /* best-effort */ }
     console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }

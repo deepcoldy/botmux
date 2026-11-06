@@ -919,6 +919,7 @@ import {
   parseScheduledTurnId,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
+import { scheduledSessionRun } from './scheduled-send.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
@@ -1256,9 +1257,8 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { turnId: string; reason: string; messageKey: string },
   ) => void;
-  /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
-   * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
-   * adapters use the existing debounced idle edge as a compatibility fallback. */
+  /** A scheduled turn can reconcile delivery (and reclaim hidden sessions)
+   * once settled. Screen-only/remote adapters use the debounced idle edge. */
   onDeferredScheduleTurnSettled?: (
     ds: DaemonSession,
     context: { turnId: string; source: 'terminal' | 'idle'; errorCode?: string },
@@ -18836,7 +18836,8 @@ function setupWorkerHandlers(
           if (
             ds.lastScreenStatus === 'idle'
             && msg.turnId
-            && ds.session.deferredScheduleRun?.turnId === msg.turnId
+            && (ds.session.deferredScheduleRun?.turnId === msg.turnId
+              || scheduledSessionRun(ds.session, msg.turnId))
           ) {
             void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
           }
