@@ -1,4 +1,5 @@
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
+import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
@@ -1403,6 +1404,7 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       <div className="bd-feedback-controls">
         <ToggleRow checked={on} disabled={busy} title={tr('botDefaults.sectionFeedback')} help={null} description={tr('botDefaults.sectionFeedbackDesc')} onChange={checked => { setOn(checked); void save(checked); }} />
         <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} active={props.active} />
+        {props.active && <FeedbackExtensionPanel appId={props.bot.larkAppId} />}
       </div>
       <StatusSpan status={status} />
       {on ? (
@@ -6562,6 +6564,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [chatId, setChatId] = useState(savedForm.chatId);
   const [autoJoin, setAutoJoin] = useState(savedForm.autoJoinNewGroups);
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
+  const [closeHints, setCloseHints] = useState(savedForm.closeHints);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6580,6 +6583,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setChatId(savedForm.chatId); }, [appId, savedForm.chatId]);
   useEffect(() => { setAutoJoin(savedForm.autoJoinNewGroups); }, [appId, savedForm.autoJoinNewGroups]);
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
+  useEffect(() => { setCloseHints(savedForm.closeHints); }, [appId, savedForm.closeHints]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6647,6 +6651,12 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     const previous = autoJoinSolo;
     setAutoJoinSolo(on);
     void save({ ...savedForm, autoJoinSoloGroups: on }, setStatus, () => setAutoJoinSolo(previous));
+  }
+
+  function toggleCloseHints(on: boolean): void {
+    const previous = closeHints;
+    setCloseHints(on);
+    void save({ ...savedForm, closeHints: on }, setStatus, () => setCloseHints(previous));
   }
 
   function changeChat(next: string): void {
@@ -6720,6 +6730,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
             title={tr('botDefaults.stewardAutoJoinSolo')}
             help={tr('botDefaults.stewardAutoJoinSoloHelp')}
             onChange={toggleAutoJoinSolo}
+          />
+          <ToggleRow
+            checked={closeHints}
+            disabled={busy}
+            dataAction="toggle-steward-close-hints"
+            title={tr('botDefaults.stewardCloseHints')}
+            help={tr('botDefaults.stewardCloseHintsHelp')}
+            onChange={toggleCloseHints}
           />
           <div className="bd-row bd-steward-guide">
             <div className="bd-field">

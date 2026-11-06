@@ -2011,10 +2011,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return handleCompletionProposalAction(data, larkAppId, deps.completionProposalDeps);
   }
 
-  if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
+  if (['feedback_custom_action', 'feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
     const { handleSkillFeedbackCardAction } = await import('./skill-feedback-card.js');
     const { getSkillFeedbackStore } = await import('../../services/skill-feedback-store.js');
     const { config } = await import('../../config.js');
+    const { handleFeedbackExtensionCard } = await import('../../services/feedback-extension-host.js');
+    const extension = await handleFeedbackExtensionCard(data, larkAppId, config.session.dataDir);
+    if (extension !== undefined) return extension;
+    if (value?.action === 'feedback_custom_action') return { toast: { type: 'error', content: '动作不存在或已失效' } };
     return handleSkillFeedbackCardAction(data, larkAppId, {
       store: await getSkillFeedbackStore(config.session.dataDir),
       loadBaseCard: async (platformMessageId) => {

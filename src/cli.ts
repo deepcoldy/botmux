@@ -6095,7 +6095,7 @@ async function cmdMaintenance(args: string[]): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -20732,6 +20732,21 @@ switch (command) {
     break;
   }
   case 'feedback': {
+    if (process.argv[3] === 'bind') {
+      const filename = argValue(process.argv.slice(4), '--file');
+      if (!filename) throw new Error('Usage: botmux feedback bind --file binding.json');
+      const binding = JSON.parse(readFileSync(filename, 'utf8'));
+      const { sid, larkAppId } = await resolveSessionAppId(undefined);
+      const currentTurn = resolveSessionContext(resolveDataDir(), sid)?.turnId;
+      if (!currentTurn) throw new Error('feedback_binding_turn_unavailable');
+      const port = resolveDaemonIpcPort(findDaemon(larkAppId)?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+      if (!port) throw new Error('feedback_binding_daemon_unavailable');
+      const response = await postSessionCliIpc(port, sid, 'feedback-bind', { ...binding, expectedTurnId: currentTurn });
+      const body = await response.json() as { ok?: boolean; error?: string };
+      if (!response.ok || body.ok !== true) throw new Error(body.error ?? 'feedback_binding_failed');
+      console.log(JSON.stringify(body));
+      break;
+    }
     if (process.argv[3] !== 'storage') throw new Error('feedback_storage_command_required');
     const { runFeedbackStorageCommand } = await import('./cli/feedback-storage.js');
     process.exitCode = await runFeedbackStorageCommand(process.argv.slice(4), { input: process.stdin, output: process.stdout, error: process.stderr }, resolveDataDir());
