@@ -80,6 +80,15 @@ describe('structured merged execution final delivery', () => {
     expect(structuredFallbackKind(input, undefined, markers, false, true)).toBe('empty_completed');
   });
 
+  it('does not let a folded final stand in for a durable successor attempt on an empty terminal', () => {
+    // A successor turn bound to a durable dispatch attempt keeps its own
+    // recovery owner. A predecessor receipt that carries no attempt must not
+    // give it superseded-final credit, even with an empty normal terminal.
+    const input = { ...gate(mergedTurn(4)), finalText: '', dispatchAttempt: 1 };
+    expect(structuredFallbackKind(input, undefined, [finalMarker()], false, true)).toBe('empty_completed');
+    expect(shouldSuppressBridgeEmit(input, undefined, [finalMarker()], false)).toBe(false);
+  });
+
   it.each(['failed', 'ambiguous'] as const)('does not use a folded final to erase an empty %s terminal', terminalStatus => {
     const input = { ...gate(mergedTurn()), finalText: '', terminalStatus };
     expect(shouldSuppressBridgeEmit(input, undefined, [finalMarker()], false)).toBe(false);
