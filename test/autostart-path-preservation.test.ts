@@ -39,6 +39,7 @@ vi.mock('node:child_process', () => ({
 
 import {
   AUTOSTART_UNIT_ENV,
+  autostartPath,
   bootHookPath,
   enableAutostart,
   mergePathEntries,
@@ -116,6 +117,41 @@ describe('boot hook PATH merge', () => {
     });
     expect(merged).not.toContain('cli-identity');
     expect(merged).toContain('/usr/bin');
+  });
+
+  it('bootHookPath drops fnm per-shell shims but keeps the durable node dir', () => {
+    // fnm gives every shell its own pid/timestamp-stamped shim directory in
+    // tmpfs (/run/user/<uid>/...) or under ~/.local/state; those are dead by
+    // the next boot and unique per probe, so they must never be persisted.
+    const ephemeral = [
+      '/run/user/0/fnm_multishells/1023401_1793928310595/bin',
+      '/home/u/.local/state/fnm_multishells/1082415_1793915768618/bin',
+    ];
+    const durable = '/home/u/.local/share/fnm/node-versions/v22.21.1/installation/bin';
+    const merged = bootHookPath({
+      callerPath: `${ephemeral[0]}:${ephemeral[1]}:${durable}:/usr/bin`,
+      targetPlatform: 'linux',
+    });
+    expect(merged).not.toContain('fnm_multishells');
+    expect(merged).toContain(durable);
+    // Sanitizing is terminal: such an entry must be dropped no matter which
+    // tier (login / existing / caller) brought it in.
+    const fromExisting = bootHookPath({
+      callerPath: '/usr/bin',
+      existingPath: `${ephemeral[0]}:/keep`,
+      targetPlatform: 'linux',
+    });
+    expect(fromExisting).not.toContain('fnm_multishells');
+    expect(fromExisting).toContain('/keep');
+  });
+
+  it('autostartPath strips backslash-form multishell entries too', () => {
+    const out = autostartPath(
+      'C:\\Users\\u\\AppData\\Local\\state\\fnm_multishells\\42_1\\bin;C:\\Windows',
+      'win32',
+    );
+    expect(out).not.toContain('fnm_multishells');
+    expect(out).toContain('C:\\Windows');
   });
 });
 
@@ -199,5 +235,78 @@ describe('refreshAutostart keeps the unit PATH', () => {
     const service = readFileSync(join(dir, 'botmux-watchdog.service'), 'utf-8');
     expect(service).toContain('Environment=PATH=/home/u/.local/bin:/usr/bin');
     expect(service).toContain(`Environment=${AUTOSTART_UNIT_ENV}=1`);
+  });
+
+  it('re-enabling does not shrink a unit that already carried a wider PATH', () => {
+    // enableAutostart path (not just refresh): a pre-existing unit file must
+    // keep entries neither the caller PATH nor the login PATH has.
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    vi.stubEnv('HOME', home);
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+
+    const dir = unitDir();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'botmux.service'),
+      '[Service]\nEnvironment=PATH=/home/u/legacy-tools:/usr/bin\n',
+    );
+
+    enableAutostart(opts({
+      environmentPath: '/usr/bin:/bin',
+      loginShellPath: undefined,
+    }));
+
+    const unit = readFileSync(join(dir, 'botmux.service'), 'utf-8');
+    expect(unitPathFromContent(unit)).toContain('/home/u/legacy-tools');
+  });
+
+  it('refresh keeps a wider PATH already carried by the watchdog service', () => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    vi.stubEnv('HOME', home);
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+
+    const dir = unitDir();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'botmux.service'), '[Service]\nEnvironment=PATH=/usr/bin\n');
+    writeFileSync(
+      join(dir, 'botmux-watchdog.service'),
+      `[Service]\nEnvironment=PATH=/home/u/watchdog-tools:/usr/bin\n`
+      + `Environment=${AUTOSTART_UNIT_ENV}=1\nExecStart=x __watchdog\n`,
+    );
+
+    refreshAutostart(opts({
+      environmentPath: '/usr/bin:/bin',
+      loginShellPath: undefined,
+    }));
+
+    const service = readFileSync(join(dir, 'botmux-watchdog.service'), 'utf-8');
+    expect(unitPathFromContent(service)).toContain('/home/u/watchdog-tools');
+  });
+
+  it('a second refresh with an unchanged login PATH is a no-op', () => {
+    // Regression: per-shell shim dirs (fnm_multishells) made the rendered unit
+    // differ on every probe, so refresh rewrote + reloaded on every run even
+    // when nothing real changed. With those stripped, stable inputs must render
+    // a stable file.
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    vi.stubEnv('HOME', home);
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+
+    const dir = unitDir();
+    mkdirSync(dir, { recursive: true });
+    const unitFile = join(dir, 'botmux.service');
+    writeFileSync(unitFile, '[Service]\nEnvironment=PATH=/usr/bin\n');
+    // The stubbed "login shell" reports the SAME stable PATH on every probe.
+    const stableOpts = () => opts({
+      environmentPath: '/usr/bin:/bin',
+      loginShellPath: '/home/u/.local/bin:/usr/bin',
+    });
+
+    expect(refreshAutostart(stableOpts())).toBe(true);
+    const afterFirst = readFileSync(unitFile, 'utf-8');
+    expect(unitPathFromContent(afterFirst)).toContain('/home/u/.local/bin');
+
+    expect(refreshAutostart(stableOpts())).toBe(false);
+    expect(readFileSync(unitFile, 'utf-8')).toBe(afterFirst);
   });
 });

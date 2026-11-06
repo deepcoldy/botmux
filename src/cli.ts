@@ -81,6 +81,7 @@ import {
   autostartStatus,
   refreshAutostart,
   resolveLoginShellPath,
+  autostartHookFileExists,
   clearWatchdogStopped,
   markWatchdogStopped,
   watchdogStopRequested,
@@ -2925,8 +2926,9 @@ async function startConfiguredFleet(
         // environment of whoever happens to run this command — a CLI session's
         // PATH is narrower than the user's shell and would strip tool dirs
         // from the unit. Resolved here (not in autostart.ts) so the boot-hook
-        // path stays a pure function of its inputs.
-        loginShellPath: resolveLoginShellPath(),
+        // path stays a pure function of its inputs. Skip the (multi-shell,
+        // synchronous) probe when no boot hook exists: refresh would no-op.
+        loginShellPath: autostartHookFileExists() ? resolveLoginShellPath() : undefined,
       })) {
     console.log(`   autostart 主 unit 已同步到当前启动路径`);
   }
@@ -3131,7 +3133,8 @@ async function cmdRestart(): Promise<void> {
       logDir: LOG_DIR,
       // Same reason as the start path: the unit's PATH must come from the
       // user's login shell, not from this process's (possibly narrowed) PATH.
-      loginShellPath: resolveLoginShellPath(),
+      // No boot hook installed → refresh is a no-op, so don't pay the probe.
+      loginShellPath: autostartHookFileExists() ? resolveLoginShellPath() : undefined,
     })) {
       console.log(`autostart 主 unit 已同步到当前启动路径`);
     }
