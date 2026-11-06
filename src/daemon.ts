@@ -30,6 +30,7 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
+import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
@@ -5575,6 +5576,7 @@ function removePidFile(): void {
 const DAEMON_REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 
 interface DaemonDescriptor {
+  readonly larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   botName: string;
   /** CLI adapter id from bots.json, used by dashboard roster before any sessions exist. */
@@ -32535,6 +32537,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     throw new Error('cannot bind daemon descriptor to a process-start identity');
   }
   const desc: DaemonDescriptor = {
+    // Read at serialization time. Inbound traffic does not trigger any disk I/O.
+    get larkConnection() {
+      return cfg.apiOnly ? null : getLarkConnectionHealth(cfg.larkAppId);
+    },
     larkAppId: cfg.larkAppId,
     botName: cfg.displayName ?? cfg.larkAppId,
     cliId: cfg.cliId,

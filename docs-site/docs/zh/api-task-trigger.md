@@ -587,8 +587,11 @@ curl -X POST "http://<host>:7891/api/sessions/:sessionId/close" \
 | 400 | `bad_json` | JSON 写错，或请求体超过 512 KiB |
 | 400 | `target_required` | 缺 `target.botId` |
 | 400 | 其它 | 字段校验不通过（见 §4） |
+| 403 | `control_origin_forbidden` | 浏览器跨站写请求被拒（见下注） |
 | 502 | `daemon_offline` | 转发给 daemon 失败 |
 | 503 | `daemon_offline` | 目标 daemon 没在线 |
+
+> **关于 403 `control_origin_forbidden`**：只有浏览器发起、且带了 `Origin` 或 `Sec-Fetch-Site` 并被判为跨站（含同站不同端口、兄弟子域、`Origin: null`）的非读请求才会收到它，按设计拒绝、重试无用。这道门禁同时作用于本接口和 `/api/sessions/` 下的会话写接口；curl、脚本、CI 等不带这两个来源头的非浏览器调用不受影响，照常调用即可。
 
 **daemon 这一层**
 

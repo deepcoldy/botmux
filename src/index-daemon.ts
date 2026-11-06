@@ -3,12 +3,14 @@ import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
+import { installDaemonFatalErrorGuard } from './utils/daemon-fatal-error.js';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubWorkflowWorkerEnv, stripCompanionStartupEnv, stripDashboardH5Env } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
-// unhandled 'error' and crash the daemon, which has no uncaughtException trap.
+// unhandled 'error' and unnecessarily restart the daemon.
+installDaemonFatalErrorGuard();
 installStdioEpipeGuard();
 
 // Legacy: load .env for global settings (WEB_HOST, WEB_EXTERNAL_HOST, etc.)

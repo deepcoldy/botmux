@@ -1283,6 +1283,21 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
   min-width: 0;
 }
 
+.resource-connections { overflow: auto; max-height: 28rem; }
+.resource-connections table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.resource-connections :is(th, td) {
+  padding: 8px 12px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border-soft);
+}
+.resource-connections thead th { color: var(--muted); }
+.resource-connections tbody tr:last-child > * { border-bottom: none; }
+.resource-ws-state { color: var(--muted); font-family: var(--mono); }
+.resource-ws-state[data-state="connected"] { color: var(--success); }
+.resource-ws-state:is([data-state="connecting"], [data-state="reconnecting"]) { color: var(--warning); }
+.resource-ws-state[data-state="failed"] { color: var(--danger); }
+
 .resource-runtime-list {
   max-height: calc(56px * 8 + 20px);
   overflow-y: auto;
