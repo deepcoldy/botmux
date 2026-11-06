@@ -112,7 +112,7 @@ import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
   strongestTraexModelSettings, strongestTraexPreflightModelSettings, type TraexAutoModelDraft,
 } from './traex-auto-model-preferences.js';
-import { AGENT_SECTIONS } from '../agent-profiles-model.js';
+import { AGENT_SECTIONS, parseStartupCommands, type AgentStartupConfig } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import { fetchStewardGuide } from './decision-board-api.js';
 import {
@@ -788,7 +788,7 @@ export function BotDefaultsPage() {
           .filter(([, id]) => byId.has(id))
           .map(([appId, id]) => {
             const agent = byId.get(id)!;
-            return [appId, { id, name: agent.name, sections: AGENT_SECTIONS.filter(section => agent[section] !== undefined) }];
+            return [appId, { id, name: agent.name, sections: AGENT_SECTIONS.filter(section => agent[section] !== undefined), startup: agent.startup }];
           })));
       }
       setLoadError(nextBots.error);
@@ -2351,8 +2351,25 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
   );
 }
 
-/** 关联到 Agent 的 Bot：哪些分组由该 Agent 统一管理（与 agent-profiles-model 的 AGENT_SECTIONS 同名）。 */
-export type AgentLockInfo = { id: string; name: string; sections: readonly string[] };
+/** 关联到 Agent 的 Bot：哪些分组由该 Agent 统一管理（与 agent-profiles-model 的 AGENT_SECTIONS 同名）。
+ *  `startup` 是 Agent 的启动命令分组原值，用来标出 Bot 实际值与 Agent 不一致。 */
+export type AgentLockInfo = { id: string; name: string; sections: readonly string[]; startup?: AgentStartupConfig };
+
+/**
+ * 启动命令由 Agent 统一、但 Bot 当前生效值（bots.json）与 Agent 不一致时的说明数据。
+ * 锁定区显示的是 Bot 实际生效的值（会话启动 / 重启时重放的就是它），不一致只会在
+ * Agent 页保存、关联或点同步时被改回 Agent 的值——daemon 不会自动对齐。
+ */
+export function startupCommandsAgentDrift(
+  lock: AgentLockInfo | null | undefined,
+  botStartupCommands: string | undefined,
+): { agent: string[]; bot: string[] } | null {
+  if (!lock || !lock.sections.includes('startup') || !lock.startup) return null;
+  const agent = lock.startup.commands;
+  const bot = parseStartupCommands(botStartupCommands ?? '');
+  if (agent.join('\n') === bot.join('\n')) return null;
+  return { agent: [...agent], bot };
+}
 
 /**
  * Agent 托管分组的锁：置灰并整体 inert（不可聚焦、不可点击），点击锁定区域时提示去
@@ -2363,6 +2380,8 @@ export function AgentManagedLock(props: {
   lock?: AgentLockInfo | null;
   section: string;
   quiet?: boolean;
+  /** 锁定区上方的补充说明（如 Bot 值与 Agent 不一致），不进 inert 区。 */
+  notice?: ReactNode;
   children: ReactNode;
 }) {
   const tr = useT();
@@ -2383,6 +2402,7 @@ export function AgentManagedLock(props: {
           <a href="#/agents" onClick={event => event.stopPropagation()}>{tr('botDefaults.agentLinkedOpen')}</a>
         </p>
       )}
+      {props.notice}
       <div className="bd-agent-lock-body" inert>{props.children}</div>
     </div>
   );
@@ -8402,13 +8422,14 @@ function PromptCacheSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   );
 }
 
-function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
+export function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const [value, setValue] = useState(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : '');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => setValue(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : ''), [props.bot.startupCommands]);
+  const drift = startupCommandsAgentDrift(props.lock, props.bot.startupCommands);
 
   async function save(): Promise<void> {
     await saveBotField({
@@ -8427,7 +8448,15 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h3>
-      <AgentManagedLock lock={props.lock} section="startup">
+      <AgentManagedLock lock={props.lock} section="startup" notice={drift ? (
+        <p className="bd-agent-lock-drift" role="note" data-startup-agent-drift="">
+          {tr('botDefaults.startupCommandsAgentDrift', {
+            name: props.lock!.name,
+            bot: drift.bot.length ? drift.bot.join(' / ') : tr('agents.valueNone'),
+            agent: drift.agent.length ? drift.agent.join(' / ') : tr('agents.valueNone'),
+          })}
+        </p>
+      ) : null}>
       <textarea
         data-input="startupCommands"
         rows={3}

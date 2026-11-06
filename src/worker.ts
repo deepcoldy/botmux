@@ -183,6 +183,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
+import { applyRespawnConfigPatch } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
@@ -32348,11 +32349,18 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
       // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
       // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
-      if (msg.model !== undefined && lastInitConfig) {
-        lastInitConfig.model = msg.model === null ? undefined : msg.model;
-      }
-      if (msg.larkToolBinding !== undefined && lastInitConfig) {
-        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      // startupCommands / launchShell 同理，但只在**真的 parked**（下面那条恢复重启
+      // 即将执行）时才收：daemon 的 crashDiagnosticParked 在 worker 内恢复后不会清
+      // （只有 refork 的 ready 才清），之后每条消息都还捎带；而 runStartupCommands
+      // 在当前 spawn 的启动序列里实时读 lastInitConfig.startupCommands——若在启动
+      // 命令待确认时被换掉，正在跑的 CLI 会拿新列表配旧游标，两份都敲不全。
+      const parkedRespawnPending = !backend && crashDiagnosticStopped && !lastInitConfig?.adoptMode;
+      if (lastInitConfig) {
+        applyRespawnConfigPatch(lastInitConfig, {
+          model: msg.model,
+          larkToolBinding: msg.larkToolBinding,
+          ...(parkedRespawnPending ? { startupCommands: msg.startupCommands, launchShell: msg.launchShell } : {}),
+        });
       }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
@@ -32805,45 +32813,33 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
       // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
-      if (msg.updateWorkingDir && lastInitConfig) {
-        lastInitConfig.workingDir = msg.updateWorkingDir;
-      }
-      // per-bot env 热更：daemon 发 restart 时捎带 bots.json `env` 的最新值
-      // （live-worker restart 不 refork，没有 init 重发这条通道），respawn 前
-      // 全量覆盖 lastInitConfig.env —— spawnCli 的 botInjectedEnv(cfg.env, cfg.envPolicy)
-      // 每次 spawn 都重跑，覆盖即在重启出的 CLI 上生效。undefined=不携带（旧
-      // daemon / 兜底）保持快照；null=dashboard 已清空 → 移除快照。与上面的
-      // cwd merge 一样放在合并守卫之前：被合并的重复 restart 也应带走 env
-      // 更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
-      if (msg.env !== undefined && lastInitConfig) {
-        lastInitConfig.env = msg.env === null ? undefined : msg.env;
-      }
-      // Session-env removals + fingerprint ride the same channel and tri-state.
-      if (msg.envUnset !== undefined && lastInitConfig) {
-        lastInitConfig.envUnset = msg.envUnset === null ? undefined : msg.envUnset;
-      }
-      if (msg.envFingerprint !== undefined && lastInitConfig) {
-        lastInitConfig.envFingerprint = msg.envFingerprint;
-      }
-      // model 热更，与 env 同一条通道、同一套三分态。model 不进冻结集合、每次
-      // spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），但 live-worker
-      // restart 不 refork，没有 init 重发这条通道——不覆盖的话，改完模型再重启
-      // 起来的还是快照里的旧模型。undefined=不携带（旧 daemon / 取不到）保持快照；
-      // null=当前不该传模型（bot 未配 / 已清空）→ 移除快照。同样放在合并守卫之前。
-      if (msg.model !== undefined && lastInitConfig) {
-        lastInitConfig.model = msg.model === null ? undefined : msg.model;
-      }
-      if (lastInitConfig && msg.codexRpcInput !== undefined) {
-        lastInitConfig.codexRpcInput = msg.codexRpcInput;
-      }
-      if (lastInitConfig && msg.traexAutoModel !== undefined) {
-        lastInitConfig.traexAutoModel = msg.traexAutoModel ?? undefined;
-        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
-      } else if (lastInitConfig && msg.codexRpcInput !== undefined) {
-        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
-      }
-      if (msg.larkToolBinding !== undefined && lastInitConfig) {
-        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      // 合并顺序约束：以下热更字段都放在合并守卫之前——被合并的重复 restart 也应
+      // 带走更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
+      //  - workingDir：角色切换 cwd-move respawn 先收敛目录（旧桶 transcript 由
+      //    resume 预检 syncClaudeResumeTargetToCwd 接住）。
+      //  - env / envUnset / envFingerprint、model、traexAutoModel、codexRpcInput、
+      //    larkToolBinding、startupCommands、launchShell：live-worker restart 不
+      //    refork，没有 init 重发这条通道；不覆盖的话，改完 Bot 配置再重启起来的
+      //    还是 fork 时的旧快照（startupCommands 曾因此重放旧的 /effort）。
+      //    三分态：undefined = 不携带（旧 daemon / 取不到）保持快照；null = 明确清空。
+      //  语义与不可覆盖项（/rename、per-session 冻结选择）见 core/respawn-config-patch.ts。
+      if (lastInitConfig) {
+        const patched = applyRespawnConfigPatch(lastInitConfig, {
+          workingDir: msg.updateWorkingDir,
+          env: msg.env,
+          envUnset: msg.envUnset,
+          envFingerprint: msg.envFingerprint,
+          model: msg.model,
+          codexRpcInput: msg.codexRpcInput,
+          traexAutoModel: msg.traexAutoModel,
+          larkToolBinding: msg.larkToolBinding,
+          startupCommands: msg.startupCommands,
+          launchShell: msg.launchShell,
+        });
+        if (patched.traexReconfigure) configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
+        if (patched.startupCommandsChanged) {
+          log(`Startup commands updated from current bot config for the next spawn (${lastInitConfig.startupCommands?.length ?? 0} command(s))`);
+        }
       }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
