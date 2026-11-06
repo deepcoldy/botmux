@@ -301,12 +301,20 @@ export function formatHintPrompt(entries: readonly HintNoticeEntry[], locale: Lo
   return `${formatHintNotice(entries, locale)}\n\n${tail}`;
 }
 
-/** 提示回合的 id：`board:<appId>:hint-<n>`。worker 按 `board:` 前缀走看板投递协议；批次号解析（纯数字）不会误认它。 */
-export function formatHintTurnId(larkAppId: string, round: number): string {
-  return `board:${larkAppId}:hint-${round}`;
+let hintTurnSeq = 0;
+
+/** 重置计数器（供测试用）。 */
+export function resetHintTurnSeqForTest(): void {
+  hintTurnSeq = 0;
 }
 
-export function parseHintTurnId(turnId: string): { appId: string; round: number } | null {
-  const m = /^board:([^:]+):hint-(\d{1,16})$/.exec(turnId);
-  return m ? { appId: m[1]!, round: Number(m[2]) } : null;
+/** 提示回合的 id：`board:<appId>:hint-<round>-<seq>`。worker 按 `board:` 前缀走看板投递协议；批次号解析（纯数字）不会误认它。 */
+export function formatHintTurnId(larkAppId: string, round: number, seq?: number): string {
+  const s = seq ?? ++hintTurnSeq;
+  return `board:${larkAppId}:hint-${round}-${s}`;
+}
+
+export function parseHintTurnId(turnId: string): { appId: string; round: number; seq?: number } | null {
+  const m = /^board:([^:]+):hint-(\d{1,16})(?:-(\d+))?$/.exec(turnId);
+  return m ? { appId: m[1]!, round: Number(m[2]), ...(m[3] !== undefined ? { seq: Number(m[3]) } : {}) } : null;
 }
