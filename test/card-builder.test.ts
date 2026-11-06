@@ -2974,6 +2974,30 @@ describe('buildPrivateSnapshotCard', () => {
     expect(md.endsWith(fence)).toBe(true);
   });
 
+  it('caps a run of exactly 9 backticks at 8 in the body, keeping a length-9 fence that closes', () => {
+    const card = build({ screen: 'a\n' + '`'.repeat(9) });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.startsWith('`')).content;
+    const fence = '`'.repeat(9);
+    expect(md.startsWith(fence)).toBe(true);
+    expect(md.endsWith(fence)).toBe(true);
+    // The capped content sits between the two fences; no run of 9+ survives there.
+    const body = md.slice(fence.length, md.length - fence.length);
+    const maxBodyRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+    expect(maxBodyRun).toBe(8);
+  });
+
+  it('stays bounded when a huge backtick run is the final line and truncation keeps its tail', () => {
+    // The run is the LAST line: once truncateContent preserves an oversized
+    // line's tail, dropping the cap would keep ~50k ticks and the two
+    // maxRun+1 fences would push the card past Feishu's size limit.
+    const json = buildPrivateSnapshotCard(
+      'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+      'a\n' + '`'.repeat(200_000),
+      'sess-9', 'om_anchor', 'zh',
+    );
+    expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+  });
+
   it('does not opt private one-shot snapshots into shared PATCH updates', () => {
     expect(build().config.update_multi).toBeUndefined();
   });
