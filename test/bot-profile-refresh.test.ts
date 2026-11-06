@@ -271,6 +271,16 @@ describe('bot profile refresher', () => {
     expect(changes).toEqual([]);
   });
 
+  it('refreshNow works before start() and does not arm the periodic timer', async () => {
+    const feishu = fakeFeishu('Bot');
+    const state: BotProfileState = {};
+    const { refresher } = wire(feishu, state);
+    await expect(refresher.refreshNow('manual')).resolves.toBe(true);
+    expect(state.botName).toBe('Bot');
+    await onePeriod();
+    expect(feishu.fetchProfile).toHaveBeenCalledTimes(1);
+  });
+
   it('stop() cancels further periodic fetches', async () => {
     const feishu = fakeFeishu('Bot');
     const { refresher } = wire(feishu, {});

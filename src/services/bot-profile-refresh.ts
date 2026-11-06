@@ -94,7 +94,10 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
   const holdMs = deps.localWriteHoldMs ?? 2 * intervalMs;
 
   let timer: unknown = null;
-  let stopped = true;
+  /** start() 后、stop() 前：排周期定时器、接受 requestRefresh。 */
+  let running = false;
+  /** stop() 过：在途拉取结果一律丢弃。 */
+  let disposed = false;
   let inflight: Promise<boolean> | null = null;
   let lastAttemptAt = -Infinity;
   let succeededOnce = false;
@@ -104,7 +107,7 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
   let localHoldUntil = -Infinity;
 
   const schedule = (): void => {
-    if (stopped) return;
+    if (!running) return;
     if (timer !== null) clearTimer(timer);
     timer = setTimer(() => {
       timer = null;
@@ -122,7 +125,7 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
       logger.debug(`[${deps.larkAppId}] bot profile refresh (${reason}) failed, keeping cached name: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     }
-    if (stopped) return false;
+    if (disposed) return false;
     const state = deps.state();
     const previousName = state.botName;
     // A local rename/avatar change that happened during this fetch, or so
@@ -163,18 +166,19 @@ export function createBotProfileRefresher(deps: BotProfileRefresherDeps): BotPro
 
   return {
     start() {
-      if (!stopped) return;
-      stopped = false;
+      if (running || disposed) return;
+      running = true;
       void refreshNow('startup');
     },
     stop() {
-      stopped = true;
+      running = false;
+      disposed = true;
       if (timer !== null) clearTimer(timer);
       timer = null;
     },
     refreshNow,
     requestRefresh(reason) {
-      if (stopped || inflight) return;
+      if (!running || inflight) return;
       if (now() - lastAttemptAt < minGapMs) return;
       void refreshNow(reason);
     },
