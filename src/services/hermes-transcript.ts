@@ -158,7 +158,8 @@ export function restoreFilteredHermesUserEvents(
   if (users.length === 0) return events;
   try {
     const proc = spawnSync('python3', ['-c', PASTE_RECOVERY_SCRIPT, dirname(dbPath)], {
-      input: JSON.stringify(users), encoding: 'utf8', maxBuffer: 10 * 1024 * 1024,
+      // Recovered UTF-8 budgets do not count JSON escaping (up to 6x).
+      input: JSON.stringify(users), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
       timeout: 1_000, killSignal: 'SIGKILL', windowsHide: true,
     });
     if (proc.status !== 0 || proc.error) return events;

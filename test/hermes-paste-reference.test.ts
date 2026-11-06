@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, linkSync, chmodSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -289,5 +290,35 @@ describe('Hermes: raw source authorization precedes paste recovery', () => {
     insert(f.db, [{ session: 'native-a', role: 'assistant', content: inner, timestamp: epoch / 1000 + 1, finish: 'stop' }]);
     h.run();
     expect(h.ingest.mock.calls.at(-1)?.[0][0]?.text).toBe(inner);
+  });
+
+  posixTest('restores a budget-valid user when JSON escaping exceeds ten MiB', () => {
+    const f = fixture();
+    const firstPrefix = 'synthetic escaped payload must keep its attribution\n';
+    const first = firstPrefix + '\u0000'.repeat(1024 * 1024 - Buffer.byteLength(firstPrefix));
+    const second = '\u0000'.repeat(1024 * 1024);
+    const expected = first + '\n' + second;
+    // Valid UTF-8 controls cost one recovered byte but six JSON wire bytes.
+    // The original capture cap must not silently discard this valid recovery.
+    expect(Buffer.byteLength(expected)).toBeLessThan(4 * 1024 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(expected))).toBeGreaterThan(10 * 1024 * 1024);
+    const h = worker(f, initialBinding(f), expected);
+    const original = paste(f.home, first, 1) + '\n' + paste(f.home, second, 2);
+    insert(f.db, [{ session: 'native-a', role: 'user', content: original, timestamp: epoch / 1000 }]);
+    h.run();
+    expect(h.scope.hermesBridgeOffset).toBe(2);
+    const recovered = h.ingest.mock.calls.at(-1)?.[0][0]?.text ?? '';
+    // Digest/length keep a regression failure from logging megabytes of data.
+    expect(Buffer.byteLength(recovered)).toBe(Buffer.byteLength(expected));
+    expect(createHash('sha256').update(recovered).digest('hex'))
+      .toBe(createHash('sha256').update(expected).digest('hex'));
+    expect(h.queue.peek()[0]?.started).toBe(true);
+    h.advance(30_000);
+    expect(h.queue.pruneExpiredPreStartHeads()).toEqual([]);
+    insert(f.db, [{ session: 'native-a', role: 'assistant', content: 'synthetic escaped payload completion', timestamp: epoch / 1000 + 30, finish: 'stop' }]);
+    h.run();
+    expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([
+      ['synthetic-turn-a', 'synthetic escaped payload completion'],
+    ]);
   });
 });
