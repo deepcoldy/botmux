@@ -10,6 +10,9 @@
  *
  * Run:  pnpm vitest run test/event-dispatcher.test.ts
  */
+// Must stay the first import: refuses to run outside the data-dir fence (this
+// file fakes node:fs while renameSync stays real).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';

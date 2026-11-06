@@ -11,6 +11,9 @@
  *   - getChildPid resolves through display-message, not list-panes
  *   - captureCurrentScreen issues capture-pane -e -p -S -
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

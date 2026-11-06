@@ -9,6 +9,9 @@ const dataDir = join(fileRoot, 'data');
 mkdirSync(dataDir);
 
 process.env.SESSION_DATA_DIR = dataDir;
+// Proof for test/helpers/require-fenced-data-dir.ts that this fence ran in this
+// process (a temp-looking SESSION_DATA_DIR alone is not proof).
+process.env.__TEST_DATA_DIR_FENCE = '1';
 
 // Fence every unit-test worker inside a disposable home before the test module
 // is imported. Bun caches os.homedir() at process startup, so changing HOME via

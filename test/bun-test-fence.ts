@@ -55,6 +55,9 @@ const fileRoot = mkdtempSync(join(realOs.tmpdir(), 'botmux-bun-unit-'));
 const dataDir = join(fileRoot, 'data');
 mkdirSync(dataDir);
 process.env.SESSION_DATA_DIR = dataDir;
+// Proof for test/helpers/require-fenced-data-dir.ts that this fence ran in this
+// process (a temp-looking SESSION_DATA_DIR alone is not proof).
+process.env.__TEST_DATA_DIR_FENCE = '1';
 
 const fileHome = join(fileRoot, 'home');
 mkdirSync(fileHome);
