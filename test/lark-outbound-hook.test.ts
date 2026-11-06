@@ -305,6 +305,7 @@ describe('Lark send gate retry keeps one dedupe uuid', () => {
     mocks.create.mockReset();
     mocks.reply.mockReset();
     mocks.forward.mockReset();
+    mocks.request.mockReset();
     mocks.emitHookEvent.mockReset();
   });
   afterEach(() => { vi.useRealTimers(); });
@@ -420,6 +421,22 @@ describe('Lark send gate retry keeps one dedupe uuid', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await expect(action).resolves.toBe('om_dm');
     const uuids = mocks.create.mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[1]).toBe(uuids[0]);
+  });
+
+  // requestOptions takes a DIFFERENT wire branch (generic c.request instead of
+  // the SDK create). Deadline DMs (codex notifier, card delivery) all go through
+  // it, so it needs its own retry-reuse anchor.
+  it('sendUserMessage retry on the deadline request branch reuses one uuid', async () => {
+    mocks.request
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_dm_deadline' } });
+    const action = sendUserMessage('app-retry-uuid', 'ou_user', 'hi', 'text', undefined, { timeoutMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_dm_deadline');
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    const uuids = mocks.request.mock.calls.map(c => c[0].data.uuid);
     expect(uuids[0]).toEqual(expect.any(String));
     expect(uuids[1]).toBe(uuids[0]);
   });
