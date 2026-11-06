@@ -223,6 +223,48 @@ describe('source reply IPC', () => {
     expect(changed.status).toBe(200);
     expect(changedPaths).toEqual([REPORT_SOURCE_REPLY_ROUTE, '/api/trigger']);
   });
+  it('replays a settled direct reply after the source session drifts, never via /api/trigger', async () => {
+    // 首投成功且回执已落盘；此后来源会话行消失/漂移（话题关闭、重启恢复期）。
+    // 重试必须只凭持久账本重放 200：不重发卡片，也不得回退 /api/trigger 再启
+    // 一个来源模型回合（否则同一已投递结果被二次处理）。
+    const body = request();
+    expect(await reply(body)).toMatchObject({ status: 200, body: { delivery: 'reply' } });
+    sessions.clear();
+    sessionStore.init(APP);
+    const drifted = sessionStore.getSession('source');
+    expect(drifted).toBeDefined();
+    drifted!.rootMessageId = 'om_other';
+    drifted!.quoteTargetId = 'om_followup';
+    drifted!.reportReplyInputId = 'om_followup';
+    sessionStore.updateSession(drifted!);
+
+    const decision = authorizeReportSessionRelayRequest({
+      trustedHost: true, selfLarkAppId: 'cli_project',
+      session: { sessionId: 'project', larkAppId: 'cli_project', chatId: 'oc_project', receiver: false,
+        scope: 'thread', rootMessageId: 'om_child', liveOrigin: { capability: CAP, turnId: 'om_work' } },
+      raw: { sessionId: 'project', dispatchRoot: 'om_child', content: body.content,
+        originCapability: CAP, status: 'completed' },
+      registry: { om_child: { reportBinding: body.binding } },
+      bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(root)),
+    });
+    expect(decision.ok).toBe(true);
+    if (!decision.ok) throw new Error(decision.error);
+    const paths: string[] = [];
+    const result = await deliverReportSessionRelay({ decision,
+      triggerMeta: { requestId: 'r4', receivedAt: new Date().toISOString() },
+      fetchTarget: async (path, init) => {
+        paths.push(path);
+        return fetch(`http://127.0.0.1:${server.port}${path}`, { ...init,
+          headers: daemonIpcAuthHeaders({ secret: 'test-ipc-secret', port: server.port,
+            method: 'POST', path, headers: init.headers }) });
+      },
+      postProjectUpdate: vi.fn(async () => ({ projectSynced: true })),
+    });
+    expect(result).toMatchObject({ status: 200, body: { delivery: 'reply', publishedMessageId: 'om_reply' } });
+    expect(paths).toEqual([REPORT_SOURCE_REPLY_ROUTE]);
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
 });
 
 describe('report publication IPC', () => {

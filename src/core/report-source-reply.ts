@@ -38,16 +38,17 @@ export async function deliverReportSourceReply(raw: unknown, deps: ReplyDependen
     'source-reply', binding.dispatchRoot, binding.targetSessionId, reply.sourceTurnId, content,
   ])).digest('hex');
   const current = () => deps.session(binding.targetSessionId);
-  const validate = () => {
-    const session = current();
-    if (!session || session.chatId !== binding.targetChatId || session.rootMessageId !== reply.rootMessageId) {
-      throw new Error('report_reply_source_changed');
-    }
-  };
+  // Live-state checks belong ONLY to the first write: beforeFirstPublication
+  // runs them before the pending journal is created, and publish's beforeWrite
+  // rechecks at the provider boundary. A settled receipt replay or a pending
+  // outcome must never see this check — deliverPublishedReport short-circuits
+  // both before validate(), and post-publish reference recovery failing must
+  // surface as a non-switching error, not as "proven unsent".
   const beforeWrite = () => {
-    validate();
-    if (current()?.status !== 'active' || current()?.quoteTargetId !== reply.sourceTurnId
-      || current()?.reportReplyInputId !== reply.sourceTurnId) {
+    const session = current();
+    if (!session || session.chatId !== binding.targetChatId || session.rootMessageId !== reply.rootMessageId
+      || session.status !== 'active' || session.quoteTargetId !== reply.sourceTurnId
+      || session.reportReplyInputId !== reply.sourceTurnId) {
       const error = new Error('report_reply_source_changed');
       error.name = 'ReportReplySourceChangedError';
       throw error;
@@ -56,7 +57,7 @@ export async function deliverReportSourceReply(raw: unknown, deps: ReplyDependen
   try {
     const delivered = await deliverPublishedReport({
       dataDir: deps.dataDir, key, cardJson: buildMarkdownCard(content, undefined, ''),
-      chatId: binding.targetChatId!, delivery: 'publish', validate,
+      chatId: binding.targetChatId!, delivery: 'publish', validate: () => {},
       beforeFirstPublication: beforeWrite,
       publish: uuid => deps.publish(content, { sessionId: binding.targetSessionId,
         chatId: binding.targetChatId!, rootMessageId: reply.rootMessageId, uuid, beforeWrite }),

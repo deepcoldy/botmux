@@ -56,7 +56,6 @@ export async function deliverPublishedReport(input: {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${input.key}.json`);
   return withFileLock(path, async () => {
-    input.validate();
     let saved: Journal | undefined;
     try {
       saved = JSON.parse(readFileSync(path, 'utf8'));
@@ -67,10 +66,17 @@ export async function deliverPublishedReport(input: {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
+    // A settled receipt replays as-is and a pending outcome stays unknown.
+    // Neither branch writes to the provider or starts another turn, so they must
+    // not depend on live session state: running validate() here would turn a
+    // retry after the source session drifted into a false "proven unsent"
+    // signal, letting callers repost or switch sinks despite a message that may
+    // already exist. The turn-validity gate below covers only real writes.
     if (saved?.response) return saved.response;
     if (saved?.publication === 'pending') {
       return { status: 409, body: { ok: false, error: 'report_publication_unknown', deliveryKey: input.key } };
     }
+    input.validate();
     if (!saved) {
       input.beforeFirstPublication?.();
       saved = { version: 1, key: input.key, receivedAt: new Date().toISOString(), publication: 'pending' };

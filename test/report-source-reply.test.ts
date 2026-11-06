@@ -121,6 +121,74 @@ describe('source topic result delivery', () => {
   });
 });
 
+describe('source reply retry after the source session drifts', () => {
+  // The message may already exist in the source topic while the source session
+  // row is gone/changed (topic closed, daemon restart, pointers advanced). A
+  // retry must judge by the durable journal, never by live session state:
+  // replay a settled receipt, keep an unknown outcome, and turn reference
+  // recovery failure into a plain 502 — never a "proven unsent" 409 that would
+  // make the relay layer start another source model turn with the same result.
+  function driftFixture() {
+    const f = fixture();
+    let session: typeof f.session | undefined = f.session;
+    let rememberFails = false;
+    let publishLosesResponse = false;
+    const deps = {
+      ...f.deps,
+      session: () => session,
+      publish: async (content: string) => {
+        f.posted.push(content);
+        if (publishLosesResponse) throw new Error('response lost');
+        return 'om_answer';
+      },
+      remember: async (reference: { messageId: string; dispatchRoot: string }) => {
+        if (!session) throw new Error('session row is gone');
+        if (rememberFails) throw new Error('store unavailable');
+        f.references.push(reference);
+      },
+    };
+    return {
+      request: f.request, deps, posted: f.posted, references: f.references,
+      drift() { session = undefined; },
+      failRemember() { rememberFails = true; },
+      losePublishResponse() { publishLosesResponse = true; },
+    };
+  }
+
+  it('replays a settled receipt after the session disappears without resending or a model-turn 409', async () => {
+    const f = driftFixture();
+    expect((await deliverReportSourceReply(f.request, f.deps)).status).toBe(200);
+    f.drift();
+    const retry = await deliverReportSourceReply(f.request, f.deps);
+    expect(retry).toMatchObject({ status: 200, body: { publishedMessageId: 'om_answer' } });
+    expect(f.posted).toHaveLength(1);
+  });
+
+  it('keeps post-publication reference recovery at the direct sink as 502 when the session row is gone', async () => {
+    const f = driftFixture();
+    f.failRemember();
+    expect((await deliverReportSourceReply(f.request, f.deps)).status).toBe(502);
+    expect(f.posted).toHaveLength(1);
+    f.drift();
+    const retry = await deliverReportSourceReply(f.request, f.deps);
+    expect(retry.status).toBe(502);
+    expect(retry.body.error).not.toBe('report_reply_source_changed');
+    expect(retry.body.publishedMessageId).toBe('om_answer');
+    expect(f.posted).toHaveLength(1);
+  });
+
+  it('keeps a pending (unknown) journal unknown after drift instead of reporting proven-unsent', async () => {
+    const f = driftFixture();
+    f.losePublishResponse();
+    expect((await deliverReportSourceReply(f.request, f.deps)).status).toBe(502);
+    expect(f.posted).toHaveLength(1);
+    f.drift();
+    const retry = await deliverReportSourceReply(f.request, f.deps);
+    expect(retry).toMatchObject({ status: 409, body: { error: 'report_publication_unknown' } });
+    expect(f.posted).toHaveLength(1);
+  });
+});
+
 describe('report reply reference list', () => {
   const ref = (messageId: string) => ({ messageId, dispatchRoot: `om_${messageId}` });
   it('appends new references and reports the change', () => {
