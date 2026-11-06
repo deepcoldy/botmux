@@ -20629,45 +20629,50 @@ switch (command) {
   }
   case 'workflow': {
     const wfSub = process.argv[3] ?? '';
-    if (wfSub === 'cancel') {
-      // Durable v3 run cancellation. The v2 runtime is retired.
-      await cmdWorkflowCancelV3(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'start') {
-      // `botmux workflow start <runId>` — kick a daemon-driven v3 run (so
-      // humanGate posts approval cards).  Needs a live daemon; findDaemon is
-      // cli.ts-local so this case handles it instead of cmdWorkflow.
-      await cmdWorkflowStart(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'retry') {
-      // v3 blocked-node retry; the former v2 `resume` verb is retired.
-      await cmdWorkflowRetry(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'grant') {
-      // v3 exhausted-loop grant (+1 iteration).
-      await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'status') {
-      // v3 runtime flow status for the main bot (design §13.1).
-      await cmdWorkflowStatusV3(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'edit') {
-      // v3 runtime flow edit (design §13.2).
-      await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'ask-human') {
-      // v3: the main bot hands a node to a human (design §13.6).
-      await cmdWorkflowAskHuman(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    const { cmdWorkflow } = await import('./cli/workflow.js');
-    await cmdWorkflow(wfSub, process.argv.slice(4));
+    // A deliberate refusal prints its message only (no stack): the main bot
+    // relays this output to the chat.
+    const { runWorkflowCliCommand } = await import('./cli/workflow.js');
+    await runWorkflowCliCommand(async () => {
+      if (wfSub === 'cancel') {
+        // Durable v3 run cancellation. The v2 runtime is retired.
+        await cmdWorkflowCancelV3(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'start') {
+        // `botmux workflow start <runId>` — kick a daemon-driven v3 run (so
+        // humanGate posts approval cards).  Needs a live daemon; findDaemon is
+        // cli.ts-local so this case handles it instead of cmdWorkflow.
+        await cmdWorkflowStart(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'retry') {
+        // v3 blocked-node retry; the former v2 `resume` verb is retired.
+        await cmdWorkflowRetry(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'grant') {
+        // v3 exhausted-loop grant (+1 iteration).
+        await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'status') {
+        // v3 runtime flow status for the main bot (design §13.1).
+        await cmdWorkflowStatusV3(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'edit') {
+        // v3 runtime flow edit (design §13.2).
+        await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'ask-human') {
+        // v3: the main bot hands a node to a human (design §13.6).
+        await cmdWorkflowAskHuman(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      const { cmdWorkflow } = await import('./cli/workflow.js');
+      await cmdWorkflow(wfSub, process.argv.slice(4));
+    });
     break;
   }
   case 'template': {
