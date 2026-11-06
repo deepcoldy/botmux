@@ -51,4 +51,16 @@ describe('claude-code buildArgs: lead-only', () => {
     expect(lead.filter(a => a.endsWith('claude-plugin-lead-only'))).toHaveLength(1);
     expect(build({}).args.some(a => a.endsWith('-lead-only'))).toBe(false);
   });
+
+  it('fail closed: when the guard plugin dir cannot be materialised, Bash is disallowed and no guard dir is mounted', async () => {
+    const guard = await import('../src/skills/lead-only-guard.js');
+    const spy = vi.spyOn(guard, 'ensureLeadOnlyPluginDir').mockReturnValue(undefined);
+    try {
+      const { args, disallowed } = build({ leadOnly: true });
+      expect(disallowed).toContain('Bash');
+      expect(args.some(a => a.endsWith('claude-plugin-lead-only'))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
