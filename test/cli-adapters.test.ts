@@ -3,6 +3,10 @@
  *
  * Run:  pnpm vitest run test/cli-adapters.test.ts
  */
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件有用例会写 homedir() 推导的目录（PI_PLUGIN_DIR/extensions、~/.botmux/dsh-question-bridge 等）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，这些写入落在了真实的 ~/.botmux 下。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
@@ -2236,6 +2240,8 @@ describe('pi buildArgs', () => {
   });
 
   it('materializes turn-boundary extension to ~/.botmux/pi-skills/extensions for compiled binaries', () => {
+    // 写入目标 PI_PLUGIN_DIR 在模块加载时由 homedir() 推导：只在它落在本文件的测试围栏里时才写。
+    expect(isInsideDir(PI_PLUGIN_DIR, process.env.__TEST_DATA_DIR_FENCE)).toBe(true);
     const extPath = materializePiTurnBoundaryExtension();
     expect(extPath).toBeTruthy();
     expect(existsSync(extPath!)).toBe(true);
