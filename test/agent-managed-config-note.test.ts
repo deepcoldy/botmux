@@ -10,18 +10,18 @@ import type { AgentProfilesDoc } from '../src/dashboard/agent-profiles-model.js'
 const doc: AgentProfilesDoc = {
   version: 1,
   agents: [
-    { id: 'ag_FeV9dmwSCdJY', name: 'Claude 付费版', startup: { commands: ['/effort xhigh'] }, exec: { cliId: 'claude-code', model: '', reasoningEffort: '', configDir: '' }, createdAt: 1, updatedAt: 1 },
+    { id: 'ag_example0001', name: '示例 Agent', startup: { commands: ['/effort xhigh'] }, exec: { cliId: 'claude-code', model: '', reasoningEffort: '', configDir: '' }, createdAt: 1, updatedAt: 1 },
     { id: 'ag_plain00001', name: '只管目录', workspace: { mode: 'off', workingDir: '', autoWorktree: false }, backend: { backendType: 'tmux' }, createdAt: 1, updatedAt: 1 },
   ],
-  links: { cli_paid: 'ag_FeV9dmwSCdJY', cli_plain: 'ag_plain00001', cli_dangling: 'ag_missing0001' },
+  links: { cli_paid: 'ag_example0001', cli_plain: 'ag_plain00001', cli_dangling: 'ag_missing0001' },
 } as AgentProfilesDoc;
 const read = async () => doc;
 
 describe('agentManagingConfigField', () => {
   it('names the Agent when it manages the section the field belongs to', async () => {
-    expect(await agentManagingConfigField('cli_paid', 'startupCommands', read)).toBe('Claude 付费版');
-    expect(await agentManagingConfigField('cli_paid', 'model', read)).toBe('Claude 付费版');
-    expect(await agentManagingConfigField('cli_paid', 'reasoningEffort', read)).toBe('Claude 付费版');
+    expect(await agentManagingConfigField('cli_paid', 'startupCommands', read)).toBe('示例 Agent');
+    expect(await agentManagingConfigField('cli_paid', 'model', read)).toBe('示例 Agent');
+    expect(await agentManagingConfigField('cli_paid', 'reasoningEffort', read)).toBe('示例 Agent');
     expect(await agentManagingConfigField('cli_plain', 'backendType', read)).toBe('只管目录');
   });
 

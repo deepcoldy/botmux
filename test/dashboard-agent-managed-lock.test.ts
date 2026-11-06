@@ -58,7 +58,7 @@ describe('AgentManagedLock (Bot config sections managed by an Agent)', () => {
 });
 
 describe('startup commands managed by an Agent: show what actually runs', () => {
-  const startupLock = { id: 'ag_claude', name: 'Claude 付费版', sections: ['exec', 'startup'], startup: { commands: ['/effort xhigh'] } };
+  const startupLock = { id: 'ag_claude', name: '示例 Agent', sections: ['exec', 'startup'], startup: { commands: ['/effort xhigh'] } };
 
   function renderStartup(botStartupCommands: string, lockInfo: typeof startupLock | null = startupLock) {
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -93,7 +93,7 @@ describe('startup commands managed by an Agent: show what actually runs', () => 
     const text = textOf(notes[0]!);
     expect(text).toContain('/effort max / /effort ultracode');
     expect(text).toContain('/effort xhigh');
-    expect(text).toContain('Claude 付费版');
+    expect(text).toContain('示例 Agent');
     const lockedBody = r.root.find(node => node.props.className === 'bd-agent-lock-body');
     expect(lockedBody.findAll(node => node.props['data-startup-agent-drift'] === '')).toHaveLength(0);
     expect(lockedBody.findAll(node => node.props['data-input'] === 'startupCommands')).toHaveLength(1);

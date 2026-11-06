@@ -3,7 +3,7 @@
  * restart replays — against a REAL worker (tmux backend + claude-code adapter +
  * runStartupCommands) and a fake Claude Code that records every submit.
  *
- * Incident 2026-11-06 (session 858ca892): the Agent changed the bot's startup
+ * Incident 2026-11-06: an Agent sync changed the bot's startup
  * commands from `/effort max, /effort ultracode` to `/effort xhigh`; the card
  * restart that followed respawned the CLI in place from the worker's fork-time
  * snapshot and replayed the OLD commands.
