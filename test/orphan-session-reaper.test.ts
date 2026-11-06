@@ -99,6 +99,23 @@ describe('classifyOrphanPanes — the ONLY auto-kill is a taken-over bare wrappe
     expect(r.verdicts[0]).toMatchObject({ kill: false, reason: 'lock-held' });
   });
 
+  it('HOST-WIDE lock veto: a lock holder OUTSIDE the pane group/subtree (setsid/reparented live CLI) still blocks the kill', () => {
+    // The pane group is a clean bare wrapper (shell + pipe cat) and its binding
+    // is live on the reachable server. But pid 777 — not in the pgid, not in
+    // the ppid subtree — holds a thread-writer lock: a CLI that escaped via
+    // setsid/double-fork/reparent. The kill predicate must fail closed anyway;
+    // deleting the host-wide veto would approve this SIGHUP.
+    const panes: OrphanPane[] = [{ panePid: 100, sessionName: 'bmx-aaaaaaaa', instanceBinding: 'inst-A' }];
+    const procs = [
+      proc('9000:1:9000:S:tmux', 'tmux: server'),
+      SHELL(100),
+      proc('101:100:100:S:cat', 'cat'),
+      proc('777:1:777:S:codex', 'codex exec'), // escaped, unrelated subtree
+    ];
+    const r = classifyOrphanPanes({ ...base, panes, procs, lockHolderPids: new Set([777]) });
+    expect(r.verdicts[0]).toMatchObject({ kill: false, reason: 'lock-held' });
+  });
+
   it('refuses to signal a pane group containing another-uid process', () => {
     const panes: OrphanPane[] = [{ panePid: 100, sessionName: 'bmx-aaaaaaaa', instanceBinding: 'inst-A' }];
     const procs = [SHELL(100), proc('101:100:100:S:bash', 'bash', 0 /* root */)];

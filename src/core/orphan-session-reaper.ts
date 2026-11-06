@@ -299,13 +299,17 @@ export function classifyOrphanPanes(inputs: ReapInputs): ReapResult {
 }
 
 /**
- * Linux: pids holding a codex/traex thread-writer lock, from TWO joined sources:
- *   - /proc/locks FLOCK and POSIX ADVISORY WRITE rows (holder pid = field 5);
- *   - /proc/<pid>/fd readlinks matching …/thread-writer-locks/<uuid>.lock
- *     (catches deleted locks and any lock type).
- * Returns null when enumeration is incomplete (unreadable /proc), so callers
- * fail closed. uid-scoped reads that EPERM do not appear; the caller treats a
- * partial table as report-only.
+ * Linux: pids holding a codex/traex thread-writer lock, by readlink-ing every
+ * `/proc/<pid>/fd` and matching `…/thread-writer-locks/<uuid>.lock` (including
+ * the ` (deleted)` suffix). This single source is authoritative: it is
+ * path-specific (a /proc/locks WRITE row alone cannot be attributed to a lock
+ * PATH — POSIX/flock locks carry no name), it catches deleted-but-held files,
+ * and every POSIX/flock holder necessarily has the file open on some fd, so
+ * the fd scan cannot miss a live holder.
+ *
+ * Returns null when enumeration is incomplete (unreadable /proc or an EPERM/
+ * EACCES fd boundary), so callers fail closed. A process that vanishes mid-scan
+ * (ENOENT/ESRCH) is benign.
  */
 export function enumerateThreadLockHolders(): Set<number> | null {
   if (process.platform !== 'linux') return null;
@@ -313,30 +317,7 @@ export function enumerateThreadLockHolders(): Set<number> | null {
   let entries: string[];
   try { entries = readdirSync('/proc'); } catch { return null; }
 
-  // Source 1: /proc/locks (FLOCK + POSIX write holders).
-  try {
-    const locks = readFileSync('/proc/locks', 'utf8').split('\n');
-    for (const line of locks) {
-      const c = line.trim().split(/\s+/);
-      // id: TYPE KIND ACCESS MODE pid major:minor:inode start end
-      if (c.length < 6) continue;
-      const type = c[1]?.toUpperCase();
-      const access = c[3]?.toUpperCase();
-      const holder = Number(c[4]);
-      if ((type === 'FLOCK' || type === 'POSIX') && access === 'WRITE' && Number.isInteger(holder) && holder > 0) {
-        // /proc/locks alone is not path-specific; resolve inode→path via fd
-        // below. Keep the pid only if one of its fds resolves to a lock path.
-        holders.add(holder); // candidate; filtered against fd paths next
-      }
-    }
-  } catch { return null; }
-
-  // Source 2: fd readlink (authoritative for path + catches deleted files).
-  // A process that vanishes mid-scan (ENOENT/ESRCH) is benign; an EPERM/
-  // EACCES boundary means we could be HIDING a holder (root/setuid), so the
-  // whole lock census is unreadable → caller fails closed and signals nothing.
   let sawAnyProc = false;
-  const fdHolders = new Set<number>();
   const isBenignExit = (err: unknown): boolean => {
     const code = (err as { code?: string } | null)?.code;
     return code === 'ENOENT' || code === 'ESRCH';
@@ -353,17 +334,13 @@ export function enumerateThreadLockHolders(): Set<number> | null {
       try { target = readlinkSync(`/proc/${e}/fd/${fd}`); }
       catch (err) { if (!isBenignExit(err)) return null; continue; }
       if (/[\\/]thread-writer-locks[\\/][0-9a-fA-F-]{36}\.lock(?: \(deleted\))?$/i.test(target)) {
-        fdHolders.add(pid);
+        holders.add(pid);
         break;
       }
     }
   }
   if (!sawAnyProc) return null;
-  // fd paths are the specific, correct signal — use them directly. The
-  // /proc/locks WRITE-holder set computed above is cross-checked by the caller
-  // against the plan (same pids); keeping both sources consistent is what lets
-  // a POSIX lockf-only holder not be mistaken for a thread-lock holder.
-  return fdHolders;
+  return holders;
 }
 
 /** uid of a process from /proc/<pid>/status's Uid line. null if unreadable. */

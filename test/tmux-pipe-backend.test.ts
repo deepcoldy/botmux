@@ -3137,4 +3137,41 @@ describe('TmuxPipeBackend anti-fork gate wiring', () => {
       rmSpy.mockRestore();
     }
   });
+
+  it('a -N spawn answered "no server running" (owner died in the probe→exec gap) retries and then cold-boots without -N', () => {
+    // "no server running" is a numeric-status, deterministic-looking rejection,
+    // so it is NOT in isRetryableStartupTmuxFailure; the gate-specific retry arm
+    // is the only thing that turns this race into another gate cycle (whose
+    // census then proves a real cold boot) instead of a fatal 会话创建失败.
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const leading: string[][] = [];
+      mockedLeadingArgs
+        .mockImplementationOnce(() => { leading.push(['-N']); return ['-N']; })
+        .mockImplementationOnce(() => { leading.push([]); return []; });
+      let attempts = 0;
+      const attemptArgv: string[][] = [];
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        if (Array.isArray(args) && args.includes('new-session')) {
+          attempts += 1;
+          attemptArgv.push(args as string[]);
+          if (attempts === 1) {
+            throw Object.assign(new Error('no server'), {
+              status: 1, signal: null, stderr: Buffer.from('no server running on /tmp/tmux-0/botmux'),
+            });
+          }
+        }
+        return '' as any;
+      }) as any);
+
+      const be = creatingBackend();
+      expect(() => be.spawn('/bin/echo', [], spawnOpts())).not.toThrow();
+      expect(attempts).toBe(2);
+      expect(attemptArgv[0]!.slice(0, 3)).toEqual(['-N', 'new-session', '-d']);
+      expect(attemptArgv[1]!.slice(0, 2)).toEqual(['new-session', '-d']);
+      expect(leading).toEqual([['-N'], []]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
 });

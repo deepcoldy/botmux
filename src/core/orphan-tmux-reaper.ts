@@ -151,6 +151,13 @@ interface ReaperSeam {
   bootstrap?: (socketName: SocketName, sessionName: string) => boolean;
   /** Remove a bootstrap session previously created on the socket. */
   cleanupBootstrap?: (socketName: SocketName, sessionName: string) => void;
+  /** Kernel listener census for the owner-down SIGUSR1 recovery branch.
+   *  Defaults to the /proc + lsof census in tmux-server-guard; injected by
+   *  tests so the recovery-before-bootstrap branch is exercisable without a
+   *  real tmux server. */
+  listeningServerPids?: (socketPath: string, platform: NodeJS.Platform) => number[] | null;
+  /** SIGUSR1 send used by the recovery branch (defaults to process.kill). */
+  recreateSocket?: (pid: number) => void;
   env?: NodeJS.ProcessEnv;
   uid?: number;
   platform?: NodeJS.Platform;
@@ -597,14 +604,17 @@ export function ensureServerThenReapOrphanTmuxServers(
       // shape: recover the NEWEST botmux listener; older displaced generations
       // are reaped below against the recovered owner.
       if (platform === 'linux') {
-        const liveListeners = listeningServersOnPath(socketPath, platform) ?? [];
+        const censusPids = opts.listeningServerPids ?? listeningServersOnPath;
+        const liveListeners = censusPids(socketPath, platform) ?? [];
         const isBotmux = (pid: number) => {
           const proc = procs.find(p => p.pid === pid);
           return proc ? argvCarriesBotmuxSession(proc.cmd) : false;
         };
         const recoverPid = newestBotmuxListener(liveListeners, isBotmux, procStartTicks);
         if (recoverPid !== null) {
-          const recovered = recoverNewestBotmuxSocket(socketPath, platform, recoverPid, { isBotmuxListener: isBotmux });
+          const recovered = recoverNewestBotmuxSocket(socketPath, platform, recoverPid, {
+            listeningServerPids: censusPids, isBotmuxListener: isBotmux, recreateSocket: opts.recreateSocket,
+          });
           if (recovered) {
             // Give the server a beat to re-bind, then see if it now answers.
             sleep(200);

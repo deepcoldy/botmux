@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   decideBootDirective,
   parseProcNetUnix,
   parseLsofListeners,
   parseLsofListenerResult,
+  recoverNewestBotmuxSocket,
   tmuxSocketPath,
   newestBotmuxListener,
   type TmuxOwnerProbe,
@@ -101,6 +105,17 @@ describe('decideBootDirective', () => {
       .toEqual({ mode: 'recreate-socket', pid: 4101 });
   });
 
+  it('socket file PRESENT + a botmux listener → wait; USR1 may only fire on a provably ENOENT path', () => {
+    // SIGUSR1 first unlinks then binds the path: signalling while a socket file
+    // exists could delete a freshly booted SUCCESSOR's socket. The ENOENT
+    // precondition is what prevents that, so a fingerprinted listener alone
+    // must never be enough.
+    const d = decideBootDirective({
+      ...base, listeners: [4101], filePresent: true, isBotmuxListener: p => p === 4101,
+    });
+    expect(d.mode).toBe('wait');
+  });
+
   it('multi-orphan shape: ENOENT + THREE bmx listeners → recreate the NEWEST', () => {
     const ticks = new Map([[4101, 100], [4202, 200], [4303, 300]]);
     expect(decideBootDirective({
@@ -178,5 +193,72 @@ describe('tmuxSocketPath', () => {
   it('honours TMUX_TMPDIR and default name', () => {
     expect(tmuxSocketPath({ TMUX_TMPDIR: '/t' }, 42, 'botmux')).toBe('/t/tmux-42/botmux');
     expect(tmuxSocketPath({}, 42)).toBe('/tmp/tmux-42/default');
+  });
+});
+
+describe('recoverNewestBotmuxSocket (re-census immediately before SIGUSR1)', () => {
+  const isBotmux = (p: number) => p === 4101 || p === 4202 || p === 4303;
+  const ticks = new Map([[4101, 100], [4202, 200], [4303, 300]]);
+  const seamFor = (census: () => number[] | null) => ({
+    listeningServerPids: () => census(),
+    isBotmuxListener: isBotmux,
+    startTicks: (p: number) => ticks.get(p) ?? null,
+  });
+
+  it('sends USR1 while the path is ENOENT and the pid still listens as the newest bmx server', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guard-recover-'));
+    try {
+      const sock = join(dir, 'sock'); // absent
+      const sent: number[] = [];
+      const ok = recoverNewestBotmuxSocket(sock, 'linux', 4202, {
+        ...seamFor(() => [4101, 4202]),
+        recreateSocket: p => sent.push(p),
+      });
+      expect(ok).toBe(true);
+      expect(sent).toEqual([4202]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('withholds when a successor already (re)created the socket file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guard-recover-'));
+    try {
+      const sock = join(dir, 'sock');
+      writeFileSync(sock, '');
+      const sent: number[] = [];
+      const ok = recoverNewestBotmuxSocket(sock, 'linux', 4202, {
+        ...seamFor(() => [4101, 4202]),
+        recreateSocket: p => sent.push(p),
+      });
+      expect(ok).toBe(false);
+      expect(sent).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('withholds when the expected pid stopped listening before the signal', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guard-recover-'));
+    try {
+      const sock = join(dir, 'sock');
+      const sent: number[] = [];
+      const ok = recoverNewestBotmuxSocket(sock, 'linux', 4202, {
+        ...seamFor(() => [4101]),
+        recreateSocket: p => sent.push(p),
+      });
+      expect(ok).toBe(false);
+      expect(sent).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('withholds when a NEWER botmux generation appeared between decision and signal', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guard-recover-'));
+    try {
+      const sock = join(dir, 'sock');
+      const sent: number[] = [];
+      const ok = recoverNewestBotmuxSocket(sock, 'linux', 4202, {
+        ...seamFor(() => [4101, 4202, 4303]),
+        recreateSocket: p => sent.push(p),
+      });
+      expect(ok).toBe(false);
+      expect(sent).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
