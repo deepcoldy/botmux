@@ -178,6 +178,20 @@ describe('managed schedule frequency update', () => {
       .toMatchObject({ ok: true, task: { nextRunAt: expect.any(String) } });
   });
 
+  it('keeps the first run no later than an until-done deadline', () => {
+    const created = scheduler.addTask({
+      name: 'bounded', schedule: '2026-11-07T10:00', prompt: 'wrap up', workingDir: tempDir,
+      chatId: 'oc_patrol', larkAppId: APP_ID, untilDone: { deadline: '2026-11-08T10:00' },
+    });
+    const before = getTask(created.id, APP_ID)!;
+    expect(applyManagedScheduleUpdate(created.id, APP_ID, { schedule: '2026-11-09T09:00' }))
+      .toEqual({ ok: false, error: 'until_done_deadline_before_first_run' });
+    expect(getTask(created.id, APP_ID)).toEqual(before);
+    // A future time still before the deadline is accepted and reschedules.
+    expect(applyManagedScheduleUpdate(created.id, APP_ID, { schedule: '2026-11-07T18:00' }))
+      .toMatchObject({ ok: true, task: { schedule: '2026-11-07T18:00' } });
+  });
+
   it('rolls the calendar back with the frequency when the precondition rebind fails', () => {
     const before = patrolTask();
     // Losing the protected record between the row write and the rebind makes
@@ -190,6 +204,24 @@ describe('managed schedule frequency update', () => {
     expect(result).toEqual({ ok: false, error: 'schedule_precondition_update_failed' });
     expect(getTask(before.id, APP_ID)).toMatchObject({
       schedule: before.schedule, nextRunAt: before.nextRunAt, calendar: 'cn',
+    });
+  });
+
+  it('restores a pending manual run together with the frequency when the rebind fails', () => {
+    // "Run now" was requested but no tick has claimed it yet. A failed edit
+    // reports that nothing changed, so the manual flag must survive the
+    // frequency rollback instead of silently cancelling that run.
+    const before = patrolTask();
+    updateStoredTask(before.id, { manualRunRequested: true });
+    expect(getTask(before.id, APP_ID)!.manualRunRequested).toBe(true);
+    __setScheduleStoreBeforeRenameTestHook(() => {
+      __setScheduleStoreBeforeRenameTestHook(undefined);
+      rmSync(schedulePreconditionPath(APP_ID, before.id), { force: true });
+    });
+    expect(applyManagedScheduleUpdate(before.id, APP_ID, { schedule: 'every 4h' }))
+      .toEqual({ ok: false, error: 'schedule_precondition_update_failed' });
+    expect(getTask(before.id, APP_ID)).toMatchObject({
+      schedule: before.schedule, nextRunAt: before.nextRunAt, manualRunRequested: true,
     });
   });
 });
