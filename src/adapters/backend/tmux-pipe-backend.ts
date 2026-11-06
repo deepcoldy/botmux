@@ -937,10 +937,32 @@ export class TmuxPipeBackend implements SessionBackend {
    * selectSessionBackend), not the only backend type in the repo.
    */
   pasteText(text: string): boolean {
+    return this.pasteBuffer(text, false);
+  }
+
+  /** Paste framing and Enter are queued in one tmux command batch. Send ESC
+   * markers as literal keys: newer servers sanitize ESC inside buffers.
+   * No separate client call or adapter timer can target a replacement draft. */
+  submitBracketedPaste(text: string): boolean {
+    return this.pasteBuffer(text, true);
+  }
+
+  private pasteBuffer(text: string, submit: boolean): boolean {
     if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
     return this.guardedSend('paste-buffer', () => {
+      // Empty load-buffer creates no buffer: paste-buffer would abort after
+      // the opening marker. Queue the entire empty frame as literal keys.
+      if (submit && text.length === 0) {
+        execFileSync('tmux', [...this.tmuxArgs,
+          'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~\x1b[201~\r'], {
+          stdio: 'ignore',
+          timeout: 5000,
+          env: tmuxEnv(),
+        });
+        return;
+      }
       let loaded = false;
       try {
         execFileSync('tmux', [...this.tmuxArgs, 'load-buffer', '-b', bufferName, '-'], {
@@ -950,7 +972,12 @@ export class TmuxPipeBackend implements SessionBackend {
           env: tmuxEnv(),
         });
         loaded = true;
-        execFileSync('tmux', [...this.tmuxArgs, 'paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', '-p'], {
+        const pasteArgs = ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', submit ? '-r' : '-p'];
+        const commands = submit
+          ? ['send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~', ';',
+            ...pasteArgs, ';', 'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[201~\r']
+          : pasteArgs;
+        execFileSync('tmux', [...this.tmuxArgs, ...commands], {
           stdio: 'ignore',
           timeout: 5000,
           env: tmuxEnv(),

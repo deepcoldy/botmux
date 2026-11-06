@@ -908,6 +908,21 @@ describe('TmuxPipeBackend input addressing', () => {
     expect(pasteArgs).toContain('-p');
   });
 
+  it('submits multiline Codex input and Enter in one tmux command batch', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    expect(be.submitBracketedPaste('line one  \nline two')).toBe(true);
+    const calls = getExecFileCalls();
+    expect(calls).toHaveLength(2);
+    expect((calls[0][2] as any).input).toBe('line one  \nline two');
+    expect(calls[1][1]).toContain('paste-buffer');
+    expect(calls[1][1]).toContain('-r');
+    expect(calls[1][1]).not.toContain('-p');
+    expect((calls[1][1] as string[]).slice(-7)).toEqual([';', 'send-keys', '-t', '0:5.0', '-l', '--', '\x1b[201~\r']);
+    expect(calls[1][1]).toContain('\x1b[200~');
+  });
+
   it('uses a fresh named tmux buffer for each paste', () => {
     const be = new TmuxPipeBackend('0:5.0');
     be.spawn('', [], spawnOpts());
