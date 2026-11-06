@@ -20,6 +20,10 @@ export interface PtyHandle {
   /** Deliver one explicit bracketed-paste frame, preserving embedded newlines.
    * Unlike pasteText, this capability guarantees the boundary markers. */
   sendBracketedPaste?(text: string): void | boolean;
+  /** Deliver bracketed paste plus its submit Enter in ONE backend operation. No
+   * adapter delay or separate transport call may separate them. false/throw is
+   * ambiguous and must never cause an automatic replay. Used by Codex's terminal submit path. */
+  submitBracketedPaste?(text: string): void | boolean;
   /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
   sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**

@@ -21,6 +21,7 @@ import {
 import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
+import { prepareCodexTranscriptInput } from '../../services/codex-transcript-input.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
@@ -477,38 +478,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
+      const blocked = await prepareCodexTranscriptInput(pty);
+      if (blocked) return { submitted: false, failureReason: blocked };
       const terminalSession = await refreshCodexTerminalSession(pty);
-      // Codex's input mode treats every literal \n as Enter. The old path
-      // (`send-keys -l` with the whole multi-line blob) therefore submitted
-      // each line as its own turn — a single Lark message fragmented into
-      // several user messages / "Queued follow-up inputs" in the TUI, and a
-      // literal \t in the content also leaked through as a Tab keystroke.
-      //
-      // Fix: bracketed paste, same as coco.ts. tmux `load-buffer` +
-      // `paste-buffer -d -p` wraps the content in \x1b[200~...\x1b[201~ when
-      // the pane has bracketed paste on (Codex enables it), so embedded \n
-      // stay content and only the trailing Enter after the delay submits.
-      // The old "Codex exits on bracketed paste (parses ESC as abort)" note
-      // was true for a much earlier build; verified on codex 0.134.0 that a
-      // bracketed paste lands the whole multi-line message in the composer
-      // un-submitted, with the process staying alive and \t absorbed cleanly.
-      //
-      // The history.jsonl verification loop below is unchanged: it polls for
-      // the submitted prefix and, if it never appears, surfaces the failure
-      // via the worker's deferred recheck + Lark warning rather than silently
-      // dropping the message.
-      const trySendEnter = (): boolean => {
-        try {
-          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-          else pty.write('\r');
-          return true;
-        } catch {
-          // tmux session is gone (CLI exited mid-write) — bail out cleanly
-          // rather than crashing the worker on an unhandled execFileSync error.
-          return false;
-        }
-      };
-
+      // One frame: Paste is processed before Enter by the native event loop.
+      // Never leave a timer window in which a human can submit/replace the
+      // draft or open backtrack before our delayed Enter. Receipt checks below
+      // are read-only, including after an ambiguous transport result.
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
 
@@ -562,32 +538,15 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           : undefined;
 
       try {
-        if (pty.pasteText) {
-          // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
-          // bracketed-paste markers when the pane has them on (Codex default);
-          // `-d` deletes the buffer after so it doesn't accumulate.
-          pty.pasteText(content);
-        } else {
-          // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write(wrapBracketedPaste(content));
-        }
-      } catch {
-        return { submitted: false };
-      }
-      await delay(200);
-      if (!trySendEnter()) return { submitted: false };
-
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
-        if (match.found) return historyMatchResult(match, cliPid !== undefined);
-        if (!trySendEnter()) return { submitted: false };
-      }
-      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+        if (pty.submitBracketedPaste) pty.submitBracketedPaste(content);
+        else pty.write(wrapBracketedPaste(content) + '\r');
+      } catch { /* The frame may have landed before acknowledgement failed. */ }
+      const match = await waitForHistoryAppend(historyPath, baseByte, content, 3200, acceptSid, proveSid);
       if (match.found) return historyMatchResult(match, cliPid !== undefined);
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
-      // initial prompt) may still append our marker after the retries gave
-      // up, and the worker re-scans on a delay before warning the user.
+      // initial prompt) may still append our marker after the wait expires,
+      // and the worker re-scans on a delay before warning the user.
       const recheck = () => {
         const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid, proveSid);
         return late.found ? historyMatchResult(late, cliPid !== undefined) : false;
