@@ -19101,6 +19101,14 @@ if (__entrySubcommand) {
   await new Promise<never>(() => {});
 }
 
+// Hidden: runtime host for the native Botmux.app shell (stdio JSON protocol,
+// see src/desktop/host/desktop-host.ts). Only the app spawns it.
+if (command === '__desktop-host') {
+  const { runDesktopHost } = await import('./desktop/host/desktop-host.js');
+  await runDesktopHost();
+  process.exit(0);
+}
+
 // Hidden: perform a compiled-binary self-replace and exit. Invoked by
 // `runSelfReplaceBlocking` (src/core/maintenance.ts) so the synchronous
 // maintenance tick / dashboard handler can wait on one child instead of
