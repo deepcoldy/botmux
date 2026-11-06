@@ -64,7 +64,14 @@ describe.skipIf(process.platform === 'win32')('real CLI delayed delivery receipt
         expect(receipt.responseKind).toBe('final');
         expect(receipt.sentAtMs).toBeLessThan(clock.nextInputAt);
       }
-      if (replay) expect(result.stdout).toContain('"replayed":true');
+      expect(String(result.stdout).split('\n').filter(line => line.startsWith('PROVIDER_DELIVERY=')))
+        .toHaveLength(kind === 'text-with-file' ? 2 : 1);
+      if (replay) {
+        expect(result.stdout).toContain('"replayed":true');
+        const outcome = JSON.parse(String(result.stdout).split('\n')
+          .find(line => line.startsWith('REPLAY_RESULT='))!.slice('REPLAY_RESULT='.length));
+        expect(outcome).toEqual({ publisherReplayed: false, loserReplayed: true });
+      }
 
       const queue = new CodexBridgeQueue(() => clock.startedAt);
       for (const [turnId, timestampMs] of [
