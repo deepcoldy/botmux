@@ -306,6 +306,8 @@ export interface DecisionCardDeps {
   locale(): Locale;
   steward(): StewardConfig | undefined;
   links(seq: number): { url?: string; appLink?: string };
+  /** 管家 bot 有没有能认出来的 owner：没有时谁点都会被拒，就不发新卡（与「拉新群带管家」同口径）。 */
+  hasOwner(): boolean;
   /** 发到管家群，返回消息 id。uuid 是飞书的发送去重键（1 小时内同一个只发一条）。 */
   sendCard(chatId: string, cardJson: string, uuid: string): Promise<string>;
   updateCard(messageId: string, cardJson: string): Promise<void>;
@@ -451,14 +453,14 @@ export class DecisionCards {
       if (rec?.messageId) await this.patch(rec, this.render(seq, 'disabled'));
       return;
     }
-    const wantsNew = opts.create && item.state === 'decide';
+    const wantsNew = opts.create && item.state === 'decide' && this.deps.hasOwner();
     if (!rec) {
       if (wantsNew) await this.post(seq, steward.chatId);
       return;
     }
     // 发卡前落的占位：上次没发出去（失败 / 进程死在中间），仍在待拍板就补发，否则丢掉。
     if (!rec.messageId) {
-      if (item.state === 'decide') await this.post(seq, steward.chatId, rec);
+      if (item.state === 'decide' && this.deps.hasOwner()) await this.post(seq, steward.chatId, rec);
       else store.deleteCard(app, seq);
       return;
     }

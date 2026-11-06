@@ -33,6 +33,7 @@ let sendImpl: () => Promise<void>;
 let updated: Array<{ messageId: string; card: any }>;
 let updateImpl: (messageId: string) => Promise<void>;
 let service: DecisionBoardService;
+let owner: string | undefined;
 
 function makeService(): DecisionBoardService {
   return new DecisionBoardService({
@@ -42,7 +43,7 @@ function makeService(): DecisionBoardService {
     locale: () => 'zh',
     brand: () => 'feishu',
     dashboardOrigin: () => 'https://dash.example',
-    ownerOpenId: () => OWNER,
+    ownerOpenId: () => owner,
     ownerName: async () => '主人',
     timeZone: () => 'UTC',
     batchAttachmentsDir: batchId => join(dir, 'attachments', `board-${batchId}`),
@@ -75,6 +76,7 @@ beforeEach(() => {
   updated = [];
   updateImpl = async () => {};
   sendImpl = async () => {};
+  owner = OWNER;
   service = makeService();
 });
 afterEach(() => { setDecisionCardService(undefined); service.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -165,6 +167,16 @@ describe('发卡', () => {
       await addDecide();
       expect(sent).toHaveLength(0);
     }
+  });
+
+  it('管家 bot 认不出 owner 时不发卡（谁点都会被拒）；有了 owner 之后再进入待拍板照常发', async () => {
+    owner = undefined;
+    const seq = await addDecide();
+    expect(sent).toHaveLength(0);
+    owner = OWNER;
+    await service.cli({ action: 'set', ref: String(seq), options: ['A=合', 'B=再等'] }, { sessionId: 's' });
+    await service.cardsIdle();
+    expect(sent).toHaveLength(1);
   });
 
   it('开关默认开，只在关掉时写 decisionCards:false；非布尔拒绝', () => {

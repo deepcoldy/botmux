@@ -257,6 +257,7 @@ export class DecisionBoardService {
         locale: () => this.deps.locale(),
         steward: () => this.deps.steward(),
         links: seq => this.itemLinks(seq),
+        hasOwner: () => !!this.deps.ownerOpenId(),
         sendCard: (chatId, card, uuid) => sink.sendCard(chatId, card, uuid),
         updateCard: (messageId, card) => sink.updateCard(messageId, card),
         isCardGone: error => sink.isCardGone(error),
