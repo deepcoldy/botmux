@@ -503,6 +503,80 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     }
     expect(exists).toBe(false);
   });
+
+  // 2026-11-06: corpses left behind by a tmux server crash. Launch selection
+  // reads the corpse as 'missing', so the next generation CREATES the session —
+  // and every new-session failed with "duplicate session: bmx-…" until someone
+  // removed the corpse by hand.
+  it('a fresh launch onto a corpse\'s name reaps the corpse and starts a live session', async () => {
+    const corpsePanePid = String(tmux('display-message', '-p', '-t', 'bmx-corpse', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    try {
+      backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+        cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+      });
+      const pane = String(tmux('display-message', '-p', '-t', 'bmx-corpse', '#{pane_dead}:#{pane_pid}').stdout).trim();
+      const [dead, panePid] = pane.split(':');
+      expect(dead).toBe('0');
+      expect(panePid).not.toBe(corpsePanePid);
+      // The neighbour was never touched.
+      expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_dead}').stdout).trim()).toBe('0');
+    } finally {
+      backend.kill();
+    }
+  });
+
+  // Only a session whose panes are ALL dead may be reaped: a live one keeps
+  // both its pane and the original error.
+  it('a fresh launch onto a LIVE session\'s name still fails and leaves that session alone', () => {
+    const livePanePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-live-one', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_dead}:#{pane_pid}').stdout).trim())
+      .toBe(`0:${livePanePid}`);
+  });
+
+  // The corpse can be reaped by someone else between the reap's two tmux calls.
+  // A bare `-t bmx-corpse` then PREFIX-matches the live `bmx-corpse-neighbour`;
+  // the reap must name its session exactly. The wrapper makes the race certain.
+  it('a corpse that vanishes mid-reap never lets the reap hit a live session sharing its prefix', () => {
+    tmux('new-session', '-d', '-s', 'bmx-corpse-neighbour', 'sleep 60');
+    const neighbour = () => String(tmux('display-message', '-p', '-t', 'bmx-corpse-neighbour', '#{pane_dead}:#{pane_pid}').stdout).trim();
+    const before = neighbour();
+    expect(before.startsWith('0:')).toBe(true);
+    const raceBin = join(dir, 'race-bin');
+    mkdirSync(raceBin);
+    writeFileSync(join(raceBin, 'tmux'), [
+      '#!/bin/sh',
+      `'${realTmux}' -S '${socket}' "$@"`,
+      'rc=$?',
+      `case " $* " in *" list-panes "*) '${realTmux}' -S '${socket}' kill-session -t '=bmx-corpse' >/dev/null 2>&1 ;; esac`,
+      'exit $rc',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    process.env.PATH = `${raceBin}:${process.env.PATH}`;
+    const backend = new TmuxPipeBackend('bmx-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    try {
+      backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+        cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+      });
+    } finally {
+      backend.kill();
+    }
+    expect(neighbour()).toBe(before);
+  });
+
+  it('never reaps a session outside botmux\'s bmx- names, even a corpse', async () => {
+    tmux('new-session', '-d', '-s', 'user-corpse', 'sh -c "exit 5"', ';', 'set-option', '-t', 'user-corpse', 'remain-on-exit', 'on');
+    expect(await waitForDeadPane(tmux, 'user-corpse')).toMatchObject({ dead: true });
+    const backend = new TmuxPipeBackend('user-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    expect(tmux('has-session', '-t', '=user-corpse').status).toBe(0);
+  });
 });
 
 /**
