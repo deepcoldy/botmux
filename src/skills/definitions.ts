@@ -850,6 +850,7 @@ botmux bots list
 
 每个机器人一行，关键字段：
 - \`name\` / \`openId\` / \`isSelf\`
+  - \`name\` 只用于展示：以飞书开放平台当前应用名为准，Bot 在开放平台改名后，它的 daemon 在线时 10–12 分钟内跟着更新，**不要把它存下来当身份**；要引用某个 bot 时用 \`openId\` / \`larkAppId\`。
 - \`larkAppId\`：本机托管的机器人才有（可用作 workflow 的 bot id）
 - \`capability\`：团队能力标签（它擅长什么）——挑选交棒/协作对象的依据
 - \`hasTeamRole\`：是否配置了团队级角色
