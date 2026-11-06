@@ -1173,38 +1173,56 @@ export function reconcileVcMeetingDeliveriesOnBoot(
   const dir = join(dataDir, DIR_NAME);
   if (!existsSync(dir)) return [];
   const affected: VcMeetingAmbiguousReceiptRef[] = [];
-  for (const name of readdirSync(dir)) {
+  // Runs synchronously in daemon startup for every bot, over every meeting file
+  // (filtering by agent happens after the read). One unreadable file must not
+  // abort startup host-wide: skip it — a stale `dispatched` receipt it holds is
+  // still turned ambiguous by the periodic lease sweep
+  // (expireVcMeetingDeliveryLeases) once its lease runs out.
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    logger.warn(`[vc-meeting-delivery-store] boot reconcile skipped: cannot list ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+  for (const name of names) {
     if (!name.endsWith('.json')) continue;
     const fp = join(dir, name);
-    withFileLockSync(fp, () => {
-      const state = readStateFileForMutation(fp);
-      if (!state) return;
-      let changed = false;
-      for (const stream of Object.values(state.streams)) {
-        const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
-        if (projection?.agentAppId !== input.agentAppId) continue;
-        const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
-        if (!active || active.status !== 'dispatched') continue;
-        if (active.receiverBootId === input.receiverBootId) continue;
-        active.status = 'ambiguous';
-        active.ambiguousReplayCount += 1;
-        active.updatedAt = now;
-        stream.updatedAt = now;
-        changed = true;
-        affected.push({
-          listenerAppId: stream.listenerAppId,
-          meetingId: stream.meetingId,
-          memberId: stream.memberId,
-          memberEpoch: stream.memberEpoch,
-          deliveryKey: active.deliveryKey,
-          receiverSessionId: stream.receiverSessionId,
-          workerGeneration: active.workerGeneration,
-          dispatchAttempt: active.dispatchAttempt,
-          ambiguousReplayCount: active.ambiguousReplayCount,
-        });
-      }
-      if (changed) writeStateFile(fp, state, now);
-    });
+    try {
+      withFileLockSync(fp, () => {
+        const state = readStateFileForMutation(fp);
+        if (!state) return;
+        let changed = false;
+        for (const stream of Object.values(state.streams)) {
+          const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
+          if (projection?.agentAppId !== input.agentAppId) continue;
+          const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
+          if (!active || active.status !== 'dispatched') continue;
+          if (active.receiverBootId === input.receiverBootId) continue;
+          active.status = 'ambiguous';
+          active.ambiguousReplayCount += 1;
+          active.updatedAt = now;
+          stream.updatedAt = now;
+          changed = true;
+          affected.push({
+            listenerAppId: stream.listenerAppId,
+            meetingId: stream.meetingId,
+            memberId: stream.memberId,
+            memberEpoch: stream.memberEpoch,
+            deliveryKey: active.deliveryKey,
+            receiverSessionId: stream.receiverSessionId,
+            workerGeneration: active.workerGeneration,
+            dispatchAttempt: active.dispatchAttempt,
+            ambiguousReplayCount: active.ambiguousReplayCount,
+          });
+        }
+        if (changed) writeStateFile(fp, state, now);
+      });
+    } catch (err) {
+      logger.warn(
+        `[vc-meeting-delivery-store] boot reconcile skipped ${fp}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return affected;
 }
