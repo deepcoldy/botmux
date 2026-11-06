@@ -1,5 +1,7 @@
 # 接入点（Webhook）
 
+<video src="img/video-v5-automation.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 接入点让外部系统（监控告警、CI、工单、定时脚本…）通过一个 URL **触发机器人干活**：发一个 HTTP POST，机器人就会在群里读到这条事件并处理。
 
 botmux 不解析各平台的格式，而是把收到的 JSON **原样**交给模型自己读。所以接一个新系统，通常只要把 URL 填进去就行。

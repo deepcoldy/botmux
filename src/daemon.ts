@@ -7,6 +7,8 @@ import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } fro
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
+import { setDecisionCardService } from './core/decision-board/card-action.js';
+import { createPrStateLookup } from './core/decision-board/github-pr-state.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
 import { createBoardChatProbes, sameOwnerAs } from './services/board-chat-probes.js';
 import { resolveDashboardOrigin } from './core/workbench-link.js';
@@ -35,9 +37,12 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
+import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { createBotProfileRefresher } from './services/bot-profile-refresh.js';
+import { lastKnownBotName } from './services/bot-display-name.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
@@ -329,7 +334,15 @@ async function trustedCallerForInboundTurn(
     senderUnionId,
     senderIsBot,
     messageId,
-  }, { resolveMessageSenderUnionId });
+  }, {
+    resolveMessageSenderUnionId,
+    resolveVerifiedUserEmail: async (appId, openId) => {
+      const identity = await resolveVerifiedUserIdentity(appId, openId);
+      if (!identity || identity.type !== 'user' || identity.openId !== openId) return undefined;
+      try { return normalizeActorEmail(identity.email); }
+      catch { return undefined; }
+    },
+  });
   const canonicalBindings = caller?.senderType === 'bot'
     ? await readCanonicalBotActorOwnerBindings(
       getLoadedConfigProvenance() === 'loaded' ? getLoadedConfigPath() : undefined,
@@ -401,6 +414,7 @@ import {
 } from './core/dispatch-output-sink.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
+import { applyManagedScheduleUpdate, readManagedScheduleUpdate } from './core/schedule-managed-update.js';
 import {
   buildUntilDoneRunPrompt,
   isAutoCompletedSchedule,
@@ -478,6 +492,7 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
   buildStreamingCardJson,
+  substituteCardControlFor,
   isResumeRecoveryPlaceholder,
   identityStorageModelForDaemonSession,
   identityDecisionConflict,
@@ -909,6 +924,9 @@ let selfDaemonLarkAppId: string | undefined;
 export function __testOnly_setDaemonLarkAppId(appId: string | undefined): void {
   selfDaemonLarkAppId = appId;
 }
+/** Set once the profile refresher exists: dashboard ✎ rename / avatar writes
+ *  tell it so an in-flight or not-yet-propagated /bot/v3/info read cannot revert them. */
+let noteLocalBotProfileWrite: (() => void) | undefined;
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -964,13 +982,14 @@ function startAdminUnionsPublisher(larkAppId: string): void {
   void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
 import { ListenerCircuitBreaker } from './services/listener-circuit-breaker.js';
 import { pruneBotAttachments } from './core/attachment-prune.js';
-import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { learnFromMentions, getIdentity, resolveSender, resolveVerifiedUserIdentity, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { normalizeActorEmail } from './cli/current-actor.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -4530,6 +4549,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 }
 
@@ -4627,6 +4647,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
   return true;
 }
@@ -4712,6 +4733,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 
   // NO chat notice here.
@@ -5567,6 +5589,7 @@ function removePidFile(): void {
 const DAEMON_REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 
 interface DaemonDescriptor {
+  readonly larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   botName: string;
   /** CLI adapter id from bots.json, used by dashboard roster before any sessions exist. */
@@ -6463,6 +6486,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       previousIdleLabel,
       dshRuntimeForSession(ds),
       resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+      false,
+      substituteCardControlFor(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -7034,6 +7059,7 @@ async function withdrawWorkflowHandoffIdentity(ds: DaemonSession, turnId: string
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 }
 
@@ -9737,9 +9763,6 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (action === 'update' && authority.kind === 'delegated') {
     return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_reauthorization_required' });
   }
-  if (action === 'update' && authority.task.preconditionRef) {
-    return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
-  }
   // A capability-only caller borrows the current human administrator's
   // authority, but the request bytes come from the (untrusted) agent. Keep it
   // to the tasks this conversation could have created: same chat, and a
@@ -9773,29 +9796,17 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     });
   }
   if (action === 'update') {
-    const hasPrompt = typeof body.prompt === 'string' && body.prompt.trim();
-    const hasCalendar = body.calendar !== undefined || body.calendarDayType !== undefined;
-    if (!hasPrompt && !hasCalendar) {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_update' });
-    }
-    if (body.prompt !== undefined && !hasPrompt) {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_prompt' });
-    }
-    if (body.calendar !== undefined && body.calendar !== null && typeof body.calendar !== 'string') {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_calendar' });
-    }
-    if (body.calendarDayType !== undefined
-      && body.calendarDayType !== 'workday' && body.calendarDayType !== 'restday') {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_calendar_day_type' });
-    }
-    const result = scheduler.updateTask(id, {
-      ...(hasPrompt ? { prompt: body.prompt } : {}),
-      ...(body.calendar !== undefined ? { calendar: body.calendar } : {}),
-      ...(body.calendarDayType !== undefined ? { calendarDayType: body.calendarDayType } : {}),
-    });
-    ok = result.ok;
-    error = result.error;
-  } else if (action === 'remove') ok = scheduler.removeTask(id);
+    // Same compound operation as the Dashboard PATCH: a changed schedule is
+    // re-parsed with nextRunAt recomputed from now, and a configured
+    // precondition is kept and rebound to the edited task input.
+    const parsedUpdate = readManagedScheduleUpdate(body);
+    if (!parsedUpdate.ok) return jsonRes(res, 400, { ok: false, error: parsedUpdate.error });
+    const result = applyManagedScheduleUpdate(id, appId, parsedUpdate.updates);
+    return result.ok
+      ? jsonRes(res, 200, { ok: true, task: result.task })
+      : jsonRes(res, 409, { ok: false, error: result.error });
+  }
+  if (action === 'remove') ok = scheduler.removeTask(id);
   else if (action === 'pause') ok = scheduler.disableTask(id);
   else if (action === 'resume') ok = scheduler.enableTask(id);
   else if (action === 'run') {
@@ -32385,6 +32396,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
   );
   process.once('exit', stopFeedbackMaintenanceParticipant);
+  let feedbackExtensionBusy = false;
+  const feedbackExtensionTimer = setInterval(() => {
+    if (feedbackExtensionBusy) return;
+    feedbackExtensionBusy = true;
+    void import('./services/feedback-extension-host.js')
+      .then(module => module.tickFeedbackExtensions(config.session.dataDir, cfg.larkAppId))
+      .catch(error => logger.warn(`[feedback-extension] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { feedbackExtensionBusy = false; });
+  }, 2000);
+  feedbackExtensionTimer.unref();
+  process.once('exit', () => clearInterval(feedbackExtensionTimer));
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -32573,8 +32595,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     throw new Error('cannot bind daemon descriptor to a process-start identity');
   }
   const desc: DaemonDescriptor = {
+    // Read at serialization time. Inbound traffic does not trigger any disk I/O.
+    get larkConnection() {
+      return cfg.apiOnly ? null : getLarkConnectionHealth(cfg.larkAppId);
+    },
     larkAppId: cfg.larkAppId,
-    botName: cfg.displayName ?? cfg.larkAppId,
+    // Until this process's first /bot/v3/info fetch lands, show the last-known
+    // Feishu name (bots-info.json) rather than the raw app id.
+    botName: cfg.displayName ?? lastKnownBotName(cfg.larkAppId, config.session.dataDir) ?? cfg.larkAppId,
     cliId: cfg.cliId,
     botIndex: idx,
     ipcPort,
@@ -32631,6 +32659,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (!r.ok) return r;
     const bot = getBot(cfg.larkAppId);
     bot.botName = newName;
+    noteLocalBotProfileWrite?.();
     const spec = findConfigField('displayName');
     if (spec && bot.config.displayName) {
       // applyConfigField 的 displayName 钩子会顺带触发 refreshBotNameState。
@@ -32644,14 +32673,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 机器人真·改头像（dashboard 档案头头像入口）：开放平台自动化换飞书应用头像并
   // 发布新版本（群内头像跟随已发布版本，同 rename）。成功后用上传返回的 url
   // 同步内存 botAvatarUrl / descriptor / bots-info 让 dashboard 立即换图——该 url
-  // 是飞书 CDN 上的持久资源，与 /bot/v3/info 的 canonical avatar_url 指向同一张图，
-  // 会一直沿用到下次 daemon 重启时 probeBotOpenId 重新拉取（probe 在 botOpenId
-  // 已知时不会重复请求，进程内没有周期性刷新）。
+  // 是飞书 CDN 上的持久资源，与 /bot/v3/info 的 canonical avatar_url 指向同一张图；
+  // 之后由名片刷新器（services/bot-profile-refresh.ts）按周期以 /bot/v3/info 为准校正。
   setBotAvatarChanger(async (image) => {
     const r = await changeBotAvatarOnOpenPlatform(cfg.larkAppId, image, cfg.brand);
     if (!r.ok) return r;
     const bot = getBot(cfg.larkAppId);
     bot.botAvatarUrl = r.avatarUrl;
+    noteLocalBotProfileWrite?.();
     if (desc.botAvatarUrl !== r.avatarUrl) {
       desc.botAvatarUrl = r.avatarUrl;
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
@@ -32836,7 +32865,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onBoardTurnDeliveryFailed(ds, context) {
       if (ds.larkAppId !== cfg.larkAppId) return;
       try {
-        decisionBoard.noteDeliveryFailure(context.turnId, context.reason);
+        decisionBoard.noteDeliveryFailure(context.turnId, context.reason, context.messageKey);
       } catch (err) {
         logger.warn(`[decision-board] noteDeliveryFailure failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -33364,7 +33393,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // bot's config id); the friendly name from /bot/v3/info is wired into the
   // registry descriptor (below) but the IPC server also needs its own copy for
   // SessionRow.botName.
-  setBotName(cfg.displayName ?? cfg.larkAppId);
+  setBotName(cfg.displayName ?? lastKnownBotName(cfg.larkAppId, config.session.dataDir) ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
   // Dashboard workflow drafts of this bot (design 2026-11-03
   // workflow-dashboard-orchestration D2): drafts left 编排中 by the previous
@@ -33837,35 +33866,38 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       bot.botName ||= cfg.displayName ?? cfg.larkAppId;
       logger.info(`[api-only] ${cfg.larkAppId} 以 core-only 模式启动：跳过飞书 open_id 探测 / scope 校验 / WSClient 订阅，仅 HTTP 控制 API 驱动`);
     } else {
-    // Probe bot open_id and persist to bots-info.json. When the friendly
-    // botName comes back from /bot/v3/info, refresh the dashboard descriptor
-    // so the registry shows "Claude" / "Codex" instead of the raw app id.
-    // A custom displayName (bots.json) beats the probed Lark name — the probe
-    // must not overwrite a rename seeded at startup.
-    probeBotOpenId(cfg.larkAppId).then(() => {
-      writeBotInfoFile(config.session.dataDir);
-      const probedName = cfg.displayName ?? bot.botName;
-      const probedAvatar = bot.botAvatarUrl;
-      let descChanged = false;
-      if (probedName && probedName !== desc.botName) {
-        desc.botName = probedName;
-        descChanged = true;
-      }
-      if (probedAvatar && probedAvatar !== desc.botAvatarUrl) {
-        desc.botAvatarUrl = probedAvatar;
-        descChanged = true;
-      }
-      if (descChanged) {
-        try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
-      }
-      // SessionRow.botName 同步换成友好名——否则 dashboard 会话行一直显示
-      // 启动时 seed 的 larkAppId（web 端有注册表映射兜底，这里是根因修复）。
-      if (probedName) setBotName(probedName);
-    }).catch(err => {
-      // Probe runs in background and is retried by the periodic heartbeat;
-      // a single failure here is not actionable. Surface as debug only.
-      logger.debug(`[${cfg.larkAppId}] Bot open_id probe failed (will retry): ${err.message}`);
+    // Feishu name / avatar: /bot/v3/info is the single authoritative source.
+    // The refresher fetches it now (replacing the old one-shot boot probe) and
+    // again every BOT_PROFILE_REFRESH_INTERVAL_MS, plus early when an inbound
+    // @ of this bot carries a different name. Every derived cache —
+    // bots-info.json (other daemons, CLI, dashboard offline rows), the dashboard
+    // descriptor (registry roster → bots.changed SSE) and SessionRow.botName —
+    // is re-derived here, so a rename in the open-platform console shows up
+    // everywhere within one period without a restart. A failed fetch keeps the
+    // last-known name. A custom displayName (bots.json) still wins for display
+    // (effectiveBotDisplayName inside refreshBotNameState).
+    const profileRefresher = createBotProfileRefresher({
+      larkAppId: cfg.larkAppId,
+      fetchProfile: () => fetchBotProfileFromLark(cfg.larkAppId),
+      state: () => getBot(cfg.larkAppId),
+      onChange: () => {
+        // Descriptor / SessionRow first so a failing bots-info write cannot
+        // hold them back; the bots-info error is rethrown so the refresher
+        // re-derives on its next successful fetch.
+        refreshBotNameState();
+        const avatar = getBot(cfg.larkAppId).botAvatarUrl;
+        if (avatar && avatar !== desc.botAvatarUrl) {
+          desc.botAvatarUrl = avatar;
+          try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+        }
+        writeBotInfoFile(config.session.dataDir);
+      },
     });
+    noteLocalBotProfileWrite = () => profileRefresher.noteLocalWrite();
+    setSelfMentionNameObserver((appId) => {
+      if (appId === cfg.larkAppId) profileRefresher.requestRefresh('self-mention name mismatch');
+    });
+    profileRefresher.start();
     } // end !cfg.apiOnly (open_id probe)
 
     // Required-scope check: 启动后 best-effort 校验
@@ -34977,11 +35009,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     })),
     log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
     lookupChat: (chatId, opts) => lookupChatAcrossBots(chatId, boardChatProbes(), { deadline: opts.deadline }),
+    // 管家群里的拍板卡片（steward.decisionCards，默认开）：发卡 / 原地更新，卡已失效时才另发。
+    cards: {
+      sendCard: (chatId, card, uuid) => sendMessage(cfg.larkAppId, chatId, card, 'interactive', uuid),
+      updateCard: (messageId, card) => updateMessage(cfg.larkAppId, messageId, card),
+      isCardGone: error => error instanceof MessageUpdateExpiredError
+        || error instanceof MessageWithdrawnError
+        || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
+    },
+    prState: createPrStateLookup({ log: message => logger.info(message) }),
   });
   setDecisionBoardService(decisionBoard);
+  setDecisionCardService(decisionBoard);
+  // 「自动发现可以关的项」：管家开了这个开关才真正干活（sweepHints 内部判断），没开的 bot 每轮只读一次配置。
+  // 5 分钟一轮：PR 合入后十来分钟内出提示（开着的 PR 每 10 分钟最多查一次，见 github-pr-state.ts），
+  // 复查时间到点后最多晚一轮；不需要更密。
+  const boardHintSweep = setInterval(() => {
+    void decisionBoard.sweepHints().catch(err => logger.warn(`[decision-board] hint sweep failed: ${err?.message ?? err}`));
+  }, 5 * 60_000);
+  boardHintSweep.unref?.();
   // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。
   setTimeout(() => {
-    void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`));
+    void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`))
+      // 补投之后对一遍拍板卡片：补发重启前没发出去的，刷新重启前后变了状态的。
+      .then(() => decisionBoard.reconcileCards())
+      .catch(err => logger.warn(`[decision-board] card reconcile failed: ${err?.message ?? err}`));
   }, 30_000).unref?.();
 
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions

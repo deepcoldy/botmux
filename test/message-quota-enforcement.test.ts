@@ -85,10 +85,15 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
-// 团队拉群（bot 免 /grant 的信任根）。只把 oc_team_group 标成拉群，其余不变。
+// 团队拉群（bot 免 /grant 的信任根）。只把 oc_team_group 登记成旧版联邦团队群
+//（无 platform: 前缀，按群放行），其余不变。
 vi.mock('../src/services/team-groups-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/team-groups-store.js');
-  return { ...actual, isTeamGroupChat: (_dataDir: string, chatId?: string) => chatId === 'oc_team_group' };
+  const bindings = [{ teamId: 'legacy-team', chatId: 'oc_team_group', createdAt: 0 }];
+  return {
+    ...actual,
+    listTeamGroups: (_dataDir: string, teamId?: string) => bindings.filter(b => teamId === undefined || b.teamId === teamId),
+  };
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';

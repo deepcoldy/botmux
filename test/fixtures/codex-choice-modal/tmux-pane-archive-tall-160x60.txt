@@ -1,0 +1,60 @@
+
+  [38;5;75m>_ [1m[39mOpenAI Codex[0;2m[39m[49m (v0.164.0)
+[0m[39m[49m     [2m/tmp/botmux/proj
+
+[0m[39m[49m  [1m[38;5;211mTip:[0m[39m[49m Use [1m[38;5;211m/statusline[0m[39m[49m to configure which items appear in the status line.
+
+                                              [1mArchive this session?[0m[39m[49m
+[1m›[0m[39m[49m [2mAsk Codex to do anything[0m[39m[49m                    [2mThis will stop the current turn and archive the session.[0m[39m[49m
+
+  [38;5;223mGPT-6.1-Sol xhigh[39m · [38;5;151m/tmp/botmux/proj[39m · [1m←[0m[39m[49m f
+                                            [1;7m› 1. No, don't archive  [0;7m[39m[49mReturn to the current session[1m
+[0m[39m[49m                                              2. Yes, archive       [2mArchive this session now[0m[39m[49m
+
+                                              [1menter[0;2m[39m[49m select · [0;1m[39m[49mesc[0;2m[39m[49m back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

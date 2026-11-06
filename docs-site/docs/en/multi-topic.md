@@ -1,5 +1,7 @@
 # Multi-Topic Orchestration Mode
 
+<video src="../img/video-v4-multibot-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Hand a big task to a main bot and it will:
 
 - split the task into a few sub-projects;

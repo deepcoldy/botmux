@@ -1,5 +1,7 @@
 # 5-minute quick setup
 
+<video src="../img/video-v1-quickstart-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Four steps and you're chatting with an AI coding CLI from Lark:
 
 | Step | Command / action | What it does |

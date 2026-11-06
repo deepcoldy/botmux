@@ -1,5 +1,7 @@
 # 驾驶舱（Agent 工作台）
 
+<video src="img/video-v7-dashboard.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 驾驶舱是 [Dashboard](/dashboard) 里专门用来**同时盯多个 AI 会话**的界面：左边是这台机器上所有会话的列表，右边是选中会话的终端。哪个会话干完活了、哪个卡住等你处理，一眼就能看到。
 
 飞书 `/dashboard` 卡片上的「打开工作台」按钮、`botmux dashboard` 打印的 `工作台: …` 链接，打开的都是它。

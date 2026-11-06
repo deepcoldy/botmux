@@ -1,5 +1,7 @@
 # Create a Session Group in One Step
 
+<video src="../img/video-v4-multibot-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Want a clean group dedicated to one project or task? Send `/group <group name>` (short form `/g`). The bot will:
 
 1. Create a new Lark group and add you to it;

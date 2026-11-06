@@ -1,5 +1,7 @@
 # 会话接力（Relay）
 
+<video src="img/video-v3-adopt-relay.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 `/relay` 能把一个**正在跑的 AI 会话**搬到另一个群、另一个话题或单聊里接着聊。
 
 - 搬过去的是**同一个 CLI 进程、同一份 AI 记忆**，不是复制一份重新开始。

@@ -1,10 +1,12 @@
 # botmux
 
+<video src="img/video-v0-overview.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 <p class="lead">在飞书里遥控你的 AI 编程 CLI。一条消息启动一个会话，每个会话一个独立 CLI 进程。</p>
 
 botmux 是一座桥。它在你的开发机上常驻一个后台服务（**daemon**），负责监听飞书消息：
 
-- 每开一个新话题，就为它启动一个独立的 AI 编程 CLI（Claude Code、Codex、Cursor、OpenCode、Antigravity 等 20+ 种）
+- 每开一个新话题，就为它启动一个独立的 AI 编程 CLI（Claude Code、Codex、Cursor、OpenCode、Antigravity 等 30 多种）
 - CLI 每一轮的输出，实时刷新到飞书里的一张**流式卡片**上
 - 想直接动手时，点卡片上的按钮打开 **Web 终端**，在浏览器或手机里操作同一个 CLI
 
@@ -71,7 +73,7 @@ botmux **不重新实现** Agent 能力。记忆、上下文管理、工具调�
 | 桥接的是什么 | 完整的 CLI 进程，CLI 自带的 hooks / 记忆 / plan mode / MCP / `/` 命令都在 | SDK 暴露出来的接口 |
 | CLI 升级 | 多数能力直接受益 | 取决于 SDK 版本和你的集成 |
 | 记忆 / 上下文 | 直接用 CLI 内建的 | 取决于 SDK 或自建 |
-| 多种 CLI | 20+ 适配器，在配置里一键切换 | 取决于 SDK 覆盖面 |
+| 多种 CLI | 30 多种适配器，在配置里一键切换 | 取决于 SDK 覆盖面 |
 | 多机器人 | 同群多个 bot，按 @ 分派 | 取决于实现 |
 | 直连终端 | 用 tmux 后端时，可以 `tmux attach` 进真实的 CLI 进程 | 取决于实现 |
 

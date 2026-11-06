@@ -21,6 +21,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
+import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
 import {
   ensureSchedulePreconditionRoot,
   resolveSchedulePrecondition,
@@ -5350,9 +5351,11 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
       expect(res.status).toBe(200);
       await vi.waitFor(() => expect(replySpy).toHaveBeenCalled());
-      const notice = JSON.parse(replySpy.mock.calls[0]![2]);
-      expect(notice.text).toContain('Frozen Vendor Codex');
-      expect(notice.text).not.toContain('New Live Name');
+      // Plain text: sendMessage/replyMessage perform the {"text": …} wrap.
+      const notice = replySpy.mock.calls[0]![2] as string;
+      expect(notice.trimStart().startsWith('{')).toBe(false);
+      expect(notice).toContain('Frozen Vendor Codex');
+      expect(notice).not.toContain('New Live Name');
     } finally {
       replySpy.mockRestore();
       findSpy.mockRestore();
@@ -6963,6 +6966,46 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
       const res = await create(base, { model: 'gpt-5.6-sol' });
       expect(res.status).toBe(400);
       expect((await res.json()).field).toBe('model');
+    });
+  });
+
+  it.each([
+    { model: 'minimax/MiniMax-M3' },
+    { reasoningEffort: 'max' },
+    { model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high' },
+  ])('rejects a MiniMax task override without creating a task: %j', async fields => {
+    await withServer('minimax', 'minimax/MiniMax-M3.1-Flash', async base => {
+      const before = scheduleStore.listTasks(APP);
+      expect((await create(base, fields)).status).toBe(400);
+      expect(scheduleStore.listTasks(APP)).toEqual(before);
+    });
+  });
+
+  it.each(['', null])('allows clearing legacy MiniMax task overrides with %j, but rejects new ones', async clear => {
+    await withServer('minimax', 'minimax/MiniMax-M3.1-Flash', async base => {
+      const created = await create(base, {});
+      expect(created.status).toBe(200);
+      const task = (await created.json()).task;
+      // CLI/schedule-store can contain older intent that fire time ignores.
+      scheduleStore.updateTask(task.id, { model: 'minimax/MiniMax-M3', reasoningEffort: 'high' }, APP);
+      const before = scheduleStore.getTask(task.id, APP)!;
+      const patch = (body: Record<string, unknown>) => fetch(`${base}/api/schedules/${task.id}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect((await patch({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'max' })).status).toBe(400);
+      expect(scheduleStore.getTask(task.id, APP)).toEqual(before);
+      const ignored = resolveScheduleModelOverride(before, getBot(APP).config);
+      expect(ignored.model).toBeUndefined();
+      expect(ignored.reasoningEffort).toBeUndefined();
+      expect(ignored.warnings).toHaveLength(1);
+
+      expect((await patch({ reasoningEffort: clear })).status).toBe(400);
+      expect(scheduleStore.getTask(task.id, APP)).toEqual(before);
+      expect((await patch({ model: clear, reasoningEffort: clear })).status).toBe(200);
+      const after = scheduleStore.getTask(task.id, APP)!;
+      expect(after.model).toBeUndefined();
+      expect(after.reasoningEffort).toBeUndefined();
+      expect(resolveScheduleModelOverride(after, getBot(APP).config)).toEqual({ warnings: [] });
     });
   });
 

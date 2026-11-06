@@ -21,12 +21,16 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 20+ CLI / agent adapters">
+  <a href="https://deepcoldy.github.io/botmux/img/video-promo-en.mp4"><img src="docs/assets/botmux-promo-poster-en.jpg" width="900" alt="botmux promo video: click to play"></a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 30+ CLI / agent adapters">
 </p>
 
 ---
 
-A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**20+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
+A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**30+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
 
 ## What it solves
 

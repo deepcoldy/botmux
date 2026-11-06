@@ -1,5 +1,7 @@
 # Skill + CLI Interaction
 
+<video src="../img/video-v8-skills-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Inside a botmux session, the AI talks to Lark (sending messages, reading history, creating scheduled tasks…) through two things:
 
 - **The `botmux` command**: added to the CLI's PATH when the session starts. The AI just runs it in the terminal.

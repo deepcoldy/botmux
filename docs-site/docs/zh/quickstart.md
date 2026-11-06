@@ -1,5 +1,7 @@
 # 5 分钟快速接入
 
+<video src="img/video-v1-quickstart.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 四步就能在飞书里和 AI 编程 CLI 对话：
 
 | 步骤 | 命令 / 操作 | 做了什么 |

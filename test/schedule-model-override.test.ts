@@ -67,6 +67,38 @@ describe('resolveScheduleModelOverride — codex', () => {
 });
 
 describe('resolveScheduleModelOverride — CLI gate', () => {
+  it.each([
+    { cliId: 'codex', model: 'gpt-5.5' },
+    { cliId: 'codex-app', model: 'gpt-5.5' },
+    { cliId: 'grok', model: 'grok-4.6' },
+    { cliId: 'traex', model: 'gpt-6-astra' },
+    { cliId: 'remote-runner', model: 'provider-model' },
+    { cliId: 'claude-code', model: 'claude-opus-5' },
+    { cliId: 'kimi', model: 'kimi-code/k3' },
+    { cliId: 'zcode', model: 'provider-model' },
+  ] as const)('preserves the existing $cliId task override contract', ({ cliId, model }) => {
+    expect(resolveScheduleModelOverride({ model, reasoningEffort: 'high' }, { cliId }))
+      .toEqual({ model, reasoningEffort: 'high', warnings: [] });
+  });
+
+  it.each([
+    { model: 'minimax/MiniMax-M3' },
+    { reasoningEffort: 'high' as const },
+    { model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'max' as const },
+  ])('keeps a stored MiniMax task on the bot configuration: %j', task => {
+    const resolved = resolveScheduleModelOverride(task, {
+      cliId: 'minimax', model: 'minimax/MiniMax-M3.1-Flash',
+    });
+    expect(resolved.model).toBeUndefined();
+    expect(resolved.reasoningEffort).toBeUndefined();
+    expect(resolved.warnings).toHaveLength(1);
+    expect(resolved.warnings[0]).toContain('minimax');
+  });
+
+  it('does not warn for a MiniMax task without overrides', () => {
+    expect(resolveScheduleModelOverride({}, { cliId: 'minimax' })).toEqual({ warnings: [] });
+  });
+
   it('drops both on a CLI without the per-turn model contract', () => {
     // Mirrors the trigger API gate: a codex model id must never reach an OpenCode
     // bot just because someone re-pointed the task's bot.

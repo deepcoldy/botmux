@@ -1,5 +1,7 @@
 # Web Terminal (interactive)
 
+<video src="../img/video-v2-daily-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 Every session has a browser-based terminal: open it to watch the CLI live, and if you have permission, type into it directly. It works on desktop, tablet, and phone.
 
 The one exception is the ZMX backend, which has no Web Terminal. Run `botmux list` or `zmx attach` on the host instead; see [ZMX backend](/en/zmx).
@@ -59,6 +61,10 @@ The Lark topic, the Web Terminal, and the host's tmux all show the **same** CLI 
 | Terminal link expired | The credential in the link no longer matches | Go back to Lark and reopen from the session's **latest card** |
 | This session is closed | The session has ended | Can't be viewed anymore; start a new topic if needed |
 | Session not found | The link is wrong, or the session was deleted | Check the link |
+
+## Works on networks without internet access {#self-hosted-xterm}
+
+Automatic, nothing to configure. The xterm.js library and its add-ons used by the terminal page are served by botmux itself from the same origin (bundled with botmux) instead of an external CDN, so the terminal opens fine on internal networks that can't reach the internet. They are public open-source library files and carry no session data. If the terminal page fails to start, only the first error is shown, which makes it easier to pin down.
 
 ## Remote access (when your phone is on another network)
 

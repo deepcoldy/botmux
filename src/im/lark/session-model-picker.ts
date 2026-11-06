@@ -67,6 +67,13 @@ function sessionCliId(ds: DaemonSession) {
 
 export const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
+/** Bot-default model values are written to bots.json and handed to the CLI as a
+ * launch argument, never typed into a terminal, so they may also carry a
+ * `#variant` suffix (e.g. MiniMax's `MiniMax-M3.1-Flash#thinking`). Without it
+ * a stored variant renders as "CLI default" and cannot be re-selected. Session
+ * pickers inject `/model <slug>` into the PTY and keep the strict pattern. */
+export const DEFAULT_MODEL_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(?:#[A-Za-z0-9._-]{1,32})?$/;
+
 /**
  * Resolve the model-catalogue selection for THIS session's frozen CLI shape.
  * The catalogue functions take a "selection key" (cliId + wrapperCli +
@@ -251,8 +258,8 @@ export function buildDefaultModelPickerCard(
   reasoning?: { cliId: string; effort?: string },
   load?: ModelPickerLoad,
 ): string {
-  const safe = [...new Set(models)].filter(model => MODEL_SLUG_PATTERN.test(model));
-  if (currentModel && MODEL_SLUG_PATTERN.test(currentModel)) {
+  const safe = [...new Set(models)].filter(model => DEFAULT_MODEL_VALUE_PATTERN.test(model));
+  if (currentModel && DEFAULT_MODEL_VALUE_PATTERN.test(currentModel)) {
     const existing = safe.indexOf(currentModel);
     if (existing >= 0) safe.splice(existing, 1);
     safe.unshift(currentModel);
