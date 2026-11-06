@@ -124,6 +124,12 @@ export function sameWorker(left?: WorkerRef, right?: WorkerRef): boolean {
 export function sameExecution(left?: ExecutionRef, right?: ExecutionRef): boolean {
   return !!left && !!right && left.executionId === right.executionId && left.turnId === right.turnId && left.dispatchAttempt === right.dispatchAttempt;
 }
+/** Restart replaces the uncertain executor instead of asserting that an old
+ * teardown/interrupt had no effect. Other in-flight controls remain exclusive. */
+export function canSupersedeControlOperation(operation: ControlOperation | undefined, kind: ControlKind): boolean {
+  return kind === 'close' || (kind === 'restart' && operation?.phase === 'uncertain'
+    && (operation.kind === 'suspend' || operation.kind === 'cancel'));
+}
 export function reusableRuntimeIdentity(left?: RuntimeIdentity, right?: RuntimeIdentity): boolean {
   return !!left && !!right && left.proof !== 'opaque' && left.proof === right.proof
     && left.backend === right.backend && left.physicalId === right.physicalId
@@ -216,11 +222,14 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
       execution.revision++; return finish('historical');
     }
     case 'control_requested': {
-      if (session.activeOperationId && event.operation.kind !== 'close') return finish('conflict', 'control_operation_in_progress');
+      if (session.activeOperationId && !canSupersedeControlOperation(state.operation, event.operation.kind)) return finish('conflict', 'control_operation_in_progress');
       if (event.operation.expectedRevision !== session.revision) return finish('conflict', 'state_revision_changed');
       if (event.operation.targetRuntime && !sameRuntime(session.activeRuntime, event.operation.targetRuntime)) return finish('stale');
       if (session.lifecycle === 'closed' && event.operation.kind !== 'resume') return finish('stale');
-      if (state.operation && session.activeOperationId) state.retiredOperation = { ...state.operation, phase: 'uncertain', error: 'superseded_by_close' };
+      if (state.operation && session.activeOperationId) {
+        state.retiredOperation = { ...state.operation, phase: 'uncertain', error: `superseded_by_${event.operation.kind}` };
+        if (event.operation.kind === 'restart') session.lifecycle = state.operation.previousLifecycle ?? 'active';
+      }
       state.operation = event.operation; session.activeOperationId = event.operation.operationId;
       if (event.operation.kind === 'close') session.lifecycle = 'closing';
       if (event.operation.kind === 'suspend') session.lifecycle = 'suspending';

@@ -28,10 +28,14 @@ export class WorkerSessionEventScope {
   private readonly admissionStates = new Map<string, ExecutionAdmissionState>();
   private readonly submissions = new Map<string, RuntimeEventBinding>();
   private current?: RuntimeEventBinding;
+  private readonly predecessors = new Map<string, RuntimeEventBinding | undefined>();
+  private readonly aborted = new Set<string>();
+  private readonly abortReports = new Map<string, { timer?: ReturnType<typeof setTimeout> }>();
   private sequence = 0;
   constructor(readonly session: ContractSessionRef, readonly worker: WorkerRef) {}
   beginRuntime(operationId?: string, physicalId: string = randomUUID()): RuntimeEventBinding {
     const value: RuntimeEventBinding = { bindingId: randomUUID(), physicalId, ...(operationId ? { operationId } : {}) };
+    this.predecessors.set(value.bindingId, this.current);
     this.bindings.set(value.bindingId, value); this.current = value; return value;
   }
   assign(bindingId: string, runtime: RuntimeRef): boolean {
@@ -40,6 +44,32 @@ export class WorkerSessionEventScope {
     binding.runtime = runtime; return true;
   }
   currentBinding(): RuntimeEventBinding | undefined { return this.current; }
+  restoreAfterAbortedStart(binding: RuntimeEventBinding, previous?: RuntimeEventBinding): void {
+    if (binding.runtime) return;
+    if (previous && this.bindings.get(previous.bindingId) !== previous) throw new Error('previous_runtime_binding_unproven');
+    this.aborted.add(binding.bindingId);
+    if (this.current !== binding) return;
+    let source = this.predecessors.get(binding.bindingId);
+    while (source && this.aborted.has(source.bindingId)) source = this.predecessors.get(source.bindingId);
+    this.current = source;
+  }
+  reportAbortedStart(binding: RuntimeEventBinding, report: () => void): void {
+    if (!this.aborted.has(binding.bindingId) || this.abortReports.has(binding.bindingId)) return;
+    const pending: { timer?: ReturnType<typeof setTimeout> } = {};
+    this.abortReports.set(binding.bindingId, pending);
+    const retry = (): void => {
+      if (this.abortReports.get(binding.bindingId) !== pending) return;
+      try { this.run(binding, report); } catch { /* retry until the host confirms persistence */ }
+      if (this.abortReports.get(binding.bindingId) !== pending) return;
+      pending.timer = setTimeout(retry, 1_000); pending.timer.unref?.();
+    };
+    retry();
+  }
+  confirmAbortedStart(bindingId: string): void {
+    const pending = this.abortReports.get(bindingId); if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    this.abortReports.delete(bindingId);
+  }
   isCurrentContext(): boolean {
     const origin = this.storage.getStore()?.binding;
     return !origin || origin === this.current || sameRuntime(origin.runtime, this.current?.runtime);

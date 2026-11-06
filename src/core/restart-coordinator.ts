@@ -37,7 +37,7 @@ export class RestartCoordinator {
     createAttemptId?: () => string;
     persistence?: {
       restore(sessionId: string): { id: string; uncertain: boolean; planned?: boolean } | undefined;
-      record(sessionId: string, id: string, phase: 'requested' | 'started' | 'succeeded' | 'failed' | 'timed_out'): 'terminal' | 'uncertain' | 'started' | 'joined' | void;
+      record(sessionId: string, id: string, phase: 'requested' | 'started' | 'succeeded' | 'failed' | 'failed_before_effect' | 'timed_out'): 'terminal' | 'uncertain' | 'started' | 'joined' | void;
     };
   } = {}) {}
 
@@ -67,23 +67,25 @@ export class RestartCoordinator {
     // Notifications are deliberately detached: a slow IM request must not
     // postpone replacing the process.
     this.enqueueNotify(observer, 'in_progress');
+    let physicalStartInvoked = false;
     try {
       const start = this.options.persistence?.record(sessionId, attemptId, 'started');
       if (start === 'joined') return { attemptId, joined: true };
+      physicalStartInvoked = true;
       const started = startPhysicalRestart(attemptId);
       void Promise.resolve(started).catch(() => {
         this.resolve(sessionId, attemptId, 'failed');
       });
     } catch {
-      this.resolve(sessionId, attemptId, 'failed');
+      this.resolve(sessionId, attemptId, 'failed', !physicalStartInvoked);
     }
     return { attemptId, joined: false };
   }
 
-  resolve(sessionId: string, attemptId: string, status: RestartTerminalStatus): boolean {
+  resolve(sessionId: string, attemptId: string, status: RestartTerminalStatus, beforeEffect = false): boolean {
     const attempt = this.attempts.get(sessionId);
     if (!attempt || attempt.id !== attemptId) return false;
-    const result = this.options.persistence?.record(sessionId, attemptId, status);
+    const result = this.options.persistence?.record(sessionId, attemptId, beforeEffect ? 'failed_before_effect' : status);
     if (result === 'uncertain') {
       attempt.uncertain = true;
       clearTimeout(attempt.timer);

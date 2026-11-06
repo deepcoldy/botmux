@@ -7,6 +7,7 @@ import { recoverFailedTurn, parseFailedTurnRecoveryRequest, noteFailedTurnRecove
   failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal } from '../src/core/failed-turn-recovery.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import { REPLY_TARGETS_MAX, beginReplyTargetTurn, inheritTurnReplyRouting, frozenReplyContextForTurn, resolveSessionReplyTarget } from '../src/core/reply-target.js';
 
 const caller = { requestUserOpenId: 'ou_user_a', requestLarkAppId: 'cli_app', senderType: 'user' as const };
 const request = { turnId: 'om_failed', failedAt: '2026-10-16T00:00:00.000Z', requestId: 'retry-1', mode: 'retry' as const };
@@ -24,7 +25,7 @@ beforeEach(() => {
       userPrompt: 'original task', cliInput: 'original wrapped input', retryCount: 0, trustedCaller: caller } },
     larkAppId: 'cli_app', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
     workingDir: '/tmp/work', hasHistory: true, lastMessageAt: Date.parse(request.failedAt) - 1000,
-    lastScreenStatus: 'idle', worker: { killed: false }, cliVersion: 'test',
+    lastCliInputTurnId: request.turnId, lastScreenStatus: 'idle', worker: { killed: false }, cliVersion: 'test',
     currentReplyTarget: { turnId: request.turnId } };
   registry = new Map([['om_root:cli_app', ds]]);
   rows = new Map([['old', ds.session]]);
@@ -53,12 +54,127 @@ beforeEach(() => {
   });
   vi.spyOn(permissions, 'canTalk').mockReturnValue(true);
   vi.spyOn(pool, 'prepareFailedTurnRecoveryIdentity').mockResolvedValue(undefined);
-  vi.spyOn(manager, 'rememberLastCliInput').mockImplementation(() => undefined);
+  vi.spyOn(manager, 'rememberLastCliInput').mockImplementation((target, prompt, input, turnId) => {
+    target.lastUserPrompt = prompt; target.lastCliInput = typeof input === 'string' ? input : input.content;
+    target.lastCliInputTurnId = turnId; target.session.lastCliInputTurnId = turnId;
+  });
   vi.spyOn(manager, 'buildFollowUpCliInput').mockImplementation((prompt, id) => ({ content: `${id}:${prompt}` }));
 });
 afterEach(() => vi.restoreAllMocks());
 
 describe('controlled failed-turn recovery', () => {
+  it.each([false, true])('inherits the original retry destination without granting its identity (quote=%s)', quoteOnly => {
+    ds.scope = ds.session.scope = 'chat';
+    beginReplyTargetTurn(ds, 'om_topic_a', 'om_original', undefined, {
+      quoteOnly, senderOpenId: 'ou_original', participants: [{ openId: 'ou_original', isBot: false }],
+    });
+    beginReplyTargetTurn(ds, 'om_topic_b', 'om_later');
+    inheritTurnReplyRouting(ds, 'om_original', 'retry_new');
+    expect(resolveSessionReplyTarget(ds, 'retry_new')).toEqual({
+      mode: quoteOnly ? 'quote' : 'thread', rootMessageId: 'om_topic_a',
+    });
+    expect(frozenReplyContextForTurn(ds, 'retry_new').target).toEqual(frozenReplyContextForTurn(ds, 'om_original').target);
+    expect(failedTurnCaller(ds, 'retry_new')).toBeUndefined();
+  });
+  it.each([false, true])('retains the frozen retry destination after the short reply index is pruned (quote=%s)', quoteOnly => {
+    ds.scope = ds.session.scope = 'chat';
+    beginReplyTargetTurn(ds, 'om_original_topic', 'om_original', '2026-10-16T00:00:00.000Z', { quoteOnly });
+    for (let index = 0; index <= REPLY_TARGETS_MAX; index++) {
+      beginReplyTargetTurn(ds, `om_new_topic_${index}`, `om_new_${index}`, '2026-10-17T00:00:00.000Z');
+    }
+    expect(ds.session.replyTargets.om_original).toBeUndefined();
+    inheritTurnReplyRouting(ds, 'om_original', 'retry_new');
+    expect(resolveSessionReplyTarget(ds, 'retry_new')).toEqual({
+      mode: quoteOnly ? 'quote' : 'thread', rootMessageId: 'om_original_topic',
+    });
+    expect(frozenReplyContextForTurn(ds, 'retry_new').target).toEqual(resolveSessionReplyTarget(ds, 'retry_new'));
+  });
+  it.each(['failed', 'ambiguous', 'limited'])(
+    'never captures newer input under a late predecessor identity (%s)', async status => {
+      ds.currentReplyTarget = undefined;
+      await recoverFailedTurn('old', request);
+      const priorReceipt = structuredClone(ds.session.lastFailedTurn);
+      for (const turnId of ['om_user_b', 'om_user_c']) {
+        beginReplyTargetTurn(ds, 'om_root', turnId, undefined, {
+          senderOpenId: `ou_${turnId}`, participants: [{ openId: `ou_${turnId}`, isBot: false }],
+        });
+        manager.rememberLastCliInput(ds, `${turnId} prompt`, `${turnId} wrapped`, turnId);
+      }
+      if (status === 'limited') {
+        ds.usageLimit = { limited: true, kind: 'rate' };
+        recordLimitedFailedTurn(ds, 'om_user_b');
+      } else {
+        recordFailedTurnTerminal(ds, { turnId: 'om_user_b', status },
+          { workerGeneration: 1, caller: failedTurnCaller(ds, 'om_user_b'), silent: false });
+      }
+      expect(ds.session.lastFailedTurn).toEqual(priorReceipt);
+      recordFailedTurnTerminal(ds, { turnId: 'om_user_c', status: 'failed' },
+        { workerGeneration: 1, caller: failedTurnCaller(ds, 'om_user_c'), silent: false });
+      expect(ds.session.lastFailedTurn).toMatchObject({ turnId: 'om_user_c',
+        cliInput: 'om_user_c wrapped', trustedCaller: { requestUserOpenId: 'ou_om_user_c' } });
+    });
+  it('records a scheduled failure even when the visible reply cursor belongs to an old human', () => {
+    const turnId = 'schedule:fixture:next';
+    manager.rememberLastCliInput(ds, 'scheduled prompt', 'scheduled input', turnId);
+    const creator = { ...caller, source: 'schedule_creator' as const, taskId: 'fixture' };
+    recordFailedTurnTerminal(ds, { turnId, status: 'failed' },
+      { workerGeneration: 1, caller: creator, silent: true });
+    expect(ds.session.lastFailedTurn).toMatchObject({ turnId, cliInput: 'scheduled input', trustedCaller: creator });
+  });
+  it.each([
+    { mode: 'retry', cliId: 'codex' }, { mode: 'fresh', cliId: 'codex' },
+    { mode: 'retry', cliId: 'claude-code' }, { mode: 'fresh', cliId: 'claude-code' },
+  ] as const)(
+    'records the next human failure after a thread recovery ($cliId, $mode)', async ({ mode, cliId }) => {
+      // Thread ingress owns per-turn entries, not the chat-scope reply cursor.
+      ds.session.cliId = cliId;
+      ds.currentReplyTarget = undefined;
+      const recovered = await recoverFailedTurn('old', { ...request, mode });
+      expect(recovered).toMatchObject({ ok: true, state: 'accepted' });
+      const target = [...registry.values()][0] as any;
+      const nextCaller = { ...caller, requestUserOpenId: 'ou_user_c' };
+      const nextTurn = 'om_next_human';
+      beginReplyTargetTurn(target, 'om_root', nextTurn, undefined, {
+        senderOpenId: nextCaller.requestUserOpenId,
+        participants: [{ openId: nextCaller.requestUserOpenId, isBot: false }],
+      });
+      target.lastCliInputTurnId = 'om_next_human';
+      target.lastUserPrompt = 'new task';
+      target.lastCliInput = 'new wrapped input';
+      target.activeInteractiveTurn = { turnId: nextTurn, caller: nextCaller };
+      recordFailedTurnTerminal(target,
+        { turnId: nextTurn, status: 'failed', errorCode: 'codex_invalid_request' },
+        { workerGeneration: 1, caller: failedTurnCaller(target, nextTurn), silent: false });
+      expect(target.session.lastFailedTurn).toMatchObject({
+        turnId: nextTurn, originalTurnId: nextTurn, errorCode: 'codex_invalid_request',
+        userPrompt: 'new task', cliInput: 'new wrapped input', trustedCaller: nextCaller,
+      });
+      expect(target.session.lastFailedTurn.recovery).toBeUndefined();
+      expect(target.currentReplyTarget).toBeUndefined();
+      expect(target.session.currentReplyTarget).toBeUndefined();
+    });
+  it.each(['retry', 'fresh'] as const)(
+    'keeps chat recovery routing and rejects late terminals after new input (%s)', async mode => {
+      ds.scope = ds.session.scope = 'chat';
+      ds.session.replyTargets.om_failed.rootMessageId = 'om_topic_a';
+      const recovered = await recoverFailedTurn('old', { ...request, mode });
+      expect(recovered).toMatchObject({ ok: true, state: 'accepted' });
+      if (!recovered.ok) throw new Error('recovery rejected');
+      const target = [...registry.values()][0] as any;
+      expect(target.currentReplyTarget).toMatchObject({ rootMessageId: 'om_topic_a', turnId: recovered.turnId });
+      expect(target.session.currentReplyTarget).toEqual(target.currentReplyTarget);
+      beginReplyTargetTurn(target, 'om_topic_b', 'om_next_human');
+      target.lastCliInputTurnId = 'om_next_human';
+      target.lastUserPrompt = 'new task';
+      target.lastCliInput = 'new wrapped input';
+      recordFailedTurnTerminal(target, { turnId: recovered.turnId, status: 'failed' },
+        { workerGeneration: 1, caller, silent: false });
+      expect(target.session.lastFailedTurn?.turnId).not.toBe(recovered.turnId);
+      recordFailedTurnTerminal(target, { turnId: 'om_next_human', status: 'failed' },
+        { workerGeneration: 1, caller, silent: false });
+      expect(target.session.lastFailedTurn?.turnId).toBe('om_next_human');
+      expect(target.currentReplyTarget).toMatchObject({ rootMessageId: 'om_topic_b', turnId: 'om_next_human' });
+    });
   it('replays exact input once with original user A, never the owner B', async () => {
     const first = await recoverFailedTurn('old', request);
     expect(first).toMatchObject({ ok: true, state: 'accepted', sessionId: 'old', originalTurnId: 'om_failed' });
@@ -232,8 +348,8 @@ describe('controlled failed-turn recovery', () => {
       expect(ds.session.lastFailedTurn?.recovery?.state).toBe(state);
       expect(store.updateSession).not.toHaveBeenCalled();
     });
-  it.each(['reply', 'clock', 'queue', 'active', 'working', 'native-recovery'])('rejects newer or owned input before any close (%s)', async kind => {
-    if (kind === 'reply') ds.currentReplyTarget.turnId = 'om_new';
+  it.each(['input-owner', 'clock', 'queue', 'active', 'working', 'native-recovery'])('rejects newer or owned input before any close (%s)', async kind => {
+    if (kind === 'input-owner') ds.lastCliInputTurnId = 'om_new';
     if (kind === 'clock') ds.lastMessageAt = Date.parse(request.failedAt) + 1;
     if (kind === 'queue') ds.session.queuedActivationTail = [{}];
     if (kind === 'active') ds.activeInteractiveTurn = { turnId: 'om_new' };
@@ -241,6 +357,10 @@ describe('controlled failed-turn recovery', () => {
     if (kind === 'native-recovery') ds.session.ordinaryTurnRecovery = { status: 'backoff' };
     expect(await recoverFailedTurn('old', { ...request, mode: 'fresh' })).toEqual({ ok: false, error: 'newer_input' });
     expect(pool.closeSessionForBackgroundCleanup).not.toHaveBeenCalled(); expect(pool.forkWorker).not.toHaveBeenCalled();
+  });
+  it('does not mistake an old routing cursor for a newer accepted input', async () => {
+    ds.currentReplyTarget.turnId = 'old-recovery-cursor';
+    expect(await recoverFailedTurn('old', request)).toMatchObject({ ok: true, state: 'accepted' });
   });
   it('cancels an obsolete replay when input arrives while teardown awaits', async () => {
     let release!: () => void;

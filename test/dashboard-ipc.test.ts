@@ -21,6 +21,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
+import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
 import {
   ensureSchedulePreconditionRoot,
   resolveSchedulePrecondition,
@@ -2183,7 +2184,7 @@ describe('GET /api/bot-default-oncall — oncall chat counts', () => {
 });
 
 describe('GET /api/bot-default-oncall — schedule host paths', () => {
-  it('reports the execution cwd and trusted file root without persisting either as bot config', async () => {
+  it('reports the validated Bot default and trusted file root without persisting either as extra bot config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-cwd-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-schedule-cwd-app';
@@ -2192,6 +2193,7 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
     try {
       process.env.BOTS_CONFIG = configPath;
       config.session.dataDir = join(dir, 'daemon-data');
+      mkdirSync(join(dir, 'session-default'));
       writeFileSync(configPath, JSON.stringify([{
         larkAppId: appId,
         larkAppSecret: 'secret',
@@ -2206,7 +2208,7 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
       const response = await fetch(`${base}/api/bot-default-oncall`);
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({
-        scheduleWorkingDir: process.cwd(),
+        scheduleWorkingDir: join(dir, 'session-default'),
         schedulePreconditionFileRoot: join(
           config.session.dataDir,
           'schedule-preconditions',
@@ -2866,14 +2868,18 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
 });
 
 describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
-  async function withBot(cliId: string, run: (base: string, configPath: string, appId: string) => Promise<void>): Promise<void> {
+  async function withBot(
+    cliId: string,
+    run: (base: string, configPath: string, appId: string) => Promise<void>,
+    extraConfig: Record<string, unknown> = {},
+  ): Promise<void> {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-delivery-'));
     const configPath = join(dir, 'bots.json');
     const appId = `test-reply-delivery-${cliId}`;
     const prevBotsConfig = process.env.BOTS_CONFIG;
     try {
       process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId }], null, 2));
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId, ...extraConfig }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -2968,6 +2974,42 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
       expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
       expect(persisted(configPath).replyDelivery).toBe('send');
     });
+  });
+
+  it('doubao: GET 缺省 transcript/supported（共享常驻 service 进程下 send 归属不可靠），PUT send 显式落盘可退回', async () => {
+    await withBot('doubao', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' 清 key，回到 doubao 的缺省 transcript（而不是通用缺省 send）。
+      const cleared = await put(base, '');
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+    });
+  });
+
+  it('doubao + scratch: GET 生效值回落 send、缺省值仍 transcript、开关 unsupported，PUT transcript 4xx（#2828 静默边）', async () => {
+    await withBot('doubao', async (base) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: false });
+
+      const rejected = await put(base, 'transcript');
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'reply_delivery_unsupported' });
+
+      // 显式 send 在 scratch 下仍可写（doubao scratch 回旧行为，不静默）。
+      const send = await put(base, 'send');
+      expect(send.status).toBe(200);
+      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
+    }, { sandbox: 'scratch' });
   });
 
   it('antigravity: 只有零注入转写，PUT transcript 4xx reply_delivery_unsupported 且不落盘，PUT send 落盘', async () => {
@@ -4583,7 +4625,7 @@ describe('POST /api/grants/chat', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it('rejects stable subject app ids for revoke or readback before invoking the service', async () => {
+  it('rejects stable subject app ids for readback before invoking the service (grant and revoke resolve them)', async () => {
     const handler = vi.fn();
     setExactChatGrantHandler(handler as any);
     setLarkAppId('cli_receiver');
@@ -4594,7 +4636,7 @@ describe('POST /api/grants/chat', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
       body: JSON.stringify({
-        operation: 'revoke',
+        operation: 'readback',
         receiverLarkAppId: 'cli_receiver',
         chatId: 'oc_chat',
         subjectLarkAppIds: ['cli_pm'],
@@ -6768,6 +6810,7 @@ describe('POST /api/schedules — creator identity binding', () => {
       const bot = registerBot({
         larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
         allowedUsers: [ownerOpenId],
+        defaultWorkingDir: dir,
       });
       bot.resolvedAllowedUsers = [ownerOpenId];
       bot.rawAllowedUserResolution.set(ownerUnionId, ownerOpenId);
@@ -6808,6 +6851,7 @@ describe('POST /api/schedules — creator identity binding', () => {
       const bot = registerBot({
         larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
         allowedUsers: ['ou_owner'],
+        defaultWorkingDir: dir,
       });
       bot.resolvedAllowedUsers = ['ou_owner'];
       bot.rawAllowedUserResolution.set('on_owner', 'ou_someone_else');
@@ -6851,7 +6895,14 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
       config.session.dataDir = join(dir, 'data');
       scheduleStore.setScheduleScope(APP);
       setLarkAppId(APP);
-      registerBot({ larkAppId: APP, larkAppSecret: '', cliId: cliId as any, apiOnly: true, ...(model ? { model } : {}) });
+      registerBot({
+        larkAppId: APP,
+        larkAppSecret: '',
+        cliId: cliId as any,
+        apiOnly: true,
+        defaultWorkingDir: dir,
+        ...(model ? { model } : {}),
+      });
       local = await startIpcServer({ port: 0, host: '127.0.0.1' });
       return await run(`http://127.0.0.1:${local.port}`);
     } finally {
@@ -6916,6 +6967,46 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
     });
   });
 
+  it.each([
+    { model: 'minimax/MiniMax-M3' },
+    { reasoningEffort: 'max' },
+    { model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high' },
+  ])('rejects a MiniMax task override without creating a task: %j', async fields => {
+    await withServer('minimax', 'minimax/MiniMax-M3.1-Flash', async base => {
+      const before = scheduleStore.listTasks(APP);
+      expect((await create(base, fields)).status).toBe(400);
+      expect(scheduleStore.listTasks(APP)).toEqual(before);
+    });
+  });
+
+  it.each(['', null])('allows clearing legacy MiniMax task overrides with %j, but rejects new ones', async clear => {
+    await withServer('minimax', 'minimax/MiniMax-M3.1-Flash', async base => {
+      const created = await create(base, {});
+      expect(created.status).toBe(200);
+      const task = (await created.json()).task;
+      // CLI/schedule-store can contain older intent that fire time ignores.
+      scheduleStore.updateTask(task.id, { model: 'minimax/MiniMax-M3', reasoningEffort: 'high' }, APP);
+      const before = scheduleStore.getTask(task.id, APP)!;
+      const patch = (body: Record<string, unknown>) => fetch(`${base}/api/schedules/${task.id}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect((await patch({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'max' })).status).toBe(400);
+      expect(scheduleStore.getTask(task.id, APP)).toEqual(before);
+      const ignored = resolveScheduleModelOverride(before, getBot(APP).config);
+      expect(ignored.model).toBeUndefined();
+      expect(ignored.reasoningEffort).toBeUndefined();
+      expect(ignored.warnings).toHaveLength(1);
+
+      expect((await patch({ reasoningEffort: clear })).status).toBe(400);
+      expect(scheduleStore.getTask(task.id, APP)).toEqual(before);
+      expect((await patch({ model: clear, reasoningEffort: clear })).status).toBe(200);
+      const after = scheduleStore.getTask(task.id, APP)!;
+      expect(after.model).toBeUndefined();
+      expect(after.reasoningEffort).toBeUndefined();
+      expect(resolveScheduleModelOverride(after, getBot(APP).config)).toEqual({ warnings: [] });
+    });
+  });
+
   it('PATCH validates the SETTLED pairing, not just the supplied half', async () => {
     await withServer('codex', 'gpt-5.5', async base => {
       const task = (await (await create(base, { model: 'gpt-5.6-sol', reasoningEffort: 'ultra' })).json()).task;
@@ -6953,7 +7044,13 @@ describe('POST/PATCH /api/schedules — local work calendar', () => {
       process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
       scheduleStore.setScheduleScope(app);
       setLarkAppId(app);
-      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'opencode', apiOnly: true });
+      registerBot({
+        larkAppId: app,
+        larkAppSecret: '',
+        cliId: 'opencode',
+        apiOnly: true,
+        defaultWorkingDir: dir,
+      });
       const { workCalendarPath } = await import('../src/services/work-calendar.js');
       const fixture = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
       mkdirSync(join(dir, 'bots', app), { recursive: true });
@@ -8017,6 +8114,7 @@ describe('POST /api/schedules execution position', () => {
         name: '每日巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_target',
         executionPosition: 'new-topic',
         topicTitle: '每日发布巡检',
@@ -8056,6 +8154,7 @@ describe('POST /api/schedules execution position', () => {
         name: '多群巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_first',
         chatIds: ['oc_first', 'oc_second', 'oc_second'],
         executionPosition: 'top-level',
@@ -8117,6 +8216,7 @@ describe('POST /api/schedules execution position', () => {
         name: '静默巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_target',
         executionPosition: 'new-topic',
         silent: true,
@@ -11444,6 +11544,34 @@ describe('POST /api/groups/create', () => {
     expect(spy).toHaveBeenCalledWith('cli_X', 'oc_new', process.cwd());
     addSpy.mockRestore();
     spy.mockRestore();
+    createSpy.mockRestore();
+    linkSpy.mockRestore();
+  });
+
+  it('optional topic-group mode and bot collaboration: passed through when sent, refused when malformed', async () => {
+    setLarkAppId('test-app');
+    const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({ chatId: 'oc_topic', invalidBotIds: [], invalidUserIds: [] });
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([{ id: 'cli_X', ok: true }]);
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({ ok: true, shareLink: 'https://example.test/chat' });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const post = (body: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/groups/create`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+
+    expect((await post({ larkAppIds: ['test-app'], chatMode: 'thread' })).status).toBe(400);
+    expect((await post({ larkAppIds: ['test-app'], botCollaboration: 'yes' })).status).toBe(400);
+    expect(createSpy).not.toHaveBeenCalled();
+
+    const plain = await (await post({ larkAppIds: ['test-app', 'cli_X'] })).json();
+    expect(createSpy).toHaveBeenLastCalledWith('test-app', { name: undefined, botIds: [], userIds: [], chatMode: undefined });
+    expect('collaborationError' in plain).toBe(false);
+
+    const topic = await (await post({ larkAppIds: ['test-app', 'cli_X'], chatMode: 'topic', botCollaboration: true })).json();
+    expect(createSpy).toHaveBeenLastCalledWith('test-app', expect.objectContaining({ chatMode: 'topic' }));
+    // The grant matrix ran for the joined bots (no host secret / daemon here,
+    // so it reports its error; without the flag the key is absent).
+    expect(typeof topic.collaborationError).toBe('string');
+    addSpy.mockRestore();
     createSpy.mockRestore();
     linkSpy.mockRestore();
   });

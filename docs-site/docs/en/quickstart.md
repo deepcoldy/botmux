@@ -1,10 +1,17 @@
 # 5-minute quick setup
 
-Feedback defaults to SQLite. A fresh interactive start also offers PostgreSQL; existing installations can use `botmux feedback storage configure/test/migrate/status` or the Feedback page storage panel. Migration requires a maintenance window and retains the original SQLite database without automatic fallback.
+<video src="../img/video-v1-quickstart-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
-> 💡 **TL;DR**: `curl -fsSL .../install.sh | sh` → `botmux setup` (**a single Lark QR scan** creates the app + configures all permissions + publishes) → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
+Four steps and you're chatting with an AI coding CLI from Lark:
 
-**Before you start**: confirm the [Prerequisites](/en/prerequisites) (target CLI installed and logged in, tmux) — a missing prerequisite here is the most common cause of "installed but won't connect."
+| Step | Command / action | What it does |
+|---|---|---|
+| 1. Install | `curl -fsSL .../install.sh \| sh` | Installs a single-file program; no Node needed |
+| 2. Configure | `botmux setup` | One Lark QR scan: creates the app, sets permissions, and publishes a version for you |
+| 3. Start | `botmux start` + `botmux autostart enable` | Starts the background service and enables start on boot |
+| 4. Chat | Add the bot to a group and @ it | Pick a directory and the CLI gets to work |
+
+**Before you start**: take a quick look at the [Prerequisites](/en/prerequisites). The CLI you want to use (e.g. `claude`, `codex`) must already be installed, signed in, and working in a terminal; tmux is also needed by default. Most "installed but won't connect" problems come from something missing here.
 
 ## Step 1 · Install
 
@@ -12,84 +19,139 @@ Feedback defaults to SQLite. A fresh interactive start also offers PostgreSQL; e
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 ```
 
-botmux is a **self-contained single-file binary** with its runtime embedded — **neither installing nor running it needs Node**. It installs to `~/.botmux/bin/botmux` (override with `BOTMUX_INSTALL_DIR`), picks the binary for your OS/arch, verifies its SHA-256, and adds `~/.botmux/bin` to the startup file your shell actually reads (zsh / bash / fish each get the correct one), so **a new terminal has the command**. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2.**
+**Open a new terminal** afterwards and the `botmux` command is ready.
 
-> 🔁 **Upgrading is always the curl command**, regardless of how you originally installed (npm/pnpm global installs included): re-run the command above to replace the binary in place — it won't append a second PATH line — then open a new terminal and run `botmux restart`. To install a specific version: `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh` (the variable must precede the `sh` on the right side of the pipe to take effect). ⚠️ **Do not npm-upgrade from releases older than v3.18.0** — crossing the Node-sources → binary form boundary leaves the daemon unable to restart; see [FAQ · How do I upgrade?](/en/faq#how-do-i-upgrade).
+- Supports Linux / macOS (x64, arm64). On musl systems such as Alpine, the musl build is picked automatically. On Windows, install inside WSL2.
+- Installs to `~/.botmux/bin/botmux`; set `BOTMUX_INSTALL_DIR` to change it. The script verifies the download's SHA-256 and adds that directory to your shell's startup file (zsh / bash / fish).
+- botmux itself needs no Node. If your CLI is an npm package, installing that CLI still needs Node.
 
-> 📦 **npm works too** (`npm install -g botmux`, needs Node ≥ 22 to run the install itself): the npm package carries **the same self-contained binary** (verified byte-identical to the GitHub Release asset by SHA-256; only the one matching your os/arch is installed), and its postinstall points `~/.botmux/bin/botmux` at it and writes PATH the same way. The only difference is **who installs it**: the npm path needs Node, the curl path never touches it; **upgrades always re-run the curl command, no matter how you installed** (npm-upgrading from a pre-v3.18.0 install across that form boundary can leave the daemon unable to restart — see [FAQ · How do I upgrade?](/en/faq#how-do-i-upgrade)). Once running, the two are identical.
+You can also install with npm: `npm install -g botmux` (this step needs Node ≥ 22). The npm package contains the same program and behaves exactly like the curl install.
 
-Running botmux itself needs no Node, but you do need **at least one AI coding CLI installed and signed in locally** (`claude` / `codex` / `cursor-agent` / `opencode` / `coco` / `agy`, etc. — each with its own runtime requirements). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
+On a Mac and want to start and stop the service with a click? You can also install the [macOS Desktop App](/en/desktop): it bundles its own runtime and shares the same `~/.botmux` config with the command-line install.
 
-## Step 2 · Configure (`botmux setup`)
+**Upgrading later**:
+
+| Goal | Command |
+|---|---|
+| Upgrade to the latest (works for any install method) | Re-run the curl command above, then open a new terminal and run `botmux restart` |
+| Already on v3.18.0 or later | You can also just run `botmux update`, then `botmux restart` |
+| Install a specific version | `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh \| BOTMUX_VERSION=v3.18.8 sh` |
+
+> ⚠️ `BOTMUX_VERSION` only takes effect when placed before the `sh` on the right side of the pipe. For releases older than v3.18.0, upgrade only with curl; see [FAQ · How do I upgrade?](/en/faq#how-do-i-upgrade) for why.
+
+## Step 2 · Configure the bot
 
 ```bash
 botmux setup
 ```
 
-An interactive wizard; just follow the prompts:
+This is an interactive wizard: use the arrow keys to choose and Enter to confirm. Pressing `Esc` cancels setup without writing any config. On first run it asks you the following:
 
-1. **New config**: type `1` and press Enter. (If you already have a config, type `2` to add a bot.)
-2. **Create a bot**:
-   - Type `1` → **Create by QR code** (recommended): scan with Lark, and a PersonalAgent app is created automatically with the AppID/AppSecret saved to disk; event subscriptions and bot capabilities are pre-configured by default.
-   - Type `2` → **Create manually**: go to the [Lark Open Platform](https://open.larkoffice.com/app) to create a custom enterprise app, then paste the AppID/AppSecret.
-3. **Pick a CLI**: choose the CLI to onboard this time (e.g. choose `1` for Claude Code).
-4. **Default working directory**: usually fill in the **parent directory** of your git projects (e.g. `~/projects`); it searches up to 3 levels down. Try not to use `~` (it would have to traverse too many folders).
+**① Where the Lark app comes from**
 
-> ✅ **Both Feishu (feishu.cn) and Lark (international, larksuite.com) are supported**: when creating the app by QR code, the tenant type is detected automatically; when pasting manually, you can choose it. You can mix both on the same machine.
+| Option | Best for |
+|---|---|
+| **One-scan create new app** (recommended) | First-time users. Name the bot, then scan with the Lark app; botmux creates the app and retrieves the AppID/AppSecret |
+| Select existing app | You've created apps before. After logging in, it lists your apps and fetches the credentials (Feishu tenants only) |
+| Enter AppID/Secret manually | You already created an app in the [Open Platform](https://open.larkoffice.com/app). You'll first choose Feishu or Lark (international) |
 
-> 🔧 **Creating by QR code auto-configures all permissions and publishes a version** — no manual steps needed. Only if you add `botmux setup --no-open-platform-auto` (skip auto-config) or create the app manually do you need to import the permission JSON yourself in the Open Platform (setup writes the full set to `~/.botmux/lark-scopes.json` and prints a one-click copy command) and create/publish a version; choosing availability "Visible to me only" gets auto-approved.
+> After one scan on this machine, the login is remembered. Next time you add a bot, just confirm the account; no new scan needed.
+
+**② Pick a CLI**: choose the CLI this bot connects to, e.g. Claude Code or Codex. You can type to search. If the CLI isn't found on this machine, you'll be told to install it first.
+
+**③ Where new topics start**
+
+| Option | Effect | What to enter |
+|---|---|---|
+| **Pinned default directory** (recommended) | New topics start directly in this directory, no card | An existing directory, e.g. `~/projects/my-app` |
+| Repo selection card | Each new topic first shows a card to pick one of the scanned git repos | Scan root(s), e.g. `~/projects` (searched 3 levels down; comma-separate several) |
+
+> In repo-card mode, try not to use `~`; there are too many folders to scan.
+
+**④ Admin (owner)**: when you create the app by scanning, the person who scanned becomes the admin automatically. When entering credentials manually, you fill it in yourself; a full work email is recommended, a phone number also works.
+
+Once done, setup **configures the Open Platform automatically**: imports all permissions, sets the redirect URL, creates and publishes a version, then prints the result of each step.
+
+> 🔧 **When you need to finish Open Platform config yourself**
+> - You passed `botmux setup --no-open-platform-auto` (skip auto-config), or the auto-config failed.
+> - setup then lists the remaining items (enable bot capability, long-connection event subscription, permissions, redirect URL, publish a version) with links; the full permission list is written to `~/.botmux/lark-scopes.json`.
+> - Choosing availability "Visible to me only" usually gets the version approved automatically.
+
+Running `botmux setup` on a machine that's already configured shows a menu: Add new bot, Edit existing bot, Delete bot, Reconfigure. When done, run `botmux restart` as prompted.
+
+> Want to configure from a script or an AI agent instead of the interactive UI? Use the `botmux setup add` / `botmux setup list` subcommands; `botmux setup help` shows all options.
 
 ## Step 3 · Start
 
 ```bash
-botmux start            # Start the daemon
-botmux autostart enable # Start on boot (recommended; survives machine restarts, no sudo needed)
+botmux start            # Start the background service (daemon)
+botmux autostart enable # Start on boot (recommended; no sudo needed)
 ```
+
+- Start on boot uses user systemd on Linux and launchd on macOS.
+- The first `botmux start` asks which "feedback storage" to use. **Just press Enter for the default SQLite.** You can pick PostgreSQL here if you need it, and migrate later with `botmux feedback storage` (new tasks pause during migration; the original SQLite is kept, but botmux won't switch back automatically if PostgreSQL fails). See [Feedback storage and migration](/en/feedback-storage).
+- Check status: `botmux status`; view logs: `botmux logs`.
 
 ## Step 4 · Create a group and start chatting
 
-1. Create a **topic group** in Lark (regular groups are also supported).
+1. Create a **topic group** in Lark (regular groups work too).
 2. Group settings → Group bots → add the bot you just created.
-3. Send a message directly in the group, and the bot responds automatically — it pops up a repository selection card, and once you pick a project the CLI launches in that directory.
+3. **@ the bot** with a message, e.g. "@bot how do I build this project?".
+4. If you chose the repo selection card in step 2, a card asks you to pick a project first; with a pinned directory, the CLI starts there right away.
 
-You can also **DM the bot** to start chatting directly, or use `botmux dashboard` and switch to the Group Tab to create a group with one click.
+The bot replies with a card that updates as it works and shows the full answer when finished:
 
-## Not receiving messages? Self-check
+![Reply card: in progress and finished](/img/unified-reply-card-preview.png)
 
-Most "no messages" cases are **local config or network issues**, not a botmux bug. botmux already wires up an AI agent — so **run a one-shot headless self-check with your CLI** and let it read the logs, check the config, and give you a verdict.
+Common questions:
 
-First save the diagnostic task into a variable (single line, so you don't have to paste it repeatedly):
+- **Do I always need to @ it?** In groups, the bot replies only when @-mentioned by default. In a group with just you and one bot, follow-ups inside a topic that's already started don't need the @. To go mention-free, see [Mention policy](/en/mention-mode).
+- **Don't want a group?** Just **DM the bot**.
+- **Want to create a group in one click?** Send `/g <group name>` in any chat, or open the "Groups" page in `botmux dashboard` and click "New Chat"; see [Create a Session Group in One Step](/en/group).
+
+## Not receiving messages? Self-check first
+
+Most "no response" cases are local config or network issues. Let your AI CLI troubleshoot: it reads the logs, checks the config, and gives you a verdict.
+
+First save the diagnostic task in a variable:
 
 ```bash
-DIAG='botmux is not receiving messages in the Lark group. Diagnose read-only (do NOT change anything), run these in order and give the most likely cause + fix: botmux status (is the daemon running); botmux logs --lines 150 (look for WebSocket connection failures, token/auth errors, permission errors 401/403/411/400, CLI spawn failures); cat ~/.botmux/bots.json (check AppID/Secret/CLI config); judge whether the long-lived WebSocket is blocked by a corporate network/proxy/firewall. Conclude at the end.'
+DIAG='botmux is not receiving messages in the Lark group. Diagnose read-only (do NOT change anything), run these in order and give the most likely cause + fix: botmux status (is the daemon running); botmux logs --lines 150 --no-follow (look for WebSocket connection failures, token/auth errors, permission errors 401/403/411/400, CLI spawn failures); cat ~/.botmux/bots.json (check AppID/Secret/CLI config); judge whether the long-lived WebSocket is blocked by a corporate network/proxy/firewall. Conclude at the end.'
 ```
 
-Pick one line for the CLI you have installed (all non-interactive; they print the verdict and exit):
+Then run the line for the CLI you have (all non-interactive; they print the verdict and exit):
 
 ```bash
 claude -p "$DIAG" --allowedTools "Bash"   # Claude Code
 codex exec "$DIAG"                         # Codex
-coco  -p "$DIAG" --yolo                    # Trae / CoCo (aliases trae-agent / ta)
+coco  -p "$DIAG" --yolo                    # TRAE CLI 1.0 / CoCo (legacy)
 cursor-agent -p "$DIAG"                    # Cursor
 ```
 
-> The trailing flags (`--allowedTools` / `--yolo`, etc.) just let the agent actually run commands and read logs — it's a read-only check. `botmux logs` can pinpoint almost any problem; it's the gold standard.
+> The trailing `--allowedTools` / `--yolo` just let the agent run commands to read logs. `botmux logs` can pinpoint almost any problem.
 
-Still stuck? Check manually (usually local-side):
+Still stuck? Check by hand:
 
-- **Daemon not running / config changed without restart** → `botmux status`, then `botmux restart`.
-- **Incomplete bot permissions / reusing a bot created from an old app** (most common) → see [Common Pitfalls](/en/pitfalls); recreate via the latest `botmux setup` QR flow.
-- **Event subscriptions / bot capability** (only needed for manually-created apps): in the Open Platform, subscribe to `im.message.receive_v1` + `card.action.trigger` (long-lived WebSocket), and enable App features → Bot.
-- **Network**: the long-lived WebSocket can't get out (corporate network / proxy / firewall) → the agent will see the connection errors in the logs.
+| Symptom / suspicion | How to check and fix |
+|---|---|
+| Daemon not running, or config changed without a restart | `botmux status` to check, `botmux restart` to restart |
+| Message didn't @ the bot | Groups require an @ by default; see [Mention policy](/en/mention-mode) |
+| Incomplete permissions, or a bot built from an old app (most common) | See [Common Pitfalls](/en/pitfalls); recreate via the latest `botmux setup` QR flow |
+| Manually created app not fully configured | In the Open Platform: enable App features → Bot; receive events via long connection and subscribe to `im.message.receive_v1`, plus the `card.action.trigger` callback; publish a version |
+| Long connection blocked (corporate network / proxy / firewall) | `botmux logs` will show connection errors |
 
-After confirming, run `botmux restart`. See [FAQ / Troubleshooting](/en/faq) for more.
+Run `botmux restart` after fixing. See [FAQ / Troubleshooting](/en/faq) for more.
 
-### Adding an @ mention by editing does not trigger the bot?
+### Optional events: @ by editing, recall sync
 
-Editing a message that has not yet triggered the bot to add an @ mention requires the optional `im.message.updated_v1` subscription with long-connection delivery. Missing this event does not affect ordinary new messages.
+Missing either of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
 
-Group context sharing (`/context-sharing`) marks recalled messages in its record only when the optional `im.message.recalled_v1` event is subscribed. Without it, recalls are not reflected and the bot's startup log reports the gap; ordinary new messages are unaffected.
+| Event | Used for |
+|---|---|
+| `im.message.updated_v1` | Editing a message that didn't @ the bot to add the @, which then triggers a task |
+| `im.message.recalled_v1` | In group context sharing (`/context-sharing`), marking recalled messages in the record. Only added when that feature is on |
 
-At startup, botmux uses an existing Feishu Open Platform login session to add this event to an existing long-connection configuration. It does not switch delivery modes, change permissions, or publish an app version. Logs reporting a successful update request or a configuration readback do not verify the published version or actual event delivery. After adding the subscription to a production app, inspect the pending changes in the Open Platform and publish a version, then test by adding an @ mention to a message that has not previously triggered the bot.
+Things to note:
 
-If the sender relies on team membership for chat access, edited messages also require a contact lookup to recover the sender's `union_id`. The app needs contact read permissions (the default permission manifest includes `contact:user.id:readonly`), and the sender must be within its visibility scope. If permission is missing or the lookup fails, botmux uses only the original message author's `open_id` under the existing access rules; team membership alone cannot grant access. It never borrows the editor's identity.
+- The startup top-up only adds events to the existing long-connection config. It does **not** change the delivery mode, change permissions, or publish a version. A log line saying the update request succeeded doesn't mean it's live. For production apps, review pending changes in the Open Platform, publish a version, then verify by editing a message that hasn't triggered the bot to add an @.
+- If the sender's chat access comes from team membership, an edited message also needs a contact lookup to get their `union_id`. This requires contact read permission (the default permission list includes `contact:user.id:readonly`) and the sender must be within the app's visibility scope. If the lookup fails, access is judged only by the original author's `open_id`; the editor's identity is never borrowed.

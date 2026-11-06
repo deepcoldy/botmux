@@ -65,7 +65,9 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
   freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue', terminalDelayMs = 0,
   delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false, holdPreferredSuccessor = false,
-  quota?: { code: string; exhaustLast?: boolean; initial?: boolean; blocked?: boolean },
+  quota?: { code: string; message?: string; trigger?: 'quota' | 'capacity'; queueModels?: string[];
+    modelErrors?: Record<string, { codex_error_info: string; message?: string }>;
+    exhaustLast?: boolean; initial?: boolean; blocked?: boolean },
   delayedHistoryReceipt?: { submission: number; ms: number },
   preflight?: { enabled: boolean; initialPrompt?: string; dispatchAttempt?: number;
     probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number },
@@ -198,12 +200,15 @@ process.stdin.on('data', chunk => {
       && fs.existsSync(${JSON.stringify(launches)})
       && fs.readFileSync(${JSON.stringify(launches)}, 'utf8').includes('"model":"last"');
     if (${JSON.stringify(!!quota)}) {
+      if (${JSON.stringify(quota?.queueModels ?? [])}.includes(model)) { queued(); return; }
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
       setTimeout(() => {
         completed = true;
         const failed = model !== 'last' || ${JSON.stringify(quota?.exhaustLast === true)};
+        const error = ${JSON.stringify(quota?.modelErrors ?? {})}[model]
+          ?? { codex_error_info: ${JSON.stringify(quota?.code ?? '')}, message: ${JSON.stringify(quota?.message)} };
         line({ type: 'task_complete', turn_id: turnId, last_agent_message: failed ? '' : 'done',
-          ...(failed ? { error: { codex_error_info: ${JSON.stringify(quota?.code ?? '')} } } : {}) });
+          ...(failed ? { error } : {}) });
         idle();
       }, 1200);
     } else if (successorAfterReset) {
@@ -349,7 +354,7 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
     } } : {}),
     ...(rpcPolicy ? { codexRpcInput: resolveCodexRpcInput('traex', rpcPolicy.override, rpcPolicy.global) } : {}),
     ...(enabled ? { traexAutoModel: { enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000, switchCooldownMs: 5_000,
-      ...(quota ? { trigger: 'quota' as const } : {}),
+      ...(quota ? { trigger: quota.trigger ?? 'quota' } : {}),
       ...(preflight?.enabled ? {
         preflightLoadCheck: true,
         overloadThresholdPercent: 100,
@@ -372,6 +377,61 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('model access restrictions continue through the ordered pool without replaying the original input', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity' });
+    f.child.send({ type: 'message', content: 'original restricted task', turnId: 'om_access' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_access' && message.status === 'completed'), 'restriction recovery complete');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.launches).slice(1).every(row => row.args.includes(f.nativeId))).toBe(true);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('original restricted task'))).toHaveLength(1);
+    expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access')).toHaveLength(1);
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(2);
+    expect(f.messages.filter(message => message.type === 'active_runtime' && message.traexAutoModelRuntime?.modelAccessRecovery?.blockedModels.length === 2).length).toBeGreaterThan(0);
+  }, 45_000);
+
+  it('model access restrictions also skip confirmed quota failures during the same capacity search', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity',
+        modelErrors: { backup: { codex_error_info: 'usage_limit_exceeded', message: 'Usage quota exhausted' } },
+      });
+    f.child.send({ type: 'message', content: 'mixed access and quota task', turnId: 'om_access_quota' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_access_quota' && message.status === 'completed'), 'mixed failure recovery complete');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('mixed access and quota task'))).toHaveLength(1);
+    expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access_quota')).toHaveLength(1);
+  }, 45_000);
+
+  it('model access restrictions retain a queued candidate while checking for a later non-queued model', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity', queueModels: ['backup'] });
+    f.child.send({ type: 'message', content: 'restricted then queued task', turnId: 'om_access_queue' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_access_queue' && message.status === 'completed'), 'later non-queued model complete');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('restricted then queued task'))).toHaveLength(1);
+  }, 45_000);
+
+  it('model access restrictions hold a genuinely queued candidate when the remaining models all queue', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity', queueModels: ['backup', 'last'] });
+    f.child.send({ type: 'message', content: 'restricted all remaining queued', turnId: 'om_access_wait' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'active_runtime' && message.traexAutoModelRuntime?.waitingOnFinalModel && message.model === 'last'), 'queued candidate held');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access_wait')).toHaveLength(0);
+    writeFileSync(f.release, '1');
+    await f.wait(() => f.messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_access_wait' && message.status === 'completed'), 'held queue released');
+    expect(rows(f.submissions).filter(row => row.text.startsWith('restricted all remaining queued'))).toHaveLength(1);
+  }, 45_000);
+
+  it('model access restrictions stop once when every configured model refuses access', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity', exhaustLast: true });
+    f.child.send({ type: 'message', content: 'all access restricted', turnId: 'om_access_exhausted' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_access_exhausted' && message.status === 'failed'), 'all access refusals settled');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('all access restricted'))).toHaveLength(1);
+    expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access_exhausted')).toHaveLength(1);
+  }, 45_000);
   it('releases a cold-restored interrupted structured turn before accepting new input', async () => {
     const f = await fixture(false, false, false, undefined, false, undefined, false,
       undefined, 0, 0, false, false, undefined, undefined, undefined, true);

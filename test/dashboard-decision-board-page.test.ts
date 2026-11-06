@@ -312,6 +312,19 @@ describe('Bot config steward section', () => {
     expect(p2p().props.disabled).toBe(true);
   });
 
+  it('"decision cards in Feishu" is on by default; turning it off saves false, turning it back on drops the field', async () => {
+    serve();
+    await render({ enabled: true, chatId: 'oc_1' });
+    const cards = () => renderer!.root.find(n => n.type === 'input' && n.props['data-action'] === 'toggle-steward-decision-cards');
+    expect(cards().props.checked).toBe(true);
+    expect(text()).toContain(zh('botDefaults.stewardDecisionCards'));
+    await act(async () => { cards().props.onChange({ currentTarget: { checked: false } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', decisionCards: false } });
+    expect(cards().props.checked).toBe(false);
+    await act(async () => { cards().props.onChange({ currentTarget: { checked: true } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1' } });
+  });
+
   it('the auto-join switch only shows while the bot is a steward, and a saved "off" survives turning the steward off and on', async () => {
     serve();
     await render({ enabled: false, autoJoinNewGroups: false });

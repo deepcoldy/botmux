@@ -26,6 +26,15 @@ awaits that receipt before starting its CLI. Once the backend exists, it reports
 its native identity; the host confirms the binding and releases deferred events.
 Both permits and assignments recheck IPC ownership after asynchronous waits.
 Reserved epochs are never rolled back or reused, including checkpoint restore.
+If reservation permission is refused or arrives after the worker's wait expires,
+the worker reports `runtime_binding_aborted` before invoking the physical spawn.
+The host settles only an unbound reservation owned by that producer. A stopped
+reservation cannot grant permission or bind later; the worker restores its
+previous binding so recovery commands can still address the surviving executor.
+Restoration skips predecessors whose starts were also aborted. The no-spawn
+report retains its original binding and retries until the host acknowledges its
+durable commit. Observed no-spawn evidence also fences late permits while the
+commit is failing; a lost acknowledgement cannot leave the reservation pending.
 
 Events carry a producer ID, producer sequence, event ID, session reference and
 their original runtime/execution/operation scope. Async callbacks keep the scope
@@ -48,6 +57,10 @@ reattachment. Identity publication leaves the attempt queued and unbound; stale
 runtime/producer or unproven attempt references cannot publish that authority.
 Turn-scoped publications and revocations must carry an existing `ExecutionRef`
 before any deferred write or attempt inference; they never create admissions.
+The full admitted reference is checked before deferral. Permanently rejected
+deferred messages are removed when replayed, including records from older boots.
+Rejection cleanup matches the recorded message body as well as its event ID;
+an unproven envelope cannot discard a different valid deferred event.
 
 ## Durable state and operations
 
@@ -74,6 +87,24 @@ operation; concurrent requests join it. A planned restart recovered before its
 start claim resumes the same operation, with a single start claim. Close can
 supersede another operation; its late success cannot revive a closed selection.
 A rejected close restores the previous suspended lifecycle.
+If persistence of the restart start claim fails before physical restart is
+invoked, the operation settles as `failed_before_effect` and can be retried.
+Failures after invocation remain uncertain because effects may already exist.
+
+An unverified suspend retains `uncertain`: the backing verifier has already
+attempted teardown, so failure does not prove that no effect occurred. Retrying
+suspend reuses the same operation and rechecks the exact selected runtime's
+backing. A verified teardown confirms that operation. Restart can supersede an
+uncertain suspend or cancel, retaining the old intent and restoring its prior
+lifecycle under the new restart fence. Late results settle only the retired
+operation. Input stays fenced until verification or restart confirmation;
+ordinary readiness events alone do not prove a failed teardown harmless.
+
+During reserve-to-bind replacement, an authorized predecessor exit still records
+the physical loss and reconciles its executions, but has historical admission.
+It cannot invoke the current executor's crash handling while a newer unbound
+reservation belongs to the selected worker. Confirmed bindings, retired workers
+and allocator high water alone do not suppress genuine current exits.
 
 Cancellation records intent first. An interrupt delivery receipt confirms that
 the key/command was delivered; it does not claim native cancellation. Native

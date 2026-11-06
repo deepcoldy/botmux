@@ -8,7 +8,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
-import { startLarkConnection } from './transport/connection.js';
+import { startLarkConnection, type LarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
@@ -29,8 +29,7 @@ import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.j
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
-import { isTeamGroupChat } from '../../services/team-groups-store.js';
-import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
+import { isPlatformTeamBotTrustedBy, isPlatformHallChat, isPlatformTeamMember, isTeamGroupChatFor, isLegacyTeamGroupChat } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { readBotAdminUnions } from '../../services/bot-admin-unions-store.js';
 import { isStewardSilentJoin } from '../../services/steward-auto-join.js';
@@ -1226,7 +1225,11 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
       }
       if (typeof result.afterAck === 'function') {
         setTimeout(() => {
-          void Promise.resolve(result.afterAck())
+          // Pass the REAL ACK-timeout state observed by this wrapper. Existing
+          // afterAck callbacks ignore the extra argument; callbacks that must
+          // decide between a synchronous toast and a visible fallback (e.g. the
+          // substitute toggle) use it instead of estimating elapsed time.
+          void Promise.resolve(result.afterAck(timedOut))
             .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
         }, 0);
       }
@@ -1572,10 +1575,12 @@ export function resolveSiblingBotNameByUnionId(
  * this covers cross-deployment TEAM peers. Returns false when neither holds, so
  * the caller falls back to the /grant request card.
  *
- * 平台团队与旧版联邦团队同权：isPlatformTeamBot（平台 team-sync 下发的团队 bot
- * union_id roster）与 isTeamBot（团队群里学来的 union_id）都是 union_id 锚定的
- * bot 专属信任；平台拉的团队群则经 platform: 前缀镜像进 team-groups，走同一个
- * isTeamGroupChat。两条路都算团队模式，都不需要 /grant。
+ * 平台团队与旧版联邦团队同权：平台 team-sync 下发的团队 bot union_id roster
+ *（{@link isPlatformTeamBotTrustedForReceiver}）与 isTeamBot（团队群里学来的 union_id）
+ * 都是 union_id 锚定的 bot 专属信任；平台拉的团队群则经 platform: 前缀镜像进
+ * team-groups，走 isTeamGroupChatFor（平台群要求接收 bot 在该团队）。两条路都算团队模式，都不需要 /grant。
+ * 平台 roster 是按**机器**下发的（owner 所在的全部团队），所以那条腿必须按接收 bot
+ * 收窄：同队或同机才算，详见 isPlatformTeamBotTrustedBy。
  *
  * 调用方只剩 {@link evaluateBotTalk} 一个（bot 闸门的唯一入口）；(1) 的两条腿与
  * evaluateTalk 的 teamBot 腿重合，真正额外放行的是 (2)。保留本谓词是因为它是
@@ -1583,12 +1588,55 @@ export function resolveSiblingBotNameByUnionId(
  */
 export function isTrustedTeamBotSender(
   dataDir: string,
+  larkAppId: string,
   chatId: string | undefined,
   senderUnionId: string | undefined,
 ): boolean {
   return isTeamBot(dataDir, senderUnionId)
-    || isPlatformTeamBot(dataDir, senderUnionId)
-    || isTeamGroupChat(dataDir, chatId);
+    || isPlatformTeamBotTrustedForReceiver(dataDir, larkAppId, senderUnionId)
+    || isTeamGroupChatFor(dataDir, larkAppId, chatId);
+}
+
+/**
+ * 团队群里 bot 发言 → 把它的 union_id 学进整机共享的 team-bots.json（之后在任意群按队友放行，
+ * 见 team-bots-store）。调用方保证 `senderUnionId` 来自飞书盖章的 bot 发送方。
+ *
+ * 只在**旧版联邦**团队群里学：平台团队群的 bot 身份以平台 roster 为准（已按接收 bot 收窄到
+ * 同队/同机），在平台群里学会让别队、别机的 bot 经 isTeamBot 拿到本机所有 bot 的 talk + operate。
+ * 返回是否写入。
+ */
+export function learnTeamBotFromGroupMessage(
+  dataDir: string,
+  chatId: string | undefined,
+  senderUnionId: string | undefined,
+): boolean {
+  if (!senderUnionId || !isLegacyTeamGroupChat(dataDir, chatId)) return false;
+  return recordTeamBot(dataDir, { unionId: senderUnionId });
+}
+
+/** 本机 bots.json 是否配置了 `appId`（同机判定）。读配置失败按「不是本机」处理（fail closed）。 */
+function isConfiguredOnThisMachine(appId: string): boolean {
+  const id = appId.trim();
+  if (!id) return false;
+  try {
+    return loadBotConfigsCached().some(cfg => (cfg.larkAppId ?? '').trim() === id);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 平台团队 bot 信任（talk + operate 的平台 roster 腿）：发送方 union_id 在平台 roster 里，
+ * 且与接收 bot `larkAppId` 同属一个团队，或发送方就配置在本机 bots.json（同机不同团队照样免授权；
+ * 同机腿不校验 owner、不看 trustSameOwnerBots，与收窄前一致——按 owner 区分的是兄弟 bot 腿）。
+ * 只认飞书盖章的 bot 发送方 union（调用方契约同 teamBot 腿）。
+ */
+export function isPlatformTeamBotTrustedForReceiver(
+  dataDir: string,
+  larkAppId: string,
+  senderUnionId: string | undefined,
+): boolean {
+  return isPlatformTeamBotTrustedBy(dataDir, larkAppId, senderUnionId, isConfiguredOnThisMachine);
 }
 
 /** Update the per-bot cross-reference from @mention data in an event.
@@ -2198,7 +2246,9 @@ export function evaluateTalk(
   //（isTrustedTeamBotSender）放进来的团队 bot 消息会在 enforceMessageQuotaForCliInput
   // 的 evaluateTalk 复查处被静默丢弃（受限 bot 上 #332 的端到端断点）。仅认租户
   // 稳定 union_id（bot 专属，人不会进这两张表），不看 chatId，不授 operate。
-  if (senderUnionId && (isTeamBot(config.session.dataDir, senderUnionId) || isPlatformTeamBot(config.session.dataDir, senderUnionId))) {
+  // 平台 roster 腿按接收 bot 收窄（同队或同机），不是「本机任一团队里有它」——
+  // 否则 owner 在 A 队的另一台机器上的 bot，能驱动只在 B 队的本 bot。
+  if (senderUnionId && (isTeamBot(config.session.dataDir, senderUnionId) || isPlatformTeamBotTrustedForReceiver(config.session.dataDir, larkAppId, senderUnionId))) {
     return { allowed: true, reason: 'teamBot' };
   }
   // 平台团队成员（人）：发送者 union_id 与本 bot 同属某平台团队 → talk 免 grant，
@@ -2287,7 +2337,7 @@ export function evaluateBotTalk(
   // 黑名单否决不可被 bot 独有的团队拉群 chat 维度腿复活：被黑 bot 即使出现在团队
   // 拉群里也照样拒绝（人侧 evaluateTalk 已挡 union 腿，这里挡 chat 腿）。
   if (ev.reason === 'blocked') return ev;
-  return isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
+  return isTrustedTeamBotSender(config.session.dataDir, larkAppId, chatId, senderUnionId)
     ? { allowed: true, reason: 'teamBot' }
     : ev;
 }
@@ -2395,8 +2445,9 @@ export function canOperate(
   // 不走 isTrustedTeamBotSender 的「团队群成员」分支——那条按 chat 放行是 sender
   // 无关的，会把「团队群里的真人」也误放进 operate，破坏 allowedUsers 边界。union_id
   // 是发送方专属、且必须先被团队背书（团队群学习 / 平台 roster）才进表，人不会命中。
+  // 平台 roster 与 evaluateTalk 同口径：只认与本 bot 同队、或配置在本机的 bot。
   if (isTeamBot(config.session.dataDir, senderUnionId)) return true;
-  if (isPlatformTeamBot(config.session.dataDir, senderUnionId)) return true;
+  if (isPlatformTeamBotTrustedForReceiver(config.session.dataDir, larkAppId, senderUnionId)) return true;
   // 同机兄弟 bot 互信 operate（与团队 peer 同一口径：union_id 精确对上本机 bots.json 里
   // 登记的兄弟应用），另加「同一个 owner」：对方的管理员都得是本 bot 的管理员，一台机器
   // 托管多人 bot 时别人的 bot 仍只能对话。可在 Bot 配置关掉（trustSameOwnerBots）。
@@ -4780,9 +4831,9 @@ async function processCommentEvent(
 }
 
 export interface LarkEventDispatcherRuntime {
-  connect(): Lark.WSClient;
+  connect(): LarkConnection;
   connectPrimary(input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   };
   close(): void;
@@ -5169,15 +5220,15 @@ export function createLarkEventDispatcherRuntime(
             .catch(err => logger.error(`Error handling message event: ${err}`));
           return;
         }
-        // Learn teammate identity from team-assembled groups (the trust root):
-        // any bot talking in a 拉群 group is a vouched teammate, so capture its
+        // Learn teammate identity from LEGACY federation 拉群 groups (the trust
+        // root there): a bot talking in one is a vouched teammate, so capture its
         // tenant-stable union_id — we then honour it as a teammate in ANY chat
-        // (see team-bots-store). Done BEFORE the @mention gate so even a non-@
-        // message in a team group teaches us the teammate. Cheap + idempotent.
+        // (see team-bots-store). Platform team groups are excluded: platform bot
+        // identity comes from the roster (see learnTeamBotFromGroupMessage).
+        // Done BEFORE the @mention gate so even a non-@ message teaches us the
+        // teammate. Cheap + idempotent.
         const senderUnionId = sender.sender_id?.union_id as string | undefined;
-        if (senderUnionId && isTeamGroupChat(config.session.dataDir, chatId)) {
-          recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
-        }
+        learnTeamBotFromGroupMessage(config.session.dataDir, chatId, senderUnionId);
         // 机器人大厅：bot 消息只用于身份登记（上面已学 sender union / mentions
         // 自学），绝不当任务路由——平台 bot 会 @ 新 bot 教它 union，不吞掉的话
         // 接收 bot 会把这类消息当任务拉起会话在大厅里回话（实测）。只吞 bot 发送方：
@@ -5625,6 +5676,23 @@ export function createLarkEventDispatcherRuntime(
           && resolveSubstituteTrigger(larkAppId, message)) {
         logger.info(
           `[substitute:${larkAppId}] excluded chat — dropping @target message ` +
+          `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+        );
+        return;
+      }
+      // 运行态 per-chat off：同上，只 @配置替身对象、未直接 @本 bot 的消息必须让路。
+      // 仅清 substituteTrigger 不够——通用 relax 仍可能因 mentionMode=never/ambient/topic、
+      // 已有活跃会话或 solo-group bypass 放行，导致用户在本群关掉替身后，@替身对象
+      // 仍被送进会话并产生可见回复。这里只丢弃这一类消息，不做全群静音；直接 @本 bot
+      // 不受影响（explicitlyMentionedThisBot 为真时不进入本 gate）。
+      if (substituteCfg?.enabled === true
+          && chatType === 'group'
+          && !explicitlyMentionedThisBot
+          && isSubstituteAllowedChat(substituteCfg, chatId)
+          && !isSubstituteEnabledForChat(larkAppId, chatId)
+          && resolveSubstituteTrigger(larkAppId, message)) {
+        logger.info(
+          `[substitute:${larkAppId}] per-chat off — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
         );
         return;
@@ -6847,7 +6915,7 @@ export function createLarkEventDispatcherRuntime(
     };
   }
 
-  let wsClient: Lark.WSClient | undefined;
+  let wsClient: LarkConnection | undefined;
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
@@ -6990,6 +7058,9 @@ export function createLarkEventDispatcherRuntime(
     primaryTransportReady = false;
     if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
         || primaryLeadershipSignal.aborted) return;
+    // A replacement during the same outage must keep the first scan's
+    // history cutoff and ready promise, including during initial leadership.
+    if (pendingTransportReady?.leadershipSignal === primaryLeadershipSignal) return;
     const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
     void ready.catch(error => {
       if (primaryLeadershipSignal?.aborted) return;
@@ -7000,7 +7071,7 @@ export function createLarkEventDispatcherRuntime(
     });
   };
 
-  const connect = (): Lark.WSClient => {
+  const connect = (): LarkConnection => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
       onReady: settlePrimaryTransportReady,
@@ -7038,7 +7109,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const connectPrimary = (input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
@@ -7151,7 +7222,7 @@ export function startLarkEventDispatcher(
   handlers: EventHandlers,
   brand: Brand = 'feishu',
   durableInboxShadow?: DurableInboxStore,
-): Lark.WSClient {
+): LarkConnection {
   return createLarkEventDispatcherRuntime(
     larkAppId,
     larkAppSecret,

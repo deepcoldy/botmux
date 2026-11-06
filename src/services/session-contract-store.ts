@@ -5,7 +5,7 @@ import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.
 import { isOutputJournalAppId } from './universal-output-handoff.js';
 import type { TurnResultBinding, TurnResult, TurnDeliveryReceipt } from './turn-result.js';
 import {
-  reduceSessionContract, reusableRuntimeIdentity, sameRuntime, samePhysicalRuntimeIdentity,
+  reduceSessionContract, reusableRuntimeIdentity, sameRuntime, samePhysicalRuntimeIdentity, canSupersedeControlOperation,
   type ContractSessionRef, type SessionContract, type RuntimeContract, type RuntimeIdentity, type RuntimeRef,
   type ExecutionContract, type ExecutionRef, type ControlOperation, type ControlKind, type ContractEvent,
   type ContractTransition, type ContractTransitionInput, type WorkerRef,
@@ -183,6 +183,18 @@ export class SessionContractStore {
       .map(row => JSON.parse(row.value) as RuntimeContract).filter(runtime => samePhysicalRuntimeIdentity(runtime.identity, source.identity)
         && (source.identity!.proof !== 'opaque' || runtime.worker.workerId === source.worker.workerId));
   }
+  hasPendingRuntimeReplacement(ref: ContractSessionRef, origin: RuntimeRef): boolean {
+    const worker = this.read(ref)?.worker;
+    if (!worker) return false;
+    // Check bindings still owned by the selected worker. Allocator high water
+    // and orphaned reservation entities survive a successful identity reuse.
+    const rows = this.db.prepare("SELECT e.value FROM runtime_bindings b JOIN entities e ON e.session_key=b.session_key AND e.id=b.runtime_id AND e.kind='runtime' WHERE b.session_key=? AND b.worker_id=? AND b.generation=? AND e.phase='starting'")
+      .all(sessionKey(ref), worker.workerId, worker.generation) as Array<{ value: string }>;
+    return rows.some(row => {
+      const runtime = JSON.parse(row.value) as RuntimeContract;
+      return !runtime.identity && runtime.ref.epoch > origin.epoch;
+    });
+  }
   execution(ref: ContractSessionRef, executionId: string): ExecutionContract | undefined { return this.entity(ref, 'execution', executionId); }
   operation(ref: ContractSessionRef, operationId?: string): ControlOperation | undefined { return this.entity(ref, 'operation', operationId ?? this.read(ref)?.activeOperationId); }
   latestCancel(ref: ContractSessionRef, executionId: string): ControlOperation | undefined {
@@ -302,6 +314,7 @@ export class SessionContractStore {
       const previous = this.runtime(ref);
       const reserved = this.runtime(ref, proposed.runtimeId);
       if (!reserved || !sameRuntime(reserved.ref, proposed)) throw new Error('runtime_reservation_missing');
+      if (!reserved.identity && ['stopped', 'retiring'].includes(reserved.phase)) throw new Error('runtime_reservation_abandoned');
       if (reserved.identity && reusableRuntimeIdentity(reserved.identity, identity) && reserved.worker.workerId === worker.workerId) return reserved;
       if (reserved.identity && reserved.worker.workerId === worker.workerId && reserved.identity.proof !== 'opaque') {
         const old = reserved.identity;
@@ -366,8 +379,10 @@ export class SessionContractStore {
   deferredEvents<T>(ref: ContractSessionRef, bindingId: string): T[] {
     return (this.db.prepare('SELECT value FROM deferred_events WHERE session_key=? AND binding_id=? ORDER BY sequence,event_id').all(sessionKey(ref), bindingId) as Array<{ value: string }>).map(row => JSON.parse(row.value));
   }
-  acknowledgeDeferred(ref: ContractSessionRef, eventId: string): void {
-    this.db.prepare('DELETE FROM deferred_events WHERE session_key=? AND event_id=?').run(sessionKey(ref), eventId);
+  acknowledgeDeferred(ref: ContractSessionRef, eventId: string, rejectedMessage?: unknown): void {
+    if (rejectedMessage !== undefined) {
+      this.db.prepare('DELETE FROM deferred_events WHERE session_key=? AND event_id=? AND value=?').run(sessionKey(ref), eventId, JSON.stringify(rejectedMessage));
+    } else this.db.prepare('DELETE FROM deferred_events WHERE session_key=? AND event_id=?').run(sessionKey(ref), eventId);
   }
   binding(ref: ContractSessionRef, bindingId: string): RuntimeContract | undefined {
     const row = this.db.prepare('SELECT runtime_id FROM runtime_bindings WHERE session_key=? AND binding_id=?').get(sessionKey(ref), bindingId) as { runtime_id: string } | undefined;
@@ -402,12 +417,13 @@ export class SessionContractStore {
     return this.transaction(() => {
       const session = this.read(ref); if (!session) throw new Error('contract_session_missing');
       const active = this.operation(ref);
-      if (active && kind !== 'close') {
+      const supersedes = !!active && canSupersedeControlOperation(active, kind);
+      if (active && !supersedes) {
         if (active.kind !== kind || (options.execution && active.targetExecution?.executionId !== options.execution.executionId)) throw new Error('control_operation_in_progress');
         return { operation: active, joined: true };
       }
       if (active?.kind === 'close' && kind === 'close') return { operation: active, joined: true };
-      const operation: ControlOperation = { operationId: options.operationId ?? randomUUID(), kind, phase: 'planned', targetRuntime: options.runtime ?? session.activeRuntime, targetExecution: options.execution, proposedRuntime: options.proposedRuntime, expectedRevision: session.revision, previousLifecycle: session.lifecycle };
+      const operation: ControlOperation = { operationId: options.operationId ?? randomUUID(), kind, phase: 'planned', targetRuntime: options.runtime ?? session.activeRuntime, targetExecution: options.execution, proposedRuntime: options.proposedRuntime, expectedRevision: session.revision, previousLifecycle: supersedes && kind === 'restart' ? active!.previousLifecycle ?? 'active' : session.lifecycle };
       const result = this.applyInside(ref, { type: 'control_requested', operation }, `operation:${operation.operationId}`, session.revision);
       if (result.decision !== 'applied') throw new Error(`control_request_${result.decision}`); return { operation, joined: false };
     });

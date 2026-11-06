@@ -29,6 +29,7 @@ export function workerSubmitHarness() {
     sessionRenameInFlight: () => false,
     shouldDeferUserFlush: () => false,
     refreshHookReviewInputHold: vi.fn(),
+    hookReviewHoldsQueuedWrite: () => false,
     pendingInputMayFlush: () => true,
     rpcLifecycleFailClosedOwners: new Map(),
     probeStartupBlocker: () => false,

@@ -32,7 +32,8 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
     workerSessionEventScope: undefined,
     currentBotmuxTurnId: 'stop', currentBotmuxDispatchAttempt: undefined, backend: {}, lastInitConfig: { cliId }, effectiveBackendType: 'pty', isCodexAppCliId,
     codexCliEffortOperation: undefined, cliLifetimeNonce: 1,
-    traexAutoModelController: null,
+    traexAutoModelController: null, traexQuotaPending: undefined, traexModelAccessSwitchNotice: undefined,
+    publishActiveRuntime: vi.fn(), emitReadyCodexTurns: vi.fn(),
     cliAdapter: interruptKey ? { id: cliId, interruptKey } : undefined,
     inflightInputs, pendingMessages, send, log: vi.fn(), tuiPromptBlocking: true,
     flushPending: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
@@ -42,6 +43,8 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
     retireDoubaoBridgeTurnOnInterrupt,
   });
   context.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', context);
+  context.holdTraexRecoveryForStop = loadWorkerFunction('holdTraexRecoveryForStop', context);
+  context.settleStoppedTraexRecovery = loadWorkerFunction('settleStoppedTraexRecovery', context);
   runInContext(handler, context);
   const interrupt = () => runInContext("handleExactTurnInterrupt('request', 'stop')", context) as Promise<void>;
   const replay = () => { inflightInputs.onCliExit(); return inflightInputs.takeCarryOver().map(item => item.turnId); };

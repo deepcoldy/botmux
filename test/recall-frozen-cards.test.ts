@@ -452,6 +452,10 @@ describe('restoreUsageLimitRuntimeState', () => {
       undefined,
       // 22nd arg: no streaming-card buttons are hidden by default.
       [],
+      // 23rd arg: screenshot-unavailable placeholder flag — not set on restore.
+      false,
+      // 24th arg: per-chat substitute card control — unavailable for this fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

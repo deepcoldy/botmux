@@ -232,7 +232,17 @@ export async function maybeRunRiffHostTool(argv: string[], readStdin: () => Prom
   if (env.BOTMUX_RIFF_HOST_TOOLS !== '1') return false;
   if (['--version', '-v', '--help', '-h', 'help', 'capabilities', 'skill'].includes(argv[0] ?? '')
     || (argv[0] === 'send' && argv.includes('--dry-run'))) return false;
-  const b = JSON.parse(readFileSync(path, 'utf8')) as RiffHostBinding;
+  let raw: string;
+  try { raw = readFileSync(path, 'utf8'); }
+  catch (error) {
+    // A missing binding means this turn's bootstrap did not finish; a bare
+    // ENOENT sends the reader looking at the file system instead of that line.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('riff_host_binding_missing: run this turn\'s <botmux_host_tools> bootstrap command first and check its error output');
+    }
+    throw error;
+  }
+  const b = JSON.parse(raw) as RiffHostBinding;
   if (b.sessionId !== env.BOTMUX_SESSION_ID) throw new Error('riff_host_session_mismatch');
   let request: RiffHostRequest;
   try {

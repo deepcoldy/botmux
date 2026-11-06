@@ -11,9 +11,10 @@ import { outputSnapshot, UniversalOutputHandoff, type OutputSnapshot } from '../
 import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
-import { loadWorkerPoolClosure } from './helpers/worker-pool-function-harness.js';
+import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import type { DaemonSession } from '../src/core/types.js';
-import { sameWorker } from '../src/services/session-contract.js';
+import { sameWorker, sameRuntime } from '../src/services/session-contract.js';
+import { RestartCoordinator } from '../src/core/restart-coordinator.js';
 
 const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
 vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return fixtureConfig.dataDir; } } } }));
@@ -39,6 +40,286 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  it('does not upgrade an old runtime scope through a newer pending binding', () => {
+    const s = fixture(); const execution = s.controller.admitInput('known-turn'); s.controller.reserveBinding('new-pending', s.worker);
+    const before = s.store.read(s.ref)!.revision;
+    const message = { type: 'managed_turn_origin', turnId: 'known-turn', sessionContract: { ...s.context(1, { runtime: s.runtime, execution }), bindingId: 'new-pending' } };
+    expect(s.controller.ingest(message, s.worker)).toMatchObject({ kind: 'reject', reason: 'runtime_binding_scope_mismatch' });
+    expect(s.store.deferredEvents(s.ref, 'new-pending')).toEqual([]); expect(s.store.read(s.ref)!.revision).toBe(before);
+  });
+  it.each([false, true])('restores the surviving runtime when overlapping starts abort in either order (newestFirst=%s)', newestFirst => {
+    const s = fixture(); const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const old = scope.beginRuntime(); scope.assign(old.bindingId, s.runtime);
+    const a = scope.beginRuntime(); const b = scope.beginRuntime();
+    for (const binding of newestFirst ? [b, a] : [a, b]) scope.restoreAfterAbortedStart(binding);
+    expect(scope.currentBinding()).toBe(old);
+    expect(admitSessionCommand('restart', { version: 2, runtime: s.runtime, operationId: 'restart' }, scope.currentBinding()?.runtime, 'restart').allowed).toBe(true);
+  });
+  it.each(['transaction_failure', 'lost_ack'] as const)('retries no-spawn evidence until the host confirms durable abandonment (%s)', condition => {
+    vi.useFakeTimers(); const s = fixture(); const workerScope = new WorkerSessionEventScope(s.ref, s.worker);
+    const old = workerScope.beginRuntime(); workerScope.assign(old.bindingId, s.runtime);
+    const aborted = workerScope.beginRuntime(); s.controller.reserveBinding(aborted.bindingId, s.worker);
+    workerScope.restoreAfterAbortedStart(aborted);
+    const env: any = { workerSessionEventScope: workerScope };
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
+    const receive = loadWorkerFunction<(message: any) => Promise<void>>('handleContractDaemonMessage', env);
+    let dropAck = condition === 'lost_ack';
+    const worker = { send: vi.fn((message: any) => { if (dropAck) { dropAck = false; return; } void receive(message); }) }; s.ds.worker = worker as any;
+    const hostScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: vi.fn() };
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', hostScope);
+    const db = openDatabaseSyncOrThrow(s.store.filename); handles.push(db);
+    if (condition === 'transaction_failure') db.exec("CREATE TRIGGER fail_abort BEFORE INSERT ON events WHEN NEW.type='runtime_lost' BEGIN SELECT RAISE(ABORT,'abort_failed'); END");
+    const pending: Promise<void>[] = []; const report = vi.fn(() => { pending.push(host(metadata({ type: 'runtime_binding_aborted', bindingId: aborted.bindingId }))); });
+    workerScope.reportAbortedStart(aborted, report);
+    return (async () => {
+      await Promise.all(pending);
+      if (condition === 'transaction_failure') {
+        expect(s.store.binding(s.ref, aborted.bindingId)?.phase).toBe('starting');
+        expect(s.controller.bindingMayStart(aborted.bindingId)).toBe(false);
+        expect(worker.send).not.toHaveBeenCalled();
+        db.exec('DROP TRIGGER fail_abort');
+        s.ds = { ...s.ds, session: structuredClone(s.ds.session) }; s.store.close();
+        const reopened = new SessionContractStore(s.data, s.appId); handles.push(reopened);
+        hostScope.sessionController = new SessionController(s.ds, reopened); hostScope.ds = s.ds;
+      }
+      await vi.advanceTimersByTimeAsync(1_001); await Promise.all(pending);
+      expect(report).toHaveBeenCalledTimes(2);
+      expect(hostScope.sessionController.store.binding(s.ref, aborted.bindingId)?.phase).toBe('stopped');
+      expect(hostScope.sessionController.store.hasPendingRuntimeReplacement(s.ref, s.runtime)).toBe(false);
+      const sent = report.mock.calls.length; await vi.advanceTimersByTimeAsync(5_000); expect(report).toHaveBeenCalledTimes(sent);
+      await host(workerScope.run(old, () => metadata({ type: 'claude_exit', code: 1 })));
+      expect(hostScope.handleLegacyWorkerMessage).toHaveBeenCalledOnce();
+    })();
+  });
+  it.each(['managed_turn_origin', 'managed_turn_origin_revoked'])('rejects an unadmitted %s before persisting a deferred event', type => {
+    const s = fixture(); s.controller.reserveBinding('unbound-start', s.worker);
+    const execution = { executionId: 'not-admitted', turnId: 'unknown-turn', dispatchAttempt: 1 };
+    const before = s.store.read(s.ref)!.revision;
+    const admission = s.controller.ingest({ type, turnId: execution.turnId, dispatchAttempt: 1,
+      sessionContract: { ...s.context(1, { execution }), bindingId: 'unbound-start' } }, s.worker);
+    expect(admission.kind).toBe('reject');
+    expect(s.store.deferredEvents(s.ref, 'unbound-start')).toEqual([]);
+    expect(s.store.executions(s.ref)).toEqual([]); expect(s.store.read(s.ref)!.revision).toBe(before);
+  });
+  it('removes a rejected deferred authority record left by an earlier boot', async () => {
+    const s = fixture(); s.controller.reserveBinding('old-poison', s.worker);
+    const context = { ...s.context(1, { execution: { executionId: 'not-admitted', turnId: 'unknown-turn' } }), bindingId: 'old-poison' };
+    s.store.deferEvent(s.ref, 'old-poison', context.eventId, context.sequence, { type: 'managed_turn_origin_revoked', turnId: 'unknown-turn', sessionContract: context });
+    const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const scope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: vi.fn() };
+    const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', scope); scope.handleWorkerMessage = handler;
+    await handler({ type: 'runtime_binding', bindingId: 'old-poison', identity: { backend: 'tmux', physicalId: '222:start2', proof: 'process_start' },
+      sessionContract: { ...s.context(2, {}), bindingId: 'old-poison' } });
+    expect(s.store.deferredEvents(s.ref, 'old-poison')).toEqual([]); expect(s.store.executions(s.ref)).toEqual([]);
+    expect(scope.handleLegacyWorkerMessage).not.toHaveBeenCalled();
+  });
+  it('does not let a rejected message discard another deferred event with the same id', async () => {
+    const s = fixture(); const execution = s.controller.admitInput('known-turn'); s.controller.reserveBinding('legitimate-pending', s.worker);
+    const context = { ...s.context(1, { execution }), bindingId: 'legitimate-pending' };
+    const message = { type: 'managed_turn_origin', turnId: 'known-turn', sessionContract: context };
+    expect(s.controller.ingest(message, s.worker).kind).toBe('defer');
+    const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const scope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: vi.fn() };
+    const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', scope);
+    await handler({ ...message, sessionContract: { ...context, producer: { workerId: 'unproven-worker', generation: 1 } } });
+    expect(s.store.deferredEvents(s.ref, 'legitimate-pending')).toEqual([message]);
+  });
+  it.each(['refused', 'timeout'] as const)('settles a %s spawn reservation and restores the surviving binding before a genuine crash', async condition => {
+    vi.useFakeTimers(); const s = fixture();
+    const workerScope = new WorkerSessionEventScope(s.ref, s.worker); const previous = workerScope.beginRuntime(); workerScope.assign(previous.bindingId, s.runtime);
+    const reservations = new Map(); const pending: Promise<void>[] = [];
+    const env: any = { workerSessionEventScope: workerScope, pendingRuntimeReservations: reservations,
+      activeRestartAttemptId: undefined, closeRequested: false, initialInputOwnershipPending: false,
+      spawnCliBody: vi.fn(), publishRuntimeContract: vi.fn(), CliSpawnSupersededError: class extends Error {} };
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
+    s.controller.ingest(workerScope.run(previous, () => metadata({ type: 'ready' })), s.worker);
+    s.controller.ingest(workerScope.run(previous, () => metadata({ type: 'prompt_ready' })), s.worker);
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; }); let flushes = 0;
+    vi.spyOn(s.controller, 'flushPrimary').mockImplementation(() => flushes++ === 0 ? gate : Promise.resolve());
+    const receive = loadWorkerFunction<(message: any) => Promise<void>>('handleContractDaemonMessage', env);
+    const worker = { send: vi.fn((message: any) => { void receive(message); }) }; s.ds.worker = worker as any;
+    const legacy = vi.fn(); const hostScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: legacy };
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', hostScope); hostScope.handleWorkerMessage = host;
+    env.send = (message: any) => { pending.push(host(metadata(message))); };
+    const spawn = loadWorkerFunction<(cfg: any) => Promise<void>>('spawnCli', env);
+    const started = spawn({ prompt: '' }); const rejected = expect(started).rejects.toBeInstanceOf(Error);
+    const abandoned = workerScope.currentBinding()!;
+    if (condition === 'refused') { s.controller.beginControl('close', 'close-during-start'); release(); }
+    else { await vi.advanceTimersByTimeAsync(15_001); release(); }
+    await rejected; await Promise.all(pending); await Promise.all(pending);
+    if (condition === 'refused') s.controller.controlResult('close-during-start', 'rejected');
+    expect(env.spawnCliBody).not.toHaveBeenCalled(); expect(workerScope.currentBinding()).toBe(previous);
+    expect(worker.send.mock.calls.some(([message]) => message.type === 'runtime_contract_reserved' && message.mayStart)).toBe(false);
+    expect(s.store.binding(s.ref, abandoned.bindingId)?.phase).toBe('stopped');
+    expect(s.store.hasPendingRuntimeReplacement(s.ref, s.runtime)).toBe(false);
+    expect(() => s.controller.bindRuntime(abandoned.bindingId, s.worker, { backend: 'tmux', physicalId: '222:start2', proof: 'process_start' })).toThrow('runtime_reservation_abandoned');
+    await host(workerScope.run(previous, () => metadata({ type: 'claude_exit', code: 1 })));
+    expect(legacy).toHaveBeenCalledOnce();
+  });
+  it('allows restart retry after persistence of the start claim fails before any physical effect', () => {
+    const s = fixture(); let ds = { ...s.ds, session: structuredClone(s.ds.session), worker: null } as DaemonSession;
+    let controller = s.controller; const db = openDatabaseSyncOrThrow(s.store.filename); handles.push(db);
+    db.exec("CREATE TRIGGER fail_start_claim BEFORE INSERT ON events WHEN NEW.type='control_started' BEGIN SELECT RAISE(ABORT,'start_claim_failed'); END");
+    const scope: any = { RestartCoordinator, findActiveBySessionId: () => ds, controllerForSession: () => controller,
+      isSessionTransferring: () => false, sessionContractPrimary: () => false,
+      destroyLivePaneBeforeRestart: vi.fn(), forkWorker: vi.fn(), logger: { warn: vi.fn() }, tag: () => 'test' };
+    scope.restartCoordinator = loadWorkerPoolClosure('restartCoordinator', scope);
+    const restart = loadWorkerPoolFunction<(ds: DaemonSession, observer: any) => any>('requestSessionRestart', scope);
+    try {
+      const first = restart(ds, { source: 'slash', notify: vi.fn() });
+      expect(scope.forkWorker).not.toHaveBeenCalled();
+      expect(controller.operation(first.attemptId)?.phase).toBe('failed_before_effect');
+      expect(controller.allowsInput()).toBe(true);
+      db.exec('DROP TRIGGER fail_start_claim'); s.store.close();
+      const reopened = new SessionContractStore(s.data, s.appId); handles.push(reopened); controller = new SessionController(ds, reopened);
+      const next = restart(ds, { source: 'slash', notify: vi.fn() });
+      expect(next.joined).toBe(false); expect(next.attemptId).not.toBe(first.attemptId);
+      expect(scope.forkWorker).toHaveBeenCalledOnce();
+    } finally { scope.restartCoordinator.reset(); }
+  });
+  it.each([false, true])('reverifies the original uncertain suspend, including after reopen (primary=%s)', async primary => {
+    const s = fixture(); let controller = s.controller;
+    const worker = { killed: false, send: vi.fn(), kill: vi.fn() }; s.ds.worker = worker as any;
+    s.ds.initConfig = { backendType: 'tmux' } as any;
+    const verifier = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const scope: any = { controllerForSession: () => controller, sessionContractPrimary: () => primary,
+      primarySuspendInFlight: new WeakMap(), primarySuspendApplying: new WeakSet(), sameRuntime,
+      hasProtectedSessionMutationOwnership: () => false, isSessionTransferring: () => false,
+      isSuspendableBackendType: () => true, suspendBackingVerifier: verifier,
+      trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(), armWorkerKillBackstop: vi.fn(),
+      invalidateStuckWarning: vi.fn(), invalidateTuiPrompt: vi.fn(), clearIdleAutoCompactStretch: vi.fn(),
+      clearPendingSuspendClaim: vi.fn(),
+      takeSessionPreviewTarget: () => undefined, sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
+      dashboardEventBus: { publish: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
+    scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
+    const suspend = loadWorkerPoolFunction<(ds: DaemonSession) => Promise<boolean>>('suspendWorkerAsync', scope);
+    expect(await suspend(s.ds)).toBe(false);
+    const operation = controller.operation()!;
+    expect(operation).toMatchObject({ kind: 'suspend', phase: 'uncertain' });
+    expect(controller.allowsInput()).toBe(false); expect(worker.send).not.toHaveBeenCalled();
+    s.ds = { ...s.ds, session: structuredClone(s.ds.session) };
+    s.store.close(); const reopened = new SessionContractStore(s.data, s.appId); handles.push(reopened);
+    controller = new SessionController(s.ds, reopened);
+    expect(await suspend(s.ds)).toBe(true);
+    expect(verifier).toHaveBeenCalledTimes(2);
+    expect(controller.operation(operation.operationId)?.phase).toBe('confirmed');
+    expect(reopened.read(s.ref)?.lifecycle).toBe('suspended');
+    expect(reopened.read(s.ref)?.activeOperationId).toBeUndefined();
+    expect(worker.send).toHaveBeenCalledTimes(1); expect(s.ds.worker).toBeNull();
+    expect(controller.prepareResume()).toBeDefined();
+  });
+  it.each(['suspend', 'cancel'] as const)('recovers persisted uncertain %s through restart without granting late callbacks authority', kind => {
+    const s = fixture(); const execution = s.controller.admitInput('old-turn');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.controller.beginControl(kind, 'old-control', kind === 'cancel' ? execution : undefined);
+    s.controller.controlStarted('old-control'); s.controller.controlResult('old-control', 'uncertain');
+    s.ds = { ...s.ds, session: structuredClone(s.ds.session) };
+    s.store.close(); const reopened = new SessionContractStore(s.data, s.appId); handles.push(reopened);
+    const controller = new SessionController(s.ds, reopened);
+    const restart = controller.beginControl('restart', 'recovery-restart');
+    expect(restart.joined).toBe(false); expect(restart.operation.previousLifecycle).toBe('active');
+    controller.controlStarted('recovery-restart');
+    expect(controller.allowsInput()).toBe(false);
+    expect(reopened.operation(s.ref, 'old-control')).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
+    controller.controlResult('old-control', 'confirmed');
+    expect(reopened.read(s.ref)).toMatchObject({ lifecycle: 'active', activeOperationId: 'recovery-restart' });
+    expect(controller.allowsInput()).toBe(false);
+    const next = controller.reserveBinding('recovery-runtime', s.worker);
+    controller.bindRuntime('recovery-runtime', s.worker, { backend: 'tmux', physicalId: '222:start2', proof: 'process_start' }, 'recovery-restart');
+    controller.ingest({ type: 'ready', sessionContract: s.context(1, {}) }, s.worker);
+    controller.ingest({ type: 'prompt_ready', sessionContract: s.context(2, { runtime: next }) }, s.worker);
+    controller.ingest({ type: 'restart_result', attemptId: 'recovery-restart', status: 'succeeded', sessionContract: s.context(3, { runtime: next, operationId: 'recovery-restart' }) }, s.worker);
+    expect(controller.allowsInput()).toBe(true); expect(s.ds.cliReady).toBe(true);
+    controller.ingest({ type: 'turn_terminal', turnId: 'old-turn', status: 'completed', sessionContract: s.context(4, { runtime: s.runtime, execution }) }, s.worker);
+    expect(controller.currentRuntime()).toEqual(next); expect(s.ds.cliReady).toBe(true);
+    expect(reopened.execution(s.ref, execution.executionId)?.phase).toBe('succeeded');
+  });
+  it.each(['suspend', 'cancel'] as const)('does not restart over an applying %s or lift its fence on ordinary readiness', kind => {
+    const s = fixture(); const execution = s.controller.admitInput('old-turn'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.controller.beginControl(kind, 'active-control', kind === 'cancel' ? execution : undefined); s.controller.controlStarted('active-control');
+    expect(() => s.controller.beginControl('restart')).toThrow('control_operation_in_progress');
+    s.controller.controlResult('active-control', 'uncertain');
+    s.controller.ingest({ type: 'ready', sessionContract: s.context(1, {}) }, s.worker);
+    s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(2) }, s.worker);
+    expect(s.controller.allowsInput()).toBe(false); expect(s.controller.operation()?.operationId).toBe('active-control');
+  });
+  it.each(['suspend', 'cancel'] as const)('starts physical recovery for persisted uncertain %s through the actual restart route', kind => {
+    const s = fixture(); const execution = s.controller.admitInput('old-turn'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.controller.beginControl(kind, 'uncertain-control', kind === 'cancel' ? execution : undefined);
+    s.controller.controlStarted('uncertain-control'); s.controller.controlResult('uncertain-control', 'uncertain');
+    const ds = { ...s.ds, session: structuredClone(s.ds.session), worker: null } as DaemonSession;
+    s.store.close(); const reopened = new SessionContractStore(s.data, s.appId); handles.push(reopened);
+    const controller = new SessionController(ds, reopened);
+    const scope: any = { RestartCoordinator, findActiveBySessionId: () => ds, controllerForSession: () => controller,
+      isSessionTransferring: () => false, sessionContractPrimary: () => false,
+      destroyLivePaneBeforeRestart: vi.fn(), forkWorker: vi.fn(), logger: { warn: vi.fn() }, tag: () => 'test' };
+    scope.restartCoordinator = loadWorkerPoolClosure('restartCoordinator', scope);
+    const restart = loadWorkerPoolFunction<(ds: DaemonSession, observer: any) => any>('requestSessionRestart', scope);
+    try {
+      const request = restart(ds, { source: 'slash', notify: vi.fn() });
+      expect(request).toMatchObject({ joined: false }); expect(request.startFailure).toBeUndefined();
+      expect(scope.destroyLivePaneBeforeRestart).toHaveBeenCalledWith(ds);
+      expect(scope.forkWorker).toHaveBeenCalledWith(ds, '', expect.objectContaining({ restartAttemptId: request.attemptId }));
+      expect(controller.operation()).toMatchObject({ operationId: request.attemptId, kind: 'restart', phase: 'applying' });
+      expect(controller.allowsInput()).toBe(false);
+    } finally { scope.restartCoordinator.reset(); }
+  });
+  it('records predecessor loss as history in the reserve-only window and still handles the later current crash', async () => {
+    const s = fixture(); const execution = s.controller.admitInput('old-turn'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.controller.ingest({ type: 'ready', sessionContract: s.context(1, {}) }, s.worker);
+    s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(2) }, s.worker);
+    const next = s.controller.reserveBinding('pending-next', s.worker);
+    const legacy = vi.fn(); const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const scope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: legacy };
+    const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', scope);
+    expect(s.controller.gateway.admit('claude_exit', s.context(3), s.worker).kind).toBe('historical');
+    await handler({ type: 'claude_exit', code: 0, sessionContract: s.context(3) });
+    expect(legacy).not.toHaveBeenCalled();
+    expect(s.store.runtime(s.ref, s.runtime.runtimeId)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('reconciling');
+    expect(s.store.runtime(s.ref, next.runtimeId)?.phase).toBe('starting');
+    s.controller.bindRuntime('pending-next', s.worker, { backend: 'tmux', physicalId: '222:start2', proof: 'process_start' });
+    s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(4, { runtime: next }) }, s.worker);
+    expect(s.ds.cliReady).toBe(true);
+    await handler({ type: 'claude_exit', code: 1, sessionContract: s.context(5, { runtime: next }) });
+    expect(legacy).toHaveBeenCalledOnce();
+    expect(s.ds.cliReady).toBe(false);
+  });
+  it('does not mistake allocator high water or an orphaned reused reservation for an outstanding replacement', () => {
+    const s = fixture(); const old = s.store.runtime(s.ref)!;
+    const next = s.controller.reserveBinding('reuse-same-process', s.worker);
+    const reused = s.controller.bindRuntime('reuse-same-process', s.worker, old.identity!);
+    expect(reused.ref).toEqual(s.runtime); expect(next.epoch).toBeGreaterThan(s.runtime.epoch);
+    expect(s.store.runtime(s.ref, next.runtimeId)?.phase).toBe('starting');
+    expect(s.store.runtime(s.ref, next.runtimeId)?.identity).toBeUndefined();
+    expect(s.store.hasPendingRuntimeReplacement(s.ref, s.runtime)).toBe(false);
+    expect(s.controller.ingest({ type: 'claude_exit', code: 1, sessionContract: s.context(1) }, s.worker).kind).toBe('current');
+    expect(s.store.runtime(s.ref)?.phase).toBe('stopped');
+  });
+  it('ignores reservations left by an older worker when classifying the current physical exit', () => {
+    const s = fixture(); const identity = s.store.runtime(s.ref)!.identity!;
+    s.controller.reserveBinding('abandoned-reservation', s.worker);
+    const worker = s.controller.bindWorker(2).worker;
+    s.controller.reserveBinding('reattach', worker); s.controller.bindRuntime('reattach', worker, identity);
+    const context = { ...s.context(1), producer: worker, eventId: `${worker.workerId}:1` };
+    expect(s.store.hasPendingRuntimeReplacement(s.ref, s.runtime)).toBe(false);
+    expect(s.controller.ingest({ type: 'claude_exit', code: 1, sessionContract: context }, worker).kind).toBe('current');
+  });
+  it.each([false, true])('handles a physical exit across semantic bindings without overriding a pending replacement (pending=%s)', pending => {
+    const s = fixture();
+    const semantic = s.controller.reserveBinding('same-physical-new-conversation', s.worker);
+    s.controller.bindRuntime('same-physical-new-conversation', s.worker, { ...s.store.runtime(s.ref)!.identity!, nativeSessionId: 'native2' });
+    const next = pending ? s.controller.reserveBinding('pending-replacement', s.worker) : undefined;
+    const admission = s.controller.ingest({ type: 'claude_exit', code: 1, sessionContract: s.context(1) }, s.worker);
+    expect(admission.kind).toBe(pending ? 'historical' : 'current');
+    expect(s.store.runtime(s.ref, semantic.runtimeId)?.phase).toBe('stopped');
+    if (next) expect(s.store.runtime(s.ref, next.runtimeId)?.phase).toBe('starting');
+  });
   it.each(['recover', 'stopped', 'retiring', 'different_pid', 'different_sid', 'middle_attempt', 'confirmed_binding', 'foreign_binding', 'history_gap', 'historical_switch', 'candidate_switch'] as const)(
     'repairs only a proven uninterrupted unresolved runtime through a bare observation: %s', condition => {
     const s = fixture(); const old = s.store.runtime(s.ref)!;

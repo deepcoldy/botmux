@@ -4,7 +4,7 @@ import type { DaemonSession } from './types.js';
 import { config } from '../config.js';
 import { sessionContractStore, type SessionContractStore } from '../services/session-contract-store.js';
 import {
-  contractReadiness, sameWorker, sameRuntime, type ContractSessionRef, type WorkerRef, type RuntimeRef,
+  contractReadiness, sameWorker, sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef,
   type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ControlKind,
   type ControlOperation, type RuntimeContract,
   sessionContractsEnabled,
@@ -31,6 +31,7 @@ export class SessionController {
   readonly gateway: SessionEventGateway;
   private primaryRevision = 0;
   private primaryQueue = Promise.resolve();
+  private readonly abortedBindings = new Set<string>();
   constructor(readonly ds: DaemonSession, store?: SessionContractStore) {
     this.ref = { appId: ds.larkAppId, sessionId: ds.session.sessionId };
     this.store = store ?? sessionContractStore(config.session.dataDir, ds.larkAppId);
@@ -73,10 +74,23 @@ export class SessionController {
     const value = this.store.reserveRuntime(this.ref, worker, bindingId); this.refresh(); return value;
   }
   bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string): RuntimeContract {
+    if (this.abortedBindings.has(bindingId)) throw new Error('runtime_reservation_abandoned');
     const existing = this.store.binding(this.ref, bindingId);
     if (existing && !this.store.bindingProducer(this.ref, bindingId, worker)) throw new Error('runtime_binding_producer_mismatch');
     const proposed = existing ?? { ref: this.reserveBinding(bindingId, worker) };
     const runtime = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operationId); this.refresh(); return runtime;
+  }
+  bindingMayStart(bindingId: string): boolean {
+    return !this.abortedBindings.has(bindingId) && this.store.binding(this.ref, bindingId)?.phase === 'starting';
+  }
+  abandonBinding(bindingId: string, worker: WorkerRef, eventId: string): boolean {
+    const runtime = this.store.binding(this.ref, bindingId);
+    if (!runtime || runtime.identity || !this.store.bindingProducer(this.ref, bindingId, worker)) return false;
+    // Remember the worker's no-spawn evidence before a fallible durable write,
+    // so an older reservation await cannot release a contradictory permit.
+    this.abortedBindings.add(bindingId);
+    this.store.apply(this.ref, { type: 'runtime_lost', runtime: runtime.ref, confirmed: true, reason: 'runtime_start_aborted' }, eventId);
+    this.refresh(); return true;
   }
   admitsRegistration(type: string, bindingId: string, context: SessionEventContext | undefined, worker: WorkerRef): boolean {
     if (!context || context.bindingId !== bindingId) return false;
@@ -181,9 +195,11 @@ export class SessionController {
     if (context.session.appId !== this.ref.appId || context.session.sessionId !== this.ref.sessionId
       || !Number.isSafeInteger(context.sequence) || context.sequence < 1 || context.eventId !== `${channel.workerId}:${context.sequence}`
       || (message.turnId && context.scope.execution && (message.turnId !== context.scope.execution.turnId || ('dispatchAttempt' in message && message.dispatchAttempt !== context.scope.execution.dispatchAttempt)))) return { kind: 'reject', reason: 'session_event_reference_mismatch' };
+    if (context.scope.execution && !sameExecution(this.store.execution(this.ref, context.scope.execution.executionId)?.ref, context.scope.execution)) return { kind: 'reject', reason: 'execution_scope_unproven' };
     if (context.bindingId) {
       const runtime = this.store.binding(this.ref, context.bindingId);
       if (runtime && this.store.bindingProducer(this.ref, context.bindingId, channel)) {
+        if (context.scope.runtime && !sameRuntime(context.scope.runtime, runtime.ref)) return { kind: 'reject', reason: 'runtime_binding_scope_mismatch' };
         const waitsForBinding = message.type === 'restart_result' && message.status === 'succeeded';
         if (!runtime.identity && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack'].includes(message.type))) {
           this.store.deferEvent(this.ref, context.bindingId, context.eventId, context.sequence, message);
@@ -248,7 +264,8 @@ export class SessionController {
         if (sameRuntime(sibling.ref, this.currentRuntime())) currentPhysicalExit = true;
       }
       this.refresh();
-      if (currentPhysicalExit) return { kind: 'current', context: { ...context, scope: { ...context.scope, runtime: this.currentRuntime() } } };
+      const current = this.currentRuntime();
+      if (currentPhysicalExit && current && !this.store.hasPendingRuntimeReplacement(this.ref, current)) return { kind: 'current', context: { ...context, scope: { ...context.scope, runtime: current } } };
     }
     return admission;
   }

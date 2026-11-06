@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   overview: vi.fn(),
   issue: vi.fn(),
   issueDeps: { marker: 'issue-deps' },
+  boardCard: vi.fn(),
   createDaemonClientFor: vi.fn((appId: string) => ({ client: appId })),
   v3: {
     gate: vi.fn(), blocked: vi.fn(), revisit: vi.fn(), loop: vi.fn(), revision: vi.fn(), runSave: vi.fn(), distill: vi.fn(),
@@ -40,6 +41,7 @@ vi.mock('../src/im/lark/groups-card.js', async (orig) => ({ ...(await orig<objec
 vi.mock('../src/im/lark/overview-card.js', async (orig) => ({ ...(await orig<object>()), handleOverviewCardAction: mocks.overview }));
 vi.mock('../src/im/lark/issue-command.js', async (orig) => ({ ...(await orig<object>()), handleIssueCardAction: mocks.issue }));
 vi.mock('../src/im/lark/issue-command-deps.js', async (orig) => ({ ...(await orig<object>()), buildIssueCommandDeps: () => mocks.issueDeps }));
+vi.mock('../src/core/decision-board/card-action.js', async (orig) => ({ ...(await orig<object>()), handleDecisionCardAction: mocks.boardCard }));
 vi.mock('../src/daemon-internal-client-wrapper.js', async (orig) => ({ ...(await orig<object>()), createDaemonClientFor: mocks.createDaemonClientFor }));
 vi.mock('../src/im/lark/v3-gate-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3GateAction: mocks.v3.gate }));
 vi.mock('../src/im/lark/v3-blocked-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3BlockedAction: mocks.v3.blocked }));
@@ -64,7 +66,7 @@ const clickData = (action: string, extra: Record<string, unknown> = {}): any => 
 });
 
 beforeEach(() => {
-  for (const m of [mocks.settings, mocks.sessions, mocks.groupSessions, mocks.schedules, mocks.groups, mocks.overview, mocks.issue,
+  for (const m of [mocks.settings, mocks.sessions, mocks.groupSessions, mocks.schedules, mocks.groups, mocks.overview, mocks.issue, mocks.boardCard,
     ...Object.values(mocks.v3), mocks.createDaemonClientFor]) m.mockClear();
 });
 
@@ -72,6 +74,7 @@ describe('前缀路由表', () => {
   it('表序与前缀逐项钉死', () => {
     expect(CARD_PREFIX_ROUTES.map(r => r.prefix)).toEqual([
       'dash_settings_', 'dash_sessions_', 'group_sessions_', 'dash_schedules_', 'dash_groups_', 'issue_', 'dash_overview_',
+      'board_card_',
     ]);
   });
 
@@ -125,6 +128,14 @@ describe('前缀路由表', () => {
     const data = clickData('issue_refresh');
     expect(await handleCardAction(data, baseDeps(), 'cli_app')).toEqual({ toast: 'issue' });
     expect(mocks.issue).toHaveBeenCalledWith(data, 'cli_app', mocks.issueDeps);
+  });
+
+  it('board_card_ → handleDecisionCardAction(data, larkAppId)，不经 session 查找与 canOperate 门', async () => {
+    mocks.boardCard.mockResolvedValueOnce({ toast: { type: 'error', content: 'board' } });
+    const data = clickData('board_card_pick');
+    expect(await handleCardAction(data, baseDeps(), 'cli_app')).toEqual({ toast: { type: 'error', content: 'board' } });
+    expect(mocks.boardCard).toHaveBeenCalledWith(data, 'cli_app');
+    expect(mocks.issue).not.toHaveBeenCalled();
   });
 
   it.each(['dash_settings_open', 'dash_overview_goto', 'issue_refresh'])('%s 缺 larkAppId 时不转交（落空继续往下走）', async (action) => {
@@ -202,7 +213,7 @@ describe('敏感动作清单', () => {
     'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
     'retry_last_task', 'retry_turn', 'session_effort_apply', 'session_effort_pick', 'session_model_pick', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
-    'toggle_display', 'toggle_idle_compact', 'toggle_stream', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
+    'toggle_display', 'toggle_idle_compact', 'toggle_stream', 'toggle_substitute', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];
 
@@ -228,6 +239,7 @@ describe('敏感动作清单', () => {
       ['open_local_cli', 'card.action.local_cli_no_permission'],
       ['open_local_terminal', 'card.action.local_terminal_no_permission'],
       ['toggle_idle_compact', 'card.idle_compact.no_permission'],
+      ['toggle_substitute', 'cmd.substitute.owner_only'],
     ]);
   });
 

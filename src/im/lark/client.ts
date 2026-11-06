@@ -950,7 +950,7 @@ export async function getChatContext(larkAppId: string, chatId: string): Promise
     else mode = 'unknown';
 
     if (mode !== 'unknown') {
-      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now(), strict: true });
     } else {
       logger.warn(`getChatContext(${chatId}) unrecognized chat_mode='${rawMode}'`);
     }
@@ -1037,7 +1037,12 @@ export async function getChatNameAndMode(
  *                perspective (chat-scope by default) */
 export type ChatMode = 'group' | 'topic' | 'p2p';
 
-const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number }>(1000);
+/** `strict` records provenance: true only when the mode came from a successful
+ *  chat.get classification (getChatModeStrict / getChatContext). getChatMode's
+ *  lenient `unknown → group` fallback stores strict:false so callers that need
+ *  proof (e.g. the substitute-card topicGroups gate) never treat a failed
+ *  lookup as a confirmed flat group. */
+const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number; strict: boolean }>(1000);
 const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a group is converted to topic mode
 
 /** Resolve the conversational topology of a chat (话题群 vs 普通群 vs p2p).
@@ -1090,7 +1095,7 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
       logger.warn(`getChatModeStrict(${chatId}) unrecognized chat_mode='${rawMode}' — returning 'unknown'`);
       return 'unknown';
     }
-    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now(), strict: true });
     return mode;
   } catch (err: any) {
     logger.warn(`getChatModeStrict(${chatId}) errored: ${err?.message ?? err}`);
@@ -1101,6 +1106,15 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
 export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode | undefined {
   const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
   if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
+  return undefined;
+}
+
+/** Like {@link getCachedChatMode}, but only returns modes proven by a successful
+ *  strict chat.get. A lenient `unknown → group` fallback is never evidence that
+ *  the chat is flat, so feature gates that must fail closed use this. */
+export function getCachedChatModeStrict(larkAppId: string, chatId: string): ChatMode | undefined {
+  const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
+  if (cached && cached.strict && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
   return undefined;
 }
 
@@ -1121,7 +1135,7 @@ export async function getChatMode(
   if (strict !== 'unknown') return strict;
   const mode: ChatMode = 'group';
   logger.warn(`getChatMode(${chatId}) unconfirmed; falling back to 'group'`);
-  chatModeCache.set(cacheKey, { mode, cachedAt: Date.now() });
+  chatModeCache.set(cacheKey, { mode, cachedAt: Date.now(), strict: false });
   return mode;
 }
 

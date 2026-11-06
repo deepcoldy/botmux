@@ -150,6 +150,12 @@ export interface DaemonSession {
     engineProcStart?: string;
     workerGeneration?: number;
   };
+  /** Per-worker-generation HMAC key for the protected local-service proxy.
+   * It exists only in daemon/worker memory and crosses only their private IPC. */
+  protectedLoopbackProxyAttestation?: {
+    secret: string;
+    workerGeneration: number;
+  };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
@@ -751,6 +757,8 @@ export interface DaemonSession {
   usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
@@ -928,6 +936,11 @@ export interface DaemonSession {
    *  Forwarded back to the worker in tui_keys so it can verify the backend
    *  hasn't been replaced within the same worker process. */
   stuckWarningCliLifetime?: number;
+  /** Turn initiator frozen when the active stuck-warning card was posted
+   *  (same rule as the recovery-retry card: daemon-authenticated caller or a
+   *  reply-registry entry proving a human sender). They may press the card's
+   *  `initiator` keys; undefined = operators only. */
+  stuckWarningInitiatorOpenId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

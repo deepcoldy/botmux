@@ -222,6 +222,11 @@ export interface SpawnOpts {
    */
   unsetEnv?: string[];
   /**
+   * Host-authorized protected-MCP removals. Unlike user/session `unsetEnv`,
+   * these may name reserved BOTMUX_* controls and must still run after rcfiles.
+   */
+  protectedUnsetEnv?: string[];
+  /**
    * The git `-c` pairs (config KEY/VALUE contents) botmux authored for THIS
    * turn, e.g. the trigger-user credential helper + URL rewrites from
    * gitIdentityConfigPairs. Shell-wrapped backends publish exactly this set

@@ -19,6 +19,7 @@ import {
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
   parseRemoteRunnerEventLine,
+  projectRemoteRunnerTrustedCaller,
   remoteRunnerCommand,
   type RemoteRunnerBackendState,
   type RemoteRunnerCapability,
@@ -287,7 +288,9 @@ export class RemoteRunnerBackend implements SessionBackend {
         turnId: input.turnId,
         content: input.content,
         ...(input.dispatchAttempt !== undefined ? { dispatchAttempt: input.dispatchAttempt } : {}),
-        ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+        ...(input.trustedCaller
+          ? { trustedCaller: projectRemoteRunnerTrustedCaller(input.trustedCaller as typeof input.trustedCaller & Record<string, unknown>) }
+          : {}),
       }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
       if (acknowledgement.type === 'failure') {
         const failure: BackendTurnFailure = {

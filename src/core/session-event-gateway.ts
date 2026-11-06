@@ -8,7 +8,7 @@ export type SessionEventAdmission =
   | { kind: 'defer'; bindingId: string }
   | { kind: 'reject'; reason: string };
 const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
-const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack']);
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack']);
 /** A trusted channel supplies producer identity. An event cannot self-upgrade
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {
@@ -48,7 +48,10 @@ export class SessionEventGateway {
         return { kind: 'reject', reason: 'execution_scope_unproven' };
       }
     }
-    if (!recovery && sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime) && state.lifecycle !== 'closed' && state.lifecycle !== 'closing') return { kind: 'current', context };
+    if (!recovery && sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime) && state.lifecycle !== 'closed' && state.lifecycle !== 'closing') {
+      if (type === 'claude_exit' && this.store.hasPendingRuntimeReplacement(this.session, runtime)) return { kind: 'historical', context };
+      return { kind: 'current', context };
+    }
     if (immutableFacts.has(type)) return { kind: 'historical', context };
     return { kind: 'reject', reason: 'stale_runtime_scope' };
   }

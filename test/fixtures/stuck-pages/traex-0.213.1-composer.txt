@@ -1,0 +1,50 @@
+▍ Second test: reply OK.
+▍ filler line 00 lorem ipsum dolor sit amet consectetur
+▍ filler line 01 lorem ipsum dolor sit amet consectetur
+▍ filler line 02 lorem ipsum dolor sit amet consectetur
+▍ filler line 03 lorem ipsum dolor sit amet consectetur
+▍ filler line 04 lorem ipsum dolor sit amet consectetur
+▍ filler line 05 lorem ipsum dolor sit amet consectetur
+▍ filler line 06 lorem ipsum dolor sit amet consectetur
+▍ filler line 07 lorem ipsum dolor sit amet consectetur
+▍ filler line 08 lorem ipsum dolor sit amet consectetur
+▍ filler line 09 lorem ipsum dolor sit amet consectetur
+▍ filler line 10 lorem ipsum dolor sit amet consectetur
+▍ filler line 11 lorem ipsum dolor sit amet consectetur
+▍ filler line 12 lorem ipsum dolor sit amet consectetur
+▍ filler line 13 lorem ipsum dolor sit amet consectetur
+▍ filler line 14 lorem ipsum dolor sit amet consectetur
+▍ filler line 15 lorem ipsum dolor sit amet consectetur
+▍ filler line 16 lorem ipsum dolor sit amet consectetur
+▍ filler line 17 lorem ipsum dolor sit amet consectetur
+▍ filler line 18 lorem ipsum dolor sit amet consectetur
+▍ filler line 19 lorem ipsum dolor sit amet consectetur
+▍ filler line 20 lorem ipsum dolor sit amet consectetur
+▍ filler line 21 lorem ipsum dolor sit amet consectetur
+▍ filler line 22 lorem ipsum dolor sit amet consectetur
+▍ filler line 23 lorem ipsum dolor sit amet consectetur
+▍ filler line 24 lorem ipsum dolor sit amet consectetur
+▍ filler line 25 lorem ipsum dolor sit amet consectetur
+▍ filler line 26 lorem ipsum dolor sit amet consectetur
+▍ filler line 27 lorem ipsum dolor sit amet consectetur
+▍ filler line 28 lorem ipsum dolor sit amet consectetur
+▍ filler line 29 lorem ipsum dolor sit amet consectetur
+▍ filler line 30 lorem ipsum dolor sit amet consectetur
+▍ filler line 31 lorem ipsum dolor sit amet consectetur
+▍ filler line 32 lorem ipsum dolor sit amet consectetur
+▍ filler line 33 lorem ipsum dolor sit amet consectetur
+▍ filler line 34 lorem ipsum dolor sit amet consectetur
+▍ filler line 35 lorem ipsum dolor sit amet consectetur
+▍ filler line 36 lorem ipsum dolor sit amet consectetur
+▍ filler line 37 lorem ipsum dolor sit amet consectetur
+▍ filler line 38 lorem ipsum dolor sit amet consectetur
+▍ filler line 39 lorem ipsum dolor sit amet consectetur
+
+
+■ You have exceeded your usage quota for this period. Enter quota management page to view details: https://example.invalid/plan
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Just reply with the single word OK. ─
+❯ Improve documentation in @filename
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Seed-Evolving · /tmp/repo · Context 100% left
+  ☢ Full Access (shift+tab to cycle) · ? for shortcuts · ← for agents

@@ -14,6 +14,20 @@ function open(directory = mkdtempSync(join(tmpdir(), 'session-contract-'))) { if
 function bind(store: SessionContractStore, owner = worker, physical = identity) { store.bindWorker(ref, owner); const runtime = store.reserveRuntime(ref, owner); return store.bindRuntime(ref, runtime, owner, physical); }
 afterEach(() => { vi.useRealTimers(); for (const store of stores.splice(0)) try { store.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 describe('session identity and state contract', () => {
+  it.each(['suspend', 'cancel'] as const)('retains an uncertain %s record while a reopened store starts one recovery restart', kind => {
+    const store = open(); bind(store);
+    const execution = store.admitExecution(ref, 'old-turn');
+    const old = store.beginOperation(ref, kind, { execution: kind === 'cancel' ? execution.ref : undefined }).operation;
+    store.apply(ref, { type: 'control_started', operationId: old.operationId });
+    store.apply(ref, { type: 'control_result', operationId: old.operationId, phase: 'uncertain' });
+    const data = directories[0]; store.close(); const restored = open(data);
+    const next = restored.beginOperation(ref, 'restart', { operationId: 'recovery' });
+    expect(next.joined).toBe(false); expect(restored.beginOperation(ref, 'restart').joined).toBe(true);
+    expect(restored.operation(ref, old.operationId)).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
+    expect(restored.read(ref)?.lifecycle).toBe('active');
+    restored.apply(ref, { type: 'control_result', operationId: old.operationId, phase: 'confirmed' });
+    expect(restored.read(ref)?.activeOperationId).toBe('recovery');
+  });
   it('carries allocated epoch floors when an older checkpoint replaces the database file', () => {
     const dir = mkdtempSync(join(tmpdir(), 'contract-replacement-')); directories.push(dir);
     const original = sessionContractStore(dir, ref.appId); stores.push(original); original.ensure(ref);
