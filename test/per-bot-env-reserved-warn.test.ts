@@ -99,4 +99,37 @@ describe('reserved per-bot env warning on config load (#2007)', () => {
     expect(msg).toContain('GROK_HOME');
     expect(msg).not.toContain('cliConfigDir');
   });
+
+  it('warns for reserved keys in pluginRuntime.<id>.env, naming the plugin, and still strips them (#2441)', () => {
+    const [bot] = parseBotConfigsFromText(
+      JSON.stringify([{
+        larkAppId: 'envplug',
+        larkAppSecret: 's',
+        env: { CODEX_HOME: '/bot' },
+        pluginRuntime: {
+          reporting: { env: { CODEX_HOME: '/x', PROFILE: 'production' } },
+          only: { env: { CLAUDE_CONFIG_DIR: '/c' } },
+        },
+      }]),
+    );
+
+    expect(bot.pluginRuntime).toEqual({ reporting: { env: { PROFILE: 'production' } } });
+    const lines = reservedWarnings().split('\n');
+    expect(lines.find(m => m.includes('pluginRuntime.reporting.env'))).toContain('CODEX_HOME');
+    expect(lines.find(m => m.includes('pluginRuntime.only.env'))).toContain('CLAUDE_CONFIG_DIR');
+    // The bot-level warning for the same key set is a separate line, not latched away.
+    expect(lines.filter(m => m.includes('[bot-registry:envplug]'))).toHaveLength(3);
+    expect(reservedWarnings()).not.toContain('cliConfigDir');
+  });
+
+  it('warns once per plugin and dropped-key set across repeated parses', () => {
+    const text = JSON.stringify([{
+      larkAppId: 'envplug2',
+      larkAppSecret: 's',
+      pluginRuntime: { p: { env: { CODEX_HOME: '/x' } } },
+    }]);
+    parseBotConfigsFromText(text);
+    parseBotConfigsFromText(text);
+    expect(reservedWarnings().split('\n').filter(m => m.includes('pluginRuntime.p.env'))).toHaveLength(1);
+  });
 });
