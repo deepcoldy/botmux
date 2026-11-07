@@ -249,6 +249,8 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_READ_ISOLATION: '1' } },
     { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: '1' } },
+    { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: 'oncall' } },
+    { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: 'scratch' } },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true, reserveCard: false },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: true, oncall: true },
     { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: true, oncall: true },
