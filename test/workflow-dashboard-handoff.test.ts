@@ -437,6 +437,18 @@ describe('换编排 Bot', () => {
     expect(workflowDraftOwner(base, runId)).toBe(MAIN);
   });
 
+  it('refuses to start a handoff while a clarify turn is still in flight: the session is never closed mid-turn and no handoff is recorded', async () => {
+    const h = fleet();
+    // create() leaves the first clarify turn pending (the model has not answered).
+    const { runId } = await h.a.service.create(ALICE_ON_MAIN, { goal: 'g' });
+    expect((await h.a.service.view(runId)).clarify.pending).toBeTruthy();
+    expect(await code(h.a.service.prepareHandoff(runId, ALICE_ON_MAIN, { toLarkAppId: DOC }))).toBe('clarify_turn_running');
+    // The draft stays with its owner, its session open, no handoff under way.
+    expect(workflowDraftOwner(base, runId)).toBe(MAIN);
+    expect(record(runId).handoff).toBeUndefined();
+    expect(h.a.clarify.closes).toEqual([]);
+  });
+
   it('two tabs: one target wins, the other token is refused; the winning accept repeated opens no second session', async () => {
     const h = fleet();
     const runId = await failedClarify(h);
