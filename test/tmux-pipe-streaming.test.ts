@@ -220,7 +220,8 @@ writeFileSync(${JSON.stringify(ready)}, 'ready');
   // an if-shell command string that tmux parses again; tmux 2.x's parser knows
   // no backslash escapes outside quotes. The shim reports 3.1c so a modern
   // binary takes that path too; a real 2.x/3.0/3.1 binary takes it by itself.
-  it('delivers through the legacy dead-pane guard to a FIFO path with shell and tmux metacharacters', async () => {
+  // tmux 3.x expands a `~` opening a quoted target (an adopted user session).
+  it.each(['legacy-guard', '~legacy-guard'])('delivers through the legacy dead-pane guard of session %s to a FIFO path with shell and tmux metacharacters', async (sessionName) => {
     const fx = fixture('uutils');
     socket = join(fx.root, 'socket');
     const commands = join(fx.root, 'tmux-commands');
@@ -236,7 +237,7 @@ exec ${quote(realTmux!)} -S ${quote(socket)} "$@"
     const tmp = join(fx.root, `a b\\sl#S%d$x"y'z`); mkdirSync(tmp);
     vi.stubEnv('TMPDIR', tmp);
     resetTmuxVersionCacheForTests();
-    backend = new TmuxPipeBackend('legacy-guard', { createSession: true, ownsSession: true });
+    backend = new TmuxPipeBackend(sessionName, { createSession: true, ownsSession: true });
     let received = '';
     backend.onData(data => { received += data; });
     backend.spawn('/bin/sh', ['-c', 'sleep 60'], {

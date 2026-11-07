@@ -60,10 +60,12 @@ function shellescape(s: string): string {
 
 /** Quote one argument of a command string that tmux parses itself (an if-shell
  *  branch). tmux 2.x has no backslash escapes outside quotes, so the `'\''`
- *  form above splits there; every tmux unescapes `\\`, `\"`, `\$` inside double
- *  quotes. tmux 2.x also ends a command at an argument ending in `;`. */
+ *  form above splits there; every tmux unescapes `\\`, `\"`, `\$`, `\~` inside
+ *  double quotes, and tmux 3.x expands a `~` that opens them (an adopted pane's
+ *  target is the user's own session name). tmux 2.x also ends a command at an
+ *  argument ending in `;`. */
 function tmuxQuote(s: string): string {
-  return `"${s.replace(/[\\"$]/g, '\\$&')}"`;
+  return `"${s.replace(/[\\"$~]/g, '\\$&')}"`;
 }
 
 /** `failed` was added in tmux 3.2. Older/unknown versions retain every exit

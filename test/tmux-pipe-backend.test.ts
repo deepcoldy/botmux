@@ -2779,17 +2779,17 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
   }
 
   // The shell hands if-shell its arguments, then tmux parses the subscription
-  // branch AGAIN as a command string. tmux 2.8 is the strictest parser that
-  // takes this path, so the branch is read with its rules: the subscription
+  // branch AGAIN as a command string. tmux 2.8, 3.0 and 3.1 take this path, so
+  // the branch is read with the stricter of their rules: the subscription
   // must arrive as exactly one pipe-pane with the shell command byte-for-byte.
   // The marker display is the then-branch (death verdict), before it in argv.
-  function expectGuardShape(cmd: string) {
+  function expectGuardShape(cmd: string, paneTarget = target) {
     const words = shWords(cmd);
     const ifShell = words.slice(words.indexOf('if-shell'));
-    expect(ifShell.slice(0, 6)).toEqual(['if-shell', '-F', '-t', target, '#{pane_dead}', `display-message -p ${MARKER}`]);
+    expect(ifShell.slice(0, 6)).toEqual(['if-shell', '-F', '-t', paneTarget, '#{pane_dead}', `display-message -p ${MARKER}`]);
     expect(ifShell).toHaveLength(7);
-    const subscription = tmux28Words(ifShell[6]);
-    expect(subscription.slice(0, 4)).toEqual(['pipe-pane', '-O', '-t', target]);
+    const subscription = legacyTmuxWords(ifShell[6]);
+    expect(subscription.slice(0, 4)).toEqual(['pipe-pane', '-O', '-t', paneTarget]);
     expect(subscription).toHaveLength(5);
     const fifo = /^exec >'([^']+)' /.exec(subscription[4])?.[1];
     expect(fifo).toMatch(/botmux-pipe-[0-9a-f]+\.fifo$/);
@@ -2831,8 +2831,9 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
   // tmux 2.8 cmd_string_split (cmd-string.c): single quotes are literal, double
   // quotes take backslash escapes, and outside quotes a backslash is an ordinary
   // character and `#` starts a comment. `$` and a leading `~` would expand, and
-  // cmd_list_parse ends the command at any argument ending in `;`.
-  function tmux28Words(cmd: string): string[] {
+  // cmd_list_parse ends the command at any argument ending in `;`. tmux 3.0/3.1
+  // (cmd-parse.y) also expand a `~` that opens a double-quoted string.
+  function legacyTmuxWords(cmd: string): string[] {
     const words: string[] = [];
     let word: string | null = null;
     for (let i = 0; i < cmd.length; i++) {
@@ -2843,6 +2844,7 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
         word = (word ?? '') + cmd.slice(i + 1, end);
         i = end;
       } else if (ch === '"') {
+        if (cmd[i + 1] === '~') throw new Error(`tmux 3.0 would expand ~ in ${cmd}`);
         let text = '';
         for (i++; cmd[i] !== '"'; i++) {
           if (i >= cmd.length) throw new Error(`unterminated quote in ${cmd}`);
@@ -2890,6 +2892,21 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
         be.kill();
       }
     });
+
+  // An adopted pane's target is the user's own session name.
+  it.each(['tmux 2.8', 'tmux 3.1c'])('%s: a pane target starting with ~ reaches the subscription literally', (versionString) => {
+    emulateOldTmux(versionString);
+    const tildeTarget = `~${target}`;
+    const be = new TmuxPipeBackend(tildeTarget, { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('', [], spawnOpts())).not.toThrow();
+      const cmds = attachCommands();
+      expect(cmds).toHaveLength(1);
+      expectGuardShape(cmds[0], tildeTarget);
+    } finally {
+      be.kill();
+    }
+  });
 
   it('a marker reply on a fresh create is a deterministic one-shot startup failure: no retry, no exit, reader recycled', () => {
     emulateOldTmux('tmux 2.8', { attachReply: MARKER });
