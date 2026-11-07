@@ -231,13 +231,28 @@ exit 0`);
         // Z until its parent reaps it, and kill(pid, 0) answers TRUE for a zombie. So
         // the cheap check would call an un-reaped corpse "still running" and make this
         // assertion flap depending on reap timing.
+        //
+        // Wait for the death window to close before judging: destroySession's scanner
+        // treats an ENOENT/ESRCH on /proc/<pid>/environ as "the process vanished", and
+        // that file can disappear a few milliseconds BEFORE /proc/<pid>/stat stops
+        // reporting a running state. A zero-delay liveness read here therefore races
+        // the kernel teardown — the close honestly says ok (the SIGKILL was delivered
+        // and the scan no longer sees the member) while stat still says "running".
+        // Same wait pattern as the PROBE 1b handle case below.
+        const settled = await waitFor(() => {
+            const live = readProcLiveness(escaped);
+            return live === 'gone' || live === 'zombie';
+        });
         const liveness = readProcLiveness(escaped);
         const stillExecuting = liveness === 'running' || liveness === 'unreadable';
         note(`P2: escaped still alive after close=${alive(escaped)}`);
-        note(`P2: escaped liveness=${liveness} stillExecuting=${stillExecuting}`);
+        note(`P2: escaped liveness=${liveness} stillExecuting=${stillExecuting} settled=${settled}`);
 
         // The real invariant: the close may only succeed once nothing is executing.
+        // If a survivor were genuinely unkillable the wait above would time out
+        // (settled=false), so an ok:true in that case still fails this assertion.
         if (result.ok) {
+            expect(settled).toBe(true);
             expect(stillExecuting).toBe(false);
         } else {
             note('P2: close refused — acceptable, but then the blocker must be retained');

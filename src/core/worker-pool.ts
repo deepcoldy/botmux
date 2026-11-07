@@ -9,6 +9,7 @@ import { deploymentContinuationAuthority } from './deployment-continuation-autho
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { traexStreamCardActivity } from './stream-card-activity.js';
 import { listPendingAsks } from './ask-broker.js';
+import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY } from './ask-hook/types.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
@@ -1247,7 +1248,9 @@ export interface WorkerPoolCallbacks {
   ) => void;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
-   * may be cleared without emitting the ambiguous-failure terminal. */
+   * may be cleared without emitting the ambiguous-failure terminal.
+   * Returning `'not_executed'` means a retry would be rejected the same way:
+   * the delivery fails at once with the known non-execution notice. */
   onOrdinaryImInputRejected?: (
     ds: DaemonSession,
     context: {
@@ -1259,7 +1262,7 @@ export interface WorkerPoolCallbacks {
       activeCaller?: TrustedCaller;
       activeController?: TrustedCaller;
     },
-  ) => boolean | Promise<boolean>;
+  ) => boolean | 'not_executed' | Promise<boolean | 'not_executed'>;
   /** A decision-board batch turn (`board:<app>:<batchId>`) never got a
    * confirmed worker receipt (watchdog expiry or authoritative rejection).
    * The pool does NOT post its usual group failure card for these turns:
@@ -11483,7 +11486,7 @@ type OrdinaryImDelivery = {
   /** At most one daemon ownership handoff may run for a logical delivery.
    * Duplicate worker reject events join this promise instead of creating a
    * second durable record. */
-  rejectionHandoff?: Promise<boolean>;
+  rejectionHandoff?: Promise<boolean | 'not_executed'>;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -11836,8 +11839,16 @@ async function rejectOrdinaryImDelivery(
     }));
     record.rejectionHandoff = handoff;
     try {
-      const accepted = await handoff;
-      if (accepted) {
+      const outcome = await handoff;
+      if (outcome === 'not_executed') {
+        failOrdinaryImDelivery(
+          record,
+          `worker_rejected:${rejection.reason}`,
+          'worker.input_rejected_before_admission',
+        );
+        return;
+      }
+      if (outcome) {
         clearOrdinaryImDelivery(record);
         logger.info(
           `[${tag(ds)}] Ordinary IM rejection durably handed back to daemon `
@@ -16895,6 +16906,18 @@ function currentTurnProcessIdentities(
   return [...identities].sort();
 }
 
+/** The PermissionRequest hook posts its card around the time Claude renders the
+ *  dialog, while the worker samples the screen every 2s: its notice can arrive
+ *  before the card is registered. */
+const PERMISSION_CARD_GRACE_MS = 3_000;
+
+/** The hook's allow/deny card for a Claude permission dialog, still unanswered. */
+function permissionCardPending(ds: DaemonSession): boolean {
+  return listPendingAsks().some(a => a.larkAppId === ds.larkAppId && a.sessionId === ds.session.sessionId
+    && a.originKind === 'hook' && a.questions.length === 1
+    && a.questions[0].options.map(o => o.key).join('\n') === `${PERMISSION_ALLOW_KEY}\n${PERMISSION_DENY_KEY}`);
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -18015,7 +18038,7 @@ function setupWorkerHandlers(
             cb.onWorkflowNodeInputCommitted?.(ds, { turnId: msg.turnId, committedAt: Date.now() });
           }
         } else {
-          logger[unboundInputCommitLogLevel(msg.turnId)](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+          logger[unboundInputCommitLogLevel(msg.turnId, frozenReplyContextForTurn(ds, msg.turnId))](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
@@ -19082,9 +19105,13 @@ function setupWorkerHandlers(
         // Notify once per idle episode, including a first frame already at idle,
         // so repeated snapshots cannot keep resetting the settlement debounce.
         const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId);
+        if (msg.turnId && msg.turnId === ds.deferredScheduleUnconfirmedTurnId) {
+          ds.deferredScheduleUnconfirmedTurnId = undefined;
+        }
         if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnId = undefined;
         if (ds.lastScreenStatus === 'idle' && deferredTurnId
-          && deferredScheduleIdleTurnId !== deferredTurnId) {
+          && deferredScheduleIdleTurnId !== deferredTurnId
+          && (msg.turnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
           deferredScheduleIdleTurnId = deferredTurnId;
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
@@ -20696,6 +20723,15 @@ function setupWorkerHandlers(
           reason: 'user_notify',
           message: msg.message,
         });
+        // The card already asks about this dialog. Fork agents and sessions
+        // without the hook get no card and keep this notice.
+        if (msg.kind === 'claude_permission_prompt') {
+          if (!permissionCardPending(ds)) await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
+          if (permissionCardPending(ds)) {
+            logger.info(`[${t}] Claude permission dialog notice skipped: PermissionRequest card pending`);
+            break;
+          }
+        }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if (msg.kind === 'input_not_submitted' && ownsLifecycleMutation()
           && (!msg.turnId || !ds.currentTurnId || ds.currentTurnId === msg.turnId)) {

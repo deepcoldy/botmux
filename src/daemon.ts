@@ -172,6 +172,7 @@ import {
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import {
+  canonicalPrimarySession,
   claimDurableLarkActiveSession,
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
@@ -669,6 +670,7 @@ import {
   cancelCrossPrincipalInterruptionsForFeatureDisable,
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
+  crossPrincipalRerouteGaps,
   markCrossPrincipalSuggestionWaiting,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
@@ -5318,7 +5320,7 @@ export async function enforceMessageQuotaForCliInput(
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
     : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
-    logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
+    logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
   // Control/setup messages still need the authorization decision above, but
@@ -33076,14 +33078,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         activeCaller: context.activeCaller,
         activeController: context.activeController,
       });
-      if (!envelope || !proposer || !active
-        || sameTrustedPrincipal(active.caller, proposer)
-        || sameTrustedPrincipal(active.controller, proposer)) {
+      const gaps = crossPrincipalRerouteGaps({ envelope, proposer, active });
+      if (gaps.length > 0 || !envelope || !proposer || !active) {
+        // A retry hits the same worker gate while the active turn is still running.
         logger.error(
-          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute envelope/owner `
-          + `turn=${context.turnId.slice(0, 12)}`,
+          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute gaps=${gaps.join(',')}; `
+          + `failing delivery as not executed turn=${context.turnId.slice(0, 12)}`,
         );
-        return false;
+        return 'not_executed';
       }
       return stageCrossPrincipalInterruption({
         ds,
@@ -34290,10 +34292,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             pendingPrimaryControlCard: data =>
               primaryControlRuntime?.pendingCardBeforeAck(data),
-            readPrimarySession: async stableKey => {
-              const current = await durableCoordinationRuntime.store.readSession(stableKey);
-              return current ? parseDurablePrimarySessionRecord(current).session : undefined;
-            },
+            readPrimarySession: async stableKey =>
+              canonicalPrimarySession(await durableCoordinationRuntime.store.readSession(stableKey)),
             takeOverPrimarySession,
           },
         );

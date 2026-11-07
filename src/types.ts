@@ -2618,7 +2618,10 @@ export type WorkerToDaemon =
          *  re-renders the status card from its current state: a single
          *  working→idle edge PATCH may have been lost, and nothing else would
          *  ever correct a card still claiming the unsubmitted turn runs. */
-        | 'input_not_submitted';
+        | 'input_not_submitted'
+        /** Claude's own permission dialog seen on screen (claudeActionPrompt). The
+         *  daemon drops it while the PermissionRequest hook's card is pending. */
+        | 'claude_permission_prompt';
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */
