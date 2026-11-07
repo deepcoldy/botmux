@@ -39,12 +39,18 @@ import {
  * behaviour rather than inventing a third semantic.
  */
 
-// DATA-DIR FENCE — mirrors the disposable-root block in
-// test/helpers/session-data-dir-fence.ts (used by vitest's unit-setup.ts and
-// e2e-setup.ts). It cannot import that helper: this preload runs BEFORE
-// bun-test-shim.ts (the node:os override has to be installed first), while the
-// helper imports its hooks from 'vitest', which only resolves under the shim.
-// Change one copy, compare the other.
+// DATA-DIR FENCE — keep the disposable-root block below in sync with
+// test/helpers/session-data-dir-fence.ts (the vitest half mounted by
+// unit-setup.ts and e2e-setup.ts): change one copy, compare the other.
+// Deliberately duplicated rather than imported — the blocker is shape and
+// ordering, not module resolution: `bun test` runs the whole invocation in ONE
+// process and has no globalSetup channel, so this file mints the root itself
+// (once, process-wide) alongside the node:os/home and tmux fences that must be
+// installed before bun-test-shim.ts loads; the vitest helper is built around a
+// per-file root under a globalSetup-injected parent and per-test repair for
+// forked workers. (Bun aliases 'vitest' itself inside `bun test` preloads —
+// measured, the helper's beforeEach/afterAll register without the shim — the
+// shim only fills methods missing from bun:test's vi.)
 const inheritedDataDir = process.env.SESSION_DATA_DIR;
 
 // One disposable root per test PROCESS — note that `bun test` runs every file
