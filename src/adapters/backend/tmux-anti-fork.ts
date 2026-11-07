@@ -88,11 +88,30 @@ export function createTmuxBootGate(
 
         if (directive.mode === 'spawn') return directive.noFork ? ['-N'] : [];
 
+        // The deadline check MUST cover the recreate-socket arm too. A server
+        // that ignores SIGUSR1 (wedged, or its socket directory was removed so
+        // the re-bind can never succeed) keeps the census reporting the same
+        // single bmx listener with the path still ENOENT, so the directive
+        // repeats forever. Measured before this guard: an unbounded synchronous
+        // loop that never returns — the worker hangs instead of failing into the
+        // 15/60/180 s retry, and every cycle logs a SIGUSR1 warning.
+        const remaining = deadline - now();
+        if (remaining <= 0) {
+          // Surface as a transient startup failure → the worker's retryable
+          // card and the daemon's bounded auto-retry (visible to the operator).
+          // Deliberately "fail rather than fork".
+          const reason = directive.mode === 'wait'
+            ? directive.reason
+            : `sent SIGUSR1 to botmux server pid=${directive.pid} but its socket never became reachable`;
+          logger.warn(`[tmux-anti-fork] ${label}: still bound-but-unreachable after ${budgetMs}ms; failing this attempt rather than forking`);
+          throw new TmuxCompetingServerBlockedError(label, reason);
+        }
+
         // The core just asked the orphaned botmux server to recreate its
         // socket (SIGUSR1); give it a beat and re-probe. No fork happened.
         if (directive.mode === 'recreate-socket') {
           logger.warn(`[tmux-anti-fork] ${label}: sent SIGUSR1 to orphaned server pid=${directive.pid} to recreate its socket; re-probing`);
-          sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+          sleep(Math.min(pollMs, remaining));
           continue;
         }
 
@@ -105,14 +124,6 @@ export function createTmuxBootGate(
         } else if (!loggedWaiting) {
           logger.warn(`[tmux-anti-fork] ${label}: ${directive.reason}; holding new-session (no competing server)`);
           loggedWaiting = true;
-        }
-        const remaining = deadline - now();
-        if (remaining <= 0) {
-          // Surface as a transient startup failure → the worker's retryable
-          // card and the daemon's bounded auto-retry (visible to the operator).
-          // Deliberately "fail rather than fork".
-          logger.warn(`[tmux-anti-fork] ${label}: still bound-but-unreachable after ${budgetMs}ms; failing this attempt rather than forking`);
-          throw new TmuxCompetingServerBlockedError(label, directive.reason);
         }
         sleep(Math.min(pollMs, remaining));
       }

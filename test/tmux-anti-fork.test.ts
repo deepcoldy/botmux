@@ -65,4 +65,25 @@ describe('createTmuxBootGate.leadingArgs', () => {
       expect(e.code).toBe('ETIMEDOUT'); // rides existing transient-startup retry
     }
   });
+
+  it('a REPEATING recreate-socket directive is bounded by the same deadline (never an infinite loop)', () => {
+    // A server that ignores SIGUSR1 (wedged, or its socket directory is gone so
+    // the re-bind can never succeed) makes decideBootDirective return
+    // recreate-socket forever: the census still sees the single bmx listener
+    // and the path stays ENOENT. Without a deadline check on that arm the gate
+    // spins synchronously and NEVER returns — the worker hangs instead of
+    // riding the 15/60/180 s transient retry.
+    let t = 0;
+    let cycles = 0;
+    const gate = createTmuxBootGate('botmux', {
+      budgetMs: 800, pollMs: 500, platform: 'linux',
+      sleep: ms => { t += ms; }, now: () => t,
+      resolve: () => { cycles += 1; return { mode: 'recreate-socket', pid: 4101 }; },
+    });
+    expect(() => gate.leadingArgs()).toThrow(TmuxCompetingServerBlockedError);
+    // One cycle per poll interval, plus the final over-budget check: bounded,
+    // and it names the SIGUSR1 attempt rather than a silent-wait reason.
+    expect(cycles).toBeLessThanOrEqual(4);
+    expect(t).toBeGreaterThanOrEqual(800);
+  });
 });

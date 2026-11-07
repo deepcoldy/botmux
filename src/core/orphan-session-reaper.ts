@@ -402,6 +402,10 @@ export interface OrphanSweepOptions {
   lockHolderPids: ReadonlySet<number> | null;
   ownUid: number;
   permitBareWrapperReap?: boolean;
+  /** Pane enumeration seam. Defaults to the real /proc enumeration; injected by
+   *  tests that must place a pane the live topology would filter out (e.g. a
+   *  same-server-pgid helper) so the signalling GUARDS are actually exercised. */
+  enumeratePanes?: (orphanPid: number, procs: RichProc[]) => OrphanPane[];
 }
 
 export interface OrphanSweepReport {
@@ -426,8 +430,9 @@ export function planOrphanSessionSweep(opts: OrphanSweepOptions): OrphanSweepRep
   }
   let panesEvaluated = 0;
   const killable = new Set<number>();
+  const enumerate = opts.enumeratePanes ?? ((pid, procs) => enumerateOrphanPanes(pid, procs, readProcEnviron));
   for (const orphanPid of opts.orphanServerPids) {
-    const panes = enumerateOrphanPanes(orphanPid, opts.procs, readProcEnviron);
+    const panes = enumerate(orphanPid, opts.procs);
     const result = classifyOrphanPanes({
       panes,
       procs: opts.procs,
@@ -559,6 +564,7 @@ export function runPeriodicOrphanSessionSweep(seam: PeriodicSweepSeam): Periodic
       procs, lockHolderPids: lockHolders,
       ownUid: seam.ownUid ?? (typeof process.getuid === 'function' ? process.getuid() : -1),
       permitBareWrapperReap: true,
+      enumeratePanes: seam.enumeratePanes,
     });
     result.panesEvaluated += plan.panesEvaluated;
     if (!plan.censusComplete) { result.censusComplete = false; continue; }
