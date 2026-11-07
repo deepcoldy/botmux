@@ -83,7 +83,6 @@
 | `BOTMUX_SCHEDULE_TIMEZONE` | 不设，用页面里选的时区，再没有就用主机时区 | [定时任务](/schedule)用的时区，如 `Asia/Shanghai`。优先级高于「全局设置」页里选的时区；不合法的名字会被忽略 |
 | `BOTMUX_RECOVERY_FORK_BATCH` | `5` | botmux 重启后恢复会话时，每批重新拉起几个，避免一下子全起来把机器压满。最小 `1` |
 | `BOTMUX_RECOVERY_FORK_DELAY_MS` | `250` | 恢复会话时两批之间隔多久（毫秒）。最小 `0` |
-| `BOTMUX_WORKTREE_ROOT` | 不设，建在主仓库旁边 | botmux 新建 worktree 放到哪个目录下，如 `/data00/worktrees`。适合系统盘小、另有大数据盘的机器。只影响之后新建的 worktree；主仓库旁边已有的同名 worktree 照常复用 |
 | `BOTMUX_WORKTREE_SLUG_AI_ENABLED` | 关 | 设 `true` 后，用 AI 给新 worktree 起分支名，见下方「用 AI 给 worktree 起名」 |
 | `BOTMUX_ALLOW_UNKNOWN_SCOPES` | 不设 | 设 `1` 后，可以申请 botmux 权限清单里还没收录的飞书权限（只检查格式）。飞书新出权限、botmux 还没发版时临时用 |
 | `BOTMUX_CODEX_NODE_REPL_PATH` | 不设 | 显式启用浏览器相关功能、但没配好 MCP 运行时时，指定已安装的 Codex `node_repl` 可执行文件的绝对路径 |

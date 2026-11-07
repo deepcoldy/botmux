@@ -83,7 +83,6 @@ These variables (including the app secret) are used only by the Dashboard proces
 | `BOTMUX_SCHEDULE_TIMEZONE` | Unset: the timezone chosen on the page, else the host timezone | Timezone for [scheduled tasks](/en/schedule), e.g. `Asia/Shanghai`. Takes priority over the timezone chosen on the Global Settings page; invalid names are ignored |
 | `BOTMUX_RECOVERY_FORK_BATCH` | `5` | When botmux restarts and recovers sessions, how many it relaunches per batch, so they don't all start at once and swamp the machine. Minimum `1` |
 | `BOTMUX_RECOVERY_FORK_DELAY_MS` | `250` | Pause (ms) between recovery batches. Minimum `0` |
-| `BOTMUX_WORKTREE_ROOT` | Unset: next to the main repo | Directory where botmux creates new worktrees, e.g. `/data00/worktrees`. Useful when the system disk is small and a larger data disk is mounted. Only affects worktrees created from then on; an existing worktree of the same name next to the main repo is still reused |
 | `BOTMUX_WORKTREE_SLUG_AI_ENABLED` | Off | Set `true` to name new worktree branches with AI. See "Name worktrees with AI" below |
 | `BOTMUX_ALLOW_UNKNOWN_SCOPES` | Unset | Set `1` to request Feishu scopes not yet in botmux's scope list (syntax check only). A stopgap when Feishu ships a new scope before a botmux release |
 | `BOTMUX_CODEX_NODE_REPL_PATH` | Unset | Absolute path to an installed Codex `node_repl` executable, for opt-in browser features when no MCP runtime is configured |

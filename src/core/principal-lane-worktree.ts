@@ -268,11 +268,14 @@ export async function materializePrincipalLaneWorktree<T>(args: {
     sourceRepoRoot,
     `${basename(sourceRepoRoot)}-wt-principal-lane-${suffix}`,
   );
+  // A lane materialized before `worktreeRoot` changed is reused where it already is.
+  let materializedPath = worktreePath;
   try {
     const committed = await createRepoWorktreeAndCommit(
       sourceRepoRoot,
       { branch, worktreePath, reuseExisting: true, ignoreRemoteBranch: true },
       async creation => {
+        materializedPath = creation.path;
         const worktreeRoot = realpathSync(creation.path);
         const observedMain = realpathSync(await mainWorktreeFor(worktreeRoot));
         const worktreeGit = await readPrincipalLaneGitIdentity(worktreeRoot);
@@ -316,11 +319,11 @@ export async function materializePrincipalLaneWorktree<T>(args: {
     return { status: 'ready', ...committed.result };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (existsSync(worktreePath)) {
+    if (existsSync(materializedPath)) {
       return {
         status: 'unknown',
         reason: 'publication_unknown',
-        orphan: { worktreePath, branch, materializationId },
+        orphan: { worktreePath: materializedPath, branch, materializationId },
         detail,
       };
     }
