@@ -86,6 +86,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   });
   return {
   forkWorker: vi.fn(),
+  recordTurnExplicitMention: vi.fn(),
   killWorker: vi.fn(),
   suspendWorker: vi.fn(() => false),
   teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
