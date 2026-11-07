@@ -9,4 +9,4 @@ import { installSessionDataDirFence } from './helpers/session-data-dir-fence.js'
 // HOME is deliberately NOT fenced here: e2e files drive real CLIs (claude,
 // codex, …) that need the developer's own credentials and config, so only the
 // botmux-owned data directory is redirected.
-installSessionDataDirFence(inject('unitSessionDataRoot'), 'e2e-');
+installSessionDataDirFence(inject('testSessionDataRoot'), 'e2e-');

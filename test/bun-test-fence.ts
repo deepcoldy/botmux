@@ -39,6 +39,12 @@ import {
  * behaviour rather than inventing a third semantic.
  */
 
+// DATA-DIR FENCE — mirrors the disposable-root block in
+// test/helpers/session-data-dir-fence.ts (used by vitest's unit-setup.ts and
+// e2e-setup.ts). It cannot import that helper: this preload runs BEFORE
+// bun-test-shim.ts (the node:os override has to be installed first), while the
+// helper imports its hooks from 'vitest', which only resolves under the shim.
+// Change one copy, compare the other.
 const inheritedDataDir = process.env.SESSION_DATA_DIR;
 
 // One disposable root per test PROCESS — note that `bun test` runs every file
