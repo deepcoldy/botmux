@@ -129,7 +129,7 @@ const topicLookups = new Map<string, number>();
     const state = states[id] ?? 'live';
     if (state === 'error') throw new Error('topic lookup unavailable');
     data = state === 'withdrawn-code' ? { code: 230011, msg: 'withdrawn' }
-      : { code: 0, data: { items: [{ message_id: id, chat_id: 'oc_test',
+      : { code: 0, data: { items: state === 'missing' ? [] : [{ message_id: id, chat_id: 'oc_test',
         deleted: state === 'withdrawn' || (state === 'withdraw-after-preflight' && count > 1),
         body: { content: '{"text":"hello"}' } }] } };
   } else if (url.pathname.includes('/im/v1/messages/')) {

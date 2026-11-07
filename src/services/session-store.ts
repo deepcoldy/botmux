@@ -2234,7 +2234,7 @@ function buildNewSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: { source?: SessionCreationSource; inherit?: Session; messageListenerRun?: Session['messageListenerRun'] } = {},
 ): Session {
   const bot = configuredCodexInstanceBot(currentAppId);
   const source = intent.source ?? 'other';
@@ -2245,6 +2245,7 @@ function buildNewSession(
   } : bot ? newSessionCodexInstanceState(bot, source) : {};
   const session: Session = {
     sessionId: randomUUID(),
+    ...(intent.messageListenerRun ? { messageListenerRun: { ...intent.messageListenerRun } } : {}),
     chatId,
     chatType,
     rootMessageId,
@@ -2277,7 +2278,7 @@ export function createSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: { source?: SessionCreationSource; inherit?: Session; messageListenerRun?: Session['messageListenerRun'] } = {},
 ): Session {
   loadForWrite();
   const session = buildNewSession(chatId, rootMessageId, title, chatType, scope, intent);
