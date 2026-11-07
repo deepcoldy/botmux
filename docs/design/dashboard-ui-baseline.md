@@ -126,6 +126,11 @@
 - `HeaderAction` 用于“查看全部”等标题行次级跳转按钮；多个控件时用 `HeaderControls` 包裹。
 - `OverviewList`、`OverviewListItem`、`OverviewListMain`、`OverviewListTail` 用于工作台同类紧凑列表。列表项高度由内容决定，不因列表容器变高而拉伸。
 - `DropdownMenu` 用于短选项下拉筛选/排序；`SortMenu` 是排序语义的兼容封装。触发按钮只展示当前模式，不展示“排序”前缀；触发器宽度默认使用 `--dropdown-trigger-width`，选中项和 hover 项使用不同背景，避免状态黏连。
+- `DropdownMenu` 底层是 Base UI 的 Select（`searchable` 时是 Combobox），实现随第一个渲染的下拉按需加载。弹层 portal 到 `body`（触发器在打开的原生 `<dialog>` 里时 portal 到该 dialog），由 Floating UI 做翻转和视口碰撞，不再被滚动容器裁切。页面样式接入规则：
+  - 触发器用 `.页面class > .sect-sort-trigger` 命中，展开态是根节点上的 `.is-open`。
+  - 弹层不在页面 DOM 里，不能用祖先选择器；组件把 `className` 原样写到弹层的 `data-menu` 上，用 `.sect-sort-pop[data-menu~="页面class"]` 写宽度、限高等。选项是 `.sect-sort-item`，状态是 `[data-selected]`、`[data-highlighted]`（鼠标悬停和键盘高亮共用）、`[data-disabled]`。
+  - 弹层默认相对触发器居中；要贴左缘或右缘时，在触发器根节点上设 `--dropdown-align: start` / `end`。宽度可用 `var(--anchor-width)`（触发器宽度）。
+  - 限高必须带 `var(--available-height, 100vh)`，否则触发器上下空间都不够时会超出视口。
 - `LoadingState` 用于所有数据加载占位；页面级使用默认尺寸，卡片、弹窗、列表、局部面板使用 `compact` 或页面 class 缩小高度，但必须复用同一个 `.page-loading-spin`。
 - `OverflowText` 用于单行文本溢出处理：外层容器必须有明确宽度或 `min-width: 0`，内部文本由组件检测 `scrollWidth`，只有溢出时才显示平台风格 fixed tooltip 并执行横向 pan 动画。不要在各页面复制测量、portal tooltip 或 marquee 逻辑。
 - 公共组件只沉淀结构和状态 class，不写业务数据逻辑；页面自己的 API、过滤、排序、权限判断保留在页面模块内。
