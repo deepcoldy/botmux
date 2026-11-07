@@ -9199,7 +9199,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean; task?: ManagedScheduleUpdateReceipt };
     if (!response.ok || body.ok !== true) {
-      throw new Error(scheduleIpcErrorMessage(body.error) ?? body.error ?? `HTTP ${response.status}`);
+      throw new Error(scheduleIpcErrorMessage(body.error)
+        ?? (body.error ? describeUntilDoneError(body.error) : `HTTP ${response.status}`));
     }
     return { replay: body.replay === true, ...(body.task && typeof body.task === 'object' ? { task: body.task } : {}) };
   };
@@ -9227,7 +9228,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         const nextLine = task.enabled
           ? (task.nextRunAt ? fmt(task.nextRunAt) : '—')
           : task.disabledReason === 'once_completed'
-            ? '任务已结束，不会自动执行'
+            ? updates.schedule !== undefined
+              ? `任务已结束；用 botmux schedule resume ${id} 按新频率重新开始`
+              : '任务已结束，不会自动执行'
             : '任务已暂停，恢复后按此频率执行';
         console.log(`   下次执行: ${nextLine}`);
         if (task.enabled && task.calendar !== undefined) {
