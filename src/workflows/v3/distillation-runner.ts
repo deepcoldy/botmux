@@ -40,6 +40,7 @@ import {
 } from '../../core/session-marker.js';
 import { locateExecutable } from '../../utils/executable.js';
 import { systemBwrapPath } from '../../core/system-bwrap.js';
+import { logger } from '../../utils/logger.js';
 import {
   fsyncDirectorySyncPortable,
   fsyncRegularFileSync,
@@ -538,8 +539,11 @@ function snapshotDistillationEtcEntries(): string[] {
   } catch {
     throw new V3DistillationRunnerError('MANAGED_POLICY_UNSUPPORTED');
   }
+  // bwrap refuses to start when a bind source is missing, e.g. a dangling
+  // symlink; existsSync follows links, so those entries are skipped.
   return entries
-    .filter((name) => name !== 'claude-code' && name.length > 0 && !name.includes('/') && !name.includes('\0'))
+    .filter((name) => name !== 'claude-code' && name.length > 0 && !name.includes('/') && !name.includes('\0')
+      && existsSync(join('/etc', name)))
     .sort();
 }
 
@@ -1155,5 +1159,8 @@ function normalizeTimeout(value: number | undefined): number {
 
 function normalizeRunnerFailure(error: unknown, setupPhase: boolean): unknown {
   if (error instanceof V3DistillationRunnerError) return error;
+  if (setupPhase) {
+    logger.warn(`[v3-distillation] scratch setup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return new V3DistillationRunnerError(setupPhase ? 'SCRATCH_SETUP_FAILED' : 'MODEL_FAILED');
 }
