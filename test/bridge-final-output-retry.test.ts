@@ -5358,6 +5358,34 @@ describe('Worker hidden schedule retirement', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it('does not let an in-flight frame stamped with the previous turn disarm the marker', async () => {
+    // The scheduler rewrites run.turnId in the daemon while the worker's periodic
+    // sampler may already have queued a screen_update stamped with the OLD turn.
+    // That frame matches neither run nor marker: it must neither settle nor clear
+    // the marker, or the old turn's later unattributed tail would settle the new
+    // turn again.
+    const oldTurn = turnId;
+    const rerunTurnId = 'schedule:task-hidden:66666666-7777-8888-9999-000000000000';
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(
+      Date.now(), true, false, 'schedule-task:task-hidden',
+    );
+    ds.session.deferredScheduleRun!.turnId = rerunTurnId;
+    ds.deferredScheduleUnconfirmedTurnId = rerunTurnId;
+    ds.silentScheduledTurns = new Map([[oldTurn, Date.now()], [rerunTurnId, Date.now()]]);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'wrapping up', status: 'idle', turnId: oldTurn,
+    });
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    });
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it.each([true, false])('keeps a still-hidden run quiet after the bounded turn registry expired, identity=%s', async hasIdentity => {
     const { ds, sessionReply } = prepareHiddenRun(Date.now() - 25 * 60 * 60 * 1000);
     (ds.worker as any).emit('message', {
