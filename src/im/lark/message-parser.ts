@@ -1820,7 +1820,8 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'close', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli',
   'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
   'retry_last_task', 'takeover', 'term_action', 'toggle_display',
-  'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  'toggle_stream', 'toggle_keys_panel',
+  'tui_keys', 'tui_text_input', 'voice_summary',
   'reply_card_menu', 'reply_model_pick', 'session_model_pick', 'session_effort_pick', 'session_effort_apply', 'models_default_pick', 'models_default_effort_pick', 'reply_menu_cancel',
   // pendingRepo gates
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',

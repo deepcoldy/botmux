@@ -173,6 +173,7 @@ import {
   buildStreamingCardJson,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -302,6 +303,25 @@ describe('Worker ready: set_display_mode re-sync', () => {
     } finally {
       resetTerminalProxy();
     }
+  });
+
+  it('renders the terminal keys through live card rebuilds after opening the panel', async () => {
+    const actual = await vi.importActual<typeof import('../src/im/lark/card-builder.js')>('../src/im/lark/card-builder.js');
+    await vi.mocked(buildStreamingCard).withImplementation(actual.buildStreamingCard, async () => {
+      const ds = makeDs({ displayMode: 'screenshot', keysPanelOpen: true });
+      const keysIn = (card: any) => card.elements
+        .filter((element: any) => element.tag === 'column_set')
+        .flatMap((row: any) => row.columns.flatMap((column: any) => column.elements))
+        .filter((button: any) => button.value?.action === 'term_action')
+        .map((button: any) => button.value.key);
+
+      expect(keysIn(JSON.parse(buildStreamingCardJson(ds, 'working')))).toEqual([
+        'esc', 'ctrlc', 'tab', 'space', 'enter', 'left', 'up', 'down', 'right',
+        'half_page_up', 'half_page_down',
+      ]);
+      ds.keysPanelOpen = false;
+      expect(keysIn(JSON.parse(buildStreamingCardJson(ds, 'working')))).toEqual([]);
+    });
   });
 
   it('keeps the Web Terminal button on live streaming cards when the current worker owns a terminal', () => {

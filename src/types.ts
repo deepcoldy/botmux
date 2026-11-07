@@ -1067,6 +1067,8 @@ export interface Session {
   streamExpanded?: boolean;
   /** Card body display mode — 'hidden' | 'screenshot'. */
   displayMode?: DisplayMode;
+  /** Whether the streaming card's terminal-key grid is expanded (persisted). */
+  streamKeysPanelOpen?: boolean;
   /** Latest uploaded screenshot image_key, persisted so card can re-render after restart. */
   currentImageKey?: string;
   currentTurnTitle?: string;

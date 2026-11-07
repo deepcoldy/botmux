@@ -213,7 +213,7 @@ describe('敏感动作清单', () => {
     'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
     'retry_last_task', 'retry_turn', 'session_effort_apply', 'session_effort_pick', 'session_model_pick', 'session_model_unpin', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
-    'toggle_display', 'toggle_idle_compact', 'toggle_stream', 'toggle_substitute', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
+    'toggle_display', 'toggle_idle_compact', 'toggle_keys_panel', 'toggle_stream', 'toggle_substitute', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];
 

@@ -161,6 +161,7 @@ vi.mock('../src/global-config.js', () => ({
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
+import { persistStreamCardState } from '../src/core/session-manager.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
@@ -624,5 +625,85 @@ describe('toggle_idle_compact card action', () => {
     expect(result.toast.type).toBe('warning');
     expect(ds.session.idleAutoCompact).toBeUndefined();
     expect(sensitiveCardActionMeta('toggle_idle_compact')).toBeDefined();
+  });
+});
+
+// ─── toggle_keys_panel ───────────────────────────────────────────────────
+
+describe('toggle_keys_panel card action', () => {
+  beforeEach(() => {
+    vi.mocked(persistStreamCardState).mockClear();
+  });
+
+  function toggleAction(messageId = 'om_stream_card', nonce = 'nonce_live') {
+    const data = actionData('toggle_keys_panel');
+    data.context.open_message_id = messageId;
+    data.action.value.card_nonce = nonce;
+    return data;
+  }
+
+  it('flips the session flag, persists it, and rebuilds the card', async () => {
+    const ds = makeDs({ streamCardNonce: 'nonce_live' });
+    expect(ds.keysPanelOpen).toBeFalsy();
+    const result = await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBe(true);
+    expect(persistStreamCardState).toHaveBeenCalledWith(ds);
+    // scheduleCardPatch mock returns falsy → the rebuilt card rides the callback.
+    expect(result).toBeDefined();
+  });
+
+  it('flips back on a second click', async () => {
+    const ds = makeDs({ keysPanelOpen: true, streamCardNonce: 'nonce_live' });
+    await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBe(false);
+  });
+
+  it('refuses on a closed session without mutating state', async () => {
+    const ds = makeDs({ sessionOverrides: { status: 'closed' } });
+    const result = await handleCardAction(actionData('toggle_keys_panel'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.keysPanelOpen).toBeFalsy();
+  });
+
+  it('rejects panel toggles in primary mode without changing local state', async () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    try {
+      const ds = makeDs({ streamCardNonce: 'nonce_live' });
+      const result = await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+      expect(result?.toast?.type).toBe('warning');
+      expect(ds.keysPanelOpen).toBeFalsy();
+      expect(persistStreamCardState).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('rejects panel toggles from a non-operator', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = makeDs({ streamCardNonce: 'nonce_live' });
+    await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBeFalsy();
+    expect(persistStreamCardState).not.toHaveBeenCalled();
+  });
+
+  it('is registered behind the canOperate gate', () => {
+    expect(sensitiveCardActionMeta('toggle_keys_panel')).toBeDefined();
+  });
+
+  it('reports a session that is no longer active', async () => {
+    const result = await handleCardAction(toggleAction(), depsWith(undefined), LARK_APP_ID);
+    expect(result?.toast.type).toBe('warning');
+    expect(persistStreamCardState).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['om_old_card', 'nonce_live'],
+    ['om_stream_card', 'nonce_old'],
+  ])('keeps live state unchanged for stale card identity %s / %s', async (messageId, nonce) => {
+    const ds = makeDs({ streamCardNonce: 'nonce_live' });
+    const result = await handleCardAction(toggleAction(messageId, nonce), depsWith(ds), LARK_APP_ID);
+    expect(result?.toast?.type).toBe('info');
+    expect(ds.keysPanelOpen).toBeFalsy();
+    expect(persistStreamCardState).not.toHaveBeenCalled();
   });
 });

@@ -267,6 +267,7 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['open_local_cli', { denyToastKey: 'card.action.local_cli_no_permission' }],
   ['toggle_stream', NO_META],
   ['toggle_display', NO_META],
+  ['toggle_keys_panel', NO_META],
   ['export_text', NO_META],
   ['term_action', NO_META],
   ['refresh_screenshot', NO_META],

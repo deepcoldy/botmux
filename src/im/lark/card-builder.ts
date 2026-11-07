@@ -1159,6 +1159,9 @@ export function buildStreamingCard(
   screenshotUnavailable = false,
   /** Per-chat substitute toggle. Omitted ⇒ no button (fail-closed). */
   substituteControl?: SubstituteCardControl,
+  /** Terminal-key grid expanded state, owned by the daemon session and carried
+   *  through every PATCH so streaming refreshes don't snap the grid shut. */
+  keysPanelOpen = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1185,86 +1188,114 @@ export function buildStreamingCard(
   // 比 footer 少了绝对值。唯一不冗余的是「超阈值提醒」，已折进 footer 那一行
   // （见 cardUsageFooterSegment 的 compactHintThreshold）。
 
-  // ── Main control row: display toggle, mode toggle, terminal, manage ─────
-  const headerActions: any[] = [];
+  // ── Primary control row: high-frequency / dangerous actions only. The rest
+  //    move into the overflow menu on the secondary row, so narrow cards (e.g.
+  //    meeting chats) no longer render a dozen full-width buttons stacked into
+  //    one long vertical strip.
+  const primaryActions: any[] = [];
   const hidden = new Set(hiddenButtons);
 
+  if (terminalUrl && !hidden.has('terminal')) {
+    primaryActions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)));
+  }
+  if (status === 'limited' && usageLimit?.retryReady) {
+    primaryActions.push(callbackButton(
+      t('card.btn.retry_last_task', undefined, locale),
+      'primary',
+      { action: 'retry_last_task', ...actionBase },
+    ));
+  }
+  // 「压缩」显示判据必须调谓词 cliHasNoRawPassthroughSurface，不能手写 cliId 字面量：
+  // remote CLI（riff/mojo）无本地终端；无 raw passthrough 面的 CLI（codex-app/mira/mir/
+  // dsh/ebsd）发 /compact 会被帧协议丢弃或当成普通消息白烧一个 turn。dshRuntime='tui'
+  // 的真交互 TUI 照常显示。handler 侧另有同谓词拒绝兜底。
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+    primaryActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
+  }
+  // 「停止」仅在有 turn 可停时显示（working/analyzing/stalled）：idle 无 turn 可停，
+  // starting CLI 未起，limited turn 已失败，只剩后台子任务时 ^C 也停不了后台任务。
+  // remote CLI 无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
+    && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
+    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
+  }
+  if (adoptMode) {
+    if (showTakeover) {
+      primaryActions.push(callbackButton(t('card.btn.takeover', undefined, locale), 'default', { action: 'takeover', ...actionBase }));
+    }
+    if (!hidden.has('close')) {
+      primaryActions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
+    }
+  } else if (!hidden.has('close')) {
+    primaryActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
+  }
+  if (primaryActions.length > 0) elements.push({ tag: 'action', actions: primaryActions });
+
+  // ── Secondary row + collapsible panels ──────────────────────────────────
+  // The terminal-key grid is a daemon-controlled toggle (state must survive
+  // card PATCHes). The low-frequency controls live in a native Feishu
+  // collapsible_panel with a titled header — an unlabelled overflow "⋯" icon
+  // was not discoverable on mobile. The panel expands locally in the client
+  // (no callback/state needed); its items are one-shot actions, so collapsing
+  // back on the next streaming PATCH is harmless.
+  const keysAvailable = displayMode === 'screenshot' && !isRemoteCliId(cliId);
+  const primaryMode = coordinationModeIsPrimary();
+  if (keysAvailable && !primaryMode) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        callbackButton(
+          `${t('card.btn.keys_panel', undefined, locale)} ${keysPanelOpen ? '▴' : '▾'}`,
+          'default',
+          { action: 'toggle_keys_panel', ...actionBase },
+        ),
+      ],
+    });
+  }
+  const morePanelButtons: any[] = [];
   if (!hidden.has('output')) {
-    headerActions.push(callbackButton(
+    morePanelButtons.push(callbackButton(
       t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
       'default',
       coordinationModeIsPrimary()
         ? {
             action: 'toggle_display',
-            // #2062: in primary multi-replica mode the click travels through the
-            // durable control lane, which may retry it after an owner failover.
-            // Carry the visible intent so a retry applies the same mode instead
-            // of toggling back. Single-replica cards keep the pre-#2062 payload.
+            // #2062: carry the visible intent so a durable-lane retry applies
+            // the same mode instead of toggling back.
             target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
             ...actionBase,
           }
         : { action: 'toggle_display', ...actionBase },
     ));
     if (displayMode !== 'hidden') {
-      headerActions.push(callbackButton(
+      morePanelButtons.push(callbackButton(
         t('card.btn.export_text', undefined, locale),
         'default',
         { action: 'export_text', ...actionBase },
       ));
     }
     if (displayMode === 'screenshot') {
-      headerActions.push(callbackButton(
+      morePanelButtons.push(callbackButton(
         t('card.btn.refresh', undefined, locale),
         'default',
         { action: 'refresh_screenshot', ...actionBase },
       ));
     }
   }
-  if (terminalUrl && !hidden.has('terminal')) {
-    headerActions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)));
-  }
   const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
-  if (localBtn) headerActions.push(localBtn);
-  if (status === 'limited' && usageLimit?.retryReady) {
-    headerActions.push(callbackButton(
-      t('card.btn.retry_last_task', undefined, locale),
-      'primary',
-      { action: 'retry_last_task', ...actionBase },
-    ));
-  }
+  if (localBtn) morePanelButtons.push(localBtn);
   if (terminalUrl && !hidden.has('writeLink')) {
-    headerActions.push(callbackButton(
+    morePanelButtons.push(callbackButton(
       t('card.btn.get_write_link', undefined, locale),
       'default',
       { action: 'get_write_link', ...actionBase },
     ));
   }
-  // 「🗜️ 压缩」：只要该 CLI 有能接收 /compact 的输入通道就显示——**不再要求有上下文
-  // 百分比**。此前条件是 hasContextPct，但只有 codex（native model_context_window）和
-  // pi（读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里根本没有
-  // 上下文窗口字段（只有 model），于是 Claude 会话永远看不到压缩按钮——而 Claude 恰好
-  // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
-  // 闸门是拿错了判据。
-  //
-  // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
-  //   ① remote CLI（riff/mojo）无本地终端可驱动；
-  //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
-  //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
-  //      `ignoring non-frame input` 静默丢弃，mira/mir 把 `/compact` 当**普通用户消息**
-  //      发给模型白烧一个 turn。打字发 /compact 本就被 router 的
-  //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
-  // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
-  // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
-    headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
-  }
-  // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in 的闲置自动 /compact（core/idle-auto-compact.ts）。
-  // 状态随 usage 快照到卡（与 modelFallback 同理，所有调用点都已转发），快照里没有 ⇒ 该
-  // CLI/后端不支持，不渲染。跟随「压缩」按钮的隐藏配置：隐藏压缩即一并隐藏。按钮值带目标
-  // 状态 desired（而非「翻转」），旧卡片重复点击是幂等的。
+  // 闲置自动压缩：状态随 usage 快照到卡，快照里没有 ⇒ 该 CLI/后端不支持，不渲染。
+  // 跟随「压缩」的隐藏配置；按钮值带目标状态 desired，重复点击幂等。
   const idleCompact = !adoptMode && !hidden.has('compact') ? usage?.idleAutoCompact : undefined;
   if (idleCompact) {
-    headerActions.push(callbackButton(
+    morePanelButtons.push(callbackButton(
       t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
       'default',
       { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
@@ -1273,33 +1304,45 @@ export function buildStreamingCard(
   // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关（不是会话设置）。
   // 按钮值携带明确的目标 desired，处理侧按目标写入而不是翻转，旧卡重复点击幂等。
   if (!hidden.has('substitute') && substituteControl) {
-    headerActions.push(callbackButton(
+    morePanelButtons.push(callbackButton(
       t(substituteControl.enabled ? 'card.btn.substitute_off' : 'card.btn.substitute_on', undefined, locale),
       'default',
       { action: 'toggle_substitute', desired: substituteControl.enabled ? 'off' : 'on', ...actionBase },
     ));
   }
-  // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
-  // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
-  // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
-  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败；
-  // 主回合已结束、只剩后台子任务在跑时也无 turn 可停（^C 停不了后台任务）。
-  // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
-    && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
-    headerActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
-  }
-  if (adoptMode) {
-    if (showTakeover) {
-      headerActions.push(callbackButton(t('card.btn.takeover', undefined, locale), 'default', { action: 'takeover', ...actionBase }));
+  if (morePanelButtons.length > 0) {
+    // Two weighted columns keep labels on one line even on a phone-sized card;
+    // an odd last button simply occupies the first column of the final row.
+    const panelRows: any[] = [];
+    for (let i = 0; i < morePanelButtons.length; i += 2) {
+      const pair = morePanelButtons.slice(i, i + 2);
+      panelRows.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        ...(i > 0 ? { margin: '6px 0px 0px 0px' } : {}),
+        columns: pair.map((btn: any) => ({
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'top',
+          elements: [{ ...btn, width: 'fill' }],
+        })),
+      });
     }
-    if (!hidden.has('close')) {
-      headerActions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
-    }
-  } else if (!hidden.has('close')) {
-    headerActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded: false,
+      margin: '6px 0px 0px 0px',
+      header: {
+        title: { tag: 'plain_text', content: t('card.btn.more_actions', undefined, locale) },
+        icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+        icon_position: 'right',
+        icon_expanded_angle: -180,
+      },
+      elements: panelRows,
+    });
   }
-  if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
   const effortControl = !adoptMode && usage?.reasoningControl;
   if (effortControl && effortControl.choices.length > 0) {
     // Display executor truth; keep CAS bound to the saved session setting.
@@ -1346,36 +1389,52 @@ export function buildStreamingCard(
     });
   }
 
-  // ── Quick-action keys (only when the screenshot is visible — in text mode
-  //    there's no visible cursor/input, so these keys would fire blindly) ──
-  // 远端任务后端（riff / mojo）没有可驱动的终端，PTY 快捷键只会变成内容为控制
-  // 字符的 follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
-  // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
-  // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
-  // 以后再加远端 CLI 不会重复漏改。
-  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
-    const mkKey = (label: string, key: string) => (callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }));
-    elements.push({
-      tag: 'action',
-      actions: [
-        mkKey('Esc', 'esc'),
-        mkKey('^C', 'ctrlc'),
-        mkKey('Tab', 'tab'),
-        mkKey('␣ Space', 'space'),
-        mkKey('↵ Enter', 'enter'),
-      ],
+  // ── Terminal-key grid (behind the 「⌨️ 终端按键」 toggle above). Only rendered
+  //    with a visible screenshot — in text mode the keys would fire blindly.
+  //    远端任务后端（riff / mojo）没有可驱动的终端，整组隐藏（isRemoteCliId 单一
+  //    事实源，新增远端 CLI 自动跟随）。weighted columns pin the keys into a
+  //    fixed grid: the old `action` rows stacked every key full-width on narrow
+  //    cards, which is what made the card a long vertical strip.
+  if (keysAvailable && (primaryMode || keysPanelOpen)) {
+    const mkKey = (label: string, key: string) => ({
+      ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
+      width: 'fill' as const,
     });
-    elements.push({
-      tag: 'action',
-      actions: [
-        mkKey('←', 'left'),
-        mkKey('↑', 'up'),
-        mkKey('↓', 'down'),
-        mkKey('→', 'right'),
-        mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
-        mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
-      ],
+    // Row widths are deliberately unequal: Feishu truncates button text with an
+    // ellipsis when a weighted column gets narrower than the label. Labels are
+    // therefore single symbols wherever possible (×/⇥/␣/↵/⇞/⇟) — even a
+    // half-width column can't ellipsize one glyph. Esc renders as × (its
+    // common "exit/cancel" glyph); ^C stays textual, already two characters.
+    const keyRow = (keys: Array<{ label: string; key: string }>, topMargin = false) => ({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+      ...(topMargin ? { margin: '6px 0px 0px 0px' } : {}),
+      columns: keys.map(({ label, key }) => ({
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'top',
+        elements: [mkKey(label, key)],
+      })),
     });
+    elements.push(keyRow([
+      { label: '×', key: 'esc' },
+      { label: '^C', key: 'ctrlc' },
+      { label: '⇥', key: 'tab' },
+      { label: '␣', key: 'space' },
+      { label: '↵', key: 'enter' },
+    ]));
+    elements.push(keyRow([
+      { label: '←', key: 'left' },
+      { label: '↑', key: 'up' },
+      { label: '↓', key: 'down' },
+      { label: '→', key: 'right' },
+    ], true));
+    elements.push(keyRow([
+      { label: t('card.btn.half_page_up', undefined, locale), key: 'half_page_up' },
+      { label: t('card.btn.half_page_down', undefined, locale), key: 'half_page_down' },
+    ], true));
   }
 
   // Model auto-fallback notice — pinned as small yellow text at the very bottom of
