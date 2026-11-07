@@ -19264,7 +19264,18 @@ function markPromptReady(): void {
     hasQueuedTurn: queuedTypeAheadTurns.length > 0,
   });
   const beforeMarkerSync = readyTransition(false);
-  if (beforeMarkerSync.releaseActiveTurnAuthority) {
+  // A ready reported as working below (the argv-baked first prompt still runs,
+  // or the turn only waits on its background agents) is not the turn's end:
+  // that work still reports under this turn's authority.
+  const readyContinuesTurn = (spawnArgvInitialPromptBusy
+      || (backgroundTaskTracker.pendingTurnAgents() > 0 && !spawnArgvNeedsWorkingSeed))
+    && !!renderer
+    && queuedTypeAheadTurns.length === 0
+    && pendingMessages.length === 0
+    && pendingRawInputs.length === 0
+    && pendingSessionRename === null
+    && !isFlushing;
+  if (beforeMarkerSync.releaseActiveTurnAuthority && !readyContinuesTurn) {
     releaseActiveTurnAuthority('prompt_ready');
   }
   // A ready published without the detector's own idle (first-prompt timeout

@@ -2497,6 +2497,14 @@ button.primary {
   display: inline-flex;
 }
 
+.kanban-card-avatar,
+.kanban-card-avatar .orb-avatar {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+}
+
 .kanban-cluster-toggle svg {
   width: 14px;
   height: 14px;
