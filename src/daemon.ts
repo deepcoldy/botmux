@@ -259,6 +259,7 @@ import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterrup
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
+import { missingCliExecutableAfterRetry } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { comparableSessionDir } from './core/working-dir-range.js';
@@ -34450,13 +34451,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           });
         });
       } else {
-        startEventDispatchers.push(() => startLarkEventDispatcher(
-          cfg.larkAppId,
-          cfg.larkAppSecret,
-          botEventHandlers,
-          normalizeBrand(cfg.brand),
-          durableCoordinationRuntime?.store,
-        ));
+        const missingCli = await missingCliExecutableAfterRetry({
+          cliId: cfg.cliId,
+          cliPathOverride: cfg.cliPathOverride,
+          wrapperCli: cfg.wrapperCli,
+          cliLaunchMode: cfg.cliLaunchMode,
+        });
+        if (missingCli) {
+          logger.error(
+            `[${cfg.larkAppId}] 跳过飞书长连接注册：${missingCli}（cliId=${cfg.cliId}）。`
+            + '本机起不动这个 bot 的 CLI，注册了只会分走同一应用的消息再报会话启动失败；本 daemon 不会收到这个 bot 的任何飞书消息。'
+            + '在本机安装或修正 CLI（PATH / cliPathOverride / wrapperCli）后重启 daemon，或改由能启动它的机器承载此 bot。',
+          );
+        } else {
+          startEventDispatchers.push(() => startLarkEventDispatcher(
+            cfg.larkAppId,
+            cfg.larkAppSecret,
+            botEventHandlers,
+            normalizeBrand(cfg.brand),
+            durableCoordinationRuntime?.store,
+          ));
+        }
       }
     }
 
