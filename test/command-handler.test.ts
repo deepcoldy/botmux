@@ -249,6 +249,11 @@ vi.mock('../src/core/scheduler.js', () => ({
   extractScheduleModifiers: vi.fn((prompt: string) => ({ deliver: 'origin' as const, silent: false, prompt })),
 }));
 
+vi.mock('../src/core/project-group-command.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/core/project-group-command.js')>();
+  return { ...actual, runProjectGroupSlashCommand: vi.fn(actual.runProjectGroupSlashCommand) };
+});
+
 vi.mock('../src/services/project-scanner.js', () => ({
   scanProjects: vi.fn(() => []),
   scanMultipleProjects: vi.fn(() => []),
@@ -772,6 +777,7 @@ import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
+import { runProjectGroupSlashCommand } from '../src/core/project-group-command.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
 import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
@@ -1275,6 +1281,26 @@ describe('EXISTING_SESSION_ONLY_DAEMON_COMMANDS set', () => {
   it('keeps /lane existing-session-only so status and cleanup never create a phantom session', () => {
     expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/lane')).toBe(true);
     expect(DAEMON_COMMANDS.has('/lane')).toBe(true);
+  });
+});
+
+describe('/project status', () => {
+  it('shows the project title without the trailing task marker', async () => {
+    vi.mocked(getBot).mockImplementation(((id?: string) => ({ ...defaultGetBot(id), resolvedAllowedUsers: ['ou_sender'] })) as any);
+    vi.mocked(runProjectGroupSlashCommand).mockResolvedValueOnce({
+      kind: 'status',
+      config: { mode: 'project', coordinatorAppId: LARK_APP_ID, workerAppIds: [] },
+      project: { title: '终态刷新修复 [task:0917f0d4099c854321c8aca3f1459c31]', phase: 'executing' },
+    } as any);
+    const deps = makeDeps();
+    try {
+      await handleCommand('/project', ROOT_ID, makeLarkMessage('/project status', { chatId: 'oc_project' }), deps, LARK_APP_ID);
+    } finally {
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+    const reply = String(vi.mocked(deps.sessionReply).mock.calls.at(-1)?.[1]);
+    expect(reply).toContain('终态刷新修复 · executing');
+    expect(reply).not.toContain('[task:');
   });
 });
 
