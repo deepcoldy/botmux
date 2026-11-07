@@ -177,6 +177,52 @@ describe('migration output stays loadable under strict sandbox field validation 
     expect(tiers.readOnly).toEqual(['/srv/ro']);
     expect(tiers.deny).toEqual(['/legacy-deny']);
   });
+
+  it.each([
+    ['scalar deny string', { deny: '~/.ssh' }],
+    ['scalar readOnly number', { readOnly: 42 }],
+    ['scalar readWrite boolean', { readWrite: true }],
+  ])('does not silently delete a scalar tier without a legacy source — stays fail-closed (%s)', async (_label, tiers) => {
+    // issue #2530 literal shape: a hand-written scalar carries an intent the
+    // migration cannot extract. Deleting it would widen the sandbox before the
+    // parser ever runs, so migration must leave the entry untouched and let the
+    // strict loader report the exact bad field.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxPaths: tiers,
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual([]);
+    expect(read()[0].sandboxPaths).toEqual(tiers);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).toThrow(/must be an array of path strings|must be an object/);
+  });
+
+  it('still fail-closes when one tier is valid but a sibling scalar has no legacy source', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxPaths: { deny: ['/good'], readWrite: 5 },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual([]);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).toThrow(/sandboxPaths\.readWrite/);
+    // The valid sibling stays on disk for the operator's repair.
+    expect(read()[0].sandboxPaths.deny).toEqual(['/good']);
+  });
+
+  it('repairs a scalar tier from legacy when a legacy source exists', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['/legacy-deny'],
+      sandboxPaths: { deny: '~/.ssh' },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(read()[0].sandboxPaths.deny).toEqual(['/legacy-deny']);
+  });
 });
 
 describe('migrateSandboxConfigAtStartup when the bots.json lock is busy', () => {

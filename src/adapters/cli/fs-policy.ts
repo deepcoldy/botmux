@@ -1638,6 +1638,22 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     ...sanitizeLegacyPathList(entry.sandboxHidePaths),
     ...sanitizeLegacyPathList(entry.readDenyExtraPaths),
   ];
+  // A non-array tier (the #2530 scalar typo: deny:"~/.ssh", or a number/object)
+  // carries no extractable path. With no legacy tier to rebuild it from,
+  // "repairing" would delete the field and silently widen the sandbox BEFORE the
+  // parser runs, so its accurate field error would never surface — the exact
+  // defect #2530 set out to remove. Bail out and let the strict loader reject.
+  // An all-invalid ARRAY is different: it holds zero valid strings, so dropping
+  // it loses nothing. readWrite has no legacy source at all.
+  const scalarTierWithoutSource = (raw: unknown, legacyList: string[]): boolean =>
+    raw !== undefined && raw !== null && !Array.isArray(raw) && legacyList.length === 0;
+  if (
+    scalarTierWithoutSource(onDisk?.readWrite, [])
+    || scalarTierWithoutSource(onDisk?.readOnly, legacyReadOnly)
+    || scalarTierWithoutSource(onDisk?.deny, legacyDeny)
+  ) {
+    return null;
+  }
   // The on-disk tiers are the dashboard/CLI-written source of truth: sanitize
   // them in place (dropping only unloadable elements). Legacy fills a tier only
   // when the on-disk tier is absent or empties out — never overwrite a surviving
