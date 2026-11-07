@@ -790,7 +790,7 @@ export const messages: Record<string, string> = {
   'cmd.vc.project_optional': '当前会话未绑定项目目录。是否需要会议问答结合本地代码？需要时发送 `/cd <项目目录>`；不操作则仅使用本群上下文、监听文档和会议字幕回答。',
   'cmd.vc.replaced': '注意：本群此前还绑定了会议 `{meetingNo}`；旧记录仍保留，可用 `/vc off {meetingNo}` 解除。',
   'cmd.vc.store_unavailable': '会议准备记录暂时不可读写（文件暂时读不了或正被占用），本次操作没有完成，请稍后重试。',
-  'cmd.vc.store_corrupt': '会议准备记录文件已损坏（内容不是合法 JSON）。重试无法恢复：发送 `/vc prepare` 会先把原文件另存为同目录下的 .corrupt 证据文件再重建绑定（或用 `/vc off` 清空），此前的绑定需要重新设置。',
+  'cmd.vc.store_corrupt': '会议准备记录文件已损坏（内容无法解析，或顶层不是记录格式）。重试无法恢复：发送 `/vc prepare` 会先把原文件另存为同目录下的 .corrupt 证据文件再重建绑定（或用 `/vc off` 清空），此前的绑定需要重新设置。',
   'daemon.doc_mention_notify_title': '📄 文档 @bot 触发通知',
   'daemon.doc_mention_notify_body': '用户 {requester} 在文档 {token} 中 @了机器人，已触发回复。',
   'daemon.doc_dropped_notify_title': '⚠️ 文档评论事件未处理',
