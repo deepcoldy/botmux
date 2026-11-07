@@ -75,8 +75,9 @@ function harness(options: {
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => false, selfDaemonLarkAppId: appId,
     jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
     // The daemon's own lookup of a delegation already bound to this turn's message.
-    dispatchUserForTurn: (session: any, turn: string) => resolveDispatchUser({
-      dataDir, secret, appId: session.larkAppId, chatId: session.chatId, turnId: turn, waitMs: 0 }),
+    // Like the real one, it waits for an unbound handoff to this bot unless the caller passes waitMs.
+    dispatchUserForTurn: (session: any, turn: string, opts: { waitMs?: number } = {}) => resolveDispatchUser({
+      dataDir, secret, appId: session.larkAppId, chatId: session.chatId, turnId: turn, waitMs: opts.waitMs }),
     targetUserForDelegation: vi.fn(async (_session: unknown, user: any) =>
       options.delegatedUserAllowed === false ? undefined : user.openId),
     getBot: () => ({ config: { larkAppId: appId,
@@ -221,6 +222,42 @@ describe('mention handoff: a delegated turn hands the same person on', () => {
     expect(await h.prepare({ targetAppIds: ['cli_third'] }))
       .toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'no_direct_human' } });
   });
+
+  it('does not hold the send for another bot\'s handoff to this bot that is still unbound', async () => {
+    // cli_third registered a handoff to cli_target in this chat but never bound it.
+    await registerPendingDispatchUser({ dataDir, secret, payload: {
+      sourceAppId: 'cli_third', sourceSessionId: 'third-session', sourceTurnId: 'om_third', chatId: 'oc_chat',
+      targetAppIds: ['cli_target'], authority: { appId: 'cli_third', openId: 'ou_bob', unionId: 'on_bob', tools: ['bytedcli'] },
+    } });
+    const h = harness({ appId: 'cli_target', turnId: 'om_unrelated', caller: peerBot });
+    const started = Date.now();
+    expect(await h.prepare({ targetAppIds: ['cli_source'] }))
+      .toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'no_direct_human' } });
+    expect(Date.now() - started).toBeLessThan(1_000);
+  }, 10_000);
+});
+
+describe('the daemon\'s lookup of the delegation a turn carries', () => {
+  const fn = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'dispatchUserForTurn');
+  if (!fn) throw new Error('Missing dispatchUserForTurn');
+  const lookupCode = ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+
+  it('waits for an unbound handoff to this bot no longer than the caller allows', async () => {
+    await registerPendingDispatchUser({ dataDir, secret, payload: {
+      sourceAppId: 'cli_third', sourceSessionId: 'third-session', sourceTurnId: 'om_third', chatId: 'oc_chat',
+      targetAppIds: ['cli_target'], authority: { appId: 'cli_third', openId: 'ou_bob', unionId: 'on_bob', tools: ['bytedcli'] },
+    } });
+    const lookup = new Function('scope', 'with (scope) { ' + lookupCode + '; return dispatchUserForTurn; }')({
+      config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
+      pickTurnReplyTarget: () => ({ senderOpenId: 'ou_source_bot' }),
+      dispatchCallerFromReply, resolveDispatchUser, workflowDelegationRefusalFor: () => undefined, logger: { info: vi.fn() },
+    });
+    const ds = { larkAppId: 'cli_target', chatId: 'oc_chat', scope: 'chat', session: { sessionId: 'target-session' },
+      activeInteractiveTurn: { turnId: 'om_unrelated', caller: { senderType: 'bot', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_source_bot' } } };
+    const started = Date.now();
+    expect(await lookup(ds, 'om_unrelated', { waitMs: 0 })).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(1_000);
+  }, 10_000);
 });
 
 describe('mention handoff: bind', () => {

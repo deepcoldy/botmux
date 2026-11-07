@@ -4356,8 +4356,9 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
 /** `keepInactiveWorkflow`: also return a workflow handoff's delegation that no
  *  longer holds (the caller reports why). Every other caller — the inherited
  *  authority of a dispatch / `--mention` handoff, schedule creation — gets no
- *  delegation from it. */
-async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean } = {}) {
+ *  delegation from it. `waitMs`: how long to wait for an unbound handoff to
+ *  this bot to be bound (default: resolveDispatchUser's). */
+async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean; waitMs?: number } = {}) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   // The main bot's own workflow node turn has no inbound message (design
   // §6.5): its turn id is the handoff it posted, its topic the node card.
@@ -4377,6 +4378,7 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { ke
     secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     appId: ds.larkAppId, chatId: ds.chatId, turnId,
     rootId: reply?.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+    waitMs: opts.waitMs,
   });
   // A workflow handoff's delegation (design 2026-11-03 §10) holds only while
   // its run attempt does; past that it is no delegation at all.
@@ -9159,7 +9161,10 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     // lead that is handed a report by one bot can still hand the same person
     // on to the next. Re-checked against this chat and narrowed to this bot's
     // tools; a schedule or a plain bot-to-bot message still has no sender.
-    let inherited = await dispatchUserForTurn(ds, turnId);
+    // This turn's own handoff had its wait when the turn was delivered; an
+    // unbound one to this bot now is another handoff in flight, and waiting
+    // for it would only hold up this send.
+    let inherited = await dispatchUserForTurn(ds, turnId, { waitMs: 0 });
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
     if (inherited && 'workflow' in inherited) {
       // Same rule as `botmux dispatch` from a workflow node (design §10).
