@@ -14,6 +14,7 @@
  *   - platform gate  off-Linux, /proc means nothing, so scanning is refused
  */
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -128,7 +129,57 @@ describe('scanMojoTree enumeration', () => {
   });
 });
 
+describe('an empty environ read from a live process is not final', () => {
+  // exec installs the new address space before it writes the new environment,
+  // and /proc/<pid>/environ reads empty in between. A FIFO stands in for that
+  // file: the child serves one empty read, waits for the reader to close it,
+  // then serves the nonce to the next open.
+  const SERVE = `
+    const fs = require('node:fs');
+    const { FIFO, CONTENT } = process.env;
+    fs.closeSync(fs.openSync(FIFO, 'w'));
+    for (;;) {
+      try { fs.closeSync(fs.openSync(FIFO, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)); }
+      catch (err) { if (err.code === 'ENXIO') break; throw err; }
+    }
+    fs.writeFileSync(FIFO, CONTENT + '\\0');
+  `;
+  const servers: ChildProcess[] = [];
+  afterEach(() => { for (const s of servers.splice(0)) s.kill('SIGKILL'); });
+
+  function environMidExec(pid: number, opts: { ppid: number; pgid: number; state?: string; stat?: string }): void {
+    proc(pid, opts);
+    const fifo = join(procRoot, String(pid), 'environ');
+    rmSync(fifo);
+    expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+    servers.push(spawn(process.execPath, ['-e', SERVE], {
+      env: { ...process.env, FIFO: fifo, CONTENT: `${MOJO_TREE_NONCE_ENV}=${NONCE}` },
+      stdio: 'ignore',
+    }));
+  }
+
+  it('claims a setsid escapee whose first environ read landed mid-exec', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('reads kernel thread and zombie environs once, since they are empty for good', () => {
+    const filler = Array.from({ length: 16 }, () => '0');
+    filler[3] = String(0x00200000);   // flags: PF_KTHREAD
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(400, { ppid: 2, pgid: 0, stat: `400 (kworker/0:1) S 2 0 ${filler.join(' ')} 1000` });
+    environMidExec(500, { ppid: 1, pgid: 500, state: 'Z' });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid)).toEqual([100]);
+  });
+});
+
 describe('PGID claiming is gated on root identity (P0-3)', () => {
+
   it('a recycled root pid never claims the stranger group wearing its number', () => {
     // The turn root (pid 100, starttime 1000) was reaped; a NEW process now
     // wears pid 100 (starttime 2000) and leads its own group with a child.

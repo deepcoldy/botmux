@@ -288,7 +288,7 @@ export const MOJO_TREE_NONCE_ENV = 'BOTMUX_MOJO_TREE_NONCE';
 
 interface RawProc { pid: number; ppid: number; pgid: number; hasNonce: boolean; zombie: boolean }
 
-interface ParsedStat { ppid: number; pgid: number; starttime: number; state: string }
+interface ParsedStat { ppid: number; pgid: number; starttime: number; state: string; flags: number }
 
 function errnoOf(err: unknown): string | undefined {
   const code = (err as { code?: unknown } | null)?.code;
@@ -333,7 +333,7 @@ function parseStat(text: string): ParsedStat | null {
   // field 22 still yields a usable tree member, so it degrades to NaN here and
   // is rejected by readProcessIdentity instead of failing enumeration.
   const starttime = Number(rest[19]);
-  return { ppid, pgid, starttime, state };
+  return { ppid, pgid, starttime, state, flags: Number(rest[6]) };
 }
 
 /** Boot id, so a persisted (pid, starttime) pair cannot survive a reboot. */
@@ -425,6 +425,20 @@ function readEnviron(
   }
 }
 
+/** stat flags bit for kernel threads, whose environ is empty for good. */
+const PF_KTHREAD = 0x00200000;
+
+/**
+ * Pauses before re-reading an empty environ, about 60 ms in all. exec installs
+ * the new address space before it writes the new environment, and environ reads
+ * empty in between; that window stays within a few ms even on a loaded host.
+ */
+const EMPTY_ENVIRON_REREAD_MS = [2, 4, 8, 16, 32];
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function readProcTable(
   procRoot: string,
   nonce: string,
@@ -446,6 +460,7 @@ function readProcTable(
 
   const table: RawProc[] = [];
   const envBlindSpots: number[] = [];
+  let emptyEnviron: RawProc[] = [];
 
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
@@ -489,7 +504,7 @@ function readProcTable(
     }
     if (environ.state === 'blind') envBlindSpots.push(pid);
 
-    table.push({
+    const entry: RawProc = {
       pid,
       ppid: parsed.ppid,
       pgid: parsed.pgid,
@@ -498,7 +513,35 @@ function readProcTable(
       zombie: parsed.state === 'Z',
       // Zero-separated; a substring test is enough for a unique nonce.
       hasNonce: environ.state === 'read' && environ.text.includes(nonce),
-    });
+    };
+    table.push(entry);
+    if (environ.state === 'read' && environ.text === '' && !entry.zombie && (parsed.flags & PF_KTHREAD) === 0) {
+      emptyEnviron.push(entry);
+    }
+  }
+
+  // A live process caught mid-exec reads an empty environ, and for a setsid
+  // escapee the nonce is the only thing tying it to the turn. Re-read before
+  // calling it a non-member; one that stays empty (env -i) stays unclaimed.
+  for (const delayMs of EMPTY_ENVIRON_REREAD_MS) {
+    if (emptyEnviron.length === 0) break;
+    sleepSyncMs(delayMs);
+    const stillEmpty: RawProc[] = [];
+    for (const entry of emptyEnviron) {
+      const environ = readEnviron(procRoot, String(entry.pid));
+      if (environ.state === 'error') {
+        return {
+          ok: false,
+          failure: { kind: 'proc-entry-unreadable', pid: entry.pid, detail: environ.detail },
+          reason: `cannot read ${procRoot}/${entry.pid}/environ: ${environ.detail}`,
+        };
+      }
+      if (environ.state === 'blind') envBlindSpots.push(entry.pid);
+      if (environ.state !== 'read') continue;
+      if (environ.text === '') stillEmpty.push(entry);
+      else entry.hasNonce = environ.text.includes(nonce);
+    }
+    emptyEnviron = stillEmpty;
   }
 
   return { ok: true, table, envBlindSpots };
