@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { createConnection, type Socket } from 'node:net';
 import { homedir, platform, tmpdir } from 'node:os';
@@ -515,13 +515,16 @@ function errorResult(error: unknown): DynamicToolCallResponse {
   };
 }
 
-export function resolveCodexBrowserPluginRoot(explicitRoot?: string): string {
+export function resolveCodexBrowserPluginRoot(
+  explicitRoot?: string,
+  bundledRoots: readonly string[] = defaultBundledPluginRoots(),
+): string {
   if (explicitRoot && !isAbsolute(explicitRoot)) {
     throw new Error('Codex browser plugin root must be absolute');
   }
   const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
   const pluginCache = join(codexHome, 'plugins', 'cache', 'openai-bundled', 'chrome');
-  const candidate = explicitRoot ? resolve(explicitRoot) : discoverPluginRoot(pluginCache);
+  const candidate = explicitRoot ? resolve(explicitRoot) : discoverPluginRoot(pluginCache, bundledRoots);
   const root = realpathSync(candidate);
   for (const relative of ['scripts/browser-client.mjs', 'scripts/browser-service.mjs']) {
     if (!existsSync(join(root, relative))) {
@@ -531,23 +534,44 @@ export function resolveCodexBrowserPluginRoot(explicitRoot?: string): string {
   return root;
 }
 
-function discoverPluginRoot(pluginCache: string): string {
-  const latest = join(pluginCache, 'latest');
-  if (isCompletePluginRoot(latest)) return latest;
-  let entries: string[];
+function defaultBundledPluginRoots(): string[] {
+  return [
+    '/usr/lib/chatgpt/resources',
+    '/opt/ChatGPT/resources',
+    '/Applications/Codex.app/Contents/Resources',
+    '/Applications/ChatGPT.app/Contents/Resources',
+    join(homedir(), 'Applications/Codex.app/Contents/Resources'),
+    join(homedir(), 'Applications/ChatGPT.app/Contents/Resources'),
+  ].map(resources => join(resources, 'plugins', 'openai-bundled', 'plugins', 'chrome'));
+}
+
+function discoverPluginRoot(pluginCache: string, bundledRoots: readonly string[]): string {
+  let entries: string[] = [];
   try {
     entries = readdirSync(pluginCache, { withFileTypes: true })
       .filter(entry => entry.isDirectory() || entry.isSymbolicLink())
       .map(entry => entry.name);
-  } catch {
-    throw new Error(`Codex browser plugin is not installed under ${pluginCache}`);
-  }
-  const candidates = entries
-    .map(name => join(pluginCache, name))
+  } catch { /* A desktop installation can exist without a user plugin cache. */ }
+  // Desktop updates do not necessarily refresh the CLI cache (or its latest
+  // symlink). Loading that older service against an updated extension can
+  // break debugger attachment, including its network-policy contract. Select
+  // a complete client/service pair by plugin version across both locations.
+  const candidates = [...bundledRoots, ...entries.map(name => join(pluginCache, name))]
     .filter(isCompletePluginRoot)
-    .sort((left, right) => compareVersionNames(right, left));
+    .map(root => ({ root, version: pluginVersion(root) }))
+    .sort((left, right) => compareVersionNames(right.version, left.version));
   if (!candidates[0]) throw new Error(`Codex browser plugin is not installed under ${pluginCache}`);
-  return candidates[0];
+  return candidates[0].root;
+}
+
+function pluginVersion(root: string): string {
+  try {
+    const manifest = JSON.parse(readFileSync(join(root, '.codex-plugin', 'plugin.json'), 'utf8')) as Json;
+    if (typeof manifest.version === 'string' && /^\d+(?:\.\d+)*$/.test(manifest.version)) {
+      return manifest.version;
+    }
+  } catch { /* Older caches may only identify their version in the directory. */ }
+  return basename(realpathSync(root));
 }
 
 function isCompletePluginRoot(root: string): boolean {
@@ -556,13 +580,13 @@ function isCompletePluginRoot(root: string): boolean {
 }
 
 function compareVersionNames(left: string, right: string): number {
-  const leftParts = basename(left).split('.').map(Number);
-  const rightParts = basename(right).split('.').map(Number);
+  const leftParts = left.split('.').map(Number);
+  const rightParts = right.split('.').map(Number);
   for (let i = 0; i < Math.max(leftParts.length, rightParts.length); i++) {
     const delta = (leftParts[i] || 0) - (rightParts[i] || 0);
     if (delta) return delta;
   }
-  return left.localeCompare(right);
+  return 0;
 }
 
 async function connectNativePipe(path: string): Promise<Socket> {

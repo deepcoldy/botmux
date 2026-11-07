@@ -19,7 +19,7 @@ import {
   resolveCodexBrowserPluginRoot,
   type DynamicToolCallParams,
 } from '../src/services/codex-browser-broker.js';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -581,7 +581,7 @@ describe('resolveCodexBrowserPluginRoot', () => {
         writeFileSync(join(scripts, 'browser-client.mjs'), 'export {}');
         writeFileSync(join(scripts, 'browser-service.mjs'), 'export {}');
       }
-      expect(resolveCodexBrowserPluginRoot()).toBe(
+      expect(resolveCodexBrowserPluginRoot(undefined, [])).toBe(
         realpathSync(join(root, 'plugins', 'cache', 'openai-bundled', 'chrome', '26.10.1')),
       );
     } finally {
@@ -590,4 +590,73 @@ describe('resolveCodexBrowserPluginRoot', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('loads the newer desktop plugin instead of a stale cache latest symlink', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const old = plugin(join(cache, '26.1007.21434'));
+      symlinkSync(old, join(cache, 'latest'), 'junction');
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+    });
+  });
+
+  it('keeps a newer complete cache and ignores an incomplete desktop update', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(bundled, '26.1029.61003');
+      const newest = plugin(join(cache, '26.1105.1'));
+      plugin(join(cache, '26.1007.21434'));
+      mkdirSync(join(cache, '26.1201.1', 'scripts'), { recursive: true });
+      writeFileSync(join(cache, '26.1201.1', 'scripts', 'browser-client.mjs'), 'export {}');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(newest));
+      rmSync(join(bundled, 'scripts', 'browser-service.mjs'));
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(newest));
+    });
+  });
+
+  it('finds a desktop plugin without a CLI cache and honors an explicit pin', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+      const pinned = plugin(join(cache, '26.1007.21434'));
+      expect(resolveCodexBrowserPluginRoot(pinned, [bundled])).toBe(realpathSync(pinned));
+      rmSync(join(pinned, 'scripts', 'browser-service.mjs'));
+      expect(() => resolveCodexBrowserPluginRoot(pinned, [bundled])).toThrow('incomplete');
+    });
+  });
+
+  it('uses numeric versions and falls back to a cache directory with an invalid manifest', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(bundled, '26.9.0');
+      const newest = plugin(join(cache, '26.10.1'), 'invalid');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(newest));
+    });
+  });
+
+  function withPlugins(run: (fixture: {
+    cache: string; bundled: string; plugin: (root: string, version?: string) => string;
+  }) => void): void {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-browser-plugin-'));
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = root;
+    try {
+      run({
+        cache: join(root, 'plugins', 'cache', 'openai-bundled', 'chrome'),
+        bundled: join(root, 'desktop', 'plugins', 'chrome'),
+        plugin: (path, version) => {
+          mkdirSync(join(path, 'scripts'), { recursive: true });
+          writeFileSync(join(path, 'scripts', 'browser-client.mjs'), 'export {}');
+          writeFileSync(join(path, 'scripts', 'browser-service.mjs'), 'export {}');
+          if (version) {
+            mkdirSync(join(path, '.codex-plugin'), { recursive: true });
+            writeFileSync(join(path, '.codex-plugin', 'plugin.json'), JSON.stringify({ version }));
+          }
+          return path;
+        },
+      });
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
 });
