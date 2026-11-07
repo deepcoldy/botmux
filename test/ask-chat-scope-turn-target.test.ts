@@ -125,17 +125,19 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       .toEqual({ via: 'reply', target: ROOT });
   });
 
-  it('话题 A/B 交错：旧 turn 提问发到它自己的话题，不跟最新话题；群顶层 turn 仍发群顶层', async () => {
+  it('话题 A/B 交错：旧 turn 提问发到它自己的话题，不跟最新话题；群顶层 turn 与引用回复 turn 仍发群顶层', async () => {
     const ds = chatScopeSession({
       turnReplyContexts: {
         om_turn_a: { target: { mode: 'thread', rootMessageId: 'om_root_a' } },
         om_turn_top: { target: { mode: 'plain', chatId: CHAT } },
+        om_turn_quote: { target: { mode: 'quote', rootMessageId: 'om_quoted' } },
         om_turn_b: { target: { mode: 'thread', rootMessageId: 'om_root_b' } },
       },
       currentReplyTarget: { rootMessageId: 'om_root_b', turnId: 'om_turn_b', updatedAt: new Date().toISOString() },
     }, 'om_turn_b');
     expect(await cardThenTextAnswer(ds, askBody('om_turn_a'))).toEqual({ via: 'reply', target: 'om_root_a' });
     expect(await cardThenTextAnswer(ds, askBody('om_turn_top'))).toEqual({ via: 'send', target: CHAT });
+    expect(await cardThenTextAnswer(ds, askBody('om_turn_quote'))).toEqual({ via: 'send', target: CHAT });
   });
 
   it('只有 replyTargets 的 turn（如失败重试重建的 turn）按同一冻结口径回退到它的话题', async () => {
