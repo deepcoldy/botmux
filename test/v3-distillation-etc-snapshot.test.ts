@@ -5,6 +5,7 @@
  * images). /etc is hard-coded, so the listing is mocked to add one entry that
  * does not resolve; everything else is the real filesystem.
  */
+import './helpers/require-fenced-data-dir.js';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
