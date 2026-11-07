@@ -317,7 +317,7 @@ import {
 import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
-import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
+import { DISPATCH_REPORT_REGISTER_ROUTE, loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { PERMISSION_ALLOW_KEY } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -365,7 +365,9 @@ import {
   knownBotOpenIdsFromCrossRef,
   loadBotMentionIdentityMap,
   mentionedBotAppIds,
+  type BotMentionEntry,
   orderedFooterRecipients,
+  withoutDispatchDispatcherAddressing,
 } from './utils/bot-routing.js';
 import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
@@ -10826,6 +10828,51 @@ async function sendDryRun(rest: string[], preflightPlan?: ClientSendPlan): Promi
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, ...(rendered ? { diff: { stats: rendered.stats, statsScope: rendered.statsScope, preview: rendered.preview } } : {}), card }, null, 2));
 }
 
+/**
+ * The open_ids this app sees the dispatching bot as, for a topic whose
+ * `botmux dispatch` report binding verifies. Returns an empty set when the
+ * topic is not a dispatched one, when the binding is absent/tampered/
+ * unreadable, or when the mapping cannot be proven — every one of those keeps
+ * the historical addressing exactly as it was.
+ */
+function resolveDispatchDispatcherOpenIds(input: {
+  dataDir: string;
+  dispatchRoot: string | undefined;
+  selfAppId: string;
+  botEntries: readonly BotMentionEntry[];
+  crossRef: Readonly<Record<string, string>>;
+}): Set<string> {
+  const openIds = new Set<string>();
+  const dispatchRoot = input.dispatchRoot;
+  if (!dispatchRoot) return openIds;
+  let resolved: ReturnType<typeof resolveVerifiedDispatchReportTarget>;
+  try {
+    resolved = resolveVerifiedDispatchReportTarget({
+      registry: JSON.parse(readFileSync(join(input.dataDir, 'orchestrate-dispatch.json'), 'utf-8')),
+      dispatchRoot,
+      secret: loadOrCreateDispatchReportBindingSecret(input.dataDir),
+    });
+  } catch {
+    // Missing/corrupt registry or unreadable secret: the binding is unproven,
+    // so the old behaviour (address the dispatcher) stays.
+    return openIds;
+  }
+  if (!resolved.ok) return openIds;
+  const dispatcherAppId = resolved.binding.targetLarkAppId;
+  if (!dispatcherAppId || dispatcherAppId === input.selfAppId) return openIds;
+  for (const entry of input.botEntries) {
+    if (entry.larkAppId === dispatcherAppId && entry.botOpenId) openIds.add(entry.botOpenId);
+  }
+  // crossRef maps a bot NAME to the open_id this app sees it as; only names
+  // that resolve to the dispatching app may contribute an id.
+  for (const [name, openId] of Object.entries(input.crossRef)) {
+    if (!openId) continue;
+    const appIdForName = input.botEntries.find(entry => entry.botName === name)?.larkAppId;
+    if (appIdForName === dispatcherAppId) openIds.add(openId);
+  }
+  return openIds;
+}
+
 async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
   const resolved = preflight ?? await preflightSendInvocation(rest);
   if (resolved.kind === 'help') {
@@ -12825,7 +12872,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // (default-deny: the model can't @ arbitrary people).
   // Splitting on the FIRST ':' is safe: open_id / union_id / email / mobile
   // never contain ':', only the optional trailing Display Name might.
-  const mentions: Array<{ open_id: string; name: string }> = [];
+  let mentions: Array<{ open_id: string; name: string }> = [];
   const rawMentions: Array<{ identifier: string; name: string }> = [];
   for (const m of mentionArgs) {
     const idx = m.indexOf(':');
@@ -13698,6 +13745,28 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     } catch { /* best-effort */ }
 
     const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
+    // A topic opened by `botmux dispatch` returns its result through
+    // `botmux report --dispatch-root`; @-ing the dispatcher here instead starts
+    // a second, context-free dispatcher session inside this very sub-topic
+    // (#1887, #2001). The daemon's own fallback cards already drop that @, so
+    // this is the model-sent reply the same rule was missing. Resolve the
+    // dispatcher's open_id from a VERIFIED binding only: a missing, unreadable
+    // or forged binding yields no id, and nothing changes.
+    const dispatchDispatcherOpenIds = resolveDispatchDispatcherOpenIds({
+      dataDir,
+      dispatchRoot: frozenTurnDispatch?.replyTarget?.mode === 'plain'
+        ? s.rootMessageId
+        : frozenTurnDispatch?.replyTarget?.rootMessageId ?? s.rootMessageId,
+      selfAppId: appId, botEntries, crossRef,
+    });
+    const addressedMentions = withoutDispatchDispatcherAddressing({
+      dispatcherOpenIds: dispatchDispatcherOpenIds,
+      mentionIds: mentions.map(mention => mention.open_id),
+    });
+    if (addressedMentions.length !== mentions.length) {
+      mentions = mentions.filter(mention => dispatchDispatcherOpenIds.has(mention.open_id) === false);
+      console.error('botmux send: 本话题是派单话题，结果已由 botmux report 交回原会话；已去掉对派单 Bot 的 @。');
+    }
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
     const suppressImplicitReplyTarget = shouldSuppressImplicitReplyTarget({
       explicitQuote,

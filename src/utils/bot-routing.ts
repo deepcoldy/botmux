@@ -242,3 +242,24 @@ export function orderedFooterRecipients(opts: {
   for (const id of opts.cc ?? []) push(id);
   return out;
 }
+
+/**
+ * In a topic opened by `botmux dispatch`, the dispatcher already receives the
+ * result through `botmux report --dispatch-root`. Addressing it here instead
+ * starts a second, context-free session inside the very same sub-topic
+ * (#1887 / #2001). The daemon's fallback and zero-prompt cards answer to the
+ * same rule; this is the one the model itself sends, where the dispatcher id
+ * arrives as the turn's reply target (`--mention-back`, or an explicit
+ * `--mention` the model copied from the brief).
+ *
+ * `dispatcherOpenIds` is resolved by the caller from a VERIFIED dispatch
+ * binding; an unverifiable binding yields an empty set and nothing changes.
+ */
+export function withoutDispatchDispatcherAddressing(opts: {
+  dispatcherOpenIds: ReadonlySet<string>;
+  mentionIds: readonly string[];
+}): string[] {
+  return opts.dispatcherOpenIds.size === 0
+    ? [...opts.mentionIds]
+    : opts.mentionIds.filter(id => !opts.dispatcherOpenIds.has(id));
+}
