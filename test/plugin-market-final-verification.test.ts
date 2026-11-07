@@ -1,3 +1,4 @@
+import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
@@ -23,6 +24,9 @@ import { ControlCsrfTokens, guardControlRequest } from '../src/dashboard/control
 const io = vi.hoisted(() => ({
   async: async (..._args: any[]): Promise<any> => { throw new Error('Unexpected subprocess'); },
   sync: (..._args: any[]): any => { throw new Error('Unexpected synchronous subprocess'); },
+}));
+vi.mock('node:fs', async original => ({
+  ...await original<typeof import('node:fs')>(),
 }));
 vi.mock('node:child_process', async original => {
   const actual = await original<typeof import('node:child_process')>();
@@ -669,7 +673,7 @@ describe('final plugin mutation acceptance', () => {
     expect(fs.existsSync(paths.pluginHome('sample'))).toBe(false);
   });
 
-  it('RETIRED-CLEANUP: final rm failure retires the old home without risking a later reinstall', async () => {
+  it.each(['local', 'npm'])('RETIRED-CLEANUP: %s reinstall retries final rm failure without risking the new home', async source => {
     installInitial();
     const cli = cliHarness({ rm: ((path: fs.PathLike, options: fs.RmOptions) => {
       if (String(path).includes('.removed-')) throw new Error('EACCES:retired');
@@ -682,11 +686,95 @@ describe('final plugin mutation acceptance', () => {
     expect(fs.existsSync(paths.pluginHome('sample'))).toBe(false);
     const retired = fs.readdirSync(paths.pluginsHome()).filter(name => name.includes('.removed-'));
     expect(retired).toHaveLength(1);
-    installInitial('9.0.0');
+    if (source === 'local') installInitial('9.0.0');
+    else {
+      const plan = await f.market.prepare('sample', 'owner');
+      await f.market.install(plan.nonce, true, 'owner');
+    }
     await expect(f.market.uninstall(confirmed)).rejects.toMatchObject({ status: 409 });
-    expect(marker()).toBe('initial');
-    expect(fs.existsSync(join(paths.pluginsHome(), retired[0], 'dist/marker'))).toBe(true);
+    expect(marker()).toBe(source === 'local' ? 'initial' : 'market');
+    expect(fs.existsSync(join(paths.pluginsHome(), retired[0]))).toBe(false);
     expect(cli.scope.console.error).toHaveBeenCalled();
+  });
+
+  it.each(['missing', 'present'])('RETIRED-CLEANUP: preserves recovery homes while the original registry record exists (runtime=%s)', runtime => {
+    installInitial();
+    const retired = `${paths.pluginHome('sample')}.removed-123-456`;
+    if (runtime === 'missing') fs.renameSync(paths.pluginHome('sample'), retired);
+    else fs.cpSync(paths.pluginHome('sample'), retired, { recursive: true });
+    installInitial('9.0.0');
+    expect(fs.readFileSync(join(retired, 'dist/marker'), 'utf8')).toBe('initial');
+    expect(registry.getInstalledPlugin('sample')?.version).toBe('9.0.0');
+  });
+
+  it('RETIRED-CLEANUP: only exact unregistered directories are collected', () => {
+    const root = paths.pluginsHome();
+    fs.mkdirSync(root, { recursive: true });
+    const preserved = ['other.removed-123-456', 'sample.removed-123-bad',
+      'sample.removed-123-456-extra', 'sample.removed-123-456.removed-789-123'];
+    const collision = 'sample.removed-123-456';
+    installer.installLocalPlugin(localPackage({
+      ...manifest, botmux: { ...manifest.botmux, id: collision },
+    }, 'other-plugin'));
+    for (const name of preserved) fs.mkdirSync(join(root, name));
+    const external = localPackage();
+    fs.symlinkSync(external, join(root, 'sample.removed-123-457'), 'dir');
+    fs.writeFileSync(join(root, 'sample.removed-123-458'), 'not a directory');
+    fs.mkdirSync(join(root, 'sample.removed-123-459'));
+    installInitial();
+    for (const name of preserved) expect(fs.existsSync(join(root, name))).toBe(true);
+    expect(fs.readFileSync(join(paths.pluginRuntimeDir(collision), 'marker'), 'utf8')).toBe('other-plugin');
+    expect(fs.lstatSync(join(root, 'sample.removed-123-457')).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(join(external, 'dist/marker'))).toBe(true);
+    expect(fs.readFileSync(join(root, 'sample.removed-123-458'), 'utf8')).toBe('not a directory');
+    expect(fs.existsSync(join(root, 'sample.removed-123-459'))).toBe(false);
+  });
+
+  it.each([false, true])('RETIRED-CLEANUP: a symlinked local source inside a retired home remains usable (link=%s)', link => {
+    fs.mkdirSync(paths.pluginsHome(), { recursive: true });
+    registry.writePluginRegistry({ schemaVersion: 1, plugins: {} });
+    const retired = `${paths.pluginHome('sample')}.removed-123-456`;
+    fs.renameSync(localPackage(), retired);
+    const alias = join(home, 'source-alias');
+    fs.symlinkSync(retired, alias, 'dir');
+    installer.installLocalPlugin(alias, { link });
+    expect(marker()).toBe(manifest.version);
+    expect(fs.existsSync(retired)).toBe(true);
+    expect(fs.lstatSync(paths.pluginRuntimeDir('sample')).isSymbolicLink()).toBe(link);
+  });
+
+  it('RETIRED-CLEANUP: one inaccessible retired home does not prevent reinstall or other cleanup', () => {
+    fs.mkdirSync(paths.pluginsHome(), { recursive: true });
+    registry.writePluginRegistry({ schemaVersion: 1, plugins: {} });
+    const denied = `${paths.pluginHome('sample')}.removed-123-456`;
+    const removable = `${paths.pluginHome('sample')}.removed-123-457`;
+    fs.mkdirSync(denied);
+    fs.mkdirSync(removable);
+    const deniedPath = fs.realpathSync(denied);
+    const original = fs.rmSync;
+    vi.spyOn(fs, 'rmSync').mockImplementation((path, options) => {
+      if (String(path) === deniedPath) throw new Error('EACCES:retired');
+      return original(path, options);
+    });
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    installInitial();
+    expect(marker()).toBe('initial');
+    expect(fs.existsSync(denied)).toBe(true);
+    expect(fs.existsSync(removable)).toBe(false);
+    expect(warning).toHaveBeenCalled();
+  });
+
+  it('RETIRED-CLEANUP: rejected confirmation does not collect retired data', () => {
+    fs.mkdirSync(paths.pluginsHome(), { recursive: true });
+    registry.writePluginRegistry({ schemaVersion: 1, plugins: {} });
+    const retired = `${paths.pluginHome('sample')}.removed-123-456`;
+    fs.mkdirSync(retired);
+    expect(() => installer.installLocalPlugin(localPackage(), { guard: {
+      id: 'sample', packageName: entry.package, version: manifest.version,
+      expectedState: '0'.repeat(64), expectedRevision: guards.pluginRegistryRevision(),
+    } })).toThrow(/confirmation_superseded/);
+    expect(fs.existsSync(retired)).toBe(true);
+    expect(registry.getInstalledPlugin('sample')).toBeUndefined();
   });
 
   it('ROLLBACK: install registry failure restores runtime and a fresh confirmation can retry', async () => {

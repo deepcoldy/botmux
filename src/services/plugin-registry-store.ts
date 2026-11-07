@@ -54,6 +54,21 @@ function parsePluginRegistry(): PluginRegistryFile {
   }
 }
 
+/** Read-only preflight for destructive cleanup, before a lazy migration can discard invalid records. */
+export function isPluginRegistryCompleteForCleanup(): boolean {
+  try {
+    const text = readFileSync(pluginRegistryPath(), 'utf8');
+    const raw = JSON.parse(text);
+    if (raw?.schemaVersion !== 1 || !raw.plugins || typeof raw.plugins !== 'object' || Array.isArray(raw.plugins)) return false;
+    const parsed = parsePluginRegistryText(text);
+    const ids = Object.keys(raw.plugins);
+    return ids.length === Object.keys(parsed.plugins).length
+      && ids.every(id => Object.hasOwn(parsed.plugins, id));
+  } catch {
+    return false;
+  }
+}
+
 function hasPrivateMcpFields(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   return ['command', 'env', 'url', 'headers'].some(key => Object.hasOwn(value, key));

@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -18,9 +18,9 @@ Object.assign(env, { HOME: home, USERPROFILE: home, BOTS_CONFIG: join(state, 'bo
 const hash = value => createHash('sha256').update(value).digest('hex');
 const revision = () => {
   const file = join(state, 'plugins-registry.json');
-  if (!existsSync(file)) return hash('absent');
-  const stat = statSync(file, { bigint: true });
-  return hash([stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':'));
+  const counter = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')).revision ?? 0 : 0;
+  assert.ok(Number.isSafeInteger(counter) && counter >= 0, 'Fixture registry revision must be valid');
+  return hash(`plugin-registry-revision:${counter}`);
 };
 const record = () => JSON.parse(readFileSync(join(state, 'plugins-registry.json'), 'utf8')).plugins.sample;
 function run(args, succeeds = true) {
@@ -57,9 +57,14 @@ try {
   assert.equal(existsSync(join(state, 'plugins/sample')), false);
 
   const fresh = { id: 'sample', packageName: '@test/sample', version: '1.2.3', expectedState: null, authorityDigest: hash('fixture-token'), expectedRevision: revision() };
+  const retiredLocal = join(state, `plugins/sample.removed-${process.pid}-1`);
+  mkdirSync(retiredLocal);
+  writeFileSync(join(retiredLocal, 'old-data'), 'retired local runtime');
   run(['plugin', 'install', replacement, '--guard-json', JSON.stringify(fresh)], false);
   assert.equal(record(), undefined);
+  assert.equal(existsSync(retiredLocal), true, 'Rejected confirmation must not collect retired data');
   run(['plugin', 'install-verified', primary, '--guard-json', JSON.stringify(fresh)]);
+  assert.equal(existsSync(retiredLocal), false, 'Local reinstall must retry retired cleanup');
   const guard = expected();
   run(['plugin', 'enable', 'sample']);
   run(['plugin', 'uninstall', 'sample', '--guard-json', JSON.stringify(guard)], false);
@@ -82,7 +87,10 @@ try {
   }))[0];
   const archive = join(home, packed.filename);
   const archiveGuard = { ...fresh, expectedRevision: revision(), integrity: `sha512-${createHash('sha512').update(readFileSync(archive)).digest('base64')}` };
+  const retiredNpm = join(state, `plugins/sample.removed-${process.pid}-2`);
+  mkdirSync(retiredNpm);
   run(['plugin', 'install-verified', `file:${archive}`, '--guard-json', JSON.stringify(archiveGuard)]);
+  assert.equal(existsSync(retiredNpm), false, 'Npm reinstall must retry retired cleanup');
   assert.equal(record().packageName, '@test/sample');
   assert.equal(existsSync(join(home, 'hook-ran')), false, 'Unapproved lifecycle hook executed');
   run(['plugin', 'uninstall-verified', 'sample', '--guard-json', JSON.stringify(expected())]);
@@ -90,7 +98,8 @@ try {
     passed: true, actualBinary: true, isolatedHome: true,
     cases: ['replacement-safe uninstall', 'staged manifest guard', 'guarded install',
       'enabled-scope guard', 'token rotation', 'guarded uninstall cleanup', 'legacy CLI compatibility',
-      'real npm tarball install', 'lifecycle scripts suppressed', 'empty-slot revision guard'],
+      'real npm tarball install', 'lifecycle scripts suppressed', 'empty-slot revision guard',
+      'local and npm retired-home collection', 'no collection on rejected confirmation'],
   };
   console.log(JSON.stringify(result));
 } finally { rmSync(home, { recursive: true, force: true }); }
