@@ -419,6 +419,7 @@ import {
 import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
+import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
@@ -5355,6 +5356,7 @@ function setCaptureIdentity(
   callerOpenId?: string,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  if (changed) drainKimiActivityInto({ turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
@@ -12305,6 +12307,80 @@ function armAntigravityCotForTurn(): void {
   ensureAntigravityCotReader(cid);
 }
 
+// ─── Kimi activity observer (read-only) ─────────────────────────────────
+//
+// Kimi keeps its turn lifecycle on OSC 7501 and its replies on `botmux send`;
+// this observer only follows the session's wire log and streams thinking /
+// narration / tool activity to the current turn (dynamic reply card, CoT).
+// It never marks, starts, settles or delivers a turn, so a log it cannot find
+// or parse costs the card its activity and nothing else.
+let kimiActivityObserver: KimiActivityObserver | undefined;
+
+function stopKimiActivityObserver(): void {
+  kimiActivityObserver?.stop();
+  kimiActivityObserver = undefined;
+}
+
+function startKimiActivityObserver(opts: {
+  cfg: Extract<DaemonToWorker, { type: 'init' }>;
+  resume: boolean;
+  /** The id/cwd/env the adapter resolved `--session` with (see kimi.ts). */
+  resumeLookupSessionId: string;
+  workingDir: string | undefined;
+  env: NodeJS.ProcessEnv;
+}): void {
+  stopKimiActivityObserver();
+  const { cfg } = opts;
+  if (cfg.cliId !== 'kimi' || cfg.adoptMode === true) return;
+  // Full-root COW scratch: Kimi writes its log inside the overlay, which the
+  // host-side lookup cannot see.
+  if (lastResolvedSandboxMode === 'scratch') return;
+  const observer = new KimiActivityObserver({
+    botmuxSessionId: opts.resumeLookupSessionId,
+    markerSessionId: cfg.sessionId,
+    workingDir: opts.workingDir,
+    env: opts.env,
+    resume: opts.resume,
+    spawnStartMs: Date.now(),
+    onEntries: entries => {
+      if (kimiActivityObserver !== observer || !currentBotmuxTurnId) return;
+      observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+    },
+    log,
+  });
+  kimiActivityObserver = observer;
+  try {
+    observer.start();
+  } catch (err: any) {
+    log(`Kimi activity observer failed to start: ${err?.message ?? err}`);
+    stopKimiActivityObserver();
+  }
+}
+
+/** Kimi accepts no input while a turn runs, so everything already in its log
+ *  when a turn ends (or the capture identity moves on) belongs to that turn:
+ *  read it synchronously so the poll's lag cannot hand it to the next turn. */
+function drainKimiActivityInto(turn: { turnId: string | undefined; dispatchAttempt?: number }): void {
+  if (!kimiActivityObserver || !turn.turnId) return;
+  try {
+    const entries = kimiActivityObserver.drain();
+    if (entries.length) observeCotEntries(entries, { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt });
+  } catch (err: any) {
+    log(`Kimi activity drain failed: ${err?.message ?? err}`);
+  }
+}
+
+/** The daemon settles an ordinary Kimi turn on `prompt_ready`: read what the
+ *  turn has logged so far and flush it ahead of that edge, so the card's
+ *  final view carries the turn's complete activity. */
+function settleKimiActivityBeforeIdle(): void {
+  if (!kimiActivityObserver || !currentBotmuxTurnId) return;
+  drainKimiActivityInto({ turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+  if (thinkingTurn?.turnId === currentBotmuxTurnId && thinkingTurn.dispatchAttempt === currentBotmuxDispatchAttempt) {
+    flushThinkingUpdate();
+  }
+}
+
 function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): void {
   // Transcript path: .../agent-transcripts/<chatId>/<chatId>.jsonl
   const chatId = path.split('/').slice(-2, -1)[0];
@@ -14037,6 +14113,7 @@ function stopCodexBridge(): void {
   cursorCotReaderChatId = undefined;
   stopAllAntigravityCot();
   antigravityCotReaderSessionId = undefined;
+  stopKimiActivityObserver();
   codexBridgePendingSessionId = undefined;
   codexBridgeUnprovenSession = undefined;
   codexAdoptPendingPid = undefined;
@@ -19187,6 +19264,8 @@ function markPromptReady(): void {
     deliverRestartInterruptionNote();
   }
   sandboxWrapperAwaitingFirstPrompt = undefined;
+  // Kimi: publish the finished turn's last activity before its idle edge.
+  settleKimiActivityBeforeIdle();
   send({ type: 'prompt_ready' });
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
   if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
@@ -27750,6 +27829,16 @@ async function spawnCli(
     }
   }
 
+  if (cfg.cliId === 'kimi') {
+    startKimiActivityObserver({
+      cfg,
+      resume: effectiveResume,
+      resumeLookupSessionId: effectiveAdapterSessionId,
+      workingDir: buildArgsWorkingDir,
+      env: { ...process.env, ...perBotInjectEnv },
+    });
+  }
+
   // Arm the ready-gate for FRESH ready-integrated spawns. Until
   // `botmux session-ready` fires (daemon → 'session_ready' IPC → releaseReadyGate)
   // we hold the first prompt so a cjadk-style startup selector's ❯ can't eat it.
@@ -31470,6 +31559,7 @@ function emitTurnTerminal(
     releaseTerminatedActiveTurnAuthority();
   }
   retireTerminatedQueuedTurn(turnId, dispatchAttempt);
+  drainKimiActivityInto({ turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
     flushThinkingUpdate();
   }

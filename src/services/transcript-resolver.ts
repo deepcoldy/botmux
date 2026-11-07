@@ -16,9 +16,14 @@ import { resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
+import { findKimiWireBySessionId, findKimiWireForBotmuxSession } from './kimi-transcript.js';
+import { isKimiSessionId } from '../adapters/cli/kimi-session.js';
 import { minimaxDataDirForBot } from './minimax-paths.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity' | 'minimax';
+/** Kimi path hits are re-validated after this long (see the `kimi` case). */
+const KIMI_PATH_HIT_TTL_MS = 30_000;
+
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'kimi' | 'antigravity' | 'minimax';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -323,7 +328,7 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'kimi', 'antigravity', 'minimax',
   // ZCode reports usage from its own ledger (services/zcode-usage.ts), not a transcript.
   'zcode',
 ]);
@@ -464,6 +469,22 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
         { retryMiss: q.fresh },
       );
       return path ? { path, kind: 'grok' } : null;
+    }
+    case 'kimi': {
+      // Kimi mints its own `session_<uuid>` ids. Without a persisted one, the
+      // session is the newest one in this cwd carrying this botmux session's
+      // routing marker. A positive hit is re-checked after a short TTL so a
+      // fresh Kimi generation of the same botmux session takes over.
+      const kimiSid = q.cliSessionId && isKimiSessionId(q.cliSessionId) ? q.cliSessionId : undefined;
+      const path = cachedTranscriptPathLookup(
+        `kimi:${q.sessionId}:${kimiSid ?? ''}:${q.cwd ?? ''}`,
+        KIMI_PATH_HIT_TTL_MS,
+        () => foundWrap(kimiSid
+          ? findKimiWireBySessionId(kimiSid)
+          : findKimiWireForBotmuxSession(q.sessionId, q.cwd), v),
+        { retryMiss: q.fresh },
+      );
+      return path ? { path, kind: 'kimi' } : null;
     }
     case 'pi': {
       const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => foundWrap(findPiTranscriptBySessionId(sid, q.cwd), v), { retryMiss: q.fresh });

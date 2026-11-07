@@ -510,7 +510,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 
 | 字段 | 说明 |
 |------|------|
-| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi 普通会话，从下一轮生效 |
+| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi / Kimi 普通会话，从下一轮生效 |
 | `replyCardShowTools` | 仅 `unified`：设 `false` 隐藏卡里的工具调用，思考摘要和进度照常显示 |
 | `disableStreamingCard` | `true` 时不发实时终端状态卡。Web 终端照常运行，最终答复照常发送 |
 | `hiddenStreamingCardButtons` | 隐藏实时卡上的按钮，可选 `output`、`terminal`、`writeLink`、`compact`、`stop`、`close`。例如 `["terminal", "writeLink", "close"]`。也可用 `/botconfig set hiddenStreamingCardButtons terminal,close` |
