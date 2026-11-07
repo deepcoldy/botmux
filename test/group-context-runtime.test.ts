@@ -518,3 +518,20 @@ describe('group context platform integration', () => {
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_stream_0')).toBeUndefined();
   });
 });
+
+describe('group context history attachments', () => {
+  it.each([
+    ['a video (current classification)', 'video'],
+    ['a video stored as a file before the reclassification', 'file'],
+  ] as const)('delivers %s quoted from history', async (_, type) => {
+    const now = Date.now();
+    network.history.mockResolvedValue([]);
+    network.download.mockImplementation(async (_app, _id, _key, _type, path) => { writeFileSync(path, 'video-bytes'); });
+    upsertGroupContextMessage('cli_b', { messageId: 'om_clip', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',
+      senderType: 'user', msgType: type === 'video' ? 'media' : 'file', text: '[视频: demo.mp4]', createTime: now - 10,
+      resourceRefs: [{ type, key: 'file_v3_clip', name: 'demo.mp4' }], sourceAppId: 'cli_b' });
+    const prepared = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '看看上面的附件' });
+    expect(prepared?.attachments).toEqual([expect.objectContaining({ type, name: 'demo.mp4', resourceKey: 'file_v3_clip' })]);
+    expect(network.download).toHaveBeenCalledWith('cli_b', 'om_clip', 'file_v3_clip', type, expect.any(String), undefined, { allowUserTokenFallback: false });
+  });
+});
