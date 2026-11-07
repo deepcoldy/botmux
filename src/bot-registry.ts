@@ -1002,6 +1002,16 @@ function normalizeStringList(raw: unknown): string[] {
     .map((p) => p.trim());
 }
 
+/** Sandbox path lists can narrow access (deny, readOnly under readWrite), so a
+ *  mistyped value must fail the load like a mistyped `sandbox` mode: read as
+ *  an empty list it would silently widen the sandbox. null stays "not set". */
+function sandboxPathList(raw: unknown, field: string, i: number): string[] {
+  if (raw != null && (!Array.isArray(raw) || raw.some(p => typeof p !== 'string'))) {
+    throw new Error(`Bot config [${i}]: ${field} must be an array of path strings, got ${JSON.stringify(raw)}`);
+  }
+  return normalizeStringList(raw);
+}
+
 function normalizeSummaryRange(raw: unknown): SummaryRangeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
@@ -3768,7 +3778,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       && entry.scratchTmpfsSizeMb > 0
       ? Math.floor(entry.scratchTmpfsSizeMb)
       : undefined;
-    const scratchDenyPaths = normalizeStringList(entry.scratchDenyPaths);
+    const scratchDenyPaths = sandboxPathList(entry.scratchDenyPaths, 'scratchDenyPaths', i);
+    if (entry.sandboxPaths != null && (typeof entry.sandboxPaths !== 'object' || Array.isArray(entry.sandboxPaths))) {
+      throw new Error(`Bot config [${i}]: sandboxPaths must be an object of readWrite / readOnly / deny path arrays, got ${JSON.stringify(entry.sandboxPaths)}`);
+    }
+    if (entry.sandboxNetwork != null && typeof entry.sandboxNetwork !== 'boolean') {
+      throw new Error(`Bot config [${i}]: sandboxNetwork must be true or false, got ${JSON.stringify(entry.sandboxNetwork)}`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -4286,9 +4302,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       scratchDenyPaths,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
-            readWrite: normalizeStringList(entry.sandboxPaths.readWrite),
-            readOnly: normalizeStringList(entry.sandboxPaths.readOnly),
-            deny: normalizeStringList(entry.sandboxPaths.deny),
+            readWrite: sandboxPathList(entry.sandboxPaths.readWrite, 'sandboxPaths.readWrite', i),
+            readOnly: sandboxPathList(entry.sandboxPaths.readOnly, 'sandboxPaths.readOnly', i),
+            deny: sandboxPathList(entry.sandboxPaths.deny, 'sandboxPaths.deny', i),
           }
         : undefined,
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
