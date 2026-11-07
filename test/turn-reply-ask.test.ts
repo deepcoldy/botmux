@@ -117,6 +117,28 @@ describe('Ask inside the running reply card', () => {
     expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toBeUndefined();
   });
 
+  it('masks a content-audit-rejected question patch instead of failing the question', async () => {
+    // The card already shows progress with an email; settling the question
+    // re-renders the whole card and Lark rejects that text.
+    const email = 'alice.liu@example.com';
+    const { snapshot, answer } = await ask();
+    await store.update(key, { kind: 'progress', text: `作者 <${email}>` }, io);
+    const bodies: string[] = [];
+    vi.mocked(updateMessage).mockImplementation(async (_app, _id, content) => {
+      bodies.push(content);
+      if (content.includes(email)) throw { isAxiosError: true, name: 'AxiosError', message: 'Request failed with status code 400',
+        response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } } };
+      body = content;
+    });
+    await click(snapshot, { action: 'ask_select', key: 'yes' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
+    await vi.waitFor(() => expect(body).toContain('✓ 继续'));
+    expect(bodies[0]).toContain(email);
+    expect(body).not.toContain(email);
+    expect(body).toContain('example.com');
+    expect(body).toContain('部分内容已自动打码');
+  });
+
   it('observes the acknowledged inline question patch for shared history', async () => {
     const { snapshot, answer } = await ask();
     expect(observePublishedGroupMessage).toHaveBeenCalledWith('app', expect.objectContaining({
