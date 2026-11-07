@@ -1,5 +1,4 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { Session } from '../types.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { FileLockTimeoutError, withFileLockSync } from '../utils/file-lock.js';
@@ -68,10 +67,9 @@ interface SendFailure {
 }
 
 function failurePath(dataDir: string, session: ScheduleSession, turnId: string): string {
-  const ledger = new TurnSendLedger(dataDir);
-  return join(ledger.sessionDirectory(session.sessionId), `.schedule-failure-${ledger.id({
+  return new TurnSendLedger(dataDir).scheduleFailurePath({
     larkAppId: session.larkAppId!, sessionId: session.sessionId, turnId,
-  })}.json`);
+  });
 }
 
 function readFailure(dataDir: string, session: ScheduleSession, turnId: string): SendFailure | undefined {
@@ -227,19 +225,25 @@ export function reconcileScheduledDelivery(
   return logged ? { next: 'settled', delivery } : { next: 'retry_log', delivery };
 }
 
-/** Turns whose run is still the task's latest run. A daemon restart drops
- * pending settlements, so these are settled again (idempotently) on startup. */
+/** The latest turn of each run that is still its task's latest run. A daemon
+ * restart drops pending settlements, so these are settled again (idempotently)
+ * on startup. A recovery turn continues its original run, so the turn it
+ * replaced is not settled again. */
 export function scheduledTurnsOfCurrentRuns<S extends ScheduleSession>(
   sessions: readonly S[],
   currentRunId: (taskId: string) => string | undefined,
 ): Array<{ session: S; turnId: string }> {
   const turns: Array<{ session: S; turnId: string }> = [];
   for (const session of sessions) {
-    const runs = new Map(Object.entries(session.scheduledRuns ?? {}));
-    if (session.scheduledRun) runs.set(session.scheduledRun.turnId, session.scheduledRun);
+    const runs = Object.entries(session.scheduledRuns ?? {});
+    if (session.scheduledRun) runs.push([session.scheduledRun.turnId, session.scheduledRun]);
+    const latest = new Map<string, string>();
     for (const [turnId, run] of runs) {
-      if (run.turnId === turnId && currentRunId(run.taskId) === run.runId) turns.push({ session, turnId });
+      if (run.turnId === turnId && currentRunId(run.taskId) === run.runId) {
+        latest.set(JSON.stringify([run.taskId, run.runId]), turnId);
+      }
     }
+    for (const turnId of latest.values()) turns.push({ session, turnId });
   }
   return turns;
 }

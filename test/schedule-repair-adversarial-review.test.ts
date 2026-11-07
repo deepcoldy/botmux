@@ -33,7 +33,7 @@ import { SCHEDULED_SEND_IN_FLIGHT_LIMIT_MS, ScheduleSendAttempt, recordScheduled
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import { assertScheduledAuthorityCurrent, isManualScheduledTurn, parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { authorizeDelegatedScheduleRun } from '../src/core/schedule-delegated-runtime.js';
-import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
+import { TURN_SEND_LEDGER_COMPLETED_RETENTION_MS, TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import {
   __testOnly_reconcileScheduledDeliveriesAfterRestart as reconcileAfterRestart,
   __testOnly_scheduleDeferredScheduleSettlement as settleLater,
@@ -599,5 +599,50 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     await vi.advanceTimersByTimeAsync(2_000);
     expect(taskRow(task.id).runStats?.failed).toBe(1);
     expect(logFor(first)?.outcome).toBe('error');
+  });
+
+  it('does not count a corrected failure again once its delivered receipt ages out of the send ledger', async () => {
+    const s = session();
+    const run = await dispatched(s, add({ schedule: 'every 6h' }));
+    const ds = daemonSession(s);
+    const ledger = new TurnSendLedger(isolated.dataDir);
+    new ScheduleSendAttempt(isolated.dataDir, s, run.turnId).fail(new Error('first attempt rejected'));
+    settleLater(ds, { turnId: run.turnId, source: 'terminal' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(taskRow(run.taskId).runStats?.failed).toBe(1);
+    await ledger.execute(sendKey(s, run), 'final', 'retried', async () => 'om_retried');
+    settleLater(ds, { turnId: run.turnId, source: 'terminal' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
+    await ledger.pruneCompleted(Date.now() + TURN_SEND_LEDGER_COMPLETED_RETENTION_MS + 1);
+    const markFailed = vi.spyOn(runLogs, 'markScheduleRunLogFailed');
+    scheduler.stopScheduler();
+    scheduler.startScheduler();
+    reconcileAfterRestart([s], APP);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
+    expect(logFor(run)?.outcome).toBe('model_dispatched');
+    expect(markFailed).not.toHaveBeenCalled();
+  });
+
+  it('settles a recovered run by its recovery turn alone when reconciling after a restart', async () => {
+    const s = session();
+    const task = add({ schedule: 'every 6h' });
+    const original = await dispatched(s, task, 1);
+    const ledger = new TurnSendLedger(isolated.dataDir);
+    await ledger.execute(sendKey(s, original), 'final', 'interrupted', async () => {
+      throw new Error('worker died inside the provider call');
+    }, { fenced: true }).catch(() => undefined);
+    const recovery = { ...original, turnId: turn(task.id, 2) };
+    recordScheduledSessionRun(s, recovery);
+    await ledger.execute(sendKey(s, recovery), 'final', 'recovered', async () => 'om_recovered', { fenced: true });
+    const markFailed = vi.spyOn(runLogs, 'markScheduleRunLogFailed');
+    scheduler.stopScheduler();
+    scheduler.startScheduler();
+    reconcileAfterRestart([s], APP);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(markFailed).not.toHaveBeenCalled();
+    expect(taskRow(task.id)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
+    expect(logFor(original)?.outcome).toBe('model_dispatched');
   });
 });

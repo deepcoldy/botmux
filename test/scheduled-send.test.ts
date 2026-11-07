@@ -11,7 +11,7 @@ import {
   scheduledTurnsOfCurrentRuns,
   settleScheduledSend,
 } from '../src/core/scheduled-send.js';
-import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
+import { TURN_SEND_LEDGER_COMPLETED_RETENTION_MS, TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import type { Session } from '../src/types.js';
 
 const turnId = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
@@ -188,5 +188,25 @@ describe('scheduled delivery accounting', () => {
     const current: Record<string, string> = { abcdef12: 'run-2', fedcba98: 'run-9' };
     expect(scheduledTurnsOfCurrentRuns([reused], taskId => current[taskId]))
       .toEqual([{ session: reused, turnId: later }]);
+  });
+
+  it('lists only the latest turn of a run that a recovery turn continued', () => {
+    const recovered = { ...session, scheduledRun: undefined } as Session;
+    const recovery = 'schedule:abcdef12:dddddddd-1234-1234-1234-123456789abc';
+    recordScheduledSessionRun(recovered, { taskId: 'abcdef12', runId: 'run-1', turnId });
+    recordScheduledSessionRun(recovered, { taskId: 'abcdef12', runId: 'run-1', turnId: recovery });
+    expect(scheduledTurnsOfCurrentRuns([recovered], () => 'run-1'))
+      .toEqual([{ session: recovered, turnId: recovery }]);
+  });
+
+  it('stops reporting a failure once the ledger prunes the delivered record it belonged to', async () => {
+    const dataDir = dir();
+    const ledger = new TurnSendLedger(dataDir);
+    new ScheduleSendAttempt(dataDir, session, turnId).fail(new Error('rejected before the retry'));
+    await ledger.execute(key, 'final', 'retried', async () => 'om_retried');
+    expect(settleScheduledSend(dataDir, session, turnId)).toEqual({ state: 'delivered', messageId: 'om_retried' });
+    expect(await ledger.pruneCompleted(Date.now() + TURN_SEND_LEDGER_COMPLETED_RETENTION_MS + 1))
+      .toEqual({ removed: 1, retained: 0 });
+    expect(settleScheduledSend(dataDir, session, turnId)).toEqual({ state: 'silent' });
   });
 });
