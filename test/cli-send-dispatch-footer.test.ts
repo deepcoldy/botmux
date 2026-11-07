@@ -152,6 +152,25 @@ describe('a dispatched sub-topic must not @-address the dispatcher bot', () => {
     expect(raw).not.toContain(`<at id=${DISPATCHER}>`);
   });
 
+  it('keeps the dispatcher @ when the message goes to another topic', () => {
+    // `--into <other topic>` / `--top-level` are different destinations: the
+    // dispatched-topic rule must not silently strip legitimate addressing
+    // there (mentioning the lead from the main conversation is supported).
+    const { raw } = runSend({
+      args: ['--into', 'om_other_topic', '--mention', `${DISPATCHER}:Dispatcher`, '看下这个'],
+      binding: 'verified',
+    });
+    expect(raw).toContain(`<at id=${DISPATCHER}>`);
+  });
+
+  it('keeps the dispatcher @ for a top-level publish', () => {
+    const { raw } = runSend({
+      args: ['--top-level', '--mention', `${DISPATCHER}:Dispatcher`, '看下这个'],
+      binding: 'verified',
+    });
+    expect(raw).toContain(`<at id=${DISPATCHER}>`);
+  });
+
   it('still addresses the dispatcher when the topic binding does not verify', () => {
     const { raw } = runSend({ args: ['--mention-back', '结果已交回原会话。'], binding: 'forged' });
     expect(raw).toContain(`<at id=${DISPATCHER}>`);

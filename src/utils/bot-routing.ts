@@ -245,21 +245,44 @@ export function orderedFooterRecipients(opts: {
 
 /**
  * In a topic opened by `botmux dispatch`, the dispatcher already receives the
- * result through `botmux report --dispatch-root`. Addressing it here instead
+ * result through `botmux report --dispatch-root`; addressing it here instead
  * starts a second, context-free session inside the very same sub-topic
  * (#1887 / #2001). The daemon's fallback and zero-prompt cards answer to the
- * same rule; this is the one the model itself sends, where the dispatcher id
- * arrives as the turn's reply target (`--mention-back`, or an explicit
- * `--mention` the model copied from the brief).
+ * same rule; this covers the reply the model itself sends.
  *
- * `dispatcherOpenIds` is resolved by the caller from a VERIFIED dispatch
- * binding; an unverifiable binding yields an empty set and nothing changes.
+ * Only mentions whose open_id this app resolves to `dispatcherAppId` are
+ * dropped, and only for a send into the dispatched topic itself.
  */
 export function withoutDispatchDispatcherAddressing(opts: {
-  dispatcherOpenIds: ReadonlySet<string>;
+  dispatcherAppId: string;
+  entries: readonly BotMentionEntry[];
+  crossRef: Readonly<Record<string, string>>;
+  selfAppId: string;
   mentionIds: readonly string[];
 }): string[] {
-  return opts.dispatcherOpenIds.size === 0
-    ? [...opts.mentionIds]
-    : opts.mentionIds.filter(id => !opts.dispatcherOpenIds.has(id));
+  if (opts.mentionIds.length === 0) return [];
+  const dropped = new Set(mentionedBotAppIds(
+    opts.mentionIds.map(open_id => ({ open_id })),
+    opts.entries,
+    opts.crossRef,
+    opts.selfAppId,
+  ));
+  if (!dropped.has(opts.dispatcherAppId)) return [...opts.mentionIds];
+  // Re-resolve per mention: `mentionedBotAppIds` reports the app ids present,
+  // not which mention carried which. A mention resolves to the dispatcher only
+  // when it is the id this app sees that app as.
+  const dispatcherOpenIds = new Set<string>();
+  const appIdByName = new Map<string, string | null>();
+  for (const entry of opts.entries) {
+    if (!entry.botName) continue;
+    const seen = appIdByName.get(entry.botName);
+    appIdByName.set(entry.botName, seen === undefined || seen === entry.larkAppId ? entry.larkAppId : null);
+  }
+  for (const [name, openId] of Object.entries(opts.crossRef)) {
+    if (openId && appIdByName.get(name) === opts.dispatcherAppId) dispatcherOpenIds.add(openId);
+  }
+  for (const entry of opts.entries) {
+    if (entry.botOpenId && entry.larkAppId === opts.dispatcherAppId) dispatcherOpenIds.add(entry.botOpenId);
+  }
+  return opts.mentionIds.filter(id => !dispatcherOpenIds.has(id));
 }
