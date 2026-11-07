@@ -33,7 +33,10 @@
  *   F  a hook's dialog comes up only AFTER the 20s hold (so the thread was
  *      already told "press Enter in the input box"): BotMux still answers
  *      nothing, and it corrects that one notice with the dialog notice — same
- *      turn, exactly once.
+ *      turn, exactly once. The fake person does not answer until that
+ *      correction arrives, so the dialog stays on screen for the worker's 1s
+ *      hold poll to read; answering on a fixed timer instead raced that poll
+ *      (the dialog lived ~0.4s on a loaded CI runner, the poll never saw it).
  */
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
@@ -163,6 +166,13 @@ interface Scenario {
   hook?: boolean;
   /** Enters on the dialog that are lost before it listens. */
   swallowAccepts?: number;
+  /**
+   * The fake person answers only after the worker's dialog-pending correction
+   * has been observed (scenario F: the dialog appears after the hold). This
+   * makes the dialog stay on screen until a hold poll reads it, instead of
+   * racing that 1s poll with an immediate answer.
+   */
+  awaitDialogPending?: boolean;
 }
 
 interface ScenarioRun {
@@ -255,9 +265,23 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
 
     const promptSubmitted = () => events().some(e => e.kind === 'submit' && e.text === FIRST_PROMPT);
     if (scenario.hook) {
-      await waitFor(() => heldNotices(run).length > 0, 60_000, 'the held-message notice');
-      // A few seconds for an (unwanted) automatic answer to show up.
-      await new Promise(r => setTimeout(r, 4_000));
+      if (scenario.awaitDialogPending) {
+        // F: the dialog only renders after the hold (dialogDelayMs=24s > 20s
+        // hold). It stays drawn until the person answers, so wait for the
+        // worker's correction notice instead of answering on a timer: under a
+        // loaded runner the old 4s-then-answer let the person press Enter while
+        // the dialog had lived less than one 1s hold poll, the correction was
+        // never sent, and the exact-notice-sequence assertion raced.
+        await waitFor(
+          () => heldNotices(run).some(m => noticeKey(m.message) === 'worker.startup_command_dialog_pending'),
+          60_000,
+          'the dialog-pending correction notice',
+        );
+      } else {
+        await waitFor(() => heldNotices(run).length > 0, 60_000, 'the held-message notice');
+        // A few seconds for an (unwanted) automatic answer to show up.
+        await new Promise(r => setTimeout(r, 4_000));
+      }
       expect(events().filter(e => e.kind === 'accept' || e.kind === 'cancel' || e.kind === 'dialog-key'), logs.join('')).toEqual([]);
       expect(promptSubmitted(), logs.join('')).toBe(false);
       run.personAt = Date.now();
@@ -312,7 +336,12 @@ it.skipIf(!tmuxAvailable)(
       // The third press lands ~22s in: only the restarted wait keeps it unheld.
       runScenario({ name: 'E late dialog, two Enters lost', dialogDelayMs: 16_000, swallowAccepts: 2 }),
       // The hold notice went out first; the hook's dialog only turns up at 24s.
-      runScenario({ name: 'F late hook dialog', dialogDelayMs: 24_000, hook: true }),
+      // The fake person does not answer until the correction notice is seen, so
+      // the dialog stays on screen across hold polls instead of racing them.
+      runScenario({
+        name: 'F late hook dialog', dialogDelayMs: 24_000, hook: true,
+        awaitDialogPending: true,
+      }),
     ]);
 
     // A: accepted by botmux; nothing was held, so nobody was told.
