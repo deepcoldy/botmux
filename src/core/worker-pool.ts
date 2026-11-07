@@ -9,6 +9,7 @@ import { deploymentContinuationAuthority } from './deployment-continuation-autho
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { traexStreamCardActivity } from './stream-card-activity.js';
 import { listPendingAsks } from './ask-broker.js';
+import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY } from './ask-hook/types.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
@@ -16895,6 +16896,18 @@ function currentTurnProcessIdentities(
   return [...identities].sort();
 }
 
+/** The PermissionRequest hook posts its card around the time Claude renders the
+ *  dialog, while the worker samples the screen every 2s: its notice can arrive
+ *  before the card is registered. */
+const PERMISSION_CARD_GRACE_MS = 3_000;
+
+/** The hook's allow/deny card for a Claude permission dialog, still unanswered. */
+function permissionCardPending(ds: DaemonSession): boolean {
+  return listPendingAsks().some(a => a.larkAppId === ds.larkAppId && a.sessionId === ds.session.sessionId
+    && a.originKind === 'hook' && a.questions.length === 1
+    && a.questions[0].options.map(o => o.key).join('\n') === `${PERMISSION_ALLOW_KEY}\n${PERMISSION_DENY_KEY}`);
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -20696,6 +20709,15 @@ function setupWorkerHandlers(
           reason: 'user_notify',
           message: msg.message,
         });
+        // The card already asks about this dialog. Fork agents and sessions
+        // without the hook get no card and keep this notice.
+        if (msg.kind === 'claude_permission_prompt') {
+          if (!permissionCardPending(ds)) await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
+          if (permissionCardPending(ds)) {
+            logger.info(`[${t}] Claude permission dialog notice skipped: PermissionRequest card pending`);
+            break;
+          }
+        }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if (msg.kind === 'input_not_submitted' && ownsLifecycleMutation()
           && (!msg.turnId || !ds.currentTurnId || ds.currentTurnId === msg.turnId)) {
