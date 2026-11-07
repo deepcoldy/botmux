@@ -1554,6 +1554,39 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
 
 // ───────────────────────────── legacy config migration ───────────────────────
 
+/**
+ * Legacy path arrays were historically tolerated in any shape: the parser ran
+ * them through normalizeStringList, which silently dropped non-arrays and
+ * non-string elements. Migration copies their content into the new sandboxPaths
+ * field, whose strict loader rejects those shapes, so the same normalization
+ * must run HERE — the migration output must always be loadable instead of
+ * bricking the next daemon start.
+ */
+function sanitizeLegacyPathList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
+    .map(p => p.trim());
+}
+
+/**
+ * Whether an on-disk `sandboxPaths` value has a shape the strict loader accepts
+ * (mirrors parseBotConfigsFromText: null/absent means "not set"; a tier may be
+ * absent/null or a string array). A malformed value must not make migration a
+ * no-op — the legacy fields stay on disk by design, so re-running the migration
+ * can repair it once.
+ */
+export function isLoadableSandboxPaths(raw: unknown): boolean {
+  if (raw === undefined || raw === null) return true;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return false;
+  return (['readWrite', 'readOnly', 'deny'] as const).every((tier) => {
+    const value = (raw as Record<string, unknown>)[tier];
+    return value === undefined
+      || value === null
+      || (Array.isArray(value) && value.every(p => typeof p === 'string'));
+  });
+}
+
 export interface LegacySandboxFields {
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
@@ -1577,7 +1610,9 @@ export interface MigratedSandboxFields {
  * reverse script (design doc §6.2). Returns null when nothing to migrate.
  */
 export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandboxPaths?: unknown }): MigratedSandboxFields | null {
-  if (entry.sandboxPaths !== undefined) return null; // already on the new model
+  // Already on the new model in a loadable shape → nothing to do. A malformed
+  // value falls through so the retained legacy fields repair it on this pass.
+  if (entry.sandboxPaths !== undefined && isLoadableSandboxPaths(entry.sandboxPaths)) return null;
   const hasLegacy = entry.readIsolation === true
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
@@ -1591,8 +1626,8 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
       || entry.sandbox === 'oncall'
       || entry.readIsolation === true);
   if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
-  const readOnly = [...(entry.sandboxReadonlyPaths ?? [])];
-  const deny = [...(entry.sandboxHidePaths ?? []), ...(entry.readDenyExtraPaths ?? [])];
+  const readOnly = sanitizeLegacyPathList(entry.sandboxReadonlyPaths);
+  const deny = [...sanitizeLegacyPathList(entry.sandboxHidePaths), ...sanitizeLegacyPathList(entry.readDenyExtraPaths)];
   const sandboxPaths: MigratedSandboxFields['sandboxPaths'] = {};
   if (readOnly.length) sandboxPaths.readOnly = readOnly;
   if (deny.length) sandboxPaths.deny = [...new Set(deny)];

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { migrateSandboxConfigAtStartup, migrateSandboxConfigOnDisk } from '../src/services/sandbox-migration.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { withFileLock } from '../src/utils/file-lock.js';
 
 let dir: string;
@@ -87,6 +88,48 @@ describe('migrateSandboxConfigOnDisk', () => {
     write(entries);
     await migrateSandboxConfigOnDisk(botsPath);
     expect(readFileSync(`${botsPath}.bak-sandbox-v1`, 'utf-8')).toBe(bakContent);
+  });
+});
+
+describe('migration output stays loadable under strict sandbox field validation (#2530)', () => {
+  it.each([
+    ['legacy deny', { sandbox: true, sandboxHidePaths: ['~/.ssh', null] }],
+    ['legacy readOnly', { sandbox: true, sandboxReadonlyPaths: ['/srv/ro', 42] }],
+    ['readDenyExtraPaths', { readIsolation: true, readDenyExtraPaths: ['~/x', 7] }],
+  ])('sanitizes non-string legacy elements so the migrated file parses (%s)', async (_label, entry) => {
+    write([{ larkAppId: 'cli_a', larkAppSecret: 's', name: 'a', ...entry }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+  });
+
+  it('re-migrates an already-persisted malformed sandboxPaths back into a loadable shape', async () => {
+    // An older build wrote the raw, unsanitized migration output to disk.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh', null],
+      sandboxPaths: { deny: ['~/.ssh', null] },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(read()[0].sandboxPaths).toEqual({ deny: ['~/.ssh'] });
+  });
+
+  it('drops a malformed sandboxPaths when every legacy element is non-string', async () => {
+    // Nothing valid survives sanitization; the unloadable on-disk value must be
+    // removed rather than left to reject the whole bots.json at next startup.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: [null, 42],
+      sandboxPaths: { deny: [null, 42] },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(read()[0].sandboxPaths).toBeUndefined();
   });
 });
 
