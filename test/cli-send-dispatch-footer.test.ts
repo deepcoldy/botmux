@@ -33,6 +33,9 @@ function runSend(input: {
   binding?: 'verified' | 'forged' | 'absent';
   humanSender?: string;
   ownerOpenId?: string;
+  /** 'botOpenId' (bots-info) is the default; 'crossRef' models the real app-scoped
+   *  routing file, where bots-info carries no open_id for the peer. */
+  resolveVia?: 'botOpenId' | 'crossRef';
 }): FooterRun {
   const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-footer-'));
   const dataDir = join(root, 'data');
@@ -48,11 +51,18 @@ function runSend(input: {
       larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'dsh', replyCardMode: 'legacy',
       ...(input.ownerOpenId ? { allowedUsers: [input.ownerOpenId] } : {}),
     }]));
-    // This bot app sees the dispatcher as a known bot open_id.
+    // This bot app sees the dispatcher as a known bot. `crossRef` models the
+    // real app-scoped routing file (`bot-openids-<app>.json`), where bots-info
+    // carries no open_id for the peer at all.
     writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify([
       { larkAppId: APP, botName: 'Self', botOpenId: 'ou_self' },
-      { larkAppId: 'cli_dispatcher', botName: 'Dispatcher', botOpenId: DISPATCHER },
+      { larkAppId: 'cli_dispatcher', botName: 'Dispatcher',
+        ...(input.resolveVia === 'crossRef' ? {} : { botOpenId: DISPATCHER }) },
     ]));
+    if (input.resolveVia === 'crossRef') {
+      writeFileSync(join(dataDir, `bot-openids-${APP}.json`),
+        JSON.stringify({ Dispatcher: DISPATCHER }));
+    }
     if (input.binding !== 'absent') {
       // Same secret the CLI child resolves for this dataDir (dirname(dataDir)
       // unless BOTMUX_CORE_ONLY), so the binding it loads verifies.
@@ -158,6 +168,24 @@ describe('a dispatched sub-topic must not @-address the dispatcher bot', () => {
     // there (mentioning the lead from the main conversation is supported).
     const { raw } = runSend({
       args: ['--into', 'om_other_topic', '--mention', `${DISPATCHER}:Dispatcher`, '看下这个'],
+      binding: 'verified',
+    });
+    expect(raw).toContain(`<at id=${DISPATCHER}>`);
+  });
+
+  it('resolves the dispatcher through the app-scoped cross-ref, not bots-info', () => {
+    // The real routing file is `bot-openids-<app>.json`; bots-info need not carry
+    // the peer's open_id. Same outcome must hold on that path.
+    const { raw } = runSend({
+      args: ['--mention-back', '结果已交回原会话。'],
+      binding: 'verified', resolveVia: 'crossRef',
+    });
+    expect(raw).not.toContain(`<at id=${DISPATCHER}>`);
+  });
+
+  it('keeps the dispatcher @ when an explicit --chat-id overrides the destination', () => {
+    const { raw } = runSend({
+      args: ['--chat-id', 'oc_elsewhere', '--mention', `${DISPATCHER}:Dispatcher`, '看下这个'],
       binding: 'verified',
     });
     expect(raw).toContain(`<at id=${DISPATCHER}>`);

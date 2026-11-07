@@ -13742,13 +13742,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     //  - the dispatcher id comes from a VERIFIED binding read with a read-only
     //    secret, so a missing/tampered/unreadable binding changes nothing and
     //    this CLI never mints signing authority.
+    // The binding is signed per root, so a root that verifies IS this topic: look
+    // it up with the root the message actually lands on, never the session's.
     const dispatchDispatcherAppId = sendTarget.mode === 'thread'
       && !sendInto && !sendTopLevel && !overrideChatId
-      && sendTarget.rootMessageId === (frozenTurnDispatch?.replyTarget?.mode === 'thread'
-        || frozenTurnDispatch?.replyTarget?.mode === 'quote'
-        ? frozenTurnDispatch.replyTarget.rootMessageId
-        : s.rootMessageId)
-      ? resolveDispatchDispatcherAppId({ dataDir, dispatchRoot: s.rootMessageId, selfAppId: appId })
+      ? resolveDispatchDispatcherAppId({ dataDir, dispatchRoot: sendTarget.rootMessageId, selfAppId: appId })
       : undefined;
     if (dispatchDispatcherAppId) {
       const addressedMentions = withoutDispatchDispatcherAddressing({

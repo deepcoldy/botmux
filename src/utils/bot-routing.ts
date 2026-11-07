@@ -244,14 +244,18 @@ export function orderedFooterRecipients(opts: {
 }
 
 /**
- * In a topic opened by `botmux dispatch`, the dispatcher already receives the
- * result through `botmux report --dispatch-root`; addressing it here instead
- * starts a second, context-free session inside the very same sub-topic
- * (#1887 / #2001). The daemon's fallback and zero-prompt cards answer to the
- * same rule; this covers the reply the model itself sends.
+ * Drop the @s that would reach the dispatching bot of a `botmux dispatch`
+ * topic. That bot already receives the result through
+ * `botmux report --dispatch-root`; addressing it here instead starts a second,
+ * context-free session inside the very same sub-topic (#1887 / #2001). The
+ * daemon's own fallback cards answer to the same rule; this covers the reply
+ * the model itself sends, where the id arrives as the turn's reply target
+ * (`--mention-back`, or an explicit `--mention` copied from the brief).
  *
- * Only mentions whose open_id this app resolves to `dispatcherAppId` are
- * dropped, and only for a send into the dispatched topic itself.
+ * Resolution goes through {@link mentionedBotAppIds} one id at a time so this
+ * shares its precedence (cross-ref name match before a bots-info `botOpenId`)
+ * instead of re-deriving it. An ambiguous name resolves to no app at all, which
+ * keeps the @ — the safer side.
  */
 export function withoutDispatchDispatcherAddressing(opts: {
   dispatcherAppId: string;
@@ -260,29 +264,7 @@ export function withoutDispatchDispatcherAddressing(opts: {
   selfAppId: string;
   mentionIds: readonly string[];
 }): string[] {
-  if (opts.mentionIds.length === 0) return [];
-  const dropped = new Set(mentionedBotAppIds(
-    opts.mentionIds.map(open_id => ({ open_id })),
-    opts.entries,
-    opts.crossRef,
-    opts.selfAppId,
-  ));
-  if (!dropped.has(opts.dispatcherAppId)) return [...opts.mentionIds];
-  // Re-resolve per mention: `mentionedBotAppIds` reports the app ids present,
-  // not which mention carried which. A mention resolves to the dispatcher only
-  // when it is the id this app sees that app as.
-  const dispatcherOpenIds = new Set<string>();
-  const appIdByName = new Map<string, string | null>();
-  for (const entry of opts.entries) {
-    if (!entry.botName) continue;
-    const seen = appIdByName.get(entry.botName);
-    appIdByName.set(entry.botName, seen === undefined || seen === entry.larkAppId ? entry.larkAppId : null);
-  }
-  for (const [name, openId] of Object.entries(opts.crossRef)) {
-    if (openId && appIdByName.get(name) === opts.dispatcherAppId) dispatcherOpenIds.add(openId);
-  }
-  for (const entry of opts.entries) {
-    if (entry.botOpenId && entry.larkAppId === opts.dispatcherAppId) dispatcherOpenIds.add(entry.botOpenId);
-  }
-  return opts.mentionIds.filter(id => !dispatcherOpenIds.has(id));
+  return opts.mentionIds.filter(openId => !mentionedBotAppIds(
+    [{ open_id: openId }], opts.entries, opts.crossRef, opts.selfAppId,
+  ).includes(opts.dispatcherAppId));
 }
