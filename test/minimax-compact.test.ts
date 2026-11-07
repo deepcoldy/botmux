@@ -6,7 +6,8 @@ import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { finalizeRawCommandDelivery } from '../src/core/raw-command-writer.js';
-import { classifyRawDispatchFailure } from '../src/core/raw-dispatch-failure.js';
+import { classifyRawDispatchFailure, rewrapSubmissionFailure } from '../src/core/raw-dispatch-failure.js';
+import { AmbiguousSubmissionBlockedError } from '../src/adapters/backend/types.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { resolveCodexAppFinalTurnIdentity } from '../src/adapters/cli/codex-app-turn.js';
@@ -159,6 +160,38 @@ it.each([true, false])('reannounces ready after a proven unsubmitted compact, in
   // event-loop boundary on both Node and Bun without a wall-clock sleep.
   await new Promise<void>(resolve => setImmediate(resolve));
   expect(drainStates).toEqual([false]);
+});
+
+// ZMX keeps a submission journal around every logical write, so the same
+// rejected compact goes through the real journal transaction and its rewrap of
+// the writer's failure. The journal's verdict on cancel decides recovery.
+it.each([
+  ['cancelled cleanly', undefined, true],
+  ['left for ZMX recovery', 'recovery-unconfirmed', false],
+] as const)('with a submission journal, reannounces a rejected compact only when the journal is %s', async (_label, cancelFailure, recovers) => {
+  const backend = {
+    write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys: vi.fn(() => false),
+    captureAmbiguousSubmissionFence: vi.fn(() => 7),
+    cancelAmbiguousSubmission: vi.fn((_fence: number) => cancelFailure),
+    confirmAmbiguousSubmission: vi.fn(() => undefined),
+  };
+  const worker = rawWorker(createMinimaxAdapter('/not-executed'), backend);
+  Object.assign(worker.scope, {
+    ambiguousSubmissionWriteTail: Promise.resolve(), AmbiguousSubmissionBlockedError, rewrapSubmissionFailure,
+  });
+  for (const name of ['captureAmbiguousSubmissionFence', 'cancelAmbiguousSubmissionAfterFailure',
+    'confirmAmbiguousSubmissionAfterSuccess', 'ambiguousSubmissionRecoveryMessage']) {
+    worker.scope[name] = loadWorkerFunction(name, worker.scope);
+  }
+  let drains = 0;
+  worker.scope.flushPending = async () => { drains += 1; };
+  await worker.deliver({ type: 'raw_input', content: '/compact', turnId: 'compact-rejected' });
+  expect(backend.sendText).not.toHaveBeenCalled();
+  expect(backend.cancelAmbiguousSubmission).toHaveBeenCalledWith(7);
+  expect(backend.confirmAmbiguousSubmission).not.toHaveBeenCalled();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(worker.events.filter(event => event.type === 'prompt_ready')).toHaveLength(recovers ? 1 : 0);
+  expect(drains).toBe(recovers ? 1 : 0);
 });
 
 it('keeps the active business final attributable until queued compact actually starts', async () => {

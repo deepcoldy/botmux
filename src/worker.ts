@@ -4553,8 +4553,10 @@ class SubmissionWriteError extends Error {
   constructor(
     message: string,
     readonly recoveryFailureReason?: string,
-    /** False only when the logical transaction was rejected before its write
-     * callback ran, so the current input is known not to have reached the PTY. */
+    /** False only when the current input is known not to have reached the
+     * PTY: the logical transaction was rejected before its write callback ran,
+     * or the writer itself proved no byte left (a framed runner refusing the
+     * line before buffering it). rewrapSubmissionFailure keeps the latter. */
     readonly submissionStarted = true,
     /** True when a framed stdin runner may already hold part/all of the line in
      *  its own buffer (dirty_unknown submit). The CLI runner generation is then
@@ -5304,9 +5306,14 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       // untouched frame leaves the native prompt unchanged, so there will be
       // no new ready edge to release that fence. Reannounce only this exact
       // idle backend/turn; dirty frames already take the generation-fence path.
+      // On a fence-capable backend (ZMX) the submission journal must also have
+      // been cancelled cleanly: one that could not be is left to ZMX recovery
+      // (the notice below says so), and reannouncing ready would invite the
+      // very input that backend now refuses.
       const untouchedCompact = lastInitConfig?.cliId === 'minimax'
         && msg.content.trim() === '/compact'
         && err instanceof SubmissionWriteError && !err.submissionStarted
+        && !recoveryFailureReason
         && !!msg.turnId && currentBotmuxTurnId === msg.turnId
         && targetBackend === backend && isPromptReady
         && !cliRestartInProgress && commandLineWritesPending === 0;
