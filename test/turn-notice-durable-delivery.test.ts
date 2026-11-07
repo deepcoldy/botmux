@@ -105,6 +105,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -247,6 +248,10 @@ describe('durable delivery of failure cards and worker notices', () => {
     sessionReplyMock.mockRejectedValueOnce(failure());
 
     worker.emit('message', { type: 'user_notify', message: 'transient failure', turnId: 'om_turn_6' });
+    // Flush the rejected send's microtasks so the 30s retry timer is armed
+    // before fake time moves (the bun-test shim does not interleave pending
+    // microtasks while advancing timers).
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(31_000);
     expect(calls()).toHaveLength(2);
     expect(calls()[1][5]?.uuid).toBe(calls()[0][5]?.uuid);
@@ -259,13 +264,32 @@ describe('durable delivery of failure cards and worker notices', () => {
     sessionReplyMock.mockRejectedValueOnce(contentAudit());
 
     worker.emit('message', { type: 'user_notify', message: 'blocked text', turnId: 'om_turn_3' });
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(30 * 60_000);
     expect(calls()).toHaveLength(1);
 
     sessionReplyMock.mockRejectedValueOnce(dnsFailure()).mockRejectedValueOnce(contentAudit());
     worker.emit('message', { type: 'user_notify', message: 'blocked later', turnId: 'om_turn_5' });
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(30 * 60_000);
     expect(calls()).toHaveLength(3);
+  });
+
+  it('never retries a send stopped because the topic was withdrawn', async () => {
+    // topic-send-guard wraps the withdrawn lookup failure as the error cause;
+    // the BLOCKED verdict must survive that and never enter the outbox.
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-notify-withdrawn', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const withdrawnCause = Object.assign(new Error('withdrawn: om_root'), { name: 'MessageWithdrawnError' });
+    sessionReplyMock.mockRejectedValueOnce(
+      new TopicSendError('TOPIC_SEND_BLOCKED', '原话题 om_root 已撤回，停止发送。', { cause: withdrawnCause }),
+    );
+
+    worker.emit('message', { type: 'user_notify', message: 'must not be retried', turnId: 'om_turn_7' });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(calls()).toHaveLength(1);
   });
 
   it('resumes a notice still owed from before a daemon restart and never re-sends it once delivered', async () => {
