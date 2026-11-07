@@ -19145,6 +19145,9 @@ if (__entrySubcommand) {
     process.exit(process.exitCode ?? 0);
   }
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
+  else if (__entrySubcommand === 'zellij-socket-probe') {
+    (await import('./adapters/backend/zellij-socket-probe.js')).runZellijSocketProbe(process.argv.slice(3));
+  }
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
   // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that
