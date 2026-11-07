@@ -12,6 +12,35 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 const pythonAvailable = spawnSync('python3', ['-c', 'import sqlite3']).status === 0;
 const sqliteTest = pythonAvailable ? it : it.skip;
 const posixTest = pythonAvailable && process.platform !== 'win32' ? it : it.skip;
+
+// Operator escape hatches a non-UTF-8 daemon locale used to rely on. -I implies
+// -E and would ignore them; -X utf8 on the argv must restore UTF-8 regardless.
+// The case only means something when this host actually selects a non-UTF-8
+// codec for the hostile locale — minimal images with just C/C.utf8 skip it.
+function hostileLocaleSelectable(): boolean {
+  const proc = spawnSync('python3', ['-I', '-c', 'import sys; print(sys.stdout.encoding)'], {
+    encoding: 'utf8',
+    env: { ...process.env, LANG: '', LC_ALL: 'en_US.iso885915', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+  });
+  return proc.status === 0 && !proc.stdout.trim().toLowerCase().startsWith('utf');
+}
+const localeTest = pythonAvailable && process.platform !== 'win32' && hostileLocaleSelectable() ? it : it.skip;
+
+function withHostileLocale<T>(fn: () => T): T {
+  const saved = { LANG: process.env.LANG, LC_ALL: process.env.LC_ALL, PYTHONUTF8: process.env.PYTHONUTF8, PYTHONIOENCODING: process.env.PYTHONIOENCODING };
+  process.env.LANG = '';
+  process.env.LC_ALL = 'en_US.iso885915';
+  process.env.PYTHONUTF8 = '1';
+  process.env.PYTHONIOENCODING = 'utf-8';
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
 const dirs: string[] = [];
 const epoch = 1_700_000_000_000;
 const marker = '<session_id>synthetic-worker-a</session_id>';
@@ -308,6 +337,29 @@ describe('Hermes: raw source authorization precedes paste recovery', () => {
     expect(existsSync(canary)).toBe(false);
     // Positive control: isolated mode must not break normal recovery.
     expect(h.ingest.mock.calls.at(-1)?.[0][0]?.text).toBe(request);
+    expect(h.queue.peek()[0]?.started).toBe(true);
+  });
+
+  localeTest('drains non-ASCII rows under a non-UTF-8 locale despite -I ignoring PYTHONUTF8 (-X utf8)', () => {
+    const f = fixture();
+    insert(f.db, [{ session: 'native-a', role: 'user', content: '绑定行：中文用户消息', timestamp: epoch / 1000 }]);
+    // master relied on PYTHONUTF8/PYTHONIOENCODING here; -I implies -E, so only
+    // the CLI-forced UTF-8 mode keeps this print from killing the whole drain.
+    const drained = withHostileLocale(() => hermesTranscript.drainHermesStateDb(0, f.db));
+    expect(drained.events[0]?.text).toBe('绑定行：中文用户消息');
+  });
+
+  localeTest('restores a non-ASCII folded paste under a non-UTF-8 locale (arrow argv + stdout)', () => {
+    const f = fixture();
+    const chinese = '中文问题：请保留完整正文\n第二行尾';
+    const requestCn = marker + '\n' + chinese;
+    const h = worker(f, initialBinding(f), chinese);
+    insert(f.db, [{ session: 'native-a', role: 'user', content: paste(f.home, requestCn), timestamp: epoch / 1000 }]);
+    // Without -X utf8 the U+2192 literal in the -c script cannot be decoded
+    // from argv and the process exits 1: the whole turn silently keeps its
+    // placeholder and never matches.
+    withHostileLocale(() => h.run());
+    expect(h.ingest.mock.calls.at(-1)?.[0][0]?.text).toBe(requestCn);
     expect(h.queue.peek()[0]?.started).toBe(true);
   });
 
