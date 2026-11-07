@@ -23,6 +23,7 @@ import { normalizeBotsInfoRouteEntries } from '../../services/bots-info-shape.js
 import type { BotConfig } from '../../bot-registry.js';
 import { isMultiTopicOrchestrationEnabled, workflowHandoffIdentityEnabled, workflowNodeExecutorMode } from '../../global-config.js';
 import { readSessionRowCopiesAcrossStores } from '../../services/session-store.js';
+import { comparableSessionDir, unpinnedSessionWorkingDir } from '../../core/working-dir-range.js';
 import type { RunChatBinding } from '../../workflows/v3/grill-state.js';
 import type { V3MainTopicAvailability } from '../../workflows/v3/placement.js';
 import {
@@ -90,6 +91,33 @@ export function liveV3MainTopicAvailability(binding: RunChatBinding, dataDir: st
     session = undefined;
   }
   return v3MainTopicAvailability(binding, session);
+}
+
+/**
+ * The directory the run's main session runs in, in comparison form
+ * (`v3MainSessionDirProblem`), read from its persisted row like
+ * {@link liveV3MainTopicAvailability}. A row that never pinned a directory
+ * runs where the daemon's `getSessionWorkingDir` puts it — the main bot's
+ * unpinned default (`unpinnedSessionWorkingDir`, from `bots`). Undefined =
+ * unknown or no constraint: no single readable row, a closed session (the
+ * node would start a new one), or an unpinned row whose bot is not in `bots`
+ * — the runtime gate then stays the only check.
+ */
+export function liveV3MainSessionWorkingDir(
+  binding: RunChatBinding,
+  bots: readonly BotConfig[],
+  dataDir: string = config.session.dataDir,
+): string | undefined {
+  try {
+    const rows = binding.sessionId ? readSessionRowCopiesAcrossStores(binding.sessionId, dataDir).matches : [];
+    const row = rows.length === 1 ? rows[0] : undefined;
+    if (!row || row.status === 'closed') return undefined;
+    if (typeof row.workingDir === 'string' && row.workingDir.trim()) return comparableSessionDir(row.workingDir);
+    const bot = bots.find((candidate) => candidate.larkAppId === binding.larkAppId);
+    return bot ? comparableSessionDir(unpinnedSessionWorkingDir(bot)) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Display name from the shared bots-info.json, falling back to the app id. */

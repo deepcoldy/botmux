@@ -310,6 +310,8 @@ import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
+import { DEFAULT_LONG_TASK_REMINDER } from '../services/long-task-reminder-policy.js';
+import { updateLongTaskReminderConfig } from '../services/long-task-reminder-config-store.js';
 import {
   selectIdleSuspendCandidates,
   sweepIdleWorkersByAgeAfterTurnDrain,
@@ -8804,6 +8806,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   let maxLiveWorkers: number | null = null;
   let idleSuspendMinutes: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
+  /** Resolved long-task defaults are exposed even before the first console save. */
+  let longTaskReminder = DEFAULT_LONG_TASK_REMINDER;
   try {
     const botConfig = getBot(cachedLarkAppId).config;
     const m = botConfig.maxLiveWorkers;
@@ -8811,6 +8815,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     const ttl = botConfig.idleSuspendMinutes;
     if (typeof ttl === 'number' && Number.isInteger(ttl) && ttl > 0) idleSuspendMinutes = ttl;
     sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
+    longTaskReminder = botConfig.longTaskReminder ?? DEFAULT_LONG_TASK_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
   let residentSessionCount = 0;
@@ -9076,6 +9081,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     maxLiveWorkers,
     idleSuspendMinutes,
     sessionOwnerReminder,
+    longTaskReminder,
     logicalSessionCount,
     residentSessionCount,
     dormantSessionCount,
@@ -11135,6 +11141,21 @@ ipcRoute('PUT', '/api/bot-session-owner-reminder', requireBoundBot(async (req, r
   const result = await updateSessionOwnerReminderConfig(cachedLarkAppId, raw);
   if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
   return jsonRes(res, 200, { ok: true, sessionOwnerReminder: result.config });
+}));
+
+// Owning daemon validates, persists, then hot-applies the per-bot reminder policy.
+ipcRoute('PUT', '/api/bot-long-task-reminder', requireBoundBot(async (req, res) => {
+  /** Only structured preferences are accepted; no model prompts or message text. */
+  const raw = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (raw === BAD_JSON) {
+    return;
+  }
+  /** The store serializes this update with other concurrent bot configuration edits. */
+  const result = await updateLongTaskReminderConfig(cachedLarkAppId, raw);
+  if (!result.ok) {
+    return jsonRes(res, 400, { ok: false, error: result.reason });
+  }
+  return jsonRes(res, 200, { ok: true, longTaskReminder: result.config });
 }));
 
 // Per-bot skill policy. Dashboard uses this for attach/detach; JSON policy

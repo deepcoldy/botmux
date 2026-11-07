@@ -11,7 +11,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 
 import { V3_RUN_ENVELOPE_FILE, frozenNodeWorkingDir, readRunEnvelope, runInitiatorRef } from '../workflows/v3/run-envelope.js';
 import type { V3Dag } from '../workflows/v3/dag.js';
@@ -75,7 +75,7 @@ import {
 import { createV3NodeCardSync } from '../im/lark/v3-node-card-sync.js';
 import { buildV3NodeReportCard } from '../im/lark/v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
-import { checkBotWorkingDir, checkNodeWorkingDir, describeBotWorkingDirRefusal, realWorkingDir, type BotWorkingDirConfig, type NodeWorkingDirVerdict } from './working-dir-range.js';
+import { checkBotWorkingDir, checkNodeWorkingDir, comparableSessionDir, describeBotWorkingDirRefusal, type BotWorkingDirConfig, type NodeWorkingDirVerdict } from './working-dir-range.js';
 import {
   WORKFLOW_INITIATOR_UNION_ROUTE,
   isWorkflowOpenId,
@@ -94,7 +94,6 @@ import { v3BotExecutorTargets } from '../workflows/v3/node-executor-mode.js';
 import { classifyExternalAttempt } from '../workflows/v3/external-control.js';
 import { readJournal } from '../workflows/v3/journal.js';
 import type { BotConfig } from '../bot-registry.js';
-import { expandHome } from './working-dir.js';
 
 /** Where a node session for one handoff starts on the executing bot
  *  (design §15.4). */
@@ -123,7 +122,7 @@ export function workflowNodePinnedStart(admission: WorkflowInboundAdmission | un
  *  bot's handoff and on the main bot's own node delivery, with one rule. */
 export function workflowNodeSessionDirConflicts(pinnedDir: string, existingSessionDir: string | undefined): boolean {
   return existingSessionDir !== undefined
-    && realWorkingDir(resolve(expandHome(existingSessionDir))) !== pinnedDir;
+    && comparableSessionDir(existingSessionDir) !== pinnedDir;
 }
 
 /** Where (or whether) a node may run on its executing bot (§15.4). */

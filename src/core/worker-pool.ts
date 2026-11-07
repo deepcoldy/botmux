@@ -925,7 +925,7 @@ import {
 import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
-import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn, resolveDeferredScheduledTurnId } from './silent-schedule-turns.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
@@ -16976,6 +16976,7 @@ function setupWorkerHandlers(
   if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
     ds.hermesBridgeSourceSessionIds = undefined;
   }
+  let deferredScheduleIdleTurnId: string | undefined;
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -17928,9 +17929,23 @@ function setupWorkerHandlers(
         if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
           || ds.session.workerGeneration !== workerGeneration || !msg.turnId
           || !Number.isFinite(msg.startedAtMs) || msg.startedAtMs < 0 || msg.startedAtMs > Date.now()) break;
-        beginCliNotice(msg.turnId, msg.dispatchAttempt);
+        /** Bounded native-write observations used by timing and long-task reminders. */
         const starts = ds.replyExecutionStarts ??= new Map();
+        /** Each dispatch attempt has an independent execution lifetime. */
         const key = JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]);
+        /** A duplicate late start cannot revive an exact attempt already retired by its terminal. */
+        const previousExecution = starts.get(key);
+        /** Exact terminals survive even when their native start has not arrived yet. */
+        const exactTerminal = ds.replyExecutionTerminals?.has(JSON.stringify([workerGeneration, msg.turnId, msg.dispatchAttempt ?? null]));
+        /** A legacy terminal without an attempt also retires starts timestamped before its receipt. */
+        const legacyTerminalAt = ds.replyExecutionTerminals?.get(JSON.stringify([workerGeneration, msg.turnId, null]));
+        /** A new attempt beginning after a legacy terminal is a fresh execution. */
+        const predatesLegacyTerminal = legacyTerminalAt !== undefined && msg.startedAtMs < legacyTerminalAt;
+        if (exactTerminal || predatesLegacyTerminal
+          || (previousExecution?.completed && previousExecution.workerGeneration === workerGeneration)) {
+          break;
+        }
+        beginCliNotice(msg.turnId, msg.dispatchAttempt);
         starts.delete(key);
         starts.set(key, { startedAtMs: msg.startedAtMs, workerGeneration, lastProgressAtMs: msg.startedAtMs });
         if (starts.size > 512) starts.delete(starts.keys().next().value!);
@@ -19051,13 +19066,6 @@ function setupWorkerHandlers(
               }
             }
           }
-          if (
-            ds.lastScreenStatus === 'idle'
-            && msg.turnId
-            && ds.session.deferredScheduleRun?.turnId === msg.turnId
-          ) {
-            void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
-          }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
           // reclaimed immediately instead of waiting for the 60s backstop.
@@ -19066,6 +19074,18 @@ function setupWorkerHandlers(
             // The newly-idle session itself may be the oldest eviction target.
             queueMicrotask(cb.enforceLiveSessionCap);
           }
+        }
+
+        // The dedicated hidden run retains its identity after the worker retires
+        // its capture turn. Never borrow a shared session's current/queued turn.
+        // Notify once per idle episode, including a first frame already at idle,
+        // so repeated snapshots cannot keep resetting the settlement debounce.
+        const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId);
+        if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnId = undefined;
+        if (ds.lastScreenStatus === 'idle' && deferredTurnId
+          && deferredScheduleIdleTurnId !== deferredTurnId) {
+          deferredScheduleIdleTurnId = deferredTurnId;
+          void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
@@ -20772,6 +20792,30 @@ function setupWorkerHandlers(
         const terminalSet = ds.terminalIdentityTurnIds ?? (ds.terminalIdentityTurnIds = new Set());
         terminalSet.add(msg.turnId);
         trimOldest(terminalSet, TERMINAL_RECEIPT_DEDUPE_MAX);
+        /** Retirement is independent of whether this exact start was observed yet. */
+        const executionTerminals = ds.replyExecutionTerminals ??= new Map();
+        /** Receipt time supplies an upper bound for attempt-less compatibility terminals. */
+        const executionTerminalAt = Date.now();
+        executionTerminals.set(JSON.stringify([workerGeneration, msg.turnId, msg.dispatchAttempt ?? null]), executionTerminalAt);
+        // Legacy terminals may omit dispatchAttempt. Retire this turn's observed
+        // clocks in the current worker, while keeping their original render timing.
+        for (const [executionKey, execution] of ds.replyExecutionStarts ?? []) {
+          /** Native start keys carry the exact logical turn and optional retry attempt. */
+          const [executionTurnId, executionAttempt] = JSON.parse(executionKey) as [string, number | null];
+          if (execution.workerGeneration === workerGeneration && executionTurnId === msg.turnId
+            && (msg.dispatchAttempt === undefined || executionAttempt === msg.dispatchAttempt)) {
+            execution.completed = true;
+            executionTerminals.set(JSON.stringify([workerGeneration, executionTurnId, executionAttempt]), executionTerminalAt);
+          }
+        }
+        // Keep the same bound as native start observations; generations never share a key.
+        while (executionTerminals.size > 512) {
+          /** Retire the oldest dedupe fact once it leaves the bounded observation window. */
+          const oldestTerminalKey = executionTerminals.keys().next().value;
+          if (oldestTerminalKey !== undefined) {
+            executionTerminals.delete(oldestTerminalKey);
+          }
+        }
         observeTurnResultTerminal(ds, msg, workerGeneration);
         if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
           if (noteIdleAutoCompactRefused(ds, msg.turnId)) {

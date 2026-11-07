@@ -19,6 +19,15 @@ vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
 }));
 
+// The anti-fork boot gate probes the server through child_process; with it
+// mocked, the darwin lsof census reads as unavailable and the gate fails closed
+// (Linux reads /proc and is unaffected). The gate has its own tests; here it is
+// a pass-through so parkDiagnosticSession's argv stays the unit under test.
+vi.mock('../src/adapters/backend/tmux-anti-fork.js', () => ({
+  createTmuxBootGate: () => ({ leadingArgs: () => [] }),
+  TmuxCompetingServerBlockedError: class TmuxCompetingServerBlockedError extends Error {},
+}));
+
 import { execFileSync, execSync } from 'node:child_process';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 

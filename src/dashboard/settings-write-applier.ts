@@ -60,6 +60,8 @@ export interface ResolvedDashboardSettingsView {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
@@ -268,6 +270,8 @@ export type ApplySettingsWriteError =
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_reapOrphanTmuxServers'
+  | 'invalid_tmuxOrphanSessionSweep'
+  | 'invalid_tmuxOrphanSessionBareWrapperKill'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
@@ -521,6 +525,18 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_reapOrphanTmuxServers' };
     }
     patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
+  }
+  if ('tmuxOrphanSessionSweep' in obj) {
+    if (typeof obj.tmuxOrphanSessionSweep !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionSweep' };
+    }
+    patch.tmuxOrphanSessionSweep = obj.tmuxOrphanSessionSweep;
+  }
+  if ('tmuxOrphanSessionBareWrapperKill' in obj) {
+    if (typeof obj.tmuxOrphanSessionBareWrapperKill !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionBareWrapperKill' };
+    }
+    patch.tmuxOrphanSessionBareWrapperKill = obj.tmuxOrphanSessionBareWrapperKill;
   }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {

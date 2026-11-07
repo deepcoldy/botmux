@@ -229,6 +229,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('idle-suspend-minutes'),
   // session-owner-reminder：per-bot 周期性 owner 提醒策略；owning daemon 校验、落盘并热更新。
   putBotConfig('session-owner-reminder'),
+  // Long-running native turns: independent first-reminder and repeat intervals.
+  putBotConfig('long-task-reminder'),
   // 成员授权 / 黑名单 / 整群授权：管理写路径，不在 PUBLIC_READ_PATHS，非 manager 已在
   // resolveDashboardRequestGate 被 deny401。
   {

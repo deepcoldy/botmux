@@ -1090,13 +1090,37 @@ export type V3ReassignOutcome =
       detail?: string;
     };
 
-/** A caller holding the validated `run.json` passes its pinned executor;
- *  otherwise the runtime's `runStarted.nodeExecutor` stamp (written from that
- *  same validated envelope) decides. Kept free of the envelope parser so the
- *  host-neutral runtime graph carries no third-party schema library. */
-function isBotExecutedRun(events: readonly StoredEvent[], pinned: V3ReassignContext['nodeExecutor']): boolean {
+/** A caller holding the validated `run.json` passes its pinned executor.
+ *  Otherwise `run.json` itself decides (`nodeExecutor` is frozen there at
+ *  approval), read minimally: kept free of the envelope parser so the
+ *  host-neutral runtime graph carries no third-party schema library; its
+ *  integrity is the caller's (module header). The journal's
+ *  `runStarted.nodeExecutor` stamp covers hosts without a run.json. It
+ *  cannot be relied on alone: a run rooted by the daemon's start intent
+ *  before the stamp moved there has an unstamped `runStarted`. */
+function isBotExecutedRun(
+  runDir: string,
+  events: readonly StoredEvent[],
+  pinned: V3ReassignContext['nodeExecutor'],
+): boolean {
   if (pinned !== undefined) return pinned === 'bot';
-  return events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot');
+  return runEnvelopePinsBot(runDir) || events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot');
+}
+
+/** `run.json` names this run directory's run and pins bot execution. */
+function runEnvelopePinsBot(runDir: string): boolean {
+  const path = join(runDir, 'run.json');
+  let raw: unknown;
+  try {
+    // A regular file only (never block on a FIFO or follow a link).
+    if (!lstatSync(path).isFile()) return false;
+    raw = JSON.parse(readFileSync(path, 'utf-8'));
+  } catch {
+    return false;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const envelope = raw as { engine?: unknown; runId?: unknown; nodeExecutor?: unknown };
+  return envelope.engine === 'workflow-v3' && envelope.runId === basename(runDir) && envelope.nodeExecutor === 'bot';
 }
 
 export interface V3ReassignContext extends V3ExternalEngineContext {
@@ -1106,7 +1130,8 @@ export interface V3ReassignContext extends V3ExternalEngineContext {
   /** Stops the current attempt's bot turn, when one is open. */
   executor?: V3ExternalNodeExecutor;
   /** The executor pinned by the caller's validated `run.json` (`null` = the
-   *  envelope has none). Omitted: the journal's `runStarted` stamp decides. */
+   *  envelope has none). Omitted: read from `<runDir>/run.json`, else the
+   *  journal's `runStarted` stamp. */
   nodeExecutor?: 'bot' | null;
 }
 
@@ -1212,7 +1237,7 @@ export async function reassignNode(
   if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
   // Only bot-executed runs read assignments; elsewhere a reassignment would
   // be recorded while the original worker keeps running.
-  if (!isBotExecutedRun(readJournal(journalPath), ctx.nodeExecutor)) return { kind: 'rejected', reason: 'not-bot-run' };
+  if (!isBotExecutedRun(runDir, readJournal(journalPath), ctx.nodeExecutor)) return { kind: 'rejected', reason: 'not-bot-run' };
   const dag = dagFor(runDir, ctx);
   const snapshots = botSnapshotsFor(runDir, ctx);
   const botSet = new Set([...snapshots.values()].map((snapshot) => snapshot.larkAppId));
@@ -1411,7 +1436,7 @@ export async function handNodeToHuman(
   const journalPath = journalPathOf(runDir);
   if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
   const before = readJournal(journalPath);
-  if (!isBotExecutedRun(before, ctx.nodeExecutor)) return { kind: 'rejected', reason: 'not-bot-run' };
+  if (!isBotExecutedRun(runDir, before, ctx.nodeExecutor)) return { kind: 'rejected', reason: 'not-bot-run' };
   const reason = input.reason.trim().slice(0, V3_HAND_TO_HUMAN_REASON_MAX);
   // Only to tell "not started yet" from "no such node" in the refusal.
   const inFlow = (nodeId: string): boolean => {
