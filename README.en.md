@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="https://deepcoldy.github.io/botmux/img/video-promo-en.mp4"><img src="docs/assets/botmux-promo-poster-en.jpg" width="900" alt="botmux promo video: click to play"></a>
+  <a href="https://deepcoldy.github.io/botmux/img/video-promo-en.mp4"><img src="docs/assets/botmux-promo-cover-en.gif" width="900" alt="botmux video intro: click to play"></a>
 </p>
 
 <p align="center">
@@ -104,22 +104,6 @@ Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (proce
 
 Authoritative `cliId` list and wrapper setups are documented in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 
-### Doubao CLI quickstart
-
-Use a Botmux build containing the `doubao` adapter. Install Doubao and finish native login as the same OS user that will run Botmux, then configure the Bot:
-
-```bash
-npm install -g '@bytedance/doubao-cli' --registry=https://registry.npmjs.org
-doubao --version
-doubao                      # finish login, verify the composer, then /exit
-botmux setup                # select Doubao and the actual project directory
-botmux start
-```
-
-For an existing Bot, select Doubao in Dashboard or merge `"cliId": "doubao"` and the actual `workingDir` into its existing `bots.json` entry, preserving credentials and other settings. Restart after saving and create a new session. Omit `model` for the default, or use a display name available to the account in native `/model`.
-
-Multiline tasks are submitted once; **Esc** interrupts through the Web terminal. Final answers are collected automatically from native logs, and restart resumes by the exact native decimal ID, never the “latest” conversation. Default permissions pass `--permission-mode always_allow`; restrict access to trusted users/projects. **The Botmux binary needs no Node; Doubao's npm installation and launcher still need Node/npm.** See the [Doubao guide](docs/doubao.en.md) for enterprise installation, local HTTP trials, permissions, and limits. Native Linux execution/sandbox and the existing-terminal `/adopt` bridge are not acceptance-tested; ordinary chat support does not imply every capability is supported.
-
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 
 botmux doesn't reimplement memory, context management, tool calls, or permission systems — **most native CLI capabilities don't need reimplementing, and CLI upgrades usually benefit botmux directly** (when interfaces / params / output formats / resume semantics change, an adapter may still need to catch up). You keep talking in plain language; the daemon wraps context into structured prompts behind the scenes before feeding the CLI. An Agent-SDK-based approach is the inverse: capabilities depend on what the SDK exposes and on your own integration.
@@ -149,5 +133,5 @@ The table below compares only **verifiable integration boundaries** — it does 
 botmux may well be the most-contributed-to open-source project built specifically for Feishu/Lark — and that is entirely thanks to everyone who has taken part. Thanks to all who have contributed code, documentation, and issues:
 
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
+  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux&amp;max=500&amp;columns=16" alt="contributors" />
 </a>
