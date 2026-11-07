@@ -10210,6 +10210,48 @@ function consumeDocCommentTurn(ds: DaemonSession, turnId: string): void {
   }
 }
 
+/** A document turn refused before admission never runs and never emits
+ * final_output, so nothing else would answer its comment or clear its Typing
+ * marker. The route is consumed synchronously before any await: a duplicate
+ * rejection frame then finds no target and cannot post a second notice.
+ * A pending queued activation and a Codex App accepted ledger entry are both
+ * replayed by the next fork; unless that entry is cancelled, the turn may
+ * still run, so it must not be reported as not executed. */
+function rejectDocCommentTurnBeforeAdmission(ds: DaemonSession, turnId: string, reason: string): void {
+  const docTurn = resolveDocCommentTarget(ds, turnId);
+  if (!docTurn) return;
+  if (ds.session.queuedActivationPending && ds.session.queuedActivationTurnId === turnId) return;
+  const ledgerEntries = ds.session.codexAppDispatchLedger?.filter(entry => entry.turnId === turnId) ?? [];
+  if (ledgerEntries.length > 0) {
+    const accepted = ledgerEntries.length === 1 && ledgerEntries[0]!.state === 'accepted' ? ledgerEntries[0]! : undefined;
+    if (!accepted || !rollbackAcceptedCodexAppDispatch(ds, accepted.dispatchId, turnId, accepted.dispatchAttempt)) return;
+  }
+  consumeDocCommentTurn(ds, turnId);
+  logger.warn(`[${tag(ds)}] doc-comment turn rejected before admission turn=${turnId.substring(0, 16)} reason=${reason}`);
+  const file = { fileToken: docTurn.fileToken, fileType: docTurn.fileType };
+  const notice = tr(
+    'worker.input_rejected_before_admission',
+    { turnId: turnId.substring(0, 16), reason },
+    botLocale(getBot(ds.larkAppId).config),
+  );
+  void (async () => {
+    try {
+      await replyToDocComment(ds.larkAppId, file, docTurn.commentId, notice, docTurn.replyToOpenId);
+    } catch (err: any) {
+      logger.error(`[doc-comment] failed to report rejected turn ${turnId.substring(0, 16)}: ${err?.message ?? err}`);
+    }
+    const reactionType = docTurn.reactionType ?? (docTurn.replyId ? 'Typing' : undefined);
+    if (reactionType && docTurn.replyId) {
+      try {
+        await removeCommentReaction(ds.larkAppId, file, docTurn.commentId, docTurn.replyId, reactionType,
+          { identity: docTurn.reactionIdentity });
+      } catch (err: any) {
+        logger.debug(`[doc-comment] failed to remove rejected reaction ${reactionType}: ${err?.message ?? err}`);
+      }
+    }
+  })();
+}
+
 function collectDocCommentReactionTargets(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
@@ -13415,14 +13457,14 @@ function rollbackAcceptedCodexAppDispatch(
   dispatchId: string | undefined,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
-): void {
-  if (!dispatchId || !turnId) return;
+): boolean {
+  if (!dispatchId || !turnId) return false;
   const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
     dispatchId,
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
-  if (!cancelled.ok) return;
+  if (!cancelled.ok) return false;
   const priorLedger = ds.session.codexAppDispatchLedger;
   ds.session.codexAppDispatchLedger = cancelled.ledger;
   try {
@@ -13437,7 +13479,9 @@ function rollbackAcceptedCodexAppDispatch(
     }
   } catch {
     ds.session.codexAppDispatchLedger = priorLedger;
+    return false;
   }
+  return true;
 }
 
 /**
@@ -17866,6 +17910,7 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         // The turn never started and will never terminal. Run GC, but do NOT
         // release this turn's own ledger anchor here: a same-turnId redelivery
