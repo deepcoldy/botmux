@@ -19923,11 +19923,22 @@ function scheduleSubmitFailureNotify(
       && lastInitConfig?.cliId === 'claude-code'
       && claudeComposerHoldsInput(submitDiagnosisScreen, msg)
     ) {
-      lateSessionStartEnterPressed = true;
-      log(`Deferred recheck: SessionStart arrived after the write and the composer still holds the input — pressing Enter once. preview="${preview}"`);
-      pressBackendEnter(backend);
-      armDeferredRecheck();
-      return;
+      // Route through the adapter's submit-key resolution: with submit remapped
+      // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly = newline),
+      // a plain Enter would not submit and would edit the parked draft instead.
+      const rescueAdapter = cliAdapter;
+      const rescuePressed = !backend
+        ? false
+        : rescueAdapter?.pressComposerSubmit
+          ? rescueAdapter.pressComposerSubmit(backend)
+          : (pressBackendEnter(backend), true);
+      if (rescuePressed) {
+        lateSessionStartEnterPressed = true;
+        log(`Deferred recheck: SessionStart arrived after the write and the composer still holds the input — pressing submit once. preview="${preview}"`);
+        armDeferredRecheck();
+        return;
+      }
+      log(`Deferred recheck: composer holds the input but the configured submit key could not be sent — leaving it for the normal verdict. preview="${preview}"`);
     }
 
     if (sessionStartGated) {

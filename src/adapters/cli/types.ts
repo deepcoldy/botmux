@@ -528,6 +528,16 @@ export interface CliAdapter {
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
+  /** Press the composer's SUBMIT key once for a draft already parked in the
+   *  input box (the cold-start late-SessionStart re-submit path). Must use the
+   *  same key resolution as {@link writeInput}: users can remap submit
+   *  (keybindings.json / CLAUDE_CODE_SUBMIT_KEY) and bind plain Enter to
+   *  chat:newline, in which case sending Enter would merely insert a newline.
+   *  Returns false when no terminal-sendable submit key is configured or the
+   *  backend could not confirm the send (ambiguous — callers must not retry on
+   *  a guess). Adapters without this method get a plain Enter. */
+  pressComposerSubmit?(pty: PtyHandle): boolean;
+
   /** Optional deterministic evidence that a slash-command LINE typed into the
    *  TUI (a bot startup command such as `/effort xhigh`) was executed, e.g.
    *  Claude Code's transcript `<command-name>/effort</command-name>` record.
