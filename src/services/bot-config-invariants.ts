@@ -4,7 +4,7 @@ import { parseSandboxNetworkPolicy } from '../core/sandbox-network-policy.js';
 // bot-config-store → config-store 回到本文件，取道 reply-delivery 会闭合环，
 // bun 在模块链接期报 "Export named 'resolveReplyDelivery' not found"
 // （CI bun-test test/summary-command-window.test.ts 实测）。
-import { supportsTranscriptReplyDeliveryForBot } from '../core/zero-prompt-support.js';
+import { supportsTranscriptReplyDeliveryForBot, zeroPromptInjectionUnsupportedReason } from '../core/zero-prompt-support.js';
 import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 export type BotConfigInvariantError =
   | 'codex_browser_requires_codex_app'
@@ -12,7 +12,8 @@ export type BotConfigInvariantError =
   | 'existing_app_server_sandbox_conflict'
   | 'invalid_sandbox_network_policy'
   | 'reply_delivery_unsupported'
-  | 'sandbox_network_policy_requires_local_pty_oncall';
+  | 'sandbox_network_policy_requires_local_pty_oncall'
+  | 'zero_prompt_unsupported';
 
 function codexBrowserEnabled(entry: any): boolean {
   return entry?.codexBrowser === true
@@ -65,6 +66,15 @@ export function botConfigInvariantError(entry: any): BotConfigInvariantError | u
       && supportsTranscriptReplyDelivery(entry.cliId)
       && !supportsTranscriptReplyDeliveryForBot(entry.cliId, { sandbox: 'scratch' })) {
     return 'reply_delivery_unsupported';
+  }
+  // promptInjection=none × scratch × 「scratch 使零注入失效」的 CLI（cursor/doubao/antigravity）：
+  // worker spawnCli 会拒绝启动。同上，sandbox 切换与 cliId 切换经 rmwBotEntry 落盘、不过
+  // applyConfigField 的零注入门禁。只拦 scratch 致因：切回非 scratch 或关掉零注入即可修复；
+  // CLI 本身不支持零注入的存量 entry 不在此锁。
+  if (entry.promptInjection === 'none'
+      && entry.sandbox === 'scratch'
+      && zeroPromptInjectionUnsupportedReason(entry.cliId, { sandbox: 'scratch' }) === 'scratch_unsupported_for_cli') {
+    return 'zero_prompt_unsupported';
   }
   return undefined;
 }

@@ -9196,6 +9196,44 @@ esac
     }
   });
 
+  it('rejects switching a zero-injection scratch bot to a CLI that loses zero injection under scratch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-zero-prompt-scratch-cli-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-zero-prompt-scratch-cli-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        promptInjection: 'none',
+        sandbox: 'scratch',
+      }], null, 2));
+      loadBotConfigs().forEach((config: any) => registerBot(config));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'cursor' }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'zero_prompt_unsupported' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({
+        cliId: 'codex',
+        promptInjection: 'none',
+        sandbox: 'scratch',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects switching a read-isolated bot to Forge x TraeX instead of clearing readIsolation', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-forge-read-isolation-conflict-'));
     const configPath = join(dir, 'bots.json');
