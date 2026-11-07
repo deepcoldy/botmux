@@ -74,10 +74,12 @@ describe('owned session systemd scope', () => {
     try {
       writeFileSync(join(dir, 'systemd-run'),
         '#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift\nBOTMUX_FAKE_SCOPE=1 exec "$@"\n', { mode: 0o755 });
+      const payload = join(dir, 'payload');
+      writeFileSync(payload,
+        '#!/bin/sh\nIFS= read -r line\nprintf "%s\\n%s\\n%s\\n%s\\n" "$$" "$line" "$1" "${BOTMUX_FAKE_SCOPE:-none}"\nexit 7\n', { mode: 0o755 });
       const argument = 'literal spaces; $(must-not-run)';
-      const wrapped = wrapCommandInSessionScope('parent-boundary', '/bin/sh', [
-        '-c', 'IFS= read -r line; printf "%s\\n%s\\n%s\\n%s\\n" "$$" "$line" "$1" "${BOTMUX_FAKE_SCOPE:-none}"; exit 7', '_', argument,
-      ], undefined, { cleanupSupported: true, memoryControllerSupported: false }, {}, undefined, pidNamespace);
+      const wrapped = wrapCommandInSessionScope('parent-boundary', payload, [argument],
+        undefined, { cleanupSupported: true, memoryControllerSupported: false }, {}, undefined, pidNamespace);
       const child = spawnSync(wrapped.bin, wrapped.args, {
         env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ''}` },
         input: 'interactive input\n', encoding: 'utf8', timeout: 5_000,

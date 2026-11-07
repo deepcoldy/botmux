@@ -99,11 +99,11 @@ function createShims(binDir: string, pathValue: string | undefined): void {
     }
   }
   mkdirSync(binDir, { recursive: true });
-  const refuse = (name: string) => `echo "botmux test systemd fence: refusing ${name} $*" >&2\nexit 1\n`;
+  const refuse = (name: string) => `echo "botmux test systemd fence: refusing ${name} $*" >&2; exit 1`;
   const scripts: Record<string, string> = {
-    'systemd-run': refuse('systemd-run'),
-    busctl: refuse('busctl'),
-    systemctl: `for a in "$@"; do\n  case "$a" in --user) ${refuse('systemctl').replace('\n', '\n  ').trimEnd()} ;; esac\ndone\n`
+    'systemd-run': `${refuse('systemd-run')}\n`,
+    busctl: `${refuse('busctl')}\n`,
+    systemctl: `for a in "$@"; do\n  case "$a" in --user) ${refuse('systemctl')} ;; esac\ndone\n`
       + (realSystemctl ? `exec ${shellSingleQuote(realSystemctl)} "$@"\n` : 'echo "systemctl: not found" >&2\nexit 127\n'),
   };
   for (const [name, body] of Object.entries(scripts)) {
