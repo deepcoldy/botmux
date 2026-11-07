@@ -181,6 +181,10 @@ if (argv[0] === 'app-server') {
   };
   delete workerEnv.TMUX;
   delete workerEnv.TMUX_PANE;
+  // socket 名由 BOTMUX_TMUX_SOCKET 决定（preferredManagedTmuxSocket，文档化的逃生阀），
+  // 而测试围栏不清这个变量；继承宿主环境会让下面的私有 socket 断言随宿主配置假红。
+  // 本文件只断言默认命名（-L botmux）下的私有目录语义。
+  delete workerEnv.BOTMUX_TMUX_SOCKET;
   const child = spawnTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: workerEnv,
