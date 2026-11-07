@@ -151,6 +151,59 @@ describe('redirect whitelist recovery', () => {
     expect(fixture.state.urls).toEqual([CUSTOM]);
   });
 
+  const readReset = () => new TypeError('fetch failed', {
+    cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+  });
+
+  it('re-reads after a transient read failure and merges with the entries it then sees (#2700)', async () => {
+    const fixture = consoleFixture(undefined, state => {
+      if (state.reads === 1) throw readReset();
+      return undefined;
+    });
+    const client = await fixture.client();
+
+    const result = await writeRedirectWhitelist(client.postJson, APP_ID, WANTED, { timeoutMs: 4_000 });
+
+    expect(result.status).toBe('updated');
+    expect(fixture.state.writes).toEqual([[BOTMUX_REDIRECT_URL, CUSTOM, PLATFORM]]);
+    expect(fixture.state.reads).toBe(3);
+  });
+
+  it('keeps zero writes when every read within the budget fails transiently', async () => {
+    const fixture = consoleFixture(undefined, () => { throw readReset(); });
+    const client = await fixture.client();
+
+    const result = await writeRedirectWhitelist(client.postJson, APP_ID, WANTED, { timeoutMs: 4_000 });
+
+    expect(result).toMatchObject({ status: 'skipped_unreadable', redirectUrls: [] });
+    expect(result).not.toHaveProperty('mutationSubmitted');
+    expect(result.warning).toContain('本次未写入');
+    expect(fixture.state.reads).toBe(3);
+    expect(fixture.state.writes).toHaveLength(0);
+  });
+
+  it('returns the zero-write result instead of a timeout when the budget ends between re-reads', async () => {
+    const fixture = consoleFixture(undefined, () => { throw readReset(); });
+    const client = await fixture.client();
+
+    const result = await writeRedirectWhitelist(client.postJson, APP_ID, WANTED, { timeoutMs: 100 });
+
+    expect(result.status).toBe('skipped_unreadable');
+    expect(fixture.state.reads).toBe(1);
+    expect(fixture.state.writes).toHaveLength(0);
+  });
+
+  it('does not re-read after a permission rejection on the read', async () => {
+    const fixture = consoleFixture(undefined, () => Response.json({ code: 10003, msg: 'not owned' }, { status: 403 }));
+    const client = await fixture.client();
+
+    const result = await writeRedirectWhitelist(client.postJson, APP_ID, WANTED, { timeoutMs: 4_000 });
+
+    expect(result.status).toBe('skipped_unreadable');
+    expect(fixture.state.reads).toBe(1);
+    expect(fixture.state.writes).toHaveLength(0);
+  });
+
   it('cancels a pending request at the deadline without scheduling another write', async () => {
     const fixture = consoleFixture((_state, signal) => new Promise<Response>((_resolve, reject) => {
       if (!signal) throw new Error('Expected a request cancellation signal');
