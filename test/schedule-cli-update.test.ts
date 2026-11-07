@@ -154,7 +154,8 @@ async function managed(
       const updated = rows[taskId!];
       return res.end(JSON.stringify(request.action === 'update' && !f.preFrequencyDaemon
         ? { ok: true, task: { schedule: updated.schedule, display: updated.parsed?.display,
-          nextRunAt: updated.nextRunAt ?? null, enabled: updated.enabled } }
+          nextRunAt: updated.nextRunAt ?? null, enabled: updated.enabled,
+          ...(!updated.enabled && updated.disabledReason ? { disabledReason: updated.disabledReason } : {}) } }
         : { ok: true }));
     }
     writeManagedOriginAttestationProof({ dataDir: f.dataDir, proof: {
@@ -572,6 +573,33 @@ describe('schedule CLI frequency updates', () => {
     const result = await f.run(['update', f.task.id, '--schedule=0 */4 * * *']);
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain('任务已暂停');
+  });
+
+  it('points a finished one-shot at resume only when its frequency changed', async () => {
+    const f = fixture();
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, disabledReason: 'once_completed' } }));
+    await managed(f);
+    const rescheduled = await f.run(['update', f.task.id, '--schedule', 'every 4h']);
+    expect(rescheduled.code, rescheduled.output).toBe(0);
+    expect(rescheduled.output).toContain(`botmux schedule resume ${f.task.id}`);
+    const promptOnly = await f.run(['update', f.task.id, '--prompt', 'new prompt']);
+    expect(promptOnly.code, promptOnly.output).toBe(0);
+    expect(promptOnly.output).toContain('任务已结束，不会自动执行');
+    expect(promptOnly.output).not.toContain('schedule resume');
+  });
+
+  it.each([
+    ['calendar_once_unsupported', '--calendar none'],
+    ['schedule_precondition_update_failed', '已全部回滚'],
+    ['until_done_retry_requires_once', '--retry-every 只用于一次性任务'],
+    ['until_done_deadline_before_first_run', '--deadline 早于任务第一次执行的时间'],
+  ])('turns the frequency refusal %s into Chinese text', async (code, text) => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, code);
+    const result = await f.run(['update', f.task.id, '--schedule', 'every 4h']);
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain(text);
+    expect(result.output).not.toContain(code);
   });
 
   it.each(['sometimes', '25:99', '* * *'])('refuses the unreadable frequency %s before contacting the daemon', async raw => {
