@@ -12,8 +12,10 @@ import { DecisionBoardService, type DecisionBoardServiceDeps } from '../src/core
 import { composeStewardGuide, normalizeStewardConfig, parseBoardTurnId, stewardGuidePreset, type StewardConfig } from '../src/core/decision-board/model.js';
 import {
   evaluateHints,
+  formatHintTurnId,
   parseCloseWhenSpec,
   parseDependsOnSpec,
+  parseHintTurnId,
   parseNextCheckSpec,
   type PrMergeState,
 } from '../src/core/decision-board/hints.js';
@@ -96,7 +98,7 @@ describe('巡检提示', () => {
     expect(item(seq)).toMatchObject({ state: 'active', hint: { kind: 'close', key: 'close:pr:o/r#142' } });
     expect(hintEvents(seq)).toEqual([expect.objectContaining({ actor: 'system', text: '建议关闭：PR o/r#142 已合入' })]);
     expect(delivered).toHaveLength(1);
-    expect(delivered[0]!.turnId).toMatch(new RegExp(`^board:${APP}:hint-\\d+$`));
+    expect(delivered[0]!.turnId).toMatch(new RegExp(`^board:${APP}:hint-\\d+(?:-\\d+)?$`));
     expect(delivered[0]!.prompt).toContain('#1 修登录 — 建议关闭：PR o/r#142 已合入');
     expect(delivered[0]!.prompt).toContain('--dismiss-hint');
     expect(delivered[0]!.announcement.texts.join('')).toContain('【决策看板 · 提示】');
@@ -286,6 +288,25 @@ describe('巡检提示', () => {
     expect(delivered[2]!.prompt).not.toContain('修登录');
     // 提示回合 id 不会被当成批次号解析。
     expect(parseBoardTurnId(delivered[0]!.turnId)).toBeNull();
+  });
+
+  it('同毫秒两次 sweep 或提示通知生成的回合 turnId 互不相同（防撞 id）', async () => {
+    // 用未来时间：sweepHints 内 at = max(now, Date.now())，过去的注入值会被真实时钟顶掉，
+    // 两次 sweep 落到不同毫秒，同毫秒防撞 id 的后半段断言就不再咬回归。
+    const fixedNow = Date.now() + HOUR;
+    const id1 = formatHintTurnId('app_test', fixedNow);
+    const id2 = formatHintTurnId('app_test', fixedNow);
+    expect(id1).not.toBe(id2);
+    expect(parseHintTurnId(id1)).toMatchObject({ appId: 'app_test', round: fixedNow });
+    expect(parseHintTurnId(id2)).toMatchObject({ appId: 'app_test', round: fixedNow });
+
+    await add('任务1', { links: ['pr=o/r#101'] });
+    prStates.set('o/r#101', 'merged');
+    await service.sweepHints(fixedNow);
+    service.noteDeliveryFailure(delivered.at(-1)!.turnId, 'worker_rejected:busy', 'worker.input_rejected_before_admission');
+    await service.sweepHints(fixedNow);
+    const lastTwo = delivered.slice(-2);
+    expect(lastTwo[1]!.turnId).not.toBe(lastTwo[0]!.turnId);
   });
 
   it('投递一直抛错（可能已发出横幅）：同一条提示最多自动投 3 次', async () => {

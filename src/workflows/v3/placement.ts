@@ -14,6 +14,11 @@
  *    root, or its main session is the chat-wide session of a normal group
  *    (P4). Private chats never reach bot execution at all.
  *
+ * The same three entry points also refuse a checkpoint nothing depends on
+ * (design §13.6, {@link v3CheckpointsWithoutDependants}): the main bot is
+ * woken only while the run still goes on, so a checkpoint that is the last
+ * node to finish would end the run without anybody looking at it.
+ *
  * Pure: the caller resolves who executes each node and whether the run has a
  * main topic. Part of workflow-core (no IO, no daemon imports).
  */
@@ -40,6 +45,30 @@ export interface V3PlacementProblem {
   /** The executing bot the conflict is about (rules 1 and 2). */
   larkAppId?: string;
   message: string;
+}
+
+/** Why a checkpoint without dependants is refused, and what to do instead. */
+const V3_CHECKPOINT_WITHOUT_DEPENDANTS = '检查点后面没有节点，主 Bot 不会被叫来；去掉这个标记，或在后面加一个汇总节点';
+
+/**
+ * Top-level goal nodes marked `checkpoint: true` that no top-level node
+ * depends on. Such a checkpoint holds nothing: when it is the last node to
+ * finish the run ends at once, and the main bot is only woken while a run is
+ * still running or blocked — the mark would silently do nothing. Checked
+ * after the Architect, at approval and on runtime edits of bot-executed runs
+ * only (the mark has no effect on temporary workers), never when an existing
+ * run, journal or saved template is read.
+ */
+export function v3CheckpointsWithoutDependants(dag: Pick<V3Dag, 'nodes'>): string[] {
+  const dependedOn = new Set(dag.nodes.flatMap((node) => node.depends.map((dep) => dep.from)));
+  return dag.nodes
+    .filter((node) => isGoalNode(node) && node.checkpoint === true && !dependedOn.has(node.id))
+    .map((node) => node.id);
+}
+
+/** One refusal line per checkpoint without dependants. */
+export function v3CheckpointProblems(nodeIds: Iterable<string>): string[] {
+  return [...nodeIds].map((nodeId) => `节点 ${nodeId}：${V3_CHECKPOINT_WITHOUT_DEPENDANTS}`);
 }
 
 /** Does `node` start only after EVERY node it depends on has finished?
@@ -156,7 +185,11 @@ export function v3PlacementProblems(input: {
    *  from `dag`); appended to the refusal. */
   explainUnordered?: (a: string, b: string) => { joinId: string; rule: string; first: string } | undefined;
 }): V3PlacementProblem[] {
-  const nameOf = input.nameOf ?? ((appId: string) => appId);
+  // A bot is named by its display name, the app id kept beside it.
+  const nameOf = (appId: string): string => {
+    const name = input.nameOf?.(appId);
+    return name && name !== appId ? `${name}（${appId}）` : appId;
+  };
   const mainNodes = input.dag.nodes.filter((node) => isGoalNode(node) && v3NodePlacement(node) === 'main');
   const problems: V3PlacementProblem[] = [];
   if (mainNodes.length === 0) return problems;
@@ -212,4 +245,36 @@ export function v3PlacementProblems(input: {
     }
   }
   return problems;
+}
+
+/**
+ * §5.2 rule 2 × §15.4: the main bot's own main-topic nodes run IN the main
+ * session, and that session already runs in its own directory (it was
+ * started when `/workflow` was sent). A frozen node working directory other
+ * than that one can never be honoured for them — the runtime blocks such a
+ * node with WORKING_DIR_REFUSED — so every entry that freezes the directory
+ * or makes a node one of them refuses it up front, through this one check.
+ *
+ * `nodes`: the nodes to judge, each with the bot that will execute it and its
+ * placement (an entry passes only the nodes it is responsible for: Gate-2 all
+ * of them, a runtime change the ones it turns into this kind). Both
+ * directories are in comparison form (`comparableSessionDir`), compared as
+ * strings. `mainSessionDir` undefined = unknown: nothing is refused here and
+ * the runtime gate stays the only check. Pure.
+ */
+export function v3MainSessionDirProblem(input: {
+  nodes: Iterable<{ nodeId: string; larkAppId: string; placement?: V3NodePlacement }>;
+  mainLarkAppId: string;
+  workingDir: string | undefined;
+  mainSessionDir: string | undefined;
+}): string | undefined {
+  const { workingDir, mainSessionDir } = input;
+  if (workingDir === undefined || mainSessionDir === undefined || workingDir === mainSessionDir) return undefined;
+  const nodeIds = [...input.nodes]
+    .filter((node) => node.placement === 'main' && node.larkAppId === input.mainLarkAppId)
+    .map((node) => node.nodeId);
+  if (nodeIds.length === 0) return undefined;
+  return `节点 ${nodeIds.join('、')} 由主 Bot 自己在主话题执行，工作目录 ${workingDir} 不是主会话的目录：`
+    + `主 Bot 自己在主话题执行的节点只能在主会话的目录 ${mainSessionDir} 里跑；`
+    + `把节点改成节点话题，或不指定工作目录，或指定为 ${mainSessionDir}`;
 }

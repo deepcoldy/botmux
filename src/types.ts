@@ -543,6 +543,10 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** 已在来源话题直投的项目结果；下次输入携带引用，不额外启动模型。 */
+  reportReplyReferences?: import('./core/report-source-reply.js').ReportReplyReference[];
+  /** 最近一次真人输入/停止，用于使旧委托的自动直投失效。 */
+  reportReplyInputId?: string;
   /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
   topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
@@ -1188,6 +1192,8 @@ export interface Session {
    * live config applies, which is what keeps a config change effective.
    */
   model?: string;
+  /** Explicit user choice; never populated from inherited bot defaults (#773). */
+  modelPin?: import('./core/model-pin.js').ModelPin;
   /** Retained Auto-model selection for the exact native conversation. */
   traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
   /** Group defaults at topic creation; absent on legacy sessions. */
@@ -1867,7 +1873,9 @@ export interface ScheduledTask {
    *  It rides on the in-memory DaemonSession (spawnModelOverride), never on the
    *  session record, so a daemon restart drops it: a `topic` / `top-level` task
    *  whose session survives the restart re-forks on the bot's model. Persisting
-   *  it is not the fix — a stored session model outranks the bot's configured one
+   *  it is not the fix for inherited defaults. Explicit user modelPin has its
+   *  own visible/clearable lifecycle and never comes from this task default.
+   *  The old stored session model outranks the bot's configured one
    *  forever, which is the bug `resolveSessionLaunchModel` exists to undo. Same
    *  behavior as the trigger API's per-turn model. */
   model?: string;
@@ -2093,7 +2101,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -2131,8 +2139,11 @@ type DaemonToWorkerBase =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; topicEffort?: import('./utils/traex-session-effort.js').TraexTopicEffortRestart; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
-      traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig | null }
+  | { type: 'restart'; topicEffort?: import('./utils/traex-session-effort.js').TraexTopicEffortRestart; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
+      traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig | null;
+      /** Latest bot startupCommands / launchShell for the respawn (a frozen per-session
+       *  `/cli` selection keeps its own). Same tri-state; see core/respawn-config-patch.ts. */
+      startupCommands?: string[] | null; launchShell?: string | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -2440,6 +2451,13 @@ export type WorkerToDaemon =
    *  scheduled fire still routes into its originating topic after 32+ newer
    *  turns. turnId null = task created from a local-terminal turn. */
   | { type: 'cron_task_anchors_sync'; anchors: Array<{ taskId: string; turnId: string | null }> }
+  /** Full snapshot of the Lark turns that this worker's still-running Claude
+   *  background tasks were launched from. Sent only where a wake answer is
+   *  forwarded (transcript delivery, not adopt / zero-injection), and only
+   *  when the set changes. The daemon keeps those turns' replyTargets records
+   *  past the 32-entry eviction until the set drops them or the worker exits,
+   *  so the wake answer still routes into its launching topic. */
+  | { type: 'background_task_pins_sync'; turnIds: string[] }
   /** Transport-only receipt for ordinary Lark IM delivery. Emitted
    * synchronously when the live worker's IPC handler claims the exact turn,
    * before slow startup work; input-queue ownership is acknowledged separately

@@ -3,6 +3,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
 import { TRAEX_QUOTA_ERROR_CODE } from '../src/services/traex-quota.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,7 +18,9 @@ function fixture(extra: Record<string, unknown> = {}) {
   authority.markStarted({ turnId: 'turn' });
   let resolve!: (value: any) => void;
   const catalog = new Promise<any>(done => { resolve = done; });
+  const tracker = new InflightInputTracker(); tracker.onWrite({ content: 'task', turnId: 'turn' });
   const scope: Record<string, any> = {
+    inflightInputs: tracker, pendingMessages: [],
     traexAutoModelRuntimeEligible: () => true, traexAutoModelController: controller,
     activeTurnAuthority: authority, currentBotmuxTurnId: 'turn', cliSpawnGeneration: 1,
     lastInitConfig: { cliSessionId: 'native', model: 'first' }, TRAEX_QUOTA_ERROR_CODE,
@@ -29,6 +32,8 @@ function fixture(extra: Record<string, unknown> = {}) {
     t: (key: string) => key, ...extra,
   };
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
+  scope.holdTraexRecoveryForStop = loadWorkerFunction('holdTraexRecoveryForStop', scope);
+  scope.settleStoppedTraexRecovery = loadWorkerFunction('settleStoppedTraexRecovery', scope);
   const recover = loadWorkerFunction<(turn: any) => boolean>('recoverTraexQuotaTurn', scope);
   const turn = { turnId: 'turn', sourceTurnId: 'native-turn', started: true,
     terminalStatus: 'failed', terminalErrorCode: TRAEX_QUOTA_ERROR_CODE };

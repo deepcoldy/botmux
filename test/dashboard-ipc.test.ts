@@ -5351,9 +5351,11 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
       expect(res.status).toBe(200);
       await vi.waitFor(() => expect(replySpy).toHaveBeenCalled());
-      const notice = JSON.parse(replySpy.mock.calls[0]![2]);
-      expect(notice.text).toContain('Frozen Vendor Codex');
-      expect(notice.text).not.toContain('New Live Name');
+      // The restart status card, posted into the thread.
+      expect(replySpy.mock.calls[0]![3]).toBe('interactive');
+      const title = JSON.parse(replySpy.mock.calls[0]![2] as string).header.title.content as string;
+      expect(title).toContain('Frozen Vendor Codex');
+      expect(title).not.toContain('New Live Name');
     } finally {
       replySpy.mockRestore();
       findSpy.mockRestore();
@@ -5439,25 +5441,30 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     forkSpy.mockRestore();
   });
 
-  it('revives a worker-less but active session by re-forking (matches the Feishu card path)', async () => {
+  it('revives a worker-less but active session through the restart coordinator (matches the Feishu card path)', async () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const restartSpy = vi.spyOn(workerPool, 'requestSessionRestart')
+      .mockReturnValue({ attemptId: 'attempt-revive', joined: false });
+    const ds = {
       session: { sessionId: 's-revive', cliId: 'codex' },
       worker: null,
       adoptedFrom: undefined,
       hasHistory: true,
-    } as any);
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-revive/restart`, { method: 'POST' });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-revive', cliId: 'codex', revived: true });
-    expect(forkSpy).toHaveBeenCalledTimes(1);
-    // forkWorker(ds, prompt, resume) — resume must carry ds.hasHistory so the
-    // revived CLI resumes the conversation rather than starting blank.
-    expect(forkSpy.mock.calls[0][2]).toBe(true);
+    // A correlated attempt (pane teardown + fork with a restartAttemptId, resume
+    // from ds.hasHistory) — not a bare forkWorker whose result nobody hears.
+    expect(restartSpy).toHaveBeenCalledTimes(1);
+    expect(restartSpy).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'dashboard' }));
+    expect(forkSpy).not.toHaveBeenCalled();
     findSpy.mockRestore();
+    restartSpy.mockRestore();
     forkSpy.mockRestore();
   });
 

@@ -1,3 +1,4 @@
+import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
 import {
   Fragment,
@@ -833,7 +834,7 @@ export function SessionsTableBase(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /><ModelPinChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':

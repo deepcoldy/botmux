@@ -14,13 +14,14 @@
  * relay needs bun to run from source, the session scope needs a user systemd).
  */
 import { randomUUID } from 'node:crypto';
-import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { claudeJsonlPathForSession } from '../../src/adapters/cli/claude-code.js';
 import { preferredManagedTmuxSocket } from '../../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../../src/setup/ensure-tmux.js';
+import { locateExecutable } from '../../src/utils/executable.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
 import { privateTmuxEnv } from './private-tmux-env.js';
 import { readJsonLines } from './read-json-lines.js';
@@ -303,6 +304,9 @@ export interface Harness {
    *  stay up — an in-worker CLI crash. */
   crashCli: () => void;
   startWorker: (init?: Partial<Extract<DaemonToWorker, { type: 'init' }>>) => Generation;
+  /** `onPath` only: take the `claude` command off PATH, and put it back. */
+  hideCli: () => void;
+  restoreCli: () => void;
 }
 
 export interface Generation {
@@ -348,6 +352,12 @@ export function setupFakeClaude(opts: {
   programStatus?: boolean;
   /** How long a `--resume` launch waits before drawing its prompt. */
   resumeReadyDelayMs?: number;
+  /** Install the fake as `claude` in a directory of its own on the worker's
+   *  PATH and launch it by name, with no CLI path configured — the way a
+   *  global install is found. The worker gets a HOME of its own and a PATH
+   *  without the directories that hold another `claude`; setup fails if a
+   *  shell lookup the way the worker does it still finds one. */
+  onPath?: boolean;
 }): Harness {
   mkdirSync(join(homedir(), '.botmux'), { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(tmpdir(), 'bmx-clear-restore-'));
@@ -386,7 +396,9 @@ export function setupFakeClaude(opts: {
   // An extensionless script follows the nearest package.json; never inherit a
   // stray `"type": "module"` from a parent directory.
   writeFileSync(join(root, 'package.json'), '{"type":"commonjs"}');
-  const fakeCli = join(root, 'claude');
+  const pathDir = join(root, 'path-bin');
+  const fakeCli = opts.onPath ? join(pathDir, 'claude') : join(root, 'claude');
+  mkdirSync(dirname(fakeCli), { recursive: true });
   writeFileSync(fakeCli, FAKE_CLAUDE.replace('__CONFIG__', JSON.stringify(configFile)));
   chmodSync(fakeCli, 0o755);
   const launcher = opts.unknownLayer === 'cli-named-launcher' ? join(root, 'wrap', 'claude') : join(root, 'launcher');
@@ -417,7 +429,43 @@ child.on('exit', code => process.exit(code ?? 1));
   });
 
   let notified = 0;
+  const workerHome = join(root, 'home');
+  mkdirSync(workerHome);
+  const parkedCli = join(root, 'claude.parked');
+  const workerPath = opts.onPath
+    ? [pathDir, ...(process.env.PATH ?? '').split(':').filter(dir => dir && !existsSync(join(dir, 'claude')))].join(':')
+    : undefined;
+  const pathEnv: NodeJS.ProcessEnv = workerPath
+    ? { PATH: workerPath, HOME: workerHome, ZDOTDIR: workerHome, SHELL: '/bin/sh' }
+    : {};
+  if (opts.onPath) {
+    // The fake runs on whatever `node` the test runs on, even if that lives in
+    // a directory left out above for holding a `claude` too.
+    const node = locateExecutable('node');
+    if (!node) throw new Error('onPath: no node on PATH for the fake claude');
+    symlinkSync(node, join(pathDir, 'node'));
+    // Nothing but the fake may answer to `claude`, the way the worker looks it
+    // up: on PATH, then through login and interactive shells — /etc/profile
+    // can put system directories back. Never launch a real Claude.
+    const env = privateTmuxEnv(root, pathEnv);
+    renameSync(fakeCli, parkedCli);
+    try {
+      for (const sh of ['/bin/sh', '/bin/zsh', '/bin/bash'].filter(existsSync)) {
+        for (const flags of ['-lc', '-ic']) {
+          const found = spawnSync(sh, [flags, 'command -v claude'], { env, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] });
+          if (found.status === 0 && found.stdout.trim()) {
+            throw new Error(`onPath: ${sh} ${flags} finds a claude outside the test: ${found.stdout.trim()}`);
+          }
+        }
+      }
+    } finally {
+      renameSync(parkedCli, fakeCli);
+    }
+  }
   const harness: Harness = {
+    // Moved out of and back into the PATH directory, as a reinstall does.
+    hideCli: () => renameSync(fakeCli, parkedCli),
+    restoreCli: () => renameSync(parkedCli, fakeCli),
     root, sessionId, workingDir, claudeDir, transcript, clearSid, forkSid, pidStateGate, killCli,
     // Staged outside notifyDir and renamed in: the fake polls notifyDir every
     // 100ms, and a file it reads between creation and write is an empty reply.
@@ -446,6 +494,7 @@ child.on('exit', code => process.exit(code ?? 1));
         env: privateTmuxEnv(root, {
           SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
           LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+          ...pathEnv,
         }),
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       };
@@ -462,7 +511,7 @@ child.on('exit', code => process.exit(code ?? 1));
       cleanups.push(kill);
       child.send({
         type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root', workingDir,
-        cliId: 'claude-code', cliPathOverride: opts.unknownLayer ? launcher : fakeCli, cliConfigDir: claudeDir, backendType: 'tmux',
+        cliId: 'claude-code', cliPathOverride: opts.onPath ? undefined : opts.unknownLayer ? launcher : fakeCli, cliConfigDir: claudeDir, backendType: 'tmux',
         prompt: '', promptInjection: 'none', larkAppId: 'app_test', larkAppSecret: 'secret', locale: 'zh',
         ...init,
       } satisfies DaemonToWorker);

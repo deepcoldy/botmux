@@ -1,4 +1,5 @@
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
+import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
@@ -43,6 +44,7 @@ import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
+import type { GroupJoinAnchorMode } from './core/auto-start.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
@@ -1872,6 +1874,8 @@ export interface BotConfig {
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
+  /** Opt-in cards for still-running native turns, with separate first/repeat windows. */
+  longTaskReminder?: LongTaskReminderConfig;
   /**
    * Optional daemon-side handoff when this bot's CLI enters a trusted usage or
    * rate-limit state. The stable target App ID is resolved to a live,
@@ -2331,6 +2335,17 @@ export interface BotConfig {
    * the historical allowedUsers-only behaviour.
    */
   autoStartOnGroupJoinGateRequired?: boolean;
+  /**
+   * 主动开工 — 场景① 普通群会话锚点。只作用于 reply mode 本会让入群会话留在
+   * chat-scope 的普通群（chat / shared / chat-topic）；话题群与 new-topic 不变。
+   *   - 'reply-mode'（缺省）：跟随群的 reply mode，即现有行为。
+   *   - 'latest-message'：以群里最新一条已有消息（跳过系统消息、已撤回消息和本
+   *     bot 自己的消息）为根开 thread-scope 会话，回复落在该消息的话题里，而不是
+   *     群顶层。没有可用消息或拉取失败时回退 'reply-mode'。典型场景：外部平台建群、
+   *     先发一张上下文卡片再拉 bot，bot 在那张卡片的话题里干活。
+   * 仅 bots.json 配置；forcePrompt（Issue Board 领取 / 会议预热）路径不读它。
+   */
+  autoStartOnGroupJoinAnchor?: GroupJoinAnchorMode;
   /**
    * 主动开工 — 场景① optional pre-configured first-turn prompt. When set, it
    * becomes the user_message of the auto-started session; when unset/blank the
@@ -4298,6 +4313,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.idleSuspendMinutes
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
+      longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
@@ -4429,6 +4445,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
       autoStartOnGroupJoinGateRequired: entry.autoStartOnGroupJoinGateRequired === true || undefined,
+      // Only the non-default value is meaningful/persisted (undefined = 'reply-mode').
+      autoStartOnGroupJoinAnchor: entry.autoStartOnGroupJoinAnchor === 'latest-message' ? 'latest-message' : undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank

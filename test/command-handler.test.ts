@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/command-handler.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../src/services/feed-group-tagger.js', () => ({
@@ -425,8 +428,11 @@ vi.mock('../src/core/worker-pool.js', () => ({
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
   requestSessionRestart: vi.fn((_ds: any, observer: any) => {
-    void observer.notify('in_progress');
-    return { attemptId: 'attempt-test', joined: false };
+    // A fresh physical attempt each call, like the real coordinator: the status
+    // card is shared per attempt, so reusing one id would join an earlier card.
+    const attemptId = `attempt-test-${Math.random().toString(36).slice(2)}`;
+    void observer.notify('in_progress', attemptId);
+    return { attemptId, joined: false };
   }),
   isSessionTransferring: vi.fn(() => false),
   updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
@@ -4599,7 +4605,7 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
-        undefined,
+        'interactive',
         LARK_APP_ID,
         'msg_001',
       );
@@ -4667,7 +4673,7 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
-        undefined,
+        'interactive',
         LARK_APP_ID,
         'msg_001',
       );
@@ -4683,7 +4689,7 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
-        undefined,
+        'interactive',
         LARK_APP_ID,
         'msg_001',
       );
@@ -4707,6 +4713,16 @@ describe('handleCommand', () => {
   // ─── /stop ──────────────────────────────────────────────────────────────
 
   describe('/stop', () => {
+    it.each(['claude-code', 'codex-app'] as const)('invalidates pending source replies when stopping %s', async cliId => {
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: vi.fn() } as any,
+        session: makeSession({ cliId, quoteTargetId: 'om_request', reportReplyInputId: 'om_request' }),
+      });
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), makeDeps(ds), LARK_APP_ID);
+      expect(ds.session.reportReplyInputId).toBe('msg_001');
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+      expect(ds.session.quoteTargetId).toBe('om_request');
+    });
     it('does not claim a stop was sent while an Antigravity fork is pending', async () => {
       const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any });
       ds.session.cliId = 'antigravity';
@@ -10829,7 +10845,7 @@ describe('Codex App /effort command', () => {
     Object.assign(deps, { submitEffortTask: submit });
     const message = makeLarkMessage(content);
     await handleCommand('/effort', ROOT_ID, message, deps, LARK_APP_ID);
-    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(submit).toHaveBeenCalledWith(ds, message, '检查输入投递', undefined);
     expect(vi.mocked(updateCodexCliEffort).mock.invocationCallOrder.at(-1))
       .toBeLessThan(submit.mock.invocationCallOrder[0]);
@@ -10842,7 +10858,7 @@ describe('Codex App /effort command', () => {
     Object.assign(deps, { submitEffortTask: submit });
     vi.mocked(updateCodexCliEffort).mockResolvedValueOnce({ status: 'unavailable', reason: 'cli_menu_unavailable' });
     await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort ultra 检查输入投递'), deps, LARK_APP_ID);
-    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(submit).not.toHaveBeenCalled();
   });
 
@@ -10897,7 +10913,7 @@ describe('Codex App /effort command', () => {
     const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }), lastScreenStatus: 'working' });
     const deps = makeDeps(ds);
     await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort max'), deps, LARK_APP_ID);
-    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'max');
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'max', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(updateCodexAppEffort).not.toHaveBeenCalled();
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
       t('cmd.effort.cli_next_turn', { effort: 'max', choices: '' }), undefined, LARK_APP_ID, 'msg_001');
@@ -10917,7 +10933,7 @@ describe('Codex App /effort command', () => {
     const deps = makeDeps(ds);
     vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status, choices: ['low', 'high'] });
     await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort HIGH'), deps, LARK_APP_ID);
-    expect(updateCodexAppEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(updateCodexAppEffort).toHaveBeenCalledWith(ds, 'high', undefined, expect.any(Function), { source: 'command', setBy: 'ou_sender' });
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
       t(`cmd.effort.${status}`, { effort: 'high', choices: 'low, high' }), undefined, LARK_APP_ID, 'msg_001');
     expect(sendWorkerSessionInput).not.toHaveBeenCalled();

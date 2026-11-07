@@ -19,6 +19,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 
 import { mkdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import ts from 'typescript';
 import { config } from '../src/config.js';
 import { registerBot } from '../src/bot-registry.js';
@@ -33,6 +34,7 @@ import { assertScheduledAuthorityCurrent, isManualScheduledTurn, parseScheduledT
 import { authorizeDelegatedScheduleRun } from '../src/core/schedule-delegated-runtime.js';
 import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import { __testOnly_scheduleDeferredScheduleSettlement as settleLater } from '../src/daemon.js';
+import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 
 const APP = 'adversarial_schedule_app';
 const CHAT = 'oc_adversarial';
@@ -92,6 +94,26 @@ async function dispatched(s: Session) {
 }
 const logFor = (run: { taskId: string; runId: string }) =>
   runLogs.queryScheduleRunLogs(run.taskId, { limit: 100 }, APP).logs.find(row => row.id === run.runId);
+
+function scheduledScreenWorker(s: Session) {
+  const ds = daemonSession(s);
+  const worker = new EventEmitter() as any;
+  Object.assign(worker, { killed: false, pid: 99999, send: vi.fn(), kill: vi.fn(),
+    stdout: new EventEmitter(), stderr: new EventEmitter() });
+  Object.assign(ds, { worker, workerReady: true, lastMessageAt: Date.now(),
+    workerGeneration: 1,
+    suppressRecoveryCard: true,
+    silentScheduledTurns: new Map(Object.keys(s.scheduledRuns ?? {}).map(id => [id, Date.now()])) });
+  s.workerGeneration = 1;
+  const settled = vi.fn((value, context) => settleLater(value, context));
+  initWorkerPool({ sessionReply: async () => { throw new Error('probe must never reply'); },
+    getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1,
+    closeSession: vi.fn(), onDeferredScheduleTurnSettled: settled } as any);
+  __testOnly_setupWorkerHandlers(ds, worker, { ready: true, failureNotified: false }, 1);
+  return { ds, settled, frame: (turnId?: string, status = 'idle') =>
+    worker.listeners('message')[0]({ type: 'screen_update', sessionId: s.sessionId,
+      content: 'ready', status, ...(turnId ? { turnId } : {}) }) };
+}
 
 /** Executes the real otherwise-private daemon admission function; assertions
  * concern its side effects and authority result, never the source text. */
@@ -344,5 +366,76 @@ describe('schedule repair adversarial overlap probes', () => {
     expect(store.getRecord(APP, run.taskId)?.task.lastStatus).toBe('error');
     expect(logFor(run)?.outcome).toBe('error');
     expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('reconciles retained delivery from a first already-idle IPC frame despite repeated snapshots', async () => {
+    const s = session();
+    const run = await dispatched(s);
+    new ScheduleSendAttempt(isolated.dataDir, s, run.turnId).fail(new Error('retained failure'));
+    const { frame, settled } = scheduledScreenWorker(s);
+    for (let n = 0; n < 10; n++) {
+      await frame(run.turnId);
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect(settled).toHaveBeenCalledTimes(1);
+    expect(store.getRecord(APP, run.taskId)?.task.lastStatus).toBe('error');
+    expect(logFor(run)?.outcome).toBe('error');
+    await new TurnSendLedger(isolated.dataDir).execute({ larkAppId: APP, sessionId: s.sessionId,
+      turnId: run.turnId }, 'final', 'renewed work delivered', async () => 'om_renewed_work');
+    await frame(run.turnId, 'working');
+    await frame(run.turnId);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(settled).toHaveBeenCalledTimes(2);
+    expect(store.getRecord(APP, run.taskId)?.task.lastStatus).toBe('ok');
+    expect(logFor(run)?.outcome).toBe('model_dispatched');
+  });
+
+  it('keeps hidden capture retirement fallback while reconciling delivery before busy cleanup', async () => {
+    const s = session();
+    const run = await dispatched(s);
+    s.deferredScheduleRun = { ...run, routingAnchor: s.rootMessageId,
+      createdAt: new Date().toISOString() };
+    new ScheduleSendAttempt(isolated.dataDir, s, run.turnId).fail(new Error('hidden failure'));
+    const { frame, ds, settled } = scheduledScreenWorker(s);
+    await frame();
+    await vi.advanceTimersByTimeAsync(500);
+    await frame();
+    await frame(undefined, 'working');
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(settled).toHaveBeenCalledExactlyOnceWith(ds, { turnId: run.turnId, source: 'idle' });
+    expect(store.getRecord(APP, run.taskId)?.task.lastStatus).toBe('error');
+    expect(logFor(run)?.outcome).toBe('error');
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(s.status).toBe('active');
+  });
+
+  it('does not borrow a retained scheduled mapping for an unattributed ordinary IPC frame', async () => {
+    const s = session();
+    const run = await dispatched(s);
+    new ScheduleSendAttempt(isolated.dataDir, s, run.turnId).fail(new Error('prior failure'));
+    const { frame, ds, settled } = scheduledScreenWorker(s);
+    ds.currentTurnId = run.turnId;
+    await frame();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(settled).not.toHaveBeenCalled();
+    expect(store.getRecord(APP, run.taskId)?.task.lastStatus).toBe('ok');
+  });
+
+  it('does not postpone two exact retained deliveries when their idle snapshots interleave', async () => {
+    const s = session();
+    const first = await dispatched(s);
+    const second = await dispatched(s);
+    new ScheduleSendAttempt(isolated.dataDir, s, first.turnId).fail(new Error('first failure'));
+    new ScheduleSendAttempt(isolated.dataDir, s, second.turnId).fail(new Error('second failure'));
+    const { frame, settled } = scheduledScreenWorker(s);
+    for (let n = 0; n < 12; n++) {
+      await frame(n % 2 === 0 ? first.turnId : second.turnId);
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect.soft(store.getRecord(APP, first.taskId)?.task.lastStatus).toBe('error');
+    expect.soft(store.getRecord(APP, second.taskId)?.task.lastStatus).toBe('error');
+    expect.soft(logFor(first)?.outcome).toBe('error');
+    expect.soft(logFor(second)?.outcome).toBe('error');
+    expect(settled).toHaveBeenCalledTimes(2);
   });
 });

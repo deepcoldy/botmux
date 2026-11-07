@@ -319,6 +319,25 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 ### 等待提醒与无进展提醒 {#reminders}
 
+**`longTaskReminder`**：任务实际执行超过指定时长仍未结束时，在原群聊或话题发送独立提醒卡片。Dashboard「Bot 配置 → 消息卡片 → 长任务卡片提醒」提供开关和保存按钮，保存后立即生效。
+
+```json
+{
+  "longTaskReminder": {
+    "enabled": true,
+    "thresholdMinutes": 10,
+    "intervalMinutes": 10
+  }
+}
+```
+
+- 默认关闭；首次提醒阈值和后续间隔分别默认 10 分钟，均支持 1–10080 的整数分钟。
+- 从 CLI 实际接收任务并开始执行的时间计时，排队和空闲时间不计入；后续消息和正常进度不会重置已运行任务的计时。
+- 每 30 秒检查一次；首次达到阈值后提醒，之后从上次成功投递起按间隔提醒，不补发错过的周期。发送失败一分钟后重试，同一未确认通知复用投递 ID。
+- 任务完成、取消、worker 停止或会话关闭后停止提醒。每轮任务独立计时；支持普通群、私聊和话题，文档评论和无 IM 会话不发送。
+- 保持静默任务、会议驱动任务和已抑制执行轮次的辅助卡片限制；提醒不会触发普通回答的 `outbound.send` hook。
+- 偏好会持久保存，执行计时只使用当前存活 worker 的真实观测，不从旧会话或历史日志猜测。daemon 重启后，没有重新观测到执行开始的旧任务不会提醒。
+
 **`sessionOwnerReminder`**：会话停在某个需要人处理的状态、而且一直没变化时，每隔一段时间在原话题里 @ 一次会话 owner。
 
 ```json
@@ -631,6 +650,7 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 | `autoStartOnGroupJoinPrompt` | 入群自动开工时的第一轮任务。不填时，bot 会先看看群里的上下文；没人派活就报告自己已就绪 |
 | `autoStartOnGroupJoinSeed` | 入群时先发的那条开场消息的文字，不填用内置文案 |
 | `autoStartOnGroupJoinGateRequired` | `true` 时，入群自动开工还必须有一条匹配的 `chat.bot_added` 同步 [Hook](/hooks) 明确放行，否则静默不开工。适合只让特定的群自动开工 |
+| `autoStartOnGroupJoinAnchor` | 普通群里入群会话挂在哪。默认 `"reply-mode"`，跟随群的回复模式；`"latest-message"` 时不发开场消息，直接在群里最新一条已有消息（跳过系统消息、已撤回消息和本 bot 自己的消息）的话题里开会话，适合外部平台先发一条上下文消息再拉 bot 的群。没有可用消息或读取失败时按默认处理。话题群和 `new-topic` 模式不受影响。若要锚定其他机器人发的消息（如平台卡片），还需授权 `im:message.group_msg.include_bot:read`，否则列表里只有用户消息 |
 | `autoStartExcludedChats` | 这些群里不自动开工（入群和新话题都算），被 @ 时照常响应 |
 | `groupJoinCommandEnabled` / `groupJoinCommand` | 被拉进任意群时，直接在本机执行一条命令，不起会话、不经过模型。和 `autoStartOnGroupJoin` 互不影响，也不要求群里有管理员。同样需要订阅 `im.chat.member.bot.added_v1` |
 

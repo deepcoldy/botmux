@@ -50,7 +50,7 @@ import { latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
 import { materialize } from './state.js';
 import { withJournalMutationSync } from './journal.js';
 import { affectedNodesFrom } from './revisit-plan.js';
-import { v3NodePlacement, v3PlacementProblems } from './placement.js';
+import { v3CheckpointProblems, v3CheckpointsWithoutDependants, v3NodePlacement, v3PlacementProblems } from './placement.js';
 import type { V3RunSnapshot } from './state.js';
 
 // ─── Files ────────────────────────────────────────────────────────────────
@@ -757,6 +757,11 @@ export interface PlanV3DagRevisionInput {
   liftSpentRerunBudget?: boolean;
   /** Injected for tests; defaults to reading the done node's manifest. */
   readProducts?: (nodeId: string) => V3DoneNodeProducts | undefined;
+  /** The run's frozen executor. Checkpoints only take effect when goal nodes
+   *  run on bots, so only then is a checkpoint nothing depends on refused. */
+  nodeExecutor?: 'bot';
+  /** Bot display names for the §5.2 refusals (default: the app id). */
+  nameOf?: (larkAppId: string) => string;
 }
 
 /** A rerun refused because the revisit budget is spent: the initiator can
@@ -1234,8 +1239,37 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       return (added.has(nodeId) ? undefined : snap.assignments.get(nodeId))
         ?? snapshotForSelector(knownBots, defined)?.larkAppId ?? defined ?? mainApp;
     },
+    ...(input.nameOf ? { nameOf: input.nameOf } : {}),
   });
   if (placementProblems.length > 0) return { ok: false, problems: placementProblems.map((problem) => problem.message) };
+  // §13.6: an edit may not leave a checkpoint that nothing depends on (newly
+  // marked, its last dependant removed or rewired away, or one the flow
+  // already had). Only one that may still (re)complete counts. "May redo it"
+  // must match the supersede effects computed below exactly: the rerun cone
+  // re-dispatches a node only while it still has an effective instance.
+  //  - done: redone by this edit's reruns (itself or downstream of one) runs
+  //    again as a new instance;
+  //  - cancelled: an early-release loser is cancelled WITH its instance, so a
+  //    cone supersede revives it; one cancelled before dispatch has no
+  //    instance and stays cancelled;
+  //  - skipped: normally a pending node that never dispatched (no instance);
+  //    but a blocked node re-queued on its same instance
+  //    (nodeRetryRequested resetGate) and then skipped KEEPS the instance, so
+  //    the same cone-supersede revival applies to it.
+  if (input.nodeExecutor === 'bot') {
+    const redone = new Set([...rerun].flatMap((nodeId) => affectedNodesFrom(next, nodeId)));
+    const settled = (nodeId: string): boolean => {
+      if (added.has(nodeId)) return false;
+      const state = snap.nodes.get(nodeId);
+      if (state?.status === 'done') return !redone.has(nodeId);
+      if (state?.status === 'skipped' || state?.status === 'cancelled') {
+        return !redone.has(nodeId) || !state.effectiveInstanceId;
+      }
+      return false;
+    };
+    const sinks = v3CheckpointsWithoutDependants(next).filter((nodeId) => !settled(nodeId));
+    if (sinks.length > 0) return { ok: false, problems: v3CheckpointProblems(sinks) };
+  }
 
   // Updates that turned out to be no-ops do not count as changes.
   const changed = [...updated].filter((nodeId) => {

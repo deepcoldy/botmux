@@ -212,6 +212,12 @@ function restoreUpdatedTaskRow(
     patch.schedule = before.schedule;
     patch.parsed = before.parsed;
     patch.nextRunAt = before.nextRunAt;
+    patch.manualRunRequested = before.manualRunRequested;
+  }
+  if (updates.calendar !== undefined || updates.calendarDayType !== undefined) {
+    patch.calendar = before.calendar;
+    patch.calendarDayType = before.calendarDayType;
+    patch.lastCalendarCheck = before.lastCalendarCheck;
   }
   if (
     updates.deliver !== undefined

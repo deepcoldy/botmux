@@ -319,6 +319,14 @@ Requirements and limits:
 
 ### Waiting and no-progress reminders {#reminders}
 
+**`longTaskReminder`** sends an independent status card to the original chat or topic while an executing task remains unfinished. Configure it in **Bot Defaults → Message cards → Long-running task cards**; saves apply immediately.
+
+```json
+{"longTaskReminder": {"enabled": true, "thresholdMinutes": 10, "intervalMinutes": 10}}
+```
+
+Disabled by default. Both windows default to 10 minutes and accept integers from 1 to 10080. Timing starts at the observed native execution write, excluding queued and idle time. Progress and follow-up messages do not reset the running turn. Scans run every 30 seconds; repeats start at the previous successful delivery and missed cycles are not replayed. Failed sends retry after one minute using the same delivery ID. Completion, cancellation, worker exit or session closure stops reminders. Chat, DM and topic sessions are supported; document comments and headless sessions are excluded. Silent, meeting-driven and suppressed replay turns keep their auxiliary-UI restrictions; reminder cards do not invoke `outbound.send` hooks. Preferences persist, but execution timing requires a current worker observation and is never inferred across daemon restarts.
+
 **`sessionOwnerReminder`**: when a session sits in a state that needs a person and nothing changes, it @-mentions the session owner in the original topic at a fixed interval.
 
 ```json
@@ -631,6 +639,7 @@ By default a bot only starts working when @-mentioned. These fields make it more
 | `autoStartOnGroupJoinPrompt` | First task when auto-starting on group join. If empty, the bot looks at the group's context first and reports that it's ready if nobody has assigned anything |
 | `autoStartOnGroupJoinSeed` | Text of the opening message posted on join; a built-in text is used if empty |
 | `autoStartOnGroupJoinGateRequired` | `true`: auto-start on join also needs a matching `chat.bot_added` sync [hook](/en/hooks) to explicitly allow it, otherwise nothing happens. Useful when only specific groups should auto-start |
+| `autoStartOnGroupJoinAnchor` | Where the join session lives in a regular group. Default `"reply-mode"` follows the group's reply mode; `"latest-message"` skips the opening message and starts the session in the thread of the newest existing message (system events, recalled messages and this bot's own messages are skipped). Useful when another platform posts a context message and then adds the bot. Falls back to the default when there is no usable message or the read fails. Topic groups and `new-topic` mode are unaffected. Anchoring on a message sent by another bot (e.g. a platform card) also requires the `im:message.group_msg.include_bot:read` scope; without it only user messages are listed |
 | `autoStartExcludedChats` | Groups where auto-start (join and new topic) never happens; @-mentions still work |
 | `groupJoinCommandEnabled` / `groupJoinCommand` | When the bot is added to any group, run a command on this machine directly: no session, no model. Independent of `autoStartOnGroupJoin`, and no admin needs to be in the group. Also needs the `im.chat.member.bot.added_v1` subscription |
 

@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
+import { locateExecutable } from '../src/utils/executable.js';
 import {
   checkCliAvailability,
   checkCliAvailabilityAsync,
-  cliUnavailableMessage,
+  cliUnavailableMessageAfterRetry,
   hasAgentLaunchConfigChanged,
   preliminaryCliAvailability,
+  createAdapterAfterMissingCliWait,
 } from '../src/setup/cli-availability.js';
 
 // Pass-through spies: every process the availability check could start (the
@@ -254,14 +256,163 @@ describe('CLI launch availability', () => {
       .toEqual({ available: true, localExecutableRequired: false });
   });
 
-  it('builds an actionable user-facing failure message', () => {
+  it('builds an actionable user-facing failure message', async () => {
     process.env.PATH = '';
-    const message = cliUnavailableMessage({
+    const message = await cliUnavailableMessageAfterRetry({
       cliId: 'codex',
       cliPathOverride: '/definitely/missing/codex',
-    }, 'Codex');
+    }, 'Codex', { log: () => {}, alreadyWaited: true });
     expect(message).toContain('无法启动 Codex');
     expect(message).toContain('/definitely/missing/codex');
     expect(message).toContain('daemon');
+  });
+});
+
+describe('a launch whose CLI executable is missing', () => {
+  const tempDirs: string[] = [];
+  afterEach(() => {
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+  const tempDir = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-retry-'));
+    tempDirs.push(dir);
+    return dir;
+  };
+  const noLog = () => {};
+  /** What a launch says without (another) wait. */
+  const unwaited = (input: Parameters<typeof cliUnavailableMessageAfterRetry>[0], name: string) =>
+    cliUnavailableMessageAfterRetry(input, name, { log: noLog, alreadyWaited: true });
+
+  describe('the launch check', () => {
+    it('looks again after a wait and passes once the executable is back', async () => {
+      const dir = tempDir();
+      const input = { cliId: 'claude-code' as const, cliPathOverride: join(dir, 'claude') };
+      const waits: number[] = [];
+      const message = await cliUnavailableMessageAfterRetry(input, 'Claude', {
+        log: noLog,
+        alreadyWaited: false,
+        // The reinstall finishes while the launch waits.
+        sleep: async ms => { waits.push(ms); executable(dir, 'claude'); },
+      });
+      expect(message).toBeUndefined();
+      expect(waits).toHaveLength(1);
+    });
+
+    it('gives up after one more look with the message a launch without the retry gives', async () => {
+      const dir = tempDir();
+      const input = { cliId: 'claude-code' as const, cliPathOverride: join(dir, 'claude') };
+      const sleep = vi.fn(async () => {});
+      const message = await cliUnavailableMessageAfterRetry(input, 'Claude', { log: noLog, alreadyWaited: false, sleep });
+      expect(message).toBeDefined();
+      expect(message).toBe(await unwaited(input, 'Claude'));
+      expect(sleep).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not wait a second time in a launch that already waited', async () => {
+      const dir = tempDir();
+      const input = { cliId: 'claude-code' as const, cliPathOverride: join(dir, 'claude') };
+      const sleep = vi.fn(async () => {});
+      const message = await cliUnavailableMessageAfterRetry(input, 'Claude', { log: noLog, alreadyWaited: true, sleep });
+      expect(message).toBe(await unwaited(input, 'Claude'));
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('does not wait when the executable is there', async () => {
+      const dir = tempDir();
+      const input = { cliId: 'claude-code' as const, cliPathOverride: executable(dir, 'claude') };
+      const sleep = vi.fn(async () => {});
+      expect(await cliUnavailableMessageAfterRetry(input, 'Claude', { log: noLog, alreadyWaited: false, sleep })).toBeUndefined();
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('does not wait for a failure other than a missing executable', async () => {
+      const sleep = vi.fn(async () => {});
+      // An invalid launch configuration.
+      const invalid = { cliId: 'codex' as const, cliLaunchMode: 'forge-traex' as const };
+      expect(await cliUnavailableMessageAfterRetry(invalid, 'Codex', { log: noLog, alreadyWaited: false, sleep }))
+        .toBe(await unwaited(invalid, 'Codex'));
+      // Both executables there, but forge doctor fails.
+      const dir = tempDir();
+      executable(dir, 'traex');
+      writeFileSync(join(dir, 'forge'), '#!/bin/sh\necho not ready >&2\nexit 1\n');
+      chmodSync(join(dir, 'forge'), 0o755);
+      process.env.PATH = dir;
+      const doctorFails = { cliId: 'traex' as const, cliLaunchMode: 'forge-traex' as const };
+      const message = await cliUnavailableMessageAfterRetry(doctorFails, 'TraeX', { log: noLog, alreadyWaited: false, sleep });
+      expect(message).toContain('forge doctor');
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('the wait before the adapter resolves anything', () => {
+    /** An adapter that resolves its binary the way the real ones do: once, on
+     *  first read, falling back to the bare name when nothing is found. */
+    const fakeAdapterFactory = (rawBin: string) => {
+      const built: Array<{ readonly resolvedBin: string }> = [];
+      const create = () => {
+        let cached: string | undefined;
+        const adapter = {
+          get resolvedBin() {
+            return (cached ??= rawBin.startsWith('/') ? rawBin : (locateExecutable(rawBin) ?? rawBin));
+          },
+        };
+        built.push(adapter);
+        return adapter;
+      };
+      return { create, built };
+    };
+    const launch = (input: Parameters<typeof createAdapterAfterMissingCliWait>[0], factory: ReturnType<typeof fakeAdapterFactory>, sleep: (ms: number) => Promise<void>) =>
+      createAdapterAfterMissingCliWait(input, factory.create(), factory.create, { log: noLog, sleep });
+
+    it('waits once while the CLI is missing, and goes on with an adapter that resolves it as it is after the wait', async () => {
+      const dir = tempDir();
+      process.env.PATH = dir;
+      const factory = fakeAdapterFactory('claude');
+      const sleep = vi.fn(async () => { executable(dir, 'claude'); });
+      const { adapter, waited } = await launch({ cliId: 'claude-code' }, factory, sleep);
+      expect(waited).toBe(true);
+      expect(sleep).toHaveBeenCalledTimes(1);
+      // The first adapter cached the bare name while the command was gone.
+      expect(factory.built[0]!.resolvedBin).toBe('claude');
+      expect(adapter.resolvedBin).toBe(join(dir, 'claude'));
+    });
+
+    it('does not wait when the CLI is there, nor probe it again through a shell', async () => {
+      process.env.PATH = '';
+      const dir = tempDir();
+      const bin = executable(dir, 'claude');
+      // Found only through the adapter's resolved path (a login-shell install).
+      const factory = fakeAdapterFactory(bin);
+      const sleep = vi.fn(async () => {});
+      vi.mocked(childProcess.spawnSync).mockClear();
+      const { adapter, waited } = await launch({ cliId: 'claude-code' }, factory, sleep);
+      expect(waited).toBe(false);
+      expect(adapter).toBe(factory.built[0]);
+      expect(sleep).not.toHaveBeenCalled();
+      expect(childProcess.spawnSync).not.toHaveBeenCalled();
+    });
+
+    it('checks what the launch really needs: a wrapper, a runner\'s second stage, both Forge binaries', async () => {
+      const dir = tempDir();
+      executable(dir, 'claude');
+      process.env.PATH = dir;
+      const sleep = vi.fn(async () => {});
+      const waited = async (input: Parameters<typeof createAdapterAfterMissingCliWait>[0], bin: string) =>
+        (await launch(input, fakeAdapterFactory(bin), sleep)).waited;
+      expect(await waited({ cliId: 'claude-code', wrapperCli: join(dir, 'aiden') }, 'claude')).toBe(true);
+      // codex-app's adapter binary is the bundled runner, not codex.
+      expect(await waited({ cliId: 'codex-app', cliPathOverride: join(dir, 'codex') }, process.execPath)).toBe(true);
+      executable(dir, 'traex');
+      expect(await waited({ cliId: 'traex', cliLaunchMode: 'forge-traex' }, 'traex')).toBe(true);
+      expect(sleep).toHaveBeenCalledTimes(3);
+    });
+
+    it('does not wait for an invalid launch configuration or an agent with nothing to launch locally', async () => {
+      process.env.PATH = '';
+      const sleep = vi.fn(async () => {});
+      expect((await launch({ cliId: 'codex', cliLaunchMode: 'forge-traex' }, fakeAdapterFactory('codex'), sleep)).waited).toBe(false);
+      expect((await launch({ cliId: 'mira' }, fakeAdapterFactory(process.execPath), sleep)).waited).toBe(false);
+      expect(sleep).not.toHaveBeenCalled();
+    });
   });
 });

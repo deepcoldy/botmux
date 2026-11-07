@@ -15,8 +15,10 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from './daemon-heartbeat.js';
+import { parseLarkConnectionHealth, type LarkConnectionHealth } from '../im/lark/transport/connection-health.js';
 
 export interface OnlineDaemonInfo {
+  larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   ipcPort: number;
   /** Random per-process audience for authenticated Workflow v3 mutations. */
@@ -95,7 +97,9 @@ export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } =
       const d = JSON.parse(raw) as Partial<OnlineDaemonInfo>;
       if (typeof d.ipcPort !== 'number' || typeof d.larkAppId !== 'string') continue;
       if (now - (d.lastHeartbeat ?? 0) > DAEMON_HEARTBEAT_STALE_MS) continue;
+      const larkConnection = parseLarkConnectionHealth(d.larkConnection);
       out.push({
+        ...(larkConnection !== undefined ? { larkConnection } : {}),
         larkAppId: d.larkAppId,
         ipcPort: d.ipcPort,
         ...(typeof d.bootInstanceId === 'string' && d.bootInstanceId

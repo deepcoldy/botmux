@@ -332,6 +332,10 @@ export interface SessionBackend {
    */
   onScreenResync?(cb: (snapshot: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
+  /** After onExit: true when the exit was the multiplexer server being lost
+   *  (another server now answers on the socket), not the CLI exiting. A
+   *  restart for that exit must not spend the fresh-session fallback budget. */
+  exitedBecauseServerReplaced?(): boolean;
   kill(): void;
   /** Permanently destroy the backing session (e.g. kill tmux session).
    *  Called only on explicit /close. Default: same as kill(). */

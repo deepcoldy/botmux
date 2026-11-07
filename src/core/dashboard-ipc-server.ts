@@ -1,5 +1,10 @@
+import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
+import { isSessionEffortChangeInFlight } from './worker-pool.js';
+import { scheduleActiveRuntimePatch } from './worker-pool.js';
+import { botModelPins, clearModelPins } from './model-pin-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
+import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexConfigPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
@@ -110,7 +115,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
-import { resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { envSandboxMode, resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
@@ -266,6 +271,8 @@ import { knownBotAppIds } from '../services/known-bot-app-ids.js';
 import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
+import { createGroupMessageRecallService } from '../services/group-message-recall-lark.js';
+import { GroupRecallError } from '../services/group-message-recall.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { readProjectGroup } from '../services/project-group-store.js';
 import {
@@ -276,6 +283,8 @@ import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
+import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
+import type { RestartObserver } from './restart-coordinator.js';
 
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -301,6 +310,8 @@ import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
+import { DEFAULT_LONG_TASK_REMINDER } from '../services/long-task-reminder-policy.js';
+import { updateLongTaskReminderConfig } from '../services/long-task-reminder-config-store.js';
 import {
   selectIdleSuspendCandidates,
   sweepIdleWorkersByAgeAfterTurnDrain,
@@ -1535,7 +1546,7 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   // Opt-in, so a CLI with the original strict key check never sees new keys.
   const fields = (body as Record<string, unknown>).fields;
   const includeOrigin = Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_ORIGIN_FIELD);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1573,7 +1584,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
   if (!sessionId || !tool) return jsonRes(res, 400, blocked);
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
@@ -1667,7 +1678,7 @@ for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
       || (route === BACKGROUND_REVOKE_ROUTE && (typeof body.jobId !== 'string' || body.jobId.length > 128))) {
       return jsonRes(res, 400, { error: 'invalid_background_request' });
     }
-    const peer = resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
+    const peer = await resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
       remotePort: req.socket.remotePort, localPort: req.socket.localPort });
     if (!peer.ok) return jsonRes(res, 403, { error: 'current_execution_unverified' });
     const input = { sessionDataDir: config.session.dataDir, sessionId: body.sessionId, peer: peer.peer };
@@ -1704,7 +1715,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     && body.expectedScheduledTurnId.length <= 256
     ? body.expectedScheduledTurnId
     : undefined;
-  const peer = resolveLoopbackPeerProcesses({
+  const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
     localPort: req.socket.localPort,
@@ -2757,36 +2768,54 @@ ipcRoute('POST', '/api/sessions/:sessionId/prune', async (_req, res, params) => 
   });
 });
 
-/** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
+/** Post a dashboard restart's status card into the session's Lark thread/chat,
  *  mirroring the /resume route — so a Feishu-side observer sees why the CLI just
- *  restarted under them (the IM `/restart` command and the card button notify
- *  too; the dashboard was the lone silent path). `fresh` = the worker was gone
- *  and we re-forked it (revive) rather than doing an in-place CLI restart.
- *  Best-effort and fire-and-forget; never blocks the HTTP response. */
-function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
-  if (!ds.larkAppId) return;
+ *  restarted under them and how it ended. Same card as IM `/restart` and the
+ *  card button; routing stays the dashboard's own (chat-scope: flat group →
+ *  chat message, topic group → threaded reply to the root; thread-scope →
+ *  threaded reply). Best-effort; never blocks the HTTP response. */
+function dashboardRestartObserver(ds: DaemonSession): RestartObserver {
+  const sessionId = ds.session.sessionId;
+  const warnUnsettled = (status: string) => {
+    if (status === 'failed' || status === 'timed_out') logger.warn(`[restart] dashboard restart of ${sessionId} ${status}`);
+  };
   // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
-  // to post a restart notice into — skip (the raw sendMessage/replyMessage below
-  // bypass sessionReply's gate). Best-effort path; a silent skip is correct.
-  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
-  const loc = localeForBot(ds.larkAppId);
-  const botCfg = getBot(ds.larkAppId).config;
+  // to post into — the raw sendMessage/replyMessage below bypass sessionReply's
+  // gate. Best-effort path; a silent skip is correct.
+  if (!ds.larkAppId
+    || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) {
+    return { source: 'dashboard', notify: warnUnsettled };
+  }
+  const larkAppId = ds.larkAppId;
+  const loc = localeForBot(larkAppId);
+  const botCfg = getBot(larkAppId).config;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime)
     ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId ?? 'claude-code');
-  const text = fresh
-    ? t('card.action.restarted_fresh', { cliName }, loc)
-    : t('cmd.restart.in_progress', { cliName }, loc);
-  const notice = JSON.stringify({ text });
-  if (ds.scope === 'chat' && ds.chatId) {
-    getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-      .then((mode) => mode === 'topic' && ds.session.rootMessageId
-        ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-      .catch(err => logger.debug(`[restart] failed to post chat-scope restart notice: ${err}`));
-  } else if (ds.session.rootMessageId) {
-    replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-      .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
-  }
+  const post = async (card: string): Promise<string | undefined> => {
+    if (ds.scope === 'chat' && ds.chatId) {
+      const mode = await getChatMode(larkAppId, ds.chatId, { forceRefresh: true });
+      return mode === 'topic' && ds.session.rootMessageId
+        ? replyMessage(larkAppId, ds.session.rootMessageId, card, 'interactive', true)
+        : sendMessage(larkAppId, ds.chatId, card, 'interactive');
+    }
+    if (ds.session.rootMessageId) {
+      return replyMessage(larkAppId, ds.session.rootMessageId, card, 'interactive', true);
+    }
+    return undefined;
+  };
+  const notify = restartStatusCardNotifier({
+    larkAppId,
+    sessionId,
+    render: status => buildRestartStatusCard({ status, cliName, source: 'dashboard', locale: loc }),
+    post,
+  });
+  return {
+    source: 'dashboard',
+    notify: (status, attemptId) => {
+      warnUnsettled(status);
+      return notify(status, attemptId);
+    },
+  };
 }
 
 /** Privileged host recovery: worker capabilities and request actor claims do not authorize this route. */
@@ -2816,6 +2845,50 @@ ipcRoute('POST', '/api/sessions/:sessionId/failure-recovery', async (req, res, p
   } catch {
     return jsonRes(res, 503, { ok: false, error: 'recovery_persistence_unavailable' });
   }
+});
+
+function clearDashboardModelPins(appId: string, sessionId?: string): string[] {
+  return clearModelPins(appId, sessionId, {
+    findActive: findActiveBySessionId,
+    assertMutable(ds) {
+      const reason = isSessionTransferring(ds) ? 'transferring' : isSessionRestartInFlight(ds) ? 'restarting'
+        : isSessionEffortChangeInFlight(ds) ? 'effort_change' : undefined;
+      if (reason) throw new ModelPinBusyError([{ sessionId: ds.session.sessionId, reason }]);
+    },
+    publish(id) {
+      dashboardEventBus.publish({ type: 'session.update', body: { sessionId: id, patch: { modelPin: null } } });
+      const ds = findActiveBySessionId(id);
+      if (ds) try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`Pin card refresh failed: ${String(error)}`); }
+    },
+  });
+}
+
+ipcRoute('GET', '/api/bots/:appId/model-pins', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  if (params.appId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false });
+  return jsonRes(res, 200, { ok: true, ...botModelPins(params.appId, findActiveBySessionId) });
+});
+ipcRoute('DELETE', '/api/bots/:appId/model-pins', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  if (params.appId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false });
+  return withBotTurnMutation(params.appId, () => {
+    try { return jsonRes(res, 200, { ok: true, cleared: clearDashboardModelPins(params.appId) }); }
+    catch (error) {
+      const body = modelPinClearError(error);
+      return jsonRes(res, body.error === 'session_not_found' ? 404 : 409, body);
+    }
+  });
+});
+ipcRoute('DELETE', '/api/sessions/:sessionId/model-pin', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  const appId = cachedLarkAppId;
+  return withBotTurnMutation(appId, () => {
+    try { return jsonRes(res, 200, { ok: true, cleared: clearDashboardModelPins(appId, params.sessionId) }); }
+    catch (error) {
+      const body = modelPinClearError(error);
+      return jsonRes(res, body.error === 'session_not_found' ? 404 : 409, body);
+    }
+  });
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
@@ -2860,36 +2933,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
     });
   }
   const cliId = ds.session.cliId ?? 'unknown';
-  if (ds.worker && !ds.worker.killed) {
-    // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
-    // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
-    // Correlated through the restart coordinator like IM /restart: the
-    // in-worker respawn emits no second `ready`, so only the attemptId-matched
-    // restart_result lifts the workerReady fence (#1863).
-    const sessionId = params.sessionId;
-    const restart = requestSessionRestart(ds, {
-      source: 'dashboard',
-      notify: status => {
-        if (status === 'failed' || status === 'timed_out') {
-          logger.warn(`[restart] dashboard restart of ${sessionId} ${status}`);
-        }
-      },
-    });
-    if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
-    if (restart.startFailure) {
-      return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
-    }
-    postRestartNotice(ds, false);
-    return jsonRes(res, 200, { ok: true, sessionId, cliId, revived: false });
+  const sessionId = params.sessionId;
+  // Live worker → in-place CLI restart (kills the CLI, respawns with --resume);
+  // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
+  // Worker gone but the session still active (idle-suspended over the per-bot
+  // cap, lazy-restored after a daemon restart, crash-loop-stopped) → revive it,
+  // so the dashboard isn't a dead-end: the resume button only shows for closed
+  // sessions. Both go through the restart coordinator exactly like the Feishu
+  // card button and IM /restart: the in-worker respawn emits no second
+  // `ready`, so only the attemptId-matched restart_result lifts the
+  // workerReady fence (#1863); and a worker-less restart first tears down a
+  // still-alive pane, so the revive is a real relaunch rather than a reattach
+  // to the wedged CLI — and its result can update the status card.
+  const revived = !ds.worker || ds.worker.killed;
+  const restart = requestSessionRestart(ds, dashboardRestartObserver(ds));
+  if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+  if (restart.startFailure) {
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
   }
-  // Worker is gone but the session is still active — idle-suspended (over the
-  // per-bot cap), lazy-restored after a daemon restart, or crash-loop-stopped.
-  // Revive it the same way the Feishu card restart does (forkWorker), so the
-  // dashboard isn't a dead-end: a 409 here would leave NO working control to
-  // bring the CLI back (the resume button only shows for closed sessions).
-  forkWorker(ds, '', ds.hasHistory);
-  postRestartNotice(ds, true);
-  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
+  return jsonRes(res, 200, { ok: true, sessionId, cliId, revived });
   });
 });
 
@@ -3425,7 +3487,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const peer = process.platform === 'linux'
     ? (proxyPeer
       ? { ok: true as const, peer: proxyPeer }
-      : resolveLoopbackPeerProcesses({
+      : await resolveLoopbackPeerProcesses({
           remoteAddress: req.socket.remoteAddress,
           remotePort: req.socket.remotePort,
           localPort: req.socket.localPort,
@@ -3623,7 +3685,7 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
     } else if (!boundTool) {
-      const peer = resolveLoopbackPeerProcesses({
+      const peer = await resolveLoopbackPeerProcesses({
         remoteAddress: req.socket.remoteAddress,
         remotePort: req.socket.remotePort,
         localPort: req.socket.localPort,
@@ -5867,11 +5929,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
-  const notice = JSON.stringify({
-    text: result.recoveryPending
-      ? `🔄 ${cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话。`
-      : `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。`,
-  });
+  const loc = localeForBot(ds.larkAppId);
+  // Plain text — the Lark client does the {"text": …} wrapping for 'text'.
+  // Mirror the card-button / /resume receipt wording: when the adapter can only
+  // resume a precise cliSessionId and none was persisted, the next spawn is a
+  // fresh CLI, so say so instead of claiming the old history is back.
+  const notice = result.recoveryPending
+    ? t('card.action.resume_started_remote', { cliName }, loc)
+    : resumeStartsFresh(ds.session)
+      ? t('card.action.resume_success_fresh', { cliName }, loc)
+      : t('cmd.resume.cli_success', { cliName }, loc);
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {
@@ -7566,6 +7633,33 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
   }
 }));
 
+// Host-only routes: deliberately absent from public and session-capability allowlists.
+ipcRoute('GET', '/api/groups/:chatId/messages', requireBoundBot(async (req, res, p) => {
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  try {
+    const result = await createGroupMessageRecallService(cachedLarkAppId).list(p.chatId, {
+      pageToken: query.get('pageToken') ?? undefined,
+      threadRootId: query.get('threadRootId') ?? undefined,
+    });
+    return jsonRes(res, 200, result);
+  } catch (error) {
+    return jsonRes(res, error instanceof GroupRecallError ? error.status : 502,
+      { ok: false, error: error instanceof Error ? error.message : 'message_list_failed' });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('POST', '/api/groups/:chatId/messages/recall', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (body === BAD_JSON) return;
+  try {
+    const result = await createGroupMessageRecallService(cachedLarkAppId).recall(p.chatId, body);
+    return jsonRes(res, 200, result);
+  } catch (error) {
+    return jsonRes(res, error instanceof GroupRecallError ? error.status : 502,
+      { ok: false, error: error instanceof Error ? error.message : 'message_recall_failed' });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, res, p) => {
   try {
     const inChat = await groupsStore.isInChat(cachedLarkAppId, p.chatId);
@@ -8712,6 +8806,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   let maxLiveWorkers: number | null = null;
   let idleSuspendMinutes: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
+  /** Resolved long-task defaults are exposed even before the first console save. */
+  let longTaskReminder = DEFAULT_LONG_TASK_REMINDER;
   try {
     const botConfig = getBot(cachedLarkAppId).config;
     const m = botConfig.maxLiveWorkers;
@@ -8719,6 +8815,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     const ttl = botConfig.idleSuspendMinutes;
     if (typeof ttl === 'number' && Number.isInteger(ttl) && ttl > 0) idleSuspendMinutes = ttl;
     sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
+    longTaskReminder = botConfig.longTaskReminder ?? DEFAULT_LONG_TASK_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
   let residentSessionCount = 0;
@@ -8866,6 +8963,11 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     askOptionLayout,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
+    // Machine-wide BOTMUX_SANDBOX force the worker applies over this bot's own
+    // selection (null = none). Lets the page say why "关闭" is not what runs.
+    sandboxEnvForce: (() => {
+      try { const m = envSandboxMode(process.env.BOTMUX_SANDBOX); return m === 'off' ? null : m; } catch { return null; }
+    })(),
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
@@ -8979,6 +9081,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     maxLiveWorkers,
     idleSuspendMinutes,
     sessionOwnerReminder,
+    longTaskReminder,
     logicalSessionCount,
     residentSessionCount,
     dormantSessionCount,
@@ -11038,6 +11141,21 @@ ipcRoute('PUT', '/api/bot-session-owner-reminder', requireBoundBot(async (req, r
   const result = await updateSessionOwnerReminderConfig(cachedLarkAppId, raw);
   if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
   return jsonRes(res, 200, { ok: true, sessionOwnerReminder: result.config });
+}));
+
+// Owning daemon validates, persists, then hot-applies the per-bot reminder policy.
+ipcRoute('PUT', '/api/bot-long-task-reminder', requireBoundBot(async (req, res) => {
+  /** Only structured preferences are accepted; no model prompts or message text. */
+  const raw = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (raw === BAD_JSON) {
+    return;
+  }
+  /** The store serializes this update with other concurrent bot configuration edits. */
+  const result = await updateLongTaskReminderConfig(cachedLarkAppId, raw);
+  if (!result.ok) {
+    return jsonRes(res, 400, { ok: false, error: result.reason });
+  }
+  return jsonRes(res, 200, { ok: true, longTaskReminder: result.config });
 }));
 
 // Per-bot skill policy. Dashboard uses this for attach/detach; JSON policy

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
@@ -131,7 +132,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -156,6 +157,7 @@ import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
 import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
+import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -183,6 +185,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
+import { applyRespawnConfigPatch } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
@@ -216,6 +219,7 @@ import {
   handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
   pendingInputMayFlush,
+  promoteInteractiveInputPastSchedules,
   pendingInputAllowsTypeAhead,
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
@@ -395,7 +399,7 @@ import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRollout
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession } from './services/doubao-transcript.js';
-import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
+import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import type { OmpTranscriptState } from './services/omp-transcript.js';
@@ -479,7 +483,7 @@ import {
 } from './services/codex-session-upgrade.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
 import { buildForgeTraexLaunch, validateCliLaunchModeConfig } from './core/cli-launch-mode.js';
-import { cliUnavailableMessage } from './setup/cli-availability.js';
+import { cliUnavailableMessageAfterRetry, createAdapterAfterMissingCliWait } from './setup/cli-availability.js';
 import {
   findLaunchedCliPid,
   findCliProcess,
@@ -719,6 +723,7 @@ import {
   type TraexModelLoadSnapshot,
 } from './services/traex-model-load.js';
 import { readTraexModelQuotas, TRAEX_QUOTA_ERROR_CODE } from './services/traex-quota.js';
+import { TRAEX_MODEL_ACCESS_ERROR_CODE } from './services/traex-model-access.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
@@ -2237,6 +2242,8 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
  *  (non-forced) config, so healthy restarts (e.g. user `/restart`) are
  *  unaffected. */
 let consecutiveInWorkerRestarts = 0;
+/** The last CLI exit was the tmux server being lost, not the CLI (see restart-fresh-budget.ts). */
+let lastCliExitServerReplaced = false;
 let tmuxRestartTimer: NodeJS.Timeout | null = null;
 /** Guard: user_notify for "resume → fresh fallback" is sent once per worker
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
@@ -3170,7 +3177,12 @@ let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let traexAutoModelController: TraexAutoModelController | null = null;
 let traexAutoModelSwitching = false;
 let traexAutoModelTurnReplayForbidden = false;
-let traexQuotaPending: { turnId: string; failedTurn?: CodexPendingTurn } | undefined;
+type TraexPendingRecovery = { turnId: string; failedTurn?: CodexPendingTurn; stopRequested?: boolean };
+let traexQuotaPending: TraexPendingRecovery | undefined;
+let traexModelAccessSwitchNotice: {
+  action: Extract<TraexAutoModelAction, { kind: 'switch' }>;
+  nativeSessionId: string;
+} | undefined;
 let traexAutoModelPreflightPending: { item: PendingCliInput; generation: number; startedAtMs: number } | undefined;
 let traexAutoModelReasoningEfforts = new Map<string, readonly import('./services/codex-reasoning-effort.js').CodexReasoningEffort[]>();
 
@@ -5518,6 +5530,9 @@ function configureTraexAutoModel(
     cfg.codexRpcInput = false;
     if (lastInitConfig) lastInitConfig.codexRpcInput = false;
   }
+  if (!restoreRuntime || traexModelAccessSwitchNotice?.nativeSessionId !== cfg.cliSessionId) {
+    traexModelAccessSwitchNotice = undefined;
+  }
   traexAutoModelController = managedAuto && cfg.traexAutoModel
     ? new TraexAutoModelController(cfg.traexAutoModel, restoreRuntime, sharedSettings)
     : null;
@@ -5620,6 +5635,28 @@ function enqueueTraexAutoModelRecovery(turnId: string): boolean {
   return true;
 }
 
+/** A proposed restart is not proof that a candidate is executing or queued. */
+function notifyTraexModelAccessSwitchActivity(turnId: string, queued: boolean, progressing: boolean, completed = false): void {
+  const notice = traexModelAccessSwitchNotice;
+  if (!notice || (!queued && !progressing) || !backend
+    || (!completed && (cliRestartInProgress || traexAutoModelSwitching))
+    || notice.action.turnId !== turnId || currentBotmuxTurnId !== turnId
+    || notice.nativeSessionId !== lastInitConfig?.cliSessionId
+    || notice.action.toModel !== traexAutoModelController?.currentModel()
+    || (!queued && !completed && !traexAutoModelController.modelProgressConfirmed())) return;
+  traexModelAccessSwitchNotice = undefined;
+  const action = notice.action;
+  const waiting = traexAutoModelController!.runtimeState(notice.nativeSessionId).waitingOnFinalModel;
+  const threshold = traexAutoModelController!.config.overloadThresholdPercent
+    ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+  send({ type: 'user_notify', turnId, message: t(queued
+    ? waiting ? 'worker.traex_auto_model.access_wait' : 'worker.traex_auto_model.access_queued_model'
+    : !waiting && action.loadPercent !== undefined && action.loadPercent <= threshold
+      ? 'worker.traex_auto_model.access_available_model' : 'worker.traex_auto_model.access_selected_model', {
+    fromModel: action.fromModel, toModel: action.toModel, model: action.toModel, load: action.loadPercent ?? '?',
+  }) });
+}
+
 function executeTraexAutoModelSwitch(
   action: Extract<TraexAutoModelAction, { kind: 'switch' }>,
   opts: { resumeCurrentTurn: boolean; dispatchAttempt?: number },
@@ -5651,7 +5688,12 @@ function executeTraexAutoModelSwitch(
     || action.reason === 'preflight_lowest_load'
     ? action as Extract<TraexAutoModelPreflightDecision, { kind: 'switch' }>
     : undefined;
-  send({
+  if (action.restrictionRecovery) {
+    traexModelAccessSwitchNotice = { action, nativeSessionId };
+    send({ type: 'user_notify', turnId: action.turnId, message: t('worker.traex_auto_model.access_search', {
+      fromModel: action.fromModel, toModel: action.toModel,
+    }) });
+  } else send({
     type: 'user_notify',
     turnId: action.turnId,
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
@@ -5713,7 +5755,7 @@ function executeTraexAutoModelSwitch(
 function observeTraexAutoModelCapacity(screen: string): void {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()) return;
-  if (traexAutoModelSwitching || cliRestartInProgress || isFlushing
+  if (traexAutoModelSwitching || cliRestartInProgress || isFlushing || traexQuotaPending
     || isPromptReady || traexAutoModelTurnReplayForbidden
     || !lastInitConfig?.cliSessionId) return;
 
@@ -5725,13 +5767,18 @@ function observeTraexAutoModelCapacity(screen: string): void {
   }
   const awaitingActivity = controller.awaitingModelActivity();
   const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
+  const queued = traexCapacityQueueVisible(screen);
   const action = controller.observeCapacityQueue({
     turnId: active.turnId,
-    queued: traexCapacityQueueVisible(screen),
+    queued,
     nowMs: Date.now(),
     queuePosition: traexCapacityQueuePosition(screen),
     progressing,
   });
+  if (queued && controller.modelAccessRecoveryActive()) {
+    publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig.reasoningEffort });
+  }
+  if (traexModelAccessSwitchNotice && active.turnId) notifyTraexModelAccessSwitchActivity(active.turnId, queued, progressing);
   if (awaitingActivity && !controller.awaitingModelActivity() && progressing) {
     void flushPending();
   }
@@ -5753,7 +5800,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
         || !active?.started || active.turnId !== action.turnId
         || active.dispatchAttempt !== undefined || isPromptReady
         || currentBotmuxTurnId !== action.turnId || commandLineWritesPending > 0
-        || isFlushing || traexAutoModelTurnReplayForbidden) {
+        || isFlushing || traexQuotaPending || controller.recoveryStopped(action.turnId)
+        || traexAutoModelTurnReplayForbidden) {
         // A rejected reply must not strand the controller's pending check.
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
         return;
@@ -5764,7 +5812,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
       else if (choice.kind === 'exhausted') {
         publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
         send({ type: 'user_notify', turnId: choice.turnId,
-          message: t('worker.traex_auto_model.lowest_load_hold', {
+          message: t(choice.restrictionRecovery ? 'worker.traex_auto_model.access_wait'
+            : 'worker.traex_auto_model.lowest_load_hold', {
             model: choice.model, load: choice.loadPercent ?? '?',
           }) });
       } else {
@@ -5781,7 +5830,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
     send({
       type: 'user_notify',
       turnId: action.turnId,
-      message: t('worker.traex_auto_model.exhausted', {
+      message: t(action.restrictionRecovery ? 'worker.traex_auto_model.access_wait'
+        : 'worker.traex_auto_model.exhausted', {
         count: action.modelCount,
         model: action.model,
       }),
@@ -5938,35 +5988,55 @@ function selectTraexQuotaModelBeforeTurn(head: PendingCliInput): boolean {
   return true;
 }
 
-/** Hold a confirmed quota terminal before it is settled. The same native
- * session and ordinary turn must still own the result after async IO. */
+/** Hold only confirmed quota/access failures before settlement. The same
+ * native session and ordinary turn must still own recovery after async IO. */
 function recoverTraexQuotaTurn(turn: CodexPendingTurn): boolean {
   const controller = traexAutoModelController;
   const active = activeTurnAuthority.snapshot();
-  if (!traexAutoModelRuntimeEligible() || controller?.config.trigger !== 'quota'
-    || turn.terminalStatus !== 'failed' || turn.terminalErrorCode !== TRAEX_QUOTA_ERROR_CODE
+  const accessFailure = turn.terminalErrorCode === TRAEX_MODEL_ACCESS_ERROR_CODE;
+  const capacityRecovery = accessFailure || (turn.terminalErrorCode === TRAEX_QUOTA_ERROR_CODE
+    && controller?.modelAccessRecoveryActive() === true);
+  if (!controller || !traexAutoModelRuntimeEligible()
+    || (!capacityRecovery && (controller.config.trigger !== 'quota' || turn.terminalErrorCode !== TRAEX_QUOTA_ERROR_CODE))
+    || turn.terminalStatus !== 'failed'
     || turn.isLocal || turn.dispatchAttempt !== undefined || turn.supersededTurns?.length
     || !turn.sourceTurnId || !lastInitConfig?.cliSessionId
     || traexAutoModelTurnReplayForbidden || traexAutoModelSwitching || cliRestartInProgress
     || !active?.started || active.turnId !== turn.turnId || active.dispatchAttempt !== undefined
-    || currentBotmuxTurnId !== turn.turnId || controller.currentTurnId() !== turn.turnId) return false;
+    || currentBotmuxTurnId !== turn.turnId || controller.currentTurnId() !== turn.turnId
+    || controller.recoveryStopped(turn.turnId)) return false;
   if (traexQuotaPending) return traexQuotaPending.turnId === turn.turnId;
-  const token = { turnId: turn.turnId, failedTurn: turn };
+  const token: TraexPendingRecovery = { turnId: turn.turnId, failedTurn: turn };
   const generation = cliSpawnGeneration;
   const nativeSessionId = lastInitConfig.cliSessionId;
+  const target = backend;
   traexQuotaPending = token;
-  void currentTraexQuotas().catch(() => null).then(quotas => {
-    if (traexQuotaPending !== token) return;
+  if (capacityRecovery) {
+    // Invalidate older capacity proposals and persist the refusal before IO.
+    controller.recordUnavailableModel(turn.turnId);
+    publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig.reasoningEffort });
+    if (traexModelAccessSwitchNotice?.action.turnId === turn.turnId) traexModelAccessSwitchNotice = undefined;
+  }
+  const evidence = capacityRecovery
+    ? currentTraexLoadSnapshot(TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS).catch(() => null)
+      .then(snapshot => ({ kind: 'access' as const, snapshot }))
+    : currentTraexQuotas().catch(() => null).then(quotas => ({ kind: 'quota' as const, quotas }));
+  void evidence.then(result => {
+    if (traexQuotaPending !== token || token.stopRequested) return;
     traexQuotaPending = undefined;
     const active = activeTurnAuthority.snapshot();
-    if (generation !== cliSpawnGeneration || lastInitConfig?.cliSessionId !== nativeSessionId
+    if (generation !== cliSpawnGeneration || backend !== target || lastInitConfig?.cliSessionId !== nativeSessionId
       || !active?.started || active.turnId !== turn.turnId) return;
     if (controller === traexAutoModelController && traexAutoModelRuntimeEligible()
-      && !traexAutoModelTurnReplayForbidden) {
-      const action = controller.observeQuotaFailure(turn.turnId, quotas);
+      && !traexAutoModelTurnReplayForbidden && !cliRestartInProgress && !traexAutoModelSwitching) {
+      if (result.kind === 'access') rememberTraexModelLoadSnapshot(result.snapshot);
+      const action = result.kind === 'access'
+        ? controller.observeModelAccessFailure(turn.turnId, result.snapshot?.loads ?? null)
+        : controller.observeQuotaFailure(turn.turnId, result.quotas);
       publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
       if (action.kind === 'switch' && executeTraexAutoModelSwitch(action, { resumeCurrentTurn: true })) return;
-      if (action.kind === 'exhausted') turn.terminalErrorSummary = t('worker.traex_auto_model.quota_exhausted');
+      if (action.kind === 'exhausted') turn.terminalErrorSummary = t(capacityRecovery
+        ? 'worker.traex_auto_model.access_exhausted' : 'worker.traex_auto_model.quota_exhausted');
     }
     emitReadyCodexTurns([turn]);
     idleDetector?.fireIdle();
@@ -8066,6 +8136,8 @@ const bridgeQueue = new BridgeTurnQueue(
  *  - `backgroundWait()`: the count the card shows while the main turn has
  *    ended but background work is still running (see backgroundWaitTasks). */
 const backgroundTaskTracker = new BackgroundTaskTracker();
+/** What this worker last reported as pinned (syncBackgroundTaskPinsToDaemon). */
+const backgroundTaskPins = new BackgroundTaskPinSnapshot();
 /** Background tasks shown on the card as 「主回合已结束 · 后台子任务运行中（N）」;
  *  0 otherwise. Mirrors backgroundTaskTracker.backgroundWait(), re-read after
  *  every transcript drain and sampler tick; the sampler publishes a change.
@@ -8082,6 +8154,28 @@ function refreshBackgroundWait(): void {
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
   if (next === 0) backgroundStopScanOffsets.clear();
   backgroundWaitTasks = next;
+  syncBackgroundTaskPinsToDaemon();
+}
+
+/** Tell the daemon which Lark turns this worker's running Claude background
+ *  tasks were launched from. A wake answer is forwarded to that turn's topic
+ *  (emitReadyTurns), and the daemon resolves the topic from a replyTargets
+ *  record it would otherwise evict once newer turns pile up — so it keeps
+ *  these records while the task runs, as it does for a live CronCreate task.
+ *  Only where a wake is forwarded at all (transcript delivery, not adopt /
+ *  zero-injection), so send-mode sessions keep their eviction unchanged; sent
+ *  only when the set changes. The daemon drops the pins when this worker exits. */
+function syncBackgroundTaskPinsToDaemon(): void {
+  if (lastInitConfig?.adoptMode === true || zeroPromptTerminalSync() || replyDeliveryMode() !== 'transcript') return;
+  const turnIds = bridgeQueue.backgroundTaskAnchorTurnIds(backgroundTaskTracker.liveTaskIds());
+  // The first snapshot always goes out, even empty (see BackgroundTaskPinSnapshot).
+  if (!backgroundTaskPins.changed(turnIds)) return;
+  try {
+    send({ type: 'background_task_pins_sync', turnIds });
+    backgroundTaskPins.markSent(turnIds);
+  } catch (err: any) {
+    log(`Background task pin sync failed (${err.message})`);
+  }
 }
 
 /** Sibling Claude transcripts already read for background-task stops, and
@@ -11092,7 +11186,16 @@ function emitReadyTurns(opts: {
     // check at the gate below can never run. Scheduled turns are always
     // evaluated AFTER the transcript text is available, where NOTHING_TO_SEND
     // and send-marker dedup (incl. the length comparison) have the final.
-    if (!turn.isScheduled && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+    // A background-task wake in transcript delivery is forwarded like a
+    // scheduled turn (its final is the session's only reply channel), so it
+    // skips this pre-text gate for the same reason. Every other delivery mode
+    // keeps it an ordinary headless local turn.
+    const forwardBackgroundWake = turn.isBackgroundWake === true && !adoptMode
+      && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript';
+    if (turn.backgroundWakeUnrouted === true && !adoptMode && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript') {
+      log(`Background wake ${turn.turnId.substring(0, 8)} not forwarded: its task notifications resolve to no single launching Lark turn`);
+    }
+    if (!turn.isScheduled && !forwardBackgroundWake && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (local-typed)`);
       continue;
     }
@@ -11144,6 +11247,7 @@ function emitReadyTurns(opts: {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       isScheduled: turn.isScheduled,
+      ...(forwardBackgroundWake ? { isBackgroundWake: true } : {}),
       finalText: assistantText,
       forwardLocalFinal: zeroPromptTerminalSync(),
     }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
@@ -11155,7 +11259,8 @@ function emitReadyTurns(opts: {
       // turn here already means completed. The claude family's limits arrive via
       // maybeEmitStructuredRateLimit → noteStructuredLimit, which revokes this.
       usageLimitTracker.noteTurnCompleted('answered');
-      const reason = turn.isScheduled ? 'scheduled turn already sent / silent' : 'local-typed';
+      const reason = turn.isScheduled ? 'scheduled turn already sent / silent'
+        : forwardBackgroundWake ? 'background wake already sent / silent' : 'local-typed';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
       // Positive silence evidence for the terminal — only a bare nothing-to-send
       // sentinel (no prose, no send), never "already sent" / local-typed.
@@ -11178,7 +11283,7 @@ function emitReadyTurns(opts: {
     const postText = bridgePostText(assistantText, adoptMode);
     if (!adoptMode && postText.trim().length === 0) continue;
 
-    if (turn.isLocal && !turn.isScheduled && !zeroPromptTerminalSync()) {
+    if (turn.isLocal && !turn.isScheduled && !forwardBackgroundWake && !zeroPromptTerminalSync()) {
       if (turn.userUuid) {
         // Local turn (adopt mode only): also surface the user prompt so the
         // Lark thread shows both sides of the exchange. User text comes from
@@ -11253,7 +11358,9 @@ function emitReadyTurns(opts: {
       // durable anchor store after a re-attach). Thread scope ignores this and
       // routes to the session root. Omitted in zero-injection mode —
       // terminalLocal owns routing there.
-      ...(turn.isScheduled && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
+      // A forwarded background wake anchors to the Lark turn that launched
+      // its task (the queue only flags a wake when that anchor is known).
+      ...((turn.isScheduled || forwardBackgroundWake) && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
         ? { replyTurnId: turn.replyAnchorTurnId }
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
@@ -11311,6 +11418,10 @@ function emitReadyTurns(opts: {
       const notice = localTurnFailureNotice(turn, {
         liveSinceMs: WORKER_STARTED_AT_MS,
         zeroPromptTerminalSync: zeroPromptTerminalSync(),
+        // Same condition as the forwarding above: a wake whose answer would
+        // have gone to its launching topic reports its failure there too.
+        backgroundWakeForwarded: turn.isBackgroundWake === true && !adoptMode
+          && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript',
       });
       if (notice) {
         log(`Bridge terminal for synthesised local turn ${turn.turnId.substring(0, 8)} `
@@ -11515,6 +11626,12 @@ function codexBridgeStartTimer(): void {
         // Tier-1/Tier-2 demotion to fresh would still baseline the empty
         // hermes store as "existing" and swallow the first turn.
         if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty');
+        // Hermes can expose a busy screen before its user row is persisted.
+        // Share Cursor's bounded refresh policy, before ingest's own prune;
+        // ready/adopt sessions retain their ordinary attribution timing.
+        if (!isPromptReady && !lastInitConfig?.adoptMode) {
+          codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS);
+        }
         hermesBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
@@ -11751,7 +11868,9 @@ function hermesBridgeIngest(): void {
     log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
   }
   if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(filtered.events);
+  // Raw text alone owns source binding above; restored markers are match data,
+  // never authority to rebind this worker to another native session.
+  codexBridgeQueue.ingest(restoreFilteredHermesUserEvents(filtered.events, currentHermesBridgeDbPath()));
   pruneExpiredStructuredHeadsAndEmit('Hermes ingest');
   if (filtered.events.some(event => event.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
@@ -13773,6 +13892,9 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
+    if (turnOutcome === 'answered' && traexModelAccessSwitchNotice) {
+      notifyTraexModelAccessSwitchActivity(turn.turnId, false, true, true);
+    }
     notifyExplicitRepliesObserved(
       turn.turnId,
       attributableExplicitReplyMarkersForTurnWindow(
@@ -15388,6 +15510,30 @@ function retireDoubaoBridgeTurnOnInterrupt(turnId: string | undefined, dispatchA
   return true;
 }
 
+function holdTraexRecoveryForStop(turnId: string | undefined): void {
+  if (!turnId) return;
+  const pending = traexQuotaPending;
+  if (pending?.failedTurn && pending.turnId === turnId) {
+    pending.stopRequested = true;
+    // This native turn already failed; do not replay it if key delivery retries.
+    inflightInputs.retireTurn(turnId);
+    for (let i = pendingMessages.length - 1; i >= 0; i--) {
+      if (pendingMessages[i]!.turnId === turnId && pendingMessages[i]!.traexAutoModelRecovery) pendingMessages.splice(i, 1);
+    }
+  }
+  if (traexAutoModelController?.requestRecoveryStop?.(turnId)) {
+    publishActiveRuntime({ model: traexAutoModelController.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
+  }
+  if (traexModelAccessSwitchNotice?.action.turnId === turnId) traexModelAccessSwitchNotice = undefined;
+}
+
+function settleStoppedTraexRecovery(turnId: string | undefined): void {
+  const pending = traexQuotaPending;
+  if (!turnId || !pending?.failedTurn || pending.turnId !== turnId || !pending.stopRequested) return;
+  traexQuotaPending = undefined;
+  emitReadyCodexTurns([pending.failedTurn]);
+}
+
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (nativeSessionForkPending()) return;
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
@@ -15408,6 +15554,11 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     return;
   }
   if (!backend) return;
+  const criticalInterrupt = isCriticalInterruptKey(key);
+  if (criticalInterrupt && (traexQuotaPending?.failedTurn
+    || (requestedKey === 'ctrlc' && traexAutoModelController))) {
+    holdTraexRecoveryForStop(currentBotmuxTurnId);
+  }
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
@@ -15441,7 +15592,6 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // Any non-scroll key cancels active scroll first so the live view returns.
   if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
 
-  const criticalInterrupt = isCriticalInterruptKey(key);
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(
@@ -15483,6 +15633,8 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
         }),
       });
     }
+    // The failed native turn can settle without claiming the stop key arrived.
+    if (criticalInterrupt && traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(currentBotmuxTurnId);
     // Refresh the card from real output, but do not clear prompt blocking or
     // claim that the CLI stopped when the key never reached it.
     scheduleOneShotAfterAction();
@@ -15491,11 +15643,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // The provider has already ended a quota-failed turn, so Ctrl-C may not
   // produce another native terminal. A confirmed user stop must revoke the
   // pending recovery itself rather than waiting for that nonexistent event.
-  if (criticalInterrupt && traexQuotaPending?.failedTurn) {
-    const failedTurn = traexQuotaPending.failedTurn;
-    traexQuotaPending = undefined;
-    emitReadyCodexTurns([failedTurn]);
-  }
+  if (criticalInterrupt && traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(currentBotmuxTurnId);
   // A delivered ctrlc is an explicit STOP (card ⏹ / ^C quick key / `/stop`):
   // retire doubao's record-less interrupted mark, the same retirement
   // handleExactTurnInterrupt runs for an exact-turn stop. A bare terminal
@@ -15547,6 +15695,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'unsupported' });
     return;
   }
+  if (traexQuotaPending?.failedTurn || traexAutoModelController) holdTraexRecoveryForStop(turnId);
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
@@ -15574,6 +15723,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
+  if (traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(turnId);
   if (delivered) {
     // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
     // only this exact turn BEFORE acknowledging interruption to the daemon;
@@ -19987,6 +20137,23 @@ function directRpcTurnBlocksTypeAhead(): boolean {
   );
 }
 
+/** Reorder only an authorized interactive steer, never settle its host turn. */
+function promotePendingHumanInterruption(): boolean {
+  if (!backend || !cliAdapter || cliRestartInProgress || currentInputDeliveryQuarantine()) return false;
+  const runtimeSupportsTypeAhead = runtimePtyInputPolicy().supportsTypeAhead;
+  // Scheduled continuations must wait for the current task, but must not
+  // swallow the owner's live interruption behind that wait. This is a queue
+  // selection only: retain authority, delivery fences and the scheduled work.
+  // Use the principal gate even when experimental isolation is disabled.
+  if (runtimeSupportsTypeAhead && !durableTurnInFlight && !directRpcTurnBlocksTypeAhead()
+    && !isRemoteBackendType(effectiveBackendType) && !isCodexAppCliId(lastInitConfig?.cliId)
+    && activeTurnBlocks(pendingMessages[0] ?? {})) {
+    return promoteInteractiveInputPastSchedules(pendingMessages, input =>
+      !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
+  }
+  return false;
+}
+
 async function flushPending(): Promise<void> {
   if (nativeSessionForkPending()) return;
   // Codex model-migration picker guard (startup only): the single admission
@@ -20114,6 +20281,7 @@ async function flushPending(): Promise<void> {
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
   const { supportsTypeAhead: runtimeSupportsTypeAhead, allowBackToBackWrites } = runtimePtyInputPolicy();
+  promotePendingHumanInterruption();
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
     runtimeSupportsTypeAhead,
     durableTurnInFlight,
@@ -21093,6 +21261,13 @@ async function flushPending(): Promise<void> {
     }
   } finally {
     isFlushing = false;
+    // The owner may have arrived while an earlier asynchronous write held the
+    // flush mutex. The serial schedule head stopped that drain, so no new idle
+    // edge will wake the interruption. Re-kick only after a real promotion;
+    // blocked/non-interactive queues cannot create a microtask retry loop.
+    if (itemsWrittenInThisFlush > 0 && promotePendingHumanInterruption()) {
+      queueMicrotask(() => { void flushPending(); });
+    }
     // A prompt can arrive after turn N completes but before turn N+1's chunked
     // control line finishes. We reject it while N+1 has a liveness slot. If that
     // write then fails, the prompt is still the runner's real ready boundary;
@@ -22484,7 +22659,28 @@ async function spawnCli(
   const effectiveCliId: CliId = cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'
     ? 'dsh-tui'
     : cfg.cliId as CliId;
-  cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  // A CLI reinstalling itself (Claude Code's auto-update) is absent for a
+  // moment. Wait that out before anything resolves or caches its path —
+  // resolvedBin, launcher args, the macOS policy digest — with the adapter
+  // built again afterwards. The launch check before the spawn reports a
+  // command still missing, and waits itself only if this did not.
+  const launchAvailabilityInput = {
+    cliId: cfg.cliId as CliId,
+    cliPathOverride: cfg.cliPathOverride,
+    wrapperCli: cfg.wrapperCli,
+    cliLaunchMode: cfg.cliLaunchMode,
+  };
+  const createAdapter = () => createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  cliAdapter = createAdapter();
+  let waitedForMissingCli = false;
+  if (!cfg.adoptMode && cfg.backendType !== 'riff') {
+    const launchAdapter = await createAdapterAfterMissingCliWait(launchAvailabilityInput, cliAdapter, createAdapter, {
+      log: line => log(`[cli-launch] ${line}`),
+    });
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+    cliAdapter = launchAdapter.adapter;
+    waitedForMissingCli = launchAdapter.waited;
+  }
   if (effectiveCliId === 'traex' && cfg.resume === true && cfg.cliSessionId && cfg.adoptMode !== true) {
     // The native resume target is host-owned. A resumed transcript can occupy
     // the entire viewport while a nonblocking repository notice hides both
@@ -24745,26 +24941,29 @@ async function spawnCli(
   if (willReattachPersistent) {
     log(`Re-attaching to existing ${effectiveBackendType} session: ${persistentSessionName} (requested CLI: ${cliAdapter.resolvedBin})`);
   } else {
-    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
-
     // Pre-flight the ACTUAL launch dependency, not merely adapter.resolvedBin:
     // wrapperCli replaces that binary, while Codex App / Mir use a bundled Node
     // runner that starts codex / mircli one level later.  Returning here used to
     // make init continue and emit a false `ready`; throwing routes the failure
     // through the daemon's user-visible init-error path and prevents an orphaned
     // "starting" card with no CLI behind it.
+    //
+    // A command that went missing after the check at adapter creation (it was
+    // there then) is waited for here, once per launch. A path the adapter
+    // resolved in between, while it was already gone, is not resolved again:
+    // that launch can still fail, as it would have without the retry.
     const unavailable = effectiveBackendType === 'riff'
       ? undefined
-      : cliUnavailableMessage({
-          cliId: cfg.cliId as CliId,
-          cliPathOverride: cfg.cliPathOverride,
-          wrapperCli: cfg.wrapperCli,
-          cliLaunchMode: cfg.cliLaunchMode,
-        }, cliName());
+      : await cliUnavailableMessageAfterRetry(launchAvailabilityInput, cliName(), {
+          log: line => log(`[cli-launch] ${line}`),
+          alreadyWaited: waitedForMissingCli,
+        });
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     if (unavailable) {
       log(`${unavailable} (PATH=${process.env.PATH ?? ''})`);
       throw new Error(unavailable);
     }
+    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
   }
 
   // Build the child env. redactChildEnv() DELETES the keys that must not leak
@@ -27996,6 +28195,10 @@ async function spawnCli(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    lastCliExitServerReplaced = exitMarksServerReplaced({
+      intentionalRestart,
+      backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
+    });
     if (codexAutoUpgrade) {
       backend = null;
       isPromptReady = false;
@@ -28620,10 +28823,15 @@ async function restartCliProcess(
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
+    // This restart is abandoned; the server-loss marker must not survive to be
+    // consumed by a later, unrelated restart.
+    lastCliExitServerReplaced = false;
     codexAutoUpgrade.reject?.(new Error(reason));
     return;
   }
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
+    // Adopt workers never restart in place; no restart consumes the marker.
+    lastCliExitServerReplaced = false;
     log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
   }
@@ -28655,9 +28863,15 @@ async function restartCliProcess(
   // adapter probing is still re-run on every spawn. skipRestartBudget（角色
   // 切换的 cwd-move respawn）不计入：那是用户主动迁移不是崩溃恢复，计进去
   // 会让「切角色 + 一次无关重启」无故触发强制 FRESH 丢上下文。
-  if (!opts.skipRestartBudget) {
+  // 上一次退出是整个 tmux server 丢失（另一个 server 接管了 socket）时同样不计：
+  // CLI 本身没有失败，计进去会让 server 重建期间的二次波及把会话打成 FRESH。
+  const previousExitServerReplaced = lastCliExitServerReplaced;
+  lastCliExitServerReplaced = false;
+  if (restartSpendsFreshBudget({ skipRestartBudget: opts.skipRestartBudget, previousExitServerReplaced })) {
     consecutiveInWorkerRestarts++;
     log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  } else if (previousExitServerReplaced) {
+    log(`Restart count stays ${consecutiveInWorkerRestarts}: previous exit was a tmux server loss, not a CLI failure`);
   }
   const restart = async (): Promise<void> => {
     try {
@@ -31228,6 +31442,7 @@ function emitTurnTerminal(
 ): void {
   if (!sessionId || !turnId) return;
   if (traexQuotaPending?.turnId === turnId) traexQuotaPending = undefined;
+  if (traexModelAccessSwitchNotice?.action.turnId === turnId) traexModelAccessSwitchNotice = undefined;
   cancelSubmitFailureChainForTerminal(
     submitFailureChains,
     { turnId, dispatchAttempt },
@@ -32228,11 +32443,19 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
       // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
       // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
-      if (msg.model !== undefined && lastInitConfig) {
-        lastInitConfig.model = msg.model === null ? undefined : msg.model;
-      }
-      if (msg.larkToolBinding !== undefined && lastInitConfig) {
-        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
+      // startupCommands / launchShell 同理，但只在**真的 parked**（下面那条恢复重启
+      // 即将执行）时才收：daemon 的 crashDiagnosticParked 在 worker 内恢复后不会清
+      // （只有 refork 的 ready 才清），之后每条消息都还捎带；而 runStartupCommands
+      // 在当前 spawn 的启动序列里实时读 lastInitConfig.startupCommands——若在启动
+      // 命令待确认时被换掉，正在跑的 CLI 会拿新列表配旧游标，两份都敲不全。
+      const parkedRespawnPending = !backend && crashDiagnosticStopped && !lastInitConfig?.adoptMode;
+      if (lastInitConfig) {
+        applyRespawnConfigPatch(lastInitConfig, {
+          model: msg.model,
+          larkToolBinding: msg.larkToolBinding,
+          ...(parkedRespawnPending ? { startupCommands: msg.startupCommands, launchShell: msg.launchShell } : {}),
+        });
       }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
@@ -32685,45 +32908,34 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
       // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
-      if (msg.updateWorkingDir && lastInitConfig) {
-        lastInitConfig.workingDir = msg.updateWorkingDir;
-      }
-      // per-bot env 热更：daemon 发 restart 时捎带 bots.json `env` 的最新值
-      // （live-worker restart 不 refork，没有 init 重发这条通道），respawn 前
-      // 全量覆盖 lastInitConfig.env —— spawnCli 的 botInjectedEnv(cfg.env, cfg.envPolicy)
-      // 每次 spawn 都重跑，覆盖即在重启出的 CLI 上生效。undefined=不携带（旧
-      // daemon / 兜底）保持快照；null=dashboard 已清空 → 移除快照。与上面的
-      // cwd merge 一样放在合并守卫之前：被合并的重复 restart 也应带走 env
-      // 更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
-      if (msg.env !== undefined && lastInitConfig) {
-        lastInitConfig.env = msg.env === null ? undefined : msg.env;
-      }
-      // Session-env removals + fingerprint ride the same channel and tri-state.
-      if (msg.envUnset !== undefined && lastInitConfig) {
-        lastInitConfig.envUnset = msg.envUnset === null ? undefined : msg.envUnset;
-      }
-      if (msg.envFingerprint !== undefined && lastInitConfig) {
-        lastInitConfig.envFingerprint = msg.envFingerprint;
-      }
-      // model 热更，与 env 同一条通道、同一套三分态。model 不进冻结集合、每次
-      // spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），但 live-worker
-      // restart 不 refork，没有 init 重发这条通道——不覆盖的话，改完模型再重启
-      // 起来的还是快照里的旧模型。undefined=不携带（旧 daemon / 取不到）保持快照；
-      // null=当前不该传模型（bot 未配 / 已清空）→ 移除快照。同样放在合并守卫之前。
-      if (msg.model !== undefined && lastInitConfig) {
-        lastInitConfig.model = msg.model === null ? undefined : msg.model;
-      }
-      if (lastInitConfig && msg.codexRpcInput !== undefined) {
-        lastInitConfig.codexRpcInput = msg.codexRpcInput;
-      }
-      if (lastInitConfig && msg.traexAutoModel !== undefined) {
-        lastInitConfig.traexAutoModel = msg.traexAutoModel ?? undefined;
-        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
-      } else if (lastInitConfig && msg.codexRpcInput !== undefined) {
-        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
-      }
-      if (msg.larkToolBinding !== undefined && lastInitConfig) {
-        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
+      // 合并顺序约束：以下热更字段都放在合并守卫之前——被合并的重复 restart 也应
+      // 带走更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
+      //  - workingDir：角色切换 cwd-move respawn 先收敛目录（旧桶 transcript 由
+      //    resume 预检 syncClaudeResumeTargetToCwd 接住）。
+      //  - env / envUnset / envFingerprint、model、traexAutoModel、codexRpcInput、
+      //    larkToolBinding、startupCommands、launchShell：live-worker restart 不
+      //    refork，没有 init 重发这条通道；不覆盖的话，改完 Bot 配置再重启起来的
+      //    还是 fork 时的旧快照（startupCommands 曾因此重放旧的 /effort）。
+      //    三分态：undefined = 不携带（旧 daemon / 取不到）保持快照；null = 明确清空。
+      //  语义与不可覆盖项（/rename、per-session 冻结选择）见 core/respawn-config-patch.ts。
+      if (lastInitConfig) {
+        const patched = applyRespawnConfigPatch(lastInitConfig, {
+          workingDir: msg.updateWorkingDir,
+          env: msg.env,
+          envUnset: msg.envUnset,
+          envFingerprint: msg.envFingerprint,
+          model: msg.model,
+          codexRpcInput: msg.codexRpcInput,
+          traexAutoModel: msg.traexAutoModel,
+          larkToolBinding: msg.larkToolBinding,
+          startupCommands: msg.startupCommands,
+          launchShell: msg.launchShell,
+        });
+        if (patched.traexReconfigure) configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
+        if (patched.startupCommandsChanged) {
+          log(`Startup commands updated from current bot config for the next spawn (${lastInitConfig.startupCommands?.length ?? 0} command(s))`);
+        }
       }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
