@@ -579,6 +579,25 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 - 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接；发出去之后给每项记一句 \`botmux board history <编号> "已报 owner"\`。
 - 管家开着「飞书卡片拍板」（默认开）时，botmux 会在改成 decide 或改了选项后自动往管家群发这一项的拍板卡片，之后原地更新；owner 在卡片上点的选项和网页提交一样，以「决策看板 · 批次」送到你这里。这时上面那条消息一句话说明要定什么即可，不用再列选项、不要自己发带选项的卡片。选项超过 ${DECISION_CARD_MAX_OPTIONS} 个时卡片只给看板链接。
 
+## 附图文说明（待拍板涉及代码或界面改动时）
+- 让 owner 不用翻群就能看懂要定什么：写成 decide 的同时附一份说明页，写清背景、改了什么、改前改后对比、测试结果：\`botmux board attach <编号> explainer.html --note "图文说明"\`。能录屏的再附一段视频（.mp4 / .webm，不超过 50MB；mp4 用 H.264、加 \`-movflags +faststart\`），可以和说明页放在同一条 attach 里。
+- 说明页是单个 .html 文件（UTF-8，不超过 10MB）：截图内嵌成 data URL，样式写在 \`<style>\` 里。看板上不跑脚本、不加载外链（网址图片、CDN 样式和字体都会被拦掉）；相关链接挂到事项的 \`--link\` 上，不写进说明页。
+- 最小模板（截图转 data URL：\`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`）：
+\`\`\`html
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#12 标题</title>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:860px;margin:0 auto;padding:16px} img{max-width:100%;border:1px solid #ddd} .cmp{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}</style>
+</head><body>
+<h1>#12 标题</h1>
+<h2>背景</h2><p>为什么要改，一两句。</p>
+<h2>改了什么</h2><ul><li>…</li></ul>
+<h2>改前 / 改后</h2>
+<div class="cmp"><figure><img src="data:image/png;base64,…" alt=""><figcaption>改前</figcaption></figure><figure><img src="data:image/png;base64,…" alt=""><figcaption>改后</figcaption></figure></div>
+<h2>测试结果</h2><pre>跑了什么、结果</pre>
+</body></html>
+\`\`\`
+
 ## 执行一批决定（收到「决策看板 · 批次」消息时）
 - 逐项处理：先 \`botmux board show <编号>\` 看最新内容，再按决定执行。
 - 每项做完：\`botmux board history <编号> --handled "做了什么、结果"\`，需要时改状态。
@@ -628,6 +647,25 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
   \`botmux board set <n> --state decide --ask "question" --option "A=approach → outcome and risk" --option "B=…" --recommend A --reason "why"\`.
 - Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`; once sent, note \`botmux board history <n> "reported to owner"\` on each item.
 - With "Decision cards in Feishu" on (the default), botmux posts this item's decision card in the steward chat after it becomes decide or its options change, and updates it in place; an option the owner picks on the card reaches you as a "Decision board · batch", same as a web submission. Then one sentence on what needs deciding is enough: do not repeat the options or post your own option card. With more than ${DECISION_CARD_MAX_OPTIONS} options the card only links to the board.
+
+## Attaching an explainer (decisions that involve code or UI changes)
+- Let the owner understand what to decide without reading the chats: when you make such an item decide, attach an explainer page covering the background, what changed, before / after, and test results: \`botmux board attach <n> explainer.html --note "explainer"\`. If it can be screen-recorded, attach a video too (.mp4 / .webm, at most 50MB; mp4 in H.264 with \`-movflags +faststart\`); it can go in the same attach as the page.
+- The page is a single .html file (UTF-8, at most 10MB): screenshots inlined as data URLs, styles in \`<style>\`. The board runs no scripts and loads nothing external (image URLs, CDN styles and fonts are all blocked); put related links on the item with \`--link\`, not in the page.
+- Minimal template (screenshot to data URL: \`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`):
+\`\`\`html
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#12 Title</title>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:860px;margin:0 auto;padding:16px} img{max-width:100%;border:1px solid #ddd} .cmp{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}</style>
+</head><body>
+<h1>#12 Title</h1>
+<h2>Background</h2><p>Why this change, in a sentence or two.</p>
+<h2>What changed</h2><ul><li>…</li></ul>
+<h2>Before / after</h2>
+<div class="cmp"><figure><img src="data:image/png;base64,…" alt=""><figcaption>Before</figcaption></figure><figure><img src="data:image/png;base64,…" alt=""><figcaption>After</figcaption></figure></div>
+<h2>Test results</h2><pre>What you ran and the result</pre>
+</body></html>
+\`\`\`
 
 ## Executing a batch (when a "Decision board · batch" message arrives)
 - Item by item: \`botmux board show <n>\` for the latest state, then act on the decision.
