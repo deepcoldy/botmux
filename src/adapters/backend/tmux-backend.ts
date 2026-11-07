@@ -10,6 +10,7 @@ import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
+import { createTmuxBootGate } from './tmux-anti-fork.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -552,10 +553,18 @@ export class TmuxBackend {
   static parkDiagnosticSession(name: string, opts: { cwd: string; cols: number; rows: number; contentPath: string; socketName?: string }): boolean {
     try {
       TmuxBackend.killSession(name, opts.socketName);
+      // Anti-fork gate: prepend -N (tmux >= 3.2) / hold on a bound-but-silent
+      // owner rather than booting a competing server (default ON;
+      // BOTMUX_DISABLE_TMUX_ANTI_FORK=1 opts out). A blocked boot reads as a
+      // failed park (retried later), never as a second tmux server.
+      // Ambient process.env on both sides (this exec uses tmuxEnv()); pass it
+      // explicitly so the gate's probe/-N/socket-path cannot silently diverge.
+      const bootLeading = createTmuxBootGate(opts.socketName, { env: process.env }).leadingArgs();
       const shellSpec = resolveUserShell();
       const shellKind = shellKindForPath(shellSpec.shell);
       execFileSync('tmux', [
         ...tmuxSocketArgs(opts.socketName),
+        ...bootLeading,
         'new-session',
         '-d',
         '-s', name,

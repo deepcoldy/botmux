@@ -51,6 +51,7 @@ import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
 import { pipePaneShellCommand } from './tmux-pipe-relay.js';
+import { createTmuxBootGate } from './tmux-anti-fork.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -1823,25 +1824,54 @@ export class TmuxPipeBackend implements SessionBackend {
     // means an earlier timed-out attempt actually created the session
     // server-side → treat as success.
     let createdIdentity: string | null = null;
+    // Anti-fork gate (default ON; BOTMUX_DISABLE_TMUX_ANTI_FORK=1 opts out):
+    // BEFORE every new-session — including the first attempt — refuse to boot a
+    // competing tmux server when a LIVE server still listens on this label but
+    // is not answering (slow, or its socket file was unlinked under it). The
+    // very first new-session already forks the orphan in that state (measured),
+    // so this cannot live in the retry branch. One gate spans all attempts so
+    // its bounded wait is not reset per attempt. Pass the SAME env the
+    // new-session exec below uses, so the owner probe, -N capability and socket
+    // path resolve against the launch's PATH/TMUX_TMPDIR (not daemon ambient).
+    const bootSpawnEnv = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env;
+    const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv });
     for (let attempt = 0; ; attempt++) {
+      // [] = normal spawn (attach, or a proven cold boot); ['-N'] = attach
+      // only, never fork (tmux ≥ 3.2), closing the client-internal macOS
+      // ECONNREFUSED fork race.
+      let bootLeading: string[];
       try {
-        const printed = execFileSync('tmux', [...this.tmuxArgs, ...argv], {
+        bootLeading = bootGate.leadingArgs();
+      } catch (gateErr: any) {
+        // Bound-but-unreachable past the bounded wait. Route through fail() so
+        // the secret-bearing pane launch file is discarded exactly like any
+        // other startup failure (a throw here would otherwise leak it).
+        if (opts.strictEnv) throw fail(gateErr, tmuxStartupFailureSummary(gateErr));
+        throw fail(tmuxNewSessionError(gateErr, commandBytes), tmuxStartupFailureSummary(gateErr));
+      }
+      const noFork = bootLeading.includes('-N');
+      try {
+        const printed = execFileSync('tmux', [...this.tmuxArgs, ...bootLeading, ...argv], {
           cwd: opts.cwd,
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 5000,
-          env: tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env),
+          env: tmuxEnv(bootSpawnEnv),
         });
         createdIdentity = parseSessionIdentity(String(printed ?? ''));
         break;
       } catch (err: any) {
         const stderrText = (err?.stderr?.toString?.() ?? '').trim();
+        // A -N spawn that answered "no server running" raced an owner dying
+        // between the gate probe and the exec. Retry: the next gate cycle sees
+        // no listener and permits a real cold boot (without -N).
+        const noForkRacedAway = noFork && /no server running/i.test(stderrText);
         if (attempt > 0 && /duplicate session/i.test(stderrText)) {
           if (opts.strictEnv) throw fail(new Error('Refusing unverified strict tmux-pipe generation after a startup retry'), stderrText);
           // Either an earlier timed-out attempt of ours or a racing creator made
           // it — unprovable, so this spawn never claims (or retires) it.
           break;
         }
-        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
+        if ((!isRetryableStartupTmuxFailure(err) && !noForkRacedAway) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
           if (opts.strictEnv) throw fail(new Error('Strict tmux pane startup failed (command environment redacted)'), tmuxStartupFailureSummary(err));
           throw fail(tmuxNewSessionError(err, commandBytes), tmuxStartupFailureSummary(err));
         }
