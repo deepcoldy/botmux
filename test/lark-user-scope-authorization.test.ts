@@ -122,7 +122,18 @@ describe('auth-request handler — user scope authorization', () => {
   it('rejects a misspelled scope with unknown_scopes naming the typo, before any authorization', async () => {
     const res = await post({ scopes: ['base:app:crate'] });
     expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({ ok: false, error: 'unknown_scopes', scopes: ['base:app:crate'] });
+    expect(await res.json()).toMatchObject({ ok: false, error: 'unknown_scopes', scopes: ['base:app:crate'] });
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('tells the caller how to proceed when uncataloged scopes are rejected', async () => {
+    const res = await post({ scopes: ['docx:document', 'drive:drive'] });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string; scopes: string[]; hint?: unknown };
+    expect(body).toMatchObject({ error: 'unknown_scopes', scopes: ['docx:document', 'drive:drive'] });
+    expect(typeof body.hint).toBe('string');
+    // Well-formed names: retrying with the escape hatch is a real next step.
+    expect(body.hint).toContain('--allow-unknown');
     expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
@@ -152,7 +163,11 @@ describe('auth-request handler — user scope authorization', () => {
   it('rejects malformed scope even when allowUnknown=true', async () => {
     const res = await post({ scopes: ['bad scope syntax'], allowUnknown: true });
     expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({ ok: false, error: 'unknown_scopes', scopes: ['bad scope syntax'] });
+    const body = await res.json() as { hint?: string };
+    expect(body).toMatchObject({ ok: false, error: 'unknown_scopes', scopes: ['bad scope syntax'] });
+    // --allow-unknown cannot admit a malformed name, so it is not offered.
+    expect(typeof body.hint).toBe('string');
+    expect(body.hint).not.toContain('--allow-unknown');
     expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
