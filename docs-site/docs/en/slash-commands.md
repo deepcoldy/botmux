@@ -198,7 +198,7 @@ For Claude Code and other CLIs, `/effort` continues to follow the passthrough ru
 
 **Riff has no passthrough surface**: Riff has no local CLI, so the slash commands above are not delivered as keystrokes. They are wrapped as a single normal message that becomes **one remote task**, and the command text never reaches a slash parser. Sending `/compact`, `/model`, etc. (including entries from `customPassthroughCommands`) in a Riff session therefore behaves like an ordinary chat message instead of being split into multiple remote tasks.
 
-`/fast` is Codex-specific: it toggles Codex's native service tier, and the streaming card shows a read-only `⚡ <tier>` badge reflecting whatever tier Codex actually runs. On RPC-input or Riff backends the keystroke can't reach Codex's executor, so `/fast` fails closed there with a clear notice instead of a silent no-op.
+`/fast` is Codex-specific: it toggles Codex's native service tier, and the streaming card shows a read-only `⚡ <tier>` badge reflecting whatever tier Codex actually runs. On RPC-input sessions or the Mojo backend, `/fast` still goes through the passthrough branch and is rejected fail-closed with a clear notice rather than silently applying. On the Riff backend it follows the paragraph above: `/fast` is not a passthrough command and is wrapped as an ordinary message that becomes one remote task, so it does not switch the tier either.
 
 Some CLIs also declare adapter-default passthrough commands: Claude Code and Codex default-allow `/goal`, so a new topic whose first message is `/goal ...` will start/select the repository first and then send `/goal ...` to the CLI literally.
 
