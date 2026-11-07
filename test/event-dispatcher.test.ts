@@ -4983,6 +4983,9 @@ describe('message listener polling backfill', () => {
     expect(silentLogLines.length).toBeGreaterThan(0);
     const searchTerms = [...dm.matchAll(/「([^」]+)」/g)].map((match) => match[1]!);
     expect(searchTerms.some((term) => silentLogLines.some((line) => line.includes(term)))).toBe(true);
+    // lark-gate（api-gate.ts）与 doc-comment-poll（daemon.ts）也有同名「circuit OPEN」日志行，
+    // 私信给的搜索词必须带本链路独有的 "for chat=" 段，否则管理员会搜出无关链路的行。
+    expect(searchTerms).toContain('circuit OPEN for chat=');
   });
 });
 

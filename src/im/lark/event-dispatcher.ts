@@ -3130,10 +3130,10 @@ async function listenerChatFailed(
     `[botmux] 群消息监听已自动熔断：${chatId}\n` +
     `原因：该群连续 ${LISTENER_PERMANENT_THRESHOLD} 次返回永久错误${codePart}（${classified.message.slice(0, 120)}），` +
     `通常是 bot 被移出群或群已解散。\n` +
-    `现状：已停止对该群的常规轮询，改为每 ${LISTENER_PROBE_INTERVAL_MS / 60_000} 分钟探测一次。\n` +
+    `现状：已停止对该群的常规轮询，改为每 ${Math.round(LISTENER_PROBE_INTERVAL_MS / 60_000)} 分钟探测一次。\n` +
     `恢复：把 bot 重新拉回该群，下一次探测成功后自动恢复监听，无需重启；如不再需要该监听，可在工作台关闭该群的监听。\n` +
-    `${LISTENER_ALERT_DEDUPE_MS / 60_000} 分钟内同一应用其它群也熔断时不再逐条私信，` +
-    `可在 daemon 日志（botmux logs）中搜索「circuit OPEN」找到这些群。`;
+    `${Math.round(LISTENER_ALERT_DEDUPE_MS / 60_000)} 分钟内同一应用其它群也熔断时不再逐条私信，` +
+    `可在 daemon 日志（botmux logs）中搜索「circuit OPEN for chat=」找到这些群。`;
   lastListenerAlertAt.set(larkAppId, now);
   try {
     await dmAdmin(larkAppId, adminOpenId, dm, `listener circuit open ${chatId.substring(0, 12)}`);
