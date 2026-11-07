@@ -189,7 +189,7 @@ type SessionPhase =
 - **turn 标识**：级联第 2..N 条不能复用飞书 `messageId` 当 `turnId`——worker 的 `InputTurnDeduper` 按 `turnId` 去重，重复的 id 会被当成重投递丢弃。定序器给每条派生一个独立 turn 标识（新增字段，不复用专指 durable 重投递次数的 `dispatchAttempt`），并按它注册回复目标/卡片血缘；`quoteTargetId` 仍指向真实 `messageId`。`prompt_ready` 不带 turnId，不受此影响。
 - 等待有上限（建议 120s）。超时按今天的 busy delivery 语义把剩余条目立即送出并在话题里提示一句，不无限持有——与 `session-turn-queue.ts` 头注释的原则一致："人等待的东西是会话状态，不可拿队列去等"。
 - **拒绝级联**（fail closed，回一句"该后端不支持多条命令级联，请分条发送"；单条透传行为不变）：① `isRemoteBackendSession(ds)`（riff / mojo，按冻结后端判，`src/core/persistent-backend.ts:172`）——这两个后端上一条透传是两次 write（文本 + `\r`），riff 因此产生两个远端 task、两次 `prompt_ready`，mojo 的 `\r` 被判空拒收，turn 边界与写入命令不是 1:1，代际计数无从成立；② adopt 会话（`ds.adoptedFrom || ds.initConfig?.adoptMode`）——人机输入交错，与 `/suspend` `/restart` `inject_command` 同款排除。
-- 无 raw 面的 CLI（codex-app / mira / mir / dsh（路由不传 `dshRuntime`，见 §3 第 10 层）/ ebsd）：透传集为空 → `/compact ⏎ 正文` 整条是正文，与今天一致。
+- 无 raw 面的 CLI（codex-app / mira / mir / dsh（路由不传 `dshRuntime`，见 §3 第 10 层）/ ebsd / riff）：透传集为空 → `/compact ⏎ 正文` 整条是正文，与今天一致。riff 无本地 CLI，斜杠命令不会进任何斜杠解析器，而是按普通消息封装成一次远端任务（见 #3080）。
 - 被拒绝的方案：改用 worker 的 `pendingInjections`（`inject_command`）——它已按空闲逐条写入，但没有 turn 记账（`/compact` 的流式卡片会消失）、拒绝 riff/mojo/adopt、且写入路径与 `raw_input` 不同，等于给透传开第二条语义；改用 worker 的 `pendingRawInputs` 则需要新增"级联在飞"入队条件并给正文 type-ahead 旁路加闸（R7）。`runStartupCommands`（`src/worker.ts:2548`）的"逐条 + 等静默"是最接近的样板，但只在 spawn 期、用 PTY 静默而非 idle-detector。
 
 ## 7. 透传命令与参数形状
