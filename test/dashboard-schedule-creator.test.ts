@@ -11,7 +11,7 @@
  *      authority (real SQLite store and scheduler).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { connect, createServer, type Server as NetServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -266,6 +266,36 @@ describe('daemon records the Dashboard Feishu-login person as creator', () => {
     const id = await create();
 
     expect(record(id).task.workingDir).toBe(oncallDir);
+  });
+
+  it('tests a new task precondition in the target chat oncall directory the task will use', async () => {
+    const oncallDir = join(dir, 'oncall-project');
+    mkdirSync(oncallDir);
+    bot.config.oncallChats = [{ chatId: 'oc_target', workingDir: oncallDir }];
+
+    const response = await signed('POST', '/api/schedules/precondition/test', {
+      larkAppId: APP,
+      chatId: 'oc_target',
+      source: { kind: 'inline', script: `[ "$(pwd -P)" = ${JSON.stringify(realpathSync(oncallDir))} ] && printf 1 || printf 0` },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, result: 'pass' });
+  });
+
+  it('reports the missing Bot default directory when testing a new task precondition', async () => {
+    bot.config.defaultWorkingDir = undefined;
+
+    const response = await signed('POST', '/api/schedules/precondition/test', {
+      larkAppId: APP, chatId: 'oc_target', source: { kind: 'inline', script: 'printf 1' },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      errorCode: 'schedule_working_dir_unavailable',
+      field: 'workingDir',
+    });
   });
 
   it('uses an explicit request directory ahead of the target chat oncall directory', async () => {

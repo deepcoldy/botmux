@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -745,6 +745,44 @@ describe('vc meeting delivery store', () => {
       expect(expireVcMeetingDeliveryLeases(dir, { agentAppId: 'cli_agent', leaseMs: 0 }, 99_000)).toEqual([]);
       expect(expireVcMeetingDeliveryLeases(dir, { agentAppId: '  ', leaseMs: 5_000 }, 99_000)).toEqual([]);
     });
+
+    it('keeps expiring leases in healthy files when an unreadable file sorts before them', () => {
+      markVcMeetingDeliveryDispatched(dir, RK, { receiverBootId: 'boot-rx-1', workerGeneration: 1 }, 1_000);
+      // Persistent read error (EISDIR stands in for EACCES/EIO) in a file whose
+      // name sorts first used to abort the whole sweep before healthy files were
+      // visited, stranding their over-lease dispatched receipts forever.
+      mkdirSync(join(dir, 'vc-meeting-delivery', 'aaa__m9.json'));
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      const affected = expireVcMeetingDeliveryLeases(dir, { agentAppId: 'cli_agent', leaseMs: 5_000 }, 10_000);
+      expect(affected.map(ref => ref.deliveryKey)).toEqual(['dk-1']);
+      // Subsequent sweeps keep skipping the bad file (warn) without throwing and
+      // stay idempotent on the now-ambiguous healthy receipt.
+      expect(expireVcMeetingDeliveryLeases(dir, { agentAppId: 'cli_agent', leaseMs: 5_000 }, 11_000)).toEqual([]);
+      expect(getVcMeetingDeliveryReceipt(dir, KEY, 'dk-1')?.receipt.status).toBe('ambiguous');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('lease sweep skipped'));
+    });
+  });
+
+  // ─── delivery 目录本身不可列举（启动对账与租约扫描同形隔离）──────────────
+
+  describe('unreadable delivery directory', () => {
+    function replaceDirWithFile(): ReturnType<typeof vi.spyOn> {
+      writeFileSync(join(dir, 'vc-meeting-delivery'), 'not a directory');
+      return vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    }
+
+    it('boot reconcile returns no changes and warns instead of throwing', () => {
+      const warn = replaceDirWithFile();
+      expect(reconcileVcMeetingDeliveriesOnBoot(dir, { receiverBootId: 'boot-rx-2', agentAppId: 'cli_agent' })).toEqual([]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('cannot list'));
+    });
+
+    it('lease sweep returns no changes and warns instead of throwing', () => {
+      const warn = replaceDirWithFile();
+      expect(expireVcMeetingDeliveryLeases(dir, { agentAppId: 'cli_agent', leaseMs: 1 }, 99_000)).toEqual([]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('cannot list'));
+    });
   });
 
   // ─── frozen envelope 同 key 恢复（owner boot / generation 换代不卡死 head）──
@@ -898,6 +936,19 @@ describe('vc meeting delivery store', () => {
       const d2 = markVcMeetingDeliveryDispatched(dir, RK, { receiverBootId: 'boot-rx-2', workerGeneration: 1 });
       expect(d2).toMatchObject({ ok: true, receipt: { status: 'dispatched', dispatchAttempt: 2 } });
       expect(completeVcMeetingDelivery(dir, RK)).toMatchObject({ ok: true, receiverCommittedThrough: 3 });
+    });
+
+    it('skips an unreadable meeting file on boot instead of aborting startup for every bot', () => {
+      markVcMeetingDeliveryDispatched(dir, RK, { receiverBootId: 'boot-rx-1', workerGeneration: 1 });
+      // Another meeting's state that cannot be read (EISDIR stands in for EIO/EACCES).
+      mkdirSync(join(dir, 'vc-meeting-delivery', 'cli_other__m9.json'));
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      const affected = reconcileVcMeetingDeliveriesOnBoot(dir, { receiverBootId: 'boot-rx-2', agentAppId: 'cli_agent' });
+
+      expect(affected.map(ref => ref.deliveryKey)).toEqual(['dk-1']);
+      expect(getVcMeetingDeliveryReceipt(dir, KEY, 'dk-1')?.receipt.status).toBe('ambiguous');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('boot reconcile skipped'));
     });
 
     it('leaves accepted-but-never-dispatched receipts untouched on boot', () => {
