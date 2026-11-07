@@ -499,7 +499,7 @@ What the cards look like and what each switch does: see [Live streaming cards](/
 
 | Field | Description |
 |------|------|
-| `replyCardMode` | `legacy` (default): progress and answer are sent separately; `unified`: a turn's progress, tool calls and final answer all update one card. Works for non-sandboxed Claude Code / Codex / Grok / TraeX / Pi sessions, from the next turn |
+| `replyCardMode` | `legacy` (default): progress and answer are sent separately; `unified`: a turn's progress, tool calls and final answer all update one card. Works for non-sandboxed Claude Code / Codex / Grok / TraeX / Pi / Kimi sessions, from the next turn |
 | `replyCardShowTools` | `unified` only: `false` hides tool calls on the card; thinking summaries and progress still show |
 | `disableStreamingCard` | `true` stops sending the live terminal status card. The web terminal still runs and final answers are still sent |
 | `hiddenStreamingCardButtons` | Hide buttons on the live card: `output`, `terminal`, `writeLink`, `compact`, `stop`, `close`. E.g. `["terminal", "writeLink", "close"]`. Also `/botconfig set hiddenStreamingCardButtons terminal,close` |
