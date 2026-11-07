@@ -298,7 +298,7 @@ import {
 } from '../src/vc-agent/push-source.js';
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
-import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { claimPendingGrant, getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 import { localeForBot, t } from '../src/i18n/index.js';
 import { hasTriggeredMessage } from '../src/services/triggered-message-store.js';
 import { logger } from '../src/utils/logger.js';
@@ -10080,6 +10080,43 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     // 同 (chat, sender) 在节流窗口内只发一次卡（isThrottled 复用人分支同款节流表）
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('待批期间被节流的第 2 条挂在申请卡上，批准后与第 1 条按到达顺序串行重放', async () => {
+    setupAutoTopicBotSender(true, false);
+    const e1 = makeBotTopicSeed('msg-bot-hold-1', 'chat-bot-hold');
+    const e2 = makeBotTopicSeed('msg-bot-hold-2', 'chat-bot-hold');
+    await capturedHandlers['im.message.receive_v1'](e1);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](e2);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+
+    // 管理员点「授权」：核销卡上的 pending，再把授权写进本群 chatGrants。
+    const nonce = String(mockReplyMessage.mock.calls[0]![2])
+      .match(/nonce[^0-9a-z]{1,12}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)?.[1];
+    const claim = claimPendingGrant(MY_APP_ID, 'chat-bot-hold', [OTHER_BOT_OPEN_ID], nonce ?? '');
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    const replay = [claim.messageData, ...(claim.heldMessages ?? [])];
+    expect(replay.map(d => d?.message?.message_id)).toEqual(['msg-bot-hold-1', 'msg-bot-hold-2']);
+    mockGetBot().config.chatGrants = { 'chat-bot-hold': [OTHER_BOT_OPEN_ID] };
+
+    // 第 1 条的会话还在建：第 2 条必须等它处理完才进 handler。
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    handlers.handleNewTopic.mockImplementationOnce(async () => { await gate; });
+    for (const data of replay) handlers.replayMessageEvent!(data);
+    await flushEventWork();
+    await flushEventWork();
+    expect(handlers.handleNewTopic.mock.calls.map((c: any[]) => c[0].message.message_id)).toEqual(['msg-bot-hold-1']);
+
+    release();
+    await vi.waitFor(() => expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2));
+    expect(handlers.handleNewTopic.mock.calls.map((c: any[]) => c[0].message.message_id))
+      .toEqual(['msg-bot-hold-1', 'msg-bot-hold-2']);
     expect(mockReplyMessage).toHaveBeenCalledTimes(1);
   });
 
