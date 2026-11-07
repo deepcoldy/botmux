@@ -7,7 +7,7 @@
  *   - extractAssistantText / joinAssistantText concatenate multi-block text.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync, mkdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { hasTrailingBridgeSentinelLine, shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
@@ -686,6 +686,114 @@ describe('findJsonlContainingFingerprint', () => {
       3_000_000,
     );
     expect(findJsonlContainingFingerprint(projectDir, 'please run the bridge tests')).toBe(userPane);
+  });
+
+  // Regression: a prompt submitted while a Task tool agent is running is
+  // delivered to the subagent and recorded as a user event in
+  // <projectDir>/<sid>/subagents/agent-*.jsonl ("The user sent a new message
+  // while you were working: …"). The session jsonl the bridge watches gets no
+  // user event until the agent reports back, so a top-level-only fingerprint
+  // scan produced a false submit_unconfirmed even though the prompt ran.
+  it('finds a prompt delivered to a running Task subagent only when subagent scan is enabled', () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const subDir = join(projectDir, sid, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
+    const ev = {
+      type: 'user',
+      isMeta: true,
+      timestamp: '2026-09-17T03:39:54.000Z',
+      message: {
+        role: 'user',
+        content: 'The user sent a new message while you were working: 那先提交&push 一波把',
+      },
+    };
+    writeFileSync(subagent, JSON.stringify(ev) + '\n');
+    utimesSync(subagent, 2_000_000, 2_000_000);
+
+    expect(findJsonlContainingFingerprint(projectDir, '那先提交&push 一波把')).toBeNull();
+    expect(findJsonlContainingFingerprint(projectDir, '那先提交&push 一波把', {
+      includeSubagentTranscripts: true,
+    })).toBe(subagent);
+  });
+
+  it('does not treat the initial subagent task instruction as forwarded delivery', () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const subDir = join(projectDir, sid, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
+    const submittedFingerprint = 'review the exact submission marker';
+    writeFileSync(subagent, [
+      JSON.stringify({
+        type: 'user',
+        isSidechain: true,
+        timestamp: '2026-09-17T03:39:54.000Z',
+        message: { role: 'user', content: `Initial agent task: ${submittedFingerprint}` },
+      }),
+      JSON.stringify({
+        type: 'user',
+        isSidechain: true,
+        isMeta: true,
+        timestamp: '2026-09-17T03:39:55.000Z',
+        message: { role: 'user', content: 'The user sent a new message while you were working: unrelated follow-up' },
+      }),
+    ].join('\n') + '\n');
+    utimesSync(subagent, 2_000_000, 2_000_000);
+
+    expect(findJsonlContainingFingerprint(projectDir, submittedFingerprint, {
+      includeSubagentTranscripts: true,
+    })).toBeNull();
+  });
+
+  it('respects minMtimeMs for otherwise eligible forwarded subagent messages', () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const subDir = join(projectDir, sid, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
+    writeFileSync(subagent, JSON.stringify({
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content: 'repeatable short prompt' },
+    }) + '\n');
+    utimesSync(subagent, 1_000_000, 1_000_000);
+
+    // Positive control: without the mtime floor, this forwarded event matches.
+    expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
+      includeSubagentTranscripts: true,
+    })).toBe(subagent);
+    expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
+      includeSubagentTranscripts: true,
+      minMtimeMs: 1_500_000_000,
+    })).toBeNull();
+  });
+
+  it('does not descend into non-session-named subdirectories', () => {
+    const forwardedEvent = (content: string) => JSON.stringify({
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content },
+    }) + '\n';
+    const rogue = join(projectDir, 'some-other-folder', 'subagents');
+    mkdirSync(rogue, { recursive: true });
+    const rogueFile = join(rogue, 'agent-x.jsonl');
+    writeFileSync(rogueFile, forwardedEvent('fingerprint-in-nested-folder'));
+    utimesSync(rogueFile, 2_000_000, 2_000_000);
+
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const validSubDir = join(projectDir, sid, 'subagents');
+    mkdirSync(validSubDir, { recursive: true });
+    const validFile = join(validSubDir, 'agent-control.jsonl');
+    writeFileSync(validFile, forwardedEvent('valid-session-folder-control'));
+    utimesSync(validFile, 2_000_000, 2_000_000);
+
+    // Positive control: the same forwarded-event shape is eligible under a
+    // UUID-named session directory.
+    expect(findJsonlContainingFingerprint(projectDir, 'valid-session-folder-control', {
+      includeSubagentTranscripts: true,
+    })).toBe(validFile);
+    expect(findJsonlContainingFingerprint(projectDir, 'fingerprint-in-nested-folder', {
+      includeSubagentTranscripts: true,
+    })).toBeNull();
   });
 });
 
