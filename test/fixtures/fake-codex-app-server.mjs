@@ -186,8 +186,10 @@ function completeTurn(request) {
     ];
     if (behavior === 'user-input-unsupported') questions[1].options = [{ label: 'Only one' }];
     if (behavior === 'user-input-text') questions[1].options = null;
-    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, turnId, questions } });
-    if (behavior === 'user-input-cancelled') {
+    // Protocol variant: the owning turn id only rides on the nested turn object.
+    const turnRef = behavior === 'user-input-cancelled-nested' ? { turn: { id: turnId } } : { turnId };
+    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, ...turnRef, questions } });
+    if (behavior === 'user-input-cancelled' || behavior === 'user-input-cancelled-nested') {
       setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
     }
     if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
