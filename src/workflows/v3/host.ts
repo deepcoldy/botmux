@@ -81,7 +81,13 @@ import {
   type V3BotRoster,
 } from './bot-assignment.js';
 import { isGoalNode, type V3Dag } from './dag.js';
-import { v3MainSessionDirProblem, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
+import {
+  v3CheckpointProblems,
+  v3CheckpointsWithoutDependants,
+  v3MainSessionDirProblem,
+  v3PlacementProblems,
+  type V3MainTopicAvailability,
+} from './placement.js';
 import {
   checkV3BotExecutorEligibility,
   decideV3NodeExecutor,
@@ -92,6 +98,7 @@ import {
   resolveV3HandoffIdentity,
   v3BotExecutorTargets,
   v3TargetPlacementProblems,
+  v3TargetsHaveFlowRules,
   type V3BotEligibilityProbe,
   type V3HandoffIdentityPolicy,
   type V3BotEligibilityProblem,
@@ -419,6 +426,10 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
     if (cur.status !== 'spec_approved' && cur.status !== 'architect_running') {
       throw new HostGuardError(`architect 需要 status=spec_approved（先 approve-spec），当前 ${cur.status}`);
     }
+    // A failed attempt left its problems on spec_approved: the next attempt
+    // is told what to fix (cleared by revise-spec / revise-dag, and by this
+    // transition, so they are quoted to exactly one attempt).
+    const previousProblems = cur.status === 'spec_approved' ? cur.problems ?? [] : [];
     transition(runDir, 'architect_running', { problems: undefined }, now);
 
     let res: RunArchitectResult;
@@ -433,6 +444,7 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
         timeoutMs: deps.timeoutMs,
         cancelSignal: deps.cancelSignal,
         ...(deps.botAssignment ? { botAssignment: deps.botAssignment } : {}),
+        ...(previousProblems.length > 0 ? { previousProblems } : {}),
       });
     } catch (err) {
       // Defense in depth: intended Gate-2 publication also takes this host
@@ -475,6 +487,8 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
             },
             mainTopic: deps.botAssignment.mainTopic ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
           }).map((problem) => problem.message),
+          // §13.6: a checkpoint nothing depends on would never wake the main bot.
+          ...v3CheckpointProblems(v3CheckpointsWithoutDependants(dag as V3Dag)),
         ];
         if (problems.length > 0) throw new DagValidationError(problems);
       }
@@ -753,7 +767,7 @@ export async function planAdHocNodeExecutor(
     workingDirOverride: workingDir,
   });
   const targets = v3BotExecutorTargets(dag, snapshots);
-  if (targets.some((target) => target.placement === 'main')) {
+  if (v3TargetsHaveFlowRules(targets)) {
     const placement = v3TargetPlacementProblems({
       targets,
       orchestratorAppId: binding.larkAppId,
