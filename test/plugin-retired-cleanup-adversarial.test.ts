@@ -180,6 +180,22 @@ describe('retired cleanup: independent adversarial verification', () => {
     });
   });
 
+  it('REGISTERED-PLUGIN: updating a still-registered plugin keeps its recovery home', () => {
+    // The guard this pins: `if (registry.plugins[pluginId]) return`. Dropping it
+    // still passes every other case in this file, because those all start from a
+    // completed uninstall (record absent) and hit the same early return for a
+    // different reason. Here the record is PRESENT, so only that guard stands
+    // between an in-place update and the only copy of the previous runtime.
+    installLocalPlugin(source('sample', 'registered-v1'));
+    const recovery = `${paths.pluginHome('sample')}.removed-123-456`;
+    fs.mkdirSync(recovery, { recursive: true });
+    fs.writeFileSync(join(recovery, 'recovery-data'), 'previous runtime kept for recovery');
+    installLocalPlugin(source('sample', 'registered-v2'));
+    expect(marker()).toBe('registered-v2');
+    expect(fs.readFileSync(join(recovery, 'recovery-data'), 'utf8'),
+      'a registered plugin is not proof its retired home is garbage').toBe('previous runtime kept for recovery');
+  });
+
   it('MISSING-REGISTRY: preserves recovery data when registry absence cannot prove completed uninstall', () => {
     const recovery = retired();
     fs.rmSync(paths.pluginRegistryPath());
