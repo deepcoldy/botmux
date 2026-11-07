@@ -426,39 +426,39 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
   // 恢复健康即清零：CLI 跑到可输入 prompt 并稳定存活，说明此前那些崩溃不构成
   // 持续的确定性故障。不清掉的话，一次历史 127 会让这条会话此后任何一次 127 都
-  // 立即放弃自动重启（评审实测隔 90 天仍如此）。
+  // 立即放弃自动重启（评审实测隔 90 天仍如此）。不使用假时钟——bun:test 的假定时器
+  // 会接管 setTimeout 让 flush() 死锁；改为把 readyAt 直接拨老来模拟「已存活满窗」，
+  // 严格的窗口边界（恰好满窗 vs 超 1ms）由 restart-policy 的纯函数用例覆盖。
   it('clears the crash-restart streak once the CLI stays up a full window after ready', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] });
-    try {
-      const t0 = Date.parse('2026-11-07T00:00:00Z');
-      vi.setSystemTime(t0);
-      const worker = makeFakeWorker();
-      const ds = makeDs('sid-ready-clears-streak', worker);
-      __testOnly_setupWorkerHandlers(ds, worker);
+    const sid = 'sid-ready-clears-streak';
+    const worker = makeFakeWorker();
+    const ds = makeDs(sid, worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
 
-      worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
-      await flush();
-      expect(restartCounts.get('sid-ready-clears-streak')?.permanentCount).toBe(1);
+    worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
 
-      // The CLI comes up for real and keeps running.
-      vi.setSystemTime(t0 + 5_000);
-      worker.emit('message', { type: 'prompt_ready' });
-      await flush();
-      vi.setSystemTime(t0 + 5_000 + RESTART_WINDOW_MS + 1);
-      // Later turns keep reporting ready; the window counts from the first one.
-      worker.emit('message', { type: 'prompt_ready' });
-      await flush();
+    // The CLI reaches a prompt: prompt_ready stamps readyAt once and keeps the streak.
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    const firstReadyAt = restartCounts.get(sid)?.readyAt;
+    expect(firstReadyAt).not.toBeUndefined();
 
-      // So the NEXT permanent exit gets its own fresh single chance instead of
-      // being killed on arrival by a stale streak.
-      worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
-      await flush();
-      expect(restartCounts.get('sid-ready-clears-streak')?.permanentCount).toBe(1);
-      expect(worker.send).not.toHaveBeenCalledWith({ type: 'park_diagnostic' });
-      expect(sessionReplyMock).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
+    // Simulate the CLI having stayed up a full window; a later ready must not re-anchor.
+    const agedReadyAt = Date.now() - RESTART_WINDOW_MS - 1;
+    restartCounts.get(sid)!.readyAt = agedReadyAt;
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(restartCounts.get(sid)?.readyAt).toBe(agedReadyAt);
+
+    // So the NEXT permanent exit gets its own fresh single chance instead of
+    // being killed on arrival by a stale streak.
+    worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   // #2551：到了 prompt 不等于恢复健康。CLI 每收到（被重投的）同一条输入就退出
