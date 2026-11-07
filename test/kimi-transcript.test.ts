@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CotEntry } from '../src/types.js';
@@ -7,6 +7,7 @@ import {
   findKimiWireBySessionId,
   findKimiWireForBotmuxSession,
   KimiActivityParser,
+  kimiSessionIndexStamp,
   readKimiModelContextWindow,
 } from '../src/services/kimi-transcript.js';
 import { makeKimiSession, toolTurn, wire, type WireRecord } from './helpers/kimi-wire-fixture.js';
@@ -126,6 +127,53 @@ describe('Kimi session lookup by botmux session', () => {
     writeFileSync(join(outside, 'state.json'), JSON.stringify({ lastPrompt: envelope(BOTMUX) }));
     writeFileSync(join(home, 'session_index.jsonl'), JSON.stringify({ sessionId: 'session_x', sessionDir: outside, workDir: home }) + '\n');
     expect(findKimiWireForBotmuxSession(BOTMUX, home, { env })).toBeUndefined();
+  });
+});
+
+describe('Kimi session index change stamp', () => {
+  const env = (home: string) => ({ KIMI_CODE_HOME: home });
+  // A fixed instant with millisecond precision, so utimes round-trips exactly.
+  const pinMtime = (path: string) => utimesSync(path, STAMP_PIN_DATE, STAMP_PIN_DATE);
+  const STAMP_PIN_DATE = new Date('2025-06-01T08:30:00.000Z');
+
+  it('changes when state.json is rewritten inside the same millisecond (size component)', () => {
+    const home = tmp();
+    const s = makeKimiSession(home, {
+      id: 'session_a', workDir: home, lastPrompt: envelope(BOTMUX),
+      records: [wire.metadata(), wire.prompt(0, envelope(BOTMUX))],
+    });
+    const statePath = join(s.dir, 'state.json');
+    pinMtime(statePath);
+    const before = kimiSessionIndexStamp(env(home));
+    // A longer prompt rewrites state.json while the mtime is pinned to the
+    // same instant: two writes landing in one millisecond, the flake shape.
+    writeFileSync(statePath, JSON.stringify({
+      id: 'session_a', lastPrompt: envelope(BOTMUX, 'x'.repeat(200)),
+    }));
+    pinMtime(statePath);
+    expect(statSync(statePath).mtimeMs).toBe(STAMP_PIN_DATE.getTime());
+    expect(kimiSessionIndexStamp(env(home))).not.toBe(before);
+  });
+
+  it('stays equal when neither mtime nor size of the newest state changes', () => {
+    const home = tmp();
+    const s = makeKimiSession(home, {
+      id: 'session_a', workDir: home, lastPrompt: envelope(BOTMUX),
+      records: [wire.prompt(0, envelope(BOTMUX))],
+    });
+    const statePath = join(s.dir, 'state.json');
+    pinMtime(statePath);
+    const before = kimiSessionIndexStamp(env(home));
+    const originalSize = statSync(statePath).size;
+    // Equal-length rewrite with the mtime pinned: neither stamp component has
+    // a signal, so the stamp intentionally stays equal (the fresh re-resolve
+    // path remains the backstop for this shape).
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    state.lastPrompt = envelope(BOTMUX, 'y'.repeat(5));
+    writeFileSync(statePath, JSON.stringify(state));
+    pinMtime(statePath);
+    expect(statSync(statePath).size).toBe(originalSize);
+    expect(kimiSessionIndexStamp(env(home))).toBe(before);
   });
 });
 

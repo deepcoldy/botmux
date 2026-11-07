@@ -485,6 +485,12 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       // routing marker. Kimi indexes every new session (fresh spawn, `/new`),
       // so the index stamp in the key makes a new generation take over at
       // once; the TTL only re-checks a hit whose marker evidence moved.
+      //
+      // The stamp only watches the NEWEST index entry's state.json, so a
+      // sibling conversation that creates a session after ours hides our
+      // generation's prompt writes from it. A turn-boundary read (fresh)
+      // therefore bypasses the hit TTL and re-runs the marker lookup, which
+      // scans every entry; streaming refreshes keep riding the TTL cache.
       const kimiSid = q.cliSessionId && isKimiSessionId(q.cliSessionId) ? q.cliSessionId : undefined;
       const kimiEnv = kimiEnvForBot(q.larkAppId);
       const path = cachedTranscriptPathLookup(
@@ -493,7 +499,7 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
         () => foundWrap(kimiSid
           ? findKimiWireBySessionId(kimiSid, kimiEnv)
           : findKimiWireForBotmuxSession(q.sessionId, q.cwd, { env: kimiEnv }), v),
-        { retryMiss: q.fresh },
+        { retryMiss: q.fresh, refreshHit: q.fresh },
       );
       return path ? { path, kind: 'kimi' } : null;
     }

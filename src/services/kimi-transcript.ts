@@ -97,7 +97,13 @@ const INDEX_TAIL_BYTES = 8 * 1024;
  *  marker": the index (Kimi appends to it whenever it creates a session —
  *  first prompt, `/new`) plus the state.json of its newest entry (rewritten on
  *  every prompt, so a `/new` session's first prompt shows up even though the
- *  index did not change). `''` when there is no index. */
+ *  index did not change). `''` when there is no index.
+ *
+ *  The state.json part carries BOTH mtime and size: a prompt rewrite that
+ *  lands in the same millisecond as the previous write keeps mtimeMs identical
+ *  (observed in tight test loops and possible on a fast disk), and size still
+ *  changes when `lastPrompt` changes. Size alone is not enough — an
+ *  equal-length rewrite would be invisible — so both are kept. */
 export function kimiSessionIndexStamp(env: NodeJS.ProcessEnv = process.env): string {
   const home = kimiHome(env);
   const indexPath = join(home, 'session_index.jsonl');
@@ -117,7 +123,10 @@ export function kimiSessionIndexStamp(env: NodeJS.ProcessEnv = process.env): str
       if (typeof row.sessionId !== 'string' || typeof row.sessionDir !== 'string' || row.deleted === true) continue;
       const dir = containedSessionDir(home, { sessionId: row.sessionId, sessionDir: row.sessionDir });
       if (!dir) continue;
-      try { newestState = String(statSync(join(dir, 'state.json')).mtimeMs); } catch { newestState = '-'; }
+      try {
+        const st = statSync(join(dir, 'state.json'));
+        newestState = `${st.mtimeMs}:${st.size}`;
+      } catch { newestState = '-'; }
     } catch { /* partial first line of the tail window, or a torn line */ }
   }
   return `${size}:${mtimeMs}:${newestState}`;

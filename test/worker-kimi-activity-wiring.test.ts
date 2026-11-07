@@ -110,3 +110,86 @@ describe('Kimi activity reaches the turn it belongs to', () => {
     expect(scope.observeCotEntries).not.toHaveBeenCalled();
   });
 });
+
+describe('Kimi activity observer startup guards', () => {
+  /** Records construction args instead of touching the filesystem. */
+  function makeFakeObserverClass() {
+    const instances: Array<{ opts: Record<string, unknown>; started: boolean; stops: number }> = [];
+    class FakeObserver {
+      started = false;
+      stops = 0;
+      constructor(public opts: Record<string, unknown>) { instances.push(this); }
+      start() { this.started = true; }
+      stop() { this.stops++; }
+    }
+    return { FakeObserver, instances };
+  }
+
+  function startupScope() {
+    const scope: Record<string, any> = {
+      kimiActivityObserver: undefined,
+      lastResolvedSandboxMode: undefined,
+      currentBotmuxTurnId: undefined,
+      currentBotmuxDispatchAttempt: undefined,
+      log: vi.fn(),
+    };
+    scope.stopKimiActivityObserver = loadWorkerFunction('stopKimiActivityObserver', scope);
+    scope.startKimiActivityObserver = loadWorkerFunction('startKimiActivityObserver', scope);
+    const start = (cfg: Record<string, unknown>) => scope.startKimiActivityObserver({
+      cfg, resume: false, resumeLookupSessionId: 'adapter-sid',
+      workingDir: '/work', env: { KIMI_CODE_HOME: '/home' },
+    });
+    return { scope, start };
+  }
+
+  it('never starts under the scratch COW sandbox (host cannot see the overlay log)', () => {
+    const { scope, start } = startupScope();
+    const { FakeObserver, instances } = makeFakeObserverClass();
+    scope.KimiActivityObserver = FakeObserver;
+    scope.lastResolvedSandboxMode = 'scratch';
+    start({ cliId: 'kimi', adoptMode: false, sessionId: 'om_s' });
+    expect(scope.kimiActivityObserver).toBeUndefined();
+    expect(instances).toHaveLength(0);
+  });
+
+  it('never starts in adopt mode', () => {
+    const { scope, start } = startupScope();
+    const { FakeObserver, instances } = makeFakeObserverClass();
+    scope.KimiActivityObserver = FakeObserver;
+    start({ cliId: 'kimi', adoptMode: true, sessionId: 'om_s' });
+    expect(scope.kimiActivityObserver).toBeUndefined();
+    expect(instances).toHaveLength(0);
+  });
+
+  it('never starts for another CLI even with the sandbox resolved', () => {
+    const { scope, start } = startupScope();
+    const { FakeObserver, instances } = makeFakeObserverClass();
+    scope.KimiActivityObserver = FakeObserver;
+    scope.lastResolvedSandboxMode = 'off';
+    start({ cliId: 'codex', adoptMode: false, sessionId: 'om_s' });
+    expect(scope.kimiActivityObserver).toBeUndefined();
+    expect(instances).toHaveLength(0);
+  });
+
+  it('starts for a normal kimi spawn with adapter-resolved ids/env, and restarts cleanly', () => {
+    const { scope, start } = startupScope();
+    const { FakeObserver, instances } = makeFakeObserverClass();
+    scope.KimiActivityObserver = FakeObserver;
+    start({ cliId: 'kimi', adoptMode: false, sessionId: 'om_marker' });
+    expect(instances).toHaveLength(1);
+    expect(instances[0].started).toBe(true);
+    expect(instances[0].opts).toMatchObject({
+      botmuxSessionId: 'adapter-sid',
+      markerSessionId: 'om_marker',
+      workingDir: '/work',
+      env: { KIMI_CODE_HOME: '/home' },
+      resume: false,
+    });
+    expect(scope.kimiActivityObserver).toBe(instances[0]);
+    // A second spawn stops the previous observer before replacing it.
+    start({ cliId: 'kimi', adoptMode: false, sessionId: 'om_marker2' });
+    expect(instances[0].stops).toBe(1);
+    expect(instances).toHaveLength(2);
+    expect(scope.kimiActivityObserver).toBe(instances[1]);
+  });
+});

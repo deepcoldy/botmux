@@ -12341,6 +12341,13 @@ function startKimiActivityObserver(opts: {
     env: opts.env,
     resume: opts.resume,
     onEntries: entries => {
+      // No attribution target (between turns, or before the first turn's
+      // identity is set): the poll's drain has already advanced the read
+      // offset, so these entries are consumed without appearing on any card.
+      // Kimi only logs while a prompt is running and the worker sets capture
+      // identity before writing that prompt, so the window normally holds
+      // nothing; in-turn tails are additionally covered by the two
+      // synchronous edge drains, which check the turn before draining.
       if (kimiActivityObserver !== observer || !currentBotmuxTurnId) return;
       observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
     },
