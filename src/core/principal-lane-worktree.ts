@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type {
   HumanLaneIdentityEvidence,
@@ -12,6 +12,7 @@ import {
   createRepoWorktreeAndCommit,
   mainWorktreeFor,
   worktreeRootFor,
+  worktreeTargetPath,
 } from '../services/git-worktree.js';
 import { lanePrincipalKey } from './principal-lane-routing.js';
 
@@ -263,8 +264,8 @@ export async function materializePrincipalLaneWorktree<T>(args: {
   });
   const suffix = materializationId.slice(-16);
   const branch = `wt/principal-lane-${suffix}`;
-  const worktreePath = join(
-    dirname(sourceRepoRoot),
+  const worktreePath = worktreeTargetPath(
+    sourceRepoRoot,
     `${basename(sourceRepoRoot)}-wt-principal-lane-${suffix}`,
   );
   try {

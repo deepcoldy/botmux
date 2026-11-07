@@ -6,13 +6,13 @@
  *
  * Run:  pnpm vitest run test/git-worktree.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeCleanWorktree, removeRepoWorktree, resolveDeletedWorktreeOrigin, restoreDeletedWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeCleanWorktree, removeRepoWorktree, resolveDeletedWorktreeOrigin, resolveWorktreePathForBranch, restoreDeletedWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus, worktreeTargetPath } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -325,6 +325,55 @@ describe('createRepoWorktree', () => {
     mkdirSync(plain);
 
     await expect(createRepoWorktree(plain)).rejects.toThrow();
+  });
+});
+
+describe('BOTMUX_WORKTREE_ROOT', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('places worktrees next to the repo when unset', () => {
+    vi.stubEnv('BOTMUX_WORKTREE_ROOT', '');
+    expect(worktreeTargetPath(join(tempRoot, 'proj'), 'proj-wt-1')).toBe(join(tempRoot, 'proj-wt-1'));
+  });
+
+  it('creates auto-named and explicit-branch worktrees under the root', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const root = join(tempRoot, 'wt-root');
+    vi.stubEnv('BOTMUX_WORKTREE_ROOT', root);
+
+    const auto = await createRepoWorktree(repo);
+    const explicit = await createRepoWorktree(repo, { branch: 'feat/x' });
+
+    expect(auto.path).toBe(join(root, 'proj-wt-1'));
+    expect(explicit.path).toBe(join(root, 'proj-feat-x'));
+    expect(git(explicit.path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feat/x');
+    expect(existsSync(join(tempRoot, 'proj-wt-1'))).toBe(false);
+    expect(await resolveWorktreePathForBranch(repo, 'feat/y')).toBe(join(root, 'proj-feat-y'));
+  });
+
+  it('keeps reusing a worktree that already sits next to the repo', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    vi.stubEnv('BOTMUX_WORKTREE_ROOT', '');
+    const legacy = await createRepoWorktree(repo, { branch: 'wt/lane' });
+    const root = join(tempRoot, 'wt-root');
+    vi.stubEnv('BOTMUX_WORKTREE_ROOT', root);
+
+    const target = worktreeTargetPath(repo, 'proj-wt-lane');
+    const reused = await createRepoWorktree(repo, { branch: 'wt/lane', worktreePath: target, reuseExisting: true });
+    const next = await createRepoWorktree(repo);
+
+    expect(target).toBe(legacy.path);
+    expect(reused).toMatchObject({ path: legacy.path, reused: true });
+    expect(next.path).toBe(join(root, 'proj-wt-1'));
+  });
+
+  it('expands a leading ~ in the root', () => {
+    vi.stubEnv('BOTMUX_WORKTREE_ROOT', '~/wts');
+    expect(worktreeTargetPath(join(tempRoot, 'proj'), 'proj-wt-1')).toBe(join(homedir(), 'wts', 'proj-wt-1'));
   });
 });
 
