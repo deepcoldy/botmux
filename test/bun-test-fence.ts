@@ -1,8 +1,9 @@
-import { afterAll, beforeEach, mock } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { afterAll, mock } from 'bun:test';
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as realOs from 'node:os';
 import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
+import { installSessionDataDirFence } from './helpers/session-data-dir-fence.js';
 import {
   applyTmuxFenceEnv,
   createTmuxFence,
@@ -39,38 +40,16 @@ import {
  * behaviour rather than inventing a third semantic.
  */
 
-// DATA-DIR FENCE — keep the disposable-root block below in sync with
-// test/helpers/session-data-dir-fence.ts (the vitest half mounted by
-// unit-setup.ts and e2e-setup.ts): change one copy, compare the other.
-// Deliberately duplicated rather than imported — the blocker is shape and
-// ordering, not module resolution: `bun test` runs the whole invocation in ONE
-// process and has no globalSetup channel, so this file mints the root itself
-// (once, process-wide) alongside the node:os/home and tmux fences that must be
-// installed before bun-test-shim.ts loads; the vitest helper is built around a
-// per-file root under a globalSetup-injected parent and per-test repair for
-// forked workers. (Bun aliases 'vitest' itself inside `bun test` preloads —
-// measured, the helper's beforeEach/afterAll register without the shim — the
-// shim only fills methods missing from bun:test's vi.)
-const inheritedDataDir = process.env.SESSION_DATA_DIR;
-
-// One disposable root per test PROCESS — note that `bun test` runs every file
-// it was given in a single process (measured: two files report the same
-// `process.pid`), unlike vitest which forks a worker per file. So this root is
-// shared by the whole invocation rather than per-file. That is fine for the
-// purpose here (keeping writes out of the real home) but it means `afterAll`
-// below fires once at the end, not between files. `bun test` also has no
-// globalSetup hook to hand a shared parent down (vitest uses
-// `unit-global-setup.ts` for that), so the root is minted here, under the real
-// tmpdir — captured from the unmocked module before the override is installed.
-const fileRoot = mkdtempSync(join(realOs.tmpdir(), 'botmux-bun-unit-'));
-
-const dataDir = join(fileRoot, 'data');
-mkdirSync(dataDir);
-process.env.SESSION_DATA_DIR = dataDir;
-// Proof for test/helpers/require-fenced-data-dir.ts that this fence ran in this
-// process: SESSION_DATA_DIR must sit inside this exact root (a temp-looking
-// SESSION_DATA_DIR alone is not proof).
-process.env.__TEST_DATA_DIR_FENCE = fileRoot;
+// DATA-DIR + MOJO FENCE — shared with vitest's unit-setup.ts / e2e-setup.ts via
+// test/helpers/session-data-dir-fence.ts. Bun resolves the real `vitest`
+// package at this preload position (ahead of bun-test-shim.ts), and the
+// helper's beforeEach/afterAll (imported from 'vitest' there) really register on
+// bun's runner and fire per test / at process exit, including failed runs. The
+// helper uses neither `inject` nor node:os, so installing it here keeps this
+// file's node:os mock below the first os-reading call. One disposable root per
+// bun test PROCESS — bun runs every file named on the command line in one
+// process — so the parent is the real tmpdir, captured before the os override.
+const { fileRoot } = installSessionDataDirFence(realOs.tmpdir(), 'botmux-bun-unit-');
 
 const fileHome = join(fileRoot, 'home');
 mkdirSync(fileHome);
@@ -127,36 +106,16 @@ const fencedOs = {
 
 mock.module('node:os', () => ({ ...fencedOs, default: fencedOs }));
 
-// Mirrors the vitest fence: mojo mints per-session workspaces under the real
-// `~/.botmux/mojo-workspaces` unless redirected (observed live before the vitest
-// side was fenced). Tests that assert the path pass an explicit home instead.
-const mojoWorkspaceRoot = join(fileRoot, 'mojo-workspaces');
-mkdirSync(mojoWorkspaceRoot);
-process.env.BOTMUX_MOJO_WORKSPACE_ROOT = mojoWorkspaceRoot;
-
 // Same tmux fence as vitest (test/helpers/tmux-fence.ts): no test may reach the
 // host's tmux servers. `bun test` runs every file in this one process, so one
 // private socket root serves the whole invocation.
 const tmuxFence = createTmuxFence(process.env);
 applyTmuxFenceEnv(tmuxFence);
 
-// A preload runs before the test module, so a file-wide override made at module
-// scope or in beforeAll must be captured once and then repaired per test.
-let fileDataDir = '';
-beforeEach(() => {
-  if (!fileDataDir) {
-    const candidate = process.env.SESSION_DATA_DIR;
-    fileDataDir = candidate && candidate !== inheritedDataDir ? candidate : dataDir;
-  }
-  process.env.SESSION_DATA_DIR = fileDataDir;
-});
-
+// The data-dir helper registers its own afterAll first (at import), so under
+// stacked hook order it runs last: this tmux teardown happens while the
+// disposable root still exists, then the helper deletes it.
 afterAll(() => {
-  // Keep leaked async work fenced inside the managed root until the process
-  // exits; restoring the invoking environment here could briefly re-expose live
-  // Botmux data to a straggling write.
-  process.env.SESSION_DATA_DIR = dataDir;
-  rmSync(fileRoot, { recursive: true, force: true });
   const tmuxDenials = readTmuxFenceDenials(tmuxFence);
   teardownTmuxFence(tmuxFence);
   if (tmuxDenials.length > 0) throw tmuxFenceDenialError(tmuxDenials);

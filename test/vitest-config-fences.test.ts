@@ -52,6 +52,11 @@ describe('repo vitest configs keep the tmux and data-dir fences', () => {
     const mod = await import(pathToFileURL(join(ROOT, file)).href);
     for (const project of projectsOf(mod.default)) {
       const label = `${file} › ${project.name ?? '(root)'}`;
+      // The disposable root comes from the globalSetup; without it the setup
+      // file's inject() gets undefined and every e2e file crashes at import —
+      // which PR CI does not catch (no e2e job runs on pull_request).
+      expect(asList(project.globalSetup).map(p => p.replace(/^\.\//, '')), label)
+        .toContain('test/unit-global-setup.ts');
       // The e2e project deliberately keeps the developer's real HOME (real CLIs
       // need real credentials) but still gets a disposable SESSION_DATA_DIR via
       // e2e-setup.ts; every other project gets the full unit-setup.ts fence.
