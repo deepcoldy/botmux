@@ -302,7 +302,13 @@ botmux · 发送给：@文档Bot                  [工作流 ›]
 
 - **字段**：只有顶层 goal 节点能写 `placement`；`"topic"` 和不写一样，归一化后不出现在 DAG 里，所以没写过这个字段的 DAG 和 Saved Workflow 模板逐字节不变。Loop 的 body 节点、Loop 节点、host 节点写了就校验失败：body 每轮都重跑、可能被返工，按 5.2 的判断依据本来就该开节点话题；host 节点由主 Bot 执行，不交接。临时进程执行的 run 忽略这个字段。
 - **硬规则的判定**：规则 1、2 是纯图判定（`src/workflows/v3/placement.ts`）：同一执行 Bot 的两个主话题节点必须有保序的传递依赖关系（`v3OrderedAncestorSets`，只走等全部上游的汇合；可达集每张图只算一次；Gate-2 / Saved Workflow 的冻结目标与运行中修改、改派共用这一个函数）。拒绝文案写明是哪个汇合节点的触发规则打断了先后。Loop body 不能放主话题、Loop 节点要等整个循环结束才算完成，不会出现这类情况；Revisit 和运行中的 rerunNode 会把被替代的后代先停掉、关账，再派发祖先的新实例（`shared-node-runtime` 在 `decideNext` 之前排空被替代的尝试），停止前先撤销交接，忙闲判定也把撤销视为已结束，所以祖先的新实例不会和旧后代同时在同一个会话里执行。执行 Bot 按「这次修改的改派 → 之前的改派 → 定义里的 Bot → 主 Bot」取。规则 3 看主会话：run 绑定的会话必须是这个主话题自己的话题会话（`scope=thread` 且根消息就是 run 的主话题根）；整群一个会话的普通群（会话 `scope=chat`）、查不到主会话，都按不可用处理（`v3MainTopicAvailability`）。
-- **在哪里检查**：Architect 产出后（违反就退回 spec_approved，问题列表写明第几条）、approve-dag（发布 run.json 之前拒绝，先于在群 / 在线等实时检查）、Saved Workflow 启动（`resolveV3NodeExecutor`，同样先于实时检查）、每次运行中修改（规则 1、2 在 planner 里查整张新 DAG；规则 3 只查这次新放进主话题的节点，已经生效的落点生效时查过、主会话的形态在 run 内不会变）、阻塞卡改派主话题节点时（`placement-conflict`）。
+- **在哪里检查**：Architect 产出后（违反就退回 spec_approved，问题列表写明第几条）、approve-dag（发布 run.json 之前拒绝，先于在群 / 在线等实时检查）、Saved Workflow 启动（`resolveV3NodeExecutor`，同样先于实时检查）、每次运行中修改（规则 1、2 在 planner 里查整张新 DAG；规则 3 只查这次新放进主话题的节点，已经生效的落点生效时查过、主会话的形态在 run 内不会变）、阻塞卡改派主话题节点时（`placement-conflict`）。拒绝文案里的 Bot 写显示名、括号带 appId（Gate-2、Saved Workflow 启动、运行中修改都传了 `nameOf`）。
+- **主 Bot 自己的主话题节点与指定工作目录**：这类节点就在主会话里跑（规则 2），而主会话在发 `/workflow` 时已经在它自己的目录里起来了；冻结的 `nodeWorkingDir` 与主会话目录（都按 realpath 比较）不同时，运行时一定以 `WORKING_DIR_REFUSED` 受阻（15.4「子 Bot 起会话时」的已有会话判定）。所以凡是会造成这种组合的入口都提前拒绝，共用 `placement.ts` 的 `v3MainSessionDirProblem`，文案写明「主 Bot 自己在主话题执行的节点只能在主会话的目录 <dir> 里跑；把节点改成节点话题，或不指定工作目录，或指定为 <dir>」：
+  - `approve-dag --working-dir`（目前唯一冻结 `nodeWorkingDir` 的入口；Dashboard 草稿和 Saved Workflow 不冻结它）：主会话目录从持久化的会话行读（与规则 3 读同一行），architect 的 Gate-2 预览同样提示。会话行没固定目录时，按 daemon `getSessionWorkingDir` 的同一条回落规则推导（`working-dir-range.ts` 的 `unpinnedSessionWorkingDir`：主 Bot 的有效默认目录，自动 worktree 的除外，再到 `workingDir`、`~`；两边共用这个函数，CLI 侧用 bots.json 当下的配置）；
+  - 运行中修改：只判这次**新变成**这类节点的（新增、挪进主话题、改派给主 Bot），已经是的不重判；主会话目录由 daemon 按交接时的同一查找（主话题根 × 主 Bot 的活跃会话）给出；
+  - 受阻卡改派给主 Bot：主 Bot 不出现在可选项里（列在「现在不能接手」），伪造或旧卡的点击同样拒绝。
+  - 主会话目录拿不到（会话行读不到或不唯一、会话已关、没固定目录且 bots.json 里没有主 Bot）时不在这些入口硬拒，保留运行时那道闸。
+  - **残留窗口**：判定用的是批准（或修改）那一刻主会话的目录。之后主会话再 `/cd` 到别处，或主 Bot 的默认目录配置改了（没固定目录的会话会跟着变），节点在运行中仍会以 `WORKING_DIR_REFUSED` 受阻；这时按受阻卡改成节点话题或改派即可。
 - **运行中修改**：`updateNode` 可以改 `placement`，只对还没开始（含还在等 Gate、尚未交接）的节点生效；已开始的节点改成不同落点就拒绝，写回同一个落点不算修改。只改落点不算改了节点的工作，不作废等待中的 Gate，也不重做。
 - **交接消息**：主话题落点不发节点卡、不分配节点卡的幂等 key，交接卡直接回复主话题根，顶部多一段状态行（与节点卡同一套状态文案），由节点卡同步按日志就地更新；同步需要的卡片内容在发出时存到尝试目录的 `handoff-card.json`。绑定与节点话题相同（按交接消息 id，签名里多一个 `placement: "main"`，`publishRoot` 是主话题根）；节点话题的绑定字节不变。
 - **执行 Bot 的 daemon 版本**：新版 daemon 在 descriptor 里声明 `workflowMainPlacement: "v1"`；没声明的子 Bot 不发主话题交接，节点受阻（`COLLABORATION_DENIED`，写明版本过旧）。旧版本收到也认不出带 `placement` 的签名，不会把交接当成普通消息执行。
@@ -454,6 +460,11 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 结束仍用现有的 `nodeSucceeded` / `nodeBlocked` / `nodeFailed` / `nodeCancelled`。新增错误码：`BOT_NOT_IN_CHAT`、`BOT_OFFLINE`、`COLLABORATION_DENIED`、`HANDOFF_NOT_ACCEPTED`、`HANDOFF_UNCERTAIN`、`BOT_REPORTED_BLOCKED`、`NODE_TIMEOUT`、`IDENTITY_UNAVAILABLE`、`HANDED_TO_HUMAN`（13.6）。
 
 `run.json` 增加 `nodeExecutor: "bot"`；没有这个字段的 run 一律按旧方式执行。流程版本相关事件见第 13 节。
+
+**判断「是不是新模式的 run」以 `run.json` 为准**：journal 根上的 `runStarted.nodeExecutor` 只是补充（给没有 `run.json` 的宿主用）。`botmux workflow start` 和 Saved Workflow 启动时，daemon 先写启动意图（`start-intent.ts` 的 `runStarted`），runtime 只在 journal 为空时才写带标记的那条，所以早先这条路径开跑的 run 根上都没有标记，看板因此拿不到交接和检查点（2026-11-06 飞书实测）。现在：
+- 启动意图读已校验的 `run.json`，冻结了 `nodeExecutor: "bot"` 就在它写的 `runStarted` 上带上；journal 只追加，不改写已有的根，也不为此新增事件类型（旧版本重放仍是同一条 `runStarted` 形状，这个形状 runtime 早就会写）。
+- 看板投影（`ops-projection.ts` 的交接、检查点）用已校验的 `run.json` 判断，读不到时退回 journal 标记；引擎控制（`external-control.ts` 的改派、交给人）调用方给了 pinned 就用它，没给就读 `run.json`（只看 `engine`、`runId` 与目录一致、`nodeExecutor`，不引入 schema 库，保持 workflow-core 无第三方依赖），再退回 journal 标记。
+- 已经存在的、根上没有标记的 run 不迁移数据，按 `run.json` 判断即可。
 
 **runtime 的改法**：现在的 `RunNode` 是一个在内存里等待的 Promise，进程没了就只能当孤儿处理。新模式下，goal 节点改成和 suspend Gate 一样的「落盘等待」：
 
@@ -816,7 +827,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
   - 安全上限：完成后 60 分钟仍未放行 → `holdTimeout`（覆盖主会话长时间忙、唤醒回合卡住等情况）；
   - daemon 重启后（内存里没有这一回合的任何信息）：唤醒已签发的检查点登记为「重启找回」，每次扫描、每次轮询、会话每次变 idle（包括重启后第一帧「未知 → idle」）都复查承接会话：已证明空闲（worker 在、提示符就绪、屏幕 idle）→ 放行（`wakeTurnEnded`，回合已结束或随旧进程丢失）；会话已关或 CLI 不在 → `wakeSessionEnded`；仍忙或还没重新接上 → 继续等。
   非 `wakeTurnEnded` 的放行记告警，节点卡写「没能唤醒主 Bot / 主 Bot 的会话中途结束 / 等待超时，已按原流程继续」，看板节点详情同样显示。旧模式的 run 不暂停（DAG 校验不拦旧模式里的标记，标了也照常往下走）。
-  - 已结束的 run（成功、失败、已取消或取消中）不再有任何暂停：未放行的检查点不再轮询、不往已结束的 journal 追加放行、节点卡和看板也不显示「后续暂停」。检查点是汇点时 run 随它完成而结束，不唤醒主 Bot（与其它已结束 run 的事件一致）。
+  - 已结束的 run（成功、失败、已取消或取消中）不再有任何暂停：未放行的检查点不再轮询、不往已结束的 journal 追加放行、节点卡和看板也不显示「后续暂停」。检查点是汇点时 run 随它完成而结束，不唤醒主 Bot（与其它已结束 run 的事件一致）——所以新模式不允许这样的检查点，见下「`checkpoint` 字段」。
 - 普通群「整群一个会话」的主会话：在群顶层发起的 run 没有话题根，`decideV3NodeExecutor` 不让它进新模式（原因 `no_thread_root`，Gate-2 写明照旧用临时进程），所以不会被唤醒，与 P4 一致（这类群的节点要开话题，而主会话本身没有根）。在某个话题里发起的 run 有根，唤醒按话题根投递，在该话题开一个话题会话，而不是投回整群会话（整群会话的当前回复位置可能已在别处，签发记录对不上）。若扫描时发现 run 没有可唤醒的主话题，检查点立即以 `wakeNotDelivered` 放行。
 - 只有新模式（`run.json` 冻结了 `nodeExecutor: "bot"`）的 run 会被唤醒；其它 run 读到信封就返回。
 
@@ -824,6 +835,11 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 
 - goal 节点可选 `checkpoint: true`。DAG 校验为可选布尔；只保留 `true`，不写或写 `false` 时序列化结果与没有这个字段时逐字节一致，已保存的模板不用迁移。host 节点、loop 节点和 loop body 节点不支持（loop 每轮都唤醒会刷屏，且主 Bot 不能改运行中的 body）。
 - 检查点完成后，依赖它的节点暂停到这次唤醒的主 Bot 回合结束（见上「检查点暂停与放行」），回合里没改流程就按原流程继续。
+- **检查点必须有下游**：顶层图里没有任何节点依赖它的检查点不能标（它是最后完成的节点时 run 直接结束，主 Bot 不会被唤醒，标记静默失效）。由 `placement.ts` 的 `v3CheckpointsWithoutDependants` 判定，与落点硬规则同在三处检查：Architect 出图后（问题退回 Architect，见下）、批准时（`approve-dag`、Saved Workflow 在飞书或 Dashboard 启动，经冻结的 targets 上的 `checkpointWithoutDependants`，由 `v3TargetPlacementProblems` 报出）、运行中修改（`planV3DagRevision`）。提示：「节点 x：检查点后面没有节点，主 Bot 不会被叫来；去掉这个标记，或在后面加一个汇总节点」。
+  - 只对新模式（`nodeExecutor: "bot"`）检查：临时进程的 run 不看这个标记（不暂停、不唤醒），Architect 的旧模式提示也不提检查点。
+  - 只在写入/批准/修改时拒绝，不进 DAG 解析期的 schema：已有的 run.json、journal、已保存模板里带这种检查点照样能加载、回放、`workflow status`；已发布 run 的批准重放也不再检查。
+  - 运行中修改：修改后的流程里有无下游、且还可能完成的检查点就拒绝（新标的、删掉或改掉了它唯一的下游、规则之前批准的 run 里本来就有的都算；同一次修改里去掉标记或补一个下游即可通过）。已完成（且这次没有重做它）、已跳过或已取消的检查点不算：它不会再完成，没有要唤醒的事——主 Bot 看完检查点结果决定不做后面的节点，可以把唯一的下游删掉。
+  - Architect 校验失败退回 `spec_approved` 时问题记在 grill.state.json；下一次 `architect` 把这些问题原样附在提示末尾（「Previous attempt」），Architect 能据此自己改图。
 - 运行中修改的 `updateNode` 可以改它，不需要确认；只改它不算改了执行内容：不作废正在跑的执行、不让受阻节点重新审批（`nodeWorkDefinition`）。
 - Architect 只在新模式的提示里说明什么时候标（「做完这一步要看结果再决定后面怎么走」），旧模式的 Architect 提示不变。
 
@@ -934,10 +950,11 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
   - **冻结**：与临时进程模式一样，把 realpath 写进 `bots.snapshot.json` 每个 Bot 快照的 `workingDir`；另在 `run.json` 记 `nodeWorkingDir`（只允许和 `nodeExecutor: "bot"` 同时出现），作为「这是 Gate-2 指定、要在子 Bot 侧应用的目录」的标记——新模式下快照里的 `workingDir` 平时只是展示用的默认目录，单凭快照分不清是否指定过。旧版本 daemon 读到这个键会因 `.strict()` 拒绝驱动。关开关时（临时进程模式）行为不变：原样冻结 `--working-dir` 的原始值，不做范围检查，`run.json` 不出现这个键。
   - **子 Bot 起会话时**：daemon 收到已核验的交接后、登记接单和放入附件之前，读 `run.json`，按自己**当时**的配置和发起人的操作权再判定一次（需要查身份时在查会话之前等完，`resolveInboundWorkingDir`）。通过：没有会话时新会话直接在这个目录起（不走 oncall / 继承 / 默认目录的解析，判定与起点在 `workflow-node-daemon.ts` 的 `admitInbound` / `workflowNodePinnedStart`，daemon.ts 只接线）。节点话题里已经有会话（有人先在话题里 @ 过子 Bot，或 `/cd` 过）时，再比较两边的 realpath，不一致就按不通过处理（「节点话题里已有会话，工作目录与指定的不一致」），不把交接塞进在别处跑的会话；一致（同一 run 前一次尝试建的会话）就继续用它。不通过：不起会话、不登记接单，向主 Bot 报 `refused`，主 Bot 把这次尝试记成受阻（`WORKING_DIR_REFUSED`，消息写明目录和原因），不改用默认目录；`run.json` 读不到也按不通过处理。`refused` 不带会话 id，已被某个会话接单的尝试不会被它关掉。
   - **拒绝原因怎么送到**：子 Bot 先把原因签名记在这次交接的 registry 条目上（与撤销记录同一处，主 Bot 判断是否接单时会读），再直接通知主 Bot；直接通知失败（报错应答或连不上）重试一次。两次都没送到时，节点在接单期限到期时以 `HANDOFF_NOT_ACCEPTED` 受阻，消息里带上这条目录原因，子 Bot 日志里也有。
-  - **主 Bot 自己执行的节点**：走同一个判定（按主 Bot 当时的配置和发起人在主 Bot 上的操作权），而且在发节点卡和交接卡**之前**判定——不通过就什么都不发，节点直接受阻；开轮次前再查一次。
+  - **主 Bot 自己执行的节点**：走同一个判定（按主 Bot 当时的配置和发起人在主 Bot 上的操作权），而且在发节点卡和交接卡**之前**判定——不通过就什么都不发，节点直接受阻；开轮次前再查一次。主 Bot 自己的**主话题**节点还要求指定目录就是主会话的目录，否则 Gate-2 就拒绝（见 5.6「主 Bot 自己的主话题节点与指定工作目录」）；这是落点硬规则，发起人对主 Bot 的操作权只放宽目录范围判定，不放宽这一条。
   - **运行中修改带进来的 Bot**（改派、新增节点）不在修改时预查，由它起会话时按同一规则检查。
 - **节点的 `override.model`**：只有子 Bot 的 CLI 支持按派发指定模型时（目前是 Codex 的 dispatch 启动规格）才生效，否则 Gate-2 报错。
 - **节点的 `override.systemPromptAppend`**：拼进交接消息正文。
+- **拒绝的输出**：`botmux workflow …` 被有意拒绝时（`HostGuardError`；用法错误、runId 非法、run 不存在的 `WorkflowUsageError`；非法 grill 状态转移；调用方无权操作这个 run），只在 stderr 打一行原因、退出码 1，不再打印 Bun 的源码片段和堆栈——主 Bot 会把输出原样贴进群里。其它异常照旧带堆栈（`src/cli/workflow.ts` 的 `runWorkflowCliCommand`）。
 - **另开小 PR 修**：`/workflow resume` 的报错让用户改用 `/workflow retry <runId>`，但 `retry` 不是保留动词，会被当成新目标进入 Grill。
 
 ### 15.5 配置项

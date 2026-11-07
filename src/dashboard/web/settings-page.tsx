@@ -52,6 +52,8 @@ interface DashboardSettings {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
@@ -224,6 +226,8 @@ function parseSettings(s: any): DashboardSettings {
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
+    tmuxOrphanSessionSweep: s?.tmuxOrphanSessionSweep !== false,
+    tmuxOrphanSessionBareWrapperKill: s?.tmuxOrphanSessionBareWrapperKill === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
@@ -901,7 +905,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -1078,6 +1082,20 @@ export function SettingsBody(props: {
             checked={settings.reapOrphanTmuxServers}
             disabled={dis || savingKey === 'reapOrphanTmuxServers'}
             onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
+          />
+          <ToggleRow
+            title={tr('settings.tmuxOrphanSessionSweep')}
+            help={tr('settings.tmuxOrphanSessionSweepHelp')}
+            checked={settings.tmuxOrphanSessionSweep}
+            disabled={dis || savingKey === 'tmuxOrphanSessionSweep'}
+            onChange={value => saveBoolean('tmuxOrphanSessionSweep', value)}
+          />
+          <ToggleRow
+            title={tr('settings.tmuxOrphanSessionBareWrapperKill')}
+            help={tr('settings.tmuxOrphanSessionBareWrapperKillHelp')}
+            checked={settings.tmuxOrphanSessionBareWrapperKill}
+            disabled={dis || savingKey === 'tmuxOrphanSessionBareWrapperKill'}
+            onChange={value => saveBoolean('tmuxOrphanSessionBareWrapperKill', value)}
           />
           <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}

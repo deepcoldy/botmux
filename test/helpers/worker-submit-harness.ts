@@ -39,6 +39,7 @@ export function workerSubmitHarness() {
     pendingInputAllowsTypeAhead: () => true,
     directRpcTurnBlocksTypeAhead: () => false,
     activeTurnBlocks: () => false,
+    promotePendingHumanInterruption: () => false,
     pendingSessionRename: null, pendingMessages, pendingRawInputs: [], pendingAdoptMessages: [], pendingInjections: [],
     CodexAppFlushPromptReplay, codexAppTurnLiveness: {},
     beginCliWriteCycle: vi.fn(), bareShellChecked: true,

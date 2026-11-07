@@ -88,7 +88,7 @@ import {
   markWatchdogStopped,
   watchdogStopRequested,
 } from './autostart.js';
-import { tmuxEnv } from './setup/ensure-tmux.js';
+import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
@@ -317,7 +317,7 @@ import {
 import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
-import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
+import { DISPATCH_REPORT_REGISTER_ROUTE, readDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { PERMISSION_ALLOW_KEY } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -366,6 +366,7 @@ import {
   loadBotMentionIdentityMap,
   mentionedBotAppIds,
   orderedFooterRecipients,
+  withoutDispatchDispatcherAddressing,
 } from './utils/bot-routing.js';
 import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
@@ -5538,9 +5539,16 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           }
           cleanup();
           applyTmuxWindowSizeLargest(target.sessionName, target.socketName);
-          spawnSync('tmux', [...tmuxSocketArgs(target.socketName), 'attach-session', '-t', `=${target.sessionName}`], {
+          // attach must never BOOT a server: the target was just selected as
+          // existing. On tmux >= 3.2 pass -N so a busy/refusing listener cannot
+          // make the attach client fork a competing server. Older clients have
+          // no -N; attach-session to a missing server errors there rather than
+          // silently creating a managed session.
+          const cliEnv = tmuxEnv();
+          const attachNoFork = tmuxVersionAtLeast(clientTmuxVersionForEnv(cliEnv), 3, 2) ? ['-N'] : [];
+          spawnSync('tmux', [...tmuxSocketArgs(target.socketName), ...attachNoFork, 'attach-session', '-t', `=${target.sessionName}`], {
             stdio: 'inherit',
-            env: tmuxEnv(),
+            env: cliEnv,
           });
         }
         resolve();
@@ -10834,6 +10842,35 @@ async function sendDryRun(rest: string[], preflightPlan?: ClientSendPlan): Promi
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, ...(rendered ? { diff: { stats: rendered.stats, statsScope: rendered.statsScope, preview: rendered.preview } } : {}), card }, null, 2));
 }
 
+/**
+ * The dispatching app id for a topic whose `botmux dispatch` report binding
+ * verifies, else undefined. An absent/tampered/unreadable binding yields
+ * undefined so the historical addressing stays exactly as it was.
+ */
+function resolveDispatchDispatcherAppId(input: {
+  dataDir: string;
+  dispatchRoot: string | undefined;
+  selfAppId: string;
+}): string | undefined {
+  const dispatchRoot = input.dispatchRoot;
+  if (!dispatchRoot) return undefined;
+  let resolved: ReturnType<typeof resolveVerifiedDispatchReportTarget>;
+  try {
+    resolved = resolveVerifiedDispatchReportTarget({
+      registry: JSON.parse(readFileSync(join(input.dataDir, 'orchestrate-dispatch.json'), 'utf-8')),
+      dispatchRoot,
+      secret: readDispatchReportBindingSecret(input.dataDir) ?? '',
+    });
+  } catch {
+    // Missing/corrupt registry or unreadable secret: the binding is unproven,
+    // so the old behaviour (address the dispatcher) stays.
+    return undefined;
+  }
+  if (!resolved.ok) return undefined;
+  const dispatcherAppId = resolved.binding.targetLarkAppId;
+  return !dispatcherAppId || dispatcherAppId === input.selfAppId ? undefined : dispatcherAppId;
+}
+
 async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
   const resolved = preflight ?? await preflightSendInvocation(rest);
   if (resolved.kind === 'help') {
@@ -11769,6 +11806,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // local parsing/card preparation cannot carry an old capability across a
   // worker restart, turn rotation, or Codex ledger settlement.
   let checkSendTopics: ((lookup?: TopicMessageLookup) => Promise<void>) | undefined;
+  let arbitraryMentionRequired = false;
   const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
@@ -11781,8 +11819,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     if (fresh.sessionId !== isolatedManagedOriginCtx.sessionId
       || fresh.turnId !== isolatedManagedOriginCtx.turnId
       || fresh.dispatchAttempt !== isolatedManagedOriginCtx.dispatchAttempt
+      || fresh.larkAppId !== isolatedManagedOriginCtx.larkAppId
       || fresh.requiresCodexAppLedger !== isolatedManagedOriginCtx.requiresCodexAppLedger) {
       throw new Error('managed origin changed before provider effect');
+    }
+    if (arbitraryMentionRequired && fresh.allowArbitraryMention !== true) {
+      throw new Error('allowArbitraryMention permission revoked before provider effect');
     }
     const currentOriginResolved = await resolveSessionById(fresh.sessionId, { dataDir: resolveDataDir() });
     const currentOriginSession = currentOriginResolved.ok
@@ -12828,7 +12870,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // (default-deny: the model can't @ arbitrary people).
   // Splitting on the FIRST ':' is safe: open_id / union_id / email / mobile
   // never contain ':', only the optional trailing Display Name might.
-  const mentions: Array<{ open_id: string; name: string }> = [];
+  let mentions: Array<{ open_id: string; name: string }> = [];
   const rawMentions: Array<{ identifier: string; name: string }> = [];
   for (const m of mentionArgs) {
     const idx = m.indexOf(':');
@@ -12902,7 +12944,14 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   //     can only @ people who are actually in that group.
   {
     const mentionChatId = overrideChatId ?? s.chatId;
+    arbitraryMentionRequired = rawMentions.some(mention => !mention.identifier.startsWith('ou_'));
     const arbitraryAllowed = (() => {
+      // Only the nonce-bound host proof carries policy into read isolation.
+      // Own credential files and child-selected env are not policy authority.
+      if (isolatedManagedOriginCtx) {
+        return isolatedManagedOriginCtx.larkAppId === s.larkAppId
+          && isolatedManagedOriginCtx.allowArbitraryMention === true;
+      }
       try { return getBot(s.larkAppId).config.allowArbitraryMention === true; }
       catch { return false; }
     })();
@@ -13747,6 +13796,37 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     } catch { /* best-effort */ }
 
     const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
+    // A topic opened by `botmux dispatch` returns its result through
+    // `botmux report --dispatch-root`; @-ing the dispatcher here instead starts
+    // a second, context-free dispatcher session inside this very sub-topic
+    // (#1887, #2001). The daemon's own fallback cards already drop that @, so
+    // this is the model-sent reply the same rule was missing.
+    //
+    // Two boundaries keep this from eating legitimate addressing:
+    //  - it only applies when THIS message lands in the dispatched topic, so
+    //    `--into <other topic>`, `--top-level` and `--chat-id` keep whatever the
+    //    caller asked for (mentioning the lead in the main conversation is a
+    //    supported workflow);
+    //  - the dispatcher id comes from a VERIFIED binding read with a read-only
+    //    secret, so a missing/tampered/unreadable binding changes nothing and
+    //    this CLI never mints signing authority.
+    // The binding is signed per root, so a root that verifies IS this topic: look
+    // it up with the root the message actually lands on, never the session's.
+    const dispatchDispatcherAppId = sendTarget.mode === 'thread'
+      && !sendInto && !sendTopLevel && !overrideChatId
+      ? resolveDispatchDispatcherAppId({ dataDir, dispatchRoot: sendTarget.rootMessageId, selfAppId: appId })
+      : undefined;
+    if (dispatchDispatcherAppId) {
+      const addressedMentions = withoutDispatchDispatcherAddressing({
+        dispatcherAppId: dispatchDispatcherAppId,
+        entries: botEntries, crossRef, selfAppId: appId,
+        mentionIds: mentions.map(mention => mention.open_id),
+      });
+      if (addressedMentions.length !== mentions.length) {
+        mentions = mentions.filter(mention => addressedMentions.includes(mention.open_id));
+        console.error('botmux send: 本话题是派单话题，结果已由 botmux report 交回原会话；已去掉对派单 Bot 的 @。');
+      }
+    }
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
     const suppressImplicitReplyTarget = shouldSuppressImplicitReplyTarget({
       explicitQuote,
@@ -19200,6 +19280,9 @@ if (__entrySubcommand) {
     process.exit(process.exitCode ?? 0);
   }
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
+  else if (__entrySubcommand === 'zellij-socket-probe') {
+    (await import('./adapters/backend/zellij-socket-probe.js')).runZellijSocketProbe(process.argv.slice(3));
+  }
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
   // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that
@@ -20722,45 +20805,50 @@ switch (command) {
   }
   case 'workflow': {
     const wfSub = process.argv[3] ?? '';
-    if (wfSub === 'cancel') {
-      // Durable v3 run cancellation. The v2 runtime is retired.
-      await cmdWorkflowCancelV3(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'start') {
-      // `botmux workflow start <runId>` — kick a daemon-driven v3 run (so
-      // humanGate posts approval cards).  Needs a live daemon; findDaemon is
-      // cli.ts-local so this case handles it instead of cmdWorkflow.
-      await cmdWorkflowStart(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'retry') {
-      // v3 blocked-node retry; the former v2 `resume` verb is retired.
-      await cmdWorkflowRetry(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'grant') {
-      // v3 exhausted-loop grant (+1 iteration).
-      await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'status') {
-      // v3 runtime flow status for the main bot (design §13.1).
-      await cmdWorkflowStatusV3(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'edit') {
-      // v3 runtime flow edit (design §13.2).
-      await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    if (wfSub === 'ask-human') {
-      // v3: the main bot hands a node to a human (design §13.6).
-      await cmdWorkflowAskHuman(process.argv[4], process.argv.slice(5));
-      break;
-    }
-    const { cmdWorkflow } = await import('./cli/workflow.js');
-    await cmdWorkflow(wfSub, process.argv.slice(4));
+    // A deliberate refusal prints its message only (no stack): the main bot
+    // relays this output to the chat.
+    const { runWorkflowCliCommand } = await import('./cli/workflow.js');
+    await runWorkflowCliCommand(async () => {
+      if (wfSub === 'cancel') {
+        // Durable v3 run cancellation. The v2 runtime is retired.
+        await cmdWorkflowCancelV3(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'start') {
+        // `botmux workflow start <runId>` — kick a daemon-driven v3 run (so
+        // humanGate posts approval cards).  Needs a live daemon; findDaemon is
+        // cli.ts-local so this case handles it instead of cmdWorkflow.
+        await cmdWorkflowStart(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'retry') {
+        // v3 blocked-node retry; the former v2 `resume` verb is retired.
+        await cmdWorkflowRetry(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'grant') {
+        // v3 exhausted-loop grant (+1 iteration).
+        await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'status') {
+        // v3 runtime flow status for the main bot (design §13.1).
+        await cmdWorkflowStatusV3(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'edit') {
+        // v3 runtime flow edit (design §13.2).
+        await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      if (wfSub === 'ask-human') {
+        // v3: the main bot hands a node to a human (design §13.6).
+        await cmdWorkflowAskHuman(process.argv[4], process.argv.slice(5));
+        return;
+      }
+      const { cmdWorkflow } = await import('./cli/workflow.js');
+      await cmdWorkflow(wfSub, process.argv.slice(4));
+    });
     break;
   }
   case 'template': {

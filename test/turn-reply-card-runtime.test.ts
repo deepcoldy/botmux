@@ -462,6 +462,45 @@ describe('reply-card runtime eligibility and recovery', () => {
     }));
   });
 
+  describe('content audit on the final PATCH', () => {
+    const email = 'alice.liu@example.com';
+    const audit = () => ({ isAxiosError: true, name: 'AxiosError', message: 'Request failed with status code 400',
+      response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } } });
+    const final = { kind: 'final' as const, text: `作者 <${email}>`, source: 'explicit' as const,
+      card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: `作者 <${email}>` }] } }) };
+
+    it('patches a masked copy once and settles the final as delivered', async () => {
+      const ds = session();
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, async () => 'om_reply');
+      vi.mocked(updateMessage).mockClear();
+      vi.mocked(updateMessage).mockImplementation(async (_app, _id, card) => {
+        if (String(card).includes(email)) throw audit();
+        return {} as any;
+      });
+      await updateTurnReplyCard(ds, 'om_mode', final, async () => 'unused');
+      const bodies = vi.mocked(updateMessage).mock.calls.map(call => String(call[2]));
+      expect(bodies).toHaveLength(2);
+      expect(bodies[0]).toContain(email);
+      expect(bodies[1]).not.toContain(email);
+      expect(bodies[1]).toContain('example.com');
+      expect(bodies[1]).toContain('worker.final_output_content_audit_redacted_note');
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      expect(new TurnReplyCardStore(dir).read(key)?.finalDelivered).toBe(true);
+    });
+
+    it('does not retry an audit rejection that survives masking', async () => {
+      const ds = session();
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, async () => 'om_reply');
+      vi.mocked(updateMessage).mockClear();
+      vi.mocked(updateMessage).mockRejectedValue(audit());
+      await expect(updateTurnReplyCard(ds, 'om_mode', final, async () => 'unused')).rejects.toMatchObject({
+        response: { data: { code: 230028 } },
+      });
+      // original + one masked copy; the identical-payload retry loop is skipped.
+      expect(updateMessage).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it('does not observe a final card when its patch is withdrawn', async () => {
     const ds = session();
     ds.session.cliSessionId = 'native_mode';

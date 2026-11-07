@@ -56,7 +56,7 @@ import {
 import { DaemonRegistry, botsRosterSignature, trackRosterFrames } from './dashboard/registry.js';
 import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
-import { reconcileDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
+import { reconcileAllDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   adoptSessionGroupFields,
@@ -1247,6 +1247,10 @@ interface ResolvedDashboardSettings {
   /** Experimental, default OFF: reap tmux servers orphaned by a previous
    *  daemon generation at daemon startup (automatic process kill). */
   reapOrphanTmuxServers: boolean;
+  /** Default ON, REPORT-ONLY periodic orphan session sweep. */
+  tmuxOrphanSessionSweep: boolean;
+  /** Default OFF: narrow bare-wrapper kill arm of the session sweep. */
+  tmuxOrphanSessionBareWrapperKill: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
@@ -1925,6 +1929,8 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
     reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
+    tmuxOrphanSessionSweep: dashboard.tmuxOrphanSessionSweep !== false, // default ON report-only; explicit false disables
+    tmuxOrphanSessionBareWrapperKill: dashboard.tmuxOrphanSessionBareWrapperKill === true, // default OFF narrow kill
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
@@ -4869,24 +4875,12 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
       if (coordinationModeIsPrimary()) {
-        const daemons = registry.list();
-        if (daemons.length === 0) {
+        const refreshed = await reconcileAllDaemonSessions(registry.list(), aggregator, 2_500);
+        if (!refreshed) {
           return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
         }
-        const snapshots = await Promise.all(daemons.map(daemon =>
-          reconcileDaemonSessions(
-            daemon,
-            aggregator,
-            AbortSignal.timeout(2_500),
-          ),
-        ));
-        if (snapshots.some(snapshot => snapshot === undefined)) {
-          return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
-        }
-        for (let index = 0; index < snapshots.length; index += 1) {
-          for (const row of snapshots[index] ?? []) {
-            sessionPresentation.schedule(daemons[index]!.larkAppId, row);
-          }
+        for (const { daemon, rows } of refreshed) {
+          for (const row of rows) sessionPresentation.schedule(daemon.larkAppId, row);
         }
       }
       // SessionRow.botName is a snapshot (closed rows keep whatever name the
