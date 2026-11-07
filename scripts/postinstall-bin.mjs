@@ -178,7 +178,14 @@ function locationSaysGlobal(root) {
   const r = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
   // Every global layout below ends at the main package; anything else is not ours.
   if (!r.endsWith('/node_modules/botmux')) return false;
-  const pnpmStore = `${(process.env.PNPM_HOME || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()}/store/`;
+  // PNPM_HOME as exported and as resolved: `root` is a realpath, so a PNPM_HOME
+  // spelled through a symlinked home only matches once resolved.
+  const pnpmHome = process.env.PNPM_HOME || '';
+  let pnpmHomeReal = '';
+  try { if (pnpmHome) pnpmHomeReal = realpathSync(pnpmHome); } catch { /* missing: as spelled only */ }
+  const pnpmStores = [pnpmHome, pnpmHomeReal]
+    .map(p => `${p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()}/store/`)
+    .filter(s => s !== '/store/');
   return r.endsWith('/lib/node_modules/botmux')                    // npm, POSIX
     || r.includes('/.bun/install/global/node_modules/botmux')      // bun
     || r.includes('/bun/install/global/node_modules/botmux')       // bun, custom BUN_INSTALL
@@ -186,8 +193,8 @@ function locationSaysGlobal(root) {
     || /\/pnpm\/global\/[^/]+\/node_modules\/botmux$/.test(r)      // pnpm 9 global
     || /\/pnpm\/global\/v\d+\/[^/]+\/node_modules\/botmux$/.test(r) // pnpm 11 global
     || /\/pnpm\/store\/v\d+\/links\/@\/botmux\//.test(r)           // pnpm 11 store links
-    || (pnpmStore !== '/store/' && r.startsWith(pnpmStore)         // …under a custom PNPM_HOME
-      && /^v\d+\/links\/@\/botmux\//.test(r.slice(pnpmStore.length)));
+    || pnpmStores.some(s => r.startsWith(s)                        // …under a custom PNPM_HOME
+      && /^v\d+\/links\/@\/botmux\//.test(r.slice(s.length)));
 }
 
 if (process.env.npm_config_global !== 'true' && !locationSaysGlobal(pkgRoot)) {

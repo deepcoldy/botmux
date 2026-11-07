@@ -47,6 +47,19 @@ function normalized(path: string): string {
   return path.replace(/\\/g, '/').replace(/\/+$/, '');
 }
 
+/** PNPM_HOME as exported and as resolved. The store path is a realpath, so a
+ * PNPM_HOME spelled through a symlinked home only matches once resolved. */
+function pnpmHomeSpellings(): string[] {
+  const raw = process.env.PNPM_HOME ?? '';
+  let resolved = '';
+  try {
+    if (raw) resolved = realpathSync(raw);
+  } catch {
+    // A missing PNPM_HOME can only match as spelled.
+  }
+  return [raw, resolved].map(p => normalized(p).toLowerCase()).filter(p => p !== '');
+}
+
 /** Node resolves pnpm 11's global botmux symlink to this store realpath. The
  * store lives under PNPM_HOME, which only the default location names `pnpm`. */
 function pnpmV11StoreMatch(root: string): RegExpMatchArray | null {
@@ -55,8 +68,7 @@ function pnpmV11StoreMatch(root: string): RegExpMatchArray | null {
   );
   if (!match) return null;
   const base = match[1].toLowerCase();
-  const pnpmHome = normalized(process.env.PNPM_HOME ?? '').toLowerCase();
-  return base.endsWith('/pnpm') || (pnpmHome !== '' && base === pnpmHome) ? match : null;
+  return base.endsWith('/pnpm') || pnpmHomeSpellings().includes(base) ? match : null;
 }
 
 function pnpmGlobalDir(
