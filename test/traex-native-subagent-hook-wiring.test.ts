@@ -35,6 +35,8 @@ interface WorkerHarness {
   projectHooksBefore: string;
   root: string;
   sessionId: string;
+  /** Private TMUX_TMPDIR the worker was spawned with; its `-L botmux` socket must live here. */
+  tmuxRoot: string;
 }
 
 const children = new Set<ChildProcess>();
@@ -232,8 +234,20 @@ if (argv[0] === 'app-server') {
   if (options.backendType === 'tmux') tmuxSessions.set(`bmx-${sessionId.slice(0, 8)}`, workerEnv);
   return {
     child, capturePath, globalHooksPath, globalHooksBefore, logs, messages,
-    projectHooksPath, projectHooksBefore, root, sessionId,
+    projectHooksPath, projectHooksBefore, root, sessionId, tmuxRoot,
   };
+}
+
+/**
+ * Where the worker's managed (`-L botmux`) server socket MUST be. Pinning this
+ * is the regression tripwire for the private TMUX_TMPDIR below: the global test
+ * fence injects a TMUX_TMPDIR of its own, so a run under the standard config
+ * stays green even if the worker stopped overriding it — the worker would
+ * silently depend on the fence again and a fence-bypassing run would land on
+ * the host socket (2026-11-06 outage).
+ */
+function privateManagedSocketPath(harness: WorkerHarness): string {
+  return join(harness.tmuxRoot, `tmux-${process.getuid?.() ?? 0}`, 'botmux');
 }
 
 function expectAuthenticatedSessionEnv(record: LaunchRecord, sessionId: string): void {
@@ -327,6 +341,10 @@ describe('TRAE native subagent hook worker launches', () => {
     expectSingleNativeHook(launches[0]);
     expectAuthenticatedSessionEnv(launches[0], harness.sessionId);
     expectHookFilesUnchanged(harness);
+    expect(
+      existsSync(privateManagedSocketPath(harness)),
+      'managed tmux server must run under the harness private TMUX_TMPDIR, not the fence/host socket',
+    ).toBe(true);
   }, 25_000);
 
   it.skipIf(!tmuxAvailable)('puts the hook on the Trae RPC app-server but not its remote viewer', async () => {
@@ -359,6 +377,10 @@ describe('TRAE native subagent hook worker launches', () => {
     expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
     expect(appServer!.env.BOTMUX_SESSION_SCOPE).toBe('thread');
     expectHookFilesUnchanged(harness);
+    expect(
+      existsSync(privateManagedSocketPath(harness)),
+      'managed tmux server must run under the harness private TMUX_TMPDIR, not the fence/host socket',
+    ).toBe(true);
   }, 25_000);
 
   it.skipIf(directPtyUnavailableInBun)(`keeps a non-Trae worker launch free of the Trae hook (${DIRECT_PTY_BUN_SKIP_REASON})`, async () => {
@@ -397,5 +419,9 @@ describe('TRAE native subagent hook worker launches', () => {
     expectAuthenticatedSessionEnv(appServer!, harness.sessionId);
     expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
     expectHookFilesUnchanged(harness);
+    expect(
+      existsSync(privateManagedSocketPath(harness)),
+      'managed tmux server must run under the harness private TMUX_TMPDIR, not the fence/host socket',
+    ).toBe(true);
   }, 25_000);
 });
