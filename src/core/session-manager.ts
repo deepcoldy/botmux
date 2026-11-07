@@ -4916,6 +4916,7 @@ export async function executeScheduledTask(
           // keeps its stable virtual anchor; hand materialization ownership to
           // the new turn (the first `botmux send` validates turn equality).
           existing.session.deferredScheduleRun.turnId = scheduledTurnId;
+          existing.deferredScheduleUnconfirmedTurnId = scheduledTurnId;
           if (runtime?.runId) existing.session.deferredScheduleRun.runId = runtime.runId;
           else delete existing.session.deferredScheduleRun.runId;
           sessionStore.updateSession(existing.session);

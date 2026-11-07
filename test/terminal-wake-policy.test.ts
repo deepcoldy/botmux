@@ -2,8 +2,11 @@ import { createServer, type Server } from 'node:http';
 import { connect } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  deriveWorkerViewGeneration,
   issueTerminalControlGrant,
+  signTerminalViewForward,
   signTerminalWakeProof,
+  TERMINAL_VIEW_FORWARD_HEADER,
   TERMINAL_WAKE_HEADER,
   TERMINAL_WAKE_PROOF_TTL_MS,
   verifyTerminalWakeProof,
@@ -24,6 +27,10 @@ import {
   TerminalControlManager,
   type TerminalDashboardActor,
 } from '../src/dashboard/terminal-control.js';
+import {
+  terminalViewCapabilityAuthSession,
+  terminalViewForwardProof,
+} from '../src/dashboard/terminal-view-capability.js';
 
 const SECRET = 'terminal-wake-policy-secret';
 const SID = 'sess-wake';
@@ -53,6 +60,21 @@ function grant(scope: 'read' | 'write', sessionId = SID, expiresAt = NOW + 60_00
     authSessionId: 'scope:guest',
     issuedAt: NOW - 1_000,
     expiresAt,
+  });
+}
+
+/** What the Dashboard view-link API hands a browser: a read grant pinned to the
+ * worker boot that was live when it was minted. */
+function centralViewGrant(sessionId = SID, issuedAt = NOW - 1_000, expiresAt = issuedAt + 61_000): string {
+  return issueTerminalControlGrant(SECRET, {
+    scope: 'read',
+    sessionId,
+    userId: 'dashboard:viewer',
+    authSessionId: 'auth-viewer',
+    issuedAt,
+    expiresAt,
+    audience: 'central',
+    workerGeneration: deriveWorkerViewGeneration(SECRET, 'previous-boot-view')!,
   });
 }
 
@@ -142,6 +164,21 @@ describe('classifyTerminalWakeCredential', () => {
     })).toBe('none');
   });
 
+  it('recognizes a Dashboard view-link grant only with the front proxy countersignature (#2341)', () => {
+    const viewToken = centralViewGrant();
+    const forwarded = (token: string, proof = signTerminalViewForward(SECRET, token)!) => classify({
+      capability: { viewToken: token },
+      headers: { [TERMINAL_VIEW_FORWARD_HEADER]: proof },
+    });
+    expect(forwarded(viewToken)).toBe('view-grant');
+    expect(classify({ capability: { viewToken } })).toBe('none');
+    expect(forwarded(viewToken, signTerminalViewForward(SECRET, centralViewGrant('other'))!)).toBe('none');
+    expect(forwarded(centralViewGrant('other'))).toBe('none');
+    expect(forwarded(centralViewGrant(SID, NOW - 120_000))).toBe('none');
+    // A loopback read grant has no audience and must never travel in a URL.
+    expect(forwarded(grant('read'))).toBe('none');
+  });
+
   it('gives nothing to a request without credentials or for an unknown session', () => {
     expect(classify()).toBe('none');
     expect(classify({
@@ -165,6 +202,8 @@ describe('terminalSessionSuspended / decideTerminalWake', () => {
     expect(decideTerminalWake('authenticated', false)).toBe('wake');
     expect(decideTerminalWake('read-link', true)).toBe('suspended');
     expect(decideTerminalWake('read-link', false)).toBe('wake');
+    expect(decideTerminalWake('view-grant', true)).toBe('suspended');
+    expect(decideTerminalWake('view-grant', false)).toBe('deny');
     expect(decideTerminalWake('none', true)).toBe('deny');
     expect(decideTerminalWake('none', false)).toBe('deny');
   });
@@ -298,5 +337,28 @@ describe('#2004: a suspended session behind the terminal proxy', () => {
     });
     expect(await signedIn.text()).toBe('worker');
     expect(wakes()).toBe(1);
+  });
+
+  it('answers a cookie-less request carrying a Dashboard view-link grant with the suspended page (#2341)', async () => {
+    const { proxy, wakes } = await suspendedSessionProxy();
+    const front = createTerminalFrontProxy({
+      resolvePort: () => proxy.port,
+      resolveActor: () => null,
+      control: new TerminalControlManager({ secret: SECRET, audit: { append() {} } }),
+      viewCapabilityAuthSession: (sessionId, viewToken) => terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+      isAuthSessionLive: () => true,
+      viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
+      wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
+    });
+    const frontServer = createServer((req, res) => {
+      if (!front.handleHttp(req, res, new URL(req.url ?? '/', 'http://front'))) res.writeHead(404).end();
+    });
+    const frontPort = await listen(frontServer);
+    const viewToken = centralViewGrant(SID, Date.now() - 1_000);
+
+    const res = await fetch(`http://127.0.0.1:${frontPort}/s/${SID}/?viewToken=${encodeURIComponent(viewToken)}`);
+    expect(res.status).toBe(503);
+    expect(await res.text()).toContain('会话已挂起');
+    expect(wakes()).toBe(0);
   });
 });

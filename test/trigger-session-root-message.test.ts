@@ -1,3 +1,7 @@
+// Must stay the first import: this file writes async-trigger records under
+// SESSION_DATA_DIR, so refuse to run outside the data-dir fence instead of
+// touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';

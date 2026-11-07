@@ -56,7 +56,7 @@ import {
 import { DaemonRegistry, botsRosterSignature, trackRosterFrames } from './dashboard/registry.js';
 import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
-import { reconcileDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
+import { reconcileAllDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   adoptSessionGroupFields,
@@ -4876,24 +4876,12 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
       if (coordinationModeIsPrimary()) {
-        const daemons = registry.list();
-        if (daemons.length === 0) {
+        const refreshed = await reconcileAllDaemonSessions(registry.list(), aggregator, 2_500);
+        if (!refreshed) {
           return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
         }
-        const snapshots = await Promise.all(daemons.map(daemon =>
-          reconcileDaemonSessions(
-            daemon,
-            aggregator,
-            AbortSignal.timeout(2_500),
-          ),
-        ));
-        if (snapshots.some(snapshot => snapshot === undefined)) {
-          return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
-        }
-        for (let index = 0; index < snapshots.length; index += 1) {
-          for (const row of snapshots[index] ?? []) {
-            sessionPresentation.schedule(daemons[index]!.larkAppId, row);
-          }
+        for (const { daemon, rows } of refreshed) {
+          for (const row of rows) sessionPresentation.schedule(daemon.larkAppId, row);
         }
       }
       // SessionRow.botName is a snapshot (closed rows keep whatever name the

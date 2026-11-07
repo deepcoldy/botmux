@@ -49,6 +49,7 @@ import { readFileSync, readdirSync, readlinkSync } from 'node:fs';
 import { connect } from 'node:net';
 import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isStandaloneBinary } from '../../core/self-spawn.js';
 
 /** Kernel socket inodes bound under `dir` per /proc/net/unix content. Pure. */
 export function unixInodesUnderDir(procNetUnix: string, dir: string): Set<string> {
@@ -141,10 +142,18 @@ function main(socketPath: string, pids: number[]): void {
   setTimeout(() => { destroyAll(); process.exit(2); }, 5000).unref();
 }
 
-// Only run when executed directly (the pure helpers are also imported by tests).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const sock = process.argv[2];
-  const pids = process.argv.slice(3).map(Number).filter(n => Number.isInteger(n) && n > 0);
+/** `<socketPath> <candidatePid>...`; the compiled binary dispatches here via
+ *  its hidden `__zellij-socket-probe` entry. */
+export function runZellijSocketProbe(args: string[]): void {
+  const sock = args[0];
+  const pids = args.slice(1).map(Number).filter(n => Number.isInteger(n) && n > 0);
   if (!sock || pids.length === 0) process.exit(64);
   main(sock, pids);
+}
+
+// Only run when executed directly (the pure helpers are also imported by tests).
+// A compiled binary bundles every module under the binary's own URL, so there
+// this check matches for any import; the hidden entry calls the runner instead.
+if (!isStandaloneBinary() && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runZellijSocketProbe(process.argv.slice(2));
 }
