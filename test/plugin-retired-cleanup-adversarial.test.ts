@@ -1,11 +1,12 @@
 import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import * as cp from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { installLocalPlugin } from '../src/core/plugins/install.js';
+import { installLocalPlugin, installNpmPlugin } from '../src/core/plugins/install.js';
 import * as paths from '../src/core/plugins/paths.js';
 import * as registry from '../src/services/plugin-registry-store.js';
 import { pluginRegistryRevision, type PluginMutationGuard } from '../src/core/plugins/mutation-guard.js';
@@ -15,6 +16,9 @@ import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 // Forward to the real filesystem; spies inject faults at individual I/O boundaries.
 vi.mock('node:fs', async original => ({
   ...await original<typeof import('node:fs')>(),
+}));
+vi.mock('node:child_process', async original => ({
+  ...await original<typeof import('node:child_process')>(),
 }));
 
 let home: string;
@@ -421,6 +425,48 @@ describe('retired cleanup: independent adversarial verification', () => {
       registered: registry.getInstalledPlugin('sample') !== undefined,
       runtimePresent: fs.existsSync(paths.pluginRuntimeDir('sample')),
     }, 'authority changed after entry validation but before install commit').toEqual({
+      error: 'plugin_authority_revoked', registered: false, runtimePresent: false,
+    });
+  });
+
+  it('LONG-CLEANUP-REVOCATION-NPM: the npm path rechecks authority after slow cleanup too', () => {
+    // Both install paths call cleanupRetiredPluginHomes before committing, and
+    // both re-assert the guard afterwards. Only the local path was covered, so
+    // deleting the npm re-check left the whole suite green.
+    const recovery = retired();
+    registry.writePluginRegistry({ schemaVersion: 1, plugins: {} });
+    fs.writeFileSync(tokenFile(), 'original');
+    const confirmed = guard('original');
+    const realRm = fs.rmSync;
+    let rotated = false;
+    vi.spyOn(fs, 'rmSync').mockImplementation((path, options) => {
+      if (String(path) === recovery && !rotated) {
+        fs.writeFileSync(tokenFile(), 'rotated-during-slow-cleanup');
+        rotated = true;
+      }
+      return realRm(path, options);
+    });
+    const exec = vi.spyOn(cp, 'execFileSync').mockImplementation(((_command: string, args: readonly string[]) => {
+      const prefix = args[args.indexOf('--prefix') + 1];
+      const dir = join(prefix, 'node_modules', confirmed.packageName);
+      fs.mkdirSync(join(dir, 'dist'), { recursive: true });
+      fs.writeFileSync(join(dir, 'package.json'), JSON.stringify({
+        name: confirmed.packageName, version: confirmed.version,
+        keywords: ['botmux-plugin'], botmux: { schemaVersion: 1, id: confirmed.id },
+      }));
+      fs.writeFileSync(join(dir, 'dist', 'marker'), 'npm');
+      return Buffer.alloc(0);
+    }) as never);
+    let error: unknown;
+    try { installNpmPlugin(`${confirmed.packageName}@${confirmed.version}`, { guard: confirmed }); }
+    catch (caught) { error = caught; }
+    expect(exec).toHaveBeenCalled();
+    expect(rotated).toBe(true);
+    expect({
+      error: error instanceof Error ? error.message : error,
+      registered: registry.getInstalledPlugin('sample') !== undefined,
+      runtimePresent: fs.existsSync(paths.pluginRuntimeDir('sample')),
+    }, 'the npm path must not commit after cleanup outlives the confirmation').toEqual({
       error: 'plugin_authority_revoked', registered: false, runtimePresent: false,
     });
   });
