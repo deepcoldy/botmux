@@ -119,8 +119,10 @@ describe('vc meeting preparations store with an unreadable file', () => {
 
     expect(listVcMeetingPreparations(dir, 'cli_a')).toEqual([]);
     expect(getVcMeetingPreparation(dir, 'cli_a', '688542737')).toBeUndefined();
-    expect(isStoreFileUnavailableError(thrown(() =>
-      listVcMeetingPreparations(dir, 'cli_a', { ioErrors: 'throw' })))).toBe(true);
+    const readErr = thrown(() =>
+      listVcMeetingPreparations(dir, 'cli_a', { ioErrors: 'throw' }));
+    if (!isStoreFileUnavailableError(readErr)) throw new Error('expected StoreFileUnavailableError');
+    expect(readErr.op).toBe('read');
     expect(readdirSync(dir).filter(name => name.includes('.corrupt'))).toEqual([]);
 
     fsFaults.open.clear();
@@ -172,8 +174,10 @@ describe('vc meeting preparations store with an unreadable file', () => {
 
     expect(listVcMeetingPreparations(dir, 'cli_a')).toEqual([]);
     expect(readdirSync(dir).filter(name => name.includes('.corrupt'))).toEqual([]);
-    expect(isStoreFileUnavailableError(thrown(() =>
-      listVcMeetingPreparations(dir, 'cli_a', { ioErrors: 'throw' })))).toBe(true);
+    const parseErr = thrown(() =>
+      listVcMeetingPreparations(dir, 'cli_a', { ioErrors: 'throw' }));
+    if (!isStoreFileUnavailableError(parseErr)) throw new Error('expected StoreFileUnavailableError');
+    expect(parseErr.op).toBe('parse');
   });
 });
 

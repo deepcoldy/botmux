@@ -5125,7 +5125,11 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.vc.need_group_chat', undefined, loc));
             break;
           }
-          const existingInChat = findVcMeetingPreparationByChat(dataDir, larkAppId, ds.chatId, strictRead);
+          // Informational only (drives the "replaced" note): a tolerant read
+          // keeps /vc prepare able to rebuild a corrupt file. The strict write
+          // right below still refuses on a transiently unreadable file, so no
+          // failure is reported as success.
+          const existingInChat = findVcMeetingPreparationByChat(dataDir, larkAppId, ds.chatId);
           const record = putVcMeetingPreparation(dataDir, {
             larkAppId,
             meetingNo: request.meetingNo,
@@ -5152,7 +5156,11 @@ export async function handleCommand(
         } catch (err) {
           if (!isStoreFileUnavailableError(err)) throw err;
           logger.warn(`[${logTag}] /vc preparations store unavailable: ${err.message}`);
-          await sessionReply(rootId, t('cmd.vc.store_unavailable', undefined, loc));
+          // Corrupt bytes do not recover by retrying: name the rebuild paths
+          // (/vc prepare quarantines and rewrites inside the lock; /vc off
+          // clears). Only transient I/O failures ask for a later retry.
+          const key = err.op === 'parse' ? 'cmd.vc.store_corrupt' : 'cmd.vc.store_unavailable';
+          await sessionReply(rootId, t(key, undefined, loc));
         }
         break;
       }

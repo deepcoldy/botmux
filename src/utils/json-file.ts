@@ -146,11 +146,16 @@ export function readJsonFileSoft<T>(path: string, opts: ReadJsonFileSoftOptions<
  */
 export class StoreFileUnavailableError extends Error {
   readonly code: string | undefined;
+  /** Which stage failed: 'read' | 'parse' | 'stat' | 'list' | 'lock' | 'update' | 'quarantine' …
+   * 'parse' means bytes were read but the content is unusable (callers may
+   * offer a rebuild path); the others mean a transient I/O failure. */
+  readonly op: string;
   constructor(label: string, path: string, op: string, cause: unknown) {
     const code = errCode(cause);
     super(`${label}: cannot ${op} ${path} (${code ?? errorMessage(cause)}); treating as temporarily unavailable`);
     this.name = 'StoreFileUnavailableError';
     this.code = code;
+    this.op = op;
   }
 }
 

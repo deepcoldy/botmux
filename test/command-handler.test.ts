@@ -1832,11 +1832,11 @@ describe('/vc preparation command', () => {
     }
 
     const replies = vi.mocked(deps.sessionReply).mock.calls.map(call => String(call[1]));
-    expect(replies.filter(text => text.includes('会议准备记录读写失败'))).toHaveLength(2);
+    expect(replies.filter(text => text.includes('会议准备记录暂时不可读写'))).toHaveLength(2);
     expect(replies.some(text => text.includes('会议准备群已就绪'))).toBe(false);
   });
 
-  it('asks the store to surface read failures for every /vc answer instead of reading them as "none"', async () => {
+  it('uses strict reads for the /vc answers, but a tolerant pre-read for /vc prepare', async () => {
     const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
     const deps = makeDeps(ds);
     for (const content of ['/vc status', '/vc status 688542737', '/vc prepare 688542737']) {
@@ -1845,7 +1845,34 @@ describe('/vc preparation command', () => {
     const strict = { ioErrors: 'throw' };
     expect(listVcMeetingPreparations).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, strict);
     expect(getVcMeetingPreparation).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, '688542737', strict);
-    expect(findVcMeetingPreparationByChat).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, CHAT_ID, strict);
+    // This read only feeds the "replaced" note; it must stay tolerant so a
+    // corrupt file can still be rebuilt by the strict write that follows.
+    expect(findVcMeetingPreparationByChat).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, CHAT_ID);
+    expect(findVcMeetingPreparationByChat).not.toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, CHAT_ID, strict);
+  });
+
+  it('names rebuild paths for corrupt content but asks for retry only for transient read failures', async () => {
+    const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
+    const deps = makeDeps(ds);
+    const corrupt = new StoreFileUnavailableError(
+      'vc-meeting-preparations-store', '/data/vc-meeting-preparations.json', 'parse',
+      new SyntaxError('Unexpected token b'),
+    );
+    const transient = new StoreFileUnavailableError(
+      'vc-meeting-preparations-store', '/data/vc-meeting-preparations.json', 'read',
+      Object.assign(new Error('i/o error'), { code: 'EIO' }),
+    );
+    vi.mocked(listVcMeetingPreparations).mockImplementationOnce(() => { throw corrupt; });
+    vi.mocked(getVcMeetingPreparation).mockImplementationOnce(() => { throw transient; });
+
+    await handleCommand('/vc', ROOT_ID, makeLarkMessage('/vc status', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+    await handleCommand('/vc', ROOT_ID, makeLarkMessage('/vc status 688542737', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+
+    const replies = vi.mocked(deps.sessionReply).mock.calls.map(call => String(call[1]));
+    expect(replies.some(text => text.includes('文件已损坏') && text.includes('/vc prepare'))).toBe(true);
+    const corruptReply = replies.find(text => text.includes('文件已损坏'))!;
+    expect(corruptReply.includes('请稍后重试')).toBe(false);
+    expect(replies.some(text => text.includes('暂时不可读写') && text.includes('请稍后重试'))).toBe(true);
   });
 
   it('removes all of the bot\'s preparations in one store update for /vc off all', async () => {

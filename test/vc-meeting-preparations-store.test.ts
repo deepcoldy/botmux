@@ -154,5 +154,30 @@ describe('vc meeting preparations store', () => {
     const written = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, unknown>;
     expect(Object.keys(written).sort()).toEqual(['__proto__', 'cli_b:123456789', 'keep']);
   });
+
+  it('lets a tolerant pre-read leave a corrupt file for the locked write to quarantine and rebuild', () => {
+    // /vc prepare does a tolerant informational read, then a strict write:
+    // corruption must not block the write path (which quarantines evidence
+    // and rebuilds), and the tolerant read itself must never quarantine.
+    const dir = tempDir();
+    const fp = join(dir, 'vc-meeting-preparations.json');
+    putVcMeetingPreparation(dir, {
+      larkAppId: 'cli_a', meetingNo: '111111111', prepChatId: 'oc_a', agentAppId: 'cli_a', qaMode: 'auto',
+    });
+    writeFileSync(fp, '{broken', 'utf-8');
+
+    expect(findVcMeetingPreparationByChat(dir, 'cli_a', 'oc_a')).toBeUndefined();
+    expect(readdirSync(dir).filter(name => name.includes('.corrupt'))).toEqual([]);
+
+    putVcMeetingPreparation(dir, {
+      larkAppId: 'cli_a', meetingNo: '222222222', prepChatId: 'oc_a', agentAppId: 'cli_a', qaMode: 'auto',
+    });
+    const evidence = readdirSync(dir).filter(name => name.startsWith('vc-meeting-preparations.json.corrupt-'));
+    expect(evidence).toHaveLength(1);
+    expect(readFileSync(join(dir, evidence[0]!), 'utf-8')).toBe('{broken');
+    const records = listVcMeetingPreparations(dir, 'cli_a');
+    expect(records).toHaveLength(1);
+    expect(records[0]?.meetingNo).toBe('222222222');
+  });
 });
 

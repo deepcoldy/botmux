@@ -119,6 +119,14 @@ function normalizeEntries(entries: RawEntries): {
  * meeting join must not fail because of this file. It never quarantines: an
  * unlocked reader renaming the file could race a locked writer and move the
  * writer's fresh file aside; quarantine is left to the locked write path.
+ *
+ * Semantics after a quarantine: the write path moves bad bytes to a
+ * `.corrupt-*` evidence file and may leave no main file behind (a mutation
+ * that changed nothing). From then on every read here answers "no
+ * preparation" — quarantine is deliberately treated as "no bindings", with
+ * recovery happening through the next `/vc prepare`. The evidence file is the
+ * only trace; stricter sibling stores reject that state via
+ * hasQuarantinedSibling, but this store keeps the join path degrading.
  */
 function readStore(
   dataDir: string,
@@ -268,8 +276,11 @@ export function removeVcMeetingPreparation(
   });
 }
 
-/** Removes every preparation of one bot in a single locked update (`/vc off all`),
- * so a failure leaves either all or none of them removed. */
+/** Removes every *recognized* preparation of one bot in a single locked
+ * update (`/vc off all`), so a failure leaves either all or none of them
+ * removed. Entries that do not normalize are opaque passthrough data and stay
+ * (same as the old per-record deletion); the returned count covers recognized
+ * records only. */
 export function removeVcMeetingPreparationsForApp(dataDir: string, larkAppId: string): number {
   return mutateStore(dataDir, store => {
     let removed = 0;
