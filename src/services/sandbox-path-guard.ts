@@ -17,7 +17,7 @@ import { homedir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { config } from '../config.js';
 
-export type ForbiddenReadWriteReason = 'filesystem_root' | 'home' | 'botmux_home' | 'relative_path';
+export type ForbiddenReadWriteReason = 'filesystem_root' | 'host_run' | 'home' | 'botmux_home' | 'relative_path';
 
 export interface ForbiddenReadWritePath {
   /** The entry exactly as configured. */
@@ -122,6 +122,9 @@ export function findForbiddenReadWritePaths(
   const home = roots.homeDirs[0] ?? homedir();
   const protectedRoots: Array<{ root: string; reason: ForbiddenReadWriteReason }> = [
     { root: '/', reason: 'filesystem_root' },
+    // Host service sockets (docker.sock = host root) live directly under /run;
+    // deeper entries such as /run/lock stay grantable.
+    { root: '/run', reason: 'host_run' },
     ...roots.homeDirs.flatMap(dir => variants(dir).map(root => ({ root, reason: 'home' as const }))),
     ...roots.botmuxHomes.flatMap(dir => variants(dir).map(root => ({ root, reason: 'botmux_home' as const }))),
   ];
@@ -150,6 +153,8 @@ export function forbiddenReadWriteMessage(found: readonly ForbiddenReadWritePath
     switch (reason) {
       case 'filesystem_root':
         return `「${path}」是根目录，设成可写会让整个宿主磁盘在沙盒里可写`;
+      case 'host_run':
+        return `「${path}」是宿主运行时目录 /run，设成可写会让沙盒能连接 docker.sock 等宿主服务套接字、改写系统运行时文件`;
       case 'home':
         return `「${path}」是宿主用户主目录 ${protectedRoot} 或它的上级，设成可写会让沙盒能改写主目录下的所有配置和凭据`;
       case 'botmux_home':
@@ -162,6 +167,10 @@ export function forbiddenReadWriteMessage(found: readonly ForbiddenReadWritePath
   // "move it to read-only" hint would lead straight into the second error.
   if (found.some(({ reason }) => reason === 'relative_path')) {
     return `沙盒「可读写」里不能放这些路径：${lines.join('；')}。请改成以 / 或 ~/ 开头的具体项目目录后再保存（相对路径放进只读也不接受）。`;
+  }
+  // /run is refused in the readOnly tier as well (findReadOnlyLauncherMountCovers).
+  if (found.some(({ reason }) => reason === 'host_run')) {
+    return `沙盒「可读写」里不能放这些路径：${lines.join('；')}。请改成确实需要的具体目录（如 /run/lock、~/projects）后再保存（/run 放进只读也不接受）。`;
   }
   return `沙盒「可读写」里不能放这些路径：${lines.join('；')}。请改成具体的项目目录，或改放到「只读」。`;
 }
@@ -236,8 +245,8 @@ export function dropReadOnlyLauncherMountCovers<T extends { readOnly?: string[] 
  *  - HOME, the botmux data root and their ancestors move from readWrite to
  *    readOnly: the user keeps the read access they asked for, the write grant
  *    over every dotfile credential / every bot's data is gone.
- *  - `/` is dropped outright, not moved to readOnly: a read-only bind of the
- *    host root cannot start either (see findReadOnlyLauncherMountCovers), so the
+ *  - `/` and `/run` are dropped outright, not moved to readOnly: a read-only
+ *    bind of either cannot start (see findReadOnlyLauncherMountCovers), so the
  *    CLI would exit at launch. A deny-by-default sandbox without the entry
  *    still starts.
  *  - Relative entries are dropped outright as well: their target depends on
@@ -268,7 +277,7 @@ export interface ResolvedStoredSandboxPaths<T> {
   lists: T | undefined;
   /** readWrite entries moved to readOnly (HOME / botmux home and ancestors). */
   downgradedReadWrite: ForbiddenReadWritePath[];
-  /** readWrite entries dropped (`/`, relative). */
+  /** readWrite entries dropped (`/`, `/run`, relative). */
   droppedReadWrite: ForbiddenReadWritePath[];
   /** readOnly entries dropped for being relative. */
   droppedReadOnlyRelative: string[];

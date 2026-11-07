@@ -537,6 +537,17 @@ export interface CliAdapter {
    *  falls back to PTY evidence (output after the submit key, then the prompt). */
   commandExecutionProbe?(pty: PtyHandle, commandLine: string): (() => boolean) | undefined;
 
+  /** Optional: a confirmation dialog the CLI raised for a startup-command LINE
+   *  botmux typed itself (e.g. Claude Code's "Change effort level?" prompt-cache
+   *  warning after `/effort max` in a resumed conversation). The worker passes
+   *  its authoritative screen while that command is still unconfirmed.
+   *  `accept: true` — the line's own argument already answers the dialog and
+   *  Enter on the focused option accepts it (the worker presses Enter);
+   *  `accept: false` — such a dialog is up but must stay for a person (the
+   *  queue stays held behind the command). null when no dialog for this line
+   *  is on screen. Pure and cheap: called at most once a second. */
+  startupCommandConfirmation?(screen: string, commandLine: string): { accept: boolean; detail: string } | null;
+
   /** Optional structured input path for adapters whose protocol can keep
    * application context out of the visible user message. The worker calls this
    * only when a typed sidecar is present; every other adapter continues through

@@ -1412,11 +1412,23 @@ export function addTask(params: {
     model: params.model?.trim() || undefined,
     reasoningEffort: params.reasoningEffort,
     ...untilDoneConfig,
-  }, params.larkAppId && authorityStore?.isInitialized(params.larkAppId)
-    ? candidate => project(authorityStore!.createDirect(candidate, audit?.directTurn))
-    : undefined);
+  }, authoritativeCreateFor(params.larkAppId, audit?.directTurn));
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
   return task;
+}
+
+/** The `authoritativeCreate` argument of scheduleStore.createTask: commits the
+ * candidate to the host authority and projects the committed row. Undefined
+ * when `appId` is not enrolled here, where createTask keeps the projection-only
+ * path. */
+export function authoritativeCreateFor(
+  appId: string | undefined,
+  directTurn?: { turnId: string; maxTasksPerTurn: number },
+): ((task: ScheduledTask) => ScheduledTask) | undefined {
+  assertScheduleAuthorityAvailable();
+  return appId && authorityStore?.isInitialized(appId)
+    ? candidate => project(authorityStore!.createDirect(candidate, directTurn))
+    : undefined;
 }
 
 /** Host-daemon only creation path for a one-shot delegated grant. It validates

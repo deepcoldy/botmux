@@ -1248,7 +1248,9 @@ export interface WorkerPoolCallbacks {
   ) => void;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
-   * may be cleared without emitting the ambiguous-failure terminal. */
+   * may be cleared without emitting the ambiguous-failure terminal.
+   * Returning `'not_executed'` means a retry would be rejected the same way:
+   * the delivery fails at once with the known non-execution notice. */
   onOrdinaryImInputRejected?: (
     ds: DaemonSession,
     context: {
@@ -1260,7 +1262,7 @@ export interface WorkerPoolCallbacks {
       activeCaller?: TrustedCaller;
       activeController?: TrustedCaller;
     },
-  ) => boolean | Promise<boolean>;
+  ) => boolean | 'not_executed' | Promise<boolean | 'not_executed'>;
   /** A decision-board batch turn (`board:<app>:<batchId>`) never got a
    * confirmed worker receipt (watchdog expiry or authoritative rejection).
    * The pool does NOT post its usual group failure card for these turns:
@@ -11483,7 +11485,7 @@ type OrdinaryImDelivery = {
   /** At most one daemon ownership handoff may run for a logical delivery.
    * Duplicate worker reject events join this promise instead of creating a
    * second durable record. */
-  rejectionHandoff?: Promise<boolean>;
+  rejectionHandoff?: Promise<boolean | 'not_executed'>;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -11836,8 +11838,16 @@ async function rejectOrdinaryImDelivery(
     }));
     record.rejectionHandoff = handoff;
     try {
-      const accepted = await handoff;
-      if (accepted) {
+      const outcome = await handoff;
+      if (outcome === 'not_executed') {
+        failOrdinaryImDelivery(
+          record,
+          `worker_rejected:${rejection.reason}`,
+          'worker.input_rejected_before_admission',
+        );
+        return;
+      }
+      if (outcome) {
         clearOrdinaryImDelivery(record);
         logger.info(
           `[${tag(ds)}] Ordinary IM rejection durably handed back to daemon `
@@ -18015,7 +18025,7 @@ function setupWorkerHandlers(
             cb.onWorkflowNodeInputCommitted?.(ds, { turnId: msg.turnId, committedAt: Date.now() });
           }
         } else {
-          logger[unboundInputCommitLogLevel(msg.turnId)](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+          logger[unboundInputCommitLogLevel(msg.turnId, frozenReplyContextForTurn(ds, msg.turnId))](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
@@ -19084,9 +19094,13 @@ function setupWorkerHandlers(
         // so repeated snapshots cannot keep resetting the settlement debounce.
         const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId)
           ?? (msg.turnId && scheduledSessionRun(ds.session, msg.turnId) ? msg.turnId : undefined);
+        if (msg.turnId && msg.turnId === ds.deferredScheduleUnconfirmedTurnId) {
+          ds.deferredScheduleUnconfirmedTurnId = undefined;
+        }
         if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnIds.clear();
         if (ds.lastScreenStatus === 'idle' && deferredTurnId
-          && !deferredScheduleIdleTurnIds.has(deferredTurnId)) {
+          && !deferredScheduleIdleTurnIds.has(deferredTurnId)
+          && (msg.turnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
           deferredScheduleIdleTurnIds.add(deferredTurnId);
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
