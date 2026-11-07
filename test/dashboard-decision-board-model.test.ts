@@ -251,17 +251,19 @@ describe('steward config payload', () => {
     expect(stewardFormFrom(null).decisionCards).toBe(true);
   });
 
-  it('subtask alerts default on and are written only when turned off', () => {
+  it('subtask alerts default off and are written only when turned on', () => {
     const base = stewardFormFrom({ enabled: true, chatId: 'oc_abc' });
-    expect(base.taskHints).toBe(true);
+    expect(base.taskHints).toBe(false);
+    expect(stewardFormFrom(null).taskHints).toBe(false);
+    expect(stewardFormFrom({ enabled: true, chatId: 'oc_abc', taskHints: false }).taskHints).toBe(false);
     expect(stewardPayload(base)).toEqual({ enabled: true, chatId: 'oc_abc' });
-    const off = stewardPayload({ ...base, taskHints: false });
-    expect(off).toEqual({ enabled: true, chatId: 'oc_abc', taskHints: false });
-    expect(stewardFormFrom(off).taskHints).toBe(false);
-    expect(normalizeStewardConfig(off)).toEqual({ ok: true, value: off });
-    // 只关了子任务提醒也要存下来，不能当成「全是默认」写 null。
-    expect(stewardPayload({ ...stewardFormFrom(null), taskHints: false })).toEqual({ enabled: false, taskHints: false });
-    expect(stewardPayload({ ...base, taskHints: false, closeHints: true })).toEqual({ enabled: true, chatId: 'oc_abc', closeHints: true, taskHints: false });
+    const on = stewardPayload({ ...base, taskHints: true });
+    expect(on).toEqual({ enabled: true, chatId: 'oc_abc', taskHints: true });
+    expect(stewardFormFrom(on).taskHints).toBe(true);
+    expect(normalizeStewardConfig(on)).toEqual({ ok: true, value: on });
+    // 只开了子任务提醒也要存下来，不能当成「全是默认」写 null。
+    expect(stewardPayload({ ...stewardFormFrom(null), taskHints: true })).toEqual({ enabled: false, taskHints: true });
+    expect(stewardPayload({ ...base, taskHints: true, closeHints: true })).toEqual({ enabled: true, chatId: 'oc_abc', closeHints: true, taskHints: true });
   });
 
   it('produces exactly what the server validator accepts and stores', () => {

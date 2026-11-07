@@ -445,7 +445,7 @@ export interface StewardConfig {
   closeHints?: boolean;
   /**
    * 事项关联的群里有一轮结束、举手或中断时，在这一项上标「子任务已交付 / 等人处理 / 中断」，
-   * 并给管家会话发一条合并的短通知。只提示，不改状态。默认开，只在关掉时写 `false`。
+   * 并给管家会话发一条合并的短通知。只提示，不改状态。默认关，只在打开时写 `true`。
    */
   taskHints?: boolean;
 }
@@ -512,11 +512,11 @@ export function normalizeStewardConfig(raw: unknown):
     ...(r.autoJoinSoloGroups === true ? { autoJoinSoloGroups: true } : {}),
     ...(r.decisionCards === false ? { decisionCards: false } : {}),
     ...(r.closeHints === true ? { closeHints: true } : {}),
-    ...(r.taskHints === false ? { taskHints: false } : {}),
+    ...(r.taskHints === true ? { taskHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
     && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
-    && value.decisionCards !== false && value.taskHints !== false) {
+    && value.decisionCards !== false && value.taskHints !== true) {
     return { ok: true, value: null };
   }
   return { ok: true, value };
@@ -546,9 +546,9 @@ export function stewardCloseHintsOn(cfg: StewardConfig | undefined): boolean {
   return stewardReady(cfg) && cfg.closeHints === true;
 }
 
-/** 子任务提醒开着：管家可用（开关开 + 选了管家群）且没关 taskHints。 */
+/** 子任务提醒开着：管家可用（开关开 + 选了管家群）且打开了 taskHints。 */
 export function stewardTaskHintsOn(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
-  return stewardReady(cfg) && cfg.taskHints !== false;
+  return stewardReady(cfg) && cfg.taskHints === true;
 }
 
 /**

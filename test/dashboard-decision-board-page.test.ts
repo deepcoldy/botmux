@@ -325,16 +325,16 @@ describe('Bot config steward section', () => {
     expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1' } });
   });
 
-  it('"subtask alerts" is on by default; turning it off saves false, turning it back on drops the field', async () => {
+  it('"subtask alerts" is off by default; turning it on saves true, turning it back off drops the field', async () => {
     serve();
     await render({ enabled: true, chatId: 'oc_1', closeHints: true });
     const alerts = () => renderer!.root.find(n => n.type === 'input' && n.props['data-action'] === 'toggle-steward-task-hints');
-    expect(alerts().props.checked).toBe(true);
-    expect(text()).toContain(zh('botDefaults.stewardTaskHints'));
-    await act(async () => { alerts().props.onChange({ currentTarget: { checked: false } }); });
-    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', closeHints: true, taskHints: false } });
     expect(alerts().props.checked).toBe(false);
+    expect(text()).toContain(zh('botDefaults.stewardTaskHints'));
     await act(async () => { alerts().props.onChange({ currentTarget: { checked: true } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', closeHints: true, taskHints: true } });
+    expect(alerts().props.checked).toBe(true);
+    await act(async () => { alerts().props.onChange({ currentTarget: { checked: false } }); });
     expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', closeHints: true } });
   });
 

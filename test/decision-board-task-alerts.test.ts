@@ -31,7 +31,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
   vi.setSystemTime(T0);
   dir = mkdtempSync(join(tmpdir(), 'decision-board-task-'));
-  steward = { enabled: true, chatId: 'oc_steward' };
+  steward = { enabled: true, chatId: 'oc_steward', taskHints: true };
   sessions = new Map();
   rows = new Map();
   delivered = [];
@@ -157,8 +157,8 @@ describe('子任务提醒', () => {
     expect(delivered).toHaveLength(0);
   });
 
-  it('开关关掉：不排提醒、看板不标提示，群状态照常显示', async () => {
-    steward = { enabled: true, chatId: 'oc_steward', taskHints: false };
+  it('默认关：不排提醒、看板不标提示，群状态照常显示；打开后新结果照常提醒', async () => {
+    steward = { enabled: true, chatId: 'oc_steward' };
     const a = await add('修登录', 'oc_a');
     await elapse(MIN);
     turnEnded('oc_a', 's-a', 't-1');
@@ -167,6 +167,20 @@ describe('子任务提醒', () => {
     const row = (await service.listView('active', 'owner')).items.find(i => i.seq === a)!;
     expect(row.taskChats).toEqual([expect.objectContaining({ chatId: 'oc_a', kind: 'delivered', summary: '修好了' })]);
     expect(row.taskHint).toBeUndefined();
+
+    steward = { enabled: true, chatId: 'oc_steward', taskHints: false };
+    turnEnded('oc_a', 's-a', 't-2');
+    await elapse(TASK_ALERT_DEBOUNCE_MS * 2);
+    expect(delivered).toHaveLength(0);
+
+    steward = { enabled: true, chatId: 'oc_steward', taskHints: true };
+    expect((await service.listView('active', 'owner')).items.find(i => i.seq === a)!.taskHint)
+      .toMatchObject({ kind: 'task_delivered', chatId: 'oc_a' });
+    turnEnded('oc_a', 's-a', 't-3', 'delivered', '打开后这轮也好了');
+    await elapse(TASK_ALERT_DEBOUNCE_MS);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.prompt).toContain(`#${a} 修登录 — 子任务已交付`);
+    expect(delivered[0]!.prompt).toContain('打开后这轮也好了');
   });
 
   it('投递抛错：不记已提醒，过一个防抖周期重试；最多投 3 次', async () => {
@@ -247,25 +261,30 @@ describe('看板列表和详情', () => {
 });
 
 describe('管家设置与存储', () => {
-  it('taskHints：默认开，只在关掉时写 false；非布尔拒绝；与 closeHints 互不影响', () => {
+  it('taskHints：默认关，只在打开时写 true；非布尔拒绝；与 closeHints 互不影响', () => {
     expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_x' })).toEqual({ ok: true, value: { enabled: true, chatId: 'oc_x' } });
-    expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_x', taskHints: true })).toEqual({ ok: true, value: { enabled: true, chatId: 'oc_x' } });
-    expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_x', taskHints: false })).toEqual({ ok: true, value: { enabled: true, chatId: 'oc_x', taskHints: false } });
+    expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_x', taskHints: false })).toEqual({ ok: true, value: { enabled: true, chatId: 'oc_x' } });
+    expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_x', taskHints: true })).toEqual({ ok: true, value: { enabled: true, chatId: 'oc_x', taskHints: true } });
+    expect(normalizeStewardConfig({ taskHints: false })).toEqual({ ok: true, value: null });
+    expect(normalizeStewardConfig({ taskHints: true })).toEqual({ ok: true, value: { enabled: false, taskHints: true } });
     expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_x', taskHints: 'no' })).toMatchObject({ ok: false });
-    expect(stewardTaskHintsOn({ enabled: true, chatId: 'oc_x' })).toBe(true);
-    expect(stewardTaskHintsOn({ enabled: true, chatId: 'oc_x', taskHints: false, closeHints: true })).toBe(false);
-    expect(stewardTaskHintsOn({ enabled: false, chatId: 'oc_x' })).toBe(false);
-    expect(stewardTaskHintsOn({ enabled: true })).toBe(false);
+    expect(stewardTaskHintsOn({ enabled: true, chatId: 'oc_x' })).toBe(false);
+    expect(stewardTaskHintsOn({ enabled: true, chatId: 'oc_x', closeHints: true })).toBe(false);
+    expect(stewardTaskHintsOn({ enabled: true, chatId: 'oc_x', taskHints: true })).toBe(true);
+    expect(stewardTaskHintsOn({ enabled: false, chatId: 'oc_x', taskHints: true })).toBe(false);
+    expect(stewardTaskHintsOn({ enabled: true, taskHints: true })).toBe(false);
   });
 
   it('管家指引里「子任务结果」一节只在开关开着时出现，且在定时巡检之前', () => {
-    const on = stewardGuidePreset('zh', { enabled: true, chatId: 'oc_x' });
-    const off = stewardGuidePreset('zh', { enabled: true, chatId: 'oc_x', taskHints: false });
+    const on = stewardGuidePreset('zh', { enabled: true, chatId: 'oc_x', taskHints: true });
+    const off = stewardGuidePreset('zh', { enabled: true, chatId: 'oc_x' });
     expect(on).toContain('## 子任务结果');
     expect(off).not.toContain('## 子任务结果');
     expect(on.indexOf('## 子任务结果')).toBeLessThan(on.indexOf('## 定时巡检'));
     expect(off).toBe(on.replace(/## 子任务结果[^]*?(?=## 定时巡检)/, ''));
-    expect(stewardGuidePreset('en', { enabled: true, chatId: 'oc_x' })).toContain('## Subtask results');
+    expect(stewardGuidePreset('zh', { enabled: true, chatId: 'oc_x', taskHints: false })).toBe(off);
+    expect(stewardGuidePreset('en', { enabled: true, chatId: 'oc_x', taskHints: true })).toContain('## Subtask results');
+    expect(stewardGuidePreset('en', { enabled: true, chatId: 'oc_x' })).not.toContain('## Subtask results');
   });
 
   it('改动前建的库：打开时补上 task_notified，旧行没有已提醒记录；版本号不升', () => {

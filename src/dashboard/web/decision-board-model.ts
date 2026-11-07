@@ -630,7 +630,7 @@ export interface StewardForm {
   decisionCards: boolean;
   /** 后台巡检找出可以关 / 可以推进 / 该看一眼的事项；默认关。 */
   closeHints: boolean;
-  /** 关联群里一轮交付 / 举手 / 中断时提醒管家；默认开。 */
+  /** 关联群里一轮交付 / 举手 / 中断时提醒管家；默认关。 */
   taskHints: boolean;
 }
 
@@ -644,7 +644,7 @@ export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardF
     autoJoinSoloGroups: cfg?.autoJoinSoloGroups === true,
     decisionCards: cfg?.decisionCards !== false,
     closeHints: cfg?.closeHints === true,
-    taskHints: cfg?.taskHints !== false,
+    taskHints: cfg?.taskHints === true,
   };
 }
 
@@ -665,11 +665,11 @@ export function stewardPayload(form: StewardForm): StewardConfig | null {
     ...(form.autoJoinSoloGroups ? { autoJoinSoloGroups: true } : {}),
     ...(form.decisionCards ? {} : { decisionCards: false }),
     ...(form.closeHints ? { closeHints: true } : {}),
-    ...(form.taskHints === false ? { taskHints: false } : {}),
+    ...(form.taskHints ? { taskHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
     && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
-    && value.decisionCards !== false && value.taskHints !== false) return null;
+    && value.decisionCards !== false && value.taskHints !== true) return null;
   return value;
 }
 
