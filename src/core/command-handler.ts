@@ -140,7 +140,8 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
-import { writeSessionModelPin, sessionAcceptsDirectCommand } from './worker-pool.js';
+import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -3297,6 +3298,15 @@ export async function handleCommand(
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (!emptyStart && pendingTurnId) await deps.prepareTurn?.(current, pendingTurnId);
+            // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+            // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+            if (!emptyStart && !pendingRawInput && pendingTurnId) {
+              recordTurnExplicitMention(current, pendingTurnId, messageMentionsBot(
+                { mentions: current.pendingMentions },
+                current.larkAppId,
+                selfBot.botOpenId,
+              ));
+            }
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),

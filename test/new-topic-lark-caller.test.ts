@@ -154,6 +154,9 @@ async function runCase(name: string, options: Record<string, any> = {}) {
     buildNewTopicCliInput: () => ({ content: 'test prompt' }), sessionPromptInjection: () => undefined,
     rememberLastCliInput: noop, publishAttentionPatch: noop, markInitialUserTurnPending: noop,
     markRepoCardConsumed: noop, deferRepoCardWithdraw: noop,
+    // commitRepoSelection 的被 @ 回执记录（#3039）：本 harness 只验证 worktree 调用者身份，
+    // 不涉及静默回执；mentions 夹具恒为空，门判 false 即中性语义。
+    recordTurnExplicitMention: noop, messageMentionsBot: () => false,
     forkWorker: (_session: any, _prompt: any, turn: any) => {
       events.push('fork');
       if (options.forkError) throw Error('worker fork rejected');
