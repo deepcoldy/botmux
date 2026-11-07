@@ -742,6 +742,8 @@ export interface Session {
   /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
    *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
   kanbanColumn?: string;
+  /** 手动放置列的时刻（epoch ms）。之后任务状态一变，手动列就失效、按推导归列。 */
+  kanbanColumnAt?: number;
   /** 看板列内手动排序位置（拖拽时取相邻卡片中点，允许小数）。 */
   kanbanPosition?: number;
   /** Dashboard 会话锁定：锁定后自动清理空闲会话时跳过；手动关闭仍允许。 */
@@ -817,6 +819,9 @@ export interface Session {
    *  topic where a person most recently spoke without being dragged along by
    *  a bot's own output. */
   lastHumanMessageAt?: string;
+  /** 最近一轮的结果（已交付 / 中断 / 无最终输出），由 daemon 在轮次终态处写入。
+   *  只供会话任务状态推导使用（core/session-task-status.ts）。 */
+  lastTurn?: import('./core/session-task-status.js').SessionLastTurn;
   closedAt?: string;
   /** Owning-daemon automatic scratch cleanup, tied to this exact close. It
    * preserves existing registered jobs, never permission to admit a new turn. */
@@ -2331,6 +2336,10 @@ export interface WorkerFinalOutput {
   /** Redacted terminal diagnostic only, without partial model text. May
    * surface as auxiliary failure UI when a loud trigger hides its answer. */
   turnFailureNotice?: string;
+  /** True when `content` is the worker's "completed but no final text matched"
+   *  diagnostic, not a model answer: it must not count as the turn's delivered
+   *  final reply. Presentation is unchanged. */
+  emptyCompletedNotice?: boolean;
   userText?: string;
   /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
   codexAppSettlement?: {

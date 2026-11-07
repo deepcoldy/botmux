@@ -1038,6 +1038,7 @@ import {
   clearAgentAttention,
   stampHumanActivity,
 } from './core/session-activity.js';
+import { holdLastTurnThrough, isMaintenanceTurnId, noteTurnStarted } from './core/turn-outcome.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
@@ -6477,6 +6478,7 @@ function runIdleAutoCompact(): void {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+  noteTurnStarted(ds, turnId);
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
@@ -10909,7 +10911,7 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   const rawKind = typeof raw.kind === 'string' ? raw.kind.trim().toLowerCase() : '';
   const kind = ['authz', 'decision', 'blocked', 'help'].includes(rawKind) ? rawKind : 'blocked';
 
-  ds.agentAttention = { kind, reason, at: Date.now() };
+  ds.agentAttention = { kind, reason, at: Date.now(), source: 'agent' };
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
@@ -25373,7 +25375,9 @@ function deliverPassthroughToExistingSession(
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
     beginNewTurn(ds, commandContent, turnId);
-    markSessionActivity(ds);
+    const activityAt = Date.now();
+    if (isMaintenanceTurnId(turnId)) holdLastTurnThrough(ds, activityAt);
+    markSessionActivity(ds, activityAt);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
   }

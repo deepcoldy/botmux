@@ -160,11 +160,31 @@ export function publishAttentionPatch(ds: DaemonSession): void {
         // Object when raised, null to clear — SSE consumers merge the patch, so
         // null overwrites the prior value and drops the row out of needs-you.
         agentAttention: ds.agentAttention
-          ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+          ? {
+              kind: ds.agentAttention.kind,
+              reason: ds.agentAttention.reason,
+              at: ds.agentAttention.at,
+              ...(ds.agentAttention.source ? { source: ds.agentAttention.source } : {}),
+            }
           : null,
       },
     },
   });
+}
+
+/** Raise the daemon's own hand for a delivery that keeps failing. Retries land
+ *  here every few seconds; while a daemon raise is still up, keep its original
+ *  `at` so the board, owner reminders and steward alerts see one raise, not a
+ *  fresh one per retry. Returns whether anything changed. */
+export function raiseDaemonAttention(ds: DaemonSession, kind: string, reason: string, now: number = Date.now()): boolean {
+  const current = ds.agentAttention;
+  if (current && current.source !== 'agent') {
+    if (current.kind === kind && current.reason === reason) return false;
+    ds.agentAttention = { kind, reason, at: current.at };
+    return true;
+  }
+  ds.agentAttention = { kind, reason, at: now };
+  return true;
 }
 
 export function clearAgentAttention(ds: DaemonSession): boolean {
