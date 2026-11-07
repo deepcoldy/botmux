@@ -9440,6 +9440,9 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
+  if (isSilentMessageListenerSession(session) && messageListenerSendBlocked(session, chatId)) {
+    throw new Error('botmux top-notice: silent_message_listener: 来源群已设置静默执行，不能在来源群置顶或取消置顶。');
+  }
   try {
     const result = await executeChatTopNoticeCli({
       ...parsed,
@@ -9523,10 +9526,14 @@ async function cmdHistory(rest: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // Silent listener sessions anchor on an internal `ml:` route id that must
+    // never reach Lark read APIs; use the frozen real source message id.
+    const threadRootMessageId = s.messageListenerRun?.sourceMessageId ?? s.rootMessageId;
+
     let ambientBeforeCreateTime: string | undefined;
     if (effectiveScope === 'ambient') {
       try {
-        const detail = await getMessageDetail(appId, s.rootMessageId, { userCardContent: false });
+        const detail = await getMessageDetail(appId, threadRootMessageId, { userCardContent: false });
         ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
       } catch {
         // Best-effort only: ambient history should still work if the root
@@ -9540,9 +9547,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
       : effectiveScope === 'ambient'
         ? await listAmbientChatMessages(appId, s.chatId, limit, {
             beforeCreateTime: ambientBeforeCreateTime,
-            excludeRootMessageId: s.rootMessageId,
+            excludeRootMessageId: threadRootMessageId,
           })
-        : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
+        : await listThreadMessages(appId, s.chatId, threadRootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
     // path in daemon.ts. Each message gets its own numberer with resources
     // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
@@ -15135,6 +15142,9 @@ async function cmdDispatchTree(rest: string[]): Promise<void> {
   const originClaim = freezeDispatchOriginClaim(sid);
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  if (isSilentMessageListenerSession(s)) {
+    throw new Error('silent_message_listener: 来源群已设置静默执行，不能在来源群更新任务树卡片。');
+  }
   const result = await trySyncDispatchTaskTree({
     originClaim,
     sessionId: sid,
@@ -15478,6 +15488,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage, lookupMessageChatId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
+
+  // Silent listener tasks may only orchestrate inside other groups: their
+  // seed/prime messages and task-tree cards must never land in the source
+  // group. --into derives its chat from a real message id, so resolve the
+  // actual destination instead of trusting a --chat-id-only view.
+  const silentDispatchSources = [dispatchOrigin, s].filter(source => isSilentMessageListenerSession(source));
+  if (silentDispatchSources.length > 0) {
+    const dispatchDestination = intoRoot
+      ? await lookupMessageChatId(appId, intoRoot)
+      : targetChatId;
+    if (silentDispatchSources.some(source => messageListenerSendBlocked(source, dispatchDestination ?? undefined))) {
+      throw new Error('silent_message_listener: 来源群已设置静默执行，不能在来源群派发话题或更新任务树；请显式指定其他目标群。');
+    }
+  }
 
   const parsedBotApps: Array<{ appId: string; role?: string }> = [];
   for (const raw of botAppSpecs) {

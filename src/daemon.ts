@@ -10593,6 +10593,18 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     });
   }
 
+  // Silent listener tasks must never surface an ask card in the source group.
+  // A non-retryable 403 makes the standalone CLI fail closed and lets hook
+  // adapters fall back to their native terminal prompt (Dashboard/terminal is
+  // the documented place to handle authorisation for these tasks).
+  if (askSession && isSilentMessageListenerSession(askSession.session)) {
+    return jsonRes(res, 403, {
+      ok: false,
+      error: 'silent_message_listener',
+      detail: '静默执行任务不能向来源群发送确认卡；请在 Dashboard/终端处理授权或异常',
+    });
+  }
+
   // 谁能答复 = 谁能在该 chat 跟 bot 说话（canTalk）。鉴权在 broker 点击时按注入的
   // canTalkChecker 判定（见下方 setAskCanTalkChecker），daemon 这里不再预解析 approver。
   // chatType 随 ask 一起记下：p2pOpen 的 bot 在私聊里提问时，答复权靠这一腿才判得出

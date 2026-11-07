@@ -59,3 +59,67 @@ describe('managed sends from silent listener tasks', () => {
     }
   });
 });
+
+describe('other source-group write paths from silent listener tasks', () => {
+  function spawnInSilentSession(args: string[], extraEnv: Record<string, string> = {}) {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-listener-send-'));
+    try {
+      const dataDir = join(root, 'data');
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 'silent', turnId: 'om_turn' }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_test', larkAppSecret: 'test', cliId: 'codex', replyCardMode: 'legacy', topicUnavailablePolicy: 'stop' }]));
+      const common = { status: 'active', cliId: 'codex', larkAppId: 'cli_test', scope: 'thread', chatType: 'group', workingDir: root, ownerOpenId: 'ou_requester' };
+      seedPersistedSessionRows(dataDir, 'cli_test', {
+        silent: { ...common, sessionId: 'silent', chatId: 'oc_test', rootMessageId: 'ml:om_source', messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' } },
+        human: { ...common, sessionId: 'human', chatId: 'oc_test', rootMessageId: 'om_human' },
+        target: { ...common, sessionId: 'target', chatId: 'oc_target', rootMessageId: 'om_target' },
+      });
+      const result = spawnSyncTsScript(fixture, args, {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          // Mirror the worker freeze: a silent task's BOTMUX_CHAT_ID is its own
+          // source chat, never an inherited ambient value.
+          BOTMUX_CHAT_ID: 'oc_test',
+          BOTMUX_SESSION_ID: 'silent', BOTMUX_TURN_ID: 'om_turn', BOTMUX_LARK_APP_ID: 'cli_test',
+          BOTMUX_TEST_TOPIC_STATES: JSON.stringify({ 'ml:om_source': 'missing', om_source: 'live', om_human: 'live', om_target: 'live' }),
+          ...extraEnv },
+      });
+      return { root, result };
+    } catch (err) {
+      rmSync(root, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  it.each([
+    ['dispatch default target', ['dispatch', '--title', '子项目', '--bot-app', 'cli_other', '--brief', '做个事']],
+    ['dispatch into a source-group message', ['dispatch', '--into', 'om_human', '--bot-app', 'cli_other', '--brief', '继续']],
+    ['dispatch tree refresh', ['dispatch', 'tree']],
+    ['top-notice in the source group', ['top-notice', 'set', 'om_human', '--json']],
+  ])('blocks %s before any Lark write', (_label, args) => {
+    const { root, result } = spawnInSilentSession(args);
+    try {
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('silent_message_listener');
+      expect(result.stdout.split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('history reads use the real source message id and never send the ml: anchor to Lark', () => {
+    const { root, result } = spawnInSilentSession(['history', '--limit', '5'],
+      { BOTMUX_TEST_CAPTURE_HTTP: '1', BOTMUX_TEST_LIST_MESSAGES: '1' });
+    try {
+      expect(result.status, result.stderr).toBe(0);
+      const queriedPaths = result.stdout.split('\n')
+        .filter(line => line.startsWith('CAPTURE_HTTP='))
+        .map(line => JSON.parse(line.slice('CAPTURE_HTTP='.length)).path as string);
+      expect(queriedPaths.length).toBeGreaterThan(0);
+      expect(queriedPaths.some(path => /ml(?::|%3a)/i.test(path))).toBe(false);
+      expect(queriedPaths.some(path => path.includes('om_source'))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
