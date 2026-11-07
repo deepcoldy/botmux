@@ -162,7 +162,7 @@ import { dismissSessionGroup } from './dismiss-command.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
-import { readProjectGroup } from '../services/project-group-store.js';
+import { projectTitleWithoutTaskMarker, readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
 import { readPlatformTeamSync } from '../services/platform-team-store.js';
@@ -5616,7 +5616,7 @@ export async function handleCommand(
           const workers = (result.config.workerAppIds ?? []).map(botDisplayName).join('、')
             || t('cmd.project.none', undefined, loc);
           const runtime = result.project
-            ? `${result.project.title} · ${result.project.phase}`
+            ? `${projectTitleWithoutTaskMarker(result.project.title)} · ${result.project.phase}`
             : t('cmd.project.waiting', undefined, loc);
           const workerPolicy = t(result.config.autoEnrollWorkers
             ? 'cmd.project.worker_policy_auto'

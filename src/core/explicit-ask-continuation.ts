@@ -1,6 +1,6 @@
 import type { TriggerRequest } from '../services/trigger-types.js';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { askKeyFor } from './ask-persist-store.js';
@@ -16,6 +16,9 @@ export interface ExplicitAskReceipt {
   /** Daemon-observed origin, never supplied as authority by the caller. */
   origin?: { turnId: string; dispatchAttempt?: number; workerGeneration?: number };
 }
+
+/** Consumed receipts only answer late reconnects of the same invocation. */
+const CONSUMED_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Explicit asks have a daemon-owned claimant, independent of the waiting CLI.
  * Keep terminal receipts until acknowledged or durably dispatched to the SAME
@@ -94,7 +97,11 @@ export function createExplicitAskContinuation(deps: {
           const key = file.slice(0, -5);
           const receipt = read(key)!;
           if (receipt.version !== 1 || receipt.input.larkAppId !== deps.appId
-            || keyFor(receipt.input) !== key || receipt.acknowledged || receipt.delivered) continue;
+            || keyFor(receipt.input) !== key) continue;
+          if (receipt.acknowledged || receipt.delivered) {
+            if (now() - receipt.settledAt! >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
+            continue;
+          }
           if (!receipt.result) {
             // Restore only existing, still-bound sessions. Never create a session
             // or revive a closed business task to recover an interaction.
