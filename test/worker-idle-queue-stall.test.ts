@@ -84,6 +84,11 @@ describe('scheduled queue heads do not swallow human input', () => {
     expect(h.activeTurnAuthority.snapshot()).toEqual(oldAuthority);
   });
 
+  // These pin the end-to-end "no reorder, no dequeue" behaviour. The
+  // durable/quarantined/startup cases return at flushPending's own earlier
+  // gates (pendingInputMayFlush / currentInputDeliveryQuarantine /
+  // isStartupPending), before the promotion call is reached — they do not
+  // exercise the duplicate guards inside promotePendingHumanInterruption.
   it.each([
     ['durable in flight', { durableTurnInFlight: true }],
     ['RPC active', { directRpcTurnBlocksTypeAhead: () => true }],
@@ -169,6 +174,45 @@ describe('scheduled queue heads do not swallow human input', () => {
     await h.flushPending();
     expect(h.pendingMessages).toEqual(before);
     expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+  });
+
+  it('drains the schedule first in FIFO order when no active turn blocks the head (CLI idle)', async () => {
+    const h = harness();
+    // No active turn means the head is not blocked, so the head gate must keep
+    // promotion from firing even though a human waits behind a schedule: the
+    // fix only reorders past a head that an active task genuinely blocks.
+    h.activeTurnAuthority.clear();
+    const human = h.pendingMessages[1];
+    h.freshnessInputQueue = { takeNormal: vi.fn(() => { h.pendingMessages.shift(); return undefined; }) };
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages).toEqual([human]);
+  });
+
+  it('does not re-kick flush from the finally clause when the drain wrote nothing', async () => {
+    const h = harness();
+    // The write loop dequeues nothing (a freshness hold) but, while that
+    // iteration runs, a blocked schedule prefix and an authorized human
+    // arrive, so promotion becomes possible exactly at the finally boundary.
+    // The itemsWrittenInThisFlush > 0 condition must suppress the microtask
+    // re-kick: removing it re-drives flushPending, which really promotes the
+    // human and enters the write loop a second time.
+    const schedule = { ...h.pendingMessages[0]! };
+    const human = { ...h.pendingMessages[1]! };
+    h.pendingMessages = [{ ...human, turnId: 'human-at-entry' }];
+    let seeded = false;
+    h.freshnessInputQueue = { takeNormal: vi.fn(() => {
+      if (!seeded) {
+        seeded = true;
+        h.pendingMessages.shift();
+        h.pendingMessages.push(schedule, human);
+      }
+      return undefined;
+    }) };
+    await h.flushPending();
+    await Promise.resolve();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages.map((x: any) => x.turnId)).toEqual(['schedule:tick', 'human-question']);
   });
 });
 
