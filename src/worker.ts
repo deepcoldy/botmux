@@ -473,6 +473,7 @@ import {
 } from './utils/render-dimensions.js';
 import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandReal } from './adapters/cli/registry.js';
 import { parsePiInstallUpdatedNotice, readPiInstallVersion } from './adapters/cli/pi.js';
+import { cursorStopLeftParkedFollowUp } from './adapters/cli/cursor.js';
 import { cliAdapterBindsOwnershipPid } from './adapters/cli/ownership-pid.js';
 import { resolveCodexUpgradeCommand } from './services/codex-upgrade-target.js';
 import {
@@ -15663,6 +15664,38 @@ function settleStoppedTraexRecovery(turnId: string | undefined): void {
   emitReadyCodexTurns([pending.failedTurn]);
 }
 
+const CURSOR_PARKED_FOLLOW_UP_POLL_MS = 250;
+const CURSOR_PARKED_FOLLOW_UP_POLL_ATTEMPTS = 20;
+let cursorParkedFollowUpTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** After an explicit stop Cursor never submits a follow-up queued during the
+ *  stopped turn; it stays at `enter steer` while the IM side believes it was
+ *  delivered. Press Enter once, only when the screen shows the turn ended, the
+ *  item parked and the composer empty: Enter on a running turn would steer
+ *  into it, and on a non-empty composer it would submit something else. */
+function submitCursorParkedFollowUpAfterStop(target: SessionBackend, lifetime: number): void {
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  clearTimeout(cursorParkedFollowUpTimer);
+  let attempts = 0;
+  const poll = () => {
+    cursorParkedFollowUpTimer = undefined;
+    if (backend !== target || cliLifetimeNonce !== lifetime || nativeSessionForkPending()) return;
+    if (!isFlushing && !injectionFlushing && commandLineWritesPending === 0) {
+      let screen = '';
+      try { screen = captureBackendScreen(target); } catch { /* retry on the next poll */ }
+      if (cursorStopLeftParkedFollowUp(screen)) {
+        sendTermActionOnce(target, 'enter');
+        log('Cursor: submitted the follow-up left parked by the stop');
+        return;
+      }
+    }
+    if (++attempts < CURSOR_PARKED_FOLLOW_UP_POLL_ATTEMPTS) {
+      cursorParkedFollowUpTimer = setTimeout(poll, CURSOR_PARKED_FOLLOW_UP_POLL_MS);
+    }
+  };
+  cursorParkedFollowUpTimer = setTimeout(poll, CURSOR_PARKED_FOLLOW_UP_POLL_MS);
+}
+
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (nativeSessionForkPending()) return;
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
@@ -15780,6 +15813,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // /model), and retiring there would swallow the still-running turn.
   if (criticalInterrupt && requestedKey === 'ctrlc') {
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+    if (cliAdapter?.id === 'cursor') submitCursorParkedFollowUpAfterStop(targetBackend, lifetime);
   }
   // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
   // flag here — without this, dismissing an AskUserQuestion dialog via the
@@ -15863,6 +15897,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
       if (pendingMessages[i]!.turnId === turnId) pendingMessages.splice(i, 1);
     }
     retireDoubaoBridgeTurnOnInterrupt(turnId, currentBotmuxDispatchAttempt);
+    if (cliAdapter?.id === 'cursor') submitCursorParkedFollowUpAfterStop(targetBackend, lifetime);
   }
   send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
   if (delivered) {
