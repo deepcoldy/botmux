@@ -7,7 +7,10 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
   <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg" alt="platform: Linux | macOS">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="#贡献者"><img src="https://img.shields.io/github/contributors/deepcoldy/botmux.svg" alt="contributors"></a>
+  <a href="https://github.com/deepcoldy/botmux/commits/master"><img src="https://img.shields.io/github/commit-activity/m/deepcoldy/botmux.svg" alt="commit activity"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
 
@@ -130,4 +133,14 @@ botmux 或许是目前专为飞书（Feishu/Lark）打造的开源项目中贡�
 
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=deepcoldy/botmux&amp;max=500&amp;columns=16" alt="contributors" />
+</a>
+
+## Star 趋势
+
+<a href="https://star-history.com/#deepcoldy/botmux&amp;Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date&amp;theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" />
+    <img src="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" alt="botmux Star 趋势" width="720" />
+  </picture>
 </a>
