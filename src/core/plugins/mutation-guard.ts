@@ -30,9 +30,13 @@ export function pluginRecordHash(record: unknown): string | null {
 export function pluginRegistryRevision(): string {
   let revision = 0;
   try {
-    const raw = JSON.parse(readFileSync(pluginRegistryPath(), 'utf8')) as { revision?: unknown };
-    if (typeof raw.revision === 'number' && Number.isSafeInteger(raw.revision) && raw.revision > 0) {
-      revision = raw.revision;
+    const raw = JSON.parse(readFileSync(pluginRegistryPath(), 'utf8')) as { revision?: unknown } | null;
+    // `null` / an array / a bare scalar is valid JSON but carries no counter;
+    // reading `.revision` straight off it would throw a TypeError where the
+    // store's own parser (parsePluginRegistryText) reports an empty registry.
+    const rawRevision = raw && typeof raw === 'object' ? raw.revision : undefined;
+    if (typeof rawRevision === 'number' && Number.isSafeInteger(rawRevision) && rawRevision > 0) {
+      revision = rawRevision;
     }
   } catch (error) {
     // ENOENT (never written) and an unreadable/corrupt file both read as

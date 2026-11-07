@@ -105,4 +105,19 @@ describe('durable registry revision counter', () => {
     expect(readPluginRegistry().revision).toBeUndefined();
     expect(pluginRegistryRevision()).toBe(pluginRegistryRevision());
   });
+  it('treats a registry whose top-level JSON is not an object as revision 0', () => {
+    const path = join(state.home, '.botmux/plugins-registry.json');
+    mkdirSync(join(state.home, '.botmux'), { recursive: true });
+    const legacy = (() => {
+      writeFileSync(path, JSON.stringify({ schemaVersion: 1, plugins: {} }));
+      return pluginRegistryRevision();
+    })();
+    // `null`, arrays and bare scalars are valid JSON but carry no counter. The
+    // store answers an empty registry for them, so the revision must read as 0
+    // rather than throwing a TypeError out of `.revision`.
+    for (const text of ['null', '[]', '42', '"x"']) {
+      writeFileSync(path, text);
+      expect(pluginRegistryRevision()).toBe(legacy);
+    }
+  });
 });
