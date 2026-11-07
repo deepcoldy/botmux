@@ -8949,6 +8949,36 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
       larkAppId: MY_APP_ID,
     }));
   });
+
+  // /fork --create 在 new-topic 默认下给新群写的就是这种群级 chat-topic 覆盖；分身登记在
+  // chat/chatId。新群只有发起人 + 本 bot，不 @ 的直接发言靠 1v1 免 @ 进来。
+  it.each([
+    { label: 'explicit @', messageId: 'msg-tri-fork-at', text: '@BotA continue the fork', mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }] },
+    { label: 'direct message in a 1v1 group', messageId: 'msg-tri-fork-direct', text: 'continue the fork', mentions: undefined },
+  ])('per-chat chat-topic over a per-bot new-topic default: $label continues the chat-scope session at chatId', async ({ messageId, text, mentions }) => {
+    __resetChatStatsForTest();
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    setupBotState({ regularGroupReplyMode: 'new-topic', chatReplyModes: { 'chat-tri-fork': 'chat-topic' }, allowedUsers: [USER_OPEN_ID] });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-tri-fork');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text }),
+      messageId,
+      chatId: 'chat-tri-fork',
+      chatType: 'group',
+      mentions,
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-tri-fork',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
 });
 
 describe('im.message.receive_v1 — per-chat mention mode (chatMentionModes overrides regularGroupMentionMode)', () => {
