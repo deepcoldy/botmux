@@ -500,4 +500,75 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(notice).toContain('127');
   });
 
+  // Node worker 进程换代（OOM / 管控杀死，没有 claude_exit）是比 in-worker CLI
+  // respawn 更强的边界：替代 worker 是全新一代，不能让上一代锚定的 readyAt 与
+  // 崩溃计数连坐它——否则新 CLI 在旧 readyAt 的窗口内第一次 127 就被直接熔断，
+  // 连自己唯一的一次重启机会都没有。
+  it('gives the replacement Node worker its own permanent budget after the old worker died', async () => {
+    const sid = 'sid-worker-generation-reset';
+    const w1 = makeFakeWorker();
+    const ds = makeDs(sid, w1);
+    __testOnly_setupWorkerHandlers(ds, w1);
+
+    w1.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
+    w1.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(restartCounts.get(sid)?.readyAt).not.toBeUndefined();
+
+    // The Node worker itself is killed (no claude_exit); the stale streak is
+    // still parked on the session until a replacement worker is bound.
+    w1.emit('exit', 137, 'SIGKILL');
+    await flush();
+    expect(restartCounts.get(sid)?.readyAt).not.toBeUndefined();
+
+    // Daemon forks a replacement worker (next user message / continuation resume):
+    // binding the new generation voids the old streak and its readyAt.
+    const w2 = makeFakeWorker();
+    ds.worker = w2;
+    __testOnly_setupWorkerHandlers(ds, w2);
+    expect(restartCounts.has(sid)).toBe(false);
+    w2.emit('message', { type: 'prompt_ready' });
+    await flush();
+    w2.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+
+    // First permanent exit OF THE NEW GENERATION gets its own single restart.
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
+    const w2Messages = w2.send.mock.calls.map((c: any[]) => c[0]);
+    expect(w2Messages.some(m => m?.type === 'restart')).toBe(true);
+    expect(w2Messages.some(m => m?.type === 'park_diagnostic')).toBe(false);
+  });
+
+  // 非 tmux（PTY）后端熔断后走 killWorker（worker 同步解绑，进程随后退出）：
+  // 用户下一条消息 fork 出新 worker 代次时必须作废旧计数，与 tmux 的 park 路径
+  // 对称——否则新 CLI 第一次崩溃就带着旧计数被再次熔断，只能 /close。
+  it('gives the post-crash-loop replacement worker a fresh budget on non-tmux backends', async () => {
+    const sid = 'sid-pty-killworker-clears';
+    const w1 = makeFakeWorker();
+    const ds = makeDs(sid, w1);
+    __testOnly_setupWorkerHandlers(ds, w1);
+
+    await crashTimes(w1, 4, false, 1);
+    expect(w1.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+    // killWorker detached the worker synchronously; the process exit follows.
+    w1.emit('exit', 0, null);
+    await flush();
+    expect(restartCounts.get(sid)?.count).toBe(4);
+
+    // The next user message forks a replacement worker: binding it resets the streak.
+    const w2 = makeFakeWorker();
+    ds.worker = w2;
+    __testOnly_setupWorkerHandlers(ds, w2);
+    expect(restartCounts.has(sid)).toBe(false);
+
+    w2.emit('message', { type: 'prompt_ready' });
+    await flush();
+    w2.emit('message', { type: 'claude_exit', code: 1, signal: null, canParkDiagnostic: false });
+    await flush();
+    expect(restartCounts.get(sid)?.count).toBe(1);
+    expect(w2.send.mock.calls.map((c: any[]) => c[0]).some(m => m?.type === 'restart')).toBe(true);
+  });
+
 });

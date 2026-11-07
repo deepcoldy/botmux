@@ -42,7 +42,7 @@ export function isPermanentCliExitCode(code: number | null | undefined): boolean
 }
 
 export interface RestartCounter {
-  /** 连续失败总次数（跨性质累计；CLI ready 后由调用方清掉整条记录）。 */
+  /** 连续失败总次数（跨性质累计；ready 后存活满窗口由本判定作废，或 Node worker 换代时由调用方删除）。 */
   count: number;
   lastAt: number;
   /** 上一次崩溃的退出码，用于日志与性质判断。 */

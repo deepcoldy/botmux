@@ -16913,6 +16913,12 @@ function setupWorkerHandlers(
     throw new Error('worker generation reservation changed before IPC setup');
   }
   ds.taskContinuationRpcProof = undefined;
+  // 新 Node worker 代次绑定即作废旧崩溃连胜：上一 worker 代次（OOM/管控死亡、
+  // 或 killWorker/retire 后由任务续跑/用户消息拉起的替代进程）锚定的 readyAt
+  // 不能连坐新一代——否则新 CLI 在旧 readyAt 的 60s 窗口内第一次永久退出
+  // （127/77）就会被直接熔断，连自己唯一的一次重启机会都拿不到。in-worker 的
+  // CLI 崩溃自动重启不换 worker、不经过这里，#2551 的快速退出循环熔断照常。
+  restartCounts.delete(ds.session.sessionId);
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.

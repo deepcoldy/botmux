@@ -125,6 +125,19 @@ describe('decideAutoRestart', () => {
     expect(again.reason).toBe('permanent_exit');
   });
 
+  // 「存活满一个窗口」是严格大于：恰好等于窗口仍算同一轮，超出 1ms 才开新预算。
+  it('treats exactly one window after ready as the same streak, but window+1ms as recovered', () => {
+    const readyAt = now + 1000;
+    const seeded = { count: 1, lastAt: now, lastCode: 127 as const, permanentCount: 1, readyAt };
+
+    const atBoundary = decideAutoRestart({ prev: seeded, now: readyAt + RESTART_WINDOW_MS, code: 127 });
+    expect(atBoundary.shouldRestart).toBe(false);
+
+    const pastBoundary = decideAutoRestart({ prev: seeded, now: readyAt + RESTART_WINDOW_MS + 1, code: 127 });
+    expect(pastBoundary.shouldRestart).toBe(true);
+    expect(pastBoundary.next.permanentCount).toBe(1);
+  });
+
   it('a streak that was NEVER cleared still stops on the second permanent exit much later', () => {
     const first = decideAutoRestart({ prev: undefined, now, code: 127 });
     const muchLater = decideAutoRestart({ prev: first.next, now: now + 90 * 24 * 3600 * 1000, code: 127 });
