@@ -71,6 +71,11 @@ export function botConfigInvariantError(entry: any): BotConfigInvariantError | u
   // worker spawnCli 会拒绝启动。同上，sandbox 切换与 cliId 切换经 rmwBotEntry 落盘、不过
   // applyConfigField 的零注入门禁。只拦 scratch 致因：切回非 scratch 或关掉零注入即可修复；
   // CLI 本身不支持零注入的存量 entry 不在此锁。
+  // 后端维度同样有写盘缺口、不在此锁：PUT /api/bot-backend-type（zmx 在可编辑后端名单）
+  // 与 PUT /api/bot-agent（entry 已带 backendType 覆盖时切到 antigravity）也直走
+  // rmwBotEntry、不过 applyConfigField，可落盘 antigravity × zmx（远端后端同形）；单看
+  // entry 解析不出生效后端（daemon 默认 + CLI 配对），由 worker spawnCli 权威闸
+  // fail-closed 拒启动。跟踪 issue #3064。
   if (entry.promptInjection === 'none'
       && entry.sandbox === 'scratch'
       && zeroPromptInjectionUnsupportedReason(entry.cliId, { sandbox: 'scratch' }) === 'scratch_unsupported_for_cli') {
