@@ -382,7 +382,7 @@ export function saveSettings(api: { config: PluginConfigApi }, value: unknown): 
 - The injected `api` has **only `config`**: `get(key?)`, `set(key, value)`, `replace(object)`, and `path`. There is no `logger`, `resolve`, or `settingsPath`.
 - Return only fields that are safe to show in a browser; don't echo raw `config.json` or secrets.
 - Return values must be JSON-serializable; returning `null`/`undefined` gives the browser `{ "ok": true }`.
-- Errors: invalid request JSON → 400; plugin missing or no adapter → 404; unsupported method → 405; adapter throws, bad exports, or unserializable result → 500 with the single code `plugin_settings_failed`, never the raw exception.
+- Errors: invalid request JSON → 400; plugin missing or no adapter → 404; unsupported method → 405; plugin updated or replaced while the save was waiting → 409 `plugin_settings_stale` (reload and retry); adapter throws, bad exports, or unserializable result → 500 with the single code `plugin_settings_failed`, never the raw exception.
 - The install scan does not run adapter code; exports are checked at request time.
 
 Dashboard code runs within the permissions of the system user that installed Botmux. Don't render sensitive config into the page or browser logs.

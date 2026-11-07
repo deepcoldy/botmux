@@ -382,7 +382,7 @@ export function saveSettings(api: { config: PluginConfigApi }, value: unknown): 
 - 注入的 `api` **只有 `config`**：`get(key?)`、`set(key, value)`、`replace(object)` 和 `path`。没有 `logger`、`resolve`、`settingsPath`。
 - 只挑能在浏览器里展示的字段返回，不要原样回传 `config.json` 或敏感信息。
 - 返回值要能 JSON 序列化；返回 `null`/`undefined` 时浏览器收到 `{ "ok": true }`。
-- 错误码：请求 JSON 不合法 → 400；插件不存在或没有适配器 → 404；方法不支持 → 405；适配器抛错、导出不对或结果无法序列化 → 500，错误码统一为 `plugin_settings_failed`，不会暴露原始异常。
+- 错误码：请求 JSON 不合法 → 400；插件不存在或没有适配器 → 404；方法不支持 → 405；保存时插件刚被更新或替换 → 409 `plugin_settings_stale`，刷新后重试；适配器抛错、导出不对或结果无法序列化 → 500，错误码统一为 `plugin_settings_failed`，不会暴露原始异常。
 - 安装扫描时不会执行适配器代码，导出是否正确在请求时才检查。
 
 Dashboard 代码运行在安装 Botmux 的系统用户权限范围内。不要把敏感配置渲染进页面或打到浏览器日志里。
