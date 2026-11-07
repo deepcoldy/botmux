@@ -144,15 +144,37 @@ describe('an empty environ read from a live process is not final', () => {
     }
     fs.writeFileSync(FIFO, CONTENT + '\\0');
   `;
+  // Serves the first empty read, then unlinks the FIFO and puts a directory in
+  // its place so every later re-read gets EISDIR: a non-vanished, non-permission
+  // error that can also be manufactured when the suite runs as root. The write
+  // fd held across the swap wakes any reader that already reopened the stale
+  // FIFO inode (it gets EOF and retries) instead of leaving it blocked forever.
+  const SERVE_ERROR = `
+    const fs = require('node:fs');
+    const { FIFO } = process.env;
+    fs.closeSync(fs.openSync(FIFO, 'w'));
+    for (;;) {
+      try { fs.closeSync(fs.openSync(FIFO, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)); }
+      catch (err) { if (err.code === 'ENXIO') break; throw err; }
+    }
+    const held = fs.openSync(FIFO, 'w');
+    fs.rmSync(FIFO);
+    fs.mkdirSync(FIFO);
+    fs.closeSync(held);
+  `;
   const servers: ChildProcess[] = [];
   afterEach(() => { for (const s of servers.splice(0)) s.kill('SIGKILL'); });
 
-  function environMidExec(pid: number, opts: { ppid: number; pgid: number; state?: string; stat?: string }): void {
+  function environMidExec(
+    pid: number,
+    opts: { ppid: number; pgid: number; state?: string; stat?: string },
+    serve: string = SERVE,
+  ): void {
     proc(pid, opts);
     const fifo = join(procRoot, String(pid), 'environ');
     rmSync(fifo);
     expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
-    servers.push(spawn(process.execPath, ['-e', SERVE], {
+    servers.push(spawn(process.execPath, ['-e', serve], {
       env: { ...process.env, FIFO: fifo, CONTENT: `${MOJO_TREE_NONCE_ENV}=${NONCE}` },
       stdio: 'ignore',
     }));
@@ -175,6 +197,16 @@ describe('an empty environ read from a live process is not final', () => {
     const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members.map(m => m.pid)).toEqual([100]);
+  });
+
+  it('fails the whole scan when a re-read of an empty environ errors, instead of keeping the non-member verdict', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 }, SERVE_ERROR);
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    expect(scan.ok).toBe(false);
+    if (scan.ok) throw new Error('expected the re-read error to fail the whole scan');
+    expect(scan.failure.kind).toBe('proc-entry-unreadable');
+    expect(scan.failure).toMatchObject({ pid: 300 });
   });
 });
 
