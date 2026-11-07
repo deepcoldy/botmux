@@ -26270,6 +26270,11 @@ async function spawnCli(
           + `not pinning a custom LARKSUITE_CLI_DATA_DIR into the sandbox; the in-sandbox lark-cli will `
           + `use the default store. The real keystore is still denied/carve-out'd by policy (no leak).`);
       }
+      // Release the previous generation before preparing: its cleanup tears down
+      // this same session's tree, so running it afterwards would remove the tree
+      // the new CLI is about to run in.
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
       const sbx = prepareDirectSandbox({
         networkPolicy: effectiveSandboxNetworkPolicy,
         sessionId: cfg.sessionId,
@@ -26312,8 +26317,6 @@ async function spawnCli(
       spawnBin = sbx.bin;
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
-      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
       localProtectedMcpContainmentActiveCapabilityIds = (
@@ -26464,6 +26467,11 @@ async function spawnCli(
       }
     } else if (process.platform === 'darwin') {
       // ── macOS: APFS clonefile COW clone + Seatbelt ──
+      // Release the previous generation before preparing: its cleanup tears down
+      // this same session's tree, so running it afterwards would remove the tree
+      // the new CLI is about to run in.
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
       const prepared = prepareMacScratchSandboxDetailed({
         sessionId: cfg.sessionId,
         dataDir: scratchDataDir,
@@ -26483,8 +26491,6 @@ async function spawnCli(
       spawnBin = sbx.bin;
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
-      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
       scratchMappings = sbx.mappings;
@@ -26499,6 +26505,11 @@ async function spawnCli(
     } else {
       // ── Linux: full-root COW overlay ──
       const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
+      // Release the previous generation before preparing: its cleanup tears down
+      // this same session's tree, so running it afterwards would remove the tree
+      // the new CLI is about to run in.
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
       const prepared = prepareScratchSandboxDetailed({
         sessionId: cfg.sessionId,
         dataDir: scratchDataDir,
@@ -26526,8 +26537,6 @@ async function spawnCli(
       spawnBin = sbx.bin;
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
-      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
       scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
@@ -26996,6 +27005,10 @@ async function spawnCli(
     ]) addProtectedCredentialMask(path);
     let credentialCliBin = spawnBin;
     try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
+    // Release the previous generation before preparing: its cleanup removes this
+    // same session's relay outbox.
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+    if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
     // A credential-only pane has no sound in-pane send authority (see
     // prepareCredentialOnlyRelayOutbox for the four measured reasons), so give it
     // the SAME host-side relay the full sandbox uses. Without this the confined
@@ -27051,8 +27064,6 @@ async function spawnCli(
     // never a Feishu credential; the host watcher re-execs the send outside the
     // pane and performs the authoritative origin check.
     childEnv.BOTMUX_SEND_RELAY = credentialRelay.outbox;
-    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-    if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
     sandboxCleanup = credentialRelay.cleanup;
     sandboxRelayOutbox = credentialRelay.outbox;
     // session-id is FORCED so a relayed send cannot target another session.
