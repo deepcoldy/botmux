@@ -5962,6 +5962,9 @@ export interface CreateHeadlessSessionArgs {
   workingDir?: string;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** See Session.headless.failureDiagnostics: set by the workflow draft's
+   *  clarify session only. */
+  failureDiagnostics?: true;
 }
 
 export async function createHeadlessSession(
@@ -5992,6 +5995,7 @@ export async function createHeadlessSession(
       id: headlessId,
       createdAt: nowIso,
       source: 'cli',
+      ...(args.failureDiagnostics === true ? { failureDiagnostics: true as const } : {}),
     };
     session.lastMessageAt = nowIso;
     session.workingDir = wd.resolvedPath;

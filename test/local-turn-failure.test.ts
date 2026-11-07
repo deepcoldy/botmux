@@ -125,7 +125,9 @@ describe('worker emitReadyTurns: failed turns', () => {
     h.queue.ingest([block('a-text', [{ type: 'text', text: 'posting it' }], 'end_turn'), connectionLost('e1', LIVE_AT), duration('d1')]);
     h.emitReadyTurns({ explicitTerminalOnly: true });
 
-    expect(h.terminals).toEqual([['om_review', 'failed', 'provider_server_error', 1, undefined, true]]);
+    // The API-error record's text rides along for the failure panel.
+    expect(h.terminals).toEqual([['om_review', 'failed', 'provider_server_error', 1, undefined, true,
+      undefined, 'API Error: Connection lost mid-response.']]);
     expect(h.sent).toEqual([]);
   });
 });
