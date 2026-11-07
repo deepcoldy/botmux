@@ -3,9 +3,8 @@
  *
  * A turn that ends `failed` or `ambiguous` records its exact CLI input here
  * (persisted on the Session as `lastFailedTurn`) so the user can re-inject it
- * with `/retry` instead of copy-pasting. Recording is guarded by the session's
- * current reply target: a type-ahead successor already owns the prompt, so the
- * failed predecessor must not capture it.
+ * with `/retry` instead of copy-pasting. The daemon verifies the input's exact
+ * dispatch turn before invoking this builder; reply routing is not input ownership.
  *
  * Pure functions only — persistence and IPC stay with the daemon/command-handler
  * callers, mirroring the ordinary-turn-recovery split.
@@ -14,21 +13,6 @@ import type { CodexAppTurnInput, FailedTurnRecord, TrustedCaller } from '../type
 
 /** Cooldown between two `/retry` attempts on the same session. */
 export const RETRY_COOLDOWN_MS = 10_000;
-
-/** Whether a turn_terminal event should be recorded as the session's last
- *  failed turn. `completed`/`cancelled` never qualify. When the session's
- *  current reply target already points at a NEWER turn (type-ahead), the
- *  failed turn's prompt has been superseded and must not be captured. */
-export function shouldRecordFailedTurn(
-  terminal: { turnId: string; status: string },
-  currentReplyTargetTurnId: string | undefined,
-): boolean {
-  if (terminal.status !== 'failed' && terminal.status !== 'ambiguous') return false;
-  if (currentReplyTargetTurnId !== undefined && currentReplyTargetTurnId !== terminal.turnId) {
-    return false;
-  }
-  return true;
-}
 
 /** Build the persisted record for a failed/interrupted turn. Returns undefined
  *  when there is no CLI input to re-inject (e.g. a turn that died before its

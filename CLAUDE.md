@@ -43,6 +43,10 @@ bun run build:bun            # 打自包含单文件二进制（scripts/build-bu
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 
+**临时探针 / 变异脚本 / 自写的 vitest 配置一律套 `bun scripts/fenced-run.ts -- <命令>`。** 仓库的 HOME 围栏和 tmux 围栏只挂在 `vitest.config.ts` 与 `bunfig.toml` 上：`bun /tmp/probe.ts` 直接调真实模块、或自写一个不带 setupFiles 的 vitest 配置，都**没有围栏**，会写真实 `~/.botmux`、`~/.config/systemd/user` 和 fleet 的 `-L botmux` tmux。2026-11-06 一个评审探针不带 HOME 调了 `enableAutostart()`，把真实 botmux.service / watchdog 改成 `ExecStart=/opt/botmux`，崩溃守护静默失效 5 小时。fenced-run 给子进程临时 HOME、私有 TMUX_TMPDIR + 拒绝宿主 socket 的 tmux shim、把 SESSION_DATA_DIR 指到临时 HOME 并清掉继承的会话身份标记和 daemon IPC 端口，并默认去掉 user bus（`systemctl --user` 碰不到真实 user manager；确需时加 `--keep-user-bus`）；触到宿主 socket 以退出码 3 失败。围栏只拦住经 PATH 解析的 tmux 和继承来的环境：探针里不要用绝对路径调 tmux（如 `/usr/bin/tmux`）、不要 `env -i` 清空环境后再 spawn tmux——这两种写法绕过 shim，能直达 fleet 的默认 socket；需要碰 tmux 时只用私有 `-L`/`-S` 目标或仓库 test helper。仓库根目录新增 `vitest*.config.ts` 必须挂 tmux 围栏，`test/vitest-config-fences.test.ts` 守着。
+
+**本机测试有整机并发闸**（`scripts/test-concurrency.mjs`，接在 `vitest.config.ts` 的 sequencer 与 `scripts/run-bun-tests.mjs` 上）：vitest 选中 ≥50 个文件、或跑全量 `test:bun` 时，在 `/tmp/botmux-test-slots` 的 flock 名额上排队，整机同时最多 `核数/16` 份（64 核 = 4 份）；vitest 默认 `maxWorkers = min(16, 核数/名额)`。CI（`CI=true`）上两者都不生效，行为不变。看到 `[test-gate] 名额已满` 说明机器忙——别用 `BOTMUX_TEST_GATE=0` 绕过，定向测试（少量文件）本来就不排队；其余覆盖变量见脚本头注释。
+
 worktree 里也能直接用 bun，且**不额外占依赖体积**——只要不跑 install（见下节）。实测在「源码 + `node_modules` symlink 到 canonical」的 worktree 里，`bun src/cli.ts`、`bun run build`、`tsc`、`vitest`、`build:bun`（`pty.node` 经 symlink 解析，不复制）以及编出二进制跑 smoke 六项，全部正常。
 
 ### worktree 的 node_modules：共享还是独立（改前必读）

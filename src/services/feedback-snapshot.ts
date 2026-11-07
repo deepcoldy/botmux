@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import { mkdir, open, readFile, stat, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
-import { FEEDBACK_TABLES } from './feedback-postgres-schema.js';
+import { FEEDBACK_TABLES } from './feedback-tables.js';
 import { SkillFeedbackStore } from './skill-feedback-store.js';
 
 export async function createFeedbackSnapshot(dataDir: string, migrationId: string): Promise<{ snapshotPath: string; fingerprint: string }> {

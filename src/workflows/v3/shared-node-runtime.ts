@@ -60,6 +60,7 @@ import {
   v3ApprovedBotScope,
   v3NodeHeldByProposal,
 } from './dag-revision.js';
+import { v3CheckpointHeldNodes, v3CheckpointMarkedSince, v3CheckpointSuccesses } from './checkpoint-hold.js';
 import {
   appendEvent,
   appendEventDurable,
@@ -403,6 +404,9 @@ export interface V3RuntimeDeps {
   ) => void;
 }
 
+/** Code defaults for the three concurrency caps (codex's three-layer cap). */
+export const V3_DEFAULT_CONCURRENCY = Object.freeze({ global: 4, perBot: 1, perCli: 2 });
+
 export interface V3RuntimeOptions {
   /** The run lives in `${baseDir}/${dag.runId}`. */
   baseDir: string;
@@ -414,6 +418,8 @@ export interface V3RuntimeOptions {
   globalConcurrency?: number; // default 4
   perBotConcurrency?: number; // default 1
   perCliConcurrency?: number; // default 2
+  /** Per-CLI override of `perCliConcurrency`, keyed by cliId. */
+  perCliConcurrencyById?: Readonly<Record<string, number>>;
   cancelSignal?: AbortSignal;
   /** Bot identities already pinned by an immutable run envelope. When set,
    *  the runtime must use these exact snapshots instead of live bots.json. */
@@ -591,9 +597,12 @@ export async function runWorkflow(
   const journalPath = join(runDir, 'journal.ndjson');
   const statePath = join(runDir, 'STATE');
 
-  const globalCap = opts.globalConcurrency ?? 4;
-  const perBotCap = opts.perBotConcurrency ?? 1;
-  const perCliCap = opts.perCliConcurrency ?? 2;
+  const globalCap = opts.globalConcurrency ?? V3_DEFAULT_CONCURRENCY.global;
+  const perBotCap = opts.perBotConcurrency ?? V3_DEFAULT_CONCURRENCY.perBot;
+  const perCliDefaultCap = opts.perCliConcurrency ?? V3_DEFAULT_CONCURRENCY.perCli;
+  const perCliById = opts.perCliConcurrencyById ?? {};
+  const perCliCap = (cliId: string): number =>
+    Object.prototype.hasOwnProperty.call(perCliById, cliId) ? perCliById[cliId]! : perCliDefaultCap;
   const gateMode = opts.gateMode ?? 'blocking';
   const hostResponseWaitMs = opts.hostResponseWaitMs ?? 15_000;
   const executionContext = opts.executionContext ?? opts.resolvedWorkflowData;
@@ -736,8 +745,22 @@ export async function runWorkflow(
       return true;
     });
 
+  // Dependants of a checkpoint success nobody released yet (bot-executed
+  // runs only, design §13.6). Re-derived from the journal every tick.
+  let checkpointHeld: ReadonlySet<string> = new Set();
+  const refreshCheckpointHolds = (events: readonly StoredEvent[]): void => {
+    if (!externalMode) return;
+    checkpointHeld = v3CheckpointHeldNodes(dag, v3CheckpointSuccesses({
+      events,
+      dag,
+      markedSince: v3CheckpointMarkedSince(runDir, authorizedDag, events),
+    }));
+  };
+  /** Held back this tick: by a pending proposal, or behind a checkpoint. */
   const heldByProposal = (nodeId: string, loopId?: string): boolean =>
-    v3NodeHeldByProposal(pendingTouched, nodeId, loopId);
+    v3NodeHeldByProposal(pendingTouched, nodeId, loopId) ||
+    checkpointHeld.has(nodeId) ||
+    (loopId !== undefined && checkpointHeld.has(loopId));
 
   /** A revision's reassign / blocked re-run whose dedicated event was lost
    *  to a crash between two appends is re-appended (idempotent, §13.3). */
@@ -766,7 +789,10 @@ export async function runWorkflow(
     );
   }
 
-  // First run only: stamp runStarted (idempotent on resume).
+  // First run only: stamp runStarted (idempotent on resume). A daemon-started
+  // run arrives with the journal already rooted by its start intent, which
+  // stamps `nodeExecutor` from the same run.json (start-intent.ts); a root
+  // written before that is never rewritten — readers fall back to run.json.
   if (readJournal(journalPath).length === 0) {
     appendEvent(journalPath, {
       type: 'runStarted',
@@ -876,6 +902,7 @@ export async function runWorkflow(
   while (true) {
     const events = readJournal(journalPath);
     refreshEffectiveDag(events);
+    refreshCheckpointHolds(events);
     if (reconcileRevisionFollowUps(events)) continue;
     const snap = materialize(events);
     writeState(statePath, snap);
@@ -1177,7 +1204,7 @@ export async function runWorkflow(
           // selectors resolving to the same bot share its slot.
           const botKey = botSnap.larkAppId;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
-          if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
+          if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap(botSnap.cliId)) continue;
           if (startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId)) {
             startedThisTick++;
           }
@@ -1187,8 +1214,11 @@ export async function runWorkflow(
       }
     }
 
+    // Cancelling an early-release loser is a decision of the node it lost
+    // to: while that node waits behind a checkpoint, the loser keeps running
+    // (the main bot may still want it once it has seen the result).
     const cancels = actions.filter((a): a is Extract<V3Action, { kind: 'cancelNode' }> =>
-      a.kind === 'cancelNode' && !heldByProposal(a.nodeId));
+      a.kind === 'cancelNode' && !heldByProposal(a.nodeId) && !checkpointHeld.has(a.byNodeId));
     let cancelledThisTick = false;
     for (const a of cancels) {
       cancelledThisTick = applyCancelNode(a) || cancelledThisTick;
@@ -2716,9 +2746,8 @@ export async function runWorkflow(
         type: 'nodeHandoffPrepared',
         ...identity,
         targetLarkAppId: current.assignments.get(node.id) ?? botSnap.larkAppId,
-        placement: 'topic',
+        ...externalPlacementIntent(loopRef ? undefined : node),
         revision: dagRevision,
-        idempotency: { nodeCard: randomUUID(), handoff: randomUUID() },
         preparedAt: clock(),
       }, { durable: true });
       return true;
@@ -2727,6 +2756,18 @@ export async function runWorkflow(
     const attempt = foldV3ExternalAttempts(readJournal(journalPath)).get(attemptId);
     if (attempt && !attempt.closed) startHandoffSend(attempt, false);
     return true;
+  }
+
+  /** Where an attempt is handed off (design §5.1), frozen with its intent:
+   *  a top-level goal node's `placement`, else a node topic. Only a node
+   *  topic has a node card, so only it gets a node-card key. */
+  function externalPlacementIntent(node: V3Node | undefined): {
+    placement: 'topic' | 'main';
+    idempotency: { nodeCard?: string; handoff: string };
+  } {
+    return node && isGoalNode(node) && node.placement === 'main'
+      ? { placement: 'main', idempotency: { handoff: randomUUID() } }
+      : { placement: 'topic', idempotency: { nodeCard: randomUUID(), handoff: randomUUID() } };
   }
 
   /** Crash window inside the claim: nodeDispatched without its intent. No
@@ -2747,9 +2788,8 @@ export async function runWorkflow(
         ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
         attemptId: attempt.attemptId,
         targetLarkAppId: current.snap.assignments.get(attempt.nodeId) ?? frozen.larkAppId,
-        placement: 'topic',
+        ...externalPlacementIntent(attempt.loop ? undefined : node),
         revision: dispatched?.revision ?? 1,
-        idempotency: { nodeCard: randomUUID(), handoff: randomUUID() },
         preparedAt: clock(),
       }, { durable: true });
       return true;
@@ -2912,7 +2952,7 @@ export async function runWorkflow(
   async function blockExternalAttempt(
     attempt: V3ExternalAttempt,
     stopReason: V3ExternalStopReason,
-    verdict: { errorClass: V3ErrorClass; errorCode: string; message: string },
+    verdict: { errorClass: V3ErrorClass; errorCode: string; message: string; recovery?: 'retry' },
   ): Promise<boolean> {
     // A crash-left install is settled (next tick) before any deadline close.
     if (hasExternalInstallIntent(runDir, attempt.attemptId)) return true;
@@ -2973,6 +3013,7 @@ export async function runWorkflow(
    *                                 acceptance deadline; accepted → record it,
    *                                 deadline passed → HANDOFF_NOT_ACCEPTED
    *   accepted                    → NODE_TIMEOUT once the deadline passed
+   *   handed to a human, not closed → HANDED_TO_HUMAN at once (any phase)
    * Returns true when the journal may have changed (an append here, or any
    * awaited transport call during which another caller may have appended),
    * so the caller re-reads before deciding.
@@ -2984,6 +3025,18 @@ export async function runWorkflow(
       if (handoffControllers.has(attempt.attemptId)) continue; // send in flight here
       if (!classifyExternalAttempt(events, attempt.attemptId).ok) continue;
       const now = clock();
+      if (attempt.handedToHuman) {
+        // A hand-over (§13.6) recorded but not closed — a crash between its
+        // two writes. Finish it now rather than at the node's deadline.
+        await blockExternalAttempt(attempt, 'handedToHuman', {
+          errorClass: 'workerError',
+          errorCode: V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN,
+          message: attempt.handedToHuman.reason,
+          recovery: 'retry',
+        });
+        progressed = true;
+        continue;
+      }
       if (attempt.phase === 'dispatched') {
         progressed = appendMissingHandoffIntent(attempt) || progressed;
       } else if (attempt.phase === 'prepared') {
@@ -3047,7 +3100,11 @@ export async function runWorkflow(
         await blockExternalAttempt(attempt, 'timeout', {
           errorClass: 'timeout',
           errorCode: V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT,
-          message: 'the node did not submit a valid result before its timeout',
+          message: attempt.startPending
+            // Main topic (§5.5): accepted into a busy session's queue, and its
+            // own turn never started within the backstop (timeout + grace).
+            ? '到期限还没收到这一轮开始的信号：多半是一直在执行 Bot 的主话题会话里排队（它前面的回合一直没结束），也可能是开始信号没送到；可以重试，或把节点改成节点话题'
+            : 'the node did not submit a valid result before its timeout',
         });
         progressed = true;
       }

@@ -90,11 +90,11 @@ function botConfig(appId: string, tools: Array<'lark-cli' | 'bytedcli'> | null) 
 }
 
 /** A handoff the main bot really signed, and the receiving bot's view of it. */
-async function receiver(opts: { self?: boolean; alsoApproved?: string[] } = {}) {
+async function receiver(opts: { self?: boolean; alsoApproved?: string[]; main?: boolean } = {}) {
   const self = opts.self === true;
   const run = new BotRun(self
     ? validateDag({ schemaVersion: 2, runId: 'rcvd-self', nodes: [{ id: 'write', type: 'goal', goal: 'g', timeoutSec: 600 }] })
-    : reportDag('rcvd'));
+    : opts.main ? reportDag('rcvd-main', { placement: 'main' }) : reportDag('rcvd'));
   const world = identityWorld();
   const snapshots = authorizeRun(run, {
     identity: { unionId: INITIATOR_UNION, tools: ['bytedcli'] },
@@ -103,10 +103,11 @@ async function receiver(opts: { self?: boolean; alsoApproved?: string[] } = {}) 
   await driveWith(run, world, snapshots);
   const attempt = run.openAttempt('write');
   const handoff = attempt.handoffMessageId!;
-  const nodeCard = attempt.nodeCardMessageId!;
   const appId = self ? MAIN : 'cli_a';
   const found = lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(world.dataDir), dispatchRoot: handoff, secret: SECRET });
   if (found.kind !== 'workflow') throw new Error('handoff binding missing');
+  // A main-topic handoff (§5.5) lives under the main topic's root.
+  const nodeCard = attempt.nodeCardMessageId ?? found.binding.publishRoot;
   const ds: any = {
     larkAppId: appId, chatId: CHAT, chatType: 'group', scope: 'thread',
     session: {
@@ -287,6 +288,32 @@ describe('the pre-handoff check runs the dispatch delegation check of this bot',
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toMatchObject({ status: 'unavailable' });
     h.scope.getBot = () => ({ config: botConfig('cli_a', null) });
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'not_required' });
+  });
+});
+
+describe('a main-topic handoff (§5.5): the delegation is the handoff turn\'s, nothing more', () => {
+  it('a turn folded into or following the handoff turn in the shared session gets no delegation; passing on stays inside the approved set', async () => {
+    const h = await receiver({ main: true, alsoApproved: ['cli_b'] });
+    expect(h.ds.session.workflowNode).toMatchObject({ placement: 'main' });
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    expect(inherited).toMatchObject({ workflow: { attemptId: h.attempt.attemptId } });
+    // A person's message in the main topic (another turn of the same session).
+    h.ds.session.replyTargets.om_person = {
+      senderOpenId: 'ou_person_in_a', rootMessageId: h.nodeCard, participants: [{ openId: 'ou_person_in_a', isBot: false }],
+      updatedAt: new Date().toISOString(),
+    };
+    const other = await h.fns.dispatchUserForTurn(h.ds, 'om_person');
+    expect(other === undefined || !('workflow' in (other as object))).toBe(true);
+    // Passing on from the handoff turn: only to the run's approved bots.
+    expect(await inheritWorkflowDelegation({
+      inherited, targetAppIds: ['cli_c'], chatId: CHAT, baseDir: h.run.base, targetUserAllowed: async () => true,
+    })).toEqual({ inherit: false });
+    expect(await inheritWorkflowDelegation({
+      inherited, targetAppIds: ['cli_b'], chatId: CHAT, baseDir: h.run.base, targetUserAllowed: async () => true,
+    })).toMatchObject({ inherit: true, workflow: { hop: 1 } });
+    // The attempt over (cancelled): the handoff turn's delegation ends too.
+    await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'runCancelled');
+    expect(await h.fns.dispatchUserForTurn(h.ds, h.handoff)).toBeUndefined();
   });
 });
 

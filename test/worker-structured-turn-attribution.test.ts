@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { advanceAncestorSessionTurn, readProcessStartIdentity, resolveSessionContext } from '../src/core/session-marker.js';
+import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { bridgeGateInputForTurn, structuredFallbackKind } from '../src/services/bridge-fallback-gate.js';
 
 function harness() {
   const scope: Record<string, any> = {
@@ -33,6 +38,73 @@ function harness() {
 }
 
 describe('structured turn send attribution retirement', () => {
+  it('retires folded PID markers before subsequent CLI sends, including an unsteered third execution', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'merged-send-attribution-'));
+    try {
+      const h = harness();
+      const queue = new CodexBridgeQueue(() => 10_000);
+      const marker = join(dir, '.botmux-cli-pids', String(process.pid));
+      mkdirSync(join(dir, '.botmux-cli-pids'));
+      Object.assign(h, {
+        sessionId: 'sid', cliPidMarker: marker, rpcEnginePidMarker: undefined,
+        codexBridgeQueue: queue, queuedTypeAheadTurns: [], currentBotmuxTurnId: undefined,
+        existsSync, readFileSync, basename, atomicWriteFileSync, readProcessStartIdentity,
+        activeTurnAuthority: new ActiveTurnAuthority(), sandboxRelayCapability: null,
+        captureIdentityAnnounced: false, captureRevision: 0, send: vi.fn(),
+        publishActiveTurn: vi.fn(), log: vi.fn(),
+        withPidMarkerLock: (_path: string, fn: () => void) => fn(),
+        markerIdentityTurnId: loadWorkerFunction('markerIdentityTurnId', { isValidMarkerIdentityTurnId }),
+        emittedTurnTerminals: new TurnTerminalDeduper(),
+      });
+      for (const name of ['setCaptureIdentity', 'adoptInitialActiveTurn', 'writeCliPidMarker',
+        'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
+        h[name] = loadWorkerFunction(name, h);
+      }
+      for (const [execution, count] of [4, 3, 1].entries()) {
+        const base = (execution + 1) * 1_000;
+        const first = `execution-${execution}-input-0`;
+        h.adoptInitialActiveTurn({ turnId: first });
+        for (let i = 0; i < count; i++) {
+          const id = `execution-${execution}-input-${i}`;
+          queue.mark(id, id, base + i * 10);
+          if (i > 0) h.queuedTypeAheadTurns.push({ turnId: id });
+          h.writeCliPidMarker();
+          queue.ingest([{ uuid: `${id}-user`, kind: 'user', text: id,
+            timestampMs: base + i * 10 + 1, sourceSessionId: 'provider',
+            sourceTurnId: `native-${execution}`, sourceMessageId: id }]);
+        }
+        // Resolve and record the send using the actual CLI process-tree path,
+        // rather than supplying the expected turn identity to the receipt.
+        const context = resolveSessionContext(dir, 'sid', process.pid)!;
+        expect(context.turnId).toBe(first);
+        recordBridgeReplyMarker({ dataDir: dir, ...context, sentAtMs: base + 90,
+          content: 'Delivered answer', responseKind: 'final', deliveryKind: 'current_session_send' });
+        // A successful final advances the disk marker before the native
+        // completion arrives, exactly where stale type-ahead used to survive.
+        advanceAncestorSessionTurn(dir, process.pid, context.turnId);
+        queue.ingest([{ uuid: `final-${execution}`, kind: 'assistant_final', text: '',
+          timestampMs: base + 100, sourceSessionId: 'provider', sourceTurnId: `native-${execution}` }]);
+        const [ready] = queue.drainEmittable();
+        const receipts = readFileSync(join(dir, 'turn-sends', 'sid.jsonl'), 'utf8')
+          .trim().split('\n').map(line => JSON.parse(line));
+        const input = bridgeGateInputForTurn('sid', ready, {
+          markTimeMs: ready.markTimeMs, isLocal: ready.isLocal,
+          finalText: ready.finalText, terminalStatus: ready.terminalStatus,
+        });
+        expect(structuredFallbackKind(input, undefined, receipts, false, true)).toBe('none');
+        h.retireStructuredTurnAttribution([...(ready.supersededTurns ?? []), ready]);
+        expect(h.currentBotmuxTurnId).toBeUndefined();
+        expect(h.queuedTypeAheadTurns).toEqual([]);
+        expect(h.pendingStructuredCaptureRetirement).toBeUndefined();
+        expect(resolveSessionContext(dir, 'sid', process.pid)?.turnId).toBeUndefined();
+        expect(queue.size()).toBe(0);
+        for (let i = 0; i < count; i++) {
+          expect(h.retiredTurnIds.has(`execution-${execution}-input-${i}`)).toBe(true);
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('keeps type-ahead context until an already-started native successor ends', () => {
     const h = harness();
     h.currentBotmuxTurnId = 'first';

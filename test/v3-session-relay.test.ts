@@ -306,11 +306,13 @@ describe('v3 session relay authorization', () => {
     });
     expect(cancel).toMatchObject({ ok: true, body: { reason: 'stop it' } });
 
+    // Who decided a retry is derived from the session record; a caller in
+    // the body is never forwarded.
     const retry = authorize({
       mutation: 'retry',
-      raw: { sessionId: 'sess-1', originCapability: CAPABILITY, nodeId: 'n1', reason: 'x' },
+      raw: { sessionId: 'sess-1', originCapability: CAPABILITY, nodeId: 'n1', reason: 'x', caller: { origin: 'runEvent' } },
     });
-    expect(retry).toMatchObject({ ok: true, body: { nodeId: 'n1' } });
+    expect(retry).toMatchObject({ ok: true, body: { nodeId: 'n1', reason: 'x', caller: { origin: 'human' } } });
 
     const grant = authorize({
       mutation: 'grant',
@@ -337,8 +339,15 @@ describe('v3 session relay authorization', () => {
 
   it('covers every relayable mutation with a green path', () => {
     writeEnvelope('bound-ok', BINDING);
+    // ask-human cannot be sent without its node and reason.
+    const required: Partial<Record<(typeof V3_SESSION_RUN_MUTATIONS)[number], Record<string, unknown>>> = {
+      'ask-human': { nodeId: 'n1', reason: 'needs a person' },
+    };
     for (const mutation of V3_SESSION_RUN_MUTATIONS) {
-      expect(authorize({ mutation }).ok, mutation).toBe(true);
+      expect(authorize({
+        mutation,
+        raw: { sessionId: 'sess-1', originCapability: CAPABILITY, ...(required[mutation] ?? {}) },
+      }).ok, mutation).toBe(true);
     }
   });
 

@@ -150,6 +150,12 @@ export interface DaemonSession {
     engineProcStart?: string;
     workerGeneration?: number;
   };
+  /** Per-worker-generation HMAC key for the protected local-service proxy.
+   * It exists only in daemon/worker memory and crosses only their private IPC. */
+  protectedLoopbackProxyAttestation?: {
+    secret: string;
+    workerGeneration: number;
+  };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
@@ -243,6 +249,8 @@ export interface DaemonSession {
    *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
    *  re-fork of the same session launches identically. */
   spawnModelOverride?: string;
+  /** Formerly pinned workers must also clear their effort launch snapshot. */
+  modelPinCleared?: boolean;
   /** True while this session's worker sits in the crash-loop park state: its CLI
    *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
    *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
@@ -467,9 +475,15 @@ export interface DaemonSession {
   /** Native write observations, scoped to the worker generation and exact attempt. */
   replyExecutionStarts?: Map<string, {
     startedAtMs: number; workerGeneration: number;
+    /** Exact terminal observed; retain timing for reply rendering, suppress reminders. */
+    completed?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
   }>;
+  /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
+   * Values are receipt epoch milliseconds, also fencing older legacy starts
+   * when a compatibility terminal omitted its attempt before any start arrived. */
+  replyExecutionTerminals?: Map<string, number>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -751,9 +765,19 @@ export interface DaemonSession {
   usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /** Lark turns that a still-running Claude background task was launched
+   *  from, as last reported by THIS worker generation
+   *  (`background_task_pins_sync`). Their replyTargets records are exempt from
+   *  eviction like a live CronCreate task's (see replyTargetPinnedTurnIds), so
+   *  the task's wake answer still finds its topic after many newer turns.
+   *  In-memory only and cleared when the worker exits: the anchors live in
+   *  the worker's memory, so a new worker never forwards an older one's wake. */
+  backgroundTaskPinnedTurnIds?: readonly string[];
   /** One-shot runtime flag set by the daemon when creating a substitute
    *  (分身) session. The worker-pool consumes and clears it once the worker
    *  reports ready, triggering a one-time substitute control card post so the
@@ -928,6 +952,11 @@ export interface DaemonSession {
    *  Forwarded back to the worker in tui_keys so it can verify the backend
    *  hasn't been replaced within the same worker process. */
   stuckWarningCliLifetime?: number;
+  /** Turn initiator frozen when the active stuck-warning card was posted
+   *  (same rule as the recovery-retry card: daemon-authenticated caller or a
+   *  reply-registry entry proving a human sender). They may press the card's
+   *  `initiator` keys; undefined = operators only. */
+  stuckWarningInitiatorOpenId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

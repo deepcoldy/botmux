@@ -11,6 +11,9 @@
  *   - getChildPid resolves through display-message, not list-panes
  *   - captureCurrentScreen issues capture-pane -e -p -S -
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,6 +35,23 @@ vi.mock('node:child_process', () => {
     spawnSync: vi.fn(),
   };
 });
+
+// This file mocks node:child_process, so the anti-fork gate's darwin lsof
+// census would get null (spawnSync mocked) and fail closed for the full 8 s
+// budget on every spawn (Linux reads /proc and is unaffected). The gate is
+// unit-tested separately; here default it to a pass-through, and override it
+// per-case (mockedLeadingArgs) for the two wiring tests below. vi.hoisted
+// keeps the mock fn alive when the factory is hoisted above the import.
+const { mockedLeadingArgs } = vi.hoisted(() => ({
+  mockedLeadingArgs: vi.fn((): string[] => []),
+}));
+vi.mock('../src/adapters/backend/tmux-anti-fork.js', () => ({
+  createTmuxBootGate: vi.fn(() => ({ leadingArgs: () => mockedLeadingArgs() })),
+  TmuxCompetingServerBlockedError: class TmuxCompetingServerBlockedError extends Error {
+    code = 'ETIMEDOUT';
+    constructor(label: string) { super(`blocked ${label}`); this.name = 'TmuxCompetingServerBlockedError'; }
+  },
+}));
 
 vi.mock('node:fs', () => {
   const actual: any = require('node:fs');
@@ -62,6 +82,7 @@ vi.mock('node:fs', () => {
 import { execSync, execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { unlinkSync, createReadStream, openSync, closeSync, writeSync } from 'node:fs';
+import * as nodeFs from 'node:fs';
 import {
   TmuxPipeBackend,
   normaliseCaptureLineEndings,
@@ -903,6 +924,21 @@ describe('TmuxPipeBackend input addressing', () => {
     // the input box (replies-to-previous-message off-by-one). Regression guard
     // for PR #25, which added -p only to the unused TmuxBackend.
     expect(pasteArgs).toContain('-p');
+  });
+
+  it('submits multiline Codex input and Enter in one tmux command batch', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    expect(be.submitBracketedPaste('line one  \nline two')).toBe(true);
+    const calls = getExecFileCalls();
+    expect(calls).toHaveLength(2);
+    expect((calls[0][2] as any).input).toBe('line one  \nline two');
+    expect(calls[1][1]).toContain('paste-buffer');
+    expect(calls[1][1]).toContain('-r');
+    expect(calls[1][1]).not.toContain('-p');
+    expect((calls[1][1] as string[]).slice(-7)).toEqual([';', 'send-keys', '-t', '0:5.0', '-l', '--', '\x1b[201~\r']);
+    expect(calls[1][1]).toContain('\x1b[200~');
   });
 
   it('uses a fresh named tmux buffer for each paste', () => {
@@ -1908,6 +1944,56 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
       errSpy.mockRestore();
     }
   });
+
+  // The 60s continuous-unreachable escalation must carry the same
+  // server-replacement classification as the missing streak: when the outage
+  // ends with a DIFFERENT server answering the socket, the exit is not charged
+  // to the CLI. Pins the escalation call site of noteServerReplacedAtPaneLoss.
+  it('classifies the 60s server-unreachable escalation as a server replacement when a different server answers', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      // Spawn: anchor the pane on server pid 111.
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a.includes('display-message') && a.some(f => String(f) === '#{pane_id} #{pid}')) {
+          return '%1 111' as any;
+        }
+        return '' as any;
+      }) as typeof execFileSync);
+      const be = new TmuxPipeBackend('bmx-outage', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      expect((be as unknown as { lastLiveServerPid?: number }).lastLiveServerPid).toBe(111);
+
+      // After spawn every pane probe fails at CONNECTION level (server never
+      // answers); once the escalation fires, a DIFFERENT server (pid 222) is
+      // already answering on the socket.
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a[0] === 'list-sessions' && a.includes('#{pid}')) return '222\n' as any;
+        if (a.includes('kill-session')) return '' as any;
+        if (a.includes('display-message')) {
+          throw Object.assign(new Error('error connecting to /tmp/tmux-0/botmux'), {
+            status: 1, signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/botmux (No such file or directory)'),
+          });
+        }
+        return '' as any;
+      }) as typeof execFileSync);
+      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+      vi.advanceTimersByTime(90_000);
+      expect(exits).toHaveLength(1);
+      expect(be.exitedBecauseServerReplaced()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
 });
 
 describe('TmuxPipeBackend send failure handling', () => {
@@ -2085,6 +2171,56 @@ describe('TmuxPipeBackend send failure handling', () => {
     const { exits, killCalls } = runReapCase({ owns: false, deathAnswer: '1:77' });
     expect(killCalls).toHaveLength(0);
     expect(exits).toEqual([[77, null]]);
+  });
+
+  // Pane loss first detected from a FAILED WRITE (guardedSend) must carry the
+  // same server-replacement classification as the watcher's missing streak:
+  // the pid anchored at attach is compared with the server answering at
+  // teardown. Pins the guardedSend call site of noteServerReplacedAtPaneLoss.
+  it('guardedSend classifies a pane loss as a server replacement when a different server answers', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      // During spawn the attach-time anchor read must see this pane alive on a
+      // server with pid 111 (format '#{pane_id} #{pid}', same answer as a probe).
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a.includes('display-message') && a.some(f => String(f) === '#{pane_id} #{pid}')) {
+          return '%13 111' as any;
+        }
+        return '' as any;
+      }) as typeof execFileSync);
+      const be = new TmuxPipeBackend('bmx-replaced-send', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], spawnOpts());
+      expect((be as unknown as { lastLiveServerPid?: number }).lastLiveServerPid).toBe(111);
+
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a[0] === '-V') return 'tmux 3.3a';
+        if (a.includes('load-buffer') || a.includes('paste-buffer')) {
+          throw Object.assign(new Error('gone'), {
+            status: 1, signal: null, stderr: Buffer.from("can't find pane: bmx-replaced-send"),
+          });
+        }
+        // A DIFFERENT server (pid 222) now answers on the socket.
+        if (a[0] === 'list-sessions' && a.includes('#{pid}')) return '222\n' as any;
+        if (a.includes('display-message') && a.some(f => String(f).includes('#{pane_dead_status}'))) {
+          return '1:77' as any;
+        }
+        // Bare '#{pane_id}' answers empty -> authoritative missing; everything
+        // else (kill-session remnant reap) succeeds.
+        return '' as any;
+      }) as typeof execFileSync);
+      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+      expect(() => be.pasteText('x')).not.toThrow();
+      expect(be.exitedBecauseServerReplaced()).toBe(true);
+      expect(exits).toEqual([[77, null]]);
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 });
 
@@ -2966,5 +3102,76 @@ describe('reattach remain-on-exit reapply vs tmux version', () => {
     expect(vCalls).toBe(2);
     expect(roeReapplyCalls()).toEqual([expect.stringContaining('remain-on-exit on')]);
     expect(roeReapplyCalls().some(c => c.includes('failed'))).toBe(false);
+  });
+});
+
+describe('TmuxPipeBackend anti-fork gate wiring', () => {
+  const creatingBackend = () => new TmuxPipeBackend('bmx-gate01', { createSession: true, ownsSession: true });
+
+  it('prepends -N to new-session argv when the gate returns the never-start flag', () => {
+    mockedLeadingArgs.mockReturnValueOnce(['-N']);
+    const be = creatingBackend();
+    expect(() => be.spawn('/bin/echo', [], spawnOpts())).not.toThrow();
+    expect(newSessionArgs().slice(0, 3)).toEqual(['-N', 'new-session', '-d']);
+  });
+
+  it('omits -N when the gate allows a normal (cold/attach) spawn', () => {
+    mockedLeadingArgs.mockReturnValueOnce([]);
+    const be = creatingBackend();
+    expect(() => be.spawn('/bin/echo', [], spawnOpts())).not.toThrow();
+    expect(newSessionArgs().slice(0, 2)).toEqual(['new-session', '-d']);
+  });
+
+  it('a gate block surfaces the startup failure and discards the secret-bearing launch file', () => {
+    // launchFile.discard() removes the file via rmSync (not unlinkSync).
+    const rmSpy = vi.spyOn(nodeFs, 'rmSync').mockImplementation(() => undefined);
+    mockedLeadingArgs.mockImplementationOnce(() => {
+      throw Object.assign(new Error('blocked -L botmux'), { code: 'ETIMEDOUT' });
+    });
+    try {
+      const be = creatingBackend();
+      expect(() => be.spawn('/bin/echo', [], spawnOpts())).toThrow(/创建会话失败/);
+      // The pane launch file written before the gate must be removed on the way out.
+      expect(rmSpy).toHaveBeenCalled();
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('a -N spawn answered "no server running" (owner died in the probe→exec gap) retries and then cold-boots without -N', () => {
+    // "no server running" is a numeric-status, deterministic-looking rejection,
+    // so it is NOT in isRetryableStartupTmuxFailure; the gate-specific retry arm
+    // is the only thing that turns this race into another gate cycle (whose
+    // census then proves a real cold boot) instead of a fatal 会话创建失败.
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const leading: string[][] = [];
+      mockedLeadingArgs
+        .mockImplementationOnce(() => { leading.push(['-N']); return ['-N']; })
+        .mockImplementationOnce(() => { leading.push([]); return []; });
+      let attempts = 0;
+      const attemptArgv: string[][] = [];
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        if (Array.isArray(args) && args.includes('new-session')) {
+          attempts += 1;
+          attemptArgv.push(args as string[]);
+          if (attempts === 1) {
+            throw Object.assign(new Error('no server'), {
+              status: 1, signal: null, stderr: Buffer.from('no server running on /tmp/tmux-0/botmux'),
+            });
+          }
+        }
+        return '' as any;
+      }) as any);
+
+      const be = creatingBackend();
+      expect(() => be.spawn('/bin/echo', [], spawnOpts())).not.toThrow();
+      expect(attempts).toBe(2);
+      expect(attemptArgv[0]!.slice(0, 3)).toEqual(['-N', 'new-session', '-d']);
+      expect(attemptArgv[1]!.slice(0, 2)).toEqual(['new-session', '-d']);
+      expect(leading).toEqual([['-N'], []]);
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 });

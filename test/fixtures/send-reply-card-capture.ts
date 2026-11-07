@@ -83,6 +83,15 @@ const topicLookups = new Map<string, number>();
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
   const url = new URL(config.url, 'https://open.feishu.cn');
   const method = String(config.method).toUpperCase();
+  if (process.env.BOTMUX_TEST_CAPTURE_HTTP === '1') {
+    const type = url.pathname.includes('/auth/') ? 'auth'
+      : url.pathname.includes('/im/v1/files') ? 'file'
+        : url.pathname.includes('/im/v1/images') ? 'image'
+          : url.pathname.includes('/im/v1/messages') ? 'message'
+            : url.pathname.includes('/cardkit/') ? 'card'
+              : 'other';
+    console.log('CAPTURE_HTTP=' + JSON.stringify({ method, path: url.pathname, type }));
+  }
   let data;
   if (url.pathname.includes('/auth/')) {
     data = { code: 0, tenant_access_token: 'test-token', expire: 7200 };

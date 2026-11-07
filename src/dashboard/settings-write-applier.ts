@@ -60,10 +60,14 @@ export interface ResolvedDashboardSettingsView {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
   cardBrandLabel: boolean;
+  /** Whether the turn initiator may press the safe keys on a stuck card. Default ON. */
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -266,9 +270,12 @@ export type ApplySettingsWriteError =
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_reapOrphanTmuxServers'
+  | 'invalid_tmuxOrphanSessionSweep'
+  | 'invalid_tmuxOrphanSessionBareWrapperKill'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
+  | 'invalid_stuckCardInitiatorKeys'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -519,6 +526,18 @@ export async function applySettingsWrite(
     }
     patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
   }
+  if ('tmuxOrphanSessionSweep' in obj) {
+    if (typeof obj.tmuxOrphanSessionSweep !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionSweep' };
+    }
+    patch.tmuxOrphanSessionSweep = obj.tmuxOrphanSessionSweep;
+  }
+  if ('tmuxOrphanSessionBareWrapperKill' in obj) {
+    if (typeof obj.tmuxOrphanSessionBareWrapperKill !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionBareWrapperKill' };
+    }
+    patch.tmuxOrphanSessionBareWrapperKill = obj.tmuxOrphanSessionBareWrapperKill;
+  }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
       return { ok: false, error: 'invalid_bypassCodexHookTrust' };
@@ -536,6 +555,15 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_cardBrandLabel' };
     }
     patch.cardBrandLabel = obj.cardBrandLabel;
+  }
+  if ('stuckCardInitiatorKeys' in obj) {
+    if (typeof obj.stuckCardInitiatorKeys !== 'boolean') {
+      return { ok: false, error: 'invalid_stuckCardInitiatorKeys' };
+    }
+    // Default ON: only `false` is stored. Writing the default removes the key
+    // (mergeDashboardConfig drops undefined), so the file never pins the
+    // default and a future default change still reaches untouched installs.
+    patch.stuckCardInitiatorKeys = obj.stuckCardInitiatorKeys ? undefined : false;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {

@@ -17,6 +17,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   finalizeRawCommandDelivery,
+  typeRawCommandLine,
   writeRawCommandLine,
 } from '../src/core/raw-command-writer.js';
 
@@ -355,5 +356,38 @@ describe('worker input fences', () => {
     const hold = markReady.search(/if \(bareShellLaunchBlocked\)/);
     expect(hold).toBeGreaterThanOrEqual(0);
     expect(markReady.indexOf('isPromptReady = true')).toBeGreaterThan(hold);
+  });
+});
+
+describe('type / submit split', () => {
+  const noDelay = async () => {};
+
+  it('types the line without submitting it, including on key-writing backends', async () => {
+    // The effort controller types `/model`, re-checks the screen, and only then
+    // presses Enter itself. If typing also submitted, the re-check would run
+    // after the damage. Cover both delivery shapes.
+    const write = vi.fn(() => true);
+    expect(await typeRawCommandLine({ write }, '/model', { delay: noDelay })).toBe(true);
+    expect(write.mock.calls.map(call => call[0])).toEqual(['/model']);
+
+    const keys: string[] = [];
+    const sendText = vi.fn(() => true);
+    expect(await typeRawCommandLine(
+      { write: vi.fn(() => true), sendText, sendSpecialKeys: (key => { keys.push(key); return true; }) as never },
+      '/model',
+      { delay: noDelay },
+    )).toBe(true);
+    expect(sendText).toHaveBeenCalledWith('/model');
+    expect(keys).toEqual([]);
+  });
+
+  it('still submits through writeRawCommandLine', async () => {
+    const sendSpecialKeys = vi.fn(() => true);
+    expect(await writeRawCommandLine(
+      { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys },
+      '/model',
+      { delay: noDelay },
+    )).toBe(true);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 });

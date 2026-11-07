@@ -20,6 +20,13 @@ import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import MarkdownIt from 'markdown-it';
 import * as cotMessage from '../src/im/lark/cot-message.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { outputSnapshot } from '../src/services/universal-output-handoff.js';
+import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
+import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
+import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
+import { FinalOutputHandoffHost, FinalOutputRejectedError } from '../src/services/final-output-handoff-host.js';
+import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
@@ -2721,8 +2728,55 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).toHaveBeenCalledOnce();
-    expect(complete).toHaveBeenCalledWith(true);
+    expect(complete).toHaveBeenCalledWith(true, 'om_provider_confirmed');
     expect(clearPendingDraft).toHaveBeenCalledOnce();
+  });
+
+  it.each(['revoked_after_receipt', 'card_rejected'] as const)('settles the real handoff delivery pipeline for %s', async scenario => {
+    const previousDir = config.session.dataDir;
+    const directory = mkdtempSync(join(tmpdir(), 'handoff-real-pool-'));
+    (config.session as any).dataDir = directory;
+    const store = new FinalOutputHandoffStore(directory, 'cli_test');
+    try {
+      const ds = makeDs(); ds.adoptedFrom = undefined; ds.larkAppId = 'cli_test'; ds.scope = 'thread';
+      const output = { sessionId: ds.session.sessionId, turnId: 'om_handoff', lastUuid: 'handoff-native', content: 'final answer' };
+      const snapshot = finalOutputSnapshot(ds.larkAppId, output);
+      store.accept(snapshot, { mode: 'thread', rootMessageId: 'om_original_target' }, 'ou_original_requester');
+      let allowed = true;
+      const sessionReply = vi.fn(async (_root: string, body: string, kind: string) => {
+        if (scenario === 'card_rejected' && kind === 'interactive') throw { response: { data: { code: 230099, msg: 'rejected card' } } };
+        if (scenario === 'revoked_after_receipt') allowed = false;
+        return kind === 'text' ? 'om_aux_notice' : 'om_known_final';
+      });
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js');
+      const ledger = new TurnSendLedger(directory);
+      const host = new FinalOutputHandoffHost(store, {
+        available: () => allowed ? 'ready' : 'cancelled', error: vi.fn(),
+        knownReceipt: () => { const final = ledger.read({ larkAppId: ds.larkAppId, sessionId: output.sessionId, turnId: output.turnId })?.final; return final ? { messageId: final.messageId } : undefined; },
+        deliver: (record, control) => {
+          const context: any = { record, store, control, suppressed: false };
+          return new Promise((resolve, reject) => __testOnly_deliverFinalOutput(ds, { type: 'final_output', ...output }, 'handoff-test', 0,
+            (ok, id) => context.rejectedReason ? reject(new FinalOutputRejectedError(context.rejectedReason))
+              : ok && id ? resolve({ messageId: id }) : reject(new Error('unconfirmed')),
+            control.owns, record.target, undefined, undefined, { omitImages: true }, context));
+        },
+      });
+      const run = host.pump();
+      await vi.advanceTimersByTimeAsync(100);
+      await run;
+      if (scenario === 'revoked_after_receipt') {
+        expect(sessionReply).toHaveBeenCalledTimes(1);
+        expect(store.read(snapshot.intentId)).toMatchObject({ state: 'delivered', messageId: 'om_known_final' });
+      } else {
+        expect(sessionReply).toHaveBeenCalledTimes(2);
+        expect(sessionReply.mock.calls[0][2]).toBe('interactive');
+        expect(sessionReply.mock.calls[1][2]).toBe('text');
+        expect(sessionReply.mock.calls[1][1]).not.toBe(sessionReply.mock.calls[0][1]);
+        expect(store.read(snapshot.intentId)?.state).toBe('rejected');
+        expect(ledger.read({ larkAppId: ds.larkAppId, sessionId: output.sessionId, turnId: output.turnId })?.publication).toBeUndefined();
+      }
+    } finally { store.close(); (config.session as any).dataDir = previousDir; rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {
@@ -3574,6 +3628,21 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
       await vi.advanceTimersByTimeAsync(2000);
       expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
+    });
+
+    it('keeps a V2 frozen dispatcher on the report path without adding an IM mention', async () => {
+      await bindTopicToDispatcher();
+      const sessionReply = vi.fn(async () => 'om_reply'); const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs(); ds.adoptedFrom = undefined; ds.session.cliId = 'antigravity'; ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1'; ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot'; ds.session.quoteTargetSenderIsBot = true;
+      const message = finalOutputMsg();
+      const control: any = { record: { sink: { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' }, requesterOpenId: 'ou_dispatcher_bot', requesterIsBot: true } } }, owns: () => true, freezeTransport: (_key: string, proposed: unknown) => proposed };
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js') as any;
+      deliver(ds, message, 'probe', 0, undefined, control.owns, undefined, undefined, { openId: 'ou_dispatcher_bot', isBot: true }, undefined, undefined, control);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(sessionReply).toHaveBeenCalledOnce(); expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
       expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
     });
 
@@ -4903,6 +4972,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(noticeCall[2]).toBe('text');
     expect(String(noticeCall[1])).toContain('230028');
     expect(String(noticeCall[1])).not.toContain('final answer');
+    // Nothing maskable was found, so no resend happened; the notice says so
+    // and does not ask the user to redact anything.
+    expect(String(noticeCall[1])).toContain('没能自动定位');
+    expect(String(noticeCall[1])).not.toMatch(/脱敏|重发/);
     const noticeUuid = noticeCall[5].uuid as string;
     expect(noticeUuid.startsWith('ab_')).toBe(true);
     expect(noticeUuid.length).toBe(50);
@@ -4920,6 +4993,141 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect.objectContaining({ reason: 'content_audit_blocked', turnId: productionMsg.turnId }),
     );
     expect(closeSession).not.toHaveBeenCalled();
+  });
+
+  describe('content audit auto-redaction (zero-prompt / transcript final)', () => {
+    const SECRET_EMAIL = 'alice.liu@example.com';
+    const NOREPLY_EMAIL = '12345678+bob@users.noreply.github.com';
+    const PHONE = '13812345678';
+    const sensitiveMsg = () => ({
+      ...finalOutputMsg(),
+      turnId: 'om_x100b63519db838a4b32f',
+      content: [
+        '复审结论：可合。',
+        `- tag 作者：\`Alice Liu <${SECRET_EMAIL}>\``,
+        `- 提交者：GitHub <${NOREPLY_EMAIL}>`,
+        `- 联系电话 ${PHONE}`,
+        '- 保持原样：@scope/pkg@1.2.3、bun@1.4.3、HEAD@{1}、42066737e、#2849、7704631496199457811',
+      ].join('\n'),
+    });
+    const auditError = (msg: string) => ({
+      isAxiosError: true,
+      name: 'AxiosError',
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230028, msg } },
+    });
+    const EMAIL_REJECT = 'The messages do NOT pass the audit, ext=contain sensitive data: EMAIL_ADDRESS';
+
+    async function deliver(sessionReply: ReturnType<typeof vi.fn>) {
+      const closeSession = vi.fn();
+      const complete = vi.fn();
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession });
+      const ds = makeDs();
+      ds.session.sessionId = '01234567-89ab-4def-8234-56789abcdef0';
+      vi.mocked(emitSessionLifecycleHook).mockClear();
+      const { logger } = await import('../src/utils/logger.js');
+      const logged: string[] = [];
+      const spies = (['debug', 'info', 'warn', 'error'] as const).map(level =>
+        vi.spyOn(logger, level).mockImplementation((...args: unknown[]) => { logged.push(args.map(String).join(' ')); }));
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, sensitiveMsg(), 'tag', 0, complete);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(15000);
+      for (const spy of spies) spy.mockRestore();
+      return { ds, complete, closeSession, logged };
+    }
+
+    function cardText(card: string): string {
+      const parsed = JSON.parse(card);
+      return (parsed.body.elements as Array<{ content?: string }>).map(element => element.content ?? '').join('\n');
+    }
+
+    it('masks the flagged emails on a copy, resends once with the same uuid, and settles as delivered without a notice', async () => {
+      const sessionReply = vi.fn()
+        .mockRejectedValueOnce(auditError(EMAIL_REJECT))
+        .mockResolvedValueOnce('om_redacted');
+      const { ds, complete, logged } = await deliver(sessionReply);
+
+      expect(sessionReply).toHaveBeenCalledTimes(2);
+      const [first, second] = sessionReply.mock.calls;
+      expect(first[2]).toBe('interactive');
+      expect(second[2]).toBe('interactive');
+      // Same provider uuid: Lark only dedupes successful sends, and a crash
+      // replay must land on the same message.
+      expect(second[5].uuid).toBe(first[5].uuid);
+
+      const original = JSON.parse(first[1]);
+      const resent = JSON.parse(second[1]);
+      expect(cardText(first[1])).toContain(SECRET_EMAIL);
+      const body = cardText(second[1]);
+      expect(body).not.toContain(SECRET_EMAIL);
+      expect(body).not.toContain(NOREPLY_EMAIL);
+      expect(body).toContain(`${'*'.repeat('alice.liu@'.length)}example.com`);
+      // Outside code spans the mask is escaped so markdown keeps it as literal stars.
+      expect(body).toContain(`${'\\*'.repeat('12345678+bob@'.length)}users.noreply.github.com`);
+      // Only the reported type is masked: the phone stays, and so do the
+      // email-like code tokens.
+      expect(body).toContain(PHONE);
+      expect(body).toContain('@scope/pkg@1.2.3、bun@1.4.3、HEAD@{1}、42066737e、#2849、7704631496199457811');
+      expect(body).toContain('部分内容已自动打码');
+      // Structure: the same elements plus exactly one note, footer untouched.
+      const tags = (card: any) => card.body.elements.map((element: any) => element.element_id ?? element.tag);
+      expect(tags(resent).filter((tag: string) => tag !== 'botmux_audit_redacted')).toEqual(tags(original));
+      const footer = (card: any) => card.body.elements.find((element: any) => element.element_id === 'botmux_reply_footer');
+      expect(footer(resent)).toEqual(footer(original));
+
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(true, 'om_redacted'));
+      expect(ds.lastBridgeEmittedUuid).toBe('01234567-89ab-4def-8234-56789abcdef0:uuid-1');
+      expect(ds.agentAttention).toBeUndefined();
+      expect(emitSessionLifecycleHook).not.toHaveBeenCalledWith(ds, 'session.requires_attention', expect.anything());
+      // Logs carry the type, hit count and outcome — never the original text.
+      expect(logged.some(line => /auto-redact resent: types=EMAIL_ADDRESS .*hits=email:2 result=delivered/.test(line))).toBe(true);
+      expect(logged.join('\n')).not.toContain(SECRET_EMAIL);
+      expect(logged.join('\n')).not.toContain(NOREPLY_EMAIL);
+    });
+
+    it('falls back to every category when Lark omits the sensitive type', async () => {
+      const sessionReply = vi.fn()
+        .mockRejectedValueOnce(auditError('The messages do NOT pass the audit'))
+        .mockResolvedValueOnce('om_redacted');
+      const { complete, logged } = await deliver(sessionReply);
+
+      expect(sessionReply).toHaveBeenCalledTimes(2);
+      const body = cardText(sessionReply.mock.calls[1][1]);
+      expect(body).not.toContain(SECRET_EMAIL);
+      expect(body).not.toContain(PHONE);
+      expect(body).toContain('\\*'.repeat(PHONE.length));
+      expect(body).toContain('7704631496199457811');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(true, 'om_redacted'));
+      expect(logged.some(line => /types=unknown .*hits=email:2,phone:1 result=delivered/.test(line))).toBe(true);
+      expect(logged.join('\n')).not.toContain(PHONE);
+    });
+
+    it('posts the no-action notice only when the masked resend is rejected too', async () => {
+      const sessionReply = vi.fn()
+        .mockRejectedValueOnce(auditError(EMAIL_REJECT))
+        .mockRejectedValueOnce(auditError(EMAIL_REJECT))
+        .mockResolvedValueOnce('om_notice');
+      const { ds, complete, logged } = await deliver(sessionReply);
+
+      // original + one masked resend + notice; never a third body attempt.
+      expect(sessionReply).toHaveBeenCalledTimes(3);
+      const notice = sessionReply.mock.calls[2];
+      expect(notice[2]).toBe('text');
+      const text = String(notice[1]);
+      expect(text).toContain('230028');
+      expect(text).toContain('自动打码后仍未通过');
+      expect(text).toContain('Web 终端');
+      // Model output caused this: the user is not asked to redact or resend.
+      expect(text).not.toMatch(/脱敏|重发/);
+      expect(text).not.toContain(SECRET_EMAIL);
+      expect(complete).toHaveBeenCalledWith(true);
+      expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
+      expect(logged.some(line => /auto-redact resent: types=EMAIL_ADDRESS .*result=still_blocked/.test(line))).toBe(true);
+      expect(logged.join('\n')).not.toContain(SECRET_EMAIL);
+    });
   });
 
   it('treats an over-length final card (230025) as permanent: rejection notice, settled, no silent give-up', async () => {
@@ -5038,6 +5246,134 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+});
+
+describe('Worker hidden schedule retirement', () => {
+  const turnId = 'schedule:task-hidden:11111111-2222-3333-4444-555555555555';
+
+  function prepareHiddenRun(armedAt = Date.now(), hidden = true, humanFollowUp = false) {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'traex';
+    ds.session.deferredScheduleRun = {
+      taskId: 'task-hidden', turnId,
+      routingAnchor: 'schedule-run:task-hidden:11111111-2222-3333-4444-555555555555',
+      createdAt: new Date().toISOString(),
+    };
+    ds.session.rootMessageId = ds.session.deferredScheduleRun.routingAnchor;
+    if (!hidden) {
+      ds.session.deferredScheduleRun = undefined;
+      ds.session.rootMessageId = 'om_root';
+      ds.session.cliId = 'claude-code';
+    }
+    if (humanFollowUp) ds.session.rootMessageId = 'om_materialized';
+    ds.currentTurnId = humanFollowUp ? 'om_human' : turnId;
+    ds.silentScheduledTurns = new Map([[turnId, armedAt]]);
+    ds.lastScreenStatus = 'working';
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onDeferredScheduleTurnSettled = vi.fn();
+    initWorkerPool({
+      sessionReply, onDeferredScheduleTurnSettled,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any, { ready: true, failureNotified: false });
+    return { ds, sessionReply, onDeferredScheduleTurnSettled };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    setActiveSessionsRegistry(undefined);
+  });
+
+  it.each([true, false])('keeps hidden idle quiet and settles the exact run with event identity=%s', async hasIdentity => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ready', status: 'idle',
+      ...(hasIdentity ? { turnId } : {}),
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect.soft(sessionReply).not.toHaveBeenCalled();
+    expect.soft(onDeferredScheduleTurnSettled).toHaveBeenCalledExactlyOnceWith(ds, { turnId, source: 'idle' });
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.lastScreenContent).toBe('ready');
+  });
+
+  it('settles an unattributed hidden idle even when its status was already idle', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledExactlyOnceWith(ds, { turnId, source: 'idle' });
+  });
+
+  it('debounces repeated hidden idle frames but settles again after renewed work', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    const idle: Extract<WorkerToDaemon, { type: 'screen_update' }> = {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    };
+    (ds.worker as any).emit('message', idle);
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledTimes(1);
+
+    (ds.worker as any).emit('message', { ...idle, status: 'working' });
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledTimes(2);
+    expect(onDeferredScheduleTurnSettled).toHaveBeenLastCalledWith(ds, { turnId, source: 'idle' });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('keeps a still-hidden run quiet after the bounded turn registry expired, identity=%s', async hasIdentity => {
+    const { ds, sessionReply } = prepareHiddenRun(Date.now() - 25 * 60 * 60 * 1000);
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'retired run notice', ...(hasIdentity ? { turnId } : {}),
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('does not silence an unattributed idle on an ordinary shared session', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(Date.now(), false);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ordinary ready', status: 'idle',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+
+  it('keeps unattributed human follow-up frames visible after topic materialization', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(Date.now(), true, true);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ordinary ready', status: 'idle',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+
+  it('does not assign an explicit other turn to the hidden run', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ordinary ready', status: 'idle', turnId: 'om_normal',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
   });
 });
 
@@ -5565,4 +5901,20 @@ describe('keyed turn input-commit observation', () => {
       expect(record).toHaveBeenCalledTimes(2);
     } finally { record.mockRestore(); }
   });
+});
+
+it('keeps V2 requester addressing frozen after the current sender changes', async () => {
+  vi.useFakeTimers();
+  const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+  const ds = makeDs(); ds.larkAppId = 'cli_test'; ds.session.ownerOpenId = 'ou_newer'; ds.session.quoteTargetSenderOpenId = 'ou_newer';
+  const sessionReply = vi.fn(async () => 'om_answer');
+  initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+  const message = { ...finalOutputMsg(), sessionId: ds.session.sessionId };
+  const journal = new OutputDeliveryJournal(config.session.dataDir, 'cli_test');
+  const record = journal.accept(outputSnapshot('cli_test', message), { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' }, requesterOpenId: 'ou_original' }, chatId: ds.chatId, chatType: ds.chatType });
+  const coordinator = new OutputDeliveryCoordinator(journal);
+  const run = coordinator.deliver(record, { owns: () => true, process: (_record, control) => new Promise(resolve => { deliver(ds, message, 'probe', 0, (ok, id) => resolve(ok ? { status: 'delivered', messageId: id } : undefined), control.owns, record.sink.kind === 'im' ? record.sink.context.target : undefined, undefined, undefined, undefined, undefined, control); }), settled: vi.fn(), error: vi.fn() });
+  await vi.advanceTimersByTimeAsync(100); await run;
+  expect(sessionReply).toHaveBeenCalledOnce(); expect(sessionReply.mock.calls[0][1]).toContain('ou_original'); expect(sessionReply.mock.calls[0][1]).not.toContain('ou_newer');
+  journal.close(); vi.useRealTimers();
 });

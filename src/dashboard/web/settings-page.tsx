@@ -25,7 +25,7 @@ import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/pr
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
-  IDLE_CLEANUP_HOUR_OPTIONS,
+  AUTO_CLEANUP_HOUR_OPTIONS as IDLE_CLEANUP_HOUR_OPTIONS,
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
@@ -52,9 +52,12 @@ interface DashboardSettings {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -223,11 +226,15 @@ function parseSettings(s: any): DashboardSettings {
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
+    tmuxOrphanSessionSweep: s?.tmuxOrphanSessionSweep !== false,
+    tmuxOrphanSessionBareWrapperKill: s?.tmuxOrphanSessionBareWrapperKill === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
     // default ON — only an explicit persisted false disables (server snapshot)
     cardBrandLabel: s?.cardBrandLabel !== false,
+    // default ON — only an explicit persisted false disables (server snapshot)
+    stuckCardInitiatorKeys: s?.stuckCardInitiatorKeys !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -898,7 +905,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -994,6 +1001,13 @@ export function SettingsBody(props: {
             onChange={value => saveBoolean('openTerminalInFeishu', value)}
           />
           <ToggleRow
+            title={tr('settings.stuckCardInitiatorKeys')}
+            help={tr('settings.stuckCardInitiatorKeysHelp')}
+            checked={settings.stuckCardInitiatorKeys}
+            disabled={dis || savingKey === 'stuckCardInitiatorKeys'}
+            onChange={value => saveBoolean('stuckCardInitiatorKeys', value)}
+          />
+          <ToggleRow
             title={tr('settings.enableLocalCliOpen')}
             help={tr('settings.enableLocalCliOpenHelp')}
             checked={settings.enableLocalCliOpen}
@@ -1068,6 +1082,20 @@ export function SettingsBody(props: {
             checked={settings.reapOrphanTmuxServers}
             disabled={dis || savingKey === 'reapOrphanTmuxServers'}
             onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
+          />
+          <ToggleRow
+            title={tr('settings.tmuxOrphanSessionSweep')}
+            help={tr('settings.tmuxOrphanSessionSweepHelp')}
+            checked={settings.tmuxOrphanSessionSweep}
+            disabled={dis || savingKey === 'tmuxOrphanSessionSweep'}
+            onChange={value => saveBoolean('tmuxOrphanSessionSweep', value)}
+          />
+          <ToggleRow
+            title={tr('settings.tmuxOrphanSessionBareWrapperKill')}
+            help={tr('settings.tmuxOrphanSessionBareWrapperKillHelp')}
+            checked={settings.tmuxOrphanSessionBareWrapperKill}
+            disabled={dis || savingKey === 'tmuxOrphanSessionBareWrapperKill'}
+            onChange={value => saveBoolean('tmuxOrphanSessionBareWrapperKill', value)}
           />
           <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
@@ -1800,7 +1828,7 @@ function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleCompo
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
 
-/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+/** 定时自动清理空闲会话：开关 + 空闲阈值（自动清理仅 24H/72H/7d；手动清理另有 1H 与全部）+ 检查频率。 */
 function SessionCleanupRow(props: {
   value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   disabled: boolean;

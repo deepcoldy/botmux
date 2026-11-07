@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 
-import { checkBotWorkingDir } from '../src/core/working-dir-range.js';
+import { checkBotWorkingDir, checkNodeWorkingDir } from '../src/core/working-dir-range.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -100,5 +100,55 @@ describe('checkBotWorkingDir', () => {
     expect(checkBotWorkingDir({ workingDirs: [linkedRoot] }, t.project)).toEqual({ ok: true, path: realpathSync(t.project) });
     // The real path of the temp root itself (macOS: /var → /private/var).
     expect(checkBotWorkingDir({ workingDirs: [realpathSync(t.repos)] }, t.project)).toMatchObject({ ok: true });
+  });
+});
+
+describe('checkNodeWorkingDir (the initiator\'s operate right, §15.4)', () => {
+  /** Records whether the operate question was asked at all. */
+  function operator(answer: 'yes' | 'no' | { unknown: string } | Error) {
+    const asked: number[] = [];
+    return {
+      asked,
+      ask: async () => {
+        asked.push(1);
+        if (answer instanceof Error) throw answer;
+        return answer;
+      },
+    };
+  }
+
+  it('an initiator who operates the bot may name any existing directory, frozen as its realpath', async () => {
+    const t = tree();
+    const op = operator('yes');
+    expect(await checkNodeWorkingDir({ workingDirs: [t.repos] }, t.outside, op.ask)).toEqual({ ok: true, path: realpathSync(t.outside) });
+    // A bot with no range at all, too.
+    expect(await checkNodeWorkingDir({}, `${t.outside}/`, op.ask)).toEqual({ ok: true, path: realpathSync(t.outside) });
+    const link = join(t.repos, 'escape');
+    symlinkSync(t.outside, link);
+    expect(await checkNodeWorkingDir({ workingDirs: [t.pinned] }, link, op.ask)).toEqual({ ok: true, path: realpathSync(t.outside) });
+  });
+
+  it('anyone else is held to the range, with the same refusal as before', async () => {
+    const t = tree();
+    expect(await checkNodeWorkingDir({ workingDirs: [t.repos] }, t.outside, operator('no').ask))
+      .toEqual({ ok: false, reason: 'outside_range', path: t.outside });
+    expect(await checkNodeWorkingDir({}, t.outside, operator('no').ask)).toEqual({ ok: false, reason: 'no_range', path: t.outside });
+  });
+
+  it('an answer that could not be confirmed decides like "no" but says why; a throw is such an answer', async () => {
+    const t = tree();
+    expect(await checkNodeWorkingDir({ workingDirs: [t.repos] }, t.outside, operator({ unknown: 'lookup timed out' }).ask))
+      .toEqual({ ok: false, reason: 'outside_range', path: t.outside, operateUnknown: 'lookup timed out' });
+    expect(await checkNodeWorkingDir({}, t.outside, operator(new Error('contact api down')).ask))
+      .toMatchObject({ ok: false, reason: 'no_range', operateUnknown: expect.any(String) });
+  });
+
+  it('a directory in range needs no operate check; one that does not exist is refused whoever asks', async () => {
+    const t = tree();
+    const op = operator('yes');
+    expect(await checkNodeWorkingDir({ workingDirs: [t.repos] }, t.project, op.ask)).toEqual({ ok: true, path: realpathSync(t.project) });
+    expect(await checkNodeWorkingDir({ workingDirs: [t.repos] }, join(t.outside, 'gone'), op.ask)).toMatchObject({ ok: false, reason: 'missing' });
+    expect(await checkNodeWorkingDir({}, join(t.repos, 'notes.txt'), op.ask)).toMatchObject({ ok: false, reason: 'not_directory' });
+    expect(op.asked).toEqual([]);
   });
 });

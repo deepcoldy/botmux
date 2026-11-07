@@ -2,9 +2,10 @@ export interface PostgresTarget {
   host: string;
   port: number;
   database: string;
-  user: string;
+  user?: string;
   schema: string;
-  passwordRef: string;
+  passwordRef?: string;
+  bytepg?: { computeId: string; tokenRef?: string; doas?: import('./feedback-doas-token.js').DoasTokenConfig };
   tls: { mode: 'verify-full' | 'disable'; caRef?: string };
   connectTimeoutMs: number;
 }
@@ -30,8 +31,8 @@ type AsyncMethods<Methods> = {
 export type FeedbackStore = AsyncMethods<Pick<SkillFeedbackStore,
   | 'close' | 'createResponse' | 'getResponse' | 'createDelivery'
   | 'recordTurnDelivery' | 'recordTurnTerminal' | 'tryRecordTurnTerminal'
-  | 'findDeliveryByPlatformMessage' | 'recordFeedback' | 'listFeedbackRevisions'
-  | 'getLatestFeedback' | 'listTurnCompletionEvents' | 'listFeedbackEvents'
+  | 'findDeliveryByPlatformMessage' | 'findDeliveryById' | 'listSubjectDeliveries' | 'recordFeedback' | 'listFeedbackRevisions'
+  | 'getLatestFeedback' | 'listTurnCompletionEvents' | 'listFeedbackEvents' | 'readFeedbackEventsAfter'
   | 'listFeedbackOutbox' | 'claimFeedbackOutbox' | 'tryClaimFeedbackOutbox'
   | 'settleFeedbackOutboxDelivered' | 'trySettleFeedbackOutboxDelivered'
   | 'rescheduleFeedbackOutbox' | 'tryRescheduleFeedbackOutbox'

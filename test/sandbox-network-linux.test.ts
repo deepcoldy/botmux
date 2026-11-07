@@ -12,6 +12,7 @@ import { createServer as httpServer, request as httpRequest } from 'node:http';
 import { createSocket } from 'node:dgram';
 import { spawn, spawnSync } from 'node:child_process';
 import type { SandboxNetworkPolicy, NetworkMode } from '../src/core/sandbox-network-policy.js';
+import { networkProxyLaunchError } from '../src/core/sandbox-network-proxy.js';
 
 const enabled = process.platform === 'linux' && process.env.BOTMUX_NETWORK_POLICY_INTEGRATION === '1';
 const modes: NetworkMode[] = ['allow', 'block', 'allowlist', 'denylist'];
@@ -23,7 +24,7 @@ const servers: Server[] = [];
 
 // source tests import the BUILT sandbox, so the production re-exec entry path
 // and compiled JS implementation are exercised, rather than a test wrapper.
-async function run(policy: SandboxNetworkPolicy, source: string, onData?: (pid: number, text: string) => void, runtime: 'default' | 'pty' | 'binary' = 'default', data?: unknown) {
+async function run(policy: SandboxNetworkPolicy, source: string, onData?: (pid: number, text: string) => void, runtime: 'default' | 'pty' | 'binary' = 'default', data?: unknown, mcpGatewaySocketPath?: string) {
   const { prepareDirectSandbox } = await import('../dist/adapters/backend/sandbox.js');
   const script = join(directory, `probe-${Math.random()}.mjs`);
   writeFileSync(script, source);
@@ -31,6 +32,7 @@ async function run(policy: SandboxNetworkPolicy, source: string, onData?: (pid: 
   const sbx = prepareDirectSandbox({ sessionId: `network-${Math.random()}`, dataDir: directory,
     networkPolicy: policy, policy: { net: true, writeRegexes: [], rules: [...new Set(paths)].map(path => ({ path, access: path === directory ? 'readWrite' : 'readOnly', source: 'baseline' })) },
     chdir: directory, home: directory, cliBin: process.execPath, cliArgs: [script, JSON.stringify(data ?? null)],
+    ...(mcpGatewaySocketPath ? { mcpGatewaySocketPath } : {}),
   });
   if (!sbx) throw new Error('sandbox setup failed');
   const env = { ...process.env, ...sbx.env } as Record<string, string>;
@@ -96,13 +98,35 @@ describe.skipIf(!enabled)('real Linux sandbox network boundary', () => {
       expect(actual).toEqual([expected(publicMode), expected(privateMode), expected(publicMode), expected(privateMode)]);
     });
   }
-  it('blocks IPv4-mapped addresses, gateway aliases and host Unix IPC', async () => {
-    const socketPath = join(directory, 'host.sock'); const host = createServer(socket => socket.end());
-    await new Promise<void>(resolve => host.listen(socketPath, resolve));
+  it('allows only the explicitly mounted MCP Unix socket while private network stays blocked', async () => {
+    const gatewayDir = mkdtempSync(join(tmpdir(), 'botmux-network-mcp-'));
+    const unrelatedDir = mkdtempSync(join(tmpdir(), 'botmux-network-unrelated-'));
+    const gatewayPath = join(gatewayDir, 'g.sock');
+    const unrelatedPath = join(unrelatedDir, 'host.sock');
+    const gateway = createServer(socket => socket.end());
+    const unrelated = createServer(socket => socket.end());
+    await Promise.all([
+      new Promise<void>(resolve => gateway.listen(gatewayPath, resolve)),
+      new Promise<void>(resolve => unrelated.listen(unrelatedPath, resolve)),
+    ]);
     try {
-      const source = `import {connect} from 'node:net'; const attempt=options=>new Promise(resolve=>{const s=connect(options);let done=false;const end=x=>{if(done)return;done=true;s.destroy();resolve(x)};s.setTimeout(250,()=>end(false));s.on('error',()=>end(false));s.on('connect',()=>end(true));}); console.log(JSON.stringify(await Promise.all([{host:'::ffff:10.77.0.1',port:${port}},{host:'10.0.2.2',port:${port}},{host:'10.0.2.3',port:53},{path:JSON.parse(process.argv[2])}].map(attempt))));`;
-      expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, source, undefined, 'default', socketPath)).toEqual([false,false,false,false]);
-    } finally { await new Promise<void>(resolve => host.close(() => resolve())); }
+      const source = `import {connect} from 'node:net'; const paths=JSON.parse(process.argv[2]); const attempt=options=>new Promise(resolve=>{const s=connect(options);let done=false;const end=x=>{if(done)return;done=true;s.destroy();resolve(x)};s.setTimeout(250,()=>end(false));s.on('error',()=>end(false));s.on('connect',()=>end(true));}); console.log(JSON.stringify(await Promise.all([{host:'10.77.0.1',port:${port}},{path:paths.gateway},{path:paths.unrelated}].map(attempt))));`;
+      expect(await run(
+        { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } },
+        source,
+        undefined,
+        'default',
+        { gateway: '/run/botmux-mcp/g.sock', unrelated: unrelatedPath },
+        gatewayPath,
+      )).toEqual([false, true, false]);
+    } finally {
+      await Promise.all([
+        new Promise<void>(resolve => gateway.close(() => resolve())),
+        new Promise<void>(resolve => unrelated.close(() => resolve())),
+      ]);
+      rmSync(gatewayDir, { recursive: true, force: true });
+      rmSync(unrelatedDir, { recursive: true, force: true });
+    }
   });
   it('blocks gateway aliases even when private access is allowed', async () => {
     const source = `import {connect} from 'node:net';
@@ -163,6 +187,7 @@ console.log(JSON.stringify(await Promise.all(['10.77.0.1','10.0.2.2','10.0.2.3',
 const get=(url,path)=>new Promise(resolve=>{const req=request(url,{...(path?{path}:{}),timeout:300},res=>{let body='';res.on('data',chunk=>body+=chunk);res.on('end',()=>resolve(body))});req.on('timeout',()=>req.destroy());req.on('error',()=>resolve(false));req.end()});
 console.log(JSON.stringify([await get('http://10.77.0.1:18089/'),await get(process.env.HTTPS_PROXY,'http://10.77.0.1:18089/'),process.env.HTTPS_PROXY]));`;
     try {
+      expect(await networkProxyLaunchError(policy, { HTTPS_PROXY: 'http://93.184.216.34:18090' })).toBeUndefined();
       await expect(run({ ...policy, proxyMode: 'reject' }, source)).rejects.toThrow('"proxyMode": "trusted-egress"');
       expect(await run(policy, source)).toEqual([false,'private-via-trusted-exit','http://93.184.216.34:18090']);
       expect(await run({ ...policy, public: { mode: 'block' } }, source))

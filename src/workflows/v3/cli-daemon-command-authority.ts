@@ -25,9 +25,10 @@ import { isValidRunId } from './ops-projection.js';
 import { readRunEnvelope, type V3RunEnvelope } from './run-envelope.js';
 import { readJournal } from './journal.js';
 import { materialize } from './state.js';
-import type { WorkflowEventTurnVerifier } from '../../core/workflow-event-turn.js';
+import { isUnattendedSyntheticTurnId, type WorkflowEventTurnVerifier } from '../../core/workflow-event-turn.js';
 import { parseScheduledTurnId } from '../../core/scheduled-turn-provenance.js';
 import { readV3MainWakeIssued } from './main-wake-ledger.js';
+import type { V3ActionCaller } from './action-provenance.js';
 
 export type V3DaemonCommandBindingSource = 'run-envelope' | 'legacy-grill' | 'legacy-unbound';
 
@@ -37,6 +38,9 @@ export interface V3DaemonCommandAuthority {
   larkAppId: string;
   mode: 'chat' | 'standalone';
   bindingSource: V3DaemonCommandBindingSource;
+  /** Chat mode only: who decided this request (design §13.6) — recorded by
+   *  `retry` / `ask-human`, and whether `--reason` is required. */
+  caller?: V3ActionCaller;
 }
 
 export interface AuthorizeV3DaemonCommandOptions {
@@ -249,7 +253,20 @@ export function authorizeV3DaemonCommand(
         `--bot ${requested} 不能覆盖 run/当前 turn 绑定的 bot ${authority.larkAppId}`,
       );
     }
-    return authority;
+    return {
+      ...authority,
+      caller: v3ActionCallerFor({
+        runId: options.runId,
+        ...(options.baseDir ? { baseDir: options.baseDir } : {}),
+        current: {
+          callerOpenId: current.callerOpenId,
+          turnId: current.turnId,
+          ...(current.workflowRunEvent ? { workflowRunEvent: current.workflowRunEvent } : {}),
+          ...(current.overtakenWorkflowRunEvent ? { overtakenWorkflowRunEvent: current.overtakenWorkflowRunEvent } : {}),
+          ...(parseScheduledTurnId(current.turnId) ? { scheduledTurn: true } : {}),
+        },
+      }),
+    };
   }
 
   const target = readTargetBinding(runDir, options.runId);
@@ -299,6 +316,9 @@ export interface V3RunEditAuthority extends V3DaemonCommandAuthority {
   /** `runEvent` whenever the main bot decided on its own for the initiator;
    *  `human` only for a turn the caller's own message opened. */
   origin: V3RunEditTurnOrigin;
+  /** The request runs inside this run's wake turn (verified, or overtaken
+   *  by a newer message): `--reason` is required (design §13.6). */
+  wakeTurn?: boolean;
 }
 
 /**
@@ -350,6 +370,7 @@ export function authorizeV3RunEditForCurrentTuple(options: {
       `当前 turn 不在 run ${options.runId} 的主会话里：${mismatches.join(', ')}`,
     );
   }
+  const wakeTurn = wake?.runId === options.runId;
   return {
     runDir,
     larkAppId: binding.larkAppId,
@@ -357,6 +378,33 @@ export function authorizeV3RunEditForCurrentTuple(options: {
     bindingSource: target.source,
     callerOpenId: current.callerOpenId,
     origin: v3RunEditOrigin(options.runId, current, target.initiatorOpenId ?? binding.ownerOpenId),
+    ...(wakeTurn ? { wakeTurn: true } : {}),
+  };
+}
+
+/**
+ * Who decided a `retry` / `ask-human` of `runId` from an authenticated turn
+ * (same grading as a runtime edit, {@link v3RunEditOrigin}): the main bot for
+ * this run's wake turn — and for that wake turn overtaken by the initiator,
+ * or the initiator's scheduled turn — otherwise the caller. `wakeTurn` marks
+ * a request that must give `--reason`.
+ */
+export function v3ActionCallerFor(input: {
+  runId: string;
+  baseDir?: string;
+  current: Pick<V3RunEditCurrentTuple, 'callerOpenId' | 'workflowRunEvent' | 'overtakenWorkflowRunEvent' | 'scheduledTurn'> & {
+    turnId?: string;
+  };
+}): V3ActionCaller {
+  const runDir = join(input.baseDir ?? defaultBaseDir(), input.runId);
+  const target = readTargetBinding(runDir, input.runId);
+  const { current } = input;
+  const wakeTurn = current.workflowRunEvent?.runId === input.runId || current.overtakenWorkflowRunEvent?.runId === input.runId;
+  return {
+    origin: v3RunEditOrigin(input.runId, current, target.initiatorOpenId ?? target.binding?.ownerOpenId),
+    openId: current.callerOpenId,
+    ...(wakeTurn ? { wakeTurn: true } : {}),
+    ...(current.turnId ? { turnId: current.turnId } : {}),
   };
 }
 
@@ -372,7 +420,7 @@ export function authorizeV3RunEditForCurrentTuple(options: {
  */
 function v3RunEditOrigin(
   runId: string,
-  current: V3RunEditCurrentTuple,
+  current: Pick<V3RunEditCurrentTuple, 'callerOpenId' | 'workflowRunEvent' | 'overtakenWorkflowRunEvent' | 'scheduledTurn'>,
   initiatorOpenId: string | undefined,
 ): V3RunEditTurnOrigin {
   if (current.workflowRunEvent?.runId === runId) return 'runEvent';
@@ -454,14 +502,15 @@ export function workflowEventTurnVerifierFor(
     // Generation join (same rule as human turns): if a message has advanced
     // the session's turn pointers since the wake turn was issued, the
     // session's identity now belongs to that newer turn — `stale` tells the
-    // caller to authenticate the request as that turn instead. Deliberately
-    // strict: a record without `turnPointersAtIssue` counts as overtaken as
-    // soon as the session has a pointer, and a pointer moved by a synthetic
-    // turn counts too (the caller then finds no human turn to fall back to
-    // and refuses) — see V3MainWakeRecord for the issuer's contract and what
-    // PR 5b still has to decide.
+    // caller to authenticate the request as that turn instead. A record
+    // without `turnPointersAtIssue` counts as overtaken as soon as the
+    // session has a pointer. A pointer moved by an unattended synthetic turn
+    // (a report relay, another wake turn, a scheduled fire) is no
+    // interjection and does not count; every other pointer does, so a card
+    // click or an unknown id still makes the wake turn stale (and, having no
+    // human turn to fall back to, refused) — see V3MainWakeRecord.
     const advanced = (pointer: string | undefined, atIssue: string | undefined): boolean =>
-      pointer !== undefined && pointer !== turnId && pointer !== atIssue;
+      pointer !== undefined && pointer !== turnId && pointer !== atIssue && !isUnattendedSyntheticTurnId(pointer);
     if (
       advanced(session.quoteTargetId, issued.turnPointersAtIssue?.quoteTargetId) ||
       advanced(session.currentReplyTargetTurnId, issued.turnPointersAtIssue?.currentReplyTargetTurnId)

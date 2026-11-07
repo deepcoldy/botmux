@@ -1,59 +1,133 @@
+import video_v3_adopt_relay from '../../static/img/video-v3-adopt-relay.mp4';
+
 # 会话接入（Adopt）
 
-把**已经在 tmux、Zellij、Herdr 或 Orca 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。典型场景：公司电脑里的 CLI 写到一半要走，手机飞书发 `/adopt` 就能接着看、接着发。
+电脑上的 CLI 正跑到一半，人要走了？在飞书里发一条 `/adopt`，就能把这个**已经在跑**的 CLI 接进当前话题：手机上看进度、接着发消息，回到电脑前一切照旧。
 
-<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421531476_adopt-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+支持接入的终端：**tmux、Zellij、Herdr、Orca（实验性）**。同一张卡片里还能挑本 Bot 同类 CLI 的**历史会话**，恢复到当前话题继续聊。
+
+<video src={video_v3_adopt_relay} controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+## 快速上手
+
+1. 在本机 tmux / Zellij / Herdr 里正常启动 CLI（比如 Claude Code）。
+2. 在飞书里对**绑定同一种 CLI 的 Bot** 发 `/adopt`。
+3. 弹出「📡 选择要接入的 CLI 会话」卡片：点一条会话选中，再点下方的确认按钮。
+4. 收到「📡 已接入 …」后，在话题里发的消息就会直接输入到那个终端；终端里的输出和回答也会同步回飞书。
+
+不想弹卡片，也可以直接指定目标：
 
 ```
-/adopt              # 扫描可接入会话，弹出选择卡片
-/adopt 0:2.0        # 直接接入指定 tmux pane（session:window.pane）
-/adopt orca:term_xxx # 直接接入指定 Orca terminal
+/adopt                 # 扫描并弹出选择卡片
+/adopt 0:2.0           # 直接接入 tmux pane（session:window.pane）
+/adopt mysess:3        # 直接接入 Zellij pane（session:paneId，也可写成 session/paneId）
+/adopt <Herdr pane ID> # 直接接入 Herdr pane
+/adopt orca:term_xxx   # 直接接入 Orca 终端（实验性）
+/adopt <会话 ID>        # 直接恢复一条历史会话（CLI 自己的会话 ID）
 ```
 
-> 选择卡片只列**当前 bot 所绑 CLI** 的会话（Pi bot 不会列出 Codex/TRAE 的 pane），且排除 botmux 自己的 `bmx-*` 常驻会话。
+## 选择卡片里有什么
 
-选择卡片中 tmux、Zellij、Herdr 的粗体标题显示工作区名，「位置」显示各自的 session/pane 标识；Orca 的粗体标题直接显示终端或 CLI 会话标题，避免与下方工作路径重复。接入后列表与恢复日志保留接入时的 Orca 标题快照；之后改名不会影响 handle 身份校验。Orca 内部 handle 只用于点击确认和恢复校验，不展示给用户。
+卡片把两类候选放在一起，支持搜索（标题 / 项目 / 路径）和翻页：
 
-> **Orca（实验性）**：目前覆盖 Orca server 与同机 SSH relay；跨主机 relay 仍依赖桌面客户端在线。兼容性受 Orca/relay 版本、终端重绘和各 CLI transcript 格式影响，升级后若发现会话发现、画面或正式回复异常，请重新接入并反馈版本信息。
+| 来源 | 是什么 | 确认按钮 | 结果 |
+|---|---|---|---|
+| 🟢 运行中 | tmux / Zellij / Herdr / Orca 里**正在跑**的本机 CLI | 确认接管到本话题 | 桥接到原终端，原进程照常运行 |
+| 🕘 历史 | 本 Bot 同类 CLI 存在磁盘上、可以 resume 的会话 | 确认恢复到本话题 | Botmux 用 `--resume` 重新拉起 CLI，变成普通 Botmux 会话 |
 
-Orca 支持 server 模式（Linux 上常驻的 orcad，CLI 位于 `~/.orca/cli/bin/orca`）和 SSH relay 模式。Botmux 与 SSH 终端在同一台 Linux 主机上时，会直接连接持有原 PTY 的本机 relay，并优先使用这条独立于桌面客户端的路由：关闭 Mac 后仍可新发 `/adopt` 接入原会话，发现、校验和输入都不需要桌面端在线。跨主机的 SSH relay 仍通过桌面 CLI 路由，需要桌面端保持连接。接入前会校验终端 handle、PTY incarnation、工作区和本机进程归属；旧版 relay 缺少 incarnation 时不开放直连。以前已接入且保存为桌面 relay 路由的会话，需要重新接入一次才能使用本机直连。
+每条候选会显示 CLI、路径、已运行时长（或最近活动时间）和「位置」。tmux、Zellij、Herdr 的标题是工作区或标签页名，「位置」里是 session / pane 标识；Orca 的标题直接用终端或 CLI 会话标题。
 
-Web Terminal 保持文本屏幕快照：可以查看并输入，但不保留原终端的颜色、精确光标和鼠标模式。本机 relay 在桌面断开后从保留的输出重建屏幕；输出从一次重绘中途开始时，画面可能不完整。正式回复依靠精确绑定的 CLI 进程与 transcript，Trae、Claude Code 和 Codex 还会用 transcript 重建可滚动的用户/助手历史。
+几条筛选规则：
 
-MTR、Hermes 及其它未验证 CLI 目前只承诺基础终端接入：当前真实 TUI、飞书输入和 Web Terminal 仍可用，但不保证 transcript 正式回复或可滚动历史。这不是终端读写限制，而是 transcript 归属无法可靠证明：MTR 的 cwd fallback 在同目录多会话时可能歧义，外部启动的 Hermes 会话也没有 Botmux session 标记。Botmux 不会按“同目录最近会话”猜测，否则可能把另一个终端的对话展示出来。
+- **只列本 Bot 绑定的 CLI**：Pi Bot 不会列出 Codex 或 TRAE 的 pane，避免接入后 Bot 背后的 CLI 被悄悄换掉。
+- **不列 Botmux 自己的会话**：`bmx-*` 开头的常驻会话、Botmux 已经管理（不管是否已关闭）的会话都不会出现。自己关掉的 Botmux 会话请用会话卡片上的「恢复会话」。
+- **运行中的不会重复出现在历史里**。
+- **历史最多列最近 20 条**，更早的用搜索缩小范围，或者直接 `/adopt <会话 ID>`。
+- **卡片只有发起人能点**。别人想用，自己发一条 `/adopt`。
 
-## 它是「桥接」，不是接管
+支持「历史」的 CLI：Claude Code、Codex、TRAE CLI、Grok、OpenCode / OpenCode 2、Antigravity、Genius。其它 CLI 的卡片只显示运行中的会话。
 
-adopt 采用**零打扰桥接**：botmux 只旁路观察并定向写入目标终端，**从不改变原终端的焦点、布局或尺寸**，本地终端和 Orca 界面全程不受影响。
+## 接入后：是「桥接」，不是接管
 
-- **共享模式**：接入后，本地终端（如 iTerm2）和飞书双向同步——流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端。本地 tmux 全程保持连接、毫发无损。
-- **安全断开**：点流式卡片上的「⏏ 断开」（或发 `/close`），botmux 退出观察、清掉自己这侧的 worker，**绝不结束你的 CLI**——原进程继续在你本地 tmux 里跑。
+接入运行中的会话时，Botmux 只在旁边看、往目标终端定向输入，**不改原终端的焦点、布局和尺寸**。
 
-> ⚠️ 卡片上旧的「🔄 接管」按钮**已停用**：桥接模式下不再渲染，历史卡片点了也是空操作。以 `--resume` 完整重建为标准 botmux 会话的能力（`/adopt --takeover`）仍在路线图上、尚未上线。当前 adopt 始终是「共享桥接」这一种形态。
+- **两边同步**：飞书里发的消息直接输进终端；终端里的输出实时显示在流式卡片上。接入时会先补一张「📜 /adopt 前最后一轮」，让你知道接手前聊到哪了；你在电脑终端里直接打的对话，也会以「🖥️ 终端本地对话」同步到飞书。
+- **随时断开**：点流式卡片上的「⏏ 断开」，或发 `/detach`（同义 `/disconnect`；在接入的话题里发 `/close` 效果也一样）。Botmux 只撤掉自己这一侧，**不会结束你的 CLI**，原进程继续在本地跑。
+- **一个话题只接一个**：话题已经接入了某个会话时再发 `/adopt`，会提示先断开再切换。
 
-## Codex 共享后台兼容
+> 卡片上旧的「🔄 接管」按钮已停用：新卡片不再显示，历史卡片上点了也没有效果。当前 adopt 只有「共享桥接」这一种形态。
 
-Codex 使用共享后台服务器时，BotMux 仍向原 tmux pane 输入消息。接入和每次发送前，若前台进程没有持有会话文件，BotMux 只读终端状态栏中的当前会话 ID，以确认输入归属并观察回复。请在 Codex 的 `/statusline` 中启用 `thread-id`（旧名 `session-id`），默认放在末尾；请确保完整 ID 可见，必要时加宽窗口或减少其他显示项目。状态栏没有完整 ID 时，BotMux 会尝试从原 Codex 进程的环境确认配置目录（`CODEX_HOME` 或该进程的 `HOME/.codex`），自动将会话 ID 项放到 `tui.status_line` 末尾（保留已有 ID 别名并去重）。保留原有项目、注释和其他配置；没有自定义列表时保留内置默认项目，首次修改前备份原文件到同路径加 `.botmux-statusline.bak`。配置目录无法确认、格式无法安全编辑或写入失败时会保留原文件，并提示手动设置。
+## 恢复历史会话
 
-BotMux 会通知配置已补齐、原本已配置或自动修改失败。保存配置不代表当前运行的 Codex 已经应用：后续启动并使用这份配置的终端会读取设置；当前会话请通过 `/statusline` 启用 ID 并保存，必要时加宽窗口。无需新建会话，BotMux 不会自动重启原 Codex。
+在卡片里选「🕘 历史」，或者 `/adopt <会话 ID>`，Botmux 会在原工作目录用 `--resume` 重新启动 CLI，回到那段对话。和桥接不同，**这时 CLI 由 Botmux 启动和管理**，跟平时新开的会话一样（可以重启、关闭会结束进程）。
 
-BotMux 不会自动输入 `/status`。即使配置已保存，状态栏未显示完整 ID 时仍会停止发送，并明确提示消息尚未写入原终端。不需要切换到 `existingAppServer`；旧版或内嵌运行模式继续使用进程持有的会话文件，无需配置版本开关。
+如果填的 ID 是一条 Botmux 自己的会话：
 
-输入框有草稿、弹窗、加载状态，或终端布局无法可靠识别时，也会停止发送。请在原 Terminal 处理后再重发。若在本地通过 `/new` 或 `/resume` 切换会话，下一次飞书输入前会重新读取 ID 并切换回复观察。
+- 属于**当前话题** → 直接恢复它。
+- 属于**别的话题** → 不会搬过来，提示你去原话题点「恢复会话」，或在本机运行 `botmux resume <id>`。
 
-若系统无法枚举前台进程的会话文件（例如 macOS 缺少 `lsof`），BotMux 保留原有的会话识别路径；只有确认前台没有持有会话文件时，才要求通过实时状态栏识别。状态栏支持单行布局及独立状态栏加快捷键提示的双行布局，也支持执行中的 spinner；不会把工作目录路径中的 UUID 当作会话 ID。
+## Codex 用户注意
 
-## 边界与注意
+**输入框里有草稿时不会写入。** 接入的 Codex 终端里如果有还没提交的本地草稿，Botmux 会保留草稿、不把飞书消息拼上去，并提示你先在终端提交或清空，再重发。Orca 终端同理；Orca 连不上、无法确认输入框是否为空时，也会先停下。
 
-adopt 会话的生命周期在**你的机器上**，不归 botmux 管，因此有几条硬边界：
+**Codex 用共享后台时**，Botmux 仍然往原 tmux pane 输入。建议在 Codex 的 `/statusline` 里打开 `thread-id`（旧名 `session-id`）并保证完整 ID 可见，Botmux 能借此确认消息落在哪条会话上，也能跟上你在终端里 `/new`、`/resume` 切换会话。
 
-- **不能接力（`/relay`）**：CLI 在你电脑里跑，botmux 控不了它的 tmux 生命周期，接力会被拒。要换群继续，用新会话 + 交接。
-- **不能 resume**：adopt 会话不支持 `--resume` 重建。
-- **CLI 退出即结束**：adopt 模式下 botmux **不做自动重启**——被接入的 CLI 自己退出后，会话随之结束（卡片冻结、worker 收掉），不会像常驻会话那样重开。
-- **沙盒 bot 不能 adopt**：沙盒要包住一个从头启动的 CLI，无法套在一个已在跑的进程上（fail-closed 拒绝）。
-- **Orca 身份必须可验证**：目标至少要提供 incarnation 或 PTY 身份；缺少稳定身份时不会列出或恢复，避免 terminal handle 被复用后写入错误终端。
-- **daemon 重启后的恢复很谨慎**：重启时会先核对被接入的宿主 CLI 是否还活着——确认没了才关会话；探测结果不确定（瞬时失败）时保持会话关闭，**要等下一次 restore pass（例如再次重启 daemon）才重新验证**，不会在下一条消息到来时自动复验。
+**Codex App 对话。** 如果 Bot 的 CLI 是 `codex-app`，`/adopt` 会改为列出 Codex App 的已有对话（「📱 选择要继续的 Codex App 对话」），选中后在话题里继续这条 thread；也可以 `/adopt <threadId>`（写 ID 前缀也行）。
+
+**共享接入开发机上的 Codex App（实验性）。** 想让飞书和桌面 Codex App 同时连着开发机上**同一个** App Server、同一条 thread，可以给 `cliId` 为 `codex` 或 `codex-app` 的 Bot 配上：
+
+```json
+{
+  "existingAppServer": { "endpoint": "unix:///绝对路径/app-server.sock" }
+}
+```
+
+`endpoint` 只接受本机地址：`unix://` 绝对路径的 socket，或 `ws://127.0.0.1:<端口>`。之后 `/adopt` 选一条对话即可共享接入。Botmux 不会新建或停掉 App Server；`/detach` 只断开飞书这一侧，App Server 和 Codex App 会话继续运行。请避免两边同时提交不同任务。远程终端第一次出现 “Hooks need review” 时，在 Web Terminal 里选 “Continue without trusting”，Botmux 不会替你信任全部 Hook。这个模式不能和 `codexBrowser`、`codexRpcInput`、`wrapperCli` 一起用。
+
+## Orca（实验性）
+
+Orca 支持两种模式：
+
+- **server 模式**：Linux 上常驻的 orcad，CLI 在 `~/.orca/cli/bin/orca`。
+- **SSH relay 模式**：Botmux 和 SSH 终端在**同一台** Linux 主机时，会直连本机持有原 PTY 的 relay，这条路不依赖桌面客户端——合上 Mac 后也能新发 `/adopt` 接回原会话。**跨主机**的 relay 仍走桌面端，需要桌面保持在线。
+
+注意事项：
+
+- 接入前会核对终端身份（handle、PTY incarnation、工作区、本机进程归属）。拿不到稳定身份的终端不会列出，也不会被恢复，避免终端 handle 被复用后写进别的终端。旧版 relay 没有 incarnation 信息时不开放直连。
+- 以前通过桌面 relay 接入的会话，要重新 `/adopt` 一次才会走本机直连。
+- Web Terminal 里看到的是文本画面：能看能输入，但不保留原终端的颜色、精确光标和鼠标模式。桌面断开后画面从保留的输出重建，如果正好从一次重绘中间开始，画面可能不完整。
+- Orca/relay 版本、终端重绘方式和各 CLI 的记录格式都会影响兼容性。升级后如果发现列不出会话、画面或回复异常，请重新接入，并附上版本信息反馈。
+
+## 各 CLI 的回复效果
+
+| CLI | 能用什么 |
+|---|---|
+| Claude Code、Codex、TRAE | 终端输入输出 + 正式回复 + 从对话记录重建的可滚动历史 |
+| MTR、Hermes 及其它未验证 CLI | 只保证基础终端接入：实时画面、飞书输入、Web Terminal 可用；不保证正式回复和可滚动历史 |
+
+最后一行不是终端读写的问题，而是 Botmux 没法可靠证明「哪份对话记录属于这个终端」：MTR 在同一目录有多个会话时会分不清，外部启动的 Hermes 没有 Botmux 的会话标记。Botmux 不会按「同目录最近一条」去猜，否则可能把另一个终端的对话发到飞书。
+
+## 限制
+
+接入的进程跑在**你的机器上**，生命周期不归 Botmux 管，所以有这些边界：
+
+| 操作 | 结果 |
+|---|---|
+| `/relay` 接力到别的群 | 不支持。要换群继续，开新会话再做交接 |
+| fork、重启、resume 接入的会话 | 不支持，Botmux 不会动你的 tmux pane 或 CLI 进程 |
+| CLI 自己退出 | 会话随之结束（提示「⏏ /adopt的 CLI 会话已断开」），不会自动重开 |
+| 开了文件沙盒的 Bot 发 `/adopt` | 被拒绝。沙盒只能在启动时套上，套不到已在跑的进程；直接发消息会以沙盒方式新开一个会话 |
+| 话题正在等你选仓库 | 先点卡片上的「关闭会话」，再重新 `/adopt` |
+| 群里有 adopt 会话时 `/dismiss` | 不解散群。先在对应话题 `/detach`，再 `/dismiss` |
+
+daemon 重启后，Botmux 会先确认被接入的 CLI 还在不在：
+
+- 确认已经退出 → 关闭这个会话。
+- 还在 → 自动重新接上，不额外发恢复卡片。
+- 一时判断不了（比如探测临时失败）→ 会话不关，但先挂起不接；等**下一次 daemon 重启**时再验证，不会在你发下一条消息时自动重试。
 
 ## 典型用法
 
-在公司电脑 tmux 里跑 Claude Code，写到一半要走？手机飞书发 `/adopt` → 选会话 → 即刻同步。路上用手机继续，回到电脑点「断开」接着用。**不是远程控制，是真正的多设备共享。**
+公司电脑的 tmux 里跑着 Claude Code，写到一半要走：手机飞书发 `/adopt` → 选会话 → 确认，马上同步。路上用手机继续盯和发；回到电脑前点「⏏ 断开」，终端里接着用。这不是远程控制，而是同一个会话在多个设备上共享。
+
+相关页面：[斜杠命令](/slash-commands)、[接力 Relay](/relay)、[文件沙盒](/sandbox)、[tmux](/tmux)。

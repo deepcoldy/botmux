@@ -20,7 +20,10 @@ import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { __testOnly_activeSessions } from '../src/daemon.js';
 import { setDefaultLocale, t } from '../src/i18n/index.js';
-import { CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS } from '../src/services/claude-stop-failure.js';
+import {
+  CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS,
+  CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS,
+} from '../src/services/claude-stop-failure.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import {
   claudeHarnessRunnable as runnable,
@@ -75,7 +78,7 @@ function mountDaemonSession(h: Harness, g: Generation): void {
 }
 
 /** Run the hook client the way Claude does when the turn ends on its error. */
-function runHookClient(h: Harness, turnId: string): Promise<number | null> {
+function runHookClient(h: Harness, turnId: string, over: Record<string, unknown> = {}): Promise<number | null> {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: hookHome,
@@ -97,6 +100,7 @@ function runHookClient(h: Harness, turnId: string): Promise<number | null> {
       hook_event_name: 'StopFailure',
       error: 'server_error',
       last_assistant_message: 'API Error: Connection lost mid-response. The response above may be incomplete.',
+      ...over,
     }));
   });
 }
@@ -161,5 +165,26 @@ describe.skipIf(!runnable)('Claude StopFailure fallback, hook client → daemon 
     );
     expect(g.notices().find(n => n.message === UNSETTLED_NOTICE)?.turnId).toBe('om_long_task');
     expect(terminalsOf(g, 'om_long_task')).toHaveLength(1);
+  }, 120_000);
+
+  it('stays quiet for a failure that never reached the transcript of a completed turn', async () => {
+    // Claude Code 2.1.318: a background request forked from the main context
+    // after the turn (memory extraction, prompt suggestion) fails and runs
+    // StopFailure with the main session's ids and transcript. The turn is done
+    // and the conversation carries on; there is nothing to tell the chat.
+    const h = setup({ turnMs: 1_000 });
+    const g = await startWorker(h);
+    g.child.send({ type: 'message', content: 'plain question', turnId: 'om_done' } satisfies DaemonToWorker);
+    await g.waitFor(() => terminalsOf(g, 'om_done').length > 0, 'the turn to complete');
+    expect(terminalsOf(g, 'om_done').map(m => m.status)).toEqual(['completed']);
+
+    for (const over of [
+      { error: 'unknown', last_assistant_message: 'API Error: Request was aborted.' },
+      // A sub-agent's failure goes to its parent as a tool result.
+      { agent_id: 'a1b2c3d4e5f6a7b8c', agent_type: 'general-purpose' },
+    ]) expect(await runHookClient(h, 'om_done', over)).toBe(0);
+    await sleep(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS + CLAUDE_STOP_FAILURE_CORROBORATION_EXTRA_MS + 3_000);
+    expect(g.notices()).toEqual([]);
+    expect(terminalsOf(g, 'om_done')).toHaveLength(1);
   }, 120_000);
 });

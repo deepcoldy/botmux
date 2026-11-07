@@ -22,6 +22,10 @@ interface PersistedTurnSession {
   rootMessageId?: string;
   lastCallerOpenId?: string;
   quoteTargetId?: string;
+  /** Sender of the message the live quote chain names, and whether Lark said
+   *  it is a bot (written with quoteTargetId). */
+  quoteTargetSenderOpenId?: string;
+  quoteTargetSenderIsBot?: boolean;
   currentReplyTarget?: {
     rootMessageId?: string;
     turnId?: string;
@@ -70,6 +74,16 @@ export interface CurrentTurnProvenance {
    * count it as one (design §13.1).
    */
   overtakenWorkflowRunEvent?: { runId: string };
+  /**
+   * The caller is proven to be a human, not just the sender of the message
+   * that opened the turn: the durable per-turn registry records them as a
+   * non-bot participant (registryEntryProvesHumanSender), or the live quote
+   * chain's sender is them with Lark's `isBot === false`. Absent for a
+   * bot-opened turn (a peer bot's message also has an `om_` id), for every
+   * synthetic turn, and for an old record that carries no such evidence.
+   * Consumers that record "the person who confirmed" require it.
+   */
+  callerProvenHuman?: true;
 }
 
 export class CurrentTurnProvenanceError extends Error {
@@ -287,7 +301,53 @@ export function resolveCurrentTurnProvenance(
     };
   }
 
-  return authenticateHumanTurn(marker.sessionId, marker.turnId, session);
+  const human = authenticateHumanTurn(marker.sessionId, marker.turnId, session);
+  // Backstop for a wake turn folded into this one (a type-ahead CLI merges
+  // input that arrives mid-turn, and the marker keeps naming the running
+  // turn; the daemon only delivers wakes to an idle session, so this should
+  // not happen): while this run's issued wake sits in the marker's queue, the
+  // request is graded like that wake turn overtaken by this one — the main
+  // bot's own decision, `--reason` required — never as this person's turn.
+  const queuedWake = queuedWakeRunOf(marker, session, options.verifyWorkflowEventTurn);
+  return queuedWake ? { ...human, overtakenWorkflowRunEvent: { runId: queuedWake } } : human;
+}
+
+/** The run of an issued wake turn of THIS session waiting in the marker's
+ *  type-ahead queue, as the caller's run-bound verifier recognizes it. */
+function queuedWakeRunOf(
+  marker: { sessionId: string; queuedTurnId?: string; queuedTurns?: Array<{ turnId: string }> },
+  session: PersistedTurnSession,
+  verify: WorkflowEventTurnVerifier | undefined,
+): string | undefined {
+  if (!verify || !nonEmpty(session.larkAppId) || !nonEmpty(session.chatId)) return undefined;
+  const queued = [
+    ...(marker.queuedTurns ?? []).map((turn) => turn.turnId),
+    ...(marker.queuedTurnId ? [marker.queuedTurnId] : []),
+  ];
+  const replyTarget = session.currentReplyTarget;
+  const rootMessageId = (session.scope ?? 'thread') === 'thread'
+    ? session.rootMessageId
+    : replyTarget?.rootMessageId;
+  for (const turnId of queued) {
+    const ref = parseWorkflowEventTurnId(turnId);
+    if (!ref) continue;
+    const verdict = verify({
+      ...ref,
+      turnId,
+      session: {
+        sessionId: marker.sessionId,
+        larkAppId: session.larkAppId,
+        chatId: session.chatId,
+        ...(nonEmpty(rootMessageId) ? { rootMessageId } : {}),
+        ...(nonEmpty(session.quoteTargetId) ? { quoteTargetId: session.quoteTargetId } : {}),
+        ...(nonEmpty(replyTarget?.turnId) ? { currentReplyTargetTurnId: replyTarget!.turnId } : {}),
+      },
+    });
+    // Issued by the owning daemon to this very session (a newer message
+    // overtaking it is still that wake).
+    if (verdict.ok || verdict.stale) return ref.runId;
+  }
+  return undefined;
 }
 
 /** The human path: authenticate `turnId` of `sessionId` as the human who
@@ -362,6 +422,19 @@ function authenticateHumanTurn(
   } else if (!quoteJoinHolds && nonEmpty(turnEntry?.rootMessageId)) {
     rootMessageId = turnEntry.rootMessageId;
   }
+  const thisTurnEntry = session.replyTargets?.[marker.turnId];
+  // The per-turn registry is the more specific record: when it lists the
+  // caller as a participant without `isBot === false`, that refutes any
+  // human claim from the live quote slots.
+  const registryRefutes = !!thisTurnEntry?.participants?.some(
+    p => p.openId === callerOpenId && p.isBot !== false,
+  );
+  const callerProvenHuman = !registryRefutes && (quoteJoinHolds
+    ? (session.quoteTargetSenderIsBot === false && session.quoteTargetSenderOpenId === callerOpenId)
+      || (registryTurnMayAuthenticateHuman(session, marker.turnId)
+        && registryEntryProvesHumanSender(thisTurnEntry) && thisTurnEntry.senderOpenId === callerOpenId)
+    : registrySender === callerOpenId);
+
   // 刻意保守：chat scope 下 quoteJoinHolds && !slotJoinHolds（quote 链在本轮、
   // reply 单槽已被排队消息推进）时 root 两不取——按现有写入序列两者同批推进，
   // 该组合本就不可达；真出现只能说明状态部分损坏，此时缺 root 比借一个
@@ -377,5 +450,6 @@ function authenticateHumanTurn(
       ? { chatType: session.chatType }
       : {}),
     ...(rootMessageId ? { rootMessageId } : {}),
+    ...(callerProvenHuman ? { callerProvenHuman: true as const } : {}),
   };
 }

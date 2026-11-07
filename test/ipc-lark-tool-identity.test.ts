@@ -18,7 +18,12 @@ import { buildDocCommentTurnInput } from '../src/core/doc-comment-prompt.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { createServer, type Server } from 'node:http';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
+import {
+  createProtectedLoopbackProxyAttestation,
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+} from '../src/core/protected-loopback-attestation.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
 const botToken = vi.fn<() => Promise<unknown>>();
@@ -27,7 +32,7 @@ beforeEach(async () => {
   binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
   session = {
     session: { sessionId: 'tool-session', status: 'active', replyTargets: { om_turn: { senderOpenId: 'ou_sender' } } },
-    larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { pid: process.pid, killed: false }, workerGeneration: 1,
+    larkAppId: 'cli_bound', chatId: 'oc_chat', chatType: 'p2p', worker: { pid: process.pid, killed: false }, workerGeneration: 1,
     localProcessAttestation: { backendType: 'pty', workerGeneration: 1,
       cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
     managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender',
@@ -54,6 +59,58 @@ async function request(mode: string, accessKey = binding.accessKey) {
   });
 }
 describe('session application identity route', () => {
+  it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
+    const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      if (!cliRoot.pid) throw new Error('fixture cli root did not start');
+      const cliProcStart = readProcessStartIdentity(cliRoot.pid);
+      session.localProcessAttestation = {
+        backendType: 'pty', workerGeneration: 1, cliPid: cliRoot.pid, cliProcStart,
+      };
+      session.managedTurnOrigin.preexistingProcessIdentities = [`${cliRoot.pid}:${cliProcStart}`];
+      session.protectedLoopbackProxyAttestation = {
+        secret: 'ab'.repeat(32), workerGeneration: 1,
+      };
+      const path = '/api/sessions/tool-session/lark-tool-identity';
+      const body = Buffer.from(JSON.stringify({ mode: 'user' }));
+      const headers = {
+        'content-type': 'application/json',
+        'x-botmux-lark-session': binding.accessKey,
+      };
+      const attestation = createProtectedLoopbackProxyAttestation(
+        session.protectedLoopbackProxyAttestation.secret,
+        {
+          sessionId: 'tool-session', serviceId: 'lark-tool-identity', workerGeneration: 1,
+          turnId: 'om_turn', peer: { pid: cliRoot.pid, procStart: cliProcStart },
+          method: 'POST', path, headers, body,
+        },
+      );
+
+      const direct = await request('user');
+      expect(direct.status).toBe(403);
+      const proxied = await fetch(`http://127.0.0.1:${ipc!.port}${path}`, {
+        method: 'POST',
+        headers: { ...headers, [PROTECTED_LOOPBACK_ATTESTATION_HEADER]: attestation },
+        body,
+      });
+      expect(proxied.status).toBe(200);
+      expect(await proxied.json()).toMatchObject({ mode: 'user', credential: 'bound-user-token' });
+
+      session.managedTurnOrigin.turnId = 'om_later';
+      const stale = await fetch(`http://127.0.0.1:${ipc!.port}${path}`, {
+        method: 'POST',
+        headers: { ...headers, [PROTECTED_LOOPBACK_ATTESTATION_HEADER]: attestation },
+        body,
+      });
+      expect(stale.status).toBe(403);
+      expect(await stale.json()).toMatchObject({ error: 'current_execution_unverified' });
+    } finally {
+      cliRoot.kill('SIGKILL');
+    }
+  });
+
   async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string; recheck?: () => string | undefined } = {}) {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
@@ -532,7 +589,7 @@ describe('platform-issued user credentials in a bound session', () => {
     });
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ ok: false, error: 'platform_authorization_required',
-      authUrl: 'https://platform.example.test/credentials' });
+      authUrl: 'https://platform.example.test/credentials?scope=search%3Adocs%3Aread' });
     expect(deviceFlow).not.toHaveBeenCalled();
   });
   it('auth request does not start a bot-app device flow for a turn that moved on during the platform check', async () => {

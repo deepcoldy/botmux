@@ -11,17 +11,21 @@
  */
 
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 
-import { V3_RUN_ENVELOPE_FILE, frozenNodeWorkingDir, readRunEnvelope } from '../workflows/v3/run-envelope.js';
+import { V3_RUN_ENVELOPE_FILE, frozenNodeWorkingDir, readRunEnvelope, runInitiatorRef } from '../workflows/v3/run-envelope.js';
 import type { V3Dag } from '../workflows/v3/dag.js';
 import type { V3ExternalNodeExecutor } from '../workflows/v3/external-executor.js';
 import { v3AcceptanceProbeUnknownSince } from '../workflows/v3/runtime.js';
+import { safeExternalAttemptDir } from '../workflows/v3/external-control.js';
+import { v3MainTopicQueueGraceMs } from '../workflows/v3/external-executor.js';
+import { DEFAULT_NODE_TIMEOUT_SEC, MAX_NODE_TIMEOUT_SEC } from '../workflows/v3/dag.js';
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import type { LarkAttachment, WorkflowNodeSessionMarker } from '../types.js';
 import type { DaemonSession } from './types.js';
 import {
   isWorkflowHandoffRevoked,
+  lookupWorkflowHandoffByNonce,
   readDispatchRegistryLoose,
   recordWorkflowHandoffRefusal,
   resolveInboundWorkflowHandoff,
@@ -32,6 +36,7 @@ import {
   findWorkflowHandoffAcceptance,
   readWorkflowAttemptInputs,
   stageWorkflowNodeInputs,
+  workflowNodeMarkerActive,
   type HandoffAcceptanceSession,
 } from './workflow-node-session.js';
 import {
@@ -51,6 +56,7 @@ import {
 } from './workflow-handoff-routes.js';
 import {
   WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE,
+  approvedWorkflowBots,
   deliverWorkflowHandoffWithUser,
   handleWorkflowHandoffIdentityCheck,
   loadWorkflowHandoffIdentityRun,
@@ -60,12 +66,34 @@ import {
   type WorkflowHandoffIdentityCheckRequest,
 } from './workflow-handoff-identity.js';
 import type { V3HandoffIdentityTool } from '../workflows/v3/run-envelope.js';
-import { createV3BotHandoffExecutor, readV3HandoffTopics, type V3SelfTurnRequest } from '../im/lark/v3-bot-handoff-executor.js';
+import {
+  createV3BotHandoffExecutor,
+  readV3HandoffCardInput,
+  readV3HandoffTopics,
+  type V3SelfTurnRequest,
+} from '../im/lark/v3-bot-handoff-executor.js';
 import { createV3NodeCardSync } from '../im/lark/v3-node-card-sync.js';
 import { buildV3NodeReportCard } from '../im/lark/v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
-import { checkBotWorkingDir, describeBotWorkingDirRefusal, realWorkingDir, type BotWorkingDirConfig } from './working-dir-range.js';
-import { expandHome } from './working-dir.js';
+import { checkBotWorkingDir, checkNodeWorkingDir, comparableSessionDir, describeBotWorkingDirRefusal, type BotWorkingDirConfig, type NodeWorkingDirVerdict } from './working-dir-range.js';
+import {
+  WORKFLOW_INITIATOR_UNION_ROUTE,
+  isWorkflowOpenId,
+  isWorkflowUnionId,
+  parseWorkflowInitiatorUnionRequest,
+  parseWorkflowWorkingDirOperatorRequest,
+  withinOperatorBudget,
+  type WorkflowInitiatorIdentity,
+  type WorkflowOperateAnswer,
+} from './workflow-working-dir-operator.js';
+import { readGrillState } from '../workflows/v3/grill-state.js';
+import { loadDag } from '../workflows/v3/dag-loader.js';
+import { freezeDagBotSnapshots } from '../workflows/v3/bot-resolve.js';
+import { loadAuthorizedV3Run } from '../workflows/v3/run-envelope.js';
+import { v3BotExecutorTargets } from '../workflows/v3/node-executor-mode.js';
+import { classifyExternalAttempt } from '../workflows/v3/external-control.js';
+import { readJournal } from '../workflows/v3/journal.js';
+import type { BotConfig } from '../bot-registry.js';
 
 /** Where a node session for one handoff starts on the executing bot
  *  (design §15.4). */
@@ -94,10 +122,11 @@ export function workflowNodePinnedStart(admission: WorkflowInboundAdmission | un
  *  bot's handoff and on the main bot's own node delivery, with one rule. */
 export function workflowNodeSessionDirConflicts(pinnedDir: string, existingSessionDir: string | undefined): boolean {
   return existingSessionDir !== undefined
-    && realWorkingDir(resolve(expandHome(existingSessionDir))) !== pinnedDir;
+    && comparableSessionDir(existingSessionDir) !== pinnedDir;
 }
 
-type WorkflowNodeWorkingDir =
+/** Where (or whether) a node may run on its executing bot (§15.4). */
+export type WorkflowNodeWorkingDir =
   /** No Gate-2 directory: the bot's own default resolution, as for any
    *  message it receives. */
   | { kind: 'default' }
@@ -182,6 +211,29 @@ export interface WorkflowNodeDaemonDeps {
   /** Whether that bot's running daemon applies a run's Gate-2 working dir
    *  (advertised in its descriptor; an older daemon would ignore it). */
   daemonAppliesNodeWorkingDir(larkAppId: string): boolean;
+  /** §15.4: may the run's initiator operate `larkAppId` (this daemon's own
+   *  bot) in `chatId` — the `/cd` gate plus current membership of the chat,
+   *  with the identity converted into that bot's app
+   *  (`createWorkflowWorkingDirOperatorWiring`). Absent = no one is taken to
+   *  operate it: the configured range applies. */
+  initiatorOperates?(input: {
+    larkAppId: string;
+    chatId: string;
+    initiator: WorkflowInitiatorIdentity;
+    /** Read the chat's members now, not from the short-lived cache (node
+     *  start: someone who just left the chat must not count). */
+    freshMembership?: boolean;
+  }): Promise<WorkflowOperateAnswer>;
+  /** The run's main bot side of {@link WORKFLOW_INITIATOR_UNION_ROUTE}: the
+   *  union_id of a person this daemon's own app knows by `openId`. */
+  lookupOwnUnionId?(openId: string): Promise<{ unionId: string } | { unknown: string }>;
+  /** bots.json as of now (the executing bots of a run not yet approved). */
+  currentBots?(): BotConfig[];
+  /** Whether that bot's running daemon handles a main-topic handoff (§5.5;
+   *  advertised in its descriptor). Absent = every daemon does (tests). */
+  daemonHandlesMainPlacement?(larkAppId: string): boolean;
+  /** §5.5: the Lark topic id of the run's main topic (display only). */
+  mainTopicThreadId?(binding: { chatId: string; rootMessageId: string; sessionId?: string }): string | undefined;
   drive(runId: string): void;
   botName(larkAppId: string): string;
   /** §11: a run's「工作流 ›」sidebar entry, keyed by its main bot; undefined
@@ -232,13 +284,47 @@ export interface WorkflowNodeDaemon {
    *  `start: false` = refused (the main bot is told, so the node blocks with
    *  `reason`; nothing may be registered or started for it); otherwise start
    *  / continue the node, a NEW session in `workingDir` when the run pinned
-   *  one. */
+   *  one. `existingMarker`: that session's workflow-node marker — a
+   *  main-topic session already carrying another node in progress refuses
+   *  the new one (§5.5, MAIN_TOPIC_BUSY). */
   admitInbound(
     binding: WorkflowHandoffBindingPayload,
     handoffMessageId: string,
     executingLarkAppId: string,
     existingSessionDir?: string,
+    existingMarker?: WorkflowNodeSessionMarker,
+    /** {@link resolveInboundWorkingDir}'s answer, taken before the session
+     *  lookup. Absent = decided here without asking whether the initiator
+     *  operates the bot (the configured range alone, the stricter rule). */
+    workingDir?: WorkflowNodeWorkingDir,
   ): WorkflowInboundAdmission;
+  /** The run's Gate-2 directory for an inbound handoff on
+   *  `executingLarkAppId`, decided by {@link checkNodeWorkingDir} with this
+   *  daemon's configuration and the initiator's operate right now. May ask
+   *  Lark and the main bot's daemon. */
+  resolveInboundWorkingDir(binding: WorkflowHandoffBindingPayload, executingLarkAppId: string): Promise<WorkflowNodeWorkingDir>;
+  /** The inbound route's whole §15.4 gate, in order: decide the directory
+   *  ({@link resolveInboundWorkingDir}, which may wait), THEN read the session
+   *  the handoff would land in (`currentSession`, so nothing read goes stale
+   *  across the wait; `'stale'` = the caller's turn is no longer current),
+   *  re-check revocation, and {@link admitInbound} with the decided
+   *  directory. The daemon calls only this. */
+  admitInboundHandoff<S>(input: {
+    binding: WorkflowHandoffBindingPayload;
+    handoffMessageId: string;
+    executingLarkAppId: string;
+    currentSession(): S | 'stale';
+    describeSession(session: S): { dir?: string; marker?: WorkflowNodeSessionMarker };
+  }): Promise<
+    | { kind: 'stale' }
+    | { kind: 'revoked' }
+    | { kind: 'admission'; admission: WorkflowInboundAdmission; session: S }
+  >;
+  /** Gate-2 → this bot: may the initiator operate it here (§15.4)? */
+  workingDirOperatorRoute(raw: unknown): Promise<RouteResult>;
+  /** Executing bot → this (main) bot: the initiator's union_id for a run
+   *  with a Gate-2 working dir, looked up through this bot's own app. */
+  initiatorUnionRoute(raw: unknown): Promise<RouteResult>;
   /** Copy the node's upstream products into this turn's attachment dir. */
   stageInbound(binding: WorkflowHandoffBindingPayload, messageId: string): LarkAttachment[];
   /** A session just registered a verified handoff: the node is accepted
@@ -246,6 +332,18 @@ export interface WorkflowNodeDaemon {
   onRegistered(sessionId: string, marker: WorkflowNodeSessionMarker): void;
   onInputCommitted(ds: DaemonSession, context: { turnId: string; committedAt: number }): void;
   onTurnSettled(ds: DaemonSession, context: { turnId?: string; at: number }): void;
+  /** A turn's input was literally written to the CLI (§5.5: a main-topic
+   *  handoff queued behind another turn really starts here). */
+  onTurnStarted(ds: DaemonSession, context: { turnId: string; startedAt: number }): void;
+}
+
+/** The refusal when the session the handoff would land in runs elsewhere
+ *  (§15.4); a main-topic session is never closed for a node, so the way out
+ *  differs. */
+function existingSessionDirRefusal(placement: 'main' | undefined): string {
+  return placement === 'main'
+    ? '主话题里已有会话，工作目录与指定的不一致；请把节点改成节点话题，或改派'
+    : '节点话题里已有会话，工作目录与指定的不一致；请在这个话题里关闭该会话后重试，或改派';
 }
 
 export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): WorkflowNodeDaemon {
@@ -283,39 +381,239 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       .catch((err) => deps.warn(`[workflow] withdrawing identity of ${turnId} failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
+
+  /**
+   * Main topic (§5.5): should a stop interrupt what this shared session runs
+   * now? While the handoff's own CLI turn is in progress — started and not
+   * yet idle again, persisted on the marker so a restart keeps knowing — yes,
+   * whatever else was folded into it: a person's message typed in while it
+   * ran (a CLI with type-ahead merges it into the running turn) is part of
+   * that same CLI turn. Interrupting it interrupts that person's message too;
+   * not interrupting it would leave the bot working on a node that is
+   * already stopped (timed out, cancelled, reassigned). The node being over
+   * wins; the person can send the message again. Before the handoff turn
+   * starts nothing is interrupted (it is stopped the moment it starts); after
+   * it went idle, only a later turn of the node itself is.
+   */
+  function mainTopicNodeTurnRunning(ds: DaemonSession, marker: WorkflowNodeSessionMarker): boolean {
+    if (!marker.handoffStartedAt) return false;
+    // The handoff turn is over once the session went idle after it started
+    // (any idle edge, whatever turn it names) — or the worker it started in
+    // is gone (restart / respawn: an idle signal may never come).
+    const settled = !!marker.handoffSettledAt || marker.handoffWorkerGeneration !== ds.workerGeneration;
+    if (!settled) return true;
+    // After it: only a later turn of the node itself that has not gone idle
+    // (persisted: a CLI a persistent backend kept across a restart may still
+    // run it; on an idle screen the interrupt is a no-op anyway).
+    const last = marker.lastTurn;
+    return !!last && !last.settledAt && last.turnId !== marker.handoffMessageId && !!marker.turnIds?.includes(last.turnId);
+  }
+
   function stopHandoffTurn(nonce: string, sessionId: string | undefined, opts?: { evenIfIdle?: boolean }): boolean {
     for (const ds of deps.activeSessions()) {
       const marker = ds.session.workflowNode;
       if (!marker || marker.nonce !== nonce) continue;
       if (sessionId && ds.session.sessionId !== sessionId) continue;
       withdrawIdentity(ds, marker.handoffMessageId);
-      return deps.interruptTurn(ds, opts);
+      if (marker.placement !== 'main') return deps.interruptTurn(ds, opts);
+      // Main topic: the attempt is over for this ordinary session; stop only
+      // the handoff's own turn, never someone else's turn in the same session
+      // (a queued handoff turn is stopped when it starts, onTurnStarted).
+      // Already over before this call (a second stop, a late "revoked"
+      // answer): whatever runs now is not the node's — nothing to interrupt.
+      if (marker.closedAt || marker.submittedAt) return false;
+      ds.session.workflowNode = { ...marker, closedAt: new Date().toISOString() };
+      deps.updateSession(ds);
+      return mainTopicNodeTurnRunning(ds, marker) ? deps.interruptTurn(ds, opts) : false;
     }
     return false;
+  }
+
+  /** Main topic: the attempt ended here without work handed in (the bot
+   *  reported it cannot do it) — the session is ordinary again. */
+  function closeMainMarker(sessionId: string | undefined, nonce: string): void {
+    for (const ds of deps.activeSessions()) {
+      const marker = ds.session.workflowNode;
+      if ((sessionId !== undefined && ds.session.sessionId !== sessionId) || marker?.nonce !== nonce || marker.placement !== 'main') continue;
+      if (marker.closedAt || marker.submittedAt) continue;
+      ds.session.workflowNode = { ...marker, closedAt: new Date().toISOString() };
+      deps.updateSession(ds);
+      withdrawIdentity(ds, marker.handoffMessageId);
+    }
   }
 
   function isRevoked(nonce: string): boolean {
     return isWorkflowHandoffRevoked(readDispatchRegistryLoose(deps.dataDir()), nonce, deps.bindingSecret());
   }
 
-  function nodeWorkingDir(runDir: string | undefined, runId: string, executingLarkAppId: string): WorkflowNodeWorkingDir {
+  /** A run as the §15.4 operate check needs it: who started it (open_id
+   *  for the main bot's app only), where, and which bots take part.
+   *  `pending`: not yet approved (Gate-2 is asking) — read from the grill
+   *  state and today's bots.json, exactly as Gate-2 freezes it; only then is
+   *  each node's executor known (`executorOf`). */
+  interface OperateRun {
+    initiator: { sourceLarkAppId: string; openId: string; unionId?: string };
+    chatId: string;
+    /** Every bot that may execute a node of this run. */
+    executors: ReadonlySet<string>;
+    /** Pending runs only: the bot that will execute `nodeId`. */
+    executorOf?(nodeId: string): string | undefined;
+  }
+
+  /**
+   * An approved run that pins a working dir. Its bots are the run's approved
+   * scope — the frozen snapshot plus every bot an applied revision brought in
+   * and the initiator's own reassignments ({@link approvedWorkflowBots}, the
+   * scope 交接带发起人身份 uses) — plus any bot a node was reassigned to by
+   * anyone, since that bot then executes it. Unreadable artifacts: no run.
+   */
+  function frozenOperateRun(runDir: string, runId: string): OperateRun | undefined {
+    const read = readRunEnvelope(runDir, runId);
+    if (read.kind !== 'ok' || frozenNodeWorkingDir(read.envelope) === undefined) return undefined;
+    const initiator = runInitiatorRef(read.envelope);
+    const chatId = read.envelope.chatBinding?.chatId;
+    if (!initiator || !chatId) return undefined;
+    let executors: Set<string>;
+    try {
+      const loaded = loadAuthorizedV3Run(runDir, { expectedRunId: runId });
+      const events = readJournal(join(runDir, 'journal.ndjson'));
+      executors = approvedWorkflowBots(runDir, loaded, events, initiator.openId);
+      for (const event of events) if (event.type === 'nodeReassigned') executors.add(event.to);
+    } catch {
+      return undefined;
+    }
+    return { initiator, chatId, executors };
+  }
+
+  function targetsMap(build: () => Array<{ nodeId: string; larkAppId: string }>): Map<string, string> | undefined {
+    try {
+      return new Map(build().map((target) => [target.nodeId, target.larkAppId]));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A run waiting at Gate-2 (no run.json yet). */
+  function pendingOperateRun(runDir: string, runId: string): OperateRun | undefined {
+    if (readRunEnvelope(runDir, runId).kind !== 'missing') return undefined;
+    const grill = readGrillState(runDir);
+    const binding = grill?.chatBinding;
+    if (!grill || grill.runId !== runId || grill.status !== 'dag_ready' || !grill.dagPath || !binding?.chatId
+      || !isWorkflowOpenId(binding.ownerOpenId) || !deps.currentBots) return undefined;
+    const bots = deps.currentBots();
+    const dagPath = grill.dagPath;
+    const targets = targetsMap(() => {
+      const dag = loadDag(dagPath);
+      return v3BotExecutorTargets(dag, freezeDagBotSnapshots(dag, bots, { defaultSelector: binding.larkAppId }));
+    });
+    if (!targets) return undefined;
+    return {
+      initiator: { sourceLarkAppId: binding.larkAppId, openId: binding.ownerOpenId },
+      chatId: binding.chatId,
+      executorOf: (nodeId) => targets.get(nodeId),
+      executors: new Set(targets.values()),
+    };
+  }
+
+  /** The initiator's union_id from the run's main bot daemon (the only app
+   *  their open_id belongs to): the one source both Gate-2 and node start
+   *  use when the run froze none. */
+  async function initiatorUnionFromMain(sourceLarkAppId: string, runId: string): Promise<{ unionId: string } | { unknown: string }> {
+    const mainName = deps.botName(sourceLarkAppId);
+    try {
+      const port = deps.daemonPort(sourceLarkAppId);
+      if (!port) return { unknown: `主 Bot ${mainName} 的 daemon 不在线，拿不到发起人的跨应用身份` };
+      const result = await deps.postDaemon(port, WORKFLOW_INITIATOR_UNION_ROUTE,
+        { runId, requesterLarkAppId: deps.selfLarkAppId() }, deps.hostSecret());
+      if (result.status === 200 && isWorkflowUnionId(result.body.unionId)) return { unionId: result.body.unionId };
+      // An older daemon has no such route: its generic 404 carries no `ok`.
+      if (result.status === 404 && result.body.ok === undefined) {
+        return { unknown: `主 Bot ${mainName} 的 daemon 版本过旧，拿不到发起人的跨应用身份` };
+      }
+      const said = typeof result.body.error === 'string' ? result.body.error : `HTTP ${result.status}`;
+      return { unknown: `主 Bot ${mainName} 没能给出发起人的跨应用身份（${said}）` };
+    } catch {
+      return { unknown: `连不上主 Bot ${mainName} 的 daemon，拿不到发起人的跨应用身份` };
+    }
+  }
+
+  /** §15.4: may the run's initiator operate `executingLarkAppId` in the
+   *  run's chat? Their open_id is used for the main bot's own app only; for
+   *  another bot their union_id — frozen on the run, else from the main bot —
+   *  is converted in that bot's app. Bounded by the operator budget. */
+  function initiatorOperates(run: OperateRun, runId: string, executingLarkAppId: string, opts: { freshMembership?: boolean } = {}): Promise<WorkflowOperateAnswer> {
+    return withinOperatorBudget((async (): Promise<WorkflowOperateAnswer> => {
+      if (!deps.initiatorOperates) return 'no';
+      let unionId = run.initiator.unionId;
+      if (executingLarkAppId !== run.initiator.sourceLarkAppId && !unionId) {
+        const got = run.initiator.sourceLarkAppId === deps.selfLarkAppId()
+          ? (deps.lookupOwnUnionId ? await deps.lookupOwnUnionId(run.initiator.openId) : { unknown: '拿不到发起人的跨应用身份' })
+          : await initiatorUnionFromMain(run.initiator.sourceLarkAppId, runId);
+        if ('unknown' in got) return { unknown: got.unknown };
+        unionId = got.unionId;
+      }
+      return deps.initiatorOperates({
+        larkAppId: executingLarkAppId,
+        chatId: run.chatId,
+        initiator: { ...run.initiator, ...(unionId ? { unionId } : {}) },
+        ...(opts.freshMembership ? { freshMembership: true } : {}),
+      });
+    })());
+  }
+
+  type NodeWorkingDirInput =
+    | { kind: 'decided'; dir: WorkflowNodeWorkingDir }
+    | { kind: 'check'; runDir: string; workingDir: string; config: BotWorkingDirConfig; botName: string };
+
+  function nodeWorkingDirInput(runDir: string | undefined, runId: string, executingLarkAppId: string): NodeWorkingDirInput {
     // The directory lives in run.json itself (the Gate-2 commit); only that
     // file is read here. Without it, whether a directory was chosen is
     // unknown: never start the node somewhere else on a guess.
     const read = runDir ? readRunEnvelope(runDir, runId) : undefined;
-    if (read?.kind !== 'ok') return { kind: 'refused', reason: '读不到这个工作流 run 的批准记录，无法确认节点该在哪个目录执行' };
+    if (!runDir || read?.kind !== 'ok') return { kind: 'decided', dir: { kind: 'refused', reason: '读不到这个工作流 run 的批准记录，无法确认节点该在哪个目录执行' } };
     const workingDir = frozenNodeWorkingDir(read.envelope);
-    if (workingDir === undefined) return { kind: 'default' };
+    if (workingDir === undefined) return { kind: 'decided', dir: { kind: 'default' } };
     const botName = deps.botName(executingLarkAppId);
     const config = deps.botWorkingDirConfig(executingLarkAppId);
-    if (!config) return { kind: 'refused', reason: `指定的工作目录 ${workingDir}：读不到 ${botName} 的配置，无法核对目录范围` };
-    const verdict = checkBotWorkingDir(config, workingDir);
+    if (!config) return { kind: 'decided', dir: { kind: 'refused', reason: `指定的工作目录 ${workingDir}：读不到 ${botName} 的配置，无法核对目录范围` } };
+    return { kind: 'check', runDir, workingDir, config, botName };
+  }
+
+  function nodeWorkingDirFrom(verdict: NodeWorkingDirVerdict, botName: string): WorkflowNodeWorkingDir {
     if (verdict.ok) return { kind: 'pinned', dir: verdict.path };
+    if (verdict.operateUnknown !== undefined) {
+      return {
+        kind: 'refused',
+        reason: `指定的工作目录 ${verdict.path}：暂时无法确认发起人能否操作 ${botName}（${verdict.operateUnknown}），`
+          + `而这个目录${verdict.reason === 'no_range' ? '不在它的目录范围内（它没有配置目录范围）' : '不在它配置的目录范围内'}。`
+          + '稍后重试，或把这个目录加进它的默认工作目录或仓库目录，或改派。',
+      };
+    }
     return {
       kind: 'refused',
       reason: `指定的工作目录 ${verdict.path}：${describeBotWorkingDirRefusal(verdict)}。`
         + `以 ${botName} 现在的配置为准（批准后可能改过）；把这个目录加进它的默认工作目录或仓库目录后重试，或改派。`,
     };
+  }
+
+  /** §15.4 on the executing bot, now: {@link checkNodeWorkingDir} against
+   *  its current configuration and the initiator's operate right. */
+  async function nodeWorkingDir(runDir: string | undefined, runId: string, executingLarkAppId: string): Promise<WorkflowNodeWorkingDir> {
+    const input = nodeWorkingDirInput(runDir, runId, executingLarkAppId);
+    if (input.kind === 'decided') return input.dir;
+    const verdict = await checkNodeWorkingDir(input.config, input.workingDir, async () => {
+      const run = frozenOperateRun(input.runDir, runId);
+      // The node is about to start: read the chat's members now.
+      return run ? initiatorOperates(run, runId, executingLarkAppId, { freshMembership: true }) : 'no';
+    });
+    return nodeWorkingDirFrom(verdict, input.botName);
+  }
+
+  /** The same decision without asking about the initiator (range only). */
+  function nodeWorkingDirByRange(runDir: string | undefined, runId: string, executingLarkAppId: string): WorkflowNodeWorkingDir {
+    const input = nodeWorkingDirInput(runDir, runId, executingLarkAppId);
+    if (input.kind === 'decided') return input.dir;
+    return nodeWorkingDirFrom(checkBotWorkingDir(input.config, input.workingDir), input.botName);
   }
 
   /** Tell the main bot this handoff's node session was not started. The
@@ -324,13 +622,82 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
    *  at once is retried once — after an error answer or an unreachable daemon
    *  alike. Should both fail, the node still blocks at the acceptance
    *  deadline (HANDOFF_NOT_ACCEPTED), with this reason in its message. */
-  async function refuse(binding: { nonce: string; sourceLarkAppId: string }, handoffMessageId: string, reason: string): Promise<void> {
+  /**
+   * §5.5: one main-topic session carries at most one node at a time. Another
+   * run in the same topic handing a main-topic node to the same bot while its
+   * node is in progress would overwrite that marker — the first node could
+   * then neither be stopped nor tell its turns apart. The later handoff is
+   * refused, visibly (the node blocks; its main bot is woken and may reassign
+   * it or move it to a node topic). An earlier node whose handoff was revoked
+   * (its stop may not have reached this daemon) no longer counts.
+   */
+  function mainTopicBusyReason(
+    placement: 'main' | undefined,
+    nonce: string,
+    existing: WorkflowNodeSessionMarker | undefined,
+    executingLarkAppId: string,
+  ): string | undefined {
+    if (placement !== 'main' || !existing || existing.placement !== 'main' || existing.nonce === nonce) return undefined;
+    if (closeMainMarkerIfOver(existing)) return undefined;
+    return `${deps.botName(executingLarkAppId)} 在主话题里正在执行另一个工作流节点（run ${existing.runId} 的 ${existing.nodeId}），`
+      + '同一个会话不能同时执行两个节点；等它结束后重试，或改派，或把这个节点改成节点话题';
+  }
+
+  /** Slack on top of a main-topic attempt's latest possible deadline. */
+  const MAIN_MARKER_EXPIRY_SLACK_MS = 10 * 60_000;
+
+  /**
+   * F5: is this main-topic marker's attempt over, even though no stop or
+   * submission reached this session? Over when it is no longer active, its
+   * handoff was revoked, its binding is gone (registry entries are pruned
+   * after two days, revocations included — a marker whose binding cannot be
+   * found is never treated as a node in progress), or it is past the latest
+   * deadline the attempt can have (from its start: the node timeout; never
+   * started: acceptance + timeout + queue grace) plus a slack. An over marker
+   * is closed in every session holding it, so the session stops counting as
+   * occupied and stops reporting for it.
+   */
+  function closeMainMarkerIfOver(marker: WorkflowNodeSessionMarker): boolean {
+    if (marker.placement !== 'main') return false;
+    if (!workflowNodeMarkerActive(marker)) return true;
+    const found = lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(deps.dataDir()), nonce: marker.nonce, secret: deps.bindingSecret() });
+    let over = found.kind !== 'workflow' || found.revoked;
+    if (!over) {
+      const runDir = runDirOf(marker.runId);
+      // The node's own timeout; when the run or the node cannot be read here,
+      // the ceiling any node may have — an early "over" would close the
+      // marker of a node that is still running.
+      let timeoutSec = MAX_NODE_TIMEOUT_SEC;
+      try {
+        const node = runDir ? deps.loadRun(runDir)?.dag.nodes.find((candidate) => candidate.id === marker.nodeId) : undefined;
+        if (node) timeoutSec = node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC;
+      } catch { /* the ceiling */ }
+      const timeoutMs = timeoutSec * 1000;
+      const started = marker.handoffStartedAt ? Date.parse(marker.handoffStartedAt) : NaN;
+      const registered = Date.parse(marker.registeredAt);
+      const latest = Number.isFinite(started)
+        ? started + timeoutMs
+        : (Number.isFinite(registered) ? registered : 0) + timeoutMs + v3MainTopicQueueGraceMs(timeoutMs);
+      over = (deps.now ?? Date.now)() > latest + MAIN_MARKER_EXPIRY_SLACK_MS;
+    }
+    if (over) closeMainMarker(undefined, marker.nonce);
+    return over;
+  }
+
+  async function refuse(
+    binding: { nonce: string; sourceLarkAppId: string },
+    handoffMessageId: string,
+    reason: string,
+    errorCode?: 'MAIN_TOPIC_BUSY',
+  ): Promise<void> {
     try {
       await recordWorkflowHandoffRefusal(deps.dataDir(), deps.bindingSecret(), binding.nonce, reason);
     } catch (err) {
       deps.warn(`[workflow] recording the refusal of ${binding.nonce} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const event: WorkflowHandoffEvent = { kind: 'refused', nonce: binding.nonce, dispatchRoot: handoffMessageId, reason };
+    const event: WorkflowHandoffEvent = {
+      kind: 'refused', nonce: binding.nonce, dispatchRoot: handoffMessageId, reason, ...(errorCode ? { errorCode } : {}),
+    };
     /** undefined = delivered (or refused for good: 409); else why it failed. */
     const send = async (): Promise<string | undefined> => {
       try {
@@ -446,11 +813,13 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       if (result.status >= 400) throw new Error(`stop failed: ${String(result.body.error ?? result.status)}`);
     },
     workflowEntry: (runId) => deps.workflowEntry?.(deps.selfLarkAppId(), runId),
-    workingDirPreflight: (request) => {
+    ...(deps.daemonHandlesMainPlacement ? { daemonHandlesMainPlacement: deps.daemonHandlesMainPlacement } : {}),
+    ...(deps.mainTopicThreadId ? { mainTopicThreadId: deps.mainTopicThreadId } : {}),
+    workingDirPreflight: async (request) => {
       const self = deps.selfLarkAppId();
       // The main bot's own node: decided here, before its cards go out.
       if (request.targetLarkAppId === self) {
-        const dir = nodeWorkingDir(request.runDir, request.runId, self);
+        const dir = await nodeWorkingDir(request.runDir, request.runId, self);
         return dir.kind === 'refused' ? dir.reason : undefined;
       }
       // Another bot decides against its own range when the handoff arrives;
@@ -464,8 +833,21 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     startSelfTurn: async (input: V3SelfTurnRequest) => {
       const runDir = input.runDir;
       // §15.4 for the main bot's own nodes too: its current configuration
-      // decides, and a refusal blocks the node (nothing is started).
-      const dir = nodeWorkingDir(runDir, input.marker.runId, deps.selfLarkAppId());
+      // and the initiator's operate right decide, and a refusal blocks the
+      // node (nothing is started). Decided FIRST: it may wait for lookups,
+      // and everything below (busy session, existing session, revocation)
+      // is read after the wait, never before it.
+      const dir = await nodeWorkingDir(runDir, input.marker.runId, deps.selfLarkAppId());
+      // §5.5: the main session already carries another run's main-topic node.
+      const reused = deps.findNodeSession(input.publishRoot, deps.selfLarkAppId());
+      const busy = reused && reused.session.status !== 'closed'
+        ? mainTopicBusyReason(input.marker.placement, input.marker.nonce, reused.session.workflowNode, deps.selfLarkAppId())
+        : undefined;
+      if (busy) {
+        deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId} not started: ${busy}`);
+        await refuse({ nonce: input.marker.nonce, sourceLarkAppId: deps.selfLarkAppId() }, input.handoffMessageId, busy, 'MAIN_TOPIC_BUSY');
+        return { refused: true as const };
+      }
       if (dir.kind === 'refused') {
         deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId} not started: ${dir.reason}`);
         await refuse({ nonce: input.marker.nonce, sourceLarkAppId: deps.selfLarkAppId() }, input.handoffMessageId, dir.reason);
@@ -484,11 +866,19 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         const existing = found && found.session.status !== 'closed' ? found : undefined;
         const existingDir = existing ? deps.getSessionWorkingDir(existing) : undefined;
         if (workflowNodeSessionDirConflicts(dir.dir, existingDir)) {
-          const reason = '节点话题里已有会话，工作目录与指定的不一致；请在这个话题里关闭该会话后重试，或改派';
+          const reason = existingSessionDirRefusal(input.marker.placement);
           deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId}: the node topic's session runs in ${existingDir}, not ${dir.dir}`);
           await refuse({ nonce: input.marker.nonce, sourceLarkAppId: self }, input.handoffMessageId, reason);
           return { refused: true as const };
         }
+      }
+      // A cancel / timeout / reassignment may have landed while the directory
+      // was being decided: its stop() revoked the binding or closed the
+      // attempt. Never start that turn (the executor checked only before).
+      if (isRevoked(input.marker.nonce)
+        || !classifyExternalAttempt(readJournal(join(runDir, 'journal.ndjson')), input.marker.attemptId).ok) {
+        deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId} not started: stopped while its directory was being decided`);
+        return { refused: true as const };
       }
       const inputs = readWorkflowAttemptInputs(runDir, input.marker.attemptId) ?? input.inputs;
       const staged = stageWorkflowNodeInputs({
@@ -528,6 +918,13 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     activity: readWorkflowHandoffActivity,
     topicCards: readV3HandoffTopics,
     workflowEntry: (runId) => deps.workflowEntry?.(deps.selfLarkAppId(), runId),
+    handoffCardInput: (runDir, attemptId) => {
+      try {
+        return readV3HandoffCardInput(safeExternalAttemptDir(runDir, attemptId));
+      } catch {
+        return undefined;
+      }
+    },
   });
 
   function notify(
@@ -569,7 +966,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
 
   function openMarker(ds: DaemonSession): WorkflowNodeSessionMarker | undefined {
     const marker = ds.session.workflowNode;
-    return marker && !marker.submittedAt ? marker : undefined;
+    return marker && !marker.submittedAt && workflowNodeMarkerActive(marker) ? marker : undefined;
   }
 
   const MAX_TRACKED_TURNS = 32;
@@ -586,7 +983,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     attempt(true);
   }
 
-  return {
+  const wiring: WorkflowNodeDaemon = {
     executor,
     syncNodeCards: async (runId) => {
       const runDir = runDirOf(runId);
@@ -618,6 +1015,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         return stageWorkflowNodeSubmission(deps.baseDir(), binding, run.dag, input);
       },
       wake,
+      markClosed: closeMainMarker,
       markSubmitted: (sessionId, nonce) => {
         for (const ds of deps.activeSessions()) {
           if (ds.session.sessionId !== sessionId || ds.session.workflowNode?.nonce !== nonce) continue;
@@ -666,13 +1064,68 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       },
     }),
     isRevoked,
-    admitInbound: (binding, handoffMessageId, executingLarkAppId, existingSessionDir) => {
-      let dir = nodeWorkingDir(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId);
+    resolveInboundWorkingDir: (binding, executingLarkAppId) =>
+      nodeWorkingDir(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId),
+    admitInboundHandoff: async (input) => {
+      const decided = await nodeWorkingDir(runDirOf(input.binding.workflow.runId), input.binding.workflow.runId, input.executingLarkAppId);
+      const session = input.currentSession();
+      if (session === 'stale') return { kind: 'stale' };
+      // Stopped while the directory was being decided: never start its turn.
+      if (isRevoked(input.binding.nonce)) return { kind: 'revoked' };
+      const described = input.describeSession(session);
+      return {
+        kind: 'admission',
+        session,
+        admission: wiring.admitInbound(input.binding, input.handoffMessageId, input.executingLarkAppId, described.dir, described.marker, decided),
+      };
+    },
+    workingDirOperatorRoute: async (raw) => {
+      const request = parseWorkflowWorkingDirOperatorRequest(raw);
+      const runDir = request ? runDirOf(request.runId) : undefined;
+      if (!request || !runDir) return { status: 400, body: { ok: false, error: 'invalid_request' } };
+      const self = deps.selfLarkAppId();
+      // Bound to a run waiting at Gate-2 whose node this bot executes: the
+      // asker names no person or chat, this daemon reads both from the run.
+      const run = pendingOperateRun(runDir, request.runId);
+      if (!run || run.executorOf?.(request.nodeId) !== self) return { status: 404, body: { ok: false, error: 'no_such_node' } };
+      const operate = await initiatorOperates(run, request.runId, self);
+      return { status: 200, body: { ok: true, operate } };
+    },
+    initiatorUnionRoute: async (raw) => {
+      const request = parseWorkflowInitiatorUnionRequest(raw);
+      const runDir = request ? runDirOf(request.runId) : undefined;
+      if (!request || !runDir) return { status: 400, body: { ok: false, error: 'invalid_request' } };
+      // Only this bot's own runs that pin a working dir (or wait at Gate-2,
+      // where one may be asked for), and only to one of their executing bots.
+      const run = frozenOperateRun(runDir, request.runId) ?? pendingOperateRun(runDir, request.runId);
+      if (!run || run.initiator.sourceLarkAppId !== deps.selfLarkAppId()
+        || !run.executors.has(request.requesterLarkAppId) || request.requesterLarkAppId === deps.selfLarkAppId()) {
+        return { status: 404, body: { ok: false, error: 'run_not_eligible' } };
+      }
+      if (run.initiator.unionId) return { status: 200, body: { ok: true, unionId: run.initiator.unionId } };
+      let got: { unionId: string } | { unknown: string };
+      try {
+        got = deps.lookupOwnUnionId ? await deps.lookupOwnUnionId(run.initiator.openId) : { unknown: '主 Bot 查不到发起人的跨应用身份' };
+      } catch {
+        got = { unknown: '主 Bot 查询发起人的跨应用身份失败' };
+      }
+      return 'unionId' in got && isWorkflowUnionId(got.unionId)
+        ? { status: 200, body: { ok: true, unionId: got.unionId } }
+        : { status: 503, body: { ok: false, error: 'unknown' in got ? got.unknown : '主 Bot 查不到发起人的跨应用身份' } };
+    },
+    admitInbound: (binding, handoffMessageId, executingLarkAppId, existingSessionDir, existingMarker, decidedDir) => {
+      const busy = mainTopicBusyReason(binding.placement, binding.nonce, existingMarker, executingLarkAppId);
+      if (busy) {
+        deps.warn(`[workflow] handoff ${handoffMessageId} not started: ${busy}`);
+        void refuse(binding, handoffMessageId, busy, 'MAIN_TOPIC_BUSY');
+        return { start: false, reason: busy };
+      }
+      let dir = decidedDir ?? nodeWorkingDirByRange(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId);
       // The node topic already has a session (someone @-ed the bot there, or
       // moved it with /cd): the handoff would run where that session runs.
       if (dir.kind === 'pinned' && workflowNodeSessionDirConflicts(dir.dir, existingSessionDir)) {
-        deps.warn(`[workflow] handoff ${handoffMessageId}: the node topic's session runs in ${existingSessionDir}, not ${dir.dir}`);
-        dir = { kind: 'refused', reason: '节点话题里已有会话，工作目录与指定的不一致；请在这个话题里关闭该会话后重试，或改派' };
+        deps.warn(`[workflow] handoff ${handoffMessageId}: the existing session runs in ${existingSessionDir}, not ${dir.dir}`);
+        dir = { kind: 'refused', reason: existingSessionDirRefusal(binding.placement) };
       }
       if (dir.kind === 'refused') {
         void refuse(binding, handoffMessageId, dir.reason);
@@ -697,6 +1150,12 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     },
     onRegistered: registered,
     onInputCommitted: (ds, context) => {
+      // F5: a main-topic marker whose attempt ended out of this daemon's
+      // sight (a stop that never arrived) is collected on the next input.
+      const held = ds.session.workflowNode;
+      // (A revoked one goes the stop path below: its running turn is interrupted.)
+      if (held?.placement === 'main' && workflowNodeMarkerActive(held) && !isRevoked(held.nonce)
+        && closeMainMarkerIfOver(held)) return;
       const marker = openMarker(ds);
       if (!marker) return;
       const sessionId = ds.session.sessionId;
@@ -705,6 +1164,13 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         stopHandoffTurn(marker.nonce, sessionId, { evenIfIdle: true });
         return;
       }
+      // A main-topic session is shared with the main bot's own synthetic turns
+      // (event wakes, schedules, report relays): only the handoff's turn and
+      // turns opened by messages in the topic belong to the node.
+      // Before the handoff's own turn started, no other turn is the node's
+      // either: it is someone else's turn ahead of it in the queue.
+      if (marker.placement === 'main' && context.turnId !== marker.handoffMessageId
+        && (!marker.handoffStartedAt || !/^(om_|join_)/.test(context.turnId))) return;
       // Remember every turn started under this handoff: any of them ending
       // without a submission shows the node as stopped.
       if (!marker.turnIds?.includes(context.turnId)) {
@@ -719,6 +1185,30 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       marker.orchestratorAppId, (result) => stopIfRevoked(result, sessionId, marker.nonce));
     },
     onTurnSettled: (ds, context) => {
+      let current = ds.session.workflowNode;
+      if (current?.placement === 'main' && current.lastTurn && !current.lastTurn.settledAt) {
+        // Whatever turn that was, the session is idle again.
+        current = { ...current, lastTurn: { ...current.lastTurn, settledAt: new Date(context.at).toISOString() } };
+        ds.session.workflowNode = current;
+        deps.updateSession(ds);
+      }
+      if (current?.placement === 'main' && current.handoffStartedAt && !current.handoffSettledAt) {
+        // §5.5: the first working → idle edge after the handoff turn started
+        // ends that CLI turn, whatever turn id the frame names (a respawned
+        // worker sends none; another turn may have taken over the envelope).
+        ds.session.workflowNode = { ...current, handoffSettledAt: new Date(context.at).toISOString() };
+        deps.updateSession(ds);
+        // The start notice may have been lost; it is idempotent on the main
+        // bot's side, so say it once more (the deadline then counts from it).
+        if (workflowNodeMarkerActive(current)) {
+          const sessionId = ds.session.sessionId;
+          const startedAt = Date.parse(current.handoffStartedAt);
+          notify({
+            kind: 'accepted', nonce: current.nonce, dispatchRoot: current.handoffMessageId, sessionId,
+            ...(Number.isFinite(startedAt) ? { startedAt } : {}),
+          }, current.orchestratorAppId);
+        }
+      }
       const marker = openMarker(ds);
       if (!marker || !context.turnId) return;
       // Only turns started under this handoff: an idle edge of a turn that
@@ -727,5 +1217,51 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       notify({ kind: 'stalled', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId: ds.session.sessionId, at: context.at },
         marker.orchestratorAppId);
     },
+    onTurnStarted: (ds, context) => {
+      let marker = ds.session.workflowNode;
+      if (!marker) return;
+      const sessionId = ds.session.sessionId;
+      if (marker.placement === 'main' && workflowNodeMarkerActive(marker) && context.turnId !== marker.handoffMessageId) {
+        // Persisted (F2): a stop after a restart still finds the node's
+        // later turn — and knows which worker generation it ran in.
+        marker = { ...marker, lastTurn: { turnId: context.turnId } };
+        ds.session.workflowNode = marker;
+        deps.updateSession(ds);
+      }
+      // Only a main-topic handoff's own turn: a node topic's timeout already
+      // counts from acceptance.
+      if (marker.placement !== 'main' || context.turnId !== marker.handoffMessageId) return;
+      if (!marker.handoffStartedAt) {
+        // Persisted: a stop (also after a restart) knows the node's turn runs.
+        marker = {
+          ...marker,
+          handoffStartedAt: new Date(context.startedAt).toISOString(),
+          ...(ds.workerGeneration !== undefined ? { handoffWorkerGeneration: ds.workerGeneration } : {}),
+        };
+        ds.session.workflowNode = marker;
+        deps.updateSession(ds);
+      }
+      const started = marker;
+      if (!workflowNodeMarkerActive(marker) || isRevoked(marker.nonce)) {
+        // Stopped while it waited in the queue: it must not run.
+        if (!marker.closedAt && !marker.submittedAt) {
+          ds.session.workflowNode = { ...marker, closedAt: new Date().toISOString() };
+          deps.updateSession(ds);
+        }
+        withdrawIdentity(ds, marker.handoffMessageId);
+        deps.interruptTurn(ds, { evenIfIdle: true });
+        return;
+      }
+      // §5.5: queued handoffs were accepted on entering the queue; the node's
+      // deadline counts from here.
+      notify({
+        kind: 'accepted',
+        nonce: marker.nonce,
+        dispatchRoot: marker.handoffMessageId,
+        sessionId,
+        startedAt: context.startedAt,
+      }, started.orchestratorAppId, (result) => stopIfRevoked(result, sessionId, started.nonce));
+    },
   };
+  return wiring;
 }

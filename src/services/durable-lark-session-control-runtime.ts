@@ -61,6 +61,9 @@ export interface DurableLarkSessionControlRuntimeOptions {
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
+  /** Execute an idempotent card-presentation action on the replica that owns
+   * the live worker. The callback returns the same shape as handleCardAction. */
+  handlePresentationControl?(data: DurableJson): Promise<unknown>;
   /** Process-level proof that the admitted provider worker is still usable. */
   isResumeReady?(session: DaemonSession): boolean;
   buildClosedCard(session: DaemonSession | Session): string;
@@ -87,6 +90,20 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function presentationCardJson(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() ? value : undefined;
+  const object = record(value);
+  if (!object) return undefined;
+  const shaped = record(object.card) ?? record(object.deferredCard);
+  if (shaped) {
+    const raw = shaped.type === 'raw' ? shaped.data : shaped;
+    return typeof raw === 'string' ? raw : JSON.stringify(raw);
+  }
+  // Raw card responses are not wrapped until event-dispatcher ACK shaping.
+  if (object.toast || object.afterAck) return undefined;
+  return JSON.stringify(object);
 }
 
 function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
@@ -164,7 +181,7 @@ export function createDurableLarkSessionControlRuntime(
     const rootId = value?.root_id;
     const operatorOpenId = operator?.open_id;
     const cardMessageId = context?.open_message_id ?? data?.open_message_id;
-    if ((actionType !== 'close' && actionType !== 'resume')
+    if ((actionType !== 'close' && actionType !== 'resume' && actionType !== 'toggle_display')
         || typeof sessionId !== 'string'
         || typeof rootId !== 'string'
         || typeof operatorOpenId !== 'string'
@@ -178,7 +195,14 @@ export function createDurableLarkSessionControlRuntime(
         || session.sessionId !== sessionId
         || session.streamCardId !== cardMessageId
         || (actionType === 'close' && session.status !== 'active')
-        || (actionType === 'resume' && session.status !== 'closed')) return false;
+        || (actionType === 'resume' && session.status !== 'closed')
+        || (actionType === 'toggle_display'
+          && (session.status !== 'active'
+            || (value?.target_display_mode !== 'hidden'
+              && value?.target_display_mode !== 'screenshot')))) return false;
+    // toggle_display is a SENSITIVE_CARD_ACTIONS member: the same canOperate
+    // gate the card handler applies, moved before ACK so a click it would drop
+    // never enters the durable lane (#2062 F2, defence in depth).
     return options.canOperate(session.chatId, operatorOpenId);
   };
 
@@ -244,21 +268,32 @@ export function createDurableLarkSessionControlRuntime(
         && canonicalSession.status !== 'closed') {
       return { kind: 'ignored', reason: 'canonical Session cannot be closed' };
     }
+    if (control.action === 'toggle_display' && canonicalSession.status !== 'active') {
+      return { kind: 'ignored', reason: 'canonical Session is not active' };
+    }
     if (source === 'lark-card' && canonicalSession.streamCardId !== control.cardMessageId) {
       return {
         kind: 'ignored',
         reason: `${control.action} card no longer owns the canonical Session lifecycle`,
       };
     }
-    if (!trustedHost && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
+    // toggle_display is gated twice already: before ACK (authorizeBeforeAck)
+    // and by the card handler's SENSITIVE_CARD_ACTIONS check during execute,
+    // whose refusal settles the control (see execute below).
+    if (!trustedHost && control.action !== 'toggle_display'
+        && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
       return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
     }
-    if (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom) {
+    if (control.action !== 'toggle_display'
+        && (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom)) {
       return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
     }
 
     let live = options.findActiveSession(control.sessionId);
     let persisted = options.getPersistedSession(control.sessionId);
+    if (control.action === 'toggle_display' && !live) {
+      throw new Error('active presentation target is owned by another replica');
+    }
     if (control.action === 'close' && canonicalSession.status === 'active') {
       if (!live) {
         const remote = normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState);
@@ -350,6 +385,16 @@ export function createDurableLarkSessionControlRuntime(
     ): { result: DurableJson; evidence: DurableJson } | undefined => {
       const current = options.getPersistedSession(control.sessionId);
       if (!current) return undefined;
+      if (control.action === 'toggle_display') {
+        const target = record(value)?.target_display_mode;
+        const active = options.findActiveSession(control.sessionId);
+        if (!active || (target !== 'hidden' && target !== 'screenshot')) return undefined;
+        if (active.displayMode !== target) return undefined;
+        return {
+          result: result('active', options.buildActiveCard(active), { displayMode: target }),
+          evidence: { source: 'active-session', status: 'active', displayMode: target },
+        };
+      }
       if (control.action === 'close' && current.status === 'closed') {
         return {
           result: result('closed', closeCard),
@@ -450,6 +495,48 @@ export function createDurableLarkSessionControlRuntime(
           }
           const already = observed();
           if (already) return { kind: 'completed', result: already.result };
+          if (control.action === 'toggle_display') {
+            if (!options.handlePresentationControl) {
+              return { kind: 'not_applied', error: 'presentation control is unavailable' };
+            }
+            const handled = await options.handlePresentationControl(control.data);
+            // The Lark ACK already went out on the receiving replica, so a
+            // post-ACK continuation the handler returned must run here.
+            const afterAck = record(handled)?.afterAck;
+            if (typeof afterAck === 'function') await (afterAck as () => Promise<void>)();
+            const target = record(value)?.target_display_mode;
+            const current = options.findActiveSession(control.sessionId);
+            if (!current) {
+              // The live owner moved while the handler ran: another replica
+              // may still apply this click.
+              return { kind: 'not_applied', error: 'presentation target left this replica' };
+            }
+            if (current.displayMode !== target) {
+              // The handler declined (operator gate, stale card, busy PATCH,
+              // closed transport, ...). Retrying the same click cannot change
+              // that verdict, so settle it instead of blocking the partition's
+              // FIFO (#2062 F2). No notice: the non-durable path is silent too.
+              const mode = current.displayMode === 'hidden' || current.displayMode === 'screenshot'
+                ? current.displayMode
+                : undefined;
+              return {
+                kind: 'completed',
+                result: result('active', undefined, {
+                  applied: false,
+                  ...(mode ? { displayMode: mode } : {}),
+                }),
+              };
+            }
+            // A raw/shaped card is the callback response the original ACK
+            // never carried, so the outbox must deliver it. A `{ toast }`
+            // reply means the handler already queued its own PATCH: carrying
+            // a second card here would write the same message twice (#2062 F3).
+            const cardJson = presentationCardJson(handled);
+            return {
+              kind: 'completed',
+              result: result('active', cardJson, { displayMode: target }),
+            };
+          }
           if (control.action === 'close') {
             const closed = await options.closeSession(control.sessionId);
             if (closed.ok) {
@@ -533,6 +620,16 @@ export function createDurableLarkSessionControlRuntime(
           };
         },
         reconcile: async signal => {
+          if (control.action === 'toggle_display') {
+            const reconciled = observed();
+            return reconciled
+              ? { kind: 'completed', ...reconciled }
+              : {
+                  kind: 'not_applied',
+                  error: 'presentation target mode is not installed',
+                  evidence: { source: 'active-session', status: 'active' } as DurableJson,
+                };
+          }
           if (control.action === 'close') {
             const reconciled = observed(true);
             return reconciled
@@ -572,6 +669,10 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'resume'
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))
+              || (control.action === 'toggle_display'
+                && (status !== 'active'
+                  || (parsed.applied !== false
+                    && parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
               || (parsed.cardJson !== undefined && typeof parsed.cardJson !== 'string')
               || (parsed.noticeText !== undefined && typeof parsed.noticeText !== 'string')) {
             throw new Error('durable lifecycle control result is invalid');

@@ -1241,6 +1241,41 @@ describe('shouldSuppressBridgeEmit', () => {
     });
   });
 
+  describe('Claude background-task wake turns (isBackgroundWake)', () => {
+    const wake = (finalText?: string) => ({
+      markTimeMs: 100, isLocal: true, isBackgroundWake: true,
+      ...(finalText !== undefined ? { finalText } : {}),
+    });
+
+    it('transcript delivery forwards a wake turn\'s real answer', () => {
+      expect(shouldSuppressBridgeEmit(wake('CI 已全部跑完：12 项检查全绿'), 200, [], false, 'transcript')).toBe(false);
+    });
+
+    it('send delivery keeps a wake turn an ordinary suppressed local turn', () => {
+      expect(shouldSuppressBridgeEmit(wake('CI 已全部跑完：12 项检查全绿'), 200, [], false, 'send')).toBe(true);
+      expect(shouldSuppressBridgeEmit(wake('CI 已全部跑完：12 项检查全绿'), 200, [], false)).toBe(true);
+    });
+
+    it('NOTHING_TO_SEND silence still suppresses a wake turn in transcript delivery', () => {
+      expect(shouldSuppressBridgeEmit(wake(BRIDGE_NOTHING_TO_SEND_SENTINEL), 200, [], false, 'transcript')).toBe(true);
+    });
+
+    it('an explicit final botmux send in-window still dedups the wake turn', () => {
+      const body = 'CI 已全部跑完：12 项检查全绿';
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent(body)! },
+      ];
+      expect(shouldSuppressBridgeEmit(wake(body), 200, markers, false, 'transcript')).toBe(true);
+      // Pre-text: a declared final send dedups even before the text is read…
+      expect(shouldSuppressBridgeEmit(wake(), 200, markers, false, 'transcript')).toBe(true);
+      // …while a mere progress send defers the decision to the final text.
+      const progress: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中，稍后汇报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(wake(), 200, progress, false, 'transcript')).toBe(false);
+    });
+  });
+
   describe('transcript mode — final is the delivery channel, not a fallback (F1)', () => {
     // Markers MUST come from the real builder: hand-writing { sentAtMs,
     // contentLength } always produces the structured shape and would test the

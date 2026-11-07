@@ -1,7 +1,8 @@
 import { randomBytes } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
+import type { Duplex } from 'node:stream';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   PluginMcpGateway,
@@ -10,7 +11,8 @@ import {
   type GatewayTrustedTurnIdentityProvider,
 } from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
-import { sessionMcpGatewaySocketDir } from './socket-dir.js';
+import { ensurePrivateGatewayDir, sessionMcpGatewaySocketDir } from './socket-dir.js';
+import type { ProtectedMcpWorkerPolicy } from '../../protected-mcp-capabilities.js';
 
 export interface SessionMcpGatewayHost {
   socketPath: string;
@@ -32,33 +34,13 @@ export function sessionMcpGatewayPathRegex(
 }
 
 export {
+  ensurePrivateGatewayDir,
   pinSessionMcpGatewaySocketRoot,
   sessionMcpGatewaySocketDir,
   sessionMcpGatewaySocketPath,
   sessionMcpGatewaySocketRoot,
+  sessionProtectedHttpEgressSocketPath,
 } from './socket-dir.js';
-
-/** Create-or-verify the deterministic socket directory. Fail closed on
- *  anything that is not a 0700 directory owned by this uid: a symlink or a
- *  foreign-owned squat must abort session startup rather than let the Gateway
- *  serve (or the token be written) through an attacker-controlled path. */
-function ensurePrivateGatewayDir(dir: string): void {
-  try {
-    mkdirSync(dir, { mode: 0o700 });
-    return;
-  } catch (err: any) {
-    if (err?.code !== 'EEXIST') throw err;
-  }
-  const stat = lstatSync(dir);
-  if (!stat.isDirectory()) {
-    throw new Error(`Gateway socket dir ${dir} exists and is not a directory (planted symlink/file?)`);
-  }
-  const uid = process.getuid?.();
-  if (uid !== undefined && stat.uid !== uid) {
-    throw new Error(`Gateway socket dir ${dir} is owned by uid ${stat.uid} (expected ${uid})`);
-  }
-  if ((stat.mode & 0o077) !== 0) chmodSync(dir, 0o700);
-}
 
 /** Rotate the Gateway auth token atomically (tmp + rename) so a relay that
  *  re-reads the file mid-rotation always sees either the old or the new token,
@@ -83,6 +65,9 @@ export async function startSessionMcpGatewayHost(opts: {
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   linkRefRegistration?: GatewayLinkRefRegistrationHandler;
+  requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
+  protectedEgressSocketPath?: string;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -117,6 +102,9 @@ export async function startSessionMcpGatewayHost(opts: {
         trustedTurnIdentity: opts.trustedTurnIdentity,
         trustedResultDelivery: opts.trustedResultDelivery,
         linkRefRegistration: opts.linkRefRegistration,
+        requestProtectedSecretChannel: opts.requestProtectedSecretChannel,
+        protectedMcpPolicy: opts.protectedMcpPolicy,
+        protectedEgressSocketPath: opts.protectedEgressSocketPath,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

@@ -1,3 +1,4 @@
+import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
 import {
   Fragment,
@@ -182,6 +183,7 @@ type IdleCleanupBarProps = {
 type IdleCleanupHoursValue = `${IdleCleanupHours}`;
 
 const idleCleanupThresholdOptions = IDLE_CLEANUP_HOUR_OPTIONS.map(hours => ({
+  hours,
   value: String(hours) as IdleCleanupHoursValue,
   label: idleCleanupHoursLabel(hours),
 }));
@@ -719,8 +721,7 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
               aria-label={t('sessions.idleCleanupThreshold')}
             >
               {idleCleanupThresholdOptions.map(option => {
-                const hours = parseIdleCleanupHours(option.value)!;
-                const active = hours === draftHours;
+                const active = option.hours === draftHours;
                 return (
                   <button
                     type="button"
@@ -728,9 +729,9 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
                     className={active ? 'active' : undefined}
                     aria-pressed={active ? 'true' : 'false'}
                     disabled={props.busy}
-                    onClick={() => setDraftHours(hours)}
+                    onClick={() => setDraftHours(option.hours)}
                   >
-                    {option.label}
+                    {option.hours === 0 ? t('sessions.idleCleanupAll') : option.label}
                   </button>
                 );
               })}
@@ -833,7 +834,7 @@ export function SessionsTableBase(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /><ModelPinChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':
@@ -2479,11 +2480,12 @@ function SessionsPage(): React.JSX.Element {
 
   const runIdleCleanup = useCallback(async (hours: IdleCleanupHours): Promise<void> => {
     const nextHours = parseIdleCleanupHours(hours);
-    if (!nextHours) return;
+    if (nextHours === null) return;
     const groups = idleCleanupCandidatesFor(nextHours);
     const candidates = [...groups.idle, ...groups.dormant];
     if (candidates.length === 0) return;
-    setIdleCleanupHours(nextHours);
+    // 「全部」是一次性的极端档位，不参与下次开层的默认值记忆，回落为上一次的非 0 档。
+    setIdleCleanupHours(prev => (nextHours === 0 ? prev : nextHours));
     setIdleCleanupBusy(true);
     setIdleCleanupStatus(t('sessions.idleCleanupRunning'));
     try {

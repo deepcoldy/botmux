@@ -15,7 +15,7 @@ export function checkpointCodexAdoptTurns(
     ? offsetAtMark
     : 0;
   const entries = queue.peek().flatMap(turn => {
-    if (turn.isLocal || turn.dispatchAttempt !== undefined || turn.finalText !== undefined
+    if (turn.isLocal || turn.dispatchAttempt !== undefined
       || turn.markTimeMs === undefined || !turn.contentFingerprint) return [];
     // Capture the cursor on the FIRST checkpoint for this pending turn. Later
     // checkpoints can run after its user/progress records were ingested, so

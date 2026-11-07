@@ -14,6 +14,7 @@ import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.j
 import { bridgePostText } from '../src/services/bridge-fallback-gate.js';
 import { runnerFinalOutcome } from '../src/services/runner-final-outcome.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
+import { claudeSwitchKindForCommand } from '../src/utils/claude-switch-confirm.js';
 import { CodexAppFlushPromptReplay } from '../src/utils/codex-app-turn-liveness.js';
 
 function rawWorker(adapter: ReturnType<typeof createMinimaxAdapter>, backend: { write(bytes: string): boolean }) {
@@ -33,7 +34,7 @@ function rawWorker(adapter: ReturnType<typeof createMinimaxAdapter>, backend: { 
     setCaptureIdentity: (id: string) => { scope.currentBotmuxTurnId = id; }, markTurnRetired() {},
     markTurnExecutionStart() {}, stampMojoTurnMark() {}, writeCliPidMarker() {}, publishSandboxRelayCapability() {},
     isEffortLevelCommand: () => false, claudeBtwQuestion: () => undefined,
-    classifyRawDispatchFailure, isWorkflowWorker: () => false, disarmEffortConfirm() {}, disarmBtwCapture() {},
+    classifyRawDispatchFailure, isWorkflowWorker: () => false, claudeSwitchKindForCommand, disarmSwitchConfirm() {}, disarmBtwCapture() {},
     emitTurnTerminal: (turnId: string, status: string) => events.push({ type: 'turn_terminal', turnId, status }),
     send: (message: Record<string, unknown>) => events.push(message),
     sendFatalWorkerErrorAndExit: async () => { throw new Error('generation fenced'); },
@@ -68,10 +69,11 @@ function idleQueue(worker: ReturnType<typeof rawWorker>) {
     settleRestartAttemptOnReady: noop, shouldFlushInjectionsFirst: off,
     nativeSessionForkPending: off, codexModelMigrationCheckNeeded: off, shouldHoldCodexRunnerInput: off,
     resetTraexAutoModelBeforePendingTurn: off, sessionRenameInFlight: off, shouldDeferUserFlush: off,
-    refreshHookReviewInputHold: noop, pendingInputMayFlush: () => true,
+    refreshHookReviewInputHold: noop, hookReviewHoldsQueuedWrite: off, pendingInputMayFlush: () => true,
     rpcLifecycleFailClosedOwners: new Set(), codexBridgeFallbackActive: off,
     runtimePtyInputPolicy: () => ({ supportsTypeAhead: false, allowBackToBackWrites: false }),
     pendingInputAllowsTypeAhead: off, directRpcTurnBlocksTypeAhead: off, activeTurnBlocks: off,
+    promotePendingHumanInterruption: noop,
     effectiveBackendType: 'tmux', CodexAppFlushPromptReplay, codexAppTurnLiveness: { hasActiveTurn: off },
     bareShellChecked: true, firstWriteMayProceed: () => true, hasRunStartupCommands: true,
     freshnessInputQueue: { onPromptReady: () => 'continue', takeRaw: () => scope.pendingRawInputs.shift() },
@@ -203,7 +205,7 @@ it('queues a compact IPC while the ordinary input flush owns submission', async 
   Object.assign(worker.scope, {
     isFlushing: true, currentBotmuxTurnId: 'business-turn',
     unattendedRawInputRefusal: () => undefined, discardDeploymentContinuation() {},
-    refreshHookReviewInputHold() {}, nativeSessionForkPending: () => false,
+    refreshHookReviewInputHold() {}, hookReviewAdmissionScreen: () => '', nativeSessionForkPending: () => false,
     firstWriteLivenessConfirmed: true, startupCommandAckHold: null,
     sessionRenameInFlight: () => false, shouldHoldCodexRunnerInput: () => false,
     shouldDeferUserFlush: () => false, codexModelMigrationHoldsRawInput: () => false,

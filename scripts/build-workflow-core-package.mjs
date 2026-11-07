@@ -114,6 +114,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/artifact-contract-declarations.ts',
     'src/workflows/v3/attempt-ledger.ts',
     'src/workflows/v3/attempt-numbering.ts',          // leaf: journal-derived attempt ids
+    'src/workflows/v3/checkpoint-hold.ts',            // pure journal fold + allowlisted v3 modules
     'src/workflows/v3/contract.ts',
     'src/workflows/v3/core-control.ts',
     'src/workflows/v3/dag.ts',
@@ -131,6 +132,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/journal.ts',
     'src/workflows/v3/manifest.ts',                   // node built-ins + contract.ts
     'src/workflows/v3/orchestrator.ts',
+    'src/workflows/v3/placement.ts',                  // pure §5.2 placement rules + dag.ts
     'src/workflows/v3/portable-artifact-snapshot.ts',
     'src/workflows/v3/portable-final-outputs.ts',
     'src/workflows/v3/portable-run-snapshot.ts',
