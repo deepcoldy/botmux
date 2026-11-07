@@ -1175,9 +1175,11 @@ export function reconcileVcMeetingDeliveriesOnBoot(
   const affected: VcMeetingAmbiguousReceiptRef[] = [];
   // Runs synchronously in daemon startup for every bot, over every meeting file
   // (filtering by agent happens after the read). One unreadable file must not
-  // abort startup host-wide: skip it — a stale `dispatched` receipt it holds is
-  // still turned ambiguous by the periodic lease sweep
-  // (expireVcMeetingDeliveryLeases) once its lease runs out.
+  // abort startup host-wide: skip it. Receipts in OTHER files are reconciled
+  // here and, if this bot is not restarting, by the periodic lease sweep
+  // (expireVcMeetingDeliveryLeases) — both isolate per file. The bad file's
+  // own stale receipts stay untouched until the file is repaired/removed
+  // (a persistent error such as EISDIR/EACCES is never self-healing).
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -1239,6 +1241,10 @@ export function reconcileVcMeetingDeliveriesOnBoot(
  *   转移后同 key 重派会 bump attempt，旧派发的迟到 terminal 被世代证据拒。
  * - 幂等：已 ambiguous / 已 terminal / 未到期 / 别的 agent 一律不动，
  *   重复调用返回空增量。
+ * - 逐文件隔离（与 reconcileOnBoot 同形）：readdirSync 失败返回空增量；
+ *   单个会议文件读不了只 warn 跳过这一轮的该文件——文件名排序在它之后的
+ *   健康会议不能被一个坏文件拖成永久 dispatched。坏文件自身的回执需人工
+ *   修复后才会被处理。
  * - lease 时间锚 = dispatchedAt（老记录缺席时以 updatedAt 兜底——dispatched
  *   期间没有其它转移刷新它，两者等价）。
  */
@@ -1251,39 +1257,52 @@ export function expireVcMeetingDeliveryLeases(
   const dir = join(dataDir, DIR_NAME);
   if (!existsSync(dir)) return [];
   const affected: VcMeetingAmbiguousReceiptRef[] = [];
-  for (const name of readdirSync(dir)) {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    logger.warn(`[vc-meeting-delivery-store] lease sweep skipped: cannot list ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+  for (const name of names) {
     if (!name.endsWith('.json')) continue;
     const fp = join(dir, name);
-    withFileLockSync(fp, () => {
-      const state = readStateFileForMutation(fp);
-      if (!state) return;
-      let changed = false;
-      for (const stream of Object.values(state.streams)) {
-        const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
-        if (projection?.agentAppId !== input.agentAppId) continue;
-        const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
-        if (!active || active.status !== 'dispatched') continue;
-        const anchoredAt = active.dispatchedAt ?? active.updatedAt;
-        if (now - anchoredAt <= input.leaseMs) continue;
-        active.status = 'ambiguous';
-        active.ambiguousReplayCount += 1;
-        active.updatedAt = now;
-        stream.updatedAt = now;
-        changed = true;
-        affected.push({
-          listenerAppId: stream.listenerAppId,
-          meetingId: stream.meetingId,
-          memberId: stream.memberId,
-          memberEpoch: stream.memberEpoch,
-          deliveryKey: active.deliveryKey,
-          receiverSessionId: stream.receiverSessionId,
-          workerGeneration: active.workerGeneration,
-          dispatchAttempt: active.dispatchAttempt,
-          ambiguousReplayCount: active.ambiguousReplayCount,
-        });
-      }
-      if (changed) writeStateFile(fp, state, now);
-    });
+    try {
+      withFileLockSync(fp, () => {
+        const state = readStateFileForMutation(fp);
+        if (!state) return;
+        let changed = false;
+        for (const stream of Object.values(state.streams)) {
+          const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
+          if (projection?.agentAppId !== input.agentAppId) continue;
+          const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
+          if (!active || active.status !== 'dispatched') continue;
+          const anchoredAt = active.dispatchedAt ?? active.updatedAt;
+          if (now - anchoredAt <= input.leaseMs) continue;
+          active.status = 'ambiguous';
+          active.ambiguousReplayCount += 1;
+          active.updatedAt = now;
+          stream.updatedAt = now;
+          changed = true;
+          affected.push({
+            listenerAppId: stream.listenerAppId,
+            meetingId: stream.meetingId,
+            memberId: stream.memberId,
+            memberEpoch: stream.memberEpoch,
+            deliveryKey: active.deliveryKey,
+            receiverSessionId: stream.receiverSessionId,
+            workerGeneration: active.workerGeneration,
+            dispatchAttempt: active.dispatchAttempt,
+            ambiguousReplayCount: active.ambiguousReplayCount,
+          });
+        }
+        if (changed) writeStateFile(fp, state, now);
+      });
+    } catch (err) {
+      logger.warn(
+        `[vc-meeting-delivery-store] lease sweep skipped ${fp}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return affected;
 }

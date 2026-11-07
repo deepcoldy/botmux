@@ -1923,6 +1923,37 @@ describe('VC meeting daemon session lifecycle', () => {
       expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
       expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_half')).toBe(false);
     });
+
+    it('keeps a healthy session that existed before restore when the same record fails again', () => {
+      vi.useFakeTimers();
+      registerListener();
+      preparationRecords.push({
+        larkAppId: APP_ID, meetingNo: '688542737', prepChatId: 'oc_m_restore_existing', agentAppId: AGENT_APP_ID, qaMode: 'auto',
+      });
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: 'm_restore_existing', topic: 'existing' },
+        listenerChatId: 'oc_m_restore_existing',
+        preparationMeetingNo: '688542737',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_existing')).toBe(true);
+      const timersAfterFirstRestore = vi.getTimerCount();
+      expect(timersAfterFirstRestore).toBeGreaterThan(0);
+
+      // The second restore fetches the already-restored session, then fails. The
+      // catch must only tear down entries THIS restore created, never the
+      // pre-existing healthy session or its timers.
+      vi.mocked(getVcMeetingPreparation).mockImplementationOnce(() => {
+        throw new Error('injected failure against existing session');
+      });
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_existing')).toBe(true);
+      expect(vi.getTimerCount()).toBe(timersAfterFirstRestore);
+    });
   });
 
   it('global VC switch blocks stale confirmation cards from starting a new listener', async () => {
@@ -7776,6 +7807,64 @@ describe('VC meeting daemon session lifecycle', () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(triggerSessionCalls).toHaveLength(1);
     expect(triggerSessionCalls[0].req.envelope.payload.stream.final).toBe(true);
+  });
+
+  it('keeps a closing entry restored earlier when a later restore of that meeting fails', async () => {
+    vi.useFakeTimers();
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchItems: 1,
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_close_restore_existing',
+      meeting: { id: 'm_close_restore_existing', meetingNo: '585858589', topic: 'Close restore existing' },
+      raw: { event: { meeting: { id: 'm_close_restore_existing', meeting_no: '585858589' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    expect(__vcMeetingAgentTest.beginCloseIntentForTest(APP_ID, 'm_joined_585858589')).toBeTypeOf('number');
+
+    const restart = () => {
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+    };
+    restart();
+    // First restore succeeds: the durable-close record becomes the live closing
+    // entry that a later (re-entrant) restore must not tear down.
+    __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_585858589')).toBe(false);
+
+    // The next restore re-enters the durable-close branch and fails persisting
+    // after replacing the entry. The catch only removes entries IT created, so
+    // the pre-existing closing state stays and reconciliation is not dropped.
+    vi.mocked(recordVcMeetingRuntimeSession).mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+    expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    // The session created by this failed restore is still cleaned up.
+    expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_585858589')).toBe(false);
+    // The durable record is kept for another restart to retry from.
+    expect(runtimeStoreRecords.some(r => r.meeting.id === 'm_joined_585858589')).toBe(true);
   });
 
   it('abandons and retires a frozen close epoch at the hard deadline when its body cannot be recovered', async () => {
