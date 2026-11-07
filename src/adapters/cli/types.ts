@@ -591,6 +591,8 @@ export interface CliAdapter {
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
      *  命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 CLI。 */
     readonly sessionStartCommand?: string;
+    /** 原生 Claude PreCompact 维护事件，不触发 prompt-ready。 */
+    readonly preCompactCommand?: string;
     /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
      *  - claude-settings：写进全局 settings.json 的 hooks.UserPromptSubmit
      *  hook 子进程按 stdin 的 prompt 内容指纹读回 daemon 预写的 sidecar，

@@ -23,7 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { claudeCompactionHookCommand, claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -1686,6 +1686,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
       // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
+      preCompactCommand: variant.id === 'claude-code' ? claudeCompactionHookCommand() : undefined,
       // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
       // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
       // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。

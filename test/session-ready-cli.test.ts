@@ -26,6 +26,7 @@ function runSessionReady(
   dataDir: string,
   relayDir: string,
   port: number,
+  command = 'session-ready',
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const env = {
@@ -41,7 +42,7 @@ function runSessionReady(
 
     const child = spawnTsScript(
       CLI_PATH,
-      ['session-ready'],
+      [command],
       { env, stdio: ['pipe', 'pipe', 'pipe'] },
     ) as ChildProcessWithoutNullStreams;
     let stdout = '';
@@ -52,12 +53,12 @@ function runSessionReady(
     child.stderr.on('data', (chunk: string) => { stderr += chunk; });
     child.once('error', reject);
     child.once('close', status => resolve({ status, stdout, stderr }));
-    child.stdin.end(JSON.stringify({ source: 'startup' }));
+    child.stdin.end(JSON.stringify(command === 'session-ready' ? { source: 'startup' } : { hook_event_name: 'PreCompact', trigger: 'auto' }));
   });
 }
 
 describe('botmux session-ready — isolated CLI fallback', () => {
-  it('uses the injected daemon port when the discovery directory is absent', async () => {
+  it.each(['session-ready', '__claude-compaction-v1'])('uses authenticated isolated IPC for %s without the discovery directory', async (command) => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-session-ready-data-'));
     const relayDir = mkdtempSync(join(tmpdir(), 'botmux-session-ready-relay-'));
     tempDirs.push(dataDir, relayDir);
@@ -84,14 +85,18 @@ describe('botmux session-ready — isolated CLI fallback', () => {
 
     try {
       const port = (server.address() as AddressInfo).port;
-      const result = await runSessionReady(dataDir, relayDir, port);
+      const result = await runSessionReady(dataDir, relayDir, port, command);
       expect(result).toEqual({ status: 0, stdout: '', stderr: '' });
-      expect(receivedUrl).toBe('/api/session-ready');
+      expect(receivedUrl).toBe(command === 'session-ready' ? '/api/session-ready' : '/api/claude-compaction-start-v1');
       expect(JSON.parse(receivedBody)).toMatchObject({
         sessionId: 'sess_ready_test',
-        source: 'startup',
         originCapability: capability,
       });
+      if (command === 'session-ready') expect(JSON.parse(receivedBody).source).toBe('startup');
+      else {
+        expect(JSON.parse(receivedBody).startedAtMs).toEqual(expect.any(Number));
+        expect(JSON.parse(receivedBody).startedAtMs).toBeLessThanOrEqual(Date.now());
+      }
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close(err => err ? reject(err) : resolve());

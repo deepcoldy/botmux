@@ -10918,10 +10918,11 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // 该会话的 worker；worker 放行被 ready-gate 门控的首条 prompt（绕开 cjadk 启动
 // 选择器吞首条消息）。找不到会话 / worker 仍返回 200（best-effort）：worker 侧
 // 有超时兜底，信号丢失不致命，没必要让 hook 客户端报错。
-ipcRoute('POST', '/api/session-ready', async (req, res) => {
+async function handleSessionLifecycleSignal(req: IncomingMessage, res: ServerResponse, compaction = false): Promise<void> {
   let raw: {
     sessionId?: unknown;
     source?: unknown;
+    startedAtMs?: unknown;
     originCapability?: unknown;
     originTurnId?: unknown;
     originDispatchAttempt?: unknown;
@@ -10934,6 +10935,10 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
   if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
   const source = typeof raw.source === 'string' ? raw.source : undefined;
+  if (compaction && (typeof raw.startedAtMs !== 'number' || !Number.isSafeInteger(raw.startedAtMs)
+    || raw.startedAtMs < 0 || raw.startedAtMs > Date.now())) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_startedAtMs' });
+  }
 
   let ds: DaemonSession | undefined;
   for (const s of activeSessions.values()) {
@@ -10969,7 +10974,9 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     const requestId = randomUUID();
     const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
-      ds.worker.send({ type: 'session_ready', source, requestId } as DaemonToWorker);
+      ds.worker.send(compaction
+        ? { type: 'claude_compaction_start', startedAtMs: raw.startedAtMs as number, requestId }
+        : { type: 'session_ready', source, requestId } as DaemonToWorker);
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
       cancelSessionReadyAck(requestId);
@@ -10981,7 +10988,10 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     }
   }
   return jsonRes(res, 200, { ok: true });
-});
+}
+
+ipcRoute('POST', '/api/session-ready', (req, res) => handleSessionLifecycleSignal(req, res));
+ipcRoute('POST', '/api/claude-compaction-start-v1', (req, res) => handleSessionLifecycleSignal(req, res, true));
 
 // ─── turn-idle IPC route (internal: 结构化回合空闲信号) ────────────────────────
 //
