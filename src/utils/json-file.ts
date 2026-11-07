@@ -148,7 +148,11 @@ export class StoreFileUnavailableError extends Error {
   readonly code: string | undefined;
   /** Which stage failed: 'read' | 'parse' | 'stat' | 'list' | 'lock' | 'update' | 'quarantine' …
    * 'parse' means bytes were read but the content is unusable (callers may
-   * offer a rebuild path); the others mean a transient I/O failure. */
+   * offer a rebuild path); the others mean a transient I/O failure.
+   * Convention: 'parse' is reserved for "bytes read, content invalid" and
+   * drives user-facing "rebuild instead of retry" replies (see the /vc
+   * handler). Introducing a new op value — or reusing 'parse' for anything
+   * else — must review every consumer that classifies on it. */
   readonly op: string;
   constructor(label: string, path: string, op: string, cause: unknown) {
     const code = errCode(cause);

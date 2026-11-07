@@ -793,7 +793,7 @@ export const messages: Record<string, string> = {
   'cmd.vc.project_optional': 'No project directory is bound to this session. To let meeting Q&A use local code, send `/cd <project directory>`; otherwise answers will use this chat, watched documents, and meeting captions only.',
   'cmd.vc.replaced': 'Note: this group was also bound to meeting `{meetingNo}`. The old record remains; remove it with `/vc off {meetingNo}` if needed.',
   'cmd.vc.store_unavailable': 'Meeting preparation records are temporarily unavailable (the file is unreadable or busy); this operation did not complete. Please try again later.',
-  'cmd.vc.store_corrupt': 'The meeting preparation file is corrupt; the original was kept in the same directory as a .corrupt evidence file. Retrying cannot recover it — send `/vc prepare` again to rebuild the binding (or `/vc off` to clear it); earlier bindings must be set up again.',
+  'cmd.vc.store_corrupt': 'The meeting preparation file is corrupt (its content is not valid JSON). Retrying cannot recover it: sending `/vc prepare` saves the original aside as a .corrupt evidence file in the same directory and then rebuilds the binding (or use `/vc off` to clear it); earlier bindings must be set up again.',
   'daemon.doc_mention_notify_title': '📄 Doc @bot trigger notification',
   'daemon.doc_mention_notify_body': 'User {requester} mentioned the bot in doc {token} and triggered a reply.',
   'daemon.doc_dropped_notify_title': '⚠️ Doc comment event not handled',
