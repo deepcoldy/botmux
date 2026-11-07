@@ -605,6 +605,12 @@ import {
   closeCliMismatchedSessionsForBot,
   resolveScheduledTaskExecutionPosition,
 } from './core/session-manager.js';
+import { createGroupSecretaryRuntime, setGroupSecretaryRuntime } from './services/group-secretary-runtime.js';
+import { fetchObserveSnapshot } from './services/session-observe-command-fetch.js';
+import { fetchSessionRecentTranscript } from './services/group-secretary-transcript.js';
+import { readSecretaryMarker, writeSecretaryMarker } from './services/group-secretary-marker.js';
+import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecretaryPeers, type SecretaryPeer } from './services/group-secretary-federation.js';
+import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
@@ -25935,7 +25941,7 @@ async function prepareGroupBackground(data: any, ctx: RoutingContext): Promise<v
       configuredTrigger: !!ctx.commandTrigger,
       renderedPrompt: ctx.commandTrigger ? renderCommandTriggerPrompt(ctx.commandTrigger) : undefined,
     });
-    if (!query) return;
+    if (query === undefined) return;
     void ensureGroupContextRecallHealth(ctx.larkAppId, () => ensureMessageRecalledEventSubscribed(ctx.larkAppId));
     const ds = activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.larkAppId));
     if (ds && sessionPromptInjection(ds) === 'none') return;
@@ -35285,6 +35291,85 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   setDecisionBoardService(decisionBoard);
   setDecisionCardService(decisionBoard);
+
+  // 群秘书（/secretary on）：旁听开启群的消息 + 每 10 秒拉一次本机会话快照，摘要以静默回合
+  // 送进本 bot 在该群的 chat 级会话。没有开启的群时每拍只做一次查表。
+  let secretaryRemoteAppPeer = new Map<string, SecretaryPeer>();
+  setGroupSecretaryRuntime(createGroupSecretaryRuntime({
+    larkAppId: cfg.larkAppId,
+    selfOpenId: () => getBot(cfg.larkAppId).botOpenId,
+    canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
+    fetchSnapshot: () => fetchObserveSnapshot(),
+    fetchTranscript: async (appId, sessionId, chatId) => {
+      const local = await fetchSessionRecentTranscript(appId, sessionId);
+      if (local) return local;
+      const peer = appId ? secretaryRemoteAppPeer.get(appId) : undefined;
+      return peer && appId ? fetchRemoteSecretaryTranscript(peer, appId, sessionId, chatId) : undefined;
+    },
+    readMarker: chatId => readSecretaryMarker(cfg.larkAppId, chatId),
+    writeMarker: (chatId, appId, opts) => writeSecretaryMarker(cfg.larkAppId, chatId, appId, opts),
+    fetchRemoteViews: async chatIds => {
+      const peers = listSecretaryPeers(config.session.dataDir);
+      if (peers.length === 0 || chatIds.length === 0) return [];
+      const remote = await fetchRemoteSecretarySessions(peers, chatIds);
+      secretaryRemoteAppPeer = remote.appPeer;
+      return remote.views;
+    },
+    fetchRecentMessages: chatId => listChatMessages(cfg.larkAppId, chatId, 50),
+    groupContextEnabled: (chatId: string) => getGroupContextSettings(cfg.larkAppId, chatId).enabled,
+    manualWatches: () => listSecretaryWatches(cfg.larkAppId),
+    deliver: async input => {
+      // 秘书回合没有触发消息，Context Sharing 默认拿不到锚点（只会注入空壳）。这里替本轮按
+      // 「整群」范围准备一份增量：与 @ 秘书的普通回合共用同一条已投递记录，互不重复。
+      if (getGroupContextSettings(cfg.larkAppId, input.chatId).enabled) {
+        const ds = activeSessions.get(sessionKey(input.chatId, cfg.larkAppId));
+        const cliId = ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? getBot(cfg.larkAppId).config.cliId;
+        try {
+          await prepareGroupContextForTurn({
+            appId: cfg.larkAppId, chatId: input.chatId, turnId: input.turnId,
+            query: '群秘书：通览全群最新动态', createTime: Date.now(), scope: 'all',
+            ...(ds ? {
+              sessionId: ds.session.sessionId,
+              epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, input.turnId),
+            } : {}),
+          });
+        } catch {
+          logger.warn('[group-secretary] group context preparation failed; delivering without it');
+        }
+      }
+      return withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+      larkAppId: cfg.larkAppId,
+      chatId: input.chatId,
+      turnId: input.turnId,
+      prompt: input.prompt,
+      announcement: { texts: [], images: [] },
+      attachments: [],
+      ownerOpenId: input.ownerOpenId,
+      sessionTitle: tr('cmd.secretary.session_title', undefined, localeForBot(cfg.larkAppId)),
+      silent: true,
+    }, activeSessions, refreshCliVersion, {
+      prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
+    }));
+    },
+    // 话题巡查：回合投进秘书在该话题的 thread 会话（落点天然是这个话题），巡查完关掉新建的会话。
+    deliverPatrol: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+      larkAppId: cfg.larkAppId,
+      chatId: input.chatId,
+      turnId: input.turnId,
+      prompt: input.prompt,
+      announcement: { texts: [], images: [] },
+      attachments: [],
+      ownerOpenId: input.ownerOpenId,
+      sessionTitle: tr('cmd.secretary.patrol_session_title', undefined, localeForBot(cfg.larkAppId)),
+      silent: true,
+      threadRootId: input.threadRoot,
+    }, activeSessions, refreshCliVersion, {
+      prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
+    })),
+    closePatrolSession: sessionId => closeSessionForBackgroundCleanup(sessionId, 'group-secretary patrol finished'),
+    log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+  }));
+
   // 「自动发现可以关的项」：管家开了这个开关才真正干活（sweepHints 内部判断），没开的 bot 每轮只读一次配置。
   // 5 分钟一轮：PR 合入后十来分钟内出提示（开着的 PR 每 10 分钟最多查一次，见 github-pr-state.ts），
   // 复查时间到点后最多晚一轮；不需要更密。

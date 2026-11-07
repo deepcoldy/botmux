@@ -57,6 +57,8 @@ import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
+import { tryHandleSecretaryCommand } from './secretary-command.js';
+import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
@@ -5169,7 +5171,7 @@ export function createLarkEventDispatcherRuntime(
     if (!rawText) return false;
     const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
     if (/^\/introduce(?:\s|$)/i.test(text)) return true;
-    const match = /^\/(reply-mode|tabs?|mention-mode|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
+    const match = /^\/(reply-mode|tabs?|mention-mode|secretary|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
     if (!match) return false;
     const command = match[1]!.toLowerCase();
     if (message.chat_type !== 'p2p' && !isBotMentioned(larkAppId, message, senderOpenId)) {
@@ -5236,6 +5238,8 @@ export function createLarkEventDispatcherRuntime(
       // 编辑事件走 processMessageUpdatedEvent 时已按「确认过的群类型」采集过（或判定不采集），
       // 这里不再二次处理，避免用回落猜测的 chat_type 把查不到群类型的编辑也收进去。
       if (chatType === 'group' && !data.__groupContextHandled) ingestGroupContextEvent(larkAppId, data);
+      // 群秘书旁听（/secretary on 的群）：只喂判定引擎，不改变下面的唤醒 / 权限判定，永不抛出。
+      if (chatType === 'group') observeGroupSecretaryMessage(data);
 
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also
@@ -5626,6 +5630,10 @@ export function createLarkEventDispatcherRuntime(
       }
 
       if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
+      }
+
+      if (await tryHandleSecretaryCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return;
       }
 
