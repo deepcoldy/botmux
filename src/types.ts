@@ -621,6 +621,10 @@ export interface Session {
      *  rewritten if the prompt never reached the CLI. */
     runId?: string;
   };
+  /** Host-written link between a scheduled model turn and its execution ledger. */
+  scheduledRun?: { taskId: string; runId: string; turnId: string; requesterSubjectId?: string };
+  /** Retain overlapping turns in a reused schedule/chat session. */
+  scheduledRuns?: Record<string, NonNullable<Session['scheduledRun']>>;
   /** Dedicated VC meeting consumer session identity. These sessions share the
    *  listener chat as their output route, but MUST NOT share the ordinary
    *  chat-scope routing slot (or another meeting/member's CLI context). */
@@ -1706,6 +1710,19 @@ export interface ScheduledTask {
   lastCalendarCheck?: import('./services/work-calendar.js').CalendarCheck;
   /** Durable CLI run-now request; consumed atomically when claiming a run. */
   manualRunRequested?: boolean;
+  /** Host-issued single-run exception to pause; never changes enabled. */
+  manualRunAuthorization?: { runId: string; turnIds: string[] };
+  /** Idempotence marker for a late delivery failure of lastRunId. */
+  deliveryFailureRunId?: string;
+  lastDeliveryErrorCode?: string;
+  deliveryFailureState?: {
+    runId: string;
+    targets: Record<string, string>;
+    counted: boolean;
+    previousStatus: ScheduledTask['lastStatus'];
+    previousError?: string;
+    previousConsecutiveFailures: number;
+  };
   /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
    *  never stored in this sandbox-writable task row. Absence does not prove
    *  that no condition exists: runtime always checks the sidecar by task id. */

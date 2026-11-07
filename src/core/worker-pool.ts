@@ -932,6 +932,7 @@ import {
   parseScheduledTurnId,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
+import { scheduledSessionRun } from './scheduled-send.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
@@ -1269,9 +1270,8 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { turnId: string; reason: string; messageKey: string },
   ) => void;
-  /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
-   * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
-   * adapters use the existing debounced idle edge as a compatibility fallback. */
+  /** A scheduled turn can reconcile delivery (and reclaim hidden sessions)
+   * once settled. Screen-only/remote adapters use the debounced idle edge. */
   onDeferredScheduleTurnSettled?: (
     ds: DaemonSession,
     context: { turnId: string; source: 'terminal' | 'idle'; errorCode?: string },
@@ -16977,7 +16977,7 @@ function setupWorkerHandlers(
   if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
     ds.hermesBridgeSourceSessionIds = undefined;
   }
-  let deferredScheduleIdleTurnId: string | undefined;
+  const deferredScheduleIdleTurnIds = new Set<string>();
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -19077,15 +19077,17 @@ function setupWorkerHandlers(
           }
         }
 
-        // The dedicated hidden run retains its identity after the worker retires
-        // its capture turn. Never borrow a shared session's current/queued turn.
+        // A hidden run retains its identity after the worker retires its capture
+        // turn; retained sessions require an exact host-written run association.
+        // Never borrow a shared session's current/queued turn.
         // Notify once per idle episode, including a first frame already at idle,
         // so repeated snapshots cannot keep resetting the settlement debounce.
-        const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId);
-        if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnId = undefined;
+        const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId)
+          ?? (msg.turnId && scheduledSessionRun(ds.session, msg.turnId) ? msg.turnId : undefined);
+        if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnIds.clear();
         if (ds.lastScreenStatus === 'idle' && deferredTurnId
-          && deferredScheduleIdleTurnId !== deferredTurnId) {
-          deferredScheduleIdleTurnId = deferredTurnId;
+          && !deferredScheduleIdleTurnIds.has(deferredTurnId)) {
+          deferredScheduleIdleTurnIds.add(deferredTurnId);
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
 
