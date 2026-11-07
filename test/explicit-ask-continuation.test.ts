@@ -1,5 +1,5 @@
 import { validateTriggerRequest } from '../src/services/trigger-types.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -23,7 +23,8 @@ function setup() {
   const onError = vi.fn();
   const deps = { dir, appId: 'app', register, dispatch, onError, now: () => clock, canResume: () => resumable };
   return { deps, manager: createExplicitAskContinuation(deps), register, dispatch, onError,
-    tick: () => { clock += 6000; }, setResumable: (value: boolean) => { resumable = value; } };
+    tick: () => { clock += 6000; }, advance: (ms: number) => { clock += ms; },
+    setResumable: (value: boolean) => { resumable = value; } };
 }
 describe('explicit Ask durable continuation', () => {
   it.each(['group', 'p2p'] as const)('production recovery builder respects %s transport permission', chatType => {
@@ -45,6 +46,25 @@ describe('explicit Ask durable continuation', () => {
     expect(await rebooted.wait(input)).toEqual(answer);
     await rebooted.sweep();
     expect(t.register).toHaveBeenCalledTimes(1); expect(t.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['acknowledged', 'delivered'] as const)('keeps a %s receipt for late reconnects, then deletes it', async state => {
+    const t = setup(); const day = 24 * 3600000;
+    await t.manager.wait(input);
+    if (state === 'acknowledged') t.manager.acknowledge(input);
+    else { t.tick(); await t.manager.sweep(); expect(t.dispatch).toHaveBeenCalledTimes(1); }
+    t.advance(day); await t.manager.sweep();
+    expect(readdirSync(t.deps.dir)).toHaveLength(1);
+    expect(await createExplicitAskContinuation(t.deps).wait(input)).toEqual(answer);
+    t.advance(30 * day); await t.manager.sweep();
+    expect(readdirSync(t.deps.dir)).toEqual([]);
+    expect(t.register).toHaveBeenCalledTimes(1); expect(t.dispatch).toHaveBeenCalledTimes(state === 'delivered' ? 1 : 0);
+  });
+  it('never deletes an answer that was neither acknowledged nor delivered', async () => {
+    const t = setup(); await t.manager.wait(input); t.setResumable(false);
+    t.advance(30 * 24 * 3600000); await t.manager.sweep();
+    expect(readdirSync(t.deps.dir)).toHaveLength(1);
+    t.setResumable(true); await t.manager.sweep();
+    expect(t.dispatch).toHaveBeenCalledTimes(1);
   });
   it('matches origin, attempt and worker generation against live daemon authority', () => {
     const receipt = { version: 1 as const, input, result: answer,

@@ -465,7 +465,6 @@ To migrate legacy environment secrets, provision the safe file and change the co
 
 A restarted stdio MCP process currently cannot receive the one-shot secret again and falls back to read-only; recreate the session to restore protected capabilities. User-visible errors from the different policy collection entry points remain a follow-up.
 
-||||||| 15acd8dde
 ### Run CLI calls as the message sender (`triggerUserAuth`) {#trigger-user-auth}
 
 **Off by default.** When on, `lark-cli` / `bytedcli` in this bot's sessions run with the authorization of whoever sent the current message, not whatever is logged in on the machine. Useful when several people share one bot: each message reads docs, checks calendars or calls internal platforms as its own sender.

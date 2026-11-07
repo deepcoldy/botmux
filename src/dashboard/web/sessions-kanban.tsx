@@ -518,6 +518,8 @@ function RenameInput(props: {
 
 function KanbanCardBase(props: {
   row: any;
+  /** 不在群簇里的单张卡片自己带群头像；簇内成员由簇头统一显示。 */
+  chatAvatar?: boolean;
   dragId: string | null;
   dropBeforeId: string | null;
   editingId: string | null;
@@ -616,6 +618,13 @@ function KanbanCardBase(props: {
           onClick={event => event.stopPropagation()}
           onChange={() => callbacks.onToggleSelect(row)}
         />
+        {props.chatAvatar && row.chatId ? (
+          <span
+            className="kanban-card-avatar"
+            title={chatTitle ?? String(row.chatId)}
+            dangerouslySetInnerHTML={rawHtml(chatAvatarHtml({ chatId: row.chatId, name: chatTitle ?? String(row.chatId), size: 'sm' }))}
+          />
+        ) : null}
         <span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span>
         {row.adopt ? <span className="badge">adopt</span> : null}
         {row.locked ? <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span> : null}
@@ -687,7 +696,7 @@ function KanbanCardBase(props: {
  * 而不是整列。
  */
 const KanbanCard = memo(KanbanCardBase, (prev, next) => {
-  if (prev.row !== next.row) return false;
+  if (prev.row !== next.row || !!prev.chatAvatar !== !!next.chatAvatar) return false;
   const id = next.row.sessionId;
   // callbacks 是整个 props 对象：selectedSessionIds 每次选中都是新 Set，onXxx 现在已在
   // 页面侧固定。所以不能拿它的引用当判据（那等于 memo 永不命中），要逐个比卡片真正
@@ -732,7 +741,7 @@ function ClusterViewBase(props: {
   onDragStartCluster: (chatId: string, col: SessionKanbanColumn, event: DragEvent<HTMLElement>) => void;
 }): React.JSX.Element {
   const item = props.item;
-  if (item.type === 'card') return <KanbanCard {...props.cardProps} row={item.row} />;
+  if (item.type === 'card') return <KanbanCard {...props.cardProps} row={item.row} chatAvatar />;
   const title = chatDisplayTitle(item.rows[0]) ?? item.chatId;
   const dragging = props.dragCluster?.chatId === item.chatId && props.dragCluster.col === props.columnId;
   const visibleRows = props.expanded
