@@ -811,6 +811,11 @@ export interface DaemonSession {
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    /** In memory only (never in the durable async store): the provider's raw
+     *  error text and the screen tail the worker's failed terminal carried,
+     *  masked and clipped (services/turn-failure-diagnostics). */
+    terminalErrorDetail?: string;
+    terminalScreenTail?: string;
     interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;

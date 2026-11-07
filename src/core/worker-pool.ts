@@ -3,6 +3,7 @@ import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
 import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
 import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
 import { codexAppSettlementOutcome } from '../services/runner-final-outcome.js';
+import { turnFailureDiagnostics } from '../services/turn-failure-diagnostics.js';
 import { canTalk, evaluateTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
@@ -888,6 +889,7 @@ import {
   storedSessionAnchorId,
   isDocNativeSession,
   isHttpVirtualSession,
+  isHeadlessSessionChatId,
   larkTransportEnabled,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
@@ -16533,6 +16535,16 @@ function forkWorkerPrepared(
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.
     ...(isWorkflowNodeSessionMarker(ds.session.workflowNode) ? { workflowNodeSession: true as const } : {}),
+    // A workflow draft's clarify session (persisted on the session, so every
+    // fork — restore, resume, cold resume after an idle release — carries it):
+    // only its failed turns capture the provider's error and the screen tail.
+    // Once moved into its topic (拉群开始), the draft's panel no longer reads
+    // it: the session's chat is then the topic's, already when the transfer
+    // forks the topic's worker (before the binding is recorded, or if it never
+    // is), so the chat — not the binding record — decides.
+    ...(ds.session.headless?.failureDiagnostics === true && isHeadlessSessionChatId(ds.session.chatId)
+      ? { captureTurnFailureDiagnostics: true as const }
+      : {}),
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
@@ -20996,6 +21008,14 @@ function setupWorkerHandlers(
                   asyncResult.failedAt = failedAt;
                   asyncResult.errorCode = 'trigger_failed';
                   asyncResult.terminalErrorCode = failureCode;
+                  // Re-masked here: an older or foreign worker may not have.
+                  // Both are this terminal's, like the code: a later terminal
+                  // (another attempt) never shows under an earlier one's text.
+                  const diagnostics = turnFailureDiagnostics({ errorDetail: msg.errorDetail, screen: msg.screenTail });
+                  if (diagnostics.errorDetail) asyncResult.terminalErrorDetail = diagnostics.errorDetail;
+                  else delete asyncResult.terminalErrorDetail;
+                  if (diagnostics.screenTail) asyncResult.terminalScreenTail = diagnostics.screenTail;
+                  else delete asyncResult.terminalScreenTail;
                 }
               }
               try {

@@ -388,6 +388,7 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
 import { handleWorkflowDraftsApi, handleWorkflowOrchestratorBotsApi, workflowOrchestratorBotOptions } from './dashboard/workflow-drafts-api.js';
+import { recentModelFailures } from './workflows/v3/draft-store.js';
 import { handleWorkflowLibraryApi } from './dashboard/workflow-library-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
@@ -6954,6 +6955,8 @@ const server = createServer(async (req, res) => {
           configs,
           (larkAppId) => !!registry.getByAppId(larkAppId),
           (larkAppId) => nameOf(larkAppId) || larkAppId,
+          // 「最近一次调用模型失败」: from the draft records on disk only.
+          recentModelFailures(v3RunsDir()),
         );
       },
     })) {
