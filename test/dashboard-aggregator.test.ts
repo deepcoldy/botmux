@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { Aggregator, subscribeDaemon } from '../src/dashboard/aggregator.js';
-import { reconcileDaemonSessions, reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
+import { reconcileAllDaemonSessions, reconcileDaemonSessions, reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
 
 describe('Aggregator cache merge', () => {
   it('keeps a dormant row routable for cold start and reports worker liveness separately (#2062 F1)', () => {
@@ -267,6 +267,32 @@ describe('primary dashboard Session refresh', () => {
     await expect(refresh).resolves.toBeUndefined();
     expect(agg.getSession('new')).toBeDefined();
     expect(agg.getSession('stale')).toBeUndefined();
+  });
+
+  it('serves healthy replicas when another one times out, keeping its last known rows (#2023)', async () => {
+    const healthy = { larkAppId: 'appA', ipcPort: 19001, botName: 'A' } as any;
+    const restarting = { larkAppId: 'appB', ipcPort: 19002, botName: 'B' } as any;
+    const agg = new Aggregator();
+    agg.hydrateSessions('appB', [{ sessionId: 'b-known', status: 'idle' } as any]);
+    const refreshed = await reconcileAllDaemonSessions([healthy, restarting], agg, 50, async (port, signal) => {
+      if (port === 19001) return { sessions: [{ sessionId: 'a-fresh', status: 'working' }] };
+      return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+    });
+
+    expect(refreshed).toEqual([{ daemon: healthy, rows: [{ sessionId: 'a-fresh', status: 'working' }] }]);
+    expect(agg.getSession('a-fresh')).toMatchObject({ larkAppId: 'appA', status: 'working' });
+    expect(agg.getSession('b-known')).toMatchObject({ larkAppId: 'appB', status: 'idle' });
+  });
+
+  it('reports nothing to serve only when every replica failed', async () => {
+    const agg = new Aggregator();
+    const daemons = [
+      { larkAppId: 'appA', ipcPort: 19001, botName: 'A' },
+      { larkAppId: 'appB', ipcPort: 19002, botName: 'B' },
+    ] as any[];
+    await expect(reconcileAllDaemonSessions(daemons, agg, 50, async () => { throw new Error('ECONNREFUSED'); }))
+      .resolves.toBeUndefined();
+    await expect(reconcileAllDaemonSessions([], agg, 50)).resolves.toBeUndefined();
   });
 });
 
