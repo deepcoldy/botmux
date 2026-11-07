@@ -47,7 +47,7 @@ import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
 import * as botRegistry from '../src/bot-registry.js';
 import * as costCalculator from '../src/core/cost-calculator.js';
-import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied } from '../src/services/message-listener-run-preview-store.js';
+import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied, markMessageListenerRunPreviewCompleted, markMessageListenerRunPreviewRunning } from '../src/services/message-listener-run-preview-store.js';
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
@@ -11912,6 +11912,7 @@ describe('role profile IPC routes', () => {
 
   it('runs message listener preview through the visible listener reply path', async () => {
     setLarkAppId('cli_listener_run');
+    sessionStore.init('cli_listener_run');
     registerBot({
       larkAppId: 'cli_listener_run',
       larkAppSecret: 'secret',
@@ -11957,7 +11958,7 @@ describe('role profile IPC routes', () => {
 
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body.ok).toBe(true);
+      expect(body.ok, JSON.stringify(body.results)).toBe(true);
       expect(body.runId).toMatch(/^mlrp_/);
       expect(body.matches).toHaveLength(1);
       expect(body.matches[0].messageId).toBe('om_match_run');
@@ -11982,6 +11983,62 @@ describe('role profile IPC routes', () => {
       chatModeSpy.mockRestore();
       inChatSpy.mockRestore();
       historySpy.mockRestore();
+    }
+  });
+
+  it('isolates silent run-preview tasks and preserves completion before trigger returns', async () => {
+    const appId = 'cli_listener_silent_run';
+    setLarkAppId(appId);
+    sessionStore.init(appId);
+    registerBot({ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', workingDir: process.cwd() });
+    const activeSessions = new Map<string, any>();
+    const existing = { session: { sessionId: 'human_session' }, busy: false };
+    activeSessions.set(sessionKey('om_silent_source', appId), existing);
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([{
+      message_id: 'om_silent_source', create_time: String(Date.now() - 5_000), msg_type: 'text',
+      body: { content: JSON.stringify({ text: 'CPU alert' }) }, sender: { id: 'ou_sender', sender_type: 'user' },
+    }]);
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue('oc_alerts');
+    const topicSpy = vi.spyOn(larkClient, 'sendMessage');
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation((ds, input, turnId) => {
+      expect(ds.session).toMatchObject({
+        chatId: 'oc_alerts', rootMessageId: `ml:${turnId}`,
+        messageListenerRun: { sourceMessageId: 'om_silent_source', replyMode: 'none' },
+        messageListenerAutoClose: true,
+      });
+      expect(JSON.stringify(input)).toContain('CPU alert');
+      expect(JSON.stringify(input)).toContain('execute existing task');
+      expect(markMessageListenerRunPreviewRunning(turnId!)).not.toBeNull();
+      expect(markMessageListenerRunPreviewCompleted(turnId!)).not.toBeNull();
+      return true;
+    });
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ limit: 1, listener: {
+          enabled: true, prompt: 'execute existing task', replyPolicy: { mode: 'none' },
+          autoCloseAfterCompletion: true, messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+        } }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.results[0].ok, body.results[0].error).toBe(true);
+      expect(body.results[0]).toMatchObject({ state: 'completed', ok: true, action: 'queued' });
+      expect(body.results[0].replyMessageId).toBeUndefined();
+      expect(activeSessions.get(sessionKey('om_silent_source', appId))).toBe(existing);
+      expect(forkSpy).toHaveBeenCalledTimes(1);
+      expect(topicSpy).not.toHaveBeenCalled();
+      const status = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview/${body.runId}`);
+      expect(await status.json()).toMatchObject({ results: [{ state: 'completed', ok: true }] });
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore(); topicSpy.mockRestore(); messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore(); inChatSpy.mockRestore(); historySpy.mockRestore();
     }
   });
 
@@ -12116,6 +12173,7 @@ describe('role profile IPC routes', () => {
 
   it('reports message listener run preview reply lifecycle by run id', async () => {
     setLarkAppId('cli_listener_status');
+    sessionStore.init('cli_listener_status');
     registerBot({
       larkAppId: 'cli_listener_status',
       larkAppSecret: 'secret',

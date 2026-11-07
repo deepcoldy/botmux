@@ -5081,7 +5081,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('routes non-mentioned bot messages through configured group listener', async () => {
+  it.each(['thread', 'none'] as const)('routes non-mentioned bot messages through configured group listener (%s)', async mode => {
     setupBotState({
       allowedUsers: [USER_OPEN_ID],
       messageListeners: {
@@ -5094,7 +5094,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
             includeSenderTypes: ['bot'],
           },
           messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
-          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+          replyPolicy: { mode, sessionMode: 'per_message' },
         },
       },
     });
@@ -5113,7 +5113,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'thread',
-      anchor: 'msg-listener-bot',
+      anchor: mode === 'none' ? 'ml:msg-listener-bot' : 'msg-listener-bot',
       messageId: 'msg-listener-bot',
       messageListener: expect.objectContaining({
         prompt: '只处理告警机器人消息',

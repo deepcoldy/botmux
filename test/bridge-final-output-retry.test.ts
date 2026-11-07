@@ -2897,6 +2897,23 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it('settles a silent listener test run on its terminal without a source reply', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const run = createMessageListenerRunPreview('app_test', 'oc_chat', ['om_source']);
+    const triggerId = 'mlrp_turn_silent';
+    markMessageListenerRunPreviewTriggered(run.runId, 'om_source', { sessionId: 'sid-final-out', triggerId });
+    const ds = makeDs();
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    ds.currentTurnId = triggerId;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: triggerId });
+    (ds.worker as any).emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: triggerId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(getMessageListenerRunPreview(run.runId)?.results[0]).toMatchObject({ state: 'completed', ok: true });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
