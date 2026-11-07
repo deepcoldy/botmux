@@ -1985,11 +1985,11 @@ describe('bot-config store', () => {
     expect(readConfig().promptInjection).toBeUndefined();
   });
 
-  it('updateBotSandboxPaths refuses `/` / HOME / botmux home and relative entries as readWrite and leaves bots.json untouched', async () => {
+  it('updateBotSandboxPaths refuses `/` / HOME / botmux home / `/run` and relative entries as readWrite and leaves bots.json untouched', async () => {
     const { registry } = await loaded({ sandbox: true, sandboxPaths: { readOnly: ['/opt/ref'] } });
     const sandboxStore = await import('../src/services/sandbox-store.js');
     const { homedir } = await import('node:os');
-    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel']) {
+    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel', '/run', '//run/']) {
       const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj', bad] });
       expect(r.ok, bad).toBe(false);
       if (!r.ok) {
