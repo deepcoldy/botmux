@@ -538,6 +538,34 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
       .toBe(`0:${livePanePid}`);
   });
 
+  // A split opened in the Web terminal can leave one dead pane (retained by
+  // remain-on-exit) next to one LIVE pane. The reap requires EVERY pane dead:
+  // such a session is alive, and neither pane may be touched.
+  it('never reaps a session whose dead pane shares it with a live pane', async () => {
+    tmux('set-option', '-t', 'bmx-live-one', 'remain-on-exit', 'on');
+    tmux('split-window', '-t', 'bmx-live-one', '-d', 'sh -c "exit 8"');
+    const deadline = Date.now() + 3_000;
+    let panes: string[] = [];
+    while (Date.now() < deadline) {
+      panes = String(
+        tmux('list-panes', '-s', '-t', '=bmx-live-one:', '-F', '#{pane_dead}:#{pane_dead_status}').stdout ?? '',
+      ).split('\n').map(line => line.trim()).filter(Boolean).sort();
+      if (panes.includes('1:8')) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    expect(panes, 'one live and one retained dead pane').toEqual(['0:', '1:8']);
+    const livePanePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-live-one', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    const after = String(
+      tmux('list-panes', '-s', '-t', '=bmx-live-one:', '-F', '#{pane_dead}:#{pane_dead_status}').stdout ?? '',
+    ).split('\n').map(line => line.trim()).filter(Boolean).sort();
+    expect(after).toEqual(['0:', '1:8']);
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim()).toBe(livePanePid);
+  });
+
   // The corpse can be reaped by someone else between the reap's two tmux calls.
   // A bare `-t bmx-corpse` then PREFIX-matches the live `bmx-corpse-neighbour`;
   // the reap must name its session exactly. The wrapper makes the race certain.
