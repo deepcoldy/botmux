@@ -54,12 +54,16 @@ jobs:
   # Four shards, split by recorded per-file duration (vitest.config.ts →
   # scripts/duration-shards.mjs; table test/shard-timings.json) rather than
   # vitest's equal-file-count hash split, which left one shard at 19–20 of its
-  # 20 minutes while another finished in 9. Rebalance instead of raising the
-  # limit, so the timeout keeps catching a genuinely hung shard.
+  # 20 minutes while another finished in 9. The plan stays balanced within
+  # ~2 s across shards, yet green runs keep brushing the wall (19m34s–19m50s):
+  # vitest Duration swings ±20% run to run on top of a 2–3 minute prep segment,
+  # so 20 minutes began cancelling fully-green shards (#2986, #2987). 25
+  # minutes absorbs that variance; it still catches a genuinely hung shard,
+  # which never finishes at any timeout.
   test:
     name: test (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
