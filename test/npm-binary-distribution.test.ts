@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -809,6 +809,28 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
       expect(inlined(p), `inlined claimed global: ${p}`).toBe(false);
       expect(detectGlobalInstallManager(p, 'linux'), `classifier claimed known: ${p}`)
         .toBe('unknown');
+    }
+  });
+
+  it('PARITY: a pnpm 11 store path counts as global only under the user\'s own PNPM_HOME (#1127)', () => {
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const fn = src.match(/function locationSaysGlobal\(root\) \{[\s\S]*?\n\}/)?.[0]!;
+    // eslint-disable-next-line no-new-func
+    const inlined = new Function(`${fn}; return locationSaysGlobal;`)() as (r: string) => boolean;
+    const custom = '/root/.pnpm-bin/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux';
+    const verdicts = () => [inlined(custom), detectGlobalInstallManager(custom, 'linux')];
+    try {
+      vi.stubEnv('PNPM_HOME', '/root/.pnpm-bin');
+      expect(verdicts()).toEqual([true, 'pnpm']);
+      vi.stubEnv('PNPM_HOME', 'C:\\Users\\u\\.pnpm-bin\\');
+      expect(inlined('C:\\Users\\u\\.pnpm-bin\\store\\v11\\links\\@\\botmux\\3.18.9\\x\\node_modules\\botmux')).toBe(true);
+      vi.stubEnv('PNPM_HOME', '/data/pnpm-global');
+      expect(verdicts()).toEqual([false, 'unknown']);
+      vi.stubEnv('PNPM_HOME', '');
+      expect(verdicts()).toEqual([false, 'unknown']);
+      expect(inlined('/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux')).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 
