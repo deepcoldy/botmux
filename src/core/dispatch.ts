@@ -672,12 +672,19 @@ export function recordDispatchInputCommit(
 
 /**
  * Dispatch acceptance waits on receipts keyed by the kickoff's Lark message id
- * (`om_…`). Synthetic turns (scheduled `schedule:…`, recovery, preview runs)
- * can never be a kickoff, so a missing receipt for them is expected and only
- * worth a debug line; an unbound Lark message turn keeps the warning.
+ * (`om_…`), and the kickoff is always posted inside the dispatch topic. Only an
+ * unbound Lark message turn whose inbound destination shows it arrived inside a
+ * topic keeps the warning. Synthetic turns (scheduled `schedule:…`, recovery,
+ * preview runs) and rootless chat-scope turns (p2p, flat group replies, the
+ * `om_`-shaped completion-proposal continuation) can never be a kickoff, so a
+ * missing receipt for them is expected and only worth a debug line.
  */
-export function unboundInputCommitLogLevel(turnId: string): 'warn' | 'debug' {
-  return turnId.trim().startsWith('om_') ? 'warn' : 'debug';
+export function unboundInputCommitLogLevel(
+  turnId: string,
+  inbound: { target: SessionReplyTarget; inThread?: boolean },
+): 'warn' | 'debug' {
+  if (!turnId.trim().startsWith('om_')) return 'debug';
+  return inbound.target.mode !== 'plain' || inbound.inThread === true ? 'warn' : 'debug';
 }
 
 /**

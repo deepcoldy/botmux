@@ -242,3 +242,29 @@ export function orderedFooterRecipients(opts: {
   for (const id of opts.cc ?? []) push(id);
   return out;
 }
+
+/**
+ * Drop the @s that would reach the dispatching bot of a `botmux dispatch`
+ * topic. That bot already receives the result through
+ * `botmux report --dispatch-root`; addressing it here instead starts a second,
+ * context-free session inside the very same sub-topic (#1887 / #2001). The
+ * daemon's own fallback cards answer to the same rule; this covers the reply
+ * the model itself sends, where the id arrives as the turn's reply target
+ * (`--mention-back`, or an explicit `--mention` copied from the brief).
+ *
+ * Resolution goes through {@link mentionedBotAppIds} one id at a time so this
+ * shares its precedence (cross-ref name match before a bots-info `botOpenId`)
+ * instead of re-deriving it. An ambiguous name resolves to no app at all, which
+ * keeps the @ — the safer side.
+ */
+export function withoutDispatchDispatcherAddressing(opts: {
+  dispatcherAppId: string;
+  entries: readonly BotMentionEntry[];
+  crossRef: Readonly<Record<string, string>>;
+  selfAppId: string;
+  mentionIds: readonly string[];
+}): string[] {
+  return opts.mentionIds.filter(openId => !mentionedBotAppIds(
+    [{ open_id: openId }], opts.entries, opts.crossRef, opts.selfAppId,
+  ).includes(opts.dispatcherAppId));
+}

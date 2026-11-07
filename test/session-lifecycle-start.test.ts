@@ -2518,10 +2518,10 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   it('reports an unstageable pre-admission rejection as a known non-execution', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
-    // The daemon declines the handoff — this is the real fallback path: the XPI
-    // switch is off, or the rejection lacked a safe reroute envelope/owner. The
-    // delivery then falls back to retry/fail, and its terminal notice must still
-    // describe a KNOWN outcome: the turn never entered the worker queue.
+    // The daemon declines the handoff — the XPI switch TTL-skew path (the daemon
+    // already reads the switch off). The delivery falls back to retry/fail, and
+    // its terminal notice must still describe a KNOWN outcome: the turn never
+    // entered the worker queue.
     const onOrdinaryImInputRejected = vi.fn(async () => false);
     initWorkerPool({
       sessionReply,
@@ -2686,6 +2686,63 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(1);
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('fails a deterministic rejection the daemon cannot reroute at once as not executed, without retrying', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onOrdinaryImInputRejected = vi.fn(async () => 'not_executed' as const);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    // A peer bot's message arrives while a caller-less scheduled turn runs, so
+    // the daemon has no principal to ask for confirmation.
+    const peerBot = {
+      requestUserOpenId: 'ou_peer_bot',
+      requestUserUnionId: 'on_peer_bot',
+      requestLarkAppId: 'app_test',
+      senderType: 'bot' as const,
+    };
+    expect(sendWorkerInput(ds, 'business turn', 'om_business', { trustedCaller: peerBot })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'schedule:abcd1234:00000000-0000-4000-8000-000000000000',
+    };
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    worker.emit('message', rejection);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1);
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const terminal = String(sessionReply.mock.calls[0]?.[1]);
+    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain('om_business');
+    expect(terminal).toContain('cross_principal_requires_owner_confirmation');
+    expect(terminal).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
   });
 
   it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
