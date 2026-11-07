@@ -70,6 +70,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/prompt-cache', '/api/bot-prompt-cache', 'raw'],
   ['PUT', '/api/bots/cli_a/idle-suspend-minutes', '/api/bot-idle-suspend-minutes', 'raw'],
   ['PUT', '/api/bots/cli_a/session-owner-reminder', '/api/bot-session-owner-reminder', 'raw'],
+  ['PUT', '/api/bots/cli_a/long-task-reminder', '/api/bot-long-task-reminder', 'raw'],
   ['GET', '/api/bots/cli_a/blocked-users', '/api/blocked-users', 'none'],
   ['PUT', '/api/bots/cli_a/blocked-users', '/api/blocked-users', 'raw'],
   ['POST', '/api/bots/cli_a/grants/chat', '/api/grants/chat', 'raw'],
