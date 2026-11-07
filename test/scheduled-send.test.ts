@@ -3,7 +3,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { feedbackPolicyForScheduledSend, recordScheduledSessionRun, ScheduleSendAttempt, settleScheduledSend } from '../src/core/scheduled-send.js';
+import {
+  feedbackPolicyForScheduledSend,
+  reconcileScheduledDelivery,
+  recordScheduledSessionRun,
+  ScheduleSendAttempt,
+  scheduledTurnsOfCurrentRuns,
+  settleScheduledSend,
+} from '../src/core/scheduled-send.js';
 import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import type { Session } from '../src/types.js';
 
@@ -101,5 +108,85 @@ describe('scheduled send settlement', () => {
     expect(settleScheduledSend(dataDir, session, turnId).state).toBe('failed');
     await ledger.execute(key, 'final', 'late answer', async () => 'om_late');
     expect(settleScheduledSend(dataDir, session, turnId)).toEqual({ state: 'delivered', messageId: 'om_late' });
+  });
+});
+
+describe('scheduled send still being delivered', () => {
+  it('waits while a sender holds the record inside its provider call, then settles its receipt', async () => {
+    const dataDir = dir();
+    let finish: ((messageId: string) => void) | undefined;
+    const send = new TurnSendLedger(dataDir).execute(key, 'final', 'slow answer',
+      () => new Promise<string>(resolve => { finish = resolve; }), { fenced: true });
+    while (!finish) await new Promise(resolve => setTimeout(resolve, 5));
+    new ScheduleSendAttempt(dataDir, session, turnId).fail(new Error('earlier attempt rejected'));
+    expect(settleScheduledSend(dataDir, session, turnId)).toEqual({ state: 'in_flight' });
+    expect(settleScheduledSend(dataDir, session, turnId, { expired: true })).toMatchObject({
+      state: 'failed', runId: 'run-1', errorCode: 'schedule_send_unknown' });
+    finish('om_slow');
+    await send;
+    expect(settleScheduledSend(dataDir, session, turnId)).toEqual({ state: 'delivered', messageId: 'om_slow' });
+  });
+
+  it('keeps the daemon delivery pending between attempts, but a receipt still settles it', async () => {
+    const dataDir = dir();
+    const ledger = new TurnSendLedger(dataDir);
+    await ledger.execute(key, 'final', 'answer',
+      async () => { throw new Error('transient'); }, { fenced: true }).catch(() => undefined);
+    expect(settleScheduledSend(dataDir, session, turnId).state).toBe('failed');
+    expect(settleScheduledSend(dataDir, session, turnId, { daemonDelivering: true })).toEqual({ state: 'in_flight' });
+    await ledger.execute(key, 'final', 'answer', async () => 'om_retry');
+    expect(settleScheduledSend(dataDir, session, turnId, { daemonDelivering: true }))
+      .toEqual({ state: 'delivered', messageId: 'om_retry' });
+  });
+});
+
+describe('scheduled delivery accounting', () => {
+  function accounting(current: boolean, logged = true) {
+    const writes: string[] = [];
+    return { writes, deps: {
+      recordFailure: (_taskId: string, _runId: string, _error: string, code: string) => { writes.push(`task:${code}`); return current; },
+      recordDelivered: () => { writes.push('task:delivered'); return current; },
+      markRunLogFailed: () => { writes.push('log:failed'); return logged; },
+      markRunLogDelivered: () => { writes.push('log:delivered'); return logged; },
+    } };
+  }
+
+  it('writes the execution log only for the run the task row still owns', async () => {
+    const dataDir = dir();
+    new ScheduleSendAttempt(dataDir, session, turnId).fail(new Error('rejected'));
+    const superseded = accounting(false);
+    expect(reconcileScheduledDelivery(dataDir, session, turnId, {}, superseded.deps))
+      .toMatchObject({ next: 'settled', superseded: true });
+    expect(superseded.writes).toEqual(['task:schedule_send_rejected']);
+    const owned = accounting(true);
+    expect(reconcileScheduledDelivery(dataDir, session, turnId, {}, owned.deps)).toMatchObject({ next: 'settled' });
+    expect(owned.writes).toEqual(['task:schedule_send_rejected', 'log:failed']);
+    await new TurnSendLedger(dataDir).execute(key, 'final', 'late', async () => 'om_late');
+    const lateSuperseded = accounting(false);
+    reconcileScheduledDelivery(dataDir, session, turnId, {}, lateSuperseded.deps);
+    expect(lateSuperseded.writes).toEqual(['task:delivered']);
+  });
+
+  it('asks for another pass while the execution-log row is missing, and writes nothing while in flight', () => {
+    const dataDir = dir();
+    new ScheduleSendAttempt(dataDir, session, turnId).fail(new Error('rejected'));
+    expect(reconcileScheduledDelivery(dataDir, session, turnId, {}, accounting(true, false).deps))
+      .toMatchObject({ next: 'retry_log' });
+    const inFlight = accounting(true);
+    expect(reconcileScheduledDelivery(dataDir, session, turnId, { daemonDelivering: true }, inFlight.deps))
+      .toEqual({ next: 'in_flight' });
+    expect(inFlight.writes).toEqual([]);
+  });
+
+  it('lists for restart reconciliation only the turns whose run is still current', () => {
+    const reused = { ...session, scheduledRun: undefined } as Session;
+    const later = 'schedule:abcdef12:bbbbbbbb-1234-1234-1234-123456789abc';
+    const other = 'schedule:fedcba98:cccccccc-1234-1234-1234-123456789abc';
+    recordScheduledSessionRun(reused, { taskId: 'abcdef12', runId: 'run-1', turnId });
+    recordScheduledSessionRun(reused, { taskId: 'abcdef12', runId: 'run-2', turnId: later });
+    recordScheduledSessionRun(reused, { taskId: 'fedcba98', runId: 'run-8', turnId: other });
+    const current: Record<string, string> = { abcdef12: 'run-2', fedcba98: 'run-9' };
+    expect(scheduledTurnsOfCurrentRuns([reused], taskId => current[taskId]))
+      .toEqual([{ session: reused, turnId: later }]);
   });
 });

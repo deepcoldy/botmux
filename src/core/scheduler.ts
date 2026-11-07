@@ -559,15 +559,18 @@ function recordDispatchOutcome(
   emitScheduleFiredHook(task, status);
 }
 
-/** Correct a dispatched execution, without consuming repeats or scheduling a retry. */
+/** Correct a dispatched execution, without consuming repeats or scheduling a retry.
+ * Returns false once a newer run owns the task: a superseded run is not accounted. */
 export function recordDeliveryFailure(id: string, runId: string, error: string, appId: string,
-  errorCode = 'schedule_send_rejected', chatId = '__single'): void {
+  errorCode = 'schedule_send_rejected', chatId = '__single'): boolean {
   const before = runtimeTask(id, appId);
-  if (!before || before.lastRunId !== runId) return;
+  if (!before || before.lastRunId !== runId) return false;
   let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
+  let current = false;
   let changed = false;
   mutateRuntimeTask(id, task => {
     if (task.lastRunId !== runId) return;
+    current = true;
     const prior = task.deliveryFailureState?.runId === runId ? task.deliveryFailureState : undefined;
     if (prior?.targets[chatId] === error && task.lastDeliveryErrorCode === errorCode) return;
     const state = prior ?? { runId, targets: {}, counted: task.lastStatus !== 'error',
@@ -583,19 +586,24 @@ export function recordDeliveryFailure(id: string, runId: string, error: string, 
       deliveryFailureState: { ...state, targets: { ...state.targets, [chatId]: error } },
       failureAlertSent: task.failureAlertSent === true || tracking?.crossedFailureThreshold ? true : undefined };
   }, appId);
-  if (!changed) return;
+  if (!changed) return current;
   emitFailureAlertIfNeeded(runtimeTask(id, appId) ?? before, result);
   dashboardEventBus.publish({ type: 'schedule.updated', body: { id,
     patch: { lastStatus: runtimeTask(id, appId)?.lastStatus, lastError: error, lastDeliveryError: error } } });
   notifyAfterSettle(before, id);
+  return true;
 }
 
-/** A late receipt corrects only this run and destination; never causes a resend. */
-export function recordDeliverySuccess(id: string, runId: string, appId: string, chatId = '__single'): void {
+/** A late receipt corrects only this run and destination; never causes a resend.
+ * Returns false once a newer run owns the task, like recordDeliveryFailure. */
+export function recordDeliverySuccess(id: string, runId: string, appId: string, chatId = '__single'): boolean {
+  let current = false;
   let changed = false;
   mutateRuntimeTask(id, task => {
+    if (task.lastRunId !== runId) return;
+    current = true;
     const state = task.deliveryFailureState;
-    if (task.lastRunId !== runId || state?.runId !== runId || !state.targets[chatId]) return;
+    if (state?.runId !== runId || !state.targets[chatId]) return;
     changed = true;
     const targets = { ...state.targets };
     delete targets[chatId];
@@ -616,6 +624,7 @@ export function recordDeliverySuccess(id: string, runId: string, appId: string, 
     dashboardEventBus.publish({ type: 'schedule.updated', body: { id,
       patch: { lastStatus: task?.lastStatus, lastError: task?.lastError, lastDeliveryError: task?.lastDeliveryError } } });
   }
+  return current;
 }
 
 /**
