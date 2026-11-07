@@ -19092,9 +19092,13 @@ function setupWorkerHandlers(
         // Notify once per idle episode, including a first frame already at idle,
         // so repeated snapshots cannot keep resetting the settlement debounce.
         const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId);
+        if (msg.turnId && msg.turnId === ds.deferredScheduleUnconfirmedTurnId) {
+          ds.deferredScheduleUnconfirmedTurnId = undefined;
+        }
         if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnId = undefined;
         if (ds.lastScreenStatus === 'idle' && deferredTurnId
-          && deferredScheduleIdleTurnId !== deferredTurnId) {
+          && deferredScheduleIdleTurnId !== deferredTurnId
+          && (msg.turnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
           deferredScheduleIdleTurnId = deferredTurnId;
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
