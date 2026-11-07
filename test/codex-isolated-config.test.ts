@@ -285,7 +285,10 @@ describe('seedIsolatedCodexHome', () => {
 });
 
 describe('worker cold-spawn wiring', () => {
-  // provisionIsolatedBotHome is internal to worker.ts with no callable seam; the behaviour is covered above.
+  // 源码结构护栏(K3)：provisionIsolatedBotHome 埋在 worker.ts 闭包里、没有可导出的行为
+  // seam；上面 seedIsolatedCodexHome 的纯函数用例只证明它自身的行为，证明不了真实 caller
+  // 接了线。caller 若被改回直接调 provisionCodexAuth，AGENTS.md 首次播种会静默丢失而全部
+  // 行为用例仍绿，故在此钉住接线不变量：codex 冷启动分支必须经 seedIsolatedCodexHome。
   it('provisions the isolated Codex home through seedIsolatedCodexHome', () => {
     const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
     const start = worker.indexOf('function provisionIsolatedBotHome(');
