@@ -5110,6 +5110,134 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   });
 });
 
+describe('Worker hidden schedule retirement', () => {
+  const turnId = 'schedule:task-hidden:11111111-2222-3333-4444-555555555555';
+
+  function prepareHiddenRun(armedAt = Date.now(), hidden = true, humanFollowUp = false) {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'traex';
+    ds.session.deferredScheduleRun = {
+      taskId: 'task-hidden', turnId,
+      routingAnchor: 'schedule-run:task-hidden:11111111-2222-3333-4444-555555555555',
+      createdAt: new Date().toISOString(),
+    };
+    ds.session.rootMessageId = ds.session.deferredScheduleRun.routingAnchor;
+    if (!hidden) {
+      ds.session.deferredScheduleRun = undefined;
+      ds.session.rootMessageId = 'om_root';
+      ds.session.cliId = 'claude-code';
+    }
+    if (humanFollowUp) ds.session.rootMessageId = 'om_materialized';
+    ds.currentTurnId = humanFollowUp ? 'om_human' : turnId;
+    ds.silentScheduledTurns = new Map([[turnId, armedAt]]);
+    ds.lastScreenStatus = 'working';
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onDeferredScheduleTurnSettled = vi.fn();
+    initWorkerPool({
+      sessionReply, onDeferredScheduleTurnSettled,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any, { ready: true, failureNotified: false });
+    return { ds, sessionReply, onDeferredScheduleTurnSettled };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    setActiveSessionsRegistry(undefined);
+  });
+
+  it.each([true, false])('keeps hidden idle quiet and settles the exact run with event identity=%s', async hasIdentity => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ready', status: 'idle',
+      ...(hasIdentity ? { turnId } : {}),
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect.soft(sessionReply).not.toHaveBeenCalled();
+    expect.soft(onDeferredScheduleTurnSettled).toHaveBeenCalledExactlyOnceWith(ds, { turnId, source: 'idle' });
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.lastScreenContent).toBe('ready');
+  });
+
+  it('settles an unattributed hidden idle even when its status was already idle', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledExactlyOnceWith(ds, { turnId, source: 'idle' });
+  });
+
+  it('debounces repeated hidden idle frames but settles again after renewed work', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    const idle: Extract<WorkerToDaemon, { type: 'screen_update' }> = {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    };
+    (ds.worker as any).emit('message', idle);
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledTimes(1);
+
+    (ds.worker as any).emit('message', { ...idle, status: 'working' });
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledTimes(2);
+    expect(onDeferredScheduleTurnSettled).toHaveBeenLastCalledWith(ds, { turnId, source: 'idle' });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('keeps a still-hidden run quiet after the bounded turn registry expired, identity=%s', async hasIdentity => {
+    const { ds, sessionReply } = prepareHiddenRun(Date.now() - 25 * 60 * 60 * 1000);
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'retired run notice', ...(hasIdentity ? { turnId } : {}),
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('does not silence an unattributed idle on an ordinary shared session', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(Date.now(), false);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ordinary ready', status: 'idle',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+
+  it('keeps unattributed human follow-up frames visible after topic materialization', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(Date.now(), true, true);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ordinary ready', status: 'idle',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+
+  it('does not assign an explicit other turn to the hidden run', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun();
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ordinary ready', status: 'idle', turnId: 'om_normal',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+});
+
 describe('Worker turn_terminal routing', () => {
   beforeEach(() => {
     vi.clearAllMocks();

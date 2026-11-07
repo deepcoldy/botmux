@@ -1333,7 +1333,11 @@ describe('updateNode may set or clear the checkpoint mark', () => {
     const runDir = join(root, runId);
     mkdirSync(runDir, { recursive: true });
     const write = (name: string, value: unknown) => writeFileSync(join(runDir, name), `${JSON.stringify(value, null, 2)}\n`);
-    write('dag.json', { schemaVersion: 2, runId, nodes: [{ id: 'a', type: 'goal', goal: 'a', bot: 'cli_w', depends: [], inputs: [] }] });
+    // `b` depends on `a`: a checkpoint nothing depends on is refused.
+    write('dag.json', { schemaVersion: 2, runId, nodes: [
+      { id: 'a', type: 'goal', goal: 'a', bot: 'cli_w', depends: [], inputs: [] },
+      { id: 'b', type: 'goal', goal: 'b', bot: 'cli_w', depends: ['a'], inputs: [] },
+    ] });
     write('spec.json', {
       schemaVersion: 1, runId, title: 't', requirement: 'r',
       nodes: [{ sketchId: 'a', goal: 'a', input_needs: [], expected_outputs: ['o'], acceptance: 'x', risk_gate: false, unknowns: [] }],

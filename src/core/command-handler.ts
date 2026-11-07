@@ -53,6 +53,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { isStoreFileUnavailableError } from '../utils/json-file.js';
+import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
@@ -2993,9 +2994,12 @@ export async function handleCommand(
           const cliName = sessionCliDisplayName(ds);
           requestSessionRestart(ds, {
             source: 'slash',
-            notify: async status => {
-              await sessionReply(rootId, t(`cmd.restart.${status}`, { cliName }, loc));
-            },
+            notify: restartStatusCardNotifier({
+              larkAppId: ds.larkAppId,
+              sessionId: ds.session.sessionId,
+              render: status => buildRestartStatusCard({ status, cliName, source: 'slash', locale: loc }),
+              post: card => sessionReply(rootId, card, 'interactive'),
+            }),
           });
           logger.info(`[${logTag}] Restart by /restart command`);
         } else {

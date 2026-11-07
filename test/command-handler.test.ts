@@ -428,8 +428,11 @@ vi.mock('../src/core/worker-pool.js', () => ({
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
   requestSessionRestart: vi.fn((_ds: any, observer: any) => {
-    void observer.notify('in_progress');
-    return { attemptId: 'attempt-test', joined: false };
+    // A fresh physical attempt each call, like the real coordinator: the status
+    // card is shared per attempt, so reusing one id would join an earlier card.
+    const attemptId = `attempt-test-${Math.random().toString(36).slice(2)}`;
+    void observer.notify('in_progress', attemptId);
+    return { attemptId, joined: false };
   }),
   isSessionTransferring: vi.fn(() => false),
   updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
@@ -4683,7 +4686,7 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
-        undefined,
+        'interactive',
         LARK_APP_ID,
         'msg_001',
       );
@@ -4751,7 +4754,7 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
-        undefined,
+        'interactive',
         LARK_APP_ID,
         'msg_001',
       );
@@ -4767,7 +4770,7 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
-        undefined,
+        'interactive',
         LARK_APP_ID,
         'msg_001',
       );
