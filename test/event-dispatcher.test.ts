@@ -4938,6 +4938,52 @@ describe('message listener polling backfill', () => {
     expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(6);
     expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
   });
+
+  it('tells the admin a log search term that finds the chats circuit-opened without their own DM', async () => {
+    mockSendUserMessage.mockClear();
+    vi.mocked(logger.warn).mockClear();
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_one: {
+          enabled: true,
+          prompt: 'p1',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [OTHER_BOT_APP_ID], includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+        chat_two: {
+          enabled: true,
+          prompt: 'p2',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [OTHER_BOT_APP_ID], includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    mockListChatMessagesUntil.mockReset().mockRejectedValue({
+      message: 'Request failed with status code 400',
+      response: { status: 400, data: { code: 230002 } },
+    });
+    for (let i = 0; i < 3; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    }
+
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+    const dm = String((mockSendUserMessage.mock.calls[0] as unknown[])[2]);
+    const alerted = ['chat_one', 'chat_two'].filter((id) => dm.includes(id));
+    expect(alerted).toHaveLength(1);
+    expect(dm).toContain('230002');
+    const silent = alerted[0] === 'chat_one' ? 'chat_two' : 'chat_one';
+    const silentLogLines = vi.mocked(logger.warn).mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes(`chat=${silent.substring(0, 12)}`));
+    expect(silentLogLines.length).toBeGreaterThan(0);
+    const searchTerms = [...dm.matchAll(/「([^」]+)」/g)].map((match) => match[1]!);
+    expect(searchTerms.some((term) => silentLogLines.some((line) => line.includes(term)))).toBe(true);
+  });
 });
 
 describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
