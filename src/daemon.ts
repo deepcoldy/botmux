@@ -669,6 +669,7 @@ import {
   cancelCrossPrincipalInterruptionsForFeatureDisable,
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
+  crossPrincipalRerouteGaps,
   markCrossPrincipalSuggestionWaiting,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
@@ -33075,14 +33076,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         activeCaller: context.activeCaller,
         activeController: context.activeController,
       });
-      if (!envelope || !proposer || !active
-        || sameTrustedPrincipal(active.caller, proposer)
-        || sameTrustedPrincipal(active.controller, proposer)) {
+      const gaps = crossPrincipalRerouteGaps({ envelope, proposer, active });
+      if (gaps.length > 0 || !envelope || !proposer || !active) {
+        // A retry hits the same worker gate while the active turn is still running.
         logger.error(
-          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute envelope/owner `
-          + `turn=${context.turnId.slice(0, 12)}`,
+          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute gaps=${gaps.join(',')}; `
+          + `failing delivery as not executed turn=${context.turnId.slice(0, 12)}`,
         );
-        return false;
+        return 'not_executed';
       }
       return stageCrossPrincipalInterruption({
         ds,
