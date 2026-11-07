@@ -533,6 +533,12 @@ export function initialScheduleEditPosition(
   return 'top-level';
 }
 
+function scheduleWorkingDirErrorText(code: unknown, tr: ReturnType<typeof useT>): string | undefined {
+  if (code === 'schedule_working_dir_unavailable') return tr('schedules.form.errWorkingDirUnavailable');
+  if (code === 'invalid_working_dir') return tr('schedules.form.errInvalidWorkingDir');
+  return undefined;
+}
+
 function placementLabel(s: ScheduleRow, tr: ReturnType<typeof useT>): string {
   const placement = scheduleExecutionPlacement(s);
   if (placement === 'local') return tr('schedules.deliveryLocal');
@@ -1523,7 +1529,7 @@ function SchedulesPage() {
           ? tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })
           : body?.error === 'multiple_chats_task_unsupported'
             ? tr('schedulePos.webTaskMultiChatUnsupported')
-            : body?.error ?? `HTTP ${r.status}`);
+            : scheduleWorkingDirErrorText(body?.error, tr) ?? body?.error ?? `HTTP ${r.status}`);
       }
       setFormOpen(false);
       toast(
@@ -1937,13 +1943,14 @@ export function ScheduleFormModal(props: {
     && chatIds.length === 1
     && !rootMessageId.trim();
   const selectedBot = bots.find(bot => bot.larkAppId === larkAppId);
-  const rawPreconditionWorkingDir = editing
+  // A saved task tests in its stored directory; a new one lets the daemon resolve
+  // the directory from the primary target chat, as task creation will.
+  const preconditionWorkingDir = editing
+    && typeof editing.workingDir === 'string'
+    && editing.workingDir.length > 0
     ? editing.workingDir
-    : selectedBot?.scheduleWorkingDir;
-  const preconditionWorkingDir = typeof rawPreconditionWorkingDir === 'string'
-    && rawPreconditionWorkingDir.length > 0
-    ? rawPreconditionWorkingDir
     : '';
+  const preconditionChatId = editing ? undefined : chatIds[0];
   const preconditionTrustedFileRoot = typeof selectedBot?.schedulePreconditionFileRoot === 'string'
     ? selectedBot.schedulePreconditionFileRoot.trim()
     : '';
@@ -2002,7 +2009,7 @@ export function ScheduleFormModal(props: {
   const canTestPrecondition = preconditionMode !== 'keep'
     && preconditionTestSourceReady
     && Boolean(larkAppId)
-    && Boolean(preconditionWorkingDir)
+    && Boolean(editing ? preconditionWorkingDir : preconditionChatId)
     && !preconditionTestPending;
 
   useEffect(() => {
@@ -2014,6 +2021,7 @@ export function ScheduleFormModal(props: {
     preconditionScript,
     preconditionFilePath,
     preconditionWorkingDir,
+    preconditionChatId,
     larkAppId,
     open,
   ]);
@@ -2032,7 +2040,9 @@ export function ScheduleFormModal(props: {
       const response = await fetch('/api/schedules/precondition/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ larkAppId, workingDir: preconditionWorkingDir, source }),
+        body: JSON.stringify(editing
+          ? { larkAppId, workingDir: preconditionWorkingDir, source }
+          : { larkAppId, chatId: preconditionChatId, source }),
       });
       const body = await response.json().catch(() => ({}));
       if (requestRevision !== preconditionTestRevisionRef.current) return;
@@ -2040,7 +2050,8 @@ export function ScheduleFormModal(props: {
         setPreconditionTestResult({
           outcome: 'error',
           errorCode: typeof body?.errorCode === 'string' ? body.errorCode : `HTTP ${response.status}`,
-          error: typeof body?.error === 'string' ? body.error : tr('schedules.form.preconditionTestUnknownError'),
+          error: (editing ? undefined : scheduleWorkingDirErrorText(body?.errorCode, tr))
+            ?? (typeof body?.error === 'string' ? body.error : tr('schedules.form.preconditionTestUnknownError')),
           ...(Number.isFinite(body?.durationMs) ? { durationMs: body.durationMs } : {}),
         });
         return;

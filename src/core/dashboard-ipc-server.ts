@@ -6602,7 +6602,27 @@ ipcRoute('POST', '/api/schedules/precondition/test', async (req, res) => {
     });
   }
   const draft = body as Record<string, unknown>;
-  if (typeof draft.workingDir !== 'string' || draft.workingDir.trim().length === 0) {
+  let workingDir = draft.workingDir;
+  if (workingDir === undefined) {
+    // An unsaved task has no directory yet: test where POST /api/schedules will put it.
+    const resolved = resolveDashboardScheduleWorkingDir(
+      cachedLarkAppId,
+      typeof draft.chatId === 'string' && draft.chatId.trim() ? draft.chatId.trim() : undefined,
+    );
+    if (!resolved.ok) {
+      return jsonRes(res, 400, {
+        ok: false,
+        result: 'error',
+        errorCode: resolved.error,
+        error: resolved.message ?? resolved.error,
+        field: 'workingDir',
+        durationMs: 0,
+        additionalPrompt: false,
+      });
+    }
+    workingDir = resolved.workingDir;
+  }
+  if (typeof workingDir !== 'string' || workingDir.trim().length === 0) {
     return jsonRes(res, 400, {
       ok: false,
       result: 'error',
@@ -6613,7 +6633,7 @@ ipcRoute('POST', '/api/schedules/precondition/test', async (req, res) => {
       additionalPrompt: false,
     });
   }
-  const checkedWorkingDir = validateWorkingDir(draft.workingDir);
+  const checkedWorkingDir = validateWorkingDir(workingDir);
   if (!checkedWorkingDir.ok) {
     return jsonRes(res, 400, {
       ok: false,
