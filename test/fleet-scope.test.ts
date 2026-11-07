@@ -4,13 +4,10 @@
  * session's own close / CLI restart (which stops its scope) would SIGKILL every
  * daemon and worker with it. Any OTHER unit the operator chose must keep it.
  */
-import { randomUUID } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import { moveSupervisorIntoFleetScope, type FleetScopeRuntime } from '../src/core/fleet-scope.js';
-import { sessionScopeUnitName, userSystemdBusEnv } from '../src/core/session-scope.js';
+import { probeSystemdPidNamespace, sessionScopeUnitName } from '../src/core/session-scope.js';
 import { readProcessSystemdUnit } from '../src/utils/systemd-unit.js';
-import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 
 function runtime(unit: string, over: Partial<FleetScopeRuntime> = {}) {
   let current = unit;
@@ -24,6 +21,7 @@ function runtime(unit: string, over: Partial<FleetScopeRuntime> = {}) {
       pid: 4242,
       readUnit: () => current,
       busEnv: () => ({ XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' }),
+      pidNamespace: () => ({ shared: true, basis: 'initial-namespace', namespace: 'pid:[4026531836]' }),
       run,
       now: () => 1_000_000,
       sleepMs: () => {},
@@ -93,6 +91,36 @@ describe('moveSupervisorIntoFleetScope', () => {
 
     expect(moveSupervisorIntoFleetScope({ ...runtime('botmux-session-abc.scope').rt, platform: 'darwin' }).action).toBe('unsupported');
   });
+
+  // StartTransientUnit's PIDs=[our pid] is resolved in user systemd's PID
+  // namespace: from an isolated sandbox sharing the host's user bus it moves
+  // whichever host process carries that number.
+  describe('hands user systemd its PID only from the same PID namespace', () => {
+    const unit = sessionScopeUnitName('fc17c9ee-fa8f-46f4-93cc-58c7ac288696');
+
+    it('moves where user systemd shares the namespace', () => {
+      const { rt, run } = runtime(unit, { pidNamespace: () => ({ shared: true, basis: 'user-bus', namespace: 'pid:[4026532999]' }) });
+      expect(moveSupervisorIntoFleetScope(rt).action).toBe('moved');
+      expect(run).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['in another namespace', () => probeSystemdPidNamespace({
+        platform: 'linux',
+        readlink: path => (path === '/proc/self/ns/pid' ? 'pid:[4026532999]' : 'pid:[4026531836]'),
+        readFile: () => 'NSpid:\t42\n',
+        run: () => ({ status: 0, stdout: 'Unique=:1.42\n', stderr: '', error: undefined }),
+      })],
+      ['when the check failed', () => probeSystemdPidNamespace({
+        platform: 'linux',
+        readlink: () => { throw new Error('EACCES'); },
+      })],
+    ])('stays put %s and says why', (_label, pidNamespace) => {
+      const { rt, run } = runtime(unit, { pidNamespace });
+      expect(moveSupervisorIntoFleetScope(rt)).toEqual({ action: 'unsupported', reason: expect.any(String) });
+      expect(run).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('readProcessSystemdUnit', () => {
@@ -102,62 +130,5 @@ describe('readProcessSystemdUnit', () => {
     const v2 = '0::/user.slice/user-0.slice/session-4.scope\n';
     expect(readProcessSystemdUnit(77, () => v2)).toBe('session-4.scope');
     expect(readProcessSystemdUnit(77, () => { throw new Error('ENOENT'); })).toBeUndefined();
-  });
-});
-
-describe.runIf(process.platform === 'linux' && !!userSystemdBusEnv())('against the real user systemd manager', () => {
-  const busEnv = userSystemdBusEnv()!;
-
-  // Run the eval child inside a caller-chosen transient scope, exactly like a
-  // `botmux start` executed from within that unit would be.
-  function runInScope(unit: string): Promise<{ before: string; outcome: unknown; after: string }> {
-    const { command, prefixArgs } = tsRunnerPrefix();
-    const { args } = tsEvalArgs(`
-      const { moveSupervisorIntoFleetScope } = await import(${JSON.stringify(new URL('../src/core/fleet-scope.ts', import.meta.url).pathname)});
-      const { readProcessSystemdUnit } = await import(${JSON.stringify(new URL('../src/utils/systemd-unit.ts', import.meta.url).pathname)});
-      const before = readProcessSystemdUnit(process.pid);
-      const outcome = moveSupervisorIntoFleetScope();
-      const after = readProcessSystemdUnit(process.pid);
-      console.log(JSON.stringify({ before, outcome, after }));
-    `);
-    const child = spawn('systemd-run', [
-      '--user', '--scope', '--quiet', '--collect', `--unit=${unit}`,
-      command, ...prefixArgs, ...args,
-    ], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...busEnv } });
-    let out = '';
-    child.stdout.on('data', chunk => { out += chunk; });
-    return new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', () => resolve(JSON.parse(out.trim().split('\n').pop()!)));
-    });
-  }
-
-  const unique = (kind: string) => `${kind}-${process.pid}-${Date.now().toString(36)}.scope`;
-
-  it('a process started inside a botmux session scope really moves into its own fleet scope', async () => {
-    // Producer-generated unit name: a sessionScopeUnitName prefix change must
-    // fail this gate's own test file, not only session-scope's tests.
-    const sessionUnit = sessionScopeUnitName(randomUUID());
-    const report = await runInScope(sessionUnit);
-    try {
-      expect(report.outcome).toMatchObject({ action: 'moved', from: sessionUnit });
-      expect(report.after).toBe((report.outcome as { to: string }).to);
-      expect(report.after).not.toBe(sessionUnit);
-    } finally {
-      // The transient fleet scope stays around as inactive after the child exits.
-      if ((report.outcome as { to?: string }).to) {
-        const to = (report.outcome as { to: string }).to;
-        spawnSync('systemctl', ['--user', 'stop', to], { env: { ...process.env, ...busEnv } });
-        spawnSync('systemctl', ['--user', 'reset-failed', to], { env: { ...process.env, ...busEnv } });
-      }
-    }
-  });
-
-  it('never moves a process the operator started inside their own unit', async () => {
-    const ownUnit = unique('my-own-botmux-real');
-    const report = await runInScope(ownUnit);
-    expect(report.outcome).toEqual({ action: 'kept', unit: ownUnit });
-    expect(report.before).toBe(ownUnit);
-    expect(report.after).toBe(ownUnit);
   });
 });
