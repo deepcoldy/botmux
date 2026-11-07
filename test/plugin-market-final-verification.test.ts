@@ -382,6 +382,15 @@ describe('final plugin mutation acceptance', () => {
     expect(fs.existsSync(join(home, 'script-side-effect'))).toBe(false);
   });
 
+  it('PROVENANCE: a confirmed install records the pinned registry package, not the deleted archive', async () => {
+    const f = hostFixture();
+    const plan = await f.market.prepare('sample', 'owner');
+    await f.market.install(plan.nonce, true, 'owner');
+    const record = registry.getInstalledPlugin('sample')!;
+    expect(record.source).toEqual({ type: 'npm', spec: `${entry.package}@${manifest.version}` });
+    expect(record.integrity).toBe(plan.integrity);
+  });
+
   it('AUTHORITY-INSTALL: token rotated during download blocks commit and releases busy state', async () => {
     const entered = gate(), release = gate();
     const f = hostFixture({ pack: async () => { entered.resolve(); await release.promise; } });

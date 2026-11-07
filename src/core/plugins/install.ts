@@ -298,7 +298,11 @@ export function installNpmPlugin(spec: string, opts: InstallPluginOptions = {}):
     const tmpPackageDir = findBotmuxPackageUnderNodeModules(tmpRoot);
     const pkg = readPackageManifest(tmpPackageDir);
     const tmpRuntimeDir = requireRuntimeDir(tmpPackageDir);
-    const stagedRecord = makeRecord(pkg, { type: 'npm', spec }, tmpRuntimeDir);
+    const confirmedIntegrity = opts.guard?.integrity;
+    // The confirmed archive is a temporary download that is deleted after install.
+    const recordedSpec = confirmedIntegrity ? `${pkg.name}@${pkg.version}` : spec;
+    const stagedRecord = makeRecord(pkg, { type: 'npm', spec: recordedSpec }, tmpRuntimeDir);
+    if (confirmedIntegrity) stagedRecord.record.integrity = confirmedIntegrity;
     const stagedDir = stageRuntime(pkg.botmux.id, tmpRuntimeDir, false);
     try {
       return withPluginServiceLockSync(() => {
