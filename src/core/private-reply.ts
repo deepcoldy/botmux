@@ -27,8 +27,10 @@ export async function sendPrivateReply(
   if (!sender?.startsWith('ou_') || senderIsBot) return undefined;
   let messageId: string;
   try {
-    await options?.beforeWrite?.();
-    messageId = await sendUserMessage(s.larkAppId!, sender, content, msgType, uuid);
+    const args = [s.larkAppId!, sender, content, msgType, uuid] as const;
+    messageId = options?.beforeWrite
+      ? await sendUserMessage(...args, undefined, { beforeWrite: options.beforeWrite })
+      : await sendUserMessage(...args);
   } catch (err) {
     if (options?.failClosed) throw err;
     logger.warn(`[private-reply] delivery failed for turn ${turnId}; using group reply: ${String(err)}`);
@@ -39,7 +41,8 @@ export async function sendPrivateReply(
     try {
       // A notice failure must not retry or publicly resend an already delivered answer.
       await replyMessage(s.larkAppId!, s.rootMessageId, notice, 'text', true,
-        undefined, undefined, { suppressHook: true });
+        undefined, undefined, { suppressHook: true,
+          ...(options?.beforeWrite ? { beforeWrite: options.beforeWrite } : {}) });
     } catch (err) {
       logger.warn(`[private-reply] notice failed after delivery ${messageId}: ${String(err)}`);
     }

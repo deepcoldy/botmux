@@ -613,6 +613,7 @@ vi.mock('../src/services/vc-meeting-preparations-store.js', async (importOrigina
   })),
   removeVcMeetingPreparation: vi.fn(() => undefined),
   removeVcMeetingPreparationsByChat: vi.fn(() => 0),
+  removeVcMeetingPreparationsForApp: vi.fn(() => 0),
 }));
 // The picker query helper now lives in services/relay-picker.ts — mock it so
 // the /relay picker tests can control the entry list directly without
@@ -755,7 +756,16 @@ import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirect
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
 import { bindOncall } from '../src/services/oncall-store.js';
-import { putVcMeetingPreparation } from '../src/services/vc-meeting-preparations-store.js';
+import {
+  findVcMeetingPreparationByChat,
+  getVcMeetingPreparation,
+  listVcMeetingPreparations,
+  putVcMeetingPreparation,
+  removeVcMeetingPreparation,
+  removeVcMeetingPreparationsByChat,
+  removeVcMeetingPreparationsForApp,
+} from '../src/services/vc-meeting-preparations-store.js';
+import { StoreFileUnavailableError } from '../src/utils/json-file.js';
 import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1808,6 +1818,77 @@ describe('/vc preparation command', () => {
       LARK_APP_ID,
       'msg_001',
     );
+  });
+
+  it('tells the owner when the preparations file cannot be read instead of failing silently', async () => {
+    const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
+    const deps = makeDeps(ds);
+    const unavailable = new StoreFileUnavailableError(
+      'vc-meeting-preparations-store', '/data/vc-meeting-preparations.json', 'read',
+      Object.assign(new Error('too many open files'), { code: 'EMFILE' }),
+    );
+    vi.mocked(putVcMeetingPreparation).mockImplementationOnce(() => { throw unavailable; });
+    vi.mocked(removeVcMeetingPreparationsByChat).mockImplementationOnce(() => { throw unavailable; });
+
+    for (const content of ['/vc prepare 688542737', '/vc off']) {
+      await handleCommand('/vc', ROOT_ID, makeLarkMessage(content, { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+    }
+
+    const replies = vi.mocked(deps.sessionReply).mock.calls.map(call => String(call[1]));
+    expect(replies.filter(text => text.includes('会议准备记录暂时不可读写'))).toHaveLength(2);
+    expect(replies.some(text => text.includes('会议准备群已就绪'))).toBe(false);
+  });
+
+  it('uses strict reads for the /vc answers, but a tolerant pre-read for /vc prepare', async () => {
+    const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
+    const deps = makeDeps(ds);
+    for (const content of ['/vc status', '/vc status 688542737', '/vc prepare 688542737']) {
+      await handleCommand('/vc', ROOT_ID, makeLarkMessage(content, { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+    }
+    const strict = { ioErrors: 'throw' };
+    expect(listVcMeetingPreparations).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, strict);
+    expect(getVcMeetingPreparation).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, '688542737', strict);
+    // This read only feeds the "replaced" note; it must stay tolerant so a
+    // corrupt file can still be rebuilt by the strict write that follows.
+    expect(findVcMeetingPreparationByChat).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, CHAT_ID);
+    expect(findVcMeetingPreparationByChat).not.toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, CHAT_ID, strict);
+  });
+
+  it('names rebuild paths for corrupt content but asks for retry only for transient read failures', async () => {
+    const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
+    const deps = makeDeps(ds);
+    const corrupt = new StoreFileUnavailableError(
+      'vc-meeting-preparations-store', '/data/vc-meeting-preparations.json', 'parse',
+      new SyntaxError('Unexpected token b'),
+    );
+    const transient = new StoreFileUnavailableError(
+      'vc-meeting-preparations-store', '/data/vc-meeting-preparations.json', 'read',
+      Object.assign(new Error('i/o error'), { code: 'EIO' }),
+    );
+    vi.mocked(listVcMeetingPreparations).mockImplementationOnce(() => { throw corrupt; });
+    vi.mocked(getVcMeetingPreparation).mockImplementationOnce(() => { throw transient; });
+
+    await handleCommand('/vc', ROOT_ID, makeLarkMessage('/vc status', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+    await handleCommand('/vc', ROOT_ID, makeLarkMessage('/vc status 688542737', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+
+    const replies = vi.mocked(deps.sessionReply).mock.calls.map(call => String(call[1]));
+    expect(replies.some(text => text.includes('文件已损坏') && text.includes('/vc prepare'))).toBe(true);
+    const corruptReply = replies.find(text => text.includes('文件已损坏'))!;
+    expect(corruptReply.includes('请稍后重试')).toBe(false);
+    expect(replies.some(text => text.includes('暂时不可读写') && text.includes('请稍后重试'))).toBe(true);
+  });
+
+  it('removes all of the bot\'s preparations in one store update for /vc off all', async () => {
+    const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
+    const deps = makeDeps(ds);
+    vi.mocked(removeVcMeetingPreparationsForApp).mockReturnValueOnce(3);
+
+    await handleCommand('/vc', ROOT_ID, makeLarkMessage('/vc off all', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+
+    expect(removeVcMeetingPreparationsForApp).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID);
+    expect(removeVcMeetingPreparation).not.toHaveBeenCalled();
+    expect(vi.mocked(deps.sessionReply).mock.calls.map(call => String(call[1])))
+      .toContain('已解除 3 条会议准备绑定。');
   });
 });
 
