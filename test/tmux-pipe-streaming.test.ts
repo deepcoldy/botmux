@@ -204,7 +204,7 @@ writeFileSync(${JSON.stringify(ready)}, 'ready');
   it('delivers to a FIFO path with shell and tmux metacharacters via the pipe-pane argument', async () => {
     const fx = fixture('uutils');
     socket = join(fx.root, 'socket');
-    const dir = join(fx.root, `a b#S%d$x"y'z`); mkdirSync(dir);
+    const dir = join(fx.root, `a b\\sl#S%d$x"y'z`); mkdirSync(dir);
     const fifo = join(dir, 'out.fifo');
     execFileSync('mkfifo', [fifo]);
     const out = collect(fifo);
@@ -233,7 +233,7 @@ echo "$1" >> ${quote(commands)}
 exec ${quote(realTmux!)} -S ${quote(socket)} "$@"
 `, { mode: 0o700 });
     process.env.PATH = fx.path;
-    const tmp = join(fx.root, `a b#S%d$x"y'z`); mkdirSync(tmp);
+    const tmp = join(fx.root, `a b\\sl#S%d$x"y'z`); mkdirSync(tmp);
     vi.stubEnv('TMPDIR', tmp);
     resetTmuxVersionCacheForTests();
     backend = new TmuxPipeBackend('legacy-guard', { createSession: true, ownsSession: true });
