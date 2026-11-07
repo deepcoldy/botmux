@@ -76,6 +76,7 @@ function harness(
     isFlushing: false,
     injectionFlushing: false,
     commandLineWritesPending: 0,
+    sessionRenameInFlight: () => false,
     cursorStopLeftParkedFollowUp,
   };
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
@@ -275,5 +276,44 @@ describe('handleTermAction for Cursor with a parked follow-up', () => {
     await h.handle('esc');
     await vi.advanceTimersByTimeAsync(10_000);
     expect(h.specialKeys).toEqual(['Escape']);
+  });
+
+  it('waits for an in-flight session rename before pressing Enter', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped;
+    let renameInFlight = true;
+    h.state.sessionRenameInFlight = () => renameInFlight;
+    await h.handle('ctrlc');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c']);
+    renameInFlight = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c', 'Enter']);
+  });
+
+  // The submitter runs in a timer callback outside handleTermAction's
+  // try/catch: an Orca relay rejecting Enter (adopted terminal gone) must be
+  // logged and swallowed, not thrown into the worker uncaughtException exit.
+  it('swallows a backend rejecting Enter instead of throwing out of the timer', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped;
+    const realSend = h.state.backend.sendSpecialKeys;
+    h.state.backend.sendSpecialKeys = (key: string) => {
+      if (key === 'Enter') throw new Error('Orca terminal rejected input');
+      return realSend(key);
+    };
+    await h.handle('ctrlc');
+    // A throw escaping the timer callback would make this await reject.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c']);
+    expect(h.state.log).toHaveBeenCalledWith(
+      expect.stringContaining('submitting the parked follow-up failed'),
+    );
+    // The matched branch returns without rescheduling: no retry storm later.
+    h.state.backend.sendSpecialKeys = realSend;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.specialKeys).toEqual(['C-c']);
   });
 });

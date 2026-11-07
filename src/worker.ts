@@ -15680,20 +15680,38 @@ function submitCursorParkedFollowUpAfterStop(target: SessionBackend, lifetime: n
   const poll = () => {
     cursorParkedFollowUpTimer = undefined;
     if (backend !== target || cliLifetimeNonce !== lifetime || nativeSessionForkPending()) return;
-    if (!isFlushing && !injectionFlushing && commandLineWritesPending === 0) {
+    // sessionRenameInFlight covers the rename's reserved/writing/sent phases —
+    // wider than commandLineWritesPending's literal-write window — so its menu
+    // never receives this synthetic Enter.
+    if (!isFlushing && !injectionFlushing && commandLineWritesPending === 0 && !sessionRenameInFlight()) {
       let screen = '';
       try { screen = captureBackendScreen(target); } catch { /* retry on the next poll */ }
       if (cursorStopLeftParkedFollowUp(screen)) {
-        sendTermActionOnce(target, 'enter');
-        log('Cursor: submitted the follow-up left parked by the stop');
+        // This runs in a timer callback OUTSIDE handleTermAction's try/catch:
+        // an escaping throw reaches the worker uncaughtException handler and
+        // exits the process (an Orca relay rejects input once the adopted
+        // terminal goes away). A missed Enter costs one parked follow-up; a
+        // worker crash costs the whole session plus its sandbox teardown.
+        try {
+          const delivered = sendTermActionOnce(target, 'enter');
+          if (delivered === false) {
+            log('Cursor: could not deliver Enter for the parked follow-up');
+          } else {
+            log('Cursor: submitted the follow-up left parked by the stop');
+          }
+        } catch (err) {
+          log(`Cursor: submitting the parked follow-up failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         return;
       }
     }
     if (++attempts < CURSOR_PARKED_FOLLOW_UP_POLL_ATTEMPTS) {
       cursorParkedFollowUpTimer = setTimeout(poll, CURSOR_PARKED_FOLLOW_UP_POLL_MS);
+      cursorParkedFollowUpTimer?.unref?.();
     }
   };
   cursorParkedFollowUpTimer = setTimeout(poll, CURSOR_PARKED_FOLLOW_UP_POLL_MS);
+  cursorParkedFollowUpTimer?.unref?.();
 }
 
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
