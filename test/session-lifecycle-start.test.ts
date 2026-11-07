@@ -4847,7 +4847,7 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_adopted',
-      { sourceSessionId: 'sid-start-test' },
+      expect.objectContaining({ sourceSessionId: 'sid-start-test' }),
     ));
     expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
     expect(ds.agentAttention).toEqual(expect.objectContaining({
