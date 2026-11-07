@@ -302,7 +302,7 @@ async function resolveAttachments(request: GroupContextTurnRequest, records: Gro
   for (const record of selected) {
     for (const resource of (record.resourceRefs ?? []).slice(0, 5 - attachments.length)) {
       if (signal.aborted) return { attachments, incomplete: true };
-      if (!resource.key || !['image', 'file'].includes(resource.type)) continue;
+      if (!resource.key || !['image', 'file', 'video'].includes(resource.type)) continue;
       try {
         // Never turn an API-supplied filename into a filesystem traversal.
         if (!/^om_[A-Za-z0-9_-]+$/.test(record.messageId)) throw new Error('invalid_message_id');
@@ -310,8 +310,8 @@ async function resolveAttachments(request: GroupContextTurnRequest, records: Gro
         mkdirSync(dir, { recursive: true, mode: 0o700 });
         const extension = extname(resource.name ?? '').replace(/[^.a-zA-Z0-9]/g, '').slice(0, 12);
         const path = join(dir, `context-${createHash('sha256').update(resource.key).digest('hex').slice(0, 20)}${extension || (resource.type === 'image' ? '.png' : '.bin')}`);
-        if (!existsSync(path)) await downloadMessageResource(request.appId, record.messageId, resource.key, resource.type as 'image' | 'file', path, undefined, { allowUserTokenFallback: false });
-        const attachment: LarkAttachment = { type: resource.type as 'image' | 'file', path, name: basename(resource.name ?? path), resourceKey: resource.key };
+        if (!existsSync(path)) await downloadMessageResource(request.appId, record.messageId, resource.key, resource.type as 'image' | 'file' | 'video', path, undefined, { allowUserTokenFallback: false });
+        const attachment: LarkAttachment = { type: resource.type as 'image' | 'file' | 'video', path, name: basename(resource.name ?? path), resourceKey: resource.key };
         attachments.push(await normalizeImageAttachment(attachment));
       } catch { incomplete = true; }
     }
