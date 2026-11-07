@@ -48,7 +48,9 @@ export function createExplicitAskContinuation(deps: {
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(pathFor(key), JSON.stringify(receipt), { mode: 0o600, durable: true });
   };
-  function wait(input: CreateAskInput & { requestId: string }, origin?: ExplicitAskReceipt['origin']): Promise<AskResult> {
+  /** presentation 只影响发卡位置，不写进回执：回执 input 的全等比较就是调用身份。 */
+  function wait(input: CreateAskInput & { requestId: string }, origin?: ExplicitAskReceipt['origin'],
+    presentation?: Pick<CreateAskInput, 'cardRootMessageId'>): Promise<AskResult> {
     const key = keyFor(input);
     const original = read(key);
     if (original && JSON.stringify(original.input) !== JSON.stringify(input)) {
@@ -63,7 +65,7 @@ export function createExplicitAskContinuation(deps: {
       return Promise.resolve(result);
     }
     if (!original) write(key, { version: 1, input, ...(origin ? { origin } : {}) });
-    const promise = deps.register(input).then(result => {
+    const promise = deps.register({ ...input, ...presentation }).then(result => {
       const receipt = read(key)!;
       write(key, { ...receipt, result, settledAt: now() });
       deps.releaseHandoff?.(input);
