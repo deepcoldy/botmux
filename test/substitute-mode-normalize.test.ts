@@ -2,6 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { normalizeSubstituteMode } from '../src/services/substitute-mode-normalize.js';
 
 describe('normalizeSubstituteMode', () => {
+  it('trims keyword strings, removes empty/invalid entries and deduplicates ignoring case', () => {
+    expect(normalizeSubstituteMode({
+      enabled: false, targets: [{ openId: 'ou_sub' }],
+      keywords: [' 独立卡 ', '', '  ', 'Oncall', 'oncall', '独立卡', null, 42],
+    })).toMatchObject({ enabled: false, keywords: ['独立卡', 'oncall'] });
+  });
+
+  it.each([undefined, [], [' ', null], 'incident'])('omits empty or invalid keywords: %j', keywords => {
+    expect(normalizeSubstituteMode({
+      enabled: true, targets: [{ openId: 'ou_sub' }], keywords,
+    })).not.toHaveProperty('keywords');
+  });
+
   it('returns undefined for empty / non-object inputs', () => {
     expect(normalizeSubstituteMode(undefined)).toBeUndefined();
     expect(normalizeSubstituteMode(null)).toBeUndefined();

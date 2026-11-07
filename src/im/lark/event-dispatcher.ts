@@ -9,7 +9,7 @@ import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection, type LarkConnection } from './transport/connection.js';
-import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState, type SubstituteModeConfig } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
@@ -26,6 +26,7 @@ import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, daemonCommandLanePreview, type MentionIdentity } from './message-parser.js';
+import { matchesSubstituteKeywords } from '../../services/substitute-keywords.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -1941,8 +1942,19 @@ const SUBSTITUTE_TRIGGER_MESSAGE_TYPES = new Set(['text', 'post']);
 export function resolveSubstituteTrigger(
   larkAppId: string,
   message: any,
+  cfg: SubstituteModeConfig | undefined = getBot(larkAppId).config.substituteMode,
 ): import('../../types.js').SubstituteTrigger | undefined {
-  const cfg = getBot(larkAppId).config.substituteMode;
+  const mention = resolveSubstituteMention(cfg, message);
+  return mention && matchesSubstituteKeywords(cfg?.keywords, message)
+    ? mention : undefined;
+}
+
+// Keep the raw @target candidate separate: hard-off gates must also suppress
+// messages that miss keywords, or relaxed mention policies can pick them up.
+function resolveSubstituteMention(
+  cfg: SubstituteModeConfig | undefined,
+  message: any,
+): import('../../types.js').SubstituteTrigger | undefined {
   if (!cfg?.enabled || !cfg.targets?.length) return undefined;
   const messageType = message?.message_type ?? message?.msg_type;
   if (!SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(messageType)) return undefined;
@@ -5717,6 +5729,7 @@ export function createLarkEventDispatcherRuntime(
       // per-chat toggle disk read entirely for bots that never configured a
       // substitute target (the overwhelming majority on the hot path).
       const substituteCfg = getBot(larkAppId).config.substituteMode;
+      const substituteMention = chatType === 'group' ? resolveSubstituteMention(substituteCfg, message) : undefined;
       let substituteChatMode: 'group' | 'topic' | undefined;
       // chats 白名单在 getChatMode 之前（纯内存判断走在 API roundtrip 前），
       // 对普通群与话题群统一生效：白名单是「替身可触发的群」清单，与群形态无关。
@@ -5739,7 +5752,7 @@ export function createLarkEventDispatcherRuntime(
           && chatType === 'group'
           && !explicitlyMentionedThisBot
           && isSubstituteExcludedChat(substituteCfg, chatId)
-          && resolveSubstituteTrigger(larkAppId, message)) {
+          && substituteMention) {
         logger.info(
           `[substitute:${larkAppId}] excluded chat — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
@@ -5756,7 +5769,7 @@ export function createLarkEventDispatcherRuntime(
           && !explicitlyMentionedThisBot
           && isSubstituteAllowedChat(substituteCfg, chatId)
           && !isSubstituteEnabledForChat(larkAppId, chatId)
-          && resolveSubstituteTrigger(larkAppId, message)) {
+          && substituteMention) {
         logger.info(
           `[substitute:${larkAppId}] per-chat off — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
@@ -5764,8 +5777,17 @@ export function createLarkEventDispatcherRuntime(
         return;
       }
       let substituteTrigger = substituteChatMode
-        ? resolveSubstituteTrigger(larkAppId, message)
+        // Keep the same snapshot across getChatMode's async lookup: mixing
+        // old keywords with newly saved targets can bypass the hand-off gate.
+        ? resolveSubstituteTrigger(larkAppId, message, substituteCfg)
         : undefined;
+      if (substituteMention && !explicitlyMentionedThisBot
+          && !matchesSubstituteKeywords(substituteCfg?.keywords, message)) {
+        // A keyword miss is a hand-off to the person, including owned topics,
+        // mentionMode=never and solo groups. Do not fall through to auto-reply.
+        logger.debug(`[substitute:${larkAppId}] keyword miss — dropping @target message msg=${messageId.substring(0, 12)}`);
+        return;
+      }
       if (substituteTrigger && !explicitlyMentionedThisBot) {
         const rawText = extractMessageTextForRouting(message);
         const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';

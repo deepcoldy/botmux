@@ -1300,6 +1300,9 @@ export interface SubstituteTarget {
 export interface SubstituteModeConfig {
   enabled: boolean;
   targets: SubstituteTarget[];
+  /** Optional case-insensitive body substrings; any match qualifies an @target.
+   *  Missing/empty keeps mention-only triggering. */
+  keywords?: string[];
   /** prefix = disclose "I will answer on behalf of X"; none = no extra disclosure instruction. */
   disclosure?: 'prefix' | 'none';
   /** Optional allow-list of chat IDs. When provided, substitute trigger only fires in these chats. */

@@ -989,6 +989,7 @@ function setupBotState(opts?: {
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
+	    keywords?: string[];
 	    disclosure?: 'prefix' | 'none';
 	    chats?: string[];
 	    excludedChats?: string[];
@@ -6854,6 +6855,144 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
+
+  for (const chatMode of ['group', 'topic'] as const) {
+    for (const owned of [false, true]) {
+      it(`substituteMode: keyword match triggers in ${chatMode}, owned=${owned}`, async () => {
+        setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: {
+          enabled: true, targets: [{ openId: 'ou_sub' }], keywords: ['独立卡', 'Oncall'],
+        } });
+        mockGetChatMode.mockResolvedValue(chatMode);
+        handlers.isSessionOwner.mockReturnValue(owned);
+        const event = makeUserMessageEvent({
+          senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@_sub 看下 ONCALL' }),
+          rootId: chatMode === 'topic' ? 'keyword-root' : undefined,
+          mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+        });
+        await capturedHandlers['im.message.receive_v1'](event);
+        await flushEventWork();
+        const receiver = owned ? handlers.handleThreadReply : handlers.handleNewTopic;
+        expect(receiver).toHaveBeenCalledWith(event, expect.objectContaining({
+          substituteTrigger: expect.objectContaining({ target: expect.objectContaining({ openId: 'ou_sub' }) }),
+        }));
+      });
+
+      for (const mentionMode of ['always', 'topic', 'ambient', 'never'] as const) {
+        it(`substituteMode: keyword miss stays silent in ${chatMode}, owned=${owned}, mentionMode=${mentionMode}`, async () => {
+          setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: mentionMode, substituteMode: {
+            enabled: true, targets: [{ openId: 'ou_sub' }], keywords: ['oncall'],
+          } });
+          mockGetChatMode.mockResolvedValue(chatMode);
+          handlers.isSessionOwner.mockReturnValue(owned);
+          const event = makeUserMessageEvent({
+            senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@_sub 下午开会' }),
+            rootId: chatMode === 'topic' ? 'keyword-root' : undefined,
+            mentions: [{ key: '@_sub', name: 'Oncall', id: { open_id: 'ou_sub' } }],
+          });
+          await capturedHandlers['im.message.receive_v1'](event);
+          await flushEventWork();
+          expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+          expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+        });
+      }
+    }
+  }
+
+  it('substituteMode: direct @bot still answers when @target misses keywords', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: {
+      enabled: true, targets: [{ openId: 'ou_sub' }], keywords: ['oncall'],
+    } });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@_bot @_sub 下午开会' }),
+      mentions: [
+        { key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } },
+        { key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } },
+      ],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({ substituteTrigger: undefined }));
+  });
+
+  it.each([true, false])('substituteMode: uses one config snapshot across async lookup, initially matches=%s', async matches => {
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'never', substituteMode: {
+      enabled: true, targets: [{ openId: 'ou_sub' }], keywords: [matches ? 'incident' : 'oncall'],
+    } });
+    mockGetChatMode.mockImplementationOnce(async () => {
+      state.config.substituteMode = {
+        ...state.config.substituteMode!, keywords: [matches ? 'oncall' : 'incident'],
+      };
+      return 'topic';
+    });
+    handlers.isSessionOwner.mockReturnValue(true);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, rootId: 'keyword-root', content: JSON.stringify({ text: '@_sub incident' }),
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    if (matches) {
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+        substituteTrigger: expect.objectContaining({ target: expect.objectContaining({ openId: 'ou_sub' }) }),
+      }));
+    } else {
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    }
+    handlers.handleThreadReply.mockClear();
+    mockGetChatMode.mockResolvedValue('topic');
+    const next = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, messageId: 'keyword-next', rootId: 'keyword-root',
+      content: JSON.stringify({ text: '@_sub ' + state.config.substituteMode!.keywords![0] }),
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](next);
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(next, expect.objectContaining({
+      substituteTrigger: expect.objectContaining({ target: expect.objectContaining({ openId: 'ou_sub' }) }),
+    }));
+  });
+
+  it.each(['outside-allowlist', 'topic-groups-disabled'] as const)(
+    'substituteMode: keyword miss stays silent with an owned session and %s', async scope => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'never', substituteMode: {
+        enabled: true, targets: [{ openId: 'ou_sub' }], keywords: ['oncall'],
+        chats: scope === 'outside-allowlist' ? ['other-chat'] : undefined,
+        topicGroups: scope !== 'topic-groups-disabled',
+      } });
+      mockGetChatMode.mockResolvedValue('topic');
+      handlers.isSessionOwner.mockReturnValue(true);
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID, rootId: 'keyword-root', content: JSON.stringify({ text: '@_sub 下午开会' }),
+        mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+      });
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    },
+  );
+
+  for (const blocked of ['excluded-chat', 'per-chat-off'] as const) {
+    it(`substituteMode: ${blocked} also silences an @target that misses keywords`, async () => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'never', substituteMode: {
+        enabled: true, targets: [{ openId: 'ou_sub' }], keywords: ['oncall'],
+        excludedChats: blocked === 'excluded-chat' ? ['chat-keywords'] : undefined,
+      } });
+      mockGetChatMode.mockResolvedValue('group');
+      mockIsSubstituteEnabledForChat.mockReturnValue(blocked !== 'per-chat-off');
+      handlers.isSessionOwner.mockReturnValue(true);
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID, chatId: 'chat-keywords', content: JSON.stringify({ text: '@_sub 下午开会' }),
+        mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+      });
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+  }
 
   it('substituteMode: @substitute in a regular group routes to the group chat session without @bot', async () => {
     setupBotState({
