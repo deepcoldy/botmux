@@ -1,3 +1,5 @@
+import { resolveSessionModelPinView } from '../../core/session-model.js';
+import { modelPinText } from '../../core/model-pin.js';
 import { isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 /** Model catalogue and picker shared by /models and the optional reply menu. */
 import type { DaemonSession } from '../../core/types.js';
@@ -66,6 +68,13 @@ function sessionCliId(ds: DaemonSession) {
 }
 
 export const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+
+/** Bot-default model values are written to bots.json and handed to the CLI as a
+ * launch argument, never typed into a terminal, so they may also carry a
+ * `#variant` suffix (e.g. MiniMax's `MiniMax-M3.1-Flash#thinking`). Without it
+ * a stored variant renders as "CLI default" and cannot be re-selected. Session
+ * pickers inject `/model <slug>` into the PTY and keep the strict pattern. */
+export const DEFAULT_MODEL_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(?:#[A-Za-z0-9._-]{1,32})?$/;
 
 /**
  * Resolve the model-catalogue selection for THIS session's frozen CLI shape.
@@ -158,6 +167,9 @@ export function buildSessionModelPickerCard(
     config: { wide_screen_mode: true },
     elements: [
       { tag: 'markdown', content: `**${t('card.reply_actions.model_title', undefined, loc)}**` },
+      { tag: 'div', text: { tag: 'plain_text', content: loc === 'en'
+        ? 'Choosing a model saves a topic pin. Higher-priority launch overrides remain in effect; otherwise the CLI restarts with conversation history and background terminal tasks stop.'
+        : '选择模型会保存话题固定；存在更高优先级覆盖时保留覆盖，否则重启 CLI 并保留对话上下文，后台终端任务会停止。' } },
       {
         tag: 'action',
         actions: [{
@@ -175,6 +187,11 @@ export function buildSessionModelPickerCard(
           value: { action, session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId },
         }],
       },
+      ...(ds.session.modelPin ? [
+        { tag: 'div', text: { tag: 'plain_text', content: modelPinText(resolveSessionModelPinView(ds, getBot(ds.larkAppId).config)) } },
+        { tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: '解除话题固定' },
+          value: { action: 'session_model_unpin', expected_pin_set_at: ds.session.modelPin.setAt, session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId } }] },
+      ] : []),
       ...modelLoadNote(load, loc),
       ...effortElements,
     ],
@@ -251,8 +268,8 @@ export function buildDefaultModelPickerCard(
   reasoning?: { cliId: string; effort?: string },
   load?: ModelPickerLoad,
 ): string {
-  const safe = [...new Set(models)].filter(model => MODEL_SLUG_PATTERN.test(model));
-  if (currentModel && MODEL_SLUG_PATTERN.test(currentModel)) {
+  const safe = [...new Set(models)].filter(model => DEFAULT_MODEL_VALUE_PATTERN.test(model));
+  if (currentModel && DEFAULT_MODEL_VALUE_PATTERN.test(currentModel)) {
     const existing = safe.indexOf(currentModel);
     if (existing >= 0) safe.splice(existing, 1);
     safe.unshift(currentModel);

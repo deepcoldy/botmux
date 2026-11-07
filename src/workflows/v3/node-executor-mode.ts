@@ -270,7 +270,10 @@ export type V3BotEligibilityCode =
    *  directory range (design §15.4). */
   | 'WORKING_DIR_OUT_OF_RANGE'
   /** `approve-dag --working-dir`, but this bot configures no directory. */
-  | 'WORKING_DIR_NO_RANGE';
+  | 'WORKING_DIR_NO_RANGE'
+  /** The directory is outside this bot's range (or it has none) and whether
+   *  the initiator may operate it could not be confirmed (`detail`: why). */
+  | 'WORKING_DIR_OPERATOR_UNKNOWN';
 
 export interface V3BotEligibilityProblem {
   nodeId: string;
@@ -377,9 +380,10 @@ const PROBLEM_TEXT: Record<V3BotEligibilityCode, string> = {
   DIRECTORY_OUTPUT: '节点声明了目录型产出，交给 Bot 执行时无法提交目录；请改成文件产出，或在 Dashboard 关闭该开关改用临时进程执行',
   WORKING_DIR_OUT_OF_RANGE: '指定的工作目录不在它配置的目录范围内（默认工作目录 / 仓库目录）',
   WORKING_DIR_NO_RANGE: '它没有配置目录范围（默认工作目录 / 仓库目录），不能给它指定工作目录',
+  WORKING_DIR_OPERATOR_UNKNOWN: '暂时无法确认发起人能否操作它，而指定的工作目录不在它配置的目录范围内；稍后重试，或把目录加进它的默认工作目录或仓库目录，或改派',
 };
 
-const WORKING_DIR_CODES: ReadonlySet<V3BotEligibilityCode> = new Set(['WORKING_DIR_OUT_OF_RANGE', 'WORKING_DIR_NO_RANGE']);
+const WORKING_DIR_CODES: ReadonlySet<V3BotEligibilityCode> = new Set(['WORKING_DIR_OUT_OF_RANGE', 'WORKING_DIR_NO_RANGE', 'WORKING_DIR_OPERATOR_UNKNOWN']);
 
 /** One user-facing reason for an eligibility code. */
 export function describeV3BotEligibilityCode(code: V3BotEligibilityCode): string {
@@ -403,7 +407,8 @@ export function formatV3BotEligibilityRefusal(
     ...(dirRefused ? [`指定的工作目录：${opts.workingDir}`] : []),
     ...lines,
     ...(dirRefused
-      ? ['节点在执行 Bot 自己的会话里跑，指定的目录必须落在每个执行 Bot 配置的默认工作目录或仓库目录之内；'
+      ? ['节点在执行 Bot 自己的会话里跑：发起人能操作（能在它的话题里用 /cd）的 Bot，目录存在即可；'
+        + '其余执行 Bot，指定的目录必须落在它配置的默认工作目录或仓库目录之内。'
         + '可换一个目录、给这些 Bot 的默认工作目录或仓库目录补上它，或去掉 --working-dir 让各 Bot 用自己的默认目录。']
       : []),
     '处理后重新批准；或用 revise-dag 改派节点，或在 Dashboard 关闭该开关改用临时进程执行。',
@@ -412,8 +417,8 @@ export function formatV3BotEligibilityRefusal(
 
 /** The Gate-2 summary line for a bot run approved with `--working-dir`. */
 export function describeV3NodeWorkingDir(workingDir: string): string {
-  return `工作目录：${workingDir}（每个执行 Bot 起节点会话时会按它当时的配置再核对一次；`
-    + '到时不在它的目录范围内，该节点会受阻并写明原因，不会改用它的默认目录）';
+  return `工作目录：${workingDir}（每个执行 Bot 起节点会话时会按它当时的配置和发起人当时的操作权再核对一次；`
+    + '到时不满足，该节点会受阻并写明原因，不会改用它的默认目录）';
 }
 
 /** The summary heading of a bot run: unchanged while every node gets its own

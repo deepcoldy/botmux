@@ -26,6 +26,10 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { botLocale, localeForBot, t as tr } from '../src/i18n/index.js';
+import { stuckCardFallbackText, stuckKeyResultText } from '../src/core/stuck-warning-card.js';
+import { config } from '../src/config.js';
+import { getBot } from '../src/bot-registry.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
@@ -44,6 +48,11 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptResolvedCard: vi.fn((text: string) => JSON.stringify({ type: 'resolved', text })),
   buildTuiPromptFailedCard: vi.fn((text: string) => JSON.stringify({ type: 'failed', text })),
   buildTuiPromptProcessingCard: vi.fn((text: string) => JSON.stringify({ type: 'processing', text })),
+  buildStuckPageCard: vi.fn((o: Record<string, unknown>) => JSON.stringify({ type: 'stuck_page', ...o })),
+  buildStuckKeyResultCard: vi.fn((text: string, tail: string | undefined, stillBlocked: boolean) =>
+    JSON.stringify({ type: 'stuck_result', text, tail, stillBlocked })),
+  buildInputNotSubmittedCard: vi.fn((message: string, tail: string) =>
+    JSON.stringify({ type: 'input_not_submitted', message, tail })),
   buildStreamingCard: vi.fn(() => '{}'),
   buildSessionCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Codex'),
@@ -645,5 +654,422 @@ describe('stuck-warning state machine (integration)', () => {
     // Nonces must be strictly increasing: 1, 2, 3 (never reuse)
     expect(nonces).toEqual([1, 2, 3]);
     expect(ds.stuckWarningNonceCounter).toBe(3);
+  });
+});
+
+describe('stuck-page card content and result reporting (integration)', () => {
+  let sessionReplyMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    updateMessageMock.mockClear();
+    sessionReplyMock = vi.fn(async () => 'om_card_1');
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+  });
+
+  function setup(overrides?: Partial<DaemonSession>) {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker, ...overrides });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    return { ds, fakeWorker };
+  }
+
+  /** The object the card builder mock received for the posted card. */
+  function postedCard(call = 0): Record<string, any> {
+    return JSON.parse(sessionReplyMock.mock.calls[call][1] as string);
+  }
+
+  it('posts the keyed card for the classified page with notice, screen tail and nonce', async () => {
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 4000, snapshot: '', matchedPattern: 'hook review startup',
+      turnId: 'turn_1', cliLifetime: 3, reason: 'input_held',
+      screenTail: 'Hooks need review\nPress enter to confirm or esc to go back', noticeText: 'held message',
+    });
+    await flush();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][2]).toBe('interactive');
+    const card = postedCard();
+    expect(card).toMatchObject({
+      type: 'stuck_page',
+      pageType: 'hook review startup',
+      nonce: 1,
+      noticeText: 'held message',
+      screenTail: 'Hooks need review\nPress enter to confirm or esc to go back',
+    });
+    // A held message did not stall a written turn: no "unfinished after Ns".
+    expect(card.stalledSecs).toBeUndefined();
+    expect(ds.stuckWarningPageType).toBe('hook review startup');
+    expect(ds.stuckWarningCardId).toBe('om_card_1');
+  });
+
+  it('a stalled turn (no reason) reports how long it stalled', async () => {
+    const { fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15_400, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+    });
+    await flush();
+    expect(postedCard().stalledSecs).toBe(15);
+  });
+
+  it('freezes the initiator from the active turn caller of the same turn', async () => {
+    const { ds, fakeWorker } = setup({
+      activeInteractiveTurn: {
+        turnId: 'turn_1',
+        caller: { requestUserOpenId: 'ou_alice', requestLarkAppId: 'app_test', senderType: 'user' },
+      },
+    });
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+    });
+    await flush();
+    expect(ds.stuckWarningInitiatorOpenId).toBe('ou_alice');
+    expect(postedCard().hasInitiator).toBe(true);
+    // The in-memory caller going away later does not change who may press.
+    ds.activeInteractiveTurn = undefined;
+    expect(ds.stuckWarningInitiatorOpenId).toBe('ou_alice');
+  });
+
+  it('falls back to the turn reply registry only when it proves a human sender', async () => {
+    const { ds, fakeWorker } = setup({
+      activeInteractiveTurn: {
+        turnId: 'other_turn',
+        caller: { requestUserOpenId: 'ou_mallory', requestLarkAppId: 'app_test', senderType: 'user' },
+      },
+    });
+    ds.session.replyTargets = {
+      turn_1: { senderOpenId: 'ou_bob', participants: [{ openId: 'ou_bob', isBot: false }] } as any,
+    };
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+    });
+    await flush();
+    expect(ds.stuckWarningInitiatorOpenId).toBe('ou_bob');
+  });
+
+  it('a bot or foreign-app caller, or a warning without turn id, freezes no initiator', async () => {
+    for (const caller of [
+      { requestUserOpenId: 'ou_bot_peer', requestLarkAppId: 'app_test', senderType: 'bot' as const },
+      { requestUserOpenId: 'ou_other_app', requestLarkAppId: 'app_other', senderType: 'user' as const },
+    ]) {
+      sessionReplyMock.mockClear();
+      const { ds, fakeWorker } = setup({ activeInteractiveTurn: { turnId: 'turn_1', caller } });
+      fakeWorker.emit('message', {
+        type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+      });
+      await flush();
+      expect(ds.stuckWarningCardId).toBe('om_card_1');
+      expect(ds.stuckWarningInitiatorOpenId).toBeUndefined();
+      expect(postedCard().hasInitiator).toBe(false);
+    }
+    sessionReplyMock.mockClear();
+    const { ds, fakeWorker } = setup({
+      activeInteractiveTurn: {
+        turnId: 'turn_1',
+        caller: { requestUserOpenId: 'ou_alice', requestLarkAppId: 'app_test', senderType: 'user' },
+      },
+    });
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', cliLifetime: 1,
+    });
+    await flush();
+    expect(ds.stuckWarningCardId).toBe('om_card_1');
+    expect(ds.stuckWarningInitiatorOpenId).toBeUndefined();
+  });
+
+  it('an unrecognised page posts the screen text without keys and registers no key authority', async () => {
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'something new', turnId: 'turn_1',
+      cliLifetime: 1, reason: 'submit_unconfirmed', screenTail: 'Some menu', noticeText: 'not submitted',
+    });
+    await flush();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(postedCard()).toMatchObject({ type: 'stuck_page', screenTail: 'Some menu', noticeText: 'not submitted' });
+    expect(postedCard().pageType).toBeUndefined();
+    expect(ds.stuckWarningNonce).toBeUndefined();
+    expect(ds.stuckWarningNonceCounter).toBeUndefined();
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningPageType).toBeUndefined();
+  });
+
+  it('an unrecognised page with nothing to show posts nothing', async () => {
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', turnId: 'turn_1', cliLifetime: 1,
+    });
+    await flush();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  async function postKeyedCard() {
+    const ctx = setup();
+    ctx.fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+    });
+    await flush();
+    expect(ctx.ds.stuckWarningCardId).toBe('om_card_1');
+    return ctx;
+  }
+
+  function patchedCard(): Record<string, any> {
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    const [, cardId, json] = updateMessageMock.mock.calls[0] as unknown as [string, string, string];
+    expect(cardId).toBe('om_card_1');
+    return JSON.parse(json);
+  }
+
+  it('delivered + still on a blocking page: reports the key, the page and the new screen', async () => {
+    const { ds, fakeWorker } = await postKeyedCard();
+    const ack = {
+      type: 'tui_keys_delivered', nonce: 1, key: 'Enter',
+      afterPageType: 'hook review level 2', afterScreenTail: 'PreToolUse hooks', afterObserved: true,
+    } as const;
+    fakeWorker.emit('message', ack);
+    await flush();
+    expect(patchedCard()).toEqual({
+      type: 'stuck_result',
+      text: stuckKeyResultText(ack, localeForBot('app_test')),
+      tail: 'PreToolUse hooks',
+      stillBlocked: true,
+    });
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningInitiatorOpenId).toBeUndefined();
+  });
+
+  it('delivered + left the page: reports success with the new screen', async () => {
+    const { fakeWorker } = await postKeyedCard();
+    const ack = { type: 'tui_keys_delivered', nonce: 1, key: 'Escape', afterScreenTail: '› ', afterObserved: true } as const;
+    fakeWorker.emit('message', ack);
+    await flush();
+    expect(patchedCard()).toEqual({
+      type: 'stuck_result',
+      text: stuckKeyResultText(ack, localeForBot('app_test')),
+      tail: '› ',
+      stillBlocked: false,
+    });
+  });
+
+  it('delivered but the post-key screen could not be read: says so and shows no screen', async () => {
+    const { fakeWorker } = await postKeyedCard();
+    const ack = { type: 'tui_keys_delivered', nonce: 1, key: 'Escape', afterObserved: false, afterScreenTail: 'stale' } as const;
+    fakeWorker.emit('message', ack);
+    await flush();
+    const card = patchedCard();
+    expect(card.text).toBe(stuckKeyResultText(ack, localeForBot('app_test')));
+    expect(card.tail).toBeUndefined();
+  });
+
+  it('an older worker ACK without key keeps the generic resolved card', async () => {
+    const { fakeWorker } = await postKeyedCard();
+    fakeWorker.emit('message', { type: 'tui_keys_delivered', nonce: 1 });
+    await flush();
+    expect(patchedCard()).toEqual({ type: 'resolved', text: tr('card.action.tui_done', undefined, localeForBot('app_test')) });
+  });
+
+  it('expired renders the localised "page changed, no key sent" state', async () => {
+    const { ds, fakeWorker } = await postKeyedCard();
+    fakeWorker.emit('message', { type: 'stuck_warning_expired', nonce: 1 });
+    await flush();
+    expect(patchedCard()).toEqual({ type: 'resolved', text: tr('card.stuck.expired', undefined, localeForBot('app_test')) });
+    expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  it('user_notify input_not_submitted with a screen tail is posted as a card', async () => {
+    const { fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'user_notify', message: 'not confirmed', kind: 'input_not_submitted', screenTail: 'Hooks need review', turnId: 'turn_1',
+    });
+    await flush();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][2]).toBe('interactive');
+    expect(JSON.parse(sessionReplyMock.mock.calls[0][1] as string)).toEqual({
+      type: 'input_not_submitted', message: 'not confirmed', tail: 'Hooks need review',
+    });
+  });
+
+  it('a refused input_not_submitted card falls back to the plain-text notice', async () => {
+    const { fakeWorker } = setup();
+    sessionReplyMock.mockImplementationOnce(async () => { throw new Error('Request failed (code: 230028)'); });
+    fakeWorker.emit('message', {
+      type: 'user_notify', message: 'not confirmed', kind: 'input_not_submitted', screenTail: 'Hooks need review', turnId: 'turn_1',
+    });
+    await flush();
+    expect(sessionReplyMock.mock.calls.map(c => c[2])).toEqual(['interactive', 'text']);
+    expect(sessionReplyMock.mock.calls[1][1]).toBe('not confirmed');
+  });
+
+  it('a refused submit_unconfirmed stuck card still delivers its notice as text', async () => {
+    const { ds, fakeWorker } = setup();
+    sessionReplyMock.mockImplementationOnce(async () => { throw new Error('Request failed (code: 230028)'); });
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'hook review level 1',
+      turnId: 'turn_1', cliLifetime: 1, reason: 'submit_unconfirmed', screenTail: 'Hooks', noticeText: 'not submitted',
+    });
+    await flush();
+    expect(sessionReplyMock.mock.calls.map(c => c[2])).toEqual(['interactive', 'text']);
+    expect(sessionReplyMock.mock.calls[1][1]).toBe('not submitted');
+    expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  // ─── keyed card refused / in flight / global initiator switch ───────────
+
+  /** What the worker-pool would send as text for this warning (same locale). */
+  function expectedFallback(m: Parameters<typeof stuckCardFallbackText>[0], cliName: string): string {
+    return stuckCardFallbackText(m, cliName, botLocale(getBot('app_test').config))!;
+  }
+
+  it.each([
+    { reason: 'input_held' as const, matchedPattern: 'cli migration menu' },
+    { reason: undefined, matchedPattern: 'hook review level 1' },
+  ])('a refused keyed card ($reason) still tells the chat as plain text, without the screen', async (m) => {
+    const { ds, fakeWorker } = setup();
+    sessionReplyMock.mockImplementationOnce(async () => { throw new Error('Request failed (code: 230028)'); });
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', turnId: 'turn_1', cliLifetime: 1,
+      screenTail: 'SECRET-SCREEN', ...m, ...(m.reason ? { reason: m.reason } : {}),
+    });
+    await flush();
+    expect(sessionReplyMock.mock.calls.map(c => c[2])).toEqual(['interactive', 'text']);
+    const text = sessionReplyMock.mock.calls[1][1] as string;
+    expect(text).toBe(expectedFallback(m, postedCard().cliName));
+    expect(text).not.toContain('SECRET-SCREEN');
+    expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  it('a refused card for an unrecognised page still delivers the worker notice as text', async () => {
+    const { fakeWorker } = setup();
+    sessionReplyMock.mockImplementationOnce(async () => { throw new Error('Request failed (code: 230028)'); });
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'something new', turnId: 'turn_1',
+      cliLifetime: 1, reason: 'submit_unconfirmed', screenTail: 'Some menu', noticeText: 'not submitted',
+    });
+    await flush();
+    expect(sessionReplyMock.mock.calls.map(c => [c[2], c[2] === 'text' ? c[1] : undefined])).toEqual([
+      ['interactive', undefined],
+      ['text', 'not submitted'],
+    ]);
+  });
+
+  it('a card POST that failed after the card was sent gets no duplicate text', async () => {
+    const { fakeWorker } = setup();
+    sessionReplyMock.mockImplementationOnce(async () => { throw new Error('principal-lane outbound lost turn ownership'); });
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'hook review level 1',
+      turnId: 'turn_1', cliLifetime: 1, reason: 'submit_unconfirmed', screenTail: 'Hooks', noticeText: 'not submitted',
+    });
+    await flush();
+    expect(sessionReplyMock.mock.calls.map(c => c[2])).toEqual(['interactive']);
+  });
+
+  it('a second warning for the same page while the first card POST is in flight posts no second card', async () => {
+    let resolvePost!: (id: string) => void;
+    sessionReplyMock.mockImplementationOnce(() => new Promise<string>(r => { resolvePost = r; }));
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'hook review startup',
+      turnId: 'turn_1', cliLifetime: 1, reason: 'input_held',
+    });
+    await flush();
+    // Another turn (and a warning without turn id) hit the same page meanwhile.
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'hook review startup',
+      turnId: 'turn_2', cliLifetime: 1, reason: 'input_held',
+    });
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review startup', cliLifetime: 1,
+    });
+    await flush();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(ds.stuckWarningNonce).toBe(1);
+    // An unconfirmed submit during the POST is still news: its notice goes out as text.
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'hook review startup',
+      turnId: 'turn_3', cliLifetime: 1, reason: 'submit_unconfirmed', noticeText: 'not submitted',
+    });
+    await flush();
+    expect(sessionReplyMock.mock.calls.slice(1).map(c => [c[1], c[2]])).toEqual([['not submitted', 'text']]);
+    resolvePost('om_card_1');
+    await flush();
+    expect(ds.stuckWarningCardId).toBe('om_card_1');
+    expect(ds.stuckWarningNonce).toBe(1);
+  });
+
+  it('a warning folded into an in-flight card that is then refused still gets its own text notice', async () => {
+    let rejectPost!: (err: Error) => void;
+    sessionReplyMock.mockImplementationOnce(() => new Promise<string>((_r, rej) => { rejectPost = rej; }));
+    const { fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1',
+      turnId: 'turn_1', cliLifetime: 1,
+    });
+    await flush();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 0, snapshot: '', matchedPattern: 'hook review level 1',
+      turnId: 'turn_2', cliLifetime: 1, reason: 'input_held',
+    });
+    await flush();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    rejectPost(new Error('Request failed (code: 230028)'));
+    await flush();
+    // One text notice for the refused card itself (turn_stalled) and one for
+    // the folded input_held warning — neither is lost.
+    const texts = sessionReplyMock.mock.calls.slice(1);
+    expect(texts.map(c => c[2])).toEqual(['text', 'text']);
+    expect(new Set(texts.map(c => c[1] as string)).size).toBe(2);
+  });
+
+  it('once the in-flight card is gone, a later warning for the page posts again', async () => {
+    sessionReplyMock.mockImplementationOnce(async () => { throw new Error('Request failed (code: 230028)'); });
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+    });
+    await flush();
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_2', cliLifetime: 1,
+    });
+    await flush();
+    expect(sessionReplyMock.mock.calls.map(c => c[2])).toEqual(['interactive', 'text', 'interactive']);
+    expect(ds.stuckWarningCardId).toBe('om_card_1');
+  });
+
+  it('the who-may-press hint follows the global initiator switch at build time', async () => {
+    try {
+      (config as any).stuckCardInitiatorKeys = false;
+      const off = setup();
+      off.fakeWorker.emit('message', {
+        type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+      });
+      await flush();
+      expect(postedCard(0).initiatorKeysEnabled).toBe(false);
+      delete (config as any).stuckCardInitiatorKeys;
+      const on = setup();
+      on.fakeWorker.emit('message', {
+        type: 'stuck_warning', elapsedMs: 15000, snapshot: '', matchedPattern: 'hook review level 1', turnId: 'turn_1', cliLifetime: 1,
+      });
+      await flush();
+      expect(postedCard(1).initiatorKeysEnabled).toBe(true);
+    } finally {
+      delete (config as any).stuckCardInitiatorKeys;
+    }
+  });
+
+  it('user_notify without a screen tail stays plain text', async () => {
+    const { fakeWorker } = setup();
+    fakeWorker.emit('message', { type: 'user_notify', message: 'not confirmed', kind: 'input_not_submitted', turnId: 'turn_1' });
+    fakeWorker.emit('message', { type: 'user_notify', message: 'other notice', screenTail: 'ignored', turnId: 'turn_1' });
+    await flush();
+    expect(sessionReplyMock.mock.calls.map(c => [c[1], c[2]])).toEqual([
+      ['not confirmed', 'text'],
+      ['other notice', 'text'],
+    ]);
   });
 });

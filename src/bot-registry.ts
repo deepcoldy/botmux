@@ -43,6 +43,7 @@ import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
+import type { GroupJoinAnchorMode } from './core/auto-start.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
@@ -86,6 +87,8 @@ import { normalizePromptCacheConfig, type PromptCacheConfig } from './services/p
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
+import { normalizeFeedbackPresentation } from './services/feedback-presentation.js';
+import type { FeedbackPresentationConfig } from './services/feedback-extension-types.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import {
   normalizeReplyStyleConfig,
@@ -1468,6 +1471,7 @@ export interface BotConfig {
   dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  feedbackPresentation?: FeedbackPresentationConfig;
   oncallGroup?: OncallGroupPolicy;
   /** Opt-in defaults for explicit /g group creation. */
   groupCreation?: GroupCreationDefaults;
@@ -2328,6 +2332,17 @@ export interface BotConfig {
    * the historical allowedUsers-only behaviour.
    */
   autoStartOnGroupJoinGateRequired?: boolean;
+  /**
+   * 主动开工 — 场景① 普通群会话锚点。只作用于 reply mode 本会让入群会话留在
+   * chat-scope 的普通群（chat / shared / chat-topic）；话题群与 new-topic 不变。
+   *   - 'reply-mode'（缺省）：跟随群的 reply mode，即现有行为。
+   *   - 'latest-message'：以群里最新一条已有消息（跳过系统消息、已撤回消息和本
+   *     bot 自己的消息）为根开 thread-scope 会话，回复落在该消息的话题里，而不是
+   *     群顶层。没有可用消息或拉取失败时回退 'reply-mode'。典型场景：外部平台建群、
+   *     先发一张上下文卡片再拉 bot，bot 在那张卡片的话题里干活。
+   * 仅 bots.json 配置；forcePrompt（Issue Board 领取 / 会议预热）路径不读它。
+   */
+  autoStartOnGroupJoinAnchor?: GroupJoinAnchorMode;
   /**
    * 主动开工 — 场景① optional pre-configured first-turn prompt. When set, it
    * becomes the user_message of the auto-started session; when unset/blank the
@@ -4185,6 +4200,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
+      feedbackPresentation: entry.feedbackPresentation === undefined
+        ? undefined
+        : normalizeFeedbackPresentation(entry.feedbackPresentation),
       chatFeedbackPolicies: entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
         ? Object.fromEntries(Object.entries(entry.chatFeedbackPolicies).map(([chatId, layer]) => [chatId, normalizeFeedbackPolicyLayer(layer)]))
         : undefined,
@@ -4423,6 +4441,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
       autoStartOnGroupJoinGateRequired: entry.autoStartOnGroupJoinGateRequired === true || undefined,
+      // Only the non-default value is meaningful/persisted (undefined = 'reply-mode').
+      autoStartOnGroupJoinAnchor: entry.autoStartOnGroupJoinAnchor === 'latest-message' ? 'latest-message' : undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank

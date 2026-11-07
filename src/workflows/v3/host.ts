@@ -23,7 +23,7 @@ import { WORKFLOW_DRAFT_FILE } from './draft-store.js';
 import { join, resolve, sep } from 'node:path';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
-import { checkBotWorkingDir, realWorkingDir } from '../../core/working-dir-range.js';
+import { checkNodeWorkingDir, comparableSessionDir, realWorkingDir, type NodeWorkingDirOperate } from '../../core/working-dir-range.js';
 import { resolveCurrentTurnProvenance } from '../../core/current-turn-provenance.js';
 import { isHumanInboundTurnId } from '../../core/reply-target.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -84,6 +84,7 @@ import { isGoalNode, type V3Dag } from './dag.js';
 import {
   v3CheckpointProblems,
   v3CheckpointsWithoutDependants,
+  v3MainSessionDirProblem,
   v3PlacementProblems,
   type V3MainTopicAvailability,
 } from './placement.js';
@@ -691,14 +692,31 @@ export interface AdHocNodeExecutorPlanInput {
   switchMode: V3NodeExecutorSwitch;
   multiTopicEnabled: boolean;
   /** `approve-dag --working-dir`. For a `bot` decision it must name an
-   *  existing directory inside every executing bot's configured range. */
+   *  existing directory, inside every executing bot's configured range
+   *  unless the initiator may operate that bot (§15.4). */
   workingDirOverride?: string;
+  /** §15.4: may the run's initiator operate the node's executing bot (use
+   *  `/cd` there), as that bot's daemon judges it? Asked only for a bot whose
+   *  range refuses the directory; `unknown` when it cannot be confirmed.
+   *  Absent = no one is taken to operate any bot (the architect preview):
+   *  the range alone decides. */
+  workingDirOperator?: (run: { runId: string; binding: RunChatBinding }) => V3WorkingDirOperator | Promise<V3WorkingDirOperator>;
   /** Live §6.1 probe for the run's chat; only built for a `bot` decision. */
   probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
   /** §5.2 rule 3, read only when some node is placed in the main topic
    *  (absent = unknown: such a dag is refused). */
   mainTopic?: (binding: RunChatBinding) => V3MainTopicAvailability;
+  /** The main session's directory in comparison form, read only with a
+   *  `--working-dir` and a main-bot main-topic node (absent / undefined =
+   *  unknown: not refused here, the runtime gate decides). */
+  mainSessionDir?: (binding: RunChatBinding) => string | undefined;
+  /** Bot display names for the placement refusals (default: the app id). */
+  nameOf?: (larkAppId: string) => string;
 }
+
+/** See {@link AdHocNodeExecutorPlanInput.workingDirOperator}. Asked once per
+ *  executing bot, naming one node it executes (the daemon checks that). */
+export type V3WorkingDirOperator = (target: { nodeId: string; larkAppId: string }) => Promise<NodeWorkingDirOperate>;
 
 export type AdHocNodeExecutorPlan =
   | { kind: 'ephemeral'; decision: Extract<V3NodeExecutorDecision, { mode: 'ephemeral' }> }
@@ -713,9 +731,10 @@ export type AdHocNodeExecutorPlan =
  * the experimental switch, the run's chat shape and — for a `bot` decision —
  * each goal node's executing bot (frozen exactly as {@link authorizeAdHocRun}
  * will freeze it, default = the bot the grill was born in) checked against
- * §6.1 items 1–4. A `--working-dir` must exist and lie inside every executing
- * bot's configured directory range (§15.4, the main bot included); a node
- * whose bot does not allow it refuses the approval before any live probe.
+ * §6.1 items 1–4. A `--working-dir` must exist and, for every executing bot
+ * the initiator may not operate, lie inside its configured directory range
+ * (§15.4, the main bot included); a node whose bot does not allow it refuses
+ * the approval before any eligibility probe.
  * Read-only: nothing is published here.
  */
 export async function planAdHocNodeExecutor(
@@ -753,12 +772,34 @@ export async function planAdHocNodeExecutor(
       targets,
       orchestratorAppId: binding.larkAppId,
       mainTopic: input.mainTopic?.(binding) ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+      ...(input.nameOf ? { nameOf: input.nameOf } : {}),
     });
     if (placement.length > 0) return { kind: 'placementRefused', binding, targets, problems: placement };
+    // The main bot's own main-topic nodes run in the main session, i.e. in
+    // its directory: another frozen directory would block them at runtime.
+    if (workingDir !== undefined) {
+      const ownMain = targets.filter((target) => target.placement === 'main' && target.larkAppId === binding.larkAppId);
+      const problem = ownMain.length > 0
+        ? v3MainSessionDirProblem({
+            nodes: ownMain,
+            mainLarkAppId: binding.larkAppId,
+            workingDir,
+            mainSessionDir: input.mainSessionDir?.(binding),
+          })
+        : undefined;
+      if (problem) return { kind: 'placementRefused', binding, targets, problems: [problem] };
+    }
   }
   const withDir = workingDir !== undefined ? { workingDir } : {};
   if (workingDir !== undefined) {
-    const dirProblems = v3WorkingDirProblems(targets, bots, workingDir);
+    // A check that cannot even be set up answers "no" for every bot.
+    let operator: V3WorkingDirOperator | undefined;
+    try {
+      operator = input.workingDirOperator ? await input.workingDirOperator({ runId: cur.runId, binding }) : undefined;
+    } catch {
+      operator = undefined;
+    }
+    const dirProblems = await v3WorkingDirProblems(targets, bots, workingDir, operator);
     if (dirProblems.length > 0) return { kind: 'refused', binding, targets, problems: dirProblems, ...withDir };
   }
   const checked = await checkV3BotExecutorEligibility({
@@ -771,24 +812,44 @@ export async function planAdHocNodeExecutor(
     : { kind: 'refused', binding, targets, problems: checked.problems, ...withDir };
 }
 
-/** §15.4 at Gate-2: one problem per node whose executing bot's configured
- *  directory range (bots.json as of now) does not contain `workingDir`. */
-function v3WorkingDirProblems(
+/** §15.4 at Gate-2: one problem per node whose executing bot (bots.json as
+ *  of now) may not be given `workingDir` — it is outside that bot's
+ *  configured range and the initiator may not (or cannot be confirmed to)
+ *  operate the bot. Each bot is asked at most once, all bots at the same
+ *  time; the problems keep node order. */
+async function v3WorkingDirProblems(
   targets: readonly V3NodeExecutorTarget[],
   bots: readonly BotConfig[],
   workingDir: string,
-): V3BotEligibilityProblem[] {
-  const problems: V3BotEligibilityProblem[] = [];
-  for (const target of targets) {
+  operator: V3WorkingDirOperator | undefined,
+): Promise<V3BotEligibilityProblem[]> {
+  const operates = new Map<string, Promise<NodeWorkingDirOperate>>();
+  const asked = (target: V3NodeExecutorTarget): Promise<NodeWorkingDirOperate> => {
+    let answer = operates.get(target.larkAppId);
+    if (!answer) {
+      answer = operator
+        ? operator({ nodeId: target.nodeId, larkAppId: target.larkAppId }).catch(() => ({ unknown: '查询出错' }))
+        : Promise.resolve('no' as const);
+      operates.set(target.larkAppId, answer);
+    }
+    return answer;
+  };
+  const verdicts = await Promise.all(targets.map(async (target) => {
     const bot = bots.find((candidate) => candidate.larkAppId === target.larkAppId);
     // An unknown bot is reported by the eligibility check (BOT_NOT_CONFIGURED).
-    if (!bot) continue;
-    const verdict = checkBotWorkingDir(bot, workingDir);
-    if (verdict.ok) continue;
+    if (!bot) return undefined;
+    return { target, verdict: await checkNodeWorkingDir(bot, workingDir, () => asked(target)) };
+  }));
+  const problems: V3BotEligibilityProblem[] = [];
+  for (const entry of verdicts) {
+    if (!entry || entry.verdict.ok) continue;
+    const { target, verdict } = entry;
     problems.push({
       nodeId: target.nodeId,
       larkAppId: target.larkAppId,
-      code: verdict.reason === 'no_range' ? 'WORKING_DIR_NO_RANGE' : 'WORKING_DIR_OUT_OF_RANGE',
+      ...(verdict.operateUnknown !== undefined
+        ? { code: 'WORKING_DIR_OPERATOR_UNKNOWN' as const, detail: verdict.operateUnknown }
+        : { code: verdict.reason === 'no_range' ? 'WORKING_DIR_NO_RANGE' as const : 'WORKING_DIR_OUT_OF_RANGE' as const }),
     });
   }
   return problems;
@@ -1019,9 +1080,20 @@ export class HostGuardError extends Error {
   }
 }
 
+/** A `botmux workflow` command used wrongly: missing or malformed arguments,
+ *  an invalid run id, a run that does not exist. Like {@link HostGuardError}
+ *  the CLI prints only its message. Kept apart from it so callers that map
+ *  guard refusals (e.g. the Dashboard draft service) are unaffected. */
+export class WorkflowUsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkflowUsageError';
+  }
+}
+
 function mustRead(runDir: string): GrillState {
   const s = readGrillState(runDir);
-  if (!s) throw new Error(`grill.state.json 不存在于 ${runDir}`);
+  if (!s) throw new WorkflowUsageError(`grill.state.json 不存在于 ${runDir}`);
   return s;
 }
 
@@ -1068,10 +1140,17 @@ export interface WorkflowHostCommandDeps {
   /** The person confirming Gate-2 in this turn (default:
    *  {@link currentTurnConfirmerFromEnv}). Undefined / throwing = unknown. */
   resolveCurrentTurnConfirmer?: () => string | undefined;
+  /** §15.4 operate check per executing bot (default: each bot's daemon over
+   *  trusted IPC, the initiator converted into its app via union_id). */
+  workingDirOperator?: (run: { runId: string; binding: RunChatBinding }) => V3WorkingDirOperator | Promise<V3WorkingDirOperator>;
   /** Capability labels for the Architect roster (default: bot profiles). */
   botRole?: () => (larkAppId: string) => string | undefined;
   /** §5.2 rule 3 (default: the run's persisted main session). */
   mainTopicAvailability?: (binding: RunChatBinding) => V3MainTopicAvailability | Promise<V3MainTopicAvailability>;
+  /** The main session's directory (default: its persisted row, an unpinned
+   *  row falling back to the main bot's default from `bots`); undefined =
+   *  unknown. */
+  mainSessionWorkingDir?: (binding: RunChatBinding, bots: readonly BotConfig[]) => string | undefined | Promise<string | undefined>;
   /** Test seam for the architect worker (default: the real ephemeral pool). */
   runArchitect?: ArchitectDeps['runArchitect'];
 }
@@ -1100,6 +1179,11 @@ async function liveBotEligibilityProbe(binding: RunChatBinding, bots: BotConfig[
     chatId: binding.chatId,
     bots,
   });
+}
+
+async function liveWorkingDirOperator(run: { runId: string; binding: RunChatBinding }): Promise<V3WorkingDirOperator> {
+  const { createLiveV3WorkingDirOperator } = await import('../../im/lark/v3-bot-eligibility.js');
+  return createLiveV3WorkingDirOperator({ runId: run.runId });
 }
 
 /** A probe that accepts every bot: the architect preview lists assignments
@@ -1132,6 +1216,32 @@ async function resolveMainTopic(
     availability = { available: false, why: `读不到主会话（${err instanceof Error ? err.message : String(err)}）` };
   }
   return () => availability;
+}
+
+async function liveMainSessionWorkingDir(binding: RunChatBinding, bots: readonly BotConfig[]): Promise<string | undefined> {
+  const { liveV3MainSessionWorkingDir } = await import('../../im/lark/v3-bot-eligibility.js');
+  return liveV3MainSessionWorkingDir(binding, bots);
+}
+
+/** The main session's directory for the run in `runDir`, resolved once per
+ *  command and only when a `--working-dir` was given. Unreadable = unknown. */
+async function resolveMainSessionDir(
+  runDir: string,
+  workingDirOverride: string | undefined,
+  bots: readonly BotConfig[],
+  deps: WorkflowHostCommandDeps,
+): Promise<((binding: RunChatBinding) => string | undefined) | undefined> {
+  if (workingDirOverride === undefined) return undefined;
+  const binding = readGrillState(runDir)?.chatBinding;
+  if (!binding) return undefined;
+  let dir: string | undefined;
+  try {
+    const raw = await (deps.mainSessionWorkingDir ?? liveMainSessionWorkingDir)(binding, bots);
+    dir = raw === undefined ? undefined : comparableSessionDir(raw);
+  } catch {
+    dir = undefined;
+  }
+  return () => dir;
 }
 
 async function liveBotDisplayName(): Promise<(larkAppId: string) => string> {
@@ -1168,7 +1278,7 @@ export async function cmdWorkflowHost(
   switch (sub) {
     case 'new': {
       const goal = firstPositional(rest);
-      if (!goal) throw new Error('用法: botmux workflow new "<目标>" [--base-dir <dir>]');
+      if (!goal) throw new WorkflowUsageError('用法: botmux workflow new "<目标>" [--base-dir <dir>]');
       // grill 经 daemon worker 出生时，env 带话题上下文 → 落 chatBinding，供后续
       // daemon humanGate 发审批卡用（CLI/dev 出生无 env → undefined，不影响）。
       const chatBinding = (deps.resolveChatBinding ?? chatBindingFromEnv)();
@@ -1279,12 +1389,16 @@ export async function cmdWorkflowHost(
       // (approve-dag re-decides and checks eligibility; this never blocks).
       if (switchMode === 'bot') {
         try {
+          const previewDir = argValue(rest, '--working-dir');
+          const mainSessionDir = await resolveMainSessionDir(runDir, previewDir, bots, deps);
           const preview = await planAdHocNodeExecutor(runDir, bots, {
             switchMode: 'bot',
             multiTopicEnabled: multiTopicEnabled(),
-            workingDirOverride: argValue(rest, '--working-dir'),
+            workingDirOverride: previewDir,
             probe: () => PREVIEW_PROBE,
             ...(mainTopic ? { mainTopic } : {}),
+            ...(mainSessionDir ? { mainSessionDir } : {}),
+            ...(nameOf ? { nameOf } : {}),
           });
           if (preview.kind === 'ephemeral') {
             const fallback = describeV3EphemeralFallback(preview.decision);
@@ -1308,7 +1422,7 @@ export async function cmdWorkflowHost(
       assertWorkflowHostCaller(runDir, currentCaller);
       const workingDirOverride = argValue(rest, '--working-dir');
       if (rest.includes('--working-dir') && (!workingDirOverride?.trim() || workingDirOverride.startsWith('--'))) {
-        throw new Error('--working-dir requires a non-empty path');
+        throw new WorkflowUsageError('--working-dir requires a non-empty path');
       }
       const now = new Date();
       // An already-published replay must not depend on today's bots.json just
@@ -1329,12 +1443,17 @@ export async function cmdWorkflowHost(
         const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
         if (switchMode === 'bot') {
           const mainTopic = await resolveMainTopic(runDir, deps);
+          const mainSessionDir = await resolveMainSessionDir(runDir, workingDirOverride, bots, deps);
+          const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
           const plan = await planAdHocNodeExecutor(runDir, bots, {
             switchMode,
             multiTopicEnabled: (deps.multiTopicEnabled ?? (() => isMultiTopicOrchestrationEnabled()))(),
             workingDirOverride,
             probe: (binding) => (deps.botEligibilityProbe ?? liveBotEligibilityProbe)(binding, bots),
+            workingDirOperator: (run) => (deps.workingDirOperator ?? liveWorkingDirOperator)(run),
             ...(mainTopic ? { mainTopic } : {}),
+            ...(mainSessionDir ? { mainSessionDir } : {}),
+            nameOf,
           });
           // §5.2: a hard-rule violation refuses the approval, naming the rule.
           if (plan.kind === 'placementRefused') throw new HostGuardError(formatV3PlacementRefusal(plan.problems));
@@ -1344,7 +1463,6 @@ export async function cmdWorkflowHost(
             const ignored = describeIgnoredAssignees(runDir);
             if (ignored) summary.push(ignored);
           } else {
-            const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
             if (plan.kind === 'refused') {
               throw new HostGuardError(formatV3BotEligibilityRefusal(plan.problems, nameOf, {
                 ...(plan.workingDir !== undefined ? { workingDir: plan.workingDir } : {}),
@@ -1512,12 +1630,12 @@ function firstPositional(args: string[]): string | undefined {
 
 function requireRunId(rest: string[]): string {
   const runId = firstPositional(rest);
-  if (!runId) throw new Error('用法: botmux workflow <sub> <runId> [--base-dir <dir>]');
+  if (!runId) throw new WorkflowUsageError('用法: botmux workflow <sub> <runId> [--base-dir <dir>]');
   // Reject anything that could escape baseDir (path separators, `..`, leading
   // dot) — these verbs are skill-driven shell commands, so harden the runId
   // before it reaches join/resolve (codex review 2026-06-02).
   if (!isValidRunId(runId)) {
-    throw new Error(`非法 runId（只允许字母数字与 . _ -、不得含路径分隔符）：${runId}`);
+    throw new WorkflowUsageError(`非法 runId（只允许字母数字与 . _ -、不得含路径分隔符）：${runId}`);
   }
   return runId;
 }

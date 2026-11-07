@@ -185,7 +185,11 @@ export function v3PlacementProblems(input: {
    *  from `dag`); appended to the refusal. */
   explainUnordered?: (a: string, b: string) => { joinId: string; rule: string; first: string } | undefined;
 }): V3PlacementProblem[] {
-  const nameOf = input.nameOf ?? ((appId: string) => appId);
+  // A bot is named by its display name, the app id kept beside it.
+  const nameOf = (appId: string): string => {
+    const name = input.nameOf?.(appId);
+    return name && name !== appId ? `${name}（${appId}）` : appId;
+  };
   const mainNodes = input.dag.nodes.filter((node) => isGoalNode(node) && v3NodePlacement(node) === 'main');
   const problems: V3PlacementProblem[] = [];
   if (mainNodes.length === 0) return problems;
@@ -241,4 +245,36 @@ export function v3PlacementProblems(input: {
     }
   }
   return problems;
+}
+
+/**
+ * §5.2 rule 2 × §15.4: the main bot's own main-topic nodes run IN the main
+ * session, and that session already runs in its own directory (it was
+ * started when `/workflow` was sent). A frozen node working directory other
+ * than that one can never be honoured for them — the runtime blocks such a
+ * node with WORKING_DIR_REFUSED — so every entry that freezes the directory
+ * or makes a node one of them refuses it up front, through this one check.
+ *
+ * `nodes`: the nodes to judge, each with the bot that will execute it and its
+ * placement (an entry passes only the nodes it is responsible for: Gate-2 all
+ * of them, a runtime change the ones it turns into this kind). Both
+ * directories are in comparison form (`comparableSessionDir`), compared as
+ * strings. `mainSessionDir` undefined = unknown: nothing is refused here and
+ * the runtime gate stays the only check. Pure.
+ */
+export function v3MainSessionDirProblem(input: {
+  nodes: Iterable<{ nodeId: string; larkAppId: string; placement?: V3NodePlacement }>;
+  mainLarkAppId: string;
+  workingDir: string | undefined;
+  mainSessionDir: string | undefined;
+}): string | undefined {
+  const { workingDir, mainSessionDir } = input;
+  if (workingDir === undefined || mainSessionDir === undefined || workingDir === mainSessionDir) return undefined;
+  const nodeIds = [...input.nodes]
+    .filter((node) => node.placement === 'main' && node.larkAppId === input.mainLarkAppId)
+    .map((node) => node.nodeId);
+  if (nodeIds.length === 0) return undefined;
+  return `节点 ${nodeIds.join('、')} 由主 Bot 自己在主话题执行，工作目录 ${workingDir} 不是主会话的目录：`
+    + `主 Bot 自己在主话题执行的节点只能在主会话的目录 ${mainSessionDir} 里跑；`
+    + `把节点改成节点话题，或不指定工作目录，或指定为 ${mainSessionDir}`;
 }

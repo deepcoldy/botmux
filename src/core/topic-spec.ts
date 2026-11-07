@@ -1,7 +1,7 @@
 /**
  * 把一个已解析的话题指令头（{@link ./topic-header.js parseTopicHeader} 的产物）
- * 变成一份可以直接往会话上写的**会话规格**：标题、工作目录、本次 spawn 的模型、
- * 持久化的推理强度。
+ * 变成一份可以直接往会话上写的**会话规格**：标题、工作目录、显式模型固定、
+ * 推理强度（与模型一同给出时绑定到 pin）。
  *
  * 形状对齐 `resolveScheduleModelOverride`（core/schedule-model-override.ts），但策略
  * 相反：定时任务在**没人在场**时触发，模型名过期就降级并警告（fail soft）；指令头是
@@ -88,9 +88,9 @@ export interface TopicSpec {
   /** 头部写了 `/repo wt …`：会话以 pendingRepo 建立，由 daemon 在话题建好后建 worktree 再 fork。
    *  与 `workingDir` / `repoStartInDefaultDir` 互斥。 */
   worktree?: TopicSpecWorktree;
-  /** 本次 spawn 的模型（落 `DaemonSession.spawnModelOverride`，内存态、不持久化）。 */
+  /** 显式模型，落持久化 modelPin，不能转成一次性 spawn override。 */
   model?: string;
-  /** 推理强度（落 `session.reasoningEffort`，与 trigger 一致地持久化）。 */
+  /** 与 model 同时指定时落 modelPin.effort；仅 effort 时沿用 reasoningEffort。 */
   reasoningEffort?: CodexReasoningEffort;
 }
 
@@ -209,7 +209,7 @@ export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContex
       errors.push({ kind: 'effort_invalid', arg: effortArg });
     } else if (!isConfigurableReasoningCliId(botCfg.cliId)) {
       errors.push({ kind: 'effort_unsupported_cli', ...(botCfg.cliId ? { cliId: botCfg.cliId } : {}) });
-    } else if (botCfg.cliId !== 'traex' && !cliModelSupportsReasoningEffort(botCfg.cliId, effectiveModel, effortArg)) {
+    } else if ((botCfg.cliId !== 'traex' || !!spec.model) && !cliModelSupportsReasoningEffort(botCfg.cliId, effectiveModel, effortArg)) {
       errors.push({
         kind: 'effort_unsupported_model',
         effort: effortArg,
@@ -221,4 +221,14 @@ export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContex
   }
 
   return errors.length > 0 ? { ok: false, errors } : spec;
+}
+
+/** Apply validated explicit topic intent. Effort-only headers preserve legacy semantics. */
+export function applyTopicModelSpec(
+  session: { modelPin?: import('./model-pin.js').ModelPin; reasoningEffort?: CodexReasoningEffort },
+  spec: TopicSpec | undefined, setBy: string, setAt: string,
+): void {
+  if (spec?.model) session.modelPin = { model: spec.model,
+    ...(spec.reasoningEffort ? { effort: spec.reasoningEffort } : {}), source: 'topic-header', setBy, setAt };
+  else if (spec?.reasoningEffort) session.reasoningEffort = spec.reasoningEffort;
 }

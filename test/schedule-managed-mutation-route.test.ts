@@ -10,6 +10,7 @@ import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { isUntilDoneClosed, UNTIL_DONE_NOTE_MAX_CHARS } from '../src/services/schedule-until-done.js';
+import { readManagedScheduleUpdate } from '../src/core/schedule-managed-update.js';
 
 // A real directory: capabilityScheduleWorkingDir realpaths both sides.
 const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
@@ -66,6 +67,15 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     listChatMemberOpenIds: async () => ['ou_admin'],
     scheduleAuthorityStore: { getRecord: () => record },
     scheduler,
+    readManagedScheduleUpdate,
+    // The compound commit itself runs against real stores in
+    // schedule-managed-update.test.ts; here it only records the call.
+    applyManagedScheduleUpdate: vi.fn((taskId: string, _appId: string, updates: Record<string, unknown>) => {
+      const result = scheduler.updateTask(taskId, updates) as { ok: boolean; error?: string };
+      return result.ok
+        ? { ok: true, task: { schedule: String(updates.schedule ?? '0 9 * * *'), nextRunAt: null, enabled: true } }
+        : { ok: false, error: result.error ?? 'not_found_or_denied' };
+    }),
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
   };
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
@@ -433,6 +443,39 @@ describe('managed schedule mutation route', () => {
       value: { error: 'schedule_session_tool_controller_forbidden' },
     });
     expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('commits a frequency change of a precondition-bound task through the compound edit', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.preconditionRef = 'host-protected';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'update', id: 'a1b2c3d4', schedule: ' every 4h ' });
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true, task: { schedule: 'every 4h' } } });
+    expect(h.scope.applyManagedScheduleUpdate).toHaveBeenCalledWith('a1b2c3d4', 'cli_target', { schedule: 'every 4h' });
+  });
+
+  it.each([
+    [{ schedule: '   ' }, 'invalid_schedule_expression'],
+    [{ schedule: 7 }, 'invalid_schedule_expression'],
+    [{}, 'invalid_schedule_update'],
+  ])('rejects malformed update body %j before committing', async (fields, error) => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'update', id: 'a1b2c3d4', ...fields });
+    expect(await h.run()).toMatchObject({ status: 400, value: { error } });
+    expect(h.scope.applyManagedScheduleUpdate).not.toHaveBeenCalled();
+  });
+
+  it('refuses a frequency change from a non-administrator before committing', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.ds.activeInteractiveTurn.caller.requestUserOpenId = 'ou_member';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'update', id: 'a1b2c3d4', schedule: 'every 4h' });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(h.scope.applyManagedScheduleUpdate).not.toHaveBeenCalled();
   });
 
   it('requires a new authorization to change a delegated task canonical input', async () => {

@@ -140,7 +140,8 @@ export const REPLY_TARGETS_MAX = 32;
  *  watermark against the turn window to decide incompleteness.
  *
  *  `pinnedTurnIds` lists turns whose routing record a LIVE built-in CronCreate
- *  task still reports into (see {@link cronPinnedTurnIds}): those entries are
+ *  task (or a running background task) still reports into (see
+ *  {@link replyTargetPinnedTurnIds}): those entries are
  *  exempt from eviction even past REPLY_TARGETS_MAX, otherwise a task created
  *  in topic A loses its replyTargets record after 32 newer turns and its next
  *  scheduled fire falls back to the group top level — no restart required. */
@@ -195,6 +196,32 @@ export function cronPinnedTurnIds(
   for (const rec of Object.values(anchors)) {
     if (rec && typeof rec.turnId === 'string' && rec.turnId) pinned.add(rec.turnId);
   }
+  return pinned;
+}
+
+/** Bound on {@link DaemonSession.backgroundTaskPinnedTurnIds}, newest kept: the
+ *  worker reports only running tasks, so this caps a misbehaving snapshot,
+ *  not a real session. Same order of magnitude as CRON_TASK_ANCHORS_MAX. */
+export const BACKGROUND_TASK_PINS_MAX = 64;
+
+/** Validate and bound a worker `background_task_pins_sync` snapshot. Returns
+ *  undefined when nothing is pinned (the field is then cleared). */
+export function normalizeBackgroundTaskPins(turnIds: unknown): string[] | undefined {
+  if (!Array.isArray(turnIds)) return undefined;
+  const ids = [...new Set(turnIds.filter((id): id is string => typeof id === 'string' && id.length > 0))];
+  const bounded = ids.length > BACKGROUND_TASK_PINS_MAX ? ids.slice(ids.length - BACKGROUND_TASK_PINS_MAX) : ids;
+  return bounded.length > 0 ? bounded : undefined;
+}
+
+/** Every replyTargets turnId that eviction must keep: the create-time topic
+ *  of each live CronCreate task, plus the launching turn of each background
+ *  task the current worker still reports as running. All three replyTargets
+ *  writers prune through this set. */
+export function replyTargetPinnedTurnIds(
+  ds: Pick<DaemonSession, 'session' | 'backgroundTaskPinnedTurnIds'>,
+): Set<string> {
+  const pinned = cronPinnedTurnIds(ds.session.cronTaskReplyAnchors);
+  for (const turnId of ds.backgroundTaskPinnedTurnIds ?? []) pinned.add(turnId);
   return pinned;
 }
 
@@ -425,7 +452,7 @@ export function inheritTurnReplyRouting(ds: DaemonSession, sourceTurnId: string 
     updatedAt: new Date().toISOString(),
   } };
   ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets,
-    ds.session.replyTargetsPrunedThrough, cronPinnedTurnIds(ds.session.cronTaskReplyAnchors));
+    ds.session.replyTargetsPrunedThrough, replyTargetPinnedTurnIds(ds));
   ds.session.replyTargets = targets;
   return () => { Object.assign(ds.session, previous); };
 }
@@ -511,7 +538,7 @@ export function beginReplyTargetTurn(
   ds.session.replyTargetsPrunedThrough = pruneReplyTargets(
     targets,
     ds.session.replyTargetsPrunedThrough,
-    cronPinnedTurnIds(ds.session.cronTaskReplyAnchors),
+    replyTargetPinnedTurnIds(ds),
   );
   ds.session.replyTargets = targets;
 

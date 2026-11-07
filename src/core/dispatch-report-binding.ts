@@ -17,6 +17,8 @@ export interface DispatchReportBindingPayload {
   targetScope?: 'thread' | 'chat';
   sourceName: string;
   issuedAt: string;
+  /** 单项目直投范围由来源宿主签发，执行端不能改写落点。 */
+  reply?: { rootMessageId: string; sourceTurnId: string; reporterLarkAppId: string };
 }
 
 export interface SignedDispatchReportBinding {
@@ -107,6 +109,7 @@ function canonicalPayload(input: {
   targetScope?: 'thread' | 'chat';
   sourceName?: string;
   issuedAt?: string;
+  reply?: DispatchReportBindingPayload['reply'];
 }): DispatchReportBindingPayload {
   const dispatchRoot = input.dispatchRoot.trim();
   const targetLarkAppId = input.targetLarkAppId.trim();
@@ -125,6 +128,9 @@ function canonicalPayload(input: {
   const sourceName = input.sourceName?.trim().slice(0, 200) || 'dispatched subtask';
   const issuedAt = input.issuedAt ?? new Date().toISOString();
   if (!Number.isFinite(Date.parse(issuedAt))) throw new Error('invalid dispatch report issue time');
+  if (input.reply && (!validDispatchRoot(input.reply.rootMessageId)
+    || !validDispatchRoot(input.reply.sourceTurnId) || !/^cli_[A-Za-z0-9_]+$/.test(input.reply.reporterLarkAppId)
+    || !targetChatId || input.targetScope !== 'thread')) throw new Error('invalid dispatch reply target');
   return {
     domain: DOMAIN,
     dispatchRoot,
@@ -134,6 +140,8 @@ function canonicalPayload(input: {
     ...(input.targetScope ? { targetScope: input.targetScope } : {}),
     sourceName,
     issuedAt,
+    ...(input.reply ? { reply: { rootMessageId: input.reply.rootMessageId,
+      sourceTurnId: input.reply.sourceTurnId, reporterLarkAppId: input.reply.reporterLarkAppId } } : {}),
   };
 }
 
@@ -177,6 +185,7 @@ export function verifyDispatchReportBinding(
         : undefined,
       sourceName: typeof candidate.sourceName === 'string' ? candidate.sourceName : '',
       issuedAt: typeof candidate.issuedAt === 'string' ? candidate.issuedAt : '',
+      ...(candidate.reply !== undefined ? { reply: candidate.reply as DispatchReportBindingPayload['reply'] } : {}),
     });
     if (candidate.domain !== DOMAIN || payload.dispatchRoot !== dispatchRoot) return null;
     const expected = Buffer.from(signPayload(secret, payload), 'base64url');

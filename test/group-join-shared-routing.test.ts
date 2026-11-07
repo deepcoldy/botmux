@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   downloadResources: vi.fn(async () => ({ attachments: [] as any[], needLogin: false })),
   deleteMessage: vi.fn(async () => true),
   listChatMemberOpenIds: vi.fn(async () => ['ou_owner']),
+  listChatMessages: vi.fn(async () => [] as any[]),
   replyMessage: vi.fn(async () => 'om_reply'),
   scanMultipleProjects: vi.fn(() => [] as Array<{ name: string; path: string; type: 'repo' | 'worktree'; branch: string }>),
   sendMessage: vi.fn(async () => 'om_join_seed'),
@@ -55,6 +56,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     deleteMessage: mocks.deleteMessage,
     getChatContext: mocks.getChatContext,
     listChatMemberOpenIds: mocks.listChatMemberOpenIds,
+    listChatMessages: mocks.listChatMessages,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
   };
@@ -138,6 +140,11 @@ beforeEach(() => {
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.deleteMessage.mockResolvedValue(true);
   mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
+  // mockReset 后再装默认实现：vi.clearAllMocks() 只清调用记录，不清上一个用例
+  // 遗留的 mockResolvedValueOnce 队列——遗留值会被下一个用例的第一次调用吃掉，
+  // 让"锚到哪条消息"的断言对着别的用例的夹具通过（顺序相关的假绿）。
+  mocks.listChatMessages.mockReset();
+  mocks.listChatMessages.mockResolvedValue([]);
   mocks.replyMessage.mockResolvedValue('om_reply');
   mocks.scanMultipleProjects.mockReturnValue([]);
   mocks.sendMessage.mockResolvedValue('om_join_seed');
@@ -1631,6 +1638,149 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledWith(
       ds, expect.anything(), expect.objectContaining({ turnId: 'om_join_seed' }), expect.any(Object),
     );
+  });
+});
+
+describe('handleBotAdded — autoStartOnGroupJoinAnchor', () => {
+  const contextCard = {
+    message_id: 'om_context_card',
+    create_time: '1700000000000',
+    msg_type: 'interactive',
+    sender: { id: 'cli_platform', id_type: 'app_id', sender_type: 'app' },
+  };
+  const joinSystemEvent = {
+    message_id: 'om_join_event',
+    create_time: '1700000001000',
+    msg_type: 'system',
+    sender: { id: 'ou_owner', id_type: 'open_id', sender_type: 'user' },
+  };
+  const register = (appId: string, extra: Record<string, unknown>) => modules.registry.registerBot({
+    larkAppId: appId,
+    larkAppSecret: 's',
+    cliId: 'claude-code',
+    allowedUsers: ['ou_owner'],
+    autoStartOnGroupJoin: true,
+    autoStartOnGroupJoinPrompt: '开始排查',
+    defaultWorkingDir: tempDir(`repo-${appId}`),
+    ...extra,
+  } as any);
+
+  it.each(['chat', 'shared', 'chat-topic'] as const)(
+    'latest-message 在 %s 模式下锚定群里最新已有消息的话题，不发 seed',
+    async (replyMode) => {
+      const { daemon, types } = modules;
+      const appId = `app_join_anchor_${replyMode}`;
+      const chatId = `oc_join_anchor_${replyMode}`;
+      register(appId, { autoStartOnGroupJoinAnchor: 'latest-message', regularGroupReplyMode: replyMode });
+      mocks.listChatMessages.mockResolvedValueOnce([contextCard, joinSystemEvent]);
+
+      await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+      expect(mocks.listChatMessages).toHaveBeenCalledWith(appId, chatId, expect.any(Number));
+      expect(mocks.sendMessage).not.toHaveBeenCalled();
+      expect(daemon.__testOnly_activeSessions.has(types.sessionKey(chatId, appId))).toBe(false);
+      const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_context_card', appId));
+      expect(ds?.scope).toBe('thread');
+      expect(ds?.session.rootMessageId).toBe('om_context_card');
+      expect(ds?.session.turnReplyContexts?.om_context_card).toMatchObject({
+        target: { mode: 'thread', rootMessageId: 'om_context_card' },
+      });
+      expect(mocks.forkWorker).toHaveBeenCalledWith(
+        ds, expect.anything(), expect.objectContaining({ turnId: 'om_context_card' }), expect.any(Object),
+      );
+    },
+  );
+
+  it('latest-message 无可锚定消息时回退 reply mode（chat 平铺）', async () => {
+    const { daemon, types } = modules;
+    const appId = 'app_join_anchor_empty';
+    const chatId = 'oc_join_anchor_empty';
+    register(appId, { autoStartOnGroupJoinAnchor: 'latest-message', regularGroupReplyMode: 'chat' });
+    mocks.listChatMessages.mockResolvedValueOnce([joinSystemEvent]);
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.scope).toBe('chat');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('latest-message 拉取消息失败时回退 reply mode（shared 照常发 seed）', async () => {
+    const { daemon, types } = modules;
+    const appId = 'app_join_anchor_error';
+    const chatId = 'oc_join_anchor_error';
+    register(appId, { autoStartOnGroupJoinAnchor: 'latest-message', regularGroupReplyMode: 'shared' });
+    mocks.listChatMessages.mockRejectedValueOnce(new Error('99991672 no permission'));
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.scope).toBe('chat');
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(ds?.session.currentReplyTarget?.rootMessageId).toBe('om_join_seed');
+  });
+
+  it('new-topic 模式不受影响：照常发 seed 开独立话题，不拉历史消息', async () => {
+    const { daemon, types } = modules;
+    const appId = 'app_join_anchor_new_topic';
+    const chatId = 'oc_join_anchor_new_topic';
+    register(appId, { autoStartOnGroupJoinAnchor: 'latest-message', regularGroupReplyMode: 'new-topic' });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.listChatMessages).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId))?.scope).toBe('thread');
+  });
+
+  it('未配置时保持现有行为，不拉历史消息', async () => {
+    const { daemon, types } = modules;
+    const appId = 'app_join_anchor_default';
+    const chatId = 'oc_join_anchor_default';
+    register(appId, { regularGroupReplyMode: 'chat' });
+    mocks.listChatMessages.mockResolvedValueOnce([contextCard]);
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.listChatMessages).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))?.scope).toBe('chat');
+  });
+
+  it('forcePrompt 路径不读该配置', async () => {
+    const { daemon, types } = modules;
+    const appId = 'app_join_anchor_forced';
+    const chatId = 'oc_join_anchor_forced';
+    register(appId, { autoStartOnGroupJoinAnchor: 'latest-message', regularGroupReplyMode: 'chat' });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId, { forcePrompt: '领取任务' });
+
+    expect(mocks.listChatMessages).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))?.scope).toBe('chat');
+  });
+
+  it('latest-message 跳过本 bot 自己 open_id 形态的最新消息，锚到次新消息', async () => {
+    // 历史消息列表里本 bot 自己的消息 sender.id 可能是 bot 的 open_id（ou_…）
+    // 而非 app_id；重复拉入等场景下最新一条恰是本 bot 早先的消息，它不能成为锚点。
+    const { daemon, types } = modules;
+    const appId = 'app_join_anchor_self_ou';
+    const chatId = 'oc_join_anchor_self_ou';
+    register(appId, { autoStartOnGroupJoinAnchor: 'latest-message', regularGroupReplyMode: 'chat' });
+    modules.registry.getBot(appId)!.botOpenId = 'ou_join_anchor_self';
+    const selfCard = {
+      message_id: 'om_self_card',
+      create_time: '1700000002000',
+      msg_type: 'interactive',
+      sender: { id: 'ou_join_anchor_self', id_type: 'open_id', sender_type: 'app' },
+    };
+    mocks.listChatMessages.mockResolvedValueOnce([contextCard, selfCard]);
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(types.sessionKey('om_self_card', appId))).toBeUndefined();
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_context_card', appId));
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.rootMessageId).toBe('om_context_card');
   });
 });
 
