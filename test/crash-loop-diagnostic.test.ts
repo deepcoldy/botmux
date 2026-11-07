@@ -115,6 +115,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER } from '../src/core/worker-stderr-ring.js';
 import { sandboxNamespaceNotice } from '../src/core/system-bwrap.js';
+import { RESTART_WINDOW_MS } from '../src/core/restart-policy.js';
 
 function makeFakeWorker() {
   const w = new EventEmitter() as any;
@@ -423,28 +424,80 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(notice).toContain('1 分钟');
   });
 
-  // 恢复健康即清零：CLI 真的跑到可输入 prompt，说明此前那些崩溃不构成持续的
-  // 确定性故障。不清掉的话，一次历史 127 会让这条会话此后任何一次 127 都立即
-  // 放弃自动重启（评审实测隔 90 天仍如此）。
-  it('clears the crash-restart streak once the CLI reports ready again', async () => {
+  // 恢复健康即清零：CLI 跑到可输入 prompt 并稳定存活，说明此前那些崩溃不构成
+  // 持续的确定性故障。不清掉的话，一次历史 127 会让这条会话此后任何一次 127 都
+  // 立即放弃自动重启（评审实测隔 90 天仍如此）。
+  it('clears the crash-restart streak once the CLI stays up a full window after ready', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const t0 = Date.parse('2026-11-07T00:00:00Z');
+      vi.setSystemTime(t0);
+      const worker = makeFakeWorker();
+      const ds = makeDs('sid-ready-clears-streak', worker);
+      __testOnly_setupWorkerHandlers(ds, worker);
+
+      worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+      await flush();
+      expect(restartCounts.get('sid-ready-clears-streak')?.permanentCount).toBe(1);
+
+      // The CLI comes up for real and keeps running.
+      vi.setSystemTime(t0 + 5_000);
+      worker.emit('message', { type: 'prompt_ready' });
+      await flush();
+      vi.setSystemTime(t0 + 5_000 + RESTART_WINDOW_MS + 1);
+      // Later turns keep reporting ready; the window counts from the first one.
+      worker.emit('message', { type: 'prompt_ready' });
+      await flush();
+
+      // So the NEXT permanent exit gets its own fresh single chance instead of
+      // being killed on arrival by a stale streak.
+      worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+      await flush();
+      expect(restartCounts.get('sid-ready-clears-streak')?.permanentCount).toBe(1);
+      expect(worker.send).not.toHaveBeenCalledWith({ type: 'park_diagnostic' });
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // #2551：到了 prompt 不等于恢复健康。CLI 每收到（被重投的）同一条输入就退出
+  // 时，每次重启都能到 prompt；若 ready 就清零，熔断永远不触发，会话在后台无限
+  // 「退出 → 重启 → 重投 → 退出」，用户收不到任何提示。
+  it('stops a crash-on-input loop even though every respawn reaches the prompt', async () => {
     const worker = makeFakeWorker();
-    const ds = makeDs('sid-ready-clears-streak', worker);
+    const ds = makeDs('sid-crash-on-input', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    for (let i = 0; i < 4; i++) {
+      if (i > 0) {
+        worker.emit('message', { type: 'prompt_ready' });
+        await flush();
+      }
+      worker.emit('message', { type: 'claude_exit', code: 42, signal: null, canParkDiagnostic: true });
+      await flush();
+    }
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(notice).toContain('崩溃 4 次');
+  });
+
+  it('stops a permanent exit that recurs right after the respawn reached the prompt', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-permanent-after-ready', worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
     worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
     await flush();
-    expect(restartCounts.get('sid-ready-clears-streak')?.permanentCount).toBe(1);
-
-    // The CLI comes up for real.
     worker.emit('message', { type: 'prompt_ready' });
     await flush();
-    expect(restartCounts.has('sid-ready-clears-streak')).toBe(false);
-
-    // So the NEXT permanent exit gets its own fresh single chance instead of
-    // being killed on arrival by a stale streak.
     worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
     await flush();
-    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'restart', reason: 'cli_crash' }));
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(notice).toContain('127');
   });
 
 });
