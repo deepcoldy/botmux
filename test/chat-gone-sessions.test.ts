@@ -141,6 +141,13 @@ describe('closeSessionsInGoneChatsOnStartup', () => {
     expect(h.probe).not.toHaveBeenCalled();
   });
 
+  it('probes only real Feishu chats, not doc-comment, HTTP or headless sessions', async () => {
+    h.rows = [row('a1'), row('doc', { chatId: 'doc:doxcnAbc' }), row('http', { chatId: 'http_async_1' })];
+    active.set('k1', live(row('headless', { chatId: 'headless_1' })));
+    await closeSessionsInGoneChatsOnStartup({ larkAppId: APP, activeSessions: active });
+    expect(h.probe.mock.calls.map(([, chat]) => chat)).toEqual([GONE]);
+  });
+
   it('closes nothing when the chat state is unknown', async () => {
     h.rows = [row('a1')];
     await closeSessionsInGoneChatsOnStartup({ larkAppId: APP, activeSessions: active });

@@ -252,6 +252,8 @@ export async function closeSessionsInGoneChatsOnStartup(args: {
     if (ds.larkAppId === args.larkAppId && ds.chatType !== 'p2p') chats.add(ds.chatId);
   }
   for (const chatId of chats) {
+    // Doc-comment, HTTP and headless sessions carry synthetic chat ids that Feishu can only reject.
+    if (!chatId.startsWith('oc_')) continue;
     const reason = await probeChatGone(args.larkAppId, chatId);
     if (reason) await closeSessionsInGoneChat({ larkAppId: args.larkAppId, chatId, reason, activeSessions: args.activeSessions });
   }
