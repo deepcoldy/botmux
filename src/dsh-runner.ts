@@ -146,7 +146,7 @@ function migrateGeneratedBotmuxProfile(name: string, pkgJson: string, cordisPatc
   const pkg = readJsonRecord(pkgJson);
   if (pkg) {
     const deps = isRecord(pkg.dependencies) ? { ...pkg.dependencies } : {};
-    if (deps[DSH_TOOL_ASK_USER_PACKAGE] !== DSH_TOOL_ASK_USER_DEP) {
+    if (deps[DSH_TOOL_ASK_USER_PACKAGE] === undefined) {
       deps[DSH_TOOL_ASK_USER_PACKAGE] = DSH_TOOL_ASK_USER_DEP;
       pkg.dependencies = deps;
       writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
