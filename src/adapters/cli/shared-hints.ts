@@ -71,6 +71,14 @@ function feedbackResponseKindHint(locale?: Locale): string {
   return t('ai.routing.feedback_response_kind', undefined, locale);
 }
 
+/** Per-turn Lark presentation rules, shared by inline and hook envelopes. */
+export function feishuReplyPresentationGuidance(locale?: Locale): string {
+  return [
+    t('ai.followup.feishu_safe_emphasis', undefined, locale),
+    t('ai.routing.no_local_addresses', undefined, locale),
+  ].join('\n');
+}
+
 /** Multiline/JSON-escaping rule plus a real, copy-pasteable quoted-heredoc
  *  example. Shared by BOTH injection paths — shell hints for non-injecting
  *  CLIs and system-prompt text for injectsSessionContext CLIs — so the wording
@@ -194,6 +202,7 @@ export function buildBotmuxShellHints(
       locale,
     )));
   }
+  hints.push(escapeXmlTagLikeTokens(t('ai.routing.no_local_addresses', undefined, locale)));
   return hints;
 }
 
@@ -205,6 +214,7 @@ export function buildBotmuxShellHints(
  *  only the live `buildBotmuxShellHints` path applies the workflow kill-switch. */
 export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.intro'),
+  t('ai.routing.no_local_addresses'),
   t('ai.shell.commands_are_shell'),
   t('ai.shell.how_to_send'),
   ...multilineHeredocLines(),
@@ -454,6 +464,7 @@ export function buildBotmuxSystemPromptText(opts: {
       hiddenContextDefense(locale),
       ...whiteboardRouting,
     ];
+  if (!noTransport) routingInner.push(prose('ai.routing.no_local_addresses'));
   // Trigger-user auth: this session acts with ONE person's credentials, and the
   // token store on disk holds everyone else's. Nothing in the OS stops a curious
   // agent from reading those files today, so the boundary is stated here.

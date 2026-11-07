@@ -1218,6 +1218,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': '你在飞书（Lark）会话中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
+  'ai.routing.no_local_addresses': '用户在自己的飞书客户端阅读回复，无法访问开发机文件或本机服务。所有回复、进度、协作说明和卡片禁止携带开发机绝对路径、文件协议或本机服务地址；技能只写名称，源码使用仓库相对引用，交付文件使用附件或真实可访问链接，没有链接时说明交付状态，禁止编造地址。',
+  'card.local_address.internal_file': '【内部文件】',
+  'card.local_address.unavailable_link': '（未提供可访问链接）',
+  'worker.final_output_local_address_rejected': '结果卡包含无法供用户访问的本机跳转地址，完整结果未发送。已停止原样重试。',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`；尺寸/排版选择先 `botmux skill show botmux-send`',

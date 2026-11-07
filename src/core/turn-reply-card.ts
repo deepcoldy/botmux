@@ -10,6 +10,8 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot, t as tr } from '../i18n/index.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../im/lark/local-address-context.js';
 import { isLarkContentAuditError } from '../im/lark/content-audit.js';
 import { sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { logger } from '../utils/logger.js';
@@ -166,6 +168,7 @@ export async function updateTurnReplyCard(
     usage: withCardRuntimeIdentity(ds, usage ?? { context: null, tokens: null }, ds.session.cliId ?? cfg.cliId),
     beforeEffect,
     send: async (body, uuid) => {
+      body = prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       const messageId = await send(body, 'interactive', uuid, beforeEffect);
       if (messageId) acknowledged.set(messageId, 'primary');
       if (messageId && groupContextAuthorOrigin) await observeAcknowledgedGroupPublication(ds.larkAppId, {
@@ -174,6 +177,7 @@ export async function updateTurnReplyCard(
       return messageId;
     },
     patch: async (messageId, card) => {
+      card = prepareLocalAddressContent(card, 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       await patchReplyCardWithAuditRedaction(ds.larkAppId, card, `${event.kind} turn=${turnId.substring(0, 8)}`,
         body => patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, body, sessionAnchorId(ds),
           groupContextAuthorOrigin, beforeEffect));
@@ -184,14 +188,15 @@ export async function updateTurnReplyCard(
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {
       const cfg = getBot(ds.larkAppId).config;
       const presentation = replyCardPresentation(cfg, ds.chatId);
-      return buildTurnReplyCard(record, {
+      return prepareLocalAddressContent(buildTurnReplyCard(record, {
         ...presentation, locale: localeForBot(ds.larkAppId), workingDir: ds.workingDir,
         showProcess: options.forceVisible || ds.cotForced || presentation.showProcess,
         showLiveUsage: normalizeUsageDisplay(cfg) === 'streaming',
         canStop: presentation.canStop && ds.initConfig?.codexRpcInput !== true,
-      });
+      }), 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
     },
     sendOverflow: async (text: string, uuid: string) => {
+      text = sanitizeLocalAddressText(text, localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       const file = join(store.directory, `${store.id(key)}-reply.md`);
       atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
       const fileKey = await uploadFile(ds.larkAppId, file);

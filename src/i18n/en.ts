@@ -1221,6 +1221,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output — you MUST reply via `botmux send`.',
+  'ai.routing.no_local_addresses': 'Users read replies in their own Lark client and cannot access files or services on the development host. All replies, progress, collaboration notes and cards must omit host absolute paths, file URIs and local service addresses. Name skills without local links, cite source files relative to the repository, and deliver files as attachments or real accessible URLs. If no URL exists, describe the delivery status; never invent one.',
+  'card.local_address.internal_file': '[internal file]',
+  'card.local_address.unavailable_link': ' (no accessible link provided)',
+  'worker.final_output_local_address_rejected': 'The result card contains a local jump target that users cannot access. The full result was not sent; identical retries have stopped.',
   'ai.routing.usage_send': '- Send: `botmux send "message"`',
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
   'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos`; for size/layout choices run `botmux skill show botmux-send`',

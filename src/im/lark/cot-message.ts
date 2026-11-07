@@ -54,6 +54,8 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { withFileLockSync } from '../../utils/file-lock.js';
 import { localeForBot, t } from '../../i18n/index.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressText } from './local-address-policy.js';
+import { localAddressContextForBot } from './local-address-context.js';
 import type { CotEntry, WorkerToDaemon } from '../../types.js';
 import type { DaemonSession } from '../../core/types.js';
 
@@ -64,6 +66,24 @@ interface CotEvent {
   event_type: string;
   content: string;
   timestamp: number;
+}
+
+/** CoT is a separate provider surface. Its entries are complete text nodes;
+ * only displayed fields are prose, while TOOL_CALL_ARGS and IDs are opaque. */
+function prepareCotEvents(events: CotEvent[], appId: string, workingDir?: string): CotEvent[] {
+  const context = localAddressContextForBot(appId, workingDir);
+  return events.map(event => {
+    const field = event.event_type === 'REASONING_MESSAGE_CONTENT' ? 'delta'
+      : event.event_type === 'TOOL_CALL_START' ? 'title'
+        : event.event_type === 'TOOL_CALL_RESULT' ? 'content' : undefined;
+    if (!field) return event;
+    const content = JSON.parse(event.content);
+    if (typeof content[field] !== 'string') return event;
+    const clean = field === 'content' ? prepareLocalAddressContent(content[field], 'post', context)
+      : sanitizeLocalAddressText(content[field], context);
+    return clean === content[field] ? event
+      : { ...event, content: JSON.stringify({ ...content, [field]: clean }) };
+  });
 }
 
 interface CotState {
@@ -510,7 +530,7 @@ export async function sweepOrphanCotMessages(
               data: {
                 cot_id: rec.cotId,
                 message_id: rec.messageId,
-                events: interruptedNoticeEvents(rec.larkAppId),
+                events: prepareCotEvents(interruptedNoticeEvents(rec.larkAppId), rec.larkAppId),
               },
               timeout: COT_REQUEST_TIMEOUT_MS,
             } as any);
@@ -732,6 +752,7 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
 
 async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[]): Promise<void> {
   if (events.length === 0) return;
+  events = prepareCotEvents(events, ds.larkAppId, ds.workingDir ?? ds.session.workingDir);
   const c = getBotClient(ds.larkAppId);
   // PUT body caps events at 50 per call.
   for (let i = 0; i < events.length; i += 50) {

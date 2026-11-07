@@ -23,6 +23,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
 import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
+import { LocalAddressOutboundError } from '../src/im/lark/local-address-policy.js';
 import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
 import { FinalOutputHandoffHost, FinalOutputRejectedError } from '../src/services/final-output-handoff-host.js';
@@ -607,7 +608,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       deliver(ds, { ...finalOutputMsg(), content: `Submitted. ![Receipt](${path})` }, 'tag', 0);
       await vi.advanceTimersByTimeAsync(30_000);
       expect(uploadImageMock).not.toHaveBeenCalled();
-      expect(sessionReply.mock.calls[0][1]).toContain(path);
+      expect(sessionReply.mock.calls[0][1]).not.toContain(path);
+      expect(sessionReply.mock.calls[0][1]).toContain('Receipt');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2159,6 +2161,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       closeSession: vi.fn(),
     });
     const ds = makeDs();
+    ds.workingDir = ds.session.workingDir = '/custom/project';
     const target = {
       fileToken: 'doc-token-230099',
       fileType: 'docx',
@@ -2171,13 +2174,21 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       'turn-1': { ...target, turnId: 'turn-1' },
     };
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
-    deliver(ds, finalOutputMsg(), 'tag', 0);
+    const content = '[协作技能](/home/alice/.agents/skills/a/SKILL.md)\n/custom/project/src/index.ts\nhttp://localhost:3000/report\nhttps://example.com/home/page?file=/tmp/x';
+    deliver(ds, { ...finalOutputMsg(), content }, 'tag', 0);
     await vi.advanceTimersByTimeAsync(30_000);
 
     // The comment is retried on the document surface; no IM notice is posted.
     expect(replyToDocCommentMock).toHaveBeenCalledTimes(2);
     expect(replyToDocCommentMock.mock.calls[0][0]).toBe('app_test');
     expect(replyToDocCommentMock.mock.calls[1][0]).toBe('app_test');
+    const published = replyToDocCommentMock.mock.calls[0][3];
+    expect(published).not.toContain('/home/alice/');
+    expect(published).not.toContain('/custom/project/');
+    expect(published).not.toContain('localhost');
+    expect(published).toContain('src/index.ts');
+    expect(published).toContain('https://example.com/home/page?file=/tmp/x');
+    expect(replyToDocCommentMock.mock.calls[1][3]).toBe(published);
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.agentAttention).not.toMatchObject({ kind: 'blocked' });
   });
@@ -2732,19 +2743,21 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(clearPendingDraft).toHaveBeenCalledOnce();
   });
 
-  it.each(['revoked_after_receipt', 'card_rejected'] as const)('settles the real handoff delivery pipeline for %s', async scenario => {
+  it.each(['revoked_after_receipt', 'card_rejected', 'local_address_rejected'] as const)('settles the real handoff delivery pipeline for %s', async scenario => {
     const previousDir = config.session.dataDir;
     const directory = mkdtempSync(join(tmpdir(), 'handoff-real-pool-'));
     (config.session as any).dataDir = directory;
     const store = new FinalOutputHandoffStore(directory, 'cli_test');
     try {
       const ds = makeDs(); ds.adoptedFrom = undefined; ds.larkAppId = 'cli_test'; ds.scope = 'thread';
-      const output = { sessionId: ds.session.sessionId, turnId: 'om_handoff', lastUuid: 'handoff-native', content: 'final answer' };
+      ds.workingDir = '/custom/project';
+      const output = { sessionId: ds.session.sessionId, turnId: 'om_handoff', lastUuid: 'handoff-native', content: 'final answer /custom/project/src/index.ts' };
       const snapshot = finalOutputSnapshot(ds.larkAppId, output);
       store.accept(snapshot, { mode: 'thread', rootMessageId: 'om_original_target' }, 'ou_original_requester');
       let allowed = true;
       const sessionReply = vi.fn(async (_root: string, body: string, kind: string) => {
         if (scenario === 'card_rejected' && kind === 'interactive') throw { response: { data: { code: 230099, msg: 'rejected card' } } };
+        if (scenario === 'local_address_rejected' && kind === 'interactive') throw new LocalAddressOutboundError();
         if (scenario === 'revoked_after_receipt') allowed = false;
         return kind === 'text' ? 'om_aux_notice' : 'om_known_final';
       });
@@ -2765,6 +2778,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       const run = host.pump();
       await vi.advanceTimersByTimeAsync(100);
       await run;
+      expect(sessionReply.mock.calls[0][1]).not.toContain('/custom/project/');
+      expect(sessionReply.mock.calls[0][1]).toContain('src/index.ts');
       if (scenario === 'revoked_after_receipt') {
         expect(sessionReply).toHaveBeenCalledTimes(1);
         expect(store.read(snapshot.intentId)).toMatchObject({ state: 'delivered', messageId: 'om_known_final' });
@@ -3737,7 +3752,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('<at id=ou_human></at>');
   });
 
-  it('uses probe-free lexical link repair for sandboxed bridge fallback output', async () => {
+  it('removes local file destinations from sandboxed bridge fallback output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3761,10 +3776,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain(`[file](/${missing})`);
+    expect(cardJson).toContain('file');
+    expect(cardJson).not.toContain(missing);
+    expect(cardJson).not.toContain('[file](');
   });
 
-  it('preserves a real home-shaped relative link in a non-isolated bridge fallback', async () => {
+  it('removes an inaccessible home-shaped relative link from non-isolated bridge output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3790,14 +3807,15 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       await vi.advanceTimersByTimeAsync(10);
 
       const cardJson = sessionReply.mock.calls[0][1] as string;
-      expect(cardJson).toContain(`[file](${relativeFile})`);
-      expect(cardJson).not.toContain(`[file](/${relativeFile})`);
+      expect(cardJson).toContain('file');
+      expect(cardJson).not.toContain(relativeFile);
+      expect(cardJson).not.toContain('[file](');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
   });
 
-  it('uses probe-free lexical link repair for read-isolated bridge fallback output', async () => {
+  it('removes local file destinations from read-isolated bridge fallback output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3821,7 +3839,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain(`[file](/${missing})`);
+    expect(cardJson).toContain('file');
+    expect(cardJson).not.toContain(missing);
+    expect(cardJson).not.toContain('[file](');
   });
 
   it.each([
@@ -3830,7 +3850,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       ds.session.backendType = 'tmux';
       ds.initConfig = { backendType: 'riff' } as any;
     }],
-  ])('uses probe-free lexical link repair for Riff via %s', async (_source, configure) => {
+  ])('removes local file destinations for Riff via %s', async (_source, configure) => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3854,10 +3874,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain(`[file](/${missing})`);
+    expect(cardJson).toContain('file');
+    expect(cardJson).not.toContain(missing);
+    expect(cardJson).not.toContain('[file](');
   });
 
-  it('uses lexical link repair when sandboxing is forced globally', async () => {
+  it('removes local file destinations when sandboxing is forced globally', async () => {
     const previous = process.env.BOTMUX_SANDBOX;
     process.env.BOTMUX_SANDBOX = '1';
     try {
@@ -3883,7 +3905,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       await vi.advanceTimersByTimeAsync(10);
 
       const cardJson = sessionReply.mock.calls[0][1] as string;
-      expect(cardJson).toContain(`[file](/${missing})`);
+      expect(cardJson).toContain('file');
+      expect(cardJson).not.toContain(missing);
+      expect(cardJson).not.toContain('[file](');
     } finally {
       if (previous === undefined) delete process.env.BOTMUX_SANDBOX;
       else process.env.BOTMUX_SANDBOX = previous;

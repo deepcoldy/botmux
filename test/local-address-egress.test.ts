@@ -1,0 +1,159 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+vi.mock('@larksuiteoapi/node-sdk', () => ({
+  Client: class { constructor(public opts: Record<string, unknown>) {} },
+}));
+
+import { getBot, registerBot } from '../src/bot-registry.js';
+import {
+  patchCardStreamElement, replyMessage, sendEphemeralCard, sendMessage,
+  sendUserMessage, updateCardStreamElementContent, updateCardStreamingSettings, updateMessage,
+} from '../src/im/lark/client.js';
+import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
+import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { outputSnapshot } from '../src/services/universal-output-handoff.js';
+
+const skillText = '协作说明：通过 [MIX Bot 协作技能](/data00/home/alice/.agents/skills/mix-bot-collaboration/SKILL.md) 联系 CAT，返回授权提示。';
+const businessUrl = 'https://example.com/v2/activity?activityId=123&path=/home/business#detail';
+const card = () => ({ schema: '2.0', body: { elements: [
+  { tag: 'markdown', content: skillText },
+  { tag: 'button', text: { tag: 'plain_text', content: '继续' },
+    value: { action: 'continue', path: '/tmp/internal-state', session_id: 's1' } },
+] } });
+let nextApp = 0;
+
+function capture() {
+  const app = 'local-egress-' + nextApp++;
+  registerBot({ larkAppId: app, larkAppSecret: 's', cliId: 'claude-code' });
+  const writes: any[] = [];
+  const write = async (args: any) => {
+    writes.push(args);
+    return { code: 0, data: { message_id: 'om_written' } };
+  };
+  getBot(app).client = {
+    im: { v1: { message: { create: write, reply: write, patch: write } } },
+    cardkit: { v1: { card: { settings: write }, cardElement: { content: write, patch: write } } },
+    request: write,
+  } as any;
+  return { app, writes };
+}
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+
+describe('local addresses at the real Lark SDK write boundary', () => {
+  it.each(['send', 'reply', 'dm', 'dm-deadline', 'ephemeral', 'update'] as const)(
+    '%s removes the reported skill destination and preserves callback data', async surface => {
+      const { app, writes } = capture();
+      const body = JSON.stringify(card());
+      if (surface === 'send') await sendMessage(app, 'oc_chat', body, 'interactive');
+      if (surface === 'reply') await replyMessage(app, 'om_parent', body, 'interactive');
+      if (surface === 'dm') await sendUserMessage(app, 'ou_user', body, 'interactive');
+      if (surface === 'dm-deadline') await sendUserMessage(app, 'ou_user', body, 'interactive', undefined, {});
+      if (surface === 'ephemeral') await sendEphemeralCard(app, 'oc_chat', 'ou_user', body);
+      if (surface === 'update') await updateMessage(app, 'om_card', body);
+      expect(writes).toHaveLength(1);
+      const sent = surface === 'ephemeral' ? writes[0].data.card : JSON.parse(writes[0].data.content);
+      expect(sent.body.elements[0].content).toContain('MIX Bot 协作技能');
+      expect(sent.body.elements[0].content).not.toContain('/data00/');
+      expect(sent.body.elements[0].content).not.toContain('SKILL.md');
+      expect(sent.body.elements[1].value.path).toBe('/tmp/internal-state');
+      expect(sent.body.elements[1].value.action).toBe('continue');
+    });
+
+  it('scrubs plain text, code and post text while keeping exact business URLs', async () => {
+    const { app, writes } = capture();
+    await sendMessage(app, 'oc_chat', '日志位于 /tmp/diagnosis.log\n```text\nfile:///home/alice/result.md\n```\n' + businessUrl);
+    const text = JSON.parse(writes[0].data.content).text;
+    expect(text).not.toContain('/tmp/');
+    expect(text).not.toContain('file:///');
+    expect(text).toContain(businessUrl);
+    await sendMessage(app, 'oc_chat', JSON.stringify({ zh_cn: { title: '报告 /Users/alice/report.md',
+      content: [[{ tag: 'text', text: skillText }]] } }), 'post');
+    expect(writes[1].data.content).not.toContain('/Users/');
+    expect(writes[1].data.content).not.toContain('/data00/');
+  });
+
+  it('scrubs full streaming snapshots, including an unclosed local destination', async () => {
+    const { app, writes } = capture();
+    await updateCardStreamElementContent(app, 'card1', 'body', '[技能](/data00/home/ali', 1, 'u1');
+    await updateCardStreamElementContent(app, 'card1', 'body', skillText, 2, 'u2');
+    await patchCardStreamElement(app, 'card1', 'body', { content: skillText }, 3, 'u3');
+    await updateCardStreamingSettings(app, 'card1', { streamingMode: false, sequence: 4, uuid: 'u4', summary: '/tmp/result.md' });
+    expect(writes).toHaveLength(4);
+    for (const write of writes) {
+      expect(JSON.stringify(write.data)).not.toContain('/data00/');
+      expect(JSON.stringify(write.data)).not.toContain('/tmp/');
+    }
+  });
+
+  it.each([
+    { tag: 'button', url: 'file:///tmp/report.md' },
+    { tag: 'button', behaviors: [{ type: 'open_url', default_url: 'http://127.0.0.1:3000/report' }] },
+    { tag: 'a', href: './report.md', text: '报告' },
+  ])('rejects local actionable URLs before any provider write', async element => {
+    const { app, writes } = capture();
+    await expect(sendMessage(app, 'oc_chat', JSON.stringify({ body: { elements: [element] } }), 'interactive'))
+      .rejects.toMatchObject({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' });
+    expect(writes).toHaveLength(0);
+  });
+
+  it('leaves a safe post and media keys byte-identical', async () => {
+    const { app, writes } = capture();
+    const post = '{ "zh_cn": { "title": "结果", "content": [[{"tag":"a","text":"活动","href":' + JSON.stringify(businessUrl) + '}]] } }';
+    await sendMessage(app, 'oc_chat', post, 'post');
+    expect(writes[0].data.content).toBe(post);
+    const media = '{ "file_key": "file_v2_abc" }';
+    await sendMessage(app, 'oc_chat', media, 'file');
+    expect(writes[1].data.content).toBe(media);
+  });
+
+  it('retries the same sanitized body and provider UUID after a transient rejection', async () => {
+    vi.useFakeTimers();
+    const { app, writes } = capture();
+    let attempt = 0;
+    (getBot(app).client as any).im.v1.message.create = async (args: any) => {
+      writes.push(args);
+      return ++attempt === 1 ? { code: 230049, msg: 'message is being sent' }
+        : { code: 0, data: { message_id: 'om_retry' } };
+    };
+    const publishing = sendMessage(app, 'oc_chat', JSON.stringify(card()), 'interactive', 'stable-local-uuid');
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(publishing).resolves.toBe('om_retry');
+    expect(writes).toHaveLength(2);
+    expect(writes[0].data.content).not.toContain('/data00/');
+    expect(writes[1].data).toEqual(writes[0].data);
+    expect(writes[1].data.uuid).toBe('stable-local-uuid');
+  });
+
+  it('durably rejects an impossible local jump without provider writes or repeated delivery', async () => {
+    vi.useFakeTimers();
+    const { app, writes } = capture();
+    const directory = mkdtempSync(join(tmpdir(), 'botmux-local-rejection-'));
+    const journal = new OutputDeliveryJournal(directory, app);
+    try {
+      const body = JSON.stringify({ body: { elements: [{ tag: 'button', url: 'file:///tmp/report.md' }] } });
+      const record = journal.accept(outputSnapshot(app, {
+        type: 'final_output', sessionId: 'sid-local', turnId: 'om_local', content: body, lastUuid: 'local-rejection',
+      }), { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' } }, chatId: 'oc_chat', chatType: 'group' });
+      const deps = {
+        owns: () => true,
+        process: vi.fn(async () => ({ status: 'delivered' as const,
+          messageId: await sendMessage(app, 'oc_chat', body, 'interactive') })),
+        settled: vi.fn(), error: vi.fn(),
+      };
+      const coordinator = new OutputDeliveryCoordinator(journal);
+      await coordinator.deliver(record, deps);
+      expect(journal.read(record.id)?.state).toBe('rejected');
+      expect(journal.read(record.id)?.reason).not.toContain('/tmp/');
+      await vi.advanceTimersByTimeAsync(65_000);
+      await coordinator.deliver(record, deps);
+      expect(journal.pending()).toEqual([]);
+      expect(deps.process).toHaveBeenCalledOnce();
+      expect(deps.error).toHaveBeenCalledWith(expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }), true);
+      expect(deps.settled).not.toHaveBeenCalled();
+      expect(writes).toHaveLength(0);
+    } finally { journal.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+});
