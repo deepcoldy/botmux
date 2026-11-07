@@ -19,6 +19,10 @@
  * forkWorker / lark client are stubbed (same pattern as
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
+// Must stay the first import: this file writes prompt contexts, deferred topic
+// bindings and schedules under SESSION_DATA_DIR, so refuse to run outside the
+// data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
