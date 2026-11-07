@@ -121,6 +121,15 @@ describe('resolveSessionEnv', () => {
     expect(botOneShotEnv({}, { env })).toMatchObject(env);
   });
 
+  it('judges the identity lock by the backend the session launches on, not the bot default', () => {
+    const env = { ZDOTDIR: '/mine', BASH_ENV: '/mine/b', OTHER: 'x' };
+    // A pty bot whose session is pinned to remote-runner: the worker installs no
+    // lark wrapper there, so the user's shell startup files must reach the CLI.
+    expect(resolveSessionEnv({ bot: { env, backendType: 'pty' }, backendType: 'remote-runner' }).env).toEqual(env);
+    // The reverse: a remote-runner bot whose session runs locally is wrapped.
+    expect(resolveSessionEnv({ bot: { env, backendType: 'remote-runner' }, backendType: 'tmux' }).env).toEqual({ OTHER: 'x' });
+  });
+
   it('lock context follows the bot flags', () => {
     expect(sessionEnvLockContextForBot({})).toEqual({ identityShell: true, identityGit: false });
     expect(sessionEnvLockContextForBot({ apiOnly: true })).toEqual({ identityShell: false, identityGit: false });
