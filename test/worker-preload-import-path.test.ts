@@ -62,4 +62,10 @@ describe('workerForkExecArgv', () => {
     expect(nodeArgv.at(-1)!.startsWith('file://')).toBe(true);
     expect(fileURLToPath(nodeArgv.at(-1)!)).toBe(bunPreload);
   });
+
+  it('defaults to the runtime it is running under', () => {
+    const bun = Boolean(process.versions.bun);
+    expect(workerForkExecArgv()).toEqual(workerForkExecArgv(bun));
+    expect(preloadImportSpecifier('/opt/任务/p.js')).toBe(preloadImportSpecifier('/opt/任务/p.js', bun));
+  });
 });

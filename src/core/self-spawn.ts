@@ -207,6 +207,16 @@ export function entryForSubcommand(token: string): BotmuxEntry | null {
 }
 
 /**
+ * `--import` operand for a preload file. Bun does not decode file URLs there (a
+ * CJK, space, `%` or `#` path fails with "preload not found"), so it needs the
+ * raw absolute path; Node resolves a raw path as a URL (`%xx` decoded, `#`
+ * starts a fragment), so it keeps the file URL.
+ */
+export function preloadImportSpecifier(path: string, bun: boolean = Boolean(process.versions.bun)): string {
+  return bun ? path : pathToFileURL(path).href;
+}
+
+/**
  * Fork-equivalent spawn of the worker entry with a Node IPC channel. Used by the
  * worker pool in place of the old direct `fork(dist/worker.js)`.
  *
@@ -220,16 +230,6 @@ export function entryForSubcommand(token: string): BotmuxEntry | null {
  *     dropped (a compiled binary has no
  *     separate interpreter args).
  */
-/**
- * `--import` operand for a preload file. Bun does not decode file URLs there (a
- * CJK, space, `%` or `#` path fails with "preload not found"), so it needs the
- * raw absolute path; Node resolves a raw path as a URL (`%xx` decoded, `#`
- * starts a fragment), so it keeps the file URL.
- */
-export function preloadImportSpecifier(path: string, bun: boolean = Boolean(process.versions.bun)): string {
-  return bun ? path : pathToFileURL(path).href;
-}
-
 export function spawnWorker(opts: {
   distDir: string;
   cwd: string;
