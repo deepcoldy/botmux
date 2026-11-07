@@ -117,6 +117,8 @@ setInterval(() => {
         type: 'init', sessionId: 'sid-pi-cot', chatId: 'oc_test', rootMessageId: 'om_root',
         workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, cliSessionId,
         backendType,
+        // Exercise Pi's tmux behavior, not the host's default shell startup files.
+        ...(backendType === 'tmux' ? { launchShell: '/bin/bash' } : {}),
         prompt: 'inspect the entry point', larkAppId: 'app_test', larkAppSecret: 'test-only',
         turnId: 'om_pi_turn',
       } satisfies DaemonToWorker);
@@ -222,6 +224,7 @@ setInterval(() => {}, 1000);
       child.send({
         type: 'init', sessionId: 'sid-pi-steer', chatId: 'oc_test', rootMessageId: 'om_root',
         workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, cliSessionId, backendType,
+        ...(backendType === 'tmux' ? { launchShell: '/bin/bash' } : {}),
         prompt: 'warmup', larkAppId: 'app_test', larkAppSecret: 'test-only', turnId: 'om_warmup',
       } satisfies DaemonToWorker);
       await waitUntil(() => logs.some(line => line.includes('Codex bridge fresh-empty:')), logs);
