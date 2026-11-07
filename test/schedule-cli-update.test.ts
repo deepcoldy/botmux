@@ -133,7 +133,8 @@ async function managed(
         }
         rows[taskId!] = { ...current, manualRunRequested: true };
       } else {
-        // update: prompt and/or work-calendar fields, mirroring daemon normalization
+        // update: prompt and/or work-calendar fields, mirroring daemon normalization;
+        // like the daemon, only an expression that differs is re-parsed
         const patch: Record<string, unknown> = {};
         if (typeof request.prompt === 'string') patch.prompt = request.prompt;
         if (request.calendar !== undefined) {
@@ -143,7 +144,7 @@ async function managed(
         if (request.calendarDayType !== undefined) {
           patch.calendarDayType = current.calendar ? request.calendarDayType : undefined;
         }
-        if (typeof request.schedule === 'string' && !f.preFrequencyDaemon) {
+        if (typeof request.schedule === 'string' && !f.preFrequencyDaemon && request.schedule !== current.schedule) {
           patch.schedule = request.schedule;
           patch.parsed = { kind: 'interval', minutes: 240, display: '每 4 小时' };
           patch.nextRunAt = '2030-01-01T08:00:00.000Z';
@@ -575,10 +576,18 @@ describe('schedule CLI frequency updates', () => {
     expect(result.output).toContain('任务已暂停');
   });
 
-  it('points a finished one-shot at resume only when its frequency changed', async () => {
+  it('points a finished one-shot at resume only when the daemon gave it a new frequency', async () => {
     const f = fixture();
-    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, disabledReason: 'once_completed' } }));
+    const { nextRunAt: _cleared, ...finished } = f.task;
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...finished, schedule: '30m',
+      parsed: { kind: 'once', runAt: '2026-01-01T04:00:00.000Z', display: '30m' }, disabledReason: 'once_completed' } }));
     await managed(f);
+    // Sent again unchanged, the expression is not re-registered: resume would
+    // enable a task with no next run.
+    const resent = await f.run(['update', f.task.id, '--schedule', '30m']);
+    expect(resent.code, resent.output).toBe(0);
+    expect(resent.output).toContain('任务已结束，不会自动执行');
+    expect(resent.output).not.toContain('schedule resume');
     const rescheduled = await f.run(['update', f.task.id, '--schedule', 'every 4h']);
     expect(rescheduled.code, rescheduled.output).toBe(0);
     expect(rescheduled.output).toContain(`botmux schedule resume ${f.task.id}`);

@@ -9226,10 +9226,13 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       if (task) {
         const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
         console.log(`   频率: ${task.display && task.display !== task.schedule ? `${task.display}（${task.schedule}）` : task.schedule}`);
+        // The daemon only re-registers an expression that differs from the
+        // stored one; a finished task left without a next run (e.g. the same
+        // expression sent again) has nothing for resume to schedule.
         const nextLine = task.enabled
           ? (task.nextRunAt ? fmt(task.nextRunAt) : '—')
           : task.disabledReason === 'once_completed'
-            ? updates.schedule !== undefined
+            ? updates.schedule !== undefined && task.nextRunAt
               ? `任务已结束；用 botmux schedule resume ${id} 按新频率重新开始`
               : '任务已结束，不会自动执行'
             : '任务已暂停，恢复后按此频率执行';
