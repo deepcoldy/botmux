@@ -13845,6 +13845,38 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
 
 });
 
+describe('chat gone: disbanded or bot removed', () => {
+  let handlers: ReturnType<typeof makeHandlers> & { handleChatGone: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = { ...makeHandlers(), handleChatGone: vi.fn(async () => {}) };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it.each([
+    ['im.chat.disbanded_v1', 'disbanded'],
+    ['im.chat.member.bot.deleted_v1', 'bot_removed'],
+  ] as const)('%s hands the chat to the daemon after the ACK, once per event id', async (eventName, reason) => {
+    const event = { event_id: `evt-${eventName}`, chat_id: 'oc_gone', operator_id: { open_id: USER_OPEN_ID } };
+    expect(capturedHandlers[eventName](event)).toBeUndefined();
+    expect(handlers.handleChatGone).not.toHaveBeenCalled();
+    await flushEventWork();
+    expect(handlers.handleChatGone).toHaveBeenCalledExactlyOnceWith('oc_gone', MY_APP_ID, reason);
+
+    capturedHandlers[eventName](event);
+    await flushEventWork();
+    expect(handlers.handleChatGone).toHaveBeenCalledTimes(1);
+
+    capturedHandlers[eventName]({ ...event, event_id: `evt-${eventName}-2` });
+    await flushEventWork();
+    expect(handlers.handleChatGone).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('chat.bot_added observer hook', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 

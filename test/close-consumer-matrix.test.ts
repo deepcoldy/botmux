@@ -137,6 +137,11 @@ const CONSUMERS: Record<string, Rule> = {
   },
 
   // ── background: no UI, so refusal/residual must be logged ────────────────
+  'core/dismiss-command.ts::closeSessionsInGoneChat::closeSession': {
+    category: 'background',
+    why: 'The chat was disbanded or the bot was removed, so there is no surface left to report to; '
+      + 'a refusal or residual is logged per session and never counted as closed.',
+  },
   'core/session-manager.ts::closeActiveSessionIfCliMismatch::closeSession': {
     category: 'background',
     why: 'Returns close_failed / closed_with_residual to the sweep; a refusal is '

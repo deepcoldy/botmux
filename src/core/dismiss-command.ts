@@ -1,4 +1,7 @@
-/** Confirmed dismissal of one owner-scoped, DM-born session group. */
+/**
+ * Confirmed dismissal of one owner-scoped, DM-born session group, and closing
+ * this bot's sessions once a chat is gone (disbanded, or the bot was removed).
+ */
 import { createHash } from 'node:crypto';
 import type { Session } from '../types.js';
 import type { DaemonSession } from './types.js';
@@ -10,7 +13,8 @@ import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { getSessionGroup, removeSessionGroup } from '../services/session-groups-store.js';
 import { listSessionsStrict, findActiveSessionsByChatStrict } from '../services/session-store.js';
-import { disbandChat } from '../services/groups-store.js';
+import { disbandChat, probeChatGone } from '../services/groups-store.js';
+import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { logger } from '../utils/logger.js';
 
 /** A peer daemon that has not answered by then is treated as an unverified close. */
@@ -183,5 +187,72 @@ export async function dismissSessionGroup(args: {
   } catch (err) {
     logger.warn(`[dismiss] group preserved or deletion unconfirmed: ${err}`);
     return { status: 'unavailable' };
+  }
+}
+
+/**
+ * The chat was disbanded or this bot was removed from it: close this bot's
+ * sessions there as /close does (resumable, worktrees kept). Nothing is posted
+ * to the chat, and peers close their own sessions on their own event.
+ */
+export async function closeSessionsInGoneChat(args: {
+  larkAppId: string;
+  chatId: string;
+  reason: 'disbanded' | 'bot_removed';
+  activeSessions: ReadonlyMap<string, DaemonSession>;
+}): Promise<void> {
+  const tag = `[chat-gone] ${args.reason} chat=${args.chatId.slice(0, 12)}`;
+  if (coordinationModeIsPrimary()) {
+    logger.warn(`${tag}: durable primary keeps its sessions; close them through the primary control path`);
+    return;
+  }
+  try {
+    await withBotTurnMutation(args.larkAppId, async () => {
+      const own = new Set<string>();
+      for (const s of listSessionsStrict()) {
+        if (s.chatId === args.chatId && s.status === 'active' && (s.larkAppId ?? args.larkAppId) === args.larkAppId) own.add(s.sessionId);
+      }
+      for (const ds of args.activeSessions.values()) {
+        if (ds.larkAppId === args.larkAppId && ds.chatId === args.chatId) own.add(ds.session.sessionId);
+      }
+      for (const id of own) {
+        try {
+          // 'private' skips patching the closed card into a chat that can no longer take it.
+          const closed = await closeSession(id, { cardVisibility: 'private', awaitWorkerExit: false });
+          if (!closed.ok) logger.warn(`${tag}: session ${id.slice(0, 8)} close refused: ${closed.error}`);
+          else if (closed.outcome !== 'closed') logger.warn(`${tag}: session ${id.slice(0, 8)} closed with residual: ${describeCloseResidual(closed.residual)}`);
+          else logger.info(`${tag}: closed session ${id.slice(0, 8)}`);
+        } catch (err) {
+          logger.warn(`${tag}: session ${id.slice(0, 8)} close failed: ${err}`);
+        }
+      }
+      if (getSessionGroup(args.chatId)) removeSessionGroup(args.chatId);
+    });
+  } catch (err) {
+    logger.warn(`${tag}: sessions not closed: ${err}`);
+  }
+}
+
+/** Events missed while this daemon was offline: close sessions in chats that are gone. */
+export async function closeSessionsInGoneChatsOnStartup(args: {
+  larkAppId: string;
+  activeSessions: ReadonlyMap<string, DaemonSession>;
+}): Promise<void> {
+  if (coordinationModeIsPrimary()) return;
+  const chats = new Set<string>();
+  try {
+    for (const s of listSessionsStrict()) {
+      if (s.status === 'active' && s.chatType !== 'p2p' && (s.larkAppId ?? args.larkAppId) === args.larkAppId) chats.add(s.chatId);
+    }
+  } catch (err) {
+    logger.warn(`[chat-gone] startup check skipped: ${err}`);
+    return;
+  }
+  for (const ds of args.activeSessions.values()) {
+    if (ds.larkAppId === args.larkAppId && ds.chatType !== 'p2p') chats.add(ds.chatId);
+  }
+  for (const chatId of chats) {
+    const reason = await probeChatGone(args.larkAppId, chatId);
+    if (reason) await closeSessionsInGoneChat({ larkAppId: args.larkAppId, chatId, reason, activeSessions: args.activeSessions });
   }
 }
