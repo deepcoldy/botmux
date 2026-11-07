@@ -375,9 +375,9 @@ describe('filterCliRuntimeUpdateEntriesForTargets', () => {
 describe('probeCodexRuntimeUpdate', () => {
   it.each([
     { provider: 'internal', action: 'manual or unknown' },
-    { provider: 'internal', action: 'standalone installer' },
     { provider: 'self', action: 'manual or unknown' },
     { provider: 'self', action: 'standalone installer' },
+    { provider: 'self', action: ' STANDALONE INSTALLER ' },
   ] as const)('does not treat $action as a $provider update command', async ({ provider, action }) => {
     const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
       ? 'codex-cli 0.156.1'
@@ -394,7 +394,10 @@ describe('probeCodexRuntimeUpdate', () => {
     expect(fetchLatest).not.toHaveBeenCalled();
   });
 
-  it.each(['manual or unknown', 'standalone installer'])('keeps %s unknown when the official version probe falls back to npm', async (action) => {
+  it.each([
+    { action: 'manual or unknown', command: null },
+    { action: 'standalone installer', command: 'codex update' },
+  ])('keeps the $action command when the official version probe falls back to npm', async ({ action, command }) => {
     const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
       ? 'codex-cli 0.156.1'
       : JSON.stringify({
@@ -406,8 +409,27 @@ describe('probeCodexRuntimeUpdate', () => {
       }));
     const fetchLatest = vi.fn(async () => '0.158.0');
     expect(await probeCodexRuntimeUpdate(runtimeTarget(), { runFile, fetchLatest }))
-      .toMatchObject({ latest: '0.158.0', updateCommand: null });
+      .toMatchObject({ latest: '0.158.0', updateCommand: command });
     expect(fetchLatest).toHaveBeenCalledOnce();
+  });
+
+  it.each(['standalone installer', ' STANDALONE INSTALLER '])('maps the official doctor label %j to codex update', async (action) => {
+    const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
+      ? 'codex-cli 0.164.0'
+      : JSON.stringify({
+        codexVersion: '0.164.0',
+        checks: [{ id: 'updates.status', details: {
+          'cached latest version': '0.167.0',
+          'latest version': '0.167.0',
+          'latest version status': 'newer version is available',
+          'update action': action,
+        } }],
+      }));
+    const fetchLatest = vi.fn();
+    expect(await probeCodexRuntimeUpdate(runtimeTarget(), { runFile, fetchLatest })).toEqual({
+      current: '0.164.0', latest: '0.167.0', managed: true, updateCommand: 'codex update',
+    });
+    expect(fetchLatest).not.toHaveBeenCalled();
   });
 
   it.each([undefined, null, '', 42, { command: 'codex update' }])(
@@ -1357,7 +1379,40 @@ describe('CLI runtime update store and card', () => {
       });
   });
 
-  it.each(['manual or unknown', 'standalone installer'])('carries %s through probe, persisted cache and notification without suggesting it', async (action) => {
+  it('carries an official standalone install through probe, persisted cache, notification and Dashboard as codex update', async () => {
+    const now = 1_500_000;
+    const target = runtimeTarget({ binPath: '/opt/codex' });
+    const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
+      ? 'codex-cli 0.164.0'
+      : JSON.stringify({ codexVersion: '0.164.0', checks: [{ id: 'updates.status', details: {
+        'latest version': '0.167.0', 'update action': 'standalone installer',
+      } }] }));
+    const cards: string[] = [];
+    await runCliRuntimeUpdateAudit({
+      now: () => now, targets: () => [target],
+      readStore: () => readCliRuntimeUpdateStoreFrom(dir),
+      writeStore: (store: CliRuntimeUpdateStore) => writeCliRuntimeUpdateStoreTo(dir, store),
+      probe: (entry: CliRuntimeUpdateTarget) => probeCodexRuntimeUpdate(entry, { runFile }),
+      notify: async (entry: CliRuntimeUpdateEntry) => { cards.push(buildCliRuntimeUpdateCard(entry, { locale: 'zh' })); },
+    });
+    const persisted = readCliRuntimeUpdateStoreFrom(dir).entries['codex:/opt/codex'];
+    expect(persisted).toMatchObject({ updateCommand: 'codex update', current: '0.164.0', latest: '0.167.0' });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toContain('建议在宿主终端执行');
+    expect(cards[0]).toContain('codex update');
+    expect(cards[0]).not.toContain('未识别出升级命令');
+    expect(cards[0]).not.toContain('standalone installer');
+    const translation = vi.spyOn(ui, 't').mockImplementation(createDashboardTranslator('zh'));
+    try {
+      const html = renderToStaticMarkup(createElement(CliRuntimeUpdates, { entries: [persisted] }));
+      expect(html).toContain('<code>codex update</code>');
+      expect(html).not.toContain('未识别出升级命令');
+    } finally {
+      translation.mockRestore();
+    }
+  });
+
+  it.each(['manual or unknown'])('carries %s through probe, persisted cache and notification without suggesting it', async (action) => {
     const now = 1_500_000;
     const target = runtimeTarget({ binPath: '/opt/codex' });
     const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
