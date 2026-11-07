@@ -22,11 +22,13 @@ import { readDispatchRegistryLoose, revokeWorkflowHandoff } from '../src/core/wo
 import { INITIATOR_MAIN_OU, INITIATOR_OU_IN, INITIATOR_UNION, authorizeRun } from './helpers/workflow-identity-world.js';
 import {
   WORKFLOW_INITIATOR_UNION_ROUTE,
+  WORKFLOW_OPERATOR_BUDGET_MS,
   WORKFLOW_WORKING_DIR_OPERATOR_ROUTE,
   createWorkflowWorkingDirOperatorWiring,
   type WorkflowWorkingDirOperatorIo,
 } from '../src/core/workflow-working-dir-operator.js';
 import { writeGrillState } from '../src/workflows/v3/grill-state.js';
+import { appendEvent } from '../src/workflows/v3/journal.js';
 import type { TargetAppOpenIdResolution } from '../src/im/lark/client.js';
 import { createLiveV3WorkingDirOperator } from '../src/im/lark/v3-bot-eligibility.js';
 
@@ -371,20 +373,35 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     return { run, world, attempt, binding };
   }
 
+  /** The inbound route's gate as daemon.ts calls it; `existingDir` = the
+   *  directory of a session already in the node topic. No operate check is
+   *  wired here, so the configured range alone decides. */
+  async function admitted(target: ReturnType<typeof daemon>, binding: never, messageId: string, existingDir?: string) {
+    const gate = await target.wiring.admitInboundHandoff({
+      binding,
+      handoffMessageId: messageId,
+      executingLarkAppId: 'cli_a',
+      currentSession: () => ({ dir: existingDir }),
+      describeSession: (session) => (session.dir ? { dir: session.dir } : {}),
+    });
+    if (gate.kind !== 'admission') throw new Error(`expected an admission, got ${gate.kind}`);
+    return gate.admission;
+  }
+
   it('the executing bot\'s daemon decides from run.json and its configuration now: in range → that directory, out of range → refused', async () => {
     const d = dirs();
     const { run, world, attempt, binding } = await handedOffPinned('wdd-decide', d.project);
     let config: Record<string, unknown> = { workingDirs: [d.repos] };
     const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => config });
-    const admit = () => target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
-    expect(admit()).toEqual({ start: true, workingDir: realpathSync(d.project) });
+    const admit = () => admitted(target, binding, attempt.handoffMessageId!);
+    expect(await admit()).toEqual({ start: true, workingDir: realpathSync(d.project) });
     // Narrowed after approval: the current configuration decides.
     config = { workingDirs: [d.lab] };
-    const refused = admit();
+    const refused = await admit();
     expect(refused).toMatchObject({ start: false });
     expect((refused as { reason: string }).reason).toContain(d.project);
     config = {};
-    expect(admit()).toMatchObject({ start: false });
+    expect(await admit()).toMatchObject({ start: false });
   });
 
   it('a symlinked directory is applied as its target: the session never stores the link', async () => {
@@ -393,19 +410,19 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     symlinkSync(d.project, link);
     const { run, world, attempt, binding } = await handedOffPinned('wdd-link', link);
     const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({ workingDirs: [d.repos] }) });
-    expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toEqual({ start: true, workingDir: realpathSync(d.project) });
+    expect(await admitted(target, binding, attempt.handoffMessageId!)).toEqual({ start: true, workingDir: realpathSync(d.project) });
     // Retargeted outside the range: the next handoff is refused.
     rmSync(link);
     symlinkSync(d.lab, link);
-    expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toMatchObject({ start: false });
+    expect(await admitted(target, binding, attempt.handoffMessageId!)).toMatchObject({ start: false });
   });
 
   it('a run approved without --working-dir keeps the bot\'s own default; an unreadable approval record is never guessed', async () => {
     const { run, world, attempt, binding } = await handedOffPinned('wdd-default', undefined);
     const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({}) });
-    expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toEqual({ start: true });
+    expect(await admitted(target, binding, attempt.handoffMessageId!)).toEqual({ start: true });
     const elsewhere = daemon('cli_a', world.dataDir, trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-empty-'))), run);
-    expect(elsewhere.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toMatchObject({ start: false });
+    expect(await admitted(elsewhere, binding, attempt.handoffMessageId!)).toMatchObject({ start: false });
     await settle();
     expect(target.posted).toEqual([]);
   });
@@ -414,7 +431,7 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     const d = dirs();
     const { run, world, attempt, binding } = await handedOffPinned('wdd-refuse', d.project);
     const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({ workingDirs: [d.lab] }) });
-    const decision = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
+    const decision = await admitted(target, binding, attempt.handoffMessageId!);
     if (decision.start) throw new Error('expected a refusal');
     await eventually(() => expect(target.posted).toHaveLength(1));
     expect(target.posted).toEqual([{
@@ -444,7 +461,7 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
         return main.wiring.eventRoute(body);
       },
     });
-    expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toMatchObject({ start: false });
+    expect(await admitted(target, binding, attempt.handoffMessageId!)).toMatchObject({ start: false });
     await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
     expect(calls).toBe(2);
   });
@@ -458,7 +475,7 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
       postDaemon: async () => { throw new Error('connect ECONNREFUSED'); },
       warn: (message) => { warnings.push(message); },
     });
-    const decision = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
+    const decision = await admitted(target, binding, attempt.handoffMessageId!);
     if (decision.start) throw new Error('expected a refusal');
     // Both sends fail (the second after the retry delay), then it gives up.
     await eventually(() => expect(warnings.join('\n')).toContain(decision.reason));
@@ -475,20 +492,20 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     const { run, world, attempt, binding } = await handedOffPinned('wdd-existing', d.project);
     const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({ workingDirs: [d.repos, d.lab] }) });
     // The session an earlier attempt of this run started (stored as given, or via a link).
-    expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a', d.project))
+    expect(await admitted(target, binding, attempt.handoffMessageId!, d.project))
       .toEqual({ start: true, workingDir: realpathSync(d.project) });
     const link = join(d.lab, 'p-link');
     symlinkSync(d.project, link);
-    expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a', link)).toMatchObject({ start: true });
+    expect(await admitted(target, binding, attempt.handoffMessageId!, link)).toMatchObject({ start: true });
     // Someone talked to the bot in the topic first, in its default (or a /cd) directory.
-    const other = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a', d.lab);
+    const other = await admitted(target, binding, attempt.handoffMessageId!, d.lab);
     expect(other).toMatchObject({ start: false });
     expect((other as { reason: string }).reason).toContain('节点话题里已有会话，工作目录与指定的不一致');
     await eventually(() => expect(target.posted.map((post) => post.body.kind)).toEqual(['refused']));
     // Without a pinned directory an existing session is used as before.
     const plainRun = await handedOffPinned('wdd-existing-plain', undefined);
     const plain = daemon('cli_a', plainRun.world.dataDir, plainRun.run.base, plainRun.run);
-    expect(plain.wiring.admitInbound(plainRun.binding, plainRun.attempt.handoffMessageId!, 'cli_a', d.lab)).toEqual({ start: true });
+    expect(await admitted(plain, plainRun.binding, plainRun.attempt.handoffMessageId!, d.lab)).toEqual({ start: true });
   });
 
   it('a new session for an admitted handoff starts exactly in the pinned directory, else the ordinary resolution applies', () => {
@@ -711,15 +728,22 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
    * fake contact directory — each app's open_id for the initiator's union_id
    * as INITIATOR_OU_IN says — fake member lists (`members[app]`, default:
    * the initiator is in the chat), and a command gate that lets
-   * `cdUsers[app]` run `/cd` only. `seen` records every gate question.
+   * `cdUsers[app]` run `/cd`, and `cdUnions[app]` (union_ids: the platform
+   * team member leg) when the gate is given one. `seen` records every gate
+   * question, `unionLookups` every open_id → union_id lookup (`unionLookup`:
+   * that lookup fails or never answers), `memberReads` every member list read.
    */
   function operateDeps(cdUsers: Record<string, string[]>, opts: {
     directory?: 'up' | 'down' | 'definitive';
     members?: Record<string, string[] | Error>;
     membershipCache?: WorkflowSidebarMembershipCache;
+    cdUnions?: Record<string, string[]>;
+    unionLookup?: 'down' | 'hang';
   } = {}) {
     const seen: string[] = [];
     const conversions: string[] = [];
+    const unionLookups: string[] = [];
+    const memberReads: string[] = [];
     const io: WorkflowWorkingDirOperatorIo = {
       resolveTargetAppOpenId: async (appId, unionId): Promise<TargetAppOpenIdResolution> => {
         conversions.push(`${appId}:${unionId}`);
@@ -727,20 +751,28 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
         if (opts.directory === 'definitive' || unionId !== INITIATOR_UNION || !INITIATOR_OU_IN[appId]) return { status: 'definitive' };
         return { status: 'resolved', openId: INITIATOR_OU_IN[appId]! };
       },
-      resolveUnionIdFromOpenId: async () => ({ status: 'unavailable' }),
+      resolveUnionIdFromOpenId: async (appId, openId) => {
+        unionLookups.push(`${appId}:${openId}`);
+        if (opts.unionLookup === 'hang') return new Promise(() => {});
+        if (opts.unionLookup === 'down') return { status: 'retryable', error: 'contact api 503' };
+        return openId === INITIATOR_OU_IN[appId] ? { status: 'resolved', unionId: INITIATOR_UNION } : { status: 'unavailable' };
+      },
       listChatMemberOpenIds: async (appId) => {
+        memberReads.push(appId);
         const members = opts.members?.[appId] ?? Object.values(INITIATOR_OU_IN);
         if (members instanceof Error) throw members;
         return members;
       },
-      canRunDaemonCommand: (appId, _chatId, openId, _unionId, cmd) => {
+      canRunDaemonCommand: (appId, _chatId, openId, unionId, cmd) => {
         seen.push(`${appId}:${openId}:${cmd}`);
-        return cmd === '/cd' && (cdUsers[appId]?.includes(openId) ?? false);
+        return cmd === '/cd' && ((cdUsers[appId]?.includes(openId) ?? false)
+          || (unionId !== undefined && (opts.cdUnions?.[appId]?.includes(unionId) ?? false)));
       },
       selfLarkAppId: () => MAIN,
       ...(opts.membershipCache ? { membershipCache: opts.membershipCache } : {}),
     };
-    return { initiatorOperates: createWorkflowWorkingDirOperatorWiring(io).initiatorOperates, seen, conversions };
+    const wiring = createWorkflowWorkingDirOperatorWiring(io);
+    return { initiatorOperates: wiring.initiatorOperates, initiatorCdGate: wiring.initiatorCdGate, seen, conversions, unionLookups, memberReads };
   }
 
   const FROZEN_UNION = { unionId: INITIATOR_UNION, tools: ['lark-cli' as const] };
@@ -978,21 +1010,29 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
       authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.lab });
       const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-self-data-')));
       const delivered: Array<{ workingDir?: string }> = [];
+      const posted: string[] = [];
       const op = operateDeps({ [MAIN]: [...cdUsers] });
       const main = daemon(MAIN, dataDir, run.base, run, {
         botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
         initiatorOperates: op.initiatorOperates,
-        sendCard: async () => 'om_node_card',
-        replyCard: async () => 'om_handoff_card',
+        initiatorCdGate: op.initiatorCdGate,
+        sendCard: async () => { posted.push('node card'); return 'om_node_card'; },
+        replyCard: async () => { posted.push('handoff card'); return 'om_handoff_card'; },
         deliverSelfTurn: async (input) => { delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) }); return { sessionId: 'self-session' }; },
       });
       await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
       if (expectStarted) {
         await eventually(() => expect(delivered).toEqual([{ workingDir: realpathSync(d.lab) }]));
         expect(run.of('nodeBlocked')).toEqual([]);
+        // The open_id alone passes: no union_id lookup.
+        expect(op.unionLookups).toEqual([]);
       } else {
         await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
+        expect(run.of('nodeBlocked')[0]!.message).not.toContain('暂时无法确认');
         expect(delivered).toEqual([]);
+        // Refused before the cards, without reading the chat's members.
+        expect(posted).toEqual([]);
+        expect(op.memberReads).toEqual([]);
       }
       expect(op.conversions).toEqual([]);
       expect(new Set(op.seen)).toEqual(new Set([`${MAIN}:${INITIATOR_MAIN_OU}:/cd`]));
@@ -1009,13 +1049,12 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
     const main = daemon(MAIN, dataDir, run.base, run, {
       botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
       initiatorOperates: async () => {
+        // Asked only inside startSelfTurn (the preflight reads no members),
+        // after the executor's own revoke checks: the attempt is stopped
+        // while this answer is on its way.
         asks += 1;
-        if (asks === 2) {
-          // Inside startSelfTurn, after the executor's own revoke checks: the
-          // attempt is stopped while this answer is on its way.
-          const key = Object.keys(readDispatchRegistryLoose(dataDir)).find((k) => k.startsWith('workflow-handoff:'))!;
-          await revokeWorkflowHandoff(dataDir, SECRET, key.slice('workflow-handoff:'.length), 'runCancelled');
-        }
+        const key = Object.keys(readDispatchRegistryLoose(dataDir)).find((k) => k.startsWith('workflow-handoff:'))!;
+        await revokeWorkflowHandoff(dataDir, SECRET, key.slice('workflow-handoff:'.length), 'runCancelled');
         return 'yes';
       },
       sendCard: async () => 'om_node_card',
@@ -1023,9 +1062,161 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
       deliverSelfTurn: async (input) => { delivered.push(input.marker.nonce); return { sessionId: 'self-session' }; },
     });
     await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
-    await eventually(() => expect(asks).toBe(2));
+    await eventually(() => expect(asks).toBe(1));
     await settleBriefly();
     expect(delivered).toEqual([]);
+  });
+
+  it('the main bot\'s own node reads the chat\'s members once, when it starts — not also before its cards go out', async () => {
+    const d = dirs();
+    for (const [members, expectStarted] of [[undefined, true], [['ou_bob_in_main'], false]] as const) {
+      const run = new BotRun(reportDag(`wdo-self-members-${expectStarted}`, { bot: undefined }));
+      authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.lab });
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-self-mem-')));
+      const delivered: Array<{ workingDir?: string }> = [];
+      const posted: string[] = [];
+      const op = operateDeps({ [MAIN]: [INITIATOR_MAIN_OU] }, members ? { members: { [MAIN]: [...members] } } : {});
+      const main = daemon(MAIN, dataDir, run.base, run, {
+        botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
+        initiatorOperates: op.initiatorOperates,
+        initiatorCdGate: op.initiatorCdGate,
+        sendCard: async () => { posted.push('node card'); return 'om_node_card'; },
+        replyCard: async () => { posted.push('handoff card'); return 'om_handoff_card'; },
+        deliverSelfTurn: async (input) => { delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) }); return { sessionId: 'self-session' }; },
+      });
+      await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+      if (expectStarted) {
+        await eventually(() => expect(delivered).toEqual([{ workingDir: realpathSync(d.lab) }]));
+      } else {
+        // She left the chat: only the start sees it, so the cards are out
+        // and the node blocks there.
+        await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
+        expect(delivered).toEqual([]);
+        expect(posted).toEqual(['node card', 'handoff card']);
+      }
+      expect(op.memberReads).toEqual([MAIN]);
+    }
+  });
+
+  it('the main bot\'s own node, no union_id frozen: the /cd gate gets the union_id its own app looks up; a failed lookup is "could not confirm", never a pass', async () => {
+    const d = dirs();
+    for (const [unionLookup, expectStarted] of [[undefined, true], ['down', false]] as const) {
+      const run = new BotRun(reportDag(`wdo-self-team-${unionLookup ?? 'up'}`, { bot: undefined }));
+      authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.lab });
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-self-team-')));
+      const delivered: Array<{ workingDir?: string }> = [];
+      // No admin of the main bot: its gate lets her use /cd by her union_id
+      // (a platform team member of a bot that lowered /cd to talk).
+      const op = operateDeps({ [MAIN]: [] }, { cdUnions: { [MAIN]: [INITIATOR_UNION] }, ...(unionLookup ? { unionLookup } : {}) });
+      const main = daemon(MAIN, dataDir, run.base, run, {
+        botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
+        initiatorOperates: op.initiatorOperates,
+        initiatorCdGate: op.initiatorCdGate,
+        sendCard: async () => 'om_node_card',
+        replyCard: async () => 'om_handoff_card',
+        deliverSelfTurn: async (input) => { delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) }); return { sessionId: 'self-session' }; },
+      });
+      await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+      if (expectStarted) {
+        await eventually(() => expect(delivered).toEqual([{ workingDir: realpathSync(d.lab) }]));
+        expect(run.of('nodeBlocked')).toEqual([]);
+      } else {
+        await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
+        const message = run.of('nodeBlocked')[0]!.message;
+        expect(message).toContain('暂时无法确认发起人能否操作');
+        expect(message).toContain('稍后重试');
+        expect(delivered).toEqual([]);
+      }
+      // Looked up through the main bot's own app, by the open_id it issued.
+      expect(new Set(op.unionLookups)).toEqual(new Set([`${MAIN}:${INITIATOR_MAIN_OU}`]));
+      expect(op.conversions).toEqual([]);
+    }
+  });
+
+  it('the main bot\'s own node: the lookup before its cards go out counts toward the same 8 s budget; nothing is posted before the refusal (fake clock)', async () => {
+    const d = dirs();
+    const run = new BotRun(reportDag('wdo-self-team-hang', { bot: undefined }));
+    authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.lab });
+    const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-self-hang-')));
+    const op = operateDeps({ [MAIN]: [] }, { cdUnions: { [MAIN]: [INITIATOR_UNION] }, unionLookup: 'hang' });
+    const cards: string[] = [];
+    const main = daemon(MAIN, dataDir, run.base, run, {
+      botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
+      initiatorOperates: op.initiatorOperates,
+      initiatorCdGate: op.initiatorCdGate,
+      sendCard: async () => { cards.push('node'); return 'om_node_card'; },
+      replyCard: async () => { cards.push('handoff'); return 'om_handoff_card'; },
+      deliverSelfTurn: async () => ({ sessionId: 'self-session' }),
+    });
+    // Only the budget's clock is faked: file I/O and setImmediate stay real.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const until = async (done: () => boolean) => {
+        for (const deadline = Date.now() + 10_000; !done() && Date.now() < deadline;) {
+          await vi.advanceTimersByTimeAsync(0);
+          await new Promise<void>((r) => setImmediate(r));
+        }
+      };
+      void run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+      await until(() => op.unionLookups.length > 0);
+      expect(op.unionLookups).toEqual([`${MAIN}:${INITIATOR_MAIN_OU}`]);
+      await vi.advanceTimersByTimeAsync(WORKFLOW_OPERATOR_BUDGET_MS - 1);
+      expect(run.of('nodeBlocked')).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      await until(() => run.of('nodeBlocked').length > 0);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
+    const message = run.of('nodeBlocked')[0]!.message;
+    expect(message).toContain('暂时无法确认发起人能否操作');
+    expect(message).toContain('超时');
+    expect(cards).toEqual([]);
+    expect(op.memberReads).toEqual([]);
+  });
+
+  it('run records that cannot be read at node start are "could not confirm" (retry later), never "cannot operate" — and the range still decides', async () => {
+    const d = dirs();
+    const breakers = {
+      journal: (runDir: string) => {
+        const path = join(runDir, 'journal.ndjson');
+        writeFileSync(path, `not json\n${readFileSync(path, 'utf-8')}`);
+      },
+      artifact: (runDir: string) => writeFileSync(join(runDir, 'dag.json'), '{}\n'),
+    };
+    for (const [what, breakIt] of Object.entries(breakers)) {
+      // Her own bot: with readable records she would start it outside the range.
+      const outside = await pinnedRun(`wdo-unreadable-${what}`, d.lab, FROZEN_UNION);
+      breakIt(outside.run.runDir);
+      const op = operateDeps({ cli_a: [INITIATOR_OU_IN.cli_a!] });
+      const config = { botWorkingDirConfig: () => ({ workingDirs: [d.repos] }), initiatorOperates: op.initiatorOperates };
+      const refused = await admit(daemon('cli_a', outside.world.dataDir, outside.run.base, outside.run, config), outside.binding, outside.attempt.handoffMessageId!);
+      expect(refused).toMatchObject({ start: false });
+      const reason = (refused as { reason: string }).reason;
+      expect(reason).toContain('暂时无法确认发起人能否操作 cli_a');
+      expect(reason).toContain('稍后重试');
+      expect(op.seen).toEqual([]);
+      // Inside the range nobody is asked: it starts as before.
+      const inside = await pinnedRun(`wdo-unreadable-${what}-in`, d.project, FROZEN_UNION);
+      breakIt(inside.run.runDir);
+      expect(await admit(daemon('cli_a', inside.world.dataDir, inside.run.base, inside.run, config), inside.binding, inside.attempt.handoffMessageId!))
+        .toEqual({ start: true, workingDir: realpathSync(d.project) });
+    }
+  });
+
+  it('a bot someone else reassigned a node to gets the union_id from the main bot; a bot outside the run still does not', async () => {
+    const d = dirs();
+    const { run, world } = await pinnedRun('wdo-union-reassigned', d.lab, null);
+    // Not by the initiator, so outside the approved scope — but cli_c
+    // executes the node now.
+    appendEvent(join(run.runDir, 'journal.ndjson'), {
+      type: 'nodeReassigned', nodeId: 'write', instanceId: 'write#001', from: 'cli_a', to: 'cli_c', by: 'ou_someone_else',
+    });
+    const main = daemon(MAIN, world.dataDir, run.base, run, { lookupOwnUnionId: async () => ({ unionId: INITIATOR_UNION }) });
+    expect(await main.wiring.initiatorUnionRoute({ runId: run.dag.runId, requesterLarkAppId: 'cli_c' }))
+      .toEqual({ status: 200, body: { ok: true, unionId: INITIATOR_UNION } });
+    expect(await main.wiring.initiatorUnionRoute({ runId: run.dag.runId, requesterLarkAppId: 'cli_b' }))
+      .toMatchObject({ status: 404, body: { error: 'run_not_eligible' } });
   });
 
   it('a revision brought in a new bot: the main bot still answers the original executor (and the new one), from the real journal', async () => {
@@ -1101,13 +1292,14 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
   });
 
   describe('Gate-2 asks the executing bot about a run still waiting for approval', () => {
-    /** A run at Gate-2 (grill state dag_ready, no run.json), its node on cli_a. */
-    function pendingRun(runId: string, inBase?: string) {
+    /** A run at Gate-2 (grill state dag_ready, no run.json), its node on cli_a
+     *  unless `dag` says otherwise. */
+    function pendingRun(runId: string, inBase?: string, dag: unknown = reportDag(runId)) {
       const base = inBase ?? trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-pending-')));
       const runDir = join(base, runId);
       mkdirSync(runDir, { recursive: true });
       const dagPath = join(runDir, 'dag.json');
-      writeFileSync(dagPath, JSON.stringify(reportDag(runId)));
+      writeFileSync(dagPath, JSON.stringify(dag));
       writeGrillState(runDir, {
         schemaVersion: 1, runId, goal: 'g', status: 'dag_ready',
         createdAt: '2026-11-06T00:00:00.000Z', updatedAt: '2026-11-06T00:00:00.000Z',
@@ -1184,6 +1376,27 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
       expect(readFileSync(join(window.base, window.runId, 'grill.state.json'), 'utf-8')).toContain('dag_ready');
       expect(await hosts(window.runId, window.base, dataDir, op).target.wiring.workingDirOperatorRoute({ runId: window.runId, nodeId: 'write' }))
         .toMatchObject({ status: 404 });
+    });
+
+    it('the main bot\'s own node: the union_id its /cd gate may need is looked up within the same 8 s budget (fake clock)', async () => {
+      const runId = 'wdo-g2-self';
+      const { base } = pendingRun(runId, undefined, reportDag(runId, { bot: undefined }));
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-g2s-data-')));
+      const ask = (op: ReturnType<typeof operateDeps>) => hosts(runId, base, dataDir, op).main.wiring.workingDirOperatorRoute({ runId, nodeId: 'write' });
+      // A platform team member, no admin: passes once the lookup answers.
+      const teamMember = { cdUnions: { [MAIN]: [INITIATOR_UNION] } };
+      expect(await ask(operateDeps({ [MAIN]: [] }, teamMember))).toEqual({ status: 200, body: { ok: true, operate: 'yes' } });
+      vi.useFakeTimers();
+      try {
+        let answered: unknown;
+        void ask(operateDeps({ [MAIN]: [] }, { ...teamMember, unionLookup: 'hang' })).then((r) => { answered = r; });
+        await vi.advanceTimersByTimeAsync(WORKFLOW_OPERATOR_BUDGET_MS - 1);
+        expect(answered).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(answered).toEqual({ status: 200, body: { ok: true, operate: { unknown: expect.stringContaining('超时') } } });
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });
