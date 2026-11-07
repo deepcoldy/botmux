@@ -87,6 +87,7 @@ import { CLEANUP_SESSION_WORKTREE_ACTION, handleSessionWorktreeCleanupAction } f
 import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
+import { buildRestartStatusCard, restartStatusCardNotifier } from '../../core/restart-status-card.js';
 import * as sessionStore from '../../services/session-store.js';
 import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled } from '../../core/idle-auto-compact.js';
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
@@ -3609,9 +3610,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         if (!selected || value.effort !== selected.effort || !control.choices.includes(selected.effort)) return 'invalid' as const;
         if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds)) return 'busy' as const;
         if (!ds.session.cliSessionId) return 'unsupported' as const;
+        const cliName = sessionCliDisplayName(ds);
         const result = requestSessionRestart(ds, {
           source: 'card',
-          notify: async status => { await sessionReply(rootId, t(`card.topic_effort.restart_${status}`, undefined, loc)); },
+          notify: restartStatusCardNotifier({
+            larkAppId: ds.larkAppId,
+            sessionId: ds.session.sessionId,
+            render: status => buildRestartStatusCard({
+              status, cliName, source: 'effort', locale: loc,
+              ...(status === 'cancelled' ? {} : { body: t(`card.topic_effort.restart_${status}`, undefined, loc) }),
+            }),
+            post: card => sessionReply(rootId, card, 'interactive'),
+          }),
         }, { topicEffort: { model: control.model, effort: selected.effort, nativeSessionId: ds.session.cliSessionId } });
         requested = !!result && !result.startFailure && !result.joined;
         return requested ? 'saved' as const : 'busy' as const;
@@ -3751,16 +3761,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       logger.info(`[${tag(ds)}] Correlated restart via card button`);
       requestSessionRestart(ds, {
         source: 'card',
-        notify: status => {
-          const content = t(`cmd.restart.${status}`, { cliName }, locDs);
-          return deliverEphemeralOrReply(
-            ds,
-            operatorOpenId,
-            content,
-            'text',
-            () => sessionReply(rootId, content),
-          );
-        },
+        notify: restartStatusCardNotifier({
+          larkAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+          render: status => buildRestartStatusCard({ status, cliName, source: 'card', locale: locDs }),
+          post: card => sessionReply(rootId, card, 'interactive'),
+        }),
       });
     }
 

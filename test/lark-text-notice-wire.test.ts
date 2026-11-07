@@ -2,15 +2,16 @@
  * Wire-level regression: plain-text notices must reach Feishu wrapped ONCE.
  *
  * `sendMessage` / `replyMessage` wrap `msgType: 'text'` content as
- * `{"text": …}` themselves. The dashboard restart / resume notices and the
- * `/introduce` grant-restricted reply used to pre-`JSON.stringify({ text })`
- * before handing it over, so the group saw a literal `{"text":"🔄 正在重启 …"}`.
+ * `{"text": …}` themselves. The dashboard resume notice and the `/introduce`
+ * grant-restricted reply used to pre-`JSON.stringify({ text })` before handing
+ * it over, so the group saw a literal `{"text":"🔄 …"}`. (The dashboard restart
+ * notice had the same bug; it is now a status card — see
+ * restart-status-card.test.ts.)
  *
  * The real routes and the real Lark client run here; only the Lark SDK object
  * (`getBotClient`) is replaced, so the assertions read the exact `content`
  * string that would be POSTed to Feishu.
  */
-import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,7 +39,6 @@ import * as sessionStore from '../src/services/session-store.js';
 import { config } from '../src/config.js';
 import { __testOnly_resetBotRegistry, registerBot } from '../src/bot-registry.js';
 import { tryHandleIntroduceCommand } from '../src/im/lark/event-dispatcher.js';
-import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
 const APP_ID = 'app_text_notice_wire';
 
@@ -105,123 +105,6 @@ function expectSingleWrap(content: string, prefix: string): string {
   expect(parsed.text.trimStart().startsWith('{')).toBe(false);
   return parsed.text;
 }
-
-function makeFakeWorker() {
-  const w = new EventEmitter() as any;
-  w.killed = false;
-  w.connected = true;
-  w.send = vi.fn();
-  w.kill = vi.fn();
-  w.pid = 12345;
-  w.stdout = new EventEmitter();
-  w.stderr = new EventEmitter();
-  return w;
-}
-
-let seq = 0;
-
-function armSession(scope: 'chat' | 'thread'): { ds: DaemonSession; sessionId: string; rootMessageId: string } {
-  const sessionId = `sid-text-notice-${++seq}`;
-  const rootMessageId = `om_root_${seq}`;
-  const worker = makeFakeWorker();
-  const ds = {
-    session: {
-      sessionId,
-      rootMessageId,
-      chatId: 'oc_chat',
-      title: 'Text notice',
-      status: 'active' as any,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      pid: null,
-      chatType: 'group',
-      cliId: 'codex',
-      scope,
-    },
-    scope,
-    worker,
-    workerPort: 9999,
-    workerToken: 'tok',
-    workerReady: true,
-    cliReady: true,
-    larkAppId: APP_ID,
-    chatId: 'oc_chat',
-    chatType: 'group',
-    spawnedAt: Date.now(),
-    cliVersion: '1.0',
-    lastMessageAt: Date.now(),
-    hasHistory: true,
-    displayMode: 'hidden',
-    lastScreenContent: '',
-    lastScreenStatus: 'idle',
-  } as unknown as DaemonSession;
-  workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
-  workerPool.__testOnly_setupWorkerHandlers(ds, worker);
-  return { ds, sessionId, rootMessageId };
-}
-
-describe('dashboard restart notice reaches Feishu wrapped once', () => {
-  beforeEach(() => {
-    vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
-  });
-
-  it('chat-scope session in a flat group: chat message, single {"text"} layer', async () => {
-    const { sessionId } = armSession('chat');
-    lark.groupMessageType = 'chat';
-
-    const res = await ipc(`/api/sessions/${sessionId}/restart`);
-    expect(res.status).toBe(200);
-
-    await vi.waitFor(() => expect(textWrites()).toHaveLength(1));
-    const [w] = textWrites();
-    expect(w.api).toBe('create');
-    expect(w.data.receive_id).toBe('oc_chat');
-    expect(expectSingleWrap(w.data.content, '🔄')).toContain('Codex');
-  });
-
-  it('chat-scope session in a topic group: threaded reply to the root, single layer', async () => {
-    const { sessionId, rootMessageId } = armSession('chat');
-    lark.groupMessageType = 'thread';
-
-    const res = await ipc(`/api/sessions/${sessionId}/restart`);
-    expect(res.status).toBe(200);
-
-    await vi.waitFor(() => expect(textWrites()).toHaveLength(1));
-    const [w] = textWrites();
-    expect(w.api).toBe('reply');
-    expect(w.path).toMatchObject({ message_id: rootMessageId });
-    expect(w.data.reply_in_thread).toBe(true);
-    expect(expectSingleWrap(w.data.content, '🔄')).toContain('Codex');
-  });
-
-  it('thread-scope session: reply into the thread root, single layer', async () => {
-    const { sessionId, rootMessageId } = armSession('thread');
-
-    const res = await ipc(`/api/sessions/${sessionId}/restart`);
-    expect(res.status).toBe(200);
-
-    await vi.waitFor(() => expect(textWrites()).toHaveLength(1));
-    const [w] = textWrites();
-    expect(w.api).toBe('reply');
-    expect(w.path).toMatchObject({ message_id: rootMessageId });
-    expect(w.data.reply_in_thread).toBe(true);
-    expect(expectSingleWrap(w.data.content, '🔄')).toContain('Codex');
-  });
-
-  it('revive branch (worker gone) uses the same single-layer notice', async () => {
-    const { ds, sessionId } = armSession('thread');
-    ds.worker = null;
-    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
-
-    const res = await ipc(`/api/sessions/${sessionId}/restart`);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ revived: true });
-    expect(forkSpy).toHaveBeenCalled();
-
-    await vi.waitFor(() => expect(textWrites()).toHaveLength(1));
-    expectSingleWrap(textWrites()[0].data.content, '🔄');
-  });
-});
 
 describe('dashboard resume notice reaches Feishu wrapped once', () => {
   // Each scenario runs under BOTH bot locales: hardcoding either locale at the

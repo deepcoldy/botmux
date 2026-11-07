@@ -477,6 +477,12 @@ export interface DashboardGlobalConfig {
    *  daemon gate (config.ts `reapOrphanTmuxServers`). BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
    *  remains an independent emergency kill-switch. */
   reapOrphanTmuxServers?: boolean;
+  /** Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY (logs
+   *  displaced servers/panes, never signals). Read live by the daemon timer. */
+  tmuxOrphanSessionSweep?: boolean;
+  /** Destructive arm of the periodic session sweep: signal only a proven
+   *  taken-over bare-wrapper pane. Default OFF. */
+  tmuxOrphanSessionBareWrapperKill?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -670,6 +676,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
   if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
+  if (typeof d.tmuxOrphanSessionSweep === 'boolean') out.tmuxOrphanSessionSweep = d.tmuxOrphanSessionSweep;
+  if (typeof d.tmuxOrphanSessionBareWrapperKill === 'boolean') out.tmuxOrphanSessionBareWrapperKill = d.tmuxOrphanSessionBareWrapperKill;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.

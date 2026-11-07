@@ -475,9 +475,15 @@ export interface DaemonSession {
   /** Native write observations, scoped to the worker generation and exact attempt. */
   replyExecutionStarts?: Map<string, {
     startedAtMs: number; workerGeneration: number;
+    /** Exact terminal observed; retain timing for reply rendering, suppress reminders. */
+    completed?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
   }>;
+  /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
+   * Values are receipt epoch milliseconds, also fencing older legacy starts
+   * when a compatibility terminal omitted its attempt before any start arrived. */
+  replyExecutionTerminals?: Map<string, number>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-

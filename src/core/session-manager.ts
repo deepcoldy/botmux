@@ -96,6 +96,7 @@ import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
+import { unpinnedSessionWorkingDir } from './working-dir-range.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
@@ -608,11 +609,7 @@ export function getSessionWorkingDir(ds?: DaemonSession): string {
     // BASE that a spawn path turns into a per-session worktree, never a launch dir.
     // Handing it out as a plain fallback would drop an unpinned session straight
     // into the shared repo, defeating the isolation the flag buys.
-    if (!botAutoWorktreeEnabled(ds.larkAppId)) {
-      const botDefault = effectiveDefaultWorkingDir(bot.config);
-      if (botDefault) return expandHome(botDefault);
-    }
-    return expandHome(bot.config.workingDir ?? '~');
+    return expandHome(unpinnedSessionWorkingDir(bot.config, botAutoWorktreeEnabled(ds.larkAppId)));
   }
   // Fallback for calls without a session (e.g. during restore)
   return expandHome(config.daemon.workingDir);

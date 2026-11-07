@@ -219,6 +219,7 @@ import {
   handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
   pendingInputMayFlush,
+  promoteInteractiveInputPastSchedules,
   pendingInputAllowsTypeAhead,
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
@@ -398,7 +399,7 @@ import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRollout
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession } from './services/doubao-transcript.js';
-import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
+import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import type { OmpTranscriptState } from './services/omp-transcript.js';
@@ -11625,6 +11626,12 @@ function codexBridgeStartTimer(): void {
         // Tier-1/Tier-2 demotion to fresh would still baseline the empty
         // hermes store as "existing" and swallow the first turn.
         if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty');
+        // Hermes can expose a busy screen before its user row is persisted.
+        // Share Cursor's bounded refresh policy, before ingest's own prune;
+        // ready/adopt sessions retain their ordinary attribution timing.
+        if (!isPromptReady && !lastInitConfig?.adoptMode) {
+          codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS);
+        }
         hermesBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
@@ -11861,7 +11868,9 @@ function hermesBridgeIngest(): void {
     log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
   }
   if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(filtered.events);
+  // Raw text alone owns source binding above; restored markers are match data,
+  // never authority to rebind this worker to another native session.
+  codexBridgeQueue.ingest(restoreFilteredHermesUserEvents(filtered.events, currentHermesBridgeDbPath()));
   pruneExpiredStructuredHeadsAndEmit('Hermes ingest');
   if (filtered.events.some(event => event.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
@@ -20128,6 +20137,23 @@ function directRpcTurnBlocksTypeAhead(): boolean {
   );
 }
 
+/** Reorder only an authorized interactive steer, never settle its host turn. */
+function promotePendingHumanInterruption(): boolean {
+  if (!backend || !cliAdapter || cliRestartInProgress || currentInputDeliveryQuarantine()) return false;
+  const runtimeSupportsTypeAhead = runtimePtyInputPolicy().supportsTypeAhead;
+  // Scheduled continuations must wait for the current task, but must not
+  // swallow the owner's live interruption behind that wait. This is a queue
+  // selection only: retain authority, delivery fences and the scheduled work.
+  // Use the principal gate even when experimental isolation is disabled.
+  if (runtimeSupportsTypeAhead && !durableTurnInFlight && !directRpcTurnBlocksTypeAhead()
+    && !isRemoteBackendType(effectiveBackendType) && !isCodexAppCliId(lastInitConfig?.cliId)
+    && activeTurnBlocks(pendingMessages[0] ?? {})) {
+    return promoteInteractiveInputPastSchedules(pendingMessages, input =>
+      !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
+  }
+  return false;
+}
+
 async function flushPending(): Promise<void> {
   if (nativeSessionForkPending()) return;
   // Codex model-migration picker guard (startup only): the single admission
@@ -20255,6 +20281,7 @@ async function flushPending(): Promise<void> {
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
   const { supportsTypeAhead: runtimeSupportsTypeAhead, allowBackToBackWrites } = runtimePtyInputPolicy();
+  promotePendingHumanInterruption();
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
     runtimeSupportsTypeAhead,
     durableTurnInFlight,
@@ -21234,6 +21261,13 @@ async function flushPending(): Promise<void> {
     }
   } finally {
     isFlushing = false;
+    // The owner may have arrived while an earlier asynchronous write held the
+    // flush mutex. The serial schedule head stopped that drain, so no new idle
+    // edge will wake the interruption. Re-kick only after a real promotion;
+    // blocked/non-interactive queues cannot create a microtask retry loop.
+    if (itemsWrittenInThisFlush > 0 && promotePendingHumanInterruption()) {
+      queueMicrotask(() => { void flushPending(); });
+    }
     // A prompt can arrive after turn N completes but before turn N+1's chunked
     // control line finishes. We reject it while N+1 has a liveness slot. If that
     // write then fails, the prompt is still the runner's real ready boundary;

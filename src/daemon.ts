@@ -256,10 +256,11 @@ import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
 import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, PrincipalLaneQueuedTurn, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
-import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
+import { scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
+import { comparableSessionDir } from './core/working-dir-range.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
 
 export function useOrdinaryOutputDelivery(): void {
@@ -504,6 +505,8 @@ import {
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
+import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
+import { listeningServersOnPath, probeTmuxOwner, tmuxSocketPath, procIsBotmuxListener } from './core/tmux-server-guard.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import {
@@ -734,6 +737,10 @@ import {
   saveSessionOwnerReminderRecords,
 } from './services/session-owner-reminder-store.js';
 import { buildSessionOwnerMention, sendSessionOwnerThreadNotification } from './services/session-owner-notification.js';
+import { LongTaskReminderController } from './core/long-task-reminder.js';
+import { canSendLongTaskReminder } from './core/long-task-reminder-eligibility.js';
+import { DEFAULT_LONG_TASK_REMINDER } from './services/long-task-reminder-policy.js';
+import { sendLongTaskReminder } from './services/long-task-reminder-notification.js';
 import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
@@ -7153,6 +7160,17 @@ const workflowMainWake = createWorkflowMainWake({
   warn: (message) => logger.warn(message),
 });
 
+/** The directory a main-topic node the main bot runs itself would meet: its
+ *  main session's, found by the same lookup the node's delivery makes (the
+ *  main topic root × the main bot). Undefined = no live session there (the
+ *  node would start one in the frozen directory). Comparison form. */
+function v3MainSessionDirOf(binding: import('./workflows/v3/grill-state.js').RunChatBinding): string | undefined {
+  if (!binding.rootMessageId) return undefined;
+  const ds = activeSessions.get(sessionKey(binding.rootMessageId, binding.larkAppId));
+  if (!ds || ds.session.status === 'closed') return undefined;
+  return comparableSessionDir(getSessionWorkingDir(ds));
+}
+
 /** 「改派」 on bot-executed runs' blocked cards: the same live §6.1 probe the
  *  approval uses, against the run's chat. */
 const v3BlockedReassignDeps: V3BlockedReassignDeps = {
@@ -7164,6 +7182,7 @@ const v3BlockedReassignDeps: V3BlockedReassignDeps = {
   nameOf: (appId) => v3BotDisplayNameResolver()(appId),
   cliOf: (appId) => loadBotConfigs().find((bot) => bot.larkAppId === appId)?.cliId,
   executor: workflowNodeDaemon.executor,
+  mainSessionDir: v3MainSessionDirOf,
 };
 
 // v3 humanGate run-controller: drives daemon-side v3 runs, posts/​re-posts
@@ -8360,6 +8379,10 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
       },
       // §5.2 rule 3, for an edit that moves a node into the main topic.
       mainTopic: v3MainTopicAvailability(binding, binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined),
+      // §5.2 rule 2 × §15.4, for an edit that makes a node one the main bot
+      // runs in the main topic while the run has a frozen working dir.
+      ...(() => { const dir = v3MainSessionDirOf(binding); return dir !== undefined ? { mainSessionDir: dir } : {}; })(),
+      nameOf: v3BotDisplayNameResolver(),
     });
   } catch (err) {
     return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -32483,10 +32506,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     config.session.dataDir,
     () => ({
       ...getTurnTerminalPersistenceHealth(),
-      busy: [...activeSessions.values()].some(session =>
-        (session.finalOutputDeliveriesInFlight?.size ?? 0) > 0 || (session.backgroundTaskCount ?? 0) > 0 ||
-        (session.session.status === 'active' &&
-        !['idle', 'limited', 'interrupted'].includes(session.lastScreenStatus ?? ''))),
+      busy: isFeedbackMaintenanceBusy(cfg.larkAppId, activeSessions.values()),
     }),
     async () => { await feedbackWebhookDispatcher?.quiesce(); },
     async () => {
@@ -34813,6 +34833,78 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
+  // Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY: it logs
+  // displaced botmux servers/panes on each candidate socket label and never
+  // signals. The narrow bare-wrapper kill is a separate, default-OFF switch and
+  // runs on Linux with strong /proc proof only. Re-read live each tick; first
+  // run is jittered; the timer is unref'd and cleared on shutdown. The census
+  // walks /proc/net/unix + /proc/<pid>/fd, so the cadence is deliberately
+  // slower than the 60 s sweeps.
+  let orphanSessionSweepInFlight = false;
+  const runOrphanSessionSweepTick = (): void => {
+    if (orphanSessionSweepInFlight) return;
+    // Live read; backend gate mirrors the startup whole-server reaper.
+    if (config.daemon.backendType !== 'tmux' || !config.tmuxOrphanSessionSweep) return;
+    if (process.env.BOTMUX_DISABLE_ORPHAN_TMUX_REAP === '1' || process.env.BOTMUX_DISABLE_TMUX_ANTI_FORK === '1') return;
+    orphanSessionSweepInFlight = true;
+    try {
+      const frozenNames = sessionStore.listSessions()
+        .filter(s => s.status === 'active' && (s.backendType ?? s.persistentBackendTarget?.backendType) === 'tmux')
+        .map(s => s.persistentBackendTarget?.backendType === 'tmux' ? s.persistentBackendTarget.socketName : undefined);
+      const socketNames = reaperCandidateSocketNames(frozenNames);
+      const ownUid = typeof process.getuid === 'function' ? process.getuid() : -1;
+      runPeriodicOrphanSessionSweep({
+        socketNames,
+        listeningPids: listeningServersOnPath,
+        socketPath: name => tmuxSocketPath(process.env, ownUid, name),
+        reachablePid: (name) => {
+          const r = probeTmuxOwner(name);
+          return r.kind === 'reachable' ? r.pid : null;
+        },
+        isBotmuxPid: (pid) => procIsBotmuxListener(pid),
+        // Destructive arm (default off). Bindings live on the reachable server:
+        // read each managed session's per-session environment for the instance
+        // binding so takeover can be proven.
+        permitBareWrapperReap: config.tmuxOrphanSessionBareWrapperKill,
+        loadProcs: loadRichProcsLinux,
+        lockHolders: enumerateThreadLockHolders,
+        enumeratePanes: (orphanPid, procs) => enumerateOrphanPanes(orphanPid, procs, readProcEnviron),
+        ownUid,
+        reachableBindings: (name) => {
+          const set = new Set<string>();
+          try {
+            const names = execFileSync('tmux', [...(name ? ['-L', name] : []), 'list-sessions', '-F', '#{session_name}'], {
+              encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: tmuxEnv(),
+            }).split('\n').map(x => x.trim()).filter(Boolean).filter(n => n.startsWith('bmx-'));
+            for (const sn of names) {
+              try {
+                const envOut = execFileSync('tmux', [...(name ? ['-L', name] : []), 'show-environment', '-t', sn], {
+                  encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: tmuxEnv(),
+                });
+                for (const line of envOut.split('\0').join('\n').split('\n')) {
+                  if (line.startsWith('BOTMUX_CODEX_INSTANCE_BINDING=')) set.add(line.slice('BOTMUX_CODEX_INSTANCE_BINDING='.length));
+                }
+              } catch { /* unreadable session env: just don't add its binding */ }
+            }
+          } catch { /* reachable server query failed: empty set → plan kills nothing */ }
+          return set;
+        },
+        signal: (pid) => { try { process.kill(pid, 'SIGHUP'); } catch { /* member gone/EPERM: the plan already vetted same-uid members */ } },
+        log: (message) => logger.warn(message),
+      });
+    } catch (error) {
+      logger.warn(`[orphan-session-sweep] sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      orphanSessionSweepInFlight = false;
+    }
+  };
+  const orphanSessionSweepTimer = setInterval(runOrphanSessionSweepTick, 120_000);
+  orphanSessionSweepTimer.unref?.();
+  // Defer the first run with a bounded jitter so a fleet restart does not run
+  // the /proc census on every host at the same instant.
+  const orphanSessionSweepKickoff = setTimeout(() => runOrphanSessionSweepTick(), 15_000 + Math.floor(Math.random() * 30_000));
+  orphanSessionSweepKickoff.unref?.();
+
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
     save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
@@ -34851,6 +34943,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 60_000);
   sessionOwnerReminderTimer.unref?.();
   void scanSessionOwnerReminders();
+
+  /** Per-bot controller tracks only positively observed native execution clocks. */
+  const longTaskReminder = new LongTaskReminderController({
+    config: () => getBot(cfg.larkAppId).config.longTaskReminder ?? DEFAULT_LONG_TASK_REMINDER,
+    sessions: () => activeSessions.values(),
+    canSend: canSendLongTaskReminder,
+    send: sendLongTaskReminder,
+    now: Date.now,
+    onError: error => logger.warn(`[long-task-reminder] ${error instanceof Error ? error.message : String(error)}`),
+  });
+  /** A 30-second scan bounds notification latency without spawning agent turns. */
+  const longTaskReminderTimer = setInterval(() => {
+    void longTaskReminder.scan().catch(error => logger.warn(`[long-task-reminder] scan failed: ${String(error)}`));
+  }, 30_000);
+  longTaskReminderTimer.unref?.();
 
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
   // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
@@ -35481,7 +35588,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(orphanSessionSweepTimer);
+    clearTimeout(orphanSessionSweepKickoff);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
@@ -35750,7 +35860,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setCrossPrincipalInterruptionDisableHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(orphanSessionSweepTimer);
+    clearTimeout(orphanSessionSweepKickoff);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     clearInterval(docCommentPollTimer);
@@ -35791,4 +35904,5 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 }
 import { feedbackMaintenanceActive, startFeedbackMaintenanceParticipant } from './services/feedback-maintenance.js';
+import { isFeedbackMaintenanceBusy } from './core/feedback-maintenance-health.js';
 import { getTurnTerminalPersistenceHealth } from './services/turn-completion-events.js';

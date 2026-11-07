@@ -227,6 +227,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
   { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval'] },
+  { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
 ];
 
 export function botDefaultsSectionDomId(id: string): string {
@@ -511,6 +512,8 @@ export type BotDefaultsRow = {
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  /** Per-bot native execution reminder preferences; absent means opt-in defaults. */
+  longTaskReminder?: import('../../services/long-task-reminder-policy.js').LongTaskReminderConfig | null;
   sessionOwnerReminder?: {
     enabled: boolean;
     intervalMinutes: number;

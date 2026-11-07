@@ -83,6 +83,12 @@ describe('group message recall', () => {
     ] });
     expect((await service.list('oc_group')).messages.map(message => message.messageId)).toEqual(['om_local', 'om_omitted']);
   });
+  it('treats hasMore without a page token as the final page', async () => {
+    vi.mocked(transport.list).mockResolvedValue({ items: [own('om_one')], hasMore: true });
+    const result = await service.list('oc_group');
+    expect(result.hasMore).toBe(false);
+    expect(result.pageToken).toBeUndefined();
+  });
   it('refuses foreign messages even when the selected bot could administratively recall them', async () => {
     vi.mocked(transport.read).mockImplementation(async id => id === 'om_cross'
       ? own(id, { chat_id: 'oc_elsewhere' }) : id === 'om_user'
@@ -91,6 +97,12 @@ describe('group message recall', () => {
     const result = await service.recall('oc_group', { messageIds: ['om_cross', 'om_user', 'om_other'] });
     expect(result.ok).toBe(false);
     expect(result.results.map(result => result.error)).toEqual(['message_chat_mismatch', 'not_bot_message', 'not_bot_message']);
+    expect(transport.recall).not.toHaveBeenCalled();
+  });
+  it('fails a message whose readback id differs from the requested id without deleting', async () => {
+    vi.mocked(transport.read).mockResolvedValue(own('om_echo', { message_id: 'om_actually_other' }));
+    const result = await service.recall('oc_group', { messageIds: ['om_echo'] });
+    expect(result.results).toEqual([{ messageId: 'om_echo', ok: false, error: 'message_chat_mismatch' }]);
     expect(transport.recall).not.toHaveBeenCalled();
   });
   it('returns per-message outcomes after partial failure and does not repeat already-recalled messages', async () => {
