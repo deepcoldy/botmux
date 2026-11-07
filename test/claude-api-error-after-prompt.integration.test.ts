@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -183,7 +184,10 @@ process.stdin.on('data', chunk => {
   chmodSync(fakeClaude, 0o755);
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
-  const sid = 'sid-api-error-idle';
+  // The session scope is named after the sid in the host-wide systemd user
+  // manager, and a launch first stops that unit by name: a fixed sid lets a
+  // concurrent run of this file elsewhere SIGTERM this Claude at startup.
+  const sid = `sid-api-error-idle-${randomUUID()}`;
   child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
