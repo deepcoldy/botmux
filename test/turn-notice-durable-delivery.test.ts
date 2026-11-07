@@ -175,6 +175,7 @@ describe('durable delivery of failure cards and worker notices', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    updateSessionMock.mockReset();
     sessionReplyMock.mockImplementation(async () => 'om_reply');
     initWorkerPool({
       sessionReply: sessionReplyMock,
@@ -317,5 +318,64 @@ describe('durable delivery of failure cards and worker notices', () => {
     __testOnly_setupWorkerHandlers(ds, nextWorker);
     await vi.advanceTimersByTimeAsync(30 * 60_000);
     expect(calls()).toHaveLength(1);
+  });
+
+  it('stops re-sending a notice whose first send may have landed before Feishu forgets its uuid', async () => {
+    // Feishu de-duplicates a repeated message uuid for one hour only. The
+    // first send is reset mid-request (it may have landed), so even though
+    // every later failure provably never reached Feishu, no send may go out
+    // after that hour: it could post a second copy next to the first.
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-notify-maybe-landed', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const startedAt = Date.now();
+    const sentAt: number[] = [];
+    sessionReplyMock.mockImplementation(async () => {
+      sentAt.push(Date.now() - startedAt);
+      throw sentAt.length === 1 ? resetMidRequest() : dnsFailure();
+    });
+
+    worker.emit('message', { type: 'user_notify', message: 'maybe landed', turnId: 'om_turn_8' });
+    for (let minute = 0; minute < 3 * 60; minute += 1) {
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+
+    expect(sentAt.length).toBeGreaterThan(2);
+    expect(Math.max(...sentAt)).toBeLessThan(60 * 60_000);
+  });
+
+  it('keeps an owed notice for the next attach instead of sending once the session is closed', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-notify-closed', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    sessionReplyMock.mockRejectedValueOnce(dnsFailure());
+
+    worker.emit('message', { type: 'user_notify', message: 'owed while closing', turnId: 'om_turn_9' });
+    await vi.advanceTimersByTimeAsync(0);
+    ds.session.status = 'closed' as any;
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(calls()).toHaveLength(1);
+    expect((ds.session as any).turnNotices?.[0]?.delivery.state).toBe('pending');
+  });
+
+  it('writes the owed notice to the session row as soon as the first send fails', async () => {
+    // A daemon restart before the first retry resumes from the durable row.
+    const rows: any[] = [];
+    updateSessionMock.mockImplementation((session: any) => { rows.push(structuredClone(session)); });
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-notify-persist', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    sessionReplyMock.mockRejectedValueOnce(dnsFailure());
+
+    worker.emit('message', { type: 'user_notify', message: 'owed before restart', turnId: 'om_turn_10' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls()).toHaveLength(1);
+    const owed = rows.at(-1)?.turnNotices;
+    expect(owed).toHaveLength(1);
+    expect(owed[0]).toMatchObject({
+      content: 'owed before restart',
+      turnId: 'om_turn_10',
+      delivery: { state: 'pending', uuid: calls()[0][5]?.uuid },
+    });
   });
 });
