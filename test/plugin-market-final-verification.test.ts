@@ -727,4 +727,15 @@ describe('final plugin mutation acceptance', () => {
     expect(f.cli.calls.service).not.toHaveBeenCalled();
     expect(marker()).toBe('initial');
   });
+
+  it('BODY-LIMIT: an oversized market request is rejected without dispatching', async () => {
+    installInitial();
+    const f = hostFixture();
+    const route = routeHarness(f.market);
+    const pending = route.call();
+    route.stream.end(JSON.stringify({ ...request(), padding: 'x'.repeat(40_000) }));
+    expect((await pending).status).toBe(413);
+    expect(f.cli.calls.service).not.toHaveBeenCalled();
+    expect(marker()).toBe('initial');
+  });
 });

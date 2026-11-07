@@ -1,9 +1,8 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { botmuxHome, pluginRegistryPath } from './paths.js';
-
 const schema = z.object({
   id: z.string().regex(/^[a-z][a-z0-9._-]{0,63}$/),
   packageName: z.string().min(1),
@@ -20,16 +19,27 @@ export function parsePluginMutationGuard(raw: string | undefined): PluginMutatio
 export function pluginRecordHash(record: unknown): string | null {
   return record == null ? null : createHash('sha256').update(JSON.stringify(record)).digest('hex');
 }
+/**
+ * Registry revision digest from the persisted monotonic counter. A stat digest
+ * (dev/inode/size/mtime/ctime) is forgeable by ordinary operation on ext4:
+ * atomic rewrites reuse the freed inode, and equal-size rewrites inside one
+ * timestamp tick produce the identical tuple, so install/uninstall A→B→A was
+ * indistinguishable from the original empty slot. The on-disk counter is bumped
+ * on every rewrite by the registry store and cannot return to a past value.
+ */
 export function pluginRegistryRevision(): string {
-  let identity: string;
+  let revision = 0;
   try {
-    const stat = statSync(pluginRegistryPath(), { bigint: true });
-    identity = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+    const raw = JSON.parse(readFileSync(pluginRegistryPath(), 'utf8')) as { revision?: unknown };
+    if (typeof raw.revision === 'number' && Number.isSafeInteger(raw.revision) && raw.revision > 0) {
+      revision = raw.revision;
+    }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    identity = 'absent';
+    // ENOENT (never written) and an unreadable/corrupt file both read as
+    // revision 0 — the same fail-operational rule readPluginRegistry() uses.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
   }
-  return createHash('sha256').update(identity).digest('hex');
+  return createHash('sha256').update(`plugin-registry-revision:${revision}`).digest('hex');
 }
 export function assertPluginMutationGuard(
   guard: PluginMutationGuard,

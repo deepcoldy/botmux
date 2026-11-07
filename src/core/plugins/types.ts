@@ -140,6 +140,11 @@ export interface InstalledPluginRecord {
 export interface PluginRegistryFile {
   schemaVersion: 1;
   plugins: Record<string, InstalledPluginRecord>;
+  /** Monotonic per-file mutation counter, bumped on every atomic rewrite.
+   *  Stat-based identity (inode/mtime) is not safe on ext4: back-to-back
+   *  rewrites of equal-size content reuse the inode and land inside the same
+   *  timestamp tick, so an install/uninstall A→B→A looked unchanged. */
+  revision?: number;
 }
 
 export interface PluginSettingsFile {

@@ -4780,7 +4780,7 @@ const server = createServer(async (req, res) => {
       if (req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
       if (!enforceControlCsrf(req, res, requestIdentity)) return;
       try {
-        const body = await readJsonBody(req) as Record<string, unknown> | null;
+        const body = await readJsonBody(req, 32 * 1024) as Record<string, unknown> | null;
         if (!body || typeof body !== 'object') return jsonRes(res, 400, { ok: false, error: 'bad_json' });
         const freshIdentity = dashboardRequestIdentity(req);
         if (!freshIdentity || freshIdentity.authSessionId !== requestIdentity.authSessionId
@@ -4801,6 +4801,9 @@ const server = createServer(async (req, res) => {
         }
         return jsonRes(res, 404, { ok: false, error: 'not_found' });
       } catch (error) {
+        if (error instanceof DashboardJsonBodyTooLargeError) {
+          return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+        }
         return jsonRes(res, error instanceof PluginMarketError ? error.status : 502, {
           ok: false, error: error instanceof PluginMarketError ? error.message : '操作未完成，请刷新已安装列表核对，并检查网络、依赖或后台服务状态',
         });

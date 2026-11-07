@@ -9,8 +9,8 @@ vi.mock('node:os', async original => {
   return { ...os, homedir: () => state.home };
 });
 import { installLocalPlugin } from '../src/core/plugins/install.js';
-import { getInstalledPlugin } from '../src/services/plugin-registry-store.js';
-import { pluginRecordHash, type PluginMutationGuard } from '../src/core/plugins/mutation-guard.js';
+import { getInstalledPlugin, readPluginRegistry, removeInstalledPlugin, writePluginRegistry } from '../src/services/plugin-registry-store.js';
+import { pluginRecordHash, pluginRegistryRevision, assertPluginMutationGuard, type PluginMutationGuard } from '../src/core/plugins/mutation-guard.js';
 
 function pkg(name: string, version: string, id = 'sample') {
   const path = join(state.home, `package-${name.replace(/\W/g, '')}-${version}`);
@@ -55,5 +55,54 @@ describe('locked plugin mutation preconditions', () => {
     const confirmed = { ...guard(), authorityDigest: createHash('sha256').update('old-token').digest('hex') };
     expect(() => installLocalPlugin(pkg('@test/sample', '1.2.3'), { guard: confirmed })).toThrow();
     expect(getInstalledPlugin('sample')).toBeUndefined();
+  });
+});
+
+describe('durable registry revision counter', () => {
+  it('is absent before the first write and changes on every rewrite, even restoring identical bytes', () => {
+    const absent = pluginRegistryRevision();
+    writePluginRegistry({ schemaVersion: 1, plugins: {} });
+    const first = pluginRegistryRevision();
+    expect(first).not.toBe(absent);
+    // 50 tight A→B→A cycles: a stat digest (inode/size/mtime) collides on this
+    // ext4 host in a majority of back-to-back equal-size rewrites; the counter
+    // must distinguish every single one.
+    let previous = first;
+    for (let cycle = 0; cycle < 50; cycle++) {
+      installLocalPlugin(pkg('@test/sample', `1.0.${cycle}`));
+      const afterInstall = pluginRegistryRevision();
+      expect(afterInstall).not.toBe(previous);
+      removeInstalledPlugin('sample');
+      const afterRemove = pluginRegistryRevision();
+      expect(afterRemove).not.toBe(afterInstall);
+      expect(afterRemove).not.toBe(absent);
+      previous = afterRemove;
+    }
+    expect(readPluginRegistry().revision).toBeGreaterThan(50);
+  });
+  it('deterministically rejects a stale empty-slot confirmation after install + uninstall', () => {
+    const staleGuard: PluginMutationGuard = {
+      id: 'sample', packageName: '@test/sample', version: '1.2.3',
+      expectedState: null, expectedRevision: pluginRegistryRevision(),
+    };
+    installLocalPlugin(pkg('@test/sample', '1.2.3'));
+    removeInstalledPlugin('sample');
+    // The empty slot is back and stat identity may already have recycled to
+    // the same tuple; only the durable counter makes this rejection reliable.
+    expect(() => assertPluginMutationGuard(staleGuard, undefined)).toThrow(/superseded/);
+    const freshGuard: PluginMutationGuard = {
+      id: 'sample', packageName: '@test/sample', version: '1.2.3',
+      expectedState: null, expectedRevision: pluginRegistryRevision(),
+    };
+    expect(() => assertPluginMutationGuard(freshGuard, undefined)).not.toThrow();
+  });
+  it('round-trips the counter through parse and ignores malformed values', () => {
+    const path = join(state.home, '.botmux/plugins-registry.json');
+    mkdirSync(join(state.home, '.botmux'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, plugins: {}, revision: 7 }));
+    expect(readPluginRegistry().revision).toBe(7);
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, plugins: {}, revision: -1 }));
+    expect(readPluginRegistry().revision).toBeUndefined();
+    expect(pluginRegistryRevision()).toBe(pluginRegistryRevision());
   });
 });
