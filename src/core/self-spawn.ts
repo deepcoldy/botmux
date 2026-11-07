@@ -1,5 +1,6 @@
 import { spawn, fork, type ChildProcess, type StdioOptions } from 'node:child_process';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 /**
  * Spawn one of botmux's own entry modules (daemon / core-only / worker /
@@ -219,6 +220,16 @@ export function entryForSubcommand(token: string): BotmuxEntry | null {
  *     dropped (a compiled binary has no
  *     separate interpreter args).
  */
+/**
+ * `--import` operand for a preload file. Bun does not decode file URLs there (a
+ * CJK, space, `%` or `#` path fails with "preload not found"), so it needs the
+ * raw absolute path; Node resolves a raw path as a URL (`%xx` decoded, `#`
+ * starts a fragment), so it keeps the file URL.
+ */
+export function preloadImportSpecifier(path: string, bun: boolean = Boolean(process.versions.bun)): string {
+  return bun ? path : pathToFileURL(path).href;
+}
+
 export function spawnWorker(opts: {
   distDir: string;
   cwd: string;
