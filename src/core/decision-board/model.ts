@@ -443,6 +443,11 @@ export interface StewardConfig {
    * 记一条历史，并给管家会话发一条合并的短通知。只提示，不改状态。默认关，只在打开时写 `true`。
    */
   closeHints?: boolean;
+  /**
+   * 事项关联的群里有一轮结束、举手或中断时，在这一项上标「子任务已交付 / 等人处理 / 中断」，
+   * 并给管家会话发一条合并的短通知。只提示，不改状态。默认开，只在关掉时写 `false`。
+   */
+  taskHints?: boolean;
 }
 
 export const STEWARD_GUIDE_TEXT_MAX = 20_000;
@@ -457,7 +462,7 @@ export function normalizeStewardConfig(raw: unknown):
   if (raw === null || raw === undefined) return { ok: true, value: null };
   if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'steward 必须是对象' };
   const r = raw as Record<string, unknown>;
-  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups', 'closeHints', 'decisionCards']);
+  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups', 'closeHints', 'decisionCards', 'taskHints']);
   const unknown = Object.keys(r).filter(k => !known.has(k));
   if (unknown.length) return { ok: false, reason: `steward 有未知字段：${unknown.join(', ')}` };
   if (r.enabled !== undefined && typeof r.enabled !== 'boolean') return { ok: false, reason: 'steward.enabled 必须是布尔值' };
@@ -472,6 +477,9 @@ export function normalizeStewardConfig(raw: unknown):
   }
   if (r.closeHints !== undefined && r.closeHints !== null && typeof r.closeHints !== 'boolean') {
     return { ok: false, reason: 'steward.closeHints 必须是布尔值' };
+  }
+  if (r.taskHints !== undefined && r.taskHints !== null && typeof r.taskHints !== 'boolean') {
+    return { ok: false, reason: 'steward.taskHints 必须是布尔值' };
   }
   let chatId: string | undefined;
   if (r.chatId !== undefined && r.chatId !== null && r.chatId !== '') {
@@ -504,10 +512,11 @@ export function normalizeStewardConfig(raw: unknown):
     ...(r.autoJoinSoloGroups === true ? { autoJoinSoloGroups: true } : {}),
     ...(r.decisionCards === false ? { decisionCards: false } : {}),
     ...(r.closeHints === true ? { closeHints: true } : {}),
+    ...(r.taskHints === false ? { taskHints: false } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
     && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
-    && value.decisionCards !== false) {
+    && value.decisionCards !== false && value.taskHints !== false) {
     return { ok: true, value: null };
   }
   return { ok: true, value };
@@ -535,6 +544,11 @@ export function stewardDecisionCardsOn(cfg: StewardConfig | undefined): cfg is S
 /** 后台巡检开着：管家开着、选了管家群（通知要有地方投）、且打开了 closeHints。 */
 export function stewardCloseHintsOn(cfg: StewardConfig | undefined): boolean {
   return stewardReady(cfg) && cfg.closeHints === true;
+}
+
+/** 子任务提醒开着：管家可用（开关开 + 选了管家群）且没关 taskHints。 */
+export function stewardTaskHintsOn(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
+  return stewardReady(cfg) && cfg.taskHints !== false;
 }
 
 /**
@@ -693,12 +707,37 @@ function withHintRules(text: string, locale: Locale): string {
   return out;
 }
 
+// 「子任务提醒」开着时插在「定时巡检」前面的一小节。
+const TASK_HINT_SECTION: Record<Locale, { beforeSection: string; section: string }> = {
+  zh: {
+    beforeSection: '## 定时巡检（',
+    section: `## 子任务结果（收到「决策看板 · 子任务」消息时）
+- 事项关联的群里有一轮交付、举手或中断时自动发来，只是提示、状态没改：逐项 \`botmux board show <编号>\` 看群里的结果，用 \`botmux board set\` 回写进展或改状态；要 owner 拍板的照常转成待拍板。
+
+`,
+  },
+  en: {
+    beforeSection: '## Scheduled patrol (',
+    section: `## Subtask results (when a "Decision board · subtask" message arrives)
+- Sent automatically when a chat linked to an item finishes a turn, raises a hand or is interrupted. Hints only; no state was changed: for each item, \`botmux board show <n>\` to read the chat's result, then write back progress or change the state with \`botmux board set\`; anything the owner must decide becomes decide as usual.
+
+`,
+  },
+};
+
+function withTaskHintSection(text: string, locale: Locale): string {
+  const rules = TASK_HINT_SECTION[locale];
+  const at = text.indexOf(rules.beforeSection);
+  return at >= 0 ? text.slice(0, at) + rules.section + text.slice(at) : text;
+}
+
 const STANDARD_HEADING: Record<Locale, string> = { zh: '## 推进标准', en: '## Standard' };
 const CUSTOM_HEADING: Record<Locale, string> = { zh: '## owner 的自定义规则（与上文冲突时以这里为准）', en: '## Owner custom rules (these win over anything above)' };
 
 export function stewardGuidePreset(locale: Locale, cfg?: StewardConfig): string {
   const preset = locale === 'en' ? GUIDE_PRESET_EN : GUIDE_PRESET_ZH;
-  return stewardCloseHintsOn(cfg) ? withHintRules(preset, locale) : preset;
+  const withHints = stewardCloseHintsOn(cfg) ? withHintRules(preset, locale) : preset;
+  return stewardTaskHintsOn(cfg) ? withTaskHintSection(withHints, locale) : withHints;
 }
 
 /**

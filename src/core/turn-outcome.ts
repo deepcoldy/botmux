@@ -20,6 +20,7 @@ import {
   type SessionLastTurn,
   type TurnOutcome,
 } from './session-task-status.js';
+import { emitSessionTaskEvent } from './session-task-events.js';
 import type { DaemonSession } from './types.js';
 
 /** 等本轮 daemon 兜底最终回复投递完成的上限，覆盖现有 0/5/15 秒重试序列。 */
@@ -158,6 +159,8 @@ function commitLastTurn(ds: DaemonSession, lastTurn: SessionLastTurn): boolean {
     return false;
   }
   dashboardEventBus.publish({ type: 'session.update', body: { sessionId, patch: { lastTurn } } });
+  const unchanged = previous?.turnId === lastTurn.turnId && previous.outcome === lastTurn.outcome;
+  if (lastTurn.outcome !== 'no_output' && !unchanged && ds.session.chatId) emitSessionTaskEvent({ chatId: ds.session.chatId, sessionId });
   return true;
 }
 

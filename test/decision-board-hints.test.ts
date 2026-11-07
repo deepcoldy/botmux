@@ -508,7 +508,8 @@ describe('解析', () => {
 
 describe('规则与配置', () => {
   it('没开 closeHints：guide 与之前逐字相同；开了才多出写条件和「收到提示」两处', () => {
-    const off: StewardConfig = { enabled: true, chatId: 'oc_x' };
+    // 子任务提醒是另一个开关（默认开），这里关掉只看 closeHints 带来的差别。
+    const off: StewardConfig = { enabled: true, chatId: 'oc_x', taskHints: false };
     const on: StewardConfig = { ...off, closeHints: true };
     for (const locale of ['zh', 'en'] as const) {
       expect(stewardGuidePreset(locale, off)).toBe(stewardGuidePreset(locale));

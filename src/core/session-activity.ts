@@ -9,6 +9,7 @@ import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 import { buildSessionMessagePreview } from './session-message-preview.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
+import { emitSessionTaskEvent } from './session-task-events.js';
 
 /**
  * Stamp `lastHumanMessageAt` on a session that is being created by a human
@@ -144,12 +145,30 @@ export function publishNativeTopicLinkPatchForSession(session: Session, activeLi
   return true;
 }
 
+const emittedAttention = new WeakMap<DaemonSession, { at: number; reason: string }>();
+
+/** Tell the steward about a raise only when it is a new one: nothing was up,
+ *  the agent asked again, or the daemon raised for a different reason. Pushes
+ *  that repeat the same raise (delivery retries) stay quiet. */
+function noteAttentionEvent(ds: DaemonSession): void {
+  const raised = ds.agentAttention;
+  if (!raised) {
+    emittedAttention.delete(ds);
+    return;
+  }
+  const last = emittedAttention.get(ds);
+  if (last && (last.at === raised.at || (raised.source !== 'agent' && last.reason === raised.reason))) return;
+  emittedAttention.set(ds, { at: raised.at, reason: raised.reason });
+  if (ds.session.chatId) emitSessionTaskEvent({ chatId: ds.session.chatId, sessionId: ds.session.sessionId });
+}
+
 /** Push the current attention signals (repo-selection pending / TUI prompt
  *  open) to the dashboard. Call after mutating `ds.pendingRepo` or
  *  `ds.tuiPromptCardId` so the board view's needs-you column tracks live
  *  state. Idempotent — patches are derived from the session, never toggled
  *  blindly. */
 export function publishAttentionPatch(ds: DaemonSession): void {
+  noteAttentionEvent(ds);
   dashboardEventBus.publish({
     type: 'session.update',
     body: {
