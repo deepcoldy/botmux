@@ -169,12 +169,12 @@ const FAILURE_SECRET_SHAPES: ReadonlyArray<{ re: RegExp; keep?: boolean; weakNam
     keep: true,
     countable: true,
   },
-  // --name at a row's end, its value word-wrapped onto the next row (a TUI
-  // wraps by words): only a value shaped like a credential — a help text's
-  // next row starts with words.
+  // --name at a row's end (a box's border after it), its value word-wrapped
+  // onto the next row (a TUI wraps by words), bare or quoted: only a value
+  // shaped like a credential — a help text's next row starts with words.
   {
     re: new RegExp(
-      String.raw`(${SECRET_FLAG}[ \t]*\n[ \t${BOX}|]*)(?=[^\s"'<>${BOX}]{0,256}[0-9])[^\s"'<>${BOX}]{8,}`,
+      String.raw`(${SECRET_FLAG}[ \t${BOX}|]*\n[ \t${BOX}|]*)(?:\\?"(?=[^"\n${BOX}]{0,256}[0-9])[^"\n${BOX}]{8,}"?|\\?'(?=[^'\n${BOX}]{0,256}[0-9])[^'\n${BOX}]{8,}'?|(?=[^\s"'<>${BOX}]{0,256}[0-9])[^\s"'<>${BOX}]{8,})`,
       'gim',
     ),
     keep: true,

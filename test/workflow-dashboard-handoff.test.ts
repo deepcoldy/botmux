@@ -437,6 +437,17 @@ describe('换编排 Bot', () => {
     expect(workflowDraftOwner(base, runId)).toBe(MAIN);
   });
 
+  it('「放弃」 while a handoff is pending ends it: the page shows no handoff, the target cannot take the draft over', async () => {
+    const h = fleet();
+    const runId = await failedClarify(h);
+    const { token } = await h.a.service.prepareHandoff(runId, ALICE_ON_MAIN, { toLarkAppId: DOC });
+    const abandoned = await h.a.service.abandon(runId, ALICE_ON_MAIN);
+    expect(abandoned.handoff).toBeUndefined();
+    expect(record(runId).handoff).toBeUndefined();
+    expect(await code(h.b.service.acceptHandoff(runId, ALICE_ON_DOC, { token }))).toBe('state_conflict');
+    expect(workflowDraftOwner(base, runId)).toBe(MAIN);
+  });
+
   it('refuses to start a handoff while a clarify turn is still in flight: the session is never closed mid-turn and no handoff is recorded', async () => {
     const h = fleet();
     // create() leaves the first clarify turn pending (the model has not answered).
