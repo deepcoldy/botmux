@@ -9,9 +9,15 @@ describe('normalizeSubstituteMode', () => {
     })).toMatchObject({ enabled: false, keywords: ['独立卡', 'oncall'] });
   });
 
-  it.each([undefined, [], [' ', null], 'incident'])('omits empty or invalid keywords: %j', keywords => {
+  it.each([undefined, [' ', null], 'incident'])('omits empty or invalid keywords: %j', keywords => {
     expect(normalizeSubstituteMode({
       enabled: true, targets: [{ openId: 'ou_sub' }], keywords,
+    })).not.toHaveProperty('keywords');
+  });
+
+  it('omits keywords when the value is an empty array', () => {
+    expect(normalizeSubstituteMode({
+      enabled: true, targets: [{ openId: 'ou_sub' }], keywords: [],
     })).not.toHaveProperty('keywords');
   });
 

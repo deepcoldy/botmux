@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { matchesSubstituteKeywords } from '../src/services/substitute-keywords.js';
 
 describe('substitute keyword matching', () => {
-  it.each([undefined, []])('keeps mention-only behavior for %j', keywords => {
-    expect(matchesSubstituteKeywords(keywords, {})).toBe(true);
+  it('keeps mention-only behavior when keywords are undefined', () => {
+    expect(matchesSubstituteKeywords(undefined, {})).toBe(true);
+  });
+
+  it('keeps mention-only behavior when keywords are an empty array', () => {
+    expect(matchesSubstituteKeywords([], {})).toBe(true);
   });
 
   it('matches any literal substring, ignoring case', () => {
