@@ -5320,7 +5320,7 @@ export async function enforceMessageQuotaForCliInput(
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
     : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
-    logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
+    logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
   // Control/setup messages still need the authorization decision above, but
