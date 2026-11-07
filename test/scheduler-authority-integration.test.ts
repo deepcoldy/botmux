@@ -108,11 +108,13 @@ describe('scheduler host authority integration', () => {
     scheduler.setEnabled(task.id, false);
     scheduler.recordDeliveryFailure(task.id, runId, 'send rejected', APP);
     scheduler.recordDeliveryFailure(task.id, runId, 'send rejected', APP);
-    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ enabled: false,
+    // runNow settles through a background Promise chain; advancing zero drains
+    // it under Vitest but not under Bun, so wait for the persisted settlement.
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task).toMatchObject({ enabled: false,
       lastStatus: 'error', lastDeliveryError: 'send rejected', repeat: { completed: 1 },
-      runStats: { dispatched: 1, failed: 1, consecutiveFailures: 1 } });
+      runStats: { dispatched: 1, failed: 1, consecutiveFailures: 1 } }));
     scheduler.runNow(task.id);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task.lastStatus).toBe('ok'));
     const latest = store.getRecord(APP, task.id)?.task;
     scheduler.recordDeliveryFailure(task.id, 'stale-run', 'old send rejected', APP);
     expect(store.getRecord(APP, task.id)?.task).toEqual(latest);
@@ -157,6 +159,8 @@ describe('scheduler host authority integration', () => {
     });
     scheduler.runNow(task.id);
     await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
+      lastError: 'another target dispatch failed', runStats: { failed: 1, consecutiveFailures: 1 } }));
     scheduler.recordDeliverySuccess(task.id, runId, APP);
     expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
       lastError: 'another target dispatch failed', runStats: { failed: 1, consecutiveFailures: 1 } });
@@ -171,8 +175,8 @@ describe('scheduler host authority integration', () => {
     });
     scheduler.runNow(task.id);
     await vi.advanceTimersByTimeAsync(0);
-    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
-      repeat: { completed: 1 }, runStats: { dispatched: 1, failed: 1 } });
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
+      repeat: { completed: 1 }, runStats: { dispatched: 1, failed: 1 } }));
   });
 
   it('rejects reuse of a deleted direct id without leaving an enabled projection', () => {

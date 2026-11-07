@@ -59,6 +59,8 @@ const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
 const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
+const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
+const { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn } = await import('../src/core/scheduled-turn-provenance.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -590,6 +592,11 @@ describe('target daemon consumes signed message authority', () => {
         const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
         return match?.[1] ?? null;
       },
+      // prepareTurnCliIdentity / the extracted scheduler callback took new
+      // schedule-authority dependencies; bind the real ones (recovery is inert
+      // here because these sessions carry no ordinaryTurnRecovery).
+      prepareScheduledRecoveryRun,
+      assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn,
       resolveScheduledRunIdentity,
       noteScheduledIdentityGap: vi.fn(),
       noteScheduledIdentityRestored: vi.fn(),
@@ -730,6 +737,9 @@ describe('target daemon consumes signed message authority', () => {
   it('the production scheduler prepares ordinary tasks before dispatch', async () => {
     const h = await targetHarness();
     const { task } = directSchedule(h);
+    // The real scheduler claims the run (writing lastRunId) before the
+    // callback; the post-admission authority fence compares against it.
+    task.lastRunId = 'test-run';
     bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
