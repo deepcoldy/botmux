@@ -157,6 +157,8 @@ describe('子任务提示', () => {
 });
 
 describe('读关联群的会话', () => {
+  // 源码结构护栏(K2)：daemon 闭包里的 configured bot 过滤没有可调用入口，行为测试够不到；
+  // 钉住源码接线，守的是「已从本机配置移除的 bot 不参与群状态探测」这条不变量。
   it('其他 bot 的会话只看本机配置着的 bot；读不到配置时不过滤', () => {
     const sessions = [
       { sessionId: 'mine', larkAppId: 'cli_me' },
@@ -166,7 +168,6 @@ describe('读关联群的会话', () => {
     ];
     expect(peerSessions(sessions, 'cli_me', new Set(['cli_me', 'cli_peer'])).map(s => s.sessionId)).toEqual(['peer']);
     expect(peerSessions(sessions, 'cli_me', undefined).map(s => s.sessionId)).toEqual(['peer', 'removed']);
-    // daemon 闭包里没有调用入口：钉住它把当前配置的 bot 传进来。
     const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
     expect(daemon).toContain('configured = new Set(loadBotConfigsCached().map(bot => bot.larkAppId));');
     expect(daemon).toContain('sessions: peerSessions(snapshot.values(), cfg.larkAppId, configured)');

@@ -52,6 +52,21 @@ describe('POST /api/steward/task-event', () => {
     expect(noteTaskEvent).toHaveBeenCalledWith('oc_abc');
   });
 
+  it('没挂全局鉴权门的形态（authRequired 缺省）：路由内宿主守卫 fail-closed 回 403', async () => {
+    const bare = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`http://127.0.0.1:${bare.port}${PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_abc' }),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, error: 'trusted_host_required' });
+    } finally {
+      await bare.close();
+    }
+  });
+
   it('这个 daemon 没有看板服务（不是管家）：照样回 ok，不报错', async () => {
     const res = await post({ chatId: 'oc_abc' });
     expect(res.status).toBe(200);
