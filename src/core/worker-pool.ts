@@ -18015,7 +18015,7 @@ function setupWorkerHandlers(
             cb.onWorkflowNodeInputCommitted?.(ds, { turnId: msg.turnId, committedAt: Date.now() });
           }
         } else {
-          logger[unboundInputCommitLogLevel(msg.turnId)](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+          logger[unboundInputCommitLogLevel(msg.turnId, frozenReplyContextForTurn(ds, msg.turnId))](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
