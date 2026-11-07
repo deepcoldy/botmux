@@ -10,8 +10,8 @@ import type { DurableSessionControlDispatchOptions } from './durable-session-con
 import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
 import {
+  canonicalPrimarySession,
   commitDurableLarkSessionControl,
-  parseDurablePrimarySessionRecord,
 } from './durable-session-primary.js';
 
 interface CloseResult {
@@ -188,9 +188,8 @@ export function createDurableLarkSessionControlRuntime(
         || typeof cardMessageId !== 'string'
         || options.privateCard
         || value?.visibility === 'private') return false;
-    const canonical = await options.store.readSession(sessionKey(rootId, options.larkAppId));
-    if (!canonical) return false;
-    const session = parseDurablePrimarySessionRecord(canonical).session;
+    const session = canonicalPrimarySession(
+      await options.store.readSession(sessionKey(rootId, options.larkAppId)));
     if (!session || session.larkAppId !== options.larkAppId
         || session.sessionId !== sessionId
         || session.streamCardId !== cardMessageId
@@ -225,9 +224,8 @@ export function createDurableLarkSessionControlRuntime(
         || typeof rootId !== 'string'
         || typeof operatorOpenId !== 'string'
         || typeof cardMessageId !== 'string') return undefined;
-    const canonical = await options.store.readSession(sessionKey(rootId, options.larkAppId));
-    if (!canonical) return undefined;
-    const session = parseDurablePrimarySessionRecord(canonical).session;
+    const session = canonicalPrimarySession(
+      await options.store.readSession(sessionKey(rootId, options.larkAppId)));
     if (!session
         || session.larkAppId !== options.larkAppId
         || session.sessionId !== sessionId
@@ -252,10 +250,7 @@ export function createDurableLarkSessionControlRuntime(
       return { kind: 'ignored', reason: 'private lifecycle cards are not durable yet' };
     }
     const canonicalKey = sessionKey(control.rootId, options.larkAppId);
-    const canonical = await options.store.readSession(canonicalKey);
-    const canonicalSession = canonical
-      ? parseDurablePrimarySessionRecord(canonical).session
-      : undefined;
+    const canonicalSession = canonicalPrimarySession(await options.store.readSession(canonicalKey));
     if (!canonicalSession
         || canonicalSession.larkAppId !== options.larkAppId
         || canonicalSession.sessionId !== control.sessionId) {
