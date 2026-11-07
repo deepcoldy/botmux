@@ -104,6 +104,7 @@ export interface BotmuxPluginManifest {
   schemaVersion: 1;
   id: string;
   displayName?: string;
+  audience?: string;
   dependencies?: {
     plugins?: string[];
   };
@@ -113,6 +114,7 @@ export interface BotmuxPluginManifest {
 export interface PluginPackageManifest {
   name: string;
   version: string;
+  description?: string;
   type?: string;
   keywords?: string[];
   botmux: BotmuxPluginManifest;
@@ -122,6 +124,7 @@ export interface InstalledPluginRecord {
   id: string;
   packageName: string;
   version: string;
+  description?: string;
   integrity?: string;
   source: {
     type: 'npm' | 'local';

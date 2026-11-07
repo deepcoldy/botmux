@@ -12,8 +12,11 @@ import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.js';
+import { createHostPluginMarket, PluginMarketError } from './dashboard/plugin-market.js';
+import { pluginRecordHash } from './core/plugins/mutation-guard.js';
+import { withPluginServiceLock } from './core/plugins/service-manager.js';
 import { createConfigApi } from './core/plugins/runtime.js';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
@@ -2957,10 +2960,13 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
       id: record.id,
       packageName: record.packageName,
       version: record.version,
+      stateHash: pluginRecordHash(record),
       source: record.source,
       installedAt: record.installedAt,
       updatedAt: record.updatedAt,
       displayName: record.manifest.displayName,
+      description: record.description,
+      audience: record.manifest.audience,
       dependencies: record.manifest.dependencies?.plugins ?? [],
       contributions: record.contributions ?? {},
       skillsCount: record.contributions?.skills?.length ?? (record.manifest as any).skills?.length ?? 0,
@@ -2996,9 +3002,11 @@ async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Pro
 }
 
 async function writeBotPluginBinding(pluginId: string, larkAppId: string, enabled: boolean): Promise<boolean> {
+  invalidateGlobalConfigCache();
   try { loadBotConfigs(); } catch { return false; }
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  if (defaults.includes(pluginId)) throw new Error('请先关闭全局启用，再按 Bot 配置');
   return runDurableConfigMutation({
     scope: 'bots',
     path,
@@ -3040,9 +3048,9 @@ async function handlePluginManagementApi(
   const settingsMatch = url.pathname.match(/^\/api\/plugins\/([^/]+)\/settings$/);
   if (settingsMatch) {
     return handlePluginSettingsRequest(req, res, settingsMatch[1], {
-      isInstalled: pluginId => {
+      installedState: pluginId => {
         const record = requireInstalledPlugin(pluginId);
-        return !!record && dashboardEntriesForRecord(record).length > 0;
+        return record && dashboardEntriesForRecord(record).length > 0 ? pluginRecordHash(record) : null;
       },
       resolveEntry: pluginId => resolvePluginPath(pluginRuntimeDir(pluginId), 'server/settings.js'),
       createConfig: createConfigApi,
@@ -3077,7 +3085,7 @@ async function handlePluginManagementApi(
     const enabled = pluginEnabledPatch(body);
     if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
     try {
-      await writeGlobalPluginBinding(pluginId, enabled);
+      await withPluginServiceLock(() => writeGlobalPluginBinding(pluginId, enabled));
     } catch (error) {
       const message = describePluginDependencyError(error);
       if (message) return pluginJson(res, 409, { ok: false, error: message });
@@ -3103,7 +3111,7 @@ async function handlePluginManagementApi(
       });
     }
     try {
-      if (!await writeBotPluginBinding(pluginId, larkAppId, enabled)) {
+      if (!await withPluginServiceLock(() => writeBotPluginBinding(pluginId, larkAppId, enabled))) {
         return pluginJson(res, 404, { ok: false, error: 'bot_not_found' });
       }
     } catch (error) {
@@ -3130,6 +3138,11 @@ async function handlePluginManagementApi(
 
   return false;
 }
+
+const pluginMarket = createHostPluginMarket(id => {
+  if (readGlobalConfig().plugins?.includes(id)) return true;
+  return loadBotConfigs().some(bot => bot.plugins?.includes(id));
+});
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
@@ -4754,6 +4767,44 @@ const server = createServer(async (req, res) => {
       }, 500);
       req.on('close', () => clearInterval(timer));
       return;
+    }
+
+    if (url.pathname === '/api/plugins/market' || [
+      '/api/plugins/market/refresh', '/api/plugins/market/prepare',
+      '/api/plugins/market/install', '/api/plugins/market/uninstall',
+    ].includes(url.pathname)) {
+      if (!legacyAuthed || !requestIdentity) return jsonRes(res, 403, { ok: false, error: '仅本机管理身份可以安装和移除插件' });
+      if (req.method === 'GET' && url.pathname === '/api/plugins/market') {
+        return jsonRes(res, 200, await pluginMarket.catalog());
+      }
+      if (req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      try {
+        const body = await readJsonBody(req) as Record<string, unknown> | null;
+        if (!body || typeof body !== 'object') return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+        const freshIdentity = dashboardRequestIdentity(req);
+        if (!freshIdentity || freshIdentity.authSessionId !== requestIdentity.authSessionId
+          || !guardControlRequest({ headers: req.headers, authSessionId: freshIdentity.authSessionId, tokens: controlCsrfTokens }).ok) {
+          return jsonRes(res, 403, { ok: false, error: '插件操作授权已失效，请重新打开页面' });
+        }
+        const authorityDigest = createHash('sha256').update(currentDashboardToken() || '').digest('hex');
+        if (url.pathname === '/api/plugins/market/refresh') return jsonRes(res, 200, await pluginMarket.catalog(true));
+        if (url.pathname === '/api/plugins/market/prepare') {
+          return jsonRes(res, 200, { plan: await pluginMarket.prepare(body.id, requestIdentity.authSessionId) });
+        }
+        if (url.pathname === '/api/plugins/market/install') {
+          return jsonRes(res, 200, { ok: true, result: await pluginMarket.install(body.nonce, body.confirm, requestIdentity.authSessionId, authorityDigest) });
+        }
+        if (url.pathname === '/api/plugins/market/uninstall') {
+          await pluginMarket.uninstall(body, authorityDigest);
+          return jsonRes(res, 200, { ok: true });
+        }
+        return jsonRes(res, 404, { ok: false, error: 'not_found' });
+      } catch (error) {
+        return jsonRes(res, error instanceof PluginMarketError ? error.status : 502, {
+          ok: false, error: error instanceof PluginMarketError ? error.message : '操作未完成，请刷新已安装列表核对，并检查网络、依赖或后台服务状态',
+        });
+      }
     }
 
     if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))

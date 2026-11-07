@@ -23,10 +23,13 @@ import {
   writePluginMcpDescriptor,
 } from './mcp/private-store.js';
 import type { PluginMcpServer } from './types.js';
+import { createHash } from 'node:crypto';
+import { assertPluginMutationGuard, type PluginMutationGuard } from './mutation-guard.js';
 
 export interface InstallPluginOptions {
   source?: 'auto' | 'npm' | 'local';
   link?: boolean;
+  guard?: PluginMutationGuard;
 }
 
 export interface InstallPluginResult {
@@ -137,6 +140,7 @@ function makeRecord(
       id: pkg.botmux.id,
       packageName: pkg.name,
       version: pkg.version,
+      ...(pkg.description ? { description: pkg.description } : {}),
       source,
       manifest: pkg.botmux,
       ...(contributions ? { contributions } : {}),
@@ -182,6 +186,7 @@ export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}
   const stagedDir = stageRuntime(pkg.botmux.id, sourceRuntimeDir, linked);
   try {
     return withPluginServiceLockSync(() => {
+      if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
       assertExistingPluginServiceStopped(pkg.botmux.id);
       ensurePluginStateFiles(pkg.botmux.id);
       return commitPluginInstall(stagedRecord, stagedDir);
@@ -216,13 +221,18 @@ function findBotmuxPackageUnderNodeModules(root: string): string {
   return botmuxPackages[0];
 }
 
-export function installNpmPlugin(spec: string): InstallPluginResult {
+export function installNpmPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
   mkdirSync(pluginsHome(), { recursive: true });
   const tmpRoot = join(pluginsHome(), `.install-${process.pid}-${Date.now()}`);
   rmSync(tmpRoot, { recursive: true, force: true });
   mkdirSync(tmpRoot, { recursive: true });
   try {
-    execFileSync('npm', ['install', '--omit=dev', '--omit=peer', '--prefix', tmpRoot, spec], {
+    if (opts.guard?.integrity) {
+      if (!spec.startsWith('file:')) throw new Error('plugin_confirmed_archive_required');
+      const actual = `sha512-${createHash('sha512').update(readFileSync(spec.slice(5))).digest('base64')}`;
+      if (actual !== opts.guard.integrity) throw new Error('plugin_confirmed_archive_mismatch');
+    }
+    execFileSync('npm', ['install', '--omit=dev', '--omit=peer', ...(opts.guard ? ['--ignore-scripts'] : []), '--prefix', tmpRoot, spec], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
       timeout: 120_000,
@@ -234,6 +244,7 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
     const stagedDir = stageRuntime(pkg.botmux.id, tmpRuntimeDir, false);
     try {
       return withPluginServiceLockSync(() => {
+        if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
         assertExistingPluginServiceStopped(pkg.botmux.id);
         ensurePluginStateFiles(pkg.botmux.id);
         return commitPluginInstall(stagedRecord, stagedDir);
@@ -249,7 +260,7 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
 export function installPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
   const source = opts.source ?? 'auto';
   if (source === 'local' || (source === 'auto' && isLocalSpec(spec))) return installLocalPlugin(spec, opts);
-  return installNpmPlugin(spec);
+  return installNpmPlugin(spec, opts);
 }
 
 export function installedPluginRuntimeDir(pluginId: string): string {
