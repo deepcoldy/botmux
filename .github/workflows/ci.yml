@@ -111,7 +111,7 @@ jobs:
           bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run build
-      # No rerun on failure: a shard spends up to ~20 of its 25 minutes in
+      # No rerun on failure: a shard spends up to ~17 of its 25 minutes in
       # vitest, so a second pass cannot finish anyway, and a flake must surface
       # to be fixed rather than be retried away (#2464).
       - name: Unit tests (shard ${{ matrix.shard }}/4)
