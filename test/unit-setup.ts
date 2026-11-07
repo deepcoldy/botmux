@@ -6,7 +6,7 @@ import { installSessionDataDirFence } from './helpers/session-data-dir-fence.js'
 
 // Disposable SESSION_DATA_DIR / mojo workspace root for this file (shared with
 // the e2e project's setup file).
-const { fileRoot } = installSessionDataDirFence(inject('unitSessionDataRoot'), 'file-');
+const { fileRoot } = installSessionDataDirFence(inject('testSessionDataRoot'), 'file-');
 
 // Fence every unit-test worker inside a disposable home before the test module
 // is imported. Bun caches os.homedir() at process startup, so changing HOME via
