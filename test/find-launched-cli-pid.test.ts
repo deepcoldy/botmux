@@ -246,6 +246,9 @@ describe('worker wrapper PID wiring', () => {
       scopePayloadPid: 150,
       children: { 150: [151], 151: [152], 152: [153], 153: [154], 154: [155], 155: [156], 156: [157], 157: [158] },
       childComms: { 150: 'node', 151: 'unshare', 152: 'node', 153: 'sh', 154: 'sh', 155: 'bwrap', 156: 'bwrap', 157: 'node', 158: 'codex' },
+      // The synchronous ownership bind must already reach the leaf: the first
+      // turn can read the observed pid before any retry tick rewrites it.
+      beforeTimers: late ? undefined : scope => expect(scope.backend.cliPid).toBe(158),
     });
     expect(result.backend.cliPid).toBe(158);
     expect(result.bridgeCliPid).toBe(158);
