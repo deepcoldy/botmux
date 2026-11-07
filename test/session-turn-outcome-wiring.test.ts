@@ -5,7 +5,7 @@ const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'
 const pool = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
-// 源码结构护栏：本轮结果的判定在 core/turn-outcome.ts 里有行为测试，这里只钉住散在 worker /
+// 源码结构护栏(K3)：本轮结果的判定在 core/turn-outcome.ts 里有行为测试，这里只钉住散在 worker /
 // worker-pool / daemon 巨型闭包里、没有可调用入口的接线。
 describe('turn outcome wiring', () => {
   it('the worker marks the empty-completion diagnostic on every final_output it sends', () => {
