@@ -61,6 +61,27 @@ export async function reconcileDaemonSessions(
 }
 
 /**
+ * Primary-mode refresh of every daemon before serving `/api/sessions`. A
+ * replica that times out or is mid-restart keeps its last known-good rows in
+ * the aggregator instead of failing the whole board; only when no daemon
+ * answered is there nothing fresh to serve (undefined).
+ */
+export async function reconcileAllDaemonSessions(
+  daemons: readonly DaemonInfo[],
+  agg: Aggregator,
+  timeoutMs: number,
+  fetchSessions: SessionSnapshotFetcher = defaultFetchSessions,
+): Promise<Array<{ daemon: DaemonInfo; rows: any[] }> | undefined> {
+  const snapshots = await Promise.all(daemons.map(daemon =>
+    reconcileDaemonSessions(daemon, agg, AbortSignal.timeout(timeoutMs), fetchSessions)));
+  const refreshed = daemons.flatMap((daemon, index) => {
+    const rows = snapshots[index];
+    return rows ? [{ daemon, rows }] : [];
+  });
+  return refreshed.length > 0 ? refreshed : undefined;
+}
+
+/**
  * Install one daemon's authoritative snapshot into the aggregator. Runs as
  * the subscribeDaemon barrier — BEFORE any SSE frame is read — on both
  * initial attach and reconnect, so the snapshot can never clobber fresher
