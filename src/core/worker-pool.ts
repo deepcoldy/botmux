@@ -150,6 +150,8 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../im/lark/local-address-context.js';
 import { isStuckPageType } from './stuck-page-catalog.js';
 import { stuckCardFallbackText, stuckCardInitiatorOpenId, stuckCardPostErrorMeansUnsent, stuckKeyResultText } from './stuck-warning-card.js';
 
@@ -22906,6 +22908,8 @@ function deliverFinalOutput(
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => {
+    content = prepareLocalAddressContent(content, msgType ?? 'interactive',
+      localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
     if (!isStillOwned() || ds.session.status === 'closed') {
       return Promise.reject(new Error('Final output ownership changed or session closed'));
     }
@@ -22919,7 +22923,8 @@ function deliverFinalOutput(
         uuid => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
           { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId })),
         { fenced: true, providerUuid: transport.providerUuid, reuseExistingFinal: true, beforeDispatch: handoff.control.beforeEffect,
-          noSideEffect: error => isLarkContentAuditError(error) || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
+          noSideEffect: error => error instanceof LocalAddressOutboundError || isLarkContentAuditError(error)
+            || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
       ).then(result => { handoff.suppressed = result.replayed; return result.messageId; });
     }
     if (outputControl?.record.sink.kind === 'im' && replyCardModeFor(ds, msg.turnId) === 'legacy') {
@@ -22967,7 +22972,8 @@ function deliverFinalOutput(
       if (docTurn) {
         // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
-        const chunks = chunkCommentText(msg.content);
+        const chunks = chunkCommentText(sanitizeLocalAddressText(msg.content,
+          localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir)));
         for (let i = 0; i < chunks.length; i++) {
           if (!isStillOwned()) { onComplete?.(false); return; }
           const write = (hooks?: import('../services/output-delivery-journal.js').OutputProviderEffectHooks) => replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined, hooks);
@@ -23590,11 +23596,13 @@ function deliverFinalOutput(
       // reads its untruncated log) reaches it, and retrying only ends in a
       // silent give-up with nothing in the chat.
       const rejectedCode = larkErrorCode(err);
+      const localAddressRejected = err instanceof LocalAddressOutboundError;
       const cardRejected = !managedReceiver && !resolveDocCommentTarget(ds, msg.turnId)
         && (rejectedCode === LARK_CODE_CARD_CONTENT_REJECTED || rejectedCode === LARK_CODE_MESSAGE_CONTENT_TOO_LONG);
-      if (isLarkContentAuditError(err) || cardRejected) {
+      if (isLarkContentAuditError(err) || cardRejected || localAddressRejected) {
         const deliveredParts = partialResultMessages();
-        const permanentReason = cardRejected ? 'card_content_rejected' : 'content_audit_blocked';
+        const permanentReason = localAddressRejected ? 'local_address_outbound_rejected'
+          : cardRejected ? 'card_content_rejected' : 'content_audit_blocked';
         if (handoff) { handoff.auxiliary = true; handoff.rejectedReason = permanentReason; }
         if (outputControl) outputControl.rejectedReason = permanentReason;
         observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: permanentReason },
@@ -23604,7 +23612,7 @@ function deliverFinalOutput(
         // Codex runner unacknowledged and restarts the entire retry loop.
         // Send a fixed notice, settle this output, and preserve the session.
         const auditCode = larkErrorCode(err);
-        const rejection = cardRejected ? 'card content' : 'content audit';
+        const rejection = localAddressRejected ? 'local address policy' : cardRejected ? 'card content' : 'content audit';
         logger.error(
           `[${t}] Bridge final_output rejected by Lark ${rejection} code=${auditCode ?? 'unknown'} `
           + `(turn ${msg.turnId.substring(0, 8)}); not retrying`,
@@ -23613,7 +23621,8 @@ function deliverFinalOutput(
         // 自动打码重发过仍被拒 / 找不到可打码的内容，分别给出如实的说明；两者都
         // 不要求用户操作——这是模型输出触发的拦截，完整回复在 Web 终端里。
         const redaction = cardRejected ? undefined : contentAuditRedactionOutcome(err);
-        const notice = tr(cardRejected ? 'worker.final_output_card_rejected'
+        const notice = tr(localAddressRejected ? 'worker.final_output_local_address_rejected'
+          : cardRejected ? 'worker.final_output_card_rejected'
           : redaction?.retried ? 'worker.final_output_content_audit_blocked'
             : 'worker.final_output_content_audit_blocked_unredacted',
           { code: String(auditCode ?? 'unknown') }, locale);
@@ -23622,7 +23631,7 @@ function deliverFinalOutput(
         // this very notice) or truncated so multiple blocks share one dedupe key.
         // Hash the composite to a stable 50-char token.
         const noticeUuid = `ab_${createHash('sha256')
-          .update(`${cardRejected ? 'card-rejected' : 'audit-blocked'}:${ds.session.sessionId}:${msg.turnId}`)
+          .update(`${localAddressRejected ? 'local-address-rejected' : cardRejected ? 'card-rejected' : 'audit-blocked'}:${ds.session.sessionId}:${msg.turnId}`)
           .digest('hex')
           .slice(0, 47)}`;
         try {
@@ -23638,7 +23647,7 @@ function deliverFinalOutput(
         ds.agentAttention = { kind: 'blocked', reason: `${rejection} ${auditCode ?? 'unknown'}`, at: Date.now() };
         publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
-          reason: cardRejected ? 'card_content_rejected' : 'content_audit_blocked',
+          reason: permanentReason,
           message: `Lark ${rejection} ${auditCode ?? 'unknown'} rejected the final reply`,
           turnId: msg.turnId,
         });

@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
@@ -52,6 +52,31 @@ describe('reply-card runtime eligibility and recovery', () => {
     vi.mocked(observePublishedGroupMessage).mockClear();
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+
+  it('sanitizes rendered cards, patches and generated overflow while preserving raw transcript facts', async () => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_sanitized');
+    vi.mocked(uploadFile).mockReset().mockResolvedValue('file_overflow');
+    vi.mocked(replyMessage).mockReset().mockResolvedValue('om_overflow');
+    const raw = '[协作技能](/home/alice/.agents/skills/a/SKILL.md)\n/custom/project/src/main.ts:12\n' + '完整结果\n'.repeat(2_000);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: raw, source: 'bridge',
+      card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: raw }] } }) }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+    const cards = [...send.mock.calls.map(call => call[0]), ...vi.mocked(updateMessage).mock.calls.map(call => call[2])];
+    expect(cards.length).toBeGreaterThan(1);
+    for (const body of cards) {
+      expect(body).not.toContain('/home/alice/');
+      expect(body).not.toContain('/custom/project/');
+    }
+    expect(uploadFile).toHaveBeenCalledOnce();
+    const overflow = readFileSync(vi.mocked(uploadFile).mock.calls[0][1], 'utf8');
+    expect(overflow).not.toContain('/home/alice/');
+    expect(overflow).not.toContain('/custom/project/');
+    expect(overflow).toContain('src/main.ts:12');
+    const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' });
+    expect(record?.finalText).toBe(raw);
+  });
 
   it.each(['oc_mode', 'om_root'])('recovers a failed overflow with stable delivery identity for root %s', async rootId => {
     const store = new TurnReplyCardStore(dir);

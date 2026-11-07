@@ -147,6 +147,8 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   // <botmux_routing> — system-prompt path (claude-family / genius / grok)
   { key: 'ai.routing.intro', block: 'routing_system', stage: 'new', label: '开场说明（标准 send 模式）', kind: 'editable' },
+  { key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', stages: ['followup'],
+    label: '飞书回复：用户可访问的地址', kind: 'editable' },
   {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
     label: '开场说明（transcript 自动转发模式）',

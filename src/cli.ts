@@ -369,6 +369,8 @@ import {
 } from './utils/bot-routing.js';
 import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { sanitizeLocalAddressText, sanitizeLocalAddressNode } from './im/lark/local-address-policy.js';
+import { localAddressContextForBot } from './im/lark/local-address-context.js';
 import {
   crossPrincipalAsKeyword,
   crossPrincipalBotSendGate,
@@ -12131,6 +12133,18 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       ? code
       : 'link_ref_ledger_unavailable';
     console.error(`botmux send refused: ${stable}`);
+    process.exit(2);
+  }
+  // Process the expanded presentation before validation, uploads or any send
+  // ledger/hash. The Lark client independently protects legacy/replayed bodies.
+  try {
+    const localContext = localAddressContextForBot(s.larkAppId, s.workingDir);
+    content = sanitizeLocalAddressText(content, localContext);
+    if (preparedText !== undefined) preparedText = sanitizeLocalAddressText(preparedText, localContext);
+    if (customCard) customCard = sanitizeLocalAddressNode(customCard, localContext);
+    if (completionProposalVisible) completionProposalVisible = sanitizeLocalAddressNode(completionProposalVisible, localContext);
+  } catch (error) {
+    console.error('botmux send refused: ' + (error instanceof Error ? error.message : 'LOCAL_ADDRESS_OUTBOUND_REJECTED'));
     process.exit(2);
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
