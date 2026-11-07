@@ -2130,6 +2130,73 @@ describe('/rename production routing — must not pre-create a session (review P
 
 
 
+  it.each([
+    ['skill', '/th /teach explain the implementation', '/teach explain the implementation', false],
+    ['cold-start passthrough', '/th\n/goal fix login', '/goal fix login', true],
+  ])('`/th` followed by a %s keeps the current working directory and forwards the slash text', async (_kind, text, forwarded, raw) => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_th_slash', text),
+      makeCtx('om_th_slash', 'om_th_slash'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_th_slash', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    if (raw) {
+      expect(mocks.forkWorker.mock.calls[0]?.[0]?.pendingRawInput).toBe(forwarded);
+      expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+    } else {
+      expect(JSON.stringify(mocks.forkWorker.mock.calls[0])).toContain(forwarded);
+    }
+    expect(JSON.stringify(mocks.replyMessage.mock.calls)).not.toContain('未知');
+  });
+
+
+
+  it('`/th` defers a precreate daemon command until the current working directory is pinned', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_th_status', '/th /status'),
+      makeCtx('om_th_status', 'om_th_status'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_th_status', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.session.workingDir).toBe(currentDir);
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
   it('`/tw <content>` creates a topic that starts from a worktree of the current chat working directory', async () => {
     const repoRoot = makeRepoFixtureDir();
     const currentDir = join(repoRoot, 'packages', 'app');

@@ -26462,12 +26462,21 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     return;
   }
 
-  // 斜杠命令执行段已搬到 executeNewTopicSlash（输入全部显式）；true = 已处理。
-  if (await executeNewTopicSlash({
+  // 斜杠命令执行段已搬到 executeNewTopicSlash（输入全部显式）。生命周期头后的
+  // passthrough / 预建型 daemon 命令必须先走下面的 cwd/worktree 会话准备，因此由执行段
+  // 返回 deferred，而不是在 bot 默认目录冷启动或提前建一个未钉目录的命令会话。
+  const newTopicSlash = await executeNewTopicSlash({
     ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent,
     senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger,
     forceTopic, forceTopicMode, botCfg,
-  })) return;
+  });
+  if (newTopicSlash === true) return;
+  const lifecycleRawOpening = newTopicSlash && newTopicSlash.kind === 'lifecycle_passthrough'
+    ? newTopicSlash.commandContent
+    : undefined;
+  const lifecycleDaemonCommand = newTopicSlash && newTopicSlash.kind === 'lifecycle_daemon'
+    ? newTopicSlash
+    : undefined;
 
   // A setup-only `/t` must still pass the same talk-permission recheck as any
   // CLI input, but it creates no AI turn and therefore must not consume a
@@ -26773,7 +26782,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     hasHistory: false,
     initialStartPending: true,
     pendingRepo: !pinnedWorkingDir || autoWt,
-    pendingPrompt: promptContent,
+    pendingPrompt: lifecycleRawOpening !== undefined || lifecycleDaemonCommand ? '' : promptContent,
+    ...(lifecycleRawOpening !== undefined ? {
+      pendingRawInput: lifecycleRawOpening,
+      pendingRawTurnId: replyAnchorId,
+    } : {}),
     // Turn identity must equal the reply anchor so current-turn provenance
     // (quoteTargetId === marker.turnId) holds on session-group first turns.
     // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
@@ -26898,6 +26911,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // messages buffered during creation). detach → return immediately.
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (lifecycleDaemonCommand) {
+      await handleCommand(
+        lifecycleDaemonCommand.cmd,
+        anchor,
+        { ...parsed, content: lifecycleDaemonCommand.commandContent },
+        commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
+        larkAppId,
+      );
+    }
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
@@ -26919,6 +26941,17 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (lifecycleDaemonCommand) {
+      await handleCommand(
+        lifecycleDaemonCommand.cmd,
+        anchor,
+        { ...parsed, content: lifecycleDaemonCommand.commandContent },
+        commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
+        larkAppId,
+      );
+      markIngressAdmitted(ctx);
+      return;
+    }
     // 指令头只交代规格、没写任务：空跑 CLI 等下一条（详见 forkReservedIdleSession）。
     // 这条路径不产生 AI 回合、也没有流式卡片，所以用一句确认回显真正钉下去的东西。
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
@@ -26940,6 +26973,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
+    if (lifecycleRawOpening !== undefined) {
+      forkReservedInitialRawSession(ds, availableBots);
+      markIngressAdmitted(ctx);
+      return;
+    }
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -27024,6 +27062,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
+    if (lifecycleRawOpening !== undefined) {
+      forkReservedInitialRawSession(ds, availableBots);
+      markIngressAdmitted(ctx);
+      return;
+    }
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -27072,7 +27115,16 @@ interface NewTopicSlashContext {
   botCfg: ReturnType<typeof getBot>['config'];
 }
 
-async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolean> {
+type NewTopicSlashExecution = boolean | {
+  kind: 'lifecycle_passthrough';
+  commandContent: string;
+} | {
+  kind: 'lifecycle_daemon';
+  cmd: string;
+  commandContent: string;
+};
+
+async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<NewTopicSlashExecution> {
   const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
   // Intercept daemon commands in new topics (no session needed for some commands)
   // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
@@ -27213,9 +27265,12 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return true;
     }
-    // `/tw /<passthrough>`：主干的 worktree 生命周期变体要先建 worktree 再起 CLI，所以不走
-    // 冷启动透传（那条路会直接在基目录 fork）；落到下面的常规建会话路径。
-    if (forceTopicMode !== 'worktree' && slashDecision.kind === 'passthrough') {
+    if (slashDecision.kind === 'passthrough') {
+      // 生命周期变体先准备当前目录 / worktree，再把原始命令作为 pendingRawInput 交给
+      // forkReservedInitialRawSession；不能落进普通 prompt，否则 CLI 看见的是 XML 包装文本。
+      if (forceTopicMode !== 'default') {
+        return { kind: 'lifecycle_passthrough', commandContent };
+      }
       if (slashDecision.delivery === 'cold_start') {
         await startInitialPassthroughSession({
           promptResources: resources,
@@ -27295,6 +27350,12 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       if (slashDecision.sessionPolicy === 'existing_only') {
         await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
         return true;
+      }
+      // Lifecycle headers own cwd/worktree preparation. Defer precreate commands until the
+      // ordinary new-session path has resolved and persisted that setup; otherwise this
+      // branch creates a command scratch in the bot default directory and skips `/th`/`/tw`.
+      if (forceTopicMode !== 'default') {
+        return { kind: 'lifecycle_daemon', cmd, commandContent };
       }
       // Same rootMessageId reasoning as below in the main spawn path:
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
