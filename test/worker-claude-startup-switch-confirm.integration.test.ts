@@ -30,6 +30,10 @@
  *   E  the dialog comes up 16s into the 20s wait and the first two Enters are
  *      lost: each press restarts the wait, so the third one lands before
  *      anything is held.
+ *   F  a hook's dialog comes up only AFTER the 20s hold (so the thread was
+ *      already told "press Enter in the input box"): BotMux still answers
+ *      nothing, and it corrects that one notice with the dialog notice — same
+ *      turn, exactly once.
  */
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
@@ -299,7 +303,7 @@ function expectDeliveredAfterAccept(run: ScenarioRun): void {
 it.skipIf(!tmuxAvailable)(
   'a startup /effort answered by Claude\'s prompt-cache confirmation is accepted; a hook\'s confirmation is left to a person',
   async () => {
-    const [atOnce, late, hook, lostOnce, lateLost] = await Promise.all([
+    const [atOnce, late, hook, lostOnce, lateLost, lateHook] = await Promise.all([
       runScenario({ name: 'A dialog at once', dialogDelayMs: 300 }),
       // Past STARTUP_COMMAND_ACK_TIMEOUT_MS (20s): the queue is held first.
       runScenario({ name: 'B dialog after the hold', dialogDelayMs: 24_000 }),
@@ -307,6 +311,8 @@ it.skipIf(!tmuxAvailable)(
       runScenario({ name: 'D first Enter lost', dialogDelayMs: 300, swallowAccepts: 1 }),
       // The third press lands ~22s in: only the restarted wait keeps it unheld.
       runScenario({ name: 'E late dialog, two Enters lost', dialogDelayMs: 16_000, swallowAccepts: 2 }),
+      // The hold notice went out first; the hook's dialog only turns up at 24s.
+      runScenario({ name: 'F late hook dialog', dialogDelayMs: 24_000, hook: true }),
     ]);
 
     // A: accepted by botmux; nothing was held, so nobody was told.
@@ -333,6 +339,22 @@ it.skipIf(!tmuxAvailable)(
     }
     expect(lostOnce.events.filter(e => e.kind === 'swallowed')).toHaveLength(1);
     expect(lateLost.events.filter(e => e.kind === 'swallowed')).toHaveLength(2);
+
+    // F: the hold's own notice was already out (nothing on screen yet), so the
+    // hook's dialog is corrected by ONE more notice — never by pressing Enter,
+    // and never on another turn. "Press Enter in the input box" here would
+    // have made a person approve the hook's request on their own behalf.
+    expectDeliveredAfterAccept(lateHook);
+    const lateHookNotices = heldNotices(lateHook);
+    expect(lateHookNotices.map(m => noticeKey(m.message)), lateHook.logs).toEqual([
+      'worker.startup_command_unconfirmed',
+      'worker.startup_command_dialog_pending',
+    ]);
+    // One notice per hold, both on the same turn as the held input.
+    expect(lateHookNotices.map(m => m.turnId), lateHook.logs).toEqual(['om_test', 'om_test']);
+    expect(lateHook.events.filter(e => e.kind === 'swallowed'), lateHook.logs).toEqual([]);
+    expect(lateHook.events.map(e => e.kind).indexOf('dialog'))
+      .toBeLessThan(lateHook.events.map(e => e.kind).indexOf('person'));
   },
   180_000,
 );

@@ -3564,6 +3564,11 @@ let startupCommandAckHold: {
   timer: ReturnType<typeof setTimeout> | null;
   /** The command's confirmation dialog can still come up while it is held. */
   confirmation: StartupCommandConfirmationState;
+  /** Turn the hold's notices belong to: the first queued input at hold time, so
+   *  a later notice cannot land on another turn. */
+  turnId: string | undefined;
+  /** The "a dialog is waiting in the terminal" notice already went out. */
+  dialogNoticeSent: boolean;
 } | null = null;
 /** Per-spawn: the first write of this spawn has seen the CLI's input prompt on
  *  screen (see decideFirstWriteLiveness). Pre-set for spawns that do not type
@@ -4725,10 +4730,41 @@ function armStartupCommandAckPoll(): void {
       return;
     }
     if (hold.confirmed()) void flushPending();
-    else answerStartupCommandConfirmation(hold.confirmation, hold.backend);
+    else {
+      answerStartupCommandConfirmation(hold.confirmation, hold.backend);
+      // The dialog may come up only now, after the hold's notice already said
+      // "if the command is still in the input box, press Enter". Correct that
+      // once: a person told to press Enter here would approve a hook's request
+      // for themselves — exactly what the notice exists to prevent.
+      if (hold.confirmation.onScreen === 'leave' && !hold.dialogNoticeSent) {
+        sendStartupCommandHoldNotice(hold, true);
+      }
+    }
     armStartupCommandAckPoll();
   }, STARTUP_CMD_HOLD_POLL_MS);
   hold.timer.unref?.();
+}
+
+/** Tell the thread what a hold is waiting for. A confirmation dialog left for a
+ *  person is what the terminal shows, not a command waiting in the input box:
+ *  say so, or "press Enter" would pick whatever the dialog has focused. At most
+ *  one dialog notice per hold (see dialogNoticeSent) — a hook's dialog only
+ *  appears once, so this never turns into a stream of notices. */
+function sendStartupCommandHoldNotice(
+  hold: NonNullable<typeof startupCommandAckHold>,
+  dialogPending: boolean,
+): void {
+  if (dialogPending) hold.dialogNoticeSent = true;
+  send({
+    type: 'user_notify',
+    kind: 'input_not_submitted',
+    turnId: hold.turnId ?? pendingMessages[0]?.turnId ?? currentBotmuxTurnId,
+    message: t(dialogPending ? 'worker.startup_command_dialog_pending' : 'worker.startup_command_unconfirmed', {
+      cliName: cliName(),
+      command: hold.cmd,
+      secs: Math.round(STARTUP_COMMAND_ACK_TIMEOUT_MS / 1000),
+    }),
+  });
 }
 
 function holdForStartupCommandAck(
@@ -4738,22 +4774,18 @@ function holdForStartupCommandAck(
   generation: number,
   confirmation: StartupCommandConfirmationState,
 ): void {
-  startupCommandAckHold = { cmd, confirmed, backend: be, generation, timer: null, confirmation };
-  log(`Startup command not confirmed within ${STARTUP_COMMAND_ACK_TIMEOUT_MS}ms — holding ${pendingMessages.length} queued input(s) behind it: ${cmd}`);
-  // A confirmation dialog left for a person is what the terminal shows, not a
-  // command waiting in the input box: say so, or "press Enter" would pick
-  // whatever the dialog has focused.
-  const dialogPending = confirmation.onScreen === 'leave';
-  send({
-    type: 'user_notify',
-    kind: 'input_not_submitted',
+  startupCommandAckHold = {
+    cmd,
+    confirmed,
+    backend: be,
+    generation,
+    timer: null,
+    confirmation,
     turnId: pendingMessages[0]?.turnId ?? currentBotmuxTurnId,
-    message: t(dialogPending ? 'worker.startup_command_dialog_pending' : 'worker.startup_command_unconfirmed', {
-      cliName: cliName(),
-      command: cmd,
-      secs: Math.round(STARTUP_COMMAND_ACK_TIMEOUT_MS / 1000),
-    }),
-  });
+    dialogNoticeSent: false,
+  };
+  log(`Startup command not confirmed within ${STARTUP_COMMAND_ACK_TIMEOUT_MS}ms — holding ${pendingMessages.length} queued input(s) behind it: ${cmd}`);
+  sendStartupCommandHoldNotice(startupCommandAckHold, confirmation.onScreen === 'leave');
   armStartupCommandAckPoll();
 }
 
