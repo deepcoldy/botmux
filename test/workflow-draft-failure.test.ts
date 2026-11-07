@@ -137,6 +137,12 @@ describe('raw failure text masking', () => {
       '│ $ claude --api-key        │\n│ Wm3Kq8Zr5Vx2Lp9Nt6Hb4Jd7  │', '│ $ claude --api-key        │\n│ ‹hidden›  │'],
     ['a flag at a row\'s end inside a TUI box, its quoted value going on past the border',
       '│ --api-key        │\n│ "Wm3Kq8Zr5Vx2Lp9Nt6  │', '│ --api-key        │\n│ ‹hidden›│'],
+    // Two more shapes of the same rule: argv serialization ends the flag with
+    // a comma, and a TUI draws a border between a label's separator and its value.
+    ['a flag at a row\'s end with a trailing comma (argv serialization), its value on the next row',
+      '--app-secret,\n  "Wm3Kq8Zr5Vx2Lp9Nt6Hb4Jd7"', '--app-secret,\n  ‹hidden›'],
+    ['a label\'s separator followed by a TUI border, its value on the next row',
+      '│ token: │\n│ Wm3Kq8Zr5Vx2Lp9Nt6Hb4Jd7 │', '│ token: │\n│ ‹hidden› │'],
     ['an argv array printed one element a row', "spawnargs: [\n  '--app-secret',\n  'Qz7Xk9PL2mN4wV8rT3yB6hJ5'\n]",
       "spawnargs: [\n  '--app-secret',\n  ‹hidden›\n]"],
     ['a hard wrap, more arguments after the tail', 'docker run -e ANTHROPIC_API_KEY=Hb4Jd7Fg1Sc0YaWm3Kq8\n3Kq8Zr5Vx2Lp9Nt6 -e FOO=bar image',

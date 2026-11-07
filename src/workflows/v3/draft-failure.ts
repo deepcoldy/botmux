@@ -106,8 +106,11 @@ const SECRET_KEY = String.raw`[${NAME}]{0,64}(?:${SECRET_WORD})[${NAME}]{0,64}|(
 const NAME_START = `(?:^|[^${NAME}])`;
 /** The same as Chinese labels (`密码：…`). */
 const SECRET_KEY_ZH = '密钥|秘钥|密码|口令|令牌|凭证|凭据';
-/** `:` or `=`, half- or full-width (`App Secret：…`). */
-const SEP = String.raw`\s*[:=：＝]\s*`;
+/** Box-drawing borders: a TUI's frame, never part of a value. */
+const BOX = '│┃║';
+/** `:` or `=`, half- or full-width (`App Secret：…`), then a TUI border between
+ *  the separator and the value (`│ token: │` puts it on the next row). */
+const SEP = String.raw`\s*[:=：＝][\s│┃║|]*`;
 /** An exception's class name and its colon (`CredentialsError: …`): what
  *  follows is its message, which a secret's name may still be in. */
 const ERROR_NAME_AHEAD = String.raw`(?!["']?[${NAME}]{0,128}(?:error|exception|failure|failed)\\?["']?${SEP})`;
@@ -115,8 +118,6 @@ const ERROR_NAME_AHEAD = String.raw`(?!["']?[${NAME}]{0,128}(?:error|exception|f
 const SECRET_NAME = String.raw`(?:${NAME_START}${ERROR_NAME_AHEAD}["']?(?:${SECRET_KEY})|["']?(?:${SECRET_KEY_ZH})[为是]?)\\?["']?${SEP}`;
 /** A command-line flag naming a secret (`--app-secret`, `--api-key`, `-token`). */
 const SECRET_FLAG = String.raw`(?:^|[^\w-])--?(?:${SECRET_KEY})`;
-/** Box-drawing borders: a TUI's frame, never part of a value. */
-const BOX = '│┃║';
 /** What an error writes after "Bearer" / "Basic" (`Missing bearer or basic
  *  authentication in header`): words, not a credential. */
 const SCHEME_PROSE = String.raw`(?!(?:or|and|auth|authentication|authorization|token|tokens|scheme|realm|header|credentials?)(?![A-Za-z0-9_+/=.~-]))`;
@@ -174,7 +175,7 @@ const FAILURE_SECRET_SHAPES: ReadonlyArray<{ re: RegExp; keep?: boolean; weakNam
   // shaped like a credential — a help text's next row starts with words.
   {
     re: new RegExp(
-      String.raw`(${SECRET_FLAG}[ \t${BOX}|]*\n[ \t${BOX}|]*)(?:\\?"(?=[^"\n${BOX}]{0,256}[0-9])[^"\n${BOX}]{8,}"?|\\?'(?=[^'\n${BOX}]{0,256}[0-9])[^'\n${BOX}]{8,}'?|(?=[^\s"'<>${BOX}]{0,256}[0-9])[^\s"'<>${BOX}]{8,})`,
+      String.raw`(${SECRET_FLAG}[ \t${BOX}|,]*\n[ \t${BOX}|]*)(?:\\?"(?=[^"\n${BOX}]{0,256}[0-9])[^"\n${BOX}]{8,}"?|\\?'(?=[^'\n${BOX}]{0,256}[0-9])[^'\n${BOX}]{8,}'?|(?=[^\s"'<>${BOX}]{0,256}[0-9])[^\s"'<>${BOX}]{8,})`,
       'gim',
     ),
     keep: true,
