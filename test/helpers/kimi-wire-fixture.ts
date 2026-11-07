@@ -3,7 +3,7 @@
  * are copied from real Kimi Code 2.5.0 `agents/main/wire.jsonl` logs (wire
  * protocol 1.5); all content is made up.
  */
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export type WireRecord = Record<string, unknown>;
@@ -48,21 +48,36 @@ export const wire = {
 
 export const toJsonl = (records: readonly WireRecord[]) => records.map(r => JSON.stringify(r)).join('\n') + '\n';
 
+function lastPromptText(records: readonly WireRecord[]): string | undefined {
+  const prompt = [...records].reverse().find(r => r.type === 'turn.prompt' && r.agentId === 'main');
+  const input = prompt?.input as Array<{ text?: string }> | undefined;
+  return input?.[0]?.text;
+}
+
+/** Kimi rewrites state.json on every prompt (lastPrompt = that prompt). */
+export function setLastPrompt(dir: string, text: string): void {
+  const path = join(dir, 'state.json');
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), lastPrompt: text, updatedAt: Date.now() }));
+}
+
 /** One Kimi session in a fake KIMI_CODE_HOME, indexed like Kimi does. */
 export function makeKimiSession(home: string, opts: {
   id: string;
   workDir: string;
   records?: readonly WireRecord[];
-  lastPrompt?: string;
+  /** Defaults to the text of the last `turn.prompt` in `records`, as Kimi
+   *  keeps it; `null` writes no lastPrompt at all. */
+  lastPrompt?: string | null;
   createdAt?: number;
 }): { dir: string; wirePath: string; append: (records: readonly WireRecord[]) => void } {
   const dir = join(home, 'sessions', 'wd_work_0123456789ab', opts.id);
   mkdirSync(join(dir, 'agents', 'main'), { recursive: true });
   const wirePath = join(dir, 'agents', 'main', 'wire.jsonl');
   writeFileSync(wirePath, opts.records ? toJsonl(opts.records) : '');
+  const lastPrompt = opts.lastPrompt === undefined ? lastPromptText(opts.records ?? []) : opts.lastPrompt ?? undefined;
   writeFileSync(join(dir, 'state.json'), JSON.stringify({
     id: opts.id, version: 2, cwd: opts.workDir,
-    ...(opts.lastPrompt !== undefined ? { lastPrompt: opts.lastPrompt } : {}),
+    ...(lastPrompt !== undefined ? { lastPrompt } : {}),
     createdAt: opts.createdAt ?? Date.now(), updatedAt: Date.now(),
   }));
   appendFileSync(join(home, 'session_index.jsonl'), JSON.stringify({ sessionId: opts.id, sessionDir: dir, workDir: opts.workDir }) + '\n');

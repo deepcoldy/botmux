@@ -723,7 +723,7 @@ describe('reply-card runtime eligibility and recovery', () => {
       const kimi = makeKimiSession(home, { id: 'session_k', workDir: home, lastPrompt: `${marker}\nold`, records: toolTurn(0, `${marker}\nold`) });
       const observer = new KimiActivityObserver({
         botmuxSessionId: ds.session.sessionId, workingDir: home, env: { KIMI_CODE_HOME: home },
-        resume: true, spawnStartMs: Date.now(), onEntries: () => {}, pollIntervalMs: 60_000,
+        resume: true, onEntries: () => {}, pollIntervalMs: 60_000,
       });
       observer.start();
       const send = vi.fn(async (_body: string) => 'om_reply');

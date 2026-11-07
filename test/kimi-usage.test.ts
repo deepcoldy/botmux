@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { makeKimiSession, toolTurn, wire } from './helpers/kimi-wire-fixture.js';
+import { makeKimiSession, setLastPrompt, toolTurn, wire } from './helpers/kimi-wire-fixture.js';
+import { __testOnly_resetBotRegistry, registerBot } from '../src/bot-registry.js';
 
 describe('Kimi native usage snapshot', () => {
   let home: string;
@@ -39,6 +40,8 @@ describe('Kimi native usage snapshot', () => {
         wire.usage(999_999, 999_999, 0, 0, { agentId: 'agent-0' }),
         wire.measured(999_999, 'agent-0'),
         wire.llmRequest('kimi-code/k3.1-pro-highspeed', 'high'),
+        // A compaction call names its own (secondary) model: not the turn's.
+        wire.llmRequest('kimi-code/k3-256k', 'low', 'compaction'),
         wire.usage(400, 60, 8_000, 0),
         wire.measured(9_460),
         wire.stepEnd('end_turn', { inputOther: 400, output: 60, inputCacheRead: 8_000, inputCacheCreation: 0 }),
@@ -86,5 +89,46 @@ describe('Kimi native usage snapshot', () => {
     const { getSessionUsageSnapshot } = await import('../src/core/cost-calculator.js');
     const snapshot = getSessionUsageSnapshot({ cliId: 'kimi', sessionId, cwd: home, fresh: true });
     expect(snapshot.context).toEqual({ usedTokens: 11 });
+  });
+
+  it('switches to a new Kimi generation of the session at once (`/new`, restart)', async () => {
+    makeKimiSession(home, {
+      id: 'session_a', workDir: home, lastPrompt: prompt('old'), createdAt: Date.now() - 60_000,
+      records: [wire.prompt(0, prompt('old')), wire.llmRequest('kimi-code/k3.1-pro-highspeed'), wire.usage(50_000, 5_000, 0), wire.measured(550_000)],
+    });
+    const { getSessionUsageSnapshot } = await import('../src/core/cost-calculator.js');
+    expect(getSessionUsageSnapshot({ cliId: 'kimi', sessionId, cwd: home, fresh: true }).turnTokens).toEqual({ in: 50_000, out: 5_000 });
+    // `/new` indexes the next session at once; its first prompt comes later.
+    const b = makeKimiSession(home, { id: 'session_b', workDir: home, records: [] });
+    expect(getSessionUsageSnapshot({ cliId: 'kimi', sessionId, cwd: home, fresh: true }).turnTokens).toEqual({ in: 50_000, out: 5_000 });
+    b.append([wire.prompt(0, prompt('new')), wire.llmRequest('kimi-code/k3.1-pro-highspeed'), wire.usage(700, 70, 0), wire.measured(770)]);
+    setLastPrompt(b.dir, prompt('new'));
+    const next = getSessionUsageSnapshot({ cliId: 'kimi', sessionId, cwd: home, fresh: true });
+    expect(next.turnTokens).toEqual({ in: 700, out: 70 });
+    expect(next.context).toEqual({ usedTokens: 770, windowTokens: 1_048_576, percentUsed: 0 });
+  });
+
+  it('reads the data dir a bot relocates with KIMI_CODE_HOME in its env', async () => {
+    const botHome = mkdtempSync(join(tmpdir(), 'botmux-kimi-bothome-'));
+    try {
+      delete process.env.KIMI_CODE_HOME;
+      writeFileSync(join(botHome, 'config.toml'), '[models."kimi-code/k3-256k"]\nmax_context_size = 262144\n');
+      makeKimiSession(botHome, {
+        id: 'session_a', workDir: botHome, lastPrompt: prompt('x'),
+        records: [wire.prompt(0, prompt('x')), wire.llmRequest('kimi-code/k3-256k'), wire.usage(100, 10, 0), wire.measured(26_214)],
+      });
+      __testOnly_resetBotRegistry();
+      registerBot({
+        larkAppId: 'cli_kimi_usage_test', larkAppSecret: '', apiOnly: true, cliId: 'kimi', allowedUsers: [],
+        env: { KIMI_CODE_HOME: botHome },
+      });
+      const { getSessionUsageSnapshot } = await import('../src/core/cost-calculator.js');
+      const snapshot = getSessionUsageSnapshot({ cliId: 'kimi', sessionId, cwd: botHome, fresh: true, larkAppId: 'cli_kimi_usage_test' });
+      expect(snapshot.tokens).toMatchObject({ inputTokens: 100, outputTokens: 10 });
+      expect(snapshot.context).toEqual({ usedTokens: 26_214, windowTokens: 262_144, percentUsed: 10 });
+    } finally {
+      __testOnly_resetBotRegistry();
+      rmSync(botHome, { recursive: true, force: true });
+    }
   });
 });

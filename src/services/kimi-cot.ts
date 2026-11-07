@@ -13,25 +13,28 @@
  *     used for `--session` (findKimiSessionForBotmuxSession); followed from its
  *     current end so history is never replayed;
  *   - fresh (or a resume that found nothing): Kimi creates the session lazily
- *     on the first prompt, so wait for a session created after this spawn
- *     that carries this botmux session's routing marker, and read it from the
- *     start (its first turn is live).
+ *     on the first prompt, so wait for a session that did not exist when this
+ *     spawn started and carries this botmux session's routing marker, and read
+ *     it from the start (its first turn is live);
+ *   - a new generation inside the same process (`/new` / `/clear` passed
+ *     through from Feishu): the same rule keeps applying while bound, so the
+ *     observer moves to the newer session after finishing the old log.
  */
 import { closeSync, openSync, readSync, statSync } from 'node:fs';
-import { join } from 'node:path';
 import type { CotEntry } from '../types.js';
-import { findKimiSessionForBotmuxSession, kimiHome } from '../adapters/cli/kimi-session.js';
-import { findKimiWireBySessionId, findKimiWireForBotmuxSession, KimiActivityParser } from './kimi-transcript.js';
+import { findKimiSessionForBotmuxSession, sameKimiWorkDir } from '../adapters/cli/kimi-session.js';
+import {
+  findKimiWireBySessionId,
+  kimiSessionIndexStamp,
+  kimiSessionPromptOwner,
+  KimiActivityParser,
+  listKimiSessions,
+  type KimiIndexedSession,
+} from './kimi-transcript.js';
 
-/** Sessions are created a few ms before their first `turn.prompt`; allow for
- *  clock granularity and a slow first write between spawn and lookup. */
-const BORN_AFTER_SLACK_MS = 5_000;
 const POLL_INTERVAL_MS = 1_000;
 /** One poll never reads more than this; the rest is picked up next tick. */
 const MAX_READ_BYTES = 4 * 1024 * 1024;
-/** How long an index change keeps the fresh-session probe running. Measured:
- *  the first `turn.prompt` follows session creation by well under 1 s. */
-const FIRST_PROMPT_PROBE_MS = 10_000;
 
 export interface KimiActivityObserverOptions {
   /** Botmux session id the adapter resolved `--session` with (resume). */
@@ -42,7 +45,6 @@ export interface KimiActivityObserverOptions {
   env?: NodeJS.ProcessEnv;
   /** The spawn resumed an existing Kimi session. */
   resume: boolean;
-  spawnStartMs: number;
   /** Entries read by the background poll. Synchronous drains return theirs. */
   onEntries: (entries: CotEntry[]) => void;
   pollIntervalMs?: number;
@@ -57,11 +59,15 @@ export class KimiActivityObserver {
   private skipFirstLine = false;
   private readonly parser = new KimiActivityParser();
   private timer: ReturnType<typeof setInterval> | undefined;
-  private bornAfterMs: number | undefined;
+  /** Wire logs never (re)considered: every session indexed before this spawn
+   *  started, plus every one seen since (bound, candidate, or not ours). */
+  private known = new Set<string>();
+  /** Sessions indexed after the spawn in this working dir whose first prompt
+   *  has not shown whose conversation they are yet, oldest first. Kimi
+   *  indexes a `/new` session at once but its first prompt may come minutes
+   *  later, so these are re-checked (state.json only) on every poll. */
+  private candidates: KimiIndexedSession[] = [];
   private lastIndexKey = '';
-  /** Keep probing an unchanged index until then: a just-indexed session may
-   *  not have written its first prompt yet. */
-  private probeUntilMs = 0;
   private stopped = false;
 
   constructor(private readonly opts: KimiActivityObserverOptions) {}
@@ -70,12 +76,17 @@ export class KimiActivityObserver {
 
   start(): void {
     const env = this.opts.env ?? process.env;
+    // Snapshot before anything can bind: a dead previous generation of this
+    // botmux session (even one created moments before the spawn) is history.
+    // Kimi only creates a session once the first prompt is submitted, which
+    // is after this point.
+    this.lastIndexKey = kimiSessionIndexStamp(env);
+    this.known = new Set(listKimiSessions(env).map(session => session.wirePath));
     if (this.opts.resume) {
       const sid = findKimiSessionForBotmuxSession(this.opts.botmuxSessionId, this.opts.workingDir, env);
       const path = sid ? findKimiWireBySessionId(sid, env) : undefined;
       if (path) this.bind(path, 'end');
     }
-    if (!this.wirePath) this.bornAfterMs = this.opts.spawnStartMs - BORN_AFTER_SLACK_MS;
     const interval = this.opts.pollIntervalMs ?? POLL_INTERVAL_MS;
     this.timer = setInterval(() => {
       try {
@@ -97,12 +108,21 @@ export class KimiActivityObserver {
   /** Read everything appended since the last read and return its entries. */
   drain(): CotEntry[] {
     if (this.stopped) return [];
-    if (!this.wirePath && !this.tryBindFresh()) return [];
-    return this.readNew();
+    const entries: CotEntry[] = [];
+    const next = this.findNewSession();
+    if (next) {
+      // Finish the previous generation's log first: its tail is still the
+      // turn that ran there.
+      if (this.wirePath) entries.push(...this.readNew());
+      this.bind(next, 'start');
+    }
+    if (this.wirePath) entries.push(...this.readNew());
+    return entries;
   }
 
   private bind(path: string, from: 'start' | 'end'): void {
     this.wirePath = path;
+    this.known.add(path);
     this.skipFirstLine = false;
     this.offset = 0;
     if (from === 'end') {
@@ -126,29 +146,35 @@ export class KimiActivityObserver {
     }
   }
 
-  /** Fresh session: wait for a session born after this spawn carrying our
-   *  marker. Re-scan only when the index changed, and briefly afterwards while
-   *  a just-indexed session has not written its first prompt yet. */
-  private tryBindFresh(): boolean {
+  /** A session created after this spawn whose latest prompt carries our
+   *  marker: the first session of a fresh spawn, or a `/new` generation while
+   *  bound. The index is re-read only when it changed; pending candidates
+   *  cost one small state.json read each per poll. */
+  private findNewSession(): string | undefined {
     const env = this.opts.env ?? process.env;
-    let indexKey = '';
-    try {
-      const st = statSync(join(kimiHome(env), 'session_index.jsonl'));
-      indexKey = `${st.size}:${st.mtimeMs}`;
-    } catch { return false; }
-    const now = Date.now();
-    if (indexKey !== this.lastIndexKey) {
+    const indexKey = kimiSessionIndexStamp(env);
+    if (indexKey && indexKey !== this.lastIndexKey) {
       this.lastIndexKey = indexKey;
-      this.probeUntilMs = now + FIRST_PROMPT_PROBE_MS;
-    } else if (now > this.probeUntilMs) {
-      return false;
+      for (const session of listKimiSessions(env)) {
+        if (this.known.has(session.wirePath)) continue;
+        this.known.add(session.wirePath);
+        const wd = this.opts.workingDir;
+        if (wd && session.workDir && !sameKimiWorkDir(session.workDir, wd)) continue;
+        this.candidates.push(session);
+      }
     }
-    const path = findKimiWireForBotmuxSession(this.opts.markerSessionId ?? this.opts.botmuxSessionId, this.opts.workingDir, {
-      env, bornAfterMs: this.bornAfterMs,
-    });
-    if (!path) return false;
-    this.bind(path, 'start');
-    return true;
+    const marker = this.opts.markerSessionId ?? this.opts.botmuxSessionId;
+    // Newest first; never move back to an older generation than the one taken.
+    for (let i = this.candidates.length - 1; i >= 0; i--) {
+      const owner = kimiSessionPromptOwner(this.candidates[i].sessionDir, marker);
+      if (owner === 'match') {
+        const chosen = this.candidates[i];
+        this.candidates = this.candidates.slice(i + 1);
+        return chosen.wirePath;
+      }
+      if (owner === 'foreign') this.candidates.splice(i, 1);
+    }
+    return undefined;
   }
 
   private readNew(): CotEntry[] {

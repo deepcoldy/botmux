@@ -10,7 +10,8 @@
  *     versa,
  *   - native usage (tokens, context window, model) resolves for the session,
  *   - a respawn with resume follows the resumed session without replaying
- *     history into the new turn.
+ *     history into the new turn,
+ *   - `/new` inside the running Kimi moves the observer to the new session.
  *
  * Kimi asks to trust every new working directory, so point the test at one
  * Kimi already trusts:
@@ -162,5 +163,20 @@ describe.runIf(process.env.BOTMUX_KIMI_E2E === '1')('Kimi reply-card activity th
     expect(hasToolMentioning(t3, `${token}_THREE`)).toBe(true);
     expect(hasToolMentioning(t3, `${token}_ONE`) || hasToolMentioning(t3, `${token}_TWO`)).toBe(false);
     expect(r.log()).toMatch(/Kimi activity observer bound to .*from end/);
+
+    // `/new` (passed through from Feishu as raw input) starts a new Kimi
+    // session inside the same process: the observer moves to it.
+    const readyBefore = r.messages.filter(m => m.type === 'prompt_ready').length;
+    r.child.send({ type: 'raw_input', content: '/new' } satisfies DaemonToWorker);
+    await r.waitFor(() => r.messages.filter(m => m.type === 'prompt_ready').length > readyBefore, '/new settled', 60_000);
+    await pause(1500);
+    r.send(`Use your shell tool to run exactly: echo ${token}_FOUR . After it finishes reply with only FOURTH_OK.`, 'om_turn_4');
+    await r.waitFor(() => r.settled('om_turn_4'), 'turn 4 settled');
+    const t4 = r.activity('om_turn_4');
+    expect(hasToolMentioning(t4, `${token}_FOUR`)).toBe(true);
+    expect(hasToolMentioning(t4, `${token}_THREE`)).toBe(false);
+    const binds = [...r.log().matchAll(/Kimi activity observer bound to (\S+)/g)].map(m => m[1]);
+    expect(binds).toHaveLength(2);
+    expect(binds[1]).not.toBe(binds[0]);
   }, 900_000);
 });

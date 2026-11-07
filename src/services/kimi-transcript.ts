@@ -53,6 +53,18 @@ export function kimiMainWirePath(sessionDir: string): string {
   return join(sessionDir, 'agents', KIMI_MAIN_AGENT_ID, 'wire.jsonl');
 }
 
+function readRange(path: string, position: number, bytes: number): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(bytes);
+    const n = readSync(fd, buf, 0, bytes, position);
+    return buf.subarray(0, n).toString('utf8');
+  } catch { return undefined; } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
 /** Index entry → its session dir, only when it stays inside `<home>/sessions`
  *  and is named after its id (the containment rule Kimi itself applies). */
 function containedSessionDir(home: string, entry: KimiSessionIndexEntry): string | undefined {
@@ -60,6 +72,55 @@ function containedSessionDir(home: string, entry: KimiSessionIndexEntry): string
   const dir = resolve(entry.sessionDir);
   if (!dir.startsWith(sessionsRoot) || dir.split(sep).pop() !== entry.sessionId) return undefined;
   return dir;
+}
+
+export interface KimiIndexedSession {
+  sessionDir: string;
+  wirePath: string;
+  workDir?: string;
+}
+
+/** Every session Kimi has indexed so far, oldest first (index order). */
+export function listKimiSessions(env: NodeJS.ProcessEnv = process.env): KimiIndexedSession[] {
+  const home = kimiHome(env);
+  const out: KimiIndexedSession[] = [];
+  for (const entry of readKimiSessionIndex(home)) {
+    const dir = containedSessionDir(home, entry);
+    if (dir) out.push({ sessionDir: dir, wirePath: kimiMainWirePath(dir), workDir: entry.workDir });
+  }
+  return out;
+}
+
+const INDEX_TAIL_BYTES = 8 * 1024;
+
+/** Cheap change stamp for "which Kimi session is the newest one carrying a
+ *  marker": the index (Kimi appends to it whenever it creates a session —
+ *  first prompt, `/new`) plus the state.json of its newest entry (rewritten on
+ *  every prompt, so a `/new` session's first prompt shows up even though the
+ *  index did not change). `''` when there is no index. */
+export function kimiSessionIndexStamp(env: NodeJS.ProcessEnv = process.env): string {
+  const home = kimiHome(env);
+  const indexPath = join(home, 'session_index.jsonl');
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const st = statSync(indexPath);
+    size = st.size;
+    mtimeMs = st.mtimeMs;
+  } catch { return ''; }
+  let newestState = '';
+  const tail = readRange(indexPath, Math.max(0, size - INDEX_TAIL_BYTES), Math.min(size, INDEX_TAIL_BYTES));
+  const lines = tail?.split('\n') ?? [];
+  for (let i = lines.length - 1; i >= 0 && !newestState; i--) {
+    try {
+      const row = JSON.parse(lines[i]) as { sessionId?: unknown; sessionDir?: unknown; deleted?: unknown };
+      if (typeof row.sessionId !== 'string' || typeof row.sessionDir !== 'string' || row.deleted === true) continue;
+      const dir = containedSessionDir(home, { sessionId: row.sessionId, sessionDir: row.sessionDir });
+      if (!dir) continue;
+      try { newestState = String(statSync(join(dir, 'state.json')).mtimeMs); } catch { newestState = '-'; }
+    } catch { /* partial first line of the tail window, or a torn line */ }
+  }
+  return `${size}:${mtimeMs}:${newestState}`;
 }
 
 /** Main-agent wire log of a native Kimi session id (`session_<uuid>`). */
@@ -88,17 +149,6 @@ function readSessionState(sessionDir: string): KimiSessionState | undefined {
   } catch { return undefined; }
 }
 
-function readHead(path: string, bytes: number): string | undefined {
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, 'r');
-    const buf = Buffer.alloc(bytes);
-    const n = readSync(fd, buf, 0, bytes, 0);
-    return buf.subarray(0, n).toString('utf8');
-  } catch { return undefined; } finally {
-    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
-  }
-}
 
 const SESSION_MARKER_RE = /<session_id>([^<\s]+)<\/session_id>/;
 
@@ -106,37 +156,38 @@ type MarkerVerdict = 'match' | 'foreign' | 'miss';
 
 /** Does this Kimi session carry the botmux routing marker? Cheapest evidence
  *  first: `state.json.lastPrompt` (the latest prompt's head, where the routing
- *  envelope starts), then the head of the wire log, then — only when allowed —
- *  the whole log. A lastPrompt that carries ANOTHER botmux session's marker is
- *  that session's conversation and is skipped without reading the log. */
-function sessionMarkerVerdict(sessionDir: string, marker: string, allowFullScan: boolean): MarkerVerdict {
+ *  envelope starts), then the head of the wire log, then the whole log. A
+ *  lastPrompt that carries ANOTHER botmux session's marker is that session's
+ *  conversation and is skipped without reading the log. */
+function sessionMarkerVerdict(sessionDir: string, marker: string): MarkerVerdict {
   const lastPrompt = readSessionState(sessionDir)?.lastPrompt;
   if (typeof lastPrompt === 'string') {
     if (lastPrompt.includes(marker)) return 'match';
     if (SESSION_MARKER_RE.test(lastPrompt)) return 'foreign';
   }
   const wire = kimiMainWirePath(sessionDir);
-  const head = readHead(wire, WIRE_HEAD_PROBE_BYTES);
+  const head = readRange(wire, 0, WIRE_HEAD_PROBE_BYTES);
   if (head === undefined) return 'miss';
   if (head.includes(marker)) return 'match';
-  if (!allowFullScan || Buffer.byteLength(head, 'utf8') < WIRE_HEAD_PROBE_BYTES) return 'miss';
+  if (Buffer.byteLength(head, 'utf8') < WIRE_HEAD_PROBE_BYTES) return 'miss';
   try {
     return readFileSync(wire, 'utf8').includes(marker) ? 'match' : 'miss';
   } catch { return 'miss'; }
 }
 
-function sessionCreatedAtMs(sessionDir: string): number | undefined {
-  const createdAt = readSessionState(sessionDir)?.createdAt;
-  if (typeof createdAt === 'number' && Number.isFinite(createdAt)) return createdAt;
-  try { return statSync(kimiMainWirePath(sessionDir)).birthtimeMs; } catch { return undefined; }
+/** Whose conversation a session's latest prompt belongs to, from state.json
+ *  alone (a few hundred bytes; cheap enough to poll): `match` = this botmux
+ *  session, `foreign` = another botmux session, `unknown` = no prompt yet or
+ *  one typed without a routing envelope. */
+export function kimiSessionPromptOwner(sessionDir: string, botmuxSessionId: string): 'match' | 'foreign' | 'unknown' {
+  const lastPrompt = readSessionState(sessionDir)?.lastPrompt;
+  if (typeof lastPrompt !== 'string') return 'unknown';
+  if (lastPrompt.includes(`<session_id>${botmuxSessionId}</session_id>`)) return 'match';
+  return SESSION_MARKER_RE.test(lastPrompt) ? 'foreign' : 'unknown';
 }
 
 export interface FindKimiWireOptions {
   env?: NodeJS.ProcessEnv;
-  /** Only sessions created at/after this instant qualify (a fresh spawn: Kimi
-   *  creates its session lazily on the first prompt, so anything older is a
-   *  previous generation of this botmux session and must not be followed). */
-  bornAfterMs?: number;
 }
 
 /**
@@ -144,7 +195,7 @@ export interface FindKimiWireOptions {
  * carries `<session_id>{botmuxSessionId}</session_id>` (every botmux prompt's
  * routing envelope does). Mirrors findKimiSessionForBotmuxSession's
  * newest-first rule but avoids reading whole logs where cheaper evidence
- * decides; used where it runs repeatedly (usage refresh, pending observers).
+ * decides; used where it runs repeatedly (usage refresh).
  */
 export function findKimiWireForBotmuxSession(
   botmuxSessionId: string,
@@ -160,11 +211,7 @@ export function findKimiWireForBotmuxSession(
     if (workingDir && entry.workDir && !sameKimiWorkDir(entry.workDir, workingDir)) continue;
     const dir = containedSessionDir(home, entry);
     if (!dir) continue;
-    if (opts.bornAfterMs !== undefined) {
-      const created = sessionCreatedAtMs(dir);
-      if (created === undefined || created < opts.bornAfterMs) continue;
-    }
-    if (sessionMarkerVerdict(dir, marker, opts.bornAfterMs === undefined) === 'match') {
+    if (sessionMarkerVerdict(dir, marker) === 'match') {
       return kimiMainWirePath(dir);
     }
   }

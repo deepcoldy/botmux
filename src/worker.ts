@@ -5356,7 +5356,6 @@ function setCaptureIdentity(
   callerOpenId?: string,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
-  if (changed) drainKimiActivityInto({ turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
@@ -12341,7 +12340,6 @@ function startKimiActivityObserver(opts: {
     workingDir: opts.workingDir,
     env: opts.env,
     resume: opts.resume,
-    spawnStartMs: Date.now(),
     onEntries: entries => {
       if (kimiActivityObserver !== observer || !currentBotmuxTurnId) return;
       observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
@@ -12357,9 +12355,10 @@ function startKimiActivityObserver(opts: {
   }
 }
 
-/** Kimi accepts no input while a turn runs, so everything already in its log
- *  when a turn ends (or the capture identity moves on) belongs to that turn:
- *  read it synchronously so the poll's lag cannot hand it to the next turn. */
+/** Kimi accepts no input while a turn runs (no type-ahead: the next message
+ *  waits for `prompt_ready`), so everything already in its log when a turn
+ *  ends belongs to that turn: read it synchronously at the terminal and idle
+ *  edges so the poll's lag cannot hand it to the next turn. */
 function drainKimiActivityInto(turn: { turnId: string | undefined; dispatchAttempt?: number }): void {
   if (!kimiActivityObserver || !turn.turnId) return;
   try {
@@ -19265,7 +19264,7 @@ function markPromptReady(): void {
   }
   sandboxWrapperAwaitingFirstPrompt = undefined;
   // Kimi: publish the finished turn's last activity before its idle edge.
-  settleKimiActivityBeforeIdle();
+  if (kimiActivityObserver) settleKimiActivityBeforeIdle();
   send({ type: 'prompt_ready' });
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
   if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
@@ -31559,7 +31558,7 @@ function emitTurnTerminal(
     releaseTerminatedActiveTurnAuthority();
   }
   retireTerminatedQueuedTurn(turnId, dispatchAttempt);
-  drainKimiActivityInto({ turnId, dispatchAttempt });
+  if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
     flushThinkingUpdate();
   }

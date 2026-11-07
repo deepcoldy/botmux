@@ -11,6 +11,7 @@ import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBy
 import {
   __resetTranscriptResolverCacheForTest,
   cachedTranscriptPathLookup,
+  kimiEnvForBot,
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
@@ -1497,7 +1498,7 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   if (!resolved || !existsSync(resolved.path)) return null;
   const cached = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
   const read = cached ? { ...cached, transcriptPath: resolved.path } : cached;
-  if (q.cliId === 'kimi' && read) return withKimiContextWindow(read);
+  if (q.cliId === 'kimi' && read) return withKimiContextWindow(read, kimiEnvForBot(q.larkAppId));
   if (q.cliId !== 'grok' || !read) return read;
   // signals.json is a small rewritten snapshot beside updates.jsonl. Read it
   // on every card refresh: the append-only JSONL cache may legitimately be
@@ -1554,10 +1555,10 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
 
 /** Kimi's context window is per model in its config.toml; read it on every
  *  refresh (small file) so a model switch is reflected immediately. */
-function withKimiContextWindow(read: UsageReadResult): UsageReadResult {
+function withKimiContextWindow(read: UsageReadResult, env: NodeJS.ProcessEnv): UsageReadResult {
   const used = read.agg.latestContextUsage?.usedTokens;
   if (!used || used <= 0) return read;
-  const windowTokens = readKimiModelContextWindow(read.agg.model || undefined);
+  const windowTokens = readKimiModelContextWindow(read.agg.model || undefined, env);
   if (!windowTokens) return read;
   const agg = cloneAggregate(read.agg);
   agg.latestContextUsage = {

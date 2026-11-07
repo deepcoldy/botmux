@@ -97,22 +97,25 @@ describe('Kimi session lookup by botmux session', () => {
     expect(findKimiWireBySessionId('not-a-kimi-id', env)).toBeUndefined();
   });
 
+  it('skips a session whose latest prompt belongs to another botmux session', () => {
+    const home = tmp();
+    const env = { KIMI_CODE_HOME: home };
+    const ours = makeKimiSession(home, { id: 'session_a', workDir: home, lastPrompt: envelope(BOTMUX), records: [wire.prompt(0, envelope(BOTMUX))] });
+    // Newer, another conversation; our marker only shows up in its tool output.
+    const theirs = makeKimiSession(home, {
+      id: 'session_b', workDir: home, lastPrompt: envelope(OTHER),
+      records: [wire.prompt(0, envelope(OTHER)), wire.toolResult('t', `grep hit: ${envelope(BOTMUX)}`)],
+    });
+    expect(findKimiWireForBotmuxSession(BOTMUX, home, { env })).toBe(ours.wirePath);
+    expect(findKimiWireForBotmuxSession(OTHER, home, { env })).toBe(theirs.wirePath);
+  });
+
   it('falls back to the wire log when state.json has no botmux prompt', () => {
     const home = tmp();
     const env = { KIMI_CODE_HOME: home };
-    const s = makeKimiSession(home, { id: 'session_a', workDir: home, records: [wire.metadata(), wire.prompt(0, envelope(BOTMUX))] });
+    const s = makeKimiSession(home, { id: 'session_a', workDir: home, lastPrompt: null, records: [wire.metadata(), wire.prompt(0, envelope(BOTMUX))] });
     makeKimiSession(home, { id: 'session_b', workDir: home, lastPrompt: 'typed locally', records: [wire.prompt(0, 'typed locally')] });
     expect(findKimiWireForBotmuxSession(BOTMUX, home, { env })).toBe(s.wirePath);
-  });
-
-  it('for a fresh spawn ignores sessions created before it', () => {
-    const home = tmp();
-    const env = { KIMI_CODE_HOME: home };
-    const spawnAt = Date.now();
-    makeKimiSession(home, { id: 'session_old', workDir: home, lastPrompt: envelope(BOTMUX), createdAt: spawnAt - 60_000 });
-    expect(findKimiWireForBotmuxSession(BOTMUX, home, { env, bornAfterMs: spawnAt })).toBeUndefined();
-    const fresh = makeKimiSession(home, { id: 'session_new', workDir: home, records: [wire.prompt(0, envelope(BOTMUX))], createdAt: spawnAt + 50 });
-    expect(findKimiWireForBotmuxSession(BOTMUX, home, { env, bornAfterMs: spawnAt })).toBe(fresh.wirePath);
   });
 
   it('never follows an index entry outside Kimi\'s sessions dir', () => {
