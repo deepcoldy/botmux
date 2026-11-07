@@ -32504,10 +32504,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     config.session.dataDir,
     () => ({
       ...getTurnTerminalPersistenceHealth(),
-      busy: [...activeSessions.values()].some(session =>
-        (session.finalOutputDeliveriesInFlight?.size ?? 0) > 0 || (session.backgroundTaskCount ?? 0) > 0 ||
-        (session.session.status === 'active' &&
-        !['idle', 'limited', 'interrupted'].includes(session.lastScreenStatus ?? ''))),
+      busy: isFeedbackMaintenanceBusy(cfg.larkAppId, activeSessions.values()),
     }),
     async () => { await feedbackWebhookDispatcher?.quiesce(); },
     async () => {
@@ -35829,4 +35826,5 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 }
 import { feedbackMaintenanceActive, startFeedbackMaintenanceParticipant } from './services/feedback-maintenance.js';
+import { isFeedbackMaintenanceBusy } from './core/feedback-maintenance-health.js';
 import { getTurnTerminalPersistenceHealth } from './services/turn-completion-events.js';
