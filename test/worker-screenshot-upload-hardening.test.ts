@@ -488,7 +488,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
     const harness = new Function('send', 'isCodexAppCliId', `
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
-      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt;
+      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt, cliSubmissionInFlight = null;
       const ptyOutputGeneration = { snapshot: () => 7 };
       const retiredTurnIds = new Set();
       const started = [];

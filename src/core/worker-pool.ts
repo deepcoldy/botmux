@@ -10040,6 +10040,10 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
     clearPendingSuspendClaim(ds, 'worker already gone');
     return;
   }
+  // The prompt can be back while the input that woke the session is still on
+  // its way into the CLI; retiring the CLI now destroys it. The claim stays and
+  // is cashed in once the worker reports that input taken.
+  if (hasUnacceptedCliInput(ds)) return;
   // Clear only on success. suspendWorker refuses mid-routing-transfer (and for a
   // backend that stopped being suspendable), and that refusal is temporary —
   // eating the flag would silently drop the request until the next `suspend all`.
@@ -11504,6 +11508,34 @@ export function hasPendingOrdinaryImDelivery(ds: DaemonSession): boolean {
   return false;
 }
 
+type WorkerCliInputBacklog = Omit<Extract<WorkerToDaemon, { type: 'cli_input_backlog' }>, 'type'>;
+
+/** Latest `cli_input_backlog` each worker reported while it was the live
+ * generation. Keyed by the process, so a replacement never inherits it. Reports
+ * after retirement are ignored: tearing down the CLI fails the write in flight,
+ * which must not erase the turn that write was carrying. */
+const workerCliInputBacklogs = new WeakMap<ChildProcess, WorkerCliInputBacklog>();
+
+export function recordWorkerCliInputBacklog(worker: ChildProcess, backlog: WorkerCliInputBacklog): void {
+  if (!backlog.pending && !backlog.writingTurnId) {
+    workerCliInputBacklogs.delete(worker);
+    return;
+  }
+  workerCliInputBacklogs.set(worker, {
+    pending: backlog.pending,
+    ...(backlog.writingTurnId ? { writingTurnId: backlog.writingTurnId } : {}),
+  });
+}
+
+/** Input delivered to this session that its CLI has not taken yet: an ordinary
+ * IM turn the worker has not committed, or the live worker's own report.
+ * Reclaiming the worker now would destroy that input together with the CLI.
+ * Both signals are exact receipts; neither is a recency guess. */
+export function hasUnacceptedCliInput(ds: DaemonSession): boolean {
+  if (hasPendingOrdinaryImDelivery(ds)) return true;
+  return !!ds.worker && workerCliInputBacklogs.get(ds.worker)?.pending === true;
+}
+
 function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGeneration: number): string {
   return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;
 }
@@ -11526,10 +11558,13 @@ function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
  * do not resend"), which is only honest when the daemon really cannot tell.
  * A `rejectedBeforeAdmission` rejection is the opposite: the worker reports
  * with certainty that the turn never entered the queue, so it gets its own
- * key instead of being described as ambiguous. */
+ * key instead of being described as ambiguous. `retired_before_cli_accept`
+ * covers a turn the worker had committed and was handing to its CLI when it
+ * was retired. */
 type OrdinaryImFailureMessageKey =
   | 'worker.input_delivery_failed'
   | 'worker.input_retired_unconfirmed'
+  | 'worker.input_retired_before_cli_accept'
   | 'worker.input_rejected_before_admission';
 
 function failOrdinaryImDelivery(
@@ -11544,12 +11579,23 @@ function failOrdinaryImDelivery(
     + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
     + `attempts=${record.attempt} reason=${reason}`,
   );
-  if (record.turnId.startsWith('bmx-recovery-')
-    && (!isRecoveryRetryTurnId(record.turnId)
-      || record.ds.session.ordinaryTurnRecovery?.currentTurnId === record.turnId)) {
+  reportOrdinaryTurnUndelivered(record.ds, record.turnId, reason, messageKey);
+}
+
+/** The user-facing outcome of an ordinary turn whose input never reached the
+ * CLI, routed like every ordinary delivery failure. */
+function reportOrdinaryTurnUndelivered(
+  ds: DaemonSession,
+  turnId: string,
+  reason: string,
+  messageKey: OrdinaryImFailureMessageKey,
+): void {
+  if (turnId.startsWith('bmx-recovery-')
+    && (!isRecoveryRetryTurnId(turnId)
+      || ds.session.ordinaryTurnRecovery?.currentTurnId === turnId)) {
     requireOrdinaryTurnRecoveryAttention(
-      record.ds.session,
-      record.turnId,
+      ds.session,
+      turnId,
       'recovery_delivery_failed',
     );
     return;
@@ -11560,18 +11606,18 @@ function failOrdinaryImDelivery(
   // 决策看板批次（board:<app>:<batchId>）是 owner 在看板前触发的后台投递，不是群里
   // 等来的真人消息：失败不往管家群贴卡片（owner 看不到，横幅还会造成困惑），交给
   // daemon 的回调把批次退回 failed——Dashboard 批次行显示原因并用同一稳定 turnId 重投。
-  if (record.turnId.startsWith('board:')) {
+  if (turnId.startsWith('board:')) {
     try {
       const handled = requireCallbacks().onBoardTurnDeliveryFailed?.(
-        record.ds,
-        { turnId: record.turnId, reason, messageKey },
+        ds,
+        { turnId, reason, messageKey },
       );
       void Promise.resolve(handled).catch(err => logger.error(
-        `[${tag(record.ds)}] board delivery failure callback errored: ${err instanceof Error ? err.message : String(err)}`,
+        `[${tag(ds)}] board delivery failure callback errored: ${err instanceof Error ? err.message : String(err)}`,
       ));
     } catch (err) {
       logger.error(
-        `[${tag(record.ds)}] board delivery failure callback threw: ${err instanceof Error ? err.message : String(err)}`,
+        `[${tag(ds)}] board delivery failure callback threw: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
     return;
@@ -11583,16 +11629,16 @@ function failOrdinaryImDelivery(
   // stamped meeting @mention follow-up stays fenced (isMeetingDrivenTurn); a
   // silent scheduled turn stays suppressed as before. (isMeetingDrivenTurn
   // supersedes the pre-Plan-B `vcMeetingReceiver` blanket check.)
-  if (isMeetingDrivenTurn(record.ds, record.turnId) || isSilentScheduledTurn(record.ds, record.turnId)) return;
-  const loc = botLocale(getBot(record.ds.larkAppId).config);
+  if (isMeetingDrivenTurn(ds, turnId) || isSilentScheduledTurn(ds, turnId)) return;
+  const loc = botLocale(getBot(ds.larkAppId).config);
   void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16), reason }, loc),
+    sessionAnchorId(ds),
+    tr(messageKey, { turnId: turnId.substring(0, 16), reason }, loc),
     'text',
-    record.ds.larkAppId,
-    record.turnId,
+    ds.larkAppId,
+    turnId,
   ).catch(err => logger.error(
-    `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
+    `[${tag(ds)}] Failed to report ordinary IM worker delivery failure: `
     + `${err instanceof Error ? err.message : String(err)}`,
   ));
 }
@@ -11910,6 +11956,36 @@ function settleOrdinaryImDeliveriesForWorker(
         : 'worker_exited_before_ipc_enqueue';
     failOrdinaryImDelivery(record, reason);
   }
+}
+
+/** A deliberately retired worker (suspend / replacement) takes down with it
+ * the input it was writing to its CLI: the unsent-input journal only carries
+ * what was never written, and the next CLI never saw the write. Report that
+ * turn instead of leaving it silent, unless the commit-pending settlement
+ * already owns it. */
+function settleWorkerCliInputBacklog(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  options: { notify: boolean; ownedByDeliveryTracker: ReadonlySet<string> },
+): void {
+  const turnId = workerCliInputBacklogs.get(worker)?.writingTurnId;
+  workerCliInputBacklogs.delete(worker);
+  if (!turnId || !options.notify || options.ownedByDeliveryTracker.has(turnId)) return;
+  logger.warn(`[${tag(ds)}] Worker retired while writing turn=${turnId.substring(0, 16)} to its CLI`);
+  reportOrdinaryTurnUndelivered(
+    ds,
+    turnId,
+    'worker_retired_before_cli_accept',
+    'worker.input_retired_before_cli_accept',
+  );
+}
+
+function ordinaryImTurnIdsForWorker(worker: ChildProcess): Set<string> {
+  const turnIds = new Set<string>();
+  for (const record of pendingOrdinaryImDeliveries.values()) {
+    if (record.worker === worker) turnIds.add(record.turnId);
+  }
+  return turnIds;
 }
 
 export function __testOnly_resetOrdinaryImDeliveries(): void {
@@ -17867,6 +17943,11 @@ function setupWorkerHandlers(
         sessionStore.updateSession(ds.session);
         break;
       }
+      case 'cli_input_backlog': {
+        recordWorkerCliInputBacklog(worker, msg);
+        if (!msg.pending) queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
+        break;
+      }
       case 'turn_input_received': {
         if (
           ds.worker !== worker
@@ -21917,6 +21998,7 @@ function setupWorkerHandlers(
       || lifecycleRetirement
       || worker.killed
       || ds.session.status === 'closed';
+    const ordinaryImTurnIds = ordinaryImTurnIdsForWorker(worker);
     settleOrdinaryImDeliveriesForWorker(worker, {
       suppressAllFailures: suppressDeliveryFailure,
       // The startup failure path owns only the initial cold-start turn. Any
@@ -21931,6 +22013,12 @@ function setupWorkerHandlers(
       retiredBeforeCommit: lifecycleRetirement
         && !transferRetirement
         && ds.session.status !== 'closed',
+    });
+    settleWorkerCliInputBacklog(ds, worker, {
+      notify: lifecycleRetirement
+        && !transferRetirement
+        && ds.session.status !== 'closed',
+      ownedByDeliveryTracker: ordinaryImTurnIds,
     });
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);

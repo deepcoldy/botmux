@@ -247,6 +247,54 @@ setInterval(() => {}, 1_000);
     }));
   }, 15_000);
 
+  it('reports a message as not yet taken by the CLI ahead of its commit, until it is written', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-input-backlog-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const fakePi = join(root, 'fake-pi');
+    writeFakeCli(fakePi, `#!/usr/bin/env node
+setTimeout(() => process.stdout.write('Ready\\n'), 500);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const sessionId = `sid-worker-input-backlog-${runId}`;
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, backendType: 'pty',
+      prompt: '', larkAppId: 'app_test', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    child.send({ type: 'message', content: 'wake-up message', turnId: 'om_wake' } satisfies DaemonToWorker);
+
+    const committedAt = () => messages.findIndex(m => m.type === 'turn_input_committed' && m.turnId === 'om_wake');
+    await waitFor(() => committedAt() >= 0, logs);
+    const backlogs = () => messages.flatMap((m, index) => (m.type === 'cli_input_backlog' ? [{ ...m, index }] : []));
+    const lastBeforeCommit = backlogs().filter(b => b.index < committedAt()).at(-1);
+    expect(lastBeforeCommit).toMatchObject({ pending: true });
+
+    await waitFor(() => backlogs().some(b => b.index > committedAt() && !b.pending), logs);
+    expect(backlogs().at(-1)).toMatchObject({ pending: false });
+  }, 15_000);
+
   // 跨身份隔离（XPI）现在由实验开关控制且默认关闭，所以这条用例必须显式打开它
   // ——它锁的正是「开关打开时」的拒绝行为。关闭态的镜像用例紧随其后。
   it('rejects a different principal at the worker backstop before type-ahead can steer it (XPI on)', async () => {

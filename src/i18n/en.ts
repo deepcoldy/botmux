@@ -1570,6 +1570,7 @@ export const messages: Record<string, string> = {
   'worker.input_delivery_failed': '⚠️ Botmux could not confirm whether this message entered the Worker execution queue. It stopped delivery to avoid duplicate execution. Check the session status first; do not resend immediately.\nturn: {turnId}',
   'worker.input_rejected_before_admission': '⚠️ This message was rejected before it entered the Worker execution queue: it did not run and produced no side effects. The usual cause is that the turn currently running was started by a different principal (cross-principal interruption isolation); resend it once that turn has finished.\nturn: {turnId} | reason: {reason}',
   'worker.input_retired_unconfirmed': '⚠️ The session was deliberately suspended or replaced while this message was in flight, and Botmux could not confirm whether it entered the execution queue. Check the session history first; resend the message only if it did not run.\nturn: {turnId}',
+  'worker.input_retired_before_cli_accept': '⚠️ The session was deliberately suspended or replaced while this message was being written to the CLI. The CLI never confirmed receiving it, and it will not be re-sent after resume. Check the session history first; resend the message if it did not start.\nturn: {turnId}',
   'worker.start_failed_log_fallback': 'the daemon log',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
   'workerDiag.recentStderr': 'Recent worker output (may include the failure cause):',

@@ -2204,6 +2204,47 @@ describe('input held in Claude\'s own queue', () => {
   });
 });
 
+describe('input the worker is still writing', () => {
+  // Under tmux overload each chunk of a long first message waits on its own
+  // send-keys, so typing it can outlast the TTL that runs from the mark.
+  const TTL = 120_000;
+  const markAt = Date.parse('2026-11-07T12:30:52.000Z');
+  const text = '<user_message>a long first message typed into the composer chunk by chunk</user_message>';
+  function marked(turnId = 't1', dispatchAttempt?: number): BridgeTurnQueue {
+    const q = new BridgeTurnQueue();
+    q.mark(turnId, makeFingerprint(text), markAt, normaliseForFingerprint(text), dispatchAttempt);
+    return q;
+  }
+
+  it('keeps the mark while its write outlasts the TTL, so the submitted input still binds', () => {
+    const started: string[] = [];
+    const q = new BridgeTurnQueue(undefined, undefined, turn => { started.push(turn.turnId); });
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    q.holdForWrite('t1');
+    expect(q.pruneExpired(TTL, markAt + 150_000)).toEqual([]);
+    q.releaseWriteHold('t1', undefined, markAt + 155_000);
+    expect(q.pruneExpired(TTL, markAt + 156_000)).toEqual([]);
+    q.ingest([user('u1', text, new Date(markAt + 157_000).toISOString())]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it('runs the TTL from the moment the write settled', () => {
+    const q = marked();
+    q.holdForWrite('t1');
+    q.releaseWriteHold('t1', undefined, markAt + 150_000);
+    expect(q.pruneExpired(TTL, markAt + 150_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 150_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('holds only the exact turn and attempt being written', () => {
+    const q = marked('t1', 2);
+    q.mark('t2', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    q.holdForWrite('t1', 1);
+    q.holdForWrite('t3');
+    expect(q.pruneExpired(TTL, markAt + TTL + 1).map(t => t.turnId)).toEqual(['t1', 't2']);
+  });
+});
+
 // Real-shaped transcript (trimmed + sanitised from Claude Code 2.1.318): a Lark
 // turn launches `run_in_background` Bash and ends; the task's
 // `<task-notification>` then wakes the main thread, which answers on its own.

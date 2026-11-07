@@ -3256,6 +3256,21 @@ let isPromptReady = false;
 let promptReadyEdges = 0;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
+/** The queued input flushPending took and is writing or settling right now. */
+let cliSubmissionInFlight: {
+  item: PendingCliInput;
+  /** CLI generation the write targets; a replacement CLI's prompt is its own. */
+  generation: number;
+  /** Its write began at an idle prompt as the flush's first input, so until
+   *  the write settles any prompt on screen is the composer echoing it. */
+  composerOwned: boolean;
+  readyDeferred?: boolean;
+  /** The transcript already showed an open turn when the prompt was hidden. */
+  turnOpenWhenDeferred?: boolean;
+  bridgeTurnId?: string;
+} | null = null;
+/** Last `cli_input_backlog` sent; undefined until module init completes. */
+let publishedCliInputBacklog: string | undefined;
 /** An init prompt exists but spawn/RPC policy has not yet established whether
  * it is argv-baked, RPC-owned, or queued. Concurrent follow-ups may enter the
  * queue during async init, but must not flush ahead of this first turn. */
@@ -19123,6 +19138,20 @@ function markPromptReady(): void {
     log('Ignoring prompt-ready from backend generation being replaced');
     return;
   }
+  if (cliSubmissionInFlight?.composerOwned && cliSubmissionInFlight.generation === cliSpawnGeneration) {
+    // The idle prompt this write started at is still on screen, echoing input
+    // the CLI has not taken yet. flushPending re-drives it once the write
+    // settles, unless the write opened a turn.
+    if (!cliSubmissionInFlight.readyDeferred) {
+      log('Ignoring prompt-ready while an input is still being written to the CLI composer');
+      cliSubmissionInFlight.turnOpenWhenDeferred = !!bridgeJsonlPath
+        && claudeTranscriptLatestTurnState(bridgeJsonlPath) === 'open';
+    }
+    cliSubmissionInFlight.readyDeferred = true;
+    structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
+    idleDetector?.reset();
+    return;
+  }
   // Readiness can arrive after the launcher's bounded discovery window. Bind
   // the real execution root before the first turn can call a BotMux tool;
   // waiting for a rollout/history match would repair ownership only AFTER it.
@@ -20450,6 +20479,29 @@ async function flushPending(): Promise<void> {
   isFlushing = true;
   const promptReadyAtFlushStart = isPromptReady;
   let itemsWrittenInThisFlush = 0;
+  let promptReadyDeferred = false;
+  // The write of `item` settled: prompts on screen belong to the CLI again
+  // and its bridge mark's TTL starts now.
+  const settleSubmission = (item: PendingCliInput): void => {
+    const inFlight = cliSubmissionInFlight;
+    if (!inFlight || inFlight.item !== item) return;
+    cliSubmissionInFlight = null;
+    if (inFlight.bridgeTurnId) bridgeQueue.releaseWriteHold(inFlight.bridgeTurnId, item.dispatchAttempt);
+    if (inFlight.readyDeferred) {
+      // A turn this write opened makes the prompt ready again when it ends;
+      // re-driving the hidden prompt now could catch the screen before its
+      // busy marker is drawn.
+      if (inFlight.turnOpenWhenDeferred === false && bridgeJsonlPath
+        && claudeTranscriptLatestTurnState(bridgeJsonlPath) === 'open') {
+        structuredRejectedReadyEvidenceGeneration = undefined;
+      } else {
+        promptReadyDeferred = true;
+      }
+    }
+    // A report still naming the written turn would make a suspend right now
+    // announce it as lost.
+    if (publishedCliInputBacklog !== undefined) publishCliInputBacklog();
+  };
   const codexAppPromptReplay = new CodexAppFlushPromptReplay();
   // Raw input and native rename own their explicit command-line/session gates;
   // pending adopt writes re-arm inside writeAdoptMessage. Clearing readiness
@@ -20606,6 +20658,7 @@ async function flushPending(): Promise<void> {
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
+      cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
       // before the turn is written. Doing it at IPC-receive time collapsed two
@@ -20632,6 +20685,9 @@ async function flushPending(): Promise<void> {
       let bridgeTurnId: string | undefined;
       let normalWritePrepared = false;
       let submissionPreparationFailed = false;
+      // Remote-runner, RPC and Codex App runner input bypass the composer.
+      const typedIntoComposer = !writeBackend.submitTurn && !writeRpcEngine
+        && !(item.codexAppInput && writeAdapter.writeStructuredInput);
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
         normalWritePrepared = true;
@@ -20654,6 +20710,10 @@ async function flushPending(): Promise<void> {
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
           && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0 || queuedTypeAheadTurns.length > 0);
+        if (cliSubmissionInFlight?.item === item) {
+          cliSubmissionInFlight.composerOwned = typedIntoComposer && promptReadyAtFlushStart
+            && itemsWrittenInThisFlush === 0 && !isTypeAhead;
+        }
 
         if (item.turnId && item.dispatchAttempt === undefined) {
           // A live correction belongs to the running model, even when idle
@@ -20747,6 +20807,10 @@ async function flushPending(): Promise<void> {
             item.dispatchAttempt,
             item.linkRefMode,
           );
+          if (bridgeTurnId && cliSubmissionInFlight?.item === item) {
+            bridgeQueue.holdForWrite(bridgeTurnId, item.dispatchAttempt);
+            cliSubmissionInFlight.bridgeTurnId = bridgeTurnId;
+          }
         } else if (codexBridgeActive && !writeRpcEngine) {
           bridgeTurnId = codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt, Date.now(), item.linkRefMode);
           if (bridgeTurnId) {
@@ -21209,6 +21273,8 @@ async function flushPending(): Promise<void> {
           }
         }
         break;
+      } finally {
+        settleSubmission(item);
       }
       if (isCodexAppCliId(lastInitConfig?.cliId)
         && item.turnId
@@ -21400,7 +21466,10 @@ async function flushPending(): Promise<void> {
       )) break;
     }
   } finally {
+    if (cliSubmissionInFlight) settleSubmission(cliSubmissionInFlight.item);
     isFlushing = false;
+    // A write that failed or stopped the batch skipped the post-write re-drive.
+    if (promptReadyDeferred) redriveRejectedStructuredReady();
     // The owner may have arrived while an earlier asynchronous write held the
     // flush mutex. The serial schedule head stopped that drain, so no new idle
     // edge will wake the interruption. Re-kick only after a real promotion;
@@ -31686,7 +31755,36 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
   };
 }
 
+type CliInputBacklog = Omit<Extract<WorkerToDaemon, { type: 'cli_input_backlog' }>, 'type'>;
+
+function cliInputBacklogKey(backlog: CliInputBacklog): string {
+  return `${backlog.pending}:${backlog.writingTurnId ?? ''}`;
+}
+
+function cliInputBacklog(): CliInputBacklog {
+  const writing = cliSubmissionInFlight?.item;
+  const writingTurnId = writing?.turnId && writing.dispatchAttempt === undefined ? writing.turnId : undefined;
+  return {
+    pending: pendingMessages.length > 0
+      || pendingRawInputs.length > 0
+      || pendingAdoptMessages.length > 0
+      || cliSubmissionInFlight !== null
+      || submitFailureChains.size() > 0,
+    ...(writingTurnId ? { writingTurnId } : {}),
+  };
+}
+
+function publishCliInputBacklog(): void {
+  const backlog = cliInputBacklog();
+  const key = cliInputBacklogKey(backlog);
+  if (key === publishedCliInputBacklog) return;
+  publishedCliInputBacklog = key;
+  send({ type: 'cli_input_backlog', ...backlog });
+}
+
 function send(msg: WorkerToDaemon): void {
+  // Once init is done, every message goes out behind the backlog it was sent under.
+  if (publishedCliInputBacklog !== undefined && msg.type !== 'cli_input_backlog') publishCliInputBacklog();
   if (closeRequested && msg.type === 'final_output') {
     log('Dropped final_output after close fence');
     return;
@@ -33999,6 +34097,9 @@ process.on('message', async (raw: unknown, handle: unknown) => {
         break;
       }
       log('Suspend requested');
+      // Inputs not written to the CLI yet go to the session's next worker, as
+      // on a shutdown exit.
+      saveUnsentInputsForSuccessor('suspend');
       stopScreenshotLoop();
       stopBridgeWatcher();
       // A parked crash diagnostic shell has backend===null, so the
@@ -34043,6 +34144,9 @@ process.on('message', async (raw: unknown, handle: unknown) => {
   }
 });
 
+// The daemon starts every worker with an empty backlog.
+publishedCliInputBacklog = cliInputBacklogKey({ pending: false });
+setInterval(publishCliInputBacklog, 1_000).unref?.();
 // 预加载层会在正式处理器注册前暂存冷启动消息；现在按到达顺序交还。
 (process as NodeJS.EventEmitter).emit(WORKER_IPC_HANDLER_READY_EVENT);
 

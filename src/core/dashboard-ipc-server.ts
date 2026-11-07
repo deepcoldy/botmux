@@ -321,7 +321,7 @@ import { sendSessionOwnerThreadNotification } from '../services/session-owner-no
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
 import { validateRecycleRequest } from './workspace-recycle-journal.js';
-import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, identityStorageModelForDaemonSession, identityDecisionConflict } from './worker-pool.js';
+import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, hasUnacceptedCliInput, identityStorageModelForDaemonSession, identityDecisionConflict } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -3032,17 +3032,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
     // already reached, so report idempotent success without a live kill.
     return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
   }
-  // Producing a reply — killing the worker now would drop this turn. Queue
-  // instead; worker-pool's runPendingSuspendIfSettled cashes it in on the
-  // idle/limited edge. Ordering matters: the idempotent no-worker branch above
-  // must win, so "worker was already gone" never reports as deferred.
+  // Producing a reply, or still taking in a message — killing the worker now
+  // would drop this turn. Queue instead; worker-pool's runPendingSuspendIfSettled
+  // cashes it in once the turn has settled. Ordering matters: the idempotent
+  // no-worker branch above must win, so "worker was already gone" never
+  // reports as deferred.
   //
   // The suspendability check is part of the queueing condition, not a new guard
   // ahead of it: a non-suspendable (pty) backend must keep falling through to
   // suspendWorker's existing 409 rather than get a `deferred` that could only
   // fail silently at fulfillment time.
   if (
-    (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing')
+    (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing' || hasUnacceptedCliInput(ds))
     && isSuspendableBackendType(ds.initConfig?.backendType)
   ) {
     ds.pendingSuspendReason = 'manual_suspend';
@@ -3217,6 +3218,7 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
       if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
       if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
       if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
+      if (hasUnacceptedCliInput(ds)) continue;                   // nor a message its CLI has not taken yet
       try {
         if (suspendWorker(ds, 'host_overload_suspend')) affected++;
       } catch (err) {
