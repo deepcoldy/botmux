@@ -86,6 +86,21 @@ describe('per-bot environment policy', () => {
     for (const [name, env] of Object.entries({ worker, child, pane })) expect(env.BOTMUX_FENCED_RUN, name).toBe('1');
     expect('BOTMUX_FENCED_RUN' in buildSessionChildEnv(buildBotWorkerEnv(host, strict), strict)).toBe(false);
   });
+  it.each([
+    { mode: 'strict' as const, socketRoot: '/test/private-tmux' },
+    { mode: 'strict' as const, socketRoot: undefined },
+    { mode: 'inherit' as const, socketRoot: '/test/private-tmux' },
+    { mode: 'inherit' as const, socketRoot: undefined },
+  ])('keeps the host tmux socket root on $mode workers without adding a CLI grant ($socketRoot)', ({ mode, socketRoot }) => {
+    const base = { ...host, ...(socketRoot !== undefined ? { TMUX_TMPDIR: socketRoot } : {}) };
+    const before = { ...base };
+    const worker = buildBotWorkerEnv(base, { mode });
+    expect(worker.TMUX_TMPDIR).toBe(socketRoot);
+    const child = buildSessionChildEnv(worker, { mode });
+    expect(child.TMUX_TMPDIR).toBe(mode === 'strict' ? undefined : socketRoot);
+    if (socketRoot === undefined) expect(Object.hasOwn(worker, 'TMUX_TMPDIR')).toBe(false);
+    expect(base).toEqual(before);
+  });
   it('preserves per-session homes and workflows after trusted injection', () => {
     const env = buildSessionChildEnv({ ...host, CODEX_HOME: '/test/bot/codex', BOTMUX_WORKFLOW: '1', BOTMUX_GOAL_PATH: '/test/goal', SESSION_DATA_DIR: '/test/data' }, strict);
     expect(env.CODEX_HOME === '/test/bot/codex').toBe(true);

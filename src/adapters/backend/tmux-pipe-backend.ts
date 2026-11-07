@@ -1935,6 +1935,13 @@ export class TmuxPipeBackend implements SessionBackend {
     // new-session exec below uses, so the owner probe, -N capability and socket
     // path resolve against the launch's PATH/TMUX_TMPDIR (not daemon ambient).
     const bootSpawnEnv = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env;
+    // Strict CLI inheritance must not move the tmux control client to another
+    // server. Discovery, reattach and teardown use the worker's socket root;
+    // retain it only for this client. The pane still receives strictPaneCommand's
+    // separately constructed env -i environment.
+    if (opts.strictEnv && process.env.TMUX_TMPDIR !== undefined) {
+      bootSpawnEnv.TMUX_TMPDIR = process.env.TMUX_TMPDIR;
+    }
     const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv });
     for (let attempt = 0; ; attempt++) {
       // [] = normal spawn (attach, or a proven cold boot); ['-N'] = attach
