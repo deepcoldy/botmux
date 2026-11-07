@@ -47,11 +47,16 @@ function normalized(path: string): string {
   return path.replace(/\\/g, '/').replace(/\/+$/, '');
 }
 
-/** Node resolves pnpm 11's global botmux symlink to this store realpath. */
+/** Node resolves pnpm 11's global botmux symlink to this store realpath. The
+ * store lives under PNPM_HOME, which only the default location names `pnpm`. */
 function pnpmV11StoreMatch(root: string): RegExpMatchArray | null {
-  return root.match(
-    /^(.*\/pnpm)\/store\/(v\d+)\/links\/@\/botmux\/[^/]+\/[^/]+\/node_modules\/botmux$/i,
+  const match = root.match(
+    /^(.*)\/store\/(v\d+)\/links\/@\/botmux\/[^/]+\/[^/]+\/node_modules\/botmux$/i,
   );
+  if (!match) return null;
+  const base = match[1].toLowerCase();
+  const pnpmHome = normalized(process.env.PNPM_HOME ?? '').toLowerCase();
+  return base.endsWith('/pnpm') || (pnpmHome !== '' && base === pnpmHome) ? match : null;
 }
 
 function pnpmGlobalDir(
