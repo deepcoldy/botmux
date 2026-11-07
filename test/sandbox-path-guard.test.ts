@@ -70,6 +70,17 @@ describe('sandbox readWrite guard', () => {
     expect(reasons(['~/..', `${roots.homeDirs[0]}/../alice`]).map(([, reason]) => reason)).toEqual(['home', 'home']);
   });
 
+  it('rejects the host /run in every spelling or link, keeps its subdirectories', () => {
+    const runLink = join(root, 'varrun');
+    symlinkSync('/run', runLink);
+    expect(reasons(['/run', '//run/', '/run/', '/./run', runLink, '/run/lock', '/run/user/1000', '/runx'])).toEqual([
+      ['/run', 'host_run'], ['//run/', 'host_run'], ['/run/', 'host_run'], ['/./run', 'host_run'], [runLink, 'host_run'],
+    ]);
+    const message = forbiddenReadWriteMessage(findForbiddenReadWritePaths(['/run'], roots));
+    expect(message).toContain('「/run」');
+    expect(message).not.toContain('改放到「只读」');
+  });
+
   it('accepts deeper paths and siblings with a shared name prefix', () => {
     const home = roots.homeDirs[0]!;
     expect(reasons([
@@ -172,17 +183,17 @@ describe('sandbox readWrite guard', () => {
   it('resolveStoredSandboxPaths applies every stored-entry rule in one step (the worker\'s list assembly)', () => {
     const home = roots.homeDirs[0]!;
     const stored = {
-      readWrite: ['/', '~/projects/app', '~', '..'],
+      readWrite: ['/', '~/projects/app', '~', '..', '/run', '/run/user/1000'],
       readOnly: ['/usr', '/', '../ref', '~/docs', '/run', '/run/lock'],
       deny: ['~/secret', 'rel/hidden'],
     };
     const linux = resolveStoredSandboxPaths(stored, { roots, home, platform: 'linux' });
     expect(linux.downgradedReadWrite.map(f => f.path)).toEqual(['~']);
-    expect(linux.droppedReadWrite.map(f => f.path)).toEqual(['/', '..']);
+    expect(linux.droppedReadWrite.map(f => f.path)).toEqual(['/', '..', '/run']);
     expect(linux.droppedReadOnlyRelative).toEqual(['../ref']);
     expect(linux.droppedReadOnlyRoot).toEqual(['/', '/run']);
     expect(linux.lists).toEqual({
-      readWrite: ['~/projects/app'], readOnly: ['/usr', '~/docs', '/run/lock', '~'], deny: ['~/secret', 'rel/hidden'],
+      readWrite: ['~/projects/app', '/run/user/1000'], readOnly: ['/usr', '~/docs', '/run/lock', '~'], deny: ['~/secret', 'rel/hidden'],
     });
     const darwin = resolveStoredSandboxPaths(stored, { roots, home, platform: 'darwin' });
     expect(darwin.droppedReadOnlyRoot).toEqual([]);
