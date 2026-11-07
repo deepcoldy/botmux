@@ -53,18 +53,24 @@ describe('repo vitest configs keep the tmux and data-dir fences', () => {
     for (const project of projectsOf(mod.default)) {
       const label = `${file} › ${project.name ?? '(root)'}`;
       // The disposable root comes from the globalSetup; without it the setup
-      // file's inject() gets undefined and every e2e file crashes at import —
-      // which PR CI does not catch (no e2e job runs on pull_request).
+      // file's inject() gets undefined and every test file crashes at import —
+      // which PR CI does not catch for the e2e project (no e2e job runs on
+      // pull_request).
       expect(asList(project.globalSetup).map(p => p.replace(/^\.\//, '')), label)
         .toContain('test/unit-global-setup.ts');
-      // The e2e project deliberately keeps the developer's real HOME (real CLIs
-      // need real credentials) but still gets a disposable SESSION_DATA_DIR via
-      // e2e-setup.ts; every other project gets the full unit-setup.ts fence.
-      const requiredDataFenceSetup = project.name === 'e2e'
-        ? 'test/e2e-setup.ts'
-        : 'test/unit-setup.ts';
-      expect(asList(project.setupFiles).map(p => p.replace(/^\.\//, '')), label)
-        .toContain(requiredDataFenceSetup);
+      // Each project must mount a per-file data-dir setup. Two shapes exist:
+      // unit-setup.ts fences HOME as well as the data dir; e2e-setup.ts fences
+      // only the data dir because e2e drives real CLIs that need the developer's
+      // real credentials/config. Decide by what is MOUNTED, not by the project's
+      // display name: a renamed/new project must not silently fall out of this
+      // check, and an e2e-shaped project that mounts e2e-setup.ts stays covered.
+      const mountedSetups = asList(project.setupFiles).map(p => p.replace(/^\.\//, ''));
+      expect(
+        mountedSetups.includes('test/unit-setup.ts')
+          || mountedSetups.includes('test/e2e-setup.ts'),
+        `${label}: setupFiles must include test/unit-setup.ts (full HOME + data fence) `
+          + `or test/e2e-setup.ts (data-only fence for real-CLI e2e); got ${JSON.stringify(mountedSetups)}`,
+      ).toBe(true);
     }
   });
 });

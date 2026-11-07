@@ -112,9 +112,13 @@ mock.module('node:os', () => ({ ...fencedOs, default: fencedOs }));
 const tmuxFence = createTmuxFence(process.env);
 applyTmuxFenceEnv(tmuxFence);
 
-// The data-dir helper registers its own afterAll first (at import), so under
-// stacked hook order it runs last: this tmux teardown happens while the
-// disposable root still exists, then the helper deletes it.
+// The two afterAll hooks are deliberately independent: the data-dir helper
+// deletes its own disposable root, while teardownTmuxFence only touches the
+// tmux fence's private root (test/helpers/tmux-fence.ts), so neither needs the
+// other's directory to still exist. Do not encode an execution order between
+// them — bun runs afterAll hooks FIFO (the helper, registered at import, runs
+// FIRST here) while vitest runs them LIFO; relying on an order would diverge
+// between runners.
 afterAll(() => {
   const tmuxDenials = readTmuxFenceDenials(tmuxFence);
   teardownTmuxFence(tmuxFence);
