@@ -925,7 +925,7 @@ import {
 import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
-import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn, resolveDeferredScheduledTurnId } from './silent-schedule-turns.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
@@ -16976,6 +16976,7 @@ function setupWorkerHandlers(
   if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
     ds.hermesBridgeSourceSessionIds = undefined;
   }
+  let deferredScheduleIdleTurnId: string | undefined;
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -19051,13 +19052,6 @@ function setupWorkerHandlers(
               }
             }
           }
-          if (
-            ds.lastScreenStatus === 'idle'
-            && msg.turnId
-            && ds.session.deferredScheduleRun?.turnId === msg.turnId
-          ) {
-            void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
-          }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
           // reclaimed immediately instead of waiting for the 60s backstop.
@@ -19066,6 +19060,18 @@ function setupWorkerHandlers(
             // The newly-idle session itself may be the oldest eviction target.
             queueMicrotask(cb.enforceLiveSessionCap);
           }
+        }
+
+        // The dedicated hidden run retains its identity after the worker retires
+        // its capture turn. Never borrow a shared session's current/queued turn.
+        // Notify once per idle episode, including a first frame already at idle,
+        // so repeated snapshots cannot keep resetting the settlement debounce.
+        const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId);
+        if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnId = undefined;
+        if (ds.lastScreenStatus === 'idle' && deferredTurnId
+          && deferredScheduleIdleTurnId !== deferredTurnId) {
+          deferredScheduleIdleTurnId = deferredTurnId;
+          void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
