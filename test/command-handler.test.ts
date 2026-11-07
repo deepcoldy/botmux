@@ -19,6 +19,11 @@ import { tagClosedSessionGroup } from '../src/services/feed-group-tagger.js';
 
 vi.mock('../src/core/dismiss-command.js', () => ({ dismissSessionGroup: vi.fn(async () => ({ status: 'confirm', state: 'a'.repeat(64), sessions: [] })) }));
 import { dismissSessionGroup } from '../src/core/dismiss-command.js';
+vi.mock('../src/services/session-groups-store.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/services/session-groups-store.js')>();
+  return { ...actual, isSessionGroup: vi.fn(actual.isSessionGroup) };
+});
+import { isSessionGroup } from '../src/services/session-groups-store.js';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
@@ -3698,6 +3703,47 @@ describe('handleCommand', () => {
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
       expect(dismissSessionGroup).not.toHaveBeenCalled();
     });
+    it('tells a non-operator the rule of the group they are in', async () => {
+      const replyFor = async (sessionGroup: boolean) => {
+        vi.mocked(isSessionGroup).mockReturnValue(sessionGroup);
+        vi.mocked(canOperate).mockReturnValueOnce(false);
+        const deps = makeDeps();
+        await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+        return vi.mocked(deps.sessionReply).mock.calls[0]![1];
+      };
+      try {
+        expect(await replyFor(true)).toContain('建群用户本人');
+        expect(await replyFor(false)).toContain('只有具备 Bot 操作权限的用户');
+      } finally {
+        vi.mocked(isSessionGroup).mockReturnValue(false);
+      }
+      expect(dismissSessionGroup).not.toHaveBeenCalled();
+    });
+    it('passes the chat type so a DM is never treated as a group', async () => {
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID, chatType: 'p2p' }), makeDeps(), LARK_APP_ID);
+      expect(dismissSessionGroup).toHaveBeenCalledWith(expect.objectContaining({ chatId: CHAT_ID, chatType: 'p2p' }));
+    });
+    it('confirms an ordinary group on a card that disbands the whole group', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'd'.repeat(64), sessions: [], ordinaryGroup: true });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0]![1]);
+      expect(card.header.title.content).toContain('解散本群');
+      expect(JSON.stringify(card)).not.toContain('会话群登记');
+      const button = card.body.elements.find((e: any) => e.tag === 'button');
+      expect(button.behaviors[0].value).toEqual({
+        action: 'dismiss_confirm', chat_id: CHAT_ID, invoker_open_id: 'ou_sender', confirmation_state: 'd'.repeat(64), ordinary_group: true,
+      });
+    });
+    it('states the ownership condition when the bot cannot prove it may disband', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'no_permission' });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]![1];
+      expect(reply).toContain('没有解散本群的权限');
+      expect(reply).toContain('群主'); expect(reply).toContain('只有它一个机器人');
+      expect(sendUserMessage).not.toHaveBeenCalled();
+    });
     it('reports successful deletion privately rather than to the deleted group', async () => {
       vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project'] });
       const deps = makeDeps();
@@ -3707,6 +3753,12 @@ describe('handleCommand', () => {
       expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).not.toContain('dismiss_cleanup_wt');
       expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+    it('titles the private receipt for an ordinary group', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: [], ordinaryGroup: true });
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      const card = JSON.parse(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+      expect(card.header.title.content).toBe('✅ 群已解散');
     });
     it('offers one-click cleanup of the linked worktrees the closed sessions used', async () => {
       vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project-wt-task'] });

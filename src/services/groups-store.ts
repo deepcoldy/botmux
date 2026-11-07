@@ -426,6 +426,24 @@ export async function getChatOwner(
 }
 
 /**
+ * Whether this bot provably owns the group. Feishu omits the owner fields when
+ * the owner is a bot, so with no other bot or agent in the group the owner can
+ * only be this bot. Any other answer, or an error, is false.
+ */
+export async function botProvablyOwnsChat(larkAppId: string, chatId: string): Promise<boolean> {
+  try {
+    // Callers hold the bot's turn gate while waiting.
+    const res: any = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {}, { timeoutMs: 10_000 });
+    const chat = res.code === 0 ? res.data : undefined;
+    return !!chat && chat.chat_status === 'normal' && (chat.chat_mode === 'group' || chat.chat_mode === 'topic')
+      && !chat.owner_id && !chat.owner_id_type
+      && String(chat.bot_count) === '1' && String(chat.agent_count) === '0';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Get a shareable join link for a chat — the link others can click to *join*
  * the group, unlike the applink:// "open chat" URL which only works for members
  * who are already in the chat.
