@@ -10,7 +10,7 @@ Start with what you want to do:
 | Write a plugin from scratch | [Five-minute start](#five-minute-start) → [Building each contribution](#building-each-contribution) |
 | Publish to npm and list it in the Plugin Market | [Publish to npm](#publish-to-npm) → [Register in the Plugin Market](#register-in-the-plugin-market) |
 
-> Installing a third-party plugin means trusting its author: plugin code runs as the system user that runs Botmux, and installing from npm may run npm lifecycle scripts. Only install packages you trust.
+> Installing a third-party plugin means trusting its author: plugin code runs as the system user that runs Botmux. Confirmed Dashboard installs skip npm lifecycle scripts; ordinary CLI installs may still run them. Only install packages you trust. A catalog listing is not a security endorsement.
 
 ## What a plugin can provide
 
@@ -105,12 +105,17 @@ botmux plugin disable my-plugin --bot <name|index|all>
 
 ### Manage from the Dashboard
 
-The **插件** (Plugins) page in the Dashboard sidebar lists every installed plugin. Each plugin card lets you:
+The **插件** (Plugins) page has **Installed** and **Discover** views using the Dashboard's light and dark themes.
 
-- Toggle the machine default with "为所有 Bot 启用" (enable for all Bots), or tick Bots one by one under "按 Bot 启用" (enable per Bot);
-- Start, stop, and restart the plugin's Host Service and see its status, port, PID, access URL, and health check;
-- Expand the details to see what the plugin provides, grouped into Skills / MCP / CLI commands / Dashboard / Service;
-- "Pin 到侧栏" (pin to sidebar) to put the plugin's own Dashboard page in the sidebar.
+- Installed supports search and source filtering. Cards show the name, description, audience, enablement and management action.
+- Management retains machine-default and per-Bot enablement, settings and sidebar pinning. Package details, contribution lists and service controls are under collapsed Advanced settings.
+- Discover reads the [plugin catalog](https://github.com/botmux-ai/plugin-market), with search, details and installation. Network failures show cached results or an explicit unavailable state.
+- Installation confirmation displays the package name, exact npm version and SHA-512 integrity. It is bound to the management identity, expires after five minutes and must be repeated if the registry state or management credentials change. Installation does not automatically enable a plugin.
+- Uninstall requires disabling all scopes and stopping the service before confirming the package and version. The installer rechecks the confirmation before committing changes.
+
+Install and uninstall require the local management identity and CSRF validation. Discovery needs network access; installation also needs `npm` and `tar` on `PATH`. Packages must ship a prebuilt `dist/`, rather than generating runtime files in install scripts.
+
+Card descriptions come from npm `package.json`'s `description`. Optional `botmux.audience` describes the intended audience or prerequisites. These are display fields, not authorization controls.
 
 A plugin's own page lives at `#/plugins/<plugin-id>`. For more on the Dashboard, see [Dashboard](/en/dashboard).
 
