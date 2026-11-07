@@ -260,7 +260,11 @@ describe('dsh worker final_output integration', () => {
       await waitFor(child, logs, () => messages.some(m => m.type === 'claude_exit'));
       child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
       await waitFor(child, logs, () => runnerStarts() >= 2);
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 3_000));
+      // Carried-over input is flushed on the replacement runner's ready edge;
+      // wait for that edge instead of a fixed settle delay, then give the write
+      // a moment to reach the fake server's log.
+      await waitFor(child, logs, () => messages.filter(m => m.type === 'prompt_ready').length >= 2);
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 800));
 
       expect(prompts()).toBe(1);
     } finally {
