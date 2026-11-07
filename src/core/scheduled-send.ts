@@ -131,9 +131,19 @@ export function settleScheduledSend(dataDir: string, session: ScheduleSession, t
     larkAppId: session.larkAppId, turnId });
   if (receipt?.final) return { state: 'delivered', messageId: receipt.final.messageId };
   const failure = readFailure(dataDir, session, turnId);
-  if (!failure) return { state: 'silent' };
-  return { state: 'failed', taskId: run.taskId, runId: run.runId,
-    errorCode: failure.unknown ? 'schedule_send_unknown' : 'schedule_send_rejected', error: failure.error };
+  if (failure) {
+    return { state: 'failed', taskId: run.taskId, runId: run.runId,
+      errorCode: failure.unknown ? 'schedule_send_unknown' : 'schedule_send_rejected', error: failure.error };
+  }
+  // A hard kill (OOM/SIGKILL/lost response) after the provider request started
+  // leaves a fenced publication or in-flight chunk marker without a final receipt
+  // or failure sidecar: the message MAY have been delivered, so it must be
+  // accounted as unknown — never silently dropped. A later receipt reconciles it.
+  if (receipt?.publication || receipt?.nonIdempotentSequence?.inFlightStep !== undefined) {
+    return { state: 'failed', taskId: run.taskId, runId: run.runId, errorCode: 'schedule_send_unknown',
+      error: 'scheduled final delivery ended with an unconfirmed provider publication' };
+  }
+  return { state: 'silent' };
 }
 
 /** Both writes are idempotent. Call again after a partial persistence failure. */

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { feedbackPolicyForScheduledSend, recordScheduledSessionRun, ScheduleSendAttempt, settleScheduledSend } from '../src/core/scheduled-send.js';
@@ -65,5 +66,40 @@ describe('scheduled send settlement', () => {
     const ledger = new TurnSendLedger(dataDir);
     await ledger.execute(key, 'final', 'raw card', async () => 'om_delivered');
     expect(settleScheduledSend(dataDir, session, turnId)).toEqual({ state: 'delivered', messageId: 'om_delivered' });
+  });
+
+  it('accounts a fenced publication with no sidecar as unknown instead of silent', async () => {
+    const dataDir = dir();
+    // Hard-kill equivalent: the fenced publication is persisted, the dispatch
+    // dies before any catch can write a failure sidecar.
+    await new TurnSendLedger(dataDir).execute(
+      key, 'final', 'maybe delivered',
+      async () => { throw new Error('process killed after provider request'); },
+      { fenced: true }).catch(() => undefined);
+    expect(settleScheduledSend(dataDir, session, turnId)).toMatchObject({ state: 'failed',
+      runId: 'run-1', errorCode: 'schedule_send_unknown' });
+  });
+
+  it('accounts an in-flight chunk marker without a sidecar as unknown', () => {
+    const dataDir = dir();
+    const ledger = new TurnSendLedger(dataDir);
+    mkdirSync(dirname(ledger.recordPath(key)), { recursive: true });
+    writeFileSync(ledger.recordPath(key), JSON.stringify({
+      ...key, version: 1,
+      nonIdempotentSequence: { fingerprint: 'fp', target: 'oc_chat',
+        stepCount: 3, completedSteps: 1, inFlightStep: 1 },
+    } satisfies import('../src/services/turn-send-ledger.js').TurnSendLedgerRecord));
+    expect(settleScheduledSend(dataDir, session, turnId)).toMatchObject({ state: 'failed',
+      errorCode: 'schedule_send_unknown' });
+  });
+
+  it('reconciles an unknown publication once a final receipt later lands', async () => {
+    const dataDir = dir();
+    const ledger = new TurnSendLedger(dataDir);
+    await ledger.execute(key, 'final', 'late answer',
+      async () => { throw new Error('killed mid-flight'); }, { fenced: true }).catch(() => undefined);
+    expect(settleScheduledSend(dataDir, session, turnId).state).toBe('failed');
+    await ledger.execute(key, 'final', 'late answer', async () => 'om_late');
+    expect(settleScheduledSend(dataDir, session, turnId)).toEqual({ state: 'delivered', messageId: 'om_late' });
   });
 });
