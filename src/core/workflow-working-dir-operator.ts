@@ -16,7 +16,8 @@
  * that bot's own open_id first. The `/cd` gate also reads the union_id (the
  * platform team member and meeting inviter legs): on the main bot's own app,
  * when the run froze none and the open_id alone does not pass, it is looked
- * up through that app before the gate is asked again.
+ * up through that app before the gate is asked again — unless that app
+ * definitively cannot see it, which leaves the open_id's refusal standing.
  *
  * Three answers: `yes`, `no`, or `unknown` (a lookup failed, timed out, or the
  * identity could not be obtained). The caller treats `unknown` like `no` for
@@ -60,11 +61,16 @@ export interface WorkflowInitiatorIdentity {
   unionId?: string;
 }
 
+/** An open_id → union_id lookup: `notFound` when the app definitively cannot
+ *  give it (the person is not visible to it, the id is invalid or another
+ *  app's, a contact scope is missing) — retrying will not help. */
+export type WorkflowUnionIdLookup = { unionId: string } | { notFound: string } | { unknown: string };
+
 export interface WorkflowInitiatorOperatesDeps {
   /** union_id → the open_id `larkAppId`'s own app issues for that person. */
   resolveTargetOpenId(larkAppId: string, unionId: string): Promise<TargetAppOpenIdResolution>;
   /** open_id issued by `larkAppId`'s own app → that person's union_id. */
-  lookupUnionId(larkAppId: string, openId: string): Promise<{ unionId: string } | { unknown: string }>;
+  lookupUnionId(larkAppId: string, openId: string): Promise<WorkflowUnionIdLookup>;
   /** The `/cd` command gate of `larkAppId` for a human with this (own-app)
    *  open_id in `chatId`. */
   canUseCd(larkAppId: string, chatId: string, openId: string, unionId: string | undefined): boolean;
@@ -109,12 +115,13 @@ async function initiatorPassesCdGate(
   // A union_id only ever adds legs to the gate: without one, a refusal is
   // not final until it has been looked up (through the open_id's own app).
   if (unionId !== undefined) return 'no';
-  let looked: { unionId: string } | { unknown: string };
+  let looked: WorkflowUnionIdLookup;
   try {
     looked = await deps.lookupUnionId(input.larkAppId, openId);
   } catch {
     return { unknown: '查询发起人的跨应用身份失败' };
   }
+  if ('notFound' in looked) return 'no';
   if ('unknown' in looked) return { unknown: looked.unknown };
   if (!isWorkflowUnionId(looked.unionId)) return { unknown: '查不到发起人的跨应用身份' };
   return deps.canUseCd(input.larkAppId, input.chatId, openId, looked.unionId) ? { passes: openId } : 'no';
@@ -166,6 +173,7 @@ export interface WorkflowWorkingDirOperatorIo {
   selfLarkAppId(): string;
   /** Membership verdict cache (default: a fresh one, as the sidebar uses). */
   membershipCache?: WorkflowSidebarMembershipCache;
+  warn?(message: string): void;
 }
 
 /** What a daemon's {@link createWorkflowNodeDaemon} gets for §15.4: the
@@ -183,18 +191,26 @@ const OPERATE_COMMAND = '/cd';
 export function createWorkflowWorkingDirOperatorWiring(io: WorkflowWorkingDirOperatorIo): WorkflowWorkingDirOperatorWiring {
   const membershipCache = io.membershipCache ?? new WorkflowSidebarMembershipCache();
   // `appId` must be the app that issued `openId`: always the run's main bot.
-  const lookupUnionId = async (appId: string, openId: string): Promise<{ unionId: string } | { unknown: string }> => {
+  const lookupUnionId = async (appId: string, openId: string): Promise<WorkflowUnionIdLookup> => {
     try {
       const resolved = await io.resolveUnionIdFromOpenId(appId, openId);
       if (resolved.status === 'resolved' && isWorkflowUnionId(resolved.unionId)) return { unionId: resolved.unionId };
-      return { unknown: resolved.status === 'unavailable' ? '主 Bot 查不到发起人的跨应用身份' : '主 Bot 查询发起人的跨应用身份失败' };
+      if (resolved.status === 'unavailable') return { notFound: '主 Bot 查不到发起人的跨应用身份' };
+      return { unknown: '主 Bot 查询发起人的跨应用身份失败' };
     } catch {
       return { unknown: '主 Bot 查询发起人的跨应用身份失败' };
     }
   };
   const gateDeps: Omit<WorkflowInitiatorOperatesDeps, 'chatMembership'> = {
     resolveTargetOpenId: io.resolveTargetAppOpenId,
-    lookupUnionId,
+    lookupUnionId: async (appId, openId) => {
+      const looked = await lookupUnionId(appId, openId);
+      if ('notFound' in looked) {
+        io.warn?.(`[workflow] ${appId} cannot look up the run initiator's union_id (contact visibility or scope): `
+          + 'the /cd gate answers by open_id alone, without its team member / meeting inviter legs');
+      }
+      return looked;
+    },
     canUseCd: (appId, chatId, openId, unionId) => io.canRunDaemonCommand(appId, chatId, openId, unionId, OPERATE_COMMAND, 'group'),
   };
   return {
@@ -213,7 +229,10 @@ export function createWorkflowWorkingDirOperatorWiring(io: WorkflowWorkingDirOpe
       },
     }, input),
     initiatorCdGate: (input) => workflowInitiatorCdGate(gateDeps, input),
-    lookupOwnUnionId: (openId) => lookupUnionId(io.selfLarkAppId(), openId),
+    lookupOwnUnionId: async (openId) => {
+      const looked = await lookupUnionId(io.selfLarkAppId(), openId);
+      return 'notFound' in looked ? { unknown: looked.notFound } : looked;
+    },
   };
 }
 

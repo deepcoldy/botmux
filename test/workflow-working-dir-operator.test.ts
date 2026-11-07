@@ -75,6 +75,7 @@ function io(opts: {
   union?: () => ReturnType<WorkflowWorkingDirOperatorIo['resolveUnionIdFromOpenId']>;
 } = {}) {
   const calls: string[] = [];
+  const warnings: string[] = [];
   const value: WorkflowWorkingDirOperatorIo = {
     resolveTargetAppOpenId: async (appId, unionId) => {
       calls.push(`resolve:${appId}:${unionId}`);
@@ -93,8 +94,9 @@ function io(opts: {
     },
     canRunDaemonCommand: opts.gate ?? humanCanRunDaemonCommand,
     selfLarkAppId: () => MAIN,
+    warn: (message) => { warnings.push(message); },
   };
-  return { io: value, calls };
+  return { io: value, calls, warnings };
 }
 
 describe('humanCanRunDaemonCommand: the /cd gate a typed command passes', () => {
@@ -159,7 +161,7 @@ describe('workflowInitiatorOperates: three answers', () => {
     expect(membership).not.toHaveBeenCalled();
   });
 
-  it('the main bot\'s own app, no union_id on the run: a refusal by open_id is asked again with the union_id that app looks up; a failed lookup is unknown, never yes', async () => {
+  it('the main bot\'s own app, no union_id on the run: a refusal by open_id is asked again with the union_id that app looks up; a failed lookup is unknown, one the app definitively cannot answer is no — never yes', async () => {
     const own = { sourceLarkAppId: MAIN, openId: ALICE_IN_MAIN };
     const ask = (overrides: Partial<WorkflowInitiatorOperatesDeps>, initiator: typeof own | typeof fromMain = own) =>
       workflowInitiatorOperates(deps(overrides).value, { larkAppId: MAIN, chatId: CHAT, initiator });
@@ -177,6 +179,12 @@ describe('workflowInitiatorOperates: three answers', () => {
       expect(await ask({ canUseCd: byUnion, lookupUnionId, chatMembership: membership })).toEqual({ unknown: expect.any(String) });
       expect(membership).not.toHaveBeenCalled();
     }
+    // The app definitively cannot see her: the open_id's refusal stands.
+    const notFound = vi.fn(async () => 'member' as const);
+    expect(await ask({ canUseCd: byUnion, lookupUnionId: async () => ({ notFound: 'not visible' }), chatMembership: notFound })).toBe('no');
+    expect(notFound).not.toHaveBeenCalled();
+    expect(await workflowInitiatorCdGate(deps({ canUseCd: byUnion, lookupUnionId: async () => ({ notFound: 'not visible' }) }).value,
+      { larkAppId: MAIN, chatId: CHAT, initiator: own })).toBe('no');
     // Looked up and still refused: no.
     expect(await ask({ canUseCd: () => false, lookupUnionId: found })).toBe('no');
     // The open_id alone passes, or the run froze a union_id: nothing is looked up.
@@ -243,7 +251,7 @@ describe('createWorkflowWorkingDirOperatorWiring (what the daemon wires)', () =>
     expect(w.calls).toEqual([`resolve:${OTHER}:${ALICE_UNION}`]);
   });
 
-  it('the main bot\'s own app, real gate: a platform team member of a bot that lowered /cd to talk passes once her union_id is looked up there; a lookup that fails is unknown', async () => {
+  it('the main bot\'s own app, real gate: a platform team member of a bot that lowered /cd to talk passes once her union_id is looked up there; a lookup that fails is unknown, one its app definitively cannot answer leaves the open_id\'s no', async () => {
     bot(MAIN, ['ou_owner'], { canTalkDaemonCommands: ['/cd'] });
     const initiator = { sourceLarkAppId: MAIN, openId: ALICE_IN_MAIN };
     const ask = (w: ReturnType<typeof io>) => createWorkflowWorkingDirOperatorWiring(w.io).initiatorOperates({ larkAppId: MAIN, chatId: CHAT, initiator });
@@ -258,11 +266,18 @@ describe('createWorkflowWorkingDirOperatorWiring (what the daemon wires)', () =>
     const teamMember = io({ members });
     expect(await ask(teamMember)).toBe('yes');
     expect(teamMember.calls).toEqual([`union:${MAIN}:${ALICE_IN_MAIN}`, `members:${MAIN}:${CHAT}`]);
-    for (const union of [async () => ({ status: 'unavailable' }) as const, async () => ({ status: 'retryable', error: '503' }) as const, async () => { throw new Error('down'); }]) {
+    for (const union of [async () => ({ status: 'retryable', error: '503' }) as const, async () => { throw new Error('down'); }]) {
       const failing = io({ members, union });
       expect(await ask(failing)).toEqual({ unknown: expect.any(String) });
       expect(failing.calls).toEqual([`union:${MAIN}:${ALICE_IN_MAIN}`]);
+      expect(failing.warnings).toEqual([]);
     }
+    // Not visible to the app, an invalid id, a missing contact scope: retrying
+    // will not help, so the answer is the open_id's own (no), with a log line.
+    const invisible = io({ members, union: async () => ({ status: 'unavailable' }) });
+    expect(await ask(invisible)).toBe('no');
+    expect(invisible.calls).toEqual([`union:${MAIN}:${ALICE_IN_MAIN}`]);
+    expect(invisible.warnings).toEqual([expect.stringContaining(`${MAIN} cannot look up the run initiator's union_id`)]);
     // The gate alone, as the main bot's own node asks before its cards go out.
     const gateOnly = io({ members });
     expect(await createWorkflowWorkingDirOperatorWiring(gateOnly.io).initiatorCdGate({ larkAppId: MAIN, chatId: CHAT, initiator })).toBe('passes');
@@ -273,7 +288,9 @@ describe('createWorkflowWorkingDirOperatorWiring (what the daemon wires)', () =>
     const w = io();
     const wiring = createWorkflowWorkingDirOperatorWiring(w.io);
     expect(await wiring.lookupOwnUnionId(ALICE_IN_MAIN)).toEqual({ unionId: ALICE_UNION });
+    // Not visible to it: still unknown here — the union route answers 503 as before.
     expect(await wiring.lookupOwnUnionId('ou_nobody')).toEqual({ unknown: expect.any(String) });
+    expect(w.warnings).toEqual([]);
     expect(w.calls).toEqual([`union:${MAIN}:${ALICE_IN_MAIN}`, `union:${MAIN}:ou_nobody`]);
   });
 });

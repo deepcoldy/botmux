@@ -427,6 +427,23 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
     expect(target.posted).toEqual([]);
   });
 
+  it('only a known decision starts the node: an unknown kind, a pinned one without a directory, or a promise never awaited is refused with a reason that names nothing internal', async () => {
+    const { run, world, attempt, binding } = await handedOffPinned('wdd-undecided', undefined);
+    const warnings: string[] = [];
+    const target = daemon('cli_a', world.dataDir, run.base, run, { warn: (message) => { warnings.push(message); } });
+    const admit = (dir: unknown) => target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a', undefined, undefined, dir as never);
+    expect(admit({ kind: 'default' })).toEqual({ start: true });
+    const undecided = [{ kind: 'bogus' }, { kind: 'pinned' }, Promise.resolve({ kind: 'default' }), undefined];
+    for (const dir of undecided) {
+      const decision = admit(dir);
+      expect(decision).toEqual({ start: false, reason: expect.stringContaining('没能确定节点该在哪个目录执行') });
+      expect((decision as { reason: string }).reason).not.toMatch(/kind|bogus|Promise|object|undefined/);
+    }
+    // Each refusal reaches the main bot, which blocks the node; no session starts.
+    await eventually(() => expect(target.posted.map((post) => post.body.kind)).toEqual(undecided.map(() => 'refused')));
+    expect(warnings.join('\n')).toContain('kind bogus');
+  });
+
   it('a refusal reaches the main bot, which blocks the node with the reason (no session involved)', async () => {
     const d = dirs();
     const { run, world, attempt, binding } = await handedOffPinned('wdd-refuse', d.project);
@@ -731,14 +748,15 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
    * `cdUsers[app]` run `/cd`, and `cdUnions[app]` (union_ids: the platform
    * team member leg) when the gate is given one. `seen` records every gate
    * question, `unionLookups` every open_id → union_id lookup (`unionLookup`:
-   * that lookup fails or never answers), `memberReads` every member list read.
+   * that lookup fails for now, never answers, or the app definitively cannot
+   * see her), `memberReads` every member list read.
    */
   function operateDeps(cdUsers: Record<string, string[]>, opts: {
     directory?: 'up' | 'down' | 'definitive';
     members?: Record<string, string[] | Error>;
     membershipCache?: WorkflowSidebarMembershipCache;
     cdUnions?: Record<string, string[]>;
-    unionLookup?: 'down' | 'hang';
+    unionLookup?: 'down' | 'hang' | 'unavailable';
   } = {}) {
     const seen: string[] = [];
     const conversions: string[] = [];
@@ -755,6 +773,7 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
         unionLookups.push(`${appId}:${openId}`);
         if (opts.unionLookup === 'hang') return new Promise(() => {});
         if (opts.unionLookup === 'down') return { status: 'retryable', error: 'contact api 503' };
+        if (opts.unionLookup === 'unavailable') return { status: 'unavailable' };
         return openId === INITIATOR_OU_IN[appId] ? { status: 'resolved', unionId: INITIATOR_UNION } : { status: 'unavailable' };
       },
       listChatMemberOpenIds: async (appId) => {
@@ -1098,13 +1117,14 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
     }
   });
 
-  it('the main bot\'s own node, no union_id frozen: the /cd gate gets the union_id its own app looks up; a failed lookup is "could not confirm", never a pass', async () => {
+  it('the main bot\'s own node, no union_id frozen: the /cd gate gets the union_id its own app looks up; a failed lookup is "could not confirm", one its app definitively cannot answer is the range refusal — never a pass, and no card goes out', async () => {
     const d = dirs();
-    for (const [unionLookup, expectStarted] of [[undefined, true], ['down', false]] as const) {
+    for (const [unionLookup, expected] of [[undefined, 'started'], ['down', 'unknown'], ['unavailable', 'out of range']] as const) {
       const run = new BotRun(reportDag(`wdo-self-team-${unionLookup ?? 'up'}`, { bot: undefined }));
       authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.lab });
       const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdo-self-team-')));
       const delivered: Array<{ workingDir?: string }> = [];
+      const cardsOut: string[] = [];
       // No admin of the main bot: its gate lets her use /cd by her union_id
       // (a platform team member of a bot that lowered /cd to talk).
       const op = operateDeps({ [MAIN]: [] }, { cdUnions: { [MAIN]: [INITIATOR_UNION] }, ...(unionLookup ? { unionLookup } : {}) });
@@ -1112,20 +1132,28 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
         botWorkingDirConfig: () => ({ defaultWorkingDir: d.repos }),
         initiatorOperates: op.initiatorOperates,
         initiatorCdGate: op.initiatorCdGate,
-        sendCard: async () => 'om_node_card',
-        replyCard: async () => 'om_handoff_card',
+        sendCard: async () => { cardsOut.push('node'); return 'om_node_card'; },
+        replyCard: async () => { cardsOut.push('handoff'); return 'om_handoff_card'; },
         deliverSelfTurn: async (input) => { delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) }); return { sessionId: 'self-session' }; },
       });
       await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
-      if (expectStarted) {
+      if (expected === 'started') {
         await eventually(() => expect(delivered).toEqual([{ workingDir: realpathSync(d.lab) }]));
         expect(run.of('nodeBlocked')).toEqual([]);
+        expect(cardsOut).toEqual(['node', 'handoff']);
       } else {
         await eventually(() => expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]));
         const message = run.of('nodeBlocked')[0]!.message;
-        expect(message).toContain('暂时无法确认发起人能否操作');
-        expect(message).toContain('稍后重试');
+        if (expected === 'unknown') {
+          expect(message).toContain('暂时无法确认发起人能否操作');
+          expect(message).toContain('稍后重试');
+        } else {
+          expect(message).toContain('不在这个 Bot 配置的目录范围内');
+          expect(message).not.toContain('暂时无法确认');
+        }
         expect(delivered).toEqual([]);
+        // Refused before anything is posted: no node card, no handoff card.
+        expect(cardsOut).toEqual([]);
       }
       // Looked up through the main bot's own app, by the open_id it issued.
       expect(new Set(op.unionLookups)).toEqual(new Set([`${MAIN}:${INITIATOR_MAIN_OU}`]));
@@ -1386,6 +1414,12 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
       // A platform team member, no admin: passes once the lookup answers.
       const teamMember = { cdUnions: { [MAIN]: [INITIATOR_UNION] } };
       expect(await ask(operateDeps({ [MAIN]: [] }, teamMember))).toEqual({ status: 200, body: { ok: true, operate: 'yes' } });
+      // Its app definitively cannot see her: the open_id's refusal stands (the
+      // range refusal at Gate-2), as before the lookup existed; a lookup that
+      // fails for now is "could not confirm".
+      expect(await ask(operateDeps({ [MAIN]: [] }, { ...teamMember, unionLookup: 'unavailable' }))).toEqual({ status: 200, body: { ok: true, operate: 'no' } });
+      expect(await ask(operateDeps({ [MAIN]: [] }, { ...teamMember, unionLookup: 'down' })))
+        .toEqual({ status: 200, body: { ok: true, operate: { unknown: expect.any(String) } } });
       vi.useFakeTimers();
       try {
         let answered: unknown;

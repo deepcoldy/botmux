@@ -136,6 +136,46 @@ export type WorkflowNodeWorkingDir =
   /** Do not start (or continue) the node here; the node blocks with `reason`. */
   | { kind: 'refused'; reason: string };
 
+const UNDECIDED_NODE_WORKING_DIR: WorkflowNodeWorkingDir = {
+  kind: 'refused',
+  reason: '没能确定节点该在哪个目录执行，未启动节点；请重试，或改派',
+};
+
+/** `dir` when it is one of the kinds, whole; anything else (a kind added
+ *  later, or not a decision at all — e.g. a promise never awaited) refuses:
+ *  only `default` may start a node in the bot's default directory. */
+function knownNodeWorkingDir(dir: WorkflowNodeWorkingDir): WorkflowNodeWorkingDir {
+  if (typeof dir !== 'object' || dir === null) return UNDECIDED_NODE_WORKING_DIR;
+  switch (dir.kind) {
+    case 'default':
+      return dir;
+    case 'pinned':
+      return typeof dir.dir === 'string' && dir.dir !== '' ? dir : UNDECIDED_NODE_WORKING_DIR;
+    case 'refused':
+      return typeof dir.reason === 'string' ? dir : UNDECIDED_NODE_WORKING_DIR;
+    default: {
+      const unhandled: never = dir;
+      void unhandled;
+      return UNDECIDED_NODE_WORKING_DIR;
+    }
+  }
+}
+
+/** Where a decision that starts the node starts it: the pinned directory, or
+ *  `undefined` — the bot's default — for `default` only. */
+function startDirOf(dir: Exclude<WorkflowNodeWorkingDir, { kind: 'refused' }>): string | undefined {
+  switch (dir.kind) {
+    case 'pinned':
+      return dir.dir;
+    case 'default':
+      return undefined;
+    default: {
+      const unhandled: never = dir;
+      return unhandled;
+    }
+  }
+}
+
 export interface WorkflowNodeDaemonDeps {
   selfLarkAppId(): string;
   dataDir(): string;
@@ -863,7 +903,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       // node (nothing is started). Decided FIRST: it may wait for lookups,
       // and everything below (busy session, existing session, revocation)
       // is read after the wait, never before it.
-      const dir = await nodeWorkingDir(runDir, input.marker.runId, deps.selfLarkAppId());
+      const dir = knownNodeWorkingDir(await nodeWorkingDir(runDir, input.marker.runId, deps.selfLarkAppId()));
       // §5.5: the main session already carries another run's main-topic node.
       const reused = deps.findNodeSession(input.publishRoot, deps.selfLarkAppId());
       const busy = reused && reused.session.status !== 'closed'
@@ -906,6 +946,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId} not started: stopped while its directory was being decided`);
         return { refused: true as const };
       }
+      const startDir = startDirOf(dir);
       const inputs = readWorkflowAttemptInputs(runDir, input.marker.attemptId) ?? input.inputs;
       const staged = stageWorkflowNodeInputs({
         runDir,
@@ -925,7 +966,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         attachments: staged.attachments,
         sessionTitle: input.sessionTitle,
         ...(input.identityDelegated ? { prepareTurnIdentity: deps.prepareTurnIdentity } : {}),
-        ...(dir.kind === 'pinned' ? { workingDir: dir.dir } : {}),
+        ...(startDir !== undefined ? { workingDir: startDir } : {}),
       });
       // The session registered the handoff: record acceptance now rather than
       // at the acceptance deadline's probe (which would find the same marker).
@@ -1145,7 +1186,10 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         void refuse(binding, handoffMessageId, busy, 'MAIN_TOPIC_BUSY');
         return { start: false, reason: busy };
       }
-      let dir = decidedDir;
+      let dir = knownNodeWorkingDir(decidedDir);
+      if (dir === UNDECIDED_NODE_WORKING_DIR && decidedDir !== UNDECIDED_NODE_WORKING_DIR) {
+        deps.warn(`[workflow] handoff ${handoffMessageId}: not a working-dir decision (${typeof decidedDir === 'object' && decidedDir !== null ? `kind ${String((decidedDir as { kind?: unknown }).kind)}` : typeof decidedDir})`);
+      }
       // The node topic already has a session (someone @-ed the bot there, or
       // moved it with /cd): the handoff would run where that session runs.
       if (dir.kind === 'pinned' && workflowNodeSessionDirConflicts(dir.dir, existingSessionDir)) {
@@ -1156,7 +1200,8 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         void refuse(binding, handoffMessageId, dir.reason);
         return { start: false, reason: dir.reason };
       }
-      return dir.kind === 'pinned' ? { start: true, workingDir: dir.dir } : { start: true };
+      const workingDir = startDirOf(dir);
+      return workingDir !== undefined ? { start: true, workingDir } : { start: true };
     },
     stageInbound: (binding, messageId) => {
       const runDir = runDirOf(binding.workflow.runId);
