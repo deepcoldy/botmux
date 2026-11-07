@@ -148,6 +148,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     };
   })()),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   isRelayableRealSession: vi.fn((ds: DaemonSession) =>
     (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
   isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
