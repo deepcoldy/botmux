@@ -45,7 +45,15 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
     messageId: parsed.messageId, chatId: message.chat_id, senderOpenId: parsed.senderId, threadId: message.thread_id,
   }) : message.chat_id);
   if (!anchor) return false;
-  return runtime.capture({ messageId: parsed.messageId, chatId: message.chat_id,
-    anchor, senderOpenId: parsed.senderId, ...(message.thread_id ? { threadId: message.thread_id } : {}),
-    memberUnionId: parsed.senderUnionId, text, ...(attachments.length ? { attachments } : {}), botSender: false });
+  const input = { messageId: parsed.messageId, chatId: message.chat_id, senderOpenId: parsed.senderId,
+    ...(message.thread_id ? { threadId: message.thread_id } : {}),
+    memberUnionId: parsed.senderUnionId, text, ...(attachments.length ? { attachments } : {}), botSender: false };
+  if (runtime.capture({ ...input, anchor })) return true;
+  // Lark's quote bubble sets root_id without thread_id. Routing treats such a message as top-level
+  // (decideRouting), so when no binding claims the quoted message itself, a chat-anchored binding
+  // gets it — otherwise a quote-reply in a captured chat would fall through to the bound session.
+  if (message.root_id && !message.thread_id && anchor !== message.chat_id) {
+    return runtime.capture({ ...input, anchor: message.chat_id });
+  }
+  return false;
 }

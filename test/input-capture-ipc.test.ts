@@ -75,6 +75,28 @@ it('captures a plugin card reply synchronously while preserving commands, attach
   expect(captureInboundText(event('inspect only'), f.runtime, () => false)).toBe(true);
   expect(f.store.read().inputs).toHaveLength(1);
 });
+it('gives a quote-reply without a topic to the chat-anchored binding, after a binding on the quoted message', async () => {
+  const f = setup();
+  f.runtime.register('s', { pluginId: 'example', requestId: 'chat', providerRef: 'chat' });
+  f.runtime.register('s', { pluginId: 'example', requestId: 'card', providerRef: 'card', inputAnchor: 'om_card' });
+  const ids = Object.fromEntries(f.store.read().bindings.map(b => [b.anchor, b.id]));
+  expect(ids).toMatchObject({ oc_chat: expect.any(String), om_card: expect.any(String) });
+  const reply = (messageId: string, rootId: string, patch = {}) => ({ sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+    message: { message_id: messageId, chat_id: 'oc_chat', chat_type: 'group', root_id: rootId, parent_id: rootId,
+      message_type: 'text', content: JSON.stringify({ text: `follow-up ${messageId}` }), ...patch } });
+  // Lark quote bubble: root_id without thread_id. Routing treats it as top-level, so the chat binding gets it.
+  expect(captureInboundText(reply('om_quote', 'om_earlier'), f.runtime, () => false)).toBe(true);
+  // a redelivery is the same input, not a second one
+  expect(captureInboundText(reply('om_quote', 'om_earlier'), f.runtime, () => false)).toBe(true);
+  // a reply quoting the card still belongs to the card's binding
+  expect(captureInboundText(reply('om_card_answer', 'om_card'), f.runtime, () => false)).toBe(true);
+  // a reply inside a real topic stays with the topic's own routing
+  expect(captureInboundText(reply('om_in_topic', 'om_earlier', { thread_id: 'omt_topic' }), f.runtime, () => false)).toBe(false);
+  expect(f.store.read().inputs.map(i => [i.messageId, i.bindingId])).toEqual([
+    ['om_quote', ids.oc_chat], ['om_card_answer', ids.om_card],
+  ]);
+  await f.runtime.drain();
+});
 it('authenticates batch revocation and reports atomic conflicts through the real CLI request shape', async () => {
   const f = setup(); setInputCaptureRuntime('cli_capture', f.runtime); setLarkAppId('cli_capture'); setIpcAuthSecret('capture-test-secret');
   const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true }); cleanup.push(() => server.close());
