@@ -131,6 +131,52 @@ describe('migration output stays loadable under strict sandbox field validation 
     expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
     expect(read()[0].sandboxPaths).toBeUndefined();
   });
+
+  it('repairs a malformed on-disk tier in place without losing its valid entries', async () => {
+    // No legacy source at all: the surviving string element must be kept —
+    // repairing loadability must never widen the sandbox by dropping a deny.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxPaths: { deny: ['/srv/secret', null] },
+    }]);
+    await migrateSandboxConfigOnDisk(botsPath);
+    const tiers = read()[0].sandboxPaths;
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(tiers.deny).toContain('/srv/secret');
+    expect(tiers.deny).toEqual(['/srv/secret']);
+  });
+
+  it('keeps valid on-disk tiers authoritative; stale legacy only fills absent tiers', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh'], // retained-for-downgrade legacy, now stale
+      sandboxPaths: { deny: ['/srv/secret', 42], readWrite: ['/srv/work'] },
+    }]);
+    await migrateSandboxConfigOnDisk(botsPath);
+    const tiers = read()[0].sandboxPaths;
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    // Monotonicity: every valid on-disk entry survives the repair.
+    expect(tiers.deny).toEqual(['/srv/secret']);
+    expect(tiers.readWrite).toEqual(['/srv/work']);
+    // Stale legacy must not overwrite an existing on-disk tier.
+    expect(tiers.deny).not.toContain('~/.ssh');
+  });
+
+  it('fills an absent on-disk tier from legacy while repairing a malformed sibling', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['/legacy-deny'],
+      sandboxPaths: { readOnly: ['/srv/ro', 9] },
+    }]);
+    await migrateSandboxConfigOnDisk(botsPath);
+    const tiers = read()[0].sandboxPaths;
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(tiers.readOnly).toEqual(['/srv/ro']);
+    expect(tiers.deny).toEqual(['/legacy-deny']);
+  });
 });
 
 describe('migrateSandboxConfigAtStartup when the bots.json lock is busy', () => {

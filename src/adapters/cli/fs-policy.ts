@@ -1611,12 +1611,19 @@ export interface MigratedSandboxFields {
  */
 export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandboxPaths?: unknown }): MigratedSandboxFields | null {
   // Already on the new model in a loadable shape → nothing to do. A malformed
-  // value falls through so the retained legacy fields repair it on this pass.
+  // value falls through so this pass repairs it in place.
   if (entry.sandboxPaths !== undefined && isLoadableSandboxPaths(entry.sandboxPaths)) return null;
   const hasLegacy = entry.readIsolation === true
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
     || (entry.readDenyExtraPaths?.length ?? 0) > 0;
+  const onDisk = entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
+    ? (entry.sandboxPaths as Record<string, unknown>)
+    : undefined;
+  // No legacy fields to map and no malformed object worth repairing → no-op.
+  // A non-object malformed value with no legacy source stays fail-closed: there
+  // is nothing valid to preserve and nothing to rebuild it from.
+  if (!hasLegacy && !onDisk) return null;
   // Preserve the tri-state: only oncall representations collapse to boolean
   // true; 'scratch' passes through unchanged (the old path lists are irrelevant
   // to scratch's full-root COW, but the mode itself must not be downgraded).
@@ -1625,14 +1632,32 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     : (entry.sandbox === true
       || entry.sandbox === 'oncall'
       || entry.readIsolation === true);
-  if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
-  const readOnly = sanitizeLegacyPathList(entry.sandboxReadonlyPaths);
-  const deny = [...sanitizeLegacyPathList(entry.sandboxHidePaths), ...sanitizeLegacyPathList(entry.readDenyExtraPaths)];
-  const sandboxPaths: MigratedSandboxFields['sandboxPaths'] = {};
-  if (readOnly.length) sandboxPaths.readOnly = readOnly;
-  if (deny.length) sandboxPaths.deny = [...new Set(deny)];
+  // Legacy-derived tiers; the raw legacy fields stay on disk for downgrade.
+  const legacyReadOnly = sanitizeLegacyPathList(entry.sandboxReadonlyPaths);
+  const legacyDeny = [
+    ...sanitizeLegacyPathList(entry.sandboxHidePaths),
+    ...sanitizeLegacyPathList(entry.readDenyExtraPaths),
+  ];
+  // The on-disk tiers are the dashboard/CLI-written source of truth: sanitize
+  // them in place (dropping only unloadable elements). Legacy fills a tier only
+  // when the on-disk tier is absent or empties out — never overwrite a surviving
+  // valid on-disk entry, which would silently widen the sandbox.
+  const mergeTier = (onDiskRaw: unknown, legacyList: string[]): string[] | undefined => {
+    const fromDisk = sanitizeLegacyPathList(onDiskRaw);
+    if (fromDisk.length) return fromDisk;
+    return legacyList.length ? legacyList : undefined;
+  };
+  // readWrite has no legacy source (the old field set never expressed it).
+  const readWrite = sanitizeLegacyPathList(onDisk?.readWrite);
+  const readOnly = mergeTier(onDisk?.readOnly, legacyReadOnly);
+  const deny = mergeTier(onDisk?.deny, legacyDeny);
+  const sandboxPaths: NonNullable<MigratedSandboxFields['sandboxPaths']> = {};
+  if (readWrite.length) sandboxPaths.readWrite = readWrite;
+  if (readOnly?.length) sandboxPaths.readOnly = readOnly;
+  if (deny?.length) sandboxPaths.deny = [...new Set(deny)];
+  const hasAnyTier = readWrite.length > 0 || (readOnly?.length ?? 0) > 0 || (deny?.length ?? 0) > 0;
   return {
     sandbox,
-    ...(readOnly.length || deny.length ? { sandboxPaths } : {}),
+    ...(hasAnyTier ? { sandboxPaths } : {}),
   };
 }
