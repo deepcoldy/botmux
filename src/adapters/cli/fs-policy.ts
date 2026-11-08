@@ -1554,6 +1554,39 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
 
 // ───────────────────────────── legacy config migration ───────────────────────
 
+/**
+ * Legacy path arrays were historically tolerated in any shape: the parser ran
+ * them through normalizeStringList, which silently dropped non-arrays and
+ * non-string elements. Migration copies their content into the new sandboxPaths
+ * field, whose strict loader rejects those shapes, so the same normalization
+ * must run HERE — the migration output must always be loadable instead of
+ * bricking the next daemon start.
+ */
+function sanitizeLegacyPathList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
+    .map(p => p.trim());
+}
+
+/**
+ * Whether an on-disk `sandboxPaths` value has a shape the strict loader accepts
+ * (mirrors parseBotConfigsFromText: null/absent means "not set"; a tier may be
+ * absent/null or a string array). A malformed value must not make migration a
+ * no-op — the legacy fields stay on disk by design, so re-running the migration
+ * can repair it once.
+ */
+export function isLoadableSandboxPaths(raw: unknown): boolean {
+  if (raw === undefined || raw === null) return true;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return false;
+  return (['readWrite', 'readOnly', 'deny'] as const).every((tier) => {
+    const value = (raw as Record<string, unknown>)[tier];
+    return value === undefined
+      || value === null
+      || (Array.isArray(value) && value.every(p => typeof p === 'string'));
+  });
+}
+
 export interface LegacySandboxFields {
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
@@ -1577,11 +1610,20 @@ export interface MigratedSandboxFields {
  * reverse script (design doc §6.2). Returns null when nothing to migrate.
  */
 export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandboxPaths?: unknown }): MigratedSandboxFields | null {
-  if (entry.sandboxPaths !== undefined) return null; // already on the new model
+  // Already on the new model in a loadable shape → nothing to do. A malformed
+  // value falls through so this pass repairs it in place.
+  if (entry.sandboxPaths !== undefined && isLoadableSandboxPaths(entry.sandboxPaths)) return null;
   const hasLegacy = entry.readIsolation === true
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
     || (entry.readDenyExtraPaths?.length ?? 0) > 0;
+  const onDisk = entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
+    ? (entry.sandboxPaths as Record<string, unknown>)
+    : undefined;
+  // No legacy fields to map and no malformed object worth repairing → no-op.
+  // A non-object malformed value with no legacy source stays fail-closed: there
+  // is nothing valid to preserve and nothing to rebuild it from.
+  if (!hasLegacy && !onDisk) return null;
   // Preserve the tri-state: only oncall representations collapse to boolean
   // true; 'scratch' passes through unchanged (the old path lists are irrelevant
   // to scratch's full-root COW, but the mode itself must not be downgraded).
@@ -1590,14 +1632,48 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     : (entry.sandbox === true
       || entry.sandbox === 'oncall'
       || entry.readIsolation === true);
-  if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
-  const readOnly = [...(entry.sandboxReadonlyPaths ?? [])];
-  const deny = [...(entry.sandboxHidePaths ?? []), ...(entry.readDenyExtraPaths ?? [])];
-  const sandboxPaths: MigratedSandboxFields['sandboxPaths'] = {};
-  if (readOnly.length) sandboxPaths.readOnly = readOnly;
-  if (deny.length) sandboxPaths.deny = [...new Set(deny)];
+  // Legacy-derived tiers; the raw legacy fields stay on disk for downgrade.
+  const legacyReadOnly = sanitizeLegacyPathList(entry.sandboxReadonlyPaths);
+  const legacyDeny = [
+    ...sanitizeLegacyPathList(entry.sandboxHidePaths),
+    ...sanitizeLegacyPathList(entry.readDenyExtraPaths),
+  ];
+  // A non-array tier (the #2530 scalar typo: deny:"~/.ssh", or a number/object)
+  // carries no extractable path. With no legacy tier to rebuild it from,
+  // "repairing" would delete the field and silently widen the sandbox BEFORE the
+  // parser runs, so its accurate field error would never surface — the exact
+  // defect #2530 set out to remove. Bail out and let the strict loader reject.
+  // An all-invalid ARRAY is different: it holds zero valid strings, so dropping
+  // it loses nothing. readWrite has no legacy source at all.
+  const scalarTierWithoutSource = (raw: unknown, legacyList: string[]): boolean =>
+    raw !== undefined && raw !== null && !Array.isArray(raw) && legacyList.length === 0;
+  if (
+    scalarTierWithoutSource(onDisk?.readWrite, [])
+    || scalarTierWithoutSource(onDisk?.readOnly, legacyReadOnly)
+    || scalarTierWithoutSource(onDisk?.deny, legacyDeny)
+  ) {
+    return null;
+  }
+  // The on-disk tiers are the dashboard/CLI-written source of truth: sanitize
+  // them in place (dropping only unloadable elements). Legacy fills a tier only
+  // when the on-disk tier is absent or empties out — never overwrite a surviving
+  // valid on-disk entry, which would silently widen the sandbox.
+  const mergeTier = (onDiskRaw: unknown, legacyList: string[]): string[] | undefined => {
+    const fromDisk = sanitizeLegacyPathList(onDiskRaw);
+    if (fromDisk.length) return fromDisk;
+    return legacyList.length ? legacyList : undefined;
+  };
+  // readWrite has no legacy source (the old field set never expressed it).
+  const readWrite = sanitizeLegacyPathList(onDisk?.readWrite);
+  const readOnly = mergeTier(onDisk?.readOnly, legacyReadOnly);
+  const deny = mergeTier(onDisk?.deny, legacyDeny);
+  const sandboxPaths: NonNullable<MigratedSandboxFields['sandboxPaths']> = {};
+  if (readWrite.length) sandboxPaths.readWrite = readWrite;
+  if (readOnly?.length) sandboxPaths.readOnly = readOnly;
+  if (deny?.length) sandboxPaths.deny = [...new Set(deny)];
+  const hasAnyTier = readWrite.length > 0 || (readOnly?.length ?? 0) > 0 || (deny?.length ?? 0) > 0;
   return {
     sandbox,
-    ...(readOnly.length || deny.length ? { sandboxPaths } : {}),
+    ...(hasAnyTier ? { sandboxPaths } : {}),
   };
 }
