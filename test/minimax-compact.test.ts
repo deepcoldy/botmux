@@ -65,7 +65,7 @@ function idleQueue(worker: ReturnType<typeof rawWorker>) {
     releaseActiveTurnAuthority: () => scope.activeTurnAuthority.clear(), promptReadyEdges: 0,
     judgeClaudeBridgeTurn: noop, bridgeQueue: { cliQueueDrained: noop },
     settleSessionRenameOnPrompt: noop, syncQueuedTurnsFromMarkerDisk: off, releaseRawInputRestartGate: noop,
-    inflightInputs: { onTurnComplete: noop }, maybeEmitWorkflowTranscriptOutput: noop,
+    inflightInputs: { onTurnComplete: noop, retireTurn: noop }, maybeEmitWorkflowTranscriptOutput: noop,
     refreshBackgroundWait: noop, backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     settleRestartAttemptOnReady: noop, shouldFlushInjectionsFirst: off,
     nativeSessionForkPending: off, codexModelMigrationCheckNeeded: off, shouldHoldCodexRunnerInput: off,

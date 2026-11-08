@@ -18045,6 +18045,13 @@ async function handleTrustedCodexAppMarker(
         // ready publishes there (never here).
         codexAppCompletionAwaitingFinal = false;
       }
+    } else {
+      // The final settles this turn even when the runner exits right after it:
+      // dsh follows its fatal-error final with exit(1) not only on the turn
+      // watchdog but also when the underlying dsh process died (timed out /
+      // exited / not running in isFatalRunnerError), so a restart must not
+      // replay that turn's input into a brand-new session.
+      inflightInputs.retireTurn(turnId);
     }
     // The app-server runner timestamps its own completion; prefer that instant
     // over "whenever this worker got around to handling the marker". The clock
