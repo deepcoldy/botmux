@@ -21,7 +21,8 @@ import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
-import { writeSessionModelPin } from '../../core/worker-pool.js';
+import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
@@ -889,6 +890,15 @@ export async function commitRepoSelection(
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
+      // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+      // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+      if (!emptyStart && !pendingRawInput && pendingTurnId) {
+        recordTurnExplicitMention(ds, pendingTurnId, messageMentionsBot(
+          { mentions: ds.pendingMentions },
+          ds.larkAppId,
+          selfBot.botOpenId,
+        ));
+      }
       forkWorker(
         ds,
         prompt,

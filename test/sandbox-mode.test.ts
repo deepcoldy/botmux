@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   envSandboxMode,
   normalizeSandboxMode,
@@ -9,6 +9,7 @@ import {
   sandboxIsActive,
   sessionCardSandboxMode,
 } from '../src/adapters/cli/sandbox-mode.js';
+import { sandboxEnabled } from '../src/adapters/backend/sandbox.js';
 
 describe('normalizeSandboxMode', () => {
   it('maps legacy boolean/absent values', () => {
@@ -56,6 +57,25 @@ describe('envSandboxMode (BOTMUX_SANDBOX)', () => {
   it('throws on unknown values (never silently off)', () => {
     expect(() => envSandboxMode('2')).toThrow(/invalid BOTMUX_SANDBOX/);
     expect(() => envSandboxMode('yes')).toThrow(/invalid BOTMUX_SANDBOX/);
+  });
+});
+
+describe('sandboxEnabled (global BOTMUX_SANDBOX force)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it.each(['1', 'oncall', 'scratch'])('BOTMUX_SANDBOX=%s forces the sandbox', raw => {
+    vi.stubEnv('BOTMUX_SANDBOX', raw);
+    expect(sandboxEnabled()).toBe(true);
+  });
+
+  it.each([undefined, '', '0', 'false'])('BOTMUX_SANDBOX=%s does not force it', raw => {
+    vi.stubEnv('BOTMUX_SANDBOX', raw);
+    expect(sandboxEnabled()).toBe(false);
+  });
+
+  it('treats an invalid value as forced (the worker refuses to spawn with it)', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', 'yes');
+    expect(sandboxEnabled()).toBe(true);
   });
 });
 

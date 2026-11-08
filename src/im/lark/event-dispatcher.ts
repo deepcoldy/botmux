@@ -49,7 +49,7 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, CHAT_DISBANDED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { isGrantTargetOnly, tryHandleGrantCommand } from './grant-command.js';
 import { applyDelegatedGrants } from './delegated-grant.js';
@@ -944,6 +944,30 @@ export async function ensureMessageUpdatedEventSubscribed(larkAppId: string): Pr
     }
   } catch (err: any) {
     logger.debug(`[${larkAppId}] message-updated event subscription check errored: ${err?.message ?? err}`);
+  }
+}
+
+/**
+ * Startup only adds im.chat.disbanded_v1 over the cached Feishu web session,
+ * like ensureMessageUpdatedEventSubscribed. Without it, sessions in a disbanded
+ * chat stay up until the next startup reconciliation closes them.
+ */
+export async function ensureChatDisbandedEventSubscribed(larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  if (normalizeBrand(bot.config.brand) !== 'feishu') return;
+  try {
+    const result = await ensureAppEventSubscriptions(larkAppId, [CHAT_DISBANDED_EVENT]);
+    if (!result.ok) {
+      logger.info(`[${larkAppId}] ${CHAT_DISBANDED_EVENT} 配置检查未完成（${result.reason}）：群被解散时不会立即结束本 bot 在群里的会话。`);
+      return;
+    }
+    const complete = result.eventModeReady && result.missingEvents.length === 0;
+    logger.info(
+      `[${larkAppId}] ${CHAT_DISBANDED_EVENT} ${complete ? '配置回读包含事件且为长连接' : `配置回读不完整（longConnection=${result.eventModeReady}）`}`
+      + `，${result.updateSubmitted ? '本次已提交更新，启动流程不会自动发布应用版本' : '本次未更新'}；发布生效及实际推送未验证。`,
+    );
+  } catch (err: any) {
+    logger.debug(`[${larkAppId}] chat-disbanded event subscription check errored: ${err?.message ?? err}`);
   }
 }
 
@@ -3872,6 +3896,10 @@ export interface EventHandlers {
    *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
    *  Best-effort fire-and-forget. `operatorOpenId` is who added the bot. */
   handleBotAdded?: (chatId: string, operatorOpenId: string | undefined, larkAppId: string) => Promise<void>;
+  /** The chat was disbanded (`im.chat.disbanded_v1`) or this bot was removed
+   *  from it (`im.chat.member.bot.deleted_v1`). Runs after the event ACK, once
+   *  per event id. Each bot's daemon receives its own copy. */
+  handleChatGone?: (chatId: string, larkAppId: string, reason: 'disbanded' | 'bot_removed') => Promise<void>;
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
@@ -6652,6 +6680,17 @@ export function createLarkEventDispatcherRuntime(
     return ack;
   };
 
+  const scheduleChatGone = (eventType: string, data: any, reason: 'disbanded' | 'bot_removed'): void => {
+    const chatId: unknown = data?.chat_id;
+    const handleChatGone = handlers.handleChatGone;
+    if (typeof chatId !== 'string' || !chatId || !handleChatGone) return;
+    scheduleAckSafeEvent(
+      `${eventType}:${larkAppId}:${eventIdForKey(data) ?? unkeyableEventKey()}`,
+      () => handleChatGone(chatId, larkAppId, reason),
+      `${eventType} event`,
+    );
+  };
+
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
     // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
@@ -6714,11 +6753,16 @@ export function createLarkEventDispatcherRuntime(
     // bot.deleted 同样只推给被移出的 bot 自己的 app——清自己的 key 即可(语义
     // 同 bot.added:进程边界上够不到兄弟 daemon;「别的 bot 离群→存量 bot
     // 陈旧」靠①守卫+TTL)。user.added/deleted_v1 推给群内已订阅的所有 bot
-    // app,每个 bot 自己的 WS 都收到,各自清自己那条。纯本地 map 删除,同步
-    // 处理、即时 ACK,不进 work 队列;去重也不必要——失效是幂等的。
+    // app,每个 bot 自己的 WS 都收到,各自清自己那条。缓存失效是纯本地 map 删除,
+    // 同步处理且幂等;bot 被移出后关本 bot 在群里的会话则按 event id 去重、放到 ACK 之后跑。
     'im.chat.member.bot.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
       if (chatId) invalidateChatStats(larkAppId, chatId);
+      scheduleChatGone('im.chat.member.bot.deleted_v1', data, 'bot_removed');
+    },
+    // 群解散推给群内每个订阅了它的 bot,各自关自己的会话。
+    [CHAT_DISBANDED_EVENT]: (data: any) => {
+      scheduleChatGone(CHAT_DISBANDED_EVENT, data, 'disbanded');
     },
     'im.chat.member.user.added_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;

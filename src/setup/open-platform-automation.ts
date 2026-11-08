@@ -47,6 +47,9 @@ export const MESSAGE_UPDATED_EVENT = 'im.message.updated_v1';
 /** 消息撤回事件名（撤回已发送消息时推送）。群聊上下文共享据此给记录写 tombstone。 */
 export const MESSAGE_RECALLED_EVENT = 'im.message.recalled_v1';
 
+/** 群解散事件名（群被解散时推给群内每个订阅了它的 bot）。 */
+export const CHAT_DISBANDED_EVENT = 'im.chat.disbanded_v1';
+
 /**
  * Best-effort app events: subscribed alongside the baseline but NEVER part of
  * the fail-closed verification (missingBaselineEvents / MANAGED_VERIFIED_EVENT_COUNT).
@@ -68,6 +71,9 @@ export const BOT_OPTIONAL_APP_EVENTS = [
   //（dispatcher 对缺订阅同样静默降级）。存量 bot 由启动时的
   // ensureMessageRecalledEventSubscribed 增量补订阅，并返回是否覆盖的状态。
   MESSAGE_RECALLED_EVENT,
+  // 群解散：结束本 bot 在该群的会话。缺订阅时会话一直挂着，直到 daemon 重启时对账关闭。
+  // 存量 bot 由启动时的 ensureChatDisbandedEventSubscribed 增量补订阅。
+  CHAT_DISBANDED_EVENT,
 ] as const;
 
 /** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */

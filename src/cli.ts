@@ -90,6 +90,7 @@ import {
 } from './autostart.js';
 import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
+import { sandboxEnabled } from './adapters/backend/sandbox.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
@@ -9210,7 +9211,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean; task?: ManagedScheduleUpdateReceipt };
     if (!response.ok || body.ok !== true) {
-      throw new Error(scheduleIpcErrorMessage(body.error) ?? body.error ?? `HTTP ${response.status}`);
+      throw new Error(scheduleIpcErrorMessage(body.error)
+        ?? (body.error ? describeUntilDoneError(body.error) : `HTTP ${response.status}`));
     }
     return { replay: body.replay === true, ...(body.task && typeof body.task === 'object' ? { task: body.task } : {}) };
   };
@@ -9235,10 +9237,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       if (task) {
         const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
         console.log(`   频率: ${task.display && task.display !== task.schedule ? `${task.display}（${task.schedule}）` : task.schedule}`);
+        // The daemon only re-registers an expression that differs from the
+        // stored one; a finished task left without a next run (e.g. the same
+        // expression sent again) has nothing for resume to schedule.
         const nextLine = task.enabled
           ? (task.nextRunAt ? fmt(task.nextRunAt) : '—')
           : task.disabledReason === 'once_completed'
-            ? '任务已结束，不会自动执行'
+            ? updates.schedule !== undefined && task.nextRunAt
+              ? `任务已结束；用 botmux schedule resume ${id} 按新频率重新开始`
+              : '任务已结束，不会自动执行'
             : '任务已暂停，恢复后按此频率执行';
         console.log(`   下次执行: ${nextLine}`);
         if (task.enabled && task.calendar !== undefined) {
@@ -14072,7 +14079,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           && !sendTopLevel && !vcMeetingManagedSendOrigin
           && !overrideChatId && !sendInto
           && !(s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch'
-            || process.env.BOTMUX_READ_ISOLATION === '1' || process.env.BOTMUX_SANDBOX === '1')
+            || process.env.BOTMUX_READ_ISOLATION === '1' || sandboxEnabled())
           && sid && anchorId
           && getBot(appId)?.config?.replyCardActions === true) {
           replyCardMenu = buildReplyCardActionOverflow({
@@ -14137,7 +14144,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // A restored record can remain readable (for example via the Linux host
       // relay). Match the daemon's sandbox exclusion instead of reviving it.
       const replyCardSandboxed = s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch' || process.env.BOTMUX_READ_ISOLATION === '1'
-        || process.env.BOTMUX_SANDBOX === '1';
+        || sandboxEnabled();
       const canUseReplyCard = replyKey && !durableCoordinationPrimary
         && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote

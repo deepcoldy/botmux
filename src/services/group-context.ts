@@ -196,7 +196,9 @@ export interface GroupContextPreparationDeps {
     reason?: string;
   };
   deliveredSeqs: (appId: string, chatId: string, sessionId: string, epoch: string) => number[];
-  resolveAttachments?: (request: GroupContextTurnRequest, messages: GroupContextRenderMessage[], signal: AbortSignal) => Promise<{
+  /** Reports each attachment through `onResolved` as soon as it is on disk:
+   * those are kept when the budget runs out before the rest resolve. */
+  resolveAttachments?: (request: GroupContextTurnRequest, messages: GroupContextRenderMessage[], signal: AbortSignal, onResolved: (attachment: LarkAttachment) => void) => Promise<{
     attachments: LarkAttachment[];
     incomplete: boolean;
   }>;
@@ -254,11 +256,15 @@ export function createGroupContextPreparer(deps: GroupContextPreparationDeps) {
       const gapsBeforeAttachments = gaps.size;
       let attachments: LarkAttachment[] = [];
       if (deps.resolveAttachments && unseen.length) {
+        const resolvedSoFar: LarkAttachment[] = [];
         try {
-          const resolved = await bounded(signal => deps.resolveAttachments!(request, unseen, signal), deps.timeoutMs ?? 5_000);
+          const resolved = await bounded(signal => deps.resolveAttachments!(request, unseen, signal, attachment => { resolvedSoFar.push(attachment); }), deps.timeoutMs ?? 5_000);
           attachments = resolved.attachments;
           if (resolved.incomplete) gaps.add('attachments_unavailable');
-        } catch { gaps.add('attachments_unavailable'); }
+        } catch {
+          attachments = [...resolvedSoFar];
+          gaps.add('attachments_unavailable');
+        }
       }
       // Attachment resolution may have added a gap after the body was rendered;
       // the stored incompleteness flag must reflect it, so re-render once.
