@@ -5,7 +5,7 @@
  *   - GET /api/decision-board/files/:id：HTML 带 CSP sandbox，视频按 Range 回 206 / 416，截图响应不变。
  */
 import { request } from 'node:http';
-import { mkdtempSync, readdirSync, rmSync, truncateSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readlinkSync, realpathSync, rmSync, truncateSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -249,6 +249,33 @@ describe('GET /api/decision-board/files/:id', () => {
     }
     const gone = await getFile(htmlId);
     expect(gone.status).toBe(404);
+  });
+
+  // 读 /proc/self/fd 数 daemon 手上还开着几个这份视频的描述符；只有 Linux 有（CI 和 daemon 都跑在 Linux）。
+  it.skipIf(!existsSync('/proc/self/fd'))('播放器中途取消视频请求：daemon 关掉文件，不留打开的描述符', async () => {
+    const seq = await addItem();
+    const id = await attachExplainer(seq, 'demo.webm', 'video/webm', VIDEO);
+    const files = decisionBoardFilesDir(dir, APP);
+    const stored = realpathSync(join(files, readdirSync(files).find(f => f.endsWith('.webm'))!));
+    const openFds = () => readdirSync('/proc/self/fd').filter(fd => {
+      try { return readlinkSync(`/proc/self/fd/${fd}`) === stored; } catch { return false; }
+    }).length;
+    const path = `/api/decision-board/files/${id}`;
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      await new Promise<void>(resolve => {
+        const headers = Object.fromEntries(daemonIpcAuthHeaders({ secret: SECRET, port: handle.port, method: 'GET', path, headers: { range: `bytes=${i}-` } }));
+        const req = request({ host: '127.0.0.1', port: handle.port, path, headers }, res => {
+          statuses.push(res.statusCode ?? 0);
+          res.once('data', () => { req.destroy(); resolve(); });
+        });
+        req.on('error', () => resolve());
+        req.end();
+      });
+    }
+    expect(statuses).toEqual(Array(10).fill(206));
+    for (const deadline = Date.now() + 2_000; openFds() > 0 && Date.now() < deadline;) await new Promise(r => setTimeout(r, 20));
+    expect(openFds()).toBe(0);
   });
 
   it('截图的响应和以前一样：不带 CSP、不认 Range', async () => {

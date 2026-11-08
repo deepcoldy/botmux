@@ -4407,6 +4407,8 @@ function sendBoardExplainer(req: IncomingMessage, res: ServerResponse, found: { 
     'content-length': String(end - start + 1),
     'content-range': `bytes ${start}-${end}/${size}`,
   });
+  // 播放器拖进度条会中途断开请求：res 提前关闭时 pipe 只解绑、不关源流，不手动 destroy 就会留下打开的文件描述符和已读进缓冲的数据。
+  res.once('close', () => stream.destroy());
   stream.on('error', () => res.destroy()).pipe(res);
 }
 
