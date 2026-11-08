@@ -96,7 +96,7 @@ docker run --rm \
     test -f /opt/node/include/node/node.h
     test -f /opt/node/include/node/config.gypi
     export npm_config_nodedir=/opt/node
-    npm install -g bun@1.4.4 --loglevel=error
+    sh scripts/ci-install-retry.sh npm install -g bun@1.4.4 --loglevel=error
     bun --version
 
     # Compiles node-pty on glibc 2.28; trustedDependencies makes this lifecycle

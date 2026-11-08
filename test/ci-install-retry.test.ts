@@ -8,14 +8,16 @@ import { parse as parseYaml } from 'yaml';
 /**
  * CI 的依赖安装不能因为上游临时 5xx 让 job 零测试就红。
  *
- * 失败形状：`bun install` 里 electron 的 postinstall 拉二进制撞上网关 504，
- * 分片在安装这一步就退出，必需 check `test` 变红、挡住与之无关的 PR。
- * 这里守两条不变量：
+ * 失败形状：`bun install` 里 electron 的 postinstall 拉二进制、或 setup-bun 从
+ * GitHub Releases 下 bun 本体，撞上网关 504，job 在安装这一步就退出，必需 check
+ * 变红、挡住与之无关的 PR。这里守三条不变量：
  *   • ci.yml 的每个 `bun install`（含两处在 docker 里跑的）都经过
  *     scripts/ci-install-retry.sh：临时失败在后续尝试里恢复，真失败在第三次
  *     之后仍以原退出码让 job 变红。
  *   • ci.yml 不下载 electron 二进制：workflow 级 env 设置，docker run 用 `-e`
  *     透传（容器不继承宿主环境）。
+ *   • bun 本体从 npm 装、同样经过重试脚本，不用 oven-sh/setup-bun：它失败的
+ *     那次尝试留下的 post step 会在作业末尾崩掉，没法在 workflow 里原地重试。
  */
 
 const ROOT = resolve(import.meta.dirname, '..');
@@ -93,7 +95,7 @@ describe('scripts/ci-install-retry.sh', () => {
 
 type Workflow = {
   env?: Record<string, unknown>;
-  jobs: Record<string, { steps?: Array<{ run?: unknown }> }>;
+  jobs: Record<string, { steps?: Array<{ run?: unknown; uses?: unknown }> }>;
 };
 const CI = parseYaml(readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8')) as Workflow;
 const GLIBC_BUILDER = readFileSync(join(ROOT, 'scripts/build-linux-glibc-baseline.sh'), 'utf8');
@@ -129,5 +131,19 @@ describe('ci.yml — dependency installs survive transient upstream failures', (
       const passed = text.match(/-e ELECTRON_SKIP_BINARY_DOWNLOAD\b/g)?.length ?? 0;
       expect(passed, where).toBe(runs);
     }
+  });
+
+  it('installs bun itself from npm through the retry wrapper wherever bun install runs, never via setup-bun', () => {
+    const setupBun = Object.entries(CI.jobs).flatMap(([job, def]) =>
+      (def.steps ?? []).filter(step => typeof step.uses === 'string' && step.uses.startsWith('oven-sh/setup-bun')).map(() => job));
+    expect(setupBun).toEqual([]);
+
+    const bootstraps = runScripts.flatMap(({ where, code }) =>
+      code.filter(line => /\bnpm (?:i|install) -g bun@/.test(line)).map(line => ({ where, line: line.trim() })));
+    for (const { where, line } of bootstraps) {
+      expect(line, where).toMatch(/^sh scripts\/ci-install-retry\.sh npm (?:i|install) -g bun@\d+\.\d+\.\d+ --loglevel=error$/);
+    }
+    const installers = runScripts.filter(({ code }) => code.some(line => /\bbun install\b/.test(line))).map(r => r.where);
+    expect(new Set(bootstraps.map(b => b.where))).toEqual(new Set(installers));
   });
 });

@@ -185,7 +185,7 @@ const selfCheck = process.argv.includes('--self-check');
 //
 // WHY NOT SNAPSHOT THE REAL HOME: that was the first attempt and it was vacuous. A
 // top-level name diff only sees a `.bun` that did not exist BEFORE — and CI runs
-// `setup-bun` + `bun install` earlier in the job, so `.bun` always exists by then, as
+// `bun install` earlier in the job, so `.bun` always exists by then, as
 // it does on any developer machine. Measured: with a pre-created empty `.bun/`, an
 // unfenced probe wrote `.bun/install/cache/@t@/*.pile` and the top-level diff was
 // EMPTY, so the check reported "untouched" and the fence mutation stayed green. A

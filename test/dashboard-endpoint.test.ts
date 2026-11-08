@@ -411,9 +411,9 @@ void existsSync;
  */
 describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
   /**
-   * Locate a bun binary the way CI actually provides one: `oven-sh/setup-bun`
-   * only prepends it to PATH (it sets no BUN_PATH), so PATH is the source of
-   * truth. $BUN_PATH stays supported as an explicit override.
+   * Locate a bun binary the way CI actually provides one: npm's global bin on
+   * PATH (nothing sets BUN_PATH), so PATH is the source of truth. $BUN_PATH
+   * stays supported as an explicit override.
    */
   function resolveBun(): string | undefined {
     if (process.env.BUN_PATH && existsSync(process.env.BUN_PATH)) return process.env.BUN_PATH;
@@ -462,8 +462,8 @@ describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
       // test/unit-setup.ts rewrites process.env.HOME to an isolated temp dir
       // before test modules load, so on a non-root GitHub runner all three miss
       // and the real proxy assertion never ran while the suite stayed green
-      // (measured: found=NONE under the isolated HOME). setup-bun only puts bun
-      // on PATH, so PATH is what we resolve; if CI still cannot find it that is a
+      // (measured: found=NONE under the isolated HOME). CI only puts bun on
+      // PATH, so PATH is what we resolve; if CI still cannot find it that is a
       // broken workflow, not a reason to skip.
       if (process.env.CI) throw new Error('bun not found on PATH; this test must not be skipped in CI');
       return;

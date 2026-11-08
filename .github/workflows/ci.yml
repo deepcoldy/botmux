@@ -45,9 +45,12 @@ jobs:
       # script runs only because it is in `trustedDependencies` — bun skips
       # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
       # need a loadable pty.node (here node-pty's own linux-x64 prebuild).
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
+      #
+      # Bun itself comes from npm, the registry `bun install` needs anyway, rather
+      # than oven-sh/setup-bun: that action downloads from GitHub Releases, whose
+      # transient 504s failed whole jobs, and it cannot be retried in place (a
+      # failed attempt leaves a post step that crashes on the state it never saved).
+      - run: sh scripts/ci-install-retry.sh npm i -g bun@1.4.4 --loglevel=error
       - run: sh scripts/ci-install-retry.sh bun install --frozen-lockfile
       - run: bun run build
       - run: bun run workflow-core:test
@@ -112,9 +115,7 @@ jobs:
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
           fi
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
+      - run: sh scripts/ci-install-retry.sh npm i -g bun@1.4.4 --loglevel=error
       - run: sh scripts/ci-install-retry.sh bun install --frozen-lockfile
       - run: bun run build
       # No rerun on failure: a shard spends up to ~17 of its 25 minutes in
@@ -221,9 +222,7 @@ jobs:
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
           fi
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
+      - run: sh scripts/ci-install-retry.sh npm i -g bun@1.4.4 --loglevel=error
       - run: sh scripts/ci-install-retry.sh bun install --frozen-lockfile
       - run: bun run build
       # Exercise the runner itself before the 20-minute suite. `node --check` cannot
@@ -320,7 +319,7 @@ jobs:
               # readelf.
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
-              npm i -g bun@1.4.4 --loglevel=error
+              sh scripts/ci-install-retry.sh npm i -g bun@1.4.4 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the entire point of this job.
@@ -455,9 +454,7 @@ jobs:
         with:
           node-version: 22
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
+      - run: sh scripts/ci-install-retry.sh npm i -g bun@1.4.4 --loglevel=error
 
       # node-pty SHIPS darwin prebuilds (prebuilds/darwin-{x64,arm64}/pty.node
       # plus the spawn-helper sidecar), which is why ONE macOS runner can emit
