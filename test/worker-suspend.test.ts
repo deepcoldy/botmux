@@ -29,6 +29,7 @@ import {
   suspendWorker,
 } from '../src/core/worker-pool.js';
 import { isSuspendableBackendType } from '../src/core/persistent-backend.js';
+import { hasFeedbackMaintenanceSessionWork } from '../src/core/feedback-maintenance-health.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { startUnreachableTmuxServer } from './helpers/unreachable-tmux-server.js';
 
@@ -269,6 +270,7 @@ describe('suspendWorker', () => {
     // --resume) and persist the suspend intent (→ restore won't zombie-close it).
     expect(ds.hasHistory).toBe(true);
     expect(ds.session.suspendedColdResume).toBe(true);
+    expect(hasFeedbackMaintenanceSessionWork(ds)).toBe(false);
     expect(dashboardEventBus.publish).toHaveBeenCalledWith({
       type: 'session.update',
       body: {

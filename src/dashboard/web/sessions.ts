@@ -11,6 +11,8 @@ import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
 import { sessionMutationBlockedText } from './session-mutation-blocked.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
+import { matchesStatusFilter, SESSION_STATUS_FILTERS } from './session-task-view.js';
 
 export function resumeErrorMessage(reason: unknown, translate: typeof t = t): string {
   if (reason === 'workspace_retired') return translate('sessions.resumeWorkspaceRetired');
@@ -87,25 +89,15 @@ export function sessionExchangePreview(row: Record<string, any>): SessionExchang
 // 'unknown' 兜底：没有 cliId 的会话在 filtered() 里按 'unknown' 归类。
 export const CLI_FILTER_OPTIONS = [...CLI_OPTIONS.map(o => o.id), 'unknown'];
 
-// 看板卡片左侧状态色条的语义分组：「启动中」并入「进行中」；「待办」是任务态（有未完成
-// TODO），不拿 idle 冒充——idle 且无未完成 todo 才是真「空闲」。
-export type BoardColumnId = 'needs-you' | 'working' | 'todo' | 'idle';
+// 看板卡片左侧状态色条的语义分组，与会话任务状态一一对应：需要你 / 进行中 / 没做完 /
+// 本轮已交付 / 空闲。
+export type BoardColumnId = 'needs-you' | 'working' | 'todo' | 'done' | 'idle';
 
 export function cssToken(value: unknown): string {
   return String(value ?? 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
 }
 
-export const SESSION_STATUS_OPTIONS = [
-  'starting',
-  'working',
-  'idle',
-  'dormant',
-  'analyzing',
-  'stalled',
-  'active',
-  'limited',
-  'closed',
-];
+export const SESSION_STATUS_OPTIONS: readonly string[] = SESSION_STATUS_FILTERS;
 
 export function sessionStatusText(status: unknown): string {
   const raw = String(status ?? 'unknown');
@@ -236,7 +228,7 @@ export function filterSessionRows<T extends Record<string, any>>(
     if (!filters.showUnknownChats && isUnknownChatSession(s)) return false;
     if (filters.status === '') {
       if (!options.keepClosed && s.status === 'closed') return false;
-    } else if (filters.status !== SESSION_STATUS_ANY && s.status !== filters.status) {
+    } else if (filters.status !== SESSION_STATUS_ANY && !matchesStatusFilter(s, filters.status)) {
       return false;
     }
     if (filters.adopt && (filters.adopt === 'yes') !== !!s.adopt) return false;
@@ -368,15 +360,14 @@ export function historySenderKey(message: any): string {
 }
 
 export function deriveSessionBoardColumn(s: any): BoardColumnId | null {
-  if (s.status === 'closed') return null;
-  // needs-you 保留 master 新增的 stalled 触发；starting 并入「进行中」(P1 命名收敛)。
-  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'needs-you';
-  // 「启动中」并入「进行中」：starting / working / analyzing / active 同列。
-  if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
-  // 任务态优先于「空闲」：机器停了但还有未完成 TODO → 待办（真），正是要抓的
-  // 「活没干完」。读不到 todo（其它 CLI / 无 transcript）时退回空闲，不硬判。
-  if (hasOpenTodos(s)) return 'todo';
-  return 'idle';
+  switch (deriveSessionTaskStatus(s).kind) {
+    case 'closed': return null;
+    case 'needs_you': return 'needs-you';
+    case 'working': return 'working';
+    case 'unfinished': return 'todo';
+    case 'delivered': return 'done';
+    default: return 'idle';
+  }
 }
 
 /** 会话是否有未完成 TODO（任务态）。openTodos 缺失 = 未知/不支持 → 视为无。 */

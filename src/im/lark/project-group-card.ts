@@ -3,6 +3,7 @@ import { threadAppLink, type Brand } from './lark-hosts.js';
 import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
   projectRemainingSummary,
+  projectTitleWithoutTaskMarker,
   type ProjectGroupState,
   type ProjectWorkstream,
   type ProjectWorkstreamStatus,
@@ -38,10 +39,8 @@ function truncate(value: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
-const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
-
 function displayProjectTitle(value: string): string {
-  const title = value.replace(TASK_TITLE_MARKER_RE, '').trim();
+  const title = projectTitleWithoutTaskMarker(value);
   return truncate(title || '项目进度', 42);
 }
 

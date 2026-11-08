@@ -13,6 +13,7 @@ function run(args: string[], zeroPrompt = false) {
     { larkAppId: 'cli_source', larkAppSecret: 'test', cliId: 'claude-code', allowedUsers: [] },
     { larkAppId: 'cli_worker', larkAppSecret: 'test', cliId: 'codex', allowedUsers: [],
       promptInjection: zeroPrompt ? 'none' : 'default' },
+    { larkAppId: 'cli_second', larkAppSecret: 'test', cliId: 'codex', allowedUsers: [] },
   ]));
   seedPersistedSessionRows(data, 'cli_source', { source: {
     sessionId: 'source', larkAppId: 'cli_source', chatId: 'oc_task', rootMessageId: 'om_task',
@@ -45,5 +46,15 @@ describe('dispatch result delivery CLI guards', () => {
   it('rejects publication to a zero-prompt target', () => {
     const result = run(['--bot-app', 'cli_worker', '--result-delivery', 'publish'], true);
     expect(result.status).toBe(1); expect(result.stderr).toContain('零注入模式使用自动回传');
+  });
+  it.each([
+    { extra: ['--into', 'om_existing'], error: 'reply' },
+    { extra: ['--repo', '/tmp'], error: 'talk-only chatGrant' },
+    { extra: ['--model', 'model'], error: 'reply' },
+    { extra: ['--bot-app', 'cli_second'], error: 'reply' },
+  ])('rejects source replies for incompatible dispatch options $extra', ({ extra, error }) => {
+    const result = run(['--bot-app', 'cli_worker', '--result-delivery', 'reply', ...extra]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(error);
   });
 });

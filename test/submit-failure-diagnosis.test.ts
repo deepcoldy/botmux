@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  claudeComposerHoldsInput,
   decideSessionStartGatedSubmitWarning,
   diagnoseSubmitFailure,
   diagnoseBackendSubmitFailure,
@@ -331,6 +332,36 @@ describe('collapsed pasted-text chip in Claude composer', () => {
   it('is gated to the claude-code family like the expanded-composer rule', () => {
     expect(diagnoseSubmitFailure({ screenText: parkedChipScreen, cliId: 'codex' }).reason).toBe('unknown');
     expect(diagnoseSubmitFailure({ screenText: parkedChipScreen }).reason).toBe('unknown');
+  });
+});
+
+describe('claudeComposerHoldsInput', () => {
+  const RULE = '─'.repeat(40);
+  const input = 'please review the attached handoff and summarise the open risks';
+
+  it('matches the input soft-wrapped across composer rows', () => {
+    const screen = [RULE, '❯ please review the attached handoff and', '  summarise the open risks', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, input)).toBe(true);
+  });
+
+  it('matches a typed multi-line draft whose soft newlines still show their backslash', () => {
+    const screen = [RULE, '❯ short\\', '  second line of the draft', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, 'short\nsecond line of the draft')).toBe(true);
+  });
+
+  it('matches the collapsed chip of a multi-line paste', () => {
+    const screen = [RULE, '❯ [Pasted text #1 +12 lines]', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, 'line one\nline two')).toBe(true);
+  });
+
+  it('does not match once the input left the composer for the transcript', () => {
+    const screen = [`> ${input}`, '', '● Working on it', RULE, '❯ ', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, input)).toBe(false);
+  });
+
+  it('does not match a different draft in the composer', () => {
+    const screen = [RULE, '❯ something the user typed in the web terminal', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, input)).toBe(false);
   });
 });
 

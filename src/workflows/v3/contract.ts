@@ -341,6 +341,11 @@ export interface SpecNodeSketch {
   acceptance: string;
   risk_gate: boolean;
   unknowns: string[];
+  /** The bot the user explicitly named for this step (a larkAppId or a bot
+   *  display name), verbatim. Only consulted when the run's goal nodes are
+   *  handed to bots in the group chat (design 2026-11-03 §6.2). Omitted =
+   *  the user named nobody. */
+  assignee?: string;
 }
 
 /**

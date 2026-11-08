@@ -3,6 +3,10 @@
  *
  * Run:  pnpm vitest run test/cli-adapters.test.ts
  */
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件有用例会写 homedir() 推导的目录（PI_PLUGIN_DIR/extensions、~/.botmux/dsh-question-bridge 等）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，这些写入落在了真实的 ~/.botmux 下。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
@@ -38,6 +42,7 @@ import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/curs
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
+import { statuslineHookCommand } from '../src/adapters/hook-command.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
@@ -339,7 +344,7 @@ describe('claude-code buildArgs', () => {
     const parsed = JSON.parse(args[idx + 1]);
     expect(Object.keys(parsed)).toEqual(['statusLine']);
     expect(parsed.statusLine.type).toBe('command');
-    expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
+    expect(parsed.statusLine.command).toBe(statuslineHookCommand());
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
@@ -1166,6 +1171,28 @@ describe('codex buildArgs', () => {
     expect(fullArgs).toContain('shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/tmp/identity.bin"');
     expect(fullArgs).toContain('model_reasoning_effort="high"');
     expect(fullArgs.includes('tui.auto_recap=false')).toBe(!forkSession);
+  });
+
+  it.each([
+    { command: 'resume', forkSession: false },
+    { command: 'fork', forkSession: true },
+  ])('keeps the protected provider base URL override before $command', ({ command, forkSession }) => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-protected-provider',
+      resume: true,
+      resumeSessionId: 'codex-existing',
+      forkSession,
+      modelProviderBaseUrlOverride: {
+        providerId: 'mixoul',
+        baseUrl: 'http://127.0.0.1:0/dev_portal/relay/model',
+      },
+    });
+    const commandIdx = args.indexOf(command);
+    const override = 'model_providers.mixoul.base_url="http://127.0.0.1:0/dev_portal/relay/model"';
+    const overrideIdx = args.indexOf(override);
+    expect(overrideIdx).toBeGreaterThan(0);
+    expect(args[overrideIdx - 1]).toBe('-c');
+    expect(overrideIdx).toBeLessThan(commandIdx);
   });
 
   it('disables automatic recap for a quiet resume without adding a prompt', () => {
@@ -2093,6 +2120,41 @@ describe('opencode buildArgs', () => {
     expect(args).toEqual([]);
   });
 
+  it('passes --auto when the probed CLI version accepts it (>= 1.17.12)', () => {
+    // V1 的默认 ask（external_directory / .env）在托管态没人看得见，turn 会
+    // 静默卡在原生弹窗上；--auto 是 opencode 1.17.12 才加的。
+    for (const cliVersion of ['1.17.12', '1.17.13', '1.19.1', 'v1.18.32', '2.1.4']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual(['--auto']);
+    }
+  });
+
+  it('omits --auto on versions that predate the flag (help-and-exit would crash-loop)', () => {
+    // adapter 注释里的实测基线就是 1.17.11 —— 传未知 flag 会打帮助退出 1，
+    // 再被 daemon 的自动重启放大成 crash-loop。
+    for (const cliVersion of ['1.17.11', '1.17.8', '1.16.0', '1.4.1', '1.0.0']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when the version was never probed', () => {
+    for (const cliVersion of [undefined, '', 'unknown']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when disableCliBypass is set even on a new version', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '1.19.1', disableCliBypass: true });
+    expect(args).toEqual([]);
+  });
+
+  it('mimo (same adapter family) never gets --auto: it has no such flag', () => {
+    const mimo = createMiMoCodeAdapter('/usr/bin/mimo');
+    expect(mimo.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '2.1.4' })).toEqual(['--trust']);
+  });
+
   it('passes initialPrompt via --prompt flag', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, initialPrompt: 'hello world' });
     expect(args).toContain('--prompt');
@@ -2213,6 +2275,8 @@ describe('pi buildArgs', () => {
   });
 
   it('materializes turn-boundary extension to ~/.botmux/pi-skills/extensions for compiled binaries', () => {
+    // 写入目标 PI_PLUGIN_DIR 在模块加载时由 homedir() 推导：只在它落在本文件的测试围栏里时才写。
+    expect(isInsideDir(PI_PLUGIN_DIR, process.env.__TEST_DATA_DIR_FENCE)).toBe(true);
     const extPath = materializePiTurnBoundaryExtension();
     expect(extPath).toBeTruthy();
     expect(existsSync(extPath!)).toBe(true);
@@ -2994,14 +3058,20 @@ describe('hermes buildArgs', () => {
 describe('antigravity buildArgs', () => {
   const adapter = createAntigravityAdapter('/usr/local/bin/agy');
 
-  it('fresh session passes --dangerously-skip-permissions only', () => {
+  it('fresh sessions keep permission bypass and use separate native identity logs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
-    expect(args).toEqual(['--dangerously-skip-permissions']);
+    const other = adapter.buildArgs({ sessionId: 'sess-8', resume: false });
+    expect(args).toContain('--dangerously-skip-permissions');
+    expect(args).toContain('--log-file');
+    expect(other).toContain('--log-file');
+    expect(args[args.indexOf('--log-file') + 1]).not.toBe(other[other.indexOf('--log-file') + 1]);
+    expect(args).not.toContain('--conversation');
   });
 
   it('omits dangerous permission flag when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true });
-    expect(args).toEqual([]);
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).toContain('--log-file');
   });
 
   it('does NOT inject initialPrompt via -i (agy -i does not auto-submit)', () => {

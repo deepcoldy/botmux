@@ -30,9 +30,16 @@ function parseHelp(text: string): CommandHelp {
     // while shortcuts use Flags. Both use the same declaration grammar.
     // Some shortcuts declare snake_case flags (whiteboard +query --output_as).
     if (section !== 'commands') {
-      const match = /^\s+(?:(-[A-Za-z0-9]),\s+)?(--[A-Za-z0-9][A-Za-z0-9_-]*)(?: ([^\s]+))?\s{2,}/.exec(line);
+      // Structured type placeholders may contain spaces; Cobra separates the
+      // type from its description with two or more spaces.
+      const match = /^\s+(?:(-[A-Za-z0-9]),\s+)?(--[A-Za-z0-9][A-Za-z0-9_-]*)(?: ([^\s].*?))?\s{2,}/.exec(line);
       if (!match) continue;
-      const flag = { name: match[2], takesValue: !!match[3] && !match[3].startsWith('[') };
+      // A "[mnemonic]" placeholder (e.g. "[row=N]") is an optional value:
+      // pflag NoOptDefVal accepts the bare flag and only takes --flag=value.
+      // A JSON-array example (e.g. '["A1:B2"]' or '[[...]]') is required.
+      const type = match[3];
+      const takesValue = !!type && (!type.startsWith('[') || /^\[\s*(?:["'[{]|-?\d|true\b|false\b|null\b)/.test(type));
+      const flag = { name: match[2], takesValue };
       flags.set(match[2], flag);
       if (match[1]) flags.set(match[1], flag);
     } else if (section === 'commands') {

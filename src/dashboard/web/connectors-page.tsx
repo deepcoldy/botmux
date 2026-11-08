@@ -29,7 +29,7 @@ interface Connector {
     allowChats?: string[];
     workflowId?: string;
   };
-  promptEnvelope: { sourceName: string; instruction?: string };
+  promptEnvelope: { sourceName: string; instruction?: string; trustPayload?: boolean };
   topicMessage?: {
     mode: 'default' | 'custom' | 'template' | 'none';
     text?: string;
@@ -82,6 +82,7 @@ interface CreateForm {
   topicMessageText: string;
   topicMessageExtractors: string;
   suppressFinalOutput: boolean;
+  trustPayload: boolean;
   verify: 'token' | 'hmac-sha256';
   secret: string;
   storePayload: boolean;
@@ -125,6 +126,7 @@ const emptyForm: CreateForm = {
   topicMessageText: '',
   topicMessageExtractors: '{}',
   suppressFinalOutput: false,
+  trustPayload: false,
   verify: 'token',
   secret: '',
   storePayload: true,
@@ -263,6 +265,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     topicMessageText: connector.topicMessage?.text || '',
     topicMessageExtractors: JSON.stringify(connector.topicMessage?.extractors || {}, null, 2),
     suppressFinalOutput: connector.suppressFinalOutput === true,
+    trustPayload: connector.promptEnvelope?.trustPayload === true,
     verify: connector.verify?.type || 'token',
     secret: '',
     storePayload: connector.loggingPolicy?.storePayload !== false,
@@ -332,6 +335,10 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
     { value: 'token' as const, label: tr('connectors.verifyToken') },
     { value: 'hmac-sha256' as const, label: tr('connectors.verifyHmac') },
   ], [tr]);
+  // Mirrors the server gate (connectorPayloadTrustBlocker): a trusted payload is
+  // only offered on a verified connector. The server re-checks on save and at
+  // dispatch, so this is presentation, not the boundary.
+  const trustPayloadAllowed = form.kind === 'turn' && (form.verify === 'token' || form.verify === 'hmac-sha256');
 
   const groupName = useCallback((chatId: string): string => {
     const g = groups.find(x => x.chatId === chatId);
@@ -484,7 +491,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       name,
       enabled: editingConnector?.enabled ?? true,
       target: buildConnectorTargetBody({ ...form, chatId }),
-      promptEnvelope: { sourceName: name, instruction: form.instruction.trim() },
+      promptEnvelope: { sourceName: name, instruction: form.instruction.trim(), trustPayload: form.trustPayload && trustPayloadAllowed },
       topicMessage: topicMessage.value,
       suppressFinalOutput: form.suppressFinalOutput,
       verify: { type: form.verify },
@@ -587,12 +594,17 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           topicMessageText: '',
           topicMessageExtractors: '{}',
           suppressFinalOutput: false,
+          trustPayload: false,
           allowChats: [],
           storePayload: true,
         }));
         await load();
       } else {
-        const e = r.body?.error || r.status;
+        const e = r.body?.error === 'trust_payload_requires_verification'
+          ? tr('connectors.errTrustPayloadVerify')
+          : r.body?.error === 'trust_payload_requires_turn_target'
+            ? tr('connectors.errTrustPayloadTurn')
+            : r.body?.error || r.status;
         setCreateMsg({ text: tr('connectors.createFailed', { error: String(e) }), error: true });
       }
     } finally {
@@ -1027,6 +1039,28 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
             </span>
           </label>
 
+          <label className="connector-log-policy connector-trust-payload cn-field-wide" htmlFor="cn-trust-payload">
+            <input
+              id="cn-trust-payload"
+              type="checkbox"
+              checked={form.trustPayload && trustPayloadAllowed}
+              disabled={!trustPayloadAllowed}
+              aria-describedby="cn-trust-payload-hint cn-trust-payload-risk"
+              onChange={e => patchForm({ trustPayload: e.currentTarget.checked })}
+            />
+            <span>
+              <strong>{tr('connectors.trustPayload')}</strong>
+              <small id="cn-trust-payload-hint">
+                {tr(trustPayloadAllowed
+                  ? 'connectors.trustPayloadHint'
+                  : form.kind !== 'turn' ? 'connectors.errTrustPayloadTurn' : 'connectors.errTrustPayloadVerify')}
+              </small>
+              {trustPayloadAllowed
+                ? <small id="cn-trust-payload-risk" className="connector-trust-payload-risk" role="note">{tr('connectors.trustPayloadRisk')}</small>
+                : null}
+            </span>
+          </label>
+
           <div className="cn-field">
             <FieldTitle>{tr('connectors.fVerify')}</FieldTitle>
             <ConnectorDropdown
@@ -1209,6 +1243,7 @@ function ConnectorList(props: {
               </div>
             ) : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
+            {c.promptEnvelope?.trustPayload ? <div className="muted connector-item-note">{tr('connectors.trustPayloadListNote')}</div> : null}
             <div className="muted connector-item-note">
               {c.topicMessage?.mode === 'none'
                 ? tr('connectors.topicMessageListNone')

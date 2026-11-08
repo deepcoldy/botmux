@@ -12,6 +12,8 @@ import {
   classifyOtherUpdate,
   observedInstallCompleted,
   binaryProgressText,
+  confirmLocalForceUpdate,
+  localForceUpdateError,
 } from './update-action.js';
 import { ui } from './ui.js';
 import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
@@ -23,7 +25,7 @@ import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/pr
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
-  IDLE_CLEANUP_HOUR_OPTIONS,
+  AUTO_CLEANUP_HOUR_OPTIONS as IDLE_CLEANUP_HOUR_OPTIONS,
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
@@ -35,6 +37,7 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 
 interface DashboardSettings {
   groupNamePrefix: string;
+  worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -50,9 +53,12 @@ interface DashboardSettings {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -109,10 +115,10 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
-  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
-  multiTopic: { enabled: boolean };
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -206,6 +212,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
 function parseSettings(s: any): DashboardSettings {
   return {
     groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
+    worktreeRoot: typeof s?.worktreeRoot === 'string' ? s.worktreeRoot : '',
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     enableLocalCliOpen: s?.enableLocalCliOpen === true,
@@ -221,11 +228,15 @@ function parseSettings(s: any): DashboardSettings {
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
+    tmuxOrphanSessionSweep: s?.tmuxOrphanSessionSweep !== false,
+    tmuxOrphanSessionBareWrapperKill: s?.tmuxOrphanSessionBareWrapperKill === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
     // default ON — only an explicit persisted false disables (server snapshot)
     cardBrandLabel: s?.cardBrandLabel !== false,
+    // default ON — only an explicit persisted false disables (server snapshot)
+    stuckCardInitiatorKeys: s?.stuckCardInitiatorKeys !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -284,6 +295,7 @@ function parseSettings(s: any): DashboardSettings {
     workflow: {
       enabled: s?.workflow?.enabled === true,
       nodeExecutor: s?.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral',
+      handoffIdentity: s?.workflow?.handoffIdentity === true,
     },
     sessionCleanup: {
       archiveCodex: s?.sessionCleanup?.archiveCodex === true,
@@ -296,7 +308,7 @@ function parseSettings(s: any): DashboardSettings {
         : 60,
     },
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
-    multiTopic: { enabled: s?.multiTopic?.enabled !== false },
+    multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
@@ -645,7 +657,7 @@ function SettingsPage() {
     pollReconnect();
   }
 
-  async function doUpdate(): Promise<void> {
+  async function doUpdate(forceLocal = false): Promise<void> {
     const s = upStatus;
     if (!s) return;
     if (!s.node.ok) {
@@ -663,12 +675,24 @@ function SettingsPage() {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
       if (!await confirm({ title: tr('update.confirmMultiInstallTitle'), message: tr('update.confirmMultiInstall', { paths }), confirmLabel: tr('update.btnContinue'), cancelLabel: tr('update.btnCancel') })) return;
     }
+    let forceToken: string | null = null;
+    if (forceLocal) {
+      if (!localDev) return;
+      setUpBusy(true);
+      setUpMsg({ text: tr('update.forcePreviewing') });
+      try { forceToken = await confirmLocalForceUpdate(fetch, confirm, tr); }
+      catch (e) {
+        setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
+        return;
+      } finally { if (mountedRef.current) setUpBusy(false); }
+      if (!forceToken || !mountedRef.current) return;
+    }
     const confirmMsg = localDev
       ? tr('update.confirmUpdateLocalDev')
       : s.latest
         ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
         : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
-    if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
+    if (!forceLocal && !await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
     const stopUpdatePoll = (): void => {
@@ -683,7 +707,10 @@ function SettingsPage() {
       }
     }, 1000);
     try {
-      const r = await fetch('/api/update/run', { method: 'POST' });
+      const r = await fetch('/api/update/run', forceToken ? {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ forceLocal: true, previewToken: forceToken }),
+      } : { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!mountedRef.current) { stopUpdatePoll(); return; }
       if (!r.ok || body.ok === false) {
@@ -729,7 +756,9 @@ function SettingsPage() {
           setUpMsg({ text: tr('update.dirtyWorktree', { detail: String(body.detail ?? '') }), cls: 'hint-warn-inline' });
           return;
         }
-        const detail = body?.detail ?? body?.error ?? `HTTP ${r.status}`;
+        const detail = localForceUpdateError(body, tr)
+          + (body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '')
+          + (body.backupStash ? '\n' + tr('update.forceBackupFallback', { ref: String(body.backupStash) }) : '');
         setUpBusy(false);
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
@@ -739,20 +768,21 @@ function SettingsPage() {
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
       const needsRestart = updateResponseNeedsRestart(body);
+      const backupNotice = body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '';
       if (needsRestart) {
         setUpBusy(false);
         // `changed` reflects whether the source actually advanced; a build-only
         // local-dev update (HEAD unchanged) still needs a restart to apply.
         setUpMsg({
-          text: body.changed
+          text: (body.changed
             ? tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` })
-            : tr('update.builtNeedsRestart'),
+            : tr('update.builtNeedsRestart')) + backupNotice,
           cls: 'hint-ok',
         });
         if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnLater') })) {
           await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
         } else if (mountedRef.current) {
-          setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+          setUpMsg({ text: tr('update.noRestartHint') + backupNotice, cls: 'hint-ok' });
         }
       } else {
         setUpBusy(false);
@@ -806,6 +836,7 @@ function SettingsPage() {
         if (next && upChangelog === null) void loadChangelog();
       }}
       onUpdate={() => void doUpdate()}
+      onForceUpdate={() => void doUpdate(true)}
       onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
@@ -876,7 +907,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -972,6 +1003,13 @@ export function SettingsBody(props: {
             onChange={value => saveBoolean('openTerminalInFeishu', value)}
           />
           <ToggleRow
+            title={tr('settings.stuckCardInitiatorKeys')}
+            help={tr('settings.stuckCardInitiatorKeysHelp')}
+            checked={settings.stuckCardInitiatorKeys}
+            disabled={dis || savingKey === 'stuckCardInitiatorKeys'}
+            onChange={value => saveBoolean('stuckCardInitiatorKeys', value)}
+          />
+          <ToggleRow
             title={tr('settings.enableLocalCliOpen')}
             help={tr('settings.enableLocalCliOpenHelp')}
             checked={settings.enableLocalCliOpen}
@@ -1046,6 +1084,20 @@ export function SettingsBody(props: {
             checked={settings.reapOrphanTmuxServers}
             disabled={dis || savingKey === 'reapOrphanTmuxServers'}
             onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
+          />
+          <ToggleRow
+            title={tr('settings.tmuxOrphanSessionSweep')}
+            help={tr('settings.tmuxOrphanSessionSweepHelp')}
+            checked={settings.tmuxOrphanSessionSweep}
+            disabled={dis || savingKey === 'tmuxOrphanSessionSweep'}
+            onChange={value => saveBoolean('tmuxOrphanSessionSweep', value)}
+          />
+          <ToggleRow
+            title={tr('settings.tmuxOrphanSessionBareWrapperKill')}
+            help={tr('settings.tmuxOrphanSessionBareWrapperKillHelp')}
+            checked={settings.tmuxOrphanSessionBareWrapperKill}
+            disabled={dis || savingKey === 'tmuxOrphanSessionBareWrapperKill'}
+            onChange={value => saveBoolean('tmuxOrphanSessionBareWrapperKill', value)}
           />
           <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
@@ -1145,6 +1197,15 @@ export function SettingsBody(props: {
               void props.onSave('workflow', { workflow: { nodeExecutor } }, s => ({ ...s, workflow: { ...s.workflow, nodeExecutor } }));
             }}
           />
+          <ToggleRow
+            title={tr('settings.workflowHandoffIdentity')}
+            help={tr('settings.workflowHandoffIdentityHelp')}
+            checked={settings.workflow.handoffIdentity}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              void props.onSave('workflow', { workflow: { handoffIdentity: value } }, s => ({ ...s, workflow: { ...s.workflow, handoffIdentity: value } }));
+            }}
+          />
         </SettingsBlock>
         <SettingsBlock id="settings-multi-topic" title={tr('settings.sectionMultiTopic')}>
           <ToggleRow
@@ -1153,7 +1214,16 @@ export function SettingsBody(props: {
             checked={settings.multiTopic.enabled}
             disabled={dis || savingKey === 'multiTopic'}
             onChange={value => {
-              void props.onSave('multiTopic', { multiTopic: { enabled: value } }, s => ({ ...s, multiTopic: { enabled: value } }));
+              void props.onSave('multiTopic', { multiTopic: { enabled: value, taskTreeCard: settings.multiTopic.taskTreeCard } }, s => ({ ...s, multiTopic: { enabled: value, taskTreeCard: s.multiTopic.taskTreeCard } }));
+            }}
+          />
+          <ToggleRow
+            title={tr('settings.multiTopicTaskTreeCard')}
+            help={tr('settings.multiTopicTaskTreeCardHelp')}
+            checked={settings.multiTopic.taskTreeCard}
+            disabled={dis || !settings.multiTopic.enabled || savingKey === 'multiTopicTaskTreeCard'}
+            onChange={value => {
+              void props.onSave('multiTopicTaskTreeCard', { multiTopic: { enabled: settings.multiTopic.enabled, taskTreeCard: value } }, s => ({ ...s, multiTopic: { ...s.multiTopic, taskTreeCard: value } }));
             }}
           />
         </SettingsBlock>
@@ -1172,6 +1242,17 @@ export function SettingsBody(props: {
               }}
             />
           </div>
+        </SettingsBlock>
+        <SettingsBlock id="settings-worktree" title={tr('settings.sectionWorktree')}>
+          <WorktreeRootRow
+            value={settings.worktreeRoot}
+            disabled={dis || savingKey === 'worktreeRoot'}
+            onSave={value => props.onSave(
+              'worktreeRoot',
+              { worktreeRoot: value },
+              s => ({ ...s, worktreeRoot: value }),
+            )}
+          />
         </SettingsBlock>
         <SettingsBlock id="settings-schedule" title={tr('settings.sectionSchedule')}>
           <TimeZoneRow
@@ -1760,7 +1841,7 @@ function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleCompo
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
 
-/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+/** 定时自动清理空闲会话：开关 + 空闲阈值（自动清理仅 24H/72H/7d；手动清理另有 1H 与全部）+ 检查频率。 */
 function SessionCleanupRow(props: {
   value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   disabled: boolean;
@@ -1880,6 +1961,54 @@ export function GroupNamePrefixRow(props: {
           onClick={submit}
         >
           {tr('settings.groupNamePrefixSave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function WorktreeRootRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const dirty = draft.trim() !== props.value;
+  const submit = () => {
+    if (props.disabled || !dirty) return;
+    void props.onSave(draft.trim());
+  };
+
+  return (
+    <div className="settings-subfield">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.worktreeRootHelp')}>{tr('settings.worktreeRoot')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={draft}
+          placeholder={tr('settings.worktreeRootPlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-worktree-root-hint>
+        {props.value
+          ? tr('settings.worktreeRootCurrent', { path: props.value })
+          : tr('settings.worktreeRootDefault')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          disabled={props.disabled || !dirty}
+          onClick={submit}
+        >
+          {tr('settings.worktreeRootSave')}
         </button>
       </div>
     </div>
@@ -2201,6 +2330,7 @@ export function UpdateCard(props: {
   onCheck(): void;
   onToggleChangelog(): void;
   onUpdate(): void;
+  onForceUpdate?(): void;
   onRestart(): void;
 }) {
   const tr = useT();
@@ -2242,8 +2372,10 @@ export function UpdateCard(props: {
             {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
           </button>
           <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{updateLabel}</button>
+          {s.localDevInstall && props.onForceUpdate ? <button type="button" data-up="force-update" disabled={updateDisabled} onClick={props.onForceUpdate}>{tr('update.forceButton')}</button> : null}
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
+        {s.localDevInstall && props.onForceUpdate ? <p className="hint-warn">{tr('update.forceHint')}</p> : null}
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
           <ChangelogPanel

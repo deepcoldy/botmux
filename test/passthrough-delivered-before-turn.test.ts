@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => {
   return {
     replyMessage: vi.fn(async () => 'om_reply'),
     updateSession: vi.fn(),
+    rejectInput: false,
   };
 });
 
@@ -20,6 +21,12 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
 vi.mock('../src/services/session-store.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/services/session-store.js')>();
   return { ...actual, updateSession: (...args: any[]) => mocks.updateSession(...args) };
+});
+
+vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
+  return { ...actual, sendWorkerSessionInput: (...args: Parameters<typeof actual.sendWorkerSessionInput>) =>
+    mocks.rejectInput ? false : actual.sendWorkerSessionInput(...args) };
 });
 
 vi.mock('../src/bot-registry.js', async (importOriginal) => {
@@ -62,7 +69,51 @@ function liveSession(): DaemonSession {
 }
 
 describe('passthrough delivery is reported at the worker-accept boundary', () => {
-  beforeEach(() => { mocks.updateSession.mockReset(); });
+  beforeEach(() => { mocks.updateSession.mockReset(); mocks.rejectInput = false; });
+
+  it.each(['thread', 'chat-root', 'chat-rootless'])('restores the full reply binding when IPC rejects %s', scope => {
+    const ds = liveSession();
+    if (scope !== 'thread') ds.scope = ds.session.scope = 'chat';
+    ds.session.quoteTargetId = 'om_business';
+    ds.session.quoteTargetSenderOpenId = 'ou_business';
+    ds.session.quoteTargetSenderIsBot = false;
+    ds.session.lastCallerOpenId = 'ou_business';
+    ds.session.replyTargets = Object.fromEntries(Array.from({ length: 32 }, (_, i) => [`turn-${i}`, { updatedAt: '2026-01-01T00:00:00.000Z' }]));
+    ds.session.turnReplyContexts = Object.fromEntries(Array.from({ length: 256 }, (_, i) => [`turn-${i}`, { target: { mode: 'plain', chatId: ds.chatId } }])) as any;
+    ds.session.replyTargetsPrunedThrough = '2025-01-01T00:00:00.000Z';
+    ds.replyThreadAliases = ds.session.replyThreadAliases = { om_previous: { createdAt: '2026-01-01', lastUsedAt: '2026-01-01' } };
+    ds.currentReplyTarget = ds.session.currentReplyTarget = { rootMessageId: 'om_previous', turnId: 'business', updatedAt: '2026-01-01' };
+    const before = structuredClone(ds.session);
+    const aliases = ds.replyThreadAliases;
+    const current = ds.currentReplyTarget;
+    let saved: unknown;
+    mocks.updateSession.mockImplementation((session: unknown) => { saved = structuredClone(session); });
+    // External IPC rejects the enqueue; daemon and reply-binding code stay real.
+    mocks.rejectInput = true;
+    const onDelivered = vi.fn();
+    const accepted = deliverPassthrough(ds, '/model', '/model sonnet', 'om_root', ds.larkAppId, {
+      messageId: 'om_picker', replyRootId: scope === 'chat-rootless' ? undefined : 'om_new_root',
+      senderOpenId: 'ou_operator', senderIsBot: true, substitute: false, turnId: 'model-new', onDelivered,
+    });
+    expect(accepted).toBe(false);
+    expect(onDelivered).not.toHaveBeenCalled();
+    expect(ds.session).toEqual(before);
+    expect(saved).toEqual(before);
+    expect(ds.replyThreadAliases).toBe(aliases);
+    expect(ds.currentReplyTarget).toBe(current);
+  });
+
+  it('restores absent binding fields when persistence fails before sending', () => {
+    const ds = liveSession();
+    const before = structuredClone(ds.session);
+    mocks.updateSession.mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(() => deliverPassthrough(ds, '/model', '/model sonnet', 'om_root', ds.larkAppId, {
+      messageId: 'om_picker', senderOpenId: 'ou_operator', senderIsBot: false, substitute: false,
+    })).toThrow('disk full');
+    expect(ds.session).toEqual(before);
+    expect(Object.hasOwn(ds.session, 'quoteTargetSenderIsBot')).toBe(false);
+    expect((ds.worker as any).send).not.toHaveBeenCalled();
+  });
 
   it('calls onDelivered even when the post-send turn bookkeeping throws', () => {
     const ds = liveSession();

@@ -64,6 +64,7 @@ function listenerProblem(listener: MessageListenerData): string | null {
   if (new TextEncoder().encode(listener.prompt.trim()).length > MAX_MESSAGE_LISTENER_PROMPT_BYTES) return 'prompt_too_large';
   if (!listener.enabled) return null;
   if (!listener.prompt.trim()) return 'prompt_required';
+  if (listener.contentPolicy?.includeMentionedOpenIds !== undefined && listener.contentPolicy.includeMentionedOpenIds.length === 0) return 'keyword_identity_required';
   if (listener.senderPolicy?.mode !== 'all_except_excluded' && (listener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) return 'sender_required';
   return null;
 }
@@ -74,6 +75,7 @@ function listenerErrorText(error: unknown, tr: Translator): string {
   switch (reason) {
     case 'prompt_required': return tr('roles.listenerPromptRequired');
     case 'sender_required': return tr('roles.listenerSenderRequired');
+    case 'keyword_identity_required': return tr('roles.listenerIdentityKeywordRequired');
     case 'prompt_too_large': return tr('listeners.errorPromptTooLarge', { max: MAX_MESSAGE_LISTENER_PROMPT_BYTES });
     case 'invalid_listener': return tr('listeners.errorInvalid');
     default: return reason;
@@ -159,8 +161,11 @@ export function MessageListenersPage() {
   const [listenerGroups, setListenerGroups] = useState<ListenerGroup[]>([]);
   const [expanded, setExpanded] = useState<string>();
   const [customEdit, setCustomEdit] = useState<CustomEdit | null>(null);
-  const [globalMembers, setGlobalMembers] = useState<GroupMemberDisplay[]>([]);
-  const [groupMembers, setGroupMembers] = useState<GroupMemberDisplay[]>([]);
+  // open_id belongs to a Bot application. Never offer a previous roster while
+  // the selected Bot / preview group's members are still loading.
+  type MemberSnapshot = { botId: string; chatId: string; members: GroupMemberDisplay[] };
+  const [globalMemberSnapshot, setGlobalMemberSnapshot] = useState<MemberSnapshot>();
+  const [groupMemberSnapshot, setGroupMemberSnapshot] = useState<MemberSnapshot>();
   const [globalSaving, setGlobalSaving] = useState(false);
   const [groupSaving, setGroupSaving] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -255,10 +260,13 @@ export function MessageListenersPage() {
 
   const ready = !!botId && loadState.botId === botId && !loadState.error;
   const selected = listenerGroups.find(group => group.chatId === expanded);
+  // Keep custom rules (including paused ones) easy to find. Stable sorting
+  // preserves /api/groups' newest-first firstSeenAt order within each tier;
+  // daemon-only fallback chats retain their existing order at the end.
   const visibleGroups = listenerGroups.filter(group => {
     const query = groupQuery.trim().toLowerCase();
     return !query || (group.name ?? group.chatId).toLowerCase().includes(query) || group.chatId.toLowerCase().includes(query);
-  });
+  }).sort((a, b) => Number(b.mode === 'custom') - Number(a.mode === 'custom'));
   const visibleBots = bots.filter(bot => {
     const query = botQuery.trim().toLowerCase();
     return !query || bot.botName.toLowerCase().includes(query) || bot.larkAppId.toLowerCase().includes(query);
@@ -277,16 +285,22 @@ export function MessageListenersPage() {
   }, [ready, botId, selected?.chatId, selected?.mode]);
   useEffect(() => {
     let active = true;
-    if (!botId || !sampleChatId) { setGlobalMembers([]); return () => { active = false; }; }
-    void loadGroupMemberDisplays(botId, sampleChatId).then(members => { if (active) setGlobalMembers(members); }).catch(() => { if (active) setGlobalMembers([]); });
+    if (!botId || !sampleChatId) return () => { active = false; };
+    const store = (members: GroupMemberDisplay[]) => { if (active) setGlobalMemberSnapshot({ botId, chatId: sampleChatId, members }); };
+    void loadGroupMemberDisplays(botId, sampleChatId).then(store).catch(() => store([]));
     return () => { active = false; };
   }, [botId, sampleChatId]);
   useEffect(() => {
     let active = true;
-    if (!botId || !expanded) { setGroupMembers([]); return () => { active = false; }; }
-    void loadGroupMemberDisplays(botId, expanded).then(members => { if (active) setGroupMembers(members); }).catch(() => { if (active) setGroupMembers([]); });
+    if (!botId || !expanded) return () => { active = false; };
+    const store = (members: GroupMemberDisplay[]) => { if (active) setGroupMemberSnapshot({ botId, chatId: expanded, members }); };
+    void loadGroupMemberDisplays(botId, expanded).then(store).catch(() => store([]));
     return () => { active = false; };
   }, [botId, expanded]);
+  const globalMembersReady = !!globalMemberSnapshot && globalMemberSnapshot.botId === botId && globalMemberSnapshot.chatId === sampleChatId;
+  const groupMembersReady = !!groupMemberSnapshot && groupMemberSnapshot.botId === botId && groupMemberSnapshot.chatId === expanded;
+  const globalMembers = useMemo(() => globalMembersReady ? globalMemberSnapshot!.members : [], [globalMembersReady, globalMemberSnapshot]);
+  const groupMembers = useMemo(() => groupMembersReady ? groupMemberSnapshot!.members : [], [groupMembersReady, groupMemberSnapshot]);
   const globalMemberById = useMemo(() => new Map(globalMembers.map(member => [member.openId, member])), [globalMembers]);
   const groupMemberById = useMemo(() => new Map(groupMembers.map(member => [member.openId, member])), [groupMembers]);
   const globalDirty = useMemo(() => listenerDraftKey(global) !== listenerDraftKey(savedGlobal), [global, savedGlobal]);
@@ -526,7 +540,7 @@ export function MessageListenersPage() {
     const update = (next: (current: MessageListenerData) => MessageListenerData) => { invalidatePreview(scope); setter(next); };
     const setTargetsForScope = (ids: string[], listening: boolean) => { invalidatePreview(scope); setTargets(setter, ids, listening); };
     const scopedFlash = flash?.scope === scope ? flash : null;
-    return <MessageListenerEditor listener={listener} members={members} memberById={memberById} promptByteLen={new TextEncoder().encode(listener.prompt).length} loading={false} membersLoading={false} flash={scopedFlash} tr={tr} previewLimit={previewLimit} previewStatus={previewStatus} previewScope={scope} onPatch={patch(scope, setter)} onSenderPolicyPatch={senderPolicy => update(current => patchListenerSenderPolicy(current, senderPolicy))} onMessagePolicyPatch={messagePolicy => update(current => patchListenerMessagePolicy(current, messagePolicy))} onContentPolicyPatch={contentPolicy => update(current => patchListenerContentPolicy(current, contentPolicy))} onToggleSenderType={(type, checked) => update(current => toggleListenerSenderType(current, type, checked))} onToggleMsgType={(type, checked) => update(current => toggleListenerMsgType(current, type, checked))} onSetTargetPolicy={(id, listening) => setTargetsForScope([id], listening)} onSetTargetsPolicy={setTargetsForScope} onSetSenderMode={mode => update(current => patchListenerSenderPolicy(current, { mode }))} onPreview={() => void previewFor(scope, false, listener)} onRunPreview={() => void previewFor(scope, true, listener)} onPreviewLimitChange={limit => { invalidatePreview(scope); (isGlobal ? setGlobalPreviewLimit : setGroupPreviewLimit)(limit); }} />;
+    return <MessageListenerEditor listener={listener} members={members} memberById={memberById} promptByteLen={new TextEncoder().encode(listener.prompt).length} loading={false} membersLoading={isGlobal ? !globalMembersReady : !groupMembersReady} flash={scopedFlash} tr={tr} previewLimit={previewLimit} previewStatus={previewStatus} previewScope={scope} onPatch={patch(scope, setter)} onSenderPolicyPatch={senderPolicy => update(current => patchListenerSenderPolicy(current, senderPolicy))} onMessagePolicyPatch={messagePolicy => update(current => patchListenerMessagePolicy(current, messagePolicy))} onContentPolicyPatch={contentPolicy => update(current => patchListenerContentPolicy(current, contentPolicy))} onToggleSenderType={(type, checked) => update(current => toggleListenerSenderType(current, type, checked))} onToggleMsgType={(type, checked) => update(current => toggleListenerMsgType(current, type, checked))} onSetTargetPolicy={(id, listening) => setTargetsForScope([id], listening)} onSetTargetsPolicy={setTargetsForScope} onSetSenderMode={mode => update(current => patchListenerSenderPolicy(current, { mode }))} onPreview={() => void previewFor(scope, false, listener)} onRunPreview={() => void previewFor(scope, true, listener)} onPreviewLimitChange={limit => { invalidatePreview(scope); (isGlobal ? setGlobalPreviewLimit : setGroupPreviewLimit)(limit); }} />;
   };
 
   const selectedPending = !!selected && customEdit?.chatId === selected.chatId && !customEdit.persisted;

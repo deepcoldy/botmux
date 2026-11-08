@@ -42,7 +42,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
 const { sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
-const { __setPlatformCredentialDepsForTest, noteInboundSenderUnionId, noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
+const { __setPlatformCredentialDepsForTest, noteInboundSenderUnionId, noteSenderUnionId, UNION_ID_SHARE_MS } = await import('../src/core/platform-credential-source.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -84,7 +84,7 @@ function botConfig(triggerUserAuth: unknown) {
   } as any;
 }
 const publish = (config: any, sender: string | undefined, turnId = 'om_t1') =>
-  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId });
+  publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: sender, turnId, privateChat: true });
 const read = (tool: 'lark-cli' | 'bytedcli') => readFileSync(sessionIdentityPath(dir, SESSION, tool), 'utf8');
 const granted = (tool: 'lark-cli' | 'bytedcli') => ({
   ok: true,
@@ -195,6 +195,7 @@ describe('credentialSource = auto, machine bound', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
     expect(read('lark-cli')).toContain('中心化平台暂时不可达');
+    expect(read('lark-cli')).toContain('[reason=platform_unreachable]');
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });
 
@@ -210,6 +211,7 @@ describe('credentialSource = auto, machine bound', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(read('lark-cli')).toContain('不在同一个团队');
+    expect(read('lark-cli')).toContain('[reason=platform_not_teammate]');
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });
 
@@ -217,6 +219,7 @@ describe('credentialSource = auto, machine bound', () => {
     unionIds.set(ALICE, null);
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+    expect(read('lark-cli')).toContain('[reason=union_id_unresolved]');
     expect(grantCalls).toHaveLength(0);
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });
@@ -419,3 +422,69 @@ describe('delegated identity (signed cross-bot dispatch)', () => {
   });
 });
 
+
+describe('both tools from the platform', () => {
+  it('asks for both grants at once, with one union_id lookup for the sender', async () => {
+    const lookups: string[] = [];
+    const pending: Array<() => void> = [];
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => BINDING,
+      resolveUnionId: async (_app, openId) => { lookups.push(openId); await new Promise(r => setTimeout(r, 5)); return 'on_alice'; },
+      requestGrant: (req) => new Promise(resolve => {
+        grantCalls.push(req);
+        pending.push(() => resolve(granted(req.tool) as any));
+      }),
+    });
+    const run = publish(botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: 'platform' }), ALICE);
+    await vi.waitFor(() => expect(grantCalls.map(c => c.tool).sort()).toEqual(['bytedcli', 'lark-cli']));
+    pending.forEach(release => release());
+    expect((await run).map(o => o.state)).toEqual(['user', 'user']);
+    expect(lookups).toEqual([ALICE]);
+    expect(read('lark-cli')).toContain('platform-user-token');
+    expect(read('bytedcli')).toContain('cloud-jwt');
+  });
+});
+
+describe('union_id lookup sharing', () => {
+  it('a hung contact lookup holds only the turns that joined it, not later ones', async () => {
+    vi.useFakeTimers();
+    try {
+      const calls: string[] = [];
+      __setPlatformCredentialDepsForTest({
+        readBinding: () => BINDING,
+        resolveUnionId: (_app, openId) => { calls.push(openId); return calls.length === 1 ? new Promise(() => {}) : Promise.resolve('on_alice'); },
+        requestGrant: async (req) => { grantCalls.push(req); return granted(req.tool) as any; },
+      });
+      const config = botConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' });
+      void publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: 'sess-hung', senderOpenId: ALICE, turnId: 'om_hung', privateChat: true });
+      await vi.advanceTimersByTimeAsync(UNION_ID_SHARE_MS + 1);
+      const later = publishTurnCliIdentity({ botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: 'om_later', privateChat: true });
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await later).find(o => o.tool === 'lark-cli')?.state).toBe('user');
+      expect(calls).toEqual([ALICE, ALICE]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a lookup started before the deps were swapped does not seed the new cache', async () => {
+    let release!: (v: string) => void;
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => BINDING,
+      resolveUnionId: () => new Promise(r => { release = r; }),
+      requestGrant: async (req) => { grantCalls.push(req); return granted(req.tool) as any; },
+    });
+    const config = botConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' });
+    const stale = publish(config, ALICE, 'om_stale');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const fresh: string[] = [];
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => BINDING,
+      resolveUnionId: async (_app, openId) => { fresh.push(openId); return null; },
+      requestGrant: async (req) => { grantCalls.push(req); return granted(req.tool) as any; },
+    });
+    release('on_stale');
+    await stale;
+    const out = await publish(config, ALICE, 'om_fresh');
+    expect(fresh).toEqual([ALICE]);
+    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+  });
+});

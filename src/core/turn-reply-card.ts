@@ -9,14 +9,16 @@ import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
-import { localeForBot } from '../i18n/index.js';
+import { localeForBot, t as tr } from '../i18n/index.js';
+import { isLarkContentAuditError } from '../im/lark/content-audit.js';
+import { sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { logger } from '../utils/logger.js';
 import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
-import { MessageWithdrawnError, uploadFile } from '../im/lark/client.js';
+import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '../im/lark/client.js';
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
-  normalizeReplyCardMode, replyCardIsTerminal, TurnReplyCardStore,
+  normalizeReplyCardMode, replyCardIsTerminal, supportsUnifiedReplyCardCli, TurnReplyCardStore,
   type TurnReplyCardMode, type TurnReplyCardEvent, type TurnReplyCardKey,
 } from '../services/turn-reply-card.js';
 import { isSubstituteTurn } from './reply-target.js';
@@ -69,7 +71,7 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
   const cli = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
   const existing = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, turnId));
   let mode: TurnReplyCardMode = existing?.mode ?? normalizeReplyCardMode(cfg.replyCardMode);
-  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !['claude-code', 'codex', 'grok'].includes(cli)
+  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !supportsUnifiedReplyCardCli(cli)
     || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: cfg.apiOnly })
     || isDocNativeSession(ds) || ds.session.vcMeetingReceiver || ds.session.deferredScheduleRun
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.session.headless
@@ -87,6 +89,20 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
   snapshot.set(turnId, mode);
   if (snapshot.size > 512) snapshot.delete(snapshot.keys().next().value!);
   return mode;
+}
+
+/**
+ * 统一回复卡片的所有 PATCH 都走这里：卡片里一旦写进最终回复，之后每次重绘（终态、
+ * 恢复、提问）都会再带上原文，被内容安全审计拒收时同样打码副本重发一次。
+ */
+export function patchReplyCardWithAuditRedaction(
+  larkAppId: string, card: string, label: string, patch: (body: string) => Promise<void>,
+): Promise<void> {
+  return sendWithContentAuditRedaction({
+    content: card, msgType: 'interactive', send: patch,
+    note: tr('worker.final_output_content_audit_redacted_note', undefined, localeForBot(larkAppId)),
+    log: line => logger.warn(`[reply-card] patch ${label} ${line}`),
+  });
 }
 
 export async function updateTurnReplyCard(
@@ -158,8 +174,9 @@ export async function updateTurnReplyCard(
       return messageId;
     },
     patch: async (messageId, card) => {
-      await patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, card, sessionAnchorId(ds),
-        groupContextAuthorOrigin, beforeEffect);
+      await patchReplyCardWithAuditRedaction(ds.larkAppId, card, `${event.kind} turn=${turnId.substring(0, 8)}`,
+        body => patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, body, sessionAnchorId(ds),
+          groupContextAuthorOrigin, beforeEffect));
       acknowledged.set(messageId, 'primary');
     },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
@@ -212,7 +229,9 @@ export async function updateTurnReplyCard(
     catch (error) {
       publication({ status: 'unavailable', reason: 'delivery_unknown' },
         acknowledged.size ? 'partial' : 'unknown', 'delivery_unknown');
-      if (attempt >= 2 || error instanceof MessageWithdrawnError || store.read(key)?.withdrawn) throw error;
+      // 内容安全审计拒收是确定性的（打码重发已在 transport 里做过一次），原样重试无用。
+      if (attempt >= 2 || error instanceof MessageWithdrawnError || isLarkContentAuditError(error)
+        || store.read(key)?.withdrawn) throw error;
       await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 800 : 2000));
       beforeEffect();
     }
@@ -305,18 +324,31 @@ export async function settleTurnReplyCards(ds: DaemonSession): Promise<void> {
   ds.replyCardRunningTurnId = undefined;
 }
 
-async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord): Promise<void> {
+async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord, beforeMs?: number): Promise<void> {
   // Resumable asks have already been restored by the broker at startup.
   const orphanAskIds = (record.asks ?? []).filter(entry => !entry.result && !getAskSnapshot(entry.ask.askId))
     .map(entry => entry.ask.askId);
-  await store.update(record, { kind: 'terminal', phase: 'ambiguous', disconnected: true, orphanAskIds }, {
-    beforeEffect: () => {
-      if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
-    },
+  const beforeEffect = () => {
+    if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
+  };
+  await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
+    beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
-    patch: (id, card) => patchPublishedGroupCard(record.larkAppId, record.chatId, id, card, record.rootId),
+    patch: (id, card) => patchReplyCardWithAuditRedaction(record.larkAppId, card, `recover turn=${record.turnId.substring(0, 8)}`,
+      body => patchPublishedGroupCard(record.larkAppId, record.chatId, id, body, record.rootId)),
+    sendOverflow: async (text, uuid) => {
+      const file = join(store.directory, `${store.id(record)}-reply.md`);
+      atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
+      beforeEffect();
+      const fileKey = await uploadFile(record.larkAppId, file);
+      beforeEffect();
+      const content = JSON.stringify({ file_key: fileKey });
+      return record.rootId && record.rootId !== record.chatId
+        ? replyMessage(record.larkAppId, record.rootId, content, 'file', true, uuid, undefined, { beforeWrite: beforeEffect })
+        : sendMessage(record.larkAppId, record.chatId, content, 'file', uuid, undefined, { beforeWrite: beforeEffect });
+    },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
-    render: state => buildTurnReplyCard({ ...state, finalCard: state.finalDelivered ? state.finalCard : undefined }, {
+    render: state => buildTurnReplyCard(state, {
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),
       locale: localeForBot(record.larkAppId), canStop: false,
     }),
@@ -334,8 +366,8 @@ export async function sweepInterruptedReplyCards(larkAppId: string): Promise<voi
       if (key.larkAppId !== larkAppId) continue;
       const record = store.read(key);
       if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn
-        || (replyCardIsTerminal(record) && record.phase !== 'ambiguous')) continue;
-      await settleDisconnectedReplyCard(store, record);
+        || (replyCardIsTerminal(record) && record.phase !== 'ambiguous' && !record.pendingPatch && !record.publishPending)) continue;
+      await settleDisconnectedReplyCard(store, record, processStartedAtMs);
     } catch (error) {
       logger.warn(`[reply-card] recovery: ${error instanceof Error ? error.message : String(error)}`);
     }

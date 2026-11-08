@@ -28,7 +28,7 @@ import {
   handleV3BlockedAction,
   isV3BlockedAction,
 } from './v3-blocked-card-handler.js';
-import type { V3BlockedActionValue, V3AskAnswerActionValue } from './v3-blocked-card.js';
+import type { V3BlockedActionValue, V3AskAnswerActionValue, V3ReassignActionValue } from './v3-blocked-card.js';
 import {
   handleV3LoopGrantAction,
   isV3LoopGrantAction,
@@ -43,6 +43,11 @@ import {
   handleV3RunSaveAction,
   isV3RunSaveAction,
 } from './v3-run-save-card-handler.js';
+import {
+  handleV3RevisionAction,
+  isV3RevisionAction,
+} from './v3-revision-card-handler.js';
+import type { V3RevisionActionValue } from './v3-revision-card.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
 import {
   handleV3DistillationAction,
@@ -111,6 +116,15 @@ export const CARD_PREFIX_ROUTES: readonly CardPrefixRoute[] = [
   // `/dashboard overview`：goto 按钮通过重新请求对应的专用 Route B 端点重建目标卡
   // （sessions-list / schedules-list / settings-snapshot）。不新增端点、不用 multi_url 跨卡跳转。
   dashboardRoute('dash_overview_', async () => (await import('./overview-card.js')).handleOverviewCardAction),
+  // 决策看板的拍板卡片（管家群）：只认管家 bot 的 owner，权限门在 DecisionBoardService.cardClick 里，
+  // 不走 canOperate（那是 bot 管理员口径）。
+  {
+    prefix: 'board_card_',
+    async handle(data, larkAppId) {
+      const { handleDecisionCardAction } = await import('../../core/decision-board/card-action.js');
+      return handleDecisionCardAction(data, larkAppId);
+    },
+  },
 ];
 
 /** 命中前缀路由则返回它；`action` 非字符串或缺 `larkAppId` 一律不命中。 */
@@ -138,7 +152,7 @@ export interface V3CardRoute {
   run(ctx: V3CardActionContext): Promise<any> | undefined;
 }
 
-/** 原 if 链顺序：gate → blocked → revisit → loop → runSave → distillation。 */
+/** 原 if 链顺序：gate → blocked → revisit → loop → revision → runSave → distillation。 */
 export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
   {
     name: 'gate',
@@ -151,10 +165,11 @@ export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
     matches: isV3BlockedAction,
     run: ctx => ctx.deps.v3BlockedDeps
       && handleV3BlockedAction(
-        ctx.value as unknown as V3BlockedActionValue | V3AskAnswerActionValue,
+        ctx.value as unknown as V3BlockedActionValue | V3AskAnswerActionValue | V3ReassignActionValue,
         ctx.operatorOpenId,
         ctx.deps.v3BlockedDeps,
         ctx.formValue as any,
+        ctx.larkAppId,
       ),
   },
   {
@@ -168,6 +183,12 @@ export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
     matches: isV3LoopGrantAction,
     run: ctx => ctx.deps.v3LoopGrantDeps
       && handleV3LoopGrantAction(ctx.value as unknown as V3LoopGrantActionValue, ctx.operatorOpenId, ctx.deps.v3LoopGrantDeps),
+  },
+  {
+    name: 'revision',
+    matches: isV3RevisionAction,
+    run: ctx => ctx.deps.v3RevisionDeps
+      && handleV3RevisionAction(ctx.value as unknown as V3RevisionActionValue, ctx.operatorOpenId, ctx.deps.v3RevisionDeps),
   },
   {
     name: 'runSave',
@@ -222,6 +243,11 @@ const NO_META: SensitiveCardActionMeta = {};
 // 不在本表、但有自己权限门的动作（别「顺手」补进来，会把合法点击者挡掉）：
 // - `retry_recovery_turn`（自动恢复失败卡的「重试」）：原发起人（仍能对话）或
 //   bot 管理员可点，门在 core/ordinary-recovery-retry.ts 的 handleOrdinaryRecoveryRetryClick。
+// - `board_card_*`（决策看板拍板卡片）：只认管家 bot 的 owner，门在 DecisionBoardService.cardClick。
+// - `stuck_key`（CLI 卡在阻塞页时卡片上的安全按键）：本轮发起人（仍能对话）可点
+//   只做拒绝/跳过的键，bot 管理员可点全部键；门在 core/stuck-warning-card.ts 的
+//   decideStuckKeyClick（键由服务端按页面类型 + 下标查 core/stuck-page-catalog.ts，
+//   卡片 value 不带键）。同卡的旧 `tui_keys` 按钮仍在本表里，只给管理员。
 
 export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta> = new Map<string, SensitiveCardActionMeta>([
   ['restart', NO_META],
@@ -256,11 +282,17 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['compact_session', NO_META],
   // 闲置自动压缩开关（core/idle-auto-compact.ts）：改的是会话持久设置，同样过 canOperate。
   ['toggle_idle_compact', { denyToastKey: 'card.idle_compact.no_permission' }],
+  // 本群替身模式开关：写 per-bot + per-chat 运行态设置，同样过 canOperate。
+  ['toggle_substitute', { denyToastKey: 'cmd.substitute.owner_only' }],
   ['quote_confirm', NO_META],
   ['set_reasoning_effort', NO_META],
   // 普通回复卡右下角操作菜单（#1877）：展开菜单与模型选择注入都必须过 canOperate。
   ['reply_card_menu', NO_META],
   ['reply_model_pick', NO_META],
+  ['session_model_unpin', NO_META],
+  ['session_model_pick', NO_META],
+  ['session_effort_pick', NO_META],
+  ['session_effort_apply', NO_META],
 ]);
 
 /** 该 action 是否过 canOperate 门；非字符串 / 未登记一律 undefined。 */

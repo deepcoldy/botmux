@@ -86,6 +86,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   });
   return {
   forkWorker: vi.fn(),
+  recordTurnExplicitMention: vi.fn(),
   killWorker: vi.fn(),
   suspendWorker: vi.fn(() => false),
   teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
@@ -141,6 +142,7 @@ vi.mock('../src/services/git-worktree.js', () => ({
   removeRepoWorktree: vi.fn(async () => {}),
   pushWorktreeBranch: vi.fn(async () => {}),
   dirSuffixForBranch: (branch: string) => branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch',
+  worktreeTargetPath: (repo: string, dirName: string) => `${repo.slice(0, repo.lastIndexOf('/'))}/${dirName}`,
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({

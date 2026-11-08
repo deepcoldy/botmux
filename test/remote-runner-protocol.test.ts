@@ -8,11 +8,28 @@ import {
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
   parseRemoteRunnerEventLine,
+  projectRemoteRunnerTrustedCaller,
   remoteRunnerCommand,
   type RemoteRunnerEvent,
 } from '../src/adapters/backend/remote-runner-protocol.js';
 
 describe('remote runner protocol', () => {
+  it('never serializes a verified local principal or capability to a remote provider', () => {
+    expect(projectRemoteRunnerTrustedCaller({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      verifiedEmail: 'actor@bytedance.com',
+      botmuxGrantedCapabilities: ['fixture.secret.v1'],
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    })).toEqual({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    });
+  });
+
   it('keeps remote compute and native agent lineage as separate state', () => {
     expect(normalizeRemoteRunnerBackendState({
       version: 1,
@@ -538,6 +555,7 @@ describe('remote runner protocol', () => {
     for (const request of [
       { tool: 'schedule.list' },
       { tool: 'schedule.update', taskId: 'deadbeef', prompt: '新提示' },
+      { tool: 'schedule.update', taskId: 'deadbeef', schedule: 'every 4h' },
       { tool: 'schedule.remove', taskId: 'deadbeef' },
       { tool: 'schedule.pause', taskId: 'self' },
       { tool: 'schedule.resume', taskId: 'deadbeef' },
@@ -561,6 +579,8 @@ describe('remote runner protocol', () => {
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'top-level', followActive: true },
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'new-topic', topicTitle: 'x'.repeat(201) },
       { tool: 'schedule.update', taskId: 'deadbeef' },
+      { tool: 'schedule.update', taskId: 'deadbeef', schedule: '' },
+      { tool: 'schedule.update', taskId: 'deadbeef', schedule: 4 },
       { tool: 'schedule.remove', taskId: 'not-an-id' },
       { tool: 'schedule.resume', taskId: 'self' },
     ]) {
