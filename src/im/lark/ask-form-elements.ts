@@ -1,12 +1,15 @@
 import type { PendingAsk, AskResult } from '../../core/ask-types.js';
 import type { Locale } from '../../i18n/index.js';
+import { optionDescriptions } from './ask-option-descriptions.js';
 
 // Shared by standalone and inline cards. Choice changes stay client-side inside
 // ONE Card 2.0 form: no toggle callback/repaint may discard an unfinished input.
 const safe = (s: string) => s.replace(/[\\`*_[\]<>!~&]/g, c => `\\${c}`);
 const plain = (content: string) => ({ tag: 'plain_text', content });
 
-export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: AskResult, valueCap = 300): Array<Record<string, any>> {
+/** `mention` (a ready `<at>` tag) is drawn only while unsettled; `descriptionCap` limits each option description. */
+export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: AskResult, valueCap = 300,
+  extras: { mention?: string; descriptionCap?: number } = {}): Array<Record<string, any>> {
   const en = locale === 'en';
   const displayValue = (value: string) => {
     if (value.length <= valueCap) return value;
@@ -23,6 +26,8 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
       const value = result.kind === 'answered'
         ? result.inputs?.[i] ?? result.answers[i]?.map(k => q.options.find(o => o.key === k)?.label ?? k).join(', ') : '';
       elements.push({ tag: 'markdown', content: `**${safe(q.prompt)}**${value ? `\n${safe(displayValue(value))}` : ''}` });
+      const details = q.input ? undefined : optionDescriptions(q, locale, extras.descriptionCap);
+      if (details) elements.push({ tag: 'markdown', text_size: 'notation', content: details.content });
     }
     if (result.kind === 'answered') {
       if (result.comment) elements.push({ tag: 'markdown', content: safe(displayValue(result.comment)) });
@@ -34,7 +39,7 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
   }
   const fields: Array<Record<string, any>> = [];
   ask.questions.forEach((q, i) => {
-    fields.push({ tag: 'markdown', content: `**${safe(q.prompt)}**${q.input?.required === false ? (en ? ' (optional)' : '（选填）') : ''}` });
+    fields.push({ tag: 'markdown', content: `${i === 0 && extras.mention ? `${extras.mention}\n` : ''}**${safe(q.prompt)}**${q.input?.required === false ? (en ? ' (optional)' : '（选填）') : ''}` });
     if (q.input) {
       // number uses text transport intentionally: validate decimals server-side
       // without coercion/precision loss or inventing a platform-specific widget.
@@ -47,6 +52,8 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
         options: q.options.map(o => ({ text: plain(o.label), value: o.key })),
         ...(q.defaultSelectedKeys?.length ? q.multiSelect ? { selected_values: [...q.defaultSelectedKeys] }
           : { initial_option: q.defaultSelectedKeys[0] } : {}) });
+      const details = optionDescriptions(q, locale, extras.descriptionCap);
+      if (details) fields.push({ tag: 'markdown', text_size: 'notation', content: details.content });
     }
   });
   fields.push({ tag: 'button', name: 'ask_form_submit', type: 'primary', form_action_type: 'submit',

@@ -8479,6 +8479,33 @@ describe('PUT /api/bot-no-progress-notify', () => {
 });
 
 describe('PUT /api/bot-substitute-mode', () => {
+  it('persists only App ID and leaves disk unchanged when any submitted App ID is invalid', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-app-id-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: 'cli_receiver', larkAppSecret: 'secret', cliId: 'codex' }]));
+      loadBotConfigs().forEach(registerBot);
+      setLarkAppId('cli_receiver');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const put = (targets: unknown[]) => fetch(`http://127.0.0.1:${handle!.port}/api/bot-substitute-mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: true, targets }),
+      });
+      const saved = await put([{ appId: 'cli_external', openId: 'ou_old', botChatId: 'oc_old' }]);
+      expect(saved.status).toBe(200);
+      expect((await saved.json()).substituteMode.targets).toEqual([{ appId: 'cli_external' }]);
+      const before = readFileSync(configPath, 'utf8');
+      const rejected = await put([{ appId: 'cli_external' }, { appId: '' }]);
+      expect(rejected.status).toBe(400);
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect(loadBotConfigs()[0].substituteMode?.targets).toEqual([{ appId: 'cli_external' }]);
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('preserves reply settings and keyword filters through HTTP, and can clear keywords', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));
     const configPath = join(dir, 'bots.json');

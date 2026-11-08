@@ -127,7 +127,7 @@ Each Dashboard field maps to `substituteMode` in this bot's [bots.json](/en/bots
 | Field | Dashboard name | Meaning |
 |------|------|------|
 | `enabled` | Enable substitute trigger | Master switch. Turning it off keeps the targets and other settings, so you don't re-enter them next time |
-| `targets` | Substitute targets | The people being covered. Each entry has one of `openId` / `userId` / `unionId`; `name` is an optional display name shown to the AI |
+| `targets` | Substitute targets | The people or bots being covered. Each entry has one of `openId` / `userId` / `unionId`; a bot can also be given by `appId` alone (see below). `name` is an optional display name shown to the AI |
 | `keywords` | Trigger keywords (optional) | Array of strings. Empty or omitted means "trigger on @-mentioning a target alone". When set, a message must both @-mention a target and contain any of these keywords (case-insensitive substring match) in the body the sender typed in this message — mention labels, quoted/forwarded or history content are excluded, and a body that can't be parsed counts as no match. **On a keyword miss the whole message is dropped and the bot stays silent; it never falls through to an existing session, no-@ mode or solo-group fallback** (except when the bot itself is @-mentioned directly, or the body starts with `/` as a slash command). In the Dashboard, separate keywords with newlines, commas or semicolons |
 | `disclosure` | Disclosure | `prefix` (default): ask the AI to say who it is answering for; `none`: no extra disclosure requirement |
 | `replyMode` | Reply style | Regular groups only. `thread` (default): reply in a thread under the trigger message; `quote`: quote the trigger message without a new thread |
@@ -139,9 +139,19 @@ Each Dashboard field maps to `substituteMode` in this bot's [bots.json](/en/bots
 
 A few notes:
 
-- When editing bots.json by hand, an **email-only target matches no one**: Lark @-mentions don't carry email. The email is only kept as a label; if substitute mode is enabled but no target has an `openId` / `userId` / `unionId`, the whole `substituteMode` block is ignored on load. To add people by email, save them in the Dashboard so they are resolved to Open IDs.
+- When editing bots.json by hand, an **email-only target matches no one**: Lark @-mentions don't carry email. The email is only kept as a label; if substitute mode is enabled but no target has an `openId` / `userId` / `unionId` / `appId`, the whole `substituteMode` block is ignored on load. To add people by email, save them in the Dashboard so they are resolved to Open IDs.
 - Run `botmux restart` after editing by hand.
 - In a blocked group, a message that @-mentions a target is ignored outright and doesn't fall through to other no-@ rules. Direct @-mentions of the bot are still answered.
+
+### Bot substitute targets by App ID
+
+To have the bot answer for another bot, choose **App ID** as the target type and enter `cli_...`; in bots.json write `{ "appId": "cli_example" }`. No Open ID or chat ID is needed, and display names are never used for matching.
+
+- @-mentions in both text and rich-text messages count, whether a person or a bot with talk access sent them.
+- The allow list, block list, per-group `/substitute off`, trigger keywords and active-topic rules work exactly as for Open ID targets, and a message they hold back doesn't fall through to other paths either. Messages from bots go through the same rules; when one is held back it also doesn't start a session through new-topic auto-start.
+- Lark events only carry the receiver-scoped Open ID, so the bot reads the message again through the Get Message API to learn the App ID. If that read fails, returns a different version of the message, or the identities don't line up, the message isn't treated as an App ID substitute trigger.
+- When a substitute message from a bot waits in the session queue, the sender's access and the substitute settings are checked again right before it runs. If the sender is revoked or blocked, or substitute mode is turned off or changed meanwhile, the message is dropped.
+- Saving only checks the format (uppercase is converted to lowercase). It doesn't check that the app exists or is in the group, and doesn't request extra scopes to look up names. A malformed `appId` in a hand-edited bots.json is logged as a warning and that target is ignored.
 
 ### Per-group toggle
 

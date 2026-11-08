@@ -44,7 +44,7 @@ import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor, refreshCodexModelSelection, recordCodexModelLaunch, resetCodexModelSelection, supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
-import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
+import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, promptCacheKeepaliveInFlight, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { clearIdleAutoCompactStretch, idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
@@ -244,7 +244,7 @@ import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
-import { isMaintenanceTurnId, noteDiagnosticFinal, noteFinalReplyText, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
+import { isTurnOutcomeExcluded, noteFinalOutputReceipt, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
 import { validateFinalOutputSnapshot, type FinalOutputOffer } from '../services/final-output-handoff.js';
 import { FinalOutputHandoffStore, type StoredFinalOutput } from '../services/final-output-handoff-store.js';
 import { FinalOutputHandoffHost, FinalOutputRejectedError, type FinalOutputDeliveryControl } from '../services/final-output-handoff-host.js';
@@ -14917,8 +14917,22 @@ export function stampIdleSinceAt(
     ds.idleSinceAt = undefined;
   }
   const busy = BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '');
-  if (busy && !BUSY_RUNTIME_STATUSES.has(prev ?? '')) ds.busySinceAt = now;
-  else if (!busy) ds.busySinceAt = undefined;
+  if (!busy) {
+    ds.busySinceAt = undefined;
+  } else if (!BUSY_RUNTIME_STATUSES.has(prev ?? '') || ds.busySinceAt === undefined) {
+    // A prompt-cache keep-alive's own busy period is not a new round: stamping it
+    // would supersede a raised hand and release a manual board column for the
+    // length of a ping. Once the keep-alive is refused or goes stale while the
+    // screen stays busy, the busy period is real work and the next update stamps it.
+    ds.busySinceAt = promptCacheKeepaliveInFlight(ds, now) ? undefined : now;
+    // The screen_update patch carries busySinceAt only on a status change.
+    if (ds.busySinceAt !== undefined && prev === ds.lastScreenStatus) {
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: { sessionId: ds.session.sessionId, patch: { busySinceAt: ds.busySinceAt } },
+      });
+    }
+  }
   // A prompt-cache keep-alive's own busy period is not activity: restore the
   // idle stretch's original start so idleSuspendMinutes keeps counting.
   notePromptCacheKeepaliveScreenStatus(ds, prev, now);
@@ -21182,14 +21196,8 @@ function setupWorkerHandlers(
             executionTerminals.delete(oldestTerminalKey);
           }
         }
-        // Auto-compact and HTTP-caller turns never reach the group, so they
-        // must not replace the session's last user-visible turn result.
-        const outcomeExcluded = isMaintenanceTurnId(msg.turnId)
-          || ds.session.idleAutoCompact?.inFlight?.turnId === msg.turnId
-          || ds.idleAutoCompactDispatchedTurnId === msg.turnId
-          || !!ds.pendingWaitPromises?.has(msg.turnId)
-          || !!ds.asyncTriggerResults?.has(msg.turnId)
-          || !!ds.settledHttpTerminalTurns?.has(msg.turnId);
+        // Read before the code below settles the auto-compact and HTTP-wait markers.
+        const outcomeExcluded = isTurnOutcomeExcluded(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
           if (noteIdleAutoCompactRefused(ds, msg.turnId)) {
@@ -23911,13 +23919,12 @@ function deliverFinalOutput(
       }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
-      if (messageId && !managedReceiver && !msg.turnFailed) {
-        if (msg.emptyCompletedNotice) {
-          noteDiagnosticFinal(ds, msg.turnId);
-        } else {
-          noteFinalReplyText(ds, msg.turnId, explicit?.finalText ?? safeAssistantText);
-          noteLateFinalReply(ds, msg.turnId);
-        }
+      if (messageId && !managedReceiver) {
+        noteFinalOutputReceipt(ds, msg.turnId, {
+          turnFailed: msg.turnFailed,
+          emptyCompletedNotice: msg.emptyCompletedNotice,
+          text: explicit?.finalText ?? safeAssistantText,
+        });
       }
       if (!managedReceiver) {
         recordOncallGroupDelivery(config.session.dataDir, {

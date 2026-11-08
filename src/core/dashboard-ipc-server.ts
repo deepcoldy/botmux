@@ -1219,6 +1219,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // exceptions: a receiver that learned another session id could otherwise
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
+  if (method === 'POST' && pathname === '/api/claude-compaction-start-v1') return true;
   if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/form-v1' || pathname === '/api/asks/cli-resolved')) return true;
   // The dsh-tui wrapper plugin's structured end-of-turn report (`botmux
   // __turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
@@ -9546,11 +9547,12 @@ ipcRoute('PUT', '/api/bot-substitute-mode', requireBoundBot(async (req, res) => 
   // Resolve the submitted email / union_id entries into runtime-matchable
   // open_ids (+ fresh display names) using this bot's own credentials before
   // persisting; unresolvable entries are dropped but reported back for the UI.
-  const { targets, resolution } = await substituteModeStore.resolveSubstituteTargets(
+  const { targets, resolution, invalidAppId } = await substituteModeStore.resolveSubstituteTargets(
     cachedLarkAppId,
     rec.targets,
     { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfileStrict },
   );
+  if (invalidAppId) return jsonRes(res, 400, { ok: false, error: 'invalid_app_id', resolution });
   const chats = Array.isArray(rec.chats)
     ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
     : [];

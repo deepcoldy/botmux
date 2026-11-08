@@ -107,6 +107,35 @@ export function noteDiagnosticFinal(ds: DaemonSession, turnId: string): void {
   remember(finalKinds, ds, turnId, 'diagnostic');
 }
 
+/**
+ * 最终输出通道送达了一条消息。失败卡不是最终回复；「已完成但没匹配到最终文本」的诊断只记成诊断；
+ * 其余记下正文第一行，回执晚于本轮结果落盘的补成已交付。
+ */
+export function noteFinalOutputReceipt(
+  ds: DaemonSession,
+  turnId: string,
+  receipt: { turnFailed?: boolean; emptyCompletedNotice?: boolean; text: unknown },
+  opts: { now?: () => number; dataDir?: string } = {},
+): void {
+  if (receipt.turnFailed) return;
+  if (receipt.emptyCompletedNotice) {
+    noteDiagnosticFinal(ds, turnId);
+    return;
+  }
+  noteFinalReplyText(ds, turnId, receipt.text);
+  noteLateFinalReply(ds, turnId, opts);
+}
+
+/** 自动压缩和 HTTP 调用方的轮不进群，不能顶掉会话上用户看得到的本轮结果。 */
+export function isTurnOutcomeExcluded(ds: DaemonSession, turnId: string): boolean {
+  return isMaintenanceTurnId(turnId)
+    || ds.session.idleAutoCompact?.inFlight?.turnId === turnId
+    || ds.idleAutoCompactDispatchedTurnId === turnId
+    || !!ds.pendingWaitPromises?.has(turnId)
+    || !!ds.asyncTriggerResults?.has(turnId)
+    || !!ds.settledHttpTerminalTurns?.has(turnId);
+}
+
 function resultStillCurrent(ds: DaemonSession, turn: SessionLastTurn | undefined): turn is SessionLastTurn {
   return !!turn && !(ds.lastMessageAt > lastTurnCurrentThrough(turn));
 }
