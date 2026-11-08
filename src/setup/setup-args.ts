@@ -43,6 +43,10 @@ export interface SetupBotFlags {
   brand?: string;
   /** UI 语言：zh | en。 */
   lang?: string;
+  /** 首次上线后私聊 owner 的欢迎语原文；'-' 清空。 */
+  welcomeMessage?: string;
+  /** 从文件读欢迎语，与 welcomeMessage 二选一；由执行层经 resolveWelcomeMessageFile 读成 welcomeMessage。 */
+  welcomeMessageFile?: string;
 }
 
 export type SetupCommand =
@@ -83,6 +87,8 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--show-in-team': 'showInTeam',
   '--brand': 'brand',
   '--lang': 'lang',
+  '--welcome-message': 'welcomeMessage',
+  '--welcome-message-file': 'welcomeMessageFile',
 };
 
 export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
@@ -144,6 +150,9 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --show-in-team <bool>      平台团队页是否展示（默认 true）
   --brand <feishu|lark>      租户类型（仅 add）
   --lang <zh|en>             Bot 语言（zh | en；edit 传 - 清空以继承全局语言）
+  --welcome-message <text>   机器人首次成功上线后私聊 owner 的欢迎语，只发一次；
+                             edit 传 - 清空。发送失败不影响启动，下次启动重试
+  --welcome-message-file <f> 从文件读欢迎语（与 --welcome-message 二选一）
 
 通用选项：
   --json                     输出机器可读 JSON（含 ok / error 字段）
@@ -358,6 +367,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
     // 显式 --wrapper-cli 覆盖 --cli 推导出的前缀（undefined 时不动 base 里的值）。
     wrapperCli: flags.wrapperCli,
     lang: flags.lang,
+    welcomeMessage: flags.welcomeMessage,
   };
   const bot = applyBotConfigEdits(base, input);
   if (!hasOwnerEntry(bot.allowedUsers)) {
@@ -408,7 +418,28 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.allowedChatGroups !== undefined) input.allowedChatGroups = flags.allowedChatGroups;
   if (flags.showInTeam !== undefined) input.showInTeam = flags.showInTeam;
   if (flags.lang !== undefined) input.lang = flags.lang;
+  if (flags.welcomeMessage !== undefined) input.welcomeMessage = flags.welcomeMessage;
   return input;
+}
+
+/**
+ * 把 --welcome-message-file 读成 welcomeMessage。读文件由调用方注入（本模块不碰 fs），
+ * --welcome-message 的值始终是原文，以 @ 开头也不当文件路径。
+ */
+export function resolveWelcomeMessageFile(
+  flags: SetupBotFlags,
+  readText: (path: string) => string,
+): SetupBotFlags {
+  const { welcomeMessageFile, ...rest } = flags;
+  if (welcomeMessageFile === undefined) return flags;
+  if (flags.welcomeMessage !== undefined) {
+    throw new Error('--welcome-message 与 --welcome-message-file 只能二选一。');
+  }
+  const text = readText(welcomeMessageFile);
+  if (!text.trim()) {
+    throw new Error(`欢迎语文件 ${welcomeMessageFile} 是空的；要清空欢迎语请用 --welcome-message -。`);
+  }
+  return { ...rest, welcomeMessage: text };
 }
 
 /** list --json 输出前的 secret 脱敏（CLI 输出可能被贴进聊天/日志）。 */

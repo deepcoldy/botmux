@@ -17,7 +17,13 @@ import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evi
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from '../src/core/restart-fresh-budget.js';
 import { join } from 'node:path';
 
-type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean; restartCause?: 'traex-auto-model' }) => Promise<void>;
+type RespawnResult = 'spawned' | 'failed' | 'superseded';
+type Restart = (reason: string, opts?: {
+  immediate?: boolean;
+  preservePending?: boolean;
+  restartCause?: 'traex-auto-model';
+  onRespawnSettled?: (result: RespawnResult) => void;
+}) => Promise<void>;
 
 function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
   const timers: Array<() => unknown> = [];
@@ -84,7 +90,7 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     await timer!();
     expect(scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
   };
-  return { scope, observed, restart, runSpawnTimer };
+  return { scope, observed, restart, runSpawnTimer, timers };
 }
 
 describe('worker restart input fence', () => {
@@ -213,6 +219,67 @@ describe('worker restart input fence', () => {
     h.scope.lastCliExitServerReplaced = true;
     await h.restart('daemon request');
     expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+});
+
+describe('restart respawn settlement', () => {
+  it('reports a running replacement once, while input is still queued for it', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const seen: Array<[RespawnResult, boolean]> = [];
+    await h.restart('purge', { preservePending: true, onRespawnSettled: r => seen.push([r, h.scope.cliRestartInProgress]) });
+    expect(seen).toEqual([]);
+    await h.runSpawnTimer();
+    expect(seen).toEqual([['spawned', true]]);
+  });
+
+  it('reports a failed spawn before the worker exits', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const order: string[] = [];
+    h.scope.spawnCli = vi.fn(async () => { throw new Error('spawn ENOENT'); });
+    h.scope.sendFatalWorkerErrorAndExit = vi.fn(async () => { order.push('fatal exit'); });
+    await h.restart('purge', { preservePending: true, onRespawnSettled: r => order.push(r) });
+    await h.timers.shift()!();
+    expect(order).toEqual(['failed', 'fatal exit']);
+  });
+
+  it('reports a spawn superseded by a newer restart', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const seen: RespawnResult[] = [];
+    h.scope.spawnCli = vi.fn(async () => { throw new h.scope.CliSpawnSupersededError(); });
+    await h.restart('purge', { preservePending: true, onRespawnSettled: r => seen.push(r) });
+    await h.timers.shift()!();
+    expect(seen).toEqual(['superseded']);
+    expect(h.scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
+  });
+
+  it('reports failure when the restart stops before any spawn', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const order: string[] = [];
+    h.scope.backend = { destroySession: vi.fn(() => Promise.reject(new Error('tmux kill failed'))) };
+    h.scope.sendFatalWorkerErrorAndExit = vi.fn(async () => { order.push('fatal exit'); });
+    await h.restart('purge', { preservePending: true, onRespawnSettled: r => order.push(r) });
+    expect(order).toEqual(['failed', 'fatal exit']);
+    expect(h.scope.spawnCli).not.toHaveBeenCalled();
+
+    const unconfigured = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    unconfigured.scope.lastInitConfig = null;
+    const unconfiguredSeen: RespawnResult[] = [];
+    await unconfigured.restart('purge', { onRespawnSettled: r => unconfiguredSeen.push(r) });
+    await unconfigured.runSpawnTimer();
+    expect(unconfiguredSeen).toEqual(['failed']);
+
+    const abandoned = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    abandoned.scope.codexAutoUpgrade = { reject: vi.fn() };
+    const seen: RespawnResult[] = [];
+    await abandoned.restart('purge', { onRespawnSettled: r => seen.push(r) });
+    expect(seen).toEqual(['failed']);
+  });
+
+  it('keeps restarting when the settle callback throws', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    await h.restart('purge', { preservePending: true, onRespawnSettled: () => { throw new Error('boom'); } });
+    await h.runSpawnTimer();
+    expect(h.scope.cliRestartInProgress).toBe(false);
   });
 });
 

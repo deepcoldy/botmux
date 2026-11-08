@@ -128,6 +128,7 @@ import {
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
+  resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
@@ -1823,6 +1824,22 @@ async function cmdSetupScripted(
   if (cmd.action === 'help') {
     console.log(SETUP_CLI_USAGE);
     return;
+  }
+
+  if (cmd.action === 'add' || cmd.action === 'edit') {
+    try {
+      cmd.flags = resolveWelcomeMessageFile(cmd.flags, path => {
+        const file = resolve(expandHomePath(path));
+        try {
+          return readFileSync(file, 'utf8');
+        } catch (err) {
+          throw new Error(`读取欢迎语文件 ${file} 失败: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
   }
 
   ensureConfigDir();
