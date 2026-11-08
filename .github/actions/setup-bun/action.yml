@@ -1,0 +1,48 @@
+name: Setup Bun
+description: >-
+  安装指定版本的 Bun 并加入 PATH（与 oven-sh/setup-bun 一样放在 ~/.bun/bin）。
+  oven-sh/setup-bun 从 GitHub release 下载，只有 tool-cache 内置的三次短重试（10s/18s），
+  release 下载网关一阵 504 就让 job 红掉（#3193）。这里改取 npm registry 上 Bun 官方发布的
+  平台包 @oven/bun-<platform>：与容器里 `npm i -g bun@…` 同源，bun install 本来就离不开
+  registry，job 不再多依赖一条 release 下载链路；下载走 scripts/ci-net-retry.mjs 的有界重试。
+inputs:
+  bun-version:
+    description: 精确版本号（如 1.4.4），与 package.json 的 packageManager 一致
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v6
+      with:
+        path: ~/.bun/bin/bun
+        key: bun-${{ runner.os }}-${{ runner.arch }}-${{ inputs.bun-version }}
+
+    - shell: bash
+      env:
+        BUN_VERSION: ${{ inputs.bun-version }}
+      run: |
+        set -euo pipefail
+        bin_dir="$HOME/.bun/bin"
+        if [ "$("$bin_dir/bun" --version 2>/dev/null || true)" != "$BUN_VERSION" ]; then
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            # 与 oven-sh/setup-bun 一致：CPU 没有 AVX2 时用 baseline 构建
+            Linux-X64) if grep -qw avx2 /proc/cpuinfo; then pkg=bun-linux-x64; else pkg=bun-linux-x64-baseline; fi ;;
+            Linux-ARM64) pkg=bun-linux-aarch64 ;;
+            macOS-X64) pkg=bun-darwin-x64 ;;
+            macOS-ARM64) pkg=bun-darwin-aarch64 ;;
+            *) echo "::error::setup-bun: unsupported runner $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+          esac
+          tmp="$(mktemp -d)"
+          node "$GITHUB_ACTION_PATH/../../../scripts/ci-net-retry.mjs" npm pack "@oven/$pkg@$BUN_VERSION" \
+            --pack-destination "$tmp" --loglevel=error
+          tar -xzf "$tmp/oven-$pkg-$BUN_VERSION.tgz" -C "$tmp"
+          mkdir -p "$bin_dir"
+          mv -f "$tmp/package/bin/bun" "$bin_dir/bun"
+          chmod +x "$bin_dir/bun"
+          rm -rf "$tmp"
+        fi
+        actual="$("$bin_dir/bun" --version)"
+        [ "$actual" = "$BUN_VERSION" ] || { echo "::error::setup-bun: expected bun $BUN_VERSION, got $actual"; exit 1; }
+        ln -sf bun "$bin_dir/bunx"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "bun $("$bin_dir/bun" --revision) at $bin_dir/bun"
