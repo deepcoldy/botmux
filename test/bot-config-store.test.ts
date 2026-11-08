@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src/services/feedback-policy-resolver.js';
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
@@ -606,6 +607,31 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('keeps an explicit buttonAlign left on the bot layer so it can override a team right', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    const team = { enabled: true, buttonAlign: 'right' } as const;
+    const stored = (raw: string) => {
+      const result = store.coerceConfigValue(spec, raw);
+      expect(result.ok).toBe(true);
+      return (result as { ok: true; value: unknown }).value as FeedbackPolicyLayer;
+    };
+
+    const explicitLeft = stored('{"enabled":true,"buttonAlign":"left"}');
+    expect(explicitLeft.buttonAlign).toBe('left');
+    const effective = resolveEffectiveFeedbackPolicy({ team, bot: explicitLeft })!;
+    expect(effective.enabled).toBe(true);
+    expect('buttonAlign' in effective).toBe(false);
+
+    // No buttonAlign on the bot layer: the team value is inherited.
+    const unset = stored('{"enabled":true}');
+    expect('buttonAlign' in unset).toBe(false);
+    expect(resolveEffectiveFeedbackPolicy({ team, bot: unset })?.buttonAlign).toBe('right');
+
+    expect(stored('{"enabled":true,"buttonAlign":"right"}').buttonAlign).toBe('right');
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"buttonAlign":"center"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
   it('persists presentation rules through the config store and reloads the same policy', async () => {

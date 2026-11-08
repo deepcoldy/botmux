@@ -1202,7 +1202,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'feedback') {
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
           if ((parsed as { enabled?: unknown }).enabled !== true) return { ok: true, value: { enabled: false } };
-          try { return { ok: true, value: normalizeFeedbackPolicy(parsed) }; }
+          try {
+            const policy = normalizeFeedbackPolicy(parsed);
+            // The full normalizer drops `left` (it is the default), but this value is stored as
+            // the bot layer: an explicit `left` must survive so it can override a team-level `right`.
+            return { ok: true, value: (parsed as { buttonAlign?: unknown }).buttonAlign === 'left' ? { ...policy, buttonAlign: 'left' } : policy };
+          }
           catch { return { ok: false, reason: 'invalid_json' }; }
         }
         if (spec.configKey === 'envPolicy') return { ok: true, value: normalizeEnvPolicy(parsed) };
