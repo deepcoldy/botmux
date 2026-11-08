@@ -488,9 +488,11 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       //
       // The stamp only watches the NEWEST index entry's state.json, so a
       // sibling conversation that creates a session after ours hides our
-      // generation's prompt writes from it. A turn-boundary read (fresh)
-      // therefore bypasses the hit TTL and re-runs the marker lookup, which
-      // scans every entry; streaming refreshes keep riding the TTL cache.
+      // generation's prompt writes from it. Fresh reads (turn boundaries AND
+      // the streaming-card tick) therefore bypass the hit TTL and re-run the
+      // marker lookup over every entry; only non-fresh callers (dashboard
+      // rows and the like) ride the TTL. Wire-log misses are cached per log
+      // size/mtime inside the lookup, so the repeated scan stays cheap.
       const kimiSid = q.cliSessionId && isKimiSessionId(q.cliSessionId) ? q.cliSessionId : undefined;
       const kimiEnv = kimiEnvForBot(q.larkAppId);
       const path = cachedTranscriptPathLookup(

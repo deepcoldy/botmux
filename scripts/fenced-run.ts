@@ -27,7 +27,11 @@
  *     fleet's `-L botmux`); any refusal fails this run with exit 3;
  *   - unless --keep-user-bus: no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS,
  *     so `systemctl --user` / `busctl --user` cannot touch the real user
- *     manager (enable/stop units, stop a live session scope).
+ *     manager (enable/stop units, stop a live session scope). botmux's own
+ *     scope code sees BOTMUX_FENCED_RUN=1 and stops deriving the bus from
+ *     /run/user/<uid>/bus (userSystemdBusEnv), so it takes the no-bus path too.
+ *     With --keep-user-bus the child gets the invoker's bus variables, or the
+ *     bus botmux would derive when the invoker exported none.
  *
  * Not covered: absolute paths the command hard-codes (e.g. /root/...), and
  * tmux invoked by absolute path. Pass paths through HOME in your probe.
@@ -45,6 +49,7 @@ import {
   tmuxFenceDenialError,
 } from '../test/helpers/tmux-fence.js';
 import { scrubSessionTurnMarkerEnv } from '../src/utils/child-env.js';
+import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
 export const FENCE_DENIED_EXIT = 3;
 
@@ -63,7 +68,7 @@ export function fencedRunEnv(
   base: NodeJS.ProcessEnv,
   home: string,
   fence: ReturnType<typeof createTmuxFence>,
-  opts: { keepUserBus: boolean },
+  opts: { keepUserBus: boolean; isBusSocket?: (path: string) => boolean },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   env.HOME = home;
@@ -84,6 +89,9 @@ export function fencedRunEnv(
   if (!opts.keepUserBus) {
     delete env.XDG_RUNTIME_DIR;
     delete env.DBUS_SESSION_BUS_ADDRESS;
+  } else if (!env.XDG_RUNTIME_DIR && !env.DBUS_SESSION_BUS_ADDRESS) {
+    // Behind BOTMUX_FENCED_RUN botmux reads the bus from these variables only.
+    Object.assign(env, userSystemdBusEnv({ env: base, isSocket: opts.isBusSocket }));
   }
   env.BOTMUX_FENCED_RUN = '1';
   return env;

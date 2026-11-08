@@ -11,7 +11,7 @@
  * worker has already settled the submit without a proven session.
  */
 import { randomUUID } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ChildProcess } from 'node:child_process';
@@ -182,7 +182,10 @@ setTimeout(() => {
     if (msg.type === 'managed_turn_origin') {
       // Model the daemon's ordered IPC publication; the fake CLI samples it
       // immediately on its first submit, before creating history or a rollout.
-      writeFileSync(attestationFile, JSON.stringify({ cliPid: attestedPid, turnId: msg.turnId }));
+      // Republications land milliseconds before that sample; an in-place rewrite
+      // can be read empty, so publish by rename.
+      writeFileSync(`${attestationFile}.tmp`, JSON.stringify({ cliPid: attestedPid, turnId: msg.turnId }));
+      renameSync(`${attestationFile}.tmp`, attestationFile);
     }
   });
   child.stdout?.on('data', b => logs.push(b.toString()));

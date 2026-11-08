@@ -4944,6 +4944,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
     activationTransferred = true;
   } else if (column) {
     currentSession.kanbanColumn = column;
+    currentSession.kanbanColumnAt = Date.now();
   }
   if (position !== null) currentSession.kanbanPosition = position;
   try {
@@ -4961,7 +4962,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
       sessionId: params.sessionId,
       // queued 一并下发：激活后 session.queued 已为 false，前端浅合并若不带这个字段
       // 会残留 queued=true（卡片仍显示「开始」、再点 409）。!!session.queued 始终反映现态。
-      patch: { kanbanColumn: currentSession.kanbanColumn, kanbanPosition: currentSession.kanbanPosition, queued: !!currentSession.queued },
+      patch: {
+        kanbanColumn: currentSession.kanbanColumn,
+        kanbanColumnAt: currentSession.kanbanColumnAt,
+        kanbanPosition: currentSession.kanbanPosition,
+        queued: !!currentSession.queued,
+      },
     },
   });
   jsonRes(res, 200, { ok: true });
@@ -9389,6 +9395,7 @@ ipcRoute('PUT', '/api/bot-substitute-mode', requireBoundBot(async (req, res) => 
   const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
     enabled: rec.enabled === true,
     targets,
+    keywords: rec.keywords,
     disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
     replyMode: rec.replyMode === 'quote' ? 'quote' : 'thread',
     disableControlCard: rec.disableControlCard === true,

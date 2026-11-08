@@ -8479,7 +8479,7 @@ describe('PUT /api/bot-no-progress-notify', () => {
 });
 
 describe('PUT /api/bot-substitute-mode', () => {
-  it('preserves quote reply mode in the response and bots.json', async () => {
+  it('preserves reply settings and keyword filters through HTTP, and can clear keywords', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-substitute-app';
@@ -8504,18 +8504,28 @@ describe('PUT /api/bot-substitute-mode', () => {
           disclosure: 'prefix',
           replyMode: 'quote',
           excludedChats: ['oc_x', ' oc_y ', '', 'oc_x'],
+          keywords: [' incident ', 'Oncall', '', 'incident'],
         }),
       });
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
         ok: true,
-        substituteMode: { replyMode: 'quote', excludedChats: ['oc_x', 'oc_y'] },
+        substituteMode: { replyMode: 'quote', excludedChats: ['oc_x', 'oc_y'], keywords: ['incident', 'Oncall'] },
       });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).toMatchObject({
         replyMode: 'quote',
         excludedChats: ['oc_x', 'oc_y'],
+        keywords: ['incident', 'Oncall'],
       });
+      const cleared = await fetch(`http://127.0.0.1:${handle.port}/api/bot-substitute-mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true, targets: [{ userId: 'u_alice' }], keywords: [] }),
+      });
+      expect(cleared.status).toBe(200);
+      expect((await cleared.json()).substituteMode).not.toHaveProperty('keywords');
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).not.toHaveProperty('keywords');
+      expect(getBot(appId).config.substituteMode).not.toHaveProperty('keywords');
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -8661,9 +8671,9 @@ esac
         await page.goto(`http://127.0.0.1:${(server.address() as any).port}`);
         const picker = page.locator('[data-section="codex-profile"]');
         await picker.locator('[role="status"]').filter({ hasText: /扫描完成|Scan complete/ }).waitFor();
-        await page.locator('#bd-menu-codexProfile summary').click();
-        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('with');
-        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /^withhooks$/ }).click();
+        await page.locator('#bd-menu-codexProfile .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible .sect-sort-search').fill('with');
+        await page.locator('.sect-sort-pop:visible [role="option"]').filter({ hasText: /^withhooks$/ }).click();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": "withhooks"' }).waitFor();
         expect(requests[0]).toMatchObject({ codexProfile: 'withhooks' });
@@ -8680,9 +8690,9 @@ esac
         if (process.env.BOTMUX_PROFILE_SCREENSHOT_DIR) {
           await page.screenshot({ path: join(process.env.BOTMUX_PROFILE_SCREENSHOT_DIR, 'profile-missing.png'), fullPage: true });
         }
-        await page.locator('#bd-menu-codexProfile summary').click();
-        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('');
-        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /不指定 profile|No profile/ }).click();
+        await page.locator('#bd-menu-codexProfile .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible .sect-sort-search').fill('');
+        await page.locator('.sect-sort-pop:visible [role="option"]').filter({ hasText: /不指定 profile|No profile/ }).click();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": null' }).waitFor();
         expect(disk()).not.toHaveProperty('codexProfile');
@@ -9009,8 +9019,8 @@ esac
           mkdirSync(process.env.BOTMUX_WRAPPER_SCREENSHOT_DIR, { recursive: true });
           await page.screenshot({ path: join(process.env.BOTMUX_WRAPPER_SCREENSHOT_DIR, 'wrapper-preserved.png'), fullPage: true });
         }
-        await page.locator('#bd-menu-agentCliId summary').click();
-        await page.locator('#bd-menu-agentCliId button[aria-current="true"]').click();
+        await page.locator('#bd-menu-agentCliId .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible [role="option"][data-selected]').click();
         await page.locator('[data-codex-runtime]').waitFor();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"wrapperCli": null' }).waitFor();

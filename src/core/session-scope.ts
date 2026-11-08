@@ -138,8 +138,13 @@ export function userSystemdBusEnv(options: {
   platform?: NodeJS.Platform;
   uid?: number;
   isSocket?: (path: string) => boolean;
+  env?: NodeJS.ProcessEnv;
 } = {}): Record<string, string> | undefined {
   if ((options.platform ?? process.platform) !== 'linux') return undefined;
+  // scripts/fenced-run.ts drops these variables so its probes cannot reach the
+  // real user manager; there their absence means "no bus", not "not exported".
+  const env = options.env ?? process.env;
+  if (env.BOTMUX_FENCED_RUN === '1' && !env.XDG_RUNTIME_DIR && !env.DBUS_SESSION_BUS_ADDRESS) return undefined;
   const uid = options.uid ?? process.getuid?.();
   if (uid === undefined || !Number.isSafeInteger(uid) || uid < 0) return undefined;
   const runtimeDir = `/run/user/${uid}`;

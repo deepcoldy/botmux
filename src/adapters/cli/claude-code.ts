@@ -1633,6 +1633,28 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return { ...buildResult(false), recheck };
     },
 
+    // One-shot re-submit for a draft parked in the composer (the cold-start
+    // late-SessionStart rescue in scheduleSubmitFailureNotify). Uses the SAME
+    // submit-key resolution as writeInput: with a remapped submit
+    // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly bound to
+    // chat:newline) plain Enter would only insert a newline and strand the
+    // draft again. False means no terminal-sendable submit key or an
+    // unconfirmed backend send — the caller must not guess with another key.
+    pressComposerSubmit(pty) {
+      const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
+      try {
+        if (pty.sendSpecialKeys && keybindings.submitKeys) {
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
+        }
+        if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
+          return pty.write(keybindings.rawSubmitSequence) !== false;
+        }
+      } catch {
+        return false;
+      }
+      return false;
+    },
+
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
     // 忙碌正证据：Claude Code 工作时输入框 ❯ 常驻（readyPattern 在忙时也命中），
