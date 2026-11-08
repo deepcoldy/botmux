@@ -198,7 +198,7 @@ import {
 } from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
-import { isMessageListenerTaskAnchor, isSilentMessageListenerSession } from './core/message-listener-silence.js';
+import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -9410,6 +9410,17 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   }
   if (!ds.managedTurnOrigin?.turnId || ds.workerGeneration === undefined) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
+  }
+  // Every fire of a task aimed at the source group posts there, so a silent
+  // listener task may only schedule into other groups.
+  if (isSilentMessageListenerSession(ds.session)) {
+    const rootChatId = typeof task.rootMessageId === 'string'
+      ? await getMessageChatId(ds.larkAppId, task.rootMessageId)
+      : task.chatId;
+    if (messageListenerSendBlocked(ds.session, task.chatId)
+      || messageListenerSendBlocked(ds.session, rootChatId ?? undefined)) {
+      return jsonRes(res, 403, { ok: false, error: 'silent_message_listener' });
+    }
   }
   if (!trustedHost) {
     const pinned = capabilityScheduleWorkingDir(ds, task.workingDir);
@@ -26252,7 +26263,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       parsed.msgType,
       data.message?.content ?? '',
       parsed.content,
-      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      // A silent listener task keeps transcription progress and failures out of the source group.
+      (text) => {
+        if (!isMessageListenerTaskAnchor(anchor)) return replyMessage(larkAppId, replyAnchorId, text, 'text');
+        logger.debug(`[message-listener] silent task kept audio notice local: ${text}`);
+        return Promise.resolve('');
+      },
       parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {

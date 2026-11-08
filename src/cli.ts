@@ -9344,11 +9344,21 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
   return { sid, larkAppId: s.larkAppId, session: s };
 }
 
-async function assertListenerCardDestination(session: SessionData, appId: string, messageId?: string): Promise<void> {
+async function silentListenerSources(session: SessionData): Promise<SessionData[]> {
   const context = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
   const origin = context?.sessionId && context.sessionId !== session.sessionId
     ? await requireSessionById(context.sessionId) : session;
-  const sources = [origin, session].filter(source => isSilentMessageListenerSession(source));
+  return [origin, session].filter(source => isSilentMessageListenerSession(source));
+}
+
+async function assertListenerChatWriteAllowed(session: SessionData, chatId: string, refusal: string): Promise<void> {
+  if ((await silentListenerSources(session)).some(source => messageListenerSendBlocked(source, chatId))) {
+    throw new Error(refusal);
+  }
+}
+
+async function assertListenerCardDestination(session: SessionData, appId: string, messageId?: string): Promise<void> {
+  const sources = await silentListenerSources(session);
   if (!sources.length) return;
   const destination = messageId
     ? await (await import('./im/lark/client.js')).getMessageChatId(appId, messageId)
@@ -9394,6 +9404,10 @@ async function cmdTabs(rest: string[]): Promise<void> {
     console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
     process.exitCode = 2;
     return;
+  }
+  if (parsed.action !== 'list') {
+    await assertListenerChatWriteAllowed(session, chatId,
+      'botmux tabs: silent_message_listener: 来源群已设置静默执行，不能修改来源群标签页。');
   }
   try {
     const result = await executeChatTabsCli({ ...parsed, larkAppId, resolvedChatId: chatId });
@@ -9441,9 +9455,8 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
-  if (isSilentMessageListenerSession(session) && messageListenerSendBlocked(session, chatId)) {
-    throw new Error('botmux top-notice: silent_message_listener: 来源群已设置静默执行，不能在来源群置顶或取消置顶。');
-  }
+  await assertListenerChatWriteAllowed(session, chatId,
+    'botmux top-notice: silent_message_listener: 来源群已设置静默执行，不能在来源群置顶或取消置顶。');
   try {
     const result = await executeChatTopNoticeCli({
       ...parsed,

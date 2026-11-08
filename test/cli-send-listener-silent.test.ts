@@ -107,6 +107,43 @@ describe('other source-group write paths from silent listener tasks', () => {
     }
   });
 
+  const chatRequests = (stdout: string) => stdout.split('\n')
+    .filter(line => line.startsWith('CAPTURE_HTTP='))
+    .map(line => JSON.parse(line.slice('CAPTURE_HTTP='.length)) as { method: string; path: string })
+    .filter(request => request.path.includes('/im/v1/chats/'));
+
+  it.each([
+    ['top-notice through another source-group session', ['top-notice', 'set', 'om_human', '--session-id', 'human', '--json']],
+    ['tabs add in the source group', ['tabs', 'add', 'https://example.com/doc', '--name', 'progress', '--json']],
+    ['tabs update in the source group', ['tabs', 'update', 'tab_1', '--name', 'progress', '--json']],
+    ['tabs remove through another source-group session', ['tabs', 'remove', 'tab_1', '--session-id', 'human', '--json']],
+    ['tabs sort in the source group', ['tabs', 'sort', 'tab_2', 'tab_1', '--json']],
+  ])('blocks %s before any chat write', (_label, args) => {
+    const { root, result } = spawnInSilentSession(args, { BOTMUX_TEST_CAPTURE_HTTP: '1' });
+    try {
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('silent_message_listener');
+      expect(chatRequests(result.stdout)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['tabs list in the source group', ['tabs', 'list', '--json'], 'GET', 'oc_test'],
+    ['tabs add in another group', ['tabs', 'add', 'https://example.com/doc', '--chat-id', 'oc_target', '--json'], 'POST', 'oc_target'],
+  ])('lets %s reach Lark', (_label, args, method, chatId) => {
+    const { root, result } = spawnInSilentSession(args, { BOTMUX_TEST_CAPTURE_HTTP: '1' });
+    try {
+      expect(result.stdout + result.stderr).not.toContain('silent_message_listener');
+      const requests = chatRequests(result.stdout);
+      expect(requests.some(request => request.method === method)).toBe(true);
+      expect(requests.every(request => request.path.includes(`/chats/${chatId}/`))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('history reads use the real source message id and never send the ml: anchor to Lark', () => {
     const { root, result } = spawnInSilentSession(['history', '--limit', '5'],
       { BOTMUX_TEST_CAPTURE_HTTP: '1', BOTMUX_TEST_LIST_MESSAGES: '1' });
