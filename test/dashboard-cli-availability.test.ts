@@ -216,9 +216,9 @@ it.skipIf(process.env.BOTMUX_AVAILABILITY_BROWSER !== '1')('uses real browser co
     expect(await page.locator('.hint-warn').count()).toBe(0);
     mkdirSync('docs/assets/cli-availability',{recursive:true});
     await page.screenshot({path:'docs/assets/cli-availability/roster-stable.png',fullPage:true});
-    // The real dropdown uses a button plus listbox options.
-    await page.locator('#bd-menu-agentCliId summary').click();
-    await page.locator('#bd-menu-agentCliId button').filter({hasText:'Reasonix'}).click();
+    // The dropdown renders a Base UI trigger with its options portaled into a visible popup.
+    await page.locator('#bd-menu-agentCliId .sect-sort-trigger').click();
+    await page.locator('.sect-sort-pop:visible [role="option"]').filter({hasText:'Reasonix'}).click();
     await page.locator('.hint-warn').waitFor();
     await page.screenshot({path:'docs/assets/cli-availability/confirmed-missing.png',fullPage:true});
     expect(await page.locator('.hint-warn').count()).toBe(1);

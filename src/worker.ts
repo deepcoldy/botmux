@@ -14181,6 +14181,7 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
         ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
         kind: 'local-turn',
         userText: fields.userText,
+        ...(fallbackKind === 'empty_completed' ? { emptyCompletedNotice: true } : {}),
       });
       continue;
     }
@@ -14201,6 +14202,7 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
         turnFailureCode: turn.terminalErrorCode || 'worker_turn_failed',
         turnFailureNotice: failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
       } : {}),
+      ...(fallbackKind === 'empty_completed' ? { emptyCompletedNotice: true } : {}),
     });
   }
   } catch (error) {

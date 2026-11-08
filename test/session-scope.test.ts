@@ -114,13 +114,27 @@ describe('owned session systemd scope', () => {
 
   it('derives the canonical user bus environment from a verified socket', () => {
     const isSocket = vi.fn((path: string) => path === '/run/user/1001/bus');
-    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket })).toEqual({
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket, env: {} })).toEqual({
       XDG_RUNTIME_DIR: '/run/user/1001',
       DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1001/bus',
     });
     expect(isSocket).toHaveBeenCalledWith('/run/user/1001/bus');
-    expect(userSystemdBusEnv({ platform: 'darwin', uid: 1001, isSocket })).toBeUndefined();
-    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket: () => false })).toBeUndefined();
+    expect(userSystemdBusEnv({ platform: 'darwin', uid: 1001, isSocket, env: {} })).toBeUndefined();
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket: () => false, env: {} })).toBeUndefined();
+  });
+
+  it('derives no user bus behind fenced-run unless the fence passed one through', () => {
+    const isSocket = () => true;
+    const derived = { XDG_RUNTIME_DIR: '/run/user/1001', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1001/bus' };
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket, env: { BOTMUX_FENCED_RUN: '1' } })).toBeUndefined();
+    expect(userSystemdBusEnv({
+      platform: 'linux', uid: 1001, isSocket, env: { BOTMUX_FENCED_RUN: '1', XDG_RUNTIME_DIR: '/run/user/1001' },
+    })).toEqual(derived);
+    expect(userSystemdBusEnv({
+      platform: 'linux', uid: 1001, isSocket, env: { BOTMUX_FENCED_RUN: '1', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1001/bus' },
+    })).toEqual(derived);
+    // Outside the fence a missing variable still means "not exported" (cron, ssh without pam).
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket, env: { BOTMUX_FENCED_RUN: '0' } })).toEqual(derived);
   });
 
   it('fails open on unsupported platforms', () => {
