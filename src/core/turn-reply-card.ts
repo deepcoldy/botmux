@@ -16,6 +16,7 @@ import { isLarkContentAuditError } from '../im/lark/content-audit.js';
 import { sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { logger } from '../utils/logger.js';
 import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
+import { getSession } from '../services/session-store.js';
 import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '../im/lark/client.js';
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
@@ -324,18 +325,20 @@ export async function settleTurnReplyCards(ds: DaemonSession): Promise<void> {
     if (mode === 'legacy') continue;
     const record = store.read(replyCardKey(ds, turnId));
     if (!record?.messageId || replyCardIsTerminal(record)) continue;
-    await settleDisconnectedReplyCard(store, record);
+    await settleDisconnectedReplyCard(store, record, undefined, ds.workingDir ?? ds.session.workingDir);
   }
   ds.replyCardRunningTurnId = undefined;
 }
 
-async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord, beforeMs?: number): Promise<void> {
+async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord, beforeMs?: number, workingDir?: string): Promise<void> {
   // Resumable asks have already been restored by the broker at startup.
   const orphanAskIds = (record.asks ?? []).filter(entry => !entry.result && !getAskSnapshot(entry.ask.askId))
     .map(entry => entry.ask.askId);
   const beforeEffect = () => {
     if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
   };
+  // The record keeps the agent's raw text; a re-render is model output entering again.
+  const localContext = localAddressContextForBot(record.larkAppId, workingDir);
   await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
     beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
@@ -343,6 +346,7 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
     patch: (id, card) => replayVettedBody(card, 'interactive', () => patchReplyCardWithAuditRedaction(record.larkAppId, card,
       `recover turn=${record.turnId.substring(0, 8)}`, body => patchPublishedGroupCard(record.larkAppId, record.chatId, id, body, record.rootId))),
     sendOverflow: async (text, uuid) => {
+      text = sanitizeLocalAddressText(text, localContext);
       const file = join(store.directory, `${store.id(record)}-reply.md`);
       atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
       beforeEffect();
@@ -354,14 +358,20 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
         : sendMessage(record.larkAppId, record.chatId, content, 'file', uuid, undefined, { beforeWrite: beforeEffect });
     },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
-    render: state => buildTurnReplyCard(state, {
+    render: state => prepareLocalAddressContent(buildTurnReplyCard(state, {
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),
       locale: localeForBot(record.larkAppId), canStop: false,
-    }),
+    }), 'interactive', localContext),
   });
 }
 
 /** Like the CoT orphan sweep: recover only this bot's previously visible cards. */
+/** Without the session row a re-render loses only workspace-relative paths;
+ * the policy still replaces paths under known roots. */
+function sessionWorkingDir(sessionId: string): string | undefined {
+  try { return getSession(sessionId)?.workingDir; } catch { return undefined; }
+}
+
 export async function sweepInterruptedReplyCards(larkAppId: string): Promise<void> {
   const store = new TurnReplyCardStore(config.session.dataDir);
   if (!existsSync(store.directory)) return;
@@ -373,7 +383,7 @@ export async function sweepInterruptedReplyCards(larkAppId: string): Promise<voi
       const record = store.read(key);
       if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn
         || (replyCardIsTerminal(record) && record.phase !== 'ambiguous' && !record.pendingPatch && !record.publishPending)) continue;
-      await settleDisconnectedReplyCard(store, record, processStartedAtMs);
+      await settleDisconnectedReplyCard(store, record, processStartedAtMs, sessionWorkingDir(record.sessionId));
     } catch (error) {
       logger.warn(`[reply-card] recovery: ${error instanceof Error ? error.message : String(error)}`);
     }

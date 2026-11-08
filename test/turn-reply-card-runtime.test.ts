@@ -9,6 +9,7 @@ import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, supersedeT
 import { MessageWithdrawnError, updateMessage, uploadFile, replyMessage, sendMessage } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+import { getSession } from '../src/services/session-store.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent } from '../src/im/lark/local-address-policy.js';
 import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
 import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
@@ -36,6 +37,10 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh', t: (key: string) => key }));
 vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
+vi.mock('../src/services/session-store.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/services/session-store.js')>();
+  return { ...actual, getSession: vi.fn(actual.getSession) };
+});
 
 function session(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
@@ -98,6 +103,58 @@ describe('reply-card runtime eligibility and recovery', () => {
       expect(body).not.toContain('/home/alice/');
       expect(body).not.toContain('/custom/project/');
     }
+  });
+
+  it.each(['disconnect', 'restart'] as const)('removes local addresses when a %s re-renders the reply card', async how => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_reply');
+    const raw = '读了 [协作技能](/home/alice/.agents/skills/a/SKILL.md)，改动在 /custom/project/src/main.ts:12';
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'progress', text: raw }, send);
+    vi.mocked(updateMessage).mockClear();
+    if (how === 'disconnect') {
+      await settleTurnReplyCards(ds);
+    } else {
+      const store = new TurnReplyCardStore(dir);
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      const record = store.read(key)!;
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+      vi.mocked(getSession).mockReturnValueOnce({ ...ds.session, workingDir: '/custom/project' } as ReturnType<typeof getSession>);
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(getSession).toHaveBeenLastCalledWith(ds.session.sessionId);
+    }
+    expect(updateMessage).toHaveBeenCalledOnce();
+    const body = vi.mocked(updateMessage).mock.calls[0][2];
+    expect(body).toContain('协作技能');
+    expect(body).not.toContain('/home/alice/');
+    expect(body).not.toContain('/custom/project/');
+    expect(body).toContain('src/main.ts:12');
+  });
+
+  it('removes local addresses from an overflow attachment that startup recovery sends', async () => {
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: 'app_mode', sessionId: 'sid_mode', turnId: 'om_mode' };
+    await store.prepare(key, { mode: 'unified', chatId: 'oc_mode', rootId: 'om_root' });
+    const io = {
+      render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, { canStop: true }),
+      beforeEffect: vi.fn(), isWithdrawn: () => false,
+      send: vi.fn(async () => 'om_reply'), patch: vi.fn(async () => {}),
+      sendOverflow: vi.fn(async () => { throw new Error('upload unavailable'); }),
+    };
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'progress', text: '读了 /home/alice/.agents/skills/a/SKILL.md\n' + 'Long process '.repeat(600) }, io);
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed' }, io)).rejects.toThrow('upload unavailable');
+    const record = store.read(key)!;
+    record.createdAtMs = record.updatedAtMs = 1;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+    vi.mocked(uploadFile).mockReset().mockResolvedValue('file_recovered');
+    vi.mocked(replyMessage).mockReset().mockResolvedValue('om_file_recovered');
+    await sweepInterruptedReplyCards(key.larkAppId);
+    expect(uploadFile).toHaveBeenCalledOnce();
+    const overflow = readFileSync(vi.mocked(uploadFile).mock.calls[0][1], 'utf8');
+    expect(overflow).toContain('Long process');
+    expect(overflow).not.toContain('/home/alice/');
   });
 
   it.each(['oc_mode', 'om_root'])('recovers a failed overflow with stable delivery identity for root %s', async rootId => {
