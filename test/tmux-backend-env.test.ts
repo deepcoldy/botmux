@@ -43,6 +43,8 @@ import {
   shellLaunchArgv,
   shellCommandArgv,
 } from '../src/adapters/backend/tmux-backend.js';
+import { tmuxEnv } from '../src/setup/ensure-tmux.js';
+import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
 type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
 
@@ -308,6 +310,33 @@ describe('buildBotmuxEnvAssignments()', () => {
     // A non-allowlisted BOTMUX_* knob is not forwarded just by sharing the prefix.
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_NOT_A_REAL_KNOB: 'x' }))
       .not.toContain('BOTMUX_NOT_A_REAL_KNOB=x');
+  });
+
+  it('re-publishes the fenced-run marker so a tmux-family pane cannot derive the host user bus (issue #3174)', () => {
+    // tmuxEnv() strips EVERY BOTMUX* key from the tmux client/server env and the
+    // marker is not in BOTMUX_INJECTED_ENV_KEYS, so the pane can only recover it
+    // through this per-pane env(1) assignment.
+    const fencedWorkerEnv = { PATH: '/usr/bin', HOME: '/tmp/u', BOTMUX_FENCED_RUN: '1' };
+    const stripped = tmuxEnv(fencedWorkerEnv);
+    expect(stripped.BOTMUX_FENCED_RUN).toBeUndefined();
+    const assignments = buildBotmuxEnvAssignments(fencedWorkerEnv);
+    expect(assignments).toContain('BOTMUX_FENCED_RUN=1');
+
+    // Reconstruct the pane env the shell wrapper actually sees: the tmux server
+    // global (marker stripped) overlaid with the per-pane KEY=VAL assignments.
+    const paneEnv: NodeJS.ProcessEnv = { ...stripped };
+    for (const assignment of assignments) {
+      const eq = assignment.indexOf('=');
+      if (eq > 0) paneEnv[assignment.slice(0, eq)] = assignment.slice(eq + 1);
+    }
+    expect(paneEnv.BOTMUX_FENCED_RUN).toBe('1');
+    // Marker restored: no canonical /run/user/<uid>/bus derivation and no socket
+    // probe even when a host bus socket exists.
+    expect(userSystemdBusEnv({ env: paneEnv, isSocket: () => true })).toBeUndefined();
+
+    // Unfenced production panes never emit the marker.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1', PATH: '/usr/bin' })
+      .some(s => s.startsWith('BOTMUX_FENCED_RUN='))).toBe(false);
   });
 
   it('forwards the reply-card usage visibility into persistent CLI panes', () => {

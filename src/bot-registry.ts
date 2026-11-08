@@ -1,4 +1,5 @@
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
+import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
@@ -311,7 +312,7 @@ export interface MessageListenerConfig {
   contentPolicy?: ListenerContentPolicy;
   replyPolicy?: {
     /** `thread` replies under the triggering message; `chat` posts at group top level. */
-    mode?: 'thread' | 'chat';
+    mode?: import('./services/message-listener-reply-policy.js').MessageListenerReplyMode;
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
   };
@@ -1223,9 +1224,8 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
     ...(contentPolicy ? { contentPolicy } : {}),
     replyPolicy: {
-      mode: entry.replyPolicy && typeof entry.replyPolicy === 'object' && (entry.replyPolicy as Record<string, unknown>).mode === 'chat'
-        ? 'chat'
-        : 'thread',
+      mode: normalizeMessageListenerReplyMode(entry.replyPolicy && typeof entry.replyPolicy === 'object'
+        ? (entry.replyPolicy as Record<string, unknown>).mode : undefined),
       sessionMode: 'per_message',
     },
   };

@@ -15,6 +15,7 @@ import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChat
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { classifyLarkError } from './error-classify.js';
 import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
+import { messageListenerTaskAnchor } from '../../core/message-listener-silence.js';
 import { logger } from '../../utils/logger.js';
 import type { FetchedBotProfile } from '../../services/bot-profile-refresh.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
@@ -3087,7 +3088,7 @@ function listenerRoutingContext(input: {
       chatType: input.chatType,
       larkAppId: input.larkAppId,
       scope: replyInChat ? 'chat' : 'thread',
-      anchor: replyInChat ? input.chatId : input.messageId,
+      anchor: input.match.replyMode === 'none' ? messageListenerTaskAnchor(input.messageId) : replyInChat ? input.chatId : input.messageId,
       regularGroupTopLevel: replyInChat,
       messageListener: input.match,
     },

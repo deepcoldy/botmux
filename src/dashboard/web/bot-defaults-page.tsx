@@ -4464,7 +4464,16 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-type CodexConfigInfo = { isolated: boolean; path: string; exists: boolean; hostPath: string; hostExists: boolean };
+type CodexConfigInfo = {
+  isolated: boolean;
+  path: string;
+  exists: boolean;
+  hostPath: string;
+  hostExists: boolean;
+  agentsPath?: string;
+  hostAgentsPath?: string;
+  hostAgentsExists?: boolean;
+};
 
 /**
  * 独立 CODEX_HOME 的 config.toml：worker 只在首次从宿主复制一次（之后可能有本 bot 的
@@ -4494,20 +4503,24 @@ export function CodexIsolatedConfigInfo(props: { bot: BotDefaultsRow }) {
 
   async function resync(): Promise<void> {
     if (!info) return;
+    const withAgents = !!(info.hostAgentsExists && info.agentsPath && info.hostAgentsPath);
     const ok = await confirm({
-      title: tr('botDefaults.codexConfigResyncConfirmTitle'),
-      message: tr('botDefaults.codexConfigResyncConfirmMessage', { host: info.hostPath, path: info.path }),
+      title: tr(withAgents ? 'botDefaults.codexConfigResyncWithAgentsConfirmTitle' : 'botDefaults.codexConfigResyncConfirmTitle'),
+      message: withAgents
+        ? tr('botDefaults.codexConfigResyncWithAgentsConfirmMessage', { host: info.hostPath, path: info.path, hostAgents: info.hostAgentsPath!, agents: info.agentsPath! })
+        : tr('botDefaults.codexConfigResyncConfirmMessage', { host: info.hostPath, path: info.path }),
       confirmLabel: tr('botDefaults.codexConfigResync'),
     });
     if (!ok) return;
     setBusy(true);
     setStatus(null);
     try {
-      const res = await sendJson<{ ok: boolean; backupPath?: string | null; error?: string; message?: string }>('POST', `${url}/resync`, {});
+      const res = await sendJson<{ ok: boolean; backupPath?: string | null; agentsBackupPath?: string | null; error?: string; message?: string }>('POST', `${url}/resync`, {});
       if (res.ok) {
+        const backups = [res.body.backupPath, res.body.agentsBackupPath].filter(Boolean).join(', ');
         setStatus({
-          text: res.body.backupPath
-            ? tr('botDefaults.codexConfigResynced', { backup: res.body.backupPath })
+          text: backups
+            ? tr('botDefaults.codexConfigResynced', { backup: backups })
             : tr('botDefaults.codexConfigResyncedNoBackup'),
           ok: true,
         });

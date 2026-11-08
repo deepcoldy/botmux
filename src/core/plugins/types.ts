@@ -104,6 +104,7 @@ export interface BotmuxPluginManifest {
   schemaVersion: 1;
   id: string;
   displayName?: string;
+  audience?: string;
   dependencies?: {
     plugins?: string[];
   };
@@ -113,6 +114,7 @@ export interface BotmuxPluginManifest {
 export interface PluginPackageManifest {
   name: string;
   version: string;
+  description?: string;
   type?: string;
   keywords?: string[];
   botmux: BotmuxPluginManifest;
@@ -122,6 +124,7 @@ export interface InstalledPluginRecord {
   id: string;
   packageName: string;
   version: string;
+  description?: string;
   integrity?: string;
   source: {
     type: 'npm' | 'local';
@@ -137,6 +140,11 @@ export interface InstalledPluginRecord {
 export interface PluginRegistryFile {
   schemaVersion: 1;
   plugins: Record<string, InstalledPluginRecord>;
+  /** Monotonic per-file mutation counter, bumped on every atomic rewrite.
+   *  Stat-based identity (inode/mtime) is not safe on ext4: back-to-back
+   *  rewrites of equal-size content reuse the inode and land inside the same
+   *  timestamp tick, so an install/uninstall A→B→A looked unchanged. */
+  revision?: number;
 }
 
 export interface PluginSettingsFile {
