@@ -544,14 +544,17 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
   it('never reaps a session whose dead pane shares it with a live pane', async () => {
     tmux('set-option', '-t', 'bmx-live-one', 'remain-on-exit', 'on');
     tmux('split-window', '-t', 'bmx-live-one', '-d', 'sh -c "exit 8"');
-    const deadline = Date.now() + 3_000;
+    // 与 waitForDeadPane 同一个理由：pane_dead 翻到 1 之后 tmux 才回填
+    // pane_dead_status，饥饿下这个 '1:' 瞬态能持续超过 3s 墙钟（CI 实测在整
+    // 个等待窗口里一直是 '1:'），按墙钟给预算会在状态回填前耗尽。按读次数给
+    // 预算——被调度走的测试不产生读取，饥饿只会拉长墙钟而不会烧穿预算。
     let panes: string[] = [];
-    while (Date.now() < deadline) {
+    for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
       panes = String(
         tmux('list-panes', '-s', '-t', '=bmx-live-one:', '-F', '#{pane_dead}:#{pane_dead_status}').stdout ?? '',
       ).split('\n').map(line => line.trim()).filter(Boolean).sort();
       if (panes.includes('1:8')) break;
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, DEAD_PANE_POLL_INTERVAL_MS));
     }
     expect(panes, 'one live and one retained dead pane').toEqual(['0:', '1:8']);
     const livePanePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim();

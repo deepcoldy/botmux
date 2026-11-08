@@ -332,6 +332,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       larkAppId: input.larkAppId,
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
+      cardRootMessageId: input.cardRootMessageId,
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,

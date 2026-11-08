@@ -21,6 +21,25 @@ function running(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+/**
+ * Wait until an escaped descendant is reaped. The group SIGTERM/SIGKILL has
+ * already been issued by the time collectNativePrint settles, but under CPU
+ * contention signal delivery and the subreaper's zombie reaping can lag by a
+ * few scheduler slices, so a one-shot alive/dead assertion races the host
+ * scheduler. The invariant under test is that the descendant DOES get reaped,
+ * hence a bounded poll rather than an immediate read. The deadline stays well
+ * inside the test's 10s wall bound; a removed cleanup guard still fails it
+ * because the fixture's `sleep 30` outlives the whole deadline.
+ */
+async function waitForReaped(pid: number, timeoutMs = 5_000, intervalMs = 50): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!running(pid)) return;
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+  expect(running(pid)).toBe(false);
+}
+
 function run(executable: string, args: string[], input = bigInput): Promise<string> {
   return collectNativePrint(executable, args, { cwd: '/tmp', env: { PATH: '/usr/bin:/bin' }, input }, new AbortController().signal);
 }
@@ -57,9 +76,9 @@ describe.skipIf(!supported)('collectNativePrint when stdin closes early', () => 
       const script = (status: number) => `exec 4<&0; sleep 30 <&4 4<&- & echo $! > "$1"; exit ${status}`;
       const started = Date.now();
       await expect(run('/bin/sh', ['-c', script(3), 'sh', pidFile])).rejects.toThrow('native_inference_failed');
-      expect(running(Number(readFileSync(pidFile, 'utf8')))).toBe(false);
+      await waitForReaped(Number(readFileSync(pidFile, 'utf8')));
       await expect(run('/bin/sh', ['-c', script(0), 'sh', pidFile])).rejects.toThrow('native_transport_closed');
-      expect(running(Number(readFileSync(pidFile, 'utf8')))).toBe(false);
+      await waitForReaped(Number(readFileSync(pidFile, 'utf8')));
       expect(Date.now() - started).toBeLessThan(10_000);
     } finally {
       rmSync(dir, { recursive: true, force: true });
