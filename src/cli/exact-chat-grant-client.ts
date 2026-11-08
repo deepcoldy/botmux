@@ -11,7 +11,7 @@ export interface ExactChatGrantClientInput {
   secret: string;
   receiverLarkAppId: string;
   chatId: string;
-  operation?: 'grant' | 'revoke' | 'readback';
+  operation?: 'grant' | 'revoke' | 'readback' | 'resolve';
   subjectOpenIds?: string[];
   subjectLarkAppIds?: string[];
 }

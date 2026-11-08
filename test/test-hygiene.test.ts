@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { findSourceTextReads, scanRepoTests } from './helpers/source-text-reads.js';
+import { checkFsMockFence, scanRepoFsMockFence } from './helpers/fs-mock-fence-scan.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -128,5 +129,30 @@ describe('源码文本扫描器', () => {
       { title: 'c', marked: true },
       { title: 'd', marked: false },
     ]);
+  });
+});
+
+// 非文本断言：扫描的是 test/ 下的测试文件（不是 src/），守的是「mock 了 node:fs 的文件
+// 必须先挂 data-dir fence 守卫」——11-06 一次绕过 fence 的运行里，event-dispatcher 的 fs
+// mock 让真实 ~/.botmux/data 下的 VC runtime store 被改名隔离。
+describe('测试卫生：mock node:fs 的文件先挂 data-dir fence 守卫', () => {
+  it('仓库里每个 mock 了 node:fs 的测试文件第一条 import 都是守卫', () => {
+    const violations = scanRepoFsMockFence(repoRoot);
+    expect(violations, [
+      `${violations.length} 个测试文件 mock 了 node:fs，但第一条 import 不是 './helpers/require-fenced-data-dir.js'：`,
+      ...violations.map(v => `  ${v.file}  (${v.reason})`),
+      '在文件最前面加：import \'./helpers/require-fenced-data-dir.js\';（见该 helper 的注释）',
+    ].join('\n')).toEqual([]);
+  });
+
+  it('扫描器两个方向都生效', () => {
+    const mock = "vi.mock('node:fs', () => ({}));";
+    expect(checkFsMockFence('a.test.ts', `import { it } from 'vitest';\n${mock}`))
+      .toEqual({ file: 'a.test.ts', reason: 'missing-guard' });
+    expect(checkFsMockFence('b.test.ts', `import { it } from 'vitest';\nimport './helpers/require-fenced-data-dir.js';\n${mock}`))
+      .toEqual({ file: 'b.test.ts', reason: 'guard-not-first' });
+    expect(checkFsMockFence('c.test.ts', `// x\nimport './helpers/require-fenced-data-dir.js';\nimport { it } from 'vitest';\n${mock}`))
+      .toBeUndefined();
+    expect(checkFsMockFence('d.test.ts', "import { it } from 'vitest';\nvi.mock('node:path');")).toBeUndefined();
   });
 });

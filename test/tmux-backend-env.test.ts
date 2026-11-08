@@ -297,6 +297,19 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
   });
 
+  it('forwards the host-resolved dispatch task-tree card switch into panes', () => {
+    // The file-sandboxed CLI cannot read ~/.botmux/config.json; the daemon
+    // projects the resolved value and it reaches the pane only because it is on
+    // the injected-keys allowlist. Removing it from the allowlist drops this.
+    const on = buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'true' });
+    expect(on).toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=true');
+    const off = buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'false' });
+    expect(off).toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=false');
+    // A non-allowlisted BOTMUX_* knob is not forwarded just by sharing the prefix.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_NOT_A_REAL_KNOB: 'x' }))
+      .not.toContain('BOTMUX_NOT_A_REAL_KNOB=x');
+  });
+
   it('forwards the reply-card usage visibility into persistent CLI panes', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

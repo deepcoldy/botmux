@@ -1,10 +1,11 @@
-import { mkdirSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { HEADLESS_CHAT_PREFIX, isHeadlessSessionChatId } from '../core/types.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { withManagedDirectories } from './managed-directory-retention.js';
 
 export const HEADLESS_ID_PREFIX = 'hl_';
 const HEADLESS_ID_RE = /^hl_[A-Za-z0-9_-]{8,128}$/;
@@ -112,10 +113,10 @@ function parseRecord(raw: unknown): HeadlessSessionRecord | null {
 
 export function saveHeadlessSession(record: HeadlessSessionRecord): void {
   ensureDir();
-  atomicWriteFileSync(fileFor(record.id), `${JSON.stringify(record, null, 2)}\n`, {
+  withManagedDirectories(record, () => atomicWriteFileSync(fileFor(record.id), `${JSON.stringify(record, null, 2)}\n`, {
     durable: true,
     followTargetSymlink: false,
-  });
+  }));
 }
 
 export function createHeadlessRecord(input: NewHeadlessSessionRecordInput): HeadlessSessionRecord {
@@ -188,4 +189,16 @@ export function updateHeadlessSession(
     saveHeadlessSession(latest);
     return latest;
   });
+}
+
+/** Delete a headless session's sidecar record (the session row is closed by
+ *  its owner first). Missing record → false. */
+export function deleteHeadlessSession(id: string): boolean {
+  if (!isHeadlessId(id)) return false;
+  try {
+    rmSync(fileFor(id), { force: false });
+    return true;
+  } catch {
+    return false;
+  }
 }

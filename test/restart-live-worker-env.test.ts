@@ -37,7 +37,7 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
 }));
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -45,6 +45,7 @@ import {
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 let sessionCounter = 0;
 
@@ -90,6 +91,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
+  invalidateGlobalConfigCache();
   __testOnly_resetRestartCoordinator();
 });
 
@@ -161,6 +164,28 @@ describe('latestSessionEnvForRestart (daemon-side env snapshot carrier)', () => 
 // ─── 2. daemon behavioral：live-worker restart 消息带 env ────────────────────
 
 describe('requestSessionRestart live-worker branch carries env (behavioral)', () => {
+  it('removes daemon-protected values from the restart payload after live bot reinjection', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(quarantineDir, 'global.json'));
+    writeFileSync(join(quarantineDir, 'global.json'), JSON.stringify({ protectedMcpCapabilities: {
+      legacy: { secret: { source: 'env', name: 'FIXTURE_PROTECTED_SECRET' }, isolation: { redactEnv: ['FIXTURE_PROTECTED_REDACTED'] } },
+    } }));
+    invalidateGlobalConfigCache();
+    getBotMock.mockReturnValue({ config: { env: {
+      FIXTURE_PROTECTED_SECRET: 'restart-secret',
+      FIXTURE_PROTECTED_REDACTED: 'restart-token',
+      SAFE_VISIBLE_VALUE: 'visible',
+    } } });
+    const { ds, send } = makeDs();
+
+    requestSessionRestart(ds, observer());
+
+    const msg = send.mock.calls[0][0];
+    expect(msg.type).toBe('restart');
+    expect(msg.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
+    expect(JSON.stringify(msg)).not.toContain('restart-secret');
+    expect(JSON.stringify(msg)).not.toContain('restart-token');
+  });
+
   it('sends {type:restart, attemptId, env} with the latest bots.json env', () => {
     getBotMock.mockReturnValue({ config: { env: { HTTPS_PROXY: 'http://p:7890' } } });
     const { ds, send } = makeDs();

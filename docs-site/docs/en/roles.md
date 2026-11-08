@@ -1,116 +1,173 @@
 # Roles and Teams
 
-Give each bot an independent persona per group, and form a "team roster" during multi-bot collaboration. The command is `/role`.
+Give a bot a "persona" (Role): who it is in the group, what it's responsible for, and how it talks. The same bot can play different roles in different groups. The command is `/role`.
 
-> This page covers two related but distinct capabilities: **`/role` personas** (one persona per bot, overridable per group — see below) and **[Role Switch](#role-switch)** (one bot owning multiple full roles, each with independent memory, switched by natural language per topic — an advanced feature).
+What's on this page:
 
-## Two-Tier Role (Persona)
+| I want to | Section |
+|------|------|
+| Give a bot a persona (global default / just for one group) | [Set a persona](#set-a-persona) |
+| Control how often the persona is injected, reply privately to the asker, and other per-group switches | [Per-group switches](#per-group-switches) |
+| Apply a set of personas to a new group in one go | [Role profiles](#role-profiles) |
+| Let other bots know "who's good at what" | [Capability tags](#capability-tags) |
+| One bot with several roles, each with its own memory (advanced) | [Role switch](#role-switch-advanced) |
+
+## Set a persona
+
+There are two levels:
+
+- **Default role**: the bot's persona in **every group**.
+- **Group role**: applies only to the **current group** and overrides the default role.
+
+The order is always: **group role > default role > none**. For example, the same bot can be a "strict code reviewer" in group A, a "patient Q&A helper" in group B, and use its default role everywhere else.
+
+### With commands in the group
+
+@-mention the bot in the group and send:
 
 | Command | Effect |
 |------|------|
-| `/role` | View the currently **effective** Role (source: this-group override > default role > none) |
-| `/role set <Markdown>` | Set the **this-group** Role (overrides the default role) |
-| `/role delete` | Delete the this-group Role |
-| `/role team set <Markdown>` | Set the **default role** (this bot's default persona **across all groups**; the command name keeps `team`) |
+| `/role` | Show the persona in effect and where it comes from (group / default) |
+| `/role set <Markdown>` | Set the group role; multi-line is fine |
+| `/role delete` | Delete the group role and fall back to the default role |
+| `/role team` | Show the default role |
+| `/role team set <Markdown>` | Set the default role (the command keeps the old name `team`; it means "default role") |
 | `/role team delete` | Delete the default role |
 
-- **This-group Role** has the highest priority: the same bot can have different personalities / responsibilities in different groups (e.g., a "strict reviewer" in group A, an "approachable Q&A assistant" in group B).
-- **Default role** is the bot's cross-group default persona, which takes effect when no this-group Role is set.
-- Role content is Markdown, injected into the CLI's system prompt, with a maximum of about 4096 bytes.
-- Role resolution stays exactly: **this-group role > default role > none**.
+Example:
 
-Project-group coordinators separately receive Botmux's fixed `<project_group_mode>` protocol for durable project state and the pinned project card. It is not a third Role layer and does not follow the Role's every-turn/once-only injection setting: custom Roles define responsibilities, style, and domain boundaries, while the project protocol governs state lifecycle; both apply together.
+```text
+/role set You are this group's technical advisor.
+- Give the conclusion first, then the reasoning
+- Flag risks before any production change
+```
 
-Role Management also exposes a per-group, per-bot **topic task reporting** switch. It is off by default. When enabled, tasks dispatched by the current bot in that group still ask the assignee to run `botmux report` so completion is injected into the orchestrator's existing session, and additionally ask it to run `botmux send --no-mention "subtask complete + output location/summary"` in the topic where the task was received to leave a human-visible final-delivery copy, without mentioning the dispatching bot or opening another topic. `--standby` sends no task, so it receives no task instruction.
+- Personas are written in Markdown and injected into the CLI as a `<role>` block.
+- Each persona can be up to 32 KB (about 10,000 CJK characters); anything beyond that is truncated.
+- After a change, "every turn" mode picks it up from the next message; "only once" mode picks it up on a new or rebuilt session (see [Per-group switches](#per-group-switches)).
 
-> 💡 The most intuitive way to set the **default role** is on the **Bot Config** page of `botmux dashboard` — every bot card has a "**Default Role**" editor (it writes to the same config as `/role team set`; it's a bot-level global default persona, so it fits better under Bot Config). The **Team** panel only provides a **read-only view** entry; do all editing on the Bot Config page.
+### In the Dashboard
+
+If you'd rather not type commands, open `botmux dashboard`:
+
+| What to change | Where |
+|------|------|
+| Default role | **Bot Config** page, each bot's "**Default Role**" section (same config as `/role team set`; saving it empty deletes it) |
+| Group role | **Role Management** page → "By Group": expand a group, pick a bot, edit |
+| Jump there from a group | **Group Management** page: in a bot's settings for that group, click "Edit chat role" |
 
 ![Dashboard Bot Config — Default Role editor](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780051089378_default-role-shot.png)
 
-## Role Profiles
+When you use "Duplicate" on the Group Management page to copy a group, you can tick "Also copy chat roles" to carry the source group's group roles (plus the per-group switches below) into the new group. Default roles are inherited automatically, so they don't need copying.
 
-A role profile is a reusable suite of bot-specific **this-group roles**. It is not a third runtime role layer, and it does not support template inheritance such as `{{teamRole}}`.
+## Per-group switches
 
-Typical commands:
+On the **Role Management** page, select a bot in a group. Besides editing the persona, you can set the options below. Each is saved per "group + bot" and takes effect immediately.
 
-```bash
-/role profile list
-/role profile show collab-main
-/role profile set collab-main <Markdown>
-/role profile save collab-main
-/role profile apply collab-main --quiet
-```
+| Switch | Default | What it does |
+|------|------|------|
+| **Injection** | Every turn | "Every turn" sends the persona with every message; "Only once (first turn)" injects it only when a session starts or is rebuilt, which suits long personas and saves tokens. You can change the default per bot in the "Default Role" section of the Bot Config page, then override it for individual groups |
+| **Prefer private replies to the requester** | Off | When on, the answer is sent to the asker in a private chat first; if that fails, it's posted publicly in the original topic. You can also set a "Group notice" (e.g. "Sent to you privately to avoid noise") shown in the original topic after a successful private reply; leave it empty for no notice |
+| **Topic task reporting mode** | Off | See below |
 
-How it works:
+**Topic task reporting mode**: when this bot uses `botmux dispatch` in this group to hand a task to another bot, the assignee still uses `botmux report` to hand the result back to the dispatcher's session. With this switch on, the assignee also posts "completion + output location/summary" with `botmux send --no-mention` in the topic where it received the task, so people can see the result right in the group. It doesn't mention the dispatcher or open a new topic. `--standby` (reserve a bot without sending a task) doesn't involve this step.
 
-- Each bot owns only its own profile entry, keyed by its `larkAppId`.
-- `save` stores this bot's current effective role into the profile: this-group role first, then default role, otherwise it fails.
-- `apply` writes this bot's profile entry into the current group's role file. If the current group already has a role, apply refuses unless `--force` is passed.
-- Missing entries are safe: nothing is written, and the bot keeps falling back to its default role if one exists.
+> In project groups, the coordinator bot also receives Botmux's fixed project-state protocol (for tracking progress and the pinned project card). It applies alongside the Role and is not affected by the Role's injection mode. For project groups, see `/project` in [Slash Commands](/en/slash-commands).
 
-In the Dashboard, **Role Profiles** is a first-class entry:
+## Role profiles
 
-- Open or create a profile from the left list.
-- Check which bots already have entries and edit each bot's Markdown role.
-- Pick a target group in the Apply panel, **Preview Apply** first, then **Apply Profile** when the overwrite behavior is clear.
-- From the **Groups** page, click a group's "Apply Profile" action to open Role Profiles with that group preselected.
+A profile is a **reusable bundle of group roles**: write a persona for each of several bots, save them under a name (e.g. `collab-main`), and apply them to a new group in one step later.
 
-For new collaboration groups, create the group and bootstrap the profile in one command:
+It's only a shortcut for writing: once applied, it becomes an ordinary group role. It doesn't add another persona layer and doesn't support template inheritance.
 
-```bash
+### Commands
+
+| Command | Effect |
+|------|------|
+| `/role profile list` | List all profiles and show whether the current bot has its own entry |
+| `/role profile show <name>` | Show the current bot's persona in that profile; add `--all` to see every bot's |
+| `/role profile set <name> <Markdown>` | Write the current bot's entry directly |
+| `/role profile save <name>` | Save the current bot's effective persona (group role, or the default role if there's none) into the profile |
+| `/role profile delete <name>` | Delete the current bot's entry |
+| `/role profile apply <name>` | Write the current bot's entry as the group role |
+
+Flags for `apply`:
+
+- `--preview`: preview only, write nothing.
+- `--force`: if the group already has a role, apply refuses by default; add this to overwrite.
+- `--quiet`: no reply on success (less noise when applying in bulk).
+
+Notes:
+
+- Each bot only manages its own entry and never changes another bot's persona.
+- If the profile has no entry for the current bot, `apply` writes nothing and the bot keeps using its default role.
+- Profile names may only use letters, digits, `.`, `_` and `-`, up to 64 characters.
+
+### In the Dashboard
+
+**Role Management** page → "Profiles" tab:
+
+1. Open or create a profile on the left.
+2. In the middle, see which bots have entries; select a bot to edit its persona.
+3. Under "Apply To Group", choose the target group and the bots to apply. Click **Preview Apply** first to check whether existing roles would be overwritten, then **Apply Profile**. Tick "Overwrite existing group roles" when you do want to overwrite.
+
+### Apply while creating a group
+
+```text
 @botA @botB @botC /g --role-profile collab-main War Room
 ```
 
-The creator applies its own entry directly, then posts `@botB @botC /role profile apply collab-main --quiet` inside the new group so peer bots apply their own local entries. No bot writes another daemon's role storage.
+Once the new group exists, the bot that created it applies its own entry, then posts `@botB @botC /role profile apply collab-main --quiet` in the new group so the other bots apply their own entries.
 
-## Capability Tags (Roster)
+## Capability tags
 
-```bash
-/role cap set <one-liner>   # Set this bot's capability tag
-/role cap clear             # Clear it
+A capability tag is a one-line self-introduction, such as "Good at frontend and UI review". It helps you and other bots pick the right one when collaborating.
+
+```text
+/role cap set Good at frontend and UI review   # set
+/role cap                                      # show
+/role cap clear                                # clear
 ```
 
-Capability tags show up in the "roster" — when `botmux bots list` lists the bots in the current group, each bot carries its `cap` one-liner summary, making it easy for you and other bots to know "who's good at what," so you can pick the right one during multi-bot collaboration / handoffs.
+- Tags are capped at 120 characters. One sentence is enough; use `/role set` for a full persona.
+- When other bots run `botmux bots list` to see who's in the group, they see each bot's tag.
+- Tip: put `workspace: required` / `optional` / `none` in the tag so dispatching bots know whether they must specify a repo or working directory when giving you a task.
 
-## Relationship to Multi-Bot Collaboration
+Personas plus capability tags are the foundation of [multi-bot collaboration](/en/multi-bot): with clear identities and responsibilities, bots are less likely to get mixed up when @-mentioned in a group.
 
-Role + capability tags are the infrastructure for [multi-bot collaboration](/en/multi-bot): giving each bot a clear identity and responsibilities makes the model less likely to get confused when @-mentioned in the group, with each one playing its part (e.g., one orchestrating, one doing implementation / review).
+## Teams: collaborating across machines
 
-## Team Collaboration (Cross-Deployment)
+The Dashboard used to have a "Team" page; it has been removed. To work with bots on **other people's machines**, your machine needs to be connected to the central platform and be in the same team. Then use the command line:
 
-On the **Team** panel of `botmux dashboard`, you can invite **someone else's deployment** (a botmux that a colleague runs themselves) into the same team, so you can discover each other's bots and create groups across deployments to collaborate.
+- `botmux bots list --scope team`: list bots that have joined your team.
+- `botmux create-group --team <team> --agent <appId>`: pull them and their owners into a new group.
 
-![Dashboard Team — cross-deployment collaboration](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033301213_dash-team.png)
+Full steps are in the "Team scope" section of [Multi-Bot Collaboration](/en/multi-bot).
 
-- **Bind identity**: use the bot credentials to automatically identify your Lark identity; after binding, creating a group will add you to the group, and the bots will be attributed to you.
-- **Team roster**: aggregates all bots from this deployment + any joined teams (possibly across deployments), searchable and filterable by name / capability / CLI, and annotates who has a capability tag / default role (roles are **read-only view** here; do editing on the Bot Config page).
-- **Cross-deployment group creation**: just check the bots in any team to create a group in one click, automatically bringing along each one's owner — a single group gathering different CLIs from different colleagues' deployments to collaborate.
-- **Team management**: creating a team, generating an invite code, and joining someone else's team are all on the "Team Management" subpage.
+## Role switch (advanced)
 
-> Suitable for multi-person / multi-machine collaboration: everyone runs their own botmux deployment, discovers each other's bots through a team federation, and collaborates in the same Lark group.
+> ⚠️ Advanced feature: you need to deploy a "role library" first, and it currently supports Claude Code only. Deployment steps are in the repo's [role-system deploy runbook](https://github.com/deepcoldy/botmux/blob/master/docs/roles/deploy-runbook.md). Below is how to use it once deployed.
 
-## Role Switch
+`/role` above means "one persona per bot". **Role switch** gives one bot **several full roles**, each with its own persona and **its own memory**. Switch to "After-sales" and it carries the after-sales persona and experience that belongs only to after-sales; switch to "Product manager" and it's a different set.
 
-> ⚠️ Advanced feature — requires deploying a "role library" first, and currently supports Claude Code only. Deployment steps are in the [role-system deploy runbook](https://github.com/deepcoldy/botmux/blob/master/docs/roles/deploy-runbook.md); the below covers **how end users use it once deployed**.
+Roles apply **per topic**; a new topic starts from the default role.
 
-Unlike `/role` above (a single persona, overridable per group), **role switch** gives one bot **multiple full roles**, each with its own persona **and independent memory** — switch to "After-sales" and it carries the after-sales persona plus memory accumulated only for after-sales; switch to "PM" and it's a whole different set. Roles take effect **per topic**; new topics start from the default role.
-
-### How to use it (pure natural language, no command to memorize)
+### How to use it: just talk
 
 | You say | What the bot does |
-|---------|-------------------|
-| "switch role" / "what roles are there" | Lists the roles available to you (shared ones + ones you created), numbered for you to pick |
-| "switch to After-sales" / reply with a number | Confirms, then switches; this topic is now answered by that role, and the card footer shows its name |
-| "new role: Xiaohongshu ops, familiar with our brand voice" | Drafts a persona for your confirmation → creates it → switches to it automatically |
-| "distill knowledge" | Distills the role's recent memory into structured domain knowledge fed back into itself (optionally distilled into a Lark doc for human review) |
+|------|-----------|
+| "switch role" / "what roles are there" | Lists the roles you can use (shared ones + ones you created), numbered for you to pick |
+| "switch to After-sales" or reply with a number | Confirms and switches; from then on this topic is answered by that role, and the card footer shows the role name |
+| "new role: Xiaohongshu ops, familiar with our brand voice" | Drafts a persona for you to confirm, then creates it and switches to it |
+| "distill knowledge" | Turns the role's recent memory into structured knowledge stored back in the role (optionally as a Lark doc for human review) |
 
-The user side is **all natural language** — under the hood the model calls `botmux role switch <role-dir>` (hard-validated by the daemon to stay inside the role library); you neither need to nor should type that command by hand.
+Behind the scenes the model runs `botmux role switch <role-dir>`; you don't need to type it yourself.
 
-### Key points
+### Good to know
 
-- **Private + shared (a protocol-layer convention, NOT daemon-enforced isolation)**: role listing and "switch to X" visibility are filtered by the role protocol (`_role-protocol.md`) on the sender's open_id — shared roles plus roles under your own `users/<your open_id>/` are visible and switchable; others' private roles are, by protocol convention, not listed or switchable. ⚠️ This is **protocol-layer behavior, not a security boundary**: the daemon only hard-validates that the target directory stays inside the role-library root `~/botmux-roles`; it does NOT do per-sender directory-level ACL. If you need private roles as hard isolation, add OS-level permissions yourself — do not rely on this protocol convention as a security guarantee.
-- **Independent memory**: one memory bucket per role, shared across groups / topics — the same role gets better at its domain the more it's used.
-- **Context preserved**: switching restarts the process with `--resume`, so the prior conversation carries over, and the new role's persona and memory load automatically at the new session's start.
-- **Distinct from `/cd`**: the slash command `/cd <path>` (see [Slash Commands](/en/slash-commands)) is the general "change working directory and restart", any directory, owner operate permission; role switch stays inside the role library and is driven by the role protocol — they are not the same thing.
+- **Separate memory**: each role has one memory, shared across groups and topics, so it gets better at its domain the more it's used.
+- **Context is kept**: switching restarts the CLI and resumes the previous conversation; the new role's persona and memory load automatically when the new session starts.
+- **Private roles are not a security boundary**: "you only see shared roles and your own" is a convention in the role protocol file (`_role-protocol.md`) that the model follows. The daemon enforces only one thing: the target directory must be inside the role library `~/botmux-roles`. It does not isolate roles per sender. If you need real isolation, add OS-level permissions yourself.
+- **Not the same as `/cd`**: `/cd <path>` (see [Slash Commands](/en/slash-commands)) is the general "change working directory and restart", works with any directory, and needs operate permission. Role switch only moves within the role library.
 
-> The former command name `botmux cd` is now `botmux role switch` (the old name is kept as a fail-loud error hint and no longer performs a switch). When maintaining an existing deployment, remember to refresh the `_role-protocol.md` in the role library to the new command name.
+> The old command `botmux cd` has been renamed to `botmux role switch`. The old name now only prints an error and does not switch. When maintaining an older deployment, update `_role-protocol.md` in the role library to the new command.

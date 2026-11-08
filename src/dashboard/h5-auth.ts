@@ -8,6 +8,7 @@ import {
   type ControlAuditSink,
 } from './control-audit.js';
 import { logger } from '../utils/logger.js';
+import { parseWorkflowSidebarEntryPath } from '../core/workflow-sidebar-link.js';
 
 export const DASHBOARD_SESSION_COOKIE = 'botmux_dashboard_session';
 export const DEFAULT_DASHBOARD_SESSION_TTL_MS = 30 * 60_000;
@@ -46,9 +47,22 @@ export interface DashboardAuthIdentity {
   unionId?: string;
   /** Authenticated only for an owner-bound result page, never Workbench. */
   resultOnly?: true;
+  /**
+   * Authenticated only for the workflow sidebar (design 2026-11-03 §11.3): the
+   * `/workflow/<app>/<run>` entry and its read-only data route, which then
+   * check live chat membership. Never Workbench, never any other Dashboard
+   * route — `resolveDashboardIdentity` treats it as no identity at all.
+   */
+  workflowViewOnly?: true;
   authSessionId: string;
   issuedAt: number;
   expiresAt: number;
+}
+
+/** H5 login works only with an app, its secret and an allowlist; the
+ *  controller answers 404 / 503 otherwise. */
+export function dashboardH5LoginUsable(config: Pick<DashboardH5AuthConfig, 'enabled' | 'appId' | 'appSecret' | 'allowedOpenIds'>): boolean {
+  return config.enabled && !!config.appId && !!config.appSecret && config.allowedOpenIds.length > 0;
 }
 
 export interface FeishuH5CodeExchanger {
@@ -56,6 +70,9 @@ export interface FeishuH5CodeExchanger {
 }
 
 export type DashboardSessionEndReason = 'expired' | 'logout';
+
+/** Path-scoped sessions for people outside the H5 allowlist. */
+export type DashboardSessionScope = 'result' | 'workflowView';
 
 interface StoredDashboardSession extends DashboardAuthIdentity {
   tokenHash: string;
@@ -108,7 +125,9 @@ export class DashboardSessionStore {
     this.cancel = opts.clearTimer ?? clearTimeout;
   }
 
-  create(userId: string, unionId?: string, resultOnly = false): { token: string; identity: DashboardAuthIdentity } {
+  /** `scope` narrows a session minted for someone outside the allowlist to
+   *  one path family (owner-bound results, or the workflow sidebar). */
+  create(userId: string, unionId?: string, scope?: DashboardSessionScope): { token: string; identity: DashboardAuthIdentity } {
     if (!validOpenId(userId)) throw new Error('invalid dashboard session user');
     if (unionId !== undefined && !/^on_[A-Za-z0-9_-]{6,128}$/.test(unionId)) {
       throw new Error('invalid dashboard session union id');
@@ -120,7 +139,8 @@ export class DashboardSessionStore {
       kind: 'feishu-h5',
       userId,
       ...(unionId ? { unionId } : {}),
-      ...(resultOnly ? { resultOnly: true as const } : {}),
+      ...(scope === 'result' ? { resultOnly: true as const } : {}),
+      ...(scope === 'workflowView' ? { workflowViewOnly: true as const } : {}),
       authSessionId: randomBytes(18).toString('base64url'),
       issuedAt: now,
       expiresAt: now + this.ttlMs,
@@ -207,6 +227,7 @@ export class DashboardSessionStore {
       userId: stored.userId,
       ...(stored.unionId ? { unionId: stored.unionId } : {}),
       ...(stored.resultOnly ? { resultOnly: true as const } : {}),
+      ...(stored.workflowViewOnly ? { workflowViewOnly: true as const } : {}),
       authSessionId: stored.authSessionId,
       issuedAt: stored.issuedAt,
       expiresAt: stored.expiresAt,
@@ -655,7 +676,7 @@ function json(res: ServerResponse, status: number, value: unknown, headers: Reco
   res.end(JSON.stringify(value));
 }
 
-async function readCode(req: IncomingMessage): Promise<{ code: string; resultOnly: boolean } | null> {
+async function readCode(req: IncomingMessage): Promise<{ code: string; scope?: DashboardSessionScope } | null> {
   const chunks: Buffer[] = [];
   let bytes = 0;
   for await (const raw of req) {
@@ -667,12 +688,15 @@ async function readCode(req: IncomingMessage): Promise<{ code: string; resultOnl
   let parsed: unknown;
   try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return null; }
   const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-    ? parsed as { code?: unknown; resultOnly?: unknown }
+    ? parsed as { code?: unknown; resultOnly?: unknown; workflowView?: unknown }
     : {};
   const code = body.code;
-  return typeof code === 'string' && code.length >= 4 && code.length <= 2_048 && !/[\s\0]/.test(code)
-    ? { code, resultOnly: body.resultOnly === true }
-    : null;
+  if (typeof code !== 'string' || code.length < 4 || code.length > 2_048 || /[\s\0]/.test(code)) return null;
+  // Asking for both narrow scopes is not a request the entry page makes.
+  if (body.resultOnly === true && body.workflowView === true) return null;
+  return body.resultOnly === true ? { code, scope: 'result' }
+    : body.workflowView === true ? { code, scope: 'workflowView' }
+      : { code };
 }
 
 export function safeDashboardH5ReturnTo(value: string | null | undefined): string {
@@ -681,6 +705,8 @@ export function safeDashboardH5ReturnTo(value: string | null | undefined): strin
   if (/^\/board\/[A-Za-z0-9_-]{1,64}\/\d{1,9}$/.test(value)) return value;
   if (/^\/plugin-result-access\/[A-Za-z0-9_-]{20,256}$/.test(value)
     || /^\/plugin-results\/[A-Za-z0-9_-]{20,256}$/.test(value)) return value;
+  // 工作流侧边栏入口（任务消息签名行「工作流 ›」→ /workflow/<app>/<run> → 免登 → 回到这里）。
+  if (parseWorkflowSidebarEntryPath(value)) return value;
   if (!value.startsWith('/#/agent-workbench')) return '/';
   const hash = value.slice(1).split('?')[0].replace(/\/+$/, '');
   const bases = ['#/agent-workbench-dock', '#/agent-workbench'];
@@ -709,7 +735,7 @@ function h5EntryHtml(appId: string, exchangePath: string, returnTo = '/'): strin
 <script>(function(){
 var appId=${safeAppId},endpoint=${safeExchangePath},returnTo=${safeReturnTo},status=document.getElementById('status'),error=document.getElementById('error'),retry=document.getElementById('retry'),attempt=0,timer=0,controller=null,sdkScript=null,timeoutMs=${DASHBOARD_H5_CLIENT_TIMEOUT_MS},sdkUrl='https://lf-scm-cn.feishucdn.com/lark/op/h5-js-sdk-1.5.44.js';
 function fail(id){if(id!==undefined&&id!==attempt)return;if(controller){controller.abort();controller=null}if(sdkScript){sdkScript.onload=sdkScript.onerror=null;sdkScript.remove();sdkScript=null}clearTimeout(timer);timer=0;attempt++;status.textContent='未能完成免登。';error.textContent='请确认正在飞书客户端中打开，或联系管理员检查入口配置。';retry.hidden=false}
-function exchange(code,id){if(id!==attempt)return;controller=typeof AbortController==='function'?new AbortController():null;fetch(endpoint,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({code:code,resultOnly:returnTo.indexOf('/plugin-result')===0}),signal:controller?controller.signal:undefined}).then(function(r){if(!r.ok)throw new Error('denied');return r.json()}).then(function(){if(id!==attempt)return;clearTimeout(timer);timer=0;controller=null;location.replace(returnTo)}).catch(function(){fail(id)})}
+function exchange(code,id){if(id!==attempt)return;controller=typeof AbortController==='function'?new AbortController():null;fetch(endpoint,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({code:code,resultOnly:returnTo.indexOf('/plugin-result')===0,workflowView:returnTo.indexOf('/workflow/')===0}),signal:controller?controller.signal:undefined}).then(function(r){if(!r.ok)throw new Error('denied');return r.json()}).then(function(){if(id!==attempt)return;clearTimeout(timer);timer=0;controller=null;location.replace(returnTo)}).catch(function(){fail(id)})}
 function auth(id){if(id!==attempt)return;if(!window.tt){fail(id);return}var fallback=function(){if(id!==attempt)return;try{window.tt.requestAuthCode({appId:appId,success:function(r){exchange(r&&r.code,id)},fail:function(){fail(id)}})}catch(e){fail(id)}};try{if(window.tt.requestAccess){window.tt.requestAccess({appID:appId,scopeList:[],success:function(r){exchange(r&&r.code,id)},fail:function(e){if(e&&e.errno===103)fallback();else fail(id)}})}else fallback()}catch(e){fail(id)}}
 function ready(id){if(id!==attempt)return;try{if(window.h5sdk&&window.h5sdk.ready)window.h5sdk.ready(function(){auth(id)});else auth(id)}catch(e){fail(id)}}
 function loadSdk(id){if(window.tt||window.h5sdk){ready(id);return}sdkScript=document.createElement('script');sdkScript.src=sdkUrl;sdkScript.async=true;sdkScript.referrerPolicy='no-referrer';sdkScript.onload=function(){sdkScript=null;ready(id)};sdkScript.onerror=function(){sdkScript=null;fail(id)};document.head.appendChild(sdkScript)}
@@ -780,7 +806,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
    * audit record. Everything lives inside so that N concurrent replays produce
    * ONE upstream call, ONE session and ONE audit line — not N of each.
    */
-  const exchangeOnce = async (codeKey: string, code: string, resultOnly: boolean): Promise<H5ExchangeOutcome> => {
+  const exchangeOnce = async (codeKey: string, code: string, scope: DashboardSessionScope | undefined): Promise<H5ExchangeOutcome> => {
     let openId: string;
     let unionId: string | undefined;
     try {
@@ -795,7 +821,9 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       }
       throw error;
     }
-    if (!allowed.has(openId) && !resultOnly) {
+    // Outside the allowlist only a path-scoped session can be minted, and only
+    // when the entry asked for one (owner-bound result / workflow sidebar).
+    if (!allowed.has(openId) && !scope) {
       auditOrFail(openId, 'auth.login_denied');
       return { ok: false, openId };
     }
@@ -808,7 +836,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
     auditOrFail(openId, 'auth.login');
     let created: { token: string; identity: DashboardAuthIdentity };
     try {
-      created = sessions.create(openId, unionId, resultOnly && !allowed.has(openId));
+      created = sessions.create(openId, unionId, allowed.has(openId) ? undefined : scope);
     } catch (error) {
       throw new DashboardH5LocalFailure('session create', error);
     }
@@ -868,7 +896,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
         json(res, 400, { ok: false, error: 'invalid_authorization_code' });
         return true;
       }
-      const { code, resultOnly } = parsedCode;
+      const { code, scope } = parsedCode;
       const codeKey = exchangeCodeKey(code);
       // The spent check and the single-flight lookup must observe the same
       // tick — no `await` between them. Otherwise a code whose flight settles
@@ -882,7 +910,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       // its single session; distinct codes beyond the global cap 429
       // immediately (never queue, so spam cannot stack pending exchanges on
       // the event loop).
-      const flight = exchangeGate.share(codeKey, () => exchangeOnce(codeKey, code, resultOnly));
+      const flight = exchangeGate.share(codeKey, () => exchangeOnce(codeKey, code, scope));
       if (!flight.ok) {
         rateLimited(res, 'exchange_busy', flight.retryAfterMs);
         return true;
@@ -918,7 +946,9 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
 
     if (req.method === 'GET' && url.pathname === sessionPath) {
       const identity = resolve(req);
-      if (!identity) {
+      // A workflow-sidebar session is no Dashboard login: answer exactly what
+      // an anonymous request gets (its owner's open_id is not echoed either).
+      if (!identity || identity.workflowViewOnly) {
         json(res, 401, { ok: false, error: 'authentication_required' });
       } else {
         json(res, 200, { ok: true, user: { openId: identity.userId }, expiresAt: identity.expiresAt });

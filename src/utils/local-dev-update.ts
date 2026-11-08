@@ -202,7 +202,7 @@ export function gitHeadSha(dir: string): string {
  * script. Only `bun run <script>` reaches package.json.
  *
  * Bun (not npm) is the right runner even though npm ships with Node: the `build`
- * script itself shells out to `bun run audit:domains` / `typecheck:scripts` /
+ * script itself shells out to `bun run audit:domains` / `typecheck` /
  * `dashboard:bundle`, so bun is required regardless — going through npm would
  * only add a hop while hiding that requirement. This also matches CI and the
  * `bun run build` documented in CLAUDE.md.

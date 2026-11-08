@@ -17,6 +17,7 @@ import {
   mergeQueuedCodexAppTurn,
 } from '../src/core/session-create.js';
 import { registerBot } from '../src/bot-registry.js';
+import { t } from '../src/i18n/index.js';
 
 describe('Codex App clean prompt sidecar', () => {
   it('keeps the legacy envelope while exposing only raw user text in the sidecar', () => {
@@ -181,6 +182,13 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.content).toContain('<botmux_reminder>');
     expect(built.codexAppInput?.text).toBe('继续看一下');
     expect(JSON.stringify(built.codexAppInput?.additionalContext)).not.toContain('botmux_reminder');
+    expect(built.codexAppInput?.additionalContext?.botmux_formatting).toEqual({
+      kind: 'application',
+      value: expect.stringContaining('<botmux_formatting>'),
+    });
+    expect(built.codexAppInput?.additionalContext?.botmux_formatting.value).toContain(
+      t('ai.followup.feishu_safe_emphasis', undefined, 'zh'),
+    );
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/readme.md');
   });
 
@@ -456,7 +464,7 @@ describe('Codex App clean prompt sidecar', () => {
     };
     const payload = buildFollowUpCliInput('visible', 'sid-off', { cliId: 'codex-app' });
 
-    rememberLastCliInput(ds, 'visible', payload);
+    rememberLastCliInput(ds, 'visible', payload, 'om_visible');
 
     expect(ds.lastCliInput).toBe(payload.content);
     expect(ds.lastCodexAppInput).toBeUndefined();
@@ -476,10 +484,23 @@ describe('Codex App clean prompt sidecar', () => {
     };
     const payload = buildFollowUpCliInput('visible', 'sid-on', { cliId: 'codex-app' });
 
-    rememberLastCliInput(ds, 'visible', payload);
+    rememberLastCliInput(ds, 'visible', payload, 'om_visible');
 
     expect(ds.lastCodexAppInput?.text).toBe('visible');
     expect(ds.session.lastCodexAppInput?.text).toBe('visible');
+  });
+
+  it('persists input ownership with the payload and clears it for an uncorrelated input', () => {
+    registerBot({ larkAppId: 'input-owner', larkAppSecret: 's', cliId: 'codex' });
+    const ds: any = { larkAppId: 'input-owner', session: { sessionId: 'sid-owner', cliId: 'codex' } };
+    rememberLastCliInput(ds, 'first', 'wrapped first', 'om_first');
+    expect(ds.session).toMatchObject({ lastUserPrompt: 'first', lastCliInput: 'wrapped first', lastCliInputTurnId: 'om_first' });
+    rememberLastCliInput(ds, 'second', 'wrapped second', 'schedule:second');
+    expect(ds.session).toMatchObject({ lastUserPrompt: 'second', lastCliInput: 'wrapped second', lastCliInputTurnId: 'schedule:second' });
+    rememberLastCliInput(ds, 'untracked', 'wrapped untracked', undefined);
+    expect(ds.lastCliInputTurnId).toBeUndefined();
+    expect(ds.session.lastCliInputTurnId).toBeUndefined();
+    expect(ds.session.lastCliInput).toBe('wrapped untracked');
   });
 
   it('strips the one-shot async steer target when persisting the sidecar for replay', () => {
@@ -502,7 +523,7 @@ describe('Codex App clean prompt sidecar', () => {
       },
     };
 
-    rememberLastCliInput(ds, 'answer', payload);
+    rememberLastCliInput(ds, 'answer', payload, 'om_answer');
 
     // A retry / failed-turn replay must not carry a target pointing at the
     // dead native turn; ordinary sidecar fields still survive.

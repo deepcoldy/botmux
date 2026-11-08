@@ -71,6 +71,8 @@ export interface PersistedAsk {
   answererOpenId?: string;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
+  customAnswers?: ReadonlyArray<string | null>;
+  customRevision?: number;
   createdAt: number;
   deadlineAt: number;
   /** Original relative timeout. Host-owned asks defer this clock until the
@@ -149,7 +151,7 @@ export interface AskPersistStore {
   /** Absolute directory this store owns. */
   readonly dir: string;
   /** Create-or-update a record. Best-effort durable (atomic rename + fsync). */
-  put(ask: PersistedAsk): void;
+  put(ask: PersistedAsk, options?: { strict?: boolean }): void;
   /** Remove a record by key. Idempotent (missing file is not an error). */
   remove(askKey: string): void;
   /** Load all valid, unexpired records (reaps corrupt / wrong-version / expired). */
@@ -167,7 +169,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
 
   return {
     dir,
-    put(ask: PersistedAsk): void {
+    put(ask: PersistedAsk, options?: { strict?: boolean }): void {
       try {
         decisions.put(ask);
       } catch (e) {
@@ -183,7 +185,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         // uncaughtException — the daemon installs no trap for that, and explicit
         // records are exempt from disk reaping below, so it would crash-loop on
         // every restart until the disk recovered. Those writes stay best-effort.
-        if (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered') throw e;
+        if (options?.strict || (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered')) throw e;
         // Persistence is a resilience enhancement, never a correctness gate for
         // the live path: a failed write just means this ask won't survive a
         // restart.

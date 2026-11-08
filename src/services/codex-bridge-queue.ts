@@ -69,6 +69,10 @@ export interface CodexPendingTurn {
   turnId: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
+  /** This attribution mark came from the previous worker generation's durable
+   * journal. Recovery-only cleanup may retire these marks without touching a
+   * new turn that the replacement process accepted during startup. */
+  restoredFromJournal?: boolean;
   started: boolean;
   contentFingerprint?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
@@ -141,6 +145,30 @@ export interface CodexPendingTurn {
    *  falsely release idle and prune a still-running turn). Cleared by the
    *  terminal edge or an explicit stop. */
   rpcActive?: boolean;
+}
+
+/** Journal-restored marks whose lifecycle the PREVIOUS worker process had
+ *  already accepted when it died: the replacement CLI cannot complete them, so
+ *  a cold-resume first prompt may retire them and let the restart-interruption
+ *  note own recovery.
+ *
+ *  The activity disjunction is load-bearing. `restorePendingTurns()` rebuilds
+ *  every mark as `started:false` with none of the submit/rpc flags. A mark
+ *  that never reached the transcript (its user record was still buffered when
+ *  the process died) must STAY queued: the resumed CLI may still emit that
+ *  user record — or genuinely run queued input — and a later ingest owns the
+ *  attribution. Only a mark the baseline replay proved the dead process had
+ *  already started / queued / confirmed is safe to retire. */
+export function selectStaleRestoredJournalTurns(
+  turns: readonly CodexPendingTurn[],
+): CodexPendingTurn[] {
+  return turns.filter(turn => turn.restoredFromJournal === true
+    && turn.finalText === undefined
+    && (turn.started
+      || turn.rpcActive === true
+      || turn.cliQueuedAtMs !== undefined
+      || turn.submitConfirmedAtMs !== undefined
+      || turn.submitVerificationStartedAtMs !== undefined));
 }
 
 export class CodexBridgeQueue {
@@ -282,6 +310,9 @@ export class CodexBridgeQueue {
       && fallback.sourceSessionId === ev.sourceSessionId
       && fallback.transcriptStartTimeMs !== undefined
       && ev.timestampMs >= fallback.transcriptStartTimeMs
+      // With multiple active turns and no exact match, refuse an ambiguous
+      // reassignment to avoid merging independent replies. Exact-id routing
+      // above stays available; if X never terminates, its turn may stay pending.
       && !this.queue.some(turn => turn !== fallback && turn.started && turn.finalText === undefined)) {
       this.rememberClosedNativeTurn(fallback);
       fallback.sourceTurnId = ev.sourceTurnId;
@@ -365,6 +396,7 @@ export class CodexBridgeQueue {
       if (existing.has(entry.turnId)) continue;
       existing.add(entry.turnId);
       restored.push({ turnId: entry.turnId, started: false,
+        restoredFromJournal: true,
         ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         recoveryJsonlPathAtMark: entry.jsonlPath,
@@ -782,11 +814,16 @@ export class CodexBridgeQueue {
             && active.sourceSessionId === ev.sourceSessionId
             && active.transcriptStartTimeMs !== undefined
             && ev.timestampMs >= active.transcriptStartTimeMs
+            // With multiple active turns, refuse a candidate that could make
+            // a later user handoff drop an independent reply. Exact native ids
+            // still route; if X never terminates, its turn may stay pending.
             && !this.queue.some(turn => turn !== active && turn.started && turn.finalText === undefined)) {
             // A new start can replace the abandoned execution containing the
             // HOL successor. Do not let an unread pending input claim it. If
             // that input's user record arrives, its fingerprint below decides
             // the handoff; otherwise the terminal still belongs to active.
+            // This is only a candidate: exact X terminals can still settle active
+            // until a valid user handoff removes it or a terminal replaces its id.
             active.replacementNativeTurnId = ev.sourceTurnId;
             return;
           }
@@ -940,6 +977,13 @@ export class CodexBridgeQueue {
       // is ignored rather than treated as a turn boundary. Mirrors Claude's
       // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
       // text yet" — the streaming-transcript equivalent of "no finalText").
+      // A same-session replacement candidate permits a valid user handoff below.
+      // Once that handoff removes the old HOL successor, late X terminals cannot
+      // settle that removed turn; X's receipt credit is not inherited by Y.
+      // This treats X as abandoned, assuming no separate X answer is still owed.
+      // The handoff does not tombstone X: a late terminal may still be absorbed
+      // by a later started turn lacking a native id. This unhandled ordering
+      // boundary is synthetically reachable, without production evidence (#2707).
       const isDistinctNativeTurn = !!ev.sourceTurnId
         && !!this.collecting?.sourceTurnId
         && ev.sourceTurnId !== this.collecting.sourceTurnId
@@ -1113,6 +1157,11 @@ export class CodexBridgeQueue {
       out.push(head);
     }
     return out;
+  }
+
+  restoreDrained(turns: readonly CodexPendingTurn[]): void {
+    const retained = new Set(this.queue);
+    this.queue.unshift(...turns.filter(turn => !retained.has(turn)));
   }
 
   size(): number {

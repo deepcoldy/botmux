@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/session-store.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import {
@@ -208,6 +211,53 @@ describe('principal lane durable store', () => {
     updateSession(session);
     return session;
   }
+
+  function protectedEgressPolicy(suffix = 'fixture') {
+    return {
+      pluginId: `${suffix}-plugin`,
+      capabilityId: `${suffix}.actor-write.v1`,
+      policy: {
+        id: `${suffix}.write.v1`,
+        targets: [{
+          scheme: 'https' as const,
+          host: `${suffix}.internal.example`,
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+        }],
+      },
+      policyDigest: suffix[0]!.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    };
+  }
+
+  it('carries a frozen protected egress policy through stale metadata writes', () => {
+    const source = sourceSession('root-egress-stale', 'on_source', 'ou_source');
+    const staleWriter = structuredClone(source);
+    source.protectedHttpEgressPolicy = protectedEgressPolicy();
+    updateSession(source);
+
+    staleWriter.title = 'unrelated stale metadata update';
+    updateSession(staleWriter);
+
+    expect(getSessionFresh(source.sessionId)?.protectedHttpEgressPolicy)
+      .toEqual(source.protectedHttpEgressPolicy);
+    init(appId);
+    expect(getOwnedSession(source.sessionId)?.protectedHttpEgressPolicy)
+      .toEqual(source.protectedHttpEgressPolicy);
+  });
+
+  it('refuses to replace an already frozen protected egress policy', () => {
+    const source = sourceSession('root-egress-conflict', 'on_source', 'ou_source');
+    source.protectedHttpEgressPolicy = protectedEgressPolicy();
+    updateSession(source);
+    const conflictingWriter = structuredClone(source);
+    conflictingWriter.protectedHttpEgressPolicy = protectedEgressPolicy('replacement');
+
+    expect(() => updateSession(conflictingWriter))
+      .toThrow('Protected HTTP egress policy is immutable');
+    expect(getSessionFresh(source.sessionId)?.protectedHttpEgressPolicy)
+      .toEqual(source.protectedHttpEgressPolicy);
+  });
 
   function initializeSourceGitRepository(): void {
     if (existsSync(join(tempDir, '.git'))) return;
@@ -633,7 +683,7 @@ describe('principal lane durable store', () => {
     } finally { db.close(); }
   });
 
-  it('freezes the network policy in shadow lanes and restores it without the XPI ingress flag', () => {
+  it('freezes network and protected egress policies in shadow lanes and restores them without the XPI ingress flag', () => {
     const source = sourceSession('root-shadow-network', 'on_source', 'ou_source');
     source.backendType = 'pty';
     source.sandbox = true;
@@ -643,7 +693,23 @@ describe('principal lane durable store', () => {
       private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
       dnsServers: ['1.1.1.1'],
     };
+    source.protectedHttpEgressPolicy = {
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy: {
+        id: 'fixture.write.v1',
+        targets: [{
+          scheme: 'https',
+          host: 'fixture.internal.example',
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+        }],
+      },
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    };
     const frozen = structuredClone(source.sandboxNetworkPolicy);
+    const frozenProtectedEgress = structuredClone(source.protectedHttpEgressPolicy);
     updateSession(source);
     expect(ensurePrincipalLaneSource({
       sourceSessionId: source.sessionId,
@@ -654,16 +720,24 @@ describe('principal lane durable store', () => {
       identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' }, now,
     });
     if (shadow.status !== 'ready') throw new Error('expected ready shadow lane');
-    expect(shadow.session).toMatchObject({ sandbox: true, sandboxNetwork: true, sandboxNetworkPolicy: frozen });
+    expect(shadow.session).toMatchObject({
+      sandbox: true,
+      sandboxNetwork: true,
+      sandboxNetworkPolicy: frozen,
+      protectedHttpEgressPolicy: frozenProtectedEgress,
+    });
     // Mutate the actual stored source, including nested arrays: copying only
     // the outer object must not weaken the child policy.
     const storedSource = getOwnedSession(source.sessionId)!;
     storedSource.sandboxNetworkPolicy!.private.rules![0]!.ports!.push(80);
     storedSource.sandboxNetworkPolicy!.dnsServers!.push('8.8.8.8');
     updateSession(storedSource);
+    storedSource.protectedHttpEgressPolicy!.frozenAddresses[0]!.push('10.20.30.41');
     expect(shadow.session.sandboxNetworkPolicy).toEqual(frozen);
+    expect(shadow.session.protectedHttpEgressPolicy).toEqual(frozenProtectedEgress);
     init(appId);
     expect(getOwnedSession(shadow.session.sessionId)?.sandboxNetworkPolicy).toEqual(frozen);
+    expect(getOwnedSession(shadow.session.sessionId)?.protectedHttpEgressPolicy).toEqual(frozenProtectedEgress);
   });
 
   it('publishes one isolated worktree proof atomically and hydrates only that shadow cwd', async () => {

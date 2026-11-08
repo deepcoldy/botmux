@@ -62,7 +62,7 @@ function activeScheduledSession(): any {
 }
 
 describe('daemon current actor attestation', () => {
-  it('derives the HTTP client pid from the live kernel socket tuple', () => {
+  it('derives the HTTP client pid from the live kernel socket tuple', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-'));
     mkdirSync(join(procRoot, 'net'), { recursive: true });
     writeFileSync(join(procRoot, 'net', 'tcp'), [
@@ -74,7 +74,7 @@ describe('daemon current actor attestation', () => {
     mkdirSync(join(procRoot, '101', 'fd'), { recursive: true });
     symlinkSync('socket:[4242]', join(procRoot, '101', 'fd', '7'));
 
-    expect(resolveLoopbackPeerProcesses({
+    expect(await resolveLoopbackPeerProcesses({
       remoteAddress: '127.0.0.1',
       remotePort: 50_000,
       localPort: 7_951,
@@ -82,13 +82,13 @@ describe('daemon current actor attestation', () => {
     })).toEqual({ ok: true, peer: { pid: 101, procStart: '2000' } });
   });
 
-  it('rejects a non-loopback request before process lookup', () => {
-    expect(resolveLoopbackPeerProcesses({
+  it('rejects a non-loopback request before process lookup', async () => {
+    expect(await resolveLoopbackPeerProcesses({
       remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951,
     })).toEqual({ ok: false, reason: 'not_loopback' });
   });
 
-  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and reaches local socket-inode resolution', () => {
+  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and reaches local socket-inode resolution', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-env-'));
     mkdirSync(join(procRoot, 'net'), { recursive: true });
     // No client-side tuple in this host's tables → a remote peer could never
@@ -100,10 +100,10 @@ describe('daemon current actor attestation', () => {
     process.env.BOTMUX_LOOPBACK_PEERS = '10.0.0.1';
     __resetLoopbackPeersCacheForTest();
     try {
-      expect(resolveLoopbackPeerProcesses({
+      expect(await resolveLoopbackPeerProcesses({
         remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951, procRoot,
       })).toEqual({ ok: false, reason: 'peer_unresolved' });
-      expect(resolveLoopbackPeerProcesses({
+      expect(await resolveLoopbackPeerProcesses({
         remoteAddress: '10.0.0.2', remotePort: 50_000, localPort: 7_951, procRoot,
       })).toEqual({ ok: false, reason: 'not_loopback' });
     } finally {

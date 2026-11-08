@@ -2,8 +2,9 @@
 
 import { dirname, resolve } from 'node:path';
 
-import { loadBotConfigs } from '../bot-registry.js';
+import { loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { resolveCurrentTurnProvenance } from '../core/current-turn-provenance.js';
+import { isHumanInboundTurnId } from '../core/reply-target.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import type { RawParamInput } from '../workflows/shared/params.js';
 import { defaultBaseDir } from '../workflows/v3/grill-state.js';
@@ -128,6 +129,7 @@ export function contextFromEnv(
     ...(provenance.chatType ? { chatType: provenance.chatType } : {}),
     ...(provenance.rootMessageId ? { rootMessageId: provenance.rootMessageId } : {}),
     sessionId: provenance.sessionId,
+    humanTurn: isHumanInboundTurnId(provenance.turnId),
   };
 }
 
@@ -347,18 +349,32 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
     const positional = positionals(args, ['--library-dir', '--base-dir', '--param', '--param-json', '--run-id']);
     const ref = positional.find((token) => !token.includes('='));
     if (!ref) throw new Error('用法: botmux workflow run <名称|workflowId> [--param key=value]');
+    const bots = loadBotConfigs();
+    const nodeExecutorPolicy = await cliNodeExecutorPolicy(bots);
     const materialized = await instantiatePublishedSavedWorkflow({
       dataDir,
       ref,
       context,
       rawParams: collectSavedWorkflowRawParams(args),
-      bots: loadBotConfigs(),
+      bots,
       baseDir,
       runId: argValue(args, '--run-id'),
+      ...(nodeExecutorPolicy ? { nodeExecutorPolicy } : {}),
     });
     await startMaterializedRun(materialized.runId, context.actor.larkAppId);
-    if (json) console.log(JSON.stringify({ runId: materialized.runId, runDir: materialized.runDir }, null, 2));
-    else console.log(`✅ Saved Workflow 已启动：${materialized.runId}`);
+    if (json) {
+      console.log(JSON.stringify({
+        runId: materialized.runId,
+        runDir: materialized.runDir,
+        ...('nodeExecutor' in materialized.envelope && materialized.envelope.nodeExecutor
+          ? { nodeExecutor: materialized.envelope.nodeExecutor }
+          : {}),
+        ...(materialized.executorNote ? { executorNote: materialized.executorNote } : {}),
+      }, null, 2));
+    } else {
+      console.log(`✅ Saved Workflow 已启动：${materialized.runId}`);
+      if (materialized.executorNote) console.log(materialized.executorNote);
+    }
     return;
   }
 
@@ -377,4 +393,18 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
   }
 
   throw new Error(`未知 Saved Workflow 子命令：${sub}`);
+}
+
+/** Experimental node-executor policy for `botmux workflow run` (design §6.3);
+ *  `undefined` while the switch is off. The strict membership resolver needs
+ *  the configured apps registered in this CLI process, as dispatch does. */
+async function cliNodeExecutorPolicy(bots: BotConfig[]) {
+  const { liveV3NodeExecutorPolicy } = await import('../im/lark/v3-bot-eligibility.js');
+  const policy = liveV3NodeExecutorPolicy(bots);
+  if (!policy) return undefined;
+  const { registerBot } = await import('../bot-registry.js');
+  for (const bot of bots) {
+    try { registerBot(bot); } catch { /* an unusable entry fails its own probe */ }
+  }
+  return policy;
 }

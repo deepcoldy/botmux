@@ -14,6 +14,7 @@ import {
   restartNoteInput,
   restartNoteMayPrefix,
   shouldSuppressRestartInterruptionScan,
+  shouldSynthesizeJournalInterruption,
   structuredTurnOpen,
   transcriptTailOffset,
   withoutReportedTasks,
@@ -49,11 +50,29 @@ describe('shouldSuppressRestartInterruptionScan', () => {
     });
 });
 
+describe('shouldSynthesizeJournalInterruption', () => {
+  const base = {
+    scanEligible: true,
+    existingAppServerEndpoint: false,
+    pendingWork: undefined,
+    hasStaleTurn: true,
+  } as const;
+  it('synthesises only in the narrow journal-proof window', () => {
+    expect(shouldSynthesizeJournalInterruption(base)).toBe(true);
+  });
+  it.each([
+    ['scan ineligible (e.g. TraeX auto-model rotation keeps the native turn)', { scanEligible: false }],
+    ['shared external app-server owns turn recovery', { existingAppServerEndpoint: true }],
+    ['tail scan already found the interruption', { pendingWork: { turnOpen: true, tasks: [] } }],
+    ['replay produced no started restored mark', { hasStaleTurn: false }],
+  ] as const)('does not synthesise when %s', (_label, overrides) => {
+    expect(shouldSynthesizeJournalInterruption({ ...base, ...overrides })).toBe(false);
+  });
+});
+
 // Record shapes follow Claude Code 2.1.305 transcripts from the 10-21 tmux
 // server loss (ids and texts are synthetic).
-const at = (hhmmss: string): string => `2026-10-20T${hhmmss}.000Z`;
-
-function prompt(uuid: string, ts: string, text = 'please watch CI'): TranscriptEvent {
+const at = (hhmmss: string): string => `2026-10-20T${hhmmss}.000Z`;function prompt(uuid: string, ts: string, text = 'please watch CI'): TranscriptEvent {
   return { type: 'user', uuid, timestamp: at(ts), message: { role: 'user', content: text } } as TranscriptEvent;
 }
 

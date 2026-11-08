@@ -34,7 +34,7 @@ const key = { larkAppId: 'app', sessionId: 'sid', turnId: 'om_turn' };
 const input: CreateAskInput = {
   larkAppId: 'app', sessionId: 'sid', chatId: 'oc_chat', rootMessageId: 'om_root', timeoutMs: 60_000,
   replyCardTarget: { turnId: 'om_turn' },
-  questions: [{ prompt: '继续执行吗？', multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
+  questions: [{ prompt: '继续执行吗？', allowCustom: false, multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
 };
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 let dir: string;
@@ -117,6 +117,28 @@ describe('Ask inside the running reply card', () => {
     expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toBeUndefined();
   });
 
+  it('masks a content-audit-rejected question patch instead of failing the question', async () => {
+    // The card already shows progress with an email; settling the question
+    // re-renders the whole card and Lark rejects that text.
+    const email = 'alice.liu@example.com';
+    const { snapshot, answer } = await ask();
+    await store.update(key, { kind: 'progress', text: `作者 <${email}>` }, io);
+    const bodies: string[] = [];
+    vi.mocked(updateMessage).mockImplementation(async (_app, _id, content) => {
+      bodies.push(content);
+      if (content.includes(email)) throw { isAxiosError: true, name: 'AxiosError', message: 'Request failed with status code 400',
+        response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } } };
+      body = content;
+    });
+    await click(snapshot, { action: 'ask_select', key: 'yes' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
+    await vi.waitFor(() => expect(body).toContain('✓ 继续'));
+    expect(bodies[0]).toContain(email);
+    expect(body).not.toContain(email);
+    expect(body).toContain('example.com');
+    expect(body).toContain('部分内容已自动打码');
+  });
+
   it('observes the acknowledged inline question patch for shared history', async () => {
     const { snapshot, answer } = await ask();
     expect(observePublishedGroupMessage).toHaveBeenCalledWith('app', expect.objectContaining({
@@ -159,6 +181,26 @@ describe('Ask inside the running reply card', () => {
     expect(body).toContain('继续执行吗');
     expect(body).toContain('✓ 继续');
     expect(body).not.toContain('ask_select');
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('submits per-question text from the same live card after another question is toggled', async () => {
+    const { snapshot, answer } = await ask({ questions: [
+      { ...input.questions[0], allowCustom: true },
+      { ...input.questions[0], prompt: '第二题', allowCustom: true },
+    ] });
+    const toggle = { action: 'ask_toggle', key: 'yes', question_index: '1', custom_form: 'v1', revision: '0' };
+    const response = await handleAskCardAction({ context: { open_message_id: 'om_reply' }, operator: { open_id: 'ou_owner' },
+      action: { value: { ...toggle, ask_id: snapshot.askId, nonce: snapshot.nonce }, form_value: { custom_0: '自定义社区', custom_1: '' } } }, { larkAppId: 'app' });
+    await (response as any)?.afterAck?.();
+    await store.update(key, { kind: 'progress', text: '等待确认' }, io);
+    expect(JSON.stringify(JSON.parse(body))).toContain('自定义社区');
+    await click(snapshot, { action: 'ask_submit', custom_form: 'v1', revision: '1' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [[], ['yes']], customAnswers: ['自定义社区', null] });
+    await Promise.allSettled([...publishing]);
+    expect(body).toContain('✓ 自定义社区');
+    expect(body).toContain('✓ 继续');
     expect(replyMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
   });

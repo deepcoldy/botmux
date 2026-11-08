@@ -92,6 +92,7 @@ const claudeCodeAdapter: HookAskAdapter = {
     answersByQuestion: ReadonlyArray<ReadonlyArray<string>>,
     parsed: ParsedAsk,
     comment?: string | null,
+    customAnswers?: ReadonlyArray<string | null>,
   ): string {
     const rawPayload = parsed.raw;
     const rawQuestions = extractRawQuestions(rawPayload);
@@ -102,6 +103,7 @@ const claudeCodeAdapter: HookAskAdapter = {
     const answers: Record<string, string> = {};
     parsed.questions.forEach((q, i) => {
       const selectedKeys = answersByQuestion[i];
+      if (customAnswers?.[i]) { answers[q.prompt] = customAnswers[i]!; return; }
       if (selectedKeys && selectedKeys.length > 0) {
         // 把 key 映射回 label（用于人类可读的 answers 值）
         const labels = selectedKeys.map((k) => {
@@ -147,6 +149,7 @@ const claudeCodeAdapter: HookAskAdapter = {
       questions: [{
         prompt,
         multiSelect: false,
+        allowCustom: false,
         options: [
           { key: PERMISSION_ALLOW_KEY, label: '允许执行' },
           { key: PERMISSION_DENY_KEY, label: '拒绝' },

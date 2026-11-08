@@ -281,6 +281,13 @@ export interface TraexAutoModelRuntimeState {
   skillCatalogFingerprint?: string;
   sharedSettings?: TraexAutoModelSettings;
   quotaBlocks?: Array<{ model: string; resetAtMs?: number }>;
+  stoppedRecoveryTurnId?: string;
+  modelAccessRecovery?: {
+    turnId: string;
+    blockedModels: string[];
+    queuedModels: string[];
+    queuePositions?: Array<{ model: string; position: number; atMs: number }>;
+  };
 }
 
 export function traexAutoModelPolicyKey(config: TraexAutoModelConfig): string {
@@ -316,13 +323,14 @@ export type TraexAutoModelAction =
   | { kind: 'load_check'; turnId: string }
   | {
       kind: 'switch';
-      reason: 'new_turn' | 'quota_exhausted' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load' | 'preflight_available' | 'preflight_lowest_load';
+      reason: 'new_turn' | 'quota_exhausted' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load' | 'preflight_available' | 'preflight_lowest_load' | 'model_access_restricted';
       turnId: string;
       fromModel: string;
       toModel: string;
       toIndex: number;
       queuePosition?: number;
       loadPercent?: number;
+      restrictionRecovery?: true;
     }
   | {
       kind: 'exhausted';
@@ -331,6 +339,7 @@ export type TraexAutoModelAction =
       modelCount: number;
       queuePosition?: number;
       loadPercent?: number;
+      restrictionRecovery?: true;
     };
 
 export type TraexAutoModelPreflightDecision =
@@ -379,6 +388,10 @@ export class TraexAutoModelController {
   private progressSinceMs: number | undefined;
   private awaitingActivity = false;
   private quotaBlocks = new Map<string, { resetAtMs?: number }>();
+  private modelAccessRecoveryTurnId: string | undefined;
+  private stoppedRecoveryTurnId: string | undefined;
+  private accessBlockedModels = new Set<number>();
+  private accessQueuedModels = new Set<number>();
 
   readonly sharedSettings?: TraexAutoModelSettings;
 
@@ -390,6 +403,37 @@ export class TraexAutoModelController {
       if (restored.sharedSettings) this.sharedSettings = { ...restored.sharedSettings };
       this.currentIndex = config.models.indexOf(restored.model);
       this.exhausted = restored.waitingOnFinalModel;
+      const access = restored.modelAccessRecovery;
+      if (access && typeof access.turnId === 'string' && access.turnId
+        && Array.isArray(access.blockedModels) && Array.isArray(access.queuedModels)) {
+        this.turnId = this.modelAccessRecoveryTurnId = access.turnId;
+        this.awaitingActivity = true;
+        this.searchingBackups = !this.exhausted;
+        for (const model of access.blockedModels) {
+          const index = config.models.indexOf(model);
+          if (index >= 0) this.accessBlockedModels.add(index);
+        }
+        for (const model of access.queuedModels) {
+          const index = config.models.indexOf(model);
+          if (index >= 0 && !this.accessBlockedModels.has(index)) this.accessQueuedModels.add(index);
+        }
+        if (Array.isArray(access.queuePositions)) {
+          const nowMs = Date.now();
+          for (const evidence of access.queuePositions) {
+            if (!evidence || typeof evidence !== 'object') continue;
+            const index = config.models.indexOf(evidence.model);
+            if (this.accessQueuedModels.has(index) && Number.isSafeInteger(evidence.position)
+              && evidence.position >= 0 && Number.isFinite(evidence.atMs) && evidence.atMs >= 0
+              && evidence.atMs <= nowMs && nowMs - evidence.atMs <= 10 * 60_000) {
+              this.queuePositions.set(index, { position: evidence.position, atMs: evidence.atMs });
+            }
+          }
+        }
+      }
+      if (typeof restored.stoppedRecoveryTurnId === 'string' && restored.stoppedRecoveryTurnId
+        && (!this.turnId || this.turnId === restored.stoppedRecoveryTurnId)) {
+        this.turnId = this.stoppedRecoveryTurnId = restored.stoppedRecoveryTurnId;
+      }
       if (config.trigger === 'quota' && Array.isArray(restored.quotaBlocks)) {
         for (const block of restored.quotaBlocks) {
           if (config.models.includes(block.model)) this.quotaBlocks.set(block.model, {
@@ -405,6 +449,16 @@ export class TraexAutoModelController {
     return { model: this.currentModel(), waitingOnFinalModel: this.exhausted,
       policyKey: traexAutoModelPolicyKey(this.config), nativeSessionId,
       ...(this.config.trigger === 'quota' ? { quotaBlocks: [...this.quotaBlocks].map(([model, block]) => ({ model, ...block })) } : {}),
+      ...(this.stoppedRecoveryTurnId ? { stoppedRecoveryTurnId: this.stoppedRecoveryTurnId } : {}),
+      ...(this.modelAccessRecoveryTurnId ? { modelAccessRecovery: {
+        turnId: this.modelAccessRecoveryTurnId,
+        blockedModels: [...this.accessBlockedModels].map(index => this.config.models[index]!),
+        queuedModels: [...this.accessQueuedModels].map(index => this.config.models[index]!),
+        queuePositions: [...this.queuePositions].filter(([index]) => this.accessQueuedModels.has(index)
+          && !this.accessBlockedModels.has(index)).map(([index, evidence]) => ({
+          model: this.config.models[index]!, ...evidence,
+        })),
+      } } : {}),
       ...(this.sharedSettings !== undefined ? { sharedSettings: { ...this.sharedSettings } } : {}) };
   }
 
@@ -438,6 +492,9 @@ export class TraexAutoModelController {
     options: { preferFirstModel?: boolean } = {},
   ): TraexAutoModelPreflightDecision {
     const currentModel = this.currentModel();
+    if (this.modelAccessRecoveryTurnId === turnId || this.recoveryStopped(turnId)) {
+      return { kind: 'keep', reason: 'disabled', model: currentModel, checkedModel: currentModel };
+    }
     const checkedIndex = options.preferFirstModel ? 0 : this.currentIndex;
     const checkedModel = this.config.models[checkedIndex]!;
     if (!traexAutoModelPreflightEnabled(this.config)) {
@@ -527,6 +584,24 @@ export class TraexAutoModelController {
     return this.awaitingActivity;
   }
 
+  modelProgressConfirmed(): boolean {
+    return this.progressSinceMs !== undefined && Date.now() - this.progressSinceMs >= 2_000;
+  }
+
+  modelAccessRecoveryActive(): boolean {
+    return this.turnId !== undefined && this.modelAccessRecoveryTurnId === this.turnId;
+  }
+
+  requestRecoveryStop(turnId: string): boolean {
+    if (turnId !== this.turnId) return false;
+    this.stoppedRecoveryTurnId = turnId;
+    return true;
+  }
+
+  recoveryStopped(turnId: string): boolean {
+    return this.stoppedRecoveryTurnId === turnId;
+  }
+
   /** Submission can leave the previous composer visible until the first
    * native activity frame. Keep follow-ups outside the CLI during that gap. */
   markInputSubmitted(turnId: string): void {
@@ -544,6 +619,13 @@ export class TraexAutoModelController {
 
   beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {
     if (!turnId || this.turnId === turnId) return { kind: 'none' };
+    if (this.stoppedRecoveryTurnId !== turnId) this.stoppedRecoveryTurnId = undefined;
+    if (this.modelAccessRecoveryTurnId !== turnId) {
+      if (this.modelAccessRecoveryTurnId) this.exhausted = false;
+      this.modelAccessRecoveryTurnId = undefined;
+      this.accessBlockedModels.clear();
+      this.accessQueuedModels.clear();
+    }
     const fromModel = this.currentModel();
     if (this.config.trigger === 'quota' && !options.retainCurrentModel) {
       this.turnId = turnId;
@@ -599,7 +681,7 @@ export class TraexAutoModelController {
 
   observeQuotaFailure(turnId: string, quotas: ReadonlyMap<string, TraexQuotaEvidence> | null,
     nowMs = Date.now()): TraexAutoModelAction {
-    if (this.config.trigger !== 'quota' || turnId !== this.turnId) return { kind: 'none' };
+    if (this.config.trigger !== 'quota' || turnId !== this.turnId || this.recoveryStopped(turnId)) return { kind: 'none' };
     this.refreshQuotaEvidence(quotas, nowMs);
     if (!this.quotaBlocks.has(this.currentModel())) this.quotaBlocks.set(this.currentModel(), {});
     for (let index = this.currentIndex + 1; index < this.config.models.length; index++) {
@@ -610,6 +692,84 @@ export class TraexAutoModelController {
     return { kind: 'exhausted', turnId, model: this.currentModel(), modelCount: this.config.models.length };
   }
 
+  /** A native access refusal excludes only the attempted model, not its family.
+   * Queue candidates must have real queue evidence before a final wait. */
+  recordUnavailableModel(turnId: string): boolean {
+    if (turnId !== this.turnId || this.recoveryStopped(turnId)) return false;
+    this.modelAccessRecoveryTurnId = turnId;
+    this.accessBlockedModels.add(this.currentIndex);
+    this.accessQueuedModels.delete(this.currentIndex);
+    this.queuePositions.delete(this.currentIndex);
+    for (const index of this.queuePositions.keys()) {
+      if (!this.accessBlockedModels.has(index)) this.accessQueuedModels.add(index);
+    }
+    this.exhausted = false;
+    this.searchingBackups = true;
+    this.queueSinceMs = undefined;
+    this.liveCapacityQueued = false;
+    this.loadCheckPending = false;
+    return true;
+  }
+
+  observeModelAccessFailure(turnId: string, loads: ReadonlyMap<string, number> | null): TraexAutoModelAction {
+    if (!this.recordUnavailableModel(turnId)) return { kind: 'none' };
+    return this.selectModelAccessCandidate(turnId, loads);
+  }
+
+  private selectModelAccessCandidate(turnId: string, loads: ReadonlyMap<string, number> | null): TraexAutoModelAction {
+    const loadAt = (index: number): number | undefined => {
+      const value = loads?.get(this.config.models[index]!.toLowerCase());
+      return value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined;
+    };
+    const blocked = (index: number) => this.accessBlockedModels.has(index)
+      || this.quotaBlocked(this.config.models[index]!, Date.now());
+    const untried: number[] = [];
+    for (let offset = 1; offset <= this.config.models.length; offset++) {
+      const index = (this.currentIndex + offset) % this.config.models.length;
+      if (!blocked(index) && !this.accessQueuedModels.has(index)) untried.push(index);
+    }
+    const threshold = this.config.overloadThresholdPercent ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+    const index = untried.find(candidate => loadAt(candidate) === undefined || loadAt(candidate)! <= threshold)
+      ?? untried[0];
+    if (index !== undefined) {
+      const percent = loadAt(index);
+      return { kind: 'switch', reason: percent !== undefined && percent <= threshold
+        ? 'available_model' : 'model_access_restricted', restrictionRecovery: true,
+        turnId, fromModel: this.currentModel(), toModel: this.config.models[index]!, toIndex: index,
+        ...(percent !== undefined ? { loadPercent: percent } : {}) };
+    }
+    const queued = [...this.accessQueuedModels].filter(candidate => !blocked(candidate))
+      .sort((a, b) => a - b);
+    if (!queued.length) {
+      this.exhausted = true;
+      return { kind: 'exhausted', restrictionRecovery: true, turnId,
+        model: this.currentModel(), modelCount: this.config.models.length };
+    }
+    let best = queued.includes(this.currentIndex) ? this.currentIndex : queued.at(-1)!;
+    let reason: 'lowest_load' | 'shortest_queue' = 'shortest_queue';
+    let position = Infinity;
+    if (queued.every(candidate => loadAt(candidate) !== undefined)) {
+      reason = 'lowest_load';
+      best = queued[0]!;
+      for (const candidate of queued) if (loadAt(candidate)! < loadAt(best)!) best = candidate;
+    } else {
+      for (const candidate of queued) {
+        const evidence = this.queuePositions.get(candidate);
+        if (evidence && evidence.atMs <= Date.now() && Date.now() - evidence.atMs <= 10 * 60_000
+          && evidence.position < position) { best = candidate; position = evidence.position; }
+      }
+    }
+    const evidence = { ...(loadAt(best) !== undefined ? { loadPercent: loadAt(best) } : {}),
+      ...(Number.isFinite(position) ? { queuePosition: position } : {}) };
+    if (best === this.currentIndex) {
+      this.exhausted = true;
+      return { kind: 'exhausted', restrictionRecovery: true, turnId,
+        model: this.currentModel(), modelCount: queued.length, ...evidence };
+    }
+    return { kind: 'switch', reason, restrictionRecovery: true, turnId,
+      fromModel: this.currentModel(), toModel: this.config.models[best]!, toIndex: best, ...evidence };
+  }
+
   /** Advance only after the host has admitted the exact native-session restart.
    * Refused proposals leave the real running model and controller in agreement. */
   commitSwitch(action: Extract<TraexAutoModelAction, { kind: 'switch' }>, nowMs = Date.now()): boolean {
@@ -618,6 +778,7 @@ export class TraexAutoModelController {
       || action.reason === 'preflight_lowest_load';
     if (action.fromModel !== this.currentModel()
       || this.config.models[action.toIndex] !== action.toModel
+      || this.accessBlockedModels.has(action.toIndex) || this.recoveryStopped(action.turnId)
       || (!admissionSwitch && action.turnId !== this.turnId)) {
       return false;
     }
@@ -643,6 +804,11 @@ export class TraexAutoModelController {
 
   endTurn(turnId: string): void {
     if (this.turnId !== turnId) return;
+    this.stoppedRecoveryTurnId = undefined;
+    if (this.modelAccessRecoveryTurnId) this.exhausted = false;
+    this.modelAccessRecoveryTurnId = undefined;
+    this.accessBlockedModels.clear();
+    this.accessQueuedModels.clear();
     this.awaitingActivity = false;
     this.turnId = undefined;
     this.queueSinceMs = undefined;
@@ -662,10 +828,11 @@ export class TraexAutoModelController {
    * zero. Reaching the end with complete data chooses one final lowest-load
    * wait, with preference order breaking ties. */
   resolveModelLoads(turnId: string, loads: ReadonlyMap<string, number> | null): TraexAutoModelAction {
-    if (turnId !== this.turnId || !this.loadCheckPending) return { kind: 'none' };
+    if (turnId !== this.turnId || !this.loadCheckPending || this.recoveryStopped(turnId)) return { kind: 'none' };
     this.loadCheckPending = false;
     if (this.queueSinceMs === undefined) return { kind: 'none' };
     this.loadCheckDone = true;
+    if (this.modelAccessRecoveryTurnId === turnId) return this.selectModelAccessCandidate(turnId, loads);
     if (!loads) return { kind: 'none' };
     const loadAt = (index: number): number | undefined => {
       const value = loads.get(this.config.models[index]!.toLowerCase());
@@ -710,7 +877,8 @@ export class TraexAutoModelController {
     nowMs: number;
     queuePosition?: number;
   }): TraexAutoModelAction {
-    if (this.config.trigger === 'quota') {
+    if (input.turnId && this.recoveryStopped(input.turnId)) return { kind: 'none' };
+    if (this.config.trigger === 'quota' && !this.modelAccessRecoveryTurnId) {
       if (input.turnId === this.turnId && (input.queued || input.progressing)) this.awaitingActivity = false;
       return { kind: 'none' };
     }
@@ -730,6 +898,7 @@ export class TraexAutoModelController {
       return { kind: 'none' };
     }
     this.progressSinceMs = undefined;
+    if (!this.accessBlockedModels.has(this.currentIndex)) this.accessQueuedModels.add(this.currentIndex);
     if (Number.isSafeInteger(input.queuePosition) && input.queuePosition! >= 0) {
       this.queuePositions.set(this.currentIndex, { position: input.queuePosition!, atMs: input.nowMs });
     }
@@ -751,6 +920,10 @@ export class TraexAutoModelController {
       return { kind: 'load_check', turnId: input.turnId };
     }
 
+    if (this.modelAccessRecoveryTurnId === input.turnId) {
+      this.queueSinceMs = undefined;
+      return this.selectModelAccessCandidate(input.turnId, null);
+    }
     const nextIndex = this.currentIndex + 1;
     this.queueSinceMs = undefined;
     if (nextIndex >= this.config.models.length) {

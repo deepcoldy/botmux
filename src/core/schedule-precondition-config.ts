@@ -212,6 +212,12 @@ function restoreUpdatedTaskRow(
     patch.schedule = before.schedule;
     patch.parsed = before.parsed;
     patch.nextRunAt = before.nextRunAt;
+    patch.manualRunRequested = before.manualRunRequested;
+  }
+  if (updates.calendar !== undefined || updates.calendarDayType !== undefined) {
+    patch.calendar = before.calendar;
+    patch.calendarDayType = before.calendarDayType;
+    patch.lastCalendarCheck = before.lastCalendarCheck;
   }
   if (
     updates.deliver !== undefined
@@ -267,7 +273,9 @@ export function updateTaskWithOptionalPrecondition(
   appId: string,
   precondition?: SchedulePreconditionUpdateInput,
 ): SchedulePreconditionUpdateResult {
-  const before = scheduleStore.getTask(id, appId);
+  // The rollback below writes this snapshot back into the authority, so it must
+  // never come from the sandbox-writable schedules.json projection.
+  const before = scheduler.getRuntimeTask(id, appId);
   if (!before) return { ok: false, error: 'not_found' };
 
   // Reject an oversized target change before staging or rewriting its sidecar.

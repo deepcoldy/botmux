@@ -6,8 +6,14 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fnpm-downloads.json" alt="npm downloads (all botmux packages)"></a>
+  <a href="https://github.com/deepcoldy/botmux/actions/workflows/ci.yml?query=branch%3Amaster"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fci.json" alt="CI"></a>
+  <a href="https://github.com/deepcoldy/botmux/actions/workflows/midscene-e2e.yml?query=branch%3Amaster"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fmidscene.json" alt="Midscene E2E"></a>
   <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg" alt="platform: Linux | macOS">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="#贡献者"><img src="https://img.shields.io/github/contributors/deepcoldy/botmux.svg" alt="contributors"></a>
+  <a href="https://github.com/deepcoldy/botmux/commits/master"><img src="https://img.shields.io/github/commit-activity/m/deepcoldy/botmux.svg" alt="commit activity"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
 
@@ -20,11 +26,13 @@
   <a href="README.en.md">English</a>
 </p>
 
-https://github.com/user-attachments/assets/2cd97623-6b92-42ea-a9e9-75c6f5434db6
+<p align="center">
+  <a href="https://deepcoldy.github.io/botmux/img/video-promo.mp4"><img src="docs/assets/botmux-promo-cover.gif" width="900" alt="botmux 视频简介：点击播放"></a>
+</p>
 
 ---
 
-Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话进程，把 AI 编程 CLI / Agent 的输出实时流式回传成飞书卡片，并提供可交互的 Web 终端。它**不重造 Agent 能力**，而是直接桥接你已经在用的工具（**20+ CLI / Agent 适配器**，见 [支持的 CLI / Agent](#支持的-cli--agent)）。
+Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话进程，把 AI 编程 CLI / Agent 的输出实时流式回传成飞书卡片，并提供可交互的 Web 终端。它**不重造 Agent 能力**，而是直接桥接你已经在用的工具（**30+ CLI / Agent 适配器**，见 [支持的 CLI / Agent](#支持的-cli--agent)）。
 
 ## 它解决什么
 
@@ -44,6 +52,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 - **自包含单文件二进制**：运行时与 PTY 已内嵌，**安装和运行都不依赖本机 Node**。支持 Linux / macOS（x64 / arm64，macOS 正式版提供稳定 Apple Developer ID 签名），Windows 用户请在 WSL2 中使用。
 - **平滑升级**：执行 `botmux upgrade` 或重跑上述 curl 命令即可原地安全更新。
+- **源码安装更新**：Dashboard「版本与更新」支持普通更新，以及预览、确认并备份后强制覆盖本地改动；恢复方法见[本地源码更新](docs/local-source-update.md)。
 - **完整指南**：包含 Lark 国际版、手动配置权限与排查，见 [5 分钟快速接入文档](https://deepcoldy.github.io/botmux/quickstart)。
 
 <details>
@@ -88,7 +97,7 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 
-`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) · `doubao` ([Doubao CLI 安装与使用](docs/doubao.md)) …
 
 - **会话级 CLI 切换**：会话尚未启动前，可通过 `/cli <cliId>` 为当前会话临时指定已注册的 CLI。
 - **Codex 多账号与实例池**：同一 Bot 支持通过 [会话级 Codex 实例](docs/codex-instances.md) 配置多登录目录与分配策略。
@@ -126,5 +135,15 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 botmux 或许是目前专为飞书（Feishu/Lark）打造的开源项目中贡献者最多的一个——这离不开每一位参与者。感谢所有提交过代码、文档，以及提出 issue 的朋友：
 
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
+  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux&amp;max=500&amp;columns=16" alt="contributors" />
+</a>
+
+## Star 趋势
+
+<a href="https://star-history.com/#deepcoldy/botmux&amp;Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date&amp;theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" />
+    <img src="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" alt="botmux Star 趋势" width="720" />
+  </picture>
 </a>
