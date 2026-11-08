@@ -7155,24 +7155,46 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(calls[0][1]?.substituteTrigger).toBeUndefined();
   });
 
-  it.each(['user', 'bot'] as const)('App ID substitute: a %s slash command naming the target keeps ordinary routing', async senderType => {
-    setupBotState({
-      allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID],
-      substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] },
-    });
-    mockGetChatMode.mockResolvedValue('group');
-    const options = {
-      senderOpenId: senderType === 'user' ? USER_OPEN_ID : OTHER_BOT_OPEN_ID,
-      messageId: `om_slash_${senderType}`, chatId: 'oc_slash_app', rootId: `om_slash_${senderType}`, threadId: null,
+  it.each([undefined, ['oncall']])('App ID substitute: a user slash command naming the target keeps owned-session routing (keywords=%s)', async keywords => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'never', substituteMode: {
+      enabled: true, targets: [{ appId: 'cli_external' }], keywords,
+    } });
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers.isSessionOwner.mockReturnValue(true);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, messageId: 'om_slash_user', chatId: 'oc_slash_app', rootId: 'slash-root',
       content: JSON.stringify({ text: '@_user_1 /solve help' }),
       mentions: [{ key: '@_user_1', name: 'External', id: { open_id: 'ou_external' } }],
-    };
-    const event = senderType === 'user' ? makeUserMessageEvent(options) : makeBotMessageEvent(options);
+    });
     stubAppIdViews(event.message, { ou_external: 'cli_external' });
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
-    const calls = [...handlers.handleNewTopic.mock.calls, ...handlers.handleThreadReply.mock.calls];
-    expect(calls.some(call => call[1]?.substituteTrigger)).toBe(false);
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    const [routed, ctx] = handlers.handleThreadReply.mock.calls[0];
+    expect(routed.message.message_id).toBe('om_slash_user');
+    expect(ctx).toMatchObject({ scope: 'thread', anchor: 'slash-root' });
+    expect(ctx.substituteTrigger).toBeUndefined();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, ['oncall']])('App ID substitute: a bot slash command naming the target keeps new-topic auto-start (keywords=%s)', async keywords => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID], autoStartOnNewTopic: true,
+      substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }], keywords },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID, senderType: 'bot', messageId: 'om_slash_bot', chatId: 'oc_slash_app',
+      content: JSON.stringify({ text: '@_user_1 /solve help' }),
+      mentions: [{ key: '@_user_1', name: 'External', id: { app_id: 'cli_external' } }],
+    });
+    event.message.root_id = undefined as any;
+    event.message.thread_id = undefined as any;
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    expect(handlers.handleNewTopic.mock.calls[0][1]?.substituteTrigger).toBeUndefined();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it.each(['group', 'topic'] as const)('App ID substitute: a rich-text @ with empty mentions[] triggers in %s', async chatMode => {
