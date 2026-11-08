@@ -148,6 +148,17 @@ describe('WrittenInputLedger', () => {
     expect(ledger.takeSubmitted(submitted(`${oldHead} another held body`))).toBe('workflow-event:r1:2');
   });
 
+  it('a turn rewritten with the same opening keeps that prefix as evidence for itself', () => {
+    const ledger = new WrittenInputLedger();
+    const head = 'G'.repeat(40);
+    ledger.noteWritten('workflow-event:r1:1', `${head} first draft`);
+    ledger.noteWritten('workflow-event:r1:1', `${head} second draft`);
+    // Both texts belong to this one turn, so the prefix still names it alone:
+    // a later write appended in the same box resolves through the fallback.
+    expect(ledger.takeSubmitted(submitted(`${head} second draft\nappended in the same box`)))
+      .toBe('workflow-event:r1:1');
+  });
+
   it('a turn written again is remembered once, and only the latest writes are kept', () => {
     const ledger = new WrittenInputLedger();
     ledger.noteWritten('t-0', 'first text');
