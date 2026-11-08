@@ -4628,7 +4628,10 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       setStatus,
       setBusy,
       saved: tr('botDefaults.sandboxSaved'),
-      errorText: res => configErrorText(res, tr),
+      // On this route only scratch can trip the zero-injection invariant.
+      errorText: res => res.body?.error === 'zero_prompt_unsupported'
+        ? tr('botDefaults.promptInjectionUnsupportedScratch')
+        : configErrorText(res, tr),
       onSaved: body => patchBot(bot.larkAppId, {
         sandbox: body.sandbox === true,
         sandboxMode: (body.mode ?? next) as 'off' | 'oncall' | 'scratch',
