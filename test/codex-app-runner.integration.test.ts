@@ -25,7 +25,7 @@ import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
-import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from '../src/services/codex-async-user-input.js';
+import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from '../src/services/codex-async-user-input.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
@@ -938,7 +938,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     },
   );
 
-  it.each(['selected', 'string', 'custom', 'text', 'timedOut', 'refused', 'interrupt-error', 'cancelled', 'exit', 'unsupported', 'workflow'] as const)(
+  it.each(['selected', 'string', 'custom', 'text', 'timedOut', 'refused', 'interrupt-error', 'cancelled', 'cancelled-nested', 'exit', 'unsupported', 'workflow'] as const)(
     'bridges native user input through the real runner/IPC exchange: %s', async outcome => {
       const dir = mkdtempSync(join(tmpdir(), 'botmux-native-user-input-'));
       const fakeCodex = join(dir, 'fake-codex');
@@ -970,7 +970,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_native_input', dispatchAttempt: 1, ipcPort: port,
       }), { mode: 0o600 });
       const requestId = outcome === 'string' ? 'native-question-1' : 9201;
-      const behavior = ['cancelled', 'exit', 'unsupported', 'text', 'string', 'interrupt-error'].includes(outcome) ? `user-input-${outcome}` : 'user-input';
+      const behavior = ['cancelled', 'cancelled-nested', 'exit', 'unsupported', 'text', 'string', 'interrupt-error'].includes(outcome) ? `user-input-${outcome}` : 'user-input';
       const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path, {
         env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
           BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test',
@@ -989,7 +989,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           expect(posts[0]).toMatchObject({ sessionId: SESSION_ID, originCapability: 'a'.repeat(64), originTurnId: 'om_native_input',
             questions: [{ prompt: expect.stringContaining('Test first') }, { prompt: expect.stringContaining('Choose channel') }] });
           expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
-          if (outcome === 'cancelled' || outcome === 'exit') {
+          if (outcome === 'cancelled' || outcome === 'cancelled-nested' || outcome === 'exit') {
             await waitFor(harness, () => closed);
             // A late result cannot revive or reply to the completed/dead turn.
             respond({ kind: 'answered', answers: [['Production'], ['Lark']], comment: null });
@@ -1029,6 +1029,49 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       }
     },
   );
+
+  it('keeps the no-progress window fed while a native question waits for the human', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-native-user-input-wait-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    let postedAtMs = 0;
+    let respond: ((result: unknown) => void) | undefined;
+    const http = createHttpServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.url !== '/api/asks') { res.writeHead(400).end(); return; }
+        postedAtMs = Date.now();
+        respond = result => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); };
+      });
+    });
+    await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+    const port = (http.address() as { port: number }).port;
+    writeFileSync(join(dir, '.botmux-origin-capability.json'), JSON.stringify({
+      sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_native_wait', dispatchAttempt: 1, ipcPort: port,
+    }), { mode: 0o600 });
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'user-input', control.bootstrap.path, {
+      env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
+        BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask me', undefined, 'om_native_wait')}\r`);
+      await waitFor(harness, () => respond !== undefined);
+      // app-server emits nothing while the question is open; any later progress
+      // marker can only come from the runner's wait heartbeat.
+      await waitFor(harness, () => control.activities.some(
+        activity => activity.phase === 'progress' && activity.atMs - postedAtMs >= 2_000,
+      ), 20_000);
+      respond!({ kind: 'answered', answers: [['Production'], ['Lark']], comment: null });
+      await waitFor(harness, () => control.finals.length > 0);
+    } finally {
+      await stopChild(harness.child); await control.close();
+      http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('refuses to start without a worker-established control bootstrap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-no-key-'));
@@ -1530,7 +1573,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('steers a follow-up into a start turn proven by an exact turn/started BEFORE the start response returns (B1 start-response-last)', async () => {
+  it.each(['om_sr_root', 'codex-async-answer-legacy'])('steers a human follow-up into %s before the start response returns', async rootTurnId => {
     // B1: the app-server may publish an exact-client `turn/started` before it
     // replies to `turn/start`. That exact match proves the canonical native id,
     // so a follow-up must be able to steer into the SAME turn during the pending
@@ -1554,7 +1597,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         `legacy:${text}`,
         { text, clientUserMessageId: replyTurnId },
         replyTurnId,
-        true,
+        replyTurnId === rootTurnId && rootTurnId.startsWith('codex-async-answer-')
+          ? codexAsyncAnswerSteerable({ answerer: 'ou_owner', originalAnswerer: 'ou_owner',
+            human: true, managedLark: true, cleanInputAccepted: true }) : true,
       );
       harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
     };
@@ -1564,7 +1609,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // Root: turn/started (exact clientId) arrives ~immediately; the start
       // response is delayed 120ms. Wait until the runner logged the turn/start
       // request so the follow-up races the pending response.
-      send('root', 'om_sr_root');
+      send('root', rootTurnId);
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
       // Follow-up arrives while the root start response is STILL pending.
       send('follow', 'om_sr_follow');
@@ -1583,7 +1628,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         clientUserMessageId: 'om_sr_follow',
       });
       expect(control.finals).toEqual([
-        expect.objectContaining({ turnId: 'om_sr_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: rootTurnId, content: '', disposition: 'steer_superseded' }),
         expect.objectContaining({ turnId: 'om_sr_follow', content: 'fake answer 1' }),
       ]);
       // steer lifecycle emitted for the follow-up.

@@ -12,6 +12,8 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
+import { resolveBotmuxDataDir } from './data-dir.js';
 import { closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openRotatedAppendLog } from '../utils/log-rotate.js';
@@ -430,6 +432,16 @@ export class FleetSupervisor {
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
     const entry = spec.entry ?? 'daemon';
+    if (!spec.external && entry === 'daemon' && feedbackMaintenanceActive(resolveBotmuxDataDir({ env: this.opts.daemonEnv }))) {
+      this.log(`feedback maintenance: deferred ${spec.name}`);
+      const timer = setTimeout(() => {
+        this.restartTimers.delete(spec.name);
+        this.spawnBot(spec, isRestart);
+      }, 1000);
+      timer.unref();
+      this.restartTimers.set(spec.name, timer);
+      return;
+    }
     // An external member (a plugin service) runs an arbitrary command instead of
     // one of our entry modules. Everything BELOW this point — logs, state,
     // restart budget, graceful stop — is shared verbatim; only the command and

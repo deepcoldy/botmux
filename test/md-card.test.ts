@@ -1521,6 +1521,47 @@ describe('buildCardBodyElements image rows', () => {
     const out = buildCardBodyElements('text\n\n    ![](img_v2_a) ![](img_v2_b)');
     expect(out.some(e => e.tag === 'column_set')).toBe(false);
   });
+
+  it('an image row wrapped in a multi-line code span is NOT promoted to a native row', () => {
+    // markdown-it reads both `![](...)` as literal characters inside one code
+    // span. Promoting them to a native img row hands Feishu a key-shaped src as
+    // an img_key it cannot resolve, and then the whole card is rejected
+    // (230099/200570) — which costs the card even its real, valid images.
+    for (const input of [
+      '`markdown\n![](img_v3_02k_fake) ![](img_v3_02k_fake)\n`',
+      '``markdown\n![](img_v3_02k_fake) ![](img_v3_02k_fake)\n``',
+    ]) {
+      const out = buildCardBodyElements(input);
+      expect(out.some(e => e.tag === 'column_set')).toBe(false);
+      expect(out.some(e => e.tag === 'img')).toBe(false);
+      expect(mdElements(out).map(e => e.content).join('\n'))
+        .toContain('![](img_v3_02k_fake) ![](img_v3_02k_fake)');
+    }
+  });
+
+  it('a single image wrapped in a multi-line code span is not promoted to a native img', () => {
+    const input = '`markdown\n![](img_v3_02k_fake)\n`';
+    const out = buildCardBodyElements(input, undefined, undefined, 'small');
+    expect(out.some(e => e.tag === 'img')).toBe(false);
+    expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v3_02k_fake)');
+  });
+
+  it('rows after a code span that closes before them are still promoted', () => {
+    // Guards against over-suppression: only lines the parser really sees as
+    // code lose their row; the next real image line keeps its side-by-side row.
+    const out = buildCardBodyElements('`code\nspan`\n![](img_v2_k1) ![](img_v2_k2)');
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].columns.map((c: any) => c.elements[0].img_key)).toEqual(['img_v2_k1', 'img_v2_k2']);
+  });
+
+  it('an unclosed backtick run is literal text, so the image row is still promoted', () => {
+    // CommonMark: no matching closing run → not a code span, the images are real.
+    const out = buildCardBodyElements('`not a code span\n![](img_v2_k1) ![](img_v2_k2)');
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].columns.map((c: any) => c.elements[0].img_key)).toEqual(['img_v2_k1', 'img_v2_k2']);
+  });
 });
 
 describe('buildImageCardElements', () => {

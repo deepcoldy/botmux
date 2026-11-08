@@ -96,7 +96,8 @@ export function readWorkflowSessionRelayContext(options: {
 export async function postWorkflowSessionRunMutation(input: {
   context: WorkflowSessionRelayContext;
   runId: string;
-  mutation: WorkflowDaemonMutation;
+  /** A run mutation, or the read-only `status` (`workflow status`). */
+  mutation: WorkflowDaemonMutation | 'status';
   body?: Record<string, unknown>;
   /** Resolve the owning daemon's ipcPort from discovery (host-visible only). */
   resolveIpcPort?: (larkAppId: string | undefined) => number | undefined;

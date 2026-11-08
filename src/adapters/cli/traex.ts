@@ -6,7 +6,7 @@ import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaEx
 import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { traeCliStatePath, traeConfigPath, traeHomeFor, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import { traeCliStatePath, traeConfigPath, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
   findTraexSessionIdByBotmuxSessionId,
   traexHistoryMatchDelta,
@@ -375,6 +375,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let launchNotice: CliLaunchNotice | undefined;
   return {
     id: 'traex',
+    // codex_core-based TUI: hook-review flow + legacy-data migration picker.
+    stuckPageFamily: 'codex-family',
     mcpGateway: {
       get configPath(): string { return traeConfigPath(); },
       format: 'codex-toml',
@@ -396,6 +398,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // The CLI must read the Gateway entry even when ~/.trae is not exposed.
     // Keep the shared config read-only; hooks/plugins must not become writable.
     sandboxReadonlyPaths: env => [traeConfigPath(env), ...traeMigrationDoneMarkers(env)],
+    // The embedded app server opens <TRAE_HOME>/installation_id read-write on every
+    // start and aborts on EROFS (e.g. when the TRAE root sits under a read-only
+    // bind such as a relocated /opt -> /data00 baseline). Only that one file.
+    sandboxWritableFiles: env => [traeInstallationIdPath(env)],
     get resolvedBin(): string { return resolvedBin(); },
 
     launchNotice: () => launchNotice,

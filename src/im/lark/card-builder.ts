@@ -18,6 +18,7 @@ import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegmen
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import {
   clampGrantQuotaForCard,
   DEFAULT_GRANT_DURATION_MS,
@@ -25,12 +26,15 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { modelPinText } from '../../core/model-pin.js';
 import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import type { SubstituteCardControl } from './substitute-card-control.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
+import { stuckPageSpec } from '../../core/stuck-page-catalog.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -521,6 +525,7 @@ export function buildSessionCard(
   localCliReady = false,
   runtimeDisplayName?: string,
   sessionSandbox?: SandboxMode,
+  modelPin?: CardUsageSnapshot['modelPin'],
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -558,6 +563,9 @@ export function buildSessionCard(
   } else {
     actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
+  if (modelPin && !adoptMode) actions.push(callbackButton('解除话题固定', 'default', {
+    action: 'session_model_unpin', ...actionBase, expected_pin_set_at: modelPin.setAt,
+  }));
   const card = wideCard({
     header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
@@ -570,6 +578,7 @@ export function buildSessionCard(
             text_size: 'notation',
           }]
         : []),
+      ...(modelPin ? [{ tag: 'div', text: { tag: 'plain_text', content: modelPinText(modelPin) } }] : []),
       { tag: 'action', actions },
     ],
   });
@@ -874,9 +883,18 @@ export function buildRelayedFrozenCard(
 
 /**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
- * Cap markdown content byte size with headroom for card JSON overhead.
+ * Budget is measured in JSON-serialized (escaped: `"`, `\`, control chars)
+ * UTF-8 bytes with headroom for the surrounding card JSON overhead.
  */
 const MAX_CONTENT_BYTES = 100_000;
+
+/**
+ * Estimates the UTF-8 byte length of a string once serialized inside JSON (accounting for
+ * escaping of `"`, `\`, control characters, etc.).
+ */
+export function jsonEscapedByteLength(str: string): number {
+  return Buffer.byteLength(JSON.stringify(str), 'utf-8') - 2;
+}
 
 /**
  * Truncate content to fit within `maxBytes`, keeping the tail (most recent
@@ -885,7 +903,7 @@ const MAX_CONTENT_BYTES = 100_000;
  * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
  */
 export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
-  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
+  if (jsonEscapedByteLength(content) <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -893,13 +911,44 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
+    if (jsonEscapedByteLength(candidate) <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
     }
   }
-  return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
+  let tail = lines.slice(lo).join('\n');
+  if (!tail.trim() && content.trim()) {
+    // Only blank trailing lines fit: the last non-blank line alone exceeds the
+    // budget (e.g. a minified blob with no newline, optionally ending in \n).
+    // Keep that line's byte tail instead of returning an empty body.
+    const budget = Math.max(0, maxBytes - 30);
+    let last = '';
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() !== '') { last = lines[i]; break; }
+    }
+    let loChar = 0;
+    let hiChar = last.length;
+    while (loChar < hiChar) {
+      const midChar = Math.floor((loChar + hiChar) / 2);
+      const sub = last.slice(midChar);
+      if (jsonEscapedByteLength(sub) <= budget) {
+        hiChar = midChar;
+      } else {
+        loChar = midChar + 1;
+      }
+    }
+    // Defensive: a paired surrogate costs 4 escaped bytes but a lone low
+    // surrogate costs 6, so on well-formed input the minimum always lands on a
+    // pair lead. Only input that already contains an unpaired surrogate can
+    // leave the cut on a trailing low one; skip it so the tail never opens with
+    // a lone low surrogate.
+    if (loChar < last.length && last.charCodeAt(loChar) >= 0xdc00 && last.charCodeAt(loChar) <= 0xdfff) {
+      loChar++;
+    }
+    tail = last.slice(loChar);
+  }
+  return `${t('card.status.truncated_prefix', undefined, locale)}\n${tail}`;
 }
 
 /** Byte budget for the private snapshot's text fallback. Well under the ~109 KB
@@ -1108,6 +1157,8 @@ export function buildStreamingCard(
   /** Screenshot mode with no image: render "no screenshot available" instead
    *  of "waiting for first screenshot". Ignored when `imageKey` is present. */
   screenshotUnavailable = false,
+  /** Per-chat substitute toggle. Omitted ⇒ no button (fail-closed). */
+  substituteControl?: SubstituteCardControl,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1142,7 +1193,17 @@ export function buildStreamingCard(
     headerActions.push(callbackButton(
       t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
       'default',
-      { action: 'toggle_display', ...actionBase },
+      coordinationModeIsPrimary()
+        ? {
+            action: 'toggle_display',
+            // #2062: in primary multi-replica mode the click travels through the
+            // durable control lane, which may retry it after an owner failover.
+            // Carry the visible intent so a retry applies the same mode instead
+            // of toggling back. Single-replica cards keep the pre-#2062 payload.
+            target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
+            ...actionBase,
+          }
+        : { action: 'toggle_display', ...actionBase },
     ));
     if (displayMode !== 'hidden') {
       headerActions.push(callbackButton(
@@ -1207,6 +1268,15 @@ export function buildStreamingCard(
       t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
       'default',
       { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
+  }
+  // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关（不是会话设置）。
+  // 按钮值携带明确的目标 desired，处理侧按目标写入而不是翻转，旧卡重复点击幂等。
+  if (!hidden.has('substitute') && substituteControl) {
+    headerActions.push(callbackButton(
+      t(substituteControl.enabled ? 'card.btn.substitute_off' : 'card.btn.substitute_on', undefined, locale),
+      'default',
+      { action: 'toggle_substitute', desired: substituteControl.enabled ? 'off' : 'on', ...actionBase },
     ));
   }
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
@@ -1311,6 +1381,13 @@ export function buildStreamingCard(
   // Model auto-fallback notice — pinned as small yellow text at the very bottom of
   // the session card (never a separate message) for as long as the session
   // keeps running on the fallback model.
+  const pinNotice = modelPinText(usage?.modelPin);
+  if (pinNotice) {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: pinNotice } });
+    if (!adoptMode) elements.push({ tag: 'action', actions: [callbackButton('解除话题固定', 'default', {
+      action: 'session_model_unpin', ...actionBase, expected_pin_set_at: usage!.modelPin!.setAt,
+    })] });
+  }
   const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
   if (modelFallbackNotice) {
     elements.push({
@@ -1386,7 +1463,11 @@ export function buildPrivateSnapshotCard(
   if (!imageKey) {
     const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
     if (text) {
-      const body = truncateContent(text, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
+      // Cap backtick runs first: the fence grows with the longest run and is
+      // emitted twice, so a huge run (e.g. 36k backticks) would push the card
+      // past Feishu's size limit even though the body fits its own budget.
+      const capped = text.replace(/`{9,}/g, '`'.repeat(8));
+      const body = truncateContent(capped, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
       // Fence must be longer than the longest backtick run in the body, else
       // terminal output containing ``` would break out of the code block.
       const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
@@ -2472,6 +2553,108 @@ export function buildTuiPromptFailedCard(message: string, locale?: Locale): stri
     div: escapeMd(message),
   });
   return JSON.stringify(card);
+}
+
+// ─── Stuck-page cards ────────────────────────────────────────────────────────
+
+/** Code block for terminal text: the fence is longer than any backtick run in
+ *  the body, so screen content cannot close it early. */
+function fencedTerminalText(body: string): string {
+  const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+  const fence = '`'.repeat(Math.max(3, maxRun + 1));
+  return `${fence}\n${body}\n${fence}`;
+}
+
+function pushScreenTail(elements: unknown[], screenTail: string | undefined, locale?: Locale): void {
+  if (!screenTail) return;
+  elements.push(larkMdDiv(t('card.stuck.screen_tail', undefined, locale)));
+  elements.push({ tag: 'markdown', content: fencedTerminalText(screenTail) });
+}
+
+/**
+ * The "CLI is stuck on a blocking page" card. Buttons come from
+ * STUCK_PAGE_CATALOG for `pageType`, one per option, and carry only the
+ * button index and the warning nonce — the daemon maps (page, index) back to
+ * a key on click. An unknown page gets the same card without buttons. There
+ * is no input box: nobody can type through this card.
+ */
+export function buildStuckPageCard(o: {
+  rootId: string;
+  sessionId: string;
+  nonce: number;
+  pageType: string | undefined;
+  cliName: string;
+  /** Already-localised context line (e.g. the notice this card replaces). */
+  noticeText?: string;
+  /** Set for the StuckDetector path: how long the written turn has stalled. */
+  stalledSecs?: number;
+  screenTail?: string;
+  /** Whether a turn initiator was identified (changes who-may-press hint). */
+  hasInitiator: boolean;
+  /** Global switch `stuckCardInitiatorKeys` at build time; false = the hint
+   *  says operators only, whoever started the turn. Absent = on. */
+  initiatorKeysEnabled?: boolean;
+  locale?: Locale;
+}): string {
+  const locale = o.locale;
+  const spec = stuckPageSpec(o.pageType);
+  const lines: string[] = [];
+  if (o.noticeText) lines.push(escapeMd(o.noticeText));
+  if (o.stalledSecs !== undefined) lines.push(escapeMd(t('card.stuck.stalled', { secs: String(o.stalledSecs) }, locale)));
+  lines.push(escapeMd(t(spec ? spec.descriptionKey : 'card.stuck.page.unknown', undefined, locale)));
+  const elements: unknown[] = [larkMdDiv(lines.join('\n\n'))];
+  pushScreenTail(elements, o.screenTail, locale);
+  if (spec && spec.options.length > 0) {
+    elements.push({ tag: 'hr' });
+    const hintKey = o.initiatorKeysEnabled === false
+      ? 'card.stuck.hint.operators_only'
+      : o.hasInitiator ? 'card.stuck.hint.initiator' : 'card.stuck.hint.admin_only';
+    elements.push(larkMdDiv(escapeMd(t(hintKey, undefined, locale))));
+    const buttons = spec.options.map((option, index) => callbackButton(
+      t(option.labelKey, undefined, locale)
+        + (option.audience === 'admin' ? t('card.stuck.admin_suffix', undefined, locale) : ''),
+      option.audience === 'initiator' ? 'primary' : 'default',
+      {
+        action: 'stuck_key',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        selected_index: String(index),
+        nonce: String(o.nonce),
+      },
+    ));
+    elements.push({ tag: 'action', actions: buttons });
+  }
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.title', { cliName: o.cliName }, locale), 'orange'),
+    elements,
+  }));
+}
+
+/** Result of a stuck-card key press: what was sent and what the screen showed
+ *  afterwards (bounded plain-text tail when the worker could read it). */
+export function buildStuckKeyResultCard(
+  resultText: string,
+  afterScreenTail: string | undefined,
+  stillBlocked: boolean,
+  locale?: Locale,
+): string {
+  const elements: unknown[] = [larkMdDiv(`**${escapeMd(resultText)}**`)];
+  pushScreenTail(elements, afterScreenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.result_title', undefined, locale), stillBlocked ? 'orange' : 'green'),
+    elements,
+  }));
+}
+
+/** An `input_not_submitted` notice together with the bottom of the terminal,
+ *  so the reader sees why the message did not go in without opening it. */
+export function buildInputNotSubmittedCard(message: string, screenTail: string, locale?: Locale): string {
+  const elements: unknown[] = [larkMdDiv(escapeMd(message))];
+  pushScreenTail(elements, screenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.notice_title', undefined, locale), 'orange'),
+    elements,
+  }));
 }
 
 // ─── Adopt cards ─────────────────────────────────────────────────────────────

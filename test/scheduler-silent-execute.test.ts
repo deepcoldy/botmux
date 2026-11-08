@@ -19,6 +19,10 @@
  * forkWorker / lark client are stubbed (same pattern as
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
+// Must stay the first import: this file writes prompt contexts, deferred topic
+// bindings and schedules under SESSION_DATA_DIR, so refuse to run outside the
+// data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -148,6 +152,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     };
   })()),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   isRelayableRealSession: vi.fn((ds: DaemonSession) =>
     (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
   isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
@@ -640,6 +645,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     const turnId = sendWorkerInputMock.mock.calls[0][2];
     expect(session.deferredScheduleRun?.turnId).toBe(turnId);
     expect(session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+    // The old turn may still emit unattributed frames; they must not settle this one.
+    expect(existing.deferredScheduleUnconfirmedTurnId).toBe(turnId);
   });
 
   it('non-silent first fire seeds a real topic, writes the root back to the task, and forks a thread session', async () => {
@@ -1565,7 +1572,7 @@ describe('silent scheduled turn lifecycle', () => {
     const turnId = forkedTurnId();
     expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
 
-    rememberLastCliInput(ds, '真实用户消息', '真实用户消息');
+    rememberLastCliInput(ds, '真实用户消息', '真实用户消息', 'om_user');
     expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
   });
 });

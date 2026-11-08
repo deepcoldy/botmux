@@ -1,3 +1,5 @@
+import type { ProtectedHttpEgressPolicy } from '../protected-http-egress.js';
+
 export type PluginRuntime = 'cli' | 'service';
 export type PluginServiceMode = 'manual' | 'auto';
 
@@ -17,6 +19,8 @@ export interface PluginStdioMcpServer {
   transport: 'stdio';
   command: string[];
   env?: Record<string, string>;
+  protectedCapability?: string;
+  protectedEgressPolicy?: ProtectedHttpEgressPolicy;
 }
 
 export interface PluginStreamableHttpMcpServer {

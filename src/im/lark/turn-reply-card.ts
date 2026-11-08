@@ -5,9 +5,10 @@ import {
   replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
-import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard } from './md-card.js';
+import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard, prepareCardMarkdown, stripCardMarkdownImages } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
+import { repairCardStrongPunctuation } from './card-strong-punctuation.js';
 
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
@@ -61,8 +62,23 @@ function bounded(text: string, bytes: number, measure = (value: string) => Buffe
 
 function publicText(text: string): string {
   // Tool arguments/results are display data; never execute their @mentions.
-  return text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
+  const withoutMentions = text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]');
+  // This text has no image-upload path: strip image syntax so an invalid key in
+  // the process panel cannot get the whole card rejected (which would also
+  // delete the body's valid images via the whole-card fallback). Code examples,
+  // escaped syntax and ordinary links are preserved.
+  // Stripping a bare fragment is only half the job: this text is later PREFIXED
+  // (`💬 `) and JOINED with other entries, and either step can move a fence so
+  // that image syntax which was inert here becomes a live token. Every place
+  // that assembles rendered markdown therefore strips the COMPOSED result too.
+  return stripCardMarkdownImages(withoutMentions)
     .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Model narration is markdown prose rendered by Feishu, like the reply body:
+ * apply the same strong-emphasis punctuation repair (tool output stays raw). */
+function narrationText(text: string): string {
+  return repairCardStrongPunctuation(publicText(text));
 }
 
 /** Match the tool categories used by CoT, including Codex's exec command names. */
@@ -198,7 +214,18 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   }
   if (!record.finalCard && !pendingAsks.length) {
     const latest = record.progress.at(-1);
-    const content = latest ? bounded(latest, 6000)
+    // Live progress is display-only text with no image upload path, just like
+    // the process panel: strip its image syntax BEFORE the body renderer. The
+    // renderer's key-aware normalization would otherwise keep a key-shaped but
+    // invalid token (hallucinated or another Lark app's app-scoped key), which
+    // can reject this working PATCH and persist the whole-card downgrade that
+    // later deletes the final answer's valid images.
+    // The body renderer runs its own fence repair (`unescapeFenceLines`), which
+    // can turn escaped fences into real ones and thereby hand back image syntax
+    // that was inert when we scanned. Run the same normalization first so the
+    // strip sees exactly the text the renderer will parse.
+    const content = latest
+      ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
       : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
         : (en ? 'Working on your request…' : '正在处理你的请求…');
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
@@ -212,12 +239,14 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // narration visible until a newer narration or another card view replaces it.
     const latest = record.activity?.slice().reverse().find(item => item.kind === 'thinking' && item.text.trim());
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
-      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: `💭 ${publicText(bounded(latest.text, 600))}` });
+      // Compose first, then strip: the `💭 ` prefix shifts the first line and can
+      // un-fence it, exposing image syntax that was inert in the bare text.
+      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: stripCardMarkdownImages(`💭 ${narrationText(bounded(latest.text, 600))}`) });
     }
     if (!terminal && !record.finalCard && !pendingAsks.length && presentation.showTools !== false && record.tools.length) {
-      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_tools', content: record.tools.slice(-2).map(tool =>
+      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_tools', content: stripCardMarkdownImages(record.tools.slice(-2).map(tool =>
         toolLine(tool, 300),
-      ).join('\n') });
+      ).join('\n')) });
     }
   }
   const activity: ReplyCardActivity[] = record.activity ?? [
@@ -226,12 +255,12 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   ];
   for (const item of activity) {
     if (item.kind === 'progress') {
-      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${publicText(item.text)}` });
+      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${narrationText(item.text)}` });
     } else if (item.kind === 'ask') {
       const entry = record.asks?.find(entry => entry.ask.askId === item.id);
       if (entry?.result) process.push({ kind: 'text', content: turnReplyAskSummary(entry, presentation.locale) });
     } else if (presentation.showProcess && item.kind === 'thinking') {
-      process.push({ kind: 'text', content: `💭 ${publicText(item.text)}` });
+      process.push({ kind: 'text', content: `💭 ${narrationText(item.text)}` });
     } else if (presentation.showProcess && presentation.showTools !== false && item.kind === 'tool') {
       const tool = record.tools.find(tool => tool.id === item.id);
       if (tool) process.push({ kind: 'tool', label: toolLine({ ...tool, subject: '' }), content: toolLine(tool)
@@ -262,7 +291,13 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       panel.header.title.content = toolCount
         ? (en ? `📋 Activity (${toolCountLabel})` : `📋 执行过程（${toolCountLabel}）`)
         : presentation.showProcess ? (en ? '📋 Activity' : '📋 执行过程') : (en ? '📋 Turn record' : '📋 本轮记录');
-      panel.elements[0].content = preview.content;
+      // Single sink for panel markdown: entries were sanitized individually, but
+      // the `💬 `/`💭 ` prefixes, the `\n` join and the fence repair above can all
+      // shift a fence and turn previously-inert image syntax into a live token.
+      // Strip the final composed string so what the card actually carries is
+      // image-free. This also runs inside the size-fitting loop, so the byte
+      // accounting below measures the text that is really sent.
+      panel.elements[0].content = stripCardMarkdownImages(preview.content);
     };
     setProcessPreview({ content: process.map(entry => entry.content).join('\n'), shownTools: process.filter(entry => entry.kind === 'tool').length });
     card.body.elements.splice(footerIndex < 0 ? card.body.elements.length : footerIndex, 0, panel);

@@ -133,9 +133,13 @@ export interface TranscriptEvent {
    *  Background launches are read from here — see {@link backgroundTaskLaunches}. */
   toolUseResult?: unknown;
   /** `type:"queue-operation"` lines: `enqueue` / `dequeue` / `remove` on Claude
-   *  Code's input queue, with the queued text in the top-level `content`. */
+   *  Code's input queue, with the queued text in the top-level `content`.
+   *  `remove` records additionally carry the queued item's `commandUuid`
+   *  (and often its `deliveryId`); `enqueue` / `dequeue` carry neither. */
   operation?: string;
   content?: unknown;
+  commandUuid?: string;
+  deliveryId?: string;
 }
 
 /**
@@ -1042,11 +1046,17 @@ export class BackgroundTaskTracker {
 
   /** Background tasks still running at `nowMs`. */
   pending(nowMs = Date.now()): number {
-    let n = 0;
-    for (const task of this.live.values()) {
-      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) n++;
+    return this.liveTaskIds(nowMs).length;
+  }
+
+  /** Ids of the background tasks still running at `nowMs` (what
+   *  {@link pending} counts). */
+  liveTaskIds(nowMs = Date.now()): string[] {
+    const ids: string[] = [];
+    for (const [taskId, task] of this.live) {
+      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) ids.push(taskId);
     }
-    return n;
+    return ids;
   }
 
   /** Mark the main turn open or ended from a source other than a Claude

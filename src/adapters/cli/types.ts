@@ -20,6 +20,10 @@ export interface PtyHandle {
   /** Deliver one explicit bracketed-paste frame, preserving embedded newlines.
    * Unlike pasteText, this capability guarantees the boundary markers. */
   sendBracketedPaste?(text: string): void | boolean;
+  /** Deliver bracketed paste plus its submit Enter in ONE backend operation. No
+   * adapter delay or separate transport call may separate them. false/throw is
+   * ambiguous and must never cause an automatic replay. Used by Codex's terminal submit path. */
+  submitBracketedPaste?(text: string): void | boolean;
   /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
   sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**
@@ -271,6 +275,10 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Process-scoped Codex-compatible provider origin override. Used when the
+     *  active model provider shares an origin with a protected business target
+     *  and must enter through the session loopback HTTP bridge. */
+    modelProviderBaseUrlOverride?: { providerId: string; baseUrl: string };
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
      *  (dsh / MiniMax). Forwarded as `--turn-timeout-ms`; semantics belong to the runner;
      *  adapters without a runner turn timeout ignore the field. */
@@ -465,6 +473,20 @@ export interface CliAdapter {
    *  e.g. claude-code/grok) or that ignore resume entirely leave this unset. */
   readonly resumeRequiresCliSessionId?: boolean;
 
+  /** Native CLIs with an interactive fork command run it before the worker
+   * publishes prompt_ready or admits input. Return only the independently
+   * confirmed child id; a stale generation must never publish a result. */
+  forkSessionAfterReady?(opts: {
+    sourceSessionId: string;
+    sendCommand: (command: string) => Promise<void>;
+    captureScreen: () => string;
+    isCurrent: () => boolean;
+  }): Promise<string>;
+
+  /** Exact active identity for a CLI which retains retired conversation DB
+   * handles (Antigravity after /fork). Prefer over the generic first-FD probe. */
+  resolveActiveSessionId?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined;
+
   /** True when this adapter finds the native session to resume by itself
    *  from the botmux session id (Kimi: its index + wire logs; the
    *  session it was started under), so no `cliSessionId` is needed. Whether a
@@ -506,6 +528,16 @@ export interface CliAdapter {
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
+  /** Press the composer's SUBMIT key once for a draft already parked in the
+   *  input box (the cold-start late-SessionStart re-submit path). Must use the
+   *  same key resolution as {@link writeInput}: users can remap submit
+   *  (keybindings.json / CLAUDE_CODE_SUBMIT_KEY) and bind plain Enter to
+   *  chat:newline, in which case sending Enter would merely insert a newline.
+   *  Returns false when no terminal-sendable submit key is configured or the
+   *  backend could not confirm the send (ambiguous — callers must not retry on
+   *  a guess). Adapters without this method get a plain Enter. */
+  pressComposerSubmit?(pty: PtyHandle): boolean;
+
   /** Optional deterministic evidence that a slash-command LINE typed into the
    *  TUI (a bot startup command such as `/effort xhigh`) was executed, e.g.
    *  Claude Code's transcript `<command-name>/effort</command-name>` record.
@@ -514,6 +546,17 @@ export interface CliAdapter {
    *  Returns undefined when no such evidence is available — the worker then
    *  falls back to PTY evidence (output after the submit key, then the prompt). */
   commandExecutionProbe?(pty: PtyHandle, commandLine: string): (() => boolean) | undefined;
+
+  /** Optional: a confirmation dialog the CLI raised for a startup-command LINE
+   *  botmux typed itself (e.g. Claude Code's "Change effort level?" prompt-cache
+   *  warning after `/effort max` in a resumed conversation). The worker passes
+   *  its authoritative screen while that command is still unconfirmed.
+   *  `accept: true` — the line's own argument already answers the dialog and
+   *  Enter on the focused option accepts it (the worker presses Enter);
+   *  `accept: false` — such a dialog is up but must stay for a person (the
+   *  queue stays held behind the command). null when no dialog for this line
+   *  is on screen. Pure and cheap: called at most once a second. */
+  startupCommandConfirmation?(screen: string, commandLine: string): { accept: boolean; detail: string } | null;
 
   /** Optional structured input path for adapters whose protocol can keep
    * application context out of the visible user message. The worker calls this
@@ -831,6 +874,13 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
+  /** This CLI renders the codex_core hook-review / migration pages recognised
+   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
+   *  the "CLI is stuck" card: queued input is held off any of those pages and
+   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
+   *  Undefined = only the legacy hook-review input hold, never a card. */
+  readonly stuckPageFamily?: 'codex-family';
+
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
    *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
@@ -982,6 +1032,16 @@ export interface CliAdapter {
    *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
   sandboxReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
 
+  /** Single FILES (never directories) the CLI must be able to open read-write
+   *  inside the oncall file sandbox even though their parent dir stays hidden
+   *  or read-only — e.g. TRAE's `<TRAE_HOME>/installation_id`, which the
+   *  embedded app server opens O_RDWR|O_CREAT on every cold start and aborts
+   *  on EROFS. Bound readWrite like `authPaths`, but the worker pre-creates a
+   *  missing one as an EMPTY regular file (authPaths' pre-create would mkdir a
+   *  directory in its place) and binds only regular files. Not consulted when
+   *  the sandbox is off or in scratch mode. Missing/empty → nothing extra. */
+  sandboxWritableFiles?(env?: NodeJS.ProcessEnv): readonly string[];
+
   /** Credential files a trusted service CLI must read inside the sandbox.
    *  This is deliberately separate from ordinary readonlyRoots so adapters
    *  cannot expose secrets accidentally. The worker validates exact regular
@@ -1101,6 +1161,16 @@ export interface StructuredBridgeDrainContext {
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
+  /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
+   *  terminal yet, measured by the worker immediately before the drain.
+   *  Drivers whose user and final records live in SEPARATE files (doubao:
+   *  assignment.md appends at submit, trajectory.jsonl at completion) use this
+   *  to decide how many finals in the window close previously-started turns
+   *  versus pairing with prompts inside the window. A driver must NOT derive
+   *  this balance from its own file increments: a turn can be retired without
+   *  any transcript record (Esc interrupt), which a file-derived counter can
+   *  never observe and would then over-count forever. */
+  openTurns?: number;
 }
 
 /**
@@ -1161,7 +1231,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode' | 'doubao';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。

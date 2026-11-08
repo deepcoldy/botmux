@@ -1,10 +1,38 @@
 import { describe, expect, it } from 'vitest';
-import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys } from '../src/core/sandbox-network-policy.js';
+import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys, privateBrokerContainmentEnabled, mergeProtectedHttpEgressNetworkPolicy, protectedHttpEgressCliSupportError } from '../src/core/sandbox-network-policy.js';
 import { networkSocketFilter } from '../src/core/sandbox-network-launch.js';
 import { workflowSandboxInitFields } from '../src/workflows/shared/sandbox-policy.js';
+import type { ProtectedHttpEgressWorkerPolicy } from '../src/core/protected-http-egress.js';
 
 const base = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+const frozenEgress: ProtectedHttpEgressWorkerPolicy = {
+  pluginId: 'fixture-plugin',
+  policy: {
+    id: 'fixture.write.v1',
+    targets: [{
+      scheme: 'https',
+      host: 'fixture.internal.example',
+      port: 443,
+      denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+    }],
+  },
+  policyDigest: 'a'.repeat(64),
+  frozenAddresses: [['10.20.30.40', '2606:4700::40', '10.20.30.40']],
+};
 describe('network policy', () => {
+  it.each(['claude', 'grok', 'antigravity', 'pi', 'unknown'])('refuses protected egress for unsupported %s before CLI launch', cliId => {
+    const error = protectedHttpEgressCliSupportError(cliId, frozenEgress);
+    expect(error).toBeTruthy();
+    expect(error).toContain(cliId);
+    expect(error).toContain('codex');
+    expect(error).toMatch(/模型.*桥|桥.*模型/);
+  });
+  it('admits codex and preserves ordinary sessions of every CLI', () => {
+    expect(protectedHttpEgressCliSupportError('codex', frozenEgress)).toBeUndefined();
+    for (const cliId of ['codex', 'claude', 'grok', 'antigravity', 'pi', 'unknown']) {
+      expect(protectedHttpEgressCliSupportError(cliId, undefined)).toBeUndefined();
+    }
+  });
   it.each(['10.0.0.1','127.0.0.1','169.254.0.1','100.64.0.1','192.168.1.1','198.18.0.1','224.0.0.1','0.0.0.0','255.255.255.255','::1','::','fe80::1','fc00::1','ff02::1','2001:db8::1','2002::1','64:ff9b::a00:1','::ffff:127.0.0.1','3fff::1'])('special/private %s', ip => expect(networkZone(ip)).toBe('private'));
   it.each(['8.8.8.8','1.1.1.1','2606:4700:4700::1111','::ffff:8.8.8.8'])('public %s', ip => expect(networkZone(ip)).toBe('public'));
   it('normalizes CIDR and IPv4 mappings', () => {
@@ -49,9 +77,17 @@ describe('network policy', () => {
   });
   // Evaluate the emitted classic BPF against seccomp_data, including native
   // arm64 and incompatible ABIs that cannot be executed on the local host.
-  function evaluateFilter(arch: 'x64' | 'arm64', audit: number, syscall: number, family = 0): number {
+  function evaluateFilter(
+    arch: 'x64' | 'arm64',
+    audit: number,
+    syscall: number,
+    family = 0,
+    socketType = 0,
+    protocol = 0,
+  ): number {
     const program = networkSocketFilter(arch), data = Buffer.alloc(64);
     data.writeUInt32LE(syscall, 0); data.writeUInt32LE(audit, 4); data.writeUInt32LE(family, 16);
+    data.writeUInt32LE(socketType, 24); data.writeUInt32LE(protocol, 32);
     let accumulator = 0;
     for (let pc = 0; pc < program.length / 8; pc++) {
       const offset = pc * 8, op = program.readUInt16LE(offset), value = program.readUInt32LE(offset + 4);
@@ -65,13 +101,136 @@ describe('network policy', () => {
   it.each([
     ['x64', 0xc000003e, 41, 53, [272, 308, 425, 426, 427]],
     ['arm64', 0xc00000b7, 198, 199, [97, 268, 425, 426, 427]],
-  ] as const)('seccomp %s rejects IPC, escape and alternate ABIs', (arch, audit, socket, socketpair, blocked) => {
-    for (const family of [2, 10]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x7fff0000);
-    for (const family of [1, 16, 17, 40]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x00050001);
+  ] as const)('seccomp %s permits mounted Unix, Internet and route-query sockets but rejects other IPC, escape and alternate ABIs', (arch, audit, socket, socketpair, blocked) => {
+    for (const family of [1, 2, 10]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x7fff0000);
+    // Node os.networkInterfaces() queries the sandbox-local interface list via
+    // AF_NETLINK + NETLINK_ROUTE. Other netlink protocols remain unavailable.
+    expect(evaluateFilter(arch, audit, socket, 16, 3 | 0x80000, 0)).toBe(0x7fff0000);
+    for (const protocol of [1, 2, 15]) expect(evaluateFilter(arch, audit, socket, 16, 3, protocol)).toBe(0x00050001);
+    for (const family of [17, 40]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x00050001);
     expect(evaluateFilter(arch, audit, socketpair, 1)).toBe(0x7fff0000);
     for (const syscall of blocked) expect(evaluateFilter(arch, audit, syscall)).toBe(0x00050001);
     expect(evaluateFilter(arch, 0x40000003, socket, 2)).toBe(0x80000000);
     if (arch === 'x64') expect(evaluateFilter(arch, audit, 0x40000029, 2)).toBe(0x00050001);
+  });
+  it('enables actor writes only for a private-blocking policy without delegated proxy egress', () => {
+    expect(privateBrokerContainmentEnabled(parseSandboxNetworkPolicy(base))).toBe(true);
+    expect(privateBrokerContainmentEnabled(parseSandboxNetworkPolicy({
+      ...base,
+      proxyMode: 'trusted-egress',
+    }))).toBe(false);
+    expect(privateBrokerContainmentEnabled(parseSandboxNetworkPolicy({
+      ...base,
+      private: { mode: 'allow' },
+    }))).toBe(false);
+    expect(privateBrokerContainmentEnabled(undefined)).toBe(false);
+  });
+  it('adds exact frozen target denies while leaving unrelated destinations on their existing path', () => {
+    const merged = mergeProtectedHttpEgressNetworkPolicy(undefined, frozenEgress, ['10.1.2.3']);
+    expect(merged.private.mode).toBe('denylist');
+    expect(merged.private.rules).toContainEqual({
+      cidr: '10.20.30.40/32', protocol: 'tcp', ports: [443],
+    });
+    expect(merged.public.mode).toBe('denylist');
+    expect(merged.public.rules).toContainEqual({
+      cidr: '2606:4700:0:0:0:0:0:40/128', protocol: 'tcp', ports: [443],
+    });
+    expect(merged.dnsServers).toEqual(['10.1.2.3']);
+    const nft = compileNetworkNft(merged);
+    expect(nft).toContain('ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport { 443 } drop');
+    expect(nft).toContain('ip6 daddr 2606:4700:0:0:0:0:0:40/128 meta l4proto tcp tcp dport { 443 } drop');
+    expect(nft).toContain('accept');
+    expect(merged.private.rules?.filter(rule => rule.cidr === '10.20.30.40/32')).toHaveLength(1);
+  });
+  it.each([
+    ['IPv4 loopback', '127.0.0.1'],
+    ['IPv6 loopback', '::1'],
+  ])('rejects a frozen %s target before loopback output can bypass a blocked zone', (_label, address) => {
+    const loopback = structuredClone(frozenEgress);
+    loopback.frozenAddresses = [[address]];
+    expect(() => mergeProtectedHttpEgressNetworkPolicy(
+      parseSandboxNetworkPolicy(base),
+      loopback,
+      ['10.1.2.3'],
+    )).toThrow('protected_http_egress_target_collides_with_loopback');
+  });
+  it('rejects a frozen DNS port target before the DNS exception can bypass a blocked zone', () => {
+    const dnsTarget = structuredClone(frozenEgress);
+    dnsTarget.policy.targets[0]!.port = 53;
+    dnsTarget.frozenAddresses = [['10.1.2.3']];
+    expect(() => mergeProtectedHttpEgressNetworkPolicy(
+      parseSandboxNetworkPolicy({ ...base, dnsServers: ['10.1.2.3'] }),
+      dnsTarget,
+      ['10.1.2.3'],
+    )).toThrow('protected_http_egress_target_collides_with_dns');
+  });
+  it.each([
+    ['allow', { mode: 'allow' }],
+    ['denylist', { mode: 'denylist', rules: [{ cidr: '10.99.0.0/16', protocol: 'tcp', ports: [8443] }] }],
+  ] as const)('preserves unrelated operator rules when merging a %s zone', (_label, privateZone) => {
+    const operator = parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: privateZone,
+      dnsServers: ['192.168.1.53'],
+      proxyMode: 'reject',
+    });
+    const merged = mergeProtectedHttpEgressNetworkPolicy(operator, frozenEgress, ['10.1.2.3']);
+    expect(merged.dnsServers).toEqual(['192.168.1.53']);
+    expect(merged.proxyMode).toBe('reject');
+    if (privateZone.mode === 'denylist') {
+      expect(merged.private.rules).toContainEqual({
+        cidr: '10.99.0.0/16', protocol: 'tcp', ports: [8443],
+      });
+    }
+    expect(merged.private.rules).toContainEqual({
+      cidr: '10.20.30.40/32', protocol: 'tcp', ports: [443],
+    });
+  });
+  it('keeps block restrictive and inserts an ordered drop ahead of allowlist grants', () => {
+    const blocked = mergeProtectedHttpEgressNetworkPolicy(parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'block' },
+    }), frozenEgress, []);
+    expect(blocked.private).toEqual({ mode: 'block' });
+
+    const allowlisted = mergeProtectedHttpEgressNetworkPolicy(parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8' }] },
+    }), frozenEgress, []);
+    expect(allowlisted.private.mode).toBe('allowlist');
+    expect(allowlisted.private.rules?.[0]).toEqual({
+      cidr: '10.20.30.40/32', protocol: 'tcp', ports: [443], action: 'drop',
+    });
+    expect(allowlisted.private.rules).toContainEqual({ cidr: '10.0.0.0/8' });
+    const nft = compileNetworkNft(allowlisted);
+    expect(nft.indexOf('ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport { 443 } drop'))
+      .toBeLessThan(nft.indexOf('ip daddr 10.0.0.0/8 accept'));
+  });
+  it('rejects delegated proxy policy conflicts instead of silently changing the operator configuration', () => {
+    const operator = parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'allow' },
+      proxyMode: 'trusted-egress',
+    });
+    expect(() => mergeProtectedHttpEgressNetworkPolicy(operator, frozenEgress, []))
+      .toThrow('protected_http_egress_proxy_policy_conflict');
+    expect(operator.proxyMode).toBe('trusted-egress');
+  });
+  it('offers protected model bridge guidance without recommending a conflicting proxy policy', () => {
+    const merged = mergeProtectedHttpEgressNetworkPolicy(undefined, frozenEgress, []);
+    const message = networkProxyError(merged, {
+      HTTPS_PROXY: 'http://user:secret@proxy.internal:8080',
+    }, true)!;
+    expect(message).toBeTruthy();
+    expect(message).toContain('HTTPS_PROXY');
+    expect(message).toMatch(/移除|去掉/);
+    expect(message).toMatch(/模型.*桥|桥.*模型/);
+    expect(message).not.toContain('trusted-egress');
+    expect(message).not.toContain('secret');
   });
   it('proxy re-resolution configurations fail closed without changing environment', () => {
     const p = parseSandboxNetworkPolicy(base); const env = { HTTPS_PROXY: 'http://example.org:8080', NO_PROXY: '*' };

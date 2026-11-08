@@ -216,6 +216,28 @@ export function resolveTmuxVersionAtSessionBoundary(): TmuxVersion | null {
 }
 
 /**
+ * Resolve the tmux CLIENT binary version under an explicit environment, WITHOUT
+ * the process-global cache. The anti-fork gate must decide whether the binary
+ * the pane launch actually spawns (its own PATH/TMUX_TMPDIR — a brew 3.6 vs
+ * /usr/bin 3.x skew is possible) supports the `-N` flag; using the daemon's
+ * ambient cached version could add -N to an older client or omit it for a new
+ * one. Never throws; null ⇒ caller must assume -N unsupported (fail closed).
+ */
+export function clientTmuxVersionForEnv(env: NodeJS.ProcessEnv): TmuxVersion | null {
+  try {
+    const out = execFileSync('tmux', ['-V'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
+      env: tmuxEnv(env),
+    });
+    return parseTmuxVersion(out);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Version of the tmux SERVER currently answering `socketArgs` (`[]` = the
  * default server), as reported by `display-message -p '#{version}'`. Commands
  * and option values are parsed by that server, which can be older than the

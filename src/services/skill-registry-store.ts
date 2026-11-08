@@ -1,3 +1,4 @@
+import { withManagedDirectories } from './managed-directory-retention.js';
 import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { rm as rmAsync } from 'node:fs/promises';
 import { execFile, execFileSync, spawn } from 'node:child_process';
@@ -89,7 +90,9 @@ export function readSkillRegistry(): SkillRegistryFile {
 
 function writeSkillRegistry(registry: SkillRegistryFile): void {
   mkdirSync(dirname(skillRegistryPath()), { recursive: true });
-  atomicWriteFileSync(skillRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
+  withManagedDirectories(registry, () => {
+    atomicWriteFileSync(skillRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
+  });
 }
 
 function shebangRuntime(path: string): string | undefined {
@@ -163,6 +166,10 @@ export function buildSkillInstallAuditSummary(pkg: SkillPackage): SkillInstallAu
 }
 
 export function installLocalSkill(dir: string, opts: { link: boolean }): SkillPackage {
+  return withManagedDirectories(resolve(dir), () => installLocalSkillWithReservation(dir, opts));
+}
+
+function installLocalSkillWithReservation(dir: string, opts: { link: boolean }): SkillPackage {
   const sourceDir = resolve(dir);
   const provisional = loadSkillPackage(sourceDir, {
     source: opts.link ? { type: 'local-link', path: sourceDir } : { type: 'local-copy', originalPath: sourceDir },

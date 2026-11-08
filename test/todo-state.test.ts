@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -291,6 +291,29 @@ describe('readSessionOpenTodos (落盘 codex rollout：增量续读 / fail-close
     // 这正是上一版漏掉的路径（旧护栏只挡冷读）——现在选路前一刀切，返 null。
     appendFileSync(s.rolloutPath, Buffer.alloc(33 * 1024 * 1024, 0x20));
     expect(read(s)).toBeNull();
+  });
+
+  it('会话数超过旧上限（512）时，未变化的 transcript 不会在每次全量扫描里被冷读', () => {
+    // /api/sessions 每次按顺序扫一遍全部会话。缓存条目若少于会话数，按插入序淘汰会让
+    // 每一轮都把下一轮要用的条目先挤掉，每次请求都退化成全量冷读（线上 1200 个会话时
+    // 一次请求阻塞主线程约 7s）。用「同 inode、同长度原地改写」区分命中与冷读：命中按
+    // 「size 未变即返缓存」给出原值，冷读才会读到改写后的内容。
+    const planWith = (text: string) => line({
+      type: 'response_item',
+      payload: { type: 'function_call', name: 'update_plan', arguments: { plan: [{ step: text, status: 'pending' }] } },
+    });
+    const sessions = Array.from({ length: 600 }, () => newSession());
+    for (const s of sessions) writeFileSync(s.rolloutPath, planWith('aaaa'));
+    for (let round = 0; round < 2; round++) {
+      for (const s of sessions) expect(read(s)?.items).toEqual([{ status: 'pending', text: 'aaaa' }]);
+    }
+    const first = sessions[0]!;
+    const before = statSync(first.rolloutPath);
+    const fd = openSync(first.rolloutPath, 'r+');
+    try { writeSync(fd, planWith('bbbb'), 0); } finally { closeSync(fd); }
+    const after = statSync(first.rolloutPath);
+    expect([after.ino, after.size]).toEqual([before.ino, before.size]);
+    expect(read(first)?.items).toEqual([{ status: 'pending', text: 'aaaa' }]);
   });
 
   it('fresh 贯穿：resolver miss 负缓存后，fresh=true 当场解析成功（non-fresh=null）', () => {

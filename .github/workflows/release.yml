@@ -77,7 +77,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
 
+      # macos-15 runners have 7 GB RAM, so Node's default old-space cap is
+      # smaller than on the 16 GB linux runners, and the whole-repo `tsc` in
+      # `bun run build` (~2.4 GB used locally, `tsc --extendedDiagnostics`)
+      # now sits right at it: a PR adding ~30 MB of types aborted with
+      # "Reached heap limit … JavaScript heap out of memory" (exit 134) while
+      # its base passed. Give it explicit headroom instead of riding the edge.
       - run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
       - run: bun run desktop:bundle
       - run: bun run desktop:runtime
 
@@ -726,8 +734,16 @@ jobs:
         if: matrix.glibc_baseline == ''
         run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
 
+      # On the macos-15 leg: macos-15 runners have 7 GB RAM, so Node's default old-space cap is
+      # smaller than on the 16 GB linux runners, and the whole-repo `tsc` in
+      # `bun run build` (~2.4 GB used locally, `tsc --extendedDiagnostics`)
+      # now sits right at it: a PR adding ~30 MB of types aborted with
+      # "Reached heap limit … JavaScript heap out of memory" (exit 134) while
+      # its base passed. Give it explicit headroom instead of riding the edge.
       - if: matrix.glibc_baseline == ''
         run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
 
       - name: Build Linux binary on the glibc 2.28 floor
         if: matrix.glibc_baseline != ''

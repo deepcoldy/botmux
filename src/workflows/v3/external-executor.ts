@@ -32,7 +32,16 @@ export const V3_EXTERNAL_ERROR_CODES = {
   HANDOFF_NOT_ACCEPTED: 'HANDOFF_NOT_ACCEPTED',
   HANDOFF_UNCERTAIN: 'HANDOFF_UNCERTAIN',
   BOT_REPORTED_BLOCKED: 'BOT_REPORTED_BLOCKED',
+  /** The executing bot's daemon would not start the node session in the
+   *  run's Gate-2 working dir: not inside its configured range (design §15.4). */
+  WORKING_DIR_REFUSED: 'WORKING_DIR_REFUSED',
+  /** Main-topic placement (design §5.5): the executing bot's session in the
+   *  main topic is executing another workflow node right now (another run in
+   *  the same topic); one session cannot carry two nodes at once. */
+  MAIN_TOPIC_BUSY: 'MAIN_TOPIC_BUSY',
   NODE_TIMEOUT: 'NODE_TIMEOUT',
+  /** The main bot (or the initiator) handed the node to a human (§13.6). */
+  HANDED_TO_HUMAN: 'HANDED_TO_HUMAN',
 } as const;
 
 export type V3ExternalErrorCode =
@@ -43,7 +52,10 @@ export type V3HandoffRejectionCode =
   | 'BOT_NOT_IN_CHAT'
   | 'BOT_OFFLINE'
   | 'COLLABORATION_DENIED'
-  | 'IDENTITY_UNAVAILABLE';
+  | 'IDENTITY_UNAVAILABLE'
+  /** The run's Gate-2 working dir cannot be honoured by the target (design
+   *  §15.4): the main bot's own range, or a target daemon too old to apply it. */
+  | 'WORKING_DIR_REFUSED';
 
 /**
  * How long a prepared-but-unconfirmed handoff may be re-sent with the same
@@ -60,6 +72,20 @@ export const V3_HANDOFF_IDEMPOTENCY_WINDOW_MS = 50 * 60 * 1000;
  *  hung transport can never freeze the run or its cancellation. */
 export const V3_EXTERNAL_CALL_TIMEOUT_MS = 30_000;
 
+/**
+ * Main-topic placement (§5.5): a handoff accepted into the target session's
+ * queue has not started; until it does, its backstop deadline is acceptance
+ * + the node timeout + this grace — the turn ahead of it may itself be long
+ * (coding CLIs' turns of tens of minutes are ordinary). The grace is the
+ * node's own timeout, at least an hour: it scales with the node, and a short
+ * node does not time out behind one ordinary long turn.
+ */
+export const V3_MAIN_TOPIC_QUEUE_GRACE_MIN_MS = 60 * 60 * 1000;
+
+export function v3MainTopicQueueGraceMs(nodeTimeoutMs: number): number {
+  return Math.max(nodeTimeoutMs, V3_MAIN_TOPIC_QUEUE_GRACE_MIN_MS);
+}
+
 /** Default acceptance window (mirrors `botmux dispatch`). */
 export const V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS = 15_000;
 
@@ -69,7 +95,8 @@ export interface V3ExternalAttemptRef {
   nodeId: string;
   instanceId?: string;
   attemptId: string;
-  /** Flow revision (design §13.3); always 1 until runtime edits land. */
+  /** Flow revision the attempt was dispatched under (design §13.3; 1 = the
+   *  approved DAG). */
   revision: number;
   targetLarkAppId: string;
   placement: V3ExternalPlacement;
@@ -96,6 +123,9 @@ export interface V3ExternalDispatchRequest extends V3ExternalAttemptRef {
   retryOf?: { attemptId: string; errorCode?: string; message?: string };
   /** Present when the node was reassigned before this attempt. */
   reassignedFrom?: string;
+  /** Present when this attempt replaces work a runtime flow revision
+   *  invalidated (the handoff should say the requirements changed). */
+  revisedBy?: { revision: number; summary: string };
   /** Aborted when the run is cancelled while the send is in flight. */
   signal: AbortSignal;
 }
@@ -116,7 +146,9 @@ export type V3ExternalDispatchOutcome =
 
 export type V3ExternalAcceptanceProbe =
   | { status: 'accepted'; sessionId: string; acceptedAt?: number }
-  | { status: 'notAccepted' };
+  /** `detail`: why the target did not take it, when the transport knows
+   *  (kept in the HANDOFF_NOT_ACCEPTED message). */
+  | { status: 'notAccepted'; detail?: string };
 
 export type V3ExternalStopReason =
   | 'runCancelled'
@@ -125,7 +157,8 @@ export type V3ExternalStopReason =
   | 'uncertain'
   | 'reassigned'
   | 'obsolete'
-  | 'runBoundary';
+  | 'runBoundary'
+  | 'handedToHuman';
 
 export interface V3ExternalStopRequest extends V3ExternalAttemptRef {
   reason: V3ExternalStopReason;

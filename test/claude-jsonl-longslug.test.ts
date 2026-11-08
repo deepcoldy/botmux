@@ -55,6 +55,27 @@ describe('long-cwd truncated project slug (Claude opaque hash suffix)', () => {
     expect(getClaudeSessionJsonlPath(sid, longCwd, dataDir)).toBeNull();
   });
 
+  it('does not treat a same-named directory in another hash bucket as an ambiguity', () => {
+    const dataDir = join(root, 'dir-shadow');
+    const slug = longCwd.replace(/[^A-Za-z0-9-]/g, '-');
+    const fileBucket = join(projects(dataDir), `${slug.slice(0, 200)}-file01`);
+    const dirBucket = join(projects(dataDir), `${slug.slice(0, 200)}-dir02`);
+    mkdirSync(join(dirBucket, jsonl), { recursive: true }); // <sid>.jsonl as a directory
+    mkdirSync(fileBucket, { recursive: true });
+    writeFileSync(join(fileBucket, jsonl), '{}');
+    expect(resolveClaudeJsonlPath(sid, longCwd, dataDir)).toBe(join(fileBucket, jsonl));
+    expect(getClaudeSessionJsonlPath(sid, longCwd, dataDir)).toBe(join(fileBucket, jsonl));
+  });
+
+  it('does not treat a same-named directory in exact path as a transcript', () => {
+    const dataDir = join(root, 'exact-dir-shadow');
+    const cwd = '/home/u/proj';
+    const d = join(projects(dataDir), '-home-u-proj');
+    mkdirSync(join(d, jsonl), { recursive: true }); // <sid>.jsonl as a directory
+    expect(resolveClaudeJsonlPath(sid, cwd, dataDir)).toBeNull();
+    expect(getClaudeSessionJsonlPath(sid, cwd, dataDir)).toBeNull();
+  });
+
   it('keeps the exact-path fast path for normal short cwds', () => {
     const dataDir = join(root, 'short');
     const cwd = '/home/u/proj';

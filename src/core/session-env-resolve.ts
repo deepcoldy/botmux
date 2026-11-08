@@ -101,7 +101,9 @@ export function resolveSessionEnv(input: {
     const bot = botEnvLayer(input.bot);
     composed = composeSessionEnv(
       [input.global ?? readGlobalSessionEnvLayer(), input.skipBotSet ? { set: {}, unset: bot.unset } : bot],
-      sessionEnvLockContextForBot(input.bot, input.facts),
+      // The wrapper follows the backend this launch runs on, which a session can
+      // pin away from the bot's default (worker.ts usesLarkToolBinding).
+      sessionEnvLockContextForBot({ ...input.bot, backendType: input.backendType }, input.facts),
     );
   }
   return {

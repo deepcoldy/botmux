@@ -1,3 +1,4 @@
+import { applyTopicModelSpec } from '../src/core/topic-spec.js';
 /**
  * 话题指令头的语义层：resolveTopicSpec 的每一条**拒绝分支**，以及成功路径落到哪。
  *
@@ -156,13 +157,11 @@ describe('resolveTopicSpec —— /effort 的拒绝分支', () => {
     { model: 'auto', effort: 'ultra' },
     { model: 'deepseek-v4-pro', effort: 'xhigh' },
     { model: 'future-traex-model', effort: 'ultra' },
-  ])('TraeX 的 $model 接受语法合法的 $effort，不受静态模型表限制', async ({ model, effort }) => {
+  ])('TraeX effort-only 保留既有校验；显式模型 pin 拒绝不受支持的组合', async ({ model, effort }) => {
     expect(await resolve(`/t /effort ${effort} 干活`, { cliId: 'traex', model })).toEqual({
       ok: true, reasoningEffort: effort,
     });
-    expect(await resolve(`/t /model ${model} /effort ${effort} 干活`, { cliId: 'traex', model: 'gpt-5.2' })).toEqual({
-      ok: true, model, reasoningEffort: effort,
-    });
+    expect(errorKinds(await resolve(`/t /model ${model} /effort ${effort} 干活`, { cliId: 'traex', model: 'gpt-5.2' }))).toEqual(['effort_unsupported_model']);
   });
 
   it('TraeX 仍拒绝非法档位，Codex 仍拒绝不兼容的模型档位组合', async () => {
@@ -264,4 +263,15 @@ describe('resolveTopicSpec —— 生命周期变体', () => {
     expect(errorKinds(await resolve('/tw /repo botmux /model 命令为啥坏了', CLAUDE)))
       .toEqual(['lifecycle_conflicts_repo', 'model_invalid']);
   });
+});
+
+it('persists only explicit header models with effort bound to the pin; effort-only retains legacy field', async () => {
+  const spec = await resolve('/t /model sonnet /effort high task', CLAUDE);
+  if (!spec.ok) throw new Error(JSON.stringify(spec.errors));
+  const session: any = { reasoningEffort: 'low' };
+  applyTopicModelSpec(session, spec, 'owner', '2026-11-06T00:00:00Z');
+  expect(session.modelPin).toEqual({ model: 'sonnet', effort: 'high', source: 'topic-header', setBy: 'owner', setAt: '2026-11-06T00:00:00Z' });
+  expect(session.reasoningEffort).toBe('low');
+  const legacy: any = {}; applyTopicModelSpec(legacy, { ok: true, reasoningEffort: 'high' }, 'owner', 'now');
+  expect(legacy).toEqual({ reasoningEffort: 'high' });
 });

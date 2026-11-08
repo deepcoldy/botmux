@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/session-discovery.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -56,7 +59,7 @@ vi.mock('node:os', () => {
   };
 });
 
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -77,8 +80,21 @@ import {
   bareShellLaunchKind,
   bareShellLaunchGuidance,
   settleLaunchComm,
+  readCmdline,
 } from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
+
+describe('exact argv inspection', () => {
+  it('does not classify words from the lossy ps fallback as command arguments', () => {
+    vi.mocked(readFileSync).mockImplementation(() => { throw new Error('procfs unavailable'); });
+    vi.mocked(execFileSync).mockReturnValue('codex --profile team debug');
+    expect(readCmdline(123, { exact: true })).toEqual([]);
+    expect(execFileSync).not.toHaveBeenCalled();
+    // Existing executable-discovery callers keep their legacy fallback.
+    expect(readCmdline(123)).toEqual(['codex', '--profile', 'team', 'debug']);
+    expect(execFileSync).toHaveBeenCalled();
+  });
+});
 
 describe('isBareShellComm()', () => {
   it('classifies interactive shells as bare shells', () => {

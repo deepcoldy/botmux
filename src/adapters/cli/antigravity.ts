@@ -10,6 +10,7 @@ import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec }
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 import { findAntigravityConversationId, findAntigravityConversationIdByPid } from '../../services/antigravity-discovery.js';
+import { AntigravitySessionLog, forkAntigravitySession } from '../../services/antigravity-session-fork.js';
 import {
   drainAntigravityTranscript,
   resolveAntigravityTranscriptPath,
@@ -328,6 +329,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // is a spawn-time concern.
   const rawBin = pathOverride ?? 'agy';
   let cachedBin: string | undefined;
+  let sessionLog: AntigravitySessionLog | undefined;
+  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined =>
+    sessionLog?.read().currentId
+      ?? findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd }) ?? undefined;
   return {
     id: 'antigravity',
     bridgeSpec: antigravityBridgeSpec,
@@ -339,8 +344,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     modelChoices: CLI_MODEL_CHOICES['antigravity'],
 
-    buildArgs({ resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
+    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
+      sessionLog = new AntigravitySessionLog(sessionId);
+      args.push('--log-file', sessionLog.path);
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
       // spawn time and ignores any value we'd pass — `--conversation`
@@ -369,6 +376,19 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // worker queues the prompt and writeInput delivers it after idle
       // — same pattern as cursor/aiden. */
       return args;
+    },
+
+    resolveActiveSessionId: activeSessionId,
+
+    forkSessionAfterReady(opts) {
+      if (!sessionLog) throw new Error('Antigravity fork has no process-scoped native log');
+      return forkAntigravitySession({
+        sourceId: opts.sourceSessionId,
+        log: sessionLog,
+        sendCommand: () => opts.sendCommand('/fork'),
+        isCurrent: opts.isCurrent,
+        isReady: () => isAntigravityIdleComposerScreen(opts.captureScreen()),
+      });
     },
 
     buildResumeCommand({ cliSessionId }) {
@@ -466,7 +486,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // genuinely dropped Enter is recovered by the worker's deferred
       // recheck, not by a second Enter (same pattern as the grok adapter).
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
-        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        const cliSessionId = activeSessionId(pty);
         return cliSessionId ? { submitted: true, cliSessionId } : undefined;
       }
 
@@ -475,7 +495,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // can still resolve the warning before user-facing Lark notify.
       const recheck = (): SubmitRecheckResult => {
         if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
-        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        const cliSessionId = activeSessionId(pty);
         return cliSessionId ? { submitted: true, cliSessionId } : true;
       };
       return { submitted: false, recheck };

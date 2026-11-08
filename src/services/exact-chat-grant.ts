@@ -18,6 +18,11 @@ import {
 import { addChatGrant, removeChatGrant } from './grant-store.js';
 
 export type ExactChatGrantOperation = 'grant' | 'revoke' | 'readback';
+/** `resolve` (stable app ids only): which open_id the receiver's app sees
+ *  for each subject bot in this chat — read only, nothing is written. Lets a
+ *  caller record the exact open_id BEFORE asking for a grant, so a grant
+ *  whose answer is lost can still be revoked by open_id later. */
+export type ExactChatGrantByLarkAppIdsOperation = 'grant' | 'resolve';
 
 export interface ExactChatGrantInput {
   operation: unknown;
@@ -52,7 +57,7 @@ export interface ExactChatGrantSubjectResult {
 
 export interface ExactChatGrantSuccess {
   ok: true;
-  operation: ExactChatGrantOperation;
+  operation: ExactChatGrantOperation | 'resolve';
   permissionSource: 'chatGrant';
   talkOnly: true;
   receiverLarkAppId: string;
@@ -326,13 +331,14 @@ export async function applyExactChatGrantByLarkAppIds(
   input: ExactChatGrantByLarkAppIdsInput,
   deps: ExactChatGrantDeps = defaultDeps,
 ): Promise<ExactChatGrantSuccess | ExactChatGrantFailure> {
-  if (input.operation !== 'grant') {
+  if (input.operation !== 'grant' && input.operation !== 'resolve') {
     return failure(
       400,
       'subject_lark_app_ids_grant_only',
-      'subjectLarkAppIds may only be used with operation=grant',
+      'subjectLarkAppIds may only be used with operation=grant or resolve',
     );
   }
+  const operation = input.operation;
   if (typeof input.chatId !== 'string' || !CHAT_ID_RE.test(input.chatId)) {
     return failure(400, 'invalid_chat_id', 'chatId must be a valid oc_ chat id');
   }
@@ -390,6 +396,20 @@ export async function applyExactChatGrantByLarkAppIds(
     });
   }
   const completeMappings = subjectMappings as CurrentChatBotAppMapping[];
+  if (operation === 'resolve') {
+    return {
+      ok: true,
+      operation: 'resolve',
+      permissionSource: 'chatGrant',
+      talkOnly: true,
+      receiverLarkAppId: input.receiverLarkAppId,
+      chatId: input.chatId,
+      grantsTalk: false,
+      grantsOperate: false,
+      subjects: [],
+      subjectMappings: completeMappings,
+    };
+  }
   const result = await applyExactChatGrant({
     operation: 'grant',
     receiverLarkAppId: input.receiverLarkAppId,

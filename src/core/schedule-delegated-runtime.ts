@@ -98,6 +98,12 @@ export async function authorizeScheduleSelfManage(
     throw new Error(`schedule authority state is ${authority.state}`);
   }
   if (authority.kind === 'direct') {
+    // A task added from the host terminal carries no controller at all: its
+    // creator is the host administrator, so there is no person whose access
+    // could have lapsed. It may still only stop itself (the route limits the
+    // action and the exact task). A task with any controller field recorded,
+    // even an empty one, keeps the live re-check and fails closed inside it.
+    if (authority.controlOpenId === undefined && authority.controlUnionId === undefined) return;
     await revalidateController(authority.task, authority, deps, deps.targetChatId);
     return;
   }
