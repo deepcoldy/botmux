@@ -62,6 +62,14 @@ describe('App ID dual-view identity proof', () => {
     expect(substituteMentionIdentities(result).some(mention => mention.appId)).toBe(false);
   });
 
+  it('rejects REST views that disagree on the body at the same version', async () => {
+    const pair = views();
+    pair.baseline.body = { content: JSON.stringify({ text: '@_user_1 something else' }) };
+    stubViews(pair);
+    const result = await resolveSubstituteAppMentions('cli_receiver', event());
+    expect(substituteMentionIdentities(result).some(mention => mention.appId)).toBe(false);
+  });
+
   it.each(['app', 'baseline'] as const)('fails closed if the %s view fails', async failing => {
     const pair = views();
     getMessageDetail.mockImplementation(async (_app, _message, options) => {
@@ -139,6 +147,12 @@ describe('App ID dual-view identity proof', () => {
     if ('restKey' in keys) pair.app.mentions[0].key = pair.baseline.mentions[0].key = keys.restKey!;
     if (keys.baselineKey) pair.baseline.mentions[0].key = keys.baselineKey;
     stubViews(pair);
+    expect(await resolveSubstituteAppMentions('cli_receiver', message)).toBe(message);
+  });
+
+  it.each([undefined, ''])('fails closed when a rich-text event mention has key %j', async key => {
+    stubViews(postPair(restPost(['@_user_1']), [{ key: '@_user_1', app: 'cli_original', open: 'ou_original' }]));
+    const message = postEvent(wsPost(['ou_original']), [{ key, name: 'Target', id: { open_id: 'ou_original' } }]);
     expect(await resolveSubstituteAppMentions('cli_receiver', message)).toBe(message);
   });
 

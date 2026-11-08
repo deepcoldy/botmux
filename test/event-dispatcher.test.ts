@@ -7115,6 +7115,20 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
     });
 
+  it('App ID lookup skips a direct @bot that mentions nobody else', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] } });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, messageId: 'om_direct_only', chatId: 'oc_direct_only',
+      content: JSON.stringify({ text: '@_bot help' }),
+      mentions: [{ key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({ substituteTrigger: undefined }));
+  });
+
   it.each(['group', 'topic'] as const)('App ID substitute: a rich-text @ with empty mentions[] triggers in %s', async chatMode => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] } });
     mockGetChatMode.mockResolvedValue(chatMode);
