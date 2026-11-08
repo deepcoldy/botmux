@@ -232,7 +232,16 @@ Limits and notes:
 
 - Only the person who created the group, with bot operator permission, can run it.
 - The bot must own the group, or be its creator with the `im:chat:operate_as_owner` permission.
-- Only works at the top level of a DM dedicated group created by this bot; groups created by `/g`, ordinary groups, DMs and subtopics are not supported.
+- In a dedicated group it only works at the top level, not in subtopics. DMs are not supported. For ordinary groups, see below.
 - It stops without disbanding, and explains why in the group, when: the group has a shared session attached via `/adopt` (run `/detach` first), another local bot is offline, a session couldn't be closed safely, or a new session appeared during confirmation.
 - If disbanding fails, sessions that were closed stay closed; send `/dismiss` again to retry.
 - Code and worktrees are not deleted by default. To end the session but keep the group, use `/close`.
+
+#### Ordinary and topic groups
+
+Groups that were not opened from a DM (ordinary and topic groups) also accept `/dismiss`, from any topic, when both hold:
+
+- The sender has bot operator permission;
+- The bot owns the group and is the only bot in it. Lark cannot confirm in advance whether a disband would succeed otherwise, so the bot replies that it has no permission and closes no session.
+
+The confirmation card lists every session this machine's bots hold in the group (every topic's session in a topic group) and states that the whole group is disbanded for everyone in it. After you confirm, those sessions are closed first, and the group is disbanded only once all of them are closed; the result arrives as a private card. It stops in the same cases as above.

@@ -71,7 +71,7 @@ export interface MessageListenerData {
    * (catastrophic-backtracking DoS risk).
    */
   contentPolicy?: ListenerContentPolicy;
-  replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
+  replyPolicy?: { mode?: import('../../services/message-listener-reply-policy.js').MessageListenerReplyMode; sessionMode?: 'per_message' };
 }
 
 export function mergeListenerContentPolicy(
@@ -92,7 +92,7 @@ export interface MessageListenerPreviewItem {
   senderType: 'user' | 'bot';
 }
 
-export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'failed';
+export type MessageListenerRunPreviewState = import('../../services/message-listener-run-preview-store.js').MessageListenerRunPreviewState;
 
 export interface MessageListenerRunPreviewResult {
   runId?: string;

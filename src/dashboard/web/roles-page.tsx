@@ -13,6 +13,7 @@ import {
   listenerTargetStateFor,
 } from './listener-filters.js';
 import { useT } from './react-hooks.js';
+import { normalizeMessageListenerReplyMode } from '../../services/message-listener-reply-policy.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { GroupProfileStatus } from './group-profile-status.js';
 import {
@@ -134,7 +135,7 @@ export function cloneListener(listener: MessageListenerData | null | undefined):
       includeMsgTypes: [...(listener?.messagePolicy?.includeMsgTypes ?? DEFAULT_LISTENER.messagePolicy?.includeMsgTypes ?? [])],
       scope: 'top_level',
     },
-    replyPolicy: { mode: listener?.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
+    replyPolicy: { mode: normalizeMessageListenerReplyMode(listener?.replyPolicy?.mode), sessionMode: 'per_message' },
     ...(listener?.contentPolicy ? {
       contentPolicy: {
         ...(listener.contentPolicy.includeKeywords ? { includeKeywords: [...listener.contentPolicy.includeKeywords] } : {}),
@@ -156,7 +157,7 @@ function memberDisplayName(member: GroupMemberDisplay | undefined, openId: strin
 
 function listenerRunPreviewStateClass(state: MessageListenerRunPreviewState | undefined, ok: boolean): string {
   if (!ok || state === 'failed') return 'error';
-  if (state === 'replied') return 'ok';
+  if (state === 'replied' || state === 'completed') return 'ok';
   if (state === 'running') return 'running';
   return 'triggered';
 }
@@ -1218,7 +1219,7 @@ export function MessageListenerEditor(props: {
             onChange={ev => props.onPatch({ name: ev.currentTarget.value })}
           />
         </label>
-        <label className="roles-listener-field">
+        {listener.replyPolicy?.mode !== 'none' ? <label className="roles-listener-field">
           <span className="roles-field-label">{tr('roles.listenerReplyCardTitle')}</span>
           <input
             type="text"
@@ -1226,7 +1227,7 @@ export function MessageListenerEditor(props: {
             placeholder={tr('roles.listenerReplyCardTitlePlaceholder')}
             onChange={ev => props.onPatch({ replyCardTitle: ev.currentTarget.value })}
           />
-        </label>
+        </label> : null}
         <label className="roles-listener-field">
           <span className="roles-field-label">{tr('roles.listenerWorkingDir')}</span>
           <input
@@ -1247,14 +1248,15 @@ export function MessageListenerEditor(props: {
         <label className="roles-listener-field" style={{ maxWidth: 320 }}>
           <span className="roles-field-label">{tr('roles.listenerReplyPlacement')}</span>
           <select
-            value={listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread'}
-            onChange={ev => props.onPatch({ replyPolicy: { mode: ev.currentTarget.value === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' } })}
+            value={normalizeMessageListenerReplyMode(listener.replyPolicy?.mode)}
+            onChange={ev => props.onPatch({ replyPolicy: { mode: normalizeMessageListenerReplyMode(ev.currentTarget.value), sessionMode: 'per_message' } })}
           >
             <option value="thread">{tr('roles.listenerReplyPlacementThread')}</option>
             <option value="chat">{tr('roles.listenerReplyPlacementChat')}</option>
+            <option value="none">{tr('roles.listenerReplyPlacementNone')}</option>
           </select>
         </label>
-        <small className="roles-listener-reply-placement-help">{tr('roles.listenerReplyPlacementHelp')}</small>
+        <small className="roles-listener-reply-placement-help">{tr(listener.replyPolicy?.mode === 'none' ? 'roles.listenerReplyPlacementNoneHelp' : 'roles.listenerReplyPlacementHelp')}</small>
       </div>
       <div className="roles-listener-policy-row">
         <div className="roles-listener-policy">
@@ -1622,6 +1624,7 @@ function ListenerPreviewResult(props: { status: ListenerPreviewStatus; tr: Trans
               triggered: stateCounts.triggered ?? 0,
               running: stateCounts.running ?? 0,
               replied: stateCounts.replied ?? 0,
+              completed: stateCounts.completed ?? 0,
               failed: stateCounts.failed ?? 0,
             })
           : tr('roles.listenerPreviewSummary', { count: matches.length })}

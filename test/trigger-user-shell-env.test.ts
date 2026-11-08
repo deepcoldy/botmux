@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ts from 'typescript';
 import { larkToolBindingPath } from '../src/core/lark-tool-binding.js';
+import { isMessageListenerTaskAnchor } from '../src/core/message-listener-silence.js';
 import { describe, expect, it } from 'vitest';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
@@ -29,13 +30,15 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
 }).outputText;
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
   'perBotInjectEnv', 'sandboxRequested', 'effectiveResume',
-  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir', `${assembly}\nreturn identityShellEnv;`);
+  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir',
+  'isMessageListenerTaskAnchor', `${assembly}\nreturn identityShellEnv;`);
 
 function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false, path?: string, sandboxRequested = false, launch: { cliId?: string; wrapperCli?: string; path?: string } = {}): Record<string, string> {
   return assemble(
     { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', cliId: launch.cliId ?? 'traex', wrapperCli: launch.wrapperCli, triggerUserAuth: { enabled, tools } },
     { env: { PATH: path, ...(sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' }) } },
     sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, { PATH: launch.path }, sandboxRequested, false, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
+    isMessageListenerTaskAnchor,
   );
 }
 

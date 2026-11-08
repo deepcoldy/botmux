@@ -8,6 +8,10 @@ import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } fro
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
+import { peerSessions, type ChatSessionRef, type ChatTaskReaderDeps } from './core/decision-board/chat-task-reader.js';
+import { stewardTaskHintsOn } from './core/decision-board/model.js';
+import { composeRowFromActive, composeRowFromPersistedActive } from './core/dashboard-rows.js';
+import { onSessionTaskEvent } from './core/session-task-events.js';
 import { setDecisionCardService } from './core/decision-board/card-action.js';
 import { createPrStateLookup } from './core/decision-board/github-pr-state.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -198,6 +202,7 @@ import {
 } from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
+import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -4234,6 +4239,7 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
  * address spaces never collide; the lookup just tries both.
  */
 function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   if (privateReplyEnabled(ds.session)) return true;
   if (ds.streamingCardForced) return false;
   try {
@@ -4249,6 +4255,7 @@ function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
 }
 
 function silentTurnReactionsFor(ds: DaemonSession): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
   } catch { return false; }
@@ -4949,6 +4956,10 @@ async function sessionReply(
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  if (isMessageListenerTaskAnchor(anchor) || (ds && isSilentMessageListenerSession(ds.session))) {
+    logger.debug(`[message-listener] suppressed automatic reply for ${anchor.substring(0, 24)}`);
+    return '';
+  }
   // Central Lark-transport gate (fail-closed): a core-only (apiOnly) bot or an
   // HTTP virtual session (http_async_* / http_wait_*) has no real Feishu chat.
   // Auxiliary worker UI is already suppressed at its source (worker-pool
@@ -5468,7 +5479,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   branch: string;
   targetSubdir?: string;
 }> {
-  const { mainWorktreeFor, worktreeRootFor } = await import('./services/git-worktree.js');
+  const { mainWorktreeFor, worktreeRootFor, worktreeTargetPath } = await import('./services/git-worktree.js');
   const containingRoot = await worktreeRootFor(baseDir);
   const repoRoot = await mainWorktreeFor(baseDir);
   // `git rev-parse --show-toplevel` can canonicalize platform aliases (for
@@ -5481,7 +5492,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   const branch = `wt/botmux-${short}`;
   return {
     branch,
-    worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
+    worktreePath: worktreeTargetPath(repoRoot, `${basename(repoRoot)}-wt-botmux-${short}`),
     ...((subdir && !subdir.startsWith('..') && !isAbsolute(subdir)) ? { targetSubdir: subdir } : {}),
   };
 }
@@ -9409,6 +9420,17 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   if (!ds.managedTurnOrigin?.turnId || ds.workerGeneration === undefined) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
   }
+  // Every fire of a task aimed at the source group posts there, so a silent
+  // listener task may only schedule into other groups.
+  if (isSilentMessageListenerSession(ds.session)) {
+    const rootChatId = typeof task.rootMessageId === 'string'
+      ? await getMessageChatId(ds.larkAppId, task.rootMessageId)
+      : task.chatId;
+    if (messageListenerSendBlocked(ds.session, task.chatId)
+      || messageListenerSendBlocked(ds.session, rootChatId ?? undefined)) {
+      return jsonRes(res, 403, { ok: false, error: 'silent_message_listener' });
+    }
+  }
   if (!trustedHost) {
     const pinned = capabilityScheduleWorkingDir(ds, task.workingDir);
     if (!pinned) return jsonRes(res, 403, { ok: false, error: 'schedule_working_dir_forbidden' });
@@ -10597,6 +10619,18 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       ok: false,
       error: 'unsupported',
       detail: 'botmux ask requires a Feishu chat; this session has no Lark transport (apiOnly / HTTP virtual session)',
+    });
+  }
+
+  // Silent listener tasks must never surface an ask card in the source group.
+  // A non-retryable 403 makes the standalone CLI fail closed and lets hook
+  // adapters fall back to their native terminal prompt (Dashboard/terminal is
+  // the documented place to handle authorisation for these tasks).
+  if (askSession && isSilentMessageListenerSession(askSession.session)) {
+    return jsonRes(res, 403, {
+      ok: false,
+      error: 'silent_message_listener',
+      detail: '静默执行任务不能向来源群发送确认卡；请在 Dashboard/终端处理授权或异常',
     });
   }
 
@@ -26249,7 +26283,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       parsed.msgType,
       data.message?.content ?? '',
       parsed.content,
-      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      // A silent listener task keeps transcription progress and failures out of the source group.
+      (text) => {
+        if (!isMessageListenerTaskAnchor(anchor)) return replyMessage(larkAppId, replyAnchorId, text, 'text');
+        logger.debug(`[message-listener] silent task kept audio notice local: ${text}`);
+        return Promise.resolve('');
+      },
       parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
@@ -26736,7 +26775,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // audit trail points at a message that actually lives in the session's chat.
   const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
-  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, { source: 'ordinary-feishu' });
+  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, {
+    source: 'ordinary-feishu',
+    ...(messageListener?.replyMode === 'none'
+      ? { messageListenerRun: { sourceMessageId: messageId, replyMode: 'none' as const } } : {}),
+  });
   if (messageListener?.autoCloseAfterCompletion === true) session.messageListenerAutoClose = true;
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
@@ -32431,6 +32474,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (tmuxEnvScrub.removed.length > 0) {
     logger.info(`[tmux] scrubbed ${tmuxEnvScrub.removed.length} server-global env key(s): ${tmuxEnvScrub.removed.join(', ')}`);
   }
+  if (tmuxEnvScrub.updated.length > 0) {
+    logger.info(`[tmux] rewrote ${tmuxEnvScrub.updated.length} server-global env key(s): ${tmuxEnvScrub.updated.join(', ')}`);
+  }
   if (tmuxEnvScrub.failed.length > 0) {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
@@ -35297,6 +35343,50 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     )(candidate),
     createClient: createDetachedLarkClient,
   });
+  // 决策看板上的群状态：本 bot 的会话读内存，其他 bot 的会话问所属 daemon（本机 HMAC）。
+  // 其他 bot 在哪些群里有会话从它们的会话库读（短缓存），状态本身只信所属 daemon 的回答。
+  let boardPeerSessions: { at: number; sessions: Session[] } | undefined;
+  const boardChatTasks: ChatTaskReaderDeps = {
+    ownAppId: () => cfg.larkAppId,
+    chatSessions: chatIds => {
+      const wanted = new Set(chatIds);
+      const out = new Map<string, ChatSessionRef[]>();
+      const add = (s: Session, appId: string): void => {
+        if (!s.chatId || !wanted.has(s.chatId)) return;
+        const list = out.get(s.chatId) ?? [];
+        out.set(s.chatId, list);
+        const closedAt = s.closedAt ? Date.parse(s.closedAt) : NaN;
+        list.push({ sessionId: s.sessionId, larkAppId: appId, status: s.status, ...(Number.isFinite(closedAt) ? { closedAt } : {}) });
+      };
+      for (const s of sessionStore.listSessionsStrict()) add(s, cfg.larkAppId);
+      const now = Date.now();
+      if (!boardPeerSessions || now - boardPeerSessions.at > 15_000) {
+        const snapshot = sessionStore.loadAllSessionsSnapshot({ dataDir: config.session.dataDir, fallbackAppId: cfg.larkAppId });
+        let configured: Set<string> | undefined;
+        try { configured = new Set(loadBotConfigsCached().map(bot => bot.larkAppId)); } catch { configured = undefined; }
+        boardPeerSessions = { at: now, sessions: peerSessions(snapshot.values(), cfg.larkAppId, configured) };
+      }
+      for (const s of boardPeerSessions.sessions) add(s, s.larkAppId!);
+      return out;
+    },
+    ownRow: sessionId => {
+      const ds = findActiveBySessionId(sessionId);
+      if (ds) return composeRowFromActive(ds, { includeTokenUsage: false });
+      const s = sessionStore.getSession(sessionId);
+      return s?.status === 'active' ? composeRowFromPersistedActive(s, { includeTokenUsage: false }) : undefined;
+    },
+    peerRow: async (appId, sessionId) => {
+      const peer = findOnlineDaemon(appId);
+      if (!peer) return undefined;
+      const res = await fetchDaemonIpc(peer.ipcPort, `/api/sessions/${encodeURIComponent(sessionId)}`, { signal: AbortSignal.timeout(2_000) });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return undefined;
+      }
+      const body = await res.json() as { session?: unknown };
+      return body.session && typeof body.session === 'object' ? body.session as Record<string, unknown> : undefined;
+    },
+  };
   const decisionBoard = new DecisionBoardService({
     dataDir: config.session.dataDir,
     larkAppId: () => cfg.larkAppId,
@@ -35336,8 +35426,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
     },
     prState: createPrStateLookup({ log: message => logger.info(message) }),
+    chatTasks: boardChatTasks,
   });
   setDecisionBoardService(decisionBoard);
+  // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
+  // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
+  onSessionTaskEvent(({ chatId }) => {
+    let bots: readonly BotConfig[];
+    try { bots = loadBotConfigsCached(); } catch { return; }
+    for (const bot of bots) {
+      if (!stewardTaskHintsOn(bot.steward) || bot.steward.chatId === chatId) continue;
+      if (bot.larkAppId === cfg.larkAppId) {
+        decisionBoard.noteTaskEvent(chatId);
+        continue;
+      }
+      const peer = findOnlineDaemon(bot.larkAppId);
+      if (!peer) continue;
+      void fetchDaemonIpc(peer.ipcPort, '/api/steward/task-event', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId }),
+        signal: AbortSignal.timeout(3_000),
+      }).then(r => r.body?.cancel()).catch(err => logger.debug(`[decision-board] task event to ${bot.larkAppId} failed: ${err?.message ?? err}`));
+    }
+  });
   setDecisionCardService(decisionBoard);
   // 「自动发现可以关的项」：管家开了这个开关才真正干活（sweepHints 内部判断），没开的 bot 每轮只读一次配置。
   // 5 分钟一轮：PR 合入后十来分钟内出提示（开着的 PR 每 10 分钟最多查一次，见 github-pr-state.ts），

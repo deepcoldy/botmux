@@ -180,6 +180,8 @@ botmux workflow architect <runId>
 
 Architect 使用一个受支持的 Bot/CLI，把 `spec.json` 编译为 `dag.json`，并产生 `architect-notes.md`。Host 随后调用 `validateDag` 做确定性校验；模型生成了格式正确的 JSON，不代表 DAG 可以执行。
 
+每次执行 `architect` 都在 Run 的 host 锁内分配新的 `architect/attempts/NNN`（磁盘上最大号 + 1，只有 `001` 的旧 Run 下一次是 `002`）。Worker 的 sessionId 和终端会话名由 attempt 派生，所以每轮重跑都是新会话；之前的 attempt 目录原样保留，`grill.state.json` 的 `dagPath` 指向产出它的那一轮。
+
 Architect 只设计流程，不启动 Workflow。
 
 ### 4.5 Gate-2：流程确认与授权封装
@@ -545,6 +547,10 @@ Goal Worker 不能持有一个进程内 Ask 等待。需要人类补充信息时
 ├── spec.json
 ├── architect-notes.md
 ├── dag.json
+├── architect/
+│   └── attempts/
+│       ├── 001/                  # 每次 architect 一个新号，旧的保留
+│       └── 002/
 ├── bots.snapshot.json
 ├── params.resolved.json          # Saved Workflow Run 才有
 ├── definition.snapshot.json      # Saved Workflow Run 才有

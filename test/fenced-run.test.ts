@@ -59,10 +59,9 @@ describe.skipIf(!bun)('fenced-run', () => {
 
     const kept = run(['--keep-user-bus', '--', bun!, '-e', probe], invoker);
     expect(kept.status, kept.stderr).toBe(0);
-    const uid = process.getuid!();
     expect(JSON.parse(kept.stdout.trim().split('\n').pop()!)).toEqual({
-      XDG_RUNTIME_DIR: `/run/user/${uid}`,
-      DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${uid}/bus`,
+      XDG_RUNTIME_DIR: invoker.XDG_RUNTIME_DIR,
+      DBUS_SESSION_BUS_ADDRESS: invoker.DBUS_SESSION_BUS_ADDRESS,
     });
   });
 
@@ -130,7 +129,15 @@ describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
   it('passes the invoker bus through unchanged with --keep-user-bus', () => {
     const env = childEnv({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' }, true);
     expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: undefined, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
-    expect(userSystemdBusEnv({ env, isSocket })).toEqual(derived);
+    expect(userSystemdBusEnv({ env, isSocket })).toEqual({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
+  });
+
+  it('does not complete a bus variable the probe exported itself into the real user bus', () => {
+    const fenced = childEnv({ XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' }, false);
+    expect(userSystemdBusEnv({ env: { ...fenced, XDG_RUNTIME_DIR: '/tmp/probe-runtime' }, isSocket }))
+      .toEqual({ XDG_RUNTIME_DIR: '/tmp/probe-runtime' });
+    expect(userSystemdBusEnv({ env: { ...fenced, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' }, isSocket }))
+      .toEqual({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
   });
 
   it('hands --keep-user-bus the bus botmux would derive when the invoker exported none', () => {
@@ -144,5 +151,7 @@ describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
     const env = childEnv(outer, true);
     expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: undefined, DBUS_SESSION_BUS_ADDRESS: undefined });
     expect(userSystemdBusEnv({ env, isSocket })).toBeUndefined();
+    const viaPrivateBus = childEnv({ ...outer, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' }, true);
+    expect(userSystemdBusEnv({ env: viaPrivateBus, isSocket })).toEqual({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
   });
 });

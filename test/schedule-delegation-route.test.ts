@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { dispatchCallerFromReply, scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
+import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
 import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
@@ -77,6 +78,8 @@ function harness(overrides: Record<string, unknown> = {}) {
     getBot: () => ({ config: { triggerUserAuth: { enabled: true,
       tools: ['lark-cli', 'bytedcli'] } } }),
     pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
+    isSilentMessageListenerSession, messageListenerSendBlocked,
+    getMessageChatId: vi.fn(async (): Promise<string | null> => null),
     dispatchUserForTurn: async () => ({
       domain: 'botmux.dispatch-user.v2', deliveryId: 'delivery-1', messageId: turnId,
       sourceSessionId: 'source-session', sourceAppId: 'cli_source', sourceTurnId: 'om_human',
@@ -338,6 +341,65 @@ function directHumanHarness() {
   delete h.body.task.rootMessageId;
   return h;
 }
+
+describe('schedules created by a silent message listener task', () => {
+  function silentHarness() {
+    const h = directHumanHarness();
+    Object.assign(h.ds.session, { chatId: 'oc_chat', rootMessageId: 'ml:om_source',
+      messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' } });
+    return h;
+  }
+
+  it.each([
+    ['top-level', undefined],
+    ['new-topic', undefined],
+    ['topic', 'ml:om_source'],
+  ])('refuses a %s task in the source group', async (position, root) => {
+    const h = silentHarness();
+    h.body.task.executionPosition = position;
+    if (root) h.body.task.rootMessageId = root;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'silent_message_listener' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['lives in the source group', 'oc_chat'],
+    ['cannot be resolved', null],
+  ])('refuses a topic in another group whose root %s', async (_label, rootChatId) => {
+    const h = silentHarness();
+    h.scope.getMessageChatId = vi.fn(async () => rootChatId);
+    Object.assign(h.body.task, { chatId: 'oc_other', executionPosition: 'topic', rootMessageId: 'om_elsewhere' });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'silent_message_listener' } });
+    expect(h.scope.getMessageChatId).toHaveBeenCalledWith('cli_target', 'om_elsewhere');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps an explicit other group available', async () => {
+    const h = silentHarness();
+    h.body.task.chatId = 'oc_other';
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      chatId: 'oc_other', executionPosition: 'new-topic',
+    }), DIRECT_TURN);
+  });
+
+  it('keeps a topic in another group available', async () => {
+    const h = silentHarness();
+    h.scope.getMessageChatId = vi.fn(async () => 'oc_other');
+    Object.assign(h.body.task, { chatId: 'oc_other', executionPosition: 'topic', rootMessageId: 'om_other_topic' });
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      chatId: 'oc_other', rootMessageId: 'om_other_topic',
+    }), DIRECT_TURN);
+  });
+
+  it('leaves ordinary sessions without a root lookup', async () => {
+    const h = directHumanHarness();
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.getMessageChatId).not.toHaveBeenCalled();
+  });
+});
 
 describe('until-done schedule creation', () => {
   const untilDone = { deadline: '2026-11-20T00:00:00.000Z' };
