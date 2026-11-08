@@ -1265,6 +1265,7 @@ function managedLarkToolAppIdForPrompt(
       larkAppId,
       chatId,
       apiOnly: botConfig.apiOnly,
+      headless: session?.headless,
       resume,
       forkSession: session?.pendingForkSession,
       adoptMode: !!session?.adoptedFrom,
@@ -1291,6 +1292,7 @@ function credentialBoundaryForPrompt(
       policy,
       managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
       locale,
+      sessionIsNoTransport(larkAppId, chatId),
     );
   } catch { return ''; }
 }
@@ -1796,7 +1798,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1886,6 +1888,14 @@ function buildFollowUpBlocks(
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (noTransport && !skipSessionId) {
+    const session = sessionStore.getSession(sessionId);
+    const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
+    if (managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
+      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale);
+      if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
+    }
+  }
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (formattingBlock && !bare) blocks.push({ key: 'formatting', text: formattingBlock });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空

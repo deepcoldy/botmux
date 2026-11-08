@@ -6,6 +6,16 @@ import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexPr
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
+import {
+  BOARD_HTML_CSP,
+  BOARD_UPLOAD_HEADERS,
+  BOARD_VIDEO_RANGE_CHUNK,
+  boardExplainerMaxBytes,
+  boardExplainerTooLargeText,
+  boardFileKind,
+  isBoardExplainerMime,
+  parseByteRange,
+} from './decision-board/files.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexAgentsPath, hostCodexConfigPath, isolatedCodexAgentsPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
 import { readTurnRegistration } from './trigger-registration.js';
@@ -37,7 +47,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
 import { join } from 'node:path';
 import { updateDispatchRegistry } from './dispatch-registry.js';
@@ -357,6 +367,8 @@ import {
   listHeadlessSessions,
   readHeadlessSession,
   updateHeadlessSession,
+  headlessChatId,
+  isHeadlessId,
   deleteHeadlessSession,
   type HeadlessSessionRecord,
 } from '../services/headless-session-store.js';
@@ -611,7 +623,7 @@ import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
 import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
-import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
+import { sessionAnchorId, isHttpVirtualSession, isHeadlessSessionChatId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
 import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn-recovery.js';
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
@@ -1226,7 +1238,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -3501,11 +3513,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
   const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
   const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
-  let botConfig: { larkToolBinding?: boolean } | undefined;
+  const validHeadlessSession = !!ds?.session.headless
+    && ds.session.headless.source === 'cli'
+    && isHeadlessId(ds.session.headless.id)
+    && headlessChatId(ds.session.headless.id) === ds.chatId;
+  let botConfig: { larkToolBinding?: boolean; apiOnly?: boolean } | undefined;
   try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
   if ((!ds && !detachedScheduled)
     || (ds && ds.session.status !== 'active')
-    || sessionTransportDisabled({ chatId: targetChatId, larkAppId: targetLarkAppId })
+    || (isHeadlessSessionChatId(targetChatId) && !validHeadlessSession)
+    || botConfig?.apiOnly === true
+    || (targetChatId !== undefined && !validHeadlessSession
+      && sessionTransportDisabled({ chatId: targetChatId, larkAppId: targetLarkAppId }))
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
@@ -3513,7 +3532,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
   res.setHeader('cache-control', 'no-store');
-  const bot = getBot(targetLarkAppId!).config;
+  let bot: ReturnType<typeof getBot>['config'];
+  try { bot = getBot(targetLarkAppId!).config; }
+  catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+  if (body.mode === 'user' && validHeadlessSession) {
+    return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
+  }
   if (body.mode === 'bot') {
     let token: unknown;
     try {
@@ -3526,9 +3550,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (typeof token !== 'string' || !token) {
       return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
     }
+    const validHeadlessSessionAfterToken = !!ds?.session.headless
+      && ds.session.headless.source === 'cli'
+      && isHeadlessId(ds.session.headless.id)
+      && headlessChatId(ds.session.headless.id) === ds.chatId;
     const stillValidSession = ds
       ? (findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
-        && !sessionTransportDisabled(ds) && ds.larkAppId === bot.larkAppId)
+        && (validHeadlessSessionAfterToken || !sessionTransportDisabled(ds))
+        && ds.larkAppId === bot.larkAppId)
       : (!!backgroundInput && !!detachedScheduled && backgroundContextStillValid(backgroundInput, detachedScheduled)
         && !sessionTransportDisabled({ chatId: targetChatId, larkAppId: bot.larkAppId }));
     if (!stillValidSession || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
@@ -4240,6 +4269,58 @@ ipcRoute('POST', '/api/sessions/:sessionId/decision-board', async (req, res, par
   }
 });
 
+function boardUploadHeader(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name];
+  if (typeof raw !== 'string' || !raw) return undefined;
+  try { return decodeURIComponent(raw); } catch { return undefined; }
+}
+
+/** 请求里没读的正文丢掉（不断开连接），让调用方还能收到报错。 */
+function drainRequest(req: IncomingMessage): void {
+  req.once('error', () => {});
+  req.resume();
+}
+
+/**
+ * `botmux board attach` 的说明页 / 视频：正文是文件原始字节，流式写进暂存区，返回暂存 id 由随后的 attach 引用。
+ * 鉴权和 /decision-board 一样（capability 放在请求头里），在读正文之前做完。
+ */
+ipcRoute('POST', '/api/sessions/:sessionId/decision-board/upload', async (req, res, params) => {
+  const H = BOARD_UPLOAD_HEADERS;
+  const attempt = Number(req.headers[H.dispatchAttempt]);
+  const claim: Record<string, unknown> = {
+    originCapability: req.headers[H.capability],
+    originTurnId: req.headers[H.turnId],
+    ...(Number.isSafeInteger(attempt) && attempt > 0 ? { originDispatchAttempt: attempt } : {}),
+  };
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, claim);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  const service = decisionBoardService;
+  if (!service) return jsonRes(res, 503, { ok: false, error: 'decision_board_unavailable' });
+  const mime = String(req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+  const name = boardUploadHeader(req, H.name) ?? '';
+  if (!isBoardExplainerMime(mime)) {
+    drainRequest(req);
+    return jsonRes(res, 400, { ok: false, error: 'unsupported_file', message: '图文说明只支持 .html 说明页和 .mp4 / .webm 视频' });
+  }
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > boardExplainerMaxBytes(mime)) {
+    drainRequest(req);
+    return jsonRes(res, 413, { ok: false, error: 'file_too_large', message: boardExplainerTooLargeText(mime, name || mime) });
+  }
+  try {
+    const result = await service.stageExplainer({ ref: boardUploadHeader(req, H.ref), name, mime, body: req }, { sessionId: ds.session.sessionId });
+    return jsonRes(res, 200, { ok: true, ...result });
+  } catch (error) {
+    if (!req.readableEnded) drainRequest(req);
+    const mapped = boardErrorStatus(error);
+    return jsonRes(res, mapped.status, { ok: false, error: mapped.error, message: mapped.message });
+  }
+});
+
 function decisionBoardAuthor(raw: unknown): string | null {
   return typeof raw === 'string' && DECISION_BOARD_AUTHOR_RE.test(raw) ? raw : null;
 }
@@ -4259,6 +4340,7 @@ function decisionBoardRoute(method: string, path: string,
     } catch (error) {
       const mapped = boardErrorStatus(error);
       if (!res.headersSent) jsonRes(res, mapped.status, { ok: false, error: mapped.error, message: mapped.message });
+      else res.destroy();
     }
   });
 }
@@ -4322,8 +4404,60 @@ decisionBoardRoute('POST', '/api/decision-board/files', async (service, req, res
   jsonRes(res, 200, { ok: true, ...service.upload(body.image) });
 });
 
-decisionBoardRoute('GET', '/api/decision-board/files/:id', (service, _req, res, params) => {
+/**
+ * 图文说明的响应：HTML 带 CSP sandbox（不跑脚本、不透明源、拦掉外链），视频按 Range 分段回。
+ * Dashboard 转发时会自己再套一遍同样的 CSP，不依赖这里。
+ *
+ * 视频不管带没带 Range，一次最多回 BOARD_VIDEO_RANGE_CHUNK：没带或写错时按 `bytes=0-` 回第一块 206，
+ * 调用方（浏览器 / Dashboard）按 Content-Range 接着要。文件被截成空的或读不到时回 404，不在发出响应头之后再出错。
+ */
+function sendBoardExplainer(req: IncomingMessage, res: ServerResponse, found: { file: { mime: string }; path: string }): void {
+  let size: number;
+  try { size = statSync(found.path).size; } catch { return jsonRes(res, 404, { ok: false, error: 'file_not_found' }); }
+  if (size === 0) return jsonRes(res, 404, { ok: false, error: 'file_not_found' });
+  const common = { 'cache-control': 'private, max-age=31536000, immutable', 'x-content-type-options': 'nosniff' };
+  if (boardFileKind(found.file.mime) === 'html') {
+    let data: Buffer;
+    try { data = readFileSync(found.path); } catch { return jsonRes(res, 404, { ok: false, error: 'file_not_found' }); }
+    res.writeHead(200, {
+      ...common,
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': String(data.length),
+      'content-security-policy': BOARD_HTML_CSP,
+      'referrer-policy': 'no-referrer',
+    });
+    res.end(data);
+    return;
+  }
+  const asked = typeof req.headers.range === 'string' ? req.headers.range : undefined;
+  let range = parseByteRange(asked, size, BOARD_VIDEO_RANGE_CHUNK);
+  if (range.kind === 'none') range = parseByteRange('bytes=0-', size, BOARD_VIDEO_RANGE_CHUNK);
+  if (range.kind !== 'range') {
+    res.writeHead(416, { 'content-type': found.file.mime, 'content-range': `bytes */${size}`, 'accept-ranges': 'bytes' });
+    res.end();
+    return;
+  }
+  const { start, end } = range;
+  let stream: ReturnType<typeof createReadStream>;
+  try { stream = createReadStream(found.path, { start, end }); } catch { return jsonRes(res, 404, { ok: false, error: 'file_not_found' }); }
+  res.writeHead(206, {
+    ...common,
+    'content-type': found.file.mime,
+    'accept-ranges': 'bytes',
+    'content-length': String(end - start + 1),
+    'content-range': `bytes ${start}-${end}/${size}`,
+  });
+  // 播放器拖进度条会中途断开请求：res 提前关闭时 pipe 只解绑、不关源流，不手动 destroy 就会留下打开的文件描述符和已读进缓冲的数据。
+  res.once('close', () => stream.destroy());
+  stream.on('error', () => res.destroy()).pipe(res);
+}
+
+decisionBoardRoute('GET', '/api/decision-board/files/:id', (service, req, res, params) => {
   if (!/^[A-Za-z0-9]{8,40}$/.test(params.id)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const info = service.fileInfo(params.id);
+  if (info && boardFileKind(info.file.mime) !== 'image' && boardFileKind(info.file.mime) !== undefined) {
+    return sendBoardExplainer(req, res, info);
+  }
   const found = service.readFile(params.id);
   if (!found) return jsonRes(res, 404, { ok: false, error: 'file_not_found' });
   res.writeHead(200, {
