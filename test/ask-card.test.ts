@@ -201,7 +201,7 @@ describe('buildAskCard', () => {
   describe('选项说明与 --mention 覆盖每种卡型', () => {
     const choice = { prompt: '选哪种发布方式？', multiSelect: false, options: [
       { key: 'gray', label: '灰度 <at id=ou_label></at>', description: '先放 5% 流量\n观察 30 分钟 <at id=all></at>' },
-      { key: 'full', label: '全量' },
+      { key: 'full', label: '全量', description: '立即放开所有流量' },
     ] };
     const effort = { prompt: 'Effort (days)', multiSelect: false, options: [], input: { type: 'number' as const, min: 0, max: 20 } };
     const timedOut: AskResult = { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true };
@@ -220,7 +220,7 @@ describe('buildAskCard', () => {
       const notes = notationBlocks(JSON.parse(json)).filter(note => note.includes('先放 5% 流量'));
       expect(notes).toHaveLength(1);
       expect(notes[0]).toContain('**灰度');
-      expect(notes[0]).toContain('观察 30 分钟');
+      expect(notes[0]).toMatch(/观察 30 分钟[^\n]*\n\n\*\*全量\*\*：立即放开所有流量/);
       expect(notes[0]!.replace(/&lt;/g, '<').replace(/&gt;/g, '>')).not.toContain('<at');
       expect(json).not.toContain('<at id=all');
     });
@@ -558,6 +558,19 @@ describe('ask 卡整卡字节预算（飞书卡片请求体 30KB）', () => {
     expect(rendered.promptTruncated).toBe(true);
     expect(rendered.json).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
     expect(cardBytes(rendered.json)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+  });
+
+  it.each([
+    ['按钮卡', {}],
+    ['自定义输入表单', { originKind: 'explicit' }],
+  ] as Array<[string, Partial<PendingAsk>]>)('%s：截短的说明不切开代理对（相邻说明 emoji 奇偶相反，任何截断长度都落在其中一条的代理对中间）', (_name, over) => {
+    const options = Array.from({ length: 16 }, (_, i) => ({ key: `o${i}`, label: `方案 ${i + 1}`, description: `${i % 2 ? 'a' : ''}${'😀'.repeat(499)}` }));
+    const rendered = renderAskCard(makePending({ ...over, questions: [{ prompt: '选哪个？', multiSelect: false, options }] }));
+    expect(rendered).toMatchObject({ promptTruncated: false, descriptionsTruncated: true, fits: true });
+    // Lone surrogates survive JSON.stringify only as `\ud83d` escapes, so inspect the parsed text.
+    const notes = notationBlocks(JSON.parse(rendered.json)).join('\n');
+    expect(notes).toContain('😀…');
+    expect(notes).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   });
 });
 
