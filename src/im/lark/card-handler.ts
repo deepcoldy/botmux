@@ -94,6 +94,7 @@ import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactE
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
+import { holdPurgeRetryRefund } from '../../services/image-purge-recovery.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
@@ -4378,23 +4379,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           },
         };
       }
-      if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
-        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
-      }
-      const submittedContent = buildTurnContinuePrompt();
+      const continueInput = { content: buildTurnContinuePrompt() };
+      // Same turnId handling as retry_turn: never reuse failedTurn.turnId — that
+      // om_ id is a committed ordinary turn the worker would dedupe before the
+      // purge branch.
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
+        // No live worker: nothing to purge-and-respawn. Reject rather than a
+        // plain fork that would replay the poisoned transcript.
         if (ds.worker && !ds.worker.killed) {
-          // Same turnId handling as retry_turn: do NOT reuse failedTurn.turnId —
-          // that om_ id is a committed ordinary turn and the worker would dedupe
-          // it before reaching the purge branch.
-          accepted = sendWorkerInput(ds, { content: submittedContent }, undefined, {
-            purgeUndersizedImages: true,
-          });
-        } else {
-          // No live worker: nothing to purge-and-respawn. Reject rather than
-          // silently doing a plain fork that would replay the poisoned file.
-          accepted = false;
+          accepted = sendWorkerInput(ds, continueInput, retryTurnId, { purgeUndersizedImages: true });
         }
       } catch (err) {
         logger.warn(
@@ -4403,10 +4399,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
-      markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent }, undefined);
+      // The worker may still decline (or fail the purge after stopping the CLI)
+      // and reject this turn; that rejection refunds the cooldown.
+      const retryReceipt = markRetryAttempt(ds.session);
+      if (retryReceipt) holdPurgeRetryRefund(ds, retryTurnId, retryReceipt);
+      rememberLastCliInput(ds, failedTurn.userPrompt, continueInput, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;

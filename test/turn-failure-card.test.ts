@@ -479,27 +479,18 @@ describe('buildTurnFailedCard', () => {
     expect(card.header.title.content).not.toMatch(/[一-龥]/);
   });
 
-  it('gives the /clear recovery guide for a poisoned-history image 400', () => {
+  it('gives the poisoned-history guide instead of the generic no-retry advice', () => {
     // A 1×1 image read by the CLI stays in session history and is replayed on
-    // every later request, so generic "resend a new message" advice is wrong:
-    // the session must be cleared first. The special advice must win even
-    // though retryOffer is 'none' (same input shape as the generic branch).
-    const card = build({ errorCode: 'provider_image_too_small', retryOffer: 'none' });
-    const body = bodyText(card);
-    expect(body).toContain('/clear');
-    expect(body).toContain('图片');
-    expect(body).not.toContain('重发同样的输入也无法成功');
-    expect(actions(card).find((a: any) => a.value?.action === 'retry_turn')).toBeUndefined();
-  });
-
-  it('renders the image recovery guide in English without zh fallback', () => {
-    const card = build({
-      locale: 'en', errorCode: 'provider_image_too_small', retryOffer: 'none',
-    });
-    const body = bodyText(card);
-    expect(body).toMatch(/\/clear/);
-    expect(body).toMatch(/too small/i);
-    expect(body).not.toMatch(/[一-龥]/);
+    // every later request, so generic "resend a new message" advice is wrong.
+    // The special advice must win even though retryOffer is 'none' (same input
+    // shape as the generic branch).
+    for (const locale of ['zh', 'en'] as const) {
+      const card = build({ locale, errorCode: 'provider_image_too_small', retryOffer: 'none' });
+      const body = bodyText(card);
+      expect(body).toContain(t('card.turn_failed.image_too_small', undefined, locale));
+      expect(body).not.toContain(t('card.turn_failed.no_retry', undefined, locale));
+      expect(actions(card).find((a: any) => a.value?.action === 'retry_turn')).toBeUndefined();
+    }
   });
 
   it('offers the one-tap purge-and-continue button for the image 400', () => {

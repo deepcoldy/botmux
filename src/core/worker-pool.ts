@@ -93,6 +93,8 @@ import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableR
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
+import { refundRetryAttempt } from '../services/failed-turn-retry.js';
+import { takePurgeRetryRefund } from '../services/image-purge-recovery.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
 import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
@@ -14024,6 +14026,9 @@ export function sendWorkerInput(
   }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
+  // The purge is a live-worker action; a staged tail would replay as a plain
+  // continuation onto the unpurged transcript.
+  if (opts.purgeUndersizedImages && hasQueuedActivationAdmissionGate(ds)) return false;
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
@@ -18081,6 +18086,11 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        const purgeRefund = takePurgeRetryRefund(ds, msg.turnId);
+        if (purgeRefund && refundRetryAttempt(ds.session, purgeRefund)) {
+          logger.info(`[${t}] Refunded retry cooldown of rejected purge continuation ${msg.turnId} (${msg.reason})`);
+          sessionStore.updateSession(ds.session);
+        }
         if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         // The turn never started and will never terminal. Run GC, but do NOT

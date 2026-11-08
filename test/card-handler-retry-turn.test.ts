@@ -173,6 +173,7 @@ import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session, FailedTurnRecord } from '../src/types.js';
 import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
+import { takePurgeRetryRefund } from '../src/services/image-purge-recovery.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -454,7 +455,7 @@ describe('retry_turn — refusal branches', () => {
 });
 
 describe('purge_images_continue — behavioral dispatch', () => {
-  it('submits a continuation carrying the purge flag', async () => {
+  it('submits a continuation carrying the purge flag under a fresh retry turn', async () => {
     const ds = makeDs();
     const res = await handleCardAction(
       actionData(TURN, null, 'purge_images_continue'),
@@ -462,9 +463,24 @@ describe('purge_images_continue — behavioral dispatch', () => {
       LARK_APP_ID,
     );
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
-    expect(sendWorkerInputMock.mock.calls[0][1].content).toContain('[BOTMUX_CONTINUE]');
-    expect(sendWorkerInputMock.mock.calls[0][3]).toMatchObject({ purgeUndersizedImages: true });
+    const [, input, retryTurnId, opts] = sendWorkerInputMock.mock.calls[0];
+    expect(input.content).toContain('[BOTMUX_CONTINUE]');
+    expect(retryTurnId).toMatch(/^retry-/);
+    expect(opts).toMatchObject({ purgeUndersizedImages: true });
+    expect(rememberLastCliInputMock).toHaveBeenCalledWith(ds, 'do the thing', input, retryTurnId);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
     expect(res?.toast?.type).toBe('success');
+  });
+
+  it('holds the cooldown stamp so a worker rejection of that turn can refund it', async () => {
+    const ds = makeDs();
+    await handleCardAction(actionData(TURN, null, 'purge_images_continue'), depsWith(ds), LARK_APP_ID);
+    const retryTurnId = sendWorkerInputMock.mock.calls[0][2];
+    expect(takePurgeRetryRefund(ds, retryTurnId)).toMatchObject({
+      turnId: TURN,
+      previousRetryCount: 0,
+      stampedAt: ds.session.lastFailedTurn?.lastRetryAt,
+    });
   });
 
   it('fails closed without a live worker and does not consume the retry lease', async () => {
@@ -550,7 +566,7 @@ describe('retry_recovery_turn — routing', () => {
 
 
 describe('manual card retries rejected admission routing transaction', () => {
-  it.each(['retry_turn', 'retry_last_task'] as const)('%s preserves full routing and retry eligibility', async action => {
+  it.each(['retry_turn', 'retry_last_task', 'purge_images_continue'] as const)('%s preserves full routing and retry eligibility', async action => {
     const { fillRetryRouting, routingSnapshot } = await import('./helpers/retry-routing.js');
     for (const mode of ['ipc', 'false', 'handled-rejected', 'partial-write-throw']) {
       const ds = makeDs({ worker: mode === 'ipc' ? { killed: false } as any : null,

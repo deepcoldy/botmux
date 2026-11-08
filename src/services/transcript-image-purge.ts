@@ -11,8 +11,11 @@
  * keeps the full text history while removing the poison.
  *
  * Scope: the pinned session jsonl PLUS `<sid>/subagents/*.jsonl` next to it
- * (Task/Agent transcripts). Every rewritten file gets a one-time
- * `.botmux-purge-bak-<ts>` backup; writes are atomic (tmp + rename).
+ * (Task/Agent transcripts). The model-API 400 can only come from non-sidechain
+ * records of the main transcript; the subagent scan is a cheap defence for
+ * resume paths that replay sidechains, not a causal claim. Every rewritten
+ * file keeps exactly one `.botmux-purge-bak-<ts>` backup (older ones are
+ * pruned); writes are atomic (tmp + rename).
  */
 import { randomBytes } from 'node:crypto';
 import {
@@ -26,6 +29,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
@@ -33,13 +37,41 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 /** API-side floor quoted in the 400 ("Minimum allowed dimension: 14 pixels"). */
 export const MIN_IMAGE_DIMENSION = 14;
 
-/** Hard skip for absurd transcripts rather than buffering gigabytes. */
-const MAX_FILE_BYTES = 256 * 1024 * 1024;
+/** Read budget shared by every file of one purge (main transcript first): the
+ *  whole purge runs synchronously on the worker's event loop. */
+const MAX_PURGE_BYTES = 256 * 1024 * 1024;
+
+const BACKUP_INFIX = '.botmux-purge-bak-';
 
 export interface PurgedFile {
   file: string;
   removed: number;
   backup?: string;
+}
+
+export interface UnmeasurableImage {
+  file: string;
+  /** 0-based position among the image blocks of `file`. Not the N of the API's
+   *  `image data N` error: N counts image blocks in request-compile order across
+   *  every record sent with that request (a future `requestIndex`). */
+  fileIndex: number;
+  mediaType?: string;
+}
+
+export interface PurgeReport {
+  /** Files rewritten — or, for a dry run, files that would be rewritten. */
+  files: PurgedFile[];
+  removed: number;
+  /** Image blocks seen across every scanned file, removed ones included. */
+  imageBlocks: number;
+  /** Base64 image blocks whose header we cannot decode; always kept. */
+  unmeasurable: UnmeasurableImage[];
+  /** Distinct `source.type` values of image blocks that are not base64. */
+  skippedSourceTypes: string[];
+  /** In-scope files that could not be read or rewritten. */
+  failedFiles: Array<{ file: string; reason: string }>;
+  /** Other transcripts under `<sid>/` the purge does not touch (logs only). */
+  outOfScopeFiles: string[];
 }
 
 export interface PurgeResumeTarget {
@@ -73,7 +105,7 @@ interface Measured {
 /** Decode pixel dimensions from an encoded image. Returns null for formats or
  *  buffers we cannot parse — an unparseable image must be left untouched
  *  (fail-safe: never delete an image the API might accept). */
-export function measureImage(buf: Buffer, mediaType?: string): Measured | null {
+export function measureImage(buf: Buffer): Measured | null {
   // PNG: signature, IHDR is the first chunk — width/height at bytes 16..23.
   if (buf.length >= 24 && buf[0] === 0x89 && buf[1] === 0x50
     && buf[2] === 0x4e && buf[3] === 0x47) {
@@ -135,8 +167,6 @@ export function measureImage(buf: Buffer, mediaType?: string): Measured | null {
     }
     return null;
   }
-  // mediaType says image/* but the header is unknown to us.
-  if (mediaType?.startsWith('image/')) return null;
   return null;
 }
 
@@ -147,42 +177,47 @@ function isImageBlock(v: unknown): v is ImageBlock {
     && (v as ImageBlock).source !== null;
 }
 
-/** Replace one undersized image block; otherwise recurse into containers.
+interface FileScan {
+  imageBlocks: number;
+  unmeasurable: Array<{ fileIndex: number; mediaType?: string }>;
+  sourceTypes: Set<string>;
+}
+
+/** Replace undersized image blocks; otherwise recurse into containers.
  *  Mutates parsed JSON in place. Returns the number of replacements made. */
-function sanitizeNode(node: unknown, minDimension: number): number {
+function sanitizeNode(node: unknown, minDimension: number, scan: FileScan): number {
   let removed = 0;
   if (Array.isArray(node)) {
     for (let i = 0; i < node.length; i += 1) {
       const child = node[i];
-      if (isImageBlock(child)
-        && child.source.type === 'base64'
-        && typeof child.source.data === 'string') {
-        let buf: Buffer;
-        try {
-          buf = Buffer.from(child.source.data, 'base64');
-        } catch {
-          // Bad base64 — not ours to judge; the API error will say so.
-          sanitizeNode(child, minDimension);
-          continue;
-        }
-        const dims = measureImage(buf, typeof child.source.media_type === 'string'
-          ? child.source.media_type
-          : undefined);
-        if (dims && (dims.width < minDimension || dims.height < minDimension)) {
-          node[i] = {
-            type: 'text',
-            text: `[botmux: removed an undersized image (${dims.width}x${dims.height} px) `
-              + `that the model API rejects; minimum allowed dimension is ${minDimension}px]`,
-          };
-          removed += 1;
-          continue;
-        }
+      if (!isImageBlock(child)) {
+        removed += sanitizeNode(child, minDimension, scan);
+        continue;
       }
-      removed += sanitizeNode(child, minDimension);
+      const fileIndex = scan.imageBlocks;
+      scan.imageBlocks += 1;
+      if (child.source.type !== 'base64' || typeof child.source.data !== 'string') {
+        scan.sourceTypes.add(typeof child.source.type === 'string' ? child.source.type : 'unknown');
+        continue;
+      }
+      const mediaType = typeof child.source.media_type === 'string' ? child.source.media_type : undefined;
+      const dims = measureImage(Buffer.from(child.source.data, 'base64'));
+      if (!dims) {
+        scan.unmeasurable.push({ fileIndex, ...(mediaType ? { mediaType } : {}) });
+        continue;
+      }
+      if (dims.width < minDimension || dims.height < minDimension) {
+        node[i] = {
+          type: 'text',
+          text: `[botmux: removed an undersized image (${dims.width}x${dims.height} px) `
+            + `that the model API rejects; minimum allowed dimension is ${minDimension}px]`,
+        };
+        removed += 1;
+      }
     }
   } else if (node && typeof node === 'object') {
     for (const value of Object.values(node as Record<string, unknown>)) {
-      removed += sanitizeNode(value, minDimension);
+      removed += sanitizeNode(value, minDimension, scan);
     }
   }
   return removed;
@@ -230,35 +265,70 @@ export function atomicReplaceTranscript(
   }
 }
 
-/** Rewrite one jsonl file, backing it up first. Returns undefined when the
- *  file is untouched (no backup, no write). */
-function purgeFile(
-  file: string,
-  minDimension: number,
-  trustedRoot: string,
-): PurgedFile | undefined {
+/** Keep only the newest backup of `file`: a backup holds the full transcript
+ *  including the image bytes, so one per click would grow without bound. */
+function pruneOlderBackups(file: string, keep: string): void {
+  const dir = dirname(file);
+  const prefix = `${basename(file)}${BACKUP_INFIX}`;
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    const candidate = join(dir, name);
+    if (!name.startsWith(prefix) || candidate === keep) continue;
+    try {
+      if (lstatSync(candidate).isFile()) unlinkSync(candidate);
+    } catch { /* best effort */ }
+  }
+}
+
+interface PurgeContext {
+  minDimension: number;
+  trustedRoot: string;
+  dryRun: boolean;
+  remainingBytes: number;
+  report: PurgeReport;
+}
+
+function purgeFile(file: string, ctx: PurgeContext): void {
+  const { report } = ctx;
   let fd: number | undefined;
   let raw: Buffer;
   let initialStat: ReturnType<typeof fstatSync>;
   try {
     const realFile = realpathSync(file);
-    if (realFile !== trustedRoot && !realFile.startsWith(`${trustedRoot}/`)) return undefined;
-    if (!lstatSync(file).isFile()) return undefined;
+    if (realFile !== ctx.trustedRoot && !realFile.startsWith(`${ctx.trustedRoot}/`)) {
+      report.failedFiles.push({ file, reason: 'outside trusted root' });
+      return;
+    }
+    if (!lstatSync(file).isFile()) {
+      report.failedFiles.push({ file, reason: 'not a regular file' });
+      return;
+    }
     fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     initialStat = fstatSync(fd);
-    if (!initialStat.isFile()) return undefined;
+    if (!initialStat.isFile()) {
+      report.failedFiles.push({ file, reason: 'not a regular file' });
+      return;
+    }
+    if (initialStat.size > ctx.remainingBytes) {
+      report.failedFiles.push({ file, reason: `over the ${MAX_PURGE_BYTES}-byte purge budget` });
+      return;
+    }
     raw = readFileSync(fd);
-  } catch {
-    return undefined;
+  } catch (err) {
+    report.failedFiles.push({ file, reason: (err as NodeJS.ErrnoException).code ?? 'unreadable' });
+    return;
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
-  if (raw.length === 0 || raw.length > MAX_FILE_BYTES) return undefined;
+  ctx.remainingBytes -= raw.length;
+  if (raw.length === 0) return;
   const trailingNewline = raw[raw.length - 1] === 0x0a;
   const lines = raw.toString('utf8').split('\n');
   // A trailing newline produces a phantom empty final element; keep it out of
   // the parse/join round-trip and restore it below instead.
   if (trailingNewline) lines.pop();
+  const scan: FileScan = { imageBlocks: 0, unmeasurable: [], sourceTypes: new Set() };
   let removed = 0;
   const out: string[] = new Array(lines.length);
   for (let i = 0; i < lines.length; i += 1) {
@@ -275,7 +345,7 @@ function purgeFile(
       out[i] = line;
       continue;
     }
-    const n = sanitizeNode(parsed, minDimension);
+    const n = sanitizeNode(parsed, ctx.minDimension, scan);
     if (n > 0) {
       removed += n;
       out[i] = JSON.stringify(parsed);
@@ -283,73 +353,150 @@ function purgeFile(
       out[i] = line;
     }
   }
-  if (removed === 0) return undefined;
-  const backup = writeExclusiveFile(`${file}.botmux-purge-bak-${timestamp()}`, raw);
-  const tmp = writeExclusiveFile(
-    `${file}.tmp-purge-${process.pid}-${randomBytes(6).toString('hex')}`,
-    out.join('\n') + (trailingNewline ? '\n' : ''),
-  );
-  // The live transcript is never moved out of place. rename(2) replaces it in
-  // one atomic step, so a crash before this point leaves the original visible
-  // and a crash after it leaves the sanitized transcript visible.
-  atomicReplaceTranscript(tmp, file, renameSync, () => {
-    // The CLI may still append while the restart begins. Never replace a newer
-    // transcript snapshot: abort and let the caller retry after the process is
-    // quiescent instead of silently deleting the appended records.
-    const current = lstatSync(file);
-    if (!current.isFile()
-      || current.dev !== initialStat.dev
-      || current.ino !== initialStat.ino
-      || current.size !== initialStat.size
-      || current.mtimeMs !== initialStat.mtimeMs) {
-      throw new Error(`transcript changed while purging: ${file}`);
+  report.imageBlocks += scan.imageBlocks;
+  for (const entry of scan.unmeasurable) report.unmeasurable.push({ file, ...entry });
+  for (const sourceType of scan.sourceTypes) {
+    if (!report.skippedSourceTypes.includes(sourceType)) report.skippedSourceTypes.push(sourceType);
+  }
+  if (removed === 0) return;
+  if (ctx.dryRun) {
+    report.files.push({ file, removed });
+    report.removed += removed;
+    return;
+  }
+  let backup: string | undefined;
+  try {
+    backup = writeExclusiveFile(`${file}${BACKUP_INFIX}${timestamp()}`, raw);
+    const tmp = writeExclusiveFile(
+      `${file}.tmp-purge-${process.pid}-${randomBytes(6).toString('hex')}`,
+      out.join('\n') + (trailingNewline ? '\n' : ''),
+    );
+    // The live transcript is never moved out of place. rename(2) replaces it in
+    // one atomic step, so a crash before this point leaves the original visible
+    // and a crash after it leaves the sanitized transcript visible.
+    atomicReplaceTranscript(tmp, file, renameSync, () => {
+      // Never replace a newer transcript snapshot: abort instead of silently
+      // deleting records appended after the read above.
+      const current = lstatSync(file);
+      if (!current.isFile()
+        || current.dev !== initialStat.dev
+        || current.ino !== initialStat.ino
+        || current.size !== initialStat.size
+        || current.mtimeMs !== initialStat.mtimeMs) {
+        throw new Error('transcript changed while purging');
+      }
+    });
+  } catch (err) {
+    if (backup) rmSync(backup, { force: true });
+    report.failedFiles.push({ file, reason: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+  pruneOlderBackups(file, backup);
+  report.files.push({ file, removed, backup });
+  report.removed += removed;
+}
+
+/** Transcripts under `<sid>/` that the purge leaves alone, for diagnostics. */
+function listOutOfScopeTranscripts(sessionDir: string): string[] {
+  const found: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return; }
+    for (const name of names) {
+      if (found.length >= 20) return;
+      const path = join(dir, name);
+      let st: ReturnType<typeof lstatSync>;
+      try { st = lstatSync(path); } catch { continue; }
+      if (st.isDirectory()) {
+        if (depth < 1 && name !== 'subagents') walk(path, depth + 1);
+      } else if (st.isFile() && name.endsWith('.jsonl')) {
+        found.push(path);
+      }
     }
-  });
-  return { file, removed, backup };
+  };
+  walk(sessionDir, 0);
+  return found;
 }
 
 const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Purge the pinned session transcript and its Task/Agent subagent files. */
+/** Purge the pinned session transcript and its Task/Agent subagent files.
+ *  `dryRun` only reports what would be removed and writes nothing. */
 export function purgeUndersizedImages(
   mainJsonlPath: string,
-  opts: { minDimension?: number; trustedProjectsRoot?: string } = {},
-): PurgedFile[] {
-  const minDimension = opts.minDimension ?? MIN_IMAGE_DIMENSION;
-  const results: PurgedFile[] = [];
+  opts: { minDimension?: number; trustedProjectsRoot?: string; dryRun?: boolean } = {},
+): PurgeReport {
+  const report: PurgeReport = {
+    files: [],
+    removed: 0,
+    imageBlocks: 0,
+    unmeasurable: [],
+    skippedSourceTypes: [],
+    failedFiles: [],
+    outOfScopeFiles: [],
+  };
   let trustedRoot: string;
   try {
     trustedRoot = realpathSync(opts.trustedProjectsRoot ?? dirname(mainJsonlPath));
     const lexicalMain = resolve(mainJsonlPath);
     const lexicalRelative = relative(resolve(opts.trustedProjectsRoot ?? dirname(mainJsonlPath)), lexicalMain);
-    if (lexicalRelative.startsWith('..') || lexicalRelative.includes('/../')) return results;
     const realMain = realpathSync(mainJsonlPath);
-    if (realMain !== trustedRoot && !realMain.startsWith(`${trustedRoot}/`)) return results;
-  } catch {
-    return results;
+    if (lexicalRelative.startsWith('..') || lexicalRelative.includes('/../')
+      || (realMain !== trustedRoot && !realMain.startsWith(`${trustedRoot}/`))) {
+      report.failedFiles.push({ file: mainJsonlPath, reason: 'outside trusted root' });
+      return report;
+    }
+  } catch (err) {
+    report.failedFiles.push({ file: mainJsonlPath, reason: (err as NodeJS.ErrnoException).code ?? 'unreadable' });
+    return report;
   }
-  const main = purgeFile(mainJsonlPath, minDimension, trustedRoot);
-  if (main) results.push(main);
+  const ctx: PurgeContext = {
+    minDimension: opts.minDimension ?? MIN_IMAGE_DIMENSION,
+    trustedRoot,
+    dryRun: opts.dryRun === true,
+    remainingBytes: MAX_PURGE_BYTES,
+    report,
+  };
+  purgeFile(mainJsonlPath, ctx);
+  // The model request is rebuilt from the main transcript; with that one
+  // unreadable or unwritable, a subagent-only rewrite would read as success.
+  if (report.failedFiles.length > 0) return report;
 
   // Layout: <projectsRoot>/<cwdHash>/<sid>.jsonl with subagents at
   // <projectsRoot>/<cwdHash>/<sid>/subagents/*.jsonl.
   const sid = basename(mainJsonlPath).replace(/\.jsonl$/i, '');
-  if (SESSION_SUBDIR_RE.test(sid)) {
-    const subDir = join(dirname(mainJsonlPath), sid, 'subagents');
-    let entries: string[];
-    try {
-      // Do not let a transcript-controlled/session-adjacent symlink redirect the
-      // purge outside the pinned session tree.
-      if (!lstatSync(subDir).isDirectory()) return results;
-      entries = readdirSync(subDir);
-    } catch {
-      return results;
+  if (!SESSION_SUBDIR_RE.test(sid)) return report;
+  const sessionDir = join(dirname(mainJsonlPath), sid);
+  const subDir = join(sessionDir, 'subagents');
+  let entries: string[] = [];
+  try {
+    // Do not let a transcript-controlled/session-adjacent symlink redirect the
+    // purge outside the pinned session tree.
+    if (lstatSync(sessionDir).isDirectory()) {
+      report.outOfScopeFiles = listOutOfScopeTranscripts(sessionDir);
+      if (lstatSync(subDir).isDirectory()) entries = readdirSync(subDir);
     }
-    for (const name of entries) {
-      if (!name.endsWith('.jsonl')) continue;
-      const purged = purgeFile(join(subDir, name), minDimension, trustedRoot);
-      if (purged) results.push(purged);
-    }
+  } catch {
+    return report;
   }
-  return results;
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    purgeFile(join(subDir, name), ctx);
+  }
+  return report;
+}
+
+/** One-line English summary for worker logs. */
+export function describePurgeReport(report: PurgeReport): string {
+  const parts = [`removed=${report.removed}`, `files=${report.files.length}`, `imageBlocks=${report.imageBlocks}`];
+  if (report.unmeasurable.length > 0) {
+    parts.push(`unmeasurable=${report.unmeasurable
+      .map(entry => `${basename(entry.file)}#${entry.fileIndex}:${entry.mediaType ?? 'unknown'}`).join(',')}`);
+  }
+  if (report.skippedSourceTypes.length > 0) parts.push(`skippedSourceTypes=${report.skippedSourceTypes.join(',')}`);
+  if (report.failedFiles.length > 0) {
+    parts.push(`failedFiles=${report.failedFiles.map(entry => `${basename(entry.file)}(${entry.reason})`).join(',')}`);
+  }
+  if (report.outOfScopeFiles.length > 0) parts.push(`outOfScopeFiles=${report.outOfScopeFiles.join(',')}`);
+  return parts.join(' ');
 }

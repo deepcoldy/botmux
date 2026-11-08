@@ -99,7 +99,7 @@ describe('cause classification', () => {
     const codes = [
       'provider_server_error', 'provider_unexpected_eof', 'provider_no_model_reply', 'provider_rate_limited',
       'provider_authentication_failed', 'provider_invalid_request', CODEX_CAPACITY_ERROR_CODE,
-      'recovery_outcome_unverified', 'recovery_restart_unverified', 'recovery_enqueue_failed',
+      'provider_image_too_small', 'recovery_outcome_unverified', 'recovery_restart_unverified', 'recovery_enqueue_failed',
       'recovery_persist_failed', 'recovery_disabled', 'something_new', undefined,
     ];
     const keys = codes.map(code => recoveryCauseI18nKey(code));
@@ -107,7 +107,7 @@ describe('cause classification', () => {
       for (const locale of ['zh', 'en'] as const) expect(t(key, undefined, locale)).not.toBe(key);
     }
     // Network/DNS-type failures and quota are told apart from each other.
-    expect(new Set(keys.slice(0, 7)).size).toBe(7);
+    expect(new Set(keys.slice(0, 8)).size).toBe(8);
     // An unknown code falls back to the generic sentence, never echoes itself.
     expect(t(recoveryCauseI18nKey('something_new'), undefined, 'zh')).not.toContain('something_new');
   });

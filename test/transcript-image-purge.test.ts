@@ -56,21 +56,27 @@ function jpeg(width: number, height: number): Buffer {
   ]);
 }
 
-function imageRecord(b64: string, mediaType = 'image/png'): string {
+function imageRecord(b64: string, mediaType = 'image/png', extra: Record<string, unknown> = {}): string {
+  return recordWithSource({ type: 'base64', media_type: mediaType, data: b64 }, extra);
+}
+
+function recordWithSource(source: Record<string, unknown>, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
     type: 'user',
+    ...extra,
     message: {
       role: 'user',
       content: [{
         type: 'tool_result',
         tool_use_id: 'toolu_1',
-        content: [{
-          type: 'image',
-          source: { type: 'base64', media_type: mediaType, data: b64 },
-        }],
+        content: [{ type: 'image', source }],
       }],
     },
   });
+}
+
+function backupsOf(dir: string): string[] {
+  return readdirSync(dir).filter(n => n.includes('.botmux-purge-bak-'));
 }
 
 let dirs: string[] = [];
@@ -80,9 +86,7 @@ function makeTemp(): string {
   return d;
 }
 afterEach(() => {
-  for (const d of dirs) {
-    try { readdirSync(d); } catch { continue; }
-  }
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
   dirs = [];
 });
 
@@ -148,25 +152,38 @@ describe('atomicReplaceTranscript', () => {
 });
 
 describe('purgeUndersizedImages', () => {
-  it('replaces undersized image blocks with text and backs up the original file', () => {
+  it('replaces undersized image blocks with text and keeps the original as a backup', () => {
     const root = makeTemp();
     const main = join(root, `${SID}.jsonl`);
     const before = `${imageRecord(png(1, 1).toString('base64'))}\n`;
     writeFileSync(main, before);
 
-    const results = purgeUndersizedImages(main);
-    expect(results).toHaveLength(1);
-    expect(results[0].removed).toBe(1);
-    expect(results[0].backup).toBeTruthy();
+    const report = purgeUndersizedImages(main);
+    expect(report.removed).toBe(1);
+    expect(report.files).toHaveLength(1);
+    expect(report.files[0].backup).toBeTruthy();
+    expect(report.failedFiles).toEqual([]);
 
     const after = JSON.parse(readFileSync(main, 'utf8').trim());
     const block = after.message.content[0].content[0];
     expect(block.type).toBe('text');
     expect(block.text).toContain('1x1');
     expect(block.text).toContain(String(MIN_IMAGE_DIMENSION));
-    // The poisoned base64 must be gone from both live and backup-present.
     expect(readFileSync(main, 'utf8')).not.toContain('"type":"image"');
-    expect(readFileSync(results[0].backup!, 'utf8')).toBe(before);
+    expect(readFileSync(report.files[0].backup!, 'utf8')).toBe(before);
+  });
+
+  it('dry run reports what it would remove and writes nothing', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    const before = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(main, before);
+
+    const report = purgeUndersizedImages(main, { dryRun: true });
+    expect(report.removed).toBe(1);
+    expect(report.files).toEqual([{ file: main, removed: 1 }]);
+    expect(readFileSync(main, 'utf8')).toBe(before);
+    expect(readdirSync(root)).toEqual([`${SID}.jsonl`]);
   });
 
   it('leaves files untouched when every image meets the minimum', () => {
@@ -175,9 +192,63 @@ describe('purgeUndersizedImages', () => {
     const original = `${imageRecord(png(14, 14).toString('base64'))}\n`;
     writeFileSync(main, original);
 
-    expect(purgeUndersizedImages(main)).toEqual([]);
+    const report = purgeUndersizedImages(main);
+    expect(report.removed).toBe(0);
+    expect(report.imageBlocks).toBe(1);
     expect(readFileSync(main, 'utf8')).toBe(original);
-    expect(readdirSync(root).filter(n => n.includes('bak'))).toHaveLength(0);
+    expect(backupsOf(root)).toHaveLength(0);
+  });
+
+  it('purges sidechain records in the main transcript too', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    writeFileSync(main, `${imageRecord(png(1, 1).toString('base64'), 'image/png', { isSidechain: true })}\n`);
+
+    expect(purgeUndersizedImages(main).removed).toBe(1);
+    expect(readFileSync(main, 'utf8')).not.toContain('"type":"image"');
+  });
+
+  it('keeps only the newest backup across repeated purges', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    const tiny = imageRecord(png(1, 1).toString('base64'));
+    writeFileSync(main, `${tiny}\n`);
+    const first = purgeUndersizedImages(main).files[0].backup!;
+
+    const second = `${readFileSync(main, 'utf8')}${tiny}\n`;
+    writeFileSync(main, second);
+    const latest = purgeUndersizedImages(main).files[0].backup!;
+
+    expect(latest).not.toBe(first);
+    expect(backupsOf(root).map(n => join(root, n))).toEqual([latest]);
+    expect(readFileSync(latest, 'utf8')).toBe(second);
+  });
+
+  it('reports images it cannot measure and removes nothing', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    const truncated = png(1, 1).subarray(0, 12);
+    const original = [
+      imageRecord(png(64, 64).toString('base64')),
+      imageRecord(truncated.toString('base64'), 'image/png'),
+    ].join('\n') + '\n';
+    writeFileSync(main, original);
+
+    const report = purgeUndersizedImages(main);
+    expect(report.removed).toBe(0);
+    expect(report.imageBlocks).toBe(2);
+    expect(report.unmeasurable).toEqual([{ file: main, fileIndex: 1, mediaType: 'image/png' }]);
+    expect(readFileSync(main, 'utf8')).toBe(original);
+  });
+
+  it('reports non-embedded image sources instead of guessing their size', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    writeFileSync(main, `${recordWithSource({ type: 'url', url: 'https://example.invalid/a.png' })}\n`);
+
+    const report = purgeUndersizedImages(main);
+    expect(report.removed).toBe(0);
+    expect(report.skippedSourceTypes).toEqual(['url']);
   });
 
   it('purges subagent transcripts next to the session file', () => {
@@ -189,10 +260,26 @@ describe('purgeUndersizedImages', () => {
     const sub = join(subDir, 'agent-deadbeef.jsonl');
     writeFileSync(sub, `${imageRecord(png(1, 1).toString('base64'))}\n`);
 
-    const results = purgeUndersizedImages(main);
-    expect(results.map(r => r.file)).toEqual([sub]);
+    const report = purgeUndersizedImages(main);
+    expect(report.files.map(r => r.file)).toEqual([sub]);
     expect(JSON.parse(readFileSync(sub, 'utf8').trim())
       .message.content[0].content[0].type).toBe('text');
+  });
+
+  it('lists other transcripts under the session folder without touching them', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    writeFileSync(main, `${imageRecord(png(1024, 1024).toString('base64'))}\n`);
+    const otherDir = join(root, SID, 'workflows');
+    mkdirSync(otherDir, { recursive: true });
+    const other = join(otherDir, 'run-1.jsonl');
+    const before = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(other, before);
+
+    const report = purgeUndersizedImages(main);
+    expect(report.removed).toBe(0);
+    expect(report.outOfScopeFiles).toEqual([other]);
+    expect(readFileSync(other, 'utf8')).toBe(before);
   });
 
   it('does not descend directories that are not session-uuid folders', () => {
@@ -203,7 +290,7 @@ describe('purgeUndersizedImages', () => {
     mkdirSync(fake, { recursive: true });
     writeFileSync(join(fake, 'agent-x.jsonl'), imageRecord(png(1, 1).toString('base64')));
 
-    expect(purgeUndersizedImages(main)).toEqual([]);
+    expect(purgeUndersizedImages(main).removed).toBe(0);
   });
 
   it('rejects an ancestor alias that escapes an independently trusted projects root', () => {
@@ -217,22 +304,29 @@ describe('purgeUndersizedImages', () => {
     const alias = join(projects, 'aliased-project');
     symlinkSync(outside, alias);
 
-    expect(purgeUndersizedImages(join(alias, `${SID}.jsonl`), {
-      trustedProjectsRoot: projects,
-    })).toEqual([]);
+    const report = purgeUndersizedImages(join(alias, `${SID}.jsonl`), { trustedProjectsRoot: projects });
+    expect(report.removed).toBe(0);
+    expect(report.failedFiles).toHaveLength(1);
     expect(readFileSync(outsideFile, 'utf8')).toBe(before);
   });
 
-  it('does not follow a main transcript symlink', () => {
+  it('does not follow a main transcript symlink, and then leaves subagents alone', () => {
     const root = makeTemp();
     const outside = join(root, 'outside.jsonl');
     const before = `${imageRecord(png(1, 1).toString('base64'))}\n`;
     writeFileSync(outside, before);
     const main = join(root, `${SID}.jsonl`);
     symlinkSync(outside, main);
+    const subDir = join(root, SID, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const sub = join(subDir, 'agent-deadbeef.jsonl');
+    writeFileSync(sub, before);
 
-    expect(purgeUndersizedImages(main)).toEqual([]);
+    const report = purgeUndersizedImages(main);
+    expect(report.removed).toBe(0);
+    expect(report.failedFiles.map(f => f.file)).toEqual([main]);
     expect(readFileSync(outside, 'utf8')).toBe(before);
+    expect(readFileSync(sub, 'utf8')).toBe(before);
   });
 
   it('does not follow a subagents directory or transcript symlink', () => {
@@ -247,16 +341,15 @@ describe('purgeUndersizedImages', () => {
     mkdirSync(join(root, SID));
     symlinkSync(outsideDir, join(root, SID, 'subagents'));
 
-    expect(purgeUndersizedImages(main)).toEqual([]);
+    expect(purgeUndersizedImages(main).removed).toBe(0);
     expect(readFileSync(outside, 'utf8')).toBe(before);
 
     mkdirSync(join(root, SID, 'subagents-real'));
     const linked = join(root, SID, 'subagents-real', 'agent-linked.jsonl');
     symlinkSync(outside, linked);
-    // Rename the real directory into the expected location after removing the symlink.
     rmSync(join(root, SID, 'subagents'));
     renameSync(join(root, SID, 'subagents-real'), join(root, SID, 'subagents'));
-    expect(purgeUndersizedImages(main)).toEqual([]);
+    expect(purgeUndersizedImages(main).removed).toBe(0);
     expect(readFileSync(outside, 'utf8')).toBe(before);
   });
 
@@ -265,7 +358,7 @@ describe('purgeUndersizedImages', () => {
     const main = join(root, `${SID}.jsonl`);
     const garbage = 'this is not json\n' + JSON.stringify({ trailing: true });
     writeFileSync(main, garbage);
-    expect(purgeUndersizedImages(main)).toEqual([]);
+    expect(purgeUndersizedImages(main).removed).toBe(0);
     expect(readFileSync(main, 'utf8')).toBe(garbage);
   });
 
@@ -277,9 +370,10 @@ describe('purgeUndersizedImages', () => {
     const tinyJpeg = imageRecord(jpeg(3, 400).toString('base64'), 'image/jpeg');
     writeFileSync(main, [tinyGif, ok, tinyJpeg].join('\n') + '\n');
 
-    const results = purgeUndersizedImages(main);
-    expect(results).toHaveLength(1);
-    expect(results[0].removed).toBe(2);
+    const report = purgeUndersizedImages(main);
+    expect(report.files).toHaveLength(1);
+    expect(report.removed).toBe(2);
+    expect(report.imageBlocks).toBe(3);
     const lines = readFileSync(main, 'utf8').trim().split('\n').map(l => JSON.parse(l));
     expect(lines[0].message.content[0].content[0].type).toBe('text');
     expect(lines[1].message.content[0].content[0].type).toBe('image');

@@ -164,6 +164,8 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { markRetryAttempt } from '../src/services/failed-turn-retry.js';
+import { holdPurgeRetryRefund, PURGE_IMAGES_NOT_APPLIED } from '../src/services/image-purge-recovery.js';
 import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -6092,4 +6094,54 @@ it('keeps V2 requester addressing frozen after the current sender changes', asyn
   await vi.advanceTimersByTimeAsync(100); await run;
   expect(sessionReply).toHaveBeenCalledOnce(); expect(sessionReply.mock.calls[0][1]).toContain('ou_original'); expect(sessionReply.mock.calls[0][1]).not.toContain('ou_newer');
   journal.close(); vi.useRealTimers();
+});
+
+describe('purge-and-continue on the daemon side', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+  });
+
+  function purgeClickedDs(): DaemonSession {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.lastFailedTurn = {
+      turnId: 'om_failed', userPrompt: 'p', cliInput: 'i', failedAt: new Date().toISOString(),
+      status: 'failed', errorCode: 'provider_image_too_small', retryCount: 0,
+    };
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    holdPurgeRetryRefund(ds, 'retry-purge', markRetryAttempt(ds.session)!);
+    return ds;
+  }
+
+  it('refunds the retry cooldown when the worker rejects the purge continuation', async () => {
+    const ds = purgeClickedDs();
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason: PURGE_IMAGES_NOT_APPLIED });
+    await vi.waitFor(() => expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined());
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(updateSessionMock).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('keeps the cooldown when some other turn is rejected', async () => {
+    const ds = purgeClickedDs();
+    const stamped = ds.session.lastFailedTurn?.lastRetryAt;
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-other', reason: PURGE_IMAGES_NOT_APPLIED });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ds.session.lastFailedTurn?.lastRetryAt).toBe(stamped);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+  });
+
+  it('refuses a purge request behind a queued activation instead of staging a plain continuation', () => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.queuedActivationPending = true;
+    expect(sendWorkerInput(ds, { content: 'continue' }, 'retry-purge', { purgeUndersizedImages: true })).toBe(false);
+    expect(ds.session.queuedActivationTail ?? []).toHaveLength(0);
+    expect((ds.worker as any).send).not.toHaveBeenCalled();
+  });
 });
