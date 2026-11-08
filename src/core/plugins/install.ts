@@ -1,6 +1,6 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parsePluginPackageManifest } from './manifest.js';
 import { scanPluginContributions } from './convention-scanner.js';
 import {
@@ -12,7 +12,7 @@ import {
   pluginConfigPath,
 } from './paths.js';
 import type { InstalledPluginRecord, PluginPackageManifest, PluginSettingsFile } from './types.js';
-import { readPluginRegistry, upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
+import { isPluginRegistryCompleteForCleanup, readPluginRegistry, upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { assertPluginServiceStopped, withPluginServiceLockSync } from './service-manager.js';
 import {
@@ -23,10 +23,13 @@ import {
   writePluginMcpDescriptor,
 } from './mcp/private-store.js';
 import type { PluginMcpServer } from './types.js';
+import { createHash } from 'node:crypto';
+import { assertPluginMutationGuard, type PluginMutationGuard } from './mutation-guard.js';
 
 export interface InstallPluginOptions {
   source?: 'auto' | 'npm' | 'local';
   link?: boolean;
+  guard?: PluginMutationGuard;
 }
 
 export interface InstallPluginResult {
@@ -137,6 +140,7 @@ function makeRecord(
       id: pkg.botmux.id,
       packageName: pkg.name,
       version: pkg.version,
+      ...(pkg.description ? { description: pkg.description } : {}),
       source,
       manifest: pkg.botmux,
       ...(contributions ? { contributions } : {}),
@@ -169,6 +173,60 @@ function assertExistingPluginServiceStopped(pluginId: string): void {
   if (existing?.manifest.service) assertPluginServiceStopped(pluginId, 'update');
 }
 
+function runtimeHasSymlinks(root: string): boolean {
+  if (lstatSync(root).isSymbolicLink()) return true;
+  const pending = [root];
+  let inspected = 0;
+  while (pending.length > 0) {
+    const dir = pending.pop()!;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (++inspected > 10_000) throw new Error('plugin_retired_scan_limit');
+      if (entry.isSymbolicLink()) return true;
+      if (entry.isDirectory()) pending.push(join(dir, entry.name));
+    }
+  }
+  return false;
+}
+
+/** Called only under the lifecycle lock, after confirmation and before creating the new home. */
+function cleanupRetiredPluginHomes(pluginId: string, stagedDir: string, sourceDir?: string): void {
+  try {
+    if (!isPluginRegistryCompleteForCleanup()) return;
+    const registry = readPluginRegistry();
+    // A failed registry commit may still need the retired home for recovery.
+    if (registry.plugins[pluginId]) return;
+    const root = realpathSync(pluginsHome());
+    const prefix = `${pluginId}.removed-`;
+    const candidates = readdirSync(root, { withFileTypes: true }).filter(entry =>
+      entry.isDirectory() && entry.name.startsWith(prefix)
+      && /^\d+-\d+$/.test(entry.name.slice(prefix.length)) && !registry.plugins[entry.name]);
+    if (candidates.length === 0 || runtimeHasSymlinks(stagedDir)) return;
+    const sourcePaths = sourceDir ? [sourceDir, join(sourceDir, 'dist')] : [];
+    for (const record of Object.values(registry.plugins)) {
+      // Copy mode preserves interior symlinks too; do not break another runtime's dependencies.
+      if (runtimeHasSymlinks(pluginRuntimeDir(record.id))) return;
+      if (record.source?.type === 'local') {
+        // Linked runtimes can depend on intermediate symlinks, not only their realpath.
+        if (record.source.link) return;
+        sourcePaths.push(record.source.spec, join(record.source.spec, 'dist'));
+      } else if (record.source?.type !== 'npm') return;
+    }
+    const sources = sourcePaths.map(path => realpathSync(path));
+    for (const entry of candidates) {
+      const retired = join(root, entry.name);
+      if (sources.some(source => {
+        const rel = relative(retired, source);
+        return rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+      })) continue;
+      try { rmSync(retired, { recursive: true, force: true }); }
+      catch { console.warn(`plugin_retired_cleanup_failed:${entry.name}`); }
+    }
+  } catch (error) {
+    // Garbage collection must not prevent a valid reinstall.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.warn(`plugin_retired_cleanup_failed:${pluginId}`);
+  }
+}
+
 export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
   const sourceDir = resolveLocalSpec(spec);
   const pkg = readPackageManifest(sourceDir);
@@ -182,7 +240,12 @@ export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}
   const stagedDir = stageRuntime(pkg.botmux.id, sourceRuntimeDir, linked);
   try {
     return withPluginServiceLockSync(() => {
+      const cleanupAllowed = isPluginRegistryCompleteForCleanup();
+      if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
       assertExistingPluginServiceStopped(pkg.botmux.id);
+      if (!linked && cleanupAllowed) cleanupRetiredPluginHomes(pkg.botmux.id, stagedDir, sourceDir);
+      // Recursive cleanup may take long enough for an operator to revoke confirmation.
+      if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
       ensurePluginStateFiles(pkg.botmux.id);
       return commitPluginInstall(stagedRecord, stagedDir);
     });
@@ -216,13 +279,18 @@ function findBotmuxPackageUnderNodeModules(root: string): string {
   return botmuxPackages[0];
 }
 
-export function installNpmPlugin(spec: string): InstallPluginResult {
+export function installNpmPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
   mkdirSync(pluginsHome(), { recursive: true });
   const tmpRoot = join(pluginsHome(), `.install-${process.pid}-${Date.now()}`);
   rmSync(tmpRoot, { recursive: true, force: true });
   mkdirSync(tmpRoot, { recursive: true });
   try {
-    execFileSync('npm', ['install', '--omit=dev', '--omit=peer', '--prefix', tmpRoot, spec], {
+    if (opts.guard?.integrity) {
+      if (!spec.startsWith('file:')) throw new Error('plugin_confirmed_archive_required');
+      const actual = `sha512-${createHash('sha512').update(readFileSync(spec.slice(5))).digest('base64')}`;
+      if (actual !== opts.guard.integrity) throw new Error('plugin_confirmed_archive_mismatch');
+    }
+    execFileSync('npm', ['install', '--omit=dev', '--omit=peer', ...(opts.guard ? ['--ignore-scripts'] : []), '--prefix', tmpRoot, spec], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
       timeout: 120_000,
@@ -230,11 +298,19 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
     const tmpPackageDir = findBotmuxPackageUnderNodeModules(tmpRoot);
     const pkg = readPackageManifest(tmpPackageDir);
     const tmpRuntimeDir = requireRuntimeDir(tmpPackageDir);
-    const stagedRecord = makeRecord(pkg, { type: 'npm', spec }, tmpRuntimeDir);
+    const confirmedIntegrity = opts.guard?.integrity;
+    // The confirmed archive is a temporary download that is deleted after install.
+    const recordedSpec = confirmedIntegrity ? `${pkg.name}@${pkg.version}` : spec;
+    const stagedRecord = makeRecord(pkg, { type: 'npm', spec: recordedSpec }, tmpRuntimeDir);
+    if (confirmedIntegrity) stagedRecord.record.integrity = confirmedIntegrity;
     const stagedDir = stageRuntime(pkg.botmux.id, tmpRuntimeDir, false);
     try {
       return withPluginServiceLockSync(() => {
+        const cleanupAllowed = isPluginRegistryCompleteForCleanup();
+        if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
         assertExistingPluginServiceStopped(pkg.botmux.id);
+        if (cleanupAllowed) cleanupRetiredPluginHomes(pkg.botmux.id, stagedDir);
+        if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
         ensurePluginStateFiles(pkg.botmux.id);
         return commitPluginInstall(stagedRecord, stagedDir);
       });
@@ -249,7 +325,7 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
 export function installPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
   const source = opts.source ?? 'auto';
   if (source === 'local' || (source === 'auto' && isLocalSpec(spec))) return installLocalPlugin(spec, opts);
-  return installNpmPlugin(spec);
+  return installNpmPlugin(spec, opts);
 }
 
 export function installedPluginRuntimeDir(pluginId: string): string {
