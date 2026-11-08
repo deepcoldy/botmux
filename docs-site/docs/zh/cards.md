@@ -16,7 +16,7 @@ Botmux 在飞书里用卡片告诉你 CLI 正在干什么，也让你在手机�
 几点说明：
 
 - 状态标记和状态卡**二选一**：开着状态卡就不贴表情；关了状态卡，表情就是唯一的轻量进度信号。两个表情可以用 `receivedReactionEmoji` / `doneReactionEmoji` 换成别的（见 [bots.json](/bots-json)）。
-- 思考过程需要飞书客户端 PC ≥ 7.70、移动端 ≥ 7.74，只有能输出思考内容的 CLI（Claude Code、Codex、TraeX、Pi 等）才有。
+- 思考过程需要飞书客户端 PC ≥ 7.70、移动端 ≥ 7.74，只有能输出思考内容的 CLI（Claude Code、Codex、TraeX、Pi、Kimi 等）才有。
 - 想换成「一轮只一张卡」的展示方式，见下文「动态单卡」一节。
 
 ## 终端状态卡
@@ -130,7 +130,8 @@ Claude Code 有些操作要在终端里弹确认框，比如内置安全检查�
 
 ### 哪些会话支持
 
-- 支持：**未开文件沙盒**的 Claude Code、Codex、Grok、TraeX、Pi 普通飞书对话（普通群和话题都行）。
+- 支持：**未开文件沙盒**的 Claude Code、Codex、Grok、TraeX、Pi、Kimi 普通飞书对话（普通群和话题都行）。
+- Kimi 的执行过程来自它本地的会话日志：Kimi 每完成一步模型调用才写入一次，所以思考和工具按「步」刷新，不是逐字流式；收尾那段答复由 `botmux send` 投递，不会在执行过程里重复出现。
 - 不支持、仍走默认模式：文件沙盒会话（含 `readIsolation`、全局 `BOTMUX_SANDBOX=1`）、API-only、非飞书渠道、远程 Riff/Mojo、adopt、本地终端同步、文档评论、视频会议、定时任务、v3 工作流。
 - 沙盒状态以会话启动时为准，改 bot 的沙盒开关不影响正在跑的会话。
 
