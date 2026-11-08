@@ -13,14 +13,13 @@ vi.mock('../src/utils/user-token.js', () => ({ resolveUserToken: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ loadBotConfigs: () => [], getBotClient: () => ({ request }) }));
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {}, LoggerLevel: { error: 4 } }));
 import { getMessageDetail } from '../src/im/lark/client.js';
-import { resolveSubstituteAppMentions } from '../src/im/lark/substitute-app-mentions.js';
-import { extractMentionIdentities } from '../src/im/lark/message-parser.js';
+import { resolveSubstituteAppMentions, substituteMentionIdentities } from '../src/im/lark/substitute-app-mentions.js';
 
 it('keeps enriched reads unchanged while App ID substitution requests explicit ID types for bot identities', async () => {
   const ordinary = await getMessageDetail('cli_receiver', message.message_id);
   expect(ordinary.items[0].mentions[0].id).toBe('ou_scoped');
   const hydrated = await resolveSubstituteAppMentions('cli_receiver', message);
-  expect(extractMentionIdentities(hydrated)[0]).toMatchObject({ appId: 'cli_external', openId: 'ou_scoped' });
+  expect(substituteMentionIdentities(hydrated)[0]).toMatchObject({ appId: 'cli_external', openId: 'ou_scoped' });
   expect(request.mock.calls[1][0].params.user_id_type).toBe('open_id');
   expect(request.mock.calls[2][0].params.user_id_type).toBeUndefined();
 });

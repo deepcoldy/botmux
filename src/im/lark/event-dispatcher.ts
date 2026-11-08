@@ -59,7 +59,7 @@ import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
-import { resolveSubstituteAppMentions } from './substitute-app-mentions.js';
+import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice, holdPendingMessage } from './grant-pending.js';
@@ -1986,7 +1986,7 @@ function resolveSubstituteMention(
   if (!cfg?.enabled || !cfg.targets?.length) return undefined;
   const messageType = message?.message_type ?? message?.msg_type;
   if (!SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(messageType)) return undefined;
-  const mentions = extractMentionIdentities(message);
+  const mentions = substituteMentionIdentities(message);
   for (const mention of mentions) {
     const target = cfg.targets.find(t =>
       (!botTargetsOnly || !!t.appId)

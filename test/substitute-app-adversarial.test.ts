@@ -3,8 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const getMessageDetail = vi.hoisted(() => vi.fn());
 vi.mock('../src/im/lark/client.js', () => ({ getMessageDetail }));
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {} }));
-import { resolveSubstituteAppMentions } from '../src/im/lark/substitute-app-mentions.js';
-import { extractMentionIdentities } from '../src/im/lark/message-parser.js';
+import { resolveSubstituteAppMentions, substituteMentionIdentities } from '../src/im/lark/substitute-app-mentions.js';
 import { resolveSubstituteTargets } from '../src/services/substitute-mode-store.js';
 
 beforeEach(() => vi.clearAllMocks());
@@ -25,7 +24,7 @@ describe('App ID adversarial identity boundaries', () => {
       mentions: [{ key: '@_user_1', name: 'Same name', id: 'cli_replacement', id_type: 'app_id' }],
     }] });
     const result = await resolveSubstituteAppMentions('cli_receiver', message);
-    expect(extractMentionIdentities(result).some(mention => mention.appId === 'cli_replacement')).toBe(false);
+    expect(substituteMentionIdentities(result).some(mention => mention.appId === 'cli_replacement')).toBe(false);
   });
 
   it('does not append a REST app mention whose placeholder is absent from the text event', async () => {
@@ -35,7 +34,7 @@ describe('App ID adversarial identity boundaries', () => {
       mentions: [{ key: '@_user_2', name: 'Same name', id: 'cli_unmentioned', id_type: 'app_id' }],
     }] });
     const result = await resolveSubstituteAppMentions('cli_receiver', message);
-    expect(extractMentionIdentities(result).some(mention => mention.appId === 'cli_unmentioned')).toBe(false);
+    expect(substituteMentionIdentities(result).some(mention => mention.appId === 'cli_unmentioned')).toBe(false);
   });
 
   it('keeps concurrent message lookups separate when their REST responses complete in reverse order', async () => {
@@ -52,10 +51,10 @@ describe('App ID adversarial identity boundaries', () => {
     }] });
     pending.get('om_second:app')!(detail(second, 'cli_second'));
     pending.get('om_second:open')!({ items: [{ ...detail(second, 'cli_second').items[0], mentions: message.mentions }] });
-    expect(extractMentionIdentities(await secondResult)[0].appId).toBe('cli_second');
+    expect(substituteMentionIdentities(await secondResult)[0].appId).toBe('cli_second');
     pending.get('om_first:app')!(detail(first, 'cli_first'));
     pending.get('om_first:open')!({ items: [{ ...detail(first, 'cli_first').items[0], mentions: message.mentions }] });
-    expect(extractMentionIdentities(await firstResult)[0].appId).toBe('cli_first');
+    expect(substituteMentionIdentities(await firstResult)[0].appId).toBe('cli_first');
     expect(message.mentions[0].id).toEqual({ open_id: 'ou_original' });
   });
 

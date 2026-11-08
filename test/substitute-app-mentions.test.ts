@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const getMessageDetail = vi.hoisted(() => vi.fn());
 vi.mock('../src/im/lark/client.js', () => ({ getMessageDetail }));
-import { resolveSubstituteAppMentions } from '../src/im/lark/substitute-app-mentions.js';
-import { extractMentionIdentities } from '../src/im/lark/message-parser.js';
+import { resolveSubstituteAppMentions, substituteMentionIdentities } from '../src/im/lark/substitute-app-mentions.js';
 
 const message = {
   message_id: 'om_probe', chat_id: 'oc_probe', message_type: 'text',
@@ -20,7 +19,7 @@ beforeEach(() => { getMessageDetail.mockReset().mockImplementation((_app, _id, o
 describe('stable App ID mention recovery', () => {
   it('uses the exact REST message app_id and preserves the event Open ID', async () => {
     const resolved = await resolveSubstituteAppMentions('cli_receiver', message);
-    expect(extractMentionIdentities(resolved)[0]).toMatchObject({ appId: 'cli_external', openId: 'ou_observed' });
+    expect(substituteMentionIdentities(resolved)[0]).toMatchObject({ appId: 'cli_external', openId: 'ou_observed' });
     expect(message.mentions[0].id).toEqual({ open_id: 'ou_observed' });
     expect(getMessageDetail).toHaveBeenCalledWith('cli_receiver', 'om_probe', expect.objectContaining({ timeoutMs: expect.any(Number) }));
   });

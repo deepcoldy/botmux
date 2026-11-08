@@ -7115,6 +7115,34 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
     });
 
+  it.each(['group', 'topic'] as const)('App ID substitute: a rich-text @ with empty mentions[] triggers in %s', async chatMode => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] } });
+    mockGetChatMode.mockResolvedValue(chatMode);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, messageId: `om_post_${chatMode}`, chatId: 'oc_post_app', messageType: 'post',
+      content: JSON.stringify({ zh_cn: { title: '', content: [[
+        { tag: 'at', user_id: 'ou_external', user_name: 'External' }, { tag: 'text', text: ' help' },
+      ]] } }),
+      mentions: [],
+    });
+    const restBody = JSON.stringify({ title: '', content: [[
+      { tag: 'at', user_id: '@_user_1', user_name: 'External', style: [] }, { tag: 'text', text: ' help', style: [] },
+    ]] });
+    mockGetMessageDetail.mockImplementation(async (_app, _id, options) => ({ items: [{
+      message_id: event.message.message_id, chat_id: 'oc_post_app', msg_type: 'post', body: { content: restBody },
+      mentions: [options?.userIdType
+        ? { key: '@_user_1', id: 'cli_external', id_type: 'app_id' }
+        : { key: '@_user_1', id: 'ou_external', id_type: 'open_id' }],
+    }] }));
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    const calls = [...handlers.handleNewTopic.mock.calls, ...handlers.handleThreadReply.mock.calls];
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toMatchObject({ substituteTrigger: {
+      target: { appId: 'cli_external' }, observedMention: { appId: 'cli_external', openId: 'ou_external' },
+    } });
+  });
+
   it('App ID substitute never substitutes an unrelated same-name bot', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] } });
     mockGetChatMode.mockResolvedValue('topic');
