@@ -272,6 +272,25 @@ describe('allocateArchitectAttempt', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('ignores numeric names beyond MAX_SAFE_INTEGER instead of looping or emitting exponent names', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-huge-'));
+    try {
+      // 16 nines parses to 1e16 (not a safe integer); 255 nines to 1e255.
+      mkdirSync(join(attemptsOf(dir), '9'.repeat(16)), { recursive: true });
+      mkdirSync(join(attemptsOf(dir), '9'.repeat(255)), { recursive: true });
+
+      const next = allocateArchitectAttempt(dir);
+      expect(next.attemptId).toBe('architect/attempts/001');
+      expect(existsSync(join(attemptsOf(dir), '10000000000000000'))).toBe(false);
+      expect(existsSync(join(attemptsOf(dir), '1e+255'))).toBe(false);
+
+      // The junk names stay ignored, so ordinary counting continues beside them.
+      expect(allocateArchitectAttempt(dir).attemptId).toBe('architect/attempts/002');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /**

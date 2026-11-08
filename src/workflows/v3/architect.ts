@@ -260,6 +260,9 @@ function architectPlacementLines(assignment: V3ArchitectBotAssignment): string[]
  * as an earlier attempt whose session may still be alive. The exclusive mkdir
  * hands out an empty directory that is never another attempt's, so no stale
  * manifest can finish the new worker early; earlier attempts stay as they are.
+ * Names whose number is outside the safe-integer range are ignored: past
+ * MAX_SAFE_INTEGER `n + 1` can equal `n`, which would make the EEXIST retry
+ * loop spin forever while holding the run's host mutation lock.
  * Callers hold the run's host mutation lock.
  */
 export function allocateArchitectAttempt(runDir: string): ArchitectAttempt {
@@ -267,8 +270,16 @@ export function allocateArchitectAttempt(runDir: string): ArchitectAttempt {
   mkdirSync(attemptsDir, { recursive: true });
   let n = readdirSync(attemptsDir)
     .filter((name) => ATTEMPT_NUMBER_RE.test(name))
-    .reduce((max, name) => Math.max(max, parseInt(name, 10)), 0) + 1;
+    .reduce((max, name) => {
+      const parsed = parseInt(name, 10);
+      return Number.isSafeInteger(parsed) ? Math.max(max, parsed) : max;
+    }, 0) + 1;
   for (;;) {
+    // Defense in depth: with unsafe names filtered above, n starts safe and
+    // only advances by one, so this throws instead of looping on a stuck n.
+    if (!Number.isSafeInteger(n)) {
+      throw new Error(`architect attempt 编号超出安全整数范围：${attemptsDir}`);
+    }
     const number = String(n).padStart(3, '0');
     const attemptDir = join(attemptsDir, number);
     try {
