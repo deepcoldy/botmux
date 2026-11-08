@@ -3,7 +3,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 
-import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
+import { createDropdownMenu, DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 import {
   commitDropdownChoice,
   dropdownRootClassName,
@@ -108,6 +108,36 @@ describe('DropdownMenu shell', () => {
     expect(trigger.props['aria-label']).toBe('Time zone');
     expect(trigger.findByProps({ className: 'sect-sort-value' }).children).toEqual(['Alpha']);
     act(() => renderer.unmount());
+  });
+
+  it('keeps the page and an inert trigger when an implementation chunk fails to load', async () => {
+    // An open tab outlives a dashboard upgrade that deletes the old hashed chunk.
+    const combobox = await import('../src/dashboard/web/dropdown-combobox.js');
+    const Menu = createDropdownMenu({
+      select: () => Promise.reject(new TypeError('Failed to fetch dynamically imported module: http://127.0.0.1/chunks/dropdown-select-OLD.js')),
+      combobox: () => Promise.resolve(combobox),
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement('section', null,
+          React.createElement('h1', null, 'Settings'),
+          React.createElement(Menu<string>, menuProps({ id: 'tz', ariaLabel: 'Time zone' })),
+          React.createElement(Menu<string>, menuProps({ id: 'cli', ariaLabel: 'CLI', searchable: true }))));
+      });
+      const trigger = (label: string) => renderer.root.find(node => typeof node.type === 'string'
+        && node.props.className === 'sect-sort-trigger' && node.props['aria-label'] === label);
+
+      expect(renderer.root.findByType('h1').children).toEqual(['Settings']);
+      expect(trigger('Time zone').findByProps({ className: 'sect-sort-value' }).children).toEqual(['Alpha']);
+      expect(trigger('Time zone').props.tabIndex).toBeUndefined();
+      expect(trigger('CLI').props.tabIndex).toBe(0);
+      expect(logged).toHaveBeenCalledWith('botmux dropdown failed to load', expect.any(TypeError));
+      act(() => renderer.unmount());
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 

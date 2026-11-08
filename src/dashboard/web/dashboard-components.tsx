@@ -404,12 +404,8 @@ export function OverviewListTail(props: { children: ReactNode }): React.JSX.Elem
   return <div className="overview-list-tail">{props.children}</div>;
 }
 
-// Base UI Select + Combobox are ~60KB gzip together, about a sixth of the whole
-// first screen, while most screens show no dropdown until a page chunk loads.
-// So the implementations arrive with the first DropdownMenu that renders; until
-// then it shows the same trigger, inert for the moment the chunk takes.
-const DropdownSelect = lazy(() => import('./dropdown-select.js'));
-const DropdownCombobox = lazy(() => import('./dropdown-combobox.js'));
+type DropdownImplModule = { default: (props: DropdownMenuProps<string>) => React.JSX.Element };
+export type DropdownImplImporters = Record<'select' | 'combobox', () => Promise<DropdownImplModule>>;
 
 function DropdownMenuFallback(props: DropdownMenuProps<string>): React.JSX.Element {
   return (
@@ -427,17 +423,42 @@ function DropdownMenuFallback(props: DropdownMenuProps<string>): React.JSX.Eleme
   );
 }
 
-export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
-  // `onChange: (value: T) => void` only accepts this menu's own options, which
-  // are the only values the implementation can report back.
-  const erased = props as unknown as DropdownMenuProps<string>;
-  const Impl = props.searchable ? DropdownCombobox : DropdownSelect;
-  return (
-    <Suspense fallback={<DropdownMenuFallback {...erased} />}>
-      <Impl {...erased} />
-    </Suspense>
-  );
+/**
+ * A failed chunk load must not reach React: nothing above a dropdown catches it,
+ * so the whole page would unmount. The browser keeps the failed fetch for the
+ * life of the page, so there is nothing to retry either; the trigger stays inert.
+ */
+function lazyDropdownImpl(load: () => Promise<DropdownImplModule>) {
+  return lazy(() => load().catch((error: unknown): DropdownImplModule => {
+    console.error('botmux dropdown failed to load', error);
+    return { default: DropdownMenuFallback };
+  }));
 }
+
+export function createDropdownMenu(importers: DropdownImplImporters) {
+  const DropdownSelect = lazyDropdownImpl(importers.select);
+  const DropdownCombobox = lazyDropdownImpl(importers.combobox);
+  return function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
+    // `onChange: (value: T) => void` only accepts this menu's own options, which
+    // are the only values the implementation can report back.
+    const erased = props as unknown as DropdownMenuProps<string>;
+    const Impl = props.searchable ? DropdownCombobox : DropdownSelect;
+    return (
+      <Suspense fallback={<DropdownMenuFallback {...erased} />}>
+        <Impl {...erased} />
+      </Suspense>
+    );
+  };
+}
+
+// Base UI Select + Combobox are ~60KB gzip together, about a sixth of the whole
+// first screen, while most screens show no dropdown until a page chunk loads.
+// So the implementations arrive with the first DropdownMenu that renders; until
+// then it shows the same trigger, inert for the moment the chunk takes.
+export const DropdownMenu = createDropdownMenu({
+  select: () => import('./dropdown-select.js'),
+  combobox: () => import('./dropdown-combobox.js'),
+});
 
 export function SortMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
   return <DropdownMenu {...props} />;
