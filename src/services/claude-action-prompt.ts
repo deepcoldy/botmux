@@ -97,7 +97,11 @@ export function screenHasUnresolvedPermissionQuestion(screen: string): boolean {
   return false;
 }
 
-export function claudeActionPrompt(screen: string): string | undefined {
+/** The real dialog replaces the composer, so its footer is the bottom row;
+ * text below the footer means the reply transcript quotes a dialog. The
+ * keep-alive gate passes `footerAnywhere` because it fails closed on any
+ * dialog evidence (see screenHasUnresolvedPermissionQuestion). */
+export function claudeActionPrompt(screen: string, { footerAnywhere = false } = {}): string | undefined {
   const lines = joinWrappedQuestion(projectDialogLines(screen));
   let questionIndex = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -110,6 +114,7 @@ export function claudeActionPrompt(screen: string): string | undefined {
   const tail = lines.slice(questionIndex + 1);
   const footerIndex = tail.findIndex(line => FOOTER_RE.test(line));
   if (footerIndex < 0) return;
+  if (!footerAnywhere && tail.slice(footerIndex + 1).some(Boolean)) return;
   // An unresolved "Do you want" head between the selected question and the
   // footer means a real (wrapped, un-rejoinable) question sits BELOW the
   // selected one — the selected line is dialog body, never the question.
