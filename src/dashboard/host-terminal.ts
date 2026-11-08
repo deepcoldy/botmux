@@ -817,6 +817,15 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
     const term = terminals.get(decodeURIComponent(m[1]));
     if (!term || term.exited) { try { socket.destroy(); } catch { /* ignore */ } return true; }
     wss.handleUpgrade(req, socket as any, head, (ws) => {
+      // Must precede the term.exited early return below: on bun 1.4.4 (and npm
+      // ws) a server-side socket with no 'error' listener turns a malformed frame
+      // into an uncaughtException, and the dashboard process installs no
+      // uncaughtException trap — one bad frame would crash every host terminal.
+      // That early return closes before a Client exists, so it can never reach
+      // the detach listener attached on the normal path; this swallow covers it.
+      // On the normal path the detach listener below is added too (both run;
+      // detach is idempotent).
+      ws.on('error', () => { /* closing or detached by the path-specific handler */ });
       if (term.exited) { try { ws.close(1000, 'process_exited'); } catch { /* ignore */ } return; }
       const c: Client = { ws, unacked: 0, hidden: false, stale: false, lastAckAt: Date.now() };
       term.clients.add(c);

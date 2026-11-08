@@ -11,6 +11,8 @@ import { describe, expect, it } from 'vitest';
 
 const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
+// 源码结构护栏(K3)：worker 无连接处理器 seam，缺 error 监听会让一个畸形帧经 uncaughtException
+// 退出整个会话，漏挂心跳则让失联浏览器永久占住 tmux attach PTY；只能钉这两条结构不变量。
 describe('worker web-terminal sockets', () => {
   it('get an error listener before the connection handler can return', () => {
     const start = workerSource.indexOf("wss.on('connection', (ws, req: IncomingMessage) => {");
