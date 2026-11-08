@@ -35,6 +35,21 @@ const failOnSystemdFenceViolations = (): void => {
 afterEach(failOnSystemdFenceViolations);
 afterAll(failOnSystemdFenceViolations);
 
+// A React test can return before a lazily imported component it rendered has
+// loaded (the dashboard's DropdownMenu imports its Base UI implementation on
+// first render). React then retries the suspended tree outside act() and logs
+// "A suspended resource finished loading inside a test…". When that lands after
+// the file's last test, Vitest is already closing the worker RPC and fails a
+// green run with EnvironmentTeardownError ("Closing rpc while
+// onUserConsoleLog was pending"). So in act environments a test ends only after
+// its in-flight dynamic imports have settled, inside act() so the retry render
+// is flushed there too.
+afterEach(async () => {
+  if ((globalThis as { IS_REACT_ACT_ENVIRONMENT?: unknown }).IS_REACT_ACT_ENVIRONMENT !== true) return;
+  const { act } = await import('react');
+  await act(() => vi.dynamicImportSettled());
+});
+
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();
   const fencedHome = () => (process.platform === 'win32'
