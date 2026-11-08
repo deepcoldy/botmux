@@ -287,5 +287,11 @@ describe('XPI switch — daemon.ts ingress gates (source-pinned)', () => {
     expect(gate).toBeGreaterThan(-1);
     expect(staged).toBeGreaterThan(gate);
     expect(body.slice(gate, staged)).toContain('return false;');
+    // 开关开启时凑不齐改道前提是确定性拒收：直接按「未执行」失败，不再交回重试。
+    const gaps = body.indexOf('crossPrincipalRerouteGaps(', gate);
+    expect(gaps).toBeGreaterThan(gate);
+    expect(staged).toBeGreaterThan(gaps);
+    expect(body.slice(gaps, staged)).toContain("return 'not_executed';");
+    expect(body.slice(gaps, staged)).not.toContain('return false;');
   });
 });

@@ -132,6 +132,8 @@ export interface CreateAskInput {
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
   rootMessageId: string | null;
+  /** chat-scope 下发起 turn 冻结的话题根，只决定卡片发到哪；不属于 ask 身份，也不落盘。 */
+  cardRootMessageId?: string;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
   /** Per-invocation identity: the hook generates this once and reuses it across
@@ -184,6 +186,7 @@ export interface PendingAsk {
   larkAppId: string;
   chatId: string;
   rootMessageId: string | null;
+  cardRootMessageId?: string;
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
   chatType?: 'group' | 'p2p';

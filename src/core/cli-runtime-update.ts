@@ -316,6 +316,7 @@ function doctorUpdateDetails(raw: string): {
   probedLatest: string | null;
   cachedLatest: string | null;
   updateCommand: string | null;
+  standaloneInstall: boolean;
   installTarget?: string;
 } {
   const parsed = JSON.parse(raw) as Record<string, unknown>;
@@ -335,6 +336,8 @@ function doctorUpdateDetails(raw: string): {
     probedLatest: versionFromText(details['latest version probe']) ?? versionFromText(details['latest version']),
     cachedLatest: versionFromText(details['cached latest version']),
     updateCommand: normalizeUpdateCommand(details['update action']),
+    standaloneInstall: typeof details['update action'] === 'string'
+      && /^standalone installer$/i.test(details['update action'].trim()),
     ...(installTargetKey && typeof details[installTargetKey] === 'string' && details[installTargetKey]
       ? { installTarget: details[installTargetKey] as string }
       : {}),
@@ -481,12 +484,17 @@ export async function probeCliRuntimeUpdate(
   }
 
   if (target.provider === 'internal') {
+    // Official doctor labels a standalone install instead of naming a command;
+    // official `codex update` runs that installer. Forks (`self`) may share the
+    // label but not the installer, so the mapping stays official-only.
+    const updateCommand = trustedDoctor?.updateCommand
+      ?? (trustedDoctor?.standaloneInstall ? 'codex update' : null);
     if (trustedDoctor?.probedLatest) {
       return {
         current,
         latest: trustedDoctor.probedLatest,
         managed: true,
-        updateCommand: trustedDoctor.updateCommand,
+        updateCommand,
         ...(trustedDoctor.installTarget ? { installTarget: trustedDoctor.installTarget } : {}),
       };
     }
@@ -495,7 +503,7 @@ export async function probeCliRuntimeUpdate(
       current,
       latest: latest ?? trustedDoctor?.cachedLatest ?? null,
       managed: true,
-      updateCommand: trustedDoctor?.updateCommand ?? null,
+      updateCommand,
       ...(trustedDoctor?.installTarget ? { installTarget: trustedDoctor.installTarget } : {}),
     };
   }

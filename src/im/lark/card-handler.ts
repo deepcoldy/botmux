@@ -1878,8 +1878,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     const durationMs = formLimits ? formLimits.durationMs : claim.durationMs;
     const expiresAt = durationMs === undefined ? undefined : Date.now() + durationMs;
     // 触发本次授权申请的原始消息事件：授权成功后重放，用户无需再 @ 一遍。
-    // 自助申请卡每次只对应一个 target，取第一个即可。
-    const pendingMessage = claim.messageData;
+    // 自助申请卡每次只对应一个 target，取第一个即可。待处理期间各 target 暂存的消息排在它后面。
+    const replayMessages = [...(claim.messageData ? [claim.messageData] : []), ...(claim.heldMessages ?? [])];
     const granted: string[] = [];
     const failed: Array<{ openId: string; reason: string }> = [];
     for (const tt of targets) {
@@ -1900,6 +1900,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     if (granted.length === 0) {
       claim.restore();
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: failed[0]?.reason ?? 'unknown' }, loc) } };
+    }
+    // 授权成功后按序重放触发本次申请的原始消息和待处理期间暂存的消息，用户无需再 @ 一遍。
+    // replayGrantedMessage 内部异步执行（setImmediate）、按调用顺序串行处理，不阻塞 callback 响应。
+    // 授权此刻已生效：必须在下面任何 await 之前入队，否则发送方新来的实时消息会插到暂存消息前面、先扣额度。
+    if (deps.replayGrantedMessage) {
+      for (const replayData of replayMessages) {
+        try {
+          deps.replayGrantedMessage(replayData, larkAppId);
+        } catch (err) {
+          logger.warn(`replay granted message failed (grant still applied): ${err}`);
+        }
+      }
     }
     // 部分成功：失败 target 的 pending 已随核销一起清掉——卡马上要变终态（owner 无法再点原卡重试），
     // 留着的话 isThrottled 会挡住失败 target 后续的自助申请直到 pending 过期（已落盘，重启也清不掉）。
@@ -1964,15 +1976,6 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           }
         })
         .catch(err => logger.error(`grant post-callback background tasks failed: ${err}`));
-    }
-    // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
-    // replayGrantedMessage 内部异步执行（setImmediate），不阻塞 callback 响应。
-    if (pendingMessage && deps.replayGrantedMessage) {
-      try {
-        deps.replayGrantedMessage(pendingMessage, larkAppId);
-      } catch (err) {
-        logger.warn(`replay granted message failed (grant still applied): ${err}`);
-      }
     }
     return resultCardBody;
   }
