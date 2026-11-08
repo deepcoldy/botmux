@@ -2046,6 +2046,7 @@ async function cmdSetupScripted(
             : { forceQrLogin: true as const };
           const created = await createFeishuOpenPlatformApp({
             name: appName,
+            ...(cmd.flags.appIcon?.trim() ? { iconFilePath: resolve(cmd.flags.appIcon.trim()) } : {}),
             ...sessionOptions,
             disableBytedcliFallback: true,
             onSessionReady: ({ identity, source }) => {
@@ -2410,12 +2411,20 @@ async function cmdSetupScripted(
 }
 
 async function cmdClone(argv: string[]): Promise<void> {
-  const [sourceSelector, nameFlag, requestedName] = argv;
-  if (
-    !sourceSelector
-    || (argv.length !== 1 && (argv.length !== 3 || nameFlag !== '--name' || !requestedName?.trim()))
-  ) {
-    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>]');
+  const [sourceSelector, ...rest] = argv;
+  let requestedName: string | undefined;
+  let iconPath: string | undefined;
+  let badArgs = !sourceSelector || sourceSelector.startsWith('-');
+  for (let i = 0; i < rest.length && !badArgs; i += 2) {
+    const flag = rest[i];
+    const value = rest[i + 1];
+    if (!value?.trim()) badArgs = true;
+    else if (flag === '--name' && requestedName === undefined) requestedName = value;
+    else if (flag === '--icon' && iconPath === undefined) iconPath = value;
+    else badArgs = true;
+  }
+  if (badArgs) {
+    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>] [--icon <PNG 路径>]');
     process.exitCode = 1;
     return;
   }
@@ -2439,8 +2448,8 @@ async function cmdClone(argv: string[]): Promise<void> {
   }
   const addArgs = ['add', '--create-app', '--allowed-users', owners.join(',')];
   if (botBrand(source) === 'lark') {
-    if (requestedName) {
-      console.error('Lark SDK 创建路径暂不支持自定义应用名称。');
+    if (requestedName || iconPath) {
+      console.error('Lark SDK 创建路径暂不支持自定义应用名称或图标。');
       process.exitCode = 1;
       return;
     }
@@ -2450,6 +2459,7 @@ async function cmdClone(argv: string[]): Promise<void> {
       ? source.displayName.trim()
       : botProcessName(source, sourceIndex);
     addArgs.push('--app-name', resolveCloneAppName(requestedName, sourceName));
+    if (iconPath) addArgs.push('--app-icon', iconPath);
   }
   await cmdSetupScripted(addArgs, source);
 }
@@ -9984,6 +9994,11 @@ import {
   managedVcSendPayloadError,
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
+  validateSecretaryAction,
+  validateSecretaryRouting,
+  parseSecretaryPatrolRoot,
+  findSecretaryDuplicate,
+  SECRETARY_TURN_PREFIX,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
 import { describeScheduleState } from './services/schedule-until-done.js';
@@ -10198,7 +10213,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -12959,6 +12974,44 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     hasQuoteTargetSender: !!replyTargetSenderOpenId,
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
+  // 群秘书回合发送闸：秘书回合里每条消息都要声明动作，旁白式发送直接拒绝。
+  const secretaryGate = validateSecretaryAction({
+    turnId: currentTurnId,
+    action: argValue(rest, '--secretary-action'),
+    reason: argValue(rest, '--secretary-reason'),
+  });
+  if (!secretaryGate.ok) { console.error(secretaryGate.error); process.exit(2); }
+  if (secretaryGate.action && currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.chatId && s.larkAppId) {
+    // 复述拦截（deliver 例外：把别的 bot 的结果转交 leader 本来就要引用原文）：与群里最近的消息高度重复（把别人刚交付的结论再说一遍）→ 拒发。拉不到历史时放行。
+    try {
+      const { listChatMessages } = await import('./im/lark/client.js');
+      const { restMessageToEventData, larkEventToSecretaryMessage } = await import('./services/group-secretary-runtime.js');
+      const items = await listChatMessages(s.larkAppId, s.chatId, 30);
+      const recent = items
+        .map(item => larkEventToSecretaryMessage(restMessageToEventData(item, s.chatId!), undefined))
+        .filter((m): m is NonNullable<typeof m> => !!m && !!m.text && !m.text.startsWith('[卡片消息'))
+        .map(m => ({ id: m.messageId, text: m.text }));
+      const dup = secretaryGate.action === 'deliver' ? undefined : findSecretaryDuplicate(content, recent);
+      if (dup) {
+        console.error(`botmux send refused: 这条内容与群里最近的消息 ${dup} 高度重复——复述已有结论属于旁白，不要发。真有新信息就只写新增的部分。`);
+        process.exit(2);
+      }
+    } catch { /* 历史拉取失败：不拦 */ }
+    try {
+      const { appendFileSync, mkdirSync: mk } = await import('node:fs');
+      const dir = resolveDataDir();
+      mk(dir, { recursive: true });
+      const auditPath = join(dir, `group-secretary-actions-${s.larkAppId}.jsonl`);
+      // 审计日志只追加：超过 5 MiB 时滚成 .1（只留一份历史），不让它无限长大。
+      const { rotateLogIfNeeded } = await import('./utils/log-rotate.js');
+      rotateLogIfNeeded(auditPath, 5 * 1024 * 1024);
+      appendFileSync(auditPath, JSON.stringify({
+        at: new Date().toISOString(), chatId: s.chatId, turnId: currentTurnId,
+        action: secretaryGate.action, reason: argValue(rest, '--secretary-reason')?.slice(0, 300),
+        text: content.slice(0, 300),
+      }) + '\n');
+    } catch { /* 审计日志写失败不挡发送 */ }
+  }
 
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
 
@@ -13051,6 +13104,21 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
   }
   // ───────────────────────────────────────────────────────────────────────────
+  // 群秘书落点闸：巡查回合锁在被巡查的话题；总管回合不许在主群顶层 @ bot。
+  if (currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.larkAppId) {
+    const { botEntries: secBotEntries, crossRef: secCrossRef } = loadBotMentionIdentityMap(resolveDataDir(), s.larkAppId);
+    const routing = validateSecretaryRouting({
+      turnId: currentTurnId,
+      mentionOpenIds: mentions.map(m => m.open_id),
+      knownBotOpenIds: knownBotOpenIdsFromCrossRef(secCrossRef, secBotEntries, s.larkAppId),
+      ...(sendInto ? { sendInto } : {}),
+      ...(explicitQuote !== undefined ? { explicitQuote } : {}),
+      sendTopLevel,
+      ...(overrideChatId ? { overrideChatId } : {}),
+      ...(s.chatId ? { sessionChatId: s.chatId } : {}),
+    });
+    if (!routing.ok) { console.error(routing.error); process.exit(2); }
+  }
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
   let oncallGroupPolicy: import('./services/oncall-group-policy.js').OncallGroupPolicy | undefined;
   let oncallGroupCard: Record<string, any> | undefined;
@@ -15544,6 +15612,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const dispatchTurnId = dispatchContext?.sessionId === dispatchOrigin.sessionId
     ? dispatchContext.turnId : undefined;
   const dispatchTurn = pickTurnReplyTarget(dispatchOrigin, dispatchTurnId);
+  // 话题巡查回合只能往被巡查的那个话题里派 / 追加，不能另开话题或派到别的话题。
+  const patrolRoot = parseSecretaryPatrolRoot(dispatchTurnId);
+  if (patrolRoot && dispatchArgs.into !== patrolRoot) {
+    console.error(`botmux dispatch refused: 这是话题巡查回合，只能 --into ${patrolRoot}（被巡查的话题）。别的话题或主群的事用 botmux secretary report --escalate 交给总管。`);
+    process.exit(2);
+  }
   const dispatchSourceAppId = dispatchOrigin.larkAppId!;
   const dispatchSource = resolveSendTarget({
     topLevel: false, chatScope: (dispatchOrigin.scope ?? 'thread') === 'chat', chatId: dispatchOrigin.chatId,
@@ -20539,6 +20613,11 @@ switch (command) {
     break;
   }
   case 'clone': await cmdClone(process.argv.slice(3)); break;
+  case 'secretary': {
+    const { runSecretaryCommand } = await import('./cli/secretary-command.js');
+    process.exitCode = await runSecretaryCommand(process.argv.slice(3));
+    break;
+  }
   case 'start':   await runFleetMutationCommand('start', cmdStart); break;
   case '__watchdog': await cmdWatchdog(); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;

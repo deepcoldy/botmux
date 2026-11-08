@@ -28,6 +28,26 @@ import {
   setTeamBoardEntry,
 } from '../services/team-board-store.js';
 import { findMembershipByDelegationToken } from '../services/federation-membership-store.js';
+import { federationPeerTeamId, isTeamGroupOf } from '../services/group-secretary-federation.js';
+import { snapshotToSessionViews } from '../services/group-secretary-runtime.js';
+import { fetchSessionRecentTranscript } from '../services/group-secretary-transcript.js';
+import { fetchObserveSnapshot } from '../services/session-observe-command-fetch.js';
+import type { ObserveSnapshot } from '../services/session-observe.js';
+
+/** 某群里的「群会话」id（chatType=group），可选限定 bot。 */
+function groupSessionIds(snapshot: ObserveSnapshot, chatId: string, appId?: string): Set<string> {
+  const out = new Set<string>();
+  for (const d of snapshot.daemons) {
+    if (d.probe.status !== 'ok') continue;
+    for (const s of d.sessions) {
+      const id = s.identity;
+      if (id.chatId !== chatId || id.chatType !== 'group') continue;
+      if (appId && (id.larkAppId ?? d.larkAppId) !== appId) continue;
+      out.add(id.sessionId);
+    }
+  }
+  return out;
+}
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import {
@@ -161,6 +181,49 @@ export async function handleFederationApi(
   if (!path.startsWith('/api/federation/')) return false;
   const dataDir = deps.dataDir ?? config.session.dataDir;
   const method = req.method ?? 'GET';
+
+  // 群秘书跨机器只读接口：本机 bot 在某群的会话投影 / 某会话最近对话（已脱敏）。
+  // 鉴权：federation 团队凭证（hub→spoke 的 delegationToken 或 spoke→hub 的 syncToken）。
+  // 只服务凭证所属团队的团队群（与团队看板同一口径），别的群一律 403。
+  if (path === '/api/federation/secretary/sessions' && method === 'GET') {
+    const teamId = federationPeerTeamId(dataDir, bearerOnly(req));
+    if (!teamId) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const chatId = url.searchParams.get('chatId') ?? '';
+    if (!chatId.startsWith('oc_')) { jsonRes(res, 400, { ok: false, error: 'chat_required' }); return true; }
+    if (!isTeamGroupOf(dataDir, teamId, chatId)) { jsonRes(res, 403, { ok: false, error: 'not_team_group' }); return true; }
+    try {
+      const snapshot = await fetchObserveSnapshot();
+      const groupIds = groupSessionIds(snapshot, chatId);
+      const views = snapshotToSessionViews(snapshot);
+      const now = Date.now();
+      // 只给群会话（私聊会话一律不出）；且只给调用方指定的这一个群。
+      const sessions = views.filter(v => v.chatId === chatId && groupIds.has(v.sessionId)
+        && (v.liveness === 'alive' || (v.lastActivityAt !== undefined && now - v.lastActivityAt < 24 * 3_600_000)));
+      jsonRes(res, 200, { ok: true, deploymentId: getDeploymentIdentity(dataDir).deploymentId, sessions });
+    } catch {
+      jsonRes(res, 503, { ok: false, error: 'observe_unavailable' });
+    }
+    return true;
+  }
+  if (path === '/api/federation/secretary/transcript' && method === 'GET') {
+    const teamId = federationPeerTeamId(dataDir, bearerOnly(req));
+    if (!teamId) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const appId = url.searchParams.get('appId') ?? '';
+    const sessionId = url.searchParams.get('sessionId') ?? '';
+    const chatId = url.searchParams.get('chatId') ?? '';
+    if (!appId || !sessionId || !chatId.startsWith('oc_')) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
+    if (!isTeamGroupOf(dataDir, teamId, chatId)) { jsonRes(res, 403, { ok: false, error: 'not_team_group' }); return true; }
+    // 只对「该群里的群会话」给对话片段：私聊 / 别的群的会话一律 404，不暴露是否存在。
+    let allowed = false;
+    try {
+      const snapshot = await fetchObserveSnapshot();
+      allowed = groupSessionIds(snapshot, chatId, appId).has(sessionId);
+    } catch { allowed = false; }
+    if (!allowed) { jsonRes(res, 404, { ok: false, error: 'not_found' }); return true; }
+    const lines = await fetchSessionRecentTranscript(appId, sessionId);
+    jsonRes(res, 200, { ok: true, lines: lines ?? [] });
+    return true;
+  }
 
   // Spoke registers via an invite → issued a syncToken bound to the team.
   if (path === '/api/federation/join' && method === 'POST') {
