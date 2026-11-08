@@ -36,6 +36,7 @@
  * every CLI adapter and both PTY / Tmux backends.
  */
 import { getBot } from '../bot-registry.js';
+import { botConfigUsesAutoWorktree } from '../core/working-dir-range.js';
 import { config } from '../config.js';
 import { resolvePairedSpawnBackendType } from '../core/persistent-backend.js';
 import { botInjectedEnv } from '../core/env-policy.js';
@@ -170,8 +171,7 @@ export interface MaybeCreateWorktreeCtx {
  */
 export function botAutoWorktreeEnabled(larkAppId: string): boolean {
   try {
-    const cfg = getBot(larkAppId).config;
-    return cfg.defaultWorkingDirAutoWorktree === true && !!cfg.defaultWorkingDir;
+    return botConfigUsesAutoWorktree(getBot(larkAppId).config);
   } catch {
     return false;
   }

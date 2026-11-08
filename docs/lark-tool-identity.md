@@ -62,6 +62,8 @@ botmux auth request --scope "docx:document:readonly" --json
 botmux auth wait --request-id <返回的请求ID> --json
 ```
 
+授权链接（设备码、OAuth 授权页）只发给发起人本人：谁打开谁确认，身份就授给谁。所以在群聊（含话题群）里，`/login` 的授权链接、`botmux auth request` 生成的链接都由 botmux 私聊发给本轮发起人，群里只回一句「已私聊你授权链接」，`auth request` 的结果里也不含 `authUrl`（返回 `delivery: "dm"`）；私聊发不出去时提示对方先私聊机器人发 `/login`，链接不会出现在群里。群聊里命令被拒时，拒绝文案也不再附设备码链接，而是提示发 `/login`。只有和发起人的单聊会直接回复链接。
+
 bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不会自动重放业务命令；写入超时或部分成功时，应先确认结果，避免重复创建或发送。
 
 ## 范围与生命周期

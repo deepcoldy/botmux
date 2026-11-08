@@ -17,7 +17,9 @@ import { short, truncate, escapeMd } from './v3-card-common.js';
 export const V3_GATE_APPROVE_ACTION = 'v3_gate_approve';
 export const V3_GATE_REJECT_ACTION = 'v3_gate_reject';
 
-export type V3GateResolutionKind = 'approved' | 'rejected';
+/** `voided` = a runtime flow revision changed the node before anyone decided
+ *  (design §13.4); the gate is asked again under the new definition. */
+export type V3GateResolutionKind = 'approved' | 'rejected' | 'voided';
 
 /** card 按钮回传的 value 形态——v3-gate-card-handler 据此解析。 */
 export interface V3GateActionValue {
@@ -76,7 +78,9 @@ export function buildV3GateCard(input: V3GateCardInput): string {
   const title = resolution
     ? `${resolutionPrefix(resolution.kind)}：${titleText(input.nodeId)}`
     : `需要审批：${titleText(input.nodeId)}`;
-  const template = resolution ? (resolution.kind === 'approved' ? 'green' : 'red') : 'blue';
+  const template = resolution
+    ? (resolution.kind === 'approved' ? 'green' : resolution.kind === 'voided' ? 'grey' : 'red')
+    : 'blue';
 
   const elements: Array<Record<string, unknown>> = [
     {
@@ -130,7 +134,9 @@ export function buildV3GateCard(input: V3GateCardInput): string {
       text: {
         tag: 'plain_text',
         content:
-          (resolution.kind === 'approved' ? '✅ 已通过' : '❌ 已拒绝') +
+          (resolution.kind === 'approved' ? '✅ 已通过'
+            : resolution.kind === 'voided' ? '⏹️ 流程已修改，本次审批作废'
+            : '❌ 已拒绝') +
           (resolution.selected ? ` · ${short(resolution.selected, 20)}` : '') +
           (resolution.by ? ` · by ${short(resolution.by, 20)}` : ''),
       },
@@ -201,7 +207,7 @@ function optionButton(
 }
 
 function resolutionPrefix(kind: V3GateResolutionKind): string {
-  return kind === 'approved' ? '已通过' : '已拒绝';
+  return kind === 'approved' ? '已通过' : kind === 'voided' ? '已作废' : '已拒绝';
 }
 
 function titleText(nodeId: string): string {

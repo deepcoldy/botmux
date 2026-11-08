@@ -61,6 +61,8 @@ const LEGACY_ROUTES: ReadonlyArray<readonly [string, string]> = [
   ['POST', '/api/session-group-tag-auth'],
   ['GET', '/api/session-group-tag-status'],
   ['PUT', '/api/session-group-tag-config'],
+  ['PUT', '/api/session-group-naming-config'],
+  ['GET', '/api/session-group-naming-config'],
   ['PUT', '/api/bot-env-policy'],
   ['PUT', '/api/bot-codex-auth-sync'],
   ['PUT', '/api/bot-trigger-user-auth'],

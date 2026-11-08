@@ -164,7 +164,12 @@ describe('daemon session-scoped IPC route wiring', () => {
     expect(askBindAt).toBeGreaterThan(blockEnd(ask, authAt));
     const inputAt = ask.indexOf('const askInput = createAskInput(boundAsk, {');
     expect(inputAt).toBeGreaterThan(askBindAt);
-    expect(ask.indexOf('registerAskForResponse(askInput')).toBeGreaterThan(inputAt);
+    const askExtra = ask.slice(inputAt, blockEnd(ask, inputAt) + 1);
+    // Identity comes only from the bound first argument: the overlay must not reintroduce
+    // caller-supplied ids (createAskInput's extra type also rejects these keys at compile time).
+    expect(askExtra).not.toMatch(/\bparsed\./);
+    expect(askExtra).not.toMatch(/\b(larkAppId|chatId|sessionId|rootMessageId|originKind)\s*:/);
+    expect(ask.search(/registerAskForResponse\((\{ \.\.\.)?askInput\b/)).toBeGreaterThan(inputAt);
 
     const hook = route('/api/hooks/emit');
     const hookBindAt = hook.indexOf('boundPayload = bindSessionScopedIpcIdentity(');

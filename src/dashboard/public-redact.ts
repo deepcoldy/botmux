@@ -232,7 +232,7 @@ type SessionFieldFilter = (key: string) => boolean;
 /** Anonymous rule: named blacklist PLUS a `preview*` prefix sweep, so a future
  *  preview-prefixed field is private by default (fail-closed). */
 const isPrivateForAnonymous: SessionFieldFilter = key =>
-  PRIVATE_SESSION_FIELDS.has(key) || key.startsWith('preview');
+  key === 'modelPin' || PRIVATE_SESSION_FIELDS.has(key) || key.startsWith('preview');
 
 const isPrivateForWorkbench: SessionFieldFilter = key =>
   WORKBENCH_PRIVATE_SESSION_FIELDS.has(key);
@@ -249,7 +249,14 @@ function omitSessionFields(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (!isPrivate(key)) out[key] = value;
+    if (isPrivate(key)) continue;
+    // lastTurn.summary 是最终回复的正文第一行，等同 preview；结果和时间本身可以公开。
+    if (key === 'lastTurn' && isPrivate === isPrivateForAnonymous && value && typeof value === 'object') {
+      const { summary: _summary, ...turn } = value as Record<string, unknown>;
+      out[key] = turn;
+      continue;
+    }
+    out[key] = value;
   }
   return out;
 }

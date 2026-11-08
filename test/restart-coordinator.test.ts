@@ -21,6 +21,24 @@ describe('RestartCoordinator', () => {
     await flush();
     expect(first.mock.calls.map(call => call[0])).toEqual(['in_progress', 'succeeded']);
     expect(second.mock.calls.map(call => call[0])).toEqual(['in_progress', 'succeeded']);
+    // A joined observer is told which physical attempt it joined, so both can
+    // share one visible status instead of each posting their own.
+    expect([...first.mock.calls, ...second.mock.calls].map(call => call[1])).toEqual(['a1', 'a1', 'a1', 'a1']);
+  });
+
+  it('tells every observer when an attempt is cancelled without a result', async () => {
+    const coordinator = new RestartCoordinator({ createAttemptId: () => 'a6' });
+    const first = vi.fn();
+    const second = vi.fn();
+    coordinator.request('s', { source: 'slash', notify: first }, vi.fn());
+    coordinator.request('s', { source: 'card', notify: second }, vi.fn());
+
+    expect(coordinator.cancelSession('s')).toBe(true);
+    expect(coordinator.cancelSession('s')).toBe(false);
+    expect(coordinator.resolve('s', 'a6', 'succeeded')).toBe(false);
+    await flush();
+    expect(first.mock.calls).toEqual([['in_progress', 'a6'], ['cancelled', 'a6']]);
+    expect(second.mock.calls).toEqual([['in_progress', 'a6'], ['cancelled', 'a6']]);
   });
 
   it('starts physical restart without waiting for a stuck progress notification', () => {

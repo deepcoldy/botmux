@@ -5,7 +5,7 @@ export type AskQuestionParseError =
   | 'bad_options' | 'bad_option_shape' | 'bad_option_key' | 'bad_option_label'
   | 'bad_option_description'
   | 'duplicate_option_key' | 'bad_questions' | 'bad_question_shape'
-  | 'bad_multiSelect' | 'bad_defaultSelectedKeys' | 'bad_inputMode' | 'bad_input';
+  | 'bad_allowCustom' | 'bad_multiSelect' | 'bad_defaultSelectedKeys' | 'bad_inputMode' | 'bad_input';
 
 /** 选项说明长度上限（卡片渲染还会再截到 400 字，这里只给 IPC 兜底）。 */
 const MAX_OPTION_DESCRIPTION = 1000;
@@ -38,6 +38,7 @@ export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: 
     if (typeof qq.prompt !== 'string' || !qq.prompt.trim()) return 'bad_question_shape';
     if (typeof qq.multiSelect !== 'boolean') return 'bad_multiSelect';
     if (qq.inputMode !== undefined && qq.inputMode !== 'text') return 'bad_inputMode';
+    if (qq.allowCustom !== undefined && typeof qq.allowCustom !== 'boolean') return 'bad_allowCustom';
     const input = qq.input === undefined ? undefined : parseInputField(qq.input);
     if (typeof input === 'string') return input;
     if (input && (qq.inputMode !== undefined || qq.multiSelect || qq.defaultSelectedKeys !== undefined)) return 'bad_input';
@@ -61,6 +62,7 @@ export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: 
     result.push({ prompt: qq.prompt, multiSelect: qq.multiSelect, options: opts,
       ...(qq.inputMode === 'text' ? { inputMode: 'text' as const } : {}),
       ...(input ? { input } : {}),
+      ...(qq.allowCustom !== undefined ? { allowCustom: qq.allowCustom as boolean } : {}),
       ...(defaults !== undefined ? { defaultSelectedKeys: [...defaults as string[]] } : {}),
     });
   }

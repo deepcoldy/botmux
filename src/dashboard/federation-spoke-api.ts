@@ -237,7 +237,7 @@ export async function syncAllMemberships(
           // Mirror this team's 拉群 groups onto THIS (member) deployment so its
           // auth gate sees the same trust boundary as the hub — a teammate bot
           // talking in one of these groups is then learned + trusted locally
-          // (see [[team-bots-store]] / isTeamGroupChat). Recorded regardless of
+          // (see [[team-bots-store]] / isLegacyTeamGroupChat). Recorded regardless of
           // sessionsProvider; the session-report below is the separate concern.
           for (const cid of groupChatIds) recordTeamGroup(dataDir, m.teamId, String(cid));
           if (groupChatIds.length && sessionsProvider) {

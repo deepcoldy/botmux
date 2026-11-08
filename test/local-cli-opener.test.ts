@@ -77,8 +77,8 @@ describe('local-cli-opener', () => {
   it('resume mode supports every adapter with a portable local resume command', () => {
     for (const cliId of LOCAL_CLI_IDS) {
       const result = buildLocalCliOpenCommand(ds({
-        // Kimi only resumes its own session_<uuid> ids.
-        session: { ...ds().session, cliId, cliSessionId: cliId === 'kimi' ? 'session_nativeid' : 'ses_nativeid' },
+        // Kimi only resumes its own session_<uuid> ids; Doubao only its numeric ids.
+        session: { ...ds().session, cliId, cliSessionId: cliId === 'kimi' ? 'session_nativeid' : cliId === 'doubao' ? '38450922917357570' : 'ses_nativeid' },
       }), {
         mode: 'resume',
         adapterFactory: (id) => id === 'oh-my-pi'
@@ -342,7 +342,7 @@ describe('local-cli-opener', () => {
       }), { mode: 'attach' });
       expect(result.ok).toBe(true);
       if (result.ok) {
-        expect(result.command).toContain("__zmx-attach-managed 'bmx-owned' 'abcdef123456' '/tmp/owner'\\''s zmx'");
+        expect(result.command).toContain("'__zmx-attach-managed' 'bmx-owned' 'abcdef123456' '/tmp/owner'\\''s zmx'");
         expect(result.command).not.toContain('/tmp/caller');
       }
     } finally { vi.unstubAllEnvs(); }
@@ -370,13 +370,39 @@ describe('local-cli-opener', () => {
       expect(result.command).toContain('unset ZMX_SESSION ZMX_SESSION_PREFIX');
       expect(result.command).toContain("export ZMX_DIR='/tmp/zmx socket'");
       expect(result.command).toContain('/dist/cli.js');
-      expect(result.command).toContain("__zmx-attach-managed 'managed-zmx-target' 'abcdef123456'");
+      expect(result.command).toContain("'__zmx-attach-managed' 'managed-zmx-target' 'abcdef123456'");
       expect(result.command).not.toContain('bmx-abcdef12');
       expect(result.command).not.toContain('grep ');
       expect(result.command).not.toContain('exec zmx attach');
     }
     expect(adapterFactory).not.toHaveBeenCalled();
     vi.unstubAllEnvs();
+  });
+
+  it('compiled binary attaches ZMX with the subcommand first, never a script path', () => {
+    // A single-file binary IS the CLI: `<binary> <cli.js> __zmx-attach-managed …`
+    // prints help and exits 0, so the terminal reported success without attaching.
+    const realArgv1 = process.argv[1];
+    process.argv[1] = '/$bunfs/root/cli.js';
+    try {
+      const result = buildLocalCliOpenCommand(ds({
+        session: {
+          ...ds().session,
+          sessionId: 'abcdef123456',
+          backendType: 'zmx',
+          persistentBackendTarget: { backendType: 'zmx', sessionName: 'managed-zmx-target', socketDir: '/tmp/zmx' },
+        },
+      }), { mode: 'attach' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.command.split('; exec ')[1])
+          .toBe(`${shellQuote(process.execPath)} '__zmx-attach-managed' 'managed-zmx-target' 'abcdef123456' '/tmp/zmx'`);
+        expect(result.command).not.toContain('cli.js');
+        expect(result.command).not.toContain('$bunfs');
+      }
+    } finally {
+      process.argv[1] = realArgv1;
+    }
   });
 
   it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {

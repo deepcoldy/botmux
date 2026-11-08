@@ -1,10 +1,15 @@
 import { z } from 'zod';
 
-import { computeNextRun, normalizeTopicTitle, parseSchedule } from '../../core/scheduler.js';
+import {
+  authoritativeCreateFor,
+  computeNextRun,
+  getRuntimeTask,
+  normalizeTopicTitle,
+  parseSchedule,
+} from '../../core/scheduler.js';
 import {
   canonicalScheduleInput,
   createTask,
-  getTask,
   IdempotencyConflictError,
 } from '../../services/schedule-store.js';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
@@ -117,12 +122,14 @@ export function parseScheduleInput(input: unknown): ScheduleInput {
 /**
  * `botmux-schedule` hostExecutor.  Calls `schedule-store.createTask`
  * passing the runtime-derived `idempotencyKey` as the deterministic
- * task id; schedule-store applies create-or-return-identical semantics
- * (Step 5).
+ * task id; create-or-return-identical semantics come from the host
+ * authority where the daemon has enrolled the bot, else from the store
+ * (Step 5).  Not `scheduler.addTask`: it normalizes scope/position, and
+ * the stored row must keep the frozen input's canonical hash.
  *
  * Provider TTL is effectively infinite for schedule (the task entry
  * lives until removed), so dangling effectAttempted reconcile uses
- * readOnlyLookup (`getTask(idempotencyKey)`) — no TTL boundary.
+ * readOnlyLookup (`getRuntimeTask(idempotencyKey)`) — no TTL boundary.
  */
 export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, ScheduleOutput> = {
   provider: 'botmux-schedule',
@@ -218,11 +225,12 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       }),
       larkAppId: input.larkAppId,
       ownerOpenId: input.ownerOpenId,
+      nextRunAt: computeNextRun(input.parsed) ?? undefined,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,
       silent: input.silent,
       followActive: input.followActive === true ? true : undefined,
-    });
+    }, authoritativeCreateFor(input.larkAppId));
     return {
       output: { taskId: task.id },
       externalRefs: { taskId: task.id },
@@ -250,8 +258,9 @@ export const botmuxScheduleReconciler: ProviderReconciler = {
   },
 
   async readOnlyLookup(idempotencyKey, input) {
-    // Per-bot stores: address the OWNING bot's file from the frozen input's
-    // larkAppId (same routing createTask used) — a zero-arg getTask would
+    // Address the OWNING bot from the frozen input's larkAppId (same routing
+    // createTask used): its authority row once enrolled, else its per-bot
+    // file — a zero-arg lookup would
     // depend on a process-global scope that non-daemon v3 runs (cli-run /
     // goal-cli resume & reconciliation) never bind. A malformed input falls
     // through to the existing validation path below instead of failing here.
@@ -259,7 +268,7 @@ export const botmuxScheduleReconciler: ProviderReconciler = {
     if (input !== undefined) {
       try { inputAppId = parseScheduleInput(input).larkAppId; } catch { /* validated below */ }
     }
-    const task = getTask(idempotencyKey, inputAppId);
+    const task = getRuntimeTask(idempotencyKey, inputAppId);
     if (!task) {
       return {
         found: false,

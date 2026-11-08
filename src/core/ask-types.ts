@@ -40,6 +40,8 @@ export interface AskInputField {
 export interface AskQuestion {
   /** Opt-in Card 2.0 form input; legacy inputMode=text remains a chat reply. */
   input?: AskInputField;
+  /** Disable free-form answers for constrained/native permission choices. */
+  allowCustom?: boolean;
   /** Native text-only questions use the existing conversation text-reply path.
    * They have no options and cannot be settled by an empty button submit. */
   inputMode?: 'text';
@@ -73,6 +75,8 @@ export type AskResult =
       answers: ReadonlyArray<ReadonlyArray<string>>;
       /** Form-only values, aligned with questions; choice/empty input slots are null. */
       inputs?: ReadonlyArray<string | null>;
+      /** Per-question free text; replaces only that question's selected keys. */
+      customAnswers?: ReadonlyArray<string | null>;
       by: string;
       /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
       comment: string | null;
@@ -110,6 +114,7 @@ export interface AskJsonOutput {
   /** v0.1.8 新增：按问题分组的完整答案，answered 时非 null。 */
   answers: string[][] | null;
   inputs?: Array<string | null> | null;
+  customAnswers?: ReadonlyArray<string | null>;
   by: string | null;
   /** 自定义回复原文；按钮选择 / 超时 / 失效时为 null。 */
   comment: string | null;
@@ -133,6 +138,8 @@ export interface CreateAskInput {
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
   rootMessageId: string | null;
+  /** chat-scope 下发起 turn 冻结的话题根，只决定卡片发到哪；不属于 ask 身份，也不落盘。 */
+  cardRootMessageId?: string;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
   /** Per-invocation identity: the hook generates this once and reuses it across
@@ -190,6 +197,7 @@ export interface PendingAsk {
   larkAppId: string;
   chatId: string;
   rootMessageId: string | null;
+  cardRootMessageId?: string;
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
   chatType?: 'group' | 'p2p';
@@ -201,6 +209,9 @@ export interface PendingAsk {
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */
   selections?: ReadonlyArray<ReadonlyArray<string>>;
+  /** Form drafts and optimistic version survive resumable Ask restarts. */
+  customAnswers?: ReadonlyArray<string | null>;
+  customRevision?: number;
   createdAt: number;
   deadlineAt: number;
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
@@ -239,6 +250,8 @@ export type AskClickOutcome =
   | 'already_settled'
   /** 多选累积：用户勾选/取消某项，尚未 submit——不触发 settle。 */
   | 'toggled'
+  | 'draft_conflict'
+  | 'invalid_custom'
   /** 空提交二次确认：鉴权 + nonce 校验都通过，但当前一个选项都没勾、且每个问题
    *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
    *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */

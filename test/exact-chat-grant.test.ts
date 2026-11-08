@@ -283,6 +283,22 @@ describe('exact chat grant service', () => {
     expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
   });
 
+  it('resolve by stable app id: returns the open_id the receiver sees, writes nothing; revoke by app id stays refused', async () => {
+    const result = await applyExactChatGrantByLarkAppIds({
+      operation: 'resolve',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+    }, fixture.deps);
+    expect(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).toHaveBeenCalledWith('cli_receiver', 'oc_chat', ['cli_pm']);
+    expect(result).toMatchObject({ ok: true, operation: 'resolve', grantsTalk: false, subjects: [], subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_peer_a' }] });
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+    expect(fixture.deps.removeChatGrant).not.toHaveBeenCalled();
+    expect(await applyExactChatGrantByLarkAppIds({
+      operation: 'revoke', receiverLarkAppId: 'cli_receiver', chatId: 'oc_chat', subjectLarkAppIds: ['cli_pm'],
+    }, fixture.deps)).toMatchObject({ ok: false, error: 'subject_lark_app_ids_grant_only' });
+  });
+
   it('allows stable app ids only for grants and validates them before resolution', async () => {
     expect(await applyExactChatGrantByLarkAppIds({
       operation: 'readback',

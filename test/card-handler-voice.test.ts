@@ -264,7 +264,8 @@ describe('card-handler retry_last_task', () => {
     // durable Codex App dispatcher assigns a fresh synthetic identity so this
     // retry has its own ledger ownership and final attribution.
     expect(send.mock.calls[0][0].codexAppInput.clientUserMessageId)
-      .toMatch(/^codex-app-dispatch-/);
+      .toBe(ds.lastCliInputTurnId);
+    expect(ds.lastCliInputTurnId).toEqual(expect.any(String));
     expect(send.mock.calls[0][0].codexAppInput.clientUserMessageId).not.toBe('om_original');
     expect(send.mock.calls[0][0].codexAppDispatchId).toEqual(expect.any(String));
   });

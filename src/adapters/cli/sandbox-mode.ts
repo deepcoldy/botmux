@@ -37,6 +37,36 @@ export function frozenSessionSandboxMode(raw: unknown): SandboxMode {
   try { return normalizeSandboxMode(raw); } catch { return 'off'; }
 }
 
+/**
+ * Sandbox mode the session card should show. The frozen session decision is
+ * not the whole truth: the worker also honours the machine-wide BOTMUX_SANDBOX
+ * force (never materialised into the session), so a session frozen "off" on a
+ * forced daemon still runs inside a sandbox and must not render as unsandboxed.
+ * The latest worker spawn report (`engaged`, e.g. a remote backend bypasses
+ * it) is treated as the strongest signal, but it describes the spawn that
+ * reported it, not the live pane at render time: between worker generations
+ * (before the new generation reports) the previous generation's value lingers,
+ * and a persistent pane that warm-reconnects may keep a different profile
+ * than a fresh spawn would resolve. Undefined until the first report of this
+ * daemon process — then the env/frozen inference stands. Display only — never
+ * feeds a spawn decision. A typo'd env value (which makes the worker refuse
+ * to start) falls back to the frozen mode.
+ */
+export function sessionCardSandboxMode(
+  frozen: unknown,
+  engaged?: boolean,
+  envValue: string | undefined = process.env.BOTMUX_SANDBOX,
+): SandboxMode {
+  if (engaged === false) return 'off';
+  const recorded = frozenSessionSandboxMode(frozen);
+  let forced: SandboxMode = 'off';
+  try { forced = envSandboxMode(envValue); } catch { /* worker refuses to start; show what was frozen */ }
+  if (forced !== 'off') return forced;
+  if (recorded !== 'off') return recorded;
+  // Engaged without a frozen or env mode: legacy readIsolation applied at spawn.
+  return engaged === true ? 'oncall' : 'off';
+}
+
 /** The mode a NEW session of this bot would freeze right now — the same rule
  *  as `freezeSessionSandboxDecision` (legacy readIsolation implies oncall). */
 export function botConfigSandboxMode(botCfg: { sandbox?: unknown; readIsolation?: boolean }): SandboxMode {

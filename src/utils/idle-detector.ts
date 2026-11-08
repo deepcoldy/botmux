@@ -191,7 +191,12 @@ export class IdleDetector {
       this.markIdle('program-status');
       return true;
     }
-    if (this.isIdle || (this.readySeen && !recheckExisting)) return false;
+    if (!recheckExisting && (this.isIdle || this.readySeen)) return false;
+    // A startup fence may have declined an earlier idle callback. A freshly
+    // verified viewport must be able to re-publish that edge, as the OSC path
+    // above already does. Re-run every quiescence guard instead of treating
+    // the detector's old idle bit as proof that the Worker accepted readiness.
+    this.isIdle = false;
     this.readySeen = true;
     // Viewport-verified seeding (recheckExisting) has already passed the
     // adapter's rendered composer predicate; it is never weak evidence.
