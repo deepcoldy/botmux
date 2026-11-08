@@ -32351,10 +32351,12 @@ body:has(.workbench-route-host) { min-width: 0; }
 .kanban-card[data-signal="idle"]::before { background: var(--st-idle); }
 .kanban-card[data-signal="closed"]::before { background: var(--border-strong); }
 
+/* 卡片 overflow:hidden：标签放不下时必须换行，否则 margin-left:auto 的「⋯」会被推到卡片外点不到。 */
 .kanban-card-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 4px 6px;
   min-width: 0;
 }
 
