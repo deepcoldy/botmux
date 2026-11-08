@@ -1262,6 +1262,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output — you MUST reply via `botmux send`.',
+  'ai.routing.no_local_addresses': 'Users read replies in their own Lark client and cannot access files or services on the development host. All replies, progress, collaboration notes and cards must omit host absolute paths, file URIs and local service addresses. Name skills without local links, cite source files relative to the repository, and deliver files as attachments or real accessible URLs. If no URL exists, describe the delivery status; never invent one.',
+  'card.local_address.internal_file': '[internal file]',
+  'card.local_address.unavailable_link': ' (no accessible link provided)',
+  'worker.final_output_local_address_rejected': 'The result card contains a local jump target that users cannot access. The full result was not sent; identical retries have stopped.',
   'ai.routing.usage_send': '- Send: `botmux send "message"`',
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
   'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos`; for size/layout choices run `botmux skill show botmux-send`',
@@ -1356,6 +1360,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark conversation via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
   'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
   'ai.followup.feishu_safe_emphasis': 'Prefer plain text for short progress updates. If emphasis is needed, wrap only a short phrase without CJK punctuation; keep punctuation and following prose outside `**`.',
+  'ai.followup.no_local_addresses': 'Keep host paths, file URIs and local service addresses out of replies; deliver files as attachments or accessible URLs.',
   // No-transport follow-up (apiOnly bot / HTTP virtual session): a program-driven
   // request/response turn with no Lark conversation, no sibling bots, and no
   // `botmux send`. The nothing-to-send sentinel appears exactly once, in this

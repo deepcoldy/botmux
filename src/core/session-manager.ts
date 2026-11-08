@@ -26,7 +26,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -1873,7 +1873,7 @@ function buildFollowUpBlocks(
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
   const formattingBlock = opts?.cliId !== 'mira' && !noTransport
-    ? `<botmux_formatting>${t('ai.followup.feishu_safe_emphasis', undefined, opts?.locale)}</botmux_formatting>`
+    ? `<botmux_formatting>${feishuReplyPresentationGuidance(opts?.locale)}</botmux_formatting>`
     : '';
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
@@ -1977,7 +1977,7 @@ export function buildFollowUpContent(
   ) {
     const formattingGuidance = sessionIsNoTransport(opts.larkAppId, opts.chatId) || opts.cliId === 'mira'
       ? undefined
-      : t('ai.followup.feishu_safe_emphasis', undefined, opts.locale);
+      : feishuReplyPresentationGuidance(opts.locale);
     return buildServiceUserPrompt(
       [opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'),
       formattingGuidance,
@@ -2183,7 +2183,7 @@ export function buildFollowUpCliInput(
   const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const formattingBlock = sessionIsNoTransport(opts.larkAppId, opts.chatId)
     ? ''
-    : `<botmux_formatting>${t('ai.followup.feishu_safe_emphasis', undefined, opts.locale)}</botmux_formatting>`;
+    : `<botmux_formatting>${feishuReplyPresentationGuidance(opts.locale)}</botmux_formatting>`;
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
