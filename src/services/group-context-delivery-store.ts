@@ -383,7 +383,7 @@ function normalizePrepared(value: unknown): PreparedGroupContext {
       throw new Error('Invalid prepared group context attachments');
     }
     attachments = input.attachments.map(attachment => {
-      if (!attachment || !['image', 'file'].includes(attachment.type)
+      if (!attachment || !['image', 'file', 'video'].includes(attachment.type)
         || !validIdentity(attachment.path) || typeof attachment.name !== 'string'
         || (attachment.resourceKey !== undefined && typeof attachment.resourceKey !== 'string')
         || (attachment.mimeType !== undefined && typeof attachment.mimeType !== 'string')) {

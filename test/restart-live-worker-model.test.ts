@@ -39,6 +39,9 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => ({
 
 import {
   latestModelForRespawn,
+  latestPinEffortForRespawn,
+  __testOnly_sessionAgentConfig,
+  writeSessionModelPin,
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
@@ -182,5 +185,52 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
     // bot hot-switches CLI (`/botconfig set cli` — no mismatch sweep)
     const switched = { cliId: 'claude-code' as const, model: 'opus' };
     expect(resolveSessionLaunchModel(ds, switched)).toBe('B');
+  });
+});
+
+
+describe('topic pin across launch channels', () => {
+  const pin = { model: 'gpt-6.1-terra', effort: 'high' as const, source: 'topic-header' as const, setBy: 'owner', setAt: '2026-11-06T00:00:00.000Z' };
+  it.each(['slash', 'dashboard', 'cwd_move', 'cli_crash'] as const)('%s respawn carries pinned launch model AND effort', source => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'low' } });
+    const { ds, send } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    const result = requestSessionRestart(ds, { source, notify: async () => {} });
+    expect(result?.joined).toBe(false);
+    expect(send.mock.calls[0][0]).toMatchObject({ model: pin.model, reasoningEffort: pin.effort });
+    expect(ds.session.model).toBe(pin.model); expect(ds.session.modelPin).toEqual(pin);
+  });
+  it('cold restore/refork and message wake after crash park resolve the same choice', () => {
+    const cfg = { cliId: 'codex' as const, model: 'gpt-6.1-sol', reasoningEffort: 'low' as const };
+    getBotMock.mockReturnValue({ config: cfg });
+    const { ds } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    const cold = __testOnly_sessionAgentConfig(ds, cfg);
+    expect(cold).toMatchObject({ model: pin.model, reasoningEffort: pin.effort });
+    expect({ model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) }).toMatchObject({ model: cold.model, reasoningEffort: cold.reasoningEffort });
+  });
+  it('clear refreshes the worker effort snapshot too; never-pinned sessions keep their wire payload', () => {
+    const cfg = { cliId: 'codex' as const, model: 'gpt-6.1-sol', reasoningEffort: 'low' as const };
+    getBotMock.mockReturnValue({ config: cfg });
+    const { ds } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    writeSessionModelPin(ds, undefined);
+    expect(latestModelForRespawn(ds)).toBe(cfg.model);
+    expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'low' });
+    const { ds: old } = makeDs({ reasoningEffort: 'high' }); expect(latestPinEffortForRespawn(old)).toEqual({});
+  });
+  it('rejects mismatched CLI, unsupported effort and in-flight restart before changing durable intent', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'claude-code', model: 'opus' } });
+    const { ds } = makeDs({ modelPin: pin });
+    expect(() => writeSessionModelPin(ds, { ...pin, source: 'command' })).toThrow();
+    expect(ds.session.modelPin).toEqual(pin); expect(updateSessionMock).not.toHaveBeenCalled();
+    getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
+    expect(() => writeSessionModelPin(ds, { ...pin, model: 'gpt-5.2', effort: 'ultra' })).toThrow();
+    requestSessionRestart(ds, observer()); updateSessionMock.mockClear();
+    expect(() => writeSessionModelPin(ds, undefined)).toThrow(); expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+  it('does not publish a successful mutation if persistence fails', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
+    const { ds } = makeDs({ modelPin: pin });
+    updateSessionMock.mockImplementationOnce(() => { throw new Error('disk'); });
+    expect(() => writeSessionModelPin(ds, undefined)).toThrow('disk'); expect(ds.session.modelPin).toEqual(pin);
+    expect(ds.modelPinCleared).toBeUndefined();
   });
 });

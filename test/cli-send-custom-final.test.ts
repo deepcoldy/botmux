@@ -201,7 +201,12 @@ describe('custom schema-2 final uses the canonical reply lifecycle', () => {
       expect(sent.body.elements).toContainEqual({ tag: 'markdown', text_size: 'heading-2', content: 'Summary' });
       expect(requests[0].body.content).not.toContain('botmux_md_h');
     } finally { rmSync(root, { recursive: true, force: true }); }
-  }, 30_000);
+    // 这一行串行 spawn 10 个 CLI 子进程（9 个拒收 + 1 个 diff 正例），单次
+    // spawn 自带 30s 上限负责抓真正挂死；这一行显式放宽到根级 testTimeout
+    // 的 60s（unit 项目自身的 testTimeout 是 30s）：满载 runner 上单个子
+    // 进程启动要 2–4s，30s 行预算曾在 CI 上被正常排队击穿（整文件 ~195s），
+    // 那是超时预算过紧而非产品回归。
+  }, 60_000);
 
   it('rejects a valid completion proposal at the custom-card mutual exclusion gate', () => {
     const { root, run } = setup();

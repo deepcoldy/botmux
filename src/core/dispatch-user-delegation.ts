@@ -67,12 +67,47 @@ const payloadV2Schema = z.object({
   ...payloadBase,
   authority: authorityV2Schema,
 }).strict();
-const payloadSchema = z.discriminatedUnion('domain', [payloadV1Schema, payloadV2Schema]);
+/**
+ * A workflow handoff's delegation (design 2026-11-03 §10.2, D5): signed by the
+ * main bot's daemon for ONE attempt of ONE node of a run, from the identity
+ * frozen at the run's authorization — never inherited from a node's report.
+ * It names exactly one target bot, the run's chat, the node topic (`rootId`)
+ * and, once sent, the handoff message. Same key, store and pending → bind
+ * steps as a dispatch; only the source differs, hence its own domain.
+ */
+export const DISPATCH_USER_WORKFLOW_DOMAIN = 'botmux.dispatch-user.workflow.v1' as const;
+const workflowRefSchema = z.object({
+  runId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  nodeId: z.string().min(1).max(256),
+  instanceId: z.string().min(1).max(256).optional(),
+  attemptId: z.string().min(1).max(256),
+  /** Flow revision the attempt was dispatched under (design §13.3). */
+  revision: z.number().int().positive(),
+  /** The handoff's binding nonce (core/workflow-handoff-binding). */
+  nonce: z.string().regex(/^wfh_[A-Za-z0-9_-]{24}$/),
+  /** Absent: signed by the main bot for its handoff. n ≥ 1: passed on n
+   *  hops by node bots (`botmux dispatch` / `send --mention` from the node
+   *  session), still tied to the same attempt and narrowed at every hop. */
+  hop: z.number().int().min(1).max(16).optional(),
+}).strict();
+const payloadWorkflowSchema = z.object({
+  domain: z.literal(DISPATCH_USER_WORKFLOW_DOMAIN),
+  ...payloadBase,
+  /** The node topic for the main bot's handoff; a passed-on record follows
+   *  the dispatch's own rule (a thread, or none for a --mention handoff). */
+  rootId: identity('om_').optional(),
+  targetAppIds: z.array(identity('cli_')).min(1).max(64),
+  workflow: workflowRefSchema,
+  authority: authorityV1Schema,
+}).strict();
+const payloadSchema = z.discriminatedUnion('domain', [payloadV1Schema, payloadV2Schema, payloadWorkflowSchema]);
 
 /** A credential-store reference, never credentials. openId belongs ONLY to appId. */
 export type ScheduleCreateCapability = z.infer<typeof scheduleCreateCapabilitySchema>;
 export type DispatchUserAuthority = z.infer<typeof authorityV1Schema> | z.infer<typeof authorityV2Schema>;
 export type DispatchUserPayload = z.infer<typeof payloadSchema>;
+export type WorkflowDispatchUserRef = z.infer<typeof workflowRefSchema>;
+export type WorkflowDispatchUserPayload = z.infer<typeof payloadWorkflowSchema>;
 export interface SignedDispatchUser { payload: DispatchUserPayload; signature: string }
 
 export function scheduleCreateCapabilities(authority: DispatchUserAuthority): ScheduleCreateCapability[] {
@@ -172,7 +207,20 @@ function readStore(dataDir: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-type DispatchUserPayloadInput = Omit<DispatchUserPayload, 'domain' | 'deliveryId' | 'issuedAt' | 'messageId'>;
+type DispatchUserPayloadInput = Omit<DispatchUserPayload, 'domain' | 'deliveryId' | 'issuedAt' | 'messageId'> & {
+  /** Present only on a workflow handoff (its own domain, §10.2). */
+  workflow?: WorkflowDispatchUserRef;
+};
+
+/** Two workflow records for the same handoff: same source, chat, topic,
+ *  target and attempt. A same-key re-send of a handoff (Lark returns the
+ *  message it already delivered) re-binds onto such a record. */
+function sameWorkflowHandoff(a: DispatchUserPayload, b: DispatchUserPayload): boolean {
+  if (a.domain !== DISPATCH_USER_WORKFLOW_DOMAIN || b.domain !== DISPATCH_USER_WORKFLOW_DOMAIN) return false;
+  return a.sourceAppId === b.sourceAppId && a.chatId === b.chatId && a.rootId === b.rootId
+    && JSON.stringify(a.targetAppIds) === JSON.stringify(b.targetAppIds)
+    && JSON.stringify(a.workflow) === JSON.stringify(b.workflow);
+}
 
 /** Register before sending; the receiver may observe the event before send resolves.
  * A pending record grants nothing. It only lets that receiver wait for the exact
@@ -183,13 +231,15 @@ export async function registerPendingDispatchUser(input: {
   payload: DispatchUserPayloadInput;
 }): Promise<SignedDispatchUser> {
   const v2 = scheduleCreateCapabilities(input.payload.authority).length > 0;
+  const workflow = input.payload.workflow;
   const pending = signDispatchUser(input.secret, {
     sourceAppId: input.payload.sourceAppId, sourceSessionId: input.payload.sourceSessionId,
     sourceTurnId: input.payload.sourceTurnId,
     ...(input.payload.rootId ? { rootId: input.payload.rootId } : {}),
     chatId: input.payload.chatId,
     targetAppIds: input.payload.targetAppIds, authority: input.payload.authority,
-    domain: v2 ? 'botmux.dispatch-user.v2' : 'botmux.dispatch-user.v1',
+    ...(workflow ? { workflow } : {}),
+    domain: workflow ? DISPATCH_USER_WORKFLOW_DOMAIN : v2 ? 'botmux.dispatch-user.v2' : 'botmux.dispatch-user.v1',
     deliveryId: randomUUID(), issuedAt: Date.now(),
   } as DispatchUserPayload);
   await updateDispatchRegistry(dispatchUserStorePath(input.dataDir), store => {
@@ -205,7 +255,11 @@ export function readPendingDispatchUser(dataDir: string, secret: string, deliver
 }
 
 /** Bind a registration to the message it was sent as. Throws when the message
- * id already carries a record or the registration is gone. */
+ * id already carries a record or the registration is gone — except a workflow
+ * handoff re-sent with its frozen uuid, which Lark answers with the message it
+ * already delivered: the record bound to it for the same handoff is replaced
+ * by this one (signed now, from the same frozen identity, after this send's
+ * own target check). */
 export async function bindPendingDispatchUser(input: {
   dataDir: string;
   secret: string;
@@ -219,7 +273,13 @@ export async function bindPendingDispatchUser(input: {
     if (!pending || pending.deliveryId !== input.deliveryId || pending.messageId) {
       throw new Error('dispatch registration is missing or already bound');
     }
-    if (store[input.messageId] !== undefined) throw new Error('duplicate dispatch message identity');
+    const existing = store[input.messageId];
+    if (existing !== undefined) {
+      const prior = verifyDispatchUser(input.secret, existing);
+      if (!prior || prior.messageId !== input.messageId || !sameWorkflowHandoff(prior, pending)) {
+        throw new Error('duplicate dispatch message identity');
+      }
+    }
     const completed = signDispatchUser(input.secret, { ...pending, messageId: input.messageId });
     store[input.messageId] = completed;
     delete store[key];

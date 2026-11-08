@@ -1,4 +1,5 @@
-import { attentionReason, botNameForAppId } from './ui.js';
+import { botNameForAppId } from './ui.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { fetchGroupsNamesSnapshot } from './groups-api.js';
 
 let groupsSnapshot: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
@@ -40,8 +41,6 @@ export type BotCard = {
   lastActiveAt: number;
 };
 
-const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
-
 /** 把会话按 bot 聚合成"数字员工"卡片数据；在线 bot 没会话也要出现（待命）。
  *  以 larkAppId 为身份键（部分会话缺 botName，按名字聚会裂成两张卡）；
  *  显示名优先 daemon 注册表，其次会话上的 botName。只剩历史 closed 会话、
@@ -79,8 +78,9 @@ export function buildBotCards(sessions: any[]): BotCard[] {
     card.lastActiveAt = Math.max(card.lastActiveAt, Number(s.lastMessageAt ?? 0));
     if (s.status !== 'closed') {
       card.active.push(s);
-      if (BUSY_STATUSES.has(s.status)) card.busy.push(s);
-      if (attentionReason(s)) card.attention.push(s);
+      const task = deriveSessionTaskStatus(s).kind;
+      if (task === 'working') card.busy.push(s);
+      if (task === 'needs_you') card.attention.push(s);
     }
   }
   for (const card of byKey.values()) {

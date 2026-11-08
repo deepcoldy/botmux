@@ -119,6 +119,9 @@ describe('defaultReplyDeliveryFor', () => {
     ['hermes', 'send'],
     ['cursor', 'send'],
     ['codex-app', 'send'],
+    // 唯一例外：doubao 的工具命令跑在共享常驻 service 进程里，`botmux send` 无法
+    // 可靠归属到当前会话，缺省改走 transcript。
+    ['doubao', 'transcript'],
     [undefined, 'send'],
     ['', 'send'],
   ];
@@ -159,6 +162,15 @@ describe('effectiveReplyDelivery', () => {
 
   it('未配置 + cursor → send', () => {
     expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('send');
+  });
+
+  it('未配置 + doubao → transcript（共享 service 进程下 botmux send 归属不可靠）', () => {
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('transcript');
+  });
+
+  it('显式 send + doubao → send（保留退回旧行为的出口）', () => {
+    vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('send');
   });
 
   it('显式 send + claude-code → send（退回旧行为）', () => {
@@ -224,14 +236,40 @@ describe('effectiveReplyDelivery', () => {
     expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('transcript');
   });
 
-  it('supportsTranscriptReplyDeliveryForBot: cursor scratch=false / oncall=true / 其它 always-on CLI 不受 scratch 影响', async () => {
+  it('supportsTranscriptReplyDeliveryForBot: cursor/doubao scratch=false / oncall=true / 其它 always-on CLI 不受 scratch 影响', async () => {
     const { supportsTranscriptReplyDeliveryForBot } = await import('../src/core/reply-delivery.js');
     expect(supportsTranscriptReplyDeliveryForBot('cursor', { sandbox: 'scratch' })).toBe(false);
     expect(supportsTranscriptReplyDeliveryForBot('cursor', { sandbox: 'oncall' })).toBe(true);
     expect(supportsTranscriptReplyDeliveryForBot('cursor')).toBe(true);
+    // doubao 的 agent_mode 会话树在 scratch merged overlay 里同样没有 host 侧映射
+    expect(supportsTranscriptReplyDeliveryForBot('doubao', { sandbox: 'scratch' })).toBe(false);
+    expect(supportsTranscriptReplyDeliveryForBot('doubao', { sandbox: 'oncall' })).toBe(true);
+    expect(supportsTranscriptReplyDeliveryForBot('doubao', { sandbox: true })).toBe(true);
+    expect(supportsTranscriptReplyDeliveryForBot('doubao')).toBe(true);
     // codex/grok 的 transcript 桥不经过 cursor 的 merged-mirror 路径，scratch 不收窄
     expect(supportsTranscriptReplyDeliveryForBot('codex', { sandbox: 'scratch' })).toBe(true);
     expect(supportsTranscriptReplyDeliveryForBot('antigravity', { sandbox: 'scratch' })).toBe(false);
+  });
+
+  it('缺省 transcript + doubao + scratch 沙箱 → 回落 send（#2828：缺省翻转不能在 scratch 下变整轮静默）', () => {
+    mockBotConfig({ sandbox: 'scratch' });
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('send');
+  });
+
+  it('缺省 transcript + doubao + oncall → transcript（authPaths 目录级 bind，宿主桥可读）', () => {
+    mockBotConfig({ sandbox: 'oncall' });
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('transcript');
+  });
+
+  it('显式 transcript + doubao + scratch → 同样回落 send', () => {
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    mockBotConfig({ sandbox: 'scratch' });
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('send');
+  });
+
+  it('机器级 BOTMUX_SANDBOX=scratch（cfg 不写 sandbox）+ doubao 缺省 → 回落 send', () => {
+    process.env.BOTMUX_SANDBOX = 'scratch';
+    expect(effectiveReplyDelivery('app_a', 'doubao')).toBe('send');
   });
 
   it('显式 transcript + antigravity → 仍回落 send（只有零注入转写）', () => {

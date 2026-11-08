@@ -29,11 +29,12 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: mocks.info, debug: mocks.debug, warn: vi.fn(), error: vi.fn() },
 }));
 
-import { ensureMessageRecalledEventSubscribed } from '../src/im/lark/event-dispatcher.js';
+import { ensureChatDisbandedEventSubscribed, ensureMessageRecalledEventSubscribed } from '../src/im/lark/event-dispatcher.js';
 import {
   BOT_OPTIONAL_APP_EVENTS,
   BOT_BASELINE_APP_EVENTS,
   BOT_CRITICAL_APP_EVENTS,
+  CHAT_DISBANDED_EVENT,
   MESSAGE_RECALLED_EVENT,
   MESSAGE_UPDATED_EVENT,
 } from '../src/setup/open-platform-automation.js';
@@ -115,6 +116,46 @@ describe('ensureMessageRecalledEventSubscribed — 存量应用启动补齐', ()
     mocks.getBot.mockReturnValue({ config: { larkAppId: appId, brand: 'lark' } });
     const status = await ensureMessageRecalledEventSubscribed(appId);
     expect(status).toEqual({ covered: false, reason: 'skipped_brand', updateSubmitted: false, missingEvents: [MESSAGE_RECALLED_EVENT] });
+    expect(mocks.ensureEvents).not.toHaveBeenCalled();
+  });
+});
+
+describe('im.chat.disbanded_v1 订阅', () => {
+  const appId = 'cli_disband_subscription';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getBot.mockReturnValue({ config: { larkAppId: appId, brand: 'feishu' } });
+    mocks.ensureEvents.mockResolvedValue({ ok: true, missingEvents: [], eventModeReady: true, updateSubmitted: true });
+    mocks.fullSetup.mockRejectedValue(new Error('full setup must never run for disband-event repair'));
+  });
+
+  afterEach(() => {
+    expect(mocks.fullSetup).not.toHaveBeenCalled();
+  });
+
+  it('新应用随 OPTIONAL 清单订阅；不进 BASELINE / CRITICAL（缺订阅只是会话晚关，不 fail-closed）', () => {
+    expect(CHAT_DISBANDED_EVENT).toBe('im.chat.disbanded_v1');
+    expect(BOT_OPTIONAL_APP_EVENTS).toContain(CHAT_DISBANDED_EVENT);
+    expect(BOT_BASELINE_APP_EVENTS as readonly string[]).not.toContain(CHAT_DISBANDED_EVENT);
+    expect(BOT_CRITICAL_APP_EVENTS as readonly string[]).not.toContain(CHAT_DISBANDED_EVENT);
+  });
+
+  it('存量应用启动时只增量补这一个事件', async () => {
+    await ensureChatDisbandedEventSubscribed(appId);
+    expect(mocks.ensureEvents).toHaveBeenCalledExactlyOnceWith(appId, [CHAT_DISBANDED_EVENT]);
+  });
+
+  it('helper 失败或抛错都不向上抛', async () => {
+    mocks.ensureEvents.mockResolvedValueOnce({ ok: false, reason: 'session_expired', message: 'x', sessionFile: '/tmp/s', updateSubmitted: false });
+    await expect(ensureChatDisbandedEventSubscribed(appId)).resolves.toBeUndefined();
+    mocks.ensureEvents.mockRejectedValueOnce(new Error('network down'));
+    await expect(ensureChatDisbandedEventSubscribed(appId)).resolves.toBeUndefined();
+  });
+
+  it('非 feishu 品牌不碰开放平台', async () => {
+    mocks.getBot.mockReturnValue({ config: { larkAppId: appId, brand: 'lark' } });
+    await ensureChatDisbandedEventSubscribed(appId);
     expect(mocks.ensureEvents).not.toHaveBeenCalled();
   });
 });

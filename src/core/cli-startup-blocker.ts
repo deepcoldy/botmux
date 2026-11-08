@@ -119,10 +119,17 @@ const RULES: readonly StartupBlockerRule[] = [
     all: [dialogLine('Sign in with ChatGPT'), dialogLine('Provide your own API key')],
   },
   {
-    // TraeX / CoCo 0.211 (binary strings).
+    // TraeX / CoCo 0.211 (binary strings): "Sign in with a Personal Access
+    // Token". 0.213.1 (captured): "Sign in to use TRAE CLI" over the options
+    // "1. Company Employee" / "2. Enterprise User — Sign in with email, a
+    // custom domain, or a PAT" and "Press Enter to continue" — Enter starts a
+    // login, so a queued prompt must never be typed into it.
     rule: 'traex-sign-in',
     kind: 'login',
-    all: [dialogLine('Welcome to TRAE CLI'), dialogLine('Sign in with a Personal Access Token')],
+    all: [
+      dialogLine('Welcome to TRAE CLI'),
+      dialogLine(String.raw`Sign in with (?:a Personal Access Token|email, a custom domain, or a PAT)`),
+    ],
   },
   {
     // Cursor Agent: any key starts a browser login, so never type into it.
@@ -214,4 +221,39 @@ export function detectCliStartupBlocker(rawScreen: string): CliStartupBlocker | 
 /** Identity of a blocker for "notify once" bookkeeping. */
 export function startupBlockerKey(blocker: CliStartupBlocker): string {
   return `${blocker.kind}:${blocker.folder ?? ''}`;
+}
+
+/** Sign-in / API-key wording and credential-shaped values, matched anywhere
+ *  on the screen. Deliberately broad and OUTBOUND-ONLY: it decides whether a
+ *  screen's text may leave the terminal (a stuck card's screen tail, a submit
+ *  notice), never whether input is held — a false positive only drops a tail.
+ *  Wording from the shipped binaries (strings):
+ *   - Claude Code 2.1.318 OAuth: "Browser didn't open? Use the url below to
+ *     sign in", "Paste code here if prompted >"
+ *   - Codex 0.164.0: "Finish signing in via your browser", "If your browser
+ *     did not open, navigate to this URL to authenticate:", "Paste or type
+ *     your API key below", device code: "Follow these steps to sign in with
+ *     ChatGPT using device code authorization:", "2. Enter this one-time code" */
+const CREDENTIAL_SCREEN_TEXT = new RegExp([
+  String.raw`Use the url below to sign in`,
+  String.raw`Paste code here`,
+  String.raw`Finish signing in via your browser`,
+  String.raw`navigate to this URL to authenticate`,
+  String.raw`one-time code`,
+  String.raw`device code`,
+  String.raw`Paste or type your API key`,
+  // OAuth / PKCE query parameters of a sign-in link.
+  String.raw`[?&](?:state|code_challenge|code)=`,
+  // Key-shaped values and "api key: …" / "api_key=…" assignments.
+  String.raw`\bsk-[A-Za-z0-9_-]{8,}`,
+  String.raw`api[_ -]?key\s*[:=]`,
+].join('|'), 'i');
+
+/** Whether a screen may show a sign-in link, a device / one-time code or an
+ *  API key: a recognised login / API-key startup dialog, or any credential
+ *  wording / value (CREDENTIAL_SCREEN_TEXT). Its text must not be forwarded. */
+export function screenMayShowCredential(rawScreen: string): boolean {
+  const kind = detectCliStartupBlocker(rawScreen)?.kind;
+  if (kind === 'login' || kind === 'api_key') return true;
+  return CREDENTIAL_SCREEN_TEXT.test(stripAnsiScreenText(rawScreen ?? ''));
 }

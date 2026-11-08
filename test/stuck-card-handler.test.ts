@@ -15,6 +15,9 @@ import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-hand
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
+import { canOperate, canTalk } from '../src/im/lark/event-dispatcher.js';
+import { t } from '../src/i18n/index.js';
+import { config } from '../src/config.js';
 
 const APP_ID = 'cli_test';
 const ROOT_ID = 'om_root';
@@ -527,3 +530,164 @@ describe('stuck-warning card tui_keys handler', () => {
     expect(ds.tuiPromptCardId).toBe(CARD_ID);
   });
 });
+
+// ─── stuck_key: the card's own gate (initiator or admin) ──────────────────
+
+describe('stuck_key card action', () => {
+  let workerSend: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(false);
+    vi.mocked(canTalk).mockReturnValue(true);
+    // The mocked config has no stuckCardInitiatorKeys: absent = default ON.
+    delete (config as any).stuckCardInitiatorKeys;
+    workerSend = vi.fn((_message, callback?: (error: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+  });
+
+  function stuckDs(overrides?: Partial<DaemonSession>): DaemonSession {
+    return makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 7,
+      stuckWarningNonceCounter: 7,
+      stuckWarningPageType: 'hook review level 1',
+      stuckWarningCliLifetime: 4,
+      stuckWarningInitiatorOpenId: 'ou_alice',
+      ...overrides,
+    });
+  }
+
+  function click(ds: DaemonSession, value: Record<string, any>, operator = 'ou_alice', clickedMessageId = CARD_ID) {
+    return handleCardAction({
+      action: { value: { action: 'stuck_key', root_id: ROOT_ID, session_id: ds.session.sessionId, nonce: '7', ...value } },
+      operator: { open_id: operator, union_id: `on_${operator}` },
+      context: { open_message_id: clickedMessageId },
+    } as any, makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]])), APP_ID);
+  }
+
+  it('the initiator (talk-only) may press a decline key; the key comes from the catalog', async () => {
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2', keys: '["rm","-rf","/"]' });
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({
+      type: 'tui_keys',
+      keys: ['Escape'],
+      isFinal: true,
+      rearmStuckDetector: false,
+      stuckNonce: 7,
+      stuckCliLifetime: 4,
+      stuckPageType: 'hook review level 1',
+    });
+    expect(ds.stuckWarningProcessing).toBe(true);
+    expect(result).toEqual({ text: t('card.stuck.processing', undefined, 'zh') });
+    // Talk permission is re-evaluated at click time with the clicker's union id.
+    expect(canTalk).toHaveBeenCalledWith(APP_ID, 'oc_chat', 'ou_alice', undefined, 'on_ou_alice', 'group');
+  });
+
+  it('global switch off: the initiator is refused on a decline key, an operator still presses it', async () => {
+    (config as any).stuckCardInitiatorKeys = false;
+    const ds = stuckDs();
+    const refused = await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(refused).toEqual({ toast: { type: 'warning', content: t('card.stuck.denied_admin_only', undefined, 'zh') } });
+    expect(ds.stuckWarningProcessing).toBeFalsy();
+
+    vi.mocked(canOperate).mockReturnValue(true);
+    await click(ds, { selected_index: '2' }, 'ou_admin');
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({ keys: ['Escape'] });
+  });
+
+  it('the switch is read at click time: turning it back on lets the same initiator press', async () => {
+    (config as any).stuckCardInitiatorKeys = false;
+    const ds = stuckDs();
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+    (config as any).stuckCardInitiatorKeys = true;
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('another group member is refused with a toast and nothing is sent', async () => {
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2' }, 'ou_bob');
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(result).toEqual({ toast: { type: 'warning', content: t('card.stuck.denied', undefined, 'zh') } });
+    expect(ds.stuckWarningProcessing).toBeFalsy();
+  });
+
+  it('the initiator whose talk permission was revoked is refused', async () => {
+    vi.mocked(canTalk).mockReturnValue(false);
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+  });
+
+  it('the initiator may not press an admin-only (trust) key', async () => {
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '0' });
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(result).toEqual({ toast: { type: 'warning', content: t('card.stuck.denied_admin_only', undefined, 'zh') } });
+  });
+
+  it('without a frozen initiator nobody but an admin may press', async () => {
+    const ds = stuckDs({ stuckWarningInitiatorOpenId: undefined });
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('an admin may press every key; Enter re-arms the stuck detector', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    await click(ds, { selected_index: '1' }, 'ou_admin');
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({ keys: ['Enter'], rearmStuckDetector: true });
+  });
+
+  it('a stale nonce is dropped silently', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    expect(await click(ds, { selected_index: '2', nonce: '6' })).toBeUndefined();
+    expect(await click(ds, { selected_index: '2', nonce: undefined })).toBeUndefined();
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('a click on a card that is not the active stuck card is dropped silently', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    expect(await click(ds, { selected_index: '2' }, 'ou_admin', 'om_old_card')).toBeUndefined();
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it.each(['3', '-1', '1.5', 'abc', '', '02', ' 2 ', '2e0', '0x2'])('a tampered index %j is dropped without sending', async (index) => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    expect(await click(ds, { selected_index: index }, 'ou_admin')).toBeUndefined();
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('a second click while the first key is in flight is dropped', async () => {
+    const ds = stuckDs();
+    await click(ds, { selected_index: '2' });
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the processing claim when IPC delivery fails', async () => {
+    workerSend.mockImplementation((_message, callback?: (error: Error | null) => void) => {
+      callback?.(new Error('channel closed'));
+      return false;
+    });
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2' });
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+    expect(ds.stuckWarningProcessing).toBe(false);
+  });
+});
+

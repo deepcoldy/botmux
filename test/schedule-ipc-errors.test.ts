@@ -7,6 +7,9 @@ describe('schedule IPC error text for sandboxed sessions', () => {
     'schedule_working_dir_forbidden',
     'schedule_mutation_scope_forbidden',
     'schedule_direct_task_limit',
+    'schedule_run_as_invalid',
+    'schedule_run_as_unresolved',
+    'schedule_run_as_not_allowed',
   ])('maps %s to an actionable Chinese message', code => {
     const text = scheduleIpcErrorMessage(code);
     expect(text).toMatch(/[一-鿿]/);
@@ -24,7 +27,9 @@ describe('schedule IPC error text for sandboxed sessions', () => {
   // 行为用例覆盖。
   it('names exactly the codes the daemon emits', () => {
     const daemon = readFileSync('src/daemon.ts', 'utf8');
-    for (const code of ['schedule_working_dir_forbidden', 'schedule_mutation_scope_forbidden', 'schedule_direct_task_limit']) {
+    for (const code of ['schedule_working_dir_forbidden', 'schedule_mutation_scope_forbidden',
+      'schedule_direct_task_limit', 'schedule_run_as_invalid', 'schedule_run_as_unresolved',
+      'schedule_run_as_not_allowed']) {
       expect(daemon).toContain(`'${code}'`);
     }
   });
