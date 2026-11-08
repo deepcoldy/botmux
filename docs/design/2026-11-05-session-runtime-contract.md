@@ -40,7 +40,10 @@ abort: that replacement never became addressable and must not mask the
 surviving runtime's exit. When the host refuses a binding (for example while
 another control operation owns the session), it stops the unbound reservation,
 discards its deferred events and tells the worker, which returns to its previous
-binding. Later events of a stopped reservation are rejected, not deferred.
+binding. Later events of a stopped reservation are rejected, not deferred,
+except failure reports (`error`, `worker_error`, a failed `restart_result`):
+those are worker-scoped and never deferred behind an unbound reservation, so the
+reason a start failed still reaches the user and settles its operation.
 
 Events carry a producer ID, producer sequence, event ID, session reference and
 their original runtime/execution/operation scope. Async callbacks keep the scope
@@ -89,7 +92,8 @@ files cannot make a known allocated epoch available for a new reservation.
 
 History is bounded per session: the newest 1024 deduplication records, 256
 settled attempts and result facts, and 128 settled operations. Reservation and
-binding records, which recovery replays, and unsettled work are never pruned.
+binding records, which recovery replays, unsettled work and the result facts of
+its turns are never pruned.
 Other deduplication records store a digest of the event, so reusing an event ID
 for a different event is still a conflict. Unchanged busy/ready samples are
 covered by the observation watermark and are not recorded; a turn records one
@@ -102,9 +106,8 @@ IPC receipt and prompt readiness do not settle a business execution.
 Operations progress through `planned`, `applying`, `confirmed`,
 `failed_before_effect`, `rejected` or `uncertain`. They retain their operation ID,
 target runtime/attempt and prior lifecycle. Timeout retains an uncertain
-operation; concurrent requests join it while its replacement reservation is still
-unbound. Once none is pending, a new restart supersedes it and the late result
-settles only the retired operation. A planned restart recovered before its
+operation; concurrent requests join it, and the worker's late receipt, its exit
+or a close settles it. A planned restart recovered before its
 start claim resumes the same operation, with a single start claim. Close can
 supersede another operation; its late success cannot revive a closed selection.
 A rejected close restores the previous suspended lifecycle.
