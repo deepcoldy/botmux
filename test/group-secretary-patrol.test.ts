@@ -290,6 +290,7 @@ function splitRuntime(opts: { maxConcurrentPatrols?: number } = {}) {
   const deliverPatrol = vi.fn(async (input: { threadRoot: string }) => ({ sessionId: `patrol-${input.threadRoot}-${++n}`, created: true }));
   const closePatrolSession = vi.fn(async () => undefined);
   const rt = createGroupSecretaryRuntime({
+    enabled: () => true,
     larkAppId: SELF,
     selfOpenId: () => 'ou_self',
     fetchSnapshot: async () => snap(current),
@@ -472,6 +473,7 @@ describe('runtime split mode (patrol)', () => {
     const h = splitRuntime();
     let lines = [{ role: 'agent', text: 'step 1' }];
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: SELF, selfOpenId: () => 'ou_self',
       fetchSnapshot: async () => snap([{ id: 's1', app: 'cli_alex', root: ROOT_A, turn: 'working' }]),
       deliver: h.deliver, deliverPatrol: h.deliverPatrol, closePatrolSession: h.closePatrolSession,

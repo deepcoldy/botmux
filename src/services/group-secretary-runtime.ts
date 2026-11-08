@@ -17,6 +17,8 @@ import type { ObserveSnapshot } from './session-observe.js';
 
 export interface GroupSecretaryRuntimeDeps {
   larkAppId: string;
+  /** bot 级总开关（默认关）：返回 false 时不旁听、不巡检，已登记的群保留。每拍重读，Dashboard 改完即生效。 */
+  enabled: () => boolean;
   selfOpenId: () => string | undefined;
   fetchSnapshot: () => Promise<ObserveSnapshot>;
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
@@ -547,6 +549,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
 
   const tick = async (): Promise<void> => {
     if (inFlight) return;
+    if (!deps.enabled()) return;
     if (listGroupSecretaryChats(deps.larkAppId).length === 0) return;
     inFlight = true;
     try {
@@ -600,7 +603,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     observeMessageEvent(data: any): void {
       try {
         const chatId = data?.message?.chat_id;
-        if (!isActiveChat(chatId)) return;
+        if (!deps.enabled() || !isActiveChat(chatId)) return;
         const message = larkEventToSecretaryMessage(data, deps.selfOpenId(), deps.larkAppId);
         if (!message) return;
         // 开启之前的消息（重放 / 补拉）不进秘书视野。

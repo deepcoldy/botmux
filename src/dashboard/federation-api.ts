@@ -28,7 +28,7 @@ import {
   setTeamBoardEntry,
 } from '../services/team-board-store.js';
 import { findMembershipByDelegationToken } from '../services/federation-membership-store.js';
-import { isFederationPeerToken } from '../services/group-secretary-federation.js';
+import { federationPeerTeamId, isTeamGroupOf } from '../services/group-secretary-federation.js';
 import { snapshotToSessionViews } from '../services/group-secretary-runtime.js';
 import { fetchSessionRecentTranscript } from '../services/group-secretary-transcript.js';
 import { fetchObserveSnapshot } from '../services/session-observe-command-fetch.js';
@@ -184,10 +184,13 @@ export async function handleFederationApi(
 
   // 群秘书跨机器只读接口：本机 bot 在某群的会话投影 / 某会话最近对话（已脱敏）。
   // 鉴权：federation 团队凭证（hub→spoke 的 delegationToken 或 spoke→hub 的 syncToken）。
+  // 只服务凭证所属团队的团队群（与团队看板同一口径），别的群一律 403。
   if (path === '/api/federation/secretary/sessions' && method === 'GET') {
-    if (!isFederationPeerToken(dataDir, bearerOnly(req))) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const teamId = federationPeerTeamId(dataDir, bearerOnly(req));
+    if (!teamId) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
     const chatId = url.searchParams.get('chatId') ?? '';
     if (!chatId.startsWith('oc_')) { jsonRes(res, 400, { ok: false, error: 'chat_required' }); return true; }
+    if (!isTeamGroupOf(dataDir, teamId, chatId)) { jsonRes(res, 403, { ok: false, error: 'not_team_group' }); return true; }
     try {
       const snapshot = await fetchObserveSnapshot();
       const groupIds = groupSessionIds(snapshot, chatId);
@@ -203,11 +206,13 @@ export async function handleFederationApi(
     return true;
   }
   if (path === '/api/federation/secretary/transcript' && method === 'GET') {
-    if (!isFederationPeerToken(dataDir, bearerOnly(req))) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const teamId = federationPeerTeamId(dataDir, bearerOnly(req));
+    if (!teamId) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
     const appId = url.searchParams.get('appId') ?? '';
     const sessionId = url.searchParams.get('sessionId') ?? '';
     const chatId = url.searchParams.get('chatId') ?? '';
     if (!appId || !sessionId || !chatId.startsWith('oc_')) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
+    if (!isTeamGroupOf(dataDir, teamId, chatId)) { jsonRes(res, 403, { ok: false, error: 'not_team_group' }); return true; }
     // 只对「该群里的群会话」给对话片段：私聊 / 别的群的会话一律 404，不暴露是否存在。
     let allowed = false;
     try {

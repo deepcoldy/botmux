@@ -89,7 +89,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionSessionMode',
     fieldKeys: [
       'botDefaults.groupP2p', 'botDefaults.groupRegular', 'botDefaults.groupMention', 'botDefaults.sgTag',
-      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.sgTagAuthPasteLabel',
+      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.groupSecretaryTitle', 'botDefaults.sgTagAuthPasteLabel',
       'botDefaults.sgTagName', 'botDefaults.sgClosedTagName',
     ],
   },
@@ -541,6 +541,7 @@ export type BotDefaultsRow = {
   groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
   chatManagerEnabled?: boolean;
+  groupSecretaryEnabled?: boolean;
   autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;

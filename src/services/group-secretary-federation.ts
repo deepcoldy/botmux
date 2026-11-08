@@ -3,12 +3,14 @@
  *
  * 服务端（每台部署的 dashboard，`/api/federation/secretary/*`，在 token 网关之前）：
  *   - 鉴权：hub→spoke 用 spoke 发给 hub 的 delegationToken；spoke→hub 用 hub 发给 spoke 的 syncToken。
- *     两种都是 federation 组队时建立的团队内凭证，只读、只返回指定群的会话投影。
+ *     两种都是 federation 组队时建立的团队内凭证，只读、只返回指定群的会话投影；
+ *     指定的群必须是该凭证所属团队的团队群（与团队看板同一口径），其它群一律拒绝。
  * 客户端（秘书所在 daemon）：按本机 federation 记录列出所有对端（hub 记录的成员 + 自己加入的 hub），
  *   每拍拉一次；单个对端失败只当暂时看不到，不回退旧数据，不影响其它对端与本机。
  */
 import { listAllFederatedDeployments, getDeploymentByToken } from './federation-store.js';
 import { listMemberships, findMembershipByDelegationToken } from './federation-membership-store.js';
+import { listTeamGroups } from './team-groups-store.js';
 import type { SecretarySessionView } from './group-secretary-engine.js';
 import type { SecretaryTranscriptLine } from './group-secretary-transcript.js';
 
@@ -31,10 +33,15 @@ export function listSecretaryPeers(dataDir: string): SecretaryPeer[] {
   return [...peers.values()];
 }
 
-/** 服务端鉴权：两种 federation 凭证任一有效即可。 */
-export function isFederationPeerToken(dataDir: string, token: string): boolean {
-  if (!token) return false;
-  return !!findMembershipByDelegationToken(dataDir, token) || !!getDeploymentByToken(dataDir, token);
+/** 服务端鉴权：两种 federation 凭证任一有效即可，返回凭证所属的团队。 */
+export function federationPeerTeamId(dataDir: string, token: string): string | undefined {
+  if (!token) return undefined;
+  return findMembershipByDelegationToken(dataDir, token)?.teamId ?? getDeploymentByToken(dataDir, token)?.teamId;
+}
+
+/** 与团队看板同一口径：只服务对端所属团队的团队群（spoke 侧是同步时从 hub 镜像来的那份）。 */
+export function isTeamGroupOf(dataDir: string, teamId: string, chatId: string): boolean {
+  return listTeamGroups(dataDir, teamId).some(b => b.chatId === chatId);
 }
 
 type Fetcher = typeof fetch;

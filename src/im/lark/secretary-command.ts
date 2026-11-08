@@ -14,6 +14,11 @@ import { forgetGroupSecretaryChat, noteSecretaryMarker } from '../../services/gr
 import { readSecretaryMarker, writeSecretaryMarker } from '../../services/group-secretary-marker.js';
 import { logger } from '../../utils/logger.js';
 
+/** bot 级总开关（bots.json `groupSecretaryEnabled`，默认关）：关着时不能开启 / 接管，off 与 status 照常。 */
+function secretaryAllowed(larkAppId: string): boolean {
+  try { return getBot(larkAppId).config.groupSecretaryEnabled === true; } catch { return false; }
+}
+
 export async function tryHandleSecretaryCommand(
   larkAppId: string,
   message: any,
@@ -65,6 +70,7 @@ export async function tryHandleSecretaryCommand(
   if (!arg || arg === 'status') {
     if (!canTalk) return true;
     if (!markerAppId) await reply(t('cmd.secretary.status_off', undefined, loc));
+    else if (isMine && !secretaryAllowed(larkAppId)) await reply(t('cmd.secretary.status_paused', undefined, loc));
     else if (isMine) await reply(t('cmd.secretary.status_on', { at: local?.larkAppId === larkAppId ? new Date(local.enabledAt).toISOString() : '-' }, loc));
     else await reply(t('cmd.secretary.status_other', { name: ownerName }, loc));
     return true;
@@ -85,6 +91,10 @@ export async function tryHandleSecretaryCommand(
   const localEntry = { larkAppId, ...(selfName ? { botName: selfName } : {}), enabledBy: senderOpenId, enabledAt: Date.now(), markerConfirmedAt: Date.now() };
 
   if (enable || takeover) {
+    if (!secretaryAllowed(larkAppId)) {
+      await reply(t('cmd.secretary.not_enabled', undefined, loc));
+      return true;
+    }
     if (isMine) {
       // 标记已是自己：补齐本机登记（例如换机器后重开）即可。
       if (local?.larkAppId !== larkAppId) setGroupSecretaryChat(chatId, localEntry);

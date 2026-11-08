@@ -28,8 +28,9 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/i18n/index.js', () => ({ t: (key: string) => key, localeForBot: () => 'zh' }));
 const mockIsSessionGroup = vi.fn(() => false);
 vi.mock('../src/services/session-groups-store.js', () => ({ isSessionGroup: (...a: any[]) => mockIsSessionGroup(...a) }));
+const botConfig = vi.hoisted(() => ({ extra: {} as Record<string, unknown> }));
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: (id: string) => ({ config: { larkAppId: id } }),
+  getBot: (id: string) => ({ config: { larkAppId: id, ...botConfig.extra } }),
   effectiveBotDisplayName: (st: any) => `Bot-${st.config.larkAppId}`,
 }));
 // 群描述标记：用内存 Map 模拟飞书群描述（跨机器共享的权威登记）。
@@ -65,6 +66,7 @@ describe('tryHandleSecretaryCommand', () => {
     mockCanOperate.mockReturnValue(true);
     mockGetChatMode.mockResolvedValue('group');
     mockIsSessionGroup.mockReturnValue(false);
+    botConfig.extra = { groupSecretaryEnabled: true };
   });
 
   it('ignores unrelated text', async () => {
@@ -166,5 +168,49 @@ describe('tryHandleSecretaryCommand', () => {
     await tryHandleSecretaryCommand(APP, msg('/secretary off', 'group', 'oc_m'), USER, true);
     expect(markerByChat.has('oc_m')).toBe(false);
     expect(isGroupSecretaryChat(APP, 'oc_m')).toBe(false);
+  });
+});
+
+describe('tryHandleSecretaryCommand — bot-level switch (groupSecretaryEnabled, default off)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIsBotMentioned.mockReturnValue(true);
+    mockCanOperate.mockReturnValue(true);
+    mockGetChatMode.mockResolvedValue('group');
+    mockIsSessionGroup.mockReturnValue(false);
+  });
+
+  it('a bot config without the field cannot turn on or take over: replies not enabled, writes nothing', async () => {
+    botConfig.extra = {};
+    markerByChat.set('oc_sw_taken', 'cli_other');
+    for (const [text, chat] of [['/secretary on', 'oc_sw'], ['/secretary takeover', 'oc_sw_taken']] as const) {
+      expect(await tryHandleSecretaryCommand(APP, msg(text, 'group', chat), USER, true)).toBe(true);
+      expect(lastReply()).toBe('cmd.secretary.not_enabled');
+    }
+    expect(mockWriteMarker).not.toHaveBeenCalled();
+    expect(markerByChat.has('oc_sw')).toBe(false);
+    expect(markerByChat.get('oc_sw_taken')).toBe('cli_other');
+    expect(isGroupSecretaryChat(APP, 'oc_sw')).toBe(false);
+  });
+
+  it('an explicit false behaves the same as unset', async () => {
+    botConfig.extra = { groupSecretaryEnabled: false };
+    await tryHandleSecretaryCommand(APP, msg('/secretary on', 'group', 'oc_sw_false'), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.not_enabled');
+    expect(isGroupSecretaryChat(APP, 'oc_sw_false')).toBe(false);
+  });
+
+  it('turning the switch off keeps off and status working for a group already registered to this bot', async () => {
+    botConfig.extra = { groupSecretaryEnabled: true };
+    await tryHandleSecretaryCommand(APP, msg('/secretary on', 'group', 'oc_sw_reg'), USER, true);
+    expect(isGroupSecretaryChat(APP, 'oc_sw_reg')).toBe(true);
+
+    botConfig.extra = {};
+    await tryHandleSecretaryCommand(APP, msg('/secretary status', 'group', 'oc_sw_reg'), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.status_paused');
+    await tryHandleSecretaryCommand(APP, msg('/secretary off', 'group', 'oc_sw_reg'), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.disabled');
+    expect(markerByChat.has('oc_sw_reg')).toBe(false);
+    expect(isGroupSecretaryChat(APP, 'oc_sw_reg')).toBe(false);
   });
 });

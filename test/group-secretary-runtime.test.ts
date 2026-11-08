@@ -44,6 +44,7 @@ beforeEach(() => {
 
 function runtime(snapshots: ObserveSnapshot[], deliver = vi.fn(async () => undefined)) {
   const rt = createGroupSecretaryRuntime({
+    enabled: () => true,
     larkAppId: APP,
     selfOpenId: () => 'ou_self',
     fetchSnapshot: async () => snapshots.shift() ?? snapshots.at(-1) ?? snapshot('idle'),
@@ -61,6 +62,7 @@ describe('group secretary runtime', () => {
   it('does nothing (no snapshot fetch) while no chat is enabled', async () => {
     const fetch = vi.fn();
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: fetch as any,
       deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
     });
@@ -123,6 +125,7 @@ describe('group secretary runtime — hardening', () => {
     let release!: (s: ObserveSnapshot) => void;
     const fetch = vi.fn(() => new Promise<ObserveSnapshot>(r => { release = r; }));
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: fetch, deliver: vi.fn(),
       log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, sessionPollMs: 0,
     });
@@ -143,6 +146,7 @@ describe('group secretary runtime — hardening', () => {
     try {
       const deliver = vi.fn((input: { chatId: string }) => input.chatId === CHAT ? new Promise(() => {}) : Promise.resolve());
       const rt = createGroupSecretaryRuntime({
+        enabled: () => true,
         larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
         deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, deliverTimeoutMs: 1_000,
       });
@@ -173,6 +177,36 @@ describe('group secretary runtime — hardening', () => {
     rt.stop();
   });
 
+  it('bot-level switch off: a registered chat gets no snapshot pull, no observation, no delivery; turning it on resumes', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    let on = false;
+    const fetch = vi.fn(async () => snapshot('idle'));
+    const deliver = vi.fn(async () => undefined);
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, enabled: () => on, selfOpenId: () => 'ou_self', fetchSnapshot: fetch,
+      deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, sessionPollMs: 0,
+    });
+    rt.observeMessageEvent(textEvent('om_while_off', clock));
+    clock += 60_000;
+    await rt.tick();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+
+    on = true;
+    clock += 60_000;
+    await rt.tick();
+    expect(fetch).toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+
+    rt.observeMessageEvent(textEvent('om_while_on', clock));
+    clock += 60_000;
+    await rt.tick();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect((deliver.mock.calls[0] as any[])[0].prompt).toContain('om_while_on');
+    expect((deliver.mock.calls[0] as any[])[0].prompt).not.toContain('om_while_off');
+    rt.stop();
+  });
+
   it('turning the secretary off drops its backlog (off → on does not replay old events)', async () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     const { rt, deliver } = runtime([]);
@@ -195,6 +229,7 @@ describe('group secretary runtime — evidence and ownership', () => {
     const deliver = vi.fn(async () => undefined);
     const snaps = [snapshot('working'), snapshot('idle')];
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => snaps.shift() ?? snapshot('idle'),
       fetchTranscript, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
     });
@@ -248,6 +283,7 @@ describe('group secretary runtime — startup backfill', () => {
     ];
     const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => 'ou_self', fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       fetchRecentMessages: async () => items, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
     });
@@ -279,6 +315,7 @@ describe('group secretary runtime — group marker and federation', () => {
     const writeMarker = vi.fn(async () => ({ ok: true }));
     const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       readMarker: async () => marker, writeMarker,
       deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
@@ -299,6 +336,7 @@ describe('group secretary runtime — group marker and federation', () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1, markerConfirmedAt: 5 });
     const writeMarker = vi.fn(async () => ({ ok: true }));
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       readMarker: async () => undefined, writeMarker,
       deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
@@ -314,6 +352,7 @@ describe('group secretary runtime — group marker and federation', () => {
     const writeMarker = vi.fn().mockResolvedValueOnce({ ok: false, reason: 'description_too_long' }).mockResolvedValue({ ok: true });
     const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       readMarker: async () => undefined, writeMarker: writeMarker as any,
       deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
@@ -336,6 +375,7 @@ describe('group secretary runtime — group marker and federation', () => {
     const writeMarker = vi.fn(async () => { marker = 'cli_remote'; return { ok: false, reason: 'marker_changed', previous: 'cli_remote' }; });
     const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       readMarker: async () => marker, writeMarker: writeMarker as any,
       deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
@@ -358,6 +398,7 @@ describe('group secretary runtime — group marker and federation', () => {
     vi.useFakeTimers();
     try {
       const rt = createGroupSecretaryRuntime({
+        enabled: () => true,
         larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
         readMarker: () => new Promise(() => {}), deliver: vi.fn(), log: () => {}, canTalk: () => true,
         now: () => clock, tickMs: 1e9, markerTimeoutMs: 1_000,
@@ -377,6 +418,7 @@ describe('group secretary runtime — group marker and federation', () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     const writeMarker = vi.fn(async () => ({ ok: true }));
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       readMarker: async () => undefined, writeMarker,
       deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
@@ -392,6 +434,7 @@ describe('group secretary runtime — group marker and federation', () => {
     const remote = [{ sessionId: 'r1', larkAppId: 'cli_fox', botName: 'fox', chatId: CHAT, scope: 'thread' as const, rootMessageId: 'om_r', liveness: 'alive' as const, turn: 'working' }];
     const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       fetchRemoteViews: async () => remote.map(r => ({ ...r })),
       deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, sessionPollMs: 10_000,
@@ -420,6 +463,7 @@ describe('group secretary runtime — busy detection', () => {
     });
     const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => own(),
       deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, sessionPollMs: 0,
     });
@@ -443,6 +487,7 @@ describe('group secretary runtime — registration re-checked after awaits', () 
   }
   function migratingRuntime(writeMarker: (chatId: string, appId: string | null) => Promise<{ ok: boolean; reason?: string }>) {
     return createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
       readMarker: async () => undefined, writeMarker,
       deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
@@ -493,6 +538,7 @@ describe('group secretary runtime — registration re-checked after awaits', () 
       const deliver = vi.fn(async () => undefined);
       const snaps = [snapshot('working'), snapshot('idle')];
       const rt = createGroupSecretaryRuntime({
+        enabled: () => true,
         larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => snaps.shift() ?? snapshot('idle'),
         fetchTranscript: fetchTranscript as any, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
       });
@@ -514,6 +560,7 @@ describe('group secretary runtime — registration re-checked after awaits', () 
     const deliver = vi.fn(async () => undefined);
     const snaps = [snapshot('working'), snapshot('idle')];
     const rt = createGroupSecretaryRuntime({
+      enabled: () => true,
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => snaps.shift() ?? snapshot('idle'),
       fetchTranscript: fetchTranscript as any, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
     });

@@ -35311,10 +35311,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   setDecisionCardService(decisionBoard);
 
   // 群秘书（/secretary on）：旁听开启群的消息 + 每 10 秒拉一次本机会话快照，摘要以静默回合
-  // 送进本 bot 在该群的 chat 级会话。没有开启的群时每拍只做一次查表。
+  // 送进本 bot 在该群的 chat 级会话。bot 级开关关着或没有开启的群时每拍只做一次查表。
   let secretaryRemoteAppPeer = new Map<string, SecretaryPeer>();
   setGroupSecretaryRuntime(createGroupSecretaryRuntime({
     larkAppId: cfg.larkAppId,
+    enabled: () => getBot(cfg.larkAppId).config.groupSecretaryEnabled === true,
     selfOpenId: () => getBot(cfg.larkAppId).botOpenId,
     canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
     fetchSnapshot: () => fetchObserveSnapshot(),
