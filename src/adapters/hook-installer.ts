@@ -30,6 +30,8 @@ export interface HookInstallConfig {
    *  - grok-hooks：写 `~/.grok/hooks/*.json` 的 SessionStart
    *  见 adapters/cli/types.ts 同名字段。 */
   readonly sessionStartCommand?: string;
+  /** 仅原生 Claude：PreCompact 维护事件，复用 session-ready 的作用域认证。 */
+  readonly preCompactCommand?: string;
   /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
    *  仅 claude-settings：写全局 settings.json 的 hooks.UserPromptSubmit。 */
   readonly userPromptSubmitCommand?: string;
@@ -382,6 +384,7 @@ function installClaudeSettings(
   userPromptSubmitCommand?: string,
   inheritClaudeEnvExclude: readonly string[] = [],
   stopFailureCommand?: string,
+  preCompactCommand?: string,
 ): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   let inheritedEnvState: { path: string; content: string } | undefined;
@@ -443,6 +446,18 @@ function installClaudeSettings(
     existingHooks['SessionStart'] = [
       ...(existingHooks['SessionStart'] ?? []),
       { hooks: [{ type: 'command', command: sessionStartCommand }] },
+    ];
+  }
+
+  if (preCompactCommand) {
+    removeBotmuxReadyHookGroups(existingHooks, 'PreCompact');
+    existingHooks['PreCompact'] = (existingHooks['PreCompact'] ?? []).filter(group =>
+      !group.hooks?.some(entry => entry.type === 'command'
+        && typeof entry.command === 'string'
+        && isBotmuxHookCommand(entry.command, '__claude-compaction-v1')));
+    existingHooks['PreCompact'] = [
+      ...(existingHooks['PreCompact'] ?? []),
+      { hooks: [{ type: 'command', command: preCompactCommand, timeout: 10 }] },
     ];
   }
 
@@ -1068,6 +1083,7 @@ export function installHook(
           hookInstall.userPromptSubmitCommand,
           hookInstall.inheritClaudeEnvExclude,
           hookInstall.stopFailureCommand,
+          hookInstall.preCompactCommand,
         );
         break;
       case 'opencode-plugin':

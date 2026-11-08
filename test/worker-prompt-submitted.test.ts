@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 interface Harness {
@@ -139,5 +140,33 @@ describe('worker prompt_submitted handler', () => {
     // Should be no-op: no new screen_update emitted
     const screenUpdateCountAfterSecond = harness.messages.filter(m => m.type === 'screen_update').length;
     expect(screenUpdateCountAfterSecond).toBe(screenUpdateCountAfterFirst);
+  });
+
+  it('reports the written turn a submitted prompt was, and nothing for another prompt', async () => {
+    const harness = startWorker();
+    await waitFor(harness, () => harness.messages.some(m => m.type === 'ready'), 'worker readiness');
+    harness.child.send({ type: 'session_ready', source: 'startup' } satisfies DaemonToWorker);
+    await waitFor(harness, () => harness.messages.some(m => m.type === 'prompt_ready'), 'worker to emit prompt_ready');
+
+    const turnId = 'workflow-event:run-1:3';
+    const content = 'checkpoint after node a: review its result';
+    harness.child.send({ type: 'message', content, turnId } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => harness.messages.some(m => m.type === 'turn_execution_started' && m.turnId === turnId),
+      'the turn to be written',
+    );
+    const submittedFor = () => harness.messages.filter(m => m.type === 'prompt_submitted_input');
+
+    const other = 'what is the status?';
+    harness.child.send({ type: 'prompt_submitted', fingerprint: fingerprintPromptText(other), prefix: prefixOf(other) } satisfies DaemonToWorker);
+    await delay(300);
+    expect(submittedFor()).toEqual([]);
+
+    harness.child.send({ type: 'prompt_submitted', fingerprint: fingerprintPromptText(content), prefix: prefixOf(content) } satisfies DaemonToWorker);
+    await waitFor(harness, () => submittedFor().length > 0, 'the submitted turn to be reported');
+    harness.child.send({ type: 'prompt_submitted', fingerprint: fingerprintPromptText(content), prefix: prefixOf(content) } satisfies DaemonToWorker);
+    await delay(300);
+    expect(submittedFor()).toEqual([{ type: 'prompt_submitted_input', turnId }]);
   });
 });

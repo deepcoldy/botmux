@@ -128,6 +128,7 @@ import {
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
+  resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
@@ -220,6 +221,7 @@ import { TurnReplyCardStore } from './services/turn-reply-card.js';
 import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from './services/group-context-publication.js';
 import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
+import { feedbackPolicyForScheduledSend, ScheduleSendAttempt, scheduledSessionRun } from './core/scheduled-send.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import {
@@ -320,8 +322,8 @@ import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISP
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE, readDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
-import { isRetryableAskHttpStatus } from './core/ask-types.js';
-import { PERMISSION_ALLOW_KEY } from './core/ask-hook/types.js';
+import { isRetryableAskHttpStatus, type CliPermissionOutcome } from './core/ask-types.js';
+import { PERMISSION_ALLOW_KEY, type PermissionOutcomeWatcher } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
 import {
   hasManagedOriginIsolationMarker,
@@ -372,6 +374,8 @@ import {
 } from './utils/bot-routing.js';
 import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { sanitizeLocalAddressText, sanitizeLocalAddressNode } from './im/lark/local-address-policy.js';
+import { localAddressContextForBot } from './im/lark/local-address-context.js';
 import {
   crossPrincipalAsKeyword,
   crossPrincipalBotSendGate,
@@ -863,6 +867,8 @@ async function finishOpenPlatformSetup(
     quiet?: boolean;
     /** 本次 setup 刚创建出这个应用 —— 只有它允许 redirect 白名单在读失败时盲写覆盖。 */
     appJustCreated?: boolean;
+    /** 内置清单 + --extra-scopes-file 合并后的权限清单；不传用内置默认清单。 */
+    scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest;
   } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
@@ -893,6 +899,7 @@ async function finishOpenPlatformSetup(
     disableQrLogin: options.reuseOnly,
     disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
     appJustCreated: options.appJustCreated,
+    scopeManifest: options.scopeManifest,
   });
   const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {
@@ -900,6 +907,10 @@ async function finishOpenPlatformSetup(
     say(`   Session 来源: ${result.sessionSource}`);
     const skipped = result.skippedScopeCount ?? 0;
     say(`   已导入权限数: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
+    if (options.scopeManifest && skipped > 0 && result.skippedScopes) {
+      const names = [...result.skippedScopes.tenant.map(n => `${n}(tenant)`), ...result.skippedScopes.user.map(n => `${n}(user)`)];
+      say(`   已跳过的权限: ${names.join(', ')}`);
+    }
     if (result.scopeWarning) {
       say(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
       say('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
@@ -1767,9 +1778,46 @@ function setupAddContinuationCommand(
   appId: string,
   brand: Brand,
   ownerPlaceholder = '<OWNER_EMAIL>',
+  extraScopesFile?: string,
 ): string {
   return `botmux setup add --app-id ${appId} --app-secret <APP_SECRET> ` +
-    `--allowed-users ${ownerPlaceholder}${brand === 'lark' ? ' --brand lark' : ''} --open-platform-auto`;
+    `--allowed-users ${ownerPlaceholder}${brand === 'lark' ? ' --brand lark' : ''} --open-platform-auto` +
+    (extraScopesFile ? ` --extra-scopes-file ${shellQuoteArg(extraScopesFile)}` : '');
+}
+
+function shellQuoteArg(value: string): string {
+  return /^[A-Za-z0-9_./~:=@%+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+type SetupExtraScopes = import('./setup/extra-scopes.js').ExtraScopesResolution;
+
+/** --extra-scopes-file 与已记录路径的取舍见 resolveExtraScopes；显式传入的文件有问题时抛错。 */
+async function resolveSetupExtraScopes(
+  requested: string | null | undefined,
+  saved?: unknown,
+): Promise<SetupExtraScopes> {
+  if (requested === undefined && saved === undefined) return {};
+  const { resolveExtraScopes } = await import('./setup/extra-scopes.js');
+  const { readDefaultScopeManifest } = await import('./setup/open-platform-automation.js');
+  return resolveExtraScopes({ requested, saved, base: readDefaultScopeManifest() });
+}
+
+/** 锁内重读 bots.json，只改这一个机器人的 extraScopesFile（null 删除），不拿入口快照整文件覆盖。 */
+async function persistBotExtraScopesFile(larkAppId: string, value: string | null): Promise<void> {
+  const { rmwBotEntry } = await import('./services/config-store.js');
+  const result = await rmwBotEntry(larkAppId, entry => {
+    if (value === null) delete entry.extraScopesFile;
+    else entry.extraScopesFile = value;
+    return { write: true, result: undefined };
+  }, { path: BOTS_JSON_FILE });
+  if (!result.ok) throw new Error(result.reason);
+}
+
+function printSetupExtraScopes(report: SetupExtraScopes['report']): void {
+  if (!report) return;
+  if (report.warning) console.warn(`⚠️  ${report.warning}`);
+  else if (report.cleared) console.log('已清除记录的追加权限清单，本次只申请内置清单。');
+  else if (report.merged) console.log(`追加权限清单: ${report.file}（内置清单之外 ${report.addedScopeCount} 项）`);
 }
 
 /** 某个（可能带 ~ 前缀的）路径若不存在/不是目录，返回展开后的绝对路径；合法返回 null。 */
@@ -1807,7 +1855,7 @@ function botJsonView(bot: Record<string, any>, index: number): Record<string, an
  * 的老姿势在问题序列变化时会静默错位）。校验口径与 TUI 一致：目录存在性、
  * owner 必填、凭证变更时的 tenant_access_token 校验，任一失败不写盘。
  */
-async function cmdSetupScripted(
+export async function cmdSetupScripted(
   argv: string[],
   cloneSource?: Record<string, any>,
 ): Promise<void> {
@@ -1823,6 +1871,22 @@ async function cmdSetupScripted(
   if (cmd.action === 'help') {
     console.log(SETUP_CLI_USAGE);
     return;
+  }
+
+  if (cmd.action === 'add' || cmd.action === 'edit') {
+    try {
+      cmd.flags = resolveWelcomeMessageFile(cmd.flags, path => {
+        const file = resolve(expandHomePath(path));
+        try {
+          return readFileSync(file, 'utf8');
+        } catch (err) {
+          throw new Error(`读取欢迎语文件 ${file} 失败: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
   }
 
   ensureConfigDir();
@@ -1848,11 +1912,36 @@ async function cmdSetupScripted(
     }
     const bot = bots[index];
     const processName = botProcessName(bot, index, PM2_NAME);
+    if (typeof cmd.extraScopesFile === 'string' && botBrand(bot) !== 'feishu') {
+      failSetupScripted(cmd.json, 'Lark 租户不支持开放平台自动配置，--extra-scopes-file 不会生效；请在开放平台「权限管理」手动添加这些权限。');
+      return;
+    }
+    // 显式 --extra-scopes-file 优先（- 清除）；否则沿用该机器人上次记下的路径。
+    let extraScopes: SetupExtraScopes;
+    try {
+      extraScopes = await resolveSetupExtraScopes(cmd.extraScopesFile, bot.extraScopesFile);
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (extraScopes.persist !== undefined) {
+      try {
+        await persistBotExtraScopesFile(bot.larkAppId, extraScopes.persist);
+      } catch (err) {
+        failSetupScripted(cmd.json, `记录追加权限清单路径失败: ${err instanceof Error ? err.message : String(err)}。未执行开放平台自动配置。`);
+        return;
+      }
+      if (extraScopes.persist === null) delete bot.extraScopesFile;
+      else bot.extraScopesFile = extraScopes.persist;
+    }
+    if (!cmd.json) printSetupExtraScopes(extraScopes.report);
+    const extraScopesJson = extraScopes.report ? { extraScopes: extraScopes.report } : {};
     const openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
       // Machine-readable callers must never be surprised by an interactive QR.
       reuseOnly: cmd.json && !cmd.switchAccount,
       forceQrLogin: cmd.switchAccount,
       quiet: cmd.json,
+      scopeManifest: extraScopes.manifest,
     });
     if (openPlatform.status === 'failed' || openPlatform.status === 'manual') {
       const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform);
@@ -1868,6 +1957,7 @@ async function cmdSetupScripted(
           bot: botJsonView(bot, index),
           appId: bot.larkAppId,
           openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
           ...(continueCommand ? { continueCommand } : {}),
           next,
         },
@@ -1883,6 +1973,7 @@ async function cmdSetupScripted(
         bot: botJsonView(bot, index),
         appId: bot.larkAppId,
         openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+        ...extraScopesJson,
         live,
         next,
       }, null, 2));
@@ -1902,6 +1993,17 @@ async function cmdSetupScripted(
     let createdAppId: string | undefined;
     let createdAppName: string | undefined;
     const requestedBrand = normalizeBrand(cmd.flags.brand);
+    // 追加权限清单在建应用之前就读取校验：文件写错不该留下一个已创建的半成品应用。
+    let extraScopes: SetupExtraScopes;
+    try {
+      extraScopes = await resolveSetupExtraScopes(cmd.extraScopesFile);
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (!cmd.json) printSetupExtraScopes(extraScopes.report);
+    const extraScopesFile = extraScopes.report?.file ?? undefined;
+    const extraScopesJson = extraScopes.report ? { extraScopes: extraScopes.report } : {};
     if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
       const legacy = parseDotEnvToBotConfig();
       if (legacy.larkAppId && legacy.larkAppSecret) {
@@ -2029,6 +2131,7 @@ async function cmdSetupScripted(
             : { forceQrLogin: true as const };
           const created = await createFeishuOpenPlatformApp({
             name: appName,
+            ...(cmd.flags.appIcon?.trim() ? { iconFilePath: resolve(cmd.flags.appIcon.trim()) } : {}),
             ...sessionOptions,
             disableBytedcliFallback: true,
             onSessionReady: ({ identity, source }) => {
@@ -2055,11 +2158,11 @@ async function cmdSetupScripted(
 
       if (!credentials.ok) {
         const continueCommand = credentials.appId
-          ? setupAddContinuationCommand(credentials.appId, requestedBrand)
+          ? setupAddContinuationCommand(credentials.appId, requestedBrand, undefined, extraScopesFile)
           : undefined;
         failSetupScripted(cmd.json,
           `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
-          credentials.appId ? { partial: true, appId: credentials.appId, appName, continueCommand } : {},
+          credentials.appId ? { partial: true, appId: credentials.appId, appName, ...extraScopesJson, continueCommand } : {},
         );
         return;
       }
@@ -2112,12 +2215,12 @@ async function cmdSetupScripted(
     const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
     if (!v.ok) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), undefined, extraScopesFile)
         : undefined;
       failSetupScripted(
         cmd.json,
         `凭证校验失败 (${v.error}): ${v.message}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
-        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), ...extraScopesJson, continueCommand } : {},
       );
       return;
     }
@@ -2135,7 +2238,7 @@ async function cmdSetupScripted(
     );
     if (unusableOwners.length > 0) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot), '<OWNER_EMAIL_OR_UNION_ID>')
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), '<OWNER_EMAIL_OR_UNION_ID>', extraScopesFile)
         : undefined;
       failSetupScripted(
         cmd.json,
@@ -2147,6 +2250,7 @@ async function cmdSetupScripted(
               partial: true,
               appId: createdAppId,
               ...(createdAppName ? { appName: createdAppName } : {}),
+              ...extraScopesJson,
               continueCommand,
             }
           : {},
@@ -2155,15 +2259,16 @@ async function cmdSetupScripted(
     }
 
     try {
+      if (typeof extraScopes.persist === 'string') bot.extraScopesFile = extraScopes.persist;
       writeBotsJsonAtomic([...existing, bot]);
     } catch (err) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), undefined, extraScopesFile)
         : undefined;
       failSetupScripted(
         cmd.json,
         `写入 bot 配置失败: ${err instanceof Error ? err.message : String(err)}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
-        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), ...extraScopesJson, continueCommand } : {},
       );
       return;
     }
@@ -2193,6 +2298,7 @@ async function cmdSetupScripted(
         // 只认「本次命令确实创建出了这个 appId」这一条硬证据：--app-id/--app-secret
         // 直接传进来的存量应用绝不能拿到盲写授权。
         appJustCreated: createdAppId !== undefined && createdAppId === bot.larkAppId,
+        scopeManifest: extraScopes.manifest,
       });
     }
 
@@ -2211,6 +2317,7 @@ async function cmdSetupScripted(
           botsFile: BOTS_JSON_FILE,
           envMigrated: migratedEnv || undefined,
           openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
           continueCommand,
           live: {
             ok: false,
@@ -2235,6 +2342,7 @@ async function cmdSetupScripted(
         botsFile: BOTS_JSON_FILE,
         envMigrated: migratedEnv || undefined,
         openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+        ...extraScopesJson,
         live,
         next,
       }, null, 2));
@@ -2393,12 +2501,20 @@ async function cmdSetupScripted(
 }
 
 async function cmdClone(argv: string[]): Promise<void> {
-  const [sourceSelector, nameFlag, requestedName] = argv;
-  if (
-    !sourceSelector
-    || (argv.length !== 1 && (argv.length !== 3 || nameFlag !== '--name' || !requestedName?.trim()))
-  ) {
-    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>]');
+  const [sourceSelector, ...rest] = argv;
+  let requestedName: string | undefined;
+  let iconPath: string | undefined;
+  let badArgs = !sourceSelector || sourceSelector.startsWith('-');
+  for (let i = 0; i < rest.length && !badArgs; i += 2) {
+    const flag = rest[i];
+    const value = rest[i + 1];
+    if (!value?.trim()) badArgs = true;
+    else if (flag === '--name' && requestedName === undefined) requestedName = value;
+    else if (flag === '--icon' && iconPath === undefined) iconPath = value;
+    else badArgs = true;
+  }
+  if (badArgs) {
+    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>] [--icon <PNG 路径>]');
     process.exitCode = 1;
     return;
   }
@@ -2422,8 +2538,8 @@ async function cmdClone(argv: string[]): Promise<void> {
   }
   const addArgs = ['add', '--create-app', '--allowed-users', owners.join(',')];
   if (botBrand(source) === 'lark') {
-    if (requestedName) {
-      console.error('Lark SDK 创建路径暂不支持自定义应用名称。');
+    if (requestedName || iconPath) {
+      console.error('Lark SDK 创建路径暂不支持自定义应用名称或图标。');
       process.exitCode = 1;
       return;
     }
@@ -2433,6 +2549,7 @@ async function cmdClone(argv: string[]): Promise<void> {
       ? source.displayName.trim()
       : botProcessName(source, sourceIndex);
     addArgs.push('--app-name', resolveCloneAppName(requestedName, sourceName));
+    if (iconPath) addArgs.push('--app-icon', iconPath);
   }
   await cmdSetupScripted(addArgs, source);
 }
@@ -4116,6 +4233,8 @@ interface SessionData {
     boundScope?: 'thread' | 'chat';
   };
   deferredScheduleRun?: DeferredScheduleRunData;
+  scheduledRun?: import('./types.js').Session['scheduledRun'];
+  scheduledRuns?: import('./types.js').Session['scheduledRuns'];
   vcMeetingReceiver?: {
     listenerAppId: string;
     meetingId: string;
@@ -6176,6 +6295,43 @@ async function postSessionCliIpc(
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
 }
 
+/** `botmux board attach` 的说明页 / 视频：正文是文件原始字节。鉴权同 postSessionCliIpc，capability 放请求头。 */
+async function postBoardExplainerUpload(
+  ipcPort: number,
+  sessionId: string,
+  ref: string,
+  file: { name: string; mime: string; bytes: Buffer },
+): Promise<Response> {
+  const { BOARD_UPLOAD_HEADERS: H } = await import('./core/decision-board/files.js');
+  const headers: Record<string, string> = {
+    'content-type': file.mime,
+    [H.name]: encodeURIComponent(file.name),
+    [H.ref]: encodeURIComponent(ref),
+  };
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
+  }
+  if (!hostSecret) {
+    const claim = readManagedOriginCapability(
+      resolveDataDir(),
+      sessionId,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    );
+    if (claim) {
+      headers[H.capability] = claim.capability;
+      if (claim.turnId) headers[H.turnId] = claim.turnId;
+      if (claim.dispatchAttempt !== undefined) headers[H.dispatchAttempt] = String(claim.dispatchAttempt);
+    }
+  }
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/decision-board/upload`;
+  const init = { method: 'POST', headers, body: new Uint8Array(file.bytes) } satisfies RequestInit;
+  return hostSecret
+    ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
+    : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
 let deferredTopicSidecarWritable: boolean | undefined;
 
 /** The daemon's deferred-topic claim route, or undefined when no daemon port is
@@ -6654,7 +6810,9 @@ ${SESSION_RENAME_USAGE}
 
 /** `botmux board …`：管家写决策看板。解析与输出在 cli/board-command.ts，这里只负责找会话和发 IPC。 */
 async function cmdBoard(argv: string[]): Promise<void> {
-  const { BOARD_CLI_USAGE, formatBoardResult, parseBoardArgs, readBoardAttachFiles } = await import('./cli/board-command.js');
+  const {
+    BOARD_CLI_USAGE, formatBoardResult, parseBoardArgs, readBoardAttachFiles, readBoardExplainerFiles, splitBoardAttachPaths,
+  } = await import('./cli/board-command.js');
   const parsed = parseBoardArgs(argv);
   if (!parsed.ok) {
     console.error(`botmux board: ${parsed.error}`);
@@ -6667,14 +6825,20 @@ async function cmdBoard(argv: string[]): Promise<void> {
     return;
   }
   const { action, json, request, attachPaths } = parsed.parsed;
+  let explainers: Array<{ name: string; mime: string; bytes: Buffer }> = [];
   if (attachPaths.length) {
-    const files = readBoardAttachFiles(attachPaths);
-    if (!files.ok) {
-      console.error(`botmux board: ${files.error}`);
+    const fail = (error: string) => {
+      console.error(`botmux board: ${error}`);
       process.exitCode = 1;
-      return;
-    }
-    request.files = files.files;
+    };
+    const split = splitBoardAttachPaths(attachPaths);
+    if (!split.ok) return fail(split.error);
+    const images = readBoardAttachFiles(split.images);
+    if (!images.ok) return fail(images.error);
+    const read = readBoardExplainerFiles(split.explainers);
+    if (!read.ok) return fail(read.error);
+    if (images.files.length) request.files = images.files;
+    explainers = read.files;
   }
   const sid = parsed.parsed.sessionId ?? findAncestorSessionId();
   if (!sid) {
@@ -6694,6 +6858,23 @@ async function cmdBoard(argv: string[]): Promise<void> {
     console.error('当前 Bot daemon 不在线。');
     process.exitCode = 1;
     return;
+  }
+  if (explainers.length) {
+    const staged: string[] = [];
+    for (const file of explainers) {
+      const up = await postBoardExplainerUpload(ipcPort, session.sessionId, String(request.ref), file);
+      const upBody = await up.json().catch(() => ({})) as { ok?: boolean; id?: string; error?: string; message?: string; warnings?: string[] };
+      if (!up.ok || !upBody.ok || !upBody.id) {
+        const old = up.status === 401 || (up.status === 404 && upBody.error === 'not_found');
+        console.error(`botmux board attach 失败: ${file.name}：${upBody.message ?? upBody.error ?? `HTTP ${up.status}`}`
+          + (old ? '（daemon 版本过旧，还不支持图文说明；重启 daemon 后再试）' : ''));
+        process.exitCode = 1;
+        return;
+      }
+      for (const w of upBody.warnings ?? []) console.error(`⚠ ${file.name}：${w}`);
+      staged.push(upBody.id);
+    }
+    request.staged = staged;
   }
   const response = await postSessionCliIpc(ipcPort, session.sessionId, 'decision-board', request);
   const body = await response.json().catch(() => ({})) as Record<string, unknown> & { ok?: boolean; error?: string; message?: string };
@@ -7938,6 +8119,8 @@ ${SEND_HELP_BODY}
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
+  ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
+                                       否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
@@ -9967,6 +10150,11 @@ import {
   managedVcSendPayloadError,
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
+  validateSecretaryAction,
+  validateSecretaryRouting,
+  parseSecretaryPatrolRoot,
+  findSecretaryDuplicate,
+  SECRETARY_TURN_PREFIX,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
 import { describeScheduleState } from './services/schedule-until-done.js';
@@ -10181,7 +10369,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -11170,6 +11358,23 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const originSession = originSessionId
     ? sessionsForOrigin.get(originSessionId)
     : undefined;
+  let effectiveResponseKind: TurnSendKind = argValue(rest, '--response-kind') === 'final' ? 'final' : 'progress';
+  const scheduledOrigin = authoritativeOriginTurnCtx?.sessionId === originSession?.sessionId
+    ? originSession : undefined;
+  const scheduledOriginRun = scheduledSessionRun(scheduledOrigin, authoritativeOriginTurnCtx?.turnId);
+  const scheduledSendAttempt = authoritativeOriginTurnCtx?.turnId && scheduledOrigin
+    && scheduledOriginRun
+    ? new ScheduleSendAttempt(resolveDataDir(), scheduledOrigin, authoritativeOriginTurnCtx.turnId)
+    : undefined;
+  if (scheduledSendAttempt) {
+    // Once the origin is authenticated, also observe process.exit-based
+    // preflight refusals. Possible provider effects remain unknown, never retried.
+    process.once('exit', code => {
+      if (code === 0 || effectiveResponseKind !== 'final') return;
+      try { scheduledSendAttempt.fail(new Error(`botmux send exited ${code} without a final delivery receipt`)); }
+      catch { /* observability cannot change a send's outcome */ }
+    });
+  }
   const hostRelayRequiresCodexAppLedger = !!trustedRelayCtx
     && process.env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1';
   // The live worker authorizes a Codex App relay only while an exact durable
@@ -11337,7 +11542,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // Only an explicit `final` may opt into feedback controls and indexing;
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
-  let effectiveResponseKind: TurnSendKind = responseKind ?? 'progress';
+  effectiveResponseKind = responseKind ?? 'progress';
   let expectedLinks = argValues(rest, '--expected-link');
   if (rest.some((token, index) => token === '--expected-link='
     || (token === '--expected-link'
@@ -11854,7 +12059,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // worker restart, turn rotation, or Codex ledger settlement.
   let checkSendTopics: ((lookup?: TopicMessageLookup) => Promise<void>) | undefined;
   let arbitraryMentionRequired = false;
-  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
+  let scheduledProviderEffectStarted = false;
+  const knownPreProviderRejections = new Set<unknown>();
+  const beginScheduledProviderEffect = (): void => {
+    scheduledProviderEffectStarted = true;
+    scheduledSendAttempt?.providerRequestStarted();
+  };
+  const resolveRevalidatedIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
       context: isolatedAttestationContext,
@@ -11890,6 +12101,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
     return fresh;
   };
+  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
+    try { return await resolveRevalidatedIsolatedOrigin(); }
+    catch (error) {
+      // This proof rejected the current call before its effect. An earlier
+      // provider attempt, even one whose response was lost, stays ambiguous.
+      if (!scheduledProviderEffectStarted) knownPreProviderRejections.add(error);
+      throw error;
+    }
+  };
   const revalidateIsolatedOriginBeforeEffect = async (
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
@@ -11900,6 +12120,10 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
     await revalidateIsolatedOriginBeforeEffect(lookup);
+  };
+  const fenceScheduledProviderWrite = async (lookup?: TopicMessageLookup): Promise<void> => {
+    await fenceIsolatedOriginBeforeEffect(lookup);
+    beginScheduledProviderEffect();
   };
   const fenceIsolatedOrigin = async (): Promise<void> => {
     await revalidateIsolatedOrigin();
@@ -11938,7 +12162,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           : { suppressHook: true as const }
         : undefined;
     return {
-      beforeWrite: fenceIsolatedOriginBeforeEffect,
+      beforeWrite: fenceScheduledProviderWrite,
       ...(hookOptions ?? {}),
       ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}),
     };
@@ -12225,6 +12449,18 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     console.error(`botmux send refused: ${stable}`);
     process.exit(2);
   }
+  // Process the expanded presentation before validation, uploads or any send
+  // ledger/hash. The Lark client checks only card link fields, not prose.
+  try {
+    const localContext = localAddressContextForBot(s.larkAppId, s.workingDir);
+    content = sanitizeLocalAddressText(content, localContext);
+    if (preparedText !== undefined) preparedText = sanitizeLocalAddressText(preparedText, localContext);
+    if (customCard) customCard = sanitizeLocalAddressNode(customCard, localContext);
+    if (completionProposalVisible) completionProposalVisible = sanitizeLocalAddressNode(completionProposalVisible, localContext);
+  } catch (error) {
+    console.error('botmux send refused: ' + (error instanceof Error ? error.message : 'LOCAL_ADDRESS_OUTBOUND_REJECTED'));
+    process.exit(2);
+  }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
     ?? turnReplyTarget?.senderOpenId
@@ -12500,9 +12736,14 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-  ): Promise<{ messageId: string; replayed: boolean }> => turnSendKey
-    ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch)
-    : { messageId: await dispatch(), replayed: false };
+  ): Promise<{ messageId: string; replayed: boolean }> => {
+    return turnSendKey
+      ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
+          ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
+            !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
+        })
+      : { messageId: await dispatch(), replayed: false };
+  };
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
     existingTurnPrimary = turnSendKey
@@ -12635,11 +12876,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
-          beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+          beforeProviderEffect: fenceScheduledProviderWrite,
         });
         dir = out.dir;
         voiceDurationMs = out.durationMs;
         await revalidateIsolatedOriginBeforeEffect();
+        beginScheduledProviderEffect();
         const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
         const proposedOutput = {
           targetChatId,
@@ -12667,7 +12909,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           const deliveryUuid = prepared?.providerKey ?? providerUuid;
           await revalidateIsolatedOriginBeforeEffect();
           const privateMessageId = !sendInto && !overrideChatId
-            ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid)
+            ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid,
+                { beforeWrite: fenceScheduledProviderWrite })
             : undefined;
           const deferred = privateMessageId !== undefined
             ? { handled: true, messageId: privateMessageId, materializedNow: false, rootMessageId: undefined }
@@ -12942,6 +13185,44 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     hasQuoteTargetSender: !!replyTargetSenderOpenId,
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
+  // 群秘书回合发送闸：秘书回合里每条消息都要声明动作，旁白式发送直接拒绝。
+  const secretaryGate = validateSecretaryAction({
+    turnId: currentTurnId,
+    action: argValue(rest, '--secretary-action'),
+    reason: argValue(rest, '--secretary-reason'),
+  });
+  if (!secretaryGate.ok) { console.error(secretaryGate.error); process.exit(2); }
+  if (secretaryGate.action && currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.chatId && s.larkAppId) {
+    // 复述拦截（deliver 例外：把别的 bot 的结果转交 leader 本来就要引用原文）：与群里最近的消息高度重复（把别人刚交付的结论再说一遍）→ 拒发。拉不到历史时放行。
+    try {
+      const { listChatMessages } = await import('./im/lark/client.js');
+      const { restMessageToEventData, larkEventToSecretaryMessage } = await import('./services/group-secretary-runtime.js');
+      const items = await listChatMessages(s.larkAppId, s.chatId, 30);
+      const recent = items
+        .map(item => larkEventToSecretaryMessage(restMessageToEventData(item, s.chatId!), undefined))
+        .filter((m): m is NonNullable<typeof m> => !!m && !!m.text && !m.text.startsWith('[卡片消息'))
+        .map(m => ({ id: m.messageId, text: m.text }));
+      const dup = secretaryGate.action === 'deliver' ? undefined : findSecretaryDuplicate(content, recent);
+      if (dup) {
+        console.error(`botmux send refused: 这条内容与群里最近的消息 ${dup} 高度重复——复述已有结论属于旁白，不要发。真有新信息就只写新增的部分。`);
+        process.exit(2);
+      }
+    } catch { /* 历史拉取失败：不拦 */ }
+    try {
+      const { appendFileSync, mkdirSync: mk } = await import('node:fs');
+      const dir = resolveDataDir();
+      mk(dir, { recursive: true });
+      const auditPath = join(dir, `group-secretary-actions-${s.larkAppId}.jsonl`);
+      // 审计日志只追加：超过 5 MiB 时滚成 .1（只留一份历史），不让它无限长大。
+      const { rotateLogIfNeeded } = await import('./utils/log-rotate.js');
+      rotateLogIfNeeded(auditPath, 5 * 1024 * 1024);
+      appendFileSync(auditPath, JSON.stringify({
+        at: new Date().toISOString(), chatId: s.chatId, turnId: currentTurnId,
+        action: secretaryGate.action, reason: argValue(rest, '--secretary-reason')?.slice(0, 300),
+        text: content.slice(0, 300),
+      }) + '\n');
+    } catch { /* 审计日志写失败不挡发送 */ }
+  }
 
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
 
@@ -13034,6 +13315,21 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
   }
   // ───────────────────────────────────────────────────────────────────────────
+  // 群秘书落点闸：巡查回合锁在被巡查的话题；总管回合不许在主群顶层 @ bot。
+  if (currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.larkAppId) {
+    const { botEntries: secBotEntries, crossRef: secCrossRef } = loadBotMentionIdentityMap(resolveDataDir(), s.larkAppId);
+    const routing = validateSecretaryRouting({
+      turnId: currentTurnId,
+      mentionOpenIds: mentions.map(m => m.open_id),
+      knownBotOpenIds: knownBotOpenIdsFromCrossRef(secCrossRef, secBotEntries, s.larkAppId),
+      ...(sendInto ? { sendInto } : {}),
+      ...(explicitQuote !== undefined ? { explicitQuote } : {}),
+      sendTopLevel,
+      ...(overrideChatId ? { overrideChatId } : {}),
+      ...(s.chatId ? { sessionChatId: s.chatId } : {}),
+    });
+    if (!routing.ok) { console.error(routing.error); process.exit(2); }
+  }
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
   let oncallGroupPolicy: import('./services/oncall-group-policy.js').OncallGroupPolicy | undefined;
   let oncallGroupCard: Record<string, any> | undefined;
@@ -13071,7 +13367,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       feedbackPolicy = undefined;
     }
   }
-  const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  // A reused session's owner or last sender is not this automatic turn's
+  // requester. Only the identity frozen on the host-written run may claim it.
+  const feedbackRequesterSubjectId = scheduledOriginRun
+    ? scheduledOriginRun.requesterSubjectId : replyTargetSenderOpenId ?? s.ownerOpenId;
+  feedbackPolicy = feedbackPolicyForScheduledSend({ policy: feedbackPolicy,
+    requesterSubjectId: feedbackRequesterSubjectId,
+    authenticatedTurnId: authoritativeOriginTurnCtx?.turnId, session: scheduledOrigin });
   const withOncallGroup = (card: string): string => {
     if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
     const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
@@ -13099,6 +13401,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // turn sender is another bot. Only the `requester` audience needs a resolvable
   // human recipient to make its control clickable.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId) {
+    try { scheduledSendAttempt?.fail(new Error('requester identity missing for final feedback')); } catch { /* best-effort */ }
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
@@ -13132,7 +13435,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
   }
 
-  const { sendMessage, replyMessage, urgentMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, urgentMessage, uploadImage: uploadLarkImage, uploadFile: uploadLarkFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
+  // Uploads are observable too. A later authority refusal must not erase an
+  // earlier upload attempt, including media sent before the primary message.
+  const uploadImage: typeof uploadLarkImage = (...args) => {
+    beginScheduledProviderEffect();
+    return uploadLarkImage(...args);
+  };
+  const uploadFile: typeof uploadLarkFile = (...args) => {
+    beginScheduledProviderEffect();
+    return uploadLarkFile(...args);
+  };
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
   // Chat-scope sessions (普通群整群一会话) post to chatId without
@@ -13277,7 +13590,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
     if (!sendInto && !overrideChatId) {
-      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid);
+      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid,
+        { beforeWrite: fenceScheduledProviderWrite });
       if (privateMessageId !== undefined) return privateMessageId;
     }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
@@ -13500,6 +13814,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (!durableIpcPort) {
         throw new Error('durable primary send requires the owning daemon IPC port');
       }
+      beginScheduledProviderEffect();
       const messageId = await dispatchDurableSessionMessage({
         post: (sessionId, route, payload) => postSessionCliIpc(
           durableIpcPort,
@@ -13584,7 +13899,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               );
             }
           : dispatchAfterOriginGate,
-        beforeWrite: fenceIsolatedOriginBeforeEffect,
+        beforeWrite: fenceScheduledProviderWrite,
         beforeEffect: originAlreadyRevalidated
           ? undefined
           : fenceIsolatedOrigin,
@@ -14154,6 +14469,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               async (lookup) => {
                 await revalidateIsolatedOriginBeforeEffect(lookup);
                 revalidateVcMeetingManagedSend();
+                beginScheduledProviderEffect();
               }),
             isWithdrawn: error => error instanceof MessageWithdrawnError,
             render: record => buildTurnReplyCard(record, {
@@ -14536,6 +14852,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }));
   } catch (err: any) {
     if (err instanceof TopicSendError) throw err;
+    try { if (effectiveResponseKind === 'final') scheduledSendAttempt?.fail(err); } catch { /* best-effort */ }
     console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }
@@ -15527,6 +15844,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const dispatchTurnId = dispatchContext?.sessionId === dispatchOrigin.sessionId
     ? dispatchContext.turnId : undefined;
   const dispatchTurn = pickTurnReplyTarget(dispatchOrigin, dispatchTurnId);
+  // 话题巡查回合只能往被巡查的那个话题里派 / 追加，不能另开话题或派到别的话题。
+  const patrolRoot = parseSecretaryPatrolRoot(dispatchTurnId);
+  if (patrolRoot && dispatchArgs.into !== patrolRoot) {
+    console.error(`botmux dispatch refused: 这是话题巡查回合，只能 --into ${patrolRoot}（被巡查的话题）。别的话题或主群的事用 botmux secretary report --escalate 交给总管。`);
+    process.exit(2);
+  }
   const dispatchSourceAppId = dispatchOrigin.larkAppId!;
   const dispatchSource = resolveSendTarget({
     topLevel: false, chatScope: (dispatchOrigin.scope ?? 'thread') === 'chat', chatId: dispatchOrigin.chatId,
@@ -17417,37 +17740,13 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
 
   let res: Response;
   try {
-    const requestBody = { ...body };
-    if (typeof requestBody.originCapability !== 'string') {
-      const sessionId = typeof requestBody.sessionId === 'string'
-        ? requestBody.sessionId
-        : undefined;
-      const claim = readManagedOriginCapability(
-        resolveDataDir(),
-        sessionId,
-        process.env.BOTMUX_SEND_RELAY,
-        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-      );
-      if (claim) requestBody.originCapability = claim.capability;
-    }
-    const init = {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(requestBody),
-      // No client-side timeout — broker enforces `timeoutMs` and will respond
-      // with `kind:'timedOut'` so this fetch always settles.
-    } satisfies RequestInit;
-    let hostSecret: string | undefined;
-    if (!process.env.BOTMUX_SEND_RELAY) {
-      try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
-    }
     // Versioned admission prevents an old daemon silently dropping the
     // respondent restriction on a choice-only request. Never downgrade it.
     const endpoint = body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
       ? '/api/asks/form-v1' : '/api/asks';
-    res = hostSecret
-      ? await fetchDaemonIpc(daemon.ipcPort, endpoint, init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${endpoint}`, init);
+    // No client-side timeout — broker enforces `timeoutMs` and will respond
+    // with `kind:'timedOut'` so this fetch always settles.
+    res = await postAskIpc(daemon.ipcPort, endpoint, body);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -17472,6 +17771,78 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
     throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
   }
 }
+
+/** POST an ask-family request to the session's daemon: host HMAC when the host
+ *  secret is readable, otherwise the session's live origin capability. */
+async function postAskIpc(ipcPort: number, endpoint: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+  const requestBody = { ...body };
+  if (typeof requestBody.originCapability !== 'string') {
+    const sessionId = typeof requestBody.sessionId === 'string'
+      ? requestBody.sessionId
+      : undefined;
+    const claim = readManagedOriginCapability(
+      resolveDataDir(),
+      sessionId,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    );
+    if (claim) requestBody.originCapability = claim.capability;
+  }
+  const init = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(requestBody),
+    ...(signal ? { signal } : {}),
+  } satisfies RequestInit;
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
+  }
+  return hostSecret
+    ? fetchDaemonIpc(ipcPort, endpoint, init, hostSecret)
+    : loopbackFetch(`http://127.0.0.1:${ipcPort}${endpoint}`, init);
+}
+
+/**
+ * 告诉 daemon：发起这张权限卡的 CLI 已自行了结这次确认（内置超时自动拒绝、终端裁决、hook 被
+ * 终止），让卡片立刻落到真实结局。daemon 暂时不可达时在 budget 内重试；daemon 还不认识这张卡（409，
+ * 卡片自己的 POST 可能还在登记）时短暂重试；老 daemon 没有这条路由（404）或其它确定性失败返回
+ * false，卡片由 hook 断开后的既有失效兜底收尾。
+ */
+async function postAskCliResolved(body: Record<string, unknown>, budgetMs: number): Promise<boolean> {
+  return sendCliResolvedReport((signal) => {
+    const daemon = findDaemon(body.larkAppId as string);
+    return daemon ? postAskIpc(daemon.ipcPort, '/api/asks/cli-resolved', body, signal) : Promise.resolve(null);
+  }, budgetMs);
+}
+
+/** Retry loop behind postAskCliResolved; `send` resolves null while no daemon is registered. */
+export async function sendCliResolvedReport(
+  send: (signal: AbortSignal) => Promise<Response | null>,
+  budgetMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  const unknownAskDeadline = Date.now() + Math.min(budgetMs, CLI_RESOLVED_UNKNOWN_ASK_RETRY_MS);
+  for (let attempt = 1; ; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    let unknownAsk = false;
+    try {
+      const res = await send(AbortSignal.timeout(remaining));
+      if (res?.ok) return true;
+      if (res) {
+        unknownAsk = res.status === 409;
+        if (unknownAsk ? Date.now() >= unknownAskDeadline : !isRetryableAskHttpStatus(res.status)) return false;
+      }
+    } catch { /* daemon unreachable or restarting → retry within budget */ }
+    const wait = Math.min(unknownAsk ? CLI_RESOLVED_UNKNOWN_ASK_POLL_MS : 1_000 * attempt, 5_000, deadline - Date.now());
+    if (wait <= 0) return false;
+    await new Promise(resolve => setTimeout(resolve, wait));
+  }
+}
+
+const CLI_RESOLVED_UNKNOWN_ASK_RETRY_MS = 3_000;
+const CLI_RESOLVED_UNKNOWN_ASK_POLL_MS = 200;
 
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
@@ -17500,7 +17871,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -17519,6 +17890,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const answererOpenId = argValue(rest, '--answerer');
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
+  const mentionRaw = argValue(rest, '--mention');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
   const positionalArgs = positionals(rest, ['--json', '--multi']);
@@ -17526,6 +17898,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   let options;
   let questions;
   let timeoutMs;
+  let mentionedOpenId;
   try {
     if (rest.some(a => a === '--answerer' || a.startsWith('--answerer='))
       && (!answererOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(answererOpenId))) {
@@ -17542,6 +17915,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       questions = parseAskQuestionsFile(raw);
     } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
+    mentionedOpenId = parseAskMention(mentionRaw);
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
@@ -17588,6 +17962,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
+    // `botmux ask --mention <open_id>`：daemon 确认对方是本应用通讯录里的真人后，在卡片
+    // 问题前注入真实 <at> 让对方收到通知；确认不了就只丢掉 @（at 到 bot 会让整卡 100290）。
+    ...(mentionedOpenId ? { mentionedOpenId } : {}),
   };
 
   const protectAskWait = () => {
@@ -17711,6 +18088,8 @@ export async function runHook(
   resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
   resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number } | null | undefined =
     sessionId => resolveSessionContext(resolveDataDir(), sessionId),
+  /** 权限确认专用：观察 CLI 是否绕过卡片自行了结了这次确认，并把结局回报 daemon。缺省 = 只等卡片。 */
+  cliOutcome?: HookCliOutcomeOptions,
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
 
@@ -17728,7 +18107,7 @@ export async function runHook(
   // 解析问题：askUserQuestion → 提问卡片；终端权限确认框（PermissionRequest）→
   // 允许/拒绝卡片；其余事件 → passthrough 放行
   const askParsed = adapter.parseQuestions(payload);
-  const permissionParsed = askParsed ? null : adapter.parsePermissionRequest?.(payload) ?? null;
+  const permissionParsed = askParsed ? null : adapter.parsePermissionRequest?.(payload, env) ?? null;
   const parsed = askParsed ?? permissionParsed;
   if (!parsed) {
     return { stdout: adapter.passthrough(payload) };
@@ -17889,32 +18268,76 @@ export async function runHook(
   // stable key, so the SAME card resolves through the normal hook directive.
   // Blocking here keeps Claude spinning; the native picker never renders.
   const deadline = Date.now() + timeoutMs;
-  let result: import('./core/ask-types.js').AskResult | undefined;
-  let attempt = 0;
-  while (true) {
-    try {
-      result = await postAskFn(body);
-      break;
-    } catch (err) {
-      // Retry ONLY genuinely transient failures (daemon unreachable / network /
-      // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the
-      // restart-in-progress case. A deterministic error (4xx bad body /
-      // capability / unsupported, non-JSON) has retryable=false → passthrough
-      // immediately rather than spin for 24h. A non-coded throw is also treated
-      // as non-retryable.
-      const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
-      if (!retryable || Date.now() >= deadline) {
-        return unresolved(PERMISSION_DENY_UNDELIVERED);
+  const abandonAsk = new AbortController();
+  const awaitAsk = async (): Promise<import('./core/ask-types.js').AskResult | null> => {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await postAskFn(body);
+      } catch (err) {
+        if (abandonAsk.signal.aborted) return null;
+        // Retry ONLY genuinely transient failures (daemon unreachable / network /
+        // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the
+        // restart-in-progress case. A deterministic error (4xx bad body /
+        // capability / unsupported, non-JSON) has retryable=false → passthrough
+        // immediately rather than spin for 24h. A non-coded throw is also treated
+        // as non-retryable.
+        const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
+        if (!retryable || Date.now() >= deadline) return null;
+        attempt++;
+        // Backoff: quick first reconnects (daemon usually returns in a few
+        // seconds), capped at 5s. Never sleep past the deadline.
+        const backoff = Math.min(5_000, 500 * attempt);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return null;
+        await new Promise<void>((r) => {
+          const wake = () => {
+            clearTimeout(timer);
+            abandonAsk.signal.removeEventListener('abort', wake);
+            r();
+          };
+          const timer = setTimeout(wake, Math.min(backoff, remaining));
+          abandonAsk.signal.addEventListener('abort', wake, { once: true });
+        });
+        if (abandonAsk.signal.aborted) return null;
       }
-      attempt++;
-      // Backoff: quick first reconnects (daemon usually returns in a few
-      // seconds), capped at 5s. Never sleep past the deadline.
-      const backoff = Math.min(5_000, 500 * attempt);
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return unresolved(PERMISSION_DENY_UNDELIVERED);
-      await new Promise((r) => setTimeout(r, Math.min(backoff, remaining)));
     }
+  };
+
+  let result: import('./core/ask-types.js').AskResult | null;
+  if (permissionParsed && adapter.formatPermissionDecision && cliOutcome) {
+    // Claude Code can end the confirmation without this hook (its own timeout,
+    // a terminal choice, an interrupt). Whichever ends first wins; when it is
+    // the CLI, settle the card with that outcome instead of waiting it out.
+    const watcher = adapter.createPermissionOutcomeWatcher?.(payload) ?? null;
+    // Already over before the card exists (answered in the terminal, or the hook
+    // terminated): posting it now would only leave a card nothing settles.
+    if (cliOutcome.terminated?.aborted || watcher?.scan()) {
+      return { stdout: adapter.formatPermissionDecision(false, PERMISSION_RESOLVED_BY_CLI) };
+    }
+    const stopWatching = new AbortController();
+    const first = await Promise.race([
+      awaitAsk().then(ask => ({ ask })),
+      watchCliPermissionOutcome(watcher, cliOutcome, stopWatching.signal).then(outcome => ({ outcome })),
+    ]);
+    stopWatching.abort();
+    if ('outcome' in first) {
+      abandonAsk.abort();
+      await cliOutcome.reportCliResolved({
+        sessionId: routeSessionId,
+        larkAppId: routeLarkAppId,
+        requestId,
+        outcome: first.outcome,
+        ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
+        ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
+      }, cliOutcome.terminated?.aborted ? HOOK_TERMINATED_REPORT_BUDGET_MS : CLI_RESOLVED_REPORT_BUDGET_MS).catch(() => false);
+      return { stdout: adapter.formatPermissionDecision(false, PERMISSION_RESOLVED_BY_CLI) };
+    }
+    result = first.ask;
+  } else {
+    result = await awaitAsk();
   }
+  if (!result) return unresolved(PERMISSION_DENY_UNDELIVERED);
 
   if (permissionParsed && adapter.formatPermissionDecision) {
     return { stdout: permissionDecisionFromResult(result, timeoutMs, adapter.formatPermissionDecision) };
@@ -17931,6 +18354,71 @@ export async function runHook(
 /** 权限确认默认等 10 分钟；上限必须小于 hook 安装侧的进程超时（见 hook-installer）。 */
 const PERMISSION_DEFAULT_TIMEOUT_MS = 600_000;
 const PERMISSION_MAX_TIMEOUT_MS = 840_000;
+
+export interface HookCliOutcomeOptions {
+  /** Tell the daemon the CLI ended this confirmation itself; true once the card is settled. */
+  reportCliResolved: (body: Record<string, unknown>, budgetMs: number) => Promise<boolean>;
+  /** Aborted when the CLI terminates this hook process (Esc / No / interrupt / exit). */
+  terminated?: AbortSignal;
+  pollMs?: number;
+  terminatedGraceMs?: number;
+}
+
+const CLI_OUTCOME_POLL_MS = 1_000;
+/** Claude Code stamps the terminal's verdict before it terminates the hook, but the
+ *  transcript reaches disk a little later. */
+const TERMINATED_SCAN_GRACE_MS = 300;
+const TERMINATED_SCAN_POLL_MS = 50;
+/** Claude Code follows its SIGTERM with a hard kill about 1.3s later; grace + budget must fit. */
+const HOOK_TERMINATED_REPORT_BUDGET_MS = 700;
+const CLI_RESOLVED_REPORT_BUDGET_MS = 30_000;
+
+/** Resolves once the CLI has ended the confirmation without this hook: an
+ *  outcome recorded by the CLI itself, or the CLI terminating the hook. Never
+ *  resolves after `stop` aborts. */
+function watchCliPermissionOutcome(
+  watcher: PermissionOutcomeWatcher | null,
+  opts: HookCliOutcomeOptions,
+  stop: AbortSignal,
+): Promise<CliPermissionOutcome> {
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    const cleanup = () => {
+      clearTimeout(timer);
+      opts.terminated?.removeEventListener('abort', onTerminated);
+    };
+    const finish = (outcome: CliPermissionOutcome) => {
+      cleanup();
+      resolve(outcome);
+    };
+    function onTerminated() {
+      cleanup();
+      const giveUpAt = Date.now() + (opts.terminatedGraceMs ?? TERMINATED_SCAN_GRACE_MS);
+      const rescan = () => {
+        if (stop.aborted) return;
+        const outcome = watcher?.scan();
+        if (outcome) return finish(outcome);
+        if (!watcher || Date.now() >= giveUpAt) return finish('cli_stopped_waiting');
+        timer = setTimeout(rescan, TERMINATED_SCAN_POLL_MS);
+      };
+      rescan();
+    }
+    const tick = () => {
+      if (stop.aborted) return;
+      const outcome = watcher?.scan();
+      if (outcome) return finish(outcome);
+      timer = setTimeout(tick, opts.pollMs ?? CLI_OUTCOME_POLL_MS);
+    };
+    stop.addEventListener('abort', cleanup, { once: true });
+    if (opts.terminated?.aborted) return onTerminated();
+    opts.terminated?.addEventListener('abort', onTerminated, { once: true });
+    if (watcher) tick();
+  });
+}
+
+// The CLI has already closed its dialog and ignores this; deny keeps it safe if not.
+const PERMISSION_RESOLVED_BY_CLI =
+  'This permission request was already resolved in Claude Code itself, so the Lark/Feishu card no longer applies.';
 
 // 以下 message 是回给模型看的（Claude 把 deny message 作为工具结果交给模型），
 // 所以用英文并直接给出可执行的下一步。
@@ -17994,7 +18482,27 @@ async function cmdHook(cliId: string): Promise<void> {
   }
 
   const env = process.env as Record<string, string | undefined>;
-  const result = await runHook(payload, env, postAsk, cliId);
+  const permissionRequest = !adapter.parseQuestions(payload) && !!adapter.parsePermissionRequest?.(payload, env);
+  const terminated = new AbortController();
+  if (permissionRequest) {
+    // The CLI terminates this hook when its dialog closes without us (Esc / No /
+    // interrupt / exit). Stay just long enough to settle the card, then go.
+    const onTerminate = () => {
+      terminated.abort();
+      setTimeout(() => process.exit(0), TERMINATED_SCAN_GRACE_MS + HOOK_TERMINATED_REPORT_BUDGET_MS + 300).unref();
+    };
+    process.once('SIGTERM', onTerminate);
+    process.once('SIGHUP', onTerminate);
+  }
+  let result: { stdout: string };
+  try {
+    result = await runHook(payload, env, postAsk, cliId, undefined, undefined, undefined,
+      permissionRequest ? { reportCliResolved: postAskCliResolved, terminated: terminated.signal } : undefined);
+  } catch (err) {
+    // A permission dialog left undecided would wait on a terminal nobody watches.
+    if (!permissionRequest || !adapter.formatPermissionDecision) throw err;
+    result = { stdout: adapter.formatPermissionDecision(false, PERMISSION_DENY_UNDELIVERED) };
+  }
   if (result.stdout) {
     // The directive can embed the user's free-form answer (unbounded size);
     // wait for the pipe write to complete before the explicit exit truncates it.
@@ -18023,12 +18531,28 @@ async function cmdSessionReady(): Promise<void> {
     payloadText = Buffer.concat(chunks).toString('utf-8');
   } catch { /* stdin 读不到也无所谓 */ }
   let source: string | undefined;
+  let nativeSessionId: string | undefined;
   try {
     const p = JSON.parse(payloadText);
     if (p && typeof p.source === 'string') source = p.source;
+    if (p && typeof p.session_id === 'string') nativeSessionId = p.session_id;
   } catch { /* 非 JSON / 空 → 不带 source */ }
 
-  await postSessionScopedSignal('/api/session-ready', { source });
+  await postSessionScopedSignal('/api/session-ready', { source, nativeSessionId });
+  process.exit(0);
+}
+
+/** 独立版本化入口与路由：新 CLI / 旧 daemon / 旧 worker 混装时只能丢维护
+ *  信号，不能把它降级成 session-ready。PreCompact hook 退出码 0 时 stdout 会被
+ *  Claude 当成自定义压缩指令、退出码 2 会拦下压缩：本命令不写 stdout，始终 exit 0。 */
+async function cmdClaudeCompactionStart(): Promise<void> {
+  const startedAtMs = Math.floor(Date.now() - process.uptime() * 1000);
+  try {
+    const payload = JSON.parse((await readStdinWithTimeout(2000)).toString('utf8'));
+    if (payload?.hook_event_name === 'PreCompact') {
+      await postSessionScopedSignal('/api/claude-compaction-start-v1', { startedAtMs });
+    }
+  } catch { /* hook best-effort，绝不阻塞 CLI */ }
   process.exit(0);
 }
 
@@ -18098,6 +18622,7 @@ async function postSessionScopedSignal(
           : (liveOrigin?.dispatchAttempt
             ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined)),
         ...payload,
+        runtimeBindingId: process.env.BOTMUX_RUNTIME_BINDING_ID,
       }),
     } satisfies RequestInit;
     let hostSecret: string | undefined;
@@ -19491,6 +20016,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // this session's worker. Local and session-scoped like `session-ready`; the
     // worker decides whether the turn still needs a terminal.
     '__claude-stop-failure-v1',
+    // Claude PreCompact hook client, same class. Exit 2 from a PreCompact hook
+    // blocks compaction, so a refusal here would leave a workflow subagent's
+    // Claude unable to compact at all.
+    '__claude-compaction-v1',
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
@@ -20522,6 +21051,11 @@ switch (command) {
     break;
   }
   case 'clone': await cmdClone(process.argv.slice(3)); break;
+  case 'secretary': {
+    const { runSecretaryCommand } = await import('./cli/secretary-command.js');
+    process.exitCode = await runSecretaryCommand(process.argv.slice(3));
+    break;
+  }
   case 'start':   await runFleetMutationCommand('start', cmdStart); break;
   case '__watchdog': await cmdWatchdog(); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;
@@ -20810,6 +21344,10 @@ switch (command) {
       workerOnline: isCodexNotifierWorkerStateFresh(worker),
       worker,
     }, null, 2));
+    break;
+  }
+  case '__claude-compaction-v1': {
+    await cmdClaudeCompactionStart();
     break;
   }
   case 'session-ready': {

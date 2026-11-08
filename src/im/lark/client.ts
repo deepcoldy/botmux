@@ -21,6 +21,8 @@ import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
+import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
@@ -362,6 +364,7 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     // A retry gets a new cache after the gate wait, never a previous attempt's
@@ -431,6 +434,7 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
@@ -795,13 +799,17 @@ export async function sendUserMessage(
   msgType: string = 'text',
   uuid?: string,
   requestOptions?: LarkRequestOptions,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(
     larkAppId,
     'sendUserMessage',
     async () => {
+      // The permission proof must follow every gate wait, including retries.
+      if (options?.beforeWrite) await options.beforeWrite();
       const c = getBotClient(larkAppId);
       // Stamp callback-button ownership markers on interactive DMs too: this is the
       // FIFTH card egress surface (config / write-link / substitute / overload / …
@@ -1309,6 +1317,7 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
   return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
     let card: unknown;
@@ -1374,6 +1383,7 @@ export async function updateMessage(
   const beforeWrite = typeof optionsOrAck === 'object' ? optionsOrAck.beforeWrite : undefined;
   const returnAcknowledgement = optionsOrAck === true || (typeof optionsOrAck === 'object' && optionsOrAck.returnAcknowledgement === true);
   assertLarkTransport(larkAppId, 'updateMessage');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -1451,6 +1461,7 @@ export async function updateCardStreamingSettings(
   settings: CardStreamingSettings,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
+  settings = sanitizeLocalAddressNode(settings, linkFieldContext());
   return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
     await assertMessageWriteAllowed(larkAppId, settings.messageId);
     const c = getBotClient(larkAppId);
@@ -1514,6 +1525,7 @@ export async function patchCardStreamElement(
   messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'patchCardStreamElement');
+  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext());
   return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -1530,7 +1542,7 @@ export async function patchCardStreamElement(
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
-  options: { userCardContent?: boolean } & LarkRequestOptions = {},
+  options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
   const c = getBotClient(larkAppId);
   // card_msg_content_type=user_card_content returns the original card JSON
@@ -1547,6 +1559,8 @@ export async function getMessageDetail(
     // user AND bot senders); without it the server omits them. Matters here for
     // merge_forward sub-messages, whose senders appear nowhere else.
     with_sender_name: 'true',
+    // Explicit ID type makes Feishu return app_id for bot mentions.
+    ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
   }, options);
   if (res.code !== 0) {
     throw larkApiError('get message', res);

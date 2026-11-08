@@ -7,7 +7,7 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
-import { turnStartedAt } from './turn-outcome.js';
+import { holdLastTurnThrough, isMaintenanceTurnId, turnStartedAt } from './turn-outcome.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
 import { emitSessionTaskEvent } from './session-task-events.js';
@@ -51,6 +51,17 @@ export function markSessionActivity(
       },
     },
   });
+}
+
+/**
+ * Bump session activity once a passthrough command reached the worker. A
+ * daemon-issued maintenance turn (auto-compact) is not a new task: extend the
+ * still-current turn result through this moment first, or the bump would make
+ * it stale.
+ */
+export function markPassthroughActivity(ds: DaemonSession, turnId: string, at: number = Date.now()): void {
+  if (isMaintenanceTurnId(turnId)) holdLastTurnThrough(ds, at);
+  markSessionActivity(ds, at);
 }
 
 /** Refresh the latest user/bot exchange after its append-only source file has

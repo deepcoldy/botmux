@@ -195,6 +195,8 @@ export type OpenPlatformAutomationResult =
       cookieCount: number;
       scopeCount: number;
       skippedScopeCount: number;
+      /** 清单里有、但当前租户开放平台目录中不存在而被跳过的权限名（按 token 类型分桶）。 */
+      skippedScopes?: { tenant: string[]; user: string[] };
       scopeWarning?: string;
       /**
        * 自动填好的「权限可访问的数据范围」条数（填成「与应用的可用范围一致」）。
@@ -538,13 +540,13 @@ export function mapManifestScopesToOpenPlatformIds(
   manifest: ScopeManifest,
   catalog: OpenPlatformScopeEntry[],
 ): MappedScopeIds {
-  const tenant = uniqueStrings(manifest.scopes?.tenant ?? []);
-  const user = uniqueStrings(manifest.scopes?.user ?? []);
+  const tenant = mapScopeIds(uniqueStrings(manifest.scopes?.tenant ?? []), catalog, 'tenant');
+  const user = mapScopeIds(uniqueStrings(manifest.scopes?.user ?? []), catalog, 'user');
   return {
-    tenantScopeIds: mapScopeIds(tenant, catalog, 'tenant').ids,
-    userScopeIds: mapScopeIds(user, catalog, 'user').ids,
-    missingTenantScopes: mapScopeIds(tenant, catalog, 'tenant').missing,
-    missingUserScopes: mapScopeIds(user, catalog, 'user').missing,
+    tenantScopeIds: tenant.ids,
+    userScopeIds: user.ids,
+    missingTenantScopes: tenant.missing,
+    missingUserScopes: user.missing,
   };
 }
 
@@ -1705,6 +1707,7 @@ export async function automateOpenPlatformSetup(
   const mapped = mapManifestScopesToOpenPlatformIds(effectiveManifest, catalog);
   const missing = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
   const skippedScopeCount = missing.length;
+  const skippedScopes = { tenant: mapped.missingTenantScopes, user: mapped.missingUserScopes };
   if (missing.length > 0) {
     console.warn(`Warning: ${missing.length} scopes are not present in the Open Platform catalog and will be skipped: ${missing.slice(0, 8).join(', ')}`);
   }
@@ -2023,6 +2026,7 @@ export async function automateOpenPlatformSetup(
       cookieCount: preparedSession.cookieCount,
       scopeCount: importedScopeCount,
       skippedScopeCount,
+      skippedScopes,
       scopeWarning,
       privilegeRangeCount,
       privilegeRangeWarning,
@@ -2165,6 +2169,7 @@ export async function automateOpenPlatformSetup(
       cookieCount: preparedSession.cookieCount,
       scopeCount: importedScopeCount,
       skippedScopeCount,
+      skippedScopes,
       scopeWarning,
       privilegeRangeCount,
       privilegeRangeWarning,
@@ -2473,11 +2478,21 @@ async function defaultAppIcon(): Promise<Uint8Array> {
   }
 }
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/** 上传时按 image/png 提交：不是 PNG 的文件在本地就拒绝，别等开放平台接口报一个看不懂的错。 */
+export function assertPngIcon(data: Buffer, iconFilePath: string): Buffer {
+  if (data.length < PNG_SIGNATURE.length || !data.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+    throw new Error(`应用图标必须是 PNG 文件: ${iconFilePath}`);
+  }
+  return data;
+}
+
 /** The custom/test icon override, read off disk. Fails with the path in the message
  *  so a caller that passed a bad path can see which one. */
 function readIconFile(iconFilePath: string) {
   if (!existsSync(iconFilePath)) throw new Error(`找不到指定的应用图标: ${iconFilePath}`);
-  return readFileSync(iconFilePath);
+  return assertPngIcon(readFileSync(iconFilePath), iconFilePath);
 }
 
 function pickPayloadString(payload: unknown, keys: string[]): string | undefined {
@@ -3415,10 +3430,10 @@ function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bu
   const ids: string[] = [];
   const missing: string[] = [];
   for (const scopeName of scopeNames) {
+    // 不跨桶借 ID：tenant / user 是两份授权，只在对侧目录出现的名字算本桶缺失。
     const matched =
       catalog.find(entry => entry.name === scopeName && entry.bucket === bucket) ??
-      catalog.find(entry => entry.name === scopeName && entry.bucket === undefined) ??
-      catalog.find(entry => entry.name === scopeName);
+      catalog.find(entry => entry.name === scopeName && entry.bucket === undefined);
     if (matched) ids.push(matched.id);
     else missing.push(scopeName);
   }

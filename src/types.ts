@@ -543,6 +543,9 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
+  sessionContractRevision?: number;
+  sessionRuntimeContract?: import('./services/session-contract-store.js').SessionContractSnapshot;
   /** 已在来源话题直投的项目结果；下次输入携带引用，不额外启动模型。 */
   reportReplyReferences?: import('./core/report-source-reply.js').ReportReplyReference[];
   /** 最近一次真人输入/停止，用于使旧委托的自动直投失效。 */
@@ -628,6 +631,10 @@ export interface Session {
      *  rewritten if the prompt never reached the CLI. */
     runId?: string;
   };
+  /** Host-written link between a scheduled model turn and its execution ledger. */
+  scheduledRun?: { taskId: string; runId: string; turnId: string; requesterSubjectId?: string };
+  /** Retain overlapping turns in a reused schedule/chat session. */
+  scheduledRuns?: Record<string, NonNullable<Session['scheduledRun']>>;
   /** Dedicated VC meeting consumer session identity. These sessions share the
    *  listener chat as their output route, but MUST NOT share the ordinary
    *  chat-scope routing slot (or another meeting/member's CLI context). */
@@ -1590,6 +1597,7 @@ export interface ChatContext {
 }
 
 export interface SubstituteTriggerIdentity {
+  appId?: string;
   name?: string;
   openId?: string;
   userId?: string;
@@ -1724,6 +1732,19 @@ export interface ScheduledTask {
   lastCalendarCheck?: import('./services/work-calendar.js').CalendarCheck;
   /** Durable CLI run-now request; consumed atomically when claiming a run. */
   manualRunRequested?: boolean;
+  /** Host-issued single-run exception to pause; never changes enabled. */
+  manualRunAuthorization?: { runId: string; turnIds: string[] };
+  /** Idempotence marker for a late delivery failure of lastRunId. */
+  deliveryFailureRunId?: string;
+  lastDeliveryErrorCode?: string;
+  deliveryFailureState?: {
+    runId: string;
+    targets: Record<string, string>;
+    counted: boolean;
+    previousStatus: ScheduledTask['lastStatus'];
+    previousError?: string;
+    previousConsecutiveFailures: number;
+  };
   /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
    *  never stored in this sandbox-writable task row. Absence does not prove
    *  that no condition exists: runtime always checks the sidecar by task id. */
@@ -2083,6 +2104,12 @@ export interface CodexAppEffortResult {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
+  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
+  | { type: 'runtime_binding_aborted_ack'; bindingId: string }
+  /** The host refused this binding; the worker returns to its predecessor. */
+  | { type: 'runtime_binding_refused'; bindingId: string }
+  | { type: 'runtime_contract_assigned'; bindingId: string; runtime: import('./services/session-contract.js').RuntimeRef; mayExecute: boolean; executions?: import('./services/session-contract.js').ExecutionRef[]; admissionStates?: import('./services/session-contract.js').ExecutionAdmissionState[] }
+  | { type: 'execution_contract_assigned'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   | import('./services/universal-output-handoff.js').OutputHandoffReceipt
   | import('./services/final-output-handoff.js').FinalOutputAccepted
   | { type: 'deployment_continuation_cancelled'; requestId: string; ok: boolean }
@@ -2102,7 +2129,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -2129,7 +2156,9 @@ type DaemonToWorkerBase =
   * worker to reattach; PTY keeps its historical cold-resume behavior. */
   | { type: 'detach_for_transfer'; requestId: string }
   | { type: 'suspend' }
-  | { type: 'prompt_submitted' }
+  /** The CLI's UserPromptSubmit hook ran; the fingerprint and prefix of the
+   *  prompt it submitted, as the hook reported them. */
+  | { type: 'prompt_submitted'; fingerprint?: string; prefix?: string }
   /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
    *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
    *  收敛到新目录，让 CLI 在新 cwd 冷启动（新 CLAUDE.md/记忆索引开场注入）
@@ -2199,6 +2228,7 @@ type DaemonToWorkerBase =
   // 证据再回复 hook，避免 Claude 在 worker 重置前继续渲染真正输入框。
   // source = SessionStart 的 startup/resume/… 。
   | { type: 'session_ready'; source?: string; requestId?: string }
+  | { type: 'claude_compaction_start'; startedAtMs: number; requestId?: string }
   // 结构化「回合空闲」信号：CLI 进程内的集成（当前只有 dsh-tui 的 cordis
   // wrapper 插件，在 agent/status 落到 idle 时）经 `botmux __turn-idle-v2` 调到
   // daemon，daemon 再转给该会话的 worker → idleDetector.fireIdle()。
@@ -2225,7 +2255,9 @@ type DaemonToWorkerBase =
     dispatchAttempt?: number;
   };
 
-export type DaemonToWorker = DaemonToWorkerBase extends infer Message
+export type DaemonToWorker = DaemonToWorkerTransport & { sessionCommand?: import('./services/session-contract.js').SessionCommandContext };
+
+type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
     ? Omit<Message, 'loadedBotsConfigPath' | 'adoptSource'> & {
         adoptSource?: 'tmux' | 'herdr' | 'zellij' | 'orca';
@@ -2236,11 +2268,14 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
         cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
         terminalCardEpoch?: string;
+        /** Daemon-owned durable headless provenance, never taken from CLI env. */
+        headless?: Pick<NonNullable<Session['headless']>, 'id' | 'source'>;
         traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
         /** Experimental, off by default: only an explicit true lets the worker
          *  suppress a failure notice after an exact acknowledged final. */
         suppressDeliveredFinalFailureNotice?: boolean;
         /** Explicit, off-by-default ordinary bridge handoff negotiation. */
+        sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
       }
     : Message
@@ -2305,6 +2340,7 @@ export interface ModelFallbackState {
 }
 
 export interface WorkerFinalOutput {
+  sessionOutputOrigin?: import('./services/session-contract.js').SessionEventContext;
   type: 'final_output';
   /** Worker-side botmux session identity. Daemon validates this before
    *  routing the reply so a stale/wrongly-bound worker cannot post into
@@ -2385,15 +2421,21 @@ export interface WorkerFinalOutput {
     cacheCreateTokens: number;
   };
   handoff?: import('./services/universal-output-handoff.js').OutputHandoffClaim;
+  sessionContract?: import('./services/session-contract.js').SessionEventContext;
 }
 
 /** Messages sent from Worker to Daemon */
-export type WorkerToDaemon =
+export type WorkerToDaemon = WorkerToDaemonBase & { sessionContract?: import('./services/session-contract.js').SessionEventContext };
+
+export type WorkerToDaemonBase =
   | import('./services/final-output-handoff.js').FinalOutputOffer
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
+  | { type: 'runtime_binding_started'; bindingId: string; operationId?: string }
+  | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
+  | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string }
   | { type: 'worker_ipc_ready' }
   | ({ type: 'link_ref_register'; requestId: string } & import('./core/link-ref-ipc.js').McpLinkRefRegistrationRequest)
   | ({ type: 'link_ref_resolve'; requestId: string } & import('./core/link-ref-ipc.js').McpHostDeliveryLinkRefRequest)
@@ -2453,6 +2495,10 @@ export type WorkerToDaemon =
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
   | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
+   * with, the text this worker wrote for this turn. Read before the model
+   * starts on it; no stand-in for `native_input_consumed`. */
+  | { type: 'prompt_submitted_input'; turnId: string }
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }

@@ -81,6 +81,10 @@ Running `botmux setup` on a machine that's already configured shows a menu: Add 
 
 > Want to configure from a script or an AI agent instead of the interactive UI? Use the `botmux setup add` / `botmux setup list` subcommands; `botmux setup help` shows all options.
 
+> ➕ **Need permissions beyond the built-in list?** Pass `--extra-scopes-file <json>` in scripted setup (Feishu tenants only; on Lark, add them manually in the developer console), e.g. `botmux setup add --create-app --allowed-users <email> --extra-scopes-file ./scopes.json`; for an existing bot run `botmux setup configure <process-name|AppID> --extra-scopes-file ./scopes.json`. The file uses the `lark-scopes.json` shape (`{"scopes":{"tenant":[],"user":[]}}`). `{"scopes":[{"scope":"x:y"}]}` is also accepted, but every entry in that form is requested as a user scope; use `{"scopes":{"tenant":["x:y"]}}` for tenant scopes. Scopes missing from the tenant catalog (including scopes that only exist for the other identity type) are skipped and listed in the result instead of failing the run. The file path is saved on the bot so later `configure` runs reuse it; if the saved file can't be read, setup warns and continues with the built-in list. Run `botmux setup configure <process-name|AppID> --extra-scopes-file -` to clear it.
+
+> 👋 **Welcome message on first launch**: `botmux setup add ... --welcome-message "Reply /init to get started"` (or `--welcome-message-file welcome.txt` to read it from a file) makes the bot DM its owner once after it first comes online; for an existing bot use `botmux setup edit <process-name|AppID> --welcome-message ...`, and `-` clears it. Delivery is recorded under `welcome-sent/` in the daemon data dir so restarts never resend; a failed send does not block startup and is retried on the next start. See [bots.json · Welcome message](/en/bots-json#welcome-message).
+
 ## Step 3 · Start
 
 ```bash

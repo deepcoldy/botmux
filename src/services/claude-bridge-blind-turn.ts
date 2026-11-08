@@ -30,6 +30,11 @@ export type BlindTurnVerdict =
   | { kind: 'none' }
   /** The bridge read the turn (its file grew, or it moved onto another one). */
   | { kind: 'read' }
+  /** An idle-compaction span the bridge read nothing of. Compaction writes its
+   *  records after the prompt returns and answers nobody, so it is not
+   *  reported; but terminal input the worker never sees (a client attached
+   *  straight to the pane) can run a real turn inside it. */
+  | { kind: 'maintenance'; turnStartedAtMs: number }
   | {
     kind: 'blind';
     /** When this turn started. */
@@ -42,20 +47,42 @@ export type BlindTurnVerdict =
   };
 
 export class BridgeBlindTurnWatch {
-  private turn: { startedAtMs: number; at: BridgeReadPosition } | undefined;
+  private turn: { startedAtMs: number; at: BridgeReadPosition; maintenance: boolean } | undefined;
   private blindSinceMs: number | undefined;
   private reported = false;
+  private idleCompaction = false;
+  private lastPromptAtMs = -Infinity;
+
+  /** PreCompact 是维护事件，不能当成产生回复的模型轮次。已有待处理输入时
+   *  不豁免：真实漏读仍由原来的恢复与告警路径处理。 */
+  noteCompactionStarted(hasPendingTurn: boolean, hookStartedAtMs: number): boolean {
+    if (hasPendingTurn || hookStartedAtMs <= this.lastPromptAtMs
+      || this.idleCompaction || this.turn?.maintenance) return false;
+    // 不能把压缩前已运行的模型轮次改成维护；只覆盖 hook 之后才观察到的忙碌。
+    if (this.turn && this.turn.startedAtMs < hookStartedAtMs) return false;
+    this.idleCompaction = true;
+    if (this.turn) this.turn.maintenance = true;
+    return true;
+  }
+
+  noteCompactionFinished(): void {
+    this.idleCompaction = false;
+  }
 
   /** Explicit evidence the CLI started a model turn. A turn already open keeps
    *  its start. */
   noteTurnStarted(at: BridgeReadPosition, nowMs: number): void {
-    this.turn ??= { startedAtMs: nowMs, at: { ...at } };
+    this.turn ??= { startedAtMs: nowMs, at: { ...at }, maintenance: this.idleCompaction };
   }
 
   /** The CLI is back at its prompt: judge the turn that just ended. */
-  noteTurnEnded(at: BridgeReadPosition, nowMs: number): BlindTurnVerdict {
+  noteTurnEnded(at: BridgeReadPosition, nowMs: number, hasPendingTurn = false): BlindTurnVerdict {
+    // 即使压缩被取消、没有 SessionStart(compact)，提示符也会结束这次豁免，
+    // 下一条真正的输入不能一直被当作维护。旧的漏读 run 与去重状态保留。
     const turn = this.turn;
     this.turn = undefined;
+    this.idleCompaction = false;
+    this.lastPromptAtMs = nowMs;
     if (!turn) return { kind: 'none' };
     if (at.path !== turn.at.path || at.offset > turn.at.offset) {
       this.blindSinceMs = undefined;
@@ -63,6 +90,7 @@ export class BridgeBlindTurnWatch {
       return { kind: 'read' };
     }
     if (nowMs - turn.startedAtMs < BLIND_TURN_MIN_BUSY_MS) return { kind: 'none' };
+    if (turn.maintenance && !hasPendingTurn) return { kind: 'maintenance', turnStartedAtMs: turn.startedAtMs };
     this.blindSinceMs ??= turn.startedAtMs;
     return { kind: 'blind', turnStartedAtMs: turn.startedAtMs, blindSinceMs: this.blindSinceMs, reported: this.reported };
   }
@@ -75,6 +103,8 @@ export class BridgeBlindTurnWatch {
 
   /** The bridge was torn down (CLI restart / exit): nothing carries over. */
   reset(): void {
+    this.idleCompaction = false;
+    this.lastPromptAtMs = -Infinity;
     this.turn = undefined;
     this.blindSinceMs = undefined;
     this.reported = false;

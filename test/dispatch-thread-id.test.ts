@@ -110,6 +110,9 @@ function harness(mode: Mode, options: {
     // pre-card shape (no attemptAt, no /dispatch-tree IPC). An explicit
     // taskTreeCardEnabled:true exercises the on path.
     isDispatchTaskTreeCardEnabled: () => options.taskTreeCardEnabled === true,
+    // Extracted cmdDispatch checks for a group-secretary patrol turn; these
+    // harness turns are ordinary bot turns, so no patrol root applies.
+    parseSecretaryPatrolRoot: () => undefined,
     loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     requireSessionById: async (sid: string) => ({
       sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',

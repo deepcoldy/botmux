@@ -1,5 +1,5 @@
 import { validateTriggerRequest } from '../src/services/trigger-types.js';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -135,6 +135,15 @@ describe('explicit Ask durable continuation', () => {
     const t = setup(); await t.manager.wait(input); t.tick(); t.setResumable(false);
     await t.manager.sweep(); expect(t.dispatch).not.toHaveBeenCalled();
     t.setResumable(true); await t.manager.sweep(); expect(t.dispatch).toHaveBeenCalledTimes(1);
+  });
+  it('a mention is presentation: it reaches the card but not the receipt, so a reconnect whose lookup flipped still joins', async () => {
+    const t = setup();
+    t.register.mockImplementationOnce(() => new Promise<AskResult>(() => {}));
+    void t.manager.wait(input, undefined, { mentionedOpenId: 'ou_human' });
+    expect(t.register).toHaveBeenCalledWith(expect.objectContaining({ mentionedOpenId: 'ou_human' }));
+    const rebooted = createExplicitAskContinuation(t.deps);
+    expect(await rebooted.wait(input)).toEqual(answer);
+    expect(JSON.stringify(readdirSync(t.deps.dir).map(f => readFileSync(join(t.deps.dir, f), 'utf8')))).not.toContain('ou_human');
   });
   it('old revision/scope cannot reuse or acknowledge an existing invocation', async () => {
     const t = setup(); await t.manager.wait(input);

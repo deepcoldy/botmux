@@ -199,6 +199,15 @@ describe('kanban columns from task status', () => {
     expect(deriveKanbanColumn({ ...pinned, agentAttention: { kind: 'decision', reason: 'r', at: T0 + 30, source: 'agent' } })).toBe('in_review');
   });
 
+  it('auto-compact activity covered by heldThrough is not a new message for a manual column', () => {
+    const held = { ...delivered(T0 + 10), heldThrough: T0 + 60 };
+    const parked = { status: 'idle', lastTurn: held, kanbanColumn: 'todo', kanbanColumnAt: T0 + 20 };
+    expect(taskStatusChangedAt({ ...parked, lastMessageAt: T0 + 60 })).toBe(T0 + 10);
+    expect(deriveKanbanColumn({ ...parked, lastMessageAt: T0 + 60 })).toBe('todo');
+    expect(taskStatusChangedAt({ ...parked, lastMessageAt: T0 + 61 })).toBe(T0 + 61);
+    expect(activeManualColumn({ ...parked, lastMessageAt: T0 + 61 })).toBeNull();
+  });
+
   it('a manual column placed before the upgrade holds until a turn starts, ends or a hand is raised', () => {
     const legacy = { status: 'idle', lastMessageAt: T0, kanbanColumn: 'in_progress', kanbanPosition: 5 };
     expect(deriveKanbanColumn(legacy)).toBe('in_progress');

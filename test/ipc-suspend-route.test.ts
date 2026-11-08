@@ -47,7 +47,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
   it.each(['working', 'analyzing'])('queues instead of killing while %s', async (status) => {
     const ds = activeSession({ lastScreenStatus: status });
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
 
     const res = await postSuspend('s-susp');
 
@@ -63,7 +63,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
   it.each(['idle', 'limited'])('suspends immediately when already settled (%s)', async (status) => {
     const ds = activeSession({ lastScreenStatus: status });
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     const res = await postSuspend('s-susp');
 
@@ -77,7 +77,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
   it('does not queue when the screen status is unknown', async () => {
     const ds = activeSession({ lastScreenStatus: undefined });
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     const res = await postSuspend('s-susp');
 
@@ -90,7 +90,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
     const ds = activeSession({ lastScreenStatus: 'idle' });
     workerPool.recordWorkerCliInputBacklog(ds.worker, { pending: true, writingTurnId: 'om_wake' });
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
 
     const res = await postSuspend('s-susp');
 
@@ -157,7 +157,7 @@ describe('POST /api/host-overload/sweep suspend_idle', () => {
     });
     workerPool.recordWorkerCliInputBacklog(waiting.worker, { pending: true, writingTurnId: 'om_wake' });
     workerPool.setActiveSessionsRegistry(new Map([['waiting', waiting], ['settled', settled]]));
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
     handle ??= await startIpcServer({ port: 0, host: '127.0.0.1' });
 
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/host-overload/sweep`, {

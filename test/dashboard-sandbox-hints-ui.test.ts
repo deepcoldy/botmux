@@ -27,6 +27,7 @@ import {
 import type { BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 import { SandboxDriftChip } from '../src/dashboard/web/session-sandbox-drift-chip.js';
 import { runSkillUpdate } from '../src/dashboard/web/skills-page.js';
+import { t } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -217,6 +218,18 @@ describe('SandboxSection — confirm before switching the sandbox on', () => {
     await click(view, 'sandbox-mode-off');
     expect(confirmMock).not.toHaveBeenCalled();
     expect(JSON.parse(sandboxPuts()[0]!.body!)).toEqual({ mode: 'off' });
+  });
+
+  it('a zero-injection rejection of scratch shows the existing scratch zero-injection note', async () => {
+    confirmMock.mockResolvedValue(true);
+    responder = () => ({ status: 400, body: { ok: false, error: 'zero_prompt_unsupported' } });
+    const view = mount(React.createElement(SandboxSection, {
+      bot: bot({ cliId: 'cursor', promptInjection: 'none', sandboxMode: 'off', scratchSupported: true }), patchBot: vi.fn(),
+    }));
+    await click(view, 'sandbox-mode-scratch');
+    expect(view.root.findByProps({ 'data-sandbox-status': '' }).children.join(''))
+      .toBe(`✗ ${t('botDefaults.promptInjectionUnsupportedScratch')}`);
+    expect(view.root.findByProps({ 'data-action': 'sandbox-mode-off' }).props['aria-pressed']).toBe(true);
   });
 
   it('re-picking the current mode or changing scratch storage does not ask again', async () => {

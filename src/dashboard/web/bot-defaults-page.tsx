@@ -560,7 +560,7 @@ function nonNegativeInteger(raw: string, fallback: number): number | null {
   return Number(value);
 }
 
-type SubstituteTargetIdField = 'email' | 'openId' | 'userId' | 'unionId';
+type SubstituteTargetIdField = 'appId' | 'email' | 'openId' | 'userId' | 'unionId';
 
 type SubstituteTargetDraft = {
   key: number;
@@ -578,7 +578,7 @@ type SubstituteTargetDraft = {
   };
 };
 
-const substituteTargetIdFields: SubstituteTargetIdField[] = ['email', 'openId', 'userId', 'unionId'];
+const substituteTargetIdFields: SubstituteTargetIdField[] = ['appId', 'email', 'openId', 'userId', 'unionId'];
 
 function parseSubstituteChats(text: string): string[] {
   const values = text.split(/[\r\n,，;；]+/).map(s => s.trim()).filter(Boolean);
@@ -605,6 +605,7 @@ export function buildSubstituteTarget(
 ): BotSubstituteTarget | null {
   const idValue = row.idValue.trim();
   if (!idValue) return null;
+  if (row.idField === 'appId') return { appId: idValue };
   const target: BotSubstituteTarget = { ...row.persisted };
   const idEdited = row.persisted[row.idField] !== idValue
     || (row.originalIdField != null && row.originalIdField !== row.idField);
@@ -3396,6 +3397,7 @@ export function BotAgentSection(props: {
               ariaLabel={tr('botDefaults.agentModel')}
               defaultLabel={tr('botDefaults.modelPickerDefault')}
               customLabel={tr('botDefaults.modelPickerCustom')}
+              includeDefault
               menuClassName="bd-field-menu"
               detectedCount={detectedLiveCount || undefined}
               detectedLabel={detectedLiveCount > 0
@@ -4627,7 +4629,10 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       setStatus,
       setBusy,
       saved: tr('botDefaults.sandboxSaved'),
-      errorText: res => configErrorText(res, tr),
+      // On this route only scratch can trip the zero-injection invariant.
+      errorText: res => res.body?.error === 'zero_prompt_unsupported'
+        ? tr('botDefaults.promptInjectionUnsupportedScratch')
+        : configErrorText(res, tr),
       onSaved: body => patchBot(bot.larkAppId, {
         sandbox: body.sandbox === true,
         sandboxMode: (body.mode ?? next) as 'off' | 'oncall' | 'scratch',
@@ -6526,6 +6531,8 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
   const [chatManager, setChatManager] = useState(props.bot.chatManagerEnabled === true);
   const [chatManagerStatus, setChatManagerStatus] = useState<StatusMessage>(null);
+  const [groupSecretary, setGroupSecretary] = useState(props.bot.groupSecretaryEnabled === true);
+  const [groupSecretaryStatus, setGroupSecretaryStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
     setP2p(normalizeP2pMode(props.bot.p2pMode));
@@ -6541,6 +6548,9 @@ function SessionModeSection(props: {
   useEffect(() => {
     setChatManager(props.bot.chatManagerEnabled === true);
   }, [props.bot.chatManagerEnabled]);
+  useEffect(() => {
+    setGroupSecretary(props.bot.groupSecretaryEnabled === true);
+  }, [props.bot.groupSecretaryEnabled]);
 
   async function saveP2p(next: string): Promise<void> {
     const mode = normalizeP2pMode(next);
@@ -6718,6 +6728,19 @@ function SessionModeSection(props: {
         }}
       />
       <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={chatManagerStatus} attr={{ 'data-chat-manager-status': '' }} /></div>
+
+      <ToggleRow
+        checked={groupSecretary}
+        disabled={busy === 'groupSecretary'}
+        dataAction="toggle-group-secretary"
+        title={tr('botDefaults.groupSecretaryTitle')}
+        help={tr('botDefaults.groupSecretaryHelp')}
+        onChange={checked => {
+          setGroupSecretary(checked);
+          void saveCardMode('groupSecretary', { groupSecretaryEnabled: checked }, setGroupSecretaryStatus);
+        }}
+      />
+      <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={groupSecretaryStatus} attr={{ 'data-group-secretary-status': '' }} /></div>
 
       <footer className="bd-session-mode-footer">{tr('botDefaults.sessionModeFooter')}</footer>
 
@@ -7319,7 +7342,7 @@ export function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: Pa
       name: target?.name ?? '',
       persisted: target ? { ...target } : {},
       originalIdField: target ? idField : undefined,
-      resolution: target?.name || target?.avatarUrl
+      resolution: target?.appId ? { ok: true, name: target.name } : target?.name || target?.avatarUrl
         ? { ok: true, name: target.name, avatarUrl: target.avatarUrl }
         : undefined,
     };
@@ -7348,12 +7371,13 @@ export function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: Pa
       const res = await resolveSubstituteTarget(props.bot.larkAppId, target);
       if (!isCurrent()) return;
       setTargetRows(rows => rows.map(r => {
-        if (r.key !== key) return r;
+        if (r.key !== key || r.idField !== row.idField || r.idValue.trim() !== idValue) return r;
         if (!res.ok) return { ...r, resolving: false, resolution: { ok: false } };
         const entry = res.resolution;
         if (entry?.ok === true) {
           // userId passthrough: nothing was verified (no openId / profile) —
           // keep the editable name input instead of showing a fake chip.
+          if (entry.appId) return { ...r, persisted: { appId: entry.appId }, resolving: false, resolution: { ok: true } };
           if (!entry.openId) return { ...r, resolving: false, resolution: undefined };
           const persisted: BotSubstituteTarget = { ...r.persisted };
           persisted.openId = entry.openId;
@@ -7627,8 +7651,9 @@ export function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: Pa
                   label: tr(`botDefaults.substituteTarget${value[0].toUpperCase()}${value.slice(1)}`),
                 }))}
                 onChange={idField => {
+                  resolveEpochs.current.set(target.key, (resolveEpochs.current.get(target.key) ?? 0) + 1);
                   setTargetRows(rows => rows.map(row => row.key === target.key
-                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolution: undefined }
+                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolving: false, resolution: undefined }
                     : row));
                 }}
               />
@@ -7642,14 +7667,17 @@ export function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: Pa
                 disabled={busy}
                 onChange={event => {
                   const idValue = event.currentTarget.value;
-                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolution: undefined } : row));
+                  resolveEpochs.current.set(target.key, (resolveEpochs.current.get(target.key) ?? 0) + 1);
+                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolving: false, resolution: undefined } : row));
                 }}
                 onBlur={() => {
                   if (target.idValue.trim()) void resolveTargetRow(target.key);
                 }}
               />
               <div className="bd-substitute-target-name">
-                {target.resolving ? (
+                {target.idField === 'appId' ? (
+                  <span className={target.resolution?.ok === false ? "bd-substitute-target-resolution-badge" : "bd-substitute-target-name-chip"}>{target.resolution?.ok === false ? substituteReasonText(target.resolution.reason) : tr('botDefaults.substituteTargetAppIdHint')}</span>
+                ) : target.resolving ? (
                   <span className="bd-substitute-target-resolving">{tr('botDefaults.substituteResolving')}</span>
                 ) : target.resolution?.ok === true && (target.name || target.resolution.avatarUrl) ? (
                   <>

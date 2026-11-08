@@ -116,6 +116,12 @@ export class TurnSendLedger {
     return join(this.sessionDirectory(key.sessionId), `${this.id(key)}.json`);
   }
 
+  /** Scheduled-send failure observation for this turn. It is pruned with the
+   * record: once the receipt is gone, a leftover failure would read as current. */
+  scheduleFailurePath(key: TurnSendLedgerKey): string {
+    return join(this.sessionDirectory(key.sessionId), `.schedule-failure-${this.id(key)}.json`);
+  }
+
   /** Host marks the exact admitted turn before its CLI can publish. This lets
    * matching CLI builds fence explicit finals even if launcher env is scrubbed. */
   enableHandoffFence(key: TurnSendLedgerKey): void {
@@ -346,6 +352,7 @@ export class TurnSendLedger {
           if (record.final && record.final.deliveredAtMs <= cutoffMs) {
             unlinkSync(path);
             rmSync(this.handoffFencePath(record), { force: true });
+            rmSync(this.scheduleFailurePath(record), { force: true });
             removed++;
           } else {
             retained++;

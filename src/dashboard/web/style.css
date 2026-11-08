@@ -3266,10 +3266,12 @@ button.primary {
 }
 .card-act:active { transform: scale(0.9); }
 
-/* ── 全局图标 tooltip（icon-tooltip.ts 委托渲染到 body，逃出容器 overflow）────── */
-.icon-tip {
-  position: fixed;
+/* ── 图标按钮 tooltip（IconTip → Base UI Tooltip，portal 到 body 或打开中的 dialog）── */
+.icon-tip-positioner {
   z-index: 9999;
+}
+.icon-tip {
+  position: relative;
   max-width: 260px;
   padding: 5px 9px;
   border-radius: var(--radius-sm);
@@ -3282,31 +3284,31 @@ button.primary {
   font-weight: 600;
   white-space: normal;
   pointer-events: none;
-  opacity: 0;
-  transform: translateY(2px);
   transition: opacity 120ms ease, transform 120ms ease;
 }
-.icon-tip.show {
-  opacity: 1;
-  transform: translateY(0);
+.icon-tip[data-starting-style],
+.icon-tip[data-ending-style] {
+  opacity: 0;
+  transform: translateY(2px);
 }
-/* 小箭头指向触发按钮 */
-.icon-tip::after {
-  content: "";
-  position: absolute;
-  left: 50%;
+.icon-tip[data-side="bottom"][data-starting-style],
+.icon-tip[data-side="bottom"][data-ending-style] {
+  transform: translateY(-2px);
+}
+/* 小箭头指向触发按钮；水平位置由 Base UI 按触发器算好写在行内 */
+.icon-tip-arrow {
   width: 7px;
   height: 7px;
-  transform: translateX(-50%) rotate(45deg);
+  transform: rotate(45deg);
   background: var(--surface-inverse, #1f2430);
   border: 1px solid var(--border-soft);
 }
-.icon-tip[data-placement="top"]::after {
+.icon-tip-arrow[data-side="top"] {
   bottom: -4px;
   border-top: none;
   border-left: none;
 }
-.icon-tip[data-placement="bottom"]::after {
+.icon-tip-arrow[data-side="bottom"] {
   top: -4px;
   border-bottom: none;
   border-right: none;
@@ -16045,11 +16047,14 @@ form.dashboard-toolbar > input[type="text"]:focus {
   line-height: 1;
 }
 
+/* InfoTip（Base UI Popover）与 OverflowText 全文浮层（Base UI Tooltip）共用的浮层外观；
+   浮层 portal 到 body 或打开中的 dialog，不在触发器下面，不能用祖先选择器命中。 */
+.ui-info-positioner {
+  z-index: 2147483647;
+}
+
 .ui-info-pop {
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 8px);
-  z-index: 1400;
+  position: relative;
   box-sizing: border-box;
   width: max-content;
   max-width: min(360px, calc(100vw - 48px));
@@ -16063,10 +16068,22 @@ form.dashboard-toolbar > input[type="text"]:focus {
   font-weight: 500;
   line-height: 1.45;
   white-space: pre-line;
-  opacity: 0;
-  pointer-events: none;
-  transform: translate(-50%, 4px);
+  /* 指针可以移进浮层，选中、复制里面的文字 */
+  user-select: text;
+  cursor: text;
+  outline: none;
   transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.ui-info-pop[data-starting-style],
+.ui-info-pop[data-ending-style] {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+.ui-info-pop[data-side="bottom"][data-starting-style],
+.ui-info-pop[data-side="bottom"][data-ending-style] {
+  transform: translateY(-4px);
 }
 
 .ui-info-pop::before {
@@ -16080,35 +16097,12 @@ form.dashboard-toolbar > input[type="text"]:focus {
   background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 42%, var(--border-soft)));
 }
 
-.ui-info-pop-floating {
-  position: fixed;
-  bottom: auto;
-  z-index: 2147483647;
-  opacity: 1;
-  /* Interactive: let the pointer reach the popover so its text is selectable /
-     copyable (JS keeps it open while hovered). */
-  pointer-events: auto;
-  user-select: text;
-  cursor: text;
-  transform: translate(-50%, -100%);
-}
-
-.ui-info-pop-floating.ui-info-pop-bottom {
-  transform: translate(-50%, 0);
-}
-
 .ui-info-tip:hover .ui-info-mark,
 .ui-info-tip:focus .ui-info-mark,
-.ui-info-tip:focus-within .ui-info-mark {
+.ui-info-tip:focus-within .ui-info-mark,
+.ui-info-tip[data-popup-open] .ui-info-mark {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft));
   color: var(--accent);
-}
-
-.ui-info-tip:hover .ui-info-pop,
-.ui-info-tip:focus .ui-info-pop,
-.ui-info-tip:focus-within .ui-info-pop {
-  opacity: 1;
-  transform: translate(-50%, 0);
 }
 
 .ui-overflow-text {
@@ -16342,19 +16336,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .skills-install-panel .ui-field-title {
   font: inherit;
-}
-
-.skills-install-panel .ui-info-pop {
-  bottom: auto;
-  top: calc(100% + 8px);
-  white-space: pre-line;
-  transform: translate(-50%, -4px);
-}
-
-.skills-install-panel .ui-info-tip:hover .ui-info-pop,
-.skills-install-panel .ui-info-tip:focus .ui-info-pop,
-.skills-install-panel .ui-info-tip:focus-within .ui-info-pop {
-  transform: translate(-50%, 0);
 }
 
 .skills-install-grid input,
@@ -22485,14 +22466,16 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-info-tip:hover .ui-info-mark,
 .bot-defaults-page .bd-info-tip:focus .ui-info-mark,
-.bot-defaults-page .bd-info-tip:focus-within .ui-info-mark {
+.bot-defaults-page .bd-info-tip:focus-within .ui-info-mark,
+.bot-defaults-page .bd-info-tip[data-popup-open] .ui-info-mark {
   border-color: color-mix(in srgb, var(--accent) 48%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .bot-defaults-page .bd-info-tip:hover,
 .bot-defaults-page .bd-info-tip:focus,
-.bot-defaults-page .bd-info-tip:focus-within {
+.bot-defaults-page .bd-info-tip:focus-within,
+.bot-defaults-page .bd-info-tip[data-popup-open] {
   color: var(--accent);
 }
 
@@ -28752,7 +28735,7 @@ button.skills-issue-badge:hover {
   width: 100%;
 }
 
-.feed-group-picker > summary {
+.feed-group-picker-trigger {
   box-sizing: border-box;
   display: flex;
   align-items: center;
@@ -28768,9 +28751,7 @@ button.skills-issue-badge:hover {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
-.feed-group-picker > summary::-webkit-details-marker { display: none; }
-
-.feed-group-picker > summary > span,
+.feed-group-picker-trigger > span,
 .feed-group-picker-pop > button {
   min-width: 0;
   overflow: hidden;
@@ -28778,7 +28759,7 @@ button.skills-issue-badge:hover {
   white-space: nowrap;
 }
 
-.feed-group-picker > summary::after {
+.feed-group-picker-trigger::after {
   content: "";
   position: absolute;
   right: 18px;
@@ -28790,17 +28771,19 @@ button.skills-issue-badge:hover {
   transform: translateY(-2px) rotate(45deg);
 }
 
-.feed-group-picker[open] > summary::after { transform: translateY(2px) rotate(225deg); }
-.feed-group-picker.is-disabled > summary { cursor: not-allowed; opacity: .58; }
+.feed-group-picker-trigger[data-popup-open]::after { transform: translateY(2px) rotate(225deg); }
+.feed-group-picker.is-disabled > .feed-group-picker-trigger { cursor: not-allowed; opacity: .58; }
+
+/* 弹层 portal 到所在的 dialog（Base UI Popover），宽度跟触发器走 */
+.feed-group-picker-positioner {
+  z-index: 120;
+}
 
 .feed-group-picker-pop {
-  position: absolute;
-  z-index: 120;
-  left: 0;
-  right: 0;
-  top: calc(100% + 6px);
+  box-sizing: border-box;
   display: grid;
-  max-height: min(420px, calc(100vh - 180px));
+  width: var(--anchor-width);
+  max-height: min(420px, var(--available-height, 100vh));
   overflow-y: auto;
   padding: 8px;
   border: 1px solid var(--border-soft);
@@ -35131,6 +35114,33 @@ a.dboard-link:hover { border-color: var(--accent-border); color: var(--accent-st
 .dboard-link-plain { color: var(--muted); }
 .dboard-summary { margin: 0; font-size: var(--fs-14); line-height: var(--lh-body); overflow-wrap: anywhere; }
 .dboard-summary-label { margin-right: 8px; color: var(--muted); font-size: var(--fs-12); }
+/* 图文说明：说明页在 sandbox iframe 里不跑脚本，高度撑不开，给固定高度在框内滚动；视频用页内播放器。 */
+.dboard-explainers { gap: 12px; }
+.dboard-explainer { display: grid; gap: 6px; min-width: 0; margin: 0; }
+.dboard-explainer-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; min-width: 0; font-size: var(--fs-13); }
+.dboard-explainer-name { min-width: 0; font-weight: var(--fw-m); overflow-wrap: anywhere; }
+.dboard-explainer-size { color: var(--muted); font-size: var(--fs-12); }
+.dboard-explainer-actions { display: inline-flex; align-items: baseline; gap: 12px; margin-left: auto; font-size: var(--fs-12); }
+.dboard-explainer-frame { display: block; width: 100%; height: min(70vh, 640px); border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: #fff; }
+.dboard-explainer-video { display: block; width: 100%; max-height: 70vh; border-radius: var(--radius-md); background: #000; }
+.dboard-row-explainer { color: var(--accent-strong); }
+.dboard-event-files { display: flex; flex-wrap: wrap; gap: 6px; }
+dialog.dboard-explainer-dialog {
+  width: 100vw;
+  max-width: none;
+  height: 100vh;
+  height: 100dvh;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+}
+dialog.dboard-explainer-dialog[open] { display: flex; flex-direction: column; }
+.dboard-explainer-bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-13); }
+.dboard-explainer-bar strong { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dboard-explainer-dialog-frame { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; background: #fff; }
 .dboard-md { font-size: var(--fs-13); line-height: var(--lh-body); overflow-wrap: anywhere; }
 .dboard-md > :first-child { margin-top: 0; }
 .dboard-md > :last-child { margin-bottom: 0; }

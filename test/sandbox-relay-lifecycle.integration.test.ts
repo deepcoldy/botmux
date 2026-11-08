@@ -83,6 +83,10 @@ function createLab(opts: { flavour: SandboxFlavour; backend: Backend }) {
   const sessionId = randomUUID();
   // Short path: tmux socket paths are length-limited.
   const dir = mkdtempSync('/tmp/sbx-life-');
+  // Strict launch drops TMUX_TMPDIR. A unique simulated -L label prevents its
+  // census from borrowing the host's botmux listener; the shim still routes
+  // every real tmux operation to this lab's private -S socket.
+  const socketName = `sbx-life-${sessionId.slice(0, 8)}`;
   const socket = join(dir, 'socket');
   const botmuxHome = join(dir, '.botmux');
   const dataDir = join(botmuxHome, 'data');

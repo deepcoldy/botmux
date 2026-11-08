@@ -124,6 +124,7 @@ import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lan
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { sessionContractStore } from '../src/services/session-contract-store.js';
 import {
   clearCodexInstanceBots,
   registerCodexInstanceBot,
@@ -2759,6 +2760,22 @@ describe('write health gate', () => {
 });
 
 describe('closeSession()', () => {
+  it('preserves the first durable close time and usage when cleaning a stale active cache', () => {
+    const session = createSession('chat1', 'root1', 'stale active cache');
+    session.previewTarget = { host: '127.0.0.1', port: 4173, registeredAt: new Date().toISOString() };
+    updateSession(session);
+    const ref = { appId: 'test-app', sessionId: session.sessionId }; const contract = sessionContractStore(tempDir, ref.appId);
+    contract.ensure(ref); const { operation } = contract.beginOperation(ref, 'close');
+    contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+    const first = readPersistedRows(tempDir, 'test-app')[session.sessionId];
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(Date.parse(first.closedAt!) + 3_600_000)); closeSession(session.sessionId);
+      const after = getSession(session.sessionId)!;
+      expect(after.closedAt).toBe(first.closedAt); expect(after.previewTarget).toBeUndefined();
+      expect(after.tokenUsage).toEqual(first.tokenUsage); expect(after.status).toBe('closed');
+    } finally { vi.useRealTimers(); }
+  });
   it.each(['active', 'closed'] as const)('cancels staged XPI work when closing a %s session', (status) => {
     const session = createSession('chat-xpi-close', 'root-xpi-close', 'Cancel protocol work');
     session.status = status;

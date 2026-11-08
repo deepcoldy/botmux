@@ -8,7 +8,7 @@
  */
 import { type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -191,6 +191,82 @@ describe('dsh worker final_output integration', () => {
         .filter(m => m.type === 'screen_update' || m.type === 'display')
         .filter(m => JSON.stringify(m).includes('\x1b]777;botmux:'));
       expect(screenLeaks).toHaveLength(0);
+    } finally {
+      await stopChild(child);
+    }
+  }, 60_000);
+
+  it('does not replay a turn the runner already finalized after its watchdog timed out', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-timeout-'));
+    tempDirs.add(root);
+    const fakeDsh = join(root, 'fake-dsh-server');
+    copyFileSync(resolve('test/fixtures/fake-dsh-server.mjs'), fakeDsh);
+    chmodSync(fakeDsh, 0o755);
+    const fakeLog = join(root, 'fake-dsh.jsonl');
+
+    const sessionId = `dsh-to-${randomBytes(4).toString('hex')}-${process.pid}`;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        DSH_HOME: join(root, '.dsh'),
+        NODE_ENV: 'test',
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
+        BOTMUX_TEST_DSH_RUNNER_PATH: resolve('src/dsh-runner.ts'),
+        SESSION_DATA_DIR: root,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_dsh_to',
+        LARK_APP_SECRET: 'secret',
+        FAKE_DSH_SCENARIO: 'hang',
+        FAKE_DSH_LOG: fakeLog,
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    const prompts = () => existsSync(fakeLog)
+      ? readFileSync(fakeLog, 'utf8').split('\n').filter(line => line.includes('"prompt"')).length
+      : 0;
+    const runnerStarts = () => existsSync(fakeLog)
+      ? readFileSync(fakeLog, 'utf8').split('\n').filter(line => line.includes('"initialize"')).length
+      : 0;
+
+    try {
+      child.send({
+        type: 'init',
+        sessionId,
+        chatId: 'oc_dsh_to',
+        rootMessageId: 'om_dsh_to_root',
+        workingDir: resolve('.'),
+        cliId: 'dsh',
+        cliPathOverride: fakeDsh,
+        backendType: 'pty',
+        prompt: '<user_message>跑一个很长的任务</user_message>',
+        larkAppId: 'app_dsh_to',
+        larkAppSecret: 'secret',
+        turnId: 'om_dsh_to_turn_1',
+        turnTimeoutMs: 500,
+      } satisfies DaemonToWorker);
+
+      await waitFor(child, logs, () => messages.some(m => m.type === 'final_output'));
+      // The runner exits after its timeout final and the daemon auto-restarts the
+      // CLI; wait for the replacement runner's handshake so any carried-over
+      // input would have been written to it.
+      await waitFor(child, logs, () => messages.some(m => m.type === 'claude_exit'));
+      child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+      await waitFor(child, logs, () => runnerStarts() >= 2);
+      // Carried-over input is flushed on the replacement runner's ready edge;
+      // wait for that edge instead of a fixed settle delay, then give the write
+      // a moment to reach the fake server's log.
+      await waitFor(child, logs, () => messages.filter(m => m.type === 'prompt_ready').length >= 2);
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 800));
+
+      expect(prompts()).toBe(1);
     } finally {
       await stopChild(child);
     }

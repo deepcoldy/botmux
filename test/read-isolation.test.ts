@@ -1140,9 +1140,9 @@ describe('CLI protected capability wiring', () => {
    * internal `__turn-idle-v2` subcommand, never named by a user or an adapter
    * command line) constructs a frozen origin, and only its `/api/turn-idle` call
    * passes one. Wire a caller-supplied origin into `send` / reply / relay (or into
-   * the session-ready or claude-stop-failure call, or into any new transport call) and one of these
-   * assertions goes red — the mention/ carrier sets are computed from the source,
-   * not from a substring's presence.
+   * the session-ready, claude-compaction-start or claude-stop-failure call, or into
+   * any new transport call) and one of these assertions goes red — the mention/
+   * carrier sets are computed from the source, not from a substring's presence.
    */
   // 源码结构护栏(K2)：调用方可供给的身份只能经内部 turn-idle 事件进入 reporter，其余入口必须自己解析
   // live origin；这是跨函数的可达性约束，只能对源码做函数归属扫描（8da52fe7ab）。
@@ -1160,13 +1160,14 @@ describe('CLI protected capability wiring', () => {
     expect(producers).toHaveLength(1);
     const versionCheckAt = code.lastIndexOf('TURN_IDLE_PROTOCOL_VERSION', producers[0].index!);
     expect(enclosingFunctionName(code, versionCheckAt)).toBe('cmdTurnIdle');
-    // …and exactly three carriers. session-ready and claude-stop-failure pass NO
-    // opts (so they must resolve the live origin themselves); turn-idle passes
-    // the frozen one.
+    // …and exactly four carriers. session-ready, claude-compaction-start and
+    // claude-stop-failure pass NO opts (so they must resolve the live origin
+    // themselves); turn-idle passes the frozen one.
     expect([...code.matchAll(/await postSessionScopedSignal\(/g)]
       .map(m => enclosingFunctionName(code, m.index!)).sort())
-      .toEqual(['cmdClaudeStopFailure', 'cmdSessionReady', 'cmdTurnIdle']);
+      .toEqual(['cmdClaudeCompactionStart', 'cmdClaudeStopFailure', 'cmdSessionReady', 'cmdTurnIdle']);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/session-ready', \{[^}]*\}\);/);
+    expect(code).toMatch(/await postSessionScopedSignal\('\/api\/claude-compaction-start-v1', \{[^}]*\}\);/);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/claude-stop-failure', \{[^}]*\}\);/);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/turn-idle', \{[^}]*\}, \{\s*frozenOrigin\s*\}\);/);
   });

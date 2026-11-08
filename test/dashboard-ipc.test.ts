@@ -5664,7 +5664,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       adoptedFrom: undefined,
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-susp/suspend`, { method: 'POST' });
@@ -5700,7 +5700,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       adoptedFrom: undefined,
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-owned/suspend`, { method: 'POST' });
@@ -5713,7 +5713,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
   });
 
   it('rejects adopt/observed sessions (suspending would kill the user pane)', async () => {
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-adopt-susp', cliId: 'codex' },
       worker: { send: vi.fn(), killed: false },
@@ -5731,7 +5731,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
   });
 
   it('is idempotent when the worker is already gone (idle-suspended earlier)', async () => {
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-gone', cliId: 'codex' },
       worker: null,
@@ -5754,7 +5754,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: undefined,
     } as any);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(false);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(false);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-pty/suspend`, { method: 'POST' });
@@ -5801,7 +5801,7 @@ describe('PUT /api/bot-read-isolation', () => {
       } as any]);
       const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
       const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget');
-      const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+      const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
       try {
         handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
         const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
@@ -5854,7 +5854,7 @@ describe('PUT /api/bot-read-isolation', () => {
     const previousRegistry = workerPool.getActiveSessionsRegistry();
     workerPool.setActiveSessionsRegistry(new Map([['owned', owned]]));
     setLarkAppId(appId);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
     try {
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
@@ -8479,6 +8479,33 @@ describe('PUT /api/bot-no-progress-notify', () => {
 });
 
 describe('PUT /api/bot-substitute-mode', () => {
+  it('persists only App ID and leaves disk unchanged when any submitted App ID is invalid', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-app-id-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: 'cli_receiver', larkAppSecret: 'secret', cliId: 'codex' }]));
+      loadBotConfigs().forEach(registerBot);
+      setLarkAppId('cli_receiver');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const put = (targets: unknown[]) => fetch(`http://127.0.0.1:${handle!.port}/api/bot-substitute-mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: true, targets }),
+      });
+      const saved = await put([{ appId: 'cli_external', openId: 'ou_old', botChatId: 'oc_old' }]);
+      expect(saved.status).toBe(200);
+      expect((await saved.json()).substituteMode.targets).toEqual([{ appId: 'cli_external' }]);
+      const before = readFileSync(configPath, 'utf8');
+      const rejected = await put([{ appId: 'cli_external' }, { appId: '' }]);
+      expect(rejected.status).toBe(400);
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect(loadBotConfigs()[0].substituteMode?.targets).toEqual([{ appId: 'cli_external' }]);
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('preserves reply settings and keyword filters through HTTP, and can clear keywords', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));
     const configPath = join(dir, 'bots.json');
@@ -9207,6 +9234,44 @@ esac
         sandbox: true,
       });
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliLaunchMode).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects switching a zero-injection scratch bot to a CLI that loses zero injection under scratch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-zero-prompt-scratch-cli-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-zero-prompt-scratch-cli-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        promptInjection: 'none',
+        sandbox: 'scratch',
+      }], null, 2));
+      loadBotConfigs().forEach((config: any) => registerBot(config));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'cursor' }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'zero_prompt_unsupported' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({
+        cliId: 'codex',
+        promptInjection: 'none',
+        sandbox: 'scratch',
+      });
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;

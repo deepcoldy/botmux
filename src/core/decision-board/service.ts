@@ -20,7 +20,10 @@ import {
   DecisionBoardStore,
   decisionBoardDbPath,
   type ItemPatch,
+  type StagedFileInput,
 } from '../../services/decision-board-store.js';
+import { discardStagedExplainer, readStagedExplainer, stageBoardExplainer } from '../../services/decision-board-staging.js';
+import { BOARD_EXPLAINERS_PER_ATTACH, normalizeBoardFileName } from './files.js';
 import {
   formatHintNotice,
   formatHintPrompt,
@@ -79,6 +82,7 @@ import {
   stewardReady,
   stewardTaskHintsOn,
   type BoardBatch,
+  type BoardFile,
   type BoardHint,
   type BoardItem,
   type BoardLink,
@@ -198,6 +202,8 @@ export interface BoardCliRequest {
   text?: unknown;
   handled?: unknown;
   files?: unknown;
+  /** attach：先经上传接口写进暂存区的说明页 / 视频（id 列表）。 */
+  staged?: unknown;
   note?: unknown;
   /** `--primary-chat oc_…` */
   primaryChat?: unknown;
@@ -658,6 +664,7 @@ export class DecisionBoardService {
         return { seq, eventId: res.eventId, handledDecisions: res.handled, ...this.itemLinks(seq) };
       }
       case 'attach': {
+        if (req.staged !== undefined) return this.attachWithExplainers(req, ctx);
         const seq = this.resolveRef(req.ref);
         const parsed = parseDashboardImageUploads(req.files);
         if (!parsed.ok) throw new BoardError('invalid_files', `截图不合规：${parsed.error}`);
@@ -680,6 +687,49 @@ export class DecisionBoardService {
       default:
         throw new BoardError('unknown_action', `不认识的子命令：${action || '(空)'}`);
     }
+  }
+
+  /**
+   * `botmux board attach` 带了说明页 / 视频：它们已经由 stageExplainer 写进暂存区，这里和同一条命令里的
+   * 截图一起挂到事项上，只记一条历史。暂存必须是同一事项、同一会话上传的；读到的暂存不管
+   * attach 成败都丢掉。
+   */
+  private attachWithExplainers(req: BoardCliRequest, ctx: { sessionId: string }) {
+    const seq = this.resolveRef(req.ref);
+    const ids = Array.isArray(req.staged) ? [...new Set(req.staged)] : null;
+    if (!ids || ids.length === 0) throw new BoardError('files_required', '至少附一个文件');
+    if (ids.length > BOARD_EXPLAINERS_PER_ATTACH) {
+      throw new BoardError('too_many_files', `一次最多附 ${BOARD_EXPLAINERS_PER_ATTACH} 个说明页 / 视频`);
+    }
+    const staged: Array<StagedFileInput & { id: string }> = [];
+    let saved: BoardFile[];
+    try {
+      for (const id of ids) staged.push(readStagedExplainer(this.deps.dataDir, this.appId, id, { seq, sessionId: ctx.sessionId }));
+      const parsed = parseDashboardImageUploads(req.files);
+      if (!parsed.ok) throw new BoardError('invalid_files', `截图不合规：${parsed.error}`);
+      saved = this.store().attachExplainers(this.appId, seq, {
+        staged,
+        images: parsed.images.map(img => ({ bytes: Buffer.from(img.dataBase64, 'base64'), mime: img.mimeType, name: img.name })),
+      }, typeof req.note === 'string' ? req.note : undefined, ctx.sessionId);
+    } finally {
+      for (const s of staged) discardStagedExplainer(this.deps.dataDir, this.appId, s.id);
+    }
+    this.syncCard(seq);
+    return { seq, files: saved.map(f => ({ id: f.id, name: f.name, bytes: f.bytes, mime: f.mime })), ...this.itemLinks(seq) };
+  }
+
+  /**
+   * 上传一个说明页 / 视频到暂存区（正文是文件原始字节，流式写盘）。返回的 id 由同一会话的 attach 引用。
+   * 先确认管家开着、事项存在，再读正文。
+   */
+  async stageExplainer(input: { ref: unknown; name: string; mime: string; body: AsyncIterable<Uint8Array | string> }, ctx: { sessionId: string }) {
+    this.requireSteward();
+    const seq = this.resolveRef(input.ref);
+    const name = normalizeBoardFileName(input.name, input.mime, 'explainer');
+    const { staged, warnings } = await stageBoardExplainer(this.deps.dataDir, this.appId, {
+      seq, sessionId: ctx.sessionId, name, mime: input.mime, body: input.body,
+    });
+    return { id: staged.id, seq, name: staged.name, mime: staged.mime, bytes: staged.bytes, warnings };
   }
 
   // ─── Dashboard ───────────────────────────────────────────────────────────
@@ -869,6 +919,11 @@ export class DecisionBoardService {
 
   readFile(id: string) {
     return this.store().readFile(this.appId, id);
+  }
+
+  /** 只取元数据和磁盘路径：视频按 Range 分段读，不整个读进内存。 */
+  fileInfo(id: string) {
+    return this.store().getFile(this.appId, id);
   }
 
   async submit(input: { author: string; submitter?: string; authorName?: string; nonce: string; items: Array<{ seq: number; draftUpdatedAt: number }> }) {
@@ -1339,6 +1394,8 @@ function askChanged(before: BoardItem | undefined, after: BoardItem): boolean {
 export function boardErrorStatus(error: unknown): { status: number; error: string; message: string } {
   if (error instanceof BoardError) {
     const status = error.code === 'not_steward' ? 409
+      : error.code === 'file_too_large' ? 413
+      : error.code === 'staging_full' ? 507
       : error.code === 'item_not_found' || error.code === 'batch_not_found' ? 404
         : error.code === 'storage_unavailable' ? 503
           : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict'
