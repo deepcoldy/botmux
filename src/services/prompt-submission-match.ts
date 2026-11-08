@@ -15,8 +15,12 @@
  * text recalled from input history (Up-arrow) after its turn was consumed
  * has no fingerprint entry left, and the unique-prefix fallback would
  * otherwise credit the wake currently held for text its CLI never took.
- * Such a prompt is left to the transcript proof. A box cleared with Esc and
- * another prompt typed in its place submits none of the turns written before.
+ * The same rule applies to text the ledger forgot: an entry pushed out by
+ * the size cap, or replaced by a rewrite of its turn, loses its fingerprint,
+ * so its prefix is spent as well — a recalled copy must not reach a later
+ * entry that happens to share it. Such a prompt is left to the transcript
+ * proof. A box cleared with Esc and another prompt typed in its place
+ * submits none of the turns written before.
  */
 import { fingerprintPromptText, prefixOf } from './prompt-context-store.js';
 
@@ -30,19 +34,34 @@ export interface SubmittedPrompt {
 
 export class WrittenInputLedger {
   private written: Array<{ turnId: string; fingerprint: string; prefix: string }> = [];
-  /** Prefixes that already backed a claim, never evidence again. */
+  /** Prefixes that can no longer be evidence: spent by a claim or orphaned
+   *  when their fingerprint was forgotten (eviction, a turn rewrite). The
+   *  set lives for the worker process; each entry is at most 30 chars and one
+   *  is added per distinct prefix actually written, so it stays small. */
   private taintedPrefixes = new Set<string>();
 
   noteWritten(turnId: string, content: string): void {
+    const fingerprint = fingerprintPromptText(content);
+    const prefix = prefixOf(content);
+    // A turn rewritten with other text abandons the old text: with its
+    // fingerprint gone its prefix must not survive as fallback evidence.
+    for (const entry of this.written) {
+      if (entry.turnId === turnId && entry.prefix !== prefix && entry.prefix) {
+        this.taintedPrefixes.add(entry.prefix);
+      }
+    }
     this.written = this.written.filter((entry) => entry.turnId !== turnId);
-    this.written.push({ turnId, fingerprint: fingerprintPromptText(content), prefix: prefixOf(content) });
-    if (this.written.length > WRITTEN_INPUTS_MAX) this.written.shift();
+    this.written.push({ turnId, fingerprint, prefix });
+    while (this.written.length > WRITTEN_INPUTS_MAX) {
+      const [evicted] = this.written.splice(0, 1);
+      if (evicted.prefix) this.taintedPrefixes.add(evicted.prefix);
+    }
   }
 
   /** The turn this submitted prompt was, forgotten once matched. The prefix
-   *  fallback resolves only while it is unique and unclaimed: a shared or
-   *  already-spent prefix cannot tell two written turns apart, so it resolves
-   *  nothing and consumes nothing. */
+   *  fallback resolves only while it is unique and unclaimed: a shared,
+   *  spent or orphaned prefix cannot tell two written turns apart, so it
+   *  resolves nothing and consumes nothing. */
   takeSubmitted(prompt: SubmittedPrompt): string | undefined {
     if (prompt.fingerprint) {
       const index = this.written.findIndex((entry) => entry.fingerprint === prompt.fingerprint);

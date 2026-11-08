@@ -101,6 +101,53 @@ describe('WrittenInputLedger', () => {
       .toBe('om_person');
   });
 
+  it('an entry pushed out by the size cap spends its prefix: recalling its text cannot credit the wake currently held', () => {
+    const ledger = new WrittenInputLedger();
+    const head = 'C'.repeat(40);
+    const evicted = `${head} evicted wake text`;
+    ledger.noteWritten('workflow-event:r1:3', evicted);
+    for (let i = 0; i < 16; i++) {
+      ledger.noteWritten(`filler-${i}`, `filler number ${i} with a clearly distinct opening line`);
+    }
+    // A later wake sharing the static preamble is now the only entry with that prefix.
+    ledger.noteWritten('workflow-event:r1:9', `${head} held wake text`);
+    // Up-arrow recalls the evicted wake's text verbatim: fingerprint misses,
+    // and its prefix was spent when the entry left the window.
+    expect(ledger.takeSubmitted(submitted(evicted))).toBeUndefined();
+    // The held wake was not consumed: its own exact submit still resolves.
+    expect(ledger.takeSubmitted(submitted(`${head} held wake text`))).toBe('workflow-event:r1:9');
+  });
+
+  it('a prefix made ambiguous and then orphaned by eviction stays unusable', () => {
+    const ledger = new WrittenInputLedger();
+    const head = 'D'.repeat(40);
+    ledger.noteWritten('workflow-event:r1:1', `${head} first body`);
+    ledger.noteWritten('workflow-event:r1:2', `${head} second body`);
+    expect(ledger.takeSubmitted({ prefix: prefixOf(`${head} first body`) })).toBeUndefined();
+    for (let i = 0; i < 15; i++) {
+      ledger.noteWritten(`filler-${i}`, `different filler opening number ${i} padding`);
+    }
+    // Only the second wake remains in the window; the first one was evicted.
+    expect(ledger.takeSubmitted(submitted(`${head} first body`))).toBeUndefined();
+    expect(ledger.takeSubmitted(submitted(`${head} second body`))).toBe('workflow-event:r1:2');
+  });
+
+  it('a turn rewritten with different text spends the old text\'s prefix', () => {
+    const ledger = new WrittenInputLedger();
+    const oldHead = 'E'.repeat(40);
+    const newHead = 'F'.repeat(40);
+    const original = `${oldHead} original draft`;
+    ledger.noteWritten('workflow-event:r1:1', original);
+    ledger.noteWritten('workflow-event:r1:1', `${newHead} replaced draft`);
+    // A later held wake reusing the abandoned text's prefix must not be
+    // credited with the abandoned draft when input history recalls it.
+    ledger.noteWritten('workflow-event:r1:2', `${oldHead} another held body`);
+    expect(ledger.takeSubmitted(submitted(original))).toBeUndefined();
+    // The replacement text and the held wake still resolve on their own fingerprints.
+    expect(ledger.takeSubmitted(submitted(`${newHead} replaced draft`))).toBe('workflow-event:r1:1');
+    expect(ledger.takeSubmitted(submitted(`${oldHead} another held body`))).toBe('workflow-event:r1:2');
+  });
+
   it('a turn written again is remembered once, and only the latest writes are kept', () => {
     const ledger = new WrittenInputLedger();
     ledger.noteWritten('t-0', 'first text');
