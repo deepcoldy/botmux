@@ -32253,6 +32253,13 @@ body:has(.workbench-route-host) { min-width: 0; }
   white-space: nowrap;
 }
 
+/* 锁定/沙盒徽标复用全局 .session-lock-badge 的 margin-left:6px（给横向邻居的间距）；
+   卡片头允许换行后，它成为换行行首项时该 margin 仍生效，会相对首行缩进 6px。
+   看板头内间距统一交给父容器 gap，这里作用域归零，不影响表格行与详情抽屉的全局规则。 */
+.kanban-card-head .session-lock-badge {
+  margin-left: 0;
+}
+
 .kanban-card-reason {
   display: -webkit-box;
   margin: 0;
