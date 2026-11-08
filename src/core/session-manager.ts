@@ -915,6 +915,7 @@ function renderSubstituteIdentity(
   if (!identity) return '';
   const attrs: string[] = [];
   if (identity.name) attrs.push(`name="${xmlEscape(identity.name)}"`);
+  if (identity.appId) attrs.push(`app_id="${xmlEscape(identity.appId)}"`);
   if (identity.openId) attrs.push(`open_id="${xmlEscape(identity.openId)}"`);
   if (identity.userId) attrs.push(`user_id="${xmlEscape(identity.userId)}"`);
   if (identity.unionId) attrs.push(`union_id="${xmlEscape(identity.unionId)}"`);
@@ -923,17 +924,22 @@ function renderSubstituteIdentity(
 
 /** Preserve the pre-clean-input legacy schema exactly: one effective target,
  * with configured fields taking precedence and event fields only filling
- * missing values. The structured Codex App sidecar keeps both sources below. */
+ * missing values. An App ID target is identified by its App ID alone; the
+ * observed open_id is receiver-scoped and must not pose as its configured id.
+ * The structured Codex App sidecar keeps both sources below. */
 function renderLegacySubstituteTarget(trigger: SubstituteTrigger): string {
   const observed = trigger.observedMention;
+  const fill = trigger.target.appId ? undefined : observed;
   const target = {
     name: trigger.target.name ?? observed?.name,
-    openId: trigger.target.openId ?? observed?.openId,
-    userId: trigger.target.userId ?? observed?.userId,
-    unionId: trigger.target.unionId ?? observed?.unionId,
+    appId: trigger.target.appId,
+    openId: trigger.target.openId ?? fill?.openId,
+    userId: trigger.target.userId ?? fill?.userId,
+    unionId: trigger.target.unionId ?? fill?.unionId,
   };
   const attrs: string[] = [];
   if (target.name) attrs.push(`name="${xmlEscape(target.name)}"`);
+  if (target.appId) attrs.push(`app_id="${xmlEscape(target.appId)}"`);
   if (target.openId) attrs.push(`open_id="${xmlEscape(target.openId)}"`);
   if (target.userId) attrs.push(`user_id="${xmlEscape(target.userId)}"`);
   if (target.unionId) attrs.push(`union_id="${xmlEscape(target.unionId)}"`);
