@@ -47,6 +47,7 @@ import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
+import { isSilentMessageListenerSession } from '../../core/message-listener-silence.js';
 import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { TopicSendError } from '../../cli/topic-send-guard.js';
 import { privateReplyEnabled } from '../../core/private-reply.js';
@@ -134,6 +135,7 @@ interface CotRecoveryBinding extends CotRecoveryIdentity { turnId: string }
 /** Only the persistent, non-isolated agy case can safely continue its native
  * task across worker replacement. Other CLI/backend lifecycles stay unchanged. */
 export function canResumeCotMessage(ds: Pick<DaemonSession, 'session' | 'larkAppId'> & Partial<Pick<DaemonSession, 'initConfig'>>): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
     const sandbox = ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox;
@@ -447,6 +449,7 @@ function recoveredCotState(rec: any): CotState {
  * reader starts at EOF; its fresh segment reserves new reasoning node IDs.
  * An unacknowledged old batch may leave a display gap, but must not be replayed. */
 export function resumeCotMessage(ds: DaemonSession, binding?: { turnId: string; dispatchAttempt?: number }): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   const current = states.get(ds);
   if (current && !current.pausedForRestore && (current.cotId || !current.disabled)) return !current.settled;
   if (!canResumeCotMessage(ds)) return false;
@@ -586,6 +589,7 @@ function turnKeyOf(msg: { turnId: string; dispatchAttempt?: number }): string {
  *  `/cot show` (`ds.cotForced`) overrides both switches for one turn —
  *  apiOnly and private replies stay hard blocks for this public channel. */
 export function cotEnabled(ds: DaemonSession): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
     if (cfg.apiOnly === true) return false;
@@ -1241,6 +1245,7 @@ export function finalizeCotMessage(
   status: 'completed' | 'failed' | 'cancelled' | 'ambiguous',
   dispatchAttempt?: number,
 ): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   if (!isSilentScheduledTurn(ds, turnId) && !ds.session.hiddenThinkingTurns?.includes(turnId)) {
     retireSupersededCotMarkers(ds, { turnId, dispatchAttempt });
   }

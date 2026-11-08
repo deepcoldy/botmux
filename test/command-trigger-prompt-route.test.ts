@@ -281,6 +281,34 @@ describe('handleNewTopic — 免@ 斜杠命令的 prompt 模板', () => {
 
     expect(mocks.created[0].title).toBe('帮我看下登录接口');
   });
+
+  it.each([
+    ['silent', 'none', 'ml:om_listener_voice', 0],
+    ['thread-reply', 'thread', 'om_listener_voice', 2],
+  ] as const)('routes voice transcription notices of a %s listener', async (_label, replyMode, anchor, replies) => {
+    mocks.resolveInboundAudio.mockImplementation(async (...args: any[]) => {
+      const reply = args[5] as (text: string) => Promise<string>;
+      await reply('🎤 正在转写语音…');
+      await reply('语音转写失败');
+      return { kind: 'failed', userMessage: '语音转写失败' };
+    });
+
+    await handleNewTopic(makeEventData('om_listener_voice', '[语音]', 'audio'), {
+      ...makeCtx('om_listener_voice'),
+      scope: 'thread',
+      anchor,
+      messageListener: {
+        name: '语音监听', prompt: '分析命中的内容。', messageText: '[语音]', msgType: 'audio',
+        senderOpenId: USER, senderType: 'user', replyMode,
+      },
+    });
+
+    expect(mocks.resolveInboundAudio).toHaveBeenCalledOnce();
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(replies);
+    if (replies) expect(mocks.replyMessage).toHaveBeenLastCalledWith(APP, 'om_listener_voice', '语音转写失败', 'text');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
 });
 
 /**

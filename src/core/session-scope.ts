@@ -138,8 +138,19 @@ export function userSystemdBusEnv(options: {
   platform?: NodeJS.Platform;
   uid?: number;
   isSocket?: (path: string) => boolean;
+  env?: NodeJS.ProcessEnv;
 } = {}): Record<string, string> | undefined {
   if ((options.platform ?? process.platform) !== 'linux') return undefined;
+  const env = options.env ?? process.env;
+  if (env.BOTMUX_FENCED_RUN === '1') {
+    // scripts/fenced-run.ts exports exactly the bus its child may use, none by
+    // default. Deriving /run/user/<uid>/bus here, even to complete a single
+    // variable, would hand the fenced child the real user manager.
+    const declared: Record<string, string> = {};
+    if (env.XDG_RUNTIME_DIR) declared.XDG_RUNTIME_DIR = env.XDG_RUNTIME_DIR;
+    if (env.DBUS_SESSION_BUS_ADDRESS) declared.DBUS_SESSION_BUS_ADDRESS = env.DBUS_SESSION_BUS_ADDRESS;
+    return Object.keys(declared).length > 0 ? declared : undefined;
+  }
   const uid = options.uid ?? process.getuid?.();
   if (uid === undefined || !Number.isSafeInteger(uid) || uid < 0) return undefined;
   const runtimeDir = `/run/user/${uid}`;

@@ -613,7 +613,7 @@ export function MessageListenersPage() {
                       <strong>{tr(savedGlobal.enabled ? 'listeners.inheritOn' : 'listeners.inheritOff')}</strong>
                       <p>{savedGlobal.enabled
                         ? tr('listeners.inheritSummary', {
-                          reply: tr(savedGlobal.replyPolicy?.mode === 'chat' ? 'listeners.replyChat' : 'listeners.replyThread'),
+                          reply: tr(savedGlobal.replyPolicy?.mode === 'none' ? 'listeners.replyNone' : savedGlobal.replyPolicy?.mode === 'chat' ? 'listeners.replyChat' : 'listeners.replyThread'),
                           keywords: savedGlobal.contentPolicy?.includeKeywords?.length
                             ? tr('listeners.keywords', { keywords: savedGlobal.contentPolicy.includeKeywords.join(tr('listeners.listSeparator')) })
                             : tr('listeners.noKeywords'),

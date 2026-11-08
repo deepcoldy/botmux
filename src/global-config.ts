@@ -57,6 +57,13 @@ export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
   return value;
 }
 
+/** A usable `worktreeRoot`: trimmed, absolute or `~`/`~/`-prefixed. */
+export function normalizeWorktreeRoot(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  return value && (isAbsolute(value) || value === '~' || value.startsWith('~/')) ? value : undefined;
+}
+
 export interface WhiteboardConfig {
   /** Optional local project whiteboard. Off by default; enabling it must not create boards by itself. */
   enabled?: boolean;
@@ -293,6 +300,10 @@ export interface GlobalConfig {
    *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
    *  selection cards; explicit /repo /abs/path/to/worktree still works. */
   repoPickerMode?: RepoPickerMode;
+  /** Machine-wide directory botmux creates new worktrees under, e.g. a large
+   *  data disk. Absolute or `~/`-prefixed. Missing keeps worktrees next to the
+   *  main checkout (services/git-worktree.ts `worktreeTargetPath`). */
+  worktreeRoot?: string;
   /** Machine-wide dashboard settings. These are intentionally global rather
    *  than per-bot: they govern the dashboard security boundary and the default
    *  terminal-opening behavior of cards emitted by all daemons on this host. */
@@ -1040,6 +1051,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
+  const worktreeRoot = normalizeWorktreeRoot(raw.worktreeRoot);
+  if (worktreeRoot) out.worktreeRoot = worktreeRoot;
   const dashboard = readDashboard(raw.dashboard);
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);

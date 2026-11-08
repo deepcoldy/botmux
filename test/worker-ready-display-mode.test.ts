@@ -1282,6 +1282,25 @@ describe('Worker ready: set_display_mode re-sync', () => {
     );
   });
 
+  it('keeps silent listener startup, notifications and failure local while running the worker', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, displayMode: 'screenshot', streamingCardForced: true });
+    ds.session.rootMessageId = 'ml:om_source';
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok' });
+    await flush();
+    expect(ds.workerReady).toBe(true);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }));
+    worker.emit('message', { type: 'user_notify', message: 'requires attention' });
+    worker.emit('message', { type: 'steer_accepted', turnId: 'om_turn', appTurnId: 'app_turn' });
+    worker.emit('message', { type: 'error', message: 'invalid launch configuration' });
+    await flush();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+  });
+
   it('managed/silent-suppressed ready (apiOnly transport) still sends set_display_mode', async () => {
     // apiOnly makes auxUiSuppressedFor() return true — the "worker exists, no
     // card will ever be posted" shape. The mode re-sync must not be tied to

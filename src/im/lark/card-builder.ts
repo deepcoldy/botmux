@@ -1,5 +1,5 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
-import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
+import { cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
@@ -1246,7 +1246,8 @@ export function buildStreamingCard(
   // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
   // 闸门是拿错了判据。
   //
-  // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
+  // Builder 与 handler 共用压缩能力判断。MiniMax 经帧协议把 /compact 直接交给 ACP，
+  // 不因此开放任意 TUI passthrough；其它无输入面的 runner 仍拒绝。
   //   ① remote CLI（riff/mojo）无本地终端可驱动；
   //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
   //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
@@ -1255,7 +1256,7 @@ export function buildStreamingCard(
   //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
   // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && cliSupportsCompactAction(effectiveCliId, { dshRuntime })) {
     headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
   }
   // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in 的闲置自动 /compact（core/idle-auto-compact.ts）。

@@ -28,6 +28,7 @@ import {
   codexConfigBackupName,
   isolatedCodexConfigPath,
   resyncIsolatedCodexConfig,
+  seedIsolatedCodexHome,
 } from '../src/services/codex-isolated-config.js';
 import { isRemoteBackendId, resolvePairedBackendId } from '../src/core/remote-cli-ids.js';
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
@@ -201,6 +202,159 @@ describe('resyncIsolatedCodexConfig', () => {
   });
 });
 
+describe('seedIsolatedCodexHome', () => {
+  function hostWith(files: { config?: string; agents?: string }): string {
+    const home = join(tmp(), 'home');
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    if (files.config !== undefined) writeFile600(join(home, '.codex', 'config.toml'), files.config);
+    if (files.agents !== undefined) writeFileSync(join(home, '.codex', 'AGENTS.md'), files.agents, { mode: 0o644 });
+    return home;
+  }
+  const seed = (botHome: string, hostHome: string) => seedIsolatedCodexHome({ botHome, mode: 'isolated', log: () => {}, hostHome });
+
+  it('copies config.toml and AGENTS.md (0600) into a newly created bot codex home', () => {
+    const hostHome = hostWith({ config: 'model = "host"\n', agents: '# host rules\n' });
+    const botHome = join(tmp(), 'bots', 'fresh');
+
+    const codexHome = seed(botHome, hostHome);
+
+    expect(readFileSync(join(codexHome, 'config.toml'), 'utf8')).toBe('model = "host"\n');
+    expect(readFileSync(join(codexHome, 'AGENTS.md'), 'utf8')).toBe('# host rules\n');
+    expect(lstatSync(join(codexHome, 'AGENTS.md')).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(hostHome, '.codex', 'AGENTS.md'), 'utf8')).toBe('# host rules\n');
+  });
+
+  it('copies AGENTS.md into a new bot home even when the host has no config.toml', () => {
+    const hostHome = hostWith({ agents: '# host rules\n' });
+    const codexHome = seed(join(tmp(), 'bots', 'fresh'), hostHome);
+    expect(readFileSync(join(codexHome, 'AGENTS.md'), 'utf8')).toBe('# host rules\n');
+    expect(existsSync(join(codexHome, 'config.toml'))).toBe(false);
+  });
+
+  it('leaves a bot provisioned earlier without AGENTS.md exactly as it was', () => {
+    const hostHome = hostWith({ config: 'model = "host"\n', agents: '# host rules\n' });
+    const botHome = join(tmp(), 'bots', 'existing');
+    mkdirSync(join(botHome, 'codex'), { recursive: true, mode: 0o700 });
+    writeFile600(join(botHome, 'codex', 'config.toml'), 'model = "bot"\n');
+
+    const codexHome = seed(botHome, hostHome);
+
+    expect(readdirSync(codexHome).sort()).toEqual(['config.toml']);
+    expect(readFileSync(join(codexHome, 'config.toml'), 'utf8')).toBe('model = "bot"\n');
+  });
+
+  it('seeds AGENTS.md together with config.toml into a codex home pre-created by a login', () => {
+    const hostHome = hostWith({ config: 'model = "host"\n', agents: '# host rules\n' });
+    const botHome = join(tmp(), 'bots', 'logged-in');
+    mkdirSync(join(botHome, 'codex'), { recursive: true, mode: 0o700 });
+    writeFile600(join(botHome, 'codex', 'auth.json'), '{}');
+
+    const codexHome = seed(botHome, hostHome);
+
+    expect(readFileSync(join(codexHome, 'config.toml'), 'utf8')).toBe('model = "host"\n');
+    expect(readFileSync(join(codexHome, 'AGENTS.md'), 'utf8')).toBe('# host rules\n');
+  });
+
+  it('never overwrites a per-bot AGENTS.md, nor re-seeds one the bot removed', () => {
+    const hostHome = hostWith({ config: 'model = "host"\n', agents: '# host rules\n' });
+    const botHome = join(tmp(), 'bots', 'custom');
+    mkdirSync(join(botHome, 'codex'), { recursive: true, mode: 0o700 });
+    writeFile600(join(botHome, 'codex', 'AGENTS.md'), '# bot rules\n');
+
+    const codexHome = seed(botHome, hostHome);
+    expect(readFileSync(join(codexHome, 'AGENTS.md'), 'utf8')).toBe('# bot rules\n');
+
+    rmSync(join(codexHome, 'AGENTS.md'));
+    seed(botHome, hostHome);
+    expect(existsSync(join(codexHome, 'AGENTS.md'))).toBe(false);
+  });
+
+  it('does not write through a planted AGENTS.md symlink', () => {
+    const hostHome = hostWith({ config: 'model = "host"\n', agents: '# host rules\n' });
+    const root = tmp();
+    const victim = join(root, 'victim.md');
+    const botHome = join(root, 'bots', 'planted');
+    mkdirSync(join(botHome, 'codex'), { recursive: true, mode: 0o700 });
+    symlinkSync(victim, join(botHome, 'codex', 'AGENTS.md'));
+
+    seed(botHome, hostHome);
+
+    expect(existsSync(victim)).toBe(false);
+    expect(lstatSync(join(botHome, 'codex', 'AGENTS.md')).isSymbolicLink()).toBe(true);
+  });
+});
+
+describe('worker cold-spawn wiring', () => {
+  // 源码结构护栏(K3)：provisionIsolatedBotHome 埋在 worker.ts 闭包里、没有可导出的行为
+  // seam；上面 seedIsolatedCodexHome 的纯函数用例只证明它自身的行为，证明不了真实 caller
+  // 接了线。caller 若被改回直接调 provisionCodexAuth，AGENTS.md 首次播种会静默丢失而全部
+  // 行为用例仍绿，故在此钉住接线不变量：codex 冷启动分支必须经 seedIsolatedCodexHome。
+  it('provisions the isolated Codex home through seedIsolatedCodexHome', () => {
+    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    const start = worker.indexOf('function provisionIsolatedBotHome(');
+    const body = worker.slice(start, worker.indexOf('\nfunction ', start + 1));
+    expect(start).toBeGreaterThan(-1);
+    expect(body).toMatch(/\} else \{\s*(?:\/\/[^\n]*\n\s*)*seedIsolatedCodexHome\(\{ botHome, mode: codexAuthSync, log \}\);/);
+    expect(body).not.toContain('provisionCodexAuth(');
+  });
+});
+
+describe('resyncIsolatedCodexConfig with AGENTS.md', () => {
+  function setup(bot: { config?: string; agents?: string }) {
+    const root = tmp();
+    const hostConfigPath = join(root, 'host-config.toml');
+    writeFile600(hostConfigPath, 'model = "host"\n');
+    const hostAgentsPath = join(root, 'host-AGENTS.md');
+    const botHome = join(root, 'bots', 'cli_a');
+    const codexDir = join(botHome, 'codex');
+    mkdirSync(codexDir, { recursive: true, mode: 0o700 });
+    if (bot.config !== undefined) writeFile600(join(codexDir, 'config.toml'), bot.config);
+    if (bot.agents !== undefined) writeFile600(join(codexDir, 'AGENTS.md'), bot.agents);
+    return { root, hostConfigPath, hostAgentsPath, botHome, codexDir };
+  }
+
+  it('backs up and replaces the per-bot AGENTS.md when the host has one', () => {
+    const t = setup({ config: 'model = "old"\n', agents: '# bot rules\n' });
+    writeFileSync(t.hostAgentsPath, '# host rules\n', { mode: 0o644 });
+    const now = new Date('2026-11-07T01:02:03.456Z');
+
+    const result = resyncIsolatedCodexConfig({ botHome: t.botHome, hostConfigPath: t.hostConfigPath, hostAgentsPath: t.hostAgentsPath, now });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.agentsPath).toBe(join(result.path, '..', 'AGENTS.md'));
+    expect(readFileSync(result.agentsPath!, 'utf8')).toBe('# host rules\n');
+    expect(lstatSync(result.agentsPath!).mode & 0o777).toBe(0o600);
+    expect(result.agentsBackupPath!.endsWith('AGENTS.md.bak-2026-11-07T01-02-03-456Z')).toBe(true);
+    expect(readFileSync(result.agentsBackupPath!, 'utf8')).toBe('# bot rules\n');
+    expect(readFileSync(result.backupPath!, 'utf8')).toBe('model = "old"\n');
+  });
+
+  it('leaves the per-bot AGENTS.md alone when the host has none', () => {
+    const t = setup({ config: 'model = "old"\n', agents: '# bot rules\n' });
+
+    const result = resyncIsolatedCodexConfig({ botHome: t.botHome, hostConfigPath: t.hostConfigPath, hostAgentsPath: t.hostAgentsPath });
+
+    expect(result).toMatchObject({ ok: true, agentsPath: null, agentsBackupPath: null });
+    expect(readFileSync(join(t.codexDir, 'AGENTS.md'), 'utf8')).toBe('# bot rules\n');
+    expect(readdirSync(t.codexDir).filter(name => name.startsWith('AGENTS.md.bak-'))).toEqual([]);
+  });
+
+  it('refuses a planted AGENTS.md symlink before writing anything', () => {
+    const t = setup({ config: 'model = "old"\n' });
+    writeFile600(t.hostAgentsPath, '# host rules\n');
+    const victim = join(t.root, 'victim.md');
+    writeFile600(victim, 'do not overwrite\n');
+    symlinkSync(victim, join(t.codexDir, 'AGENTS.md'));
+
+    const result = resyncIsolatedCodexConfig({ botHome: t.botHome, hostConfigPath: t.hostConfigPath, hostAgentsPath: t.hostAgentsPath });
+
+    expect(result).toEqual({ ok: false, error: 'target_not_regular_file' });
+    expect(readFileSync(victim, 'utf8')).toBe('do not overwrite\n');
+    expect(readFileSync(join(t.codexDir, 'config.toml'), 'utf8')).toBe('model = "old"\n');
+  });
+});
+
 describe('daemon IPC /api/bot-codex-config', () => {
   const APP_ID = 'cli_codex_cfg_test';
   let dir: string;
@@ -255,6 +409,10 @@ describe('daemon IPC /api/bot-codex-config', () => {
       exists: false,
       hostPath: join(dir, 'home', '.codex', 'config.toml'),
       hostExists: false,
+      agentsPath: join(dir, 'bots', APP_ID, 'codex', 'AGENTS.md'),
+      agentsExists: false,
+      hostAgentsPath: join(dir, 'home', '.codex', 'AGENTS.md'),
+      hostAgentsExists: false,
     });
   });
 
@@ -274,6 +432,22 @@ describe('daemon IPC /api/bot-codex-config', () => {
 
     const info = await (await call('GET', '/api/bot-codex-config')).json() as { exists: boolean; hostExists: boolean };
     expect(info).toMatchObject({ exists: true, hostExists: true });
+  });
+
+  it('POST resync also replaces AGENTS.md when the host has one, and GET reports both', async () => {
+    await boot({ cliId: 'codex', sandbox: 'oncall' });
+    writeFile600(join(dir, 'home', '.codex', 'config.toml'), 'model = "host"\n');
+    writeFile600(join(dir, 'home', '.codex', 'AGENTS.md'), '# host rules\n');
+
+    const res = await call('POST', '/api/bot-codex-config/resync');
+    expect(res.status).toBe(200);
+    const body = await res.json() as { agentsPath: string; agentsBackupPath: string | null };
+    expect(body.agentsPath.endsWith(join('bots', APP_ID, 'codex', 'AGENTS.md'))).toBe(true);
+    expect(body.agentsBackupPath).toBeNull();
+    expect(readFileSync(body.agentsPath, 'utf8')).toBe('# host rules\n');
+
+    const info = await (await call('GET', '/api/bot-codex-config')).json();
+    expect(info).toMatchObject({ agentsExists: true, hostAgentsExists: true });
   });
 
   it('POST resync surfaces a missing host config as 404 host_config_missing', async () => {

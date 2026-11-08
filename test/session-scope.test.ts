@@ -114,13 +114,32 @@ describe('owned session systemd scope', () => {
 
   it('derives the canonical user bus environment from a verified socket', () => {
     const isSocket = vi.fn((path: string) => path === '/run/user/1001/bus');
-    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket })).toEqual({
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket, env: {} })).toEqual({
       XDG_RUNTIME_DIR: '/run/user/1001',
       DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1001/bus',
     });
     expect(isSocket).toHaveBeenCalledWith('/run/user/1001/bus');
-    expect(userSystemdBusEnv({ platform: 'darwin', uid: 1001, isSocket })).toBeUndefined();
-    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket: () => false })).toBeUndefined();
+    expect(userSystemdBusEnv({ platform: 'darwin', uid: 1001, isSocket, env: {} })).toBeUndefined();
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket: () => false, env: {} })).toBeUndefined();
+  });
+
+  it('uses only the bus variables fenced-run passed through and derives none', () => {
+    const isSocket = vi.fn(() => true);
+    const derived = { XDG_RUNTIME_DIR: '/run/user/1001', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1001/bus' };
+    const fenced = (env: NodeJS.ProcessEnv) =>
+      userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket, env: { BOTMUX_FENCED_RUN: '1', ...env } });
+    expect(fenced({})).toBeUndefined();
+    expect(fenced({ XDG_RUNTIME_DIR: '/tmp/probe-runtime' })).toEqual({ XDG_RUNTIME_DIR: '/tmp/probe-runtime' });
+    expect(fenced({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' }))
+      .toEqual({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
+    expect(fenced(derived)).toEqual(derived);
+    expect(isSocket).not.toHaveBeenCalled();
+    // Outside the fence a missing variable still means "not exported" (cron, ssh without pam),
+    // and the verified canonical bus still wins over an inherited one.
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket, env: { BOTMUX_FENCED_RUN: '0' } })).toEqual(derived);
+    expect(userSystemdBusEnv({
+      platform: 'linux', uid: 1001, isSocket, env: { DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' },
+    })).toEqual(derived);
   });
 
   it('fails open on unsupported platforms', () => {

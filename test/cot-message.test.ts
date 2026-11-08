@@ -94,6 +94,18 @@ describe('handleCotThinkingUpdate', () => {
     expect(entries[0].text).toContain('/home/alice/');
   });
 
+  it.each([false, true])('keeps restored silent listener thinking and late updates local with cotForced=%s', async cotForced => {
+    const ds = makeDs({ cotForced, session: JSON.parse(JSON.stringify({
+      rootMessageId: 'ml:om_source', messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' },
+    })) });
+    expect(handleCotThinkingUpdate(ds, upd([think('private task')]))).toBe(false);
+    expect(finalizeCotMessage(ds, 'om_turn1', 'completed')).toBe(false);
+    expect(handleCotThinkingUpdate(ds, upd([say('late progress')]))).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    expect(existsSync(orphanDir)).toBe(false);
+  });
+
   it.each([false, true])('keeps hidden recovery turns quiet after restore with cotForced=%s', async cotForced => {
     const ds = makeDs({ cotForced, session: JSON.parse(JSON.stringify({ hiddenThinkingTurns: ['trg_recovery'] })) });
     handleCotThinkingUpdate(ds, upd([say('User work')], 'om_user'));
