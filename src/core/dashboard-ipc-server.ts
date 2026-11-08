@@ -543,7 +543,7 @@ import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '.
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
-import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
+import { isKnownLarkUserScope, isValidLarkScopeSyntax } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
 import {
   resolveRegisteredBackgroundContext,
@@ -3826,7 +3826,16 @@ for (const action of ['auth-request', 'auth-status']) {
     }
     const scopes = [...new Set(body.scopes as string[])];
     const unknownScopes = scopes.filter(scope => !isKnownLarkUserScope(scope, body.allowUnknown === true ? { allowUnknown: true } : undefined));
-    if (unknownScopes.length) return jsonRes(res, 400, { ok: false, error: 'unknown_scopes', scopes: unknownScopes });
+    if (unknownScopes.length) {
+      // A well-formed name left over means --allow-unknown was not in effect.
+      const allowUnknownHelps = unknownScopes.some(isValidLarkScopeSyntax);
+      return jsonRes(res, 400, {
+        ok: false, error: 'unknown_scopes', scopes: unknownScopes,
+        hint: '这些权限名不在 botmux 的飞书权限清单里。先核对拼写，照飞书报错里的 missing_scopes 原样填；'
+          + '创建或编辑文档优先用 docx:document:create、docx:document:write_only 这类细分权限，docx:document、drive:drive 这类大权限可能无法申请。'
+          + (allowUnknownHelps ? '确认权限名合法（例如飞书新开放的权限）时，加 --allow-unknown 重试。' : ''),
+      });
+    }
     const cached = delegated ? undefined : getIdentity(ds.larkAppId, callerOpenId);
     const identity = delegated ? { type: 'user' as const, openId: callerOpenId }
       : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
@@ -4745,7 +4754,11 @@ function makeSessionGroupBoardFields(): (chatId: string) => { sessionGroup?: tru
  *
  *  Legacy `action`/`async` fields are still populated so existing webhook
  *  consumers keep working; new callers branch on `state`. */
-function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
+function buildAsyncTriggerLookupResponse(
+  sessionId: string,
+  triggerId?: string,
+  opts: { includeFailureDiagnostics?: boolean } = {},
+): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
   const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
   const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
@@ -4875,10 +4888,13 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       failedAt: memResult.failedAt,
       errorCode: memResult.errorCode,
       terminalErrorCode: memResult.terminalErrorCode,
+      terminalErrorDetail: memResult.terminalErrorDetail,
+      terminalScreenTail: memResult.terminalScreenTail,
       usage: memResult.usage,
       interruptedAt: memResult.interruptedAt,
     } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
+    ...(opts.includeFailureDiagnostics ? { includeFailureDiagnostics: true } : {}),
     persisted,
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
     closedAt: stored?.closedAt,
@@ -6602,7 +6618,27 @@ ipcRoute('POST', '/api/schedules/precondition/test', async (req, res) => {
     });
   }
   const draft = body as Record<string, unknown>;
-  if (typeof draft.workingDir !== 'string' || draft.workingDir.trim().length === 0) {
+  let workingDir = draft.workingDir;
+  if (workingDir === undefined) {
+    // An unsaved task has no directory yet: test where POST /api/schedules will put it.
+    const resolved = resolveDashboardScheduleWorkingDir(
+      cachedLarkAppId,
+      typeof draft.chatId === 'string' && draft.chatId.trim() ? draft.chatId.trim() : undefined,
+    );
+    if (!resolved.ok) {
+      return jsonRes(res, 400, {
+        ok: false,
+        result: 'error',
+        errorCode: resolved.error,
+        error: resolved.message ?? resolved.error,
+        field: 'workingDir',
+        durationMs: 0,
+        additionalPrompt: false,
+      });
+    }
+    workingDir = resolved.workingDir;
+  }
+  if (typeof workingDir !== 'string' || workingDir.trim().length === 0) {
     return jsonRes(res, 400, {
       ok: false,
       result: 'error',
@@ -6613,7 +6649,7 @@ ipcRoute('POST', '/api/schedules/precondition/test', async (req, res) => {
       additionalPrompt: false,
     });
   }
-  const checkedWorkingDir = validateWorkingDir(draft.workingDir);
+  const checkedWorkingDir = validateWorkingDir(workingDir);
   if (!checkedWorkingDir.ok) {
     return jsonRes(res, 400, {
       ok: false,
@@ -6831,7 +6867,9 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
     activeSessions: getActiveSessionsRegistry,
     createHeadlessSession: (active, args) => withBotTurnAdmission(args.larkAppId, () => createHeadlessSession(active, undefined, args)),
     triggerSessionTurn,
-    lookupTriggerResult: buildAsyncTriggerLookupResponse,
+    // In-process: the draft's failure panel shows the raw error and screen.
+    lookupTriggerResult: (sessionId, triggerId) =>
+      buildAsyncTriggerLookupResponse(sessionId, triggerId, { includeFailureDiagnostics: true }),
     sessionStatus: (sessionId) => (findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId))?.status,
     suspendWorker,
     isSuspendable: (ds) => isSuspendableBackendType(ds.initConfig?.backendType),

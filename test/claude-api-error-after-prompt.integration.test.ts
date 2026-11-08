@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -58,6 +59,13 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSessionPid: vi.fn(),
 }));
 
+// The async-trigger sink persists a failed terminal; keep it off the disk.
+const recordTerminalFailureStrict = vi.fn(() => 'written_failed');
+vi.mock('../src/services/async-trigger-store.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/services/async-trigger-store.js')>()),
+  recordTerminalFailureStrict: (...args: unknown[]) => recordTerminalFailureStrict(...(args as [])),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -69,6 +77,11 @@ import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/work
 import type { DaemonSession } from '../src/core/types.js';
 import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
 import { setDefaultLocale, t } from '../src/i18n/index.js';
+import { resolveAsyncTriggerState } from '../src/services/async-trigger-state.js';
+import type { TriggerResponse } from '../src/services/trigger-types.js';
+import { createProductionDraftClarifier } from '../src/core/workflow-draft-daemon.js';
+import { draftFailureOf } from '../src/dashboard/web/workflow-draft-model.js';
+import { makeService, OWNER } from './helpers/workflow-draft-fakes.js';
 
 setDefaultLocale('zh');
 
@@ -127,7 +140,8 @@ const answerText: Row = {
 
 /** `beforePrompt`: what the fake writes before drawing `❯`.
  *  `firstTurn`: the transcript has no finished turn, so no `turn_duration`. */
-function startWorker(opts: { beforePrompt: Row[]; firstTurn: boolean }) {
+/** `screen`: what the fake draws above the prompt it redraws after a turn. */
+function startWorker(opts: { beforePrompt: Row[]; firstTurn: boolean; screen?: string; draftClarify?: boolean }) {
   root = mkdtempSync(join(tmpdir(), 'botmux-api-error-idle-'));
   const workDir = join(root, 'work');
   const dataDir = join(root, 'data');
@@ -151,6 +165,7 @@ function startWorker(opts: { beforePrompt: Row[]; firstTurn: boolean }) {
 import('node:fs').then(fs => {
 const T = ${JSON.stringify(transcript)};
 const BEFORE_PROMPT = ${JSON.stringify(opts.beforePrompt)};
+const SCREEN = ${JSON.stringify(opts.screen ?? '')};
 const put = row => fs.appendFileSync(T, JSON.stringify({ timestamp: new Date().toISOString(), ...row }) + '\\n');
 process.stdout.write('❯ ');
 let typed = '';
@@ -162,14 +177,17 @@ process.stdin.on('data', chunk => {
   typed = '';
   put({ type: 'user', uuid: 'u1', message: { role: 'user', content: prompt } });
   setTimeout(() => { for (const row of BEFORE_PROMPT) put(row); }, 300);
-  setTimeout(() => process.stdout.write('\\r\\n❯ '), 1500);
+  setTimeout(() => process.stdout.write((SCREEN ? '\\r\\n' + SCREEN : '') + '\\r\\n❯ '), 1500);
 });
 });
 `);
   chmodSync(fakeClaude, 0o755);
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
-  const sid = 'sid-api-error-idle';
+  // The session scope is named after the sid in the host-wide systemd user
+  // manager, and a launch first stops that unit by name: a fixed sid lets a
+  // concurrent run of this file elsewhere SIGTERM this Claude at startup.
+  const sid = `sid-api-error-idle-${randomUUID()}`;
   child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
@@ -185,6 +203,9 @@ process.stdin.on('data', chunk => {
     type: 'init', sessionId: sid, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: workDir, cliId: 'claude-code', cliPathOverride: fakeClaude, cliSessionId,
     backendType: 'pty', prompt: '', resume: true, larkAppId: 'app_test', larkAppSecret: 'test-only', locale: 'zh',
+    // A workflow draft's clarify session (session.headless.failureDiagnostics):
+    // the only kind whose failed turns carry the provider error and screen.
+    ...(opts.draftClarify ? { captureTurnFailureDiagnostics: true as const } : {}),
   } satisfies DaemonToWorker);
   return { sid, transcript, messages, logs };
 }
@@ -209,7 +230,12 @@ async function runTurn(w: ReturnType<typeof startWorker>, turnId: string, afterI
 
 /** What the daemon makes of the worker's outcome for this turn: the CoT bubble
  *  calls and the replies it posts. */
-async function replayIntoDaemon(sid: string, turnId: string, messages: WorkerToDaemon[]) {
+async function replayIntoDaemon(
+  sid: string,
+  turnId: string,
+  messages: WorkerToDaemon[],
+  opts: { asyncTrigger?: boolean } = {},
+) {
   const sessionReply = vi.fn(async () => 'om_reply');
   initWorkerPool({
     sessionReply,
@@ -226,6 +252,10 @@ async function replayIntoDaemon(sid: string, turnId: string, messages: WorkerToD
     },
     worker, workerPort: 0, workerToken: 'tok', larkAppId: 'app_test', chatId: 'oc_test', chatType: 'group',
     spawnedAt: Date.now(), cliVersion: '1', lastMessageAt: Date.now(), hasHistory: false, currentTurnId: turnId,
+    ...(opts.asyncTrigger ? {
+      asyncTriggerResults: new Map([[turnId, { status: 'pending', createdAt: Date.now() }]]),
+      latestAsyncTriggerId: turnId,
+    } : {}),
   } as unknown as DaemonSession;
   __testOnly_setupWorkerHandlers(ds, worker);
   for (const msg of messages) {
@@ -242,6 +272,7 @@ async function replayIntoDaemon(sid: string, turnId: string, messages: WorkerToD
     cotRunFinished: cotEvents.filter(e => e.event_type === 'RUN_FINISHED').map(e => JSON.parse(e.content).status),
     cotErrorCompletes: cotCalls.filter(req => String(req.url).includes('/message_cot/complete/')).map(req => req.params),
     replies: sessionReply.mock.calls.map(call => String((call as unknown[])[1])),
+    asyncResult: ds.asyncTriggerResults?.get(turnId),
   };
 }
 
@@ -304,4 +335,179 @@ describe('Claude turn cut by an API error that lands after the prompt (real work
       expect(daemon.replies.some(body => body.includes(failedTitle))).toBe(false);
     }, 90_000);
   }
+});
+
+/** What a draft makes of this trigger result through the production
+ *  clarifier: the failure on its page, and its draft.json on disk. */
+async function draftFailureFrom(lookup: TriggerResponse, sid: string, turnId: string) {
+  const clarifier = createProductionDraftClarifier({
+    activeSessions: () => new Map(),
+    createHeadlessSession: async () => ({ ok: false, error: 'unused' }),
+    triggerSessionTurn: async () => ({ ok: false }),
+    lookupTriggerResult: () => lookup,
+    sessionStatus: () => 'active',
+    suspendWorker: () => true,
+    isSuspendable: () => false,
+    canRetireWorker: () => false,
+    killWorker: () => {},
+    lifecycleInFlight: () => false,
+    closeSession: async () => ({ ok: true }),
+    deleteHeadlessRecord: () => {},
+  });
+  const base = mkdtempSync(join(tmpdir(), 'botmux-draft-failure-'));
+  try {
+    const h = makeService(base);
+    const { runId } = await h.service.create(OWNER, { goal: 'g' });
+    h.clarify.settle(clarifier.result(sid, turnId));
+    const failure = draftFailureOf(await h.service.view(runId))!;
+    return { failure, disk: readFileSync(join(base, runId, 'draft.json'), 'utf8') };
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+describe('a Claude API error reaches the draft failure panel as the provider wrote it (real worker, fake Claude Code)', () => {
+  const secret = 'abcdefghijklmnop12345678';
+  const apiError = `API Error: 403 {"error":{"type":"permission_error","message":"Access denied for model x"}} `
+    + `(sent with Authorization: Bearer ${secret})`;
+  const authError: Row = {
+    type: 'assistant', uuid: 'a-auth', isApiErrorMessage: true, error: 'authentication_failed', apiErrorStatus: 403,
+    message: { id: 'e403', role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', usage: zeroUsage,
+      content: [{ type: 'text', text: apiError }] },
+  };
+
+  it('worker terminal → async trigger result → clarifier → draft failure: raw error and screen tail, masked', async () => {
+    const w = startWorker({ firstTurn: false, beforePrompt: [], screen: `  ⎿  ${apiError}`, draftClarify: true });
+    const turnId = 'om_api_403';
+    const messages = await runTurn(w, turnId, [authError, turnDuration]);
+
+    const [terminal] = terminalsOf(messages, turnId);
+    expect(terminal).toMatchObject({ status: 'failed', errorCode: 'provider_authentication_failed' });
+    expect(terminal!.errorDetail).toContain('Access denied for model x');
+    expect(terminal!.screenTail).toContain('Access denied for model x');
+    expect(JSON.stringify(terminal)).not.toContain(secret);
+
+    // The daemon keeps both on the in-memory async result of this turn.
+    const daemon = await replayIntoDaemon(w.sid, turnId, messages, { asyncTrigger: true });
+    const mem = daemon.asyncResult!;
+    expect(mem).toMatchObject({ status: 'failed', terminalErrorCode: 'provider_authentication_failed' });
+    expect(recordTerminalFailureStrict).toHaveBeenCalled();
+    // Never to the durable store: its record is the old shape.
+    expect(JSON.stringify(recordTerminalFailureStrict.mock.calls)).not.toContain('Access denied');
+
+    const lookup = (includeFailureDiagnostics: boolean) => resolveAsyncTriggerState({
+      sessionId: w.sid, liveActive: true, chatId: 'oc_test', memTriggerId: turnId, includeFailureDiagnostics,
+      memResult: {
+        status: mem.status, failedAt: mem.failedAt, errorCode: mem.errorCode, terminalErrorCode: mem.terminalErrorCode,
+        terminalErrorDetail: mem.terminalErrorDetail, terminalScreenTail: mem.terminalScreenTail,
+      },
+    });
+    // The HTTP trigger-result route reads the old shape.
+    const publicResponse = lookup(false);
+    expect(publicResponse.terminalErrorDetail).toBeUndefined();
+    expect(publicResponse.terminalScreenTail).toBeUndefined();
+    expect(publicResponse).toMatchObject({
+      state: 'failed', terminalErrorCode: 'provider_authentication_failed',
+      error: 'worker reported terminal failure: provider_authentication_failed',
+    });
+
+    const { failure } = await draftFailureFrom(lookup(true), w.sid, turnId);
+    expect(failure).toMatchObject({ category: 'permission', code: 'provider_authentication_failed', step: 'clarify_turn' });
+    expect(failure.detail).toContain('Access denied for model x');
+    expect(failure.terminalTail).toContain('Access denied for model x');
+    expect(JSON.stringify(failure)).not.toMatch(new RegExp(`${secret}|Bearer ${secret.slice(0, 6)}`));
+  }, 90_000);
+});
+
+describe('every other session: a failed turn reports as before (real worker, fake Claude Code)', () => {
+  const apiError = `API Error: 403 {"error":{"type":"permission_error","message":"Access denied for model x"}}`;
+  const authError: Row = {
+    type: 'assistant', uuid: 'a-auth', isApiErrorMessage: true, error: 'authentication_failed', apiErrorStatus: 403,
+    message: { id: 'e403', role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', usage: zeroUsage,
+      content: [{ type: 'text', text: apiError }] },
+  };
+
+  it('a session that is no draft clarify session: the terminal carries neither the provider error nor the screen', async () => {
+    const w = startWorker({ firstTurn: false, beforePrompt: [], screen: `  ⎿  ${apiError}` });
+    const turnId = 'om_api_403_plain';
+    const messages = await runTurn(w, turnId, [authError, turnDuration]);
+    const [terminal] = terminalsOf(messages, turnId);
+    expect(terminal).toMatchObject({ status: 'failed', errorCode: 'provider_authentication_failed' });
+    expect(Object.keys(terminal!).filter(key => key === 'errorDetail' || key === 'screenTail')).toEqual([]);
+    expect(JSON.stringify(terminal)).not.toContain('Access denied');
+  }, 90_000);
+});
+
+describe('a draft clarify session: only a failed turn carries them (real worker, fake Claude Code)', () => {
+  it('a normally finished turn: the terminal carries neither field, though the session asks for them', async () => {
+    const w = startWorker({ firstTurn: false, beforePrompt: [], screen: '  ⎿  The review is posted.', draftClarify: true });
+    const turnId = 'om_answered_draft';
+    const messages = await runTurn(w, turnId, [answerThinking, answerText, turnDuration]);
+    const [terminal] = terminalsOf(messages, turnId);
+    expect(terminal).toMatchObject({ status: 'completed' });
+    expect(Object.keys(terminal!).filter(key => key === 'errorDetail' || key === 'screenTail')).toEqual([]);
+  }, 90_000);
+});
+
+describe('a credential in the shapes a terminal leaves it reaches neither the page nor draft.json (real worker, fake Claude Code)', () => {
+  // Wrapped onto an indented row that closes a paren, inside a TUI box (the
+  // pty renderer draws its borders as blanks), a quoted value with blanks, a
+  // full-width colon, a command-line flag — on the screen the fake draws and
+  // in the provider's error record, taken through every hop.
+  const reason = 'Access denied for model model_hub/es1_orange_o50';
+  const apiError = `API Error: 403 {"type":"error","error":{"type":"permission_error","message":"${reason}"}}`;
+  const shapes = [
+    '⏺ Bash(ANTHROPIC_API_KEY=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345',
+    '  QWERTYUIOPASDFGHJKLZXCVBNM0123)',
+    '╭──────────────────────────────────╮',
+    '│ > token=ZYXWVUTSRQPONMLKJIHG     │',
+    '│ ZXCVBNMASDFGHJKL98765            │',
+    '╰──────────────────────────────────╯',
+    '  {"password": "correct horse battery staple"}',
+    '  App Secret：a1b2c3d4e5f6g7h8i9j0',
+    '  run --app-secret f00dfacecafebabe1234 --verbose',
+  ];
+  const secrets = [
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ012345', 'QWERTYUIOPASDFGHJKLZXCVBNM0123',
+    'ZYXWVUTSRQPONMLKJIHG', 'ZXCVBNMASDFGHJKL98765',
+    'correct horse', 'battery staple',
+    'a1b2c3d4e5f6g7h8i9j0',
+    'f00dfacecafebabe1234',
+  ];
+  const labels = ['ANTHROPIC_API_KEY=', 'token=', '"password": "', 'App Secret：', '--app-secret', '--verbose'];
+  const authError: Row = {
+    type: 'assistant', uuid: 'a-auth', isApiErrorMessage: true, error: 'authentication_failed', apiErrorStatus: 403,
+    message: { id: 'e403', role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', usage: zeroUsage,
+      content: [{ type: 'text', text: [apiError, ...shapes].join('\n') }] },
+  };
+
+  it('worker terminal → daemon memory → clarifier → draft page and draft.json: masked at every hop, the reason and labels shown', async () => {
+    const w = startWorker({ firstTurn: false, beforePrompt: [], screen: [...shapes, `  ⎿  ${apiError}`].join('\r\n'), draftClarify: true });
+    const turnId = 'om_api_403_shapes';
+    const messages = await runTurn(w, turnId, [authError, turnDuration]);
+    const [terminal] = terminalsOf(messages, turnId);
+    expect(terminal).toMatchObject({ status: 'failed', errorCode: 'provider_authentication_failed' });
+
+    const daemon = await replayIntoDaemon(w.sid, turnId, messages, { asyncTrigger: true });
+    const mem = daemon.asyncResult!;
+    const lookup = resolveAsyncTriggerState({
+      sessionId: w.sid, liveActive: true, chatId: 'oc_test', memTriggerId: turnId, includeFailureDiagnostics: true,
+      memResult: {
+        status: mem.status, failedAt: mem.failedAt, errorCode: mem.errorCode, terminalErrorCode: mem.terminalErrorCode,
+        terminalErrorDetail: mem.terminalErrorDetail, terminalScreenTail: mem.terminalScreenTail,
+      },
+    });
+    const { failure, disk } = await draftFailureFrom(lookup, w.sid, turnId);
+
+    const hops = { ipc: JSON.stringify(terminal), daemon: JSON.stringify(mem), lookup: JSON.stringify(lookup), page: JSON.stringify(failure), disk };
+    for (const [hop, text] of Object.entries(hops)) {
+      for (const secret of secrets) expect({ hop, secret, leaked: text.includes(secret) }).toEqual({ hop, secret, leaked: false });
+    }
+    // Masked, not dropped: the provider's reason and each credential's label are shown.
+    expect(failure.detail).toContain(apiError);
+    expect(failure.terminalTail).toContain(reason);
+    for (const shown of [failure.detail!, failure.terminalTail!]) {
+      for (const label of labels) expect({ label, shown: shown.includes(label) }).toEqual({ label, shown: true });
+    }
+  }, 90_000);
 });
