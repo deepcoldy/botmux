@@ -49,6 +49,7 @@ import { applyV3RunEdit } from '../src/workflows/v3/run-edit.js';
 import { driveV3Run, loadV3BotExecutedRun, requestV3Retry, type V3DaemonRunDeps } from '../src/workflows/v3/daemon-run.js';
 import type { TriggerRequest, TriggerResponse } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import type { PromptHookTarget } from '../src/core/session-manager.js';
 import type { RunNode } from '../src/workflows/v3/contract.js';
 import { runWorkflow } from '../src/workflows/v3/runtime.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
@@ -1040,19 +1041,26 @@ describe('checkpoint: the dependants wait for the main bot', () => {
   });
 
   describe('on a CLI that reports taking input, the wake turn ends only after the CLI took the wake\'s text', () => {
-    it('such a CLI: the Claude family and Codex, the session\'s own or its bot\'s — not an adopted pane, not a CLI without the signal', () => {
-      const ds = (session: Record<string, unknown>) =>
-        ({ session: { sessionId: 'sess-main', status: 'active', ...session } }) as unknown as DaemonSession;
-      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'claude-code' }), 'cursor')).toBe(true);
-      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'seed' }), 'cursor')).toBe(true);
-      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'codex' }), 'cursor')).toBe(true);
-      expect(workflowMainWakeAcceptanceReported(ds({}), 'codex')).toBe(true);
-      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'cursor' }), 'claude-code')).toBe(false);
-      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'codex-app' }), 'claude-code')).toBe(false);
+    it('such a CLI: one whose prompt hook runs on every submit, asked for the session\'s own CLI (else its bot\'s), profile and backend — never an adopted pane', () => {
+      const asked: PromptHookTarget[] = [];
+      const hook = (runs: boolean) => (target: PromptHookTarget) => { asked.push(target); return runs; };
+      const ds = (session: Record<string, unknown>, rest: Record<string, unknown> = {}) =>
+        ({ larkAppId: 'cli_main', session: { sessionId: 'sess-main', status: 'active', ...session }, ...rest }) as unknown as DaemonSession;
       expect(workflowMainWakeAcceptanceReported(
-        ds({ cliId: 'claude-code', adoptedFrom: { cliId: 'claude-code' } }), 'claude-code',
+        ds({ cliId: 'claude-code', cliConfigDir: '/profiles/work', backendType: 'tmux' }), 'cursor', hook(true),
+      )).toBe(true);
+      expect(asked.at(-1)).toEqual({ cliId: 'claude-code', cliConfigDir: '/profiles/work', sessionBackendType: 'tmux', larkAppId: 'cli_main' });
+      expect(workflowMainWakeAcceptanceReported(ds({ backendType: 'pty' }), 'codex', hook(false))).toBe(false);
+      expect(asked.at(-1)).toEqual({ cliId: 'codex', sessionBackendType: 'pty', larkAppId: 'cli_main' });
+      const asks = asked.length;
+      expect(workflowMainWakeAcceptanceReported(
+        ds({ cliId: 'claude-code', backendType: 'tmux', adoptedFrom: { cliId: 'claude-code' } }), 'claude-code', hook(true),
       )).toBe(false);
-      expect(workflowMainWakeAcceptanceReported(undefined, 'claude-code')).toBe(false);
+      expect(workflowMainWakeAcceptanceReported(
+        ds({ cliId: 'claude-code', backendType: 'tmux' }, { adoptedFrom: { cliId: 'claude-code' } }), 'claude-code', hook(true),
+      )).toBe(false);
+      expect(workflowMainWakeAcceptanceReported(undefined, 'claude-code', hook(true))).toBe(false);
+      expect(asked).toHaveLength(asks);
     });
 
     it('written but not submitted: the idle prompt and a terminal release nothing; once the CLI takes it, the end of that run releases it, once', async () => {
@@ -1137,6 +1145,67 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       m.screen('working', { turnless: true });
       m.screen('idle');
       expect(released(run)).toEqual(['a:wakeTurnEnded']);
+    });
+
+    it('a proof that lags a short turn: taken only after its end was seen, with nothing running since, the first look a poll later lets it go', async () => {
+      const { run, executor, cp } = await heldRun('cp-proof-lags');
+      const clock = { t: cp.at };
+      const m = cpIssuer(run, { reportsInput: true, clock });
+      await m.wake.scan(run.dag.runId);
+      const wakeTurn = m.session.worker.active!;
+      // The turn ran and ended before the worker read its transcript record.
+      m.screen('working');
+      m.screen('idle');
+      m.endTurn();
+      m.inputTaken(wakeTurn);
+      await m.tick();
+      expect(released(run)).toEqual([]);
+      clock.t += WORKFLOW_MAIN_WAKE_POLL_MS - 1;
+      await m.tick();
+      expect(released(run)).toEqual([]);
+      clock.t += 1;
+      await m.tick();
+      expect(released(run)).toEqual(['a:wakeTurnEnded']);
+      expect(m.drives).toEqual([run.dag.runId]);
+      expect(m.warnings).toEqual([expect.stringContaining('before the main session\'s CLI took its text')]);
+      await run.drive(executor);
+      expect(dispatchedTo(executor, 'b')).toBe(1);
+    });
+
+    it('taken after an end that was not one: what runs from then on keeps it held to that run\'s own idle edge, and so does a session that is not idle', async () => {
+      const { run, cp } = await heldRun('cp-late-submit');
+      const clock = { t: cp.at };
+      const m = cpIssuer(run, { reportsInput: true, clock });
+      await m.wake.scan(run.dag.runId);
+      m.screen('working');
+      m.screen('idle');
+      // Minutes later the CLI submits the text and runs it, for longer than a poll.
+      clock.t += 3 * 60_000;
+      m.promptSubmitted();
+      m.screen('working', { turnless: true });
+      clock.t += WORKFLOW_MAIN_WAKE_POLL_MS;
+      await m.tick();
+      clock.t += WORKFLOW_MAIN_WAKE_POLL_MS;
+      await m.tick();
+      expect(released(run)).toEqual([]);
+      m.screen('idle');
+      expect(released(run)).toEqual(['a:wakeTurnEnded']);
+
+      const busy = await heldRun('cp-late-busy');
+      const busyClock = { t: busy.cp.at };
+      const b = cpIssuer(busy.run, { reportsInput: true, clock: busyClock });
+      await b.wake.scan(busy.run.dag.runId);
+      const busyTurn = b.session.worker.active!;
+      b.screen('working');
+      b.screen('idle');
+      b.inputTaken(busyTurn);
+      b.session.ds.cliReady = false;
+      busyClock.t += 2 * WORKFLOW_MAIN_WAKE_POLL_MS;
+      await b.tick();
+      expect(released(busy.run)).toEqual([]);
+      b.session.ds.cliReady = true;
+      await b.tick();
+      expect(released(busy.run)).toEqual(['a:wakeTurnEnded']);
     });
 
     it('never taken: held to the cap, then let go as holdTimeout — said out loud', async () => {
