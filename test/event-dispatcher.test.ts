@@ -9734,6 +9734,7 @@ describe('managed Agent clone owner boundary', () => {
       'activationDeactivating',
       'activationStarting',
       'activationCommitted',
+      'extraScopesFile',
     ]);
   });
 

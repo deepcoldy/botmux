@@ -195,6 +195,8 @@ export type OpenPlatformAutomationResult =
       cookieCount: number;
       scopeCount: number;
       skippedScopeCount: number;
+      /** 清单里有、但当前租户开放平台目录中不存在而被跳过的权限名（按 token 类型分桶）。 */
+      skippedScopes?: { tenant: string[]; user: string[] };
       scopeWarning?: string;
       /**
        * 自动填好的「权限可访问的数据范围」条数（填成「与应用的可用范围一致」）。
@@ -538,13 +540,13 @@ export function mapManifestScopesToOpenPlatformIds(
   manifest: ScopeManifest,
   catalog: OpenPlatformScopeEntry[],
 ): MappedScopeIds {
-  const tenant = uniqueStrings(manifest.scopes?.tenant ?? []);
-  const user = uniqueStrings(manifest.scopes?.user ?? []);
+  const tenant = mapScopeIds(uniqueStrings(manifest.scopes?.tenant ?? []), catalog, 'tenant');
+  const user = mapScopeIds(uniqueStrings(manifest.scopes?.user ?? []), catalog, 'user');
   return {
-    tenantScopeIds: mapScopeIds(tenant, catalog, 'tenant').ids,
-    userScopeIds: mapScopeIds(user, catalog, 'user').ids,
-    missingTenantScopes: mapScopeIds(tenant, catalog, 'tenant').missing,
-    missingUserScopes: mapScopeIds(user, catalog, 'user').missing,
+    tenantScopeIds: tenant.ids,
+    userScopeIds: user.ids,
+    missingTenantScopes: tenant.missing,
+    missingUserScopes: user.missing,
   };
 }
 
@@ -1705,6 +1707,7 @@ export async function automateOpenPlatformSetup(
   const mapped = mapManifestScopesToOpenPlatformIds(effectiveManifest, catalog);
   const missing = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
   const skippedScopeCount = missing.length;
+  const skippedScopes = { tenant: mapped.missingTenantScopes, user: mapped.missingUserScopes };
   if (missing.length > 0) {
     console.warn(`Warning: ${missing.length} scopes are not present in the Open Platform catalog and will be skipped: ${missing.slice(0, 8).join(', ')}`);
   }
@@ -2023,6 +2026,7 @@ export async function automateOpenPlatformSetup(
       cookieCount: preparedSession.cookieCount,
       scopeCount: importedScopeCount,
       skippedScopeCount,
+      skippedScopes,
       scopeWarning,
       privilegeRangeCount,
       privilegeRangeWarning,
@@ -2165,6 +2169,7 @@ export async function automateOpenPlatformSetup(
       cookieCount: preparedSession.cookieCount,
       scopeCount: importedScopeCount,
       skippedScopeCount,
+      skippedScopes,
       scopeWarning,
       privilegeRangeCount,
       privilegeRangeWarning,
@@ -3425,10 +3430,10 @@ function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bu
   const ids: string[] = [];
   const missing: string[] = [];
   for (const scopeName of scopeNames) {
+    // 不跨桶借 ID：tenant / user 是两份授权，只在对侧目录出现的名字算本桶缺失。
     const matched =
       catalog.find(entry => entry.name === scopeName && entry.bucket === bucket) ??
-      catalog.find(entry => entry.name === scopeName && entry.bucket === undefined) ??
-      catalog.find(entry => entry.name === scopeName);
+      catalog.find(entry => entry.name === scopeName && entry.bucket === undefined);
     if (matched) ids.push(matched.id);
     else missing.push(scopeName);
   }
