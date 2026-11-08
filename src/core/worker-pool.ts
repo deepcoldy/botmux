@@ -67,6 +67,7 @@ import {
   markMessageListenerRunPreviewFailed,
   markMessageListenerRunPreviewReplied,
   markMessageListenerRunPreviewRunning,
+  markMessageListenerRunPreviewCompleted,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { MissingWorkingDirError } from './working-dir-recovery.js';
@@ -186,6 +187,7 @@ import { managedTmuxCandidateSockets, preferredManagedTmuxSocket, tmuxServerLabe
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
+import { wrapperIdentityTokens } from '../setup/cli-selection.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import { resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
@@ -939,6 +941,7 @@ import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-ou
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn, resolveDeferredScheduledTurnId } from './silent-schedule-turns.js';
+import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
@@ -1457,6 +1460,7 @@ const universalOutputProcessors = new Map<string, { worker: ChildProcess; run(re
 function outputProcessorKey(ds: DaemonSession): string { return `${ds.larkAppId}:${ds.session.sessionId}`; }
 
 function freezeOutputSink(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): OutputSink {
+  if (isSilentMessageListenerSession(ds.session)) return { kind: 'suppressed', reason: 'silent_message_listener' };
   const journal = outputDeliveryJournal(config.session.dataDir, ds.larkAppId);
   const origin = journal.sink(ds.session.sessionId, msg.turnId);
   if (origin && origin.kind !== 'im') return origin;
@@ -1824,6 +1828,7 @@ export function isResumeRecoveryPlaceholder(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   if (privateReplyEnabled(ds.session)) return true;
   if (isDocNativeSession(ds) || handoffCardBlocksStreaming(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
@@ -1838,6 +1843,7 @@ function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
 }
 
 function silentTurnReactions(ds: DaemonSession): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
   } catch { return false; }
@@ -4760,6 +4766,7 @@ export function managedAuxUiSuppressedFor(
   turnId?: string,
   dispatchAttempt?: number,
 ): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   try {
     if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
   } catch {
@@ -9796,7 +9803,7 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
   const cfg = ds.initConfig ?? ds.session;
   const wrapper = cfg.wrapperCli?.trim();
   if ((cfg.cliId ?? ds.session.cliId) !== 'codex'
-    || (wrapper && (wrapper !== 'aiden x codex' || ds.session.cliInstanceBinding || ds.initConfig?.cliInstanceBinding))
+    || (wrapper && (wrapperIdentityTokens(wrapper).join(' ') !== 'aiden x codex' || ds.session.cliInstanceBinding || ds.initConfig?.cliInstanceBinding))
     || cfg.backendType !== 'tmux' || ds.initConfig?.codexRpcInput
     || ds.session.sandbox || ds.initConfig?.sandbox || ds.initConfig?.readIsolation || sandboxEnabled()
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return undefined;
@@ -14340,6 +14347,7 @@ export function auxUiSuppressedFor(
   turnId?: string,
   dispatchAttempt?: number,
 ): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
   // Feishu chat to render into.
   try {
@@ -17291,6 +17299,7 @@ function setupWorkerHandlers(
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
   const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+    if (isSilentMessageListenerSession(ds.session)) return true;
     // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
     // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
     // the single source every aux-UI handler funnels through — this is the
@@ -17381,6 +17390,7 @@ function setupWorkerHandlers(
     dispatchAttempt?: number,
     terminalDiagnostic = false,
   ): boolean => {
+    if (isSilentMessageListenerSession(ds.session)) return true;
     if (isSilentScheduledTurn(ds, turnId)) return true;
     // Loud triggers suppress model replies, not a redacted runtime failure.
     // Scheduled silence and managed/attempt ownership remain authoritative.
@@ -20857,7 +20867,7 @@ function setupWorkerHandlers(
             });
           }
         }
-        if (msg.turnId.startsWith('mlrp_turn_')) {
+        if (msg.turnId.startsWith('mlrp_turn_') && !isSilentMessageListenerSession(ds.session)) {
           markMessageListenerRunPreviewReplied(msg.turnId, {
             sessionId: ds.session.sessionId,
             replyMessageId: msg.messageId,
@@ -21223,6 +21233,10 @@ function setupWorkerHandlers(
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
         if (terminalPersisted) publishTurnFinished(ds, msg);
+        if (terminalPersisted && msg.turnId.startsWith('mlrp_turn_')
+          && msg.status === 'completed' && isSilentMessageListenerSession(ds.session)) {
+          markMessageListenerRunPreviewCompleted(msg.turnId);
+        }
         try {
           if (!ordinaryHttpTerminal) handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
           recoveryHandled = recoveryOwnsTerminal;

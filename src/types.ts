@@ -552,6 +552,8 @@ export interface Session {
   sessionId: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
+  /** Frozen origin of an isolated silent listener task; never a human reply route. */
+  messageListenerRun?: import('./core/message-listener-silence.js').SilentMessageListenerRun;
   /** Internal target-side owner for an idempotent dispatch-launch session. */
   dispatchLaunchId?: string;
   /** Immutable model/effort selected by the public topic dispatch seam. */
