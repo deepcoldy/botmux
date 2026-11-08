@@ -17948,16 +17948,17 @@ async function cmdSessionReady(): Promise<void> {
 }
 
 /** 独立版本化入口与路由：新 CLI / 旧 daemon / 旧 worker 混装时只能丢维护
- *  信号，不能把它降级成 session-ready。 */
+ *  信号，不能把它降级成 session-ready。PreCompact hook 退出码 0 时 stdout 会被
+ *  Claude 当成自定义压缩指令、退出码 2 会拦下压缩：本命令不写 stdout，始终 exit 0。 */
 async function cmdClaudeCompactionStart(): Promise<void> {
   const startedAtMs = Math.floor(Date.now() - process.uptime() * 1000);
   try {
-    const chunks: Buffer[] = [];
-    for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (payload?.hook_event_name !== 'PreCompact') return;
-    await postSessionScopedSignal('/api/claude-compaction-start-v1', { startedAtMs });
+    const payload = JSON.parse((await readStdinWithTimeout(2000)).toString('utf8'));
+    if (payload?.hook_event_name === 'PreCompact') {
+      await postSessionScopedSignal('/api/claude-compaction-start-v1', { startedAtMs });
+    }
   } catch { /* hook best-effort，绝不阻塞 CLI */ }
+  process.exit(0);
 }
 
 // ─── 会话作用域信号投递（session-ready / turn-idle 共用） ──────────────────────
@@ -19419,6 +19420,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // this session's worker. Local and session-scoped like `session-ready`; the
     // worker decides whether the turn still needs a terminal.
     '__claude-stop-failure-v1',
+    // Claude PreCompact hook client, same class. Exit 2 from a PreCompact hook
+    // blocks compaction, so a refusal here would leave a workflow subagent's
+    // Claude unable to compact at all.
+    '__claude-compaction-v1',
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
