@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { TimeZoneRow } from '../src/dashboard/web/settings-page.js';
 import { DropdownMenu, FieldTitle, type DropdownOption } from '../src/dashboard/web/dashboard-components.js';
 
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
 function findMenu(r: TestRenderer.ReactTestRenderer) {
   return r.root.findByType(DropdownMenu);
 }
