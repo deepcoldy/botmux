@@ -6,7 +6,7 @@ import { localeForBot } from '../i18n/index.js';
 import { getAskSnapshot } from './ask-broker.js';
 import type { AskResult, CreateAskInput, PendingAsk } from './ask-types.js';
 import type { DaemonSession } from './types.js';
-import { replyCardSandboxBlocked } from './turn-reply-card.js';
+import { patchReplyCardWithAuditRedaction, replyCardSandboxBlocked } from './turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal, type TurnReplyCardTransport } from '../services/turn-reply-card.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import { MessageWithdrawnError, replyMessage, sendMessage, uploadFile } from '../im/lark/client.js';
@@ -74,7 +74,8 @@ export async function publishReplyCardAsk(ask: PendingAsk, result?: AskResult, c
           groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined)
       : sendMessage(ask.larkAppId, ask.chatId, body, 'interactive', uuid, undefined,
           groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined),
-    patch: (messageId, body) => patchPublishedGroupCard(ask.larkAppId, ask.chatId, messageId, body, ask.rootMessageId ?? undefined, groupContextAuthorOrigin),
+    patch: (messageId, body) => patchReplyCardWithAuditRedaction(ask.larkAppId, body, `ask turn=${ask.replyCardTarget!.turnId.substring(0, 8)}`,
+      card => patchPublishedGroupCard(ask.larkAppId, ask.chatId, messageId, card, ask.rootMessageId ?? undefined, groupContextAuthorOrigin)),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     sendOverflow: async (text, uuid) => {
       const path = join(store.directory, `${store.id(key)}-reply.md`);

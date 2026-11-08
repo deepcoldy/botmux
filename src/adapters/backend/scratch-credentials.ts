@@ -33,6 +33,7 @@ import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { homedir as osHomedir } from 'node:os';
 import { resolveLarkCliLinuxStoreDir } from '../cli/fs-policy.js';
+import { BACKGROUND_JOBS_HOME_ROOT } from '../../services/bytedcli-home.js';
 
 export interface ScratchSecretInput {
   /** All botmux authority homes (~/.botmux + custom BOTMUX_HOME variants). */
@@ -83,6 +84,9 @@ function isDir(p: string): boolean {
 
 export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchSecrets {
   const out = new Set<string>();
+  // Fixed host root: custom/core-only SESSION_DATA_DIR must not redirect the
+  // mask away from detached jobs, including directories created after spawn.
+  out.add(BACKGROUND_JOBS_HOME_ROOT);
   const readOnlyCarve = new Set<string>();
   const homeDir = input.homeDir || osHomedir();
   const addFile = (p: string | undefined): void => {

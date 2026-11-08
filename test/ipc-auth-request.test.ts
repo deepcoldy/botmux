@@ -8,6 +8,7 @@ import * as botRegistry from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
 import * as cliIdentity from '../src/core/cli-identity.js';
+import * as larkClient from '../src/im/lark/client.js';
 import { config } from '../src/config.js';
 import { rememberLarkToolDelegation, clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 
@@ -22,7 +23,9 @@ let session: any;
 beforeEach(async () => {
   session = {
     session: { sessionId: 'auth-session', status: 'active', backendType: 'pty' },
-    larkAppId: 'cli_test', chatId: 'oc_test',
+    // A 1:1 chat with the requester: the only place auth request hands the
+    // link to the agent (groups get it by DM — see the group describe below).
+    larkAppId: 'cli_test', chatId: 'oc_test', chatType: 'p2p',
     worker: { killed: false, pid: process.pid }, workerGeneration: 4,
     managedTurnOrigin: { capability: CAP, turnId: 'om_turn', callerOpenId: 'ou_sender' },
     // F3: the worker spawn report is the daemon's only identity-model input.
@@ -61,6 +64,47 @@ function post(action = 'auth-request', overrides: Record<string, unknown> = {}, 
     body: JSON.stringify({ scopes: ['im:chat:read'], originCapability: CAP, originTurnId: 'om_turn', ...overrides }),
   });
 }
+
+describe('agent authorization in a group chat', () => {
+  beforeEach(() => { session.chatType = 'group'; });
+
+  it('DMs the link to the requester and never returns it to the agent', async () => {
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const response = await post();
+    expect(response.status).toBe(200);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.delivery).toBe('dm');
+    expect(body.authUrl).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain(AUTH_URL);
+    expect(typeof body.requestId).toBe('string');
+    expect(dm).toHaveBeenCalledTimes(1);
+    expect(dm.mock.calls[0][0]).toBe('cli_test');
+    expect(dm.mock.calls[0][1]).toBe('ou_sender');
+    expect(dm.mock.calls[0][2]).toContain(AUTH_URL);
+
+    // Reusing the pending request does not DM again and still hides the link.
+    const again = await (await post()).json() as Record<string, unknown>;
+    expect(again.delivery).toBe('dm');
+    expect(again.requestId).toBe(body.requestId);
+    expect(again.authUrl).toBeUndefined();
+    expect(dm).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses without a link when the DM cannot be delivered, and drops the request', async () => {
+    vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013 user not in scope'));
+    const response = await post();
+    expect(response.status).toBe(409);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.error).toBe('auth_link_private_delivery_failed');
+    expect(JSON.stringify(body)).not.toContain(AUTH_URL);
+    // A retry mints a fresh request instead of reusing the undelivered one.
+    vi.mocked(larkClient.sendUserMessage).mockResolvedValue('om_dm');
+    const retry = await (await post()).json() as Record<string, unknown>;
+    expect(retry.delivery).toBe('dm');
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe('agent authorization', () => {
   function delegate(targetOpenId = 'ou_target_human', turnId = 'om_turn', overrides = {}) {
@@ -439,7 +483,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     const start = readProcessStartIdentity(process.pid);
     return {
       session: { sessionId: 'host-session', status: 'active', backendType: 'pty' },
-      larkAppId: 'cli_test', chatId: 'oc_test',
+      larkAppId: 'cli_test', chatId: 'oc_test', chatType: 'p2p',
       worker: { pid: process.pid, killed: false }, workerGeneration: 9,
       // F3: identity model comes from the worker spawn report.
       reportedIdentityModel: { model: 'proven', sandboxEngaged: false, loopbackShared: true,

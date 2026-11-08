@@ -6,7 +6,7 @@ import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaEx
 import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { traeCliStatePath, traeConfigPath, traeHomeFor, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import { traeCliStatePath, traeConfigPath, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
   findTraexSessionIdByBotmuxSessionId,
   traexHistoryMatchDelta,
@@ -23,7 +23,7 @@ import {
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
-import { traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
+import { traexModelPickerPage, traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
 import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION } from './traex-version.js';
 
 /**
@@ -375,6 +375,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let launchNotice: CliLaunchNotice | undefined;
   return {
     id: 'traex',
+    // codex_core-based TUI: hook-review flow + legacy-data migration picker.
+    stuckPageFamily: 'codex-family',
     mcpGateway: {
       get configPath(): string { return traeConfigPath(); },
       format: 'codex-toml',
@@ -396,6 +398,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // The CLI must read the Gateway entry even when ~/.trae is not exposed.
     // Keep the shared config read-only; hooks/plugins must not become writable.
     sandboxReadonlyPaths: env => [traeConfigPath(env), ...traeMigrationDoneMarkers(env)],
+    // The embedded app server opens <TRAE_HOME>/installation_id read-write on every
+    // start and aborts on EROFS (e.g. when the TRAE root sits under a read-only
+    // bind such as a relocated /opt -> /data00 baseline). Only that one file.
+    sandboxWritableFiles: env => [traeInstallationIdPath(env)],
     get resolvedBin(): string { return resolvedBin(); },
 
     launchNotice: () => launchNotice,
@@ -500,6 +506,13 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      // /model is a native menu, not a model turn. Pasting a question into it
+      // loses the paste and its Enter only dismisses the picker; history never
+      // receives the question and the worker quarantines all later input.
+      // Cancel only these known settings pages, then prove an empty composer
+      // before writing any user text. Never select a model with submit retries.
+      const pickerFailure = await dismissTraexModelPicker(pty);
+      if (pickerFailure) return { submitted: false, failureReason: pickerFailure };
       // Same bracketed-paste strategy as the Codex adapter: multi-line user
       // messages must not be split into separate turns by embedded \n.
       const trySendEnter = (): boolean => {
@@ -713,6 +726,46 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // reach the card bridge.
     asksViaHook: false,
   };
+}
+
+async function dismissTraexModelPicker(pty: PtyHandle): Promise<string | undefined> {
+  // This capability is an authoritative viewport, not a scrollback/render
+  // cache. Backends without it retain their existing input protocol.
+  if (!pty.captureInputState) return;
+  // Recovery only needs cells, not the cursor. Tmux's async read avoids two
+  // synchronous child processes on every redraw poll.
+  const screen = async () => {
+    try {
+      return pty.captureViewportAsync
+        ? await pty.captureViewportAsync()
+        : pty.captureInputState!()?.viewport;
+    } catch { return undefined; }
+  };
+  let current = await screen();
+  let page = current === undefined ? undefined : traexModelPickerPage(current);
+  if (!page) return;
+  const failure = 'TRAE model picker could not return to an empty composer; no message was pasted. Finish or cancel the menu in the Web terminal, then retry.';
+  for (let depth = 0; depth < 3 && page; depth++) {
+    try {
+      const accepted = pty.sendSpecialKeys ? pty.sendSpecialKeys('Escape') : pty.write('\x1b');
+      if (accepted === false) return failure;
+    } catch { return failure; }
+    // Wait for a page transition, not merely any PTY output. A slow repaint
+    // must not turn repeated Escape into an interruption of a newer task.
+    for (let poll = 0; poll < 20; poll++) {
+      await delay(50);
+      current = await screen();
+      if (current !== undefined) {
+        const next = traexModelPickerPage(current);
+        if ((next && next !== page) || traexRestoredComposerReady(current)) break;
+      }
+    }
+    if (current !== undefined && traexRestoredComposerReady(current)) return;
+    const next = current === undefined ? undefined : traexModelPickerPage(current);
+    if (!next || next === page) return failure;
+    page = next;
+  }
+  return failure;
 }
 
 /** Render one process-layer hook entry. Trae merges this launch layer with

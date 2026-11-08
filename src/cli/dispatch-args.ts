@@ -12,6 +12,11 @@ export interface DispatchArgs {
   reasoningEffort?: string;
   into?: string;
   resultDelivery?: string;
+  /** Requirement shown in the task-tree card header. */
+  taskId?: string;
+  taskUrl?: string;
+  /** `review` marks the child topic as a review node in the task tree. */
+  kind?: string;
   standby: boolean;
   steer: boolean;
   delegates?: string[];
@@ -32,6 +37,7 @@ export type DispatchArgsResult =
 
 const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery' | 'model' | 'reasoningEffort'
+  | 'taskId' | 'taskUrl' | 'kind'
 >>([
   ['--session-id', 'sessionId'],
   ['--title', 'title'],
@@ -43,6 +49,9 @@ const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   ['--result-delivery', 'resultDelivery'],
   ['--model', 'model'],
   ['--reasoning-effort', 'reasoningEffort'],
+  ['--task-id', 'taskId'],
+  ['--task-url', 'taskUrl'],
+  ['--kind', 'kind'],
 ]);
 
 const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps'>([

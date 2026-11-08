@@ -64,6 +64,10 @@ export interface PendingCliInput {
    * the original turn id for reply attribution but is never merged with a
    * later user input. */
   traexAutoModelRecovery?: true;
+  /** This still-queued independent turn has completed its read-only TraeX load
+   * admission. It survives an intentional exact-resume model restart so the
+   * original prompt is submitted once without repeating the preflight. */
+  traexAutoModelPreflightDone?: true;
   taskContinuation?: TaskContinuationDispatchMarker;
   /** `content` as it was before a restart note was put in front of it (see
    *  services/restart-interruption.ts). Lets a replay of this input after a
@@ -312,4 +316,32 @@ export function terminalReleasesDurableTurn(
   return terminal.dispatchAttempt !== undefined
     && current.turnId === terminal.turnId
     && current.dispatchAttempt === terminal.dispatchAttempt;
+}
+
+/** A serial schedule prefix may wait indefinitely behind an active task.
+ * Let its authenticated human controller steer without changing the order of
+ * other user messages or crossing a durable/group/continuation boundary. */
+export function promoteInteractiveInputPastSchedules(
+  pending: PendingCliInput[],
+  mayControlActiveTurn: (input: PendingCliInput) => boolean,
+): boolean {
+  let index = 0;
+  while (index < pending.length) {
+    const item = pending[index]!;
+    if (item.trustedCaller?.source !== 'schedule_creator'
+      || !item.queueAfterActiveTurn || item.dispatchAttempt !== undefined
+      || item.durablePrimaryInbox || item.queuedActivationToken
+      || item.vcMeetingImTurnOrigin || item.taskContinuation || item.noReplay) break;
+    index++;
+  }
+  if (index === 0 || index === pending.length) return false;
+  const input = pending[index]!;
+  if (input.trustedCaller?.senderType !== 'user' || input.trustedCaller.source !== undefined
+    || input.queueAfterActiveTurn || input.dispatchAttempt !== undefined
+    || input.durablePrimaryInbox || input.codexAppDispatchId || input.queuedActivationToken
+    || input.vcMeetingImTurnOrigin || input.taskContinuation || input.noReplay
+    || input.traexAutoModelRecovery || !mayControlActiveTurn(input)) return false;
+  pending.splice(index, 1);
+  pending.unshift(input);
+  return true;
 }

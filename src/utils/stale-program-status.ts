@@ -11,6 +11,7 @@
  * marker. The screen is only the last check.
  */
 import { isClaudeTurnTerminalEvent, type TranscriptEvent } from '../services/claude-transcript.js';
+import { baselineJsonlCursor, scanJsonlBackward } from '../services/jsonl-cursor.js';
 
 /** How long the transcript must have been closed AND OSC silent. Claude writes
  *  its terminal record and its OSC `idle` within about a second of each other. */
@@ -25,6 +26,43 @@ function isMainThreadActivity(ev: TranscriptEvent): boolean {
   const role = ev.message?.role ?? ev.type;
   if (role === 'user' || role === 'assistant') return true;
   return ev.type === 'attachment' && ev.attachment?.type === 'queued_command';
+}
+
+/** How far back claudeTranscriptLatestTurnState looks for the latest
+ *  main-thread record. Tool results and attachments can make single records
+ *  large; past this bound the answer is "unknown" and callers keep their
+ *  previous behavior. */
+const LATEST_TURN_STATE_PROBE_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Whether a Claude transcript's latest main-thread record leaves its turn
+ *  open (`open`: a user prompt, tool result or an assistant `tool_use` with no
+ *  closing record after it) or closed it (`closed`); `undefined` when the file
+ *  is missing, unreadable, or holds no main-thread record within the bound.
+ *  Same record classes as ClaudeTranscriptTurnEnd, read from the file tail
+ *  instead of the bridge's live drain, so it answers at a re-attach baseline
+ *  that cursored straight to EOF. */
+export function claudeTranscriptLatestTurnState(path: string): 'open' | 'closed' | undefined {
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return undefined; }
+  if (completeEnd <= 0) return undefined;
+  let state: 'open' | 'closed' | undefined;
+  try {
+    scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - LATEST_TURN_STATE_PROBE_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => {
+        let ev: TranscriptEvent;
+        try { ev = JSON.parse(line.toString('utf8')) as TranscriptEvent; } catch { return false; }
+        if (isClaudeTurnTerminalEvent(ev)) { state = 'closed'; return true; }
+        if (isMainThreadActivity(ev)) { state = 'open'; return true; }
+        return false;
+      },
+    });
+  } catch {
+    return undefined;
+  }
+  return state;
 }
 
 /** Whether the latest main-thread record of a Claude transcript closed its turn. */

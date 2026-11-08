@@ -288,7 +288,7 @@ export const MOJO_TREE_NONCE_ENV = 'BOTMUX_MOJO_TREE_NONCE';
 
 interface RawProc { pid: number; ppid: number; pgid: number; hasNonce: boolean; zombie: boolean }
 
-interface ParsedStat { ppid: number; pgid: number; starttime: number; state: string }
+interface ParsedStat { ppid: number; pgid: number; starttime: number; state: string; flags: number }
 
 function errnoOf(err: unknown): string | undefined {
   const code = (err as { code?: unknown } | null)?.code;
@@ -333,7 +333,7 @@ function parseStat(text: string): ParsedStat | null {
   // field 22 still yields a usable tree member, so it degrades to NaN here and
   // is rejected by readProcessIdentity instead of failing enumeration.
   const starttime = Number(rest[19]);
-  return { ppid, pgid, starttime, state };
+  return { ppid, pgid, starttime, state, flags: Number(rest[6]) };
 }
 
 /** Boot id, so a persisted (pid, starttime) pair cannot survive a reboot. */
@@ -425,6 +425,40 @@ function readEnviron(
   }
 }
 
+/** stat flags bit for kernel threads, whose environ is empty for good. */
+const PF_KTHREAD = 0x00200000;
+
+/**
+ * Pauses before re-reading an incomplete environ, about 60 ms in all. exec
+ * installs the new address space before it writes the new environment, and
+ * environ reads incomplete in between; that window stays within a few ms even
+ * on a loaded host.
+ */
+const INCOMPLETE_ENVIRON_REREAD_MS = [2, 4, 8, 16, 32];
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Whether an environ read landed mid-exec and therefore must be re-read rather
+ * than trusted as a final non-member verdict.
+ *
+ * A COMPLETE `/proc/<pid>/environ` is NUL-terminated: every entry, including
+ * the last, ends in NUL. A missing trailing NUL means exec cut the read, in
+ * one of two shapes: 0 bytes (the new address space is installed before the
+ * env is written), or a non-empty truncated block when a read crosses a buffer
+ * boundary while the env is being populated. The backend appends the tree
+ * nonce to envp LAST, so a block cut short usually misses it — treating that
+ * first read as final loses a setsid escapee exactly the way the empty-read
+ * case did.
+ * A genuinely empty environ (`env -i`, size 0) reads as `''` on every attempt,
+ * exhausts the re-read budget and stays unclaimed, as before.
+ */
+export function isIncompleteEnvironRead(text: string): boolean {
+  return text === '' || !text.endsWith(String.fromCharCode(0));
+}
+
 function readProcTable(
   procRoot: string,
   nonce: string,
@@ -446,6 +480,7 @@ function readProcTable(
 
   const table: RawProc[] = [];
   const envBlindSpots: number[] = [];
+  let incompleteEnviron: RawProc[] = [];
 
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
@@ -489,7 +524,7 @@ function readProcTable(
     }
     if (environ.state === 'blind') envBlindSpots.push(pid);
 
-    table.push({
+    const entry: RawProc = {
       pid,
       ppid: parsed.ppid,
       pgid: parsed.pgid,
@@ -498,7 +533,42 @@ function readProcTable(
       zombie: parsed.state === 'Z',
       // Zero-separated; a substring test is enough for a unique nonce.
       hasNonce: environ.state === 'read' && environ.text.includes(nonce),
-    });
+    };
+    table.push(entry);
+    // A re-read may only add a claim. A shell reorders envp, so in a descendant
+    // a cut-short block can already hold the nonce, and that claim must survive
+    // the process exec'ing into an env without it.
+    if (
+      environ.state === 'read' && !entry.hasNonce && isIncompleteEnvironRead(environ.text)
+      && !entry.zombie && (parsed.flags & PF_KTHREAD) === 0
+    ) {
+      incompleteEnviron.push(entry);
+    }
+  }
+
+  // A live process caught mid-exec reads an incomplete environ (empty, or a
+  // truncated non-empty block missing its trailing NUL), and for a setsid
+  // escapee the nonce is the only thing tying it to the turn. Re-read before
+  // calling it a non-member; one that stays empty (env -i) stays unclaimed.
+  for (const delayMs of INCOMPLETE_ENVIRON_REREAD_MS) {
+    if (incompleteEnviron.length === 0) break;
+    sleepSyncMs(delayMs);
+    const stillIncomplete: RawProc[] = [];
+    for (const entry of incompleteEnviron) {
+      const environ = readEnviron(procRoot, String(entry.pid));
+      if (environ.state === 'error') {
+        return {
+          ok: false,
+          failure: { kind: 'proc-entry-unreadable', pid: entry.pid, detail: environ.detail },
+          reason: `cannot read ${procRoot}/${entry.pid}/environ: ${environ.detail}`,
+        };
+      }
+      if (environ.state === 'blind') envBlindSpots.push(entry.pid);
+      if (environ.state !== 'read') continue;
+      if (isIncompleteEnvironRead(environ.text)) stillIncomplete.push(entry);
+      else entry.hasNonce = environ.text.includes(nonce);
+    }
+    incompleteEnviron = stillIncomplete;
   }
 
   return { ok: true, table, envBlindSpots };

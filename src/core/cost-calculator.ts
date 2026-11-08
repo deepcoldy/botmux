@@ -11,6 +11,7 @@ import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBy
 import {
   __resetTranscriptResolverCacheForTest,
   cachedTranscriptPathLookup,
+  kimiEnvForBot,
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
@@ -26,6 +27,7 @@ import { readZcodeUsage } from '../services/zcode-usage.js';
 import { readZcodeSessionMarker, zcodeSessionDbPath } from '../services/zcode-session.js';
 import { readMinimaxUsage } from '../services/minimax-usage.js';
 import { readCursorUsage } from '../services/cursor-usage.js';
+import { readKimiModelContextWindow } from '../services/kimi-transcript.js';
 import { cursorConfigDirForBot } from '../services/cursor-paths.js';
 import { getBot } from '../bot-registry.js';
 import { botOneShotEnv } from './session-env-resolve.js';
@@ -282,7 +284,7 @@ interface TokenUsageAggregate {
 
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
  *  defines as billable turns — no cross-CLI guessing on usage-shaped lines. */
-type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'generic';
+type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'kimi' | 'generic';
 
 interface UsageSourceRecord {
   offset: number;
@@ -320,6 +322,8 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
       return 'pi';
     case 'grok':
       return 'grok';
+    case 'kimi':
+      return 'kimi';
     default:
       return 'generic';
   }
@@ -600,6 +604,65 @@ function foldGrokLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+/** Kimi Code main-agent wire log (`agents/main/wire.jsonl`, see
+ *  services/kimi-transcript.ts). `usage.record` is the single billed source:
+ *  one record per model call, including the compaction call
+ *  (`usageScope: "session"`). The same numbers are mirrored on `step.end` and
+ *  message metadata and must not be added again. Sub-agents log to their own
+ *  files and are not counted, like the other CLIs' main-transcript totals.
+ *  `token_counting.measured` / `.rebased` (after compaction) carry the current
+ *  context size; `llm.request` the model alias and thinking effort. */
+function foldKimiLine(agg: TokenUsageAggregate, entry: any): void {
+  if (!entry || typeof entry !== 'object') return;
+  if (typeof entry.agentId === 'string' && entry.agentId !== 'main') return;
+  switch (entry.type) {
+    case 'turn.prompt':
+      agg.turnInputTokens = 0;
+      agg.turnOutputTokens = 0;
+      return;
+    case 'llm.request': {
+      if (entry.kind !== undefined && entry.kind !== 'loop') return;
+      const model = firstNonEmptyString(entry.modelAlias, entry.model);
+      if (model) agg.model = model;
+      const effort = firstNonEmptyString(entry.thinkingEffort);
+      if (effort) agg.reasoningEffort = effort;
+      return;
+    }
+    case 'token_counting.measured':
+    case 'token_counting.rebased': {
+      const tokens = num(entry.tokens);
+      if (tokens > 0) {
+        agg.latestContextUsage = { usedTokens: tokens };
+        agg.latestContextAtMs = num(entry.time) > 0 ? num(entry.time) : null;
+      }
+      return;
+    }
+    case 'usage.record': {
+      const u = entry.usage;
+      if (!u || typeof u !== 'object') return;
+      const input = num(u.inputOther);
+      const output = num(u.output);
+      const cacheRead = num(u.inputCacheRead);
+      const cacheCreate = num(u.inputCacheCreation);
+      agg.inputTokens += input;
+      agg.outputTokens += output;
+      agg.cacheReadTokens += cacheRead;
+      agg.cacheCreateTokens += cacheCreate;
+      // Same "this turn" convention as Claude: new prompt-side tokens (cache
+      // reads only re-read context) plus output.
+      agg.turnInputTokens += input + cacheCreate;
+      agg.turnOutputTokens += output;
+      const model = firstNonEmptyString(entry.model);
+      if (model && !agg.model) agg.model = model;
+      agg.turns++;
+      return;
+    }
+  }
+}
+
+/** Wire records the Kimi fold reads; other (often large) lines skip JSON.parse. */
+const KIMI_USAGE_LINE_RE = /"(?:usage\.record|turn\.prompt|token_counting\.(?:measured|rebased)|llm\.request)"/;
+
 function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
   if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') return;
   const msg = entry.message;
@@ -675,6 +738,8 @@ function foldUsageLine(
       return foldPiLine(agg, seenMessageIds, entry);
     case 'grok':
       return foldGrokLine(agg, entry);
+    case 'kimi':
+      return foldKimiLine(agg, entry);
     case 'generic':
       return foldGenericLine(agg, seenMessageIds, entry);
   }
@@ -805,6 +870,7 @@ function foldUsageJsonLine(
   lineStart?: number,
 ): void {
   if (!line.trim()) return;
+  if (kind === 'kimi' && !KIMI_USAGE_LINE_RE.test(line)) return;
   try {
     const entry = JSON.parse(line);
     if (kind !== 'codex') {
@@ -1432,6 +1498,7 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   if (!resolved || !existsSync(resolved.path)) return null;
   const cached = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
   const read = cached ? { ...cached, transcriptPath: resolved.path } : cached;
+  if (q.cliId === 'kimi' && read) return withKimiContextWindow(read, kimiEnvForBot(q.larkAppId));
   if (q.cliId !== 'grok' || !read) return read;
   // signals.json is a small rewritten snapshot beside updates.jsonl. Read it
   // on every card refresh: the append-only JSONL cache may legitimately be
@@ -1484,6 +1551,22 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
     // summary.json is also created lazily; reasoning effort is optional.
   }
   return { agg, result, transcriptPath: resolved.path };
+}
+
+/** Kimi's context window is per model in its config.toml; read it on every
+ *  refresh (small file) so a model switch is reflected immediately. */
+function withKimiContextWindow(read: UsageReadResult, env: NodeJS.ProcessEnv): UsageReadResult {
+  const used = read.agg.latestContextUsage?.usedTokens;
+  if (!used || used <= 0) return read;
+  const windowTokens = readKimiModelContextWindow(read.agg.model || undefined, env);
+  if (!windowTokens) return read;
+  const agg = cloneAggregate(read.agg);
+  agg.latestContextUsage = {
+    usedTokens: used,
+    windowTokens,
+    percentUsed: Math.round(Math.max(0, Math.min(1, used / windowTokens)) * 100),
+  };
+  return { ...read, agg };
 }
 
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
@@ -1566,8 +1649,8 @@ function usageSnapshotFromRead(q: SessionTokenUsageQuery, read: UsageReadResult 
     // Grok exposes a stable user-facing primaryModelId in signals.json.
     // Keep other CLIs unchanged: Relay-family transcript model strings may
     // be internal routing codes and intentionally never surface on cards.
-    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.model ? { model: agg.model } : {}),
-    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode' || q.cliId === 'kimi') && agg?.model ? { model: agg.model } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode' || q.cliId === 'kimi') && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
     ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
 }

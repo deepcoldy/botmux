@@ -449,6 +449,13 @@ export function runDetachedBotTurnMutation<T>(
     mutationContext.run(new Map(), () => withBotTurnMutation(larkAppId, action)));
 }
 
+/** Includes preparation before worker creation and admission-to-mutation
+ * upgrades. A maintenance observer must not infer drain from session rows. */
+export function hasBotTurnActivity(larkAppId: string): boolean {
+  const state = gates.get(larkAppId);
+  return !!state && (state.activeAdmissions > 0 || state.mutating);
+}
+
 export function __testOnly_resetBotTurnMutationGates(): void {
   gates.clear();
 }

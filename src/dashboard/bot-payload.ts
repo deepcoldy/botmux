@@ -12,6 +12,7 @@ import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../servi
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
+import { normalizeLongTaskReminderConfig } from '../services/long-task-reminder-policy.js';
 import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { readGlobalConfig } from '../global-config.js';
@@ -167,6 +168,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     allowedChatGroupsCount: typeof j?.allowedChatGroupsCount === 'number' ? j.allowedChatGroupsCount : null,
     localSandboxApplies: typeof j?.localSandboxApplies === 'boolean' ? j.localSandboxApplies : null,
     sandboxCapable: typeof j?.sandboxCapable === 'boolean' ? j.sandboxCapable : null,
+    sandboxEnvForce: j?.sandboxEnvForce === 'oncall' || j?.sandboxEnvForce === 'scratch' ? j.sandboxEnvForce : null,
     effectiveSandboxMode: j?.effectiveSandboxMode === 'off' || j?.effectiveSandboxMode === 'oncall' || j?.effectiveSandboxMode === 'scratch'
       ? j.effectiveSandboxMode
       : null,
@@ -225,6 +227,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     codexAppCleanInput: j?.codexAppCleanInput === true,
     codexBrowser: j?.codexBrowser === true
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
+    codexBrowserAutoApproveOrigins: j?.codexBrowserAutoApproveOrigins === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
@@ -302,6 +305,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     sessionOwnerReminder: j?.sessionOwnerReminder && typeof j.sessionOwnerReminder === 'object'
       ? j.sessionOwnerReminder
       : null,
+    longTaskReminder: normalizeLongTaskReminderConfig(j?.longTaskReminder) ?? null,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     customPassthroughCommands: typeof j?.customPassthroughCommands === 'string' ? j.customPassthroughCommands : '',
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',

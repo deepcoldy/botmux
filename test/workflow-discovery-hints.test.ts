@@ -22,13 +22,14 @@ describe('Workflow discovery hint (enabled hosts)', () => {
   beforeEach(() => { process.env.BOTMUX_WORKFLOW_ENABLED = 'true'; });
   afterEach(() => { delete process.env.BOTMUX_WORKFLOW_ENABLED; });
 
-  it('advertises bounded DAGs and reuse in zh/en shell hints', () => {
+  it('stays a short single line in zh/en shell hints and points at /workflow + the on-demand skill', () => {
     const zh = buildBotmuxShellHints('zh').find((line) => line.startsWith('Workflow：'));
     const en = buildBotmuxShellHints('en').find((line) => line.startsWith('Workflow:'));
     expect(zh).toContain('/workflow');
-    expect(zh).toContain('保存复用');
+    expect(zh).toContain('botmux skill show botmux-workflow');
     expect(en).toContain('/workflow');
-    expect(en).toContain('saved and reused');
+    expect(en).toContain('botmux skill show botmux-workflow');
+    // It is the only resident workflow text left in every session: keep it short.
     expect(zh!.length).toBeLessThan(100);
     expect(en!.length).toBeLessThan(140);
     expect(BOTMUX_SHELL_HINTS.some((line) => line.includes('/workflow'))).toBe(true);
@@ -36,7 +37,7 @@ describe('Workflow discovery hint (enabled hosts)', () => {
 
   it('also appears once in injectsSessionContext system routing', () => {
     const prompt = buildBotmuxSystemPromptText({ locale: 'zh' });
-    expect(prompt.match(/Workflow：有界的多步目标/g)).toHaveLength(1);
+    expect(prompt.match(/Workflow：/g)).toHaveLength(1);
     expect(prompt.indexOf('Workflow：')).toBeLessThan(prompt.indexOf('</botmux_routing>'));
   });
 });

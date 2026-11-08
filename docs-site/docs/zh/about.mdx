@@ -4,19 +4,43 @@ import qrExternal from '../../static/img/qr-group-external.png';
 
 # 关于 & 资源
 
-botmux —— 飞书话题群 ↔ AI 编程 CLI 桥接。MIT 协议开源。
+botmux 把飞书话题群和 AI 编程 CLI（Claude Code、Codex 等）连起来：在群里发个话题，就有一个专属的 AI 会话替你干活。项目以 MIT 协议开源。
 
-## 链接
+## 常用链接
 
-- **GitHub**：[github.com/deepcoldy/botmux](https://github.com/deepcoldy/botmux)
-- **安装**：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh`（自包含二进制，不需要 Node）
-- **npm**（备选，需 Node ≥ 22）：`npm install -g botmux` · [npmjs.com/package/botmux](https://www.npmjs.com/package/botmux)
-- **贡献指南**：[CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md)
-- **许可证**：[MIT](https://github.com/deepcoldy/botmux/blob/master/LICENSE)
+| 想做什么 | 去哪里 |
+|---|---|
+| 看源码、提 Issue / PR | [GitHub：deepcoldy/botmux](https://github.com/deepcoldy/botmux) |
+| 在线看文档 | [deepcoldy.github.io/botmux](https://deepcoldy.github.io/botmux/) |
+| 从 npm 安装 | [npmjs.com/package/botmux](https://www.npmjs.com/package/botmux) |
+| 参与贡献 | [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md) |
+| 许可证 | [MIT](https://github.com/deepcoldy/botmux/blob/master/LICENSE) |
+
+## 安装与升级
+
+**推荐：一键安装脚本**（自包含二进制，不需要装 Node）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+```
+
+支持 Linux 和 macOS，x64 / arm64 都行；Alpine 这类 musl 系统会自动选对应版本。Windows 请在 WSL2 里安装。
+
+**备选：npm 安装**：
+
+```bash
+npm install -g botmux
+```
+
+这一步需要 Node ≥ 22（npm 本身的要求）。npm 包里是同一个自包含程序，装好后运行不依赖 Node。
+
+**升级**：执行 `botmux update`（`botmux upgrade` 同义），再 `botmux restart` 让新版本生效。v3.18.0 之前的老版本请重跑上面的 curl 命令，原因见 [FAQ · 怎么升级？](/faq#怎么升级)。
+
+第一次上手看 [5 分钟快速接入](/quickstart)，遇到问题先翻 [常见问题](/faq)。
 
 ## 加入交流群
 
-按身份扫码加入 Botmux 飞书交流群（入群链接均长期有效）：
+按身份扫码加入 Botmux 飞书交流群（入群链接长期有效）：
 
 <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'flex-start', margin: '16px 0' }}>
   <figure style={{ margin: 0, maxWidth: '200px' }}>
@@ -35,8 +59,11 @@ botmux —— 飞书话题群 ↔ AI 编程 CLI 桥接。MIT 协议开源。
 
 ## 反馈
 
-发现问题或想加功能，欢迎在 GitHub 提 Issue / PR，或来飞书 Botmux 交流群讨论。
+发现问题或想要新功能：
+
+- 在 GitHub 提 [Issue](https://github.com/deepcoldy/botmux/issues) 或 PR；
+- 或者到上面的飞书交流群里直接聊。
 
 ---
 
-*这份文档由 botmux 自己（在飞书话题里）生成，并发布到飞书妙搭 🪄*
+*这份文档由 botmux 自己（在飞书话题里）生成，发布在 GitHub Pages 和飞书妙搭 🪄*

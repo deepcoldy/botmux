@@ -29,6 +29,7 @@ export function workerSubmitHarness() {
     sessionRenameInFlight: () => false,
     shouldDeferUserFlush: () => false,
     refreshHookReviewInputHold: vi.fn(),
+    hookReviewHoldsQueuedWrite: () => false,
     pendingInputMayFlush: () => true,
     rpcLifecycleFailClosedOwners: new Map(),
     probeStartupBlocker: () => false,
@@ -38,6 +39,7 @@ export function workerSubmitHarness() {
     pendingInputAllowsTypeAhead: () => true,
     directRpcTurnBlocksTypeAhead: () => false,
     activeTurnBlocks: () => false,
+    promotePendingHumanInterruption: () => false,
     pendingSessionRename: null, pendingMessages, pendingRawInputs: [], pendingAdoptMessages: [], pendingInjections: [],
     CodexAppFlushPromptReplay, codexAppTurnLiveness: {},
     beginCliWriteCycle: vi.fn(), bareShellChecked: true,
@@ -86,6 +88,7 @@ export function workerSubmitHarness() {
     emitTurnTerminal: vi.fn(),
     shouldStopPendingBatch: () => true,
   };
+  scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   scope.scheduleSubmitFailureNotify = schedule;
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);

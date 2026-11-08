@@ -133,6 +133,31 @@ function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   return record?.state === 'revoked' ? undefined : record?.task;
 }
 
+export function getScheduleAuthorityRecord(
+  id: string,
+  appId?: string,
+): import('../services/schedule-authority-store.js').ScheduleAuthorityRecord | undefined {
+  if (authorityUnavailable || !authorityStore) return undefined;
+  const effectiveAppId = authorityAppId(appId);
+  if (!effectiveAppId || !authorityStore.isInitialized(effectiveAppId)) return undefined;
+  return authorityStore.getRecord(effectiveAppId, id);
+}
+
+export function registerBackgroundExecution(job: import('./background-execution-policy.js').BackgroundExecutionRegistration): void {
+  if (authorityUnavailable || !authorityStore) throw new Error('schedule_authority_unavailable');
+  authorityStore.registerBackgroundExecution(job);
+}
+
+export function backgroundExecutions(appId: string, sessionId: string): import('./background-execution-policy.js').BackgroundExecutionRegistration[] {
+  if (authorityUnavailable || !authorityStore || !authorityStore.isInitialized(appId)) return [];
+  return authorityStore.backgroundExecutions(appId, sessionId);
+}
+
+export function revokeBackgroundExecution(id: string): void {
+  if (authorityUnavailable || !authorityStore) throw new Error('schedule_authority_unavailable');
+  authorityStore.revokeBackgroundExecution(id);
+}
+
 /** Fire-time guard for tasks created through a live conversation turn.
  *
  * Every such task has a non-null authority `targetTurnId` (direct and
@@ -1280,11 +1305,23 @@ export function addTask(params: {
     model: params.model?.trim() || undefined,
     reasoningEffort: params.reasoningEffort,
     ...untilDoneConfig,
-  }, params.larkAppId && authorityStore?.isInitialized(params.larkAppId)
-    ? candidate => project(authorityStore!.createDirect(candidate, audit?.directTurn))
-    : undefined);
+  }, authoritativeCreateFor(params.larkAppId, audit?.directTurn));
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
   return task;
+}
+
+/** The `authoritativeCreate` argument of scheduleStore.createTask: commits the
+ * candidate to the host authority and projects the committed row. Undefined
+ * when `appId` is not enrolled here, where createTask keeps the projection-only
+ * path. */
+export function authoritativeCreateFor(
+  appId: string | undefined,
+  directTurn?: { turnId: string; maxTasksPerTurn: number },
+): ((task: ScheduledTask) => ScheduledTask) | undefined {
+  assertScheduleAuthorityAvailable();
+  return appId && authorityStore?.isInitialized(appId)
+    ? candidate => project(authorityStore!.createDirect(candidate, directTurn))
+    : undefined;
 }
 
 /** Host-daemon only creation path for a one-shot delegated grant. It validates
@@ -1980,6 +2017,24 @@ export function updateTask(
       parsed = parseSchedule(updates.schedule);
     } catch (err) {
       return { ok: false, error: `invalid_schedule: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    // A claimed run settles against the task as it is when it finishes: a
+    // one-shot rule written mid-run would be consumed by the old recurring
+    // run, and an until-done settle would overwrite the new nextRunAt. Ask
+    // the caller to wait for the run to finish instead.
+    if (task.lastStatus === 'running') return { ok: false, error: 'schedule_run_in_flight' };
+    // A one-shot time already past would leave an enabled task that never fires.
+    if (parsed.kind === 'once' && computeNextRun(parsed) === null) {
+      return { ok: false, error: 'schedule_in_past' };
+    }
+    // Keep the until-done invariants `add` enforces: a retry interval only
+    // exists for a one-shot, and a one-shot may not start after the deadline.
+    if (task.untilDone?.retryMinutes !== undefined && parsed.kind !== 'once') {
+      return { ok: false, error: 'until_done_retry_requires_once' };
+    }
+    if (task.untilDone?.deadline && parsed.kind === 'once' && parsed.runAt
+      && Date.parse(parsed.runAt) > Date.parse(task.untilDone.deadline)) {
+      return { ok: false, error: 'until_done_deadline_before_first_run' };
     }
     patch.schedule = updates.schedule;
     patch.parsed = parsed;

@@ -1,14 +1,23 @@
 import { DropdownField, ModelPickerField } from './field-controls.js';
 import { InfoTip } from './dashboard-components.js';
 import { isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
-import type { TraexAutoModelSettings } from '../../services/traex-auto-model.js';
+import {
+  strongestTraexPreflightReasoningEffort,
+  type TraexAutoModelSettings,
+} from '../../services/traex-auto-model.js';
 import type { ModelCapabilities } from './bot-defaults.js';
 import { useT } from './react-hooks.js';
+import { strongestTraexPreflightModelSettings } from './traex-auto-model-preferences.js';
 
 export function TraexAutoModelEditor(props: {
   enabled: boolean;
   trigger?: 'capacity' | 'quota';
   onTrigger?: (trigger: 'capacity' | 'quota') => void;
+  preflightLoadCheck: boolean;
+  overloadThresholdPercent: string;
+  preflightTimeoutSeconds: string;
+  unknownLoadPolicy: 'skip';
+  allOverloadedPolicy: 'lowest_load';
   reselectPerTurn: boolean;
   models: string[];
   modelSettings: Record<string, TraexAutoModelSettings>;
@@ -22,6 +31,11 @@ export function TraexAutoModelEditor(props: {
   saveStatus?: string;
   onSave?: () => void;
   onEnabled: (enabled: boolean) => void;
+  onPreflightLoadCheck: (enabled: boolean) => void;
+  onOverloadThresholdPercent: (percent: string) => void;
+  onPreflightTimeoutSeconds: (seconds: string) => void;
+  onUnknownLoadPolicy: (policy: 'skip') => void;
+  onAllOverloadedPolicy: (policy: 'lowest_load') => void;
   onReselectPerTurn: (enabled: boolean) => void;
   onModels: (models: string[]) => void;
   onSettings: (model: string, settings: TraexAutoModelSettings) => void;
@@ -55,6 +69,38 @@ export function TraexAutoModelEditor(props: {
           options={[{ value: 'capacity', label: tr('botDefaults.autoModelCapacityTrigger') },
             { value: 'quota', label: tr('botDefaults.autoModelQuotaTrigger') }]}
           onChange={value => props.onTrigger?.(value === 'quota' ? 'quota' : 'capacity')} />
+        {props.trigger !== 'quota' && <>
+          <label className="bd-auto-model-toggle">
+            <input type="checkbox" data-input="autoModelPreflightLoadCheck" checked={props.preflightLoadCheck}
+              disabled={props.busy} onChange={event => props.onPreflightLoadCheck(event.currentTarget.checked)} />
+            <span>{tr('botDefaults.autoModelPreflightLoadCheck')}</span>
+            <InfoTip label={tr('botDefaults.autoModelDetails')} className="bd-info-tip" trigger="?">
+              {tr('botDefaults.autoModelPreflightLoadCheckHelp')}
+            </InfoTip>
+          </label>
+          {props.preflightLoadCheck && <>
+            <label className="bd-auto-model-timeout">
+              <span>{tr('botDefaults.autoModelOverloadThreshold')}</span>
+              <input type="number" min="0" max="65535" step="1" data-input="autoModelOverloadThreshold"
+                value={props.overloadThresholdPercent} disabled={props.busy}
+                onChange={event => props.onOverloadThresholdPercent(event.currentTarget.value)} />
+            </label>
+            <label className="bd-auto-model-timeout">
+              <span>{tr('botDefaults.autoModelPreflightTimeout')}</span>
+              <input type="number" min="0.1" max="30" step="0.1" data-input="autoModelPreflightTimeout"
+                value={props.preflightTimeoutSeconds} disabled={props.busy}
+                onChange={event => props.onPreflightTimeoutSeconds(event.currentTarget.value)} />
+            </label>
+            <DropdownField dataInput="autoModelUnknownLoadPolicy" ariaLabel={tr('botDefaults.autoModelUnknownLoadPolicy')}
+              value={props.unknownLoadPolicy} disabled={props.busy}
+              options={[{ value: 'skip', label: tr('botDefaults.autoModelUnknownLoadSkip') }]}
+              onChange={() => props.onUnknownLoadPolicy('skip')} />
+            <DropdownField dataInput="autoModelAllOverloadedPolicy" ariaLabel={tr('botDefaults.autoModelAllOverloadedPolicy')}
+              value={props.allOverloadedPolicy} disabled={props.busy}
+              options={[{ value: 'lowest_load', label: tr('botDefaults.autoModelAllOverloadedLowestLoad') }]}
+              onChange={() => props.onAllOverloadedPolicy('lowest_load')} />
+          </>}
+        </>}
         {props.trigger !== 'quota' && <label className="bd-auto-model-toggle">
           <input type="checkbox" data-input="autoModelReselectPerTurn" checked={props.reselectPerTurn}
             disabled={props.busy} onChange={event => props.onReselectPerTurn(event.currentTarget.checked)} />
@@ -68,8 +114,10 @@ export function TraexAutoModelEditor(props: {
             const settings = props.modelSettings[model] ?? {};
             const capability = props.capabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
             const variant = capability?.contextVariants?.find(entry => entry.id === settings.modelBackendVariant);
-            const efforts = (variant?.reasoningEfforts ?? capability?.reasoningEfforts
+            const advertisedEfforts = (variant?.reasoningEfforts ?? capability?.reasoningEfforts
               ?? reasoningEffortsForCliModel('traex', model)).filter(isCodexReasoningEffort);
+            const forcedEffort = strongestTraexPreflightModelSettings(model, capability).reasoningEffort;
+            const efforts = props.preflightLoadCheck && forcedEffort ? [forcedEffort] : advertisedEfforts;
             const contextOptions = [
               { value: '', label: capability?.contextWindow
                 ? `${tr('botDefaults.autoModelDefault')} · ${capacityLabel(capability.contextWindow)}`
@@ -103,8 +151,9 @@ export function TraexAutoModelEditor(props: {
                 <div className="bd-auto-model-setting">
                   <span>{tr('botDefaults.agentReasoningEffort')}</span>
                   <DropdownField dataInput={`autoModelEffort${index}`} ariaLabel={`${model} ${tr('botDefaults.agentReasoningEffort')}`}
-                    value={settings.reasoningEffort ?? ''} disabled={props.busy || !model}
-                    options={[{ value: '', label: tr('botDefaults.autoModelDefault') },
+                    value={props.preflightLoadCheck ? forcedEffort ?? '' : settings.reasoningEffort ?? ''}
+                    disabled={props.busy || !model || props.preflightLoadCheck}
+                    options={[...(props.preflightLoadCheck ? [] : [{ value: '', label: tr('botDefaults.autoModelDefault') }]),
                       ...efforts.map(effort => ({ value: effort, label: effort }))]}
                     onChange={effort => props.onSettings(model, {
                       ...settings, reasoningEffort: isCodexReasoningEffort(effort) ? effort : undefined,
@@ -118,10 +167,12 @@ export function TraexAutoModelEditor(props: {
                     onChange={value => {
                       const nextVariant = value === 'standard' || value === 'max' ? value : undefined;
                       const allowed = capability?.contextVariants?.find(entry => entry.id === nextVariant)?.reasoningEfforts
-                        ?? capability?.reasoningEfforts ?? efforts;
+                        ?? capability?.reasoningEfforts ?? advertisedEfforts;
                       props.onSettings(model, { ...settings, modelBackendVariant: nextVariant,
-                        reasoningEffort: settings.reasoningEffort && allowed.includes(settings.reasoningEffort)
-                          ? settings.reasoningEffort : undefined });
+                        reasoningEffort: props.preflightLoadCheck
+                          ? strongestTraexPreflightReasoningEffort(model, allowed)
+                          : settings.reasoningEffort && allowed.includes(settings.reasoningEffort)
+                            ? settings.reasoningEffort : undefined });
                     }} />
                 </div>
               </div>

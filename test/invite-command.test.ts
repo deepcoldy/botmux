@@ -56,7 +56,7 @@ function inviteMessage(overrides: {
 }
 
 let tmpDir: string;
-function writeBotsInfo(entries: Array<{ larkAppId: string; botName: string | null }>) {
+function writeBotsInfo(entries: Array<{ larkAppId: string; botName?: unknown }>) {
   writeFileSync(join(tmpDir, 'bots-info.json'), JSON.stringify(entries));
 }
 function writePlatformSync(bots: Array<{ appId: string; name?: string; unionId?: string }>) {
@@ -125,6 +125,21 @@ describe('readBotsInfoEntries', () => {
   it('parses entries with larkAppId', () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     expect(readBotsInfoEntries()).toEqual([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+  });
+  it('drops malformed rows (null/scalar/bad appId/truthy non-string botName) but keeps valid rows', () => {
+    writeBotsInfo([
+      null,
+      'scalar',
+      { larkAppId: '', botName: 'EmptyApp' },
+      { larkAppId: 'cli_bad_name', botName: 42 },
+      { larkAppId: 'cli_array_name', botName: ['Codex'] },
+      { larkAppId: 'cli_null_name', botName: null },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ] as any);
+    expect(readBotsInfoEntries()).toEqual([
+      { larkAppId: 'cli_null_name', botName: null },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ]);
   });
 });
 
@@ -205,6 +220,18 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     const out = String(replyMock.mock.calls.at(-1)![2]);
     expect(out).toContain('已拉进群');
     expect(out).toContain('Codex');
+  });
+
+  it('malformed row (truthy non-string botName) before a valid row neither crashes the command nor hides the valid row', async () => {
+    // bots-info.json 可手工编辑/半写入：truthy 非字符串 botName 曾让
+    // e.botName?.toLowerCase() 抛 TypeError，/invite 在任何回执发出前崩溃（静默失效）。
+    writeBotsInfo([
+      { larkAppId: 'cli_bad', botName: 42 },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+    expect(replyMock).toHaveBeenCalled();
   });
 
   it('already-in-chat target (live roster openId match) is skipped', async () => {

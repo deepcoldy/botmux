@@ -10,12 +10,13 @@
  * I/O (member lookup, session spawn, event subscription) lives in the
  * dispatcher / daemon and calls into these predicates.
  */
+import { t, type Locale } from '../i18n/index.js';
 
 /** Per-bot auto-start preferences, resolved from BotConfig. */
 export interface AutoStartPrefs {
   /** 场景①: auto-start when the bot is added to a new chat. */
   autoStartOnGroupJoin: boolean;
-  /** 场景①: optional pre-configured first-turn prompt. '' = empty user_message. */
+  /** 场景①: optional first-turn prompt. Blank uses the built-in join task. */
   autoStartOnGroupJoinPrompt: string;
   /** 场景②: auto-start on every new topic in a topic group (no @ required). */
   autoStartOnNewTopic: boolean;
@@ -74,13 +75,13 @@ export function chatHasAllowedUser(
 
 /**
  * 场景①: resolve the first-turn prompt body from the configured prompt.
- * Trims whitespace; an unset / blank config yields '' (empty user_message,
- * per D8 — the model reads the group context itself). The surrounding prompt
- * envelope (role / identity) is added by buildNewTopicPrompt, so '' here still
- * produces a non-empty CLI turn (FR-11).
+ * Trims a configured task; an unset / blank config uses a localized task that
+ * asks the model to inspect the group context and greet the chat when idle.
+ * Routing / identity context alone is not a task: the prompt envelope tells
+ * agents to act on user_message, so that body must not be empty on group join.
  */
-export function resolveGroupJoinPrompt(configured: string | undefined): string {
-  return (configured ?? '').trim();
+export function resolveGroupJoinPrompt(configured: string | undefined, locale?: Locale): string {
+  return configured?.trim() || t('daemon.auto_start_join_prompt', undefined, locale);
 }
 
 /**
@@ -116,4 +117,50 @@ export async function waitForAllowedUserInChat(opts: {
     opts.onRetry?.(attempt + 1, delays[attempt]);
     await sleep(delays[attempt]);
   }
+}
+
+/**
+ * 场景①: where a group-join session anchors in a 普通群 whose reply mode would
+ * otherwise keep it chat-scope (BotConfig.autoStartOnGroupJoinAnchor).
+ *   - 'reply-mode' (default): follow the group's reply mode, unchanged.
+ *   - 'latest-message': open a thread-scope session on the newest existing
+ *     message in the chat, so replies land in that message's thread.
+ */
+export type GroupJoinAnchorMode = 'reply-mode' | 'latest-message';
+
+/** How many newest chat messages the latest-message anchor inspects. */
+export const GROUP_JOIN_ANCHOR_SCAN_LIMIT = 20;
+
+/**
+ * 场景① latest-message anchor: pick the thread root for the newest message the
+ * bot can thread under, from a chat-container listing (any order — sorted by
+ * create_time here). Skips system events (e.g. "X added the bot"), recalled
+ * messages and this bot's own messages (an earlier greeting must not become the
+ * anchor). A message already inside a native topic (root_id + thread_id)
+ * resolves to that topic's root. Returns undefined when nothing qualifies so
+ * the caller falls back to the reply-mode routing.
+ *
+ * `selfOpenId` is the bot's own open_id in this app. In the im/v1/messages
+ * history listing, a message sent by THIS bot comes back with sender.id in
+ * EITHER the app_id form (`cli_…`, id_type=app_id) OR the bot's per-app
+ * open_id form (`ou_…`) — both shapes occur in real listings (same dual match
+ * as workflow-draft-daemon's findRootCards). Matching only the app_id lets the
+ * bot's own earlier top-level message win the anchor on a re-add.
+ */
+export function pickGroupJoinAnchorMessageId(
+  messages: readonly any[],
+  larkAppId: string,
+  selfOpenId?: string,
+): string | undefined {
+  const newestFirst = [...messages].sort((a, b) => (Number(b?.create_time) || 0) - (Number(a?.create_time) || 0));
+  for (const m of newestFirst) {
+    if (typeof m?.message_id !== 'string' || !m.message_id) continue;
+    if (m.deleted === true) continue;
+    if ((m.msg_type ?? m.message_type) === 'system') continue;
+    const senderId = m.sender?.id;
+    if (senderId === larkAppId || (!!selfOpenId && senderId === selfOpenId)) continue;
+    if (typeof m.root_id === 'string' && m.root_id && typeof m.thread_id === 'string' && m.thread_id) return m.root_id;
+    return m.message_id;
+  }
+  return undefined;
 }

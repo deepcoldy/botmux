@@ -227,6 +227,7 @@ function exitPath(queue: BridgeTurnQueue) {
     bridgeWatcher: null,
     bridgeFallbackTimer: null,
     bridgeKnownSessionIds: new Set(),
+    bridgeCliProvenSessionIds: new Set(),
     bridgeSecondaryPaths: new Map(),
     bridgeRestoreGate: { markGenerationRetired: () => {} },
     bridgeBlindTurnWatch: new BridgeBlindTurnWatch(),
