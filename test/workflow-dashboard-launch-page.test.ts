@@ -25,6 +25,7 @@ import { draftActionRequest } from '../src/dashboard/web/workflow-draft-api.js';
 import type { WorkflowDraftView } from '../src/workflows/v3/draft-service.js';
 import { BOTS, DOC, MAIN, OWNER, ALICE, PI, STEWARD, SKETCHES, architectSettled, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
 import { fakeLaunch } from './helpers/workflow-launch-fakes.js';
+import { BotSearchPicker } from '../src/dashboard/web/bot-search-picker.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -210,9 +211,9 @@ describe('页面渲染', () => {
     expect(steps.findAll((node) => node.type === 'li').map((li) => li.props['aria-current'] ?? null)).toEqual([null, null, null, null, 'step', null, null, null]);
     const problem = renderer.root.find((node) => node.type === 'li' && node.props.className === 'wfd-launch-problem');
     expect(text(problem)).toContain('不在群里');
-    const select = problem.find((node) => node.type === 'select');
-    expect(select.props.disabled).toBe(false);
-    await act(async () => { select.props.onChange({ target: { value: REVIEW } }); });
+    const picker = problem.find((node) => node.type === BotSearchPicker);
+    expect(picker.props.disabled).toBe(false);
+    await act(async () => { picker.props.onChange(REVIEW); });
     await flush();
     expect(sent.find((call) => call.url.endsWith('/nodes/write/bot'))?.body).toEqual({ larkAppId: REVIEW, baseVersion: view.version });
 

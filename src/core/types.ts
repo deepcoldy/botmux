@@ -446,6 +446,11 @@ export interface DaemonSession {
    *  never recorded; its settlement reports the run instead of closing it
    *  quietly. In-memory: a restart closes unmaterialized hidden runs anyway. */
   deferredScheduleUndeliveredTurnId?: string;
+  /** The turn a task-position hidden run was re-fired to before it materialized,
+   *  until a worker frame carries that id. Until then an unattributed frame may
+   *  be the previous turn's tail and must not settle the new turn. In-memory,
+   *  like deferredScheduleUndeliveredTurnId. */
+  deferredScheduleUnconfirmedTurnId?: string;
   /** Turn-exact ids for loud external triggers whose connector opted into
    *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
    *  (the streaming card / start notice still show); keyed on the trigger turn
@@ -811,6 +816,11 @@ export interface DaemonSession {
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    /** In memory only (never in the durable async store): the provider's raw
+     *  error text and the screen tail the worker's failed terminal carried,
+     *  masked and clipped (services/turn-failure-diagnostics). */
+    terminalErrorDetail?: string;
+    terminalScreenTail?: string;
     interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;

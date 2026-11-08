@@ -4021,6 +4021,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .map(([pluginId, value]) => {
           const record = value as Record<string, unknown>;
           const runtimeEnv = sanitizePerBotEnv(record.env);
+          const droppedRuntimeEnv = droppedReservedPerBotEnvKeys(record.env);
+          if (droppedRuntimeEnv.length > 0
+            && shouldWarnDroppedReservedEnv(`${entry.larkAppId}:pluginRuntime.${pluginId}`, droppedRuntimeEnv)) {
+            logger.warn(
+              `[bot-registry:${entry.larkAppId}] pluginRuntime.${pluginId}.env 中的保留变量由 botmux 托管，已忽略且不会生效: ${droppedRuntimeEnv.join(' ')}`,
+            );
+          }
           const toolTimeoutMs = typeof record.toolTimeoutMs === 'number'
             && Number.isInteger(record.toolTimeoutMs)
             && record.toolTimeoutMs > 0

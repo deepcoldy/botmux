@@ -268,7 +268,9 @@ describe('handleClaudeStopFailureReport', () => {
     // turn, not the new active one, is the one that failed.
     ctx.activeTurn = { turnId: 'om_next', dispatchAttempt: undefined };
     timers[0].run();
-    expect(emitted).toEqual([['om_failed', 'failed', 'provider_server_error', undefined, true]]);
+    // The hook's own words travel with the terminal (the failure panel shows them).
+    expect(emitted).toEqual([['om_failed', 'failed', 'provider_server_error', undefined, true,
+      'API Error: Connection lost mid-response. The response above may be incomplete.']]);
     expect(notices).toEqual([]);
   });
 
@@ -503,7 +505,8 @@ describe('handleClaudeStopFailureReport', () => {
     expect(notices).toEqual([]);
     ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
     timers[2].run();
-    expect(emitted).toEqual([['om_next', 'ambiguous', 'provider_unknown_error', undefined, false]]);
+    expect(emitted).toEqual([['om_next', 'ambiguous', 'provider_unknown_error', undefined, false,
+      'API Error: Request was aborted.']]);
     expect(notices).toEqual([]);
   });
 

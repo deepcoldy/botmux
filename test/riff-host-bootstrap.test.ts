@@ -1,3 +1,6 @@
+// Must stay the first import: the generated bootstrap overwrites whichever
+// `botmux` its shell resolves, so refuse to run outside the test fence (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -29,6 +32,18 @@ function backend(binding: () => RiffHostBinding | undefined) {
     hostToolsBinding: binding, env: { BOTMUX_RIFF_HOST_TOOLS: '1' }, injectStatusLines: false }, 'session-1');
   backends.push(instance);
   return { instance, requests };
+}
+
+/** Env for a bootstrap shell. The bootstrap `mv`s over whichever `botmux` it
+ *  resolves, so the shell must only see `bin`: a HOME inside `root`, no inherited
+ *  PATH entry under a `.botmux` dir, and no BASH_ENV (a botmux session's
+ *  BASH_ENV re-prepends the host's ~/.botmux/bin ahead of `bin`). */
+function bootstrapEnv(root: string, bin: string, extra: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: join(root, 'home'), TMPDIR: root, ...extra };
+  delete env.BASH_ENV;
+  const inherited = (process.env.PATH ?? '').split(':').filter(dir => !dir.split('/').includes('.botmux'));
+  env.PATH = [bin, ...inherited].join(':');
+  return env;
 }
 
 describe('Riff host-tools preflight', () => {
@@ -101,9 +116,9 @@ describe('Riff verified CLI bootstrap shell boundary', () => {
         return 92
       }
       ${command}
-    `], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`,
-      TMPDIR: root, ARTIFACT_SOURCE: join(root, 'artifact'), CURL_ARGS: join(root, 'curl-args'),
-      BOUND_ARGS: join(root, 'bound-args'), PWNED: join(root, 'pwned') } });
+    `], { cwd: root, encoding: 'utf8', env: bootstrapEnv(root, bin, {
+      ARTIFACT_SOURCE: join(root, 'artifact'), CURL_ARGS: join(root, 'curl-args'),
+      BOUND_ARGS: join(root, 'bound-args'), PWNED: join(root, 'pwned') }) });
     expect(existsSync(join(root, 'pwned'))).toBe(false);
     const args = readFileSync(join(root, 'curl-args'), 'utf8').split('\0');
     expect(args).toContain(`${binding.url}?artifact=cli`);
@@ -141,8 +156,8 @@ function runBootstrap(root: string, bin: string, command: string, curlBody: stri
     ${command}
     status=$?
     echo "shell survived with status $status"
-  `], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: root,
-    CURL_CALLS: join(root, 'curl-calls'), BOUND_ARGS: join(root, 'bound-args') } });
+  `], { cwd: root, encoding: 'utf8', env: bootstrapEnv(root, bin, {
+    CURL_CALLS: join(root, 'curl-calls'), BOUND_ARGS: join(root, 'bound-args') }) });
   const status = Number(/shell survived with status (\d+)/.exec(result.stdout)?.[1] ?? NaN);
   return { ...result, status, curlCalled: existsSync(join(root, 'curl-calls')) };
 }

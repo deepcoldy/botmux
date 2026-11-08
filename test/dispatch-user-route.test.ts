@@ -105,6 +105,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
+    backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredRejectedReadyEvidenceGeneration: undefined, log: vi.fn(),
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
     // These cases all run AFTER the first prompt was admitted
