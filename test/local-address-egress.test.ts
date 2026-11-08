@@ -21,6 +21,7 @@ import { resolvePluginResultAccessUrl } from '../src/core/plugin-result-access-u
 import { resetHostLinkOrigins } from '../src/core/host-link-origins.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { buildTrustedResultDeliveryCard } from '../src/im/lark/trusted-result-delivery-card.js';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
 const skillText = '协作说明：通过 [MIX Bot 协作技能](/data00/home/alice/.agents/skills/mix-bot-collaboration/SKILL.md) 联系 CAT，返回授权提示。';
 const businessUrl = 'https://example.com/v2/activity?activityId=123&path=/home/business#detail';
@@ -45,14 +46,6 @@ function capture() {
     request: write,
   } as any;
   return { app, writes };
-}
-/** Under bun, one large advance can elapse before the first attempt has scheduled its
- * backoff timer; stepping keeps the clock moving until the send settles. */
-async function settleOnFakeClock<T>(promise: Promise<T>): Promise<T> {
-  let settled = false;
-  promise.then(() => { settled = true; }, () => { settled = true; });
-  for (let step = 0; step < 40 && !settled; step++) await vi.advanceTimersByTimeAsync(250);
-  return promise;
 }
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
@@ -133,7 +126,8 @@ describe('local addresses at the real Lark SDK write boundary', () => {
         : { code: 0, data: { message_id: 'om_retry' } };
     };
     const publishing = sendMessage(app, 'oc_chat', JSON.stringify(card()), 'interactive', 'stable-local-uuid');
-    await expect(settleOnFakeClock(publishing)).resolves.toBe('om_retry');
+    await flushFakeTimers(2_000);
+    await expect(publishing).resolves.toBe('om_retry');
     expect(writes).toHaveLength(2);
     expect(writes[0].data.content).not.toContain('/data00/');
     expect(writes[1].data).toEqual(writes[0].data);
