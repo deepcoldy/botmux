@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 function buildStreamingCardCallSites(source: string): string[] {
@@ -22,42 +23,30 @@ function buildStreamingCardCallSites(source: string): string[] {
   return sites;
 }
 
-/** Blank out `//` line comments and `/* *\/` block comments without touching
- *  string/template bodies, so an argument guard can neither be satisfied by a
- *  comment that merely names the argument nor broken by a URL literal. */
+/** Remove every comment while preserving all code, using the TypeScript parser's
+ *  own comment ranges. A hand-rolled char scanner cannot tell a regex literal
+ *  (e.g. xmlEscape's `/"/g`) from a division/string opener, so on files containing
+ *  regexes its string-state inverts and real comments survive — which would let a
+ *  comment naming the guarded argument satisfy the guard. The parser distinguishes
+ *  regex / string / template / comment correctly, so its ranges are ground truth. */
 function stripComments(source: string): string {
-  const QUOTES = new Set(["'", '"', '`']);
+  const sf = ts.createSourceFile('guard.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const ranges: Array<[number, number]> = [];
+  const collect = (node: ts.Node): void => {
+    for (const r of ts.getLeadingCommentRanges(source, node.pos) ?? []) ranges.push([r.pos, r.end]);
+    for (const r of ts.getTrailingCommentRanges(source, node.end) ?? []) ranges.push([r.pos, r.end]);
+    ts.forEachChild(node, collect);
+  };
+  collect(sf);
+  ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
   let out = '';
-  let i = 0;
-  while (i < source.length) {
-    const ch = source[i];
-    const next = source[i + 1];
-    if (ch === '/' && next === '/') {
-      while (i < source.length && source[i] !== '\n') i++;
-      continue;
-    }
-    if (ch === '/' && next === '*') {
-      i += 2;
-      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++;
-      i += 2;
-      continue;
-    }
-    if (QUOTES.has(ch)) {
-      const quote = ch;
-      out += ch;
-      i++;
-      while (i < source.length) {
-        out += source[i];
-        if (source[i] === '\\') { out += source[i + 1] ?? ''; i += 2; continue; }
-        if (source[i] === quote) { i++; break; }
-        i++;
-      }
-      continue;
-    }
-    out += ch;
-    i++;
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (start < cursor) continue; // drop overlapping ranges
+    out += source.slice(cursor, start);
+    cursor = end;
   }
-  return out;
+  return out + source.slice(cursor);
 }
 
 // 源码结构护栏(K4)：每个 buildStreamingCard 调用点都必须传入按机器人解析的隐藏按钮策略，
