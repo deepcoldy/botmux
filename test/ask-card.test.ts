@@ -1104,6 +1104,24 @@ describe('createLarkAskCardDispatcher', () => {
     expect(calls[1]!.content).toContain('完整内容见本话题中的附件文件');
   });
 
+  it('chat-scope 提问跟随发起 turn 的话题时，超长正文的附件和截断卡都回复进该话题', async () => {
+    const roots: Array<{ type: string; root: string }> = [];
+    const reply = vi.fn(async (_app: string, root: string, _content: string, type: string) => {
+      roots.push({ type, root });
+      return type === 'file' ? 'om_file' : 'om_card';
+    });
+    const send = vi.fn(async () => 'om_top_level');
+    const upload = vi.fn(async () => 'file_key_1');
+    const dispatcher = createLarkAskCardDispatcher({ replyMessage: reply as any, sendMessage: send as any, uploadFile: upload as any });
+    const ask = makePending({ rootMessageId: null, cardRootMessageId: 'om_turn_topic', questions: [
+      { prompt: '长'.repeat(20_000), multiSelect: false, options: [{ key: 'y', label: '是' }] },
+    ] });
+
+    await expect(dispatcher.send(ask)).resolves.toEqual({ messageId: 'om_card' });
+    expect(roots).toEqual([{ type: 'file', root: 'om_turn_topic' }, { type: 'interactive', root: 'om_turn_topic' }]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('P2 回归：send 信封（root=null）截断卡真实请求体 ≤ 30KB，不少算 8 字节', async () => {
     // 变异友好：若 renderAskCard 预算时未传真实 uuid（沿用 36 字符短尺），
     // 二分顶到测量 30,000 时 send 信封真实体 = 30,008，此断言变红。

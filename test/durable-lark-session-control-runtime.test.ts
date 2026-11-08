@@ -20,7 +20,12 @@ import {
 import { createDurableLarkSessionControlRuntime } from '../src/services/durable-lark-session-control-runtime.js';
 import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
-import { admitDurableLarkSession, parseDurablePrimarySessionRecord } from '../src/services/durable-session-primary.js';
+import {
+  admitDurableLarkSession,
+  canonicalPrimarySession,
+  parseDurablePrimarySessionRecord,
+} from '../src/services/durable-session-primary.js';
+import { durableSessionShadowProjection } from '../src/services/durable-session-shadow.js';
 import { parseDurableLarkOutboxRecord } from '../src/services/durable-lark-outbox.js';
 
 const tempDirs: string[] = [];
@@ -136,6 +141,55 @@ afterEach(() => {
 });
 
 describe('durable Lark session control runtime', () => {
+  it('treats a shadow row left at the canonical key as no canonical Session (#1861)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-shadow-row-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const shadow = durableSessionShadowProjection(session());
+    const shadowFacade = createDurableSessionFacade({ store, ownerId: 'shadow-owner' });
+    await shadowFacade.write(shadow.sessionKey, shadow.value);
+    await shadowFacade.stop();
+    const residual = await store.readSession(shadow.sessionKey);
+    expect(residual?.value).toMatchObject({ type: 'botmux.session.shadow' });
+    expect(canonicalPrimarySession(residual)).toBeUndefined();
+    expect(() => canonicalPrimarySession({ ...residual!, value: { type: 'botmux.session.primary' } }))
+      .toThrow(/invalid envelope/);
+
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => { throw new Error('no facade before admission'); },
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [session()],
+      getPersistedSession: () => session(),
+      materializeClosedSession: value => value,
+      canOperate: () => true,
+      closeSession: vi.fn(),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      buildPendingCard: () => '{}',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: error => error,
+    });
+    const close = control('close');
+    await expect(runtime.authorizeBeforeAck(close.data)).resolves.toBe(false);
+    await expect(runtime.pendingCardBeforeAck(close.data)).resolves.toBeUndefined();
+    await expect(runtime.resolve(close.control, {
+      claim: close.claim,
+      signal: new AbortController().signal,
+    })).rejects.toThrow('canonical Session is unavailable');
+
+    // Admission replaces the shadow row; the same click then authorizes.
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    await admitDurableLarkSession({ facade, message: message(), session: session() });
+    await expect(runtime.authorizeBeforeAck(close.data)).resolves.toBe(true);
+    await facade.stop();
+  });
+
   it('closes a never-started canonical remote Session from trusted host state', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-unstarted-'));
     tempDirs.push(dir);
