@@ -95,6 +95,8 @@ import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableR
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
+import { refundRetryAttempt } from '../services/failed-turn-retry.js';
+import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
 import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
@@ -2855,6 +2857,13 @@ export function buildOrdinaryRecoveryNoticeCard(
     failedAt: new Date(record.createdAt),
     retry: retried
       ? { kind: 'retried', byOpenId: retried.byOpenId, at: new Date(retried.at) }
+      : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
+        && cliId === 'claude-code'
+        && (record.causeErrorCode === 'provider_image_too_small'
+          || record.errorCode === 'provider_image_too_small')
+        // A generic re-delivery repeats the poisoned history forever. The purge
+        // action must outrank record.retry for this specific terminal.
+        ? { kind: 'purge_images', turnId: record.logicalTurnId }
       : record.retry
         ? { kind: 'available' }
         : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
@@ -14040,6 +14049,10 @@ export function sendWorkerInput(
      * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
+    /** Recovery from a poisoned-history image 400: the worker rewrites the
+     *  session transcript (drops undersized image blocks), respawns with
+     *  --resume, and this turn is delivered only after the fresh CLI is ready. */
+    purgeUndersizedImages?: true;
     trustedCaller?: TrustedCaller;
     /** Queue behind a running turn instead of folding into it (type-ahead):
      *  the input must start as a turn of its own. */
@@ -14072,6 +14085,9 @@ export function sendWorkerInput(
   }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
+  // The purge is a live-worker action; a staged tail would replay as a plain
+  // continuation onto the unpurged transcript.
+  if (opts.purgeUndersizedImages && hasQueuedActivationAdmissionGate(ds)) return false;
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
@@ -14215,6 +14231,7 @@ export function sendWorkerInput(
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.purgeUndersizedImages ? { purgeUndersizedImages: true as const } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
@@ -18140,6 +18157,19 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        const purgeClick = takePurgeClickRollback(ds, msg.turnId);
+        if (purgeClick) {
+          if (purgeClick.receipt && refundRetryAttempt(ds.session, purgeClick.receipt)) {
+            logger.info(`[${t}] Refunded retry cooldown of rejected purge continuation ${msg.turnId} (${msg.reason})`);
+          }
+          if (ds.lastCliInputTurnId === msg.turnId) {
+            const prevStatus = ds.lastScreenStatus;
+            purgeClick.restoreTurnState();
+            if (ds.lastScreenStatus !== prevStatus) stampIdleSinceAt(ds, prevStatus);
+            persistStreamCardState(ds);
+          }
+          sessionStore.updateSession(ds.session);
+        }
         if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         // The turn never started and will never terminal. Run GC, but do NOT
