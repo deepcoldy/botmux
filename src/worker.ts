@@ -22024,8 +22024,12 @@ function sendToPty(
     // exhausted latch that outlives the queued pane (reselectPerTurn off)
     // must NOT tag later independent turns here — that would suppress message
     // merging and markNewTurn for the rest of the session.
+    // awaitingPreferredModelReset additionally holds a follow-up when the pool
+    // is exhausted on a degraded model even if the pane no longer paints the
+    // queue frame, so it cannot be type-ahead written onto the wrong model.
     ...((opts.queueAfterActiveTurn || (traexAutoModelRuntimeEligible()
-      && traexAutoModelController?.capacityCurrentlyBlocking()))
+      && (traexAutoModelController?.capacityCurrentlyBlocking()
+        || traexAutoModelController?.awaitingPreferredModelReset())))
       ? { queueAfterActiveTurn: true } : {}),
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
     ...(opts.codexAppDispatchId ? { codexAppDispatchId: opts.codexAppDispatchId } : {}),
