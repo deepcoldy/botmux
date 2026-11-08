@@ -602,6 +602,84 @@ describe('writeInput: multiline, tmux mode', () => {
   });
 });
 
+describe('pressComposerSubmit: claude-code parked-draft rescue', () => {
+  it('tmux: sends plain Enter with the default binding', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    const pty = makeTmuxPty();
+    expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('raw PTY: writes CR with the default binding', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    const pty = makeRawPty();
+    expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+    expect(pty.write).toHaveBeenCalledWith('\r');
+  });
+
+  it('tmux: honours CLAUDE_CODE_SUBMIT_KEY without a bare Enter', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    process.env.CLAUDE_CODE_SUBMIT_KEY = 'meta+enter';
+    try {
+      const pty = makeTmuxPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+      expect(pty.sendSpecialKeys).toHaveBeenCalledWith('M-Enter');
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+    } finally {
+      delete process.env.CLAUDE_CODE_SUBMIT_KEY;
+    }
+  });
+
+  it('tmux: Enter remapped to newline sends the bound meta+enter submit key', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ 'meta+enter': 'chat:submit', enter: 'chat:newline' });
+    try {
+      const pty = makeTmuxPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+      expect(pty.sendSpecialKeys).toHaveBeenCalledWith('M-Enter');
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('raw PTY: remapped alt+enter submit becomes the ESC-prefix sequence', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ 'alt+enter': 'chat:submit', enter: 'chat:newline' });
+    try {
+      const pty = makeRawPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+      expect(pty.write).toHaveBeenCalledWith('\x1b\r');
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('returns false and sends nothing when no terminal-sendable submit key exists', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ enter: 'chat:newline' });
+    try {
+      const pty = makeTmuxPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(false);
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('returns false when the backend cannot confirm the send', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    const pty = { ...makeTmuxPty(), sendSpecialKeys: vi.fn(() => false) } satisfies PtyHandle;
+    expect(adapter.pressComposerSubmit?.(pty)).toBe(false);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+});
+
 describe('writeInput: multiline, non-tmux mode', () => {
   it.each(PLAIN_ADAPTERS)('%s: write(content) + CR', async (_name, adapter) => {
     const pty = makeRawPty();

@@ -149,7 +149,9 @@ export function stuckScreenTail(
     .replace(/\x1b[@-_]/g, '')
     .replace(/\r/g, '')
     .split('\n')
-    .map(row => row.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').replace(/\s+$/, ''));
+    // trimEnd, not /\s+$/: V8 retries that from every blank of a long blank
+    // run, quadratic over one row of a raw (cursor-addressed) TUI stream.
+    .map(row => row.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').trimEnd());
   let end = rows.length;
   while (end > 0 && rows[end - 1] === '') end--;
   const collapsed: string[] = [];
@@ -207,12 +209,21 @@ export function redactStuckPageTail(tail: string): string {
         return `${/^\s*/.exec(row)![0]}${HIDDEN}`;
       }
       inFreeForm = false;
-      let out = row.replace(/(\/(?:home|Users)\/)[^/\s]+/g, '$1~');
-      for (const shape of SECRET_SHAPES) {
-        out = out.replace(shape, (match, keep?: string) =>
-          typeof keep === 'string' && match.startsWith(keep) ? `${keep}${HIDDEN}` : HIDDEN);
-      }
-      return out;
+      return maskCredentialShapes(row);
     })
     .join('\n');
+}
+
+/**
+ * Mask credential-shaped values (SECRET_SHAPES: Bearer / token / api key /
+ * secret / password shapes, URL userinfo) and the user name in home-directory
+ * paths.
+ */
+function maskCredentialShapes(text: string): string {
+  let out = text.replace(/(\/(?:home|Users)\/)[^/\s]+/g, '$1~');
+  for (const shape of SECRET_SHAPES) {
+    out = out.replace(shape, (match, keep?: string) =>
+      typeof keep === 'string' && match.startsWith(keep) ? `${keep}${HIDDEN}` : HIDDEN);
+  }
+  return out;
 }

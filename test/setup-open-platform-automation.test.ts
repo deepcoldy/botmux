@@ -3304,6 +3304,7 @@ describe('automateOpenPlatformSetup', () => {
           'im.chat.member.user.deleted_v1',
           'im.message.updated_v1',
           'im.message.recalled_v1',
+          'im.chat.disbanded_v1',
           'vc.bot.meeting_invited_v1',
           'vc.bot.meeting_activity_v1',
           'vc.bot.meeting_ended_v1',
@@ -3331,8 +3332,8 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('im.message.receive_v1');
       expect(result.eventWarning).toBeTruthy();
     }
-    // 批量失败后逐个重试过:baseline 6 + 可选 4 + VC app 3 + VC user 1 = 批量 1 次 + 单个 14 次
-    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(15);
+    // 批量失败后逐个重试过:baseline 6 + 可选 5 + VC app 3 + VC user 1 = 批量 1 次 + 单个 15 次
+    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(16);
     // 核心事件缺失时不再继续发版,避免发布一个收不到消息的版本
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
   });
@@ -3390,7 +3391,7 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
     if (result.ok) {
       expect(result.missingVcEvents).toEqual(vcEvents);
-      expect(result.subscribedEventCount).toBe(11); // 6 baseline 事件 + 4 可选事件 + 1 回调
+      expect(result.subscribedEventCount).toBe(12); // 6 baseline 事件 + 5 可选事件 + 1 回调
       expect(result.eventWarning).toContain('VC 会议事件未确认订阅');
       // VC listener 保存门必须拦下这种结果(dashboard 两条分支都走这个门)
       expect(vcListenerEventGateError(result)).toContain('vc.bot.meeting_invited_v1');

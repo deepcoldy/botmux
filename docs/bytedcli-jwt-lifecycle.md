@@ -27,6 +27,6 @@ bytedcli 0.178 的内部跨 site 子请求可能重新取 JWT（例如请求 `cn
 
 发布层统一通过 `publishedIdentityShape` 派生 HOME。续期前后使用同一派生形状与已发布 body 严格整串比较；任何凭据、执行人、turn 或 HOME 替换均使旧续期结果失效，不通过忽略字段放宽一致性。
 
-站点别名/大小写归一另跟踪 [#2506](https://github.com/deepcoldy/botmux/issues/2506)：当前 `row`、`usttp`、`I18N-TT` 等非规范写法仍选择默认 JWT，`us-ttpbd` 无效映射的清理也留在该项一并处理。回归明确分为规范站点分区对照和带 issue 的 known-gap 行为断言；Bun 1.4.3 不支持 `it.fails`，跨引擎用例不使用该语法。
+站点别名/大小写/首尾空白归一已随 [#2506](https://github.com/deepcoldy/botmux/issues/2506) 落地：包装器照抄 bytedcli 0.173–0.187 的 `CLOUD_SITE_ALIAS_MAP`，匹配前用 POSIX 参数展开 trim，case 模式按大小写不敏感生成，与上游 `normalizeCloudSiteSelection`（trim → 小写 → 别名表）对齐；别名指向无区域 token 的 cn/boe 时仍走默认 token。`us-ttpbd` 不是通用站点（`normalizeCloudSiteSelection` 对它返回 null，只有 bmq / apm argos log / cloud-ticket 接受），三处上游都按 i18n-bd 分区取 JWT（`bmqCredentialSite`、streamlog `authSite`、cloud-ticket `jwt_site` 均为 `"i18n-bd"`），包装器据此把它从 tx 组移到 i18nbd 组而非删除。回归分规范站点分区对照与别名/大小写/空白行为断言两层；Bun 1.4.3 不支持 `it.fails`，跨引擎用例不使用该语法。
 
 真实跨区域服务请求尚未在本 PR 的验证中执行；shell 包装器选择和 region claim 故障注入通过不等同于真实跨站点主体已闭合。

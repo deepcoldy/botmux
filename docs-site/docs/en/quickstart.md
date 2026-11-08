@@ -142,14 +142,15 @@ Still stuck? Check by hand:
 
 Run `botmux restart` after fixing. See [FAQ / Troubleshooting](/en/faq) for more.
 
-### Optional events: @ by editing, recall sync
+### Optional events: @ by editing, recall sync, disbanded groups
 
-Missing either of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
+Missing any of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
 
 | Event | Used for |
 |---|---|
 | `im.message.updated_v1` | Editing a message that didn't @ the bot to add the @, which then triggers a task |
 | `im.message.recalled_v1` | In group context sharing (`/context-sharing`), marking recalled messages in the record. Only added when that feature is on |
+| `im.chat.disbanded_v1` | Ending the bot's sessions in a group once it is disbanded (like `/close`: they can be resumed and worktrees are kept). Without it, those sessions are only closed at the next daemon restart |
 
 Things to note:
 

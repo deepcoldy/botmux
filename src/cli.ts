@@ -9200,7 +9200,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean; task?: ManagedScheduleUpdateReceipt };
     if (!response.ok || body.ok !== true) {
-      throw new Error(scheduleIpcErrorMessage(body.error) ?? body.error ?? `HTTP ${response.status}`);
+      throw new Error(scheduleIpcErrorMessage(body.error)
+        ?? (body.error ? describeUntilDoneError(body.error) : `HTTP ${response.status}`));
     }
     return { replay: body.replay === true, ...(body.task && typeof body.task === 'object' ? { task: body.task } : {}) };
   };
@@ -9225,10 +9226,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       if (task) {
         const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
         console.log(`   频率: ${task.display && task.display !== task.schedule ? `${task.display}（${task.schedule}）` : task.schedule}`);
+        // The daemon only re-registers an expression that differs from the
+        // stored one; a finished task left without a next run (e.g. the same
+        // expression sent again) has nothing for resume to schedule.
         const nextLine = task.enabled
           ? (task.nextRunAt ? fmt(task.nextRunAt) : '—')
           : task.disabledReason === 'once_completed'
-            ? '任务已结束，不会自动执行'
+            ? updates.schedule !== undefined && task.nextRunAt
+              ? `任务已结束；用 botmux schedule resume ${id} 按新频率重新开始`
+              : '任务已结束，不会自动执行'
             : '任务已暂停，恢复后按此频率执行';
         console.log(`   下次执行: ${nextLine}`);
         if (task.enabled && task.calendar !== undefined) {
@@ -12334,14 +12340,23 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       }
     : undefined;
   // Relay staging paths and mtimes are attempt-local. Durable final replay must
-  // identify images by bytes so the same sandbox request can recover after a
-  // lost relay response without being rejected as a different attachment.
-  const durableImageIdentities = currentTurnId && effectiveResponseKind === 'final'
-    ? await Promise.all(images.map(async image => {
-        const inspection = await inspectFileOnlyAttachment(image, [], true);
-        return { sha256: inspection.sha256! };
-      }))
-    : images.map(sendAttachmentIdentity);
+  // identify attachments by bytes so the same sandbox request can recover after
+  // a lost relay response without being rejected as a different attachment.
+  // A non-regular --files (one-shot FIFO) can only be read once, by the upload,
+  // so it keeps the stat identity; relay staging always writes regular files.
+  const durableFinal = !!currentTurnId && effectiveResponseKind === 'final';
+  const attachmentIdentity = async (path: string) => durableFinal && statSync(path).isFile()
+    ? { sha256: (await inspectFileOnlyAttachment(path, [], true)).sha256! }
+    : sendAttachmentIdentity(path);
+  const durableImageIdentities = await Promise.all(images.map(attachmentIdentity));
+  const durableFileIdentities = fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
+    ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
+    : await Promise.all(files.map(attachmentIdentity));
+  const durableVideoIdentities = await Promise.all(videoAttachments.map(async ({ videoPath, coverPath, durationMs }) => ({
+    video: await attachmentIdentity(videoPath),
+    cover: await attachmentIdentity(coverPath),
+    durationMs,
+  })));
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -12402,14 +12417,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     },
     attachments: {
       images: durableImageIdentities,
-      files: fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
-        ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
-        : files.map(sendAttachmentIdentity),
-      videos: videoAttachments.map(({ videoPath, coverPath, durationMs }) => ({
-        video: sendAttachmentIdentity(videoPath),
-        cover: sendAttachmentIdentity(coverPath),
-        durationMs,
-      })),
+      files: durableFileIdentities,
+      videos: durableVideoIdentities,
     },
   });
   try {

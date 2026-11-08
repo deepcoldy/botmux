@@ -79,6 +79,16 @@ export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
  * command. A Riff session always carries cliId `riff` (spawn-time CLI/backend
  * pairing, see remote-cli-ids), so the id stands for the backend here.
  *
+ * Residual boundary: this predicate keys on cliId, so a historical session row
+ * persisted before the pairing invariant (cliId other than `riff` while
+ * backendType is `riff`) would not match. Such a pairing cannot be constructed
+ * by current code, and the next spawn reconciles it via
+ * resolvePairedSpawnBackendType (persistent-backend → reconcilePairedBackendId):
+ * that cliId is not remote while the resolved backend is, so the second branch
+ * discards the remote backend and falls back to the daemon default (or `pty`
+ * when the default is itself remote). Until then only that stale row keeps the
+ * old, already-broken raw-passthrough behaviour.
+ *
  * ⚠️ This set lives in this dependency-free leaf — not in command-handler — so
  * the Lark card builder can gate its own `/compact` affordance on the SAME
  * predicate the router uses. Importing command-handler from card-builder would
