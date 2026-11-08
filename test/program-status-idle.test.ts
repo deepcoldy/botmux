@@ -236,6 +236,7 @@ describe('IdleDetector program status', () => {
     }
     expect(cb).not.toHaveBeenCalled();
     expect(detector.programStatusActive()).toBe(false);
+    expect(detector.programStatusQuietMs()).toBe(Number.POSITIVE_INFINITY);
 
     // Startup readiness stays on the screen heuristics.
     detector.feed('prompt ❯');

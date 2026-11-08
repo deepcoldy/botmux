@@ -324,6 +324,24 @@ describe('Pi paste submission', () => {
       expect(composer).toBe('');
     }
   });
+
+  it.each(['tmux', 'raw'] as const)('%s pastes content without a trailing backslash byte for byte', async (mode) => {
+    vi.useFakeTimers();
+    try {
+      for (const content of ['plain', 'a\\b', 'path\\\n', '第一行\n\n第二行 ', '\\ leading']) {
+        const pasted: string[] = [];
+        const pty: PtyHandle = mode === 'raw'
+          ? { write: text => { if (text !== '\r') pasted.push(text); } }
+          : { write: () => {}, pasteText: text => { pasted.push(text); }, sendSpecialKeys: () => true };
+        const write = createPiAdapter('/bin/pi').writeInput(pty, content);
+        await flushFakeTimers(2_000);
+        await write;
+        expect(pasted).toEqual([mode === 'raw' ? `\x1b[200~${content}\x1b[201~` : content]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('writeInput: single-line, tmux mode', () => {
