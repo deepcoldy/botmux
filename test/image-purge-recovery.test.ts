@@ -5,11 +5,11 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import {
-  holdPurgeRetryRefund,
+  holdPurgeClickRollback,
   planPurgeRequest,
   purgeOutcomeNotice,
   runPurgeMaintenance,
-  takePurgeRetryRefund,
+  takePurgeClickRollback,
   unpurgedNoticeKey,
   type PurgeRequestInput,
 } from '../src/services/image-purge-recovery.js';
@@ -148,14 +148,33 @@ describe('purgeOutcomeNotice', () => {
   });
 });
 
-describe('purge retry refund holder', () => {
-  it('hands the receipt back once, only for the held continuation turn', () => {
+describe('purge click rollback holder', () => {
+  const receipt = { turnId: 'om_failed', previousRetryCount: 0, stampedAt: '2026-08-21T10:00:05.000Z' };
+
+  it('hands the rollback back once, only for the held continuation turn', () => {
     const owner = {};
-    const receipt = { turnId: 'om_failed', previousRetryCount: 0, stampedAt: '2026-08-21T10:00:05.000Z' };
-    holdPurgeRetryRefund(owner, 'retry-1', receipt);
-    expect(takePurgeRetryRefund(owner, 'retry-other')).toBeUndefined();
-    expect(takePurgeRetryRefund({}, 'retry-1')).toBeUndefined();
-    expect(takePurgeRetryRefund(owner, 'retry-1')).toBe(receipt);
-    expect(takePurgeRetryRefund(owner, 'retry-1')).toBeUndefined();
+    const rollback = { receipt, restoreTurnState: () => {} };
+    holdPurgeClickRollback(owner, 'retry-1', rollback);
+    expect(takePurgeClickRollback(owner, 'retry-other')).toBeUndefined();
+    expect(takePurgeClickRollback({}, 'retry-1')).toBeUndefined();
+    expect(takePurgeClickRollback(owner, 'retry-1')).toBe(rollback);
+    expect(takePurgeClickRollback(owner, 'retry-1')).toBeUndefined();
+  });
+
+  it('keeps an earlier click held when a later click on the same session is taken first', () => {
+    const owner = {};
+    const first = { receipt, restoreTurnState: () => {} };
+    const second = { restoreTurnState: () => {} };
+    holdPurgeClickRollback(owner, 'retry-1', first);
+    holdPurgeClickRollback(owner, 'retry-2', second);
+    expect(takePurgeClickRollback(owner, 'retry-2')).toBe(second);
+    expect(takePurgeClickRollback(owner, 'retry-1')).toBe(first);
+  });
+
+  it('drops the oldest held clicks beyond a small bound', () => {
+    const owner = {};
+    for (let i = 0; i < 20; i++) holdPurgeClickRollback(owner, `retry-${i}`, { restoreTurnState: () => {} });
+    expect(takePurgeClickRollback(owner, 'retry-0')).toBeUndefined();
+    expect(takePurgeClickRollback(owner, 'retry-19')).toBeDefined();
   });
 });

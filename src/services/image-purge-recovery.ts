@@ -125,19 +125,32 @@ export function purgeOutcomeNotice(outcome: PurgeMaintenanceOutcome): PurgeOutco
   }
 }
 
-const heldRetryRefunds = new WeakMap<object, { turnId: string; receipt: RetryAttemptReceipt }>();
-
-/** Daemon side: remember the cooldown stamp of the latest purge click on this
- *  session. A worker rejection of that continuation turn means neither the
- *  purge nor the continuation ran, so the click gives its cooldown back. */
-export function holdPurgeRetryRefund(owner: object, turnId: string, receipt: RetryAttemptReceipt): void {
-  heldRetryRefunds.set(owner, { turnId, receipt });
+/** What a purge click changed on the daemon session, held until the worker
+ *  either takes the continuation or rejects it. A rejection means neither the
+ *  purge nor the continuation ran, so the click gives back its cooldown stamp
+ *  and the turn state it overwrote. */
+export interface PurgeClickRollback {
+  receipt?: RetryAttemptReceipt;
+  restoreTurnState: () => void;
 }
 
-/** One-shot: the held receipt for exactly this continuation turn, if any. */
-export function takePurgeRetryRefund(owner: object, turnId: string): RetryAttemptReceipt | undefined {
-  const held = heldRetryRefunds.get(owner);
-  if (!held || held.turnId !== turnId) return undefined;
-  heldRetryRefunds.delete(owner);
-  return held.receipt;
+const MAX_HELD_CLICKS_PER_SESSION = 8;
+const heldClickRollbacks = new WeakMap<object, Map<string, PurgeClickRollback>>();
+
+export function holdPurgeClickRollback(owner: object, turnId: string, rollback: PurgeClickRollback): void {
+  let held = heldClickRollbacks.get(owner);
+  if (!held) heldClickRollbacks.set(owner, held = new Map());
+  held.set(turnId, rollback);
+  for (const stale of held.keys()) {
+    if (held.size <= MAX_HELD_CLICKS_PER_SESSION) break;
+    held.delete(stale);
+  }
+}
+
+/** One-shot: the held rollback for exactly this continuation turn, if any. */
+export function takePurgeClickRollback(owner: object, turnId: string): PurgeClickRollback | undefined {
+  const held = heldClickRollbacks.get(owner);
+  const rollback = held?.get(turnId);
+  held?.delete(turnId);
+  return rollback;
 }

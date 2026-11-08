@@ -173,7 +173,7 @@ import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session, FailedTurnRecord } from '../src/types.js';
 import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
-import { takePurgeRetryRefund } from '../src/services/image-purge-recovery.js';
+import { takePurgeClickRollback } from '../src/services/image-purge-recovery.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -472,15 +472,53 @@ describe('purge_images_continue — behavioral dispatch', () => {
     expect(res?.toast?.type).toBe('success');
   });
 
-  it('holds the cooldown stamp so a worker rejection of that turn can refund it', async () => {
-    const ds = makeDs();
+  it('holds a rollback that refunds the cooldown and puts back the turn state the click replaced', async () => {
+    rememberLastCliInputMock.mockImplementation((target: DaemonSession, prompt: string, input: { content: string }, turnId: string) => {
+      target.suppressRecoveryCard = undefined;
+      target.lastUserPrompt = target.session.lastUserPrompt = prompt;
+      target.lastCliInput = target.session.lastCliInput = input.content;
+      target.lastCliInputTurnId = target.session.lastCliInputTurnId = turnId;
+    });
+    const earlier = { lastUserPrompt: 'earlier', lastCliInput: 'earlier input', lastCliInputTurnId: 'om_earlier' };
+    const ds = makeDs({
+      ...earlier,
+      lastScreenStatus: 'idle',
+      streamCardPending: false,
+      currentTurnTitle: 'earlier title',
+      currentImageKey: 'img_earlier',
+      suppressRecoveryCard: true,
+      sessionOverrides: earlier,
+    });
     await handleCardAction(actionData(TURN, null, 'purge_images_continue'), depsWith(ds), LARK_APP_ID);
     const retryTurnId = sendWorkerInputMock.mock.calls[0][2];
-    expect(takePurgeRetryRefund(ds, retryTurnId)).toMatchObject({
+    expect(ds).toMatchObject({ lastScreenStatus: 'working', streamCardPending: true, lastCliInputTurnId: retryTurnId });
+    const rollback = takePurgeClickRollback(ds, retryTurnId)!;
+    expect(rollback.receipt).toMatchObject({
       turnId: TURN,
       previousRetryCount: 0,
       stampedAt: ds.session.lastFailedTurn?.lastRetryAt,
     });
+    rollback.restoreTurnState();
+    expect(ds).toMatchObject({
+      ...earlier,
+      lastScreenStatus: 'idle',
+      streamCardPending: false,
+      currentTurnTitle: 'earlier title',
+      currentImageKey: 'img_earlier',
+      suppressRecoveryCard: true,
+    });
+    expect(ds.session).toMatchObject(earlier);
+  });
+
+  it('keeps screen state a worker update replaced after the click', async () => {
+    const ds = makeDs({ lastScreenStatus: 'limited', streamCardPending: true });
+    await handleCardAction(actionData(TURN, null, 'purge_images_continue'), depsWith(ds), LARK_APP_ID);
+    const retryTurnId = sendWorkerInputMock.mock.calls[0][2];
+    ds.lastScreenStatus = 'idle';
+    ds.streamCardPending = false;
+    takePurgeClickRollback(ds, retryTurnId)!.restoreTurnState();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.streamCardPending).toBe(false);
   });
 
   it('fails closed without a live worker and does not consume the retry lease', async () => {

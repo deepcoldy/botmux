@@ -94,7 +94,7 @@ import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { refundRetryAttempt } from '../services/failed-turn-retry.js';
-import { takePurgeRetryRefund } from '../services/image-purge-recovery.js';
+import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
 import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
@@ -18086,9 +18086,17 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
-        const purgeRefund = takePurgeRetryRefund(ds, msg.turnId);
-        if (purgeRefund && refundRetryAttempt(ds.session, purgeRefund)) {
-          logger.info(`[${t}] Refunded retry cooldown of rejected purge continuation ${msg.turnId} (${msg.reason})`);
+        const purgeClick = takePurgeClickRollback(ds, msg.turnId);
+        if (purgeClick) {
+          if (purgeClick.receipt && refundRetryAttempt(ds.session, purgeClick.receipt)) {
+            logger.info(`[${t}] Refunded retry cooldown of rejected purge continuation ${msg.turnId} (${msg.reason})`);
+          }
+          if (ds.lastCliInputTurnId === msg.turnId) {
+            const prevStatus = ds.lastScreenStatus;
+            purgeClick.restoreTurnState();
+            if (ds.lastScreenStatus !== prevStatus) stampIdleSinceAt(ds, prevStatus);
+            persistStreamCardState(ds);
+          }
           sessionStore.updateSession(ds.session);
         }
         if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);

@@ -165,7 +165,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { markRetryAttempt } from '../src/services/failed-turn-retry.js';
-import { holdPurgeRetryRefund, PURGE_IMAGES_NOT_APPLIED } from '../src/services/image-purge-recovery.js';
+import { holdPurgeClickRollback, PURGE_IMAGES_NOT_APPLIED } from '../src/services/image-purge-recovery.js';
 import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -6107,15 +6107,23 @@ describe('purge-and-continue on the daemon side', () => {
     });
   });
 
-  function purgeClickedDs(): DaemonSession {
-    const ds = makeDs();
+  function purgeClickedDs(): DaemonSession & { restoreTurnState: ReturnType<typeof vi.fn> } {
+    const ds = makeDs() as DaemonSession & { restoreTurnState: ReturnType<typeof vi.fn> };
     ds.adoptedFrom = undefined;
     ds.session.lastFailedTurn = {
       turnId: 'om_failed', userPrompt: 'p', cliInput: 'i', failedAt: new Date().toISOString(),
       status: 'failed', errorCode: 'provider_image_too_small', retryCount: 0,
     };
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
-    holdPurgeRetryRefund(ds, 'retry-purge', markRetryAttempt(ds.session)!);
+    ds.restoreTurnState = vi.fn(() => {
+      ds.lastCliInputTurnId = 'om_failed';
+      ds.lastScreenStatus = 'idle';
+      ds.streamCardPending = false;
+    });
+    holdPurgeClickRollback(ds, 'retry-purge', { receipt: markRetryAttempt(ds.session)!, restoreTurnState: ds.restoreTurnState });
+    ds.lastCliInputTurnId = 'retry-purge';
+    ds.lastScreenStatus = 'working';
+    ds.streamCardPending = true;
     return ds;
   }
 
@@ -6127,6 +6135,25 @@ describe('purge-and-continue on the daemon side', () => {
     expect(updateSessionMock).toHaveBeenCalledWith(ds.session);
   });
 
+  it('puts back the pre-click turn state while the rejected continuation is still the latest input', async () => {
+    const ds = purgeClickedDs();
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason: PURGE_IMAGES_NOT_APPLIED });
+    await vi.waitFor(() => expect(ds.restoreTurnState).toHaveBeenCalledTimes(1));
+    expect(ds.lastCliInputTurnId).toBe('om_failed');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.idleSinceAt).toEqual(expect.any(Number));
+  });
+
+  it('leaves newer input alone but still refunds when the rejection arrives late', async () => {
+    const ds = purgeClickedDs();
+    ds.lastCliInputTurnId = 'om_newer';
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason: PURGE_IMAGES_NOT_APPLIED });
+    await vi.waitFor(() => expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined());
+    expect(ds.restoreTurnState).not.toHaveBeenCalled();
+    expect(ds.lastCliInputTurnId).toBe('om_newer');
+    expect(ds.streamCardPending).toBe(true);
+  });
+
   it('keeps the cooldown when some other turn is rejected', async () => {
     const ds = purgeClickedDs();
     const stamped = ds.session.lastFailedTurn?.lastRetryAt;
@@ -6134,6 +6161,7 @@ describe('purge-and-continue on the daemon side', () => {
     await new Promise(resolve => setImmediate(resolve));
     expect(ds.session.lastFailedTurn?.lastRetryAt).toBe(stamped);
     expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+    expect(ds.restoreTurnState).not.toHaveBeenCalled();
   });
 
   it('refuses a purge request behind a queued activation instead of staging a plain continuation', () => {
