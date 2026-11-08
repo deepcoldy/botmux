@@ -233,6 +233,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
             if (name in ds.session) (created as unknown as Record<string, unknown>)[name] = structuredClone(ds.session[name as keyof Session]);
           }
           created.workingDir = ds.workingDir ?? ds.session.workingDir;
+          store.updateSession(created, { modelPinWrite: true });
           target = { session: created, worker: null, workerPort: null, workerToken: null,
             larkAppId: ds.larkAppId, chatId: ds.chatId, chatType: ds.chatType, scope: ds.scope,
             workingDir: created.workingDir, spawnedAt: Date.now(), cliVersion: ds.cliVersion,

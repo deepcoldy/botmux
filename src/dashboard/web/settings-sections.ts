@@ -19,7 +19,7 @@ export interface SettingsSection {
  */
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-access', module: 'settings.moduleGeneral', section: 'settings.sectionAccess', fields: ['settings.publicReadOnly', 'settings.remoteAccess', 'settings.oauthRedirectBase'] },
-  { id: 'settings-cards', module: 'settings.moduleGeneral', section: 'settings.sectionCards', fields: ['settings.cardBrandLabel', 'settings.openTerminalInFeishu', 'settings.enableLocalCliOpen', 'settings.localCliOpenMode'] },
+  { id: 'settings-cards', module: 'settings.moduleGeneral', section: 'settings.sectionCards', fields: ['settings.cardBrandLabel', 'settings.openTerminalInFeishu', 'settings.stuckCardInitiatorKeys', 'settings.enableLocalCliOpen', 'settings.localCliOpenMode'] },
   { id: 'settings-group-creation', module: 'settings.moduleGeneral', section: 'settings.sectionGroupCreation', fields: ['settings.groupNamePrefix'] },
   {
     id: 'settings-experimental',
@@ -45,6 +45,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-workflow', module: 'settings.moduleGeneral', section: 'settings.sectionWorkflow', fields: ['settings.workflowEnable', 'settings.workflowNodeExecutorBot', 'settings.workflowHandoffIdentity'] },
   { id: 'settings-multi-topic', module: 'settings.moduleGeneral', section: 'settings.sectionMultiTopic', fields: ['settings.multiTopicEnable'] },
   { id: 'settings-repo-picker', module: 'settings.moduleGeneral', section: 'settings.sectionRepoPicker', fields: ['settings.repoPickerMode'] },
+  { id: 'settings-worktree', module: 'settings.moduleGeneral', section: 'settings.sectionWorktree', fields: ['settings.worktreeRoot'] },
   { id: 'settings-schedule', module: 'settings.moduleGeneral', section: 'settings.sectionSchedule', fields: ['settings.scheduleTimeZone', 'settings.sessionCleanupEnable', 'settings.sessionCleanupArchiveCodex'] },
   { id: 'settings-prompt-cache', module: 'settings.moduleGeneral', section: 'settings.sectionPromptCache', fields: ['promptCache.ttl', 'promptCache.keepalive'] },
   // 表格型区块在「通用设置」的瀑布流之后单独占满一行，所以排在通用设置最后。

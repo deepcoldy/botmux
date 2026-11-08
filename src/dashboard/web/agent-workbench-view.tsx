@@ -1,4 +1,5 @@
 import type React from 'react';
+import { botDisplayName } from './ui.js';
 import {
   useCallback,
   useEffect,
@@ -554,7 +555,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): React.JSX.El
         <div className="wb-workspace-title">
           <span>
             <strong title={String(selected.title || selected.sessionId)}>{String(selected.title || selected.sessionId)}</strong>
-            <small>{selected.botName || selected.larkAppId || 'Bot'} · {selected.cliId || '未知'} · {selected.repoName || '无仓库'}</small>
+            <small>{selected.botName || selected.larkAppId ? botDisplayName(selected) : 'Bot'} · {selected.cliId || '未知'} · {selected.repoName || '无仓库'}</small>
           </span>
         </div>
         <div className="wb-workspace-controls">

@@ -343,6 +343,13 @@ export interface BridgeGateInput {
    *  local-typing suppression — while the NOTHING_TO_SEND check above and the
    *  send-marker dedup below still apply exactly as for ordinary turns. */
   isScheduled?: boolean;
+  /** Claude bridge queue only (Codex callers never set it): a headless turn
+   *  opened by a live background-task `<task-notification>` launched inside a
+   *  Lark turn. Under replyDelivery 'transcript' the final is the session's
+   *  only reply channel, so it bypasses the local-typing suppression exactly
+   *  like {@link isScheduled}; under 'send' it stays an ordinary local turn
+   *  (the model `botmux send`s what matters itself). */
+  isBackgroundWake?: boolean;
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
@@ -519,21 +526,25 @@ function markerMatchesExactTurn(turn: BridgeGateInput, marker: BridgeSendMarker)
  * The CLI's explicit send can still carry the first input's authority while
  * the transcript terminal belongs to its successor. The queue records this
  * relation only after matching a native turn id. Do not widen the time window
- * or accept progress credit from any of these earlier inputs. */
+ * or accept progress credit from any of these earlier inputs. An empty normal
+ * completion has no body to compare: its explicit final receipt still proves
+ * delivery, provided it was sent after the latest folded input was processed. */
 function markerMatchesSupersededFinal(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
   const normalizedFinal = normaliseForFingerprint(bridgePostText(turn.finalText ?? '', false));
   // Same-native evidence does not make an earlier answer cover a later human
   // request. Require a completed body sent after the successor input, and an
-  // exact body proof. Durable attempts keep their separate recovery owner.
-  if (!normalizedFinal || turn.markTimeMs === undefined || !Number.isFinite(turn.markTimeMs)
+  // exact body proof for non-empty output. Durable attempts keep their separate recovery owner.
+  if (turn.markTimeMs === undefined || !Number.isFinite(turn.markTimeMs)
     || !Number.isFinite(marker.sentAtMs) || marker.sentAtMs < turn.markTimeMs
     || turn.dispatchAttempt !== undefined || marker.dispatchAttempt !== undefined) return false;
-  const sameBody = marker.contentHash !== undefined
+  const emptyCompletion = turn.finalText !== undefined && !normalizedFinal
+    && (turn.terminalStatus === undefined || turn.terminalStatus === 'completed');
+  const sameBody = !!normalizedFinal && (marker.contentHash !== undefined
     ? marker.contentHash === createHash('sha256').update(normalizedFinal).digest('hex')
     : typeof marker.previewText === 'string'
       && marker.contentLength === normalizedFinal.length
-      && normaliseForFingerprint(marker.previewText) === normalizedFinal;
-  return sameBody
+      && normaliseForFingerprint(marker.previewText) === normalizedFinal);
+  return (emptyCompletion || sameBody)
     && !!turn.turnId
     && !!turn.sessionId
     && marker.sessionId === turn.sessionId
@@ -666,7 +677,8 @@ export function shouldSuppressBridgeEmit(
   // Built-in scheduled turns are isLocal but user-scheduled: their final
   // belongs in the Lark thread. The marker rules below still dedup an explicit
   // `botmux send` and the NOTHING_TO_SEND check above already ran.
-  if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled) return true;
+  const forwardedWake = turn.isBackgroundWake === true && replyDelivery === 'transcript';
+  if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled && !forwardedWake) return true;
   if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
     && turn.terminalStatus !== 'completed') return true;
   // Headless backends (notably Remote Runner) do not always own a transcript
@@ -729,7 +741,7 @@ export function shouldSuppressBridgeEmit(
   // can run. Defer — the caller re-evaluates WITH finalText. An explicit
   // responseKind:'final' marker above already returned true, so a declared
   // final send still dedups even pre-text.
-  if (turn.isScheduled && turn.finalText === undefined) return false;
+  if ((turn.isScheduled || forwardedWake) && turn.finalText === undefined) return false;
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:

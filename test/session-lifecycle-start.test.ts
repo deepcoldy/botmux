@@ -1,3 +1,8 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件的会话启动链路会经 ensureCliSkills 往 homedir() 推导的目录装 CLI 钩子和配置
+// （~/.config/opencode/plugin/botmux-ask.js、~/.trae/traecli.toml、~/.codex/config.toml）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，真实的 opencode 插件就是这样被改写的。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { EventEmitter, once } from 'node:events';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
@@ -15,6 +20,9 @@ const {
   checkWorkerAdmissionMock,
   standaloneBinaryMock,
   tmuxProbeMock,
+  collectProtectedHttpEgressPoliciesMock,
+  resolveProtectedHttpEgressTargetsMock,
+  loggerErrorMock,
 } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
@@ -22,7 +30,19 @@ const {
   checkWorkerAdmissionMock: vi.fn(),
   standaloneBinaryMock: vi.fn(() => false),
   tmuxProbeMock: vi.fn(() => 'exists' as const),
+  collectProtectedHttpEgressPoliciesMock: vi.fn(() => [] as any[]),
+  resolveProtectedHttpEgressTargetsMock: vi.fn(),
+  loggerErrorMock: vi.fn(),
 }));
+
+vi.mock('../src/core/protected-http-egress.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/protected-http-egress.js')>();
+  return {
+    ...actual,
+    collectProtectedHttpEgressPolicies: (...args: unknown[]) => collectProtectedHttpEgressPoliciesMock(...args),
+    resolveProtectedHttpEgressTargets: (...args: unknown[]) => resolveProtectedHttpEgressTargetsMock(...args),
+  };
+});
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -144,6 +164,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
+  getSessionFresh: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
 }));
@@ -193,7 +214,7 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: loggerErrorMock },
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -277,12 +298,18 @@ import { readWorkerProcessStart } from '../src/core/session-worker-identity.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
 import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+
+// 上面那些钩子和配置都按 homedir() 落盘：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 // The session working directory these fixtures point at. It must exist:
 // forkWorker refuses to start a CLI whose directory is gone (it no longer falls
@@ -354,6 +381,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
+  vi.mocked(sessionStore.getSessionFresh).mockReturnValue(undefined);
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
   vi.mocked(sessionStore.updateSessionPid).mockImplementation(() => undefined);
   tmuxProbeMock.mockReturnValue('exists');
@@ -363,6 +391,8 @@ beforeEach(() => {
   restartCounts.clear();
   standaloneBinaryMock.mockReturnValue(false);
   forkMock.mockImplementation(() => makeFakeWorker());
+  collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+  resolveProtectedHttpEgressTargetsMock.mockReset();
   checkWorkerAdmissionMock.mockReturnValue({
     allowed: true,
     reasons: [],
@@ -394,6 +424,1162 @@ afterEach(() => {
   disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
   setActiveSessionsRegistry(undefined);
   setLinkRefRuntime(undefined);
+});
+
+describe('protected MCP env stays out of ordinary worker IPC', () => {
+  it.each(['normal', 'adopt'])('redacts newly configured rejected env-source names from %s fork inheritance and worker policy', mode => {
+    const trustedHome = mkdtempSync(join(tmpdir(), 'botmux-live-redaction-home-'));
+    const configPath = join(trustedHome, 'global.json');
+    vi.stubEnv('HOME', trustedHome);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configPath);
+    vi.stubEnv('BOTMUX_SANDBOX', '0');
+    vi.stubEnv('FIXTURE_LIVE_LEGACY_SECRET', 'inherited-legacy-secret');
+    vi.stubEnv('FIXTURE_LIVE_REDACTED', 'inherited-redacted-secret');
+    try {
+      writeFileSync(configPath, '{}');
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().protectedMcpCapabilities).toBeUndefined();
+      // The daemon is already running when an operator adds a rejected legacy
+      // source. Its recognizable names still need to reach the actual fork.
+      writeFileSync(configPath, JSON.stringify({ protectedMcpCapabilities: {
+        legacy: {
+          secret: { source: 'env', name: 'FIXTURE_LIVE_LEGACY_SECRET' },
+          isolation: { redactEnv: ['FIXTURE_LIVE_REDACTED'] },
+        },
+      } }));
+      invalidateGlobalConfigCache();
+      vi.mocked(getBot).mockImplementation(() => defaultBot({
+        env: { FIXTURE_LIVE_LEGACY_SECRET: 'bot-reintroduced-secret', SAFE_VISIBLE_VALUE: 'visible' },
+      }));
+      const ds = makeDs(mode === 'adopt' ? {
+        adoptedFrom: {
+          tmuxTarget: 'bmx-live-redaction:0.0', originalCliPid: 23456,
+          sessionId: 'fixture-adopted', cliId: 'codex', cwd: REPO,
+        },
+      } : undefined);
+      if (mode === 'adopt') forkAdoptWorker(ds, { prompt: 'live env redaction' });
+      else forkWorker(ds, 'live env redaction');
+      const env = forkMock.mock.calls.at(-1)![2].env;
+      const init = (ds.worker as any).send.mock.calls[0][0];
+      expect(env.FIXTURE_LIVE_LEGACY_SECRET).toBeUndefined();
+      expect(env.FIXTURE_LIVE_REDACTED).toBeUndefined();
+      expect(init.protectedMcpPolicy.redactEnv).toEqual(expect.arrayContaining([
+        'FIXTURE_LIVE_LEGACY_SECRET', 'FIXTURE_LIVE_REDACTED',
+      ]));
+      expect(init.env?.FIXTURE_LIVE_LEGACY_SECRET).toBeUndefined();
+      if (mode === 'normal') expect(init.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
+      expect(JSON.stringify(init)).not.toContain('bot-reintroduced-secret');
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+      rmSync(trustedHome, { recursive: true, force: true });
+    }
+  });
+
+  it('removes daemon-protected values from the initial worker payload after live bot reinjection', () => {
+    const trustedHome = mkdtempSync(join(tmpdir(), 'botmux-lifecycle-secret-home-'));
+    const configPath = join(trustedHome, '.botmux', 'config.json');
+    mkdirSync(join(trustedHome, '.botmux', 'protected-secrets'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(trustedHome, '.botmux', 'protected-secrets', 'fixture.key'),
+      'fixture-file-secret', { mode: 0o600 });
+    writeFileSync(configPath, JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          enabled: true,
+          allowedPluginIds: ['demo'],
+          secret: { source: 'file', path: '.botmux/protected-secrets/fixture.key' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: { redactEnv: ['FIXTURE_PROTECTED_SECRET', 'FIXTURE_PROTECTED_REDACTED'] },
+        },
+      },
+    }), { mode: 0o600 });
+    vi.stubEnv('HOME', trustedHome);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configPath);
+    try {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({
+        env: {
+          FIXTURE_PROTECTED_SECRET: 'reintroduced-secret',
+          FIXTURE_PROTECTED_REDACTED: 'reintroduced-token',
+          SAFE_VISIBLE_VALUE: 'visible',
+        },
+      }));
+      const ds = makeDs();
+
+      forkWorker(ds, 'ordinary protected env payload', { turnId: 'om_protected_init' });
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(init.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
+      expect(JSON.stringify(init)).not.toContain('reintroduced-secret');
+      expect(JSON.stringify(init)).not.toContain('reintroduced-token');
+      expect(JSON.stringify(init)).not.toContain('fixture-file-secret');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(trustedHome, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('protected HTTP egress policy freezing at worker preparation', () => {
+  const policy = {
+    id: 'fixture.write.v1',
+    targets: [{
+      scheme: 'https' as const,
+      host: 'fixture.internal.example',
+      port: 443,
+      denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+    }],
+  };
+
+  it('rejects feedback maintenance before reading bot configuration or starting protected DNS', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-maintenance-before-freeze-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      writeFileSync(join(dataDir, 'feedback-maintenance.json'), JSON.stringify({
+        migrationId: 'fixture', state: 'draining', generation: 1,
+        participants: [], blockers: [],
+      }));
+      const ds = makeDs();
+      const onAdmission = vi.fn();
+
+      expect(forkWorker(ds, 'maintenance opening', false, { onAdmission })).toBe(false);
+
+      expect(onAdmission.mock.calls).toEqual([['rejected']]);
+      expect(getBot).not.toHaveBeenCalled();
+      expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+      expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rechecks feedback maintenance after DNS before persisting a policy or creating a worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-maintenance-during-freeze-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    let resolveDns!: (addresses: string[][]) => void;
+    const dns = new Promise<string[][]>(resolve => { resolveDns = resolve; });
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(dns);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    try {
+      const ds = makeDs();
+      const onAdmission = vi.fn();
+
+      expect(forkWorker(ds, 'opening before maintenance', false, { onAdmission })).toBe(true);
+      expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+      expect(forkMock).not.toHaveBeenCalled();
+      writeFileSync(join(dataDir, 'feedback-maintenance.json'), JSON.stringify({
+        migrationId: 'fixture', state: 'draining', generation: 1,
+        participants: [], blockers: [],
+      }));
+      resolveDns([['10.20.30.40']]);
+      await vi.waitFor(() => expect(onAdmission.mock.calls).toEqual([['rejected']]));
+
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    } finally {
+      resolveDns([['10.20.30.40']]);
+      await dns;
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('freezes the enabled plugin policy into worker init even when no actor capability is enabled', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40', '2001:db8::40']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'protected egress', { turnId: 'om_egress_init' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.protectedHttpEgressPolicy).toEqual({
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40', '2001:db8::40']],
+    });
+    expect(init.protectedLoopbackProxyAttestation).toEqual({
+      secret: expect.stringMatching(/^[a-f0-9]{64}$/),
+      workerGeneration: ds.workerGeneration,
+    });
+    expect(ds.protectedLoopbackProxyAttestation).toEqual(init.protectedLoopbackProxyAttestation);
+    expect(JSON.stringify(init.env ?? {})).not.toContain(init.protectedLoopbackProxyAttestation.secret);
+    expect(init.protectedMcpPolicy.capabilities).toEqual([]);
+  });
+
+  it('does not retrofit a newly enabled protected egress policy onto a legacy resumed session', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    const ds = makeDs({ hasHistory: true });
+
+    expect(forkWorker(ds, 'legacy resume', true)).toBe(true);
+
+    expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    }));
+  });
+
+  it('freezes the absence of protected egress on a fresh session', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'fresh unprotected session', { turnId: 'om_unprotected' })).toBe(true);
+
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    }));
+  });
+
+  it('persists the frozen protected egress policy on a fresh session', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'fresh protected session', { turnId: 'om_fresh' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    expect(ds.session.protectedHttpEgressPolicy).toEqual({
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    });
+  });
+
+  it('reuses a session-frozen protected egress policy without resolving DNS again', () => {
+    const frozen = {
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    };
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'replacement-plugin',
+      capabilityId: 'replacement.actor-write.v1',
+      policy: { ...policy, id: 'replacement.write.v1' },
+      policyDigest: 'e'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.99.99.99']]);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.protectedHttpEgressPolicy = structuredClone(frozen);
+
+    expect(forkWorker(ds, 'protected resume', true)).toBe(true);
+
+    expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: frozen,
+    }));
+  });
+
+  it('keeps a session-frozen absence when a policy is enabled before resume', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.protectedHttpEgressPolicy = null;
+
+    expect(forkWorker(ds, 'unprotected resume', { resume: true })).toBe(true);
+
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    const worker = forkMock.mock.results[0]!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toMatchObject({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    });
+  });
+
+  it('fails closed before child creation when the protected egress freeze cannot be persisted', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.protectedHttpEgressPolicy !== undefined) {
+        throw new Error('protected egress disk full');
+      }
+    });
+    const ds = makeDs();
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'protected persistence failure', { turnId: 'om_persist_fail' }, {
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('protected egress disk full'),
+      turnId: 'om_persist_fail',
+    }));
+    expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a durable protected egress policy reloaded after a concurrent freeze conflict', async () => {
+    const currentPolicy = {
+      pluginId: 'current-plugin',
+      capabilityId: 'current.actor-write.v1',
+      policy: { ...policy, id: 'current.write.v1' },
+      policyDigest: 'c'.repeat(64),
+    };
+    const durablePolicy = {
+      pluginId: 'durable-plugin',
+      capabilityId: 'durable.actor-write.v1',
+      policy: { ...policy, id: 'durable.write.v1' },
+      policyDigest: 'a'.repeat(64),
+      frozenAddresses: [['10.10.10.10']],
+    };
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([currentPolicy]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['current-plugin'] }));
+    const ds = makeDs();
+    const blocked = vi.fn();
+    let firstFreeze = true;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (firstFreeze && session.protectedHttpEgressPolicy !== undefined) {
+        firstFreeze = false;
+        session.protectedHttpEgressPolicy = structuredClone(durablePolicy);
+        throw new Error('Session changed concurrently; routing write refused');
+      }
+    });
+
+    expect(forkWorker(ds, 'first', { turnId: 'om_first' }, {
+      onAdmissionBlocked: blocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(blocked).toHaveBeenCalled());
+    expect(ds.session.protectedHttpEgressPolicy).toEqual(durablePolicy);
+
+    expect(forkWorker(ds, 'retry', { turnId: 'om_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(forkMock.mock.results[0]!.value.send).mock.calls[0][0])
+      .toEqual(expect.objectContaining({ protectedHttpEgressPolicy: durablePolicy }));
+  });
+
+  it('keeps a durable frozen absence reloaded after a concurrent freeze conflict', () => {
+    const ds = makeDs();
+    vi.mocked(sessionStore.getSessionFresh).mockImplementation(() => ({
+      ...structuredClone(ds.session),
+      protectedHttpEgressPolicy: null,
+    }));
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.protectedHttpEgressPolicy === null) {
+        throw new Error('Session changed concurrently; routing write refused');
+      }
+    });
+
+    expect(() => forkWorker(ds, 'concurrent unprotected freeze', { turnId: 'om_null_conflict' }))
+      .toThrow('Session changed concurrently; routing write refused');
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before forking when more than one enabled plugin declares a policy', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([
+      {
+        pluginId: 'fixture-one',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: '1'.repeat(64),
+      },
+      {
+        pluginId: 'fixture-two',
+        capabilityId: 'fixture.other-actor-write.v1',
+        policy: { ...policy, id: 'fixture.other.v1' },
+        policyDigest: '2'.repeat(64),
+      },
+    ]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-one', 'fixture-two'] }));
+
+    expect(() => forkWorker(makeDs(), 'ambiguous egress', { turnId: 'om_egress_many' }))
+      .toThrow('multiple_protected_http_egress_policies');
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+  });
+
+  it('surfaces DNS freeze failure through the caller-owned admission notice lane', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockRejectedValue(new Error('dns unavailable'));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const onAdmission = vi.fn();
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(makeDs(), 'protected egress', { turnId: 'om_egress_dns' }, {
+      onAdmission,
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmission).toHaveBeenCalledWith('rejected'));
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+      turnId: 'om_egress_dns',
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('removes DNS followers before rejecting them when target resolution fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let failLookup!: (error: Error) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise((_, reject) => {
+      failLookup = reject;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const durabilityEvents: string[] = [];
+    const followerBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'opening', { turnId: 'om_dns_opening' })).toBe(true);
+    expect(forkWorker(ds, 'follower', { turnId: 'om_dns_follower' }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (!session.queuedActivationTail?.some(entry => entry.id === followerTailId)) {
+        durabilityEvents.push('cleanup persisted');
+      }
+    });
+
+    failLookup(new Error('dns unavailable'));
+    await vi.waitFor(() => expect(followerAdmissions).toEqual(['deferred', 'rejected']));
+
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+      turnId: 'om_dns_follower',
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('durably queues a concurrent input behind one pending DNS freeze and forks exactly once', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const firstAdmission = vi.fn();
+    const secondAdmission = vi.fn();
+
+    expect(forkWorker(ds, 'first protected turn', { turnId: 'om_egress_first' }, {
+      onAdmission: firstAdmission,
+    })).toBe(true);
+    expect(forkWorker(ds, 'second protected turn', {
+      turnId: 'om_egress_second',
+    }, { onAdmission: secondAdmission })).toBe(true);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        userPrompt: 'second protected turn',
+        turnId: 'om_egress_second',
+        cliInput: expect.objectContaining({ content: 'second protected turn' }),
+      }),
+    ]);
+    expect(secondAdmission).toHaveBeenCalledWith('deferred');
+
+    finishLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const worker = forkMock.mock.results[0]!.value;
+    expect(secondAdmission).toHaveBeenLastCalledWith('deferred');
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await vi.waitFor(() => expect(secondAdmission).toHaveBeenLastCalledWith('accepted'));
+    const businessMessages = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message.type !== 'worker_ipc_probe');
+    expect(businessMessages[0]).toMatchObject({
+      type: 'init',
+      prompt: 'first protected turn',
+      turnId: 'om_egress_first',
+    });
+    expect(businessMessages[1]).toMatchObject({
+      type: 'message',
+      content: 'second protected turn',
+      turnId: 'om_egress_second',
+    });
+  });
+
+  it.each([true, { resume: true, turnId: 'om_dns_resume' }] as const)(
+    'keeps a nonempty resume behind the pending DNS freeze (%j)', async resume => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-dns-resume-${typeof resume}`;
+      const admissions: string[] = [];
+
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_dns_opening' });
+      // Resume observers reuse the in-flight snapshot even if live plugins
+      // have changed; re-reading them would lose the pending opening's policy.
+      collectProtectedHttpEgressPoliciesMock.mockImplementation(() => {
+        throw new Error('resume must reuse pending policy');
+      });
+      forkWorker(ds, 'resumed follower', resume, {
+        onAdmission: admission => admissions.push(admission),
+      });
+      const beforeDns = {
+        worker: ds.worker,
+        policy: ds.session.protectedHttpEgressPolicy,
+        tail: structuredClone(ds.session.queuedActivationTail),
+        admissions: [...admissions],
+      };
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(beforeDns.worker).toBeNull();
+      expect(beforeDns.policy).toBeUndefined();
+      expect(beforeDns.admissions).toEqual(['deferred']);
+      expect(beforeDns.tail).toEqual([
+        expect.objectContaining({ userPrompt: 'resumed follower' }),
+      ]);
+      expect(admissions).toEqual(['deferred', 'accepted']);
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      expect(collectProtectedHttpEgressPoliciesMock).toHaveBeenCalledTimes(1);
+      expect(ds.session.protectedHttpEgressPolicy).toMatchObject({
+        pluginId: 'fixture-plugin',
+        policyDigest: 'd'.repeat(64),
+        frozenAddresses: [['10.20.30.40']],
+      });
+      const messages = vi.mocked(worker.send).mock.calls
+        .map(call => call[0]).filter(message => message.type !== 'worker_ipc_probe');
+      expect(messages).toEqual([
+        expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+        expect.objectContaining({ type: 'message', content: 'resumed follower' }),
+      ]);
+    },
+  );
+
+  it.each([true, { resume: true }, false] as const)(
+    'accepts an empty DNS waiter after the opening worker bootstraps (%j)', async resume => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-empty-dns-waiter-${JSON.stringify(resume)}`;
+      const admissions: string[] = [];
+
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_empty_waiter_opening' });
+      forkWorker(ds, '', resume, { onAdmission: admission => admissions.push(admission) });
+      const beforeDns = { worker: ds.worker, admissions: [...admissions] };
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      const beforeBootstrap = [...admissions];
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(beforeDns).toEqual({ worker: null, admissions: ['deferred'] });
+      expect(beforeBootstrap).toEqual(['deferred']);
+      expect(admissions).toEqual(['deferred', 'accepted']);
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+        .filter(message => message.type !== 'worker_ipc_probe')).toEqual([
+        expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+      ]);
+    },
+  );
+
+  it('rejects both resume messages and empty resume observers when pending DNS fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let failLookup!: (error: Error) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise((_, reject) => {
+      failLookup = reject;
+    }));
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-dns-resume-failure';
+    const messageAdmissions: string[] = [];
+    const observerAdmissions: string[] = [];
+    const messageBlocked = vi.fn();
+    const observerBlocked = vi.fn();
+    const persistedTails: Array<typeof ds.session.queuedActivationTail> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persistedTails.push(structuredClone(session.queuedActivationTail));
+    });
+
+    forkWorker(ds, 'opening protected turn', { turnId: 'om_resume_failure_opening' });
+    forkWorker(ds, 'resume message', { resume: true, turnId: 'om_resume_message' }, {
+      onAdmission: admission => messageAdmissions.push(admission),
+      onAdmissionBlocked: messageBlocked,
+    });
+    let observerError: unknown;
+    try {
+      forkWorker(ds, '', true, {
+        onAdmission: admission => observerAdmissions.push(admission),
+        onAdmissionBlocked: observerBlocked,
+      });
+    } catch (error) {
+      observerError = error;
+    }
+    const beforeFailure = {
+      message: [...messageAdmissions], observer: [...observerAdmissions], worker: ds.worker,
+    };
+    failLookup(new Error('dns unavailable'));
+    await Promise.resolve();
+
+    expect(observerError).toBeUndefined();
+    expect(beforeFailure).toEqual({ message: ['deferred'], observer: ['deferred'], worker: null });
+    expect(messageAdmissions).toEqual(['deferred', 'rejected']);
+    expect(observerAdmissions).toEqual(['deferred', 'rejected']);
+    expect(persistedTails).toContainEqual([
+      expect.objectContaining({ userPrompt: 'resume message', turnId: 'om_resume_message' }),
+    ]);
+    expect(persistedTails.at(-1)).toBeUndefined();
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    expect(messageBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'), turnId: 'om_resume_message',
+    }));
+    expect(observerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts an empty resume observer even when a message follower cannot be durably promoted', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-empty-resume-promotion-failure';
+    const messageAdmissions: string[] = [];
+    const observerAdmissions: string[] = [];
+
+    forkWorker(ds, 'opening protected turn', { turnId: 'om_promotion_opening' });
+    forkWorker(ds, 'durable message follower', { turnId: 'om_promotion_follower' }, {
+      onAdmission: admission => messageAdmissions.push(admission),
+    });
+    forkWorker(ds, '', { resume: true }, {
+      onAdmission: admission => observerAdmissions.push(admission),
+    });
+    finishLookup([['10.20.30.40']]);
+    await Promise.resolve();
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.queuedActivationPending) throw new Error('promotion disk full');
+    });
+    const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await Promise.resolve();
+
+    expect(observerAdmissions).toEqual(['deferred', 'accepted']);
+    expect(messageAdmissions).toEqual(['deferred', 'rejected']);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ userPrompt: 'durable message follower', turnId: 'om_promotion_follower' }),
+    ]);
+    expect(ds.session.queuedActivationPending).toBeFalsy();
+    expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+      .filter(message => message.type !== 'worker_ipc_probe')).toEqual([
+      expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+    ]);
+  });
+
+  it.each([null, { pluginId: 'replacement-plugin', policyDigest: 'e'.repeat(64) }] as const)(
+    'keeps the frozen policy conflict guard ahead of pending resume admission (%j)', async replacement => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-dns-frozen-conflict-${replacement === null ? 'null' : 'object'}`;
+      const onAdmission = vi.fn();
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_conflict_opening' });
+      ds.session.protectedHttpEgressPolicy = replacement === null ? null : {
+        ...replacement, capabilityId: 'replacement.actor.v1', policy,
+        frozenAddresses: [['10.99.99.99']],
+      };
+      let resumeError: unknown;
+      try {
+        forkWorker(ds, 'conflicting resume', true, { onAdmission });
+      } catch (error) {
+        resumeError = error;
+      }
+      delete ds.session.protectedHttpEgressPolicy;
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(resumeError).toEqual(new Error('protected_http_egress_policy_changed_during_freeze'));
+      expect(onAdmission).not.toHaveBeenCalled();
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('refuses an ordinary follower when the pending DNS policy is disabled in live config', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-dns-policy-disabled';
+    const onAdmission = vi.fn();
+
+    forkWorker(ds, 'opening protected turn', { turnId: 'om_disabled_opening' });
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+    let followerError: unknown;
+    try {
+      forkWorker(ds, 'ordinary follower', { turnId: 'om_disabled_follower' }, { onAdmission });
+    } catch (error) {
+      followerError = error;
+    }
+    const beforeDns = { worker: ds.worker, policy: ds.session.protectedHttpEgressPolicy };
+    finishLookup([['10.20.30.40']]);
+    await Promise.resolve();
+    const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await Promise.resolve();
+
+    expect(beforeDns).toEqual({ worker: null, policy: undefined });
+    expect(followerError).toEqual(new Error('protected_http_egress_policy_changed_during_freeze'));
+    expect(onAdmission).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.session.protectedHttpEgressPolicy).toMatchObject({
+      pluginId: 'fixture-plugin', policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    });
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+      .filter(message => message.type !== 'worker_ipc_probe')).toEqual([
+      expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+    ]);
+  });
+
+  it.each(['accepted', 'rejected'] as const)(
+    'settles DNS waiters before an admission callback synchronously reenters forkWorker (%s)', async outcome => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-dns-callback-reentry-${outcome}`;
+      const observerAdmissions: string[] = [];
+      const followerAdmissions: string[] = [];
+
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_callback_opening' });
+      forkWorker(ds, outcome === 'accepted' ? '' : 'failed promotion follower', { resume: true }, {
+        onAdmission: admission => {
+          observerAdmissions.push(admission);
+          if (admission === outcome) {
+            forkWorker(ds, 'reentered follower', { turnId: 'om_callback_reentered' }, {
+              onAdmission: next => followerAdmissions.push(next),
+            });
+          }
+        },
+      });
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      if (outcome === 'rejected') {
+        let failPromotion = true;
+        vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+          if (failPromotion && session.queuedActivationPending) {
+            failPromotion = false;
+            throw new Error('promotion disk full');
+          }
+        });
+      }
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(observerAdmissions).toEqual(['deferred', outcome]);
+      expect(followerAdmissions).toEqual(outcome === 'accepted' ? ['accepted'] : ['deferred']);
+      // With no durable owner the ordinary fork path may replace the worker;
+      // its new init must carry the reentered input instead of parking it in a
+      // settled DNS tail. A retained activation tail must keep the same FIFO.
+      if (ds.worker !== worker) {
+        ds.worker!.emit('message', { type: 'worker_ipc_ready' });
+        await Promise.resolve();
+      }
+      if (outcome === 'rejected') {
+        expect(ds.session.queuedActivationTail?.map(entry => entry.userPrompt))
+          .toEqual(['failed promotion follower', 'reentered follower']);
+        expect(promoteQueuedActivationTail(ds)).toBe(true);
+        worker.emit('message', {
+          type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+          activationToken: ds.session.queuedActivationToken,
+        });
+        await Promise.resolve();
+        expect(promoteQueuedActivationTail(ds)).toBe(true);
+      }
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      expect(forkMock.mock.results.flatMap(result =>
+        vi.mocked(result.value.send).mock.calls.map(call => call[0]))
+        .filter(message => message.type === 'message'
+          || (message.type === 'init' && message.prompt !== 'opening protected turn'))
+        .map(message => message.type === 'init' ? message.prompt : message.content))
+        .toEqual(outcome === 'accepted'
+          ? ['reentered follower'] : ['failed promotion follower', 'reentered follower']);
+    },
+  );
+
+  it('rejects and removes DNS followers when the standalone worker exits before IPC bootstrap', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishFirstLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock
+      .mockReturnValueOnce(new Promise(resolve => {
+        finishFirstLookup = resolve;
+      }))
+      .mockResolvedValueOnce([['10.20.30.41']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const firstFollowerAdmission = vi.fn();
+    const secondFollowerAdmission = vi.fn();
+
+    expect(forkWorker(ds, 'opening protected turn', { turnId: 'om_egress_opening' })).toBe(true);
+    expect(forkWorker(ds, 'first queued protected follower', {
+      turnId: 'om_egress_follower_1',
+    }, { onAdmission: firstFollowerAdmission })).toBe(true);
+    expect(forkWorker(ds, 'second queued protected follower', {
+      turnId: 'om_egress_follower_2',
+    }, { onAdmission: secondFollowerAdmission })).toBe(true);
+    expect(firstFollowerAdmission).toHaveBeenCalledWith('deferred');
+    expect(secondFollowerAdmission).toHaveBeenCalledWith('deferred');
+    const followerTailIds = ds.session.queuedActivationTail?.map(entry => entry.id) ?? [];
+    expect(followerTailIds).toHaveLength(2);
+    const unrelatedTail = admitQueuedActivationTail(ds, {
+      userPrompt: 'unrelated queued turn',
+      cliInput: { content: 'unrelated queued turn' },
+      turnId: 'om_unrelated_tail',
+    });
+
+    finishFirstLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const persistedTailsAfterExit: Array<typeof ds.session.queuedActivationTail> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persistedTailsAfterExit.push(structuredClone(session.queuedActivationTail));
+    });
+    const firstWorker = forkMock.mock.results[0]!.value;
+    firstWorker.emit('exit', 1, null);
+
+    await vi.waitFor(() => expect(firstFollowerAdmission).toHaveBeenLastCalledWith('rejected'));
+    expect(secondFollowerAdmission).toHaveBeenLastCalledWith('rejected');
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ id: unrelatedTail.id, turnId: 'om_unrelated_tail' }),
+    ]);
+    expect(ds.session.queuedActivationTail?.some(entry => followerTailIds.includes(entry.id))).toBe(false);
+    expect(persistedTailsAfterExit).toContainEqual([
+      expect.objectContaining({ id: unrelatedTail.id, turnId: 'om_unrelated_tail' }),
+    ]);
+
+    expect(forkWorker(ds, 'retry protected turn', { turnId: 'om_egress_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    const retryWorker = forkMock.mock.results[1]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+  });
+
+  it('keeps a failed pre-ready follower cleanup pending until a later fork persists it', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishFirstLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock
+      .mockReturnValueOnce(new Promise(resolve => {
+        finishFirstLookup = resolve;
+      }))
+      .mockResolvedValueOnce([['10.20.30.41']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const followerBlocked = vi.fn();
+    const durabilityEvents: string[] = [];
+
+    expect(forkWorker(ds, 'opening protected turn', { turnId: 'om_egress_persist_opening' })).toBe(true);
+    expect(forkWorker(ds, 'queued protected follower', {
+      turnId: 'om_egress_persist_follower',
+    }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    expect(followerAdmissions).toEqual(['deferred']);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+
+    finishFirstLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    let cleanupWriteAttempts = 0;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.queuedActivationTail !== undefined) return;
+      cleanupWriteAttempts += 1;
+      if (cleanupWriteAttempts === 1) throw new Error('cleanup disk full');
+      durabilityEvents.push('cleanup persisted');
+    });
+    const firstWorker = forkMock.mock.results[0]!.value;
+    firstWorker.emit('exit', 1, null);
+
+    expect(cleanupWriteAttempts).toBe(1);
+    expect(followerAdmissions).toEqual(['deferred']);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ id: followerTailId, turnId: 'om_egress_persist_follower' }),
+    ]);
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('cleanup persistence failed'),
+      turnId: 'om_egress_persist_follower',
+    }));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(forkMock).toHaveBeenCalledTimes(1);
+
+    expect(forkWorker(ds, 'retry after cleanup failure', {
+      turnId: 'om_egress_persist_retry',
+    })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(cleanupWriteAttempts).toBeGreaterThanOrEqual(2);
+    expect(followerAdmissions).toEqual(['deferred', 'rejected']);
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+
+    const retryWorker = forkMock.mock.results[1]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+  });
+
+  it('reports a post-freeze preparation exception as preparation failure rather than DNS failure', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    checkWorkerAdmissionMock.mockImplementation(() => {
+      throw new Error('late preparation boom');
+    });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(makeDs(), 'protected egress', { turnId: 'om_egress_late' }, {
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining(
+        'Worker preparation failed after protected egress freeze: late preparation boom',
+      ),
+      turnId: 'om_egress_late',
+    }));
+    expect(loggerErrorMock).toHaveBeenCalledWith(expect.stringContaining(
+      'Worker preparation after protected HTTP egress freeze failed',
+    ));
+    expect(loggerErrorMock).not.toHaveBeenCalledWith(expect.stringContaining(
+      'Protected HTTP egress target freeze failed',
+    ));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('removes DNS followers before rejecting them when post-freeze preparation fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const durabilityEvents: string[] = [];
+    const followerBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'opening', { turnId: 'om_opening' })).toBe(true);
+    expect(forkWorker(ds, 'follower', { turnId: 'om_follower' }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    expect(followerAdmissions).toEqual(['deferred']);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+
+    let preparationFailed = false;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (!session.queuedActivationTail?.some(entry => entry.id === followerTailId)) {
+        durabilityEvents.push('cleanup persisted');
+      }
+      if (!preparationFailed
+        && session.protectedHttpEgressPolicy !== undefined
+        && session.sandbox !== undefined) {
+        preparationFailed = true;
+        throw new Error('post-policy preparation write failed');
+      }
+    });
+    finishLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(followerAdmissions).toEqual(['deferred', 'rejected']));
+
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('post-policy preparation write failed'),
+      turnId: 'om_follower',
+    }));
+
+    expect(forkWorker(ds, 'retry opening', { turnId: 'om_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+    const retryWorker = forkMock.mock.results[0]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+    await Promise.resolve();
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(retryWorker.send).mock.calls
+      .map(call => call[0])
+      .some(message => message.type === 'message' && message.turnId === 'om_follower'))
+      .toBe(false);
+  });
 });
 
 describe('LinkRef turn admission mode freeze', () => {
@@ -642,10 +1828,15 @@ describe('host memory pressure worker admission', () => {
     expect(admissions).toEqual(['accepted']);
   });
 
-  it('forks the worker without the pm2 graceful-exit sentinel or the bot GitHub tokens', () => {
+  it('forks the worker without daemon-only sentinels, bot tokens, or the egress socket locator', () => {
     // The sentinel is the daemon/dashboard cores' private exit code: a worker
     // that inherited it would exit 90 on a clean stop, read as a crash.
-    const keys = ['BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'GITHUB_TOKEN', 'GH_TOKEN'] as const;
+    const keys = [
+      'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+      'GITHUB_TOKEN',
+      'GH_TOKEN',
+      'BOTMUX_PROTECTED_EGRESS_SOCKET',
+    ] as const;
     const prev = keys.map(key => process.env[key]);
     keys.forEach(key => { process.env[key] = 'leaked'; });
     try {
@@ -1337,10 +2528,10 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   it('reports an unstageable pre-admission rejection as a known non-execution', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
-    // The daemon declines the handoff — this is the real fallback path: the XPI
-    // switch is off, or the rejection lacked a safe reroute envelope/owner. The
-    // delivery then falls back to retry/fail, and its terminal notice must still
-    // describe a KNOWN outcome: the turn never entered the worker queue.
+    // The daemon declines the handoff — the XPI switch TTL-skew path (the daemon
+    // already reads the switch off). The delivery falls back to retry/fail, and
+    // its terminal notice must still describe a KNOWN outcome: the turn never
+    // entered the worker queue.
     const onOrdinaryImInputRejected = vi.fn(async () => false);
     initWorkerPool({
       sessionReply,
@@ -1505,6 +2696,63 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(1);
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('fails a deterministic rejection the daemon cannot reroute at once as not executed, without retrying', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onOrdinaryImInputRejected = vi.fn(async () => 'not_executed' as const);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    // A peer bot's message arrives while a caller-less scheduled turn runs, so
+    // the daemon has no principal to ask for confirmation.
+    const peerBot = {
+      requestUserOpenId: 'ou_peer_bot',
+      requestUserUnionId: 'on_peer_bot',
+      requestLarkAppId: 'app_test',
+      senderType: 'bot' as const,
+    };
+    expect(sendWorkerInput(ds, 'business turn', 'om_business', { trustedCaller: peerBot })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'schedule:abcd1234:00000000-0000-4000-8000-000000000000',
+    };
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    worker.emit('message', rejection);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1);
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const terminal = String(sessionReply.mock.calls[0]?.[1]);
+    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain('om_business');
+    expect(terminal).toContain('cross_principal_requires_owner_confirmation');
+    expect(terminal).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
   });
 
   it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
@@ -3666,7 +4914,7 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_adopted',
-      { sourceSessionId: 'sid-start-test' },
+      expect.objectContaining({ sourceSessionId: 'sid-start-test' }),
     ));
     expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
     expect(ds.agentAttention).toEqual(expect.objectContaining({
@@ -6659,6 +7907,32 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
       reason: 'adopt',
     }));
   });
+
+  it('protected HTTP egress policy → refuses adopt because an existing process cannot receive the frozen network boundary', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy: {
+        id: 'fixture.write.v1',
+        targets: [{
+          scheme: 'https',
+          host: 'fixture.internal.example',
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+        }],
+      },
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = adopt();
+    ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
+
+    expect(forkAdoptWorker(ds)).toBe('rejected');
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    expect(ds.adoptedFrom).toBeUndefined();
+    expect(ds.session.adoptedFrom).toBeUndefined();
+  });
 });
 
 describe('managed turn authority worker generations', () => {
@@ -7961,6 +9235,15 @@ describe('forkWorker session agent config freeze', () => {
 
   // ── An EXPLICIT per-trigger override (trigger API options.model) still wins
   //    over the bot config — that is the only thing that outranks it now. ──
+  it.each([false, true])('explicit pin reaches the actual worker init on fresh/restore spawn (resume=%s)', resume => {
+    const ds = makeDs();
+    ds.session.modelPin = { model: 'gpt-6.1-terra', effort: 'high', source: 'topic-header', setBy: 'owner', setAt: new Date().toISOString() };
+    forkWorker(ds, '', resume);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', model: 'gpt-6.1-terra', reasoningEffort: 'high', resume }));
+    expect(ds.session.model).toBe('gpt-6.1-terra');
+  });
+
   it('prefers an explicit per-trigger model override over the bot config', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;
@@ -8932,5 +10215,38 @@ describe('worker pid record', () => {
 
       expect(sessionStore.updateSessionPid).toHaveBeenCalledWith('sid-start-test', pid, readWorkerProcessStart(pid));
     });
+  });
+});
+
+describe('turn failure diagnostics: only a workflow draft clarify session asks its worker for them', () => {
+  const headless = { id: 'hl_draft', createdAt: '2026-11-06T00:00:00.000Z', source: 'cli' as const };
+  const initOf = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls.map(call => call[0]).find(message => message.type === 'init');
+  };
+
+  it('a draft clarify session (marker persisted on session.headless): the init asks for them', () => {
+    const ds = makeDs({ hasHistory: true, chatId: 'headless_hl_draft' });
+    ds.session.chatId = 'headless_hl_draft';
+    ds.session.headless = { ...headless, failureDiagnostics: true };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    expect(initOf()).toMatchObject({ type: 'init', captureTurnFailureDiagnostics: true });
+  });
+
+  it.each([
+    ['an ordinary topic session', undefined, 'oc_chat'],
+    ['a `botmux headless` session', headless, 'headless_hl_draft'],
+    // The transfer into the main topic forks the topic's worker before the
+    // binding is recorded (or the recording never lands): the chat decides.
+    ['a draft clarify session whose transfer into its topic forks the worker', { ...headless, failureDiagnostics: true as const }, 'oc_topic'],
+    ['a draft clarify session already bound into its topic', { ...headless, failureDiagnostics: true as const, boundChatId: 'oc_topic' }, 'oc_topic'],
+  ] as const)('%s: the init does not carry the field at all', (_name, headlessBlock, chatId) => {
+    const ds = makeDs({ hasHistory: true, chatId });
+    ds.session.chatId = chatId;
+    if (headlessBlock) ds.session.headless = { ...headlessBlock };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    const init = initOf();
+    expect(init).toMatchObject({ type: 'init' });
+    expect(Object.keys(init)).not.toContain('captureTurnFailureDiagnostics');
   });
 });

@@ -1,3 +1,7 @@
+// Must stay the first import: this file writes async-trigger records under
+// SESSION_DATA_DIR, so refuse to run outside the data-dir fence instead of
+// touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -77,6 +81,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   },
   hasQueuedActivationAdmissionGate: actual.hasQueuedActivationAdmissionGate,
   admitQueuedActivationTail: actual.admitQueuedActivationTail,
+  __testOnly_sessionAgentConfig: actual.__testOnly_sessionAgentConfig,
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
   withActiveSessionKeyLock: vi.fn(async (map: Map<string, any>, key: string, action: () => any) => {
     let locks = activeKeyLocks.byMap.get(map);
@@ -140,7 +145,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
 import { parseBotConfigsFromText, registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
-import { admitQueuedActivationTail, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { admitQueuedActivationTail, withActiveSessionKeyLock, __testOnly_sessionAgentConfig } from '../src/core/worker-pool.js';
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
@@ -249,6 +254,33 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
   it('keeps the localized topic seed by default', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
+  });
+
+  it.each([
+    { model: 'minimax/MiniMax-M3' },
+    { reasoningEffort: 'max' as const },
+    { model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'ultra' as const },
+  ])('keeps MiniMax trigger overrides inactive while inheriting bot effort: %j', async options => {
+    // Capability at bot level must not activate previously ignored task intent.
+    const botCfg = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'minimax', workingDir: '/tmp',
+      model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high',
+    }]))[0]!;
+    registerBot(botCfg);
+    mockGetBot.mockReturnValue(undefined);
+    const req = request();
+    req.options = options;
+    const activeSessions = new Map<string, DaemonSession>();
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(result).toMatchObject({ ok: true, action: 'queued' });
+    expect(mockForkWorker).toHaveBeenCalledOnce();
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBeUndefined();
+    expect(ds.session.model).toBeUndefined();
+    expect(ds.session.reasoningEffort).toBeUndefined();
+    expect(__testOnly_sessionAgentConfig(ds, botCfg)).toMatchObject({
+      cliId: 'minimax', model: botCfg.model, reasoningEffort: 'high',
+    });
   });
 
   it('stamps per-turn model + reasoningEffort onto a grok session', async () => {

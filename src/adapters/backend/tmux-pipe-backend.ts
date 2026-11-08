@@ -51,10 +51,21 @@ import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
 import { pipePaneShellCommand } from './tmux-pipe-relay.js';
+import { createTmuxBootGate } from './tmux-anti-fork.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** Quote one argument of a command string that tmux parses itself (an if-shell
+ *  branch). tmux 2.x has no backslash escapes outside quotes, so the `'\''`
+ *  form above splits there; every tmux unescapes `\\`, `\"`, `\$`, `\~` inside
+ *  double quotes, and tmux 3.x expands a `~` that opens them (an adopted pane's
+ *  target is the user's own session name). tmux 2.x also ends a command at an
+ *  argument ending in `;`. */
+function tmuxQuote(s: string): string {
+  return `"${s.replace(/[\\"$~]/g, '\\$&')}"`;
 }
 
 /** `failed` was added in tmux 3.2. Older/unknown versions retain every exit
@@ -127,6 +138,28 @@ const PANE_DEATH_STATUS_MAX_POLLS = 20; // ≈1s wall budget, matching the empir
 /** The teardown/probe read. The pane and server pids let resolvePaneDeath ask
  *  the kernel for a status tmux has not published (see unreaped-pane-exit). */
 const PANE_DEATH_FORMAT = '#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}';
+
+function parsePositivePid(raw: string | undefined): number | undefined {
+  const text = (raw ?? '').trim();
+  if (!/^\d+$/.test(text)) return undefined;
+  const pid = Number(text);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/**
+ * Whether an authoritative "pane gone" verdict came from losing the whole tmux
+ * server rather than from the CLI exiting: the pane was last seen alive on
+ * server `lastLivePid`, and now a server with a DIFFERENT pid answers on the
+ * same socket (it was killed or its socket was taken over and a fresh server
+ * started there). Both pids must be known; anything unreadable is "no", so a
+ * real CLI crash keeps counting toward the fresh-session fallback.
+ */
+export function paneLossWasServerReplacement(
+  lastLivePid: number | undefined,
+  answeringPid: number | undefined,
+): boolean {
+  return lastLivePid !== undefined && answeringPid !== undefined && lastLivePid !== answeringPid;
+}
 
 /**
  * Three-way verdict for a pane probed at teardown / reattach time.
@@ -567,6 +600,13 @@ export class TmuxPipeBackend implements SessionBackend {
   private cols = 200;
   private rows = 50;
   private exited = false;
+  /** tmux server pid (`#{pid}`) holding this pane. Anchored at attach time; the
+   *  first probe that finds the pane alive fills it only if the attach-time
+   *  read failed. Compared with the answering server at teardown time. */
+  private lastLiveServerPid: number | undefined;
+  /** Set when the pane was judged gone while a DIFFERENT tmux server answered
+   *  on the same socket — the whole server was lost, the CLI did not exit. */
+  private serverReplacedAtExit = false;
   /** Track the selected option, even if its reply is lost or the version refreshes. */
   private legacyRetention = false;
   /** Set after pipe-pane subscription is active so kill() knows to cancel it. */
@@ -773,7 +813,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // re-thrown at once instead of delaying the same failure.
     // The copier must forward short writes at once, or a quiet CLI's ready /
     // final bytes never reach the worker and its next input queues forever.
-    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(pipePaneShellCommand(this.fifoPath))}`;
+    const pipeShellCommand = pipePaneShellCommand(this.fifoPath);
     // Same-boundary decision as the applied remain-on-exit value: it was
     // resolved against the RUNNING server (serverTmuxVersion) in
     // createDetachedSession/applySessionOptions before this attach. Guard
@@ -787,8 +827,9 @@ export class TmuxPipeBackend implements SessionBackend {
           // tmux 2.8 can crash its server when pipe-pane dereferences an
           // already-dead pane's released event. Keep this check and subscription
           // in ONE server queue; a client-side probe would race the CLI exit.
+          const guardedPipePane = `pipe-pane -O -t ${tmuxQuote(this.paneTarget)} ${tmuxQuote(pipeShellCommand)}`;
           const output = execSync(
-            `${this.tmuxCmd} if-shell -F -t ${shellescape(this.paneTarget)} '#{pane_dead}' ${shellescape(`display-message -p ${deadPaneMarker}`)} ${shellescape(pipePaneCommand)}`,
+            `${this.tmuxCmd} if-shell -F -t ${shellescape(this.paneTarget)} '#{pane_dead}' ${shellescape(`display-message -p ${deadPaneMarker}`)} ${shellescape(guardedPipePane)}`,
             { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, env: tmuxEnv() },
           );
           if (String(output).trim() === deadPaneMarker) {
@@ -798,7 +839,7 @@ export class TmuxPipeBackend implements SessionBackend {
           }
         } else {
           execSync(
-            `${this.tmuxCmd} ${pipePaneCommand}`,
+            `${this.tmuxCmd} pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(pipeShellCommand)}`,
             { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv() },
           );
         }
@@ -908,10 +949,32 @@ export class TmuxPipeBackend implements SessionBackend {
    * selectSessionBackend), not the only backend type in the repo.
    */
   pasteText(text: string): boolean {
+    return this.pasteBuffer(text, false);
+  }
+
+  /** Paste framing and Enter are queued in one tmux command batch. Send ESC
+   * markers as literal keys: newer servers sanitize ESC inside buffers.
+   * No separate client call or adapter timer can target a replacement draft. */
+  submitBracketedPaste(text: string): boolean {
+    return this.pasteBuffer(text, true);
+  }
+
+  private pasteBuffer(text: string, submit: boolean): boolean {
     if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
     return this.guardedSend('paste-buffer', () => {
+      // Empty load-buffer creates no buffer: paste-buffer would abort after
+      // the opening marker. Queue the entire empty frame as literal keys.
+      if (submit && text.length === 0) {
+        execFileSync('tmux', [...this.tmuxArgs,
+          'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~\x1b[201~\r'], {
+          stdio: 'ignore',
+          timeout: 5000,
+          env: tmuxEnv(),
+        });
+        return;
+      }
       let loaded = false;
       try {
         execFileSync('tmux', [...this.tmuxArgs, 'load-buffer', '-b', bufferName, '-'], {
@@ -921,7 +984,12 @@ export class TmuxPipeBackend implements SessionBackend {
           env: tmuxEnv(),
         });
         loaded = true;
-        execFileSync('tmux', [...this.tmuxArgs, 'paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', '-p'], {
+        const pasteArgs = ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', submit ? '-r' : '-p'];
+        const commands = submit
+          ? ['send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~', ';',
+            ...pasteArgs, ';', 'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[201~\r']
+          : pasteArgs;
+        execFileSync('tmux', [...this.tmuxArgs, ...commands], {
           stdio: 'ignore',
           timeout: 5000,
           env: tmuxEnv(),
@@ -990,6 +1058,7 @@ export class TmuxPipeBackend implements SessionBackend {
         if (tail) {
           process.stderr.write(`[tmux-pipe-backend] CLI last output before exit (tail):\n${tail}\n`);
         }
+        this.noteServerReplacedAtPaneLoss();
         this.handlePaneExit();
       }
       return false;
@@ -1165,6 +1234,14 @@ export class TmuxPipeBackend implements SessionBackend {
     this.livenessGate.reset();
     this.probeSetbackStreak = 0;
     this.serverUnreachableSince = null;
+    // Anchor the server pid at ATTACH time: pipe-pane succeeding just proved
+    // this server is alive and holds the pane. The first poll is delayed
+    // 1.0–1.75s; waiting for it left a window in which a server replaced right
+    // after a resume was indistinguishable from a CLI crash and still spent the
+    // fresh-session fallback budget (the second-hit window in the 2026-11-06
+    // fleet loss). An unreadable answer stays undefined and the first
+    // successful probe below fills it later — same conservative semantics.
+    if (this.lastLiveServerPid === undefined) this.lastLiveServerPid = this.readPaneServerPid(2000);
     const poll = () => {
       if (this.exited) return;
       // The watched CLI pid (adopt mode) is a pure process.kill(pid,0) syscall —
@@ -1208,6 +1285,22 @@ export class TmuxPipeBackend implements SessionBackend {
     return Math.min(1000 * 3 ** this.probeSetbackStreak, 9000);
   }
 
+  /** `#{pid}` of the server holding this pane; undefined when unreadable.
+   *  For an unknown target tmux 3.x exits 0 and still expands the server-level
+   *  `#{pid}`, so the pane id is read in the same answer and must be non-empty. */
+  private readPaneServerPid(timeoutMs: number): number | undefined {
+    try {
+      const answer = execFileSync(
+        'tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_id} #{pid}'],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: timeoutMs, env: tmuxEnv() },
+      );
+      const [paneId = '', pid] = String(answer).replace(/\r?\n$/, '').split(' ');
+      return paneId.trim() ? parsePositivePid(pid) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Tri-state pane probe. A clean tmux rejection that the SERVER actually
    * answered is `missing`; timeout, signal, EMFILE/ENFILE and spawn failures
@@ -1239,6 +1332,9 @@ export class TmuxPipeBackend implements SessionBackend {
       ).trim();
       if (paneId.length === 0) return { state: 'missing', reason: 'empty pane id' };
       if (this.isPaneDead()) return { state: 'missing', reason: 'pane is dead (remain-on-exit remnant)' };
+      // A live pane only ever lives on the server that created it, so its
+      // server pid needs reading once, not on every probe.
+      if (this.lastLiveServerPid === undefined) this.lastLiveServerPid = this.readPaneServerPid(timeoutMs);
       return { state: 'exists' };
     } catch (err: any) {
       // Deadline first: a timed-out probe can carry a clean numeric exit when
@@ -1292,6 +1388,7 @@ export class TmuxPipeBackend implements SessionBackend {
           process.stderr.write(
             `[tmux-pipe-backend] tmux server continuously unreachable for ${Math.round((Date.now() - this.serverUnreachableSince) / 1000)}s; declaring ${this.ownsSession ? 'managed' : 'adopted'} pane dead (${probe.reason ?? 'connection error'})\n`,
           );
+          this.noteServerReplacedAtPaneLoss();
           this.handlePaneExit();
           return;
         }
@@ -1356,7 +1453,45 @@ export class TmuxPipeBackend implements SessionBackend {
     process.stderr.write(
       `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive authoritative misses; detaching observer\n`,
     );
+    this.noteServerReplacedAtPaneLoss();
     this.handlePaneExit();
+  }
+
+  /** pid of the tmux server currently answering on this socket, or undefined
+   *  when nobody answers / the answer is unreadable. Read-only. */
+  private static answeringServerPid(timeoutMs: number, socketArgs: readonly string[]): number | undefined {
+    try {
+      const out = execFileSync('tmux', [...socketArgs, 'list-sessions', '-F', '#{pid}'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: timeoutMs,
+        env: tmuxEnv(),
+      });
+      return parsePositivePid(String(out).split('\n')[0]);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** True when the last pane exit was caused by losing the whole tmux server
+   *  (a different server now answers on the socket), not by the CLI exiting. */
+  exitedBecauseServerReplaced(): boolean {
+    return this.exited && this.serverReplacedAtExit;
+  }
+
+  /** Before a probe-confirmed teardown, latch whether a DIFFERENT server now
+   *  answers on the socket. Idempotent and skipped when no live-server pid was
+   *  ever anchored: an unreadable verdict stays "CLI exit", the conservative
+   *  answer that keeps the crash-loop FRESH fallback. The adopt pid-death path
+   *  does not call this — there the CLI process itself was observed gone. */
+  private noteServerReplacedAtPaneLoss(): void {
+    if (this.serverReplacedAtExit || this.lastLiveServerPid === undefined) return;
+    const answeringPid = TmuxPipeBackend.answeringServerPid(3000, this.tmuxArgs);
+    if (!paneLossWasServerReplacement(this.lastLiveServerPid, answeringPid)) return;
+    this.serverReplacedAtExit = true;
+    process.stderr.write(
+      `[tmux-pipe-backend] the tmux server on this socket was replaced (was pid ${this.lastLiveServerPid}); the CLI did not exit on its own\n`,
+    );
   }
 
   /** Three-state server reachability cross-check. A running server always has
@@ -1604,6 +1739,50 @@ export class TmuxPipeBackend implements SessionBackend {
     } catch { /* already gone or another teardown won the race */ }
   }
 
+  /**
+   * A fresh launch found its session name taken. Launch selection reads a kept
+   * corpse (every pane dead, retained by `remain-on-exit`) as 'missing', so the
+   * next generation of that session comes here to create it — and used to fail
+   * with "duplicate session" on every attempt until someone removed the corpse
+   * by hand (2026-11-06: corpses left behind by a tmux server crash kept three
+   * sessions from starting for hours). Reap the session ONLY when tmux itself
+   * reports every one of its panes dead; a live pane, or an answer that cannot
+   * be read, keeps the session and the original error. Managed `bmx-*`
+   * sessions on this backend's own server only. Returns true once the corpse
+   * was killed (or vanished meanwhile), i.e. creating the name again may work.
+   *
+   * Both commands name the session EXACTLY (`=name:` / `=name`). The corpse can
+   * vanish between them (another teardown reaps it), and a bare `-t name` then
+   * falls back to a PREFIX match — `kill-session` would hit a live session whose
+   * name merely starts with ours; `list-panes -s -t =name` without the colon
+   * even answers for some other session (both measured on tmux 3.3a). Lines are
+   * still filtered by `#{session_name}` so no other session's panes can count.
+   */
+  private reapDeadSessionHoldingName(spawnEnv: NodeJS.ProcessEnv | undefined): boolean {
+    if (!this.ownsSession || !this.paneTarget.startsWith('bmx-')) return false;
+    let panes: string[];
+    try {
+      panes = String(execFileSync(
+        'tmux',
+        [...this.tmuxArgs, 'list-panes', '-s', '-t', `=${this.paneTarget}:`, '-F', '#{session_name}|#{pane_dead}:#{pane_dead_status}'],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv(spawnEnv) },
+      ) ?? '').split('\n').map(line => line.trim()).filter(Boolean);
+    } catch {
+      return false;
+    }
+    const own = `${this.paneTarget}|`;
+    if (panes.length === 0 || !panes.every(line => line.startsWith(own) && line.slice(own.length).startsWith('1:'))) return false;
+    process.stdout.write(
+      `[tmux-pipe-backend] ${this.paneTarget} is held by a dead session (pane_dead:status ${panes.map(line => line.slice(own.length)).join(', ')}); reaping it before creating the session afresh\n`,
+    );
+    try {
+      execFileSync('tmux', [...this.tmuxArgs, 'kill-session', '-t', `=${this.paneTarget}`], {
+        stdio: 'ignore', timeout: 3000, env: tmuxEnv(spawnEnv),
+      });
+    } catch { /* already gone; a creation that still collides reports the real error */ }
+    return true;
+  }
+
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
     const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
     // `new-session -e` only exists since tmux 3.2 (3.0/3.1 reject it with
@@ -1632,7 +1811,13 @@ export class TmuxPipeBackend implements SessionBackend {
         script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
         argv: [
           opts.cwd,
-          ...buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv, opts.gitConfigPairs),
+          ...buildBotmuxEnvAssignments(
+            opts.env,
+            opts.injectEnv,
+            opts.unsetEnv,
+            opts.gitConfigPairs,
+            opts.protectedUnsetEnv,
+          ),
           bin, ...args,
         ],
       });
@@ -1694,25 +1879,66 @@ export class TmuxPipeBackend implements SessionBackend {
     // means an earlier timed-out attempt actually created the session
     // server-side → treat as success.
     let createdIdentity: string | null = null;
+    let corpseReaped = false;
+    // Anti-fork gate (default ON; BOTMUX_DISABLE_TMUX_ANTI_FORK=1 opts out):
+    // BEFORE every new-session — including the first attempt — refuse to boot a
+    // competing tmux server when a LIVE server still listens on this label but
+    // is not answering (slow, or its socket file was unlinked under it). The
+    // very first new-session already forks the orphan in that state (measured),
+    // so this cannot live in the retry branch. One gate spans all attempts so
+    // its bounded wait is not reset per attempt. Pass the SAME env the
+    // new-session exec below uses, so the owner probe, -N capability and socket
+    // path resolve against the launch's PATH/TMUX_TMPDIR (not daemon ambient).
+    const bootSpawnEnv = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env;
+    const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv });
     for (let attempt = 0; ; attempt++) {
+      // [] = normal spawn (attach, or a proven cold boot); ['-N'] = attach
+      // only, never fork (tmux ≥ 3.2), closing the client-internal macOS
+      // ECONNREFUSED fork race.
+      let bootLeading: string[];
       try {
-        const printed = execFileSync('tmux', [...this.tmuxArgs, ...argv], {
+        bootLeading = bootGate.leadingArgs();
+      } catch (gateErr: any) {
+        // Bound-but-unreachable past the bounded wait. Route through fail() so
+        // the secret-bearing pane launch file is discarded exactly like any
+        // other startup failure (a throw here would otherwise leak it).
+        if (opts.strictEnv) throw fail(gateErr, tmuxStartupFailureSummary(gateErr));
+        throw fail(tmuxNewSessionError(gateErr, commandBytes), tmuxStartupFailureSummary(gateErr));
+      }
+      const noFork = bootLeading.includes('-N');
+      try {
+        const printed = execFileSync('tmux', [...this.tmuxArgs, ...bootLeading, ...argv], {
           cwd: opts.cwd,
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 5000,
-          env: tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env),
+          env: tmuxEnv(bootSpawnEnv),
         });
         createdIdentity = parseSessionIdentity(String(printed ?? ''));
         break;
       } catch (err: any) {
         const stderrText = (err?.stderr?.toString?.() ?? '').trim();
+        // A -N spawn that answered "no server running" raced an owner dying
+        // between the gate probe and the exec. Retry: the next gate cycle sees
+        // no listener and permits a real cold boot (without -N).
+        const noForkRacedAway = noFork && /no server running/i.test(stderrText);
         if (attempt > 0 && /duplicate session/i.test(stderrText)) {
           if (opts.strictEnv) throw fail(new Error('Refusing unverified strict tmux-pipe generation after a startup retry'), stderrText);
           // Either an earlier timed-out attempt of ours or a racing creator made
           // it — unprovable, so this spawn never claims (or retires) it.
           break;
         }
-        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
+        // On the FIRST attempt nothing of ours can hold the name yet: it is an
+        // older session. Only a confirmed corpse is reaped, once; then start
+        // over (attempt 0 again — a collision now is not a timed-out retry).
+        // The reap talks to the server this new-session just answered from
+        // (same env, hence the same PATH / TMUX_TMPDIR socket resolution).
+        if (attempt === 0 && !corpseReaped && /duplicate session/i.test(stderrText)
+            && this.reapDeadSessionHoldingName(bootSpawnEnv)) {
+          corpseReaped = true;
+          attempt = -1;
+          continue;
+        }
+        if ((!isRetryableStartupTmuxFailure(err) && !noForkRacedAway) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
           if (opts.strictEnv) throw fail(new Error('Strict tmux pane startup failed (command environment redacted)'), tmuxStartupFailureSummary(err));
           throw fail(tmuxNewSessionError(err, commandBytes), tmuxStartupFailureSummary(err));
         }

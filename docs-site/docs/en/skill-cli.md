@@ -1,48 +1,176 @@
 # Skill + CLI Interaction
 
-When a CLI enters a botmux session, it automatically gets `~/.botmux/bin` in its PATH, along with a set of ready-to-use capabilities. This is the channel through which a CLI agent can **proactively** interact with a Lark topic — and "terminal has output but nothing was sent to Lark" usually traces back to the model not using this channel (see [FAQ · C](/en/faq#c-terminal-has-output-but-nothing-sent-to-lark)).
+<video src="../img/video-v8-skills-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
-## Out-of-the-Box Capabilities
+Inside a botmux session, the AI talks to Lark (sending messages, reading history, creating scheduled tasks…) through two things:
 
-Inside a session the agent can call these `botmux` subcommands directly (session info is inferred, no id to pass):
+- **The `botmux` command**: added to the CLI's PATH when the session starts. The AI just runs it in the terminal.
+- **Skills**: short `SKILL.md` guides that tell the AI when to use which command and how.
 
-| Command | Purpose |
+```
+Lark message ──▶ botmux ──▶ AI inside the CLI
+                              │  reads Skills, knows how to reply
+                              ▼
+Lark topic   ◀── botmux ◀── botmux send "…"
+```
+
+So when "the terminal shows output but nothing reaches Lark", the AI usually didn't run `botmux send`. See [FAQ · C](/en/faq#c-terminal-has-output-but-nothing-reached-lark).
+
+## Commands available in a session
+
+When run inside a session, botmux works out which session it is on its own. No session ID needed.
+
+| What you want | Command |
 |------|------|
-| `botmux send` | Send a message to the current topic (text / image / file / interactive card JSON / @mention) |
-| `botmux history` | Read the current session's message history (topic groups pull within the topic; regular groups pull the whole group) |
-| `botmux quoted <message_id>` | Read the quoted message |
-| `botmux bots list` | List the bots in the current group and their open_id (for `--mention`) |
-| `botmux schedule` | Create, list, update, and delete scheduled tasks |
+| Send to the current topic (text, images, files, video, cards, @mentions) | `botmux send` |
+| Read the session's message history | `botmux history` (inside the topic for topics, the whole group for regular groups; `--limit N` sets the count) |
+| Read a quoted message (attachments are downloaded too) | `botmux quoted <message_id>` |
+| List bots in the group and their open_id (for `--mention`) | `botmux bots list` |
+| Ask people to choose via a button card | `botmux ask buttons --options "a,b" "<question>"` |
+| Create / edit / delete scheduled tasks | `botmux schedule ...`, see [Scheduled Tasks](/en/schedule) |
+| List this session's Skills, read one in full | `botmux skill list` / `botmux skill show <name>` |
 
-> These are the most-used set; the real command surface is larger (e.g. `botmux ask` for interactive questions, and workflow / goal / dispatch orchestration entry points) — see `botmux --help` and the injected Skill catalog for the full list. Handoff / orchestration are separate **Skills** (`botmux-handoff` / `botmux-orchestrate`), which are Skills, not executable subcommands.
+For the full list see [CLI Commands](/en/cli-commands), or run `botmux --help` in a session. Most subcommands support `botmux <subcommand> --help`.
 
-### The @-decision hard gate on `botmux send`
+## `botmux send`: decide who to @ every time
 
-A `botmux send` **must carry an @-decision**, or it refuses to send: `--mention <openId>` (name someone), `--mention-back` (@ the triggerer), or `--no-mention` (don't @). `--no-mention` is mutually exclusive with the other two. Only the explicit `--top-level` flag (or globally disabling the gate) is exempt — **ordinary topic / quote replies still have to pick one of the three**. This gate ensures "the ones that should be @-ed aren't missed, and the ones that shouldn't don't spam the group."
+`botmux send` must carry one of these three options, or it errors out and sends nothing:
 
-## Wrapper Mechanism
+| Option | When to use it |
+|------|------|
+| `--mention-back` | @ the person who messaged you this turn. Use it when there's a result they should see or decide on |
+| `--mention <open_id>` | @ a specific person or bot. Can be repeated |
+| `--no-mention` | @ nobody. Good for plain notes or low-priority progress |
 
-In-session commands rely on `~/.botmux/bin/botmux` — **maintained automatically by the daemon at startup** and added to the worker's PATH, so its **version always matches the daemon** and no separate install is needed. What it points at depends on how the daemon itself is running: with a curl install that path **is the self-contained binary** (the daemon detects this and skips rewriting, so it never overwrites itself with a script); with an npm install it's a one-line `exec "<binary inside the platform subpackage>"` shim; in a source checkout it's `exec node <this daemon's dist/cli.js>`. (Dev helpers like `bun run use:here` re-point it manually with identical, idempotent content.)
+```bash
+botmux send --mention-back <<'EOF'
+Fixed. The change is in src/foo.ts and all tests pass.
+EOF
+```
 
-Session info is inferred automatically from **ancestor-process markers**: when the worker launches the CLI it writes a marker keyed by the child PID (carrying sessionId / turnId), and the agent's commands walk up the process tree to the nearest marker to know which session they belong to — so the agent never passes a session id. If the process tree is broken (detached / `setsid` / deeply nested), it falls back to the `BOTMUX_SESSION_ID` environment variable.
+A few rules:
 
-## Injection Mechanism (varies by CLI)
+- `--no-mention` can't be combined with the other two.
+- If more than one person (or bot) took part in this turn, `--mention-back` can't tell who to @ and is rejected. Name someone with `--mention` instead, or use `--no-mention`.
+- With `--top-level` (post at the group's top level instead of into the topic), none of these checks apply.
+- To drop the "must pick one of three" requirement, set `BOTMUX_REQUIRE_MENTION_DECISION=false`.
+- Pass multi-line content with a heredoc (as above) or `--content-file`, not `"line one\nline two"`.
 
-The channel through which routing guidance and the Skill catalog are **injected varies by CLI** — it's not one-size-fits-all:
+## Don't want the AI to send replies itself?
 
-- **Claude family (claude-code / seed / relay)**: routing / identity via `--append-system-prompt`; Skills via `--plugin-dir` (not stuffed into the system prompt).
-- **genius**: both routing and the Skill catalog go through `--append-system-prompt`; **grok** uses its equivalent flag `--rules`.
-- **Most other CLIs** (codex / opencode / cursor / coco / traex, etc.): under the default `skillInjection=prompt` mode, routing and the Skill catalog are **inlined into the first prompt**, consuming no system-prompt flag.
+In three cases botmux sends the final reply to Lark for you, and the AI doesn't need `botmux send`:
 
-> Skill catalog injection is governed by the per-bot `skillInjection` mode (genius/grok too): `prompt` (default) inlines a compact catalog into the prompt and pulls full text on demand via `botmux skill show <name>`; `global` installs the skill files into the CLI's shared skills dir (your hand-run CLI sees them too); `off` installs no catalog, leaving only routing guidance + `botmux --help`. The `global`/`off` mechanics differ from the "inline" case above.
->
-> Injected guidance is generated dynamically per the current locale, so it respects your configured language.
+| Case | What happens |
+|------|------|
+| `codex-app` (Codex App protocol) | The final reply is forwarded automatically. Use `botmux send` only for mid-turn progress, attachments, or @-ing another bot |
+| `replyDelivery: "transcript"` | botmux takes the last answer of the turn from the CLI's transcript and sends it. The prompt stops mentioning `botmux send` |
+| `promptInjection: "none"` (zero injection) | botmux adds nothing to the prompt and injects no Skills; the final answer is sent back automatically |
 
-## Why Skill + CLI Instead of MCP
+The last two only work with CLIs whose transcripts botmux can read. See [bots.json](/en/bots-json) for setup.
 
-Compared with an MCP-based approach, the Skill + CLI combination:
+## Built-in Skills
 
-- The CLI **doesn't need an MCP handshake** on startup, the core `botmux send` / `history` channels have zero MCP dependency, and it doesn't consume tool-list tokens (a gateway only starts when an adapter explicitly opts in *and* a plugin actually contributes MCP servers).
-- The **shell / routing layer is universal** — as long as a CLI can read a system prompt and run shell commands, `~/.botmux/bin/botmux` + PATH work, covering Claude Code / Codex / Cursor / OpenCode / Antigravity, and more.
+No install needed; they're there when the session starts:
 
-> ⚠️ But the **out-of-box Skill layer is not equal across every CLI**: a few (e.g. Antigravity, which only recognizes SKILL.md inside plugin bundles, not a flat `skills/` dir) get routing guidance only, without a Skill catalog. So "universal" holds for the shell/routing channel, and is "most" rather than "all" for the Skill catalog.
+| Skill | What it covers |
+|------|------|
+| `botmux-send` | Sending to Lark and choosing who to @ |
+| `botmux-history` | Reading message history |
+| `botmux-quoted` | Reading a quoted message |
+| `botmux-bots` | Listing bots in the group |
+| `botmux-schedule` | Scheduled tasks |
+| `botmux-chat-rename` / `botmux-session-rename` | Renaming the group / the session title |
+| `botmux-handoff` | Handing the task to another bot |
+| `botmux-orchestrate` | Long-running projects across multiple bots and topics (hidden when [Multi-topic](/en/multi-topic) is turned off) |
+
+A few more appear only under certain conditions:
+
+- `botmux-ask`: installed only when the CLI has no native question hook, so the AI can ask people via button cards.
+- `botmux-whiteboard`: only after the [Whiteboard](/en/whiteboard) is enabled.
+- `botmux-chat-manager`: only when the bot has the group-manager feature turned on.
+- `botmux-workflow` and friends: with [Workflow](/en/workflow) on, the AI reads them on demand only when it actually runs a workflow, so they don't take up prompt space otherwise.
+
+Note: `botmux-handoff` and `botmux-orchestrate` are Skill names, not commands you can run.
+
+## How Skills reach the CLI
+
+Each CLI accepts Skills differently, and botmux picks the right way automatically:
+
+| CLI | How Skills get there | Affects the CLI you run by hand? |
+|------|------|------|
+| Claude Code (incl. seed / relay), Cursor, Pi, Oh My Pi | A plugin dir mounted per session (e.g. `--plugin-dir`) | No |
+| CLIs with only a global skills dir: Codex, OpenCode, CoCo, TraeX, Kiro CLI, Genius, Grok, etc. | Depends on `skillInjection` (table below) | Not by default |
+| Antigravity | No Skills, routing hints only | No |
+
+`skillInjection` only affects the second group:
+
+| Value | Effect |
+|------|------|
+| `prompt` (default) | Leaves the CLI's global dir alone. A compact Skill list goes into the session prompt, and the AI runs `botmux skill show <name>` to read one in full when needed |
+| `global` | Installs the Skill files into the CLI's global skills dir. Most native experience, but you'll also see them when you run that CLI by hand |
+| `off` | No Skills, only routing hints and `botmux --help`; the AI figures things out itself |
+
+How to change it:
+
+- One bot: set `"skillInjection": "global"` in bots.json, or change that bot's switch under Dashboard "Skill Management → Delivery".
+- Machine-wide default: `botmux skills injection [global|prompt|off|unset]`. With no argument it shows the current value.
+
+Routing hints (which group the AI is in, how to reply) also take different paths per CLI: Claude Code and Genius use `--append-system-prompt`, Grok uses `--rules`, and most other CLIs get them in the first message. The hints follow your language setting.
+
+## Install your own Skills
+
+Besides the built-ins, you can install Skills you wrote or found in the community, then assign them to specific bots.
+
+**1. Install** (on the machine running botmux)
+
+```bash
+botmux skills install ./my-skills            # local directory
+botmux skills install owner/repo             # GitHub shorthand; a GitHub web URL works too
+botmux skills install https://git.example.com/team/skills.git --path skills/foo
+```
+
+If a source holds several Skills, pick with `--skill <name>` or install them all with `--all`. `--ref` picks a branch or tag. You can also paste a command like `npx skills add owner/repo` as the source.
+
+**2. Assign to a bot**
+
+- In Lark, send the bot `/skills attach <name>` (owner only), `/skills detach <name>` to remove, and `/skills` to see the current state.
+- Or drag and drop under Dashboard "Skill Management → Bot Assignment".
+
+Assignments apply from the **next new session**, and the CLI's own Skills stay available. For a session that's already running, `/restart` it or start a new one.
+
+**3. Day-to-day upkeep**
+
+| What you want | Command |
+|------|------|
+| See what's installed | `botmux skills list` |
+| Update one | `botmux skills update <name>` |
+| Remove one | `botmux skills remove <name>` (warns if a bot still uses it; add `--force` to remove anyway) |
+| Check for broken installs | `botmux skills doctor` |
+| See which Skills a bot will end up with | `botmux skills resolve --bot <name>` |
+
+To give the same set of Skills to several bots, create a "Skill Pack": Dashboard "Skill Management → Skill Packs", or `botmux skills pack create ...`.
+
+Under Dashboard "Skill Management → Delivery" you can also:
+
+- Choose whether to read Skills from the workspace (`.agents/skills` and `.botmux/skills` in the project).
+- Set the delivery mode: `Auto` (use the CLI's native channel when possible, otherwise the prompt), `Prompt` (works with every CLI), or `Native` (hand off to the CLI's own Skill mechanism only).
+
+## Rewrite built-in prompts and Skills
+
+If a built-in Skill or prompt doesn't suit you, rewrite or disable it on the Dashboard "Customization" page. You can restore factory defaults or roll back at any time, and export / import your changes for another machine. Changes apply from the next session without restarting the daemon. The command-line equivalent is `botmux customize`.
+
+## How a command knows which session it belongs to
+
+The in-session `botmux` command is `~/.botmux/bin/botmux`. The daemon maintains it on every start, so its version always matches the daemon and you don't need a separate install.
+
+- curl install: this path is the botmux binary itself, and the daemon leaves it alone.
+- Other installs: it's a tiny forwarding script that points at the botmux the daemon is using.
+
+As for "which session": when botmux launches the CLI it leaves a marker keyed by process ID. The `botmux` command walks up the process tree to find it, which tells it the session and the turn. If the process has left the tree (e.g. started with `setsid` or `nohup`), read and send commands like history and send fall back to the `BOTMUX_SESSION_ID` environment variable, but commands that need to confirm identity, such as Workflow write operations, refuse to run. So try not to detach commands from the process tree.
+
+## Why Skill + CLI instead of MCP
+
+- **Fast startup, fewer tokens**: the CLI does no MCP handshake on startup, and core commands like `botmux send` / `history` don't depend on MCP at all or take up the tool list. MCP is only started when a plugin actually provides MCP servers and the CLI supports it.
+- **Works with almost every CLI**: as long as a CLI can run shell commands, `botmux` works — Claude Code, Codex, Cursor, OpenCode, Antigravity and more.
+
+The Skill layer isn't on every CLI, though: Antigravity, for example, only reads `SKILL.md` inside plugin bundles, so it gets routing hints without a Skill list.

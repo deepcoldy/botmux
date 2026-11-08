@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="320" viewBox="0 0 880 320">
+  <rect width="880" height="320" fill="#f4f5f7"/>
+  <rect x="24" y="24" width="832" height="272" rx="12" fill="white" stroke="#dce0e5"/>
+  <g font-family="sans-serif" fill="#1f2937">
+    <text x="48" y="64" font-size="22" font-weight="600">CLI 切换失败后的恢复提示 · 示意</text>
+    <text x="48" y="104" font-size="17" fill="#64748b">示例：Codex，未指定模型，思考强度 high → 切换为 MiniMax</text>
+    <rect x="48" y="128" width="784" height="112" rx="8" fill="#fff8e6" stroke="#f0ca73"/>
+    <text x="68" y="160" font-size="18">当前模型与思考强度不兼容目标 CLI，配置未修改。</text>
+    <text x="68" y="191" font-size="18">请先执行 /botconfig unset reasoningEffort，</text>
+    <text x="68" y="222" font-size="18">再重试切换 CLI。</text>
+    <text x="48" y="274" font-size="15" fill="#64748b">文字命令回复与配置卡提示使用同一文案；本图为提示示意，并非飞书实机截图。</text>
+  </g>
+</svg>

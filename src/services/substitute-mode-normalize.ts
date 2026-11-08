@@ -67,6 +67,13 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
   };
   if (chats.length) out.chats = chats;
   if (excludedChats.length) out.excludedChats = excludedChats;
+  const keywords = Array.isArray(rec.keywords)
+    ? [...new Map(rec.keywords
+        .filter((value): value is string => typeof value === 'string')
+        .map(value => value.trim()).filter(Boolean)
+        .map(value => [value.toLowerCase(), value])).values()]
+    : [];
+  if (keywords.length) out.keywords = keywords;
   const replyMode = rec.replyMode === 'quote' ? 'quote' : 'thread';
   if (replyMode === 'quote') out.replyMode = 'quote';
   if (rec.disableControlCard === true) out.disableControlCard = true;

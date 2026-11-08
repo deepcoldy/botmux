@@ -1,40 +1,82 @@
 # botmux
 
-<p class="lead">Turn a Lark topic group into a remote control for AI coding CLIs. One message launches a dedicated coding session.</p>
+<video src="../img/video-v0-overview-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
-botmux is a bridge: a persistent **daemon** listens to Lark messages and automatically launches a dedicated AI coding CLI process (Claude Code / Codex / Cursor / OpenCode / Antigravity, etc.) for each new topic. It renders terminal output into Lark **streaming cards** in real time, and provides an interactive **Web Terminal**. Phone, computer, and Lark stay in sync — wherever you are, your coding session follows.
+<p class="lead">Remote-control your AI coding CLI from Lark. One message starts a session, and every session gets its own CLI process.</p>
 
-> Project: <https://github.com/deepcoldy/botmux> ｜ Install: `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh` (self-contained binary, no Node required; `npm i -g botmux` also works)
+botmux is a bridge. It runs a background service (the **daemon**) on your dev machine that listens to Lark messages:
 
-## Design philosophy: not an SDK wrapper — bridge the CLI directly
+- Each new topic gets its own AI coding CLI (30+ supported, including Claude Code, Codex, Cursor, OpenCode, and Antigravity)
+- Every turn of CLI output is streamed live into a Lark **streaming card**
+- When you want to take over, a card button opens the **Web Terminal**, so you can drive the same CLI from a browser or phone
 
-botmux **does not reimplement** agent capabilities; it bridges directly to existing AI coding CLIs. Memory, context management, tool calls, permission systems, plan mode, `/` commands, the MCP ecosystem — these are all capabilities the CLIs themselves are iterating on rapidly. botmux chooses to **stand on top of that evolution** rather than rebuild a parallel copy. Every time a CLI ships an upgrade, botmux benefits automatically with zero adaptation.
+Whether you're on your phone, at your desk, or in a terminal, you're looking at the same session.
 
-At the same time, botmux uses **structured prompt injection** (XML tags) inside the daemon to separate user content from system instructions before feeding it to the CLI — this is the prompt format that models reliably handle best. But everyday users neither need to nor should hand-write XML; just send plain language as usual, and botmux handles the wrapping for you.
+## 5-minute start
 
-## Core advantages
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+botmux setup     # scan a QR code to create the Lark app → pick a CLI → pick a working directory (permissions and release are configured for you)
+botmux start     # start the daemon; run botmux autostart enable to start on boot
+```
 
-Compared to approaches like OpenClaw that are "rebuilt on top of an Agent SDK":
+Then DM the bot, or open the management page with `botmux dashboard` and create a group to start chatting.
 
-| Feature | botmux | SDK-based approach |
-|------|--------|----------------|
-| Underlying architecture | Bridges directly to the **full CLI process** | Rebuilt on top of an Agent SDK |
-| CLI capabilities | Full runtime (hooks / memory / plan mode / Skill / `/` commands / MCP) | A subset of the SDK API; missing features must be added manually |
-| CLI upgrades | Benefit automatically with zero adaptation | Must track SDK version changes |
-| Memory / context | Reuses the CLI's built-in memory directly, enhanced as the CLI iterates | Must build your own, duplicating the CLI's native capabilities |
-| Multiple CLIs | One-click switching among 6+ | Bound to a single SDK |
-| Web Terminal | Fully interactive terminal, synced across three surfaces | Usually read-only output |
-| Multi-bot collaboration | Multiple bots in one group with @mention routing, process isolation | Usually a single bot |
-| Direct terminal access | `tmux attach` into the process, identical to local | Cannot operate the underlying terminal |
+- What you install is a **self-contained single-file binary** that doesn't need Node on the machine. It supports Linux / macOS (x64 / arm64); on Windows, use WSL2
+- Prefer npm? `npm i -g botmux` works too and ships the same binary
+- On a Mac you can also install the [macOS Desktop App](/en/desktop) to start and stop the service, open the Dashboard, and read logs with a click
+- To upgrade later: `botmux update`, or rerun the curl command above (releases older than v3.18.0: curl only), then `botmux restart`
 
-## Highlights
+For the full walkthrough (Lark international, manual permission setup, troubleshooting), see [Quick start](/en/quickstart).
 
-- **Streaming cards** — One live-updating Lark card per conversation turn, with terminal output rendered as Markdown
-- **Interactive Web Terminal** — Not just viewing: operate the CLI directly in the browser; mobile has a floating shortcut toolbar
-- **Multi-bot collaboration** — Put multiple bots with different CLIs in one group, @ whoever you want to work, and have Claude Code and Codex review code together
-- **Persistent tmux sessions** — Restarting the daemon doesn't interrupt CLI processes
-- **Session adopt** — Adopt a CLI running in a local tmux into Lark with one click, and continue on another device
-- **Scheduled tasks** — Configure recurring tasks in natural language; group tasks default to chat top level, with explicit `--topic` support to continue in the original topic
-- **On-Call Mode** — Anchor a group to a project so anyone in the on-call group can @ for instant answers
+## What problems it solves
 
-➡️ Next: [5-minute quick setup](/en/quickstart)
+| Your pain | What botmux does |
+|---|---|
+| The CLI runs on your dev machine, so you can't see or steer it when you're away | Each turn is pushed to a Lark card; check, follow up, or interrupt from your phone, and open the Web Terminal when you need hands-on control |
+| The CLI has no idea what's happening in Lark | Add the bot to a group and @ it to start working in your local codebase; `/relay` moves a running session (same CLI process, same AI memory) to another group so you can keep going there |
+| One agent isn't enough | Put several bots backed by different CLIs in one group and @ whoever should do the work, e.g. have Claude Code and Codex review the same change |
+
+## Common features
+
+| I want to... | See |
+|---|---|
+| Understand the live-updating card and its buttons | [Streaming cards](/en/cards) |
+| Drive the CLI from a browser or phone | [Web Terminal](/en/web-terminal) |
+| Have several bots in one group split the work | [Multi-bot collaboration](/en/multi-bot) |
+| Split a big task into parallel topics | [Multi-topic orchestration](/en/multi-topic) |
+| Pin a card in the group that tracks a project's goal, to-dos, and sub-tasks | [Project Progress Card](/en/project-card) |
+| Hand dev tasks to a steward and collect everything you need to decide in one place | [Decision Board and Steward](/en/decision-board) |
+| Bring a CLI already running in a local terminal into Lark | [Session adopt (/adopt)](/en/adopt) |
+| Move a session to another group | [Session relay (/relay)](/en/relay) |
+| Run tasks on a schedule (alert analysis, group digests, etc.) | [Scheduled tasks](/en/schedule) |
+| Trigger tasks from an external system | [Webhook](/en/webhook) · [API task trigger](/en/api-task-trigger) |
+| Run sessions from scripts or CI without a Lark group | [Headless Automation Sessions](/en/headless-session) |
+| Ask the AI directly in Lark doc comments | [Doc comment watching](/en/doc-comment) |
+| Let anyone in an on-call group @ the bot for answers | [On-Call Mode](/en/oncall) |
+| Switch CLIs, or pick a CLI for one session | [CLI adapters](/en/adapters) |
+| Manage bots, sessions, and config in a web UI | [Dashboard](/en/dashboard) · [Global Settings](/en/global-settings) |
+| Watch several sessions' progress and terminals at once | [Agent Workbench](/en/workbench) |
+
+More: [Roles & teams](/en/roles) · [File sandbox](/en/sandbox) · [Voice summary](/en/voice) · [Local whiteboard](/en/whiteboard) · [Persistent tmux sessions](/en/tmux) · [Feedback storage](/en/feedback-storage) · [Model Proxy (experimental)](/en/model-proxy) · [Slash commands](/en/slash-commands) · [CLI commands](/en/cli-commands) · [Architecture overview](/en/architecture) · [Best practices](/en/best-practices)
+
+## Design philosophy: bridge the CLI, don't rebuild the agent
+
+botmux **does not reimplement** agent capabilities. Memory, context management, tool calls, permissions, plan mode, `/` commands, and MCP are left to the CLI itself. When a CLI upgrades, most new capabilities just work in botmux (only when a CLI changes its flags, output format, or resume behavior does the matching adapter need an update).
+
+Just write in plain language. The daemon wraps your message and the system instructions separately in a structured format (XML tags) before handing them to the CLI, so you never have to write any special format yourself.
+
+Compared with approaches "rebuilt on top of an Agent SDK", the difference is mainly in how things are integrated:
+
+| Aspect | botmux | Agent SDK-based approach |
+|---|---|---|
+| What gets bridged | The full CLI process, with its own hooks / memory / plan mode / MCP / `/` commands | Whatever the SDK exposes |
+| CLI upgrades | Most capabilities benefit directly | Depends on the SDK version and your integration |
+| Memory / context | Uses the CLI's built-in memory | Depends on the SDK or your own build |
+| Multiple CLIs | 30+ adapters, switch with one config change | Depends on SDK coverage |
+| Multiple bots | Several bots in one group, dispatched by @ | Depends on implementation |
+| Direct terminal access | With the tmux backend, `tmux attach` into the real CLI process | Depends on implementation |
+
+➡️ Next: [Quick start](/en/quickstart)
+
+> Project: <https://github.com/deepcoldy/botmux>

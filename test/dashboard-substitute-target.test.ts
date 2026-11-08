@@ -86,7 +86,8 @@ it('saves and reloads one App ID input without a name, group, Open ID or binding
   try {
     await mount();
     const row = () => renderer!.root.findByProps({ className: 'bd-substitute-target-row' });
-    const inputs = () => row().findAllByType('input').filter(node => node.props.type !== 'hidden');
+    const inputs = () => row().findAllByType('input')
+      .filter(node => node.props.type !== 'hidden' && node.props['aria-hidden'] !== true);
     expect(inputs()).toHaveLength(1);
     await act(async () => { inputs()[0].props.onChange({ currentTarget: { value: 'cli_changed' } }); });
     await act(async () => { renderer!.root.findByProps({ 'data-action': 'save-substitute-mode' }).props.onClick(); });

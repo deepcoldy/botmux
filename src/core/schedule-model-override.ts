@@ -13,11 +13,9 @@
  * session-level effort whose model stopped supporting it.
  */
 import type { CliId } from '../adapters/cli/types.js';
-import {
-  cliModelSupportsReasoningEffort,
-  isConfigurableReasoningCliId,
-} from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort } from '../services/codex-reasoning-effort.js';
 import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
+import { allowsTaskModelOverride } from './launch-model-capability.js';
 
 export interface ScheduleModelOverride {
   /** Feeds DaemonSession.spawnModelOverride — absent means "bot's model". */
@@ -32,9 +30,8 @@ export interface ScheduleModelOverride {
 /**
  * Resolve a task's stored override against the bot that will actually run it.
  *
- * The CLI gate mirrors the trigger API (`trigger-session.ts`): only CLIs whose
- * adapters implement the model/effort launch contract may be steered per turn,
- * so a task can never hand a codex model id to an OpenCode bot.
+ * The CLI policy mirrors the trigger API (`trigger-session.ts`), independently
+ * of bot-level reasoning controls and general adapter model support.
  */
 export function resolveScheduleModelOverride(
   task: { model?: string; reasoningEffort?: ScheduleReasoningEffort },
@@ -44,7 +41,7 @@ export function resolveScheduleModelOverride(
   const requestedEffort = task.reasoningEffort;
   if (!model && !requestedEffort) return { warnings: [] };
 
-  if (!isConfigurableReasoningCliId(botCfg.cliId)) {
+  if (!allowsTaskModelOverride(botCfg.cliId)) {
     return {
       warnings: [
         `CLI ${botCfg.cliId ?? '(unset)'} does not support per-task model/effort; `

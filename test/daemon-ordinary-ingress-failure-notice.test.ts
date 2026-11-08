@@ -367,7 +367,13 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ds.hasHistory = true;
     const ctx = makeCtx(anchor, 'om_effort_task_input');
     await handleThreadReply(makeEventData(ctx.messageId, '/effort ultra 检查投递', anchor), ctx);
-    expect(mocks.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(mocks.updateCodexCliEffort).toHaveBeenCalledWith(
+      ds, 'ultra', undefined, expect.any(Function), { source: 'command', setBy: OWNER },
+    );
+    const canCommit = mocks.updateCodexCliEffort.mock.calls[0]![3];
+    expect(canCommit()).toBe(true);
+    getBot(APP).resolvedAllowedUsers = ['ou_other_owner'];
+    expect(canCommit()).toBe(false);
     expect(mocks.sendWorkerInput).toHaveBeenCalledOnce();
     expect(mocks.sendWorkerInput.mock.calls[0][1].content).toContain('检查投递');
     expect(mocks.sendWorkerInput.mock.calls[0][1].content).not.toContain('/effort ultra');

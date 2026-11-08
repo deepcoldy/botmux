@@ -684,13 +684,26 @@ describe('host — approve-dag（gate-2）', () => {
           readyPath,
           child: runTsChild(`
             import { writeFileSync } from 'node:fs';
-            import { authorizeAdHocRun } from ${JSON.stringify(hostUrl)};
+            import { authorizeAdHocRun, HostGuardError } from ${JSON.stringify(hostUrl)};
             writeFileSync(${JSON.stringify(readyPath)}, 'ready');
-            const result = authorizeAdHocRun(
-              ${JSON.stringify(runDir)},
-              ${JSON.stringify(bots)},
-              new Date(${JSON.stringify(authorizedAt)}),
-            );
+            // 外层 host 锁只等 500ms：先拿到外层锁的那个子进程要等测试放开 run.json.lock、再做完发布，
+            // 另一个在高负载下可能等不满就收到「正在执行另一个 mutation，请稍后重试」。真实调用方遇到这条就是
+            // 稍后重试，这里照做（有总时限）；锁内串行与只发布一份的断言不变。
+            const deadline = Date.now() + 15_000;
+            let result;
+            for (;;) {
+              try {
+                result = authorizeAdHocRun(
+                  ${JSON.stringify(runDir)},
+                  ${JSON.stringify(bots)},
+                  new Date(${JSON.stringify(authorizedAt)}),
+                );
+                break;
+              } catch (err) {
+                if (!(err instanceof HostGuardError) || !String(err.message).includes('请稍后重试') || Date.now() > deadline) throw err;
+                await new Promise((resolve) => setTimeout(resolve, 50));
+              }
+            }
             process.stdout.write(JSON.stringify({
               created: result.publication.created,
               authorizedAt: result.envelope.authorization.authorizedAt,

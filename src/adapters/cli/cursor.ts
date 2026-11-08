@@ -5,6 +5,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { delay } from '../../utils/timing.js';
 import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
@@ -36,6 +37,20 @@ export const cursorBridgeSpec: StructuredBridgeSpec = {
   spawn: { sessionId: 'cli', baseline: 'resume-aware' },
   adopt: { attach: 'baseline-skip-tail' },
 };
+
+/** The mounted composer's placeholder (empty composer); see readyPattern. */
+const CURSOR_EMPTY_COMPOSER = /→\s+(?:Plan, search, build anything|Add a follow-up)/;
+
+/** True when a stopped Cursor turn left a queued follow-up parked: the turn has
+ *  ended, the follow-ups panel offers `enter steer`, and the composer is empty,
+ *  so exactly one Enter submits that item as the next turn. Cursor flushes the
+ *  queue only when a turn ends naturally; after Ctrl-C the item stays parked. */
+export function cursorStopLeftParkedFollowUp(screen: string): boolean {
+  const text = stripAnsiScreenText(screen);
+  return /\benter steer\b/.test(text)
+    && CURSOR_EMPTY_COMPOSER.test(text)
+    && !/ctrl\+c to stop/i.test(text);
+}
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -213,7 +228,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     // permanently suppressed, no idle edge). Matching the post-turn placeholder
     // too keeps every turn's idle edge alive. Neither placeholder appears on the
     // login/startup screens, so the boot-time guard is unchanged.
-    readyPattern: /→\s+(?:Plan, search, build anything|Add a follow-up)/,
+    readyPattern: CURSOR_EMPTY_COMPOSER,
     deferFirstPromptTimeoutUntilReady: true,
     supportsTypeAhead: true,
     pluginDir: CURSOR_PLUGIN_DIR,

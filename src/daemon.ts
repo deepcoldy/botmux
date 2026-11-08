@@ -1,3 +1,4 @@
+import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
@@ -7,6 +8,8 @@ import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } fro
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
+import { setDecisionCardService } from './core/decision-board/card-action.js';
+import { createPrStateLookup } from './core/decision-board/github-pr-state.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
 import { createBoardChatProbes, sameOwnerAs } from './services/board-chat-probes.js';
 import { resolveDashboardOrigin } from './core/workbench-link.js';
@@ -17,6 +20,13 @@ import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
+import {
+  REPORT_SOURCE_REPLY_ROUTE,
+  deliverReportSourceReply,
+  buildReportReplyContext,
+  markReportReplyInput,
+  appendReportReplyReference,
+} from './core/report-source-reply.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -28,9 +38,12 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
+import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { createBotProfileRefresher } from './services/bot-profile-refresh.js';
+import { lastKnownBotName } from './services/bot-display-name.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
@@ -93,7 +106,7 @@ import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
-import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
+import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
   loadBotConfigs,
@@ -103,6 +116,7 @@ import {
   getBot,
   getAllBots,
   getBotClient,
+  getBotOpenId,
   createDetachedLarkClient,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
@@ -158,6 +172,7 @@ import {
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import {
+  canonicalPrimarySession,
   claimDurableLarkActiveSession,
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
@@ -228,6 +243,7 @@ import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMent
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
+import { errorMessage } from './utils/error-message.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { applyAllowedUsersResolve, shouldSilenceAllowedUsersOwnerDm, classifyAllowedUsersTerminalNotice } from './utils/allowed-users-apply.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
@@ -242,10 +258,12 @@ import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
 import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, PrincipalLaneQueuedTurn, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
-import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
+import { scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
+import { missingCliExecutableAfterRetry } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
+import { comparableSessionDir } from './core/working-dir-range.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
 
 export function useOrdinaryOutputDelivery(): void {
@@ -322,7 +340,15 @@ async function trustedCallerForInboundTurn(
     senderUnionId,
     senderIsBot,
     messageId,
-  }, { resolveMessageSenderUnionId });
+  }, {
+    resolveMessageSenderUnionId,
+    resolveVerifiedUserEmail: async (appId, openId) => {
+      const identity = await resolveVerifiedUserIdentity(appId, openId);
+      if (!identity || identity.type !== 'user' || identity.openId !== openId) return undefined;
+      try { return normalizeActorEmail(identity.email); }
+      catch { return undefined; }
+    },
+  });
   const canonicalBindings = caller?.senderType === 'bot'
     ? await readCanonicalBotActorOwnerBindings(
       getLoadedConfigProvenance() === 'loaded' ? getLoadedConfigPath() : undefined,
@@ -394,6 +420,7 @@ import {
 } from './core/dispatch-output-sink.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
+import { applyManagedScheduleUpdate, readManagedScheduleUpdate } from './core/schedule-managed-update.js';
 import {
   buildUntilDoneRunPrompt,
   isAutoCompletedSchedule,
@@ -471,6 +498,7 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
   buildStreamingCardJson,
+  substituteCardControlFor,
   isResumeRecoveryPlaceholder,
   identityStorageModelForDaemonSession,
   identityDecisionConflict,
@@ -480,14 +508,16 @@ import {
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
+import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
+import { listeningServersOnPath, probeTmuxOwner, tmuxSocketPath, procIsBotmuxListener } from './core/tmux-server-guard.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -542,7 +572,7 @@ import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
-import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
+import { applyTopicModelSpec, resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompactRuntime } from './core/auto-compact.js';
@@ -577,7 +607,7 @@ import {
   closeCliMismatchedSessionsForBot,
   resolveScheduledTaskExecutionPosition,
 } from './core/session-manager.js';
-import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
+import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
@@ -641,6 +671,7 @@ import {
   cancelCrossPrincipalInterruptionsForFeatureDisable,
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
+  crossPrincipalRerouteGaps,
   markCrossPrincipalSuggestionWaiting,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
@@ -710,6 +741,10 @@ import {
   saveSessionOwnerReminderRecords,
 } from './services/session-owner-reminder-store.js';
 import { buildSessionOwnerMention, sendSessionOwnerThreadNotification } from './services/session-owner-notification.js';
+import { LongTaskReminderController } from './core/long-task-reminder.js';
+import { canSendLongTaskReminder } from './core/long-task-reminder-eligibility.js';
+import { DEFAULT_LONG_TASK_REMINDER } from './services/long-task-reminder-policy.js';
+import { sendLongTaskReminder } from './services/long-task-reminder-notification.js';
 import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
@@ -729,6 +764,7 @@ import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
 import { createInputCaptureRuntime, setInputCaptureRuntime, stopInputCaptureRuntimes } from './core/plugins/input-capture/runtime.js';
 import { deliverCapturedInput } from './core/plugins/input-capture/gateway.js';
 import { captureInboundText } from './im/lark/input-capture.js';
+import { isP2pForceTopicRoot } from './services/p2p-force-topic-store.js';
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
@@ -758,6 +794,7 @@ import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplay
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3MainTopicAvailability, v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon, workflowNodePinnedStart } from './core/workflow-node-daemon.js';
+import { WORKFLOW_INITIATOR_UNION_ROUTE, WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, createWorkflowWorkingDirOperatorWiring } from './core/workflow-working-dir-operator.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
 import { isRemoteCliId } from './core/remote-cli-ids.js';
@@ -902,6 +939,9 @@ let selfDaemonLarkAppId: string | undefined;
 export function __testOnly_setDaemonLarkAppId(appId: string | undefined): void {
   selfDaemonLarkAppId = appId;
 }
+/** Set once the profile refresher exists: dashboard ✎ rename / avatar writes
+ *  tell it so an in-flight or not-yet-propagated /bot/v3/info read cannot revert them. */
+let noteLocalBotProfileWrite: (() => void) | undefined;
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -957,13 +997,15 @@ function startAdminUnionsPublisher(larkAppId: string): void {
   void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, ensureChatDisbandedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
+import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup } from './core/dismiss-command.js';
 import { ListenerCircuitBreaker } from './services/listener-circuit-breaker.js';
 import { pruneBotAttachments } from './core/attachment-prune.js';
-import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { learnFromMentions, getIdentity, resolveSender, resolveVerifiedUserIdentity, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { normalizeActorEmail } from './cli/current-actor.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -998,6 +1040,7 @@ import {
   clearAgentAttention,
   stampHumanActivity,
 } from './core/session-activity.js';
+import { holdLastTurnThrough, isMaintenanceTurnId, noteTurnStarted } from './core/turn-outcome.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
@@ -1187,7 +1230,7 @@ import {
   withVcMeetingDaemonAuthHeader,
 } from './services/vc-meeting-daemon-auth.js';
 import {
-  resolveDurableVcMeetingImRouting,
+  resolveVcMeetingImRoutingForTurn,
   runBoundedVcMeetingImCatchUp,
   type VcMeetingImRoutingCandidate,
   type VcMeetingSealedReceiverSessionBinding,
@@ -3616,7 +3659,7 @@ async function maybeCatchUpVcMeetingConsumerBeforeTurn(
       agentAppId: ctx.larkAppId,
       receiverSessionId: session.sessionId,
     }));
-  const route = resolveDurableVcMeetingImRouting(config.session.dataDir, {
+  const route = resolveVcMeetingImRoutingForTurn(config.session.dataDir, {
     listenerChatId: ctx.chatId,
     agentAppId: ctx.larkAppId,
     sealedReceiverSessions,
@@ -3625,6 +3668,20 @@ async function maybeCatchUpVcMeetingConsumerBeforeTurn(
       ...(parsed.content ? { messageText: stripLeadingMentions(parsed.content, parsed.mentions) } : {}),
     },
   });
+  if (route.kind === 'unavailable') {
+    logger.warn(
+      `[vc-agent] meeting routing state unavailable chat=${ctx.chatId} agent=${ctx.larkAppId} `
+      + `message=${ctx.messageId} fallback=${route.fallback}: ${route.error}`,
+    );
+    if (route.fallback === 'ordinary') return;
+    await sessionReply(
+      ctx.chatId,
+      '会议上下文暂时读取失败，本次没有发给会议会话，也没有新建普通会话，请稍后重试。',
+      'text',
+      ctx.larkAppId,
+    );
+    return { block: true };
+  }
   if (route.kind === 'ordinary') return;
   if (route.kind === 'ambiguous') {
     const meetings = route.candidates
@@ -4302,8 +4359,9 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
 /** `keepInactiveWorkflow`: also return a workflow handoff's delegation that no
  *  longer holds (the caller reports why). Every other caller — the inherited
  *  authority of a dispatch / `--mention` handoff, schedule creation — gets no
- *  delegation from it. */
-async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean } = {}) {
+ *  delegation from it. `waitMs`: how long to wait for an unbound handoff to
+ *  this bot to be bound (default: resolveDispatchUser's). */
+async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean; waitMs?: number } = {}) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   // The main bot's own workflow node turn has no inbound message (design
   // §6.5): its turn id is the handoff it posted, its topic the node card.
@@ -4323,6 +4381,7 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { ke
     secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     appId: ds.larkAppId, chatId: ds.chatId, turnId,
     rootId: reply?.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+    waitMs: opts.waitMs,
   });
   // A workflow handoff's delegation (design 2026-11-03 §10) holds only while
   // its run attempt does; past that it is no delegation at all.
@@ -4466,7 +4525,11 @@ async function handleIdentityDecisionFlip(
     // from its schedule authority again. refreshTurnCliIdentity reads the
     // turn's human sender, which a scheduled turn never has, so replaying
     // through it turned the creator's identity into an anonymous refusal.
-    await prepareTurnCliIdentity(ds, turnId);
+    // Tracked from the start: the CLI's first identity fetch can arrive while
+    // this replay is still resolving the sender, and must wait for it rather
+    // than be refused for missing material.
+    const replay = prepareTurnCliIdentity(ds, turnId);
+    if (replay) await trackTurnIdentityPublication(config.session.dataDir, ds.session.sessionId, replay);
     ds.lastIdentityDecisionRepublish = { model: context.model, turnId, ok: true };
   } catch (error) {
     // Keep the failure visible and replayable: no success baseline, no
@@ -4519,6 +4582,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 }
 
@@ -4616,6 +4680,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
   return true;
 }
@@ -4701,6 +4766,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 
   // NO chat notice here.
@@ -5259,7 +5325,7 @@ export async function enforceMessageQuotaForCliInput(
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
     : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
-    logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
+    logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
   // Control/setup messages still need the authorization decision above, but
@@ -5402,7 +5468,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   branch: string;
   targetSubdir?: string;
 }> {
-  const { mainWorktreeFor, worktreeRootFor } = await import('./services/git-worktree.js');
+  const { mainWorktreeFor, worktreeRootFor, worktreeTargetPath } = await import('./services/git-worktree.js');
   const containingRoot = await worktreeRootFor(baseDir);
   const repoRoot = await mainWorktreeFor(baseDir);
   // `git rev-parse --show-toplevel` can canonicalize platform aliases (for
@@ -5415,7 +5481,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   const branch = `wt/botmux-${short}`;
   return {
     branch,
-    worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
+    worktreePath: worktreeTargetPath(repoRoot, `${basename(repoRoot)}-wt-botmux-${short}`),
     ...((subdir && !subdir.startsWith('..') && !isAbsolute(subdir)) ? { targetSubdir: subdir } : {}),
   };
 }
@@ -5556,6 +5622,7 @@ function removePidFile(): void {
 const DAEMON_REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 
 interface DaemonDescriptor {
+  readonly larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   botName: string;
   /** CLI adapter id from bots.json, used by dashboard roster before any sessions exist. */
@@ -6415,6 +6482,7 @@ function runIdleAutoCompact(): void {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+  noteTurnStarted(ds, turnId);
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
@@ -6452,6 +6520,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       previousIdleLabel,
       dshRuntimeForSession(ds),
       resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+      false,
+      substituteCardControlFor(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -6919,6 +6989,17 @@ function workflowSelfAppId(): string {
   return selfDaemonLarkAppId;
 }
 
+/** §15.4 operate check of this daemon's bot (design 2026-11-03). */
+// Every import is read only when called (never at module load), as before.
+const workflowWorkingDirOperatorWiring = createWorkflowWorkingDirOperatorWiring({
+  resolveTargetAppOpenId: (appId, unionId) => resolveTargetAppOpenId(appId, unionId),
+  resolveUnionIdFromOpenId: (appId, openId) => resolveUnionIdFromOpenIdStrict(appId, openId),
+  listChatMemberOpenIds: (appId, chatId) => listChatMemberOpenIds(appId, chatId),
+  canRunDaemonCommand: (appId, chatId, openId, unionId, cmd, chatType) => humanCanRunDaemonCommand(appId, chatId, openId, unionId, cmd, chatType),
+  selfLarkAppId: () => workflowSelfAppId(),
+  warn: (message) => logger.warn(message),
+});
+
 const workflowNodeDaemon = createWorkflowNodeDaemon({
   selfLarkAppId: workflowSelfAppId,
   dataDir: () => config.session.dataDir,
@@ -6981,6 +7062,11 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
     try { return getBot(appId).config; } catch { return undefined; }
   },
   daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
+  // §15.4: the initiator operates this bot when they may use /cd in its
+  // topics (the gate a typed /cd passes) and are in the run's chat now, with
+  // their identity converted into this bot's own app first.
+  ...workflowWorkingDirOperatorWiring,
+  currentBots: () => loadBotConfigs(),
   daemonHandlesMainPlacement: (appId) => findOnlineDaemon(appId)?.workflowMainPlacement === 'v1',
   // §5.5 board link: the main session's topic id (`omt_…`), display only.
   mainTopicThreadId: (binding) => {
@@ -7023,6 +7109,7 @@ async function withdrawWorkflowHandoffIdentity(ds: DaemonSession, turnId: string
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
+    privateChat: ds.chatType === 'p2p',
   });
 }
 
@@ -7084,6 +7171,17 @@ const workflowMainWake = createWorkflowMainWake({
   warn: (message) => logger.warn(message),
 });
 
+/** The directory a main-topic node the main bot runs itself would meet: its
+ *  main session's, found by the same lookup the node's delivery makes (the
+ *  main topic root × the main bot). Undefined = no live session there (the
+ *  node would start one in the frozen directory). Comparison form. */
+function v3MainSessionDirOf(binding: import('./workflows/v3/grill-state.js').RunChatBinding): string | undefined {
+  if (!binding.rootMessageId) return undefined;
+  const ds = activeSessions.get(sessionKey(binding.rootMessageId, binding.larkAppId));
+  if (!ds || ds.session.status === 'closed') return undefined;
+  return comparableSessionDir(getSessionWorkingDir(ds));
+}
+
 /** 「改派」 on bot-executed runs' blocked cards: the same live §6.1 probe the
  *  approval uses, against the run's chat. */
 const v3BlockedReassignDeps: V3BlockedReassignDeps = {
@@ -7095,6 +7193,7 @@ const v3BlockedReassignDeps: V3BlockedReassignDeps = {
   nameOf: (appId) => v3BotDisplayNameResolver()(appId),
   cliOf: (appId) => loadBotConfigs().find((bot) => bot.larkAppId === appId)?.cliId,
   executor: workflowNodeDaemon.executor,
+  mainSessionDir: v3MainSessionDirOf,
 };
 
 // v3 humanGate run-controller: drives daemon-side v3 runs, posts/​re-posts
@@ -7549,10 +7648,9 @@ async function adoptCodexNotifierEvent(
     ds.session.cliPathOverride = botCfg.cliPathOverride;
     delete ds.session.wrapperCli;
     delete ds.session.cliLaunchMode;
-    delete ds.session.model;
-    ds.spawnModelOverride = undefined;
+    clearTakeoverModelSources(ds);
     ds.session.agentFrozen = true;
-    sessionStore.updateSession(ds.session);
+    sessionStore.updateSession(ds.session, { modelPinWrite: true });
 
     // 默认 flat DM(p2pMode=chat)下这条按钮回调复用同一私聊的现有会话。若该会话
     // 恰好停在「待选仓库」挂起态且已缓冲一条尚未提交的输入，接管会消费掉
@@ -8065,34 +8163,50 @@ for (const path of [
 // Fire-and-forget: the runner drives the run + posts gate cards; the caller
 // polls /api/v3/runs/:id for status.
 workflowDaemonMutationRoute('start', async (reply, params, _body, identity) => {
-  const runId = params.runId;
-  if (!isValidV3RunId(runId)) return reply(400, { ok: false, error: 'bad_run_id' });
+  const started = startV3RunOnThisDaemon(params.runId, identity);
+  return reply(started.status, started.body);
+});
+
+/**
+ * The start of a daemon-driven run, shared by the signed `start` mutation
+ * (`botmux workflow start`, the grill `approve-dag` kick) and the Dashboard
+ * 拉群开始 (design 2026-11-03 workflow-dashboard-orchestration §4.5 第 8 步).
+ * Idempotent: the start intent is one journal record.
+ */
+function startV3RunOnThisDaemon(
+  runId: string,
+  identity: { larkAppId: string },
+): { status: number; body: Record<string, unknown> } {
+  if (!isValidV3RunId(runId)) return { status: 400, body: { ok: false, error: 'bad_run_id' } };
   // Machine-wide workflow kill-switch: refuse launching a NEW daemon-driven run
   // when the feature is off. This is the common sink for both `botmux workflow
   // start` and the grill `approve-dag` kick, so gating here closes the edge where
   // a run was grilled+approved before the flip. Restart recovery of an
   // already-started run (coldAttach / reconcileV3PendingGates) is a separate path
   // and is intentionally NOT gated, and `retry`/`grant`/`cancel` stay available.
-  if (!isWorkflowFeatureEnabled()) return reply(409, { ok: false, error: 'workflow_disabled' });
+  if (!isWorkflowFeatureEnabled()) return { status: 409, body: { ok: false, error: 'workflow_disabled' } };
   const runDir = join(v3DefaultBaseDir(), runId);
   const preflight = preflightV3RunStart(runDir);
   if (!preflight.ok) {
     if (preflight.error === 'no_grill_state') {
-      return reply(404, { ok: false, error: 'unknown_run' });
+      return { status: 404, body: { ok: false, error: 'unknown_run' } };
     }
-    return reply(409, {
-      ok: false,
-      error: preflight.error,
-      ...(preflight.status ? { status: preflight.status } : {}),
-      ...(preflight.detail ? { detail: preflight.detail } : {}),
-    });
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: preflight.error,
+        ...(preflight.status ? { status: preflight.status } : {}),
+        ...(preflight.detail ? { detail: preflight.detail } : {}),
+      },
+    };
   }
   // Owner check (codex blocker #1): only the daemon owning this run's bot may
   // start it — otherwise the wrong daemon drives + posts cards with its client.
   const binding = preflight.context.binding;
-  if (!binding) return reply(404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (!binding) return { status: 404, body: { ok: false, error: 'unknown_run_or_no_binding' } };
   if (binding.larkAppId !== identity.larkAppId) {
-    return reply(409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+    return { status: 409, body: { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId } };
   }
   // A 202 means the start intent is recoverable after an immediate daemon
   // crash. Persist the journal boundary before scheduling detached work; cold
@@ -8100,15 +8214,18 @@ workflowDaemonMutationRoute('start', async (reply, params, _body, identity) => {
   try {
     persistV3StartIntent(runId, runDir);
   } catch (err) {
-    return reply(409, {
-      ok: false,
-      error: 'run_journal_invalid',
-      detail: err instanceof Error ? err.message : String(err),
-    });
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: 'run_journal_invalid',
+        detail: err instanceof Error ? err.message : String(err),
+      },
+    };
   }
   v3GateRunner.driveDetached(runId);
-  return reply(202, { ok: true, runId });
-});
+  return { status: 202, body: { ok: true, runId } };
+}
 
 // v3 durable cancel: journal intent first, then low-latency AbortController
 // delivery + replay. HTTP 202 is returned only after runCancelRequested has
@@ -8273,6 +8390,10 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
       },
       // §5.2 rule 3, for an edit that moves a node into the main topic.
       mainTopic: v3MainTopicAvailability(binding, binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined),
+      // §5.2 rule 2 × §15.4, for an edit that makes a node one the main bot
+      // runs in the main topic while the run has a frozen working dir.
+      ...(() => { const dir = v3MainSessionDirOf(binding); return dir !== undefined ? { mainSessionDir: dir } : {}; })(),
+      nameOf: v3BotDisplayNameResolver(),
     });
   } catch (err) {
     return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -8623,6 +8744,23 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       .map(item => item.trim()).filter(Boolean).slice(0, 64)
     : [];
   const targetAppIds = stringArray(body?.targetAppIds);
+  const replyRequested = body?.resultDelivery === 'reply';
+  if (body?.resultDelivery !== undefined && !replyRequested) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_result_delivery' });
+  }
+  if (replyRequested && (targetAppIds.length !== 1 || body?.hasLegacyBots === true || !acceptanceRequested
+    || (ds.scope ?? ds.session.scope) !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')
+    || !ds.managedTurnOrigin?.turnId?.startsWith('om_') || body?.requestedLaunch !== undefined
+    || ds.session.principalLane || getBot(ds.larkAppId).config.privateCard
+    || !dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, ds.managedTurnOrigin?.turnId))
+    || (ds.session.reportReplyInputId !== undefined && ds.session.reportReplyInputId !== ds.managedTurnOrigin?.turnId))) {
+    return jsonRes(res, 400, { ok: false, error: 'reply_requires_single_human_topic_dispatch' });
+  }
+  const sourceReply = replyRequested ? { rootMessageId: ds.session.rootMessageId!,
+    sourceTurnId: ds.managedTurnOrigin!.turnId!, reporterLarkAppId: targetAppIds[0]! } : undefined;
+  if (sourceReply && markReportReplyInput(ds.session, sourceReply.sourceTurnId)) {
+    sessionStore.updateSession(ds.session);
+  }
   const rawRequestedLaunch = body?.requestedLaunch;
   const rawEffectiveRuntime = body?.effectiveRuntime;
   const hasLaunchSpec = rawRequestedLaunch !== undefined || rawEffectiveRuntime !== undefined;
@@ -8713,6 +8851,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     targetScope: ds.scope ?? ds.session.scope ?? 'thread',
     sourceName: title || 'dispatched subtask',
     issuedAt,
+    ...(sourceReply ? { reply: sourceReply } : {}),
   });
   const botOpenIds = stringArray(body?.bots);
   try {
@@ -9027,7 +9166,10 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     // lead that is handed a report by one bot can still hand the same person
     // on to the next. Re-checked against this chat and narrowed to this bot's
     // tools; a schedule or a plain bot-to-bot message still has no sender.
-    let inherited = await dispatchUserForTurn(ds, turnId);
+    // This turn's own handoff had its wait when the turn was delivered; an
+    // unbound one to this bot now is another handoff in flight, and waiting
+    // for it would only hold up this send.
+    let inherited = await dispatchUserForTurn(ds, turnId, { waitMs: 0 });
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
     if (inherited && 'workflow' in inherited) {
       // Same rule as `botmux dispatch` from a workflow node (design §10).
@@ -9689,9 +9831,6 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (action === 'update' && authority.kind === 'delegated') {
     return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_reauthorization_required' });
   }
-  if (action === 'update' && authority.task.preconditionRef) {
-    return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
-  }
   // A capability-only caller borrows the current human administrator's
   // authority, but the request bytes come from the (untrusted) agent. Keep it
   // to the tasks this conversation could have created: same chat, and a
@@ -9725,29 +9864,17 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     });
   }
   if (action === 'update') {
-    const hasPrompt = typeof body.prompt === 'string' && body.prompt.trim();
-    const hasCalendar = body.calendar !== undefined || body.calendarDayType !== undefined;
-    if (!hasPrompt && !hasCalendar) {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_update' });
-    }
-    if (body.prompt !== undefined && !hasPrompt) {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_prompt' });
-    }
-    if (body.calendar !== undefined && body.calendar !== null && typeof body.calendar !== 'string') {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_calendar' });
-    }
-    if (body.calendarDayType !== undefined
-      && body.calendarDayType !== 'workday' && body.calendarDayType !== 'restday') {
-      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_calendar_day_type' });
-    }
-    const result = scheduler.updateTask(id, {
-      ...(hasPrompt ? { prompt: body.prompt } : {}),
-      ...(body.calendar !== undefined ? { calendar: body.calendar } : {}),
-      ...(body.calendarDayType !== undefined ? { calendarDayType: body.calendarDayType } : {}),
-    });
-    ok = result.ok;
-    error = result.error;
-  } else if (action === 'remove') ok = scheduler.removeTask(id);
+    // Same compound operation as the Dashboard PATCH: a changed schedule is
+    // re-parsed with nextRunAt recomputed from now, and a configured
+    // precondition is kept and rebound to the edited task input.
+    const parsedUpdate = readManagedScheduleUpdate(body);
+    if (!parsedUpdate.ok) return jsonRes(res, 400, { ok: false, error: parsedUpdate.error });
+    const result = applyManagedScheduleUpdate(id, appId, parsedUpdate.updates);
+    return result.ok
+      ? jsonRes(res, 200, { ok: true, task: result.task })
+      : jsonRes(res, 409, { ok: false, error: result.error });
+  }
+  if (action === 'remove') ok = scheduler.removeTask(id);
   else if (action === 'pause') ok = scheduler.disableTask(id);
   else if (action === 'resume') ok = scheduler.enableTask(id);
   else if (action === 'run') {
@@ -9791,6 +9918,34 @@ ipcRoute('POST', WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE, async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
   }
   const result = await workflowNodeDaemon.identityCheckRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Executing bot's daemon ← Gate-2 (approve-dag): may the run's initiator
+// operate this bot here, i.e. use /cd (design §15.4)?
+ipcRoute('POST', WORKFLOW_WORKING_DIR_OPERATOR_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = await workflowNodeDaemon.workingDirOperatorRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Main bot's daemon ← executing bot's daemon: the initiator's union_id for a
+// run of this bot that pins a working dir (design §15.4).
+ipcRoute('POST', WORKFLOW_INITIATOR_UNION_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = await workflowNodeDaemon.initiatorUnionRoute(raw);
   return jsonRes(res, result.status, result.body);
 });
 
@@ -9873,6 +10028,42 @@ ipcRoute('POST', WORKFLOW_NODE_REPORT_ROUTE, async (req, res) => {
         } : {}),
       },
     };
+  });
+  return jsonRes(res, result.status, result.body);
+});
+
+ipcRoute('POST', REPORT_SOURCE_REPLY_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!selfDaemonLarkAppId || getBot(selfDaemonLarkAppId).config.privateCard) {
+    return jsonRes(res, 403, { ok: false, error: 'report_publication_unavailable' });
+  }
+  const result = await deliverReportSourceReply(raw, {
+    dataDir: config.session.dataDir,
+    secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    selfLarkAppId: selfDaemonLarkAppId,
+    session: id => findActiveBySessionId(id)?.session ?? sessionStore.getSession(id),
+    publish: async (content, target) => {
+      const ds = findActiveBySessionId(target.sessionId);
+      if (!ds || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) {
+        throw Object.assign(new Error('report_reply_source_changed'), { name: 'ReportReplySourceChangedError' });
+      }
+      return sessionReply(sessionAnchorId(ds), buildMarkdownCard(content, undefined, ''), 'interactive',
+        ds.larkAppId, undefined, { sourceSessionId: ds.session.sessionId, uuid: target.uuid,
+          replyTarget: { mode: 'thread', rootMessageId: target.rootMessageId }, beforeWrite: target.beforeWrite });
+    },
+    remember: async (reference, id) => {
+      const session = findActiveBySessionId(id)?.session ?? sessionStore.getSession(id);
+      if (!session) throw new Error('report_reply_source_changed');
+      session.reportReplyReferences ??= [];
+      const appended = appendReportReplyReference(session.reportReplyReferences, reference);
+      if (appended.changed) {
+        session.reportReplyReferences = appended.references;
+        sessionStore.updateSession(session);
+      }
+    },
   });
   return jsonRes(res, result.status, result.body);
 });
@@ -10498,6 +10689,13 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   };
+  // chat-scope 的 ask 身份仍是 root=null（文字答复按 chatId 锚点命中），独立卡片只是跟着发起
+  // turn 冻结的话题落点。嵌进回复卡的 ask 由回复卡决定位置；异步提问的提示与答复 turn
+  // 都按 root=null 发，卡片不单独搬走。
+  const askTurnTarget = askSession?.session.scope === 'chat' && typeof body.originTurnId === 'string'
+    ? frozenReplyContextForTurn(askSession, body.originTurnId).target : undefined;
+  const cardRoot = asyncInput || askInput.replyCardTarget || askTurnTarget?.mode !== 'thread'
+    ? undefined : { cardRootMessageId: askTurnTarget.rootMessageId };
   const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
   const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
   if (body.acknowledge === true) {
@@ -10519,8 +10717,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       ? { turnId: askOrigin.turnId,
           dispatchAttempt: askOrigin.dispatchAttempt,
           workerGeneration: askWorkerGeneration }
-      : undefined)
-    : await registerAskForResponse(askInput, res);
+      : undefined, cardRoot)
+    : await registerAskForResponse({ ...askInput, ...cardRoot }, res);
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
@@ -10728,7 +10926,7 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   const rawKind = typeof raw.kind === 'string' ? raw.kind.trim().toLowerCase() : '';
   const kind = ['authz', 'decision', 'blocked', 'help'].includes(rawKind) ? rawKind : 'blocked';
 
-  ds.agentAttention = { kind, reason, at: Date.now() };
+  ds.agentAttention = { kind, reason, at: Date.now(), source: 'agent' };
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
@@ -11911,284 +12109,339 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     logger.info(`[vc-agent] restore skipped for ${larkAppId}: global listener bot is ${listenerAppId}`);
     return;
   }
-  pruneExpiredVcMeetingRuntimeSessions(config.session.dataDir);
-  for (const record of listVcMeetingRuntimeSessions(config.session.dataDir, larkAppId)) {
+  // Startup must survive meeting state it cannot read: this runs inside the
+  // daemon's bot loop, so an exception here used to abort startDaemon for EVERY
+  // bot (a quarantined runtime store on 11-06 would have crash-looped each
+  // VC-enabled daemon). Failure paths never delete a durable record (a partly
+  // restored meeting may already have persisted some field updates), so the
+  // next start retries the meeting.
+  try {
+    pruneExpiredVcMeetingRuntimeSessions(config.session.dataDir);
+  } catch (err) {
+    logger.warn(`[vc-agent] restore: pruning expired meeting runtime records failed for ${larkAppId}: ${errorMessage(err)}`);
+  }
+  let records: VcMeetingRuntimeSessionRecord[];
+  try {
+    records = listVcMeetingRuntimeSessions(config.session.dataDir, larkAppId);
+  } catch (err) {
+    logger.error(
+      `[vc-agent] restore skipped for ${larkAppId}: meeting runtime state unreadable (${errorMessage(err)}); `
+      + 'in-progress meetings stay on disk and are restored on the next start',
+    );
+    return;
+  }
+  for (const record of records) {
     const key = vcMeetingSessionKey(larkAppId, record.meeting.id);
-    const hubClose = getVcMeetingHubCloseState(config.session.dataDir, {
-      listenerAppId: larkAppId,
-      meetingId: record.meeting.id,
-    });
-    const hasDurableClose = record.consumerClosePhase !== undefined
-      || hubClose?.phase === 'data_closing'
-      || hubClose?.phase === 'finalizing';
-    if (hubClose?.phase === 'closed') {
-      removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
-      continue;
-    }
-    if (hasRecentVcMeetingEndedTombstone(key) && !hasDurableClose) {
-      removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
-      continue;
-    }
-    const session = getOrCreateVcMeetingDaemonSession(
-      larkAppId,
-      {
-        id: record.meeting.id,
-        meetingNo: record.meeting.meetingNo,
-        topic: record.meeting.topic,
-      },
-      cfg,
-      { joined: record.listenerPresenceStale !== true, listenerChatId: record.listenerChatId },
-    );
-    if (!session) continue;
-    const preparation = record.preparationMeetingNo
-      ? getVcMeetingPreparation(config.session.dataDir, record.larkAppId, record.preparationMeetingNo)
-      : undefined;
-    // 2.105.x 的准备会议会把 Q&A Agent 同时写成普通 consumer。新模型将两者
-    // 分离；恢复旧记录时只迁移能与 preparation 精确对应的自动绑定，避免覆盖
-    // 用户后来显式选择的其它 consumer。
-    const migratePreparedConsumer = !record.qaAgentAppId
-      && !!preparation
-      && record.listenerChatId === preparation.prepChatId
-      && record.consumerMode === 'agent'
-      && record.selectedAgentAppId === preparation.agentAppId;
-    session.joined = record.listenerPresenceStale !== true;
-    session.monitoringStarted = true;
-    session.listenerPresenceStale = record.listenerPresenceStale === true;
-    session.listenerPresenceChangedAtMs = record.listenerPresenceChangedAtMs;
-    session.listenerPresenceGeneration = record.listenerPresenceGeneration;
-    session.listenerRejoinNonce = record.listenerRejoinNonce;
-    session.listenerRejoinCardMessageId = record.listenerRejoinCardMessageId;
-    session.inviterManagers = record.inviterManagers;
-    session.listenerChatCreatedForMeeting = record.listenerChatCreatedForMeeting;
-    session.listenerChatId = record.listenerChatId;
-    session.state.notificationChatId = record.listenerChatId;
-    if (record.attentionTargetOpenId) session.state.attentionTargetOpenId = record.attentionTargetOpenId;
-    session.consumerMode = migratePreparedConsumer ? 'listenOnly' : record.consumerMode;
-    session.selectedAgents = migratePreparedConsumer ? [] : (record.selectedAgents ?? []);
-    session.selectedAgentAppId = migratePreparedConsumer ? undefined : record.selectedAgentAppId;
-    session.selectedAgentLabel = migratePreparedConsumer ? undefined : record.selectedAgentLabel;
-    session.consumerPaused = migratePreparedConsumer ? false : record.consumerPaused;
-    if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = undefined;
-    session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
-    session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
-    session.syncIntervalMs = record.syncIntervalMs;
-    session.listenerPolicy = resolveVcMeetingListenerPolicy(record.listenerPolicy);
-    session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
-    session.consumerCardMessageId = record.consumerCardMessageId;
-    session.temporaryInstructionOpenIds = Object.fromEntries(
-      (record.temporaryInstructionOpenIds ?? []).map(openId => [openId, true] as const),
-    );
-    session.temporaryInstructionUnionIds = Object.fromEntries(
-      (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
-    );
-    session.preparationMeetingNo = record.preparationMeetingNo;
-    session.qaMode = record.qaMode ?? preparation?.qaMode;
-    session.qaAgentAppId = record.qaAgentAppId ?? preparation?.agentAppId;
-    session.qaRecentOutputHashes = record.qaRecentOutputHashes ?? [];
-    void synchronizeVcMeetingInviters(session, cfg).catch(err => logger.warn(`[vc-agent] inviter recovery: ${String(err)}`));
-    const selectedAgentsBeforeReconcile = JSON.stringify(session.selectedAgents);
-    const restoredProfileMemberships = session.consumerMode === 'agent'
-      && session.selectedAgents.length > 0
-      ? reconcileVcMeetingRestoredProfileMemberships(session, cfg)
-      : { activations: [], pauses: [] };
-    const profileSelectionReconciled = selectedAgentsBeforeReconcile !== JSON.stringify(session.selectedAgents);
-    if (session.consumerMode === 'agent' && session.selectedAgents.length > 0) {
-      session.consumerProfileOwnerBootReady = refreshVcMeetingProfileOwnerBoot(session);
-    }
-    if (hasDurableClose) {
-      if (session.consumerMode !== 'agent' || !vcMeetingSessionHasConsumerMembers(session, cfg)) {
-        logger.error(
-          `[vc-agent] invalid durable close record removed meeting=${record.meeting.id}: no selected agent`,
-        );
+    // Only entries this restore creates are ours to tear down on failure.
+    const hadSession = vcMeetingSessions.has(key);
+    const hadClosing = vcMeetingClosingConsumerSessions.has(key);
+    try {
+      restoreVcMeetingRuntimeSessionRecord(larkAppId, cfg, record);
+    } catch (err) {
+      // Drop the half-restored in-memory session and stop the timers it had
+      // already armed, so nothing keeps running on partial state (or doubles
+      // the cadence of the session a later push creates for the same meeting).
+      if (!hadSession) {
+        const partial = vcMeetingSessions.get(key);
+        if (partial) cleanupVcMeetingDaemonSession(partial, 'meeting-restore-failed');
         vcMeetingSessions.delete(key);
-        removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
-        continue;
       }
-      const deadlineAt = record.consumerFinalizationDeadlineAt
-        ?? hubClose?.finalizationDeadlineAt
-        ?? Date.now() + vcMeetingConsumerCloseHorizonMs();
-      session.ended = true;
-      session.consumerClosePhase = hubClose?.phase === 'finalizing'
-        ? 'finalizing'
-        : record.consumerClosePhase ?? 'data_closing';
-      session.consumerFinalizationDeadlineAt = deadlineAt;
-      session.consumerCloseResolutionDeadlineAt = record.consumerCloseResolutionDeadlineAt
-        ?? (Date.now() >= deadlineAt
-          ? deadlineAt + vcMeetingConsumerRecoveryResolutionGraceMs()
-          : undefined);
-      session.consumerRestoreCatchUpRequired = true;
+      if (!hadClosing) {
+        const closing = vcMeetingClosingConsumerSessions.get(key);
+        if (closing) {
+          if (closing.timer) clearTimeout(closing.timer);
+          cleanupVcMeetingDaemonSession(closing.session, 'meeting-restore-failed');
+        }
+        vcMeetingClosingConsumerSessions.delete(key);
+      }
+      logger.error(
+        `[vc-agent] restore failed meeting=${record.meeting.id} bot=${larkAppId}: ${errorMessage(err)}; `
+        + 'other meetings continue, this one is retried on the next start',
+      );
+    }
+  }
+}
+
+function restoreVcMeetingRuntimeSessionRecord(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+  record: VcMeetingRuntimeSessionRecord,
+): void {
+  const key = vcMeetingSessionKey(larkAppId, record.meeting.id);
+  const hubClose = getVcMeetingHubCloseState(config.session.dataDir, {
+    listenerAppId: larkAppId,
+    meetingId: record.meeting.id,
+  });
+  const hasDurableClose = record.consumerClosePhase !== undefined
+    || hubClose?.phase === 'data_closing'
+    || hubClose?.phase === 'finalizing';
+  if (hubClose?.phase === 'closed') {
+    removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+    return;
+  }
+  if (hasRecentVcMeetingEndedTombstone(key) && !hasDurableClose) {
+    removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+    return;
+  }
+  const session = getOrCreateVcMeetingDaemonSession(
+    larkAppId,
+    {
+      id: record.meeting.id,
+      meetingNo: record.meeting.meetingNo,
+      topic: record.meeting.topic,
+    },
+    cfg,
+    { joined: record.listenerPresenceStale !== true, listenerChatId: record.listenerChatId },
+  );
+  if (!session) return;
+  const preparation = record.preparationMeetingNo
+    ? getVcMeetingPreparation(config.session.dataDir, record.larkAppId, record.preparationMeetingNo)
+    : undefined;
+  // 2.105.x 的准备会议会把 Q&A Agent 同时写成普通 consumer。新模型将两者
+  // 分离；恢复旧记录时只迁移能与 preparation 精确对应的自动绑定，避免覆盖
+  // 用户后来显式选择的其它 consumer。
+  const migratePreparedConsumer = !record.qaAgentAppId
+    && !!preparation
+    && record.listenerChatId === preparation.prepChatId
+    && record.consumerMode === 'agent'
+    && record.selectedAgentAppId === preparation.agentAppId;
+  session.joined = record.listenerPresenceStale !== true;
+  session.monitoringStarted = true;
+  session.listenerPresenceStale = record.listenerPresenceStale === true;
+  session.listenerPresenceChangedAtMs = record.listenerPresenceChangedAtMs;
+  session.listenerPresenceGeneration = record.listenerPresenceGeneration;
+  session.listenerRejoinNonce = record.listenerRejoinNonce;
+  session.listenerRejoinCardMessageId = record.listenerRejoinCardMessageId;
+  session.inviterManagers = record.inviterManagers;
+  session.listenerChatCreatedForMeeting = record.listenerChatCreatedForMeeting;
+  session.listenerChatId = record.listenerChatId;
+  session.state.notificationChatId = record.listenerChatId;
+  if (record.attentionTargetOpenId) session.state.attentionTargetOpenId = record.attentionTargetOpenId;
+  session.consumerMode = migratePreparedConsumer ? 'listenOnly' : record.consumerMode;
+  session.selectedAgents = migratePreparedConsumer ? [] : (record.selectedAgents ?? []);
+  session.selectedAgentAppId = migratePreparedConsumer ? undefined : record.selectedAgentAppId;
+  session.selectedAgentLabel = migratePreparedConsumer ? undefined : record.selectedAgentLabel;
+  session.consumerPaused = migratePreparedConsumer ? false : record.consumerPaused;
+  if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = undefined;
+  session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
+  session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
+  session.syncIntervalMs = record.syncIntervalMs;
+  session.listenerPolicy = resolveVcMeetingListenerPolicy(record.listenerPolicy);
+  session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
+  session.consumerCardMessageId = record.consumerCardMessageId;
+  session.temporaryInstructionOpenIds = Object.fromEntries(
+    (record.temporaryInstructionOpenIds ?? []).map(openId => [openId, true] as const),
+  );
+  session.temporaryInstructionUnionIds = Object.fromEntries(
+    (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
+  );
+  session.preparationMeetingNo = record.preparationMeetingNo;
+  session.qaMode = record.qaMode ?? preparation?.qaMode;
+  session.qaAgentAppId = record.qaAgentAppId ?? preparation?.agentAppId;
+  session.qaRecentOutputHashes = record.qaRecentOutputHashes ?? [];
+  void synchronizeVcMeetingInviters(session, cfg).catch(err => logger.warn(`[vc-agent] inviter recovery: ${String(err)}`));
+  const selectedAgentsBeforeReconcile = JSON.stringify(session.selectedAgents);
+  const restoredProfileMemberships = session.consumerMode === 'agent'
+    && session.selectedAgents.length > 0
+    ? reconcileVcMeetingRestoredProfileMemberships(session, cfg)
+    : { activations: [], pauses: [] };
+  const profileSelectionReconciled = selectedAgentsBeforeReconcile !== JSON.stringify(session.selectedAgents);
+  if (session.consumerMode === 'agent' && session.selectedAgents.length > 0) {
+    session.consumerProfileOwnerBootReady = refreshVcMeetingProfileOwnerBoot(session);
+  }
+  if (hasDurableClose) {
+    if (session.consumerMode !== 'agent' || !vcMeetingSessionHasConsumerMembers(session, cfg)) {
+      logger.error(
+        `[vc-agent] invalid durable close record removed meeting=${record.meeting.id}: no selected agent`,
+      );
       vcMeetingSessions.delete(key);
-      vcMeetingClosingConsumerSessions.set(key, {
+      removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+      return;
+    }
+    const deadlineAt = record.consumerFinalizationDeadlineAt
+      ?? hubClose?.finalizationDeadlineAt
+      ?? Date.now() + vcMeetingConsumerCloseHorizonMs();
+    session.ended = true;
+    session.consumerClosePhase = hubClose?.phase === 'finalizing'
+      ? 'finalizing'
+      : record.consumerClosePhase ?? 'data_closing';
+    session.consumerFinalizationDeadlineAt = deadlineAt;
+    session.consumerCloseResolutionDeadlineAt = record.consumerCloseResolutionDeadlineAt
+      ?? (Date.now() >= deadlineAt
+        ? deadlineAt + vcMeetingConsumerRecoveryResolutionGraceMs()
+        : undefined);
+    session.consumerRestoreCatchUpRequired = true;
+    vcMeetingSessions.delete(key);
+    vcMeetingClosingConsumerSessions.set(key, {
+      session,
+      cfg,
+      deadlineAt,
+      ...(Date.now() >= deadlineAt ? { timedOut: true } : {}),
+      ...(session.consumerCloseResolutionDeadlineAt !== undefined
+        ? { resolutionDeadlineAt: session.consumerCloseResolutionDeadlineAt }
+        : {}),
+    });
+    session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+    if (session.consumerPaused) {
+      session.consumerOverflowNotified = true;
+      session.consumerRecoveryCardRequired = true;
+      if (!session.consumerRestoreCatchUpRequired) {
+        void ensureVcMeetingConsumerOverflowRecoveryCard(
+          session,
+          cfg,
+          VC_MEETING_PENDING_ITEM_LIMIT,
+        ).catch((err) => {
+          logger.warn(
+            `[vc-agent] restored closing recovery card failed meeting=${record.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+    }
+    if (session.selectedAgents.length > 0
+      && session.selectedAgents.some(selected => selected.status === 'paused')) {
+      void ensureVcMeetingProfileRecoveryCard(
         session,
         cfg,
-        deadlineAt,
-        ...(Date.now() >= deadlineAt ? { timedOut: true } : {}),
-        ...(session.consumerCloseResolutionDeadlineAt !== undefined
-          ? { resolutionDeadlineAt: session.consumerCloseResolutionDeadlineAt }
-          : {}),
-      });
-      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
-      if (session.consumerPaused) {
-        session.consumerOverflowNotified = true;
-        session.consumerRecoveryCardRequired = true;
-        if (!session.consumerRestoreCatchUpRequired) {
-          void ensureVcMeetingConsumerOverflowRecoveryCard(
-            session,
-            cfg,
-            VC_MEETING_PENDING_ITEM_LIMIT,
-          ).catch((err) => {
-            logger.warn(
-              `[vc-agent] restored closing recovery card failed meeting=${record.meeting.id}: `
-              + `${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-        }
-      }
-      if (session.selectedAgents.length > 0
-        && session.selectedAgents.some(selected => selected.status === 'paused')) {
-        void ensureVcMeetingProfileRecoveryCard(
-          session,
-          cfg,
-          '会议结束收口期间仍有暂停的 profile；确认后会按各自 cursor 继续并提交 final。',
-        ).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored closing profile recovery card failed meeting=${record.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-      persistVcMeetingRuntimeSession(session, cfg);
-      if (restoredProfileMemberships.pauses.length > 0) {
-        void resumeVcMeetingRestoredProfileMemberships(
-          key,
-          session,
-          cfg,
-          [],
-          restoredProfileMemberships.pauses,
-        ).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored closing profile pause failed meeting=${record.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-      scheduleVcMeetingConsumerClosePump(key);
-      logger.info(
-        `[vc-agent] restored durable consumer close meeting=${record.meeting.id} `
-        + `phase=${session.consumerClosePhase} catchUp=${session.consumerRestoreCatchUpRequired ? 'pending' : 'ready'}`,
-      );
-      continue;
-    }
-    if (profileSelectionReconciled) persistVcMeetingRuntimeSession(session, cfg);
-    if (session.consumerMode === 'agent'
-      && session.selectedAgents.length > 0
-      && session.selectedAgents.some(selected => selected.status === 'active'
-        || selected.status === 'paused'
-        || selected.status === 'activating')) {
-      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
-      if (session.consumerRestoreCatchUpRequired) {
+        '会议结束收口期间仍有暂停的 profile；确认后会按各自 cursor 继续并提交 final。',
+      ).catch((err) => {
         logger.warn(
-          `[vc-agent] restored profile fan-out is waiting for body catch-up meeting=${session.state.meeting.id}`,
+          `[vc-agent] restored closing profile recovery card failed meeting=${record.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
         );
-      }
-      if (session.selectedAgents.some(selected => selected.status === 'paused')) {
-        void ensureVcMeetingProfileRecoveryCard(session, cfg).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored profile recovery card failed meeting=${session.state.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-    } else if (session.consumerMode === 'agent' && session.selectedAgentAppId) {
-      const restoredMember = vcMeetingLatestSingleConsumerMember(session);
-      // An active runtime with a removed latest epoch is the durable marker
-      // left after an operator authorized from-now but the new receiver
-      // registration had not completed before restart. Do not resurrect or
-      // rehydrate the abandoned prefix; the regular pump will create a fresh
-      // epoch at the current ingest high-water.
-      session.consumerRestoreCatchUpRequired = restoredMember?.status === 'removed'
-        ? false
-        : !catchUpVcMeetingConsumerForRestore(session, cfg);
-      if (session.consumerRestoreCatchUpRequired) {
-        session.consumerActiveRecoveryCardRequired = true;
-        void ensureVcMeetingConsumerActiveRecoveryCard(session).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored active recovery card failed meeting=${session.state.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-      if (session.consumerPaused) {
-        session.consumerOverflowNotified = true;
-        session.consumerRecoveryCardRequired = true;
-        if (!session.consumerRestoreCatchUpRequired) {
-          void ensureVcMeetingConsumerOverflowRecoveryCard(
-            session,
-            cfg,
-            VC_MEETING_PENDING_ITEM_LIMIT,
-          ).catch((err) => {
-            logger.warn(
-              `[vc-agent] restored overflow recovery card failed meeting=${session.state.meeting.id}: `
-              + `${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-        }
-      }
-    } else if (session.consumerMode === 'pending') {
-      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
-      session.consumerSelectionNonce = undefined;
-      session.consumerSelectionExpiresAt = undefined;
-      session.consumerRestoreSelectionCardRequired = true;
+      });
     }
-    scheduleVcMeetingListenerFlush(key, cfg);
-    scheduleVcMeetingRestoreImmediateTick(key, cfg);
-    if (session.consumerMode === 'agent') {
-      scheduleVcMeetingConsumerInjection(key, cfg);
-    }
-    if (restoredProfileMemberships.activations.length > 0
-      || restoredProfileMemberships.pauses.length > 0) {
+    persistVcMeetingRuntimeSession(session, cfg);
+    if (restoredProfileMemberships.pauses.length > 0) {
       void resumeVcMeetingRestoredProfileMemberships(
         key,
         session,
         cfg,
-        restoredProfileMemberships.activations,
+        [],
         restoredProfileMemberships.pauses,
       ).catch((err) => {
         logger.warn(
-          `[vc-agent] restored profile membership reconciliation failed meeting=${record.meeting.id}: `
+          `[vc-agent] restored closing profile pause failed meeting=${record.meeting.id}: `
           + `${err instanceof Error ? err.message : String(err)}`,
         );
       });
     }
-    if (session.consumerMode === 'pending') {
-      // The old nonce intentionally was not durable. Replace the stale card
-      // with a freshly signed one after rehydrating the pre-selection backlog.
+    scheduleVcMeetingConsumerClosePump(key);
+    logger.info(
+      `[vc-agent] restored durable consumer close meeting=${record.meeting.id} `
+      + `phase=${session.consumerClosePhase} catchUp=${session.consumerRestoreCatchUpRequired ? 'pending' : 'ready'}`,
+    );
+    return;
+  }
+  if (profileSelectionReconciled) persistVcMeetingRuntimeSession(session, cfg);
+  if (session.consumerMode === 'agent'
+    && session.selectedAgents.length > 0
+    && session.selectedAgents.some(selected => selected.status === 'active'
+      || selected.status === 'paused'
+      || selected.status === 'activating')) {
+    session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+    if (session.consumerRestoreCatchUpRequired) {
+      logger.warn(
+        `[vc-agent] restored profile fan-out is waiting for body catch-up meeting=${session.state.meeting.id}`,
+      );
+    }
+    if (session.selectedAgents.some(selected => selected.status === 'paused')) {
+      void ensureVcMeetingProfileRecoveryCard(session, cfg).catch((err) => {
+        logger.warn(
+          `[vc-agent] restored profile recovery card failed meeting=${session.state.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  } else if (session.consumerMode === 'agent' && session.selectedAgentAppId) {
+    const restoredMember = vcMeetingLatestSingleConsumerMember(session);
+    // An active runtime with a removed latest epoch is the durable marker
+    // left after an operator authorized from-now but the new receiver
+    // registration had not completed before restart. Do not resurrect or
+    // rehydrate the abandoned prefix; the regular pump will create a fresh
+    // epoch at the current ingest high-water.
+    session.consumerRestoreCatchUpRequired = restoredMember?.status === 'removed'
+      ? false
+      : !catchUpVcMeetingConsumerForRestore(session, cfg);
+    if (session.consumerRestoreCatchUpRequired) {
+      session.consumerActiveRecoveryCardRequired = true;
+      void ensureVcMeetingConsumerActiveRecoveryCard(session).catch((err) => {
+        logger.warn(
+          `[vc-agent] restored active recovery card failed meeting=${session.state.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+    if (session.consumerPaused) {
+      session.consumerOverflowNotified = true;
+      session.consumerRecoveryCardRequired = true;
       if (!session.consumerRestoreCatchUpRequired) {
-        void ensureVcMeetingRestoredSelectionCard(key, session, cfg).catch((err) => {
+        void ensureVcMeetingConsumerOverflowRecoveryCard(
+          session,
+          cfg,
+          VC_MEETING_PENDING_ITEM_LIMIT,
+        ).catch((err) => {
           logger.warn(
-            `[vc-agent] restored consumer selection card failed meeting=${record.meeting.id}: `
+            `[vc-agent] restored overflow recovery card failed meeting=${session.state.meeting.id}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
         });
       }
     }
-    if (session.listenerPresenceStale && !session.listenerRejoinCardMessageId) {
-      void sendVcMeetingListenerRejoinCard(session, cfg).catch((err) => {
+  } else if (session.consumerMode === 'pending') {
+    session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+    session.consumerSelectionNonce = undefined;
+    session.consumerSelectionExpiresAt = undefined;
+    session.consumerRestoreSelectionCardRequired = true;
+  }
+  scheduleVcMeetingListenerFlush(key, cfg);
+  scheduleVcMeetingRestoreImmediateTick(key, cfg);
+  if (session.consumerMode === 'agent') {
+    scheduleVcMeetingConsumerInjection(key, cfg);
+  }
+  if (restoredProfileMemberships.activations.length > 0
+    || restoredProfileMemberships.pauses.length > 0) {
+    void resumeVcMeetingRestoredProfileMemberships(
+      key,
+      session,
+      cfg,
+      restoredProfileMemberships.activations,
+      restoredProfileMemberships.pauses,
+    ).catch((err) => {
+      logger.warn(
+        `[vc-agent] restored profile membership reconciliation failed meeting=${record.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+  if (session.consumerMode === 'pending') {
+    // The old nonce intentionally was not durable. Replace the stale card
+    // with a freshly signed one after rehydrating the pre-selection backlog.
+    if (!session.consumerRestoreCatchUpRequired) {
+      void ensureVcMeetingRestoredSelectionCard(key, session, cfg).catch((err) => {
         logger.warn(
-          `[vc-agent] restored listener rejoin card failed meeting=${record.meeting.id}: `
+          `[vc-agent] restored consumer selection card failed meeting=${record.meeting.id}: `
           + `${err instanceof Error ? err.message : String(err)}`,
         );
       });
     }
-    if (migratePreparedConsumer) {
-      persistVcMeetingRuntimeSession(session, cfg);
-      logger.info(
-        `[vc-agent] migrated prepared meeting runtime to dedicated Q&A ` +
-        `meeting=${record.meeting.id} agent=${session.qaAgentAppId ?? '-'} chat=${record.listenerChatId}`,
-      );
-    }
-    logger.info(`[vc-agent] restored runtime session meeting=${record.meeting.id} chat=${record.listenerChatId} bot=${larkAppId}`);
   }
+  if (session.listenerPresenceStale && !session.listenerRejoinCardMessageId) {
+    void sendVcMeetingListenerRejoinCard(session, cfg).catch((err) => {
+      logger.warn(
+        `[vc-agent] restored listener rejoin card failed meeting=${record.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+  if (migratePreparedConsumer) {
+    persistVcMeetingRuntimeSession(session, cfg);
+    logger.info(
+      `[vc-agent] migrated prepared meeting runtime to dedicated Q&A ` +
+      `meeting=${record.meeting.id} agent=${session.qaAgentAppId ?? '-'} chat=${record.listenerChatId}`,
+    );
+  }
+  logger.info(`[vc-agent] restored runtime session meeting=${record.meeting.id} chat=${record.listenerChatId} bot=${larkAppId}`);
 }
 
 async function maybeStartVcMeetingRealtimeVoice(
@@ -22877,6 +23130,15 @@ function forkReservedInitialSession(
   const input = buildReservedInitialInput(ds, availableBots);
   if (trustedCaller) input.trustedCaller = trustedCaller;
   const turnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+  // 被 @ 回执的来源记录只能挂在这个 turnId 上（turn_terminal 带回的就是它）：会话群出生等
+  // 路径里它不是入站 messageId，在 seed 处按 messageId 记会留下永远消费不到的记录。
+  if (turnId) {
+    recordTurnExplicitMention(ds, turnId, messageMentionsBot(
+      { mentions: ds.pendingMentions },
+      ds.larkAppId,
+      getBot(ds.larkAppId).botOpenId,
+    ));
+  }
   let admission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
   let xpiAdmissionAcquired = false;
   if (ds.session.xpiSharedCwdAdmissionGroupId) {
@@ -23905,6 +24167,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;
+  if (source.modelPin) child.modelPin = structuredClone(source.modelPin);
   child.cliLaunchSnapshot = source.cliLaunchSnapshot
     ? {
         ...source.cliLaunchSnapshot,
@@ -24117,7 +24380,7 @@ async function prepareIndependentCrossPrincipalSession(
     if (isolatedWorktree) {
       child = sessionStore.createSession(sourceDs.chatId, rootMessageId, title, sourceDs.chatType, 'thread');
       initializeChild(child);
-      sessionStore.updateSession(child);
+      sessionStore.updateSession(child, { modelPinWrite: true });
     } else {
       const activeTurn = sourceDs.activeInteractiveTurn;
       const sourceGeneration = sourceDs.workerGeneration ?? sourceDs.session.workerGeneration;
@@ -25136,7 +25399,9 @@ function deliverPassthroughToExistingSession(
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
     beginNewTurn(ds, commandContent, turnId);
-    markSessionActivity(ds);
+    const activityAt = Date.now();
+    if (isMaintenanceTurnId(turnId)) holdLastTurnThrough(ds, activityAt);
+    markSessionActivity(ds, activityAt);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
   }
@@ -26062,8 +26327,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   //
   // 指令头（`[标题] /t /repo … /model … 正文`）走的是同一个入口：解析前先剥掉对本 bot
   // 的**所有** @（路由判定按 mentions 数组、与 @ 在文本里的位置无关，见设计 D8），
-  // 解析出的规格在建会话时逐项落到 workingDir / title / spawnModelOverride /
-  // reasoningEffort。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
+  // 解析出的规格在建会话时逐项落到 workingDir / title / modelPin /
+  // reasoningEffort（仅 effort 的既有路径）。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
   // 于是拒绝路径不开新话题、不发选仓卡、不留会话记录（fail closed，D5）。
   const selfBotForHeader = getBot(larkAppId);
   const strippedTopicHeader = stripBotMentions(
@@ -26512,10 +26777,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // ——于是首次 spawn 就带上原生会话名，不必等一次 requestAgentSessionRename
   //（那条路在 worker 还没起时只会返回 not_running）。
   if (topicSpec?.title) updateSessionTitle(session, topicSpec.title, 'user');
-  // 推理强度与 trigger API 同款：持久化在会话上。sessionAgentConfig 首次冻结时用
-  // `ds.session.reasoningEffort ?? botCfg.reasoningEffort`，所以这里写的值会保留。
-  if (topicSpec?.reasoningEffort) session.reasoningEffort = topicSpec.reasoningEffort;
-  sessionStore.updateSession(session);
+  // Explicit header intent is durable; effort-only headers keep their old field.
+  applyTopicModelSpec(session, topicSpec, parsed.senderId, new Date(now).toISOString());
+  sessionStore.updateSession(session, { modelPinWrite: true });
 
   // Control card compensates for the card-less (avatar-style) chat-scope
   // substitute session. Topic-group substitute sessions (#475) are thread-scope
@@ -26583,9 +26847,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     ownerOpenId: ownerOpenIdForSession,
     currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
-    // 本次 spawn 的模型：内存态、不持久化，与 trigger API / 定时任务同一个字段，
-    // resolveSessionLaunchModel 把它排在最高优先级。
-    ...(topicSpec?.model ? { spawnModelOverride: topicSpec.model } : {}),
   };
   if (persistedWorkingDir) {
     ds.session.workingDir = persistedWorkingDir;
@@ -27279,6 +27540,27 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
 }
 
 /**
+ * 场景① latest-message anchor lookup: the thread root of the newest usable
+ * message in the chat, or undefined (none / API error) so the caller falls back
+ * to reply-mode routing. Never throws.
+ */
+async function resolveLatestMessageJoinAnchor(larkAppId: string, chatId: string): Promise<string | undefined> {
+  try {
+    const messages = await listChatMessages(larkAppId, chatId, GROUP_JOIN_ANCHOR_SCAN_LIMIT);
+    const anchor = pickGroupJoinAnchorMessageId(messages, larkAppId, getBotOpenId(larkAppId));
+    if (anchor) {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚定最新消息 ${anchor.substring(0, 12)} 开话题会话`);
+    } else {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无可锚定的已有消息，回退 reply mode 路由`);
+    }
+    return anchor;
+  } catch (err: any) {
+    logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉取最新消息失败，回退 reply mode 路由：${err?.message ?? err}`);
+    return undefined;
+  }
+}
+
+/**
  * 主动开工 — 场景①: the bot was added to a chat. Auto-start a session when
  * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) at least one of its
  * allowedUsers is a member of the chat (D7). Working dir per D6: the bot's
@@ -27483,7 +27765,16 @@ async function handleBotAdded(
     const opensOwnTopic = externalEventOpensOwnTopic(mode, regularGroupMode);
     let scope: 'thread' | 'chat';
     let anchor: string;
-    if (opensOwnTopic) {
+    // 普通群 autoStartOnGroupJoinAnchor='latest-message'：不发 seed，直接以群里最新
+    // 一条已有消息为根开 thread-scope 会话（例：外部平台先发上下文卡片再拉 bot）。
+    // 找不到可用消息或拉取失败 → 回退到下面的 reply-mode 路由。forcePrompt 路径不读。
+    const latestMessageAnchor = !forced && !opensOwnTopic && botCfg.autoStartOnGroupJoinAnchor === 'latest-message'
+      ? await resolveLatestMessageJoinAnchor(larkAppId, chatId)
+      : undefined;
+    if (latestMessageAnchor) {
+      anchor = latestMessageAnchor;
+      scope = 'thread';
+    } else if (opensOwnTopic) {
       anchor = await sendMessage(larkAppId, chatId, joinSeedText, 'text');
       scope = 'thread';
     } else {
@@ -27505,7 +27796,8 @@ async function handleBotAdded(
       return;
     }
     const needsSharedReply = mode === 'group'
-      && regularGroupMode === 'shared';
+      && regularGroupMode === 'shared'
+      && scope === 'chat';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -28443,7 +28735,8 @@ async function handleThreadReplyAdmitted(
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
   const initialCodexAppMessageContext = zeroInjection ? ''
-    : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix;
+    : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix
+      + buildReportReplyContext(inputSession?.session.reportReplyReferences);
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
   const initialPromptContent = zeroInjection
     ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
@@ -28550,7 +28843,12 @@ async function handleThreadReplyAdmitted(
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
     const ds = activeSessions.get(runtimeSessionKey);
-    if (ds) clearAgentAttention(ds);
+    if (ds) {
+      if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, parsed.messageId)) {
+        sessionStore.updateSession(ds.session);
+      }
+      clearAgentAttention(ds);
+    }
   };
   // Any human-authored reply means the user has seen/touched the raised-hand
   // blocker. Do this before command, callback, workflow, and ask-custom early
@@ -28777,24 +29075,38 @@ async function handleThreadReplyAdmitted(
 
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
-  let ds = activeSessions.get(runtimeSessionKey);
-  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
-  // A retry / later round handed off into a node topic this bot already has
-  // a session in: the session now reports to the new handoff.
-  if (workflowHandoff && workflowNodeDaemon.isRevoked(workflowHandoff.nonce)) {
+  // Design §15.4: a run approved with --working-dir runs its node in that
+  // directory only if it exists and — unless the initiator may operate this
+  // bot — lies in its configured range as it stands now. Otherwise the node
+  // blocks with the reason — never a silent fall back to the default dir.
+  // The node daemon's one gate decides the directory first (it may wait for
+  // lookups), then reads the session here, re-checks revocation and admits.
+  const workflowGate = workflowHandoff
+    ? await workflowNodeDaemon.admitInboundHandoff({
+      binding: workflowHandoff,
+      handoffMessageId: parsed.messageId,
+      executingLarkAppId: larkAppId,
+      currentSession: () => (effortSessionIsCurrent && !effortSessionIsCurrent()
+        ? 'stale' as const
+        : { current: activeSessions.get(runtimeSessionKey) }),
+      describeSession: ({ current }) => ({
+        ...(current ? { dir: getSessionWorkingDir(current) } : {}),
+        ...(current?.session.workflowNode ? { marker: current.session.workflowNode } : {}),
+      }),
+    })
+    : undefined;
+  if (workflowGate?.kind === 'stale') return;
+  if (workflowGate?.kind === 'revoked') {
     // Stopped after it was recognized above: never start its turn.
     logger.info(`[${larkAppId}] dropped workflow handoff ${parsed.messageId}: revoked before its turn started`);
     markIngressAdmitted(ctx);
     return;
   }
-  // Design §15.4: a run approved with --working-dir runs its node only inside
-  // this bot's configured directory range as it stands now. Out of range, the
-  // node blocks with the reason — never a silent fall back to the default dir.
-  const workflowAdmission = workflowHandoff
-    ? workflowNodeDaemon.admitInbound(
-      workflowHandoff, parsed.messageId, larkAppId, ds ? getSessionWorkingDir(ds) : undefined, ds?.session.workflowNode,
-    )
-    : undefined;
+  let ds = workflowGate ? workflowGate.session.current : activeSessions.get(runtimeSessionKey);
+  if (!workflowGate && effortSessionIsCurrent && !effortSessionIsCurrent()) return;
+  const workflowAdmission = workflowGate?.admission;
+  // A retry / later round handed off into a node topic this bot already has
+  // a session in: the session now reports to the new handoff (below).
   if (workflowHandoff && workflowAdmission && !workflowAdmission.start) {
     logger.info(`[${larkAppId}] workflow handoff ${parsed.messageId} not started (run ${workflowHandoff.workflow.runId}): ${workflowAdmission.reason}`);
     markIngressAdmitted(ctx);
@@ -32119,6 +32431,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (tmuxEnvScrub.removed.length > 0) {
     logger.info(`[tmux] scrubbed ${tmuxEnvScrub.removed.length} server-global env key(s): ${tmuxEnvScrub.removed.join(', ')}`);
   }
+  if (tmuxEnvScrub.updated.length > 0) {
+    logger.info(`[tmux] rewrote ${tmuxEnvScrub.updated.length} server-global env key(s): ${tmuxEnvScrub.updated.join(', ')}`);
+  }
   if (tmuxEnvScrub.failed.length > 0) {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
@@ -32219,7 +32534,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // readOnly, and the dashboard shows them until the owner fixes the config.
     const forbiddenRw = findForbiddenReadWritePaths(cfg.sandboxPaths?.readWrite);
     if (forbiddenRw.length) {
-      logger.warn(`[sandbox:${cfg.larkAppId}] ${forbiddenReadWriteMessage(forbiddenRw)}（沙盒会话忽略根目录与相对路径条目、主目录与 botmux 数据目录类条目按只读处理）`);
+      logger.warn(`[sandbox:${cfg.larkAppId}] ${forbiddenReadWriteMessage(forbiddenRw)}（沙盒会话忽略根目录、/run 与相对路径条目、主目录与 botmux 数据目录类条目按只读处理）`);
     }
     const readOnlyRoot = findReadOnlyLauncherMountCovers(cfg.sandboxPaths?.readOnly);
     if (readOnlyRoot.length) {
@@ -32281,10 +32596,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     config.session.dataDir,
     () => ({
       ...getTurnTerminalPersistenceHealth(),
-      busy: [...activeSessions.values()].some(session =>
-        (session.finalOutputDeliveriesInFlight?.size ?? 0) > 0 || (session.backgroundTaskCount ?? 0) > 0 ||
-        (session.session.status === 'active' &&
-        !['idle', 'limited', 'interrupted'].includes(session.lastScreenStatus ?? ''))),
+      busy: isFeedbackMaintenanceBusy(cfg.larkAppId, activeSessions.values()),
     }),
     async () => { await feedbackWebhookDispatcher?.quiesce(); },
     async () => {
@@ -32295,6 +32607,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
   );
   process.once('exit', stopFeedbackMaintenanceParticipant);
+  let feedbackExtensionBusy = false;
+  const feedbackExtensionTimer = setInterval(() => {
+    if (feedbackExtensionBusy) return;
+    feedbackExtensionBusy = true;
+    void import('./services/feedback-extension-host.js')
+      .then(module => module.tickFeedbackExtensions(config.session.dataDir, cfg.larkAppId))
+      .catch(error => logger.warn(`[feedback-extension] ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { feedbackExtensionBusy = false; });
+  }, 2000);
+  feedbackExtensionTimer.unref();
+  process.once('exit', () => clearInterval(feedbackExtensionTimer));
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -32483,8 +32806,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     throw new Error('cannot bind daemon descriptor to a process-start identity');
   }
   const desc: DaemonDescriptor = {
+    // Read at serialization time. Inbound traffic does not trigger any disk I/O.
+    get larkConnection() {
+      return cfg.apiOnly ? null : getLarkConnectionHealth(cfg.larkAppId);
+    },
     larkAppId: cfg.larkAppId,
-    botName: cfg.displayName ?? cfg.larkAppId,
+    // Until this process's first /bot/v3/info fetch lands, show the last-known
+    // Feishu name (bots-info.json) rather than the raw app id.
+    botName: cfg.displayName ?? lastKnownBotName(cfg.larkAppId, config.session.dataDir) ?? cfg.larkAppId,
     cliId: cfg.cliId,
     botIndex: idx,
     ipcPort,
@@ -32541,6 +32870,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (!r.ok) return r;
     const bot = getBot(cfg.larkAppId);
     bot.botName = newName;
+    noteLocalBotProfileWrite?.();
     const spec = findConfigField('displayName');
     if (spec && bot.config.displayName) {
       // applyConfigField 的 displayName 钩子会顺带触发 refreshBotNameState。
@@ -32554,14 +32884,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 机器人真·改头像（dashboard 档案头头像入口）：开放平台自动化换飞书应用头像并
   // 发布新版本（群内头像跟随已发布版本，同 rename）。成功后用上传返回的 url
   // 同步内存 botAvatarUrl / descriptor / bots-info 让 dashboard 立即换图——该 url
-  // 是飞书 CDN 上的持久资源，与 /bot/v3/info 的 canonical avatar_url 指向同一张图，
-  // 会一直沿用到下次 daemon 重启时 probeBotOpenId 重新拉取（probe 在 botOpenId
-  // 已知时不会重复请求，进程内没有周期性刷新）。
+  // 是飞书 CDN 上的持久资源，与 /bot/v3/info 的 canonical avatar_url 指向同一张图；
+  // 之后由名片刷新器（services/bot-profile-refresh.ts）按周期以 /bot/v3/info 为准校正。
   setBotAvatarChanger(async (image) => {
     const r = await changeBotAvatarOnOpenPlatform(cfg.larkAppId, image, cfg.brand);
     if (!r.ok) return r;
     const bot = getBot(cfg.larkAppId);
     bot.botAvatarUrl = r.avatarUrl;
+    noteLocalBotProfileWrite?.();
     if (desc.botAvatarUrl !== r.avatarUrl) {
       desc.botAvatarUrl = r.avatarUrl;
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
@@ -32746,7 +33076,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onBoardTurnDeliveryFailed(ds, context) {
       if (ds.larkAppId !== cfg.larkAppId) return;
       try {
-        decisionBoard.noteDeliveryFailure(context.turnId, context.reason);
+        decisionBoard.noteDeliveryFailure(context.turnId, context.reason, context.messageKey);
       } catch (err) {
         logger.warn(`[decision-board] noteDeliveryFailure failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -32779,14 +33109,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         activeCaller: context.activeCaller,
         activeController: context.activeController,
       });
-      if (!envelope || !proposer || !active
-        || sameTrustedPrincipal(active.caller, proposer)
-        || sameTrustedPrincipal(active.controller, proposer)) {
+      const gaps = crossPrincipalRerouteGaps({ envelope, proposer, active });
+      if (gaps.length > 0 || !envelope || !proposer || !active) {
+        // A retry hits the same worker gate while the active turn is still running.
         logger.error(
-          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute envelope/owner `
-          + `turn=${context.turnId.slice(0, 12)}`,
+          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute gaps=${gaps.join(',')}; `
+          + `failing delivery as not executed turn=${context.turnId.slice(0, 12)}`,
         );
-        return false;
+        return 'not_executed';
       }
       return stageCrossPrincipalInterruption({
         ds,
@@ -33274,12 +33604,35 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // bot's config id); the friendly name from /bot/v3/info is wired into the
   // registry descriptor (below) but the IPC server also needs its own copy for
   // SessionRow.botName.
-  setBotName(cfg.displayName ?? cfg.larkAppId);
+  setBotName(cfg.displayName ?? lastKnownBotName(cfg.larkAppId, config.session.dataDir) ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
   // Dashboard workflow drafts of this bot (design 2026-11-03
   // workflow-dashboard-orchestration D2): drafts left 编排中 by the previous
   // process go back to 待编排 before any route can start a new Architect.
-  installWorkflowDraftService(createProductionWorkflowDraftService(cfg.larkAppId, productionWorkflowDraftClarifier()));
+  installWorkflowDraftService(createProductionWorkflowDraftService(
+    cfg.larkAppId,
+    productionWorkflowDraftClarifier(),
+    createProductionDraftLaunchDeps({
+      appId: cfg.larkAppId,
+      startRun: async (runId) => {
+        const started = startV3RunOnThisDaemon(runId, { larkAppId: cfg.larkAppId });
+        if (started.status === 202) return { ok: true };
+        return {
+          ok: false,
+          status: started.status,
+          error: String(started.body.error ?? 'start_failed'),
+          ...(typeof started.body.detail === 'string' ? { detail: started.body.detail } : {}),
+        };
+      },
+      bindSession: productionWorkflowDraftSessionBinder(),
+      // §5.2 rule 3 at the Dashboard commit point: same read the Feishu
+      // /workflow run entry uses (the bound session is that topic's own).
+      mainTopicAvailability: (binding) => v3MainTopicAvailability(
+        binding,
+        binding.sessionId ? sessionStore.getSession(binding.sessionId) : undefined,
+      ),
+    }),
+  ));
   setDeviceIsolationDaemonIdentity({
     larkAppId: cfg.larkAppId,
     bootInstanceId: desc.bootInstanceId,
@@ -33724,35 +34077,38 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       bot.botName ||= cfg.displayName ?? cfg.larkAppId;
       logger.info(`[api-only] ${cfg.larkAppId} 以 core-only 模式启动：跳过飞书 open_id 探测 / scope 校验 / WSClient 订阅，仅 HTTP 控制 API 驱动`);
     } else {
-    // Probe bot open_id and persist to bots-info.json. When the friendly
-    // botName comes back from /bot/v3/info, refresh the dashboard descriptor
-    // so the registry shows "Claude" / "Codex" instead of the raw app id.
-    // A custom displayName (bots.json) beats the probed Lark name — the probe
-    // must not overwrite a rename seeded at startup.
-    probeBotOpenId(cfg.larkAppId).then(() => {
-      writeBotInfoFile(config.session.dataDir);
-      const probedName = cfg.displayName ?? bot.botName;
-      const probedAvatar = bot.botAvatarUrl;
-      let descChanged = false;
-      if (probedName && probedName !== desc.botName) {
-        desc.botName = probedName;
-        descChanged = true;
-      }
-      if (probedAvatar && probedAvatar !== desc.botAvatarUrl) {
-        desc.botAvatarUrl = probedAvatar;
-        descChanged = true;
-      }
-      if (descChanged) {
-        try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
-      }
-      // SessionRow.botName 同步换成友好名——否则 dashboard 会话行一直显示
-      // 启动时 seed 的 larkAppId（web 端有注册表映射兜底，这里是根因修复）。
-      if (probedName) setBotName(probedName);
-    }).catch(err => {
-      // Probe runs in background and is retried by the periodic heartbeat;
-      // a single failure here is not actionable. Surface as debug only.
-      logger.debug(`[${cfg.larkAppId}] Bot open_id probe failed (will retry): ${err.message}`);
+    // Feishu name / avatar: /bot/v3/info is the single authoritative source.
+    // The refresher fetches it now (replacing the old one-shot boot probe) and
+    // again every BOT_PROFILE_REFRESH_INTERVAL_MS, plus early when an inbound
+    // @ of this bot carries a different name. Every derived cache —
+    // bots-info.json (other daemons, CLI, dashboard offline rows), the dashboard
+    // descriptor (registry roster → bots.changed SSE) and SessionRow.botName —
+    // is re-derived here, so a rename in the open-platform console shows up
+    // everywhere within one period without a restart. A failed fetch keeps the
+    // last-known name. A custom displayName (bots.json) still wins for display
+    // (effectiveBotDisplayName inside refreshBotNameState).
+    const profileRefresher = createBotProfileRefresher({
+      larkAppId: cfg.larkAppId,
+      fetchProfile: () => fetchBotProfileFromLark(cfg.larkAppId),
+      state: () => getBot(cfg.larkAppId),
+      onChange: () => {
+        // Descriptor / SessionRow first so a failing bots-info write cannot
+        // hold them back; the bots-info error is rethrown so the refresher
+        // re-derives on its next successful fetch.
+        refreshBotNameState();
+        const avatar = getBot(cfg.larkAppId).botAvatarUrl;
+        if (avatar && avatar !== desc.botAvatarUrl) {
+          desc.botAvatarUrl = avatar;
+          try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+        }
+        writeBotInfoFile(config.session.dataDir);
+      },
     });
+    noteLocalBotProfileWrite = () => profileRefresher.noteLocalWrite();
+    setSelfMentionNameObserver((appId) => {
+      if (appId === cfg.larkAppId) profileRefresher.requestRefresh('self-mention name mismatch');
+    });
+    profileRefresher.start();
     } // end !cfg.apiOnly (open_id probe)
 
     // Required-scope check: 启动后 best-effort 校验
@@ -33776,6 +34132,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // best-effort (cached web session, incremental add); never blocks boot.
       ensureMessageUpdatedEventSubscribed(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] message-updated event subscription check failed: ${err?.message ?? err}`);
+      });
+      ensureChatDisbandedEventSubscribed(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] chat-disbanded event subscription check failed: ${err?.message ?? err}`);
       });
       // Reconcile existing enabled rooms at startup; default-off deployments
       // do not acquire an extra platform subscription as a side effect.
@@ -33821,7 +34180,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     inputCapture.start();
     const botEventHandlers: EventHandlers = {
       captureHumanInput: data => captureInboundText(data, inputCapture,
-        id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id)),
+        id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id),
+        // Same fold as decideRouting: p2p chat mode keeps DM replies in the chat session unless the root seeded a /t topic.
+        (chatId, rootId) => {
+          const p2pMode = getBot(cfg.larkAppId).config.p2pMode;
+          return p2pMode !== 'thread' && p2pMode !== 'group' && !isP2pForceTopicRoot(cfg.larkAppId, rootId, chatId);
+        }),
       handleCardAction: (data, appId) => withBotTurnAdmission(
         appId,
         () => cardActionPluginGateway.dispatch(data, appId),
@@ -33838,6 +34202,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         appId,
         () => handleBotAdded(chatId, operatorOpenId, appId),
       ),
+      handleChatGone: (chatId, appId, reason) =>
+        closeSessionsInGoneChat({ larkAppId: appId, chatId, reason, activeSessions }),
       handleDocComment: (ctx) => handleDocComment(ctx),
       handleVcMeetingPush: (ctx) => withBotTurnAdmission(
         ctx.larkAppId,
@@ -33962,10 +34328,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             pendingPrimaryControlCard: data =>
               primaryControlRuntime?.pendingCardBeforeAck(data),
-            readPrimarySession: async stableKey => {
-              const current = await durableCoordinationRuntime.store.readSession(stableKey);
-              return current ? parseDurablePrimarySessionRecord(current).session : undefined;
-            },
+            readPrimarySession: async stableKey =>
+              canonicalPrimarySession(await durableCoordinationRuntime.store.readSession(stableKey)),
             takeOverPrimarySession,
           },
         );
@@ -34128,13 +34492,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           });
         });
       } else {
-        startEventDispatchers.push(() => startLarkEventDispatcher(
-          cfg.larkAppId,
-          cfg.larkAppSecret,
-          botEventHandlers,
-          normalizeBrand(cfg.brand),
-          durableCoordinationRuntime?.store,
-        ));
+        const missingCli = await missingCliExecutableAfterRetry({
+          cliId: cfg.cliId,
+          cliPathOverride: cfg.cliPathOverride,
+          wrapperCli: cfg.wrapperCli,
+          cliLaunchMode: cfg.cliLaunchMode,
+        });
+        if (missingCli) {
+          logger.error(
+            `[${cfg.larkAppId}] 跳过飞书长连接注册：${missingCli}（cliId=${cfg.cliId}）。`
+            + '本机起不动这个 bot 的 CLI，注册了只会分走同一应用的消息再报会话启动失败；本 daemon 不会收到这个 bot 的任何飞书消息。'
+            + '在本机安装或修正 CLI（PATH / cliPathOverride / wrapperCli）后重启 daemon，或改由能启动它的机器承载此 bot。',
+          );
+        } else {
+          startEventDispatchers.push(() => startLarkEventDispatcher(
+            cfg.larkAppId,
+            cfg.larkAppSecret,
+            botEventHandlers,
+            normalizeBrand(cfg.brand),
+            durableCoordinationRuntime?.store,
+          ));
+        }
       }
     }
 
@@ -34266,6 +34644,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   startHookAskReclaim();
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();
+  if (!cfg.apiOnly) void closeSessionsInGoneChatsOnStartup({ larkAppId: cfg.larkAppId, activeSessions });
   if (durableCoordinationRuntime?.mode === 'primary') {
     const deliverDurablePrimaryMessage = async (
       request: DurableSessionSendRequest,
@@ -34567,6 +34946,78 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
+  // Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY: it logs
+  // displaced botmux servers/panes on each candidate socket label and never
+  // signals. The narrow bare-wrapper kill is a separate, default-OFF switch and
+  // runs on Linux with strong /proc proof only. Re-read live each tick; first
+  // run is jittered; the timer is unref'd and cleared on shutdown. The census
+  // walks /proc/net/unix + /proc/<pid>/fd, so the cadence is deliberately
+  // slower than the 60 s sweeps.
+  let orphanSessionSweepInFlight = false;
+  const runOrphanSessionSweepTick = (): void => {
+    if (orphanSessionSweepInFlight) return;
+    // Live read; backend gate mirrors the startup whole-server reaper.
+    if (config.daemon.backendType !== 'tmux' || !config.tmuxOrphanSessionSweep) return;
+    if (process.env.BOTMUX_DISABLE_ORPHAN_TMUX_REAP === '1' || process.env.BOTMUX_DISABLE_TMUX_ANTI_FORK === '1') return;
+    orphanSessionSweepInFlight = true;
+    try {
+      const frozenNames = sessionStore.listSessions()
+        .filter(s => s.status === 'active' && (s.backendType ?? s.persistentBackendTarget?.backendType) === 'tmux')
+        .map(s => s.persistentBackendTarget?.backendType === 'tmux' ? s.persistentBackendTarget.socketName : undefined);
+      const socketNames = reaperCandidateSocketNames(frozenNames);
+      const ownUid = typeof process.getuid === 'function' ? process.getuid() : -1;
+      runPeriodicOrphanSessionSweep({
+        socketNames,
+        listeningPids: listeningServersOnPath,
+        socketPath: name => tmuxSocketPath(process.env, ownUid, name),
+        reachablePid: (name) => {
+          const r = probeTmuxOwner(name);
+          return r.kind === 'reachable' ? r.pid : null;
+        },
+        isBotmuxPid: (pid) => procIsBotmuxListener(pid),
+        // Destructive arm (default off). Bindings live on the reachable server:
+        // read each managed session's per-session environment for the instance
+        // binding so takeover can be proven.
+        permitBareWrapperReap: config.tmuxOrphanSessionBareWrapperKill,
+        loadProcs: loadRichProcsLinux,
+        lockHolders: enumerateThreadLockHolders,
+        enumeratePanes: (orphanPid, procs) => enumerateOrphanPanes(orphanPid, procs, readProcEnviron),
+        ownUid,
+        reachableBindings: (name) => {
+          const set = new Set<string>();
+          try {
+            const names = execFileSync('tmux', [...(name ? ['-L', name] : []), 'list-sessions', '-F', '#{session_name}'], {
+              encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: tmuxEnv(),
+            }).split('\n').map(x => x.trim()).filter(Boolean).filter(n => n.startsWith('bmx-'));
+            for (const sn of names) {
+              try {
+                const envOut = execFileSync('tmux', [...(name ? ['-L', name] : []), 'show-environment', '-t', sn], {
+                  encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: tmuxEnv(),
+                });
+                for (const line of envOut.split('\0').join('\n').split('\n')) {
+                  if (line.startsWith('BOTMUX_CODEX_INSTANCE_BINDING=')) set.add(line.slice('BOTMUX_CODEX_INSTANCE_BINDING='.length));
+                }
+              } catch { /* unreadable session env: just don't add its binding */ }
+            }
+          } catch { /* reachable server query failed: empty set → plan kills nothing */ }
+          return set;
+        },
+        signal: (pid) => { try { process.kill(pid, 'SIGHUP'); } catch { /* member gone/EPERM: the plan already vetted same-uid members */ } },
+        log: (message) => logger.warn(message),
+      });
+    } catch (error) {
+      logger.warn(`[orphan-session-sweep] sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      orphanSessionSweepInFlight = false;
+    }
+  };
+  const orphanSessionSweepTimer = setInterval(runOrphanSessionSweepTick, 120_000);
+  orphanSessionSweepTimer.unref?.();
+  // Defer the first run with a bounded jitter so a fleet restart does not run
+  // the /proc census on every host at the same instant.
+  const orphanSessionSweepKickoff = setTimeout(() => runOrphanSessionSweepTick(), 15_000 + Math.floor(Math.random() * 30_000));
+  orphanSessionSweepKickoff.unref?.();
+
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
     save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
@@ -34605,6 +35056,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 60_000);
   sessionOwnerReminderTimer.unref?.();
   void scanSessionOwnerReminders();
+
+  /** Per-bot controller tracks only positively observed native execution clocks. */
+  const longTaskReminder = new LongTaskReminderController({
+    config: () => getBot(cfg.larkAppId).config.longTaskReminder ?? DEFAULT_LONG_TASK_REMINDER,
+    sessions: () => activeSessions.values(),
+    canSend: canSendLongTaskReminder,
+    send: sendLongTaskReminder,
+    now: Date.now,
+    onError: error => logger.warn(`[long-task-reminder] ${error instanceof Error ? error.message : String(error)}`),
+  });
+  /** A 30-second scan bounds notification latency without spawning agent turns. */
+  const longTaskReminderTimer = setInterval(() => {
+    void longTaskReminder.scan().catch(error => logger.warn(`[long-task-reminder] scan failed: ${String(error)}`));
+  }, 30_000);
+  longTaskReminderTimer.unref?.();
 
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
   // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
@@ -34864,11 +35330,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     })),
     log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
     lookupChat: (chatId, opts) => lookupChatAcrossBots(chatId, boardChatProbes(), { deadline: opts.deadline }),
+    // 管家群里的拍板卡片（steward.decisionCards，默认开）：发卡 / 原地更新，卡已失效时才另发。
+    cards: {
+      sendCard: (chatId, card, uuid) => sendMessage(cfg.larkAppId, chatId, card, 'interactive', uuid),
+      updateCard: (messageId, card) => updateMessage(cfg.larkAppId, messageId, card),
+      isCardGone: error => error instanceof MessageUpdateExpiredError
+        || error instanceof MessageWithdrawnError
+        || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
+    },
+    prState: createPrStateLookup({ log: message => logger.info(message) }),
   });
   setDecisionBoardService(decisionBoard);
+  setDecisionCardService(decisionBoard);
+  // 「自动发现可以关的项」：管家开了这个开关才真正干活（sweepHints 内部判断），没开的 bot 每轮只读一次配置。
+  // 5 分钟一轮：PR 合入后十来分钟内出提示（开着的 PR 每 10 分钟最多查一次，见 github-pr-state.ts），
+  // 复查时间到点后最多晚一轮；不需要更密。
+  const boardHintSweep = setInterval(() => {
+    void decisionBoard.sweepHints().catch(err => logger.warn(`[decision-board] hint sweep failed: ${err?.message ?? err}`));
+  }, 5 * 60_000);
+  boardHintSweep.unref?.();
   // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。
   setTimeout(() => {
-    void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`));
+    void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`))
+      // 补投之后对一遍拍板卡片：补发重启前没发出去的，刷新重启前后变了状态的。
+      .then(() => decisionBoard.reconcileCards())
+      .catch(err => logger.warn(`[decision-board] card reconcile failed: ${err?.message ?? err}`));
   }, 30_000).unref?.();
 
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
@@ -35215,7 +35701,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(orphanSessionSweepTimer);
+    clearTimeout(orphanSessionSweepKickoff);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
@@ -35484,7 +35973,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setCrossPrincipalInterruptionDisableHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(orphanSessionSweepTimer);
+    clearTimeout(orphanSessionSweepKickoff);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     clearInterval(docCommentPollTimer);
@@ -35525,4 +36017,5 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 }
 import { feedbackMaintenanceActive, startFeedbackMaintenanceParticipant } from './services/feedback-maintenance.js';
+import { isFeedbackMaintenanceBusy } from './core/feedback-maintenance-health.js';
 import { getTurnTerminalPersistenceHealth } from './services/turn-completion-events.js';

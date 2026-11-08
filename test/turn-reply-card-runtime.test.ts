@@ -19,6 +19,8 @@ import { piBridgeSpec } from '../src/adapters/cli/pi.js';
 import { traexBridgeSpec } from '../src/adapters/cli/traex.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
+import { KimiActivityObserver } from '../src/services/kimi-cot.js';
+import { makeKimiSession, toolTurn } from './helpers/kimi-wire-fixture.js';
 
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn(() => ({ context: null, tokens: null })) }));
@@ -462,6 +464,45 @@ describe('reply-card runtime eligibility and recovery', () => {
     }));
   });
 
+  describe('content audit on the final PATCH', () => {
+    const email = 'alice.liu@example.com';
+    const audit = () => ({ isAxiosError: true, name: 'AxiosError', message: 'Request failed with status code 400',
+      response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } } });
+    const final = { kind: 'final' as const, text: `作者 <${email}>`, source: 'explicit' as const,
+      card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: `作者 <${email}>` }] } }) };
+
+    it('patches a masked copy once and settles the final as delivered', async () => {
+      const ds = session();
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, async () => 'om_reply');
+      vi.mocked(updateMessage).mockClear();
+      vi.mocked(updateMessage).mockImplementation(async (_app, _id, card) => {
+        if (String(card).includes(email)) throw audit();
+        return {} as any;
+      });
+      await updateTurnReplyCard(ds, 'om_mode', final, async () => 'unused');
+      const bodies = vi.mocked(updateMessage).mock.calls.map(call => String(call[2]));
+      expect(bodies).toHaveLength(2);
+      expect(bodies[0]).toContain(email);
+      expect(bodies[1]).not.toContain(email);
+      expect(bodies[1]).toContain('example.com');
+      expect(bodies[1]).toContain('worker.final_output_content_audit_redacted_note');
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      expect(new TurnReplyCardStore(dir).read(key)?.finalDelivered).toBe(true);
+    });
+
+    it('does not retry an audit rejection that survives masking', async () => {
+      const ds = session();
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, async () => 'om_reply');
+      vi.mocked(updateMessage).mockClear();
+      vi.mocked(updateMessage).mockRejectedValue(audit());
+      await expect(updateTurnReplyCard(ds, 'om_mode', final, async () => 'unused')).rejects.toMatchObject({
+        response: { data: { code: 230028 } },
+      });
+      // original + one masked copy; the identical-payload retry loop is skipped.
+      expect(updateMessage).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it('does not observe a final card when its patch is withdrawn', async () => {
     const ds = session();
     ds.session.cliSessionId = 'native_mode';
@@ -563,7 +604,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(patched).toContain('README.md');
   });
 
-  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
+  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     ds.session.sandbox = true;
@@ -576,7 +617,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(existsSync(new TurnReplyCardStore(dir).directory)).toBe(false);
   });
 
-  it.each(['new-bot', 'worker-sandbox', 'legacy-isolation', 'worker-isolation', 'global'] as const)(
+  it.each(['new-bot', 'worker-sandbox', 'legacy-isolation', 'worker-isolation', 'global', 'global-oncall', 'global-scratch'] as const)(
     'rejects %s isolation even with a persisted unified reservation', source => {
       const ds = session();
       new TurnReplyCardStore(dir).prepareSync({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' }, {
@@ -587,6 +628,8 @@ describe('reply-card runtime eligibility and recovery', () => {
       if (source === 'worker-sandbox') ds.initConfig = { sandbox: true } as DaemonSession['initConfig'];
       if (source === 'worker-isolation') ds.initConfig = { readIsolation: true } as DaemonSession['initConfig'];
       if (source === 'global') vi.stubEnv('BOTMUX_SANDBOX', '1');
+      if (source === 'global-oncall') vi.stubEnv('BOTMUX_SANDBOX', 'oncall');
+      if (source === 'global-scratch') vi.stubEnv('BOTMUX_SANDBOX', 'scratch');
       expect(replyCardModeFor(ds)).toBe('legacy');
     },
   );
@@ -615,7 +658,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(replyCardModeFor(legacyIsolated)).toBe('legacy');
   });
 
-  it.each(['claude-code', 'traex', 'pi'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
+  it.each(['claude-code', 'traex', 'pi', 'kimi'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     expect(replyCardModeFor(ds)).toBe('unified');
@@ -678,7 +721,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' })?.durationMs).toBe(2500);
   });
 
-  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi'] as const)('keeps %s live narration when queued snapshots end in tool calls', async cliId => {
+  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'] as const)('keeps %s live narration when queued snapshots end in tool calls', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     const send = vi.fn(async (_body: string) => 'om_reply');
@@ -709,6 +752,46 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(liveText()).not.toContain('NARRATION_A');
     expect(send).toHaveBeenCalledTimes(1);
     expect(vi.mocked(updateMessage).mock.calls.every(call => call[1] === 'om_reply')).toBe(true);
+  });
+
+  it('turns a Kimi wire log into one dynamic card with activity and a single explicit final', async () => {
+    const ds = session();
+    ds.session.cliId = 'kimi';
+    expect(replyCardModeFor(ds)).toBe('unified');
+    const home = mkdtempSync(join(tmpdir(), 'botmux-kimi-card-'));
+    try {
+      const marker = `<session_id>${ds.session.sessionId}</session_id>`;
+      const kimi = makeKimiSession(home, { id: 'session_k', workDir: home, lastPrompt: `${marker}\nold`, records: toolTurn(0, `${marker}\nold`) });
+      const observer = new KimiActivityObserver({
+        botmuxSessionId: ds.session.sessionId, workingDir: home, env: { KIMI_CODE_HOME: home },
+        resume: true, onEntries: () => {}, pollIntervalMs: 60_000,
+      });
+      observer.start();
+      const send = vi.fn(async (_body: string) => 'om_reply');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      kimi.append(toolTurn(1, `${marker}\ninspect`));
+      const entries = observer.drain();
+      observer.stop();
+      queueTurnReplyTools(ds, { turnId: 'om_mode', entries }, send, () => true);
+      await flushTurnReplyTools(ds, 'om_mode');
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'working',
+        tools: [{ id: 'tool_a', name: 'Bash', subject: 'ls -la src', completed: true }] });
+      const live = vi.mocked(updateMessage).mock.calls.at(-1)![2];
+      expect(live).toContain('Need to look at the repo first.');
+      expect(live).toContain('**Bash** ✓ · ls -la src');
+      // The closing answer arrives once, through `botmux send` (explicit).
+      const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'FINAL_ANSWER' }] } });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: 'FINAL_ANSWER', card, source: 'explicit' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed', durationMs: 1200 }, send);
+      const done = vi.mocked(updateMessage).mock.calls.at(-1)![2];
+      expect(done.match(/FINAL_ANSWER/g)).toHaveLength(1);
+      expect(done).not.toContain('There are two files');
+      expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'completed', finalText: 'FINAL_ANSWER' });
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('uses the replacement worker sender and ownership when coalescing tool updates', async () => {
