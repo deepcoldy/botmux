@@ -25,6 +25,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
 import { config } from '../../config.js';
 import { formatUrlHost } from '../../core/dashboard-url.js';
+import { issueHostLink } from '../../core/host-issued-links.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
 
@@ -587,10 +588,10 @@ export function buildSessionTerminalUrl(row: SessionRow): string | null {
   if (row.status === 'closed') return null;
   const host = formatUrlHost(config.web.externalHost);
   if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
-    return `http://${host}:${row.proxyPort}/s/${encodeURIComponent(row.sessionId)}`;
+    return issueHostLink(`http://${host}:${row.proxyPort}/s/${encodeURIComponent(row.sessionId)}`);
   }
   if (typeof row.webPort === 'number' && row.webPort > 0) {
-    return `http://${host}:${row.webPort}`;
+    return issueHostLink(`http://${host}:${row.webPort}`);
   }
   return null;
 }

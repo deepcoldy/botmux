@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { config, getDashboardExternalHost } from '../config.js';
 import { buildDashboardUrls } from './dashboard-url.js';
+import { issueHostLink } from './host-issued-links.js';
 
 export function resolvePluginResultAccessUrl(viewToken: string): string | undefined {
   if (!/^[A-Za-z0-9_-]{20,256}$/.test(viewToken)) return undefined;
@@ -16,7 +17,7 @@ export function resolvePluginResultAccessUrl(viewToken: string): string | undefi
     parsed.pathname = `/plugin-result-access/${encodeURIComponent(viewToken)}`;
     parsed.search = '';
     parsed.hash = '';
-    return parsed.toString();
+    return issueHostLink(parsed.toString());
   } catch {
     return undefined;
   }

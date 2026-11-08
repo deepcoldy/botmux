@@ -153,7 +153,7 @@ import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
-import { localAddressContextForBot } from '../im/lark/local-address-context.js';
+import { admitVettedHostLinks, localAddressContextForBot } from '../im/lark/local-address-context.js';
 import { isStuckPageType } from './stuck-page-catalog.js';
 import { stuckCardFallbackText, stuckCardInitiatorOpenId, stuckCardPostErrorMeansUnsent, stuckKeyResultText } from './stuck-warning-card.js';
 
@@ -23133,6 +23133,7 @@ function deliverFinalOutput(
       const transport = handoff.store.freezeTransport(handoff.record.intentId, handoff.record.claim!, {
         content, msgType: msgType ?? 'interactive', providerUuid: opts?.uuid ?? bridgeFinalOutputUuid(ds, msg),
       });
+      admitVettedHostLinks(transport.content, transport.msgType);
       const ledger = new TurnSendLedger(config.session.dataDir);
       return ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId }, 'final',
         JSON.stringify([handoff.record.target, transport.msgType, transport.content]),
@@ -23147,6 +23148,7 @@ function deliverFinalOutput(
       const providerUuid = opts?.uuid ?? outputControl.publicationUuid ?? bridgeFinalOutputUuid(ds, msg);
       const transport = outputControl.freezeTransport(`${msgType ?? 'interactive'}:${providerUuid}:${imageFallback.omitImages ? 'omit-images' : 'images'}`,
         { content, msgType: msgType ?? 'interactive', providerUuid });
+      admitVettedHostLinks(transport.content, transport.msgType);
       content = transport.content; msgType = transport.msgType;
       opts = { ...opts, uuid: transport.providerUuid };
     }

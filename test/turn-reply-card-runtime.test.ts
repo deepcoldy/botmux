@@ -9,7 +9,9 @@ import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, supersedeT
 import { MessageWithdrawnError, updateMessage, uploadFile, replyMessage, sendMessage } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
-import { LocalAddressOutboundError } from '../src/im/lark/local-address-policy.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
+import { issueHostLink, resetHostIssuedLinks } from '../src/core/host-issued-links.js';
 import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 import type { CotEntry } from '../src/types.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
@@ -173,6 +175,61 @@ describe('reply-card runtime eligibility and recovery', () => {
       expect(updateMessage).toHaveBeenCalledTimes(calls);
     },
   );
+
+  describe('host-issued links across processes and restarts', () => {
+    const link = 'http://localhost:40123/workflow/app_main/run-1';
+    const finalCard = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'done' },
+      { tag: 'button', text: { tag: 'plain_text', content: 'workflow' }, behaviors: [{ type: 'open_url', default_url: link }] }] } });
+    const storeIo = () => ({
+      render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, { canStop: true }),
+      beforeEffect: vi.fn(), isWithdrawn: () => false,
+      send: vi.fn(async () => 'om_reply'), patch: vi.fn(async () => {}),
+    });
+    // The mocked client stands in for Feishu's write boundary, which judges every body.
+    beforeEach(() => {
+      vi.mocked(updateMessage).mockImplementation(async (appId: string, _id: string, body: string) => {
+        prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(appId));
+      });
+    });
+    afterEach(() => resetHostIssuedLinks());
+
+    it('startup replays an unacknowledged PATCH whose host-issued link predates the restart', async () => {
+      const ds = session();
+      const store = new TurnReplyCardStore(dir);
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      await store.prepare(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
+      issueHostLink(link);
+      const io = storeIo();
+      await store.update(key, { kind: 'start' }, io);
+      await store.update(key, { kind: 'final', text: 'done', card: finalCard, source: 'explicit' }, io);
+      io.patch.mockRejectedValueOnce(new Error('PATCH unavailable'));
+      await expect(store.update(key, { kind: 'terminal', phase: 'completed', durationMs: 1 }, io)).rejects.toThrow();
+      const record = store.read(key)!;
+      expect(record.pendingPatch?.content).toContain(link);
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+      resetHostIssuedLinks();
+
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).toHaveBeenLastCalledWith(ds.larkAppId, 'om_reply', record.pendingPatch!.content,
+        { returnAcknowledgement: true });
+      expect(store.read(key)?.pendingPatch).toBeUndefined();
+    });
+
+    it('re-renders an explicit final card that another process stored with the link it issued', async () => {
+      const ds = session();
+      const send = vi.fn(async () => 'om_reply');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      // `botmux send` runs in its own process: the link is in its registry, not this daemon's.
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      await new TurnReplyCardStore(dir).update(key, { kind: 'final', text: 'done', card: finalCard, source: 'explicit' }, storeIo());
+      vi.mocked(updateMessage).mockClear();
+
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      expect(updateMessage).toHaveBeenCalledOnce();
+      expect(vi.mocked(updateMessage).mock.calls[0][2]).toContain(link);
+    });
+  });
 
   describe.each(['traex', 'pi'] as const)('%s transcript to reply card', cliId => {
     function harness() {

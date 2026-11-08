@@ -13,9 +13,9 @@ export interface LocalAddressContext {
   localHosts?: readonly string[];
   internalFileLabel?: string;
   unavailableLinkLabel?: string;
-  /** Origins of the Web terminal / Dashboard links the host issued itself.
+  /** Capability links the host issued itself (matched by origin and path).
    * Consulted only for card link fields; prose keeps the text policy. */
-  hostLinkOrigin?: (origin: string) => boolean;
+  hostIssuedLink?: (url: string) => boolean;
 }
 
 interface Context {
@@ -25,7 +25,7 @@ interface Context {
   hostNames: RegExp;
   internalFile: string;
   unavailableLink: string;
-  hostLinkOrigin?: (origin: string) => boolean;
+  hostIssuedLink?: (url: string) => boolean;
 }
 
 export class LocalAddressOutboundError extends OutputDeliveryTerminalError {
@@ -89,7 +89,7 @@ function contextFor(input: LocalAddressContext): Context {
     hostNames: new RegExp('(?<![\\w.-])(?:(?:localhost|127(?:\\.\\d{1,3}){3}|' + hostNames.join('|') + ')(?::\\d+)?' + machineAddress + ')(?![\\w.:-])(?:/[^\\s<>"\\x27\\x60，。、；！？()[\\]]*)?', 'giu'),
     internalFile: input.internalFileLabel ?? '【内部文件】',
     unavailableLink: input.unavailableLinkLabel ?? '（未提供可访问链接）',
-    hostLinkOrigin: input.hostLinkOrigin,
+    hostIssuedLink: input.hostIssuedLink,
   };
 }
 
@@ -268,22 +268,13 @@ export function sanitizeLocalAddressText(text: string, context: LocalAddressCont
   return scrubText(text, contextFor(context));
 }
 
-/** Without a public external host, Web terminal and Dashboard buttons point at
- * this machine's own interface. Only an origin the host issued passes. */
-function hostIssuedLink(value: string, ctx: Context): boolean {
-  if (!ctx.hostLinkOrigin) return false;
-  try {
-    const url = new URL(value);
-    if (url.username || url.password) return false;
-    return ctx.hostLinkOrigin(url.origin);
-  } catch { return false; }
-}
-
 function scrubNode(node: unknown, key: string | undefined, ctx: Context): unknown {
   if (typeof node === 'string') {
     if (key && STRUCTURAL_KEYS.has(key)) return node;
     if (key && LINK_KEYS.has(key)) {
-      if (localDestination(node, ctx) && !hostIssuedLink(node, ctx)) throw new LocalAddressOutboundError();
+      // Without a public external host, Web terminal and Dashboard buttons point
+      // at this machine's own interface; only a link the host issued passes.
+      if (localDestination(node, ctx) && !ctx.hostIssuedLink?.(node)) throw new LocalAddressOutboundError();
       return node;
     }
     return scrubText(node, ctx);
@@ -302,6 +293,27 @@ function scrubNode(node: unknown, key: string | undefined, ctx: Context): unknow
 
 export function sanitizeLocalAddressNode<T>(node: T, context: LocalAddressContext = {}): T {
   return scrubNode(node, undefined, contextFor(context)) as T;
+}
+
+/** Card link fields of a body that point at this machine. A body the host
+ * vetted and froze for replay re-admits these instead of being re-judged. */
+export function localJumpTargets(content: string, msgType: string, context: LocalAddressContext = {}): string[] {
+  if (msgType !== 'interactive' && msgType !== 'post') return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(content); } catch { return []; }
+  const ctx = contextFor(context);
+  const found: string[] = [];
+  const visit = (node: unknown, key: string | undefined): void => {
+    if (typeof node === 'string') {
+      if (key && LINK_KEYS.has(key) && localDestination(node, ctx)) found.push(node);
+    } else if (Array.isArray(node)) {
+      for (const item of node) visit(item, undefined);
+    } else if (node && typeof node === 'object') {
+      for (const [childKey, child] of Object.entries(node)) if (!OPAQUE_SUBTREES.has(childKey)) visit(child, childKey);
+    }
+  };
+  visit(parsed, undefined);
+  return found;
 }
 
 export function prepareLocalAddressContent(

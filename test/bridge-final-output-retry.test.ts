@@ -23,7 +23,9 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
 import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
-import { LocalAddressOutboundError } from '../src/im/lark/local-address-policy.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
+import { issueHostLink, resetHostIssuedLinks } from '../src/core/host-issued-links.js';
 import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
 import { FinalOutputHandoffHost, FinalOutputRejectedError } from '../src/services/final-output-handoff-host.js';
@@ -2792,6 +2794,92 @@ describe('Bridge final_output delivery (P2 retry)', () => {
         expect(ledger.read({ larkAppId: ds.larkAppId, sessionId: output.sessionId, turnId: output.turnId })?.publication).toBeUndefined();
       }
     } finally { store.close(); (config.session as any).dataDir = previousDir; rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  // Feishu's write boundary judges every body; this stands in for it here.
+  const providerBoundary = async (_root: string, body: string, kind: string, appId: string) => {
+    prepareLocalAddressContent(body, kind, localAddressContextForBot(appId));
+    return 'om_frozen_final';
+  };
+  const hostIssuedTerminal = () => issueHostLink('http://localhost:40123/?viewToken=view-before-restart');
+
+  it('replays a frozen handoff card with a host-issued link after a restart emptied the registry', async () => {
+    const previousDir = config.session.dataDir;
+    const directory = mkdtempSync(join(tmpdir(), 'handoff-host-link-'));
+    (config.session as any).dataDir = directory;
+    const store = new FinalOutputHandoffStore(directory, 'cli_test');
+    try {
+      const ds = makeDs(); ds.adoptedFrom = undefined; ds.larkAppId = 'cli_test'; ds.scope = 'thread';
+      const output = { sessionId: ds.session.sessionId, turnId: 'om_host_link', lastUuid: 'host-link-native', content: 'final answer' };
+      const snapshot = finalOutputSnapshot(ds.larkAppId, output);
+      store.accept(snapshot, { mode: 'thread', rootMessageId: 'om_original_target' }, 'ou_original_requester');
+      // The previous daemon froze a card with the terminal button it issued and exited before writing it.
+      const frozen = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'final answer' },
+        { tag: 'button', text: { tag: 'plain_text', content: 'terminal' }, behaviors: [{ type: 'open_url', default_url: hostIssuedTerminal() }] }] } });
+      const prior = store.claim(snapshot.intentId)!;
+      store.freezeTransport(snapshot.intentId, prior.claim!, { content: frozen, msgType: 'interactive', providerUuid: 'frozen-final-uuid' });
+      store.release(snapshot.intentId, prior.claim!, Date.now());
+      resetHostIssuedLinks();
+      const sessionReply = vi.fn(providerBoundary);
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js');
+      const host = new FinalOutputHandoffHost(store, {
+        available: () => 'ready', error: vi.fn(), knownReceipt: () => undefined,
+        deliver: (record, control) => {
+          const context: any = { record, store, control, suppressed: false };
+          return new Promise((resolve, reject) => __testOnly_deliverFinalOutput(ds, { type: 'final_output', ...output }, 'handoff-test', 0,
+            (ok, id) => context.rejectedReason ? reject(new FinalOutputRejectedError(context.rejectedReason))
+              : ok && id ? resolve({ messageId: id }) : reject(new Error('unconfirmed')),
+            control.owns, record.target, undefined, undefined, undefined, context));
+        },
+      });
+      const run = host.pump();
+      await vi.advanceTimersByTimeAsync(100);
+      await run;
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toBe(frozen);
+      expect(store.read(snapshot.intentId)).toMatchObject({ state: 'delivered', messageId: 'om_frozen_final' });
+    } finally { resetHostIssuedLinks(); store.close(); (config.session as any).dataDir = previousDir; rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('replays a frozen legacy final with a host-issued link after a restart emptied the registry', async () => {
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    const ds = makeDs(); ds.larkAppId = 'cli_test';
+    let restarted = false;
+    const sessionReply = vi.fn(async (root: string, body: string, kind: string, appId: string) => {
+      if (!restarted) throw new Error('socket hang up');
+      return providerBoundary(root, body, kind, appId);
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const message = { ...finalOutputMsg(), sessionId: ds.session.sessionId };
+    const journal = new OutputDeliveryJournal(config.session.dataDir, 'cli_test');
+    try {
+      const record = journal.accept(outputSnapshot('cli_test', message), { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' } }, chatId: ds.chatId, chatType: ds.chatType });
+      const coordinator = new OutputDeliveryCoordinator(journal);
+      const terminalUrl = hostIssuedTerminal();
+      const withButton = (content: string) => {
+        const card = JSON.parse(content);
+        (card.body?.elements ?? card.elements).push({ tag: 'button', url: terminalUrl });
+        return JSON.stringify(card);
+      };
+      const attempt = (control: (control: any) => any) => coordinator.deliver(record, { owns: () => true, settled: vi.fn(), error: vi.fn(),
+        process: (_record, base) => new Promise(resolve => deliver(ds, message, 'probe', 0,
+          (ok, id) => resolve(ok ? { status: 'delivered', messageId: id! } : undefined), base.owns,
+          { mode: 'thread', rootMessageId: 'om_root' }, undefined, undefined, undefined, undefined, control(base))) });
+      // The previous daemon's card carried the terminal button; every write failed before it exited.
+      const first = attempt(base => ({ ...base, freezeTransport: (key: string, proposed: any) => base.freezeTransport(key, { ...proposed, content: withButton(proposed.content) }) }));
+      for (const ms of [0, 5_000, 15_000, 100]) await vi.advanceTimersByTimeAsync(ms);
+      await first;
+      expect(journal.read(record.id)?.state).toBe('blocked');
+      resetHostIssuedLinks(); restarted = true;
+      await vi.advanceTimersByTimeAsync(6_000);
+      const callsBefore = sessionReply.mock.calls.length;
+      const second = attempt(base => base);
+      await vi.advanceTimersByTimeAsync(100); await second;
+      expect(sessionReply.mock.calls.length).toBe(callsBefore + 1);
+      expect(sessionReply.mock.lastCall![1]).toContain(terminalUrl);
+      expect(journal.read(record.id)?.state).toBe('settled');
+    } finally { resetHostIssuedLinks(); journal.close(); }
   });
 
   it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {

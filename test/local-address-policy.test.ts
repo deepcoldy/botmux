@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  prepareLocalAddressContent, sanitizeLocalAddressNode, sanitizeLocalAddressText,
+  localJumpTargets, prepareLocalAddressContent, sanitizeLocalAddressNode, sanitizeLocalAddressText,
 } from '../src/im/lark/local-address-policy.js';
+import { isHostIssuedLink, issueHostLink, resetHostIssuedLinks } from '../src/core/host-issued-links.js';
 
 describe('local address presentation policy', () => {
   it.each([
@@ -93,17 +94,34 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText(`http://${name}:3000/report`, context)).not.toContain(`${name}:3000`);
   });
 
-  it('lets a card link through only for an origin the host issued itself', () => {
-    const hostLinkOrigin = (origin: string) => origin === 'http://10.20.30.40:7891';
-    const context = { localHosts: ['10.20.30.40'], hostLinkOrigin };
-    const issued = { behaviors: [{ type: 'open_url', android_url: 'http://10.20.30.40:7891/plugin-result-access/abc' }] };
-    expect(sanitizeLocalAddressNode(issued, context)).toEqual(issued);
-    for (const url of ['http://10.20.30.40:3000/report', 'http://alice@10.20.30.40:7891/', 'file:///tmp/report.md',
-      'http://127.0.0.1:7891/']) {
-      expect(() => sanitizeLocalAddressNode({ url }, context)).toThrowError(
-        expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }));
-    }
-    expect(sanitizeLocalAddressText('[入口](http://10.20.30.40:7891/x)', context)).not.toContain('10.20.30.40');
+  it('lets a card link through only for the exact origin and path the host issued', () => {
+    resetHostIssuedLinks();
+    try {
+      issueHostLink('http://10.20.30.40:7891/plugin-result-access/abc');
+      const context = { localHosts: ['10.20.30.40'], hostIssuedLink: isHostIssuedLink };
+      const issued = { behaviors: [{ type: 'open_url', android_url: 'http://10.20.30.40:7891/plugin-result-access/abc' }] };
+      expect(sanitizeLocalAddressNode(issued, context)).toEqual(issued);
+      // Query and fragment carry the capability and client route, not the destination.
+      expect(sanitizeLocalAddressNode({ url: 'http://10.20.30.40:7891/plugin-result-access/abc?t=2#x' }, context))
+        .toEqual({ url: 'http://10.20.30.40:7891/plugin-result-access/abc?t=2#x' });
+      for (const url of ['http://10.20.30.40:7891/api/sessions', 'http://10.20.30.40:7891/plugin-result-access/abd',
+        'http://10.20.30.40:7891/', 'http://10.20.30.40:3000/plugin-result-access/abc',
+        'http://alice@10.20.30.40:7891/plugin-result-access/abc', 'file:///tmp/report.md', 'http://127.0.0.1:7891/']) {
+        expect(() => sanitizeLocalAddressNode({ url }, context)).toThrowError(
+          expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }));
+      }
+      expect(sanitizeLocalAddressText('[入口](http://10.20.30.40:7891/plugin-result-access/abc)', context)).not.toContain('10.20.30.40');
+    } finally { resetHostIssuedLinks(); }
+  });
+
+  it('lists only the local jump targets of a card body', () => {
+    const body = JSON.stringify({ body: { elements: [
+      { tag: 'button', multi_url: { url: 'https://applink.feishu.cn/x', android_url: 'http://10.20.30.40:7891/s/a' } },
+      { tag: 'button', behaviors: [{ type: 'callback', value: { url: 'http://10.20.30.40:7891/opaque' } }] },
+      { tag: 'markdown', content: '[x](http://10.20.30.40:7891/text)' },
+    ] } });
+    expect(localJumpTargets(body, 'interactive', { localHosts: ['10.20.30.40'] })).toEqual(['http://10.20.30.40:7891/s/a']);
+    expect(localJumpTargets(body, 'text', { localHosts: ['10.20.30.40'] })).toEqual([]);
   });
 
   it.each(['https://127.example.com/home/page', 'https://127.0.0.1.example.com/tmp/report'])(

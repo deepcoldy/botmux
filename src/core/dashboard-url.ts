@@ -7,7 +7,7 @@ import {
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 import { immersiveWorkbenchHash } from './workbench-shell.js';
-import { noteHostLinkOrigin } from './host-link-origins.js';
+import { issueHostLink } from './host-issued-links.js';
 
 export interface DashboardUrls {
   /**
@@ -78,7 +78,7 @@ export function formatUrlHost(host: string): string {
  */
 export function buildDashboardUrls(opts: { host: string; port: number | string; token?: string }): DashboardUrls {
   const localOrigin = `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
-  noteHostLinkOrigin(localOrigin);
+  issueHostLink(`${localOrigin}/`);
   // Ask for the platform leg separately from the whole precedence chain: the two
   // answers differ exactly in the reverse-proxy / Devbox cases, which is the
   // distinction every token-stripping caller needs (see DashboardUrls.platformHosted).
@@ -158,7 +158,7 @@ export function workbenchSpaUrl(dashboardUrl: string): string | null {
   const u = parseHttpUrl(dashboardUrl);
   if (!u) return null;
   u.hash = immersiveWorkbenchHash(WORKBENCH_HASH_ROUTE);
-  return u.toString();
+  return issueHostLink(u.toString());
 }
 
 /**
@@ -182,7 +182,7 @@ export function workbenchEntryUrl(dashboardUrl: string): string | null {
   if (!u) return null;
   u.pathname = '/workbench';
   u.hash = '';
-  return u.toString();
+  return issueHostLink(u.toString());
 }
 
 /**
@@ -291,7 +291,7 @@ function remotePublicBase(): string | null {
  */
 export function buildV3RunDetailUrl(runId: string, opts: { host: string; port: number | string }): string {
   const origin = remotePublicBase() ?? `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
-  return `${origin}/#/v3/${encodeURIComponent(runId)}`;
+  return issueHostLink(`${origin}/#/v3/${encodeURIComponent(runId)}`);
 }
 
 /**
@@ -313,7 +313,7 @@ export function buildV3TerminalUrl(
   const base = platformCentralTerminalBaseUrl() ?? nonPlatformRemoteBase();
   if (base) return `${base}/s/${encodeURIComponent(sessionId)}/${capability}`;
   if (!opts.webPort || opts.webPort <= 0) return null;
-  return `http://${formatUrlHost(String(opts.host))}:${opts.webPort}/${capability}`;
+  return issueHostLink(`http://${formatUrlHost(String(opts.host))}:${opts.webPort}/${capability}`);
 }
 
 /**

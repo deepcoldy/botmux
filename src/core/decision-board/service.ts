@@ -33,6 +33,7 @@ import {
   type PrMergeState,
 } from './hints.js';
 import { formatChatLookupFailures, lookupProvesChatNotFound, type ChatLookupResult } from './chat-lookup.js';
+import { issueHostLink } from '../host-issued-links.js';
 import {
   DECISION_CARD_ACTION_NOTE,
   DECISION_CARD_ACTION_PICK,
@@ -313,7 +314,7 @@ export class DecisionBoardService {
   itemLinks(seq: number): { url?: string; appLink?: string } {
     const origin = this.deps.dashboardOrigin();
     if (!origin) return {};
-    const url = `${origin}${boardItemPath(this.appId, seq)}`;
+    const url = issueHostLink(`${origin}${boardItemPath(this.appId, seq)}`);
     return { url, appLink: sidebarAppLink(url, this.deps.brand()) };
   }
 
@@ -323,7 +324,7 @@ export class DecisionBoardService {
     const locale = this.deps.locale();
     const primary = effectivePrimaryChat(links, primaryChat);
     return links.map(l => {
-      const url = linkUrl(l, ctx);
+      const url = issueHostLink(linkUrl(l, ctx));
       return { ...l, text: linkText(l, locale), ...(url ? { url } : {}), ...(l === primary ? { primary: true as const } : {}) };
     });
   }
