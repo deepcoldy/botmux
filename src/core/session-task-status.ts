@@ -175,15 +175,20 @@ export function deriveSessionTaskStatus(input: FactsInput, now: number = Date.no
   return { kind: 'idle' };
 }
 
-/** 最近一次任务状态变化的时刻：新消息、开始新一轮、一轮结束、举手。 */
+/**
+ * 最近一次任务状态变化的时刻：新消息、开始新一轮、一轮结束、举手。自动压缩这类维护输入也会刷新
+ * 最近消息时间，但它被本轮结果的 heldThrough 盖住，不算新消息。
+ */
 export function taskStatusChangedAt(input: FactsInput): number {
   const facts = input as SessionTaskFacts;
   const attention = attentionOf(facts);
+  const turn = normalizeLastTurn(facts.lastTurn);
+  const lastMessageAt = finiteMs(facts.lastMessageAt) ?? 0;
   return Math.max(
     0,
-    finiteMs(facts.lastMessageAt) ?? 0,
+    lastMessageAt > (turn?.heldThrough ?? 0) ? lastMessageAt : 0,
     finiteMs(facts.busySinceAt) ?? 0,
-    normalizeLastTurn(facts.lastTurn)?.at ?? 0,
+    turn?.at ?? 0,
     attention?.at ?? 0,
   );
 }
