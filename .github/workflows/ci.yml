@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# No job in this workflow runs Electron (the desktop unit tests mock it), so its
+# postinstall must not download the binary. `docker run` steps do not inherit
+# this; they pass it through with `-e`.
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   # A new push to a PR replaces the run for the old head. On master every
@@ -42,7 +48,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-      - run: bun install --frozen-lockfile
+      - run: sh scripts/ci-install-retry.sh bun install --frozen-lockfile
       - run: bun run build
       - run: bun run workflow-core:test
 
@@ -109,7 +115,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-      - run: bun install --frozen-lockfile
+      - run: sh scripts/ci-install-retry.sh bun install --frozen-lockfile
       - run: bun run build
       # No rerun on failure: a shard spends up to ~17 of its 25 minutes in
       # vitest, so a second pass cannot finish anyway, and a flake must surface
@@ -218,7 +224,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-      - run: bun install --frozen-lockfile
+      - run: sh scripts/ci-install-retry.sh bun install --frozen-lockfile
       - run: bun run build
       # Exercise the runner itself before the 20-minute suite. `node --check` cannot
       # catch a missing binding (a ReferenceError is a RUNTIME error, verified), so a
@@ -307,6 +313,7 @@ jobs:
             -v "$PWD:/work" -w /work \
             -e CI_RUN_NUMBER="${{ github.run_number }}" \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e ELECTRON_SKIP_BINARY_DOWNLOAD \
             node:22-alpine sh -euc '
               # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty must compile
               # here because its linux prebuilds are glibc-only. binutils supplies
@@ -320,7 +327,7 @@ jobs:
               # build_from_source makes node-pty'"'"'s install script delete its
               # (glibc) prebuilds and run node-gyp. It only takes effect when
               # node-pty is actually (re)installed — a clean checkout here.
-              npm_config_build_from_source=true bun install --frozen-lockfile
+              npm_config_build_from_source=true sh scripts/ci-install-retry.sh bun install --frozen-lockfile
 
               # Fail closed rather than compiling a musl binary around a glibc
               # native: that mistake survives the build and surfaces only when the
@@ -458,7 +465,7 @@ jobs:
       # arch only. This install is also the only place in CI where the darwin
       # branch of scripts/build-bun-binary.mjs (`resolveNodePtyNative` picking a
       # prebuild, and the spawn-helper embed) is exercised at all.
-      - run: bun install --frozen-lockfile
+      - run: sh scripts/ci-install-retry.sh bun install --frozen-lockfile
 
       # Same reason and same ORDER as the linux/musl legs: the compiled binary
       # has no package.json on disk, so the version is baked at compile time,

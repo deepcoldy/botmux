@@ -57,6 +57,7 @@ docker run --rm \
   -e EXPECTED_UNAME="$expected_uname" \
   -e HOST_UID="$(id -u)" \
   -e HOST_GID="$(id -g)" \
+  -e ELECTRON_SKIP_BINARY_DOWNLOAD \
   "$image" /bin/bash -euo pipefail -c '
     [ "$(uname -m)" = "$EXPECTED_UNAME" ] || {
       echo "runner/image architecture mismatch: expected $EXPECTED_UNAME, got $(uname -m)" >&2
@@ -104,7 +105,7 @@ docker run --rm \
     # and compile, so the floor check below inspects what we built. It only takes
     # effect when node-pty is actually (re)installed — a clean checkout in CI.
     # Stamp only after the frozen install, mirroring release.
-    npm_config_build_from_source=true bun install --frozen-lockfile
+    npm_config_build_from_source=true sh scripts/ci-install-retry.sh bun install --frozen-lockfile
     npm version "$BUILD_VERSION" --no-git-tag-version --allow-same-version
     bun run build
 
