@@ -1,14 +1,21 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import {
   fetchDetectedModels,
   mergeModelCandidates,
   modelSuggestionsForOption,
+  type BotDefaultsRow,
   type CliOptionsState,
 } from '../src/dashboard/web/bot-defaults.js';
 import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotOnboardingDialog } from '../src/dashboard/web/bot-onboarding.js';
+import { ModelPickerField } from '../src/dashboard/web/field-controls.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -91,6 +98,176 @@ describe('BotAgentSection runtime catalog hydration', () => {
     } finally {
       if (renderer) act(() => renderer.unmount());
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+});
+
+const FOLLOW_CLI_DEFAULT = '跟随 CLI 默认';
+const PINNED_MODEL = 'gpt-6.1-sol';
+const LIVE_MODELS = [PINNED_MODEL, 'gpt-6-astra'];
+
+type MenuOption = { value: string; label: unknown };
+
+describe('BotAgentSection 主模型选择器', () => {
+  const appId = 'cli_model_default_reset';
+  const originalFetch = globalThis.fetch;
+  let dir: string | undefined;
+  let configPath: string;
+  let server: IpcServerHandle | undefined;
+  let renderer: TestRenderer.ReactTestRenderer | undefined;
+  const agentSaveBodies: Array<Record<string, unknown>> = [];
+
+  afterEach(async () => {
+    if (renderer) act(() => renderer!.unmount());
+    renderer = undefined;
+    if (server) await server.close();
+    server = undefined;
+    setLarkAppId('');
+    __testOnly_resetBotRegistry();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+    agentSaveBodies.length = 0;
+  });
+
+  function stored(): Record<string, unknown> {
+    return JSON.parse(readFileSync(configPath, 'utf8'))[0];
+  }
+
+  async function renderStored(): Promise<void> {
+    if (renderer) act(() => renderer!.unmount());
+    const bot = loadBotConfigs()[0]!;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { ...bot, agentSelectionKey: bot.cliId } as BotDefaultsRow,
+        sessionFallback: bot.cliId!,
+        cliState: {
+          options: [{ id: 'codex', label: 'Codex', modelChoices: ['static-model'] }],
+          ttadkModelDefault: '',
+          ttadkModelSuggestions: [],
+        },
+        patchBot: () => undefined,
+      }));
+    });
+  }
+
+  function modelMenu() {
+    return renderer!.root.findByProps({ id: 'bd-menu-agentModel' });
+  }
+
+  it('固定过模型的 Bot 能从下拉顶部选回「跟随 CLI 默认」，保存清掉 model，重新加载仍显示跟随默认', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'dashboard-model-default-'));
+    configPath = join(dir, 'bots.json');
+    vi.stubEnv('BOTS_CONFIG', configPath);
+    writeFileSync(configPath, JSON.stringify([
+      { larkAppId: appId, larkAppSecret: 'fixture', cliId: 'codex', model: PINNED_MODEL },
+    ]));
+    loadBotConfigs().forEach(registerBot);
+    setLarkAppId(appId);
+    server = await startIpcServer({ host: '127.0.0.1', port: 0 });
+    const base = `http://127.0.0.1:${server.port}`;
+    let finishSave: ((result: { status: number; body: unknown }) => void) | undefined;
+    // 模型探测留在本地；保存走组件真实发出的请求体，交给真实 IPC 写入处理落盘。
+    vi.stubGlobal('fetch', (async (url, init) => {
+      const path = String(url);
+      if (path === `/api/bots/${appId}/agent` && init?.method === 'PUT') {
+        agentSaveBodies.push(JSON.parse(String(init.body)));
+        const response = await originalFetch(`${base}/api/bot-agent`, init);
+        finishSave?.({ status: response.status, body: await response.clone().json() });
+        return response;
+      }
+      if (path.startsWith('/api/cli-options/models?')) {
+        return new Response(JSON.stringify({ models: LIVE_MODELS, source: 'live' }));
+      }
+      if (path.startsWith('/api/cli-options/availability?')) {
+        return new Response(JSON.stringify({ status: 'unknown' }));
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    }) as typeof fetch);
+    await renderStored();
+
+    const pinnedMenu = modelMenu();
+    expect(pinnedMenu.props.label).toBe(PINNED_MODEL);
+    expect(pinnedMenu.props.options[0]).toEqual({ value: '', label: FOLLOW_CLI_DEFAULT });
+    expect(pinnedMenu.props.options.map((option: MenuOption) => option.value).slice(1, 3)).toEqual(LIVE_MODELS);
+
+    act(() => pinnedMenu.props.onChange(''));
+    expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+
+    const completed = new Promise<{ status: number; body: unknown }>(resolve => { finishSave = resolve; });
+    await act(async () => {
+      renderer!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+      expect(await completed).toMatchObject({ status: 200, body: { ok: true } });
+    });
+    expect(agentSaveBodies).toHaveLength(1);
+    expect(agentSaveBodies[0]).toMatchObject({ cliId: 'codex', model: '' });
+    expect(stored()).not.toHaveProperty('model');
+    expect(loadBotConfigs()[0]!.model).toBeUndefined();
+
+    await renderStored();
+    expect(renderer!.root.findByType(ModelPickerField).props.value).toBe('');
+    expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+  });
+});
+
+describe('BotOnboardingDialog 模型选择器', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('选过具体模型后能选回「跟随 CLI 默认」，创建请求不再带 model', async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/bot-onboarding/start' && init?.method === 'POST') {
+        startBodies.push(JSON.parse(String(init.body)));
+        // 终态 job：表单提交到此为止，不进入轮询。
+        return new Response(JSON.stringify({ job: { id: 'job_model_default', status: 'failed', message: 'stop' } }));
+      }
+      if (url.startsWith('/api/cli-options/models?')) {
+        return new Response(JSON.stringify({ models: LIVE_MODELS, source: 'live' }));
+      }
+      if (url.startsWith('/api/cli-options/availability?')) {
+        return new Response(JSON.stringify({ status: 'available' }));
+      }
+      if (url === '/api/cli-options') {
+        return new Response(JSON.stringify({
+          options: [{ id: 'codex', label: 'Codex', modelChoices: [PINNED_MODEL] }],
+          ttadkModelSuggestions: [],
+        }));
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(BotOnboardingDialog, { open: true, onClose: () => undefined }));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const modelMenu = () => renderer.root.findByProps({ id: 'bd-menu-ob-model' });
+      expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+
+      await act(async () => {
+        modelMenu().props.onChange(PINNED_MODEL);
+      });
+      expect(modelMenu().props.label).toBe(PINNED_MODEL);
+      expect(modelMenu().props.options[0]).toEqual({ value: '', label: FOLLOW_CLI_DEFAULT });
+
+      await act(async () => {
+        modelMenu().props.onChange('');
+      });
+      expect(renderer.root.findByType(ModelPickerField).props.value).toBe('');
+      expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+
+      await act(async () => {
+        renderer.root.findByProps({ id: 'onboarding-form' }).props.onSubmit({ preventDefault() {} });
+        await Promise.resolve();
+      });
+      expect(startBodies).toHaveLength(1);
+      expect(startBodies[0]).toMatchObject({ cliId: 'codex' });
+      expect(startBodies[0]).not.toHaveProperty('model');
+    } finally {
+      if (renderer) act(() => renderer.unmount());
     }
   });
 });

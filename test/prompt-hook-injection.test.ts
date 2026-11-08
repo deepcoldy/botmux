@@ -110,7 +110,8 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
 
 // ─── 被测模块 ──────────────────────────────────────────────────────────────
 
-import { buildFollowUpCliInput, buildNewTopicCliInput } from '../src/core/session-manager.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput, promptHookRunsInCli } from '../src/core/session-manager.js';
+import { DEFAULT_CLAUDE_DATA_DIR } from '../src/adapters/cli/claude-code.js';
 import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const SESSION_ID = 'hook-session-789';
@@ -496,5 +497,51 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     expect(rescued).toBeDefined();
     expect(rescued).toContain('<sender ');
     expect(rescued).toContain('<mentions>');
+  });
+});
+
+describe('promptHookRunsInCli — the UserPromptSubmit hook runs on every submit of the session\'s CLI', () => {
+  let prevDataDir: string | undefined;
+  beforeEach(() => {
+    prevDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = '/tmp/test-sessions';
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' } as never,
+    });
+    preflightMock.mockReset();
+    preflightMock.mockReturnValue(true);
+  });
+  afterEach(() => {
+    if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = prevDataDir;
+  });
+  const target = (overrides: Record<string, unknown> = {}) => ({
+    cliId: 'claude-code' as const, sessionBackendType: 'tmux' as const, larkAppId: LARK_APP_ID, ...overrides,
+  });
+
+  it('claude-code on this host with the hook in the settings it reads — whether or not hook injection is on', () => {
+    expect(promptHookRunsInCli(target())).toBe(true);
+    expect(preflightMock).toHaveBeenLastCalledWith(`${DEFAULT_CLAUDE_DATA_DIR}/settings.json`);
+    preflightMock.mockReturnValue(false);
+    expect(promptHookRunsInCli(target())).toBe(false);
+  });
+
+  it('looks where the CLI reads: its config profile, or the per-bot copy under read isolation', () => {
+    expect(promptHookRunsInCli(target({ cliConfigDir: '/profiles/work' }))).toBe(true);
+    expect(preflightMock).toHaveBeenLastCalledWith('/profiles/work/settings.json');
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true } as never,
+    });
+    expect(promptHookRunsInCli(target())).toBe(true);
+    expect(preflightMock).toHaveBeenLastCalledWith('/tmp/bots/app_test/claude/settings.json');
+  });
+
+  it('never for a CLI that does not install it, a backend not on this host or not known, or a bot not known', () => {
+    for (const cliId of ['seed', 'relay', 'codex', 'cursor'] as const) expect(promptHookRunsInCli(target({ cliId }))).toBe(false);
+    expect(promptHookRunsInCli(target({ sessionBackendType: 'riff' }))).toBe(false);
+    expect(promptHookRunsInCli(target({ sessionBackendType: undefined }))).toBe(false);
+    expect(preflightMock).not.toHaveBeenCalled();
+    getBotMock.mockImplementation(() => { throw new Error('unknown bot'); });
+    expect(promptHookRunsInCli(target())).toBe(false);
   });
 });
