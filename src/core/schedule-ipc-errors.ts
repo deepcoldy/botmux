@@ -20,6 +20,8 @@ const SCHEDULE_IPC_ERROR_TEXT: Record<string, string> = {
   schedule_run_as_invalid: '--run-as 需要本 bot 应用下的 open_id（ou_ 开头）或飞书邮箱。',
   schedule_run_as_unresolved: '无法解析 --run-as 用户的 union_id；确认 open_id 属于本 bot 应用，或邮箱对本 bot 可见。',
   schedule_run_as_not_allowed: '--run-as 用户当前不能操作本 bot（不在允许名单内），定时任务未创建。',
+  silent_message_listener:
+    '来源群已设置静默执行，不能把定时任务投到来源群；任务需要定时发往其他群时请显式指定 --chat-id。定时任务未创建。',
 };
 
 export function scheduleIpcErrorMessage(code: string | undefined): string | undefined {

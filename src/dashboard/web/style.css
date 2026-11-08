@@ -3266,10 +3266,12 @@ button.primary {
 }
 .card-act:active { transform: scale(0.9); }
 
-/* ── 全局图标 tooltip（icon-tooltip.ts 委托渲染到 body，逃出容器 overflow）────── */
-.icon-tip {
-  position: fixed;
+/* ── 图标按钮 tooltip（IconTip → Base UI Tooltip，portal 到 body 或打开中的 dialog）── */
+.icon-tip-positioner {
   z-index: 9999;
+}
+.icon-tip {
+  position: relative;
   max-width: 260px;
   padding: 5px 9px;
   border-radius: var(--radius-sm);
@@ -3282,31 +3284,31 @@ button.primary {
   font-weight: 600;
   white-space: normal;
   pointer-events: none;
-  opacity: 0;
-  transform: translateY(2px);
   transition: opacity 120ms ease, transform 120ms ease;
 }
-.icon-tip.show {
-  opacity: 1;
-  transform: translateY(0);
+.icon-tip[data-starting-style],
+.icon-tip[data-ending-style] {
+  opacity: 0;
+  transform: translateY(2px);
 }
-/* 小箭头指向触发按钮 */
-.icon-tip::after {
-  content: "";
-  position: absolute;
-  left: 50%;
+.icon-tip[data-side="bottom"][data-starting-style],
+.icon-tip[data-side="bottom"][data-ending-style] {
+  transform: translateY(-2px);
+}
+/* 小箭头指向触发按钮；水平位置由 Base UI 按触发器算好写在行内 */
+.icon-tip-arrow {
   width: 7px;
   height: 7px;
-  transform: translateX(-50%) rotate(45deg);
+  transform: rotate(45deg);
   background: var(--surface-inverse, #1f2430);
   border: 1px solid var(--border-soft);
 }
-.icon-tip[data-placement="top"]::after {
+.icon-tip-arrow[data-side="top"] {
   bottom: -4px;
   border-top: none;
   border-left: none;
 }
-.icon-tip[data-placement="bottom"]::after {
+.icon-tip-arrow[data-side="bottom"] {
   top: -4px;
   border-bottom: none;
   border-right: none;
@@ -5507,7 +5509,7 @@ dialog.onboarding-dialog::backdrop {
   min-width: 0;
 }
 
-.onboarding-menu > summary {
+.onboarding-menu > .sect-sort-trigger {
   width: 100%;
   min-width: 0;
   height: var(--button-height);
@@ -5520,19 +5522,11 @@ dialog.onboarding-dialog::backdrop {
   max-width: 100%;
 }
 
-.onboarding-menu .sect-sort-pop {
-  left: 0;
-  width: 100%;
-  min-width: 100%;
-  max-height: min(280px, 42vh, var(--dropdown-popover-space, 100vh));
+.sect-sort-pop[data-menu~="onboarding-menu"] {
+  width: var(--anchor-width);
+  min-width: var(--anchor-width);
+  max-height: min(280px, 42vh, var(--available-height, 100vh));
   overflow-y: auto;
-  transform: none;
-  z-index: 1300;
-}
-
-.onboarding-menu[open] {
-  position: relative;
-  z-index: 1300;
 }
 
 .onboarding-actions {
@@ -9733,7 +9727,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   flex: none;
   width: var(--dropdown-trigger-width);
 }
-.sect-sort-menu > summary {
+.sect-sort-menu > .sect-sort-trigger {
   position: relative;
   display: inline-flex;
   align-items: center;
@@ -9749,7 +9743,6 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   font-size: 11.5px;
   font-weight: 700;
   line-height: 1;
-  list-style: none;
   cursor: pointer;
   user-select: none;
   transition:
@@ -9758,10 +9751,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
     color 150ms ease,
     transform 150ms ease;
 }
-.sect-sort-menu > summary::-webkit-details-marker {
-  display: none;
-}
-.sect-sort-menu > summary::after {
+.sect-sort-menu > .sect-sort-trigger::after {
   content: "";
   position: absolute;
   right: 10px;
@@ -9776,21 +9766,21 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3.5 5.25 7 8.75l3.5-3.5' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 14px 14px no-repeat;
   mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3.5 5.25 7 8.75l3.5-3.5' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 14px 14px no-repeat;
 }
-.sect-sort-menu[open] > summary,
-.sect-sort-menu > summary:hover {
+.sect-sort-menu.is-open > .sect-sort-trigger,
+.sect-sort-menu > .sect-sort-trigger:hover {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
 }
-.sect-sort-menu.is-disabled > summary,
-.sect-sort-menu.is-disabled > summary:hover {
+.sect-sort-menu.is-disabled > .sect-sort-trigger,
+.sect-sort-menu.is-disabled > .sect-sort-trigger:hover {
   border-color: var(--border-soft);
   background: var(--surface-muted);
   color: var(--faint);
   cursor: not-allowed;
   opacity: 0.62;
 }
-.sect-sort-menu[open] > summary::after {
+.sect-sort-menu.is-open > .sect-sort-trigger::after {
   transform: translateY(-50%) rotate(180deg);
 }
 .sect-head .sect-sort-menu span {
@@ -9806,35 +9796,38 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 弹层由 Base UI 的 Positioner 定位：portal 到 body（或最近的打开中 dialog），
+   fixed 定位，空间不够时自己翻转，并写入 --anchor-width / --available-height。
+   它已不在页面 DOM 里，页面级规则用 [data-menu~="<触发器 className>"] 命中弹层；
+   贴左 / 贴右对齐在触发器根上设 --dropdown-align（见 dropdown-shared.tsx）。 */
+.sect-sort-positioner {
+  z-index: 1600;
+}
 .sect-sort-pop {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 50%;
-  z-index: 40;
   display: grid;
   gap: 4px;
-  min-width: var(--dropdown-popover-min-width);
-  max-height: min(var(--dropdown-popover-max-height), var(--dropdown-popover-space, 100vh));
+  min-width: max(var(--dropdown-popover-min-width), var(--anchor-width, 0px));
+  max-height: min(var(--dropdown-popover-max-height), var(--available-height, 100vh));
   padding: 6px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--modal-shadow);
-  transform: translateX(-50%);
+  outline: none;
   /* 选项多于限高时在弹层内部滚动。少于限高时 auto 不会显示滚动条，
      所以短列表（排序菜单等）外观不变。overscroll 收敛住，避免滚到底后
      把外层 main 一起带着滚。 */
   overflow-y: auto;
   overscroll-behavior: contain;
 }
-/* 下方空间不够、且上方更宽裕时向上弹（DropdownMenu 量完可用空间后加的类）。 */
-.sect-sort-menu.is-drop-up > .sect-sort-pop {
-  top: auto;
-  bottom: calc(100% + 8px);
+.sect-sort-pop .sect-sort-list {
+  display: grid;
+  gap: 4px;
 }
-/* 会话筛选里的「来源 / 所在聊天」弹层宽度自适应 + 不折行的规则统一定义在下方
-   （.sessions-filters .sect-sort-pop，靠后覆盖），此处不再重复。 */
-.sect-sort-pop button {
+.sect-sort-pop .sect-sort-list:empty {
+  display: none;
+}
+.sect-sort-pop .sect-sort-item {
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -9850,11 +9843,17 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   line-height: 1;
   text-align: left;
   cursor: pointer;
+  user-select: none;
+  outline: none;
   /* 选项不换行：长文案（如「来源：外部接入 (/adopt)」「单聊 · 申晗 · <bot名>」）
      以前会折成多行、显得拥挤。改为单行 + 超长省略号；弹层宽度下方放宽。 */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.sect-sort-pop .sect-sort-item[data-disabled] {
+  opacity: 0.5;
+  cursor: default;
 }
 /* 长列表下拉的过滤框：滚动时钉在弹层顶部（负 margin 盖住弹层 padding）。 */
 .sect-sort-pop input.sect-sort-search[type="search"] {
@@ -9887,17 +9886,18 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--muted);
   font-size: 12px;
 }
-.sect-sort-pop button[aria-current="true"] {
+.sect-sort-pop .sect-sort-item[data-selected] {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
   color: var(--accent-strong);
 }
-.sect-sort-pop button:hover {
+/* data-highlighted 同时覆盖鼠标悬停与方向键高亮。 */
+.sect-sort-pop .sect-sort-item[data-highlighted] {
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
   color: var(--accent-strong);
 }
-.sect-sort-pop button[aria-current="true"]:hover {
+.sect-sort-pop .sect-sort-item[data-selected][data-highlighted] {
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
   color: var(--accent-strong);
 }
@@ -9907,9 +9907,9 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .overview-active-sort-menu .sect-sort-value {
   max-width: 116px;
 }
-.overview-active-sort-menu > .sect-sort-pop {
-  width: 100%;
-  min-width: 100%;
+.sect-sort-pop[data-menu~="overview-active-sort-menu"] {
+  width: var(--anchor-width);
+  min-width: var(--anchor-width);
 }
 .sect-head-action {
   margin-left: auto;
@@ -10177,33 +10177,9 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .sessions-filters .sect-sort-menu {
   width: var(--dropdown-trigger-width);
 }
-.sessions-filters .sect-sort-menu > summary {
+.sessions-filters .sect-sort-menu > .sect-sort-trigger {
   width: 100%;
   min-width: 0;
-}
-.sessions-filters .sect-sort-pop {
-  /* 「来源 / 所在聊天」选项文案偏长（如「来源：外部接入 (/adopt)」、含 bot 后缀的
-     单聊名）：弹层按最长选项自适应、不折行，封顶后省略号；左对齐避免右侧超出视口。
-     用 .dashboard-toolbar 前缀匹配上 `.dashboard-toolbar > .sect-sort-menu >
-     .sect-sort-pop`（那条把宽度锁成 100%），靠后 + 同等特指度覆盖它。 */
-  left: 0;
-  transform: none;
-  width: max-content;
-  min-width: 220px;
-  max-width: min(380px, calc(100vw - 48px));
-}
-.dashboard-toolbar.sessions-filters > .sect-sort-menu > .sect-sort-pop {
-  left: 0;
-  transform: none;
-  width: max-content;
-  min-width: 220px;
-  max-width: min(380px, calc(100vw - 48px));
-}
-/* 让选项按 max-content 撑开弹层：默认按钮的 ellipsis 会把 max-content 量成最小宽度，
-   这里放开——只有触达 max-width 上限时才由按钮自身 ellipsis 收尾。 */
-.sessions-filters .sect-sort-pop button {
-  min-width: 0;
-  white-space: nowrap;
 }
 :root[data-theme="dark"] .sessions-filters input[type=search] {
   background-color: var(--surface);
@@ -13095,7 +13071,7 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 
 .sessions-page .sessions-filters :where(
   input[type=search],
-  .sect-sort-menu > summary,
+  .sect-sort-menu > .sect-sort-trigger,
   .filter-cli summary,
   .filter-toggle,
   .idle-cleanup-run
@@ -13109,7 +13085,7 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 
 .sessions-page .sessions-filters :where(
   input[type=search],
-  .sect-sort-menu > summary,
+  .sect-sort-menu > .sect-sort-trigger,
   .filter-cli summary,
   .filter-toggle
 ) {
@@ -13179,7 +13155,7 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 }
 
 .sessions-page form.sessions-filters :where(
-  .sect-sort-menu > summary,
+  .sect-sort-menu > .sect-sort-trigger,
   .filter-cli summary
 ) {
   padding-left: var(--button-padding-x);
@@ -14831,17 +14807,12 @@ main:has(.whiteboards-page) {
 }
 
 .roles-profile-apply-controls .roles-apply-group-menu {
+  --dropdown-align: start;
   width: 100%;
 }
 
 .roles-profile-apply-controls .roles-apply-group-menu .sect-sort-value {
   max-width: calc(100% - 44px);
-}
-
-.roles-profile-apply-controls .roles-apply-group-menu .sect-sort-pop {
-  left: 0;
-  min-width: 100%;
-  transform: none;
 }
 
 .roles-profile-apply-bot {
@@ -15293,7 +15264,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   min-width: var(--dropdown-trigger-width);
 }
 
-.dashboard-toolbar > .sect-sort-menu > summary {
+.dashboard-toolbar > .sect-sort-menu > .sect-sort-trigger {
   box-sizing: border-box;
   width: 100%;
   height: var(--button-height);
@@ -15310,33 +15281,23 @@ form.dashboard-toolbar > input[type="text"]:focus {
   box-shadow: none;
 }
 
-.dashboard-toolbar > .sect-sort-menu > summary:hover,
-.dashboard-toolbar > .sect-sort-menu[open] > summary {
+.dashboard-toolbar > .sect-sort-menu > .sect-sort-trigger:hover,
+.dashboard-toolbar > .sect-sort-menu.is-open > .sect-sort-trigger {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
-}
-
-.dashboard-toolbar:has(> .sect-sort-menu[open]) {
-  position: relative;
-  z-index: 1300;
-}
-
-.dashboard-toolbar > .sect-sort-menu[open] {
-  z-index: 1301;
 }
 
 .dashboard-toolbar > .sect-sort-menu .sect-sort-value {
   max-width: 100%;
 }
 
-.dashboard-toolbar > .sect-sort-menu > .sect-sort-pop {
-  left: 50%;
-  z-index: 1302;
-  width: 100%;
-  min-width: 100%;
+/* toolbar 直属的筛选下拉在 className 里带 dashboard-toolbar-menu：弹层 portal 出去后
+   靠它和触发器同宽。 */
+.sect-sort-pop[data-menu~="dashboard-toolbar-menu"] {
+  width: var(--anchor-width);
+  min-width: var(--anchor-width);
   max-width: min(320px, 80vw);
-  transform: translateX(-50%);
 }
 
 .dashboard-toolbar > button,
@@ -16086,11 +16047,14 @@ form.dashboard-toolbar > input[type="text"]:focus {
   line-height: 1;
 }
 
+/* InfoTip（Base UI Popover）与 OverflowText 全文浮层（Base UI Tooltip）共用的浮层外观；
+   浮层 portal 到 body 或打开中的 dialog，不在触发器下面，不能用祖先选择器命中。 */
+.ui-info-positioner {
+  z-index: 2147483647;
+}
+
 .ui-info-pop {
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 8px);
-  z-index: 1400;
+  position: relative;
   box-sizing: border-box;
   width: max-content;
   max-width: min(360px, calc(100vw - 48px));
@@ -16104,10 +16068,22 @@ form.dashboard-toolbar > input[type="text"]:focus {
   font-weight: 500;
   line-height: 1.45;
   white-space: pre-line;
-  opacity: 0;
-  pointer-events: none;
-  transform: translate(-50%, 4px);
+  /* 指针可以移进浮层，选中、复制里面的文字 */
+  user-select: text;
+  cursor: text;
+  outline: none;
   transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.ui-info-pop[data-starting-style],
+.ui-info-pop[data-ending-style] {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+.ui-info-pop[data-side="bottom"][data-starting-style],
+.ui-info-pop[data-side="bottom"][data-ending-style] {
+  transform: translateY(-4px);
 }
 
 .ui-info-pop::before {
@@ -16121,35 +16097,12 @@ form.dashboard-toolbar > input[type="text"]:focus {
   background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 42%, var(--border-soft)));
 }
 
-.ui-info-pop-floating {
-  position: fixed;
-  bottom: auto;
-  z-index: 2147483647;
-  opacity: 1;
-  /* Interactive: let the pointer reach the popover so its text is selectable /
-     copyable (JS keeps it open while hovered). */
-  pointer-events: auto;
-  user-select: text;
-  cursor: text;
-  transform: translate(-50%, -100%);
-}
-
-.ui-info-pop-floating.ui-info-pop-bottom {
-  transform: translate(-50%, 0);
-}
-
 .ui-info-tip:hover .ui-info-mark,
 .ui-info-tip:focus .ui-info-mark,
-.ui-info-tip:focus-within .ui-info-mark {
+.ui-info-tip:focus-within .ui-info-mark,
+.ui-info-tip[data-popup-open] .ui-info-mark {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft));
   color: var(--accent);
-}
-
-.ui-info-tip:hover .ui-info-pop,
-.ui-info-tip:focus .ui-info-pop,
-.ui-info-tip:focus-within .ui-info-pop {
-  opacity: 1;
-  transform: translate(-50%, 0);
 }
 
 .ui-overflow-text {
@@ -16385,21 +16338,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
   font: inherit;
 }
 
-.skills-install-panel .ui-info-pop {
-  bottom: auto;
-  top: calc(100% + 8px);
-  white-space: pre-line;
-  transform: translate(-50%, -4px);
-}
-
-.skills-install-panel .ui-info-tip:hover .ui-info-pop,
-.skills-install-panel .ui-info-tip:focus .ui-info-pop,
-.skills-install-panel .ui-info-tip:focus-within .ui-info-pop {
-  transform: translate(-50%, 0);
-}
-
 .skills-install-grid input,
-.skills-attach-row .sect-sort-menu > summary {
+.skills-attach-row .sect-sort-menu > .sect-sort-trigger {
   height: var(--button-height);
   min-height: var(--button-height);
   border-radius: var(--radius-full);
@@ -16622,8 +16562,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .connectors-page .cn-form :is(input, textarea),
-.connectors-page .connector-form-menu > summary,
-.settings-field-menu > summary,
+.connectors-page .connector-form-menu > .sect-sort-trigger,
+.settings-field-menu > .sect-sort-trigger,
 .settings-card .maint-time input,
 .settings-card .settings-pill-input {
   border-radius: var(--radius-full);
@@ -16639,8 +16579,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .connectors-page .cn-form input,
-.connectors-page .connector-form-menu > summary,
-.settings-field-menu > summary,
+.connectors-page .connector-form-menu > .sect-sort-trigger,
+.settings-field-menu > .sect-sort-trigger,
 .settings-card .maint-time input,
 .settings-card .settings-pill-input {
   height: var(--button-height);
@@ -16721,13 +16661,13 @@ form.dashboard-toolbar > input[type="text"]:focus {
   min-width: 0;
 }
 
-.connectors-page .connector-form-menu > summary {
+.connectors-page .connector-form-menu > .sect-sort-trigger {
   box-sizing: border-box;
   width: 100%;
   justify-content: flex-start;
 }
 
-.settings-field-menu > summary {
+.settings-field-menu > .sect-sort-trigger {
   box-sizing: border-box;
   width: 100%;
   justify-content: flex-start;
@@ -16738,21 +16678,10 @@ form.dashboard-toolbar > input[type="text"]:focus {
   max-width: 100%;
 }
 
-.connectors-page .connector-form-menu .sect-sort-pop,
-.settings-field-menu .sect-sort-pop {
-  left: 0;
-  box-sizing: border-box;
-  width: 100%;
-  min-width: 100%;
-  max-width: 100%;
-  transform: none;
-}
-
-.settings-field-menu .sect-sort-pop button {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.sect-sort-pop:is([data-menu~="connector-form-menu"], [data-menu~="settings-field-menu"]) {
+  width: var(--anchor-width);
+  min-width: var(--anchor-width);
+  max-width: var(--anchor-width);
 }
 
 .connector-chat-control {
@@ -17572,16 +17501,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .connector-modal-body .connector-created-wrap {
   margin-top: 0;
-}
-
-.connector-create-modal #cn-verify[open] {
-  z-index: 1500;
-}
-
-.connector-create-modal #cn-verify .sect-sort-pop {
-  top: auto;
-  bottom: calc(100% + 8px);
-  z-index: 1501;
 }
 
 .connector-modal-actions {
@@ -18668,10 +18587,11 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu {
+  --dropdown-align: start;
   width: 100%;
   min-width: 0;
 }
-.webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu > summary {
+.webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu > .sect-sort-trigger {
   box-sizing: border-box;
   width: 100%;
   justify-content: flex-start;
@@ -18680,11 +18600,9 @@ form.dashboard-toolbar > input[type="text"]:focus {
 .webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu .sect-sort-value {
   max-width: calc(100% - 2px);
 }
-.webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu .sect-sort-pop {
-  left: 0;
-  width: max(100%, 220px);
-  min-width: 100%;
-  transform: none;
+.sect-sort-pop[data-menu~="webhook-log-filter-menu"] {
+  width: max(var(--anchor-width), 220px);
+  min-width: var(--anchor-width);
 }
 .webhook-log-refresh { white-space: nowrap; }
 .webhook-log-error { margin: 0; }
@@ -21018,7 +20936,7 @@ main:has(.workflows-page .v3r-runs-section) .v3r-run-list {
   width: 132px;
   min-width: 132px;
 }
-.insights-page .sesssort .sect-sort-menu > summary {
+.insights-page .sesssort .sect-sort-menu > .sect-sort-trigger {
   box-sizing: border-box;
   height: var(--button-height);
   min-height: var(--button-height);
@@ -21033,8 +20951,8 @@ main:has(.workflows-page .v3r-runs-section) .v3r-run-list {
   line-height: 1;
   box-shadow: none;
 }
-.insights-page .sesssort .sect-sort-menu > summary:hover,
-.insights-page .sesssort .sect-sort-menu[open] > summary {
+.insights-page .sesssort .sect-sort-menu > .sect-sort-trigger:hover,
+.insights-page .sesssort .sect-sort-menu.is-open > .sect-sort-trigger {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
@@ -21042,16 +20960,9 @@ main:has(.workflows-page .v3r-runs-section) .v3r-run-list {
 .insights-page .sesssort .sect-sort-menu .sect-sort-value {
   max-width: 100%;
 }
-.insights-page .sesssort .sect-sort-pop {
-  left: 50%;
-  z-index: 1302;
-  width: 100%;
-  min-width: 100%;
-  transform: translateX(-50%);
-}
-.insights-page .sesssort:has(.sect-sort-menu[open]) {
-  position: relative;
-  z-index: 1300;
+.sect-sort-pop[data-menu~="insight-sort-menu"] {
+  width: var(--anchor-width);
+  min-width: var(--anchor-width);
 }
 .insights-page .insight-layout-switch {
   display: inline-flex;
@@ -21760,17 +21671,14 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 /* ─── Bot 配置：平台化表单控件 ───────────────────────────────────────────── */
-.bot-defaults-page .clone-bot-menu[open] {
-  z-index: 1000;
+.bot-defaults-page .clone-bot-menu {
+  --dropdown-align: end;
 }
 
-.bot-defaults-page .clone-bot-menu > .sect-sort-pop {
-  right: 0;
-  left: auto;
+.sect-sort-pop[data-menu~="clone-bot-menu"] {
   width: max-content;
   min-width: 220px;
   max-width: min(340px, calc(100vw - 48px));
-  transform: none;
 }
 
 .bot-defaults-page .bd-detail,
@@ -22558,14 +22466,16 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-info-tip:hover .ui-info-mark,
 .bot-defaults-page .bd-info-tip:focus .ui-info-mark,
-.bot-defaults-page .bd-info-tip:focus-within .ui-info-mark {
+.bot-defaults-page .bd-info-tip:focus-within .ui-info-mark,
+.bot-defaults-page .bd-info-tip[data-popup-open] .ui-info-mark {
   border-color: color-mix(in srgb, var(--accent) 48%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .bot-defaults-page .bd-info-tip:hover,
 .bot-defaults-page .bd-info-tip:focus,
-.bot-defaults-page .bd-info-tip:focus-within {
+.bot-defaults-page .bd-info-tip:focus-within,
+.bot-defaults-page .bd-info-tip[data-popup-open] {
   color: var(--accent);
 }
 
@@ -23082,7 +22992,7 @@ dialog select[multiple]:hover:not(:disabled) {
   min-width: 0;
 }
 
-.bot-defaults-page .bd-field-menu > summary {
+.bot-defaults-page .bd-field-menu > .sect-sort-trigger {
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -23109,24 +23019,16 @@ dialog select[multiple]:hover:not(:disabled) {
   line-height: 1;
 }
 
-.bot-defaults-page .bd-field-menu .sect-sort-pop {
-  left: 0;
-  width: 100%;
-  min-width: 100%;
-  max-height: min(280px, 42vh, var(--dropdown-popover-space, 100vh));
+.sect-sort-pop[data-menu~="bd-field-menu"] {
+  width: var(--anchor-width);
+  min-width: var(--anchor-width);
+  max-height: min(280px, 42vh, var(--available-height, 100vh));
   overflow-y: auto;
-  transform: none;
-  z-index: 1300;
-}
-
-.bot-defaults-page .bd-field-menu[open] {
-  position: relative;
-  z-index: 1300;
 }
 
 /* 下拉选项的第二行说明（hint）：标题单行省略，副文案可折行，整块按钮变高、
    圆角从胶囊改成方角卡片，避免两行文案挤在胶囊里。 */
-.sect-sort-pop button:has(.sect-sort-option) {
+.sect-sort-pop .sect-sort-item:has(.sect-sort-option) {
   flex-direction: column;
   align-items: stretch;
   justify-content: center;
@@ -23138,7 +23040,7 @@ dialog select[multiple]:hover:not(:disabled) {
   white-space: normal;
 }
 
-.sect-sort-pop button .sect-sort-option {
+.sect-sort-pop .sect-sort-item .sect-sort-option {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -23148,14 +23050,14 @@ dialog select[multiple]:hover:not(:disabled) {
   text-align: left;
 }
 
-.sect-sort-pop button .sect-sort-option-title {
+.sect-sort-pop .sect-sort-item .sect-sort-option-title {
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.sect-sort-pop button .sect-sort-option-hint {
+.sect-sort-pop .sect-sort-item .sect-sort-option-hint {
   color: var(--muted);
   font-size: 11px;
   font-weight: 500;
@@ -23163,7 +23065,7 @@ dialog select[multiple]:hover:not(:disabled) {
   white-space: normal;
 }
 
-.sect-sort-pop button[aria-current="true"] .sect-sort-option-hint {
+.sect-sort-pop .sect-sort-item[data-selected] .sect-sort-option-hint {
   color: color-mix(in srgb, var(--accent-strong) 72%, var(--muted));
 }
 /* ═══ 会话/目录模式：紧凑选项组 + 独立示例侧栏（mode-diagrams.tsx） ═══
@@ -24313,7 +24215,7 @@ dialog.onboarding-dialog .onboarding-menu {
   max-width: none;
 }
 
-dialog.onboarding-dialog .onboarding-menu > summary {
+dialog.onboarding-dialog .onboarding-menu > .sect-sort-trigger {
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -24335,12 +24237,8 @@ dialog.onboarding-dialog .onboarding-menu .sect-sort-value {
   line-height: 1;
 }
 
-dialog.onboarding-dialog .onboarding-menu .sect-sort-pop {
-  left: 0;
-  width: 100%;
-  min-width: 100%;
+.sect-sort-pop[data-menu~="onboarding-menu"] {
   overscroll-behavior-y: auto;
-  transform: none;
 }
 
 dialog.onboarding-dialog .onboarding-actions button.onboarding-submit.primary,
@@ -25199,13 +25097,13 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   flex: 1;
 }
 /* Agent 下拉弹层：加宽 + 限高滚动，容纳「名字 · CLI + 告警」两行选项 */
-.vc-profile-agent-menu > .sect-sort-pop {
+.sect-sort-pop[data-menu~="vc-profile-agent-menu"] {
   min-width: min(300px, 84vw);
   max-width: 340px;
-  max-height: min(320px, 60vh, var(--dropdown-popover-space, 100vh));
+  max-height: min(320px, 60vh, var(--available-height, 100vh));
   overflow-y: auto;
 }
-.vc-profile-agent-menu .sect-sort-pop button {
+.sect-sort-pop[data-menu~="vc-profile-agent-menu"] .sect-sort-item {
   padding-top: 7px;
   padding-bottom: 7px;
   line-height: 1.4;
@@ -28837,7 +28735,7 @@ button.skills-issue-badge:hover {
   width: 100%;
 }
 
-.feed-group-picker > summary {
+.feed-group-picker-trigger {
   box-sizing: border-box;
   display: flex;
   align-items: center;
@@ -28853,9 +28751,7 @@ button.skills-issue-badge:hover {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
-.feed-group-picker > summary::-webkit-details-marker { display: none; }
-
-.feed-group-picker > summary > span,
+.feed-group-picker-trigger > span,
 .feed-group-picker-pop > button {
   min-width: 0;
   overflow: hidden;
@@ -28863,7 +28759,7 @@ button.skills-issue-badge:hover {
   white-space: nowrap;
 }
 
-.feed-group-picker > summary::after {
+.feed-group-picker-trigger::after {
   content: "";
   position: absolute;
   right: 18px;
@@ -28875,17 +28771,19 @@ button.skills-issue-badge:hover {
   transform: translateY(-2px) rotate(45deg);
 }
 
-.feed-group-picker[open] > summary::after { transform: translateY(2px) rotate(225deg); }
-.feed-group-picker.is-disabled > summary { cursor: not-allowed; opacity: .58; }
+.feed-group-picker-trigger[data-popup-open]::after { transform: translateY(2px) rotate(225deg); }
+.feed-group-picker.is-disabled > .feed-group-picker-trigger { cursor: not-allowed; opacity: .58; }
+
+/* 弹层 portal 到所在的 dialog（Base UI Popover），宽度跟触发器走 */
+.feed-group-picker-positioner {
+  z-index: 120;
+}
 
 .feed-group-picker-pop {
-  position: absolute;
-  z-index: 120;
-  left: 0;
-  right: 0;
-  top: calc(100% + 6px);
+  box-sizing: border-box;
   display: grid;
-  max-height: min(420px, calc(100vh - 180px));
+  width: var(--anchor-width);
+  max-height: min(420px, var(--available-height, 100vh));
   overflow-y: auto;
   padding: 8px;
   border: 1px solid var(--border-soft);
@@ -29583,8 +29481,7 @@ button.skills-issue-badge:hover {
   border-radius: var(--radius-full);
 }
 .ag-create-dialog .ag-field .bd-field-menu { width: 100%; min-width: 0; }
-.ag-create-dialog .ag-field .bd-field-menu > summary { width: 100%; height: var(--button-height); box-sizing: border-box; }
-.ag-create-dialog .ag-field .bd-field-menu .sect-sort-pop { left: 0; width: 100%; min-width: 100%; transform: none; max-height: min(280px, 42vh, var(--dropdown-popover-space, 100vh)); overflow-y: auto; z-index: 1300; }
+.ag-create-dialog .ag-field .bd-field-menu > .sect-sort-trigger { width: 100%; height: var(--button-height); box-sizing: border-box; }
 
 /* 二选一分段（新建弹窗的来源选择）：与页面 segmented rail 同一视觉。 */
 .ag-seg {
@@ -32253,6 +32150,13 @@ body:has(.workbench-route-host) { min-width: 0; }
   white-space: nowrap;
 }
 
+/* 锁定/沙盒徽标复用全局 .session-lock-badge 的 margin-left:6px（给横向邻居的间距）；
+   卡片头允许换行后，它成为换行行首项时该 margin 仍生效，会相对首行缩进 6px。
+   看板头内间距统一交给父容器 gap，这里作用域归零，不影响表格行与详情抽屉的全局规则。 */
+.kanban-card-head .session-lock-badge {
+  margin-left: 0;
+}
+
 .kanban-card-reason {
   display: -webkit-box;
   margin: 0;
@@ -33343,7 +33247,7 @@ a.card-menu-item {
 .group-default-models-row > small { flex-basis: 100%; }
 
 .group-default-models-row .sect-sort-menu,
-.group-default-models-row .sect-sort-menu > summary { width: 100%; min-width: 0; }
+.group-default-models-row .sect-sort-menu > .sect-sort-trigger { width: 100%; min-width: 0; }
 .group-default-models-row .sect-sort-value { max-width: none; }
 .group-default-models-field { min-width: 0; }
 .bd-feedback-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 24px; }
@@ -33650,18 +33554,17 @@ a.card-menu-item {
 .dw-bot-select .sect-sort-value {
   max-width: 220px;
 }
-.dw-bot-select > .sect-sort-pop,
-.dw-mode > .sect-sort-pop {
-  /* 桌面给足宽度容纳最长文案；右对齐触发器左缘，避免居中后向右溢出。 */
+/* 桌面给足宽度容纳最长文案；弹层贴触发器左缘，避免居中后向右溢出。 */
+.dw-bot-select,
+.dw-mode {
+  --dropdown-align: start;
+}
+.sect-sort-pop:is([data-menu~="dw-bot-select"], [data-menu~="dw-mode"]) {
   min-width: 220px;
   width: max-content;
   max-width: min(320px, calc(100vw - 32px));
-  left: 0;
-  right: auto;
-  transform: none;
 }
-.dw-bot-select > .sect-sort-pop button,
-.dw-mode > .sect-sort-pop button {
+.sect-sort-pop:is([data-menu~="dw-bot-select"], [data-menu~="dw-mode"]) .sect-sort-item {
   width: 100%;
   justify-content: flex-start;
   text-align: left;
@@ -33669,20 +33572,15 @@ a.card-menu-item {
   word-break: break-word;
 }
 
-/* 手机窄屏：弹层不能宽出视口。沿用组件的 absolute 定位（JS 放置逻辑照常算上/下
-   方向），只把宽度钉在视口内并贴字段左缘、选项完整换行。 */
+/* 手机窄屏：弹层不能宽出视口，宽度钉在视口内、选项完整换行。 */
 @media (max-width: 560px) {
   .dw-bot-select .sect-sort-value {
     max-width: 150px;
   }
-  .dw-bot-select > .sect-sort-pop,
-  .dw-mode > .sect-sort-pop {
-    left: 0;
-    right: auto;
+  .sect-sort-pop:is([data-menu~="dw-bot-select"], [data-menu~="dw-mode"]) {
     width: min(320px, calc(100vw - 32px));
     min-width: 0;
     max-width: calc(100vw - 16px);
-    transform: none;
   }
 }
 
@@ -34384,7 +34282,7 @@ html.terminal-immersive-lock body {
 .bd-codex-profile-controls .bd-field-menu { flex: 1; min-width: 0; }
 .bd-codex-profile .bd-aux-note { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .bd-codex-profile .bd-aux-err { color: var(--danger); }
-.bd-codex-profile .codex-profile-unavailable summary { color: var(--danger); border-color: var(--danger); }
+.bd-codex-profile .codex-profile-unavailable .sect-sort-trigger { color: var(--danger); border-color: var(--danger); }
 
 /* ═══ ⌘K 全局搜索 ════════════════════════════════════════════════════════════
    顶栏中列放一个搜索框外观的入口（窄屏收成圆形图标），面板是顶部锚定的原生
@@ -35425,11 +35323,12 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 }
 
 .sessions-page .sessions-filter-chips .sect-sort-menu {
+  --dropdown-align: start;
   width: auto;
   max-width: 260px;
 }
 
-.sessions-page .sessions-filter-chips .sect-sort-menu > summary {
+.sessions-page .sessions-filter-chips .sect-sort-menu > .sect-sort-trigger {
   width: auto;
   max-width: 260px;
   height: 30px;
@@ -35447,22 +35346,22 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 }
 
 /* 有取值的维度高亮：一眼看出当前生效了哪些筛选。 */
-.sessions-page .sessions-filter-chips .sessions-filter-chip.is-active > summary,
+.sessions-page .sessions-filter-chips .sessions-filter-chip.is-active > .sect-sort-trigger,
 .sessions-page .sessions-filter-chips .sessions-filter-toggle.is-active {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent-strong);
 }
 
-.sessions-page .sessions-filter-chips .sect-sort-pop {
-  left: 0;
-  transform: none;
+/* 「来源 / 所在聊天」选项文案偏长（如「来源：外部接入 (/adopt)」、含 bot 后缀的单聊名）：
+   弹层按最长选项自适应、不折行，封顶后由选项自身省略号收尾。 */
+.sect-sort-pop[data-menu~="sessions-filter-chip"] {
   width: max-content;
   min-width: 200px;
   max-width: min(360px, calc(100vw - 48px));
 }
 
-.sessions-page .sessions-filter-chips .sect-sort-pop button {
+.sect-sort-pop[data-menu~="sessions-filter-chip"] .sect-sort-item {
   min-width: 0;
   white-space: nowrap;
 }
@@ -35800,3 +35699,54 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .model-pin-summary p { margin: 0 0 .5rem; }
 
 .model-pin-chip > span { white-space: normal; min-width: 0; overflow-wrap: anywhere; }
+
+/* ── 会话任务状态：看板卡片状态行、状态点、表格徽标共用一套色 ────────────────── */
+.kanban-card[data-signal="done"]::before { background: var(--success); }
+.kanban-card[data-signal="closed"] { opacity: 0.6; }
+.kanban-card[data-signal="closed"]:hover,
+.kanban-card[data-signal="closed"].selected { opacity: 1; }
+
+.kanban-card-task {
+  font-size: var(--fs-12);
+  line-height: 1.45;
+}
+.kanban-card-task:not(.session-signal) { color: var(--muted); }
+.kanban-card-task-label { font-weight: 600; }
+.kanban-card-task-label + .kanban-card-task-detail::before { content: ' · '; }
+.kanban-card-task[data-tone="work"] .kanban-card-task-label { color: var(--st-work); }
+.kanban-card-task[data-tone="done"] .kanban-card-task-label { color: var(--success); }
+.kanban-card-task[data-tone="todo"] .kanban-card-task-label { color: var(--st-todo); }
+
+.kanban-card-dot[data-task="need"] { background: var(--st-need); }
+.kanban-card-dot[data-task="work"] { background: var(--st-work); }
+.kanban-card-dot[data-task="done"] { background: var(--success); }
+.kanban-card-dot[data-task="todo"] { background: var(--st-todo); }
+.kanban-card-dot[data-task="idle"] { background: var(--st-idle); }
+.kanban-card-dot[data-task="closed"] { background: var(--border); }
+
+.status-task-need { background: var(--warning-soft); color: var(--warning); }
+.status-task-work { background: color-mix(in srgb, var(--st-work) 14%, transparent); color: var(--st-work); }
+.status-task-done { background: var(--success-soft); color: var(--success); }
+.status-task-todo { background: color-mix(in srgb, var(--st-todo) 14%, transparent); color: var(--st-todo); }
+.status-task-idle { background: var(--surface-muted); color: var(--muted); }
+.status-task-closed { background: var(--surface-muted); color: var(--faint); }
+
+/* 决策看板：关联群里的子任务状态 */
+.dboard-hint-chip.is-task_delivered { background: var(--success-soft); color: var(--success); }
+.dboard-hint-chip.is-task_needs_you, .dboard-hint-chip.is-task_interrupted { background: var(--warning-soft); color: var(--warning); }
+.dboard-hint-banner.is-task_delivered { border-left-color: var(--success); background: var(--success-soft); }
+.dboard-hint-banner.is-task_needs_you, .dboard-hint-banner.is-task_interrupted { border-left-color: var(--warning); background: var(--warning-soft); }
+.dboard-row-task { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 6px; min-width: 0; color: var(--fg-2); font-size: var(--fs-12); }
+.dboard-row-task[data-fresh="true"] .dboard-task-label { font-weight: 600; }
+.dboard-task-label { flex: 0 0 auto; padding: 0 6px; border-radius: var(--radius-full); background: var(--surface-2, var(--info-soft)); color: var(--fg-2); }
+[data-task="delivered"] > .dboard-task-label { background: var(--success-soft); color: var(--success); }
+[data-task="needs_you"] > .dboard-task-label, [data-task="interrupted"] > .dboard-task-label { background: var(--warning-soft); color: var(--warning); }
+[data-task="working"] > .dboard-task-label { background: var(--info-soft); color: var(--info); }
+[data-task="unreadable"] > .dboard-task-label, [data-task="closed"] > .dboard-task-label, [data-task="no_session"] > .dboard-task-label { opacity: 0.75; }
+.dboard-task-time { flex: 0 0 auto; color: var(--muted); }
+.dboard-task-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 12em; }
+.dboard-tasks { display: grid; gap: 6px; margin: 8px 0; }
+.dboard-tasks-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.dboard-task { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; font-size: var(--fs-12); color: var(--fg-2); }
+.dboard-task-chat { flex: 0 0 auto; font-weight: 600; color: var(--fg-1, inherit); }
+.dboard-task .dboard-task-text { white-space: normal; overflow-wrap: anywhere; }

@@ -19,6 +19,10 @@ import type {
   StewardConfig,
   StewardGuideMode,
 } from '../../core/decision-board/model.js';
+import type { ChatTaskKind, ChatTaskState, TaskHint, TaskHintKind } from '../../core/decision-board/chat-task.js';
+import type { NeedsYouReason } from '../../core/session-task-status.js';
+
+export type { ChatTaskKind, ChatTaskState, TaskHint, TaskHintKind };
 
 export type {
   BoardBatch,
@@ -70,7 +74,14 @@ export interface DraftStamp {
   updatedAt: number;
 }
 
-export interface BoardItemSummary extends BoardItem {
+/** 关联群里的子任务：各群状态、是否有管家还没处理的新结果、子任务提示（旧 daemon 不带）。 */
+export interface ItemTaskFields {
+  taskChats?: ChatTaskState[];
+  taskFresh?: boolean;
+  taskHint?: TaskHint;
+}
+
+export interface BoardItemSummary extends BoardItem, ItemTaskFields {
   links: RenderedLink[];
   hasDraft: boolean;
   pendingDecisions: number;
@@ -118,7 +129,7 @@ export interface BoardListResponse {
   batches: BoardBatch[];
 }
 
-export interface BoardDetailResponse {
+export interface BoardDetailResponse extends ItemTaskFields {
   item: BoardItem;
   links: RenderedLink[];
   events: BoardEvent[];
@@ -305,6 +316,64 @@ export const BOARD_HINT_LABEL_KEYS: Readonly<Record<BoardHintKind, string>> = {
 /** 认得的提示才显示（新 daemon 加了别的类型、旧页面不认时不显示半截标签）。 */
 export function knownHint(hint: BoardHint | undefined): BoardHint | undefined {
   return hint && Object.prototype.hasOwnProperty.call(BOARD_HINT_LABEL_KEYS, hint.kind) ? hint : undefined;
+}
+
+/** 关联群状态的标签。 */
+export const CHAT_TASK_LABEL_KEYS: Readonly<Record<ChatTaskKind, string>> = {
+  needs_you: 'decisionBoard.taskNeedsYou',
+  interrupted: 'decisionBoard.taskInterrupted',
+  working: 'decisionBoard.taskWorking',
+  unreadable: 'decisionBoard.taskUnreadable',
+  delivered: 'decisionBoard.taskDelivered',
+  idle: 'decisionBoard.taskIdle',
+  closed: 'decisionBoard.taskClosed',
+  no_session: 'decisionBoard.taskNoSession',
+};
+
+const CHAT_TASK_ORDER: readonly ChatTaskKind[] = ['needs_you', 'interrupted', 'working', 'unreadable', 'delivered', 'idle', 'closed', 'no_session'];
+
+const NEEDS_YOU_REASON_KEYS: Readonly<Record<NeedsYouReason, string>> = {
+  attention: 'sessions.task.reasonAttention',
+  tui_prompt: 'sessions.task.reasonPrompt',
+  pending_repo: 'sessions.board.signalRepo',
+  limited: 'sessions.board.signalLimited',
+  stalled: 'sessions.board.signalStalled',
+  interrupted: 'sessions.task.reasonInterrupted',
+};
+
+export const TASK_HINT_LABEL_KEYS: Readonly<Record<TaskHintKind, string>> = {
+  task_delivered: 'decisionBoard.taskHintDelivered',
+  task_needs_you: 'decisionBoard.taskHintNeedsYou',
+  task_interrupted: 'decisionBoard.taskHintInterrupted',
+};
+
+export function knownTaskHint(hint: TaskHint | undefined): TaskHint | undefined {
+  return hint && Object.prototype.hasOwnProperty.call(TASK_HINT_LABEL_KEYS, hint.kind) ? hint : undefined;
+}
+
+function knownChatTask(state: ChatTaskState): boolean {
+  return Object.prototype.hasOwnProperty.call(CHAT_TASK_LABEL_KEYS, state.kind);
+}
+
+/** 一个群的状态一行：标签（需要你带原因）、时间、一句话（最终回复第一行 / 举手原因 / 错误码）。 */
+export function chatTaskLine(state: ChatTaskState, now: number, tr: Translate): { label: string; time?: string; text?: string } | null {
+  if (!knownChatTask(state)) return null;
+  const kind = tr(CHAT_TASK_LABEL_KEYS[state.kind]);
+  const label = state.kind === 'needs_you' && state.reason && state.reason !== 'attention'
+    ? `${kind} · ${tr(NEEDS_YOU_REASON_KEYS[state.reason])}`
+    : kind;
+  const showTime = state.at !== undefined && state.kind !== 'closed';
+  const text = state.summary ?? state.detail;
+  return { label, ...(showTime ? { time: boardRelativeTime(state.at, now, tr) } : {}), ...(text ? { text } : {}) };
+}
+
+/** 多群汇总：「3 个群：1 进行中 · 2 已交付」。按「需要你→…→没有会话」的顺序。 */
+export function chatTaskSummaryText(states: readonly ChatTaskState[], tr: Translate): string {
+  const known = states.filter(knownChatTask);
+  const counts = new Map<ChatTaskKind, number>();
+  for (const s of known) counts.set(s.kind, (counts.get(s.kind) ?? 0) + 1);
+  const parts = CHAT_TASK_ORDER.filter(k => counts.has(k)).map(k => `${counts.get(k)} ${tr(CHAT_TASK_LABEL_KEYS[k])}`);
+  return tr('decisionBoard.taskSummary', { n: known.length, parts: parts.join(' · ') });
 }
 
 export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>> = {
@@ -561,6 +630,8 @@ export interface StewardForm {
   decisionCards: boolean;
   /** 后台巡检找出可以关 / 可以推进 / 该看一眼的事项；默认关。 */
   closeHints: boolean;
+  /** 关联群里一轮交付 / 举手 / 中断时提醒管家；默认关。 */
+  taskHints: boolean;
 }
 
 export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardForm {
@@ -573,6 +644,7 @@ export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardF
     autoJoinSoloGroups: cfg?.autoJoinSoloGroups === true,
     decisionCards: cfg?.decisionCards !== false,
     closeHints: cfg?.closeHints === true,
+    taskHints: cfg?.taskHints === true,
   };
 }
 
@@ -593,10 +665,11 @@ export function stewardPayload(form: StewardForm): StewardConfig | null {
     ...(form.autoJoinSoloGroups ? { autoJoinSoloGroups: true } : {}),
     ...(form.decisionCards ? {} : { decisionCards: false }),
     ...(form.closeHints ? { closeHints: true } : {}),
+    ...(form.taskHints ? { taskHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
     && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
-    && value.decisionCards !== false) return null;
+    && value.decisionCards !== false && value.taskHints !== true) return null;
   return value;
 }
 

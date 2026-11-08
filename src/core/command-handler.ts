@@ -1,6 +1,8 @@
 import { resolveSessionModelPinView } from './session-model.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
+import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
+import { resetSessionCodexModelSelection } from './worker-pool.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -141,7 +143,8 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
-import { writeSessionModelPin, sessionAcceptsDirectCommand } from './worker-pool.js';
+import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -1947,6 +1950,26 @@ export async function handleCommand(
       }
 
       case '/models': {
+        if (message.content.trim().toLowerCase() === '/models inherit') {
+          if (!ds) {
+            await replyNoSession(replyHere, loc);
+            break;
+          }
+          if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+            await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
+            break;
+          }
+          if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+            await sessionReply(rootId, t('cmd.models.inherit_unsupported', undefined, loc));
+            break;
+          }
+          if (!resetSessionCodexModelSelection(ds)) {
+            await sessionReply(rootId, t('cmd.models.inherit_unavailable', undefined, loc));
+            break;
+          }
+          await sessionReply(rootId, t('cmd.models.inherit_saved', undefined, loc));
+          break;
+        }
         const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
         if (atTopLevel && larkAppId) {
           await showDefaultModelPicker(larkAppId, rootId, message.senderId, sessionReply, loc);
@@ -2453,7 +2476,7 @@ export async function handleCommand(
         const chatId = message.chatId ?? ds?.chatId;
         if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
           || !canOperate(appId, chatId, message.senderId, message.senderUnionId)) {
-          await sessionReply(rootId, t('cmd.dismiss.owner_only', undefined, loc));
+          await sessionReply(rootId, t(chatId && !isSessionGroup(chatId) ? 'cmd.dismiss.operator_only' : 'cmd.dismiss.owner_only', undefined, loc));
           break;
         }
         const parsed = /^\/dismiss(?:\s+--confirm=([a-f0-9]{64}))?\s*$/i.exec(message.content.trim());
@@ -2462,7 +2485,7 @@ export async function handleCommand(
           break;
         }
         const result = await dismissSessionGroup({
-          larkAppId: appId, chatId, rootId, senderId: message.senderId,
+          larkAppId: appId, chatId, rootId, chatType: message.chatType ?? ds?.chatType, senderId: message.senderId,
           confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
@@ -2471,7 +2494,7 @@ export async function handleCommand(
           try {
             const offers = await offerWorktreeCleanup(appId, result.workingDirs);
             await sendUserMessage(appId, message.senderId,
-              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, loc }), 'interactive');
+              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, ordinaryGroup: result.ordinaryGroup, loc }), 'interactive');
           } catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
         } else if (result.status === 'confirm') {
           await sessionReply(rootId, buildDismissConfirmCard({
@@ -2479,6 +2502,7 @@ export async function handleCommand(
             invokerOpenId: message.senderId,
             confirmationState: result.state,
             rows: result.sessions.map(s => closeWorktreeSessionRow({ ...s.session, larkAppId: s.larkAppId }, s.resident, loc)),
+            ordinaryGroup: result.ordinaryGroup,
             loc,
           }), 'interactive');
         } else if (result.status === 'peer_offline') {
@@ -3300,6 +3324,15 @@ export async function handleCommand(
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (!emptyStart && pendingTurnId) await deps.prepareTurn?.(current, pendingTurnId);
+            // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+            // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+            if (!emptyStart && !pendingRawInput && pendingTurnId) {
+              recordTurnExplicitMention(current, pendingTurnId, messageMentionsBot(
+                { mentions: current.pendingMentions },
+                current.larkAppId,
+                selfBot.botOpenId,
+              ));
+            }
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),

@@ -26,6 +26,12 @@ concurrency:
   group: sandbox-network-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # No job runs the Electron binary that electron's postinstall downloads (the
+  # desktop release lets electron-builder fetch its own copy), and that download
+  # has no retry: one 504 fails the whole bun install (#3193).
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
 jobs:
   network-boundary:
     runs-on: ubuntu-24.04
@@ -35,9 +41,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - name: Install kernel test tools
         run: |
           sudo apt-get update
@@ -45,7 +51,7 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - run: bun install --frozen-lockfile
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
       - name: Build the real single-file entry
         run: bun scripts/build-bun-binary.mjs --target bun-linux-x64 --out "$RUNNER_TEMP/botmux-network-test"

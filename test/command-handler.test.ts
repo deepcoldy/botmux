@@ -19,6 +19,11 @@ import { tagClosedSessionGroup } from '../src/services/feed-group-tagger.js';
 
 vi.mock('../src/core/dismiss-command.js', () => ({ dismissSessionGroup: vi.fn(async () => ({ status: 'confirm', state: 'a'.repeat(64), sessions: [] })) }));
 import { dismissSessionGroup } from '../src/core/dismiss-command.js';
+vi.mock('../src/services/session-groups-store.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/services/session-groups-store.js')>();
+  return { ...actual, isSessionGroup: vi.fn(actual.isSessionGroup) };
+});
+import { isSessionGroup } from '../src/services/session-groups-store.js';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
@@ -425,10 +430,12 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  resetSessionCodexModelSelection: vi.fn(() => true),
   killWorker: vi.fn(),
   teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
+  recordTurnExplicitMention: vi.fn(),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
@@ -741,6 +748,7 @@ import { getBotUnionId } from '../src/services/bot-union-ids-store.js';
 import { isTeamBot } from '../src/services/team-bots-store.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, resumeSession } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { resetSessionCodexModelSelection } from '../src/core/worker-pool.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
@@ -930,6 +938,41 @@ function mockCodexAppBot(): void {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+describe('/models inherit', () => {
+  it('delegates the Codex preference reset without replacing the current worker', async () => {
+    const ds = makeDaemonSession({ session: makeSession({
+      cliId: 'codex', cliSessionId: 'native-1', model: 'B',
+      codexModelSelection: { nativeSessionId: 'native-1', launchModel: 'B', launchStartedAtMs: 1, override: 'B' },
+    }) });
+    const deps = makeDeps(ds);
+    const worker = ds.worker;
+    await handleCommand('/models', ROOT_ID, makeLarkMessage('/models inherit'), deps, LARK_APP_ID);
+    expect(resetSessionCodexModelSelection).toHaveBeenCalledWith(ds);
+    expect(ds.session.model).toBe('B');
+    expect(ds.worker).toBe(worker);
+  });
+
+  it('requires operator permission before mutating the preference', async () => {
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    const ds = makeDaemonSession({ session: makeSession({
+      cliId: 'codex', cliSessionId: 'native-1',
+      codexModelSelection: { nativeSessionId: 'native-1', launchStartedAtMs: 1, override: 'B' },
+    }) });
+    const saved = structuredClone(ds.session);
+    await handleCommand('/models', ROOT_ID, makeLarkMessage('/models inherit'), makeDeps(ds), LARK_APP_ID);
+    expect(ds.session).toEqual(saved);
+  });
+
+  it('does not mutate another CLI or an external session', async () => {
+    for (const extra of [{ cliId: 'claude-code' as const }, { cliId: 'codex' as const, existingAppServerEndpoint: 'external' }]) {
+      const ds = makeDaemonSession({ session: makeSession(extra) });
+      const saved = structuredClone(ds.session);
+      await handleCommand('/models', ROOT_ID, makeLarkMessage('/models inherit'), makeDeps(ds), LARK_APP_ID);
+      expect(ds.session).toEqual(saved);
+    }
+  });
+});
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
@@ -3821,6 +3864,47 @@ describe('handleCommand', () => {
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
       expect(dismissSessionGroup).not.toHaveBeenCalled();
     });
+    it('tells a non-operator the rule of the group they are in', async () => {
+      const replyFor = async (sessionGroup: boolean) => {
+        vi.mocked(isSessionGroup).mockReturnValue(sessionGroup);
+        vi.mocked(canOperate).mockReturnValueOnce(false);
+        const deps = makeDeps();
+        await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+        return vi.mocked(deps.sessionReply).mock.calls[0]![1];
+      };
+      try {
+        expect(await replyFor(true)).toContain('建群用户本人');
+        expect(await replyFor(false)).toContain('只有具备 Bot 操作权限的用户');
+      } finally {
+        vi.mocked(isSessionGroup).mockReturnValue(false);
+      }
+      expect(dismissSessionGroup).not.toHaveBeenCalled();
+    });
+    it('passes the chat type so a DM is never treated as a group', async () => {
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID, chatType: 'p2p' }), makeDeps(), LARK_APP_ID);
+      expect(dismissSessionGroup).toHaveBeenCalledWith(expect.objectContaining({ chatId: CHAT_ID, chatType: 'p2p' }));
+    });
+    it('confirms an ordinary group on a card that disbands the whole group', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'd'.repeat(64), sessions: [], ordinaryGroup: true });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0]![1]);
+      expect(card.header.title.content).toContain('解散本群');
+      expect(JSON.stringify(card)).not.toContain('会话群登记');
+      const button = card.body.elements.find((e: any) => e.tag === 'button');
+      expect(button.behaviors[0].value).toEqual({
+        action: 'dismiss_confirm', chat_id: CHAT_ID, invoker_open_id: 'ou_sender', confirmation_state: 'd'.repeat(64), ordinary_group: true,
+      });
+    });
+    it('states the ownership condition when the bot cannot prove it may disband', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'no_permission' });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]![1];
+      expect(reply).toContain('没有解散本群的权限');
+      expect(reply).toContain('群主'); expect(reply).toContain('只有它一个机器人');
+      expect(sendUserMessage).not.toHaveBeenCalled();
+    });
     it('reports successful deletion privately rather than to the deleted group', async () => {
       vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project'] });
       const deps = makeDeps();
@@ -3830,6 +3914,12 @@ describe('handleCommand', () => {
       expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).not.toContain('dismiss_cleanup_wt');
       expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+    it('titles the private receipt for an ordinary group', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: [], ordinaryGroup: true });
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      const card = JSON.parse(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+      expect(card.header.title.content).toBe('✅ 群已解散');
     });
     it('offers one-click cleanup of the linked worktrees the closed sessions used', async () => {
       vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project-wt-task'] });

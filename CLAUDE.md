@@ -20,7 +20,7 @@ SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照�
 —— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
 现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
 
-**包管理器是 bun**（`packageManager: bun@1.4.3`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
+**包管理器是 bun**（`packageManager: bun@1.4.4`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
 
@@ -39,11 +39,11 @@ bun run dashboard:bun        # bun src/index-dashboard.ts
 bun run build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
 ```
 
-发版编译用的 Bun 版本**钉在 1.4.3**，唯一来源是 `package.json` 的 `packageManager`（`.github/workflows/` 各处与它一致，`test/release-darwin-codesign-gate.test.ts` 守着）。本地 bun 与它不一致时，编译产物、bun.lock 重写、`bun test` 的行为可能和 CI 不一致：`bun run build` 与 `scripts/build-bun-binary.mjs` 开头会比对并**告警（不拦截）**，见 `scripts/check-bun-version.mjs`。对齐用告警给出的官方安装命令装指定版本——它解压到同目录再 `mv` 换 inode，fleet 正跑着的 bun 进程不受影响。
+发版编译用的 Bun 版本**钉在 1.4.4**，唯一来源是 `package.json` 的 `packageManager`（`.github/workflows/` 各处与它一致，`test/release-darwin-codesign-gate.test.ts` 守着）。本地 bun 与它不一致时，编译产物、bun.lock 重写、`bun test` 的行为可能和 CI 不一致：`bun run build` 与 `scripts/build-bun-binary.mjs` 开头会比对并**告警（不拦截）**，见 `scripts/check-bun-version.mjs`。对齐用告警给出的官方安装命令装指定版本——它解压到同目录再 `mv` 换 inode，fleet 正跑着的 bun 进程不受影响。
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 
-**临时探针 / 变异脚本 / 自写的 vitest 配置一律套 `bun scripts/fenced-run.ts -- <命令>`。** 仓库的 HOME 围栏和 tmux 围栏只挂在 `vitest.config.ts` 与 `bunfig.toml` 上：`bun /tmp/probe.ts` 直接调真实模块、或自写一个不带 setupFiles 的 vitest 配置，都**没有围栏**，会写真实 `~/.botmux`、`~/.config/systemd/user` 和 fleet 的 `-L botmux` tmux。2026-11-06 一个评审探针不带 HOME 调了 `enableAutostart()`，把真实 botmux.service / watchdog 改成 `ExecStart=/opt/botmux`，崩溃守护静默失效 5 小时。fenced-run 给子进程临时 HOME、私有 TMUX_TMPDIR + 拒绝宿主 socket 的 tmux shim、把 SESSION_DATA_DIR 指到临时 HOME 并清掉继承的会话身份标记和 daemon IPC 端口，并默认去掉 user bus（`systemctl --user` 碰不到真实 user manager；确需时加 `--keep-user-bus`）；触到宿主 socket 以退出码 3 失败。围栏只拦住经 PATH 解析的 tmux 和继承来的环境：探针里不要用绝对路径调 tmux（如 `/usr/bin/tmux`）、不要 `env -i` 清空环境后再 spawn tmux——这两种写法绕过 shim，能直达 fleet 的默认 socket；需要碰 tmux 时只用私有 `-L`/`-S` 目标或仓库 test helper。仓库根目录新增 `vitest*.config.ts` 必须挂 tmux 围栏，`test/vitest-config-fences.test.ts` 守着。
+**临时探针 / 变异脚本 / 自写的 vitest 配置一律套 `bun scripts/fenced-run.ts -- <命令>`。** 仓库的 HOME 围栏和 tmux 围栏只挂在 `vitest.config.ts` 与 `bunfig.toml` 上：`bun /tmp/probe.ts` 直接调真实模块、或自写一个不带 setupFiles 的 vitest 配置，都**没有围栏**，会写真实 `~/.botmux`、`~/.config/systemd/user` 和 fleet 的 `-L botmux` tmux。2026-11-06 一个评审探针不带 HOME 调了 `enableAutostart()`，把真实 botmux.service / watchdog 改成 `ExecStart=/opt/botmux`，崩溃守护静默失效 5 小时。fenced-run 给子进程临时 HOME、私有 TMUX_TMPDIR + 拒绝宿主 socket 的 tmux shim、把 SESSION_DATA_DIR 指到临时 HOME 并清掉继承的会话身份标记和 daemon IPC 端口，并默认去掉 user bus（`systemctl --user` 碰不到真实 user manager；botmux 的 scope 代码看到 `BOTMUX_FENCED_RUN=1` 时只用环境里给出的总线变量、不再从 `/run/user/<uid>/bus` 推导，strict envPolicy 也保留这个标记；确需时加 `--keep-user-bus`）；触到宿主 socket 以退出码 3 失败。围栏只拦住经 PATH 解析的 tmux 和继承来的环境：探针里不要用绝对路径调 tmux（如 `/usr/bin/tmux`）、不要 `env -i` 清空环境后再 spawn tmux——这两种写法绕过 shim，能直达 fleet 的默认 socket；需要碰 tmux 时只用私有 `-L`/`-S` 目标或仓库 test helper。仓库根目录新增 `vitest*.config.ts` 必须挂 tmux 围栏，`test/vitest-config-fences.test.ts` 守着。
 
 **单测里不碰真实 systemd。** vitest unit 项目和 bun 腿另挂 systemd 围栏（`test/helpers/systemd-fence.ts`）：测试进程自己调 `systemd-run`、`busctl`、`systemctl --user`（含 `env …`、`sh -c` 包装和绝对路径）就让该测试失败，被测代码吞掉异常也一样；子进程经 PATH 上的 shim 被拒（退出码 1）。scope / fleet-scope 代码一律注入 `run`、`readlink` 或 `pidNamespace` 假实现，不要为了测它去连真实 user manager——在独立 PID 命名空间里，交出去的 PID 会被宿主 systemd 解释成另一个进程。
 

@@ -8,6 +8,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderGroupsPage } from '../src/dashboard/web/groups-page.js';
+import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 import { __testOnly_resetGroupsSnapshotCache } from '../src/dashboard/web/groups-api.js';
 import {
   filterGroupChats,
@@ -178,7 +179,8 @@ describe('GroupsPage — standard / session views', () => {
     expect(noMetaRow.findAll(node => node.props['data-session-state'] !== undefined)).toHaveLength(0);
     expect(noMetaRow.findAll(node => node.type === 'a' && String(node.props.className).includes('open-session'))).toHaveLength(0);
 
-    act(() => { renderer.root.findByProps({ className: 'groups-session-sort' }).props.onChange('created'); });
+    const sortMenu = renderer.root.find(node => node.type === DropdownMenu && String(node.props.className).includes('groups-session-sort'));
+    act(() => { sortMenu.props.onChange('created'); });
     expect(rowIds(renderer)).toEqual(['oc_s_old', 'oc_s_new', 'oc_s_nometa']);
 
     act(() => { viewButton(renderer, 'standard').props.onClick(); });

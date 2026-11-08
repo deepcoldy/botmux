@@ -263,6 +263,37 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
+  it.each([
+    { name: 'sandbox: "oncall"', config: { sandbox: 'oncall' as const }, env: undefined, perBot: true },
+    { name: 'BOTMUX_SANDBOX=oncall', config: {}, env: 'oncall', perBot: true },
+    { name: 'sandbox: "scratch"', config: { sandbox: 'scratch' as const }, env: undefined, perBot: false },
+    { name: 'sandbox: true + BOTMUX_SANDBOX=scratch', config: { sandbox: true }, env: 'scratch', perBot: false },
+  ])('$name：与 worker 同口径，只有 oncall 改查 BOT_HOME 的 settings', ({ config, env, perBot }) => {
+    vi.stubEnv('BOTMUX_SANDBOX', env);
+    try {
+      getBotMock.mockReturnValue({
+        config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, ...config },
+      });
+      preflightMock.mockClear();
+      buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
+      expect(preflightMock).toHaveBeenCalledTimes(1);
+      const checkedPath = preflightMock.mock.calls[0][0] as string;
+      const botHomeSettings = '/tmp/bots/app_test/claude/settings.json';
+      if (perBot) expect(checkedPath).toBe(botHomeSettings);
+      else expect(checkedPath).not.toBe(botHomeSettings);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('BOTMUX_SANDBOX 非法值：不做 preflight，回退 inline', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', 'yes');
+    try {
+      preflightMock.mockClear();
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
+      expect(preflightMock).not.toHaveBeenCalled();
+      expect(result.content).toContain('<botmux_reminder>');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('未知后端类型（白名单外）：强制 inline（hardening）', () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
