@@ -4,7 +4,7 @@
  *
  * 用真实的存储和服务，会话事实和投递是假的，时间用假定时器推进。
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -155,6 +155,13 @@ describe('子任务提醒', () => {
     turnEnded('oc_steward', 's-st', 't-st');
     await elapse(TASK_ALERT_DEBOUNCE_MS);
     expect(delivered).toHaveLength(0);
+  });
+
+  it('还没有看板（库都没建）：群里的事件不建库、不提醒', async () => {
+    turnEnded('oc_a', 's-a', 't-1');
+    await elapse(TASK_ALERT_DEBOUNCE_MS * 2);
+    expect(delivered).toHaveLength(0);
+    expect(existsSync(decisionBoardDbPath(dir))).toBe(false);
   });
 
   it('默认关：不排提醒、看板不标提示，群状态照常显示；打开后新结果照常提醒', async () => {
