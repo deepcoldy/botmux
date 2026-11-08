@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ComponentType,
   type ReactNode,
@@ -10,6 +11,9 @@ import {
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { ModalDialog } from './modal-dialog.js';
+import { RefreshIconButton } from './dashboard-components.js';
+import type { PluginMarketEntry, PluginInstallPlan } from '../plugin-market.js';
+import './plugin-market.css';
 
 interface DashboardPluginEntry {
   pluginId: string;
@@ -76,7 +80,11 @@ interface ManagedPlugin {
   id: string;
   packageName: string;
   version: string;
+  source?: { type?: string; spec?: string };
+  stateHash?: string;
   displayName?: string;
+  description?: string;
+  audience?: string;
   contributions?: {
     skills?: PluginSkillContribution[];
     mcp?: PluginMcpContribution;
@@ -211,6 +219,10 @@ function serviceLabel(report?: PluginServiceReport): string {
   return report.status || report.action;
 }
 
+function installedLocally(plugin: ManagedPlugin): boolean {
+  return plugin.source?.type === 'local' || plugin.source?.spec?.startsWith('file:') === true;
+}
+
 function serviceDisplayLabel(report?: PluginServiceReport): string {
   const label = serviceLabel(report);
   if (label === 'online' || label === 'started' || label === 'already-running') return '运行中';
@@ -320,13 +332,9 @@ function DashboardActions(props: { plugin: ManagedPlugin }): React.JSX.Element |
   const entries = props.plugin.dashboard ?? [];
   if (entries.length === 0) return null;
   return (
-    <section className="plugin-action-group">
-      <div className="plugin-action-head">
-        <span>Dashboard</span>
-        <strong>{entries.length} 个页面</strong>
-      </div>
+    <section className="plugin-settings-access" aria-label="插件设置">
       <div className="plugin-action-links">
-        {entries.map(entry => <a className="btn-link primary" href={entry.route} key={entry.id}>打开 {entry.id}</a>)}
+        {entries.map(entry => <a className="btn-link primary" href={entry.route} key={entry.id}>{entries.length === 1 ? '打开设置' : `打开 ${entry.id}`}</a>)}
       </div>
     </section>
   );
@@ -338,17 +346,14 @@ function PluginActionArea(props: {
   onServiceAction(action: PluginServiceAction): void;
 }): React.JSX.Element | null {
   const hasService = Boolean(props.plugin.service);
-  const hasDashboard = (props.plugin.dashboard?.length ?? 0) > 0;
-  if (!hasService && !hasDashboard) return null;
+  if (!hasService) return null;
   return (
     <div className="plugin-action-area" aria-label={`${props.plugin.id} 插件操作`}>
       <div className="plugin-action-title">
-        <span>操作</span>
-        <small>固定操作区，下面的 tab 只展示信息</small>
+        <span>后台服务</span>
       </div>
       <div className="plugin-action-grid">
         <ServiceActions plugin={props.plugin} busy={props.busy} onAction={props.onServiceAction} />
-        <DashboardActions plugin={props.plugin} />
       </div>
     </div>
   );
@@ -492,7 +497,7 @@ function PluginTabs(props: { plugin: ManagedPlugin }): React.JSX.Element {
   return (
     <div className="plugin-tabs">
       <div className="plugin-tab-list" role="tablist" aria-label={`${props.plugin.id} 插件能力`}>
-        {tabs.map(tab => (
+        {tabs.filter(tab => tab.count > 0).map(tab => (
           <button
             type="button"
             className={`plugin-tab-button${activeTab === tab.id ? ' is-active' : ''}`}
@@ -504,7 +509,6 @@ function PluginTabs(props: { plugin: ManagedPlugin }): React.JSX.Element {
           >
             <strong>{tab.count}</strong>
             <span>{tab.label}</span>
-            <small>{tab.hint}</small>
           </button>
         ))}
       </div>
@@ -617,50 +621,6 @@ function PluginBotSettings(props: {
   );
 }
 
-function PluginCapabilitySummary(props: {
-  plugin: ManagedPlugin;
-  globalEnabled: boolean;
-  enabledBotCount: number;
-  botCount: number;
-  expanded: boolean;
-  detailsId: string;
-  onToggle(): void;
-}): React.JSX.Element {
-  const commands = props.plugin.contributions?.cli?.commands ?? [];
-  const capabilities = [
-    { label: 'Skills', count: props.plugin.skillsCount ?? 0 },
-    { label: 'MCP', count: props.plugin.mcpCount ?? 0 },
-    { label: '命令', count: commands.length },
-    { label: 'Dashboard', count: props.plugin.dashboard?.length ?? 0 },
-  ].filter(item => item.count > 0);
-  return (
-    <button
-      type="button"
-      className="plugin-card-summary"
-      aria-expanded={props.expanded}
-      aria-controls={props.detailsId}
-      onClick={props.onToggle}
-    >
-      <span className="plugin-capability-summary" aria-label="插件能力摘要">
-        {capabilities.map(item => (
-          <span className="plugin-capability-chip" key={item.label}><strong>{item.count}</strong>{item.label}</span>
-        ))}
-        {props.plugin.service ? (
-          <span className={`plugin-capability-chip ${serviceStatusClass(props.plugin.serviceReport)}`}>
-            Service {serviceDisplayLabel(props.plugin.serviceReport)}
-          </span>
-        ) : null}
-        {capabilities.length === 0 && !props.plugin.service ? <span className="plugin-muted">未声明扩展能力</span> : null}
-      </span>
-      <span className="plugin-scope-summary">
-        {props.globalEnabled
-          ? `全部 ${props.botCount} 个 Bot`
-          : `${props.enabledBotCount}/${props.botCount} 个 Bot 单独启用`}
-      </span>
-    </button>
-  );
-}
-
 function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): void }): React.JSX.Element {
   return (
     <ModalDialog
@@ -694,10 +654,14 @@ function PluginCard(props: {
   onToggle(scope: string, enabled: boolean): void;
   onPin(pinned: boolean): void;
   onServiceAction(action: PluginServiceAction): void;
+  marketEntry?: PluginMarketEntry;
+  onPrepare(): void;
+  onUninstall(): void;
 }): React.JSX.Element {
   const { plugin } = props;
   const [expanded, setExpanded] = useState(false);
   const title = plugin.displayName || plugin.id;
+  const description = plugin.description || props.marketEntry?.description;
   const depIds = plugin.dependencies ?? [];
   const enabledGlobal = pluginEnabledInScope(plugin, 'global', props.pendingToggles);
   const enabledBotCount = props.bots.filter(bot => pluginEnabledInScope(plugin, bot.id, props.pendingToggles)).length;
@@ -707,7 +671,7 @@ function PluginCard(props: {
   const pinned = props.pendingPin ?? plugin.pinnedToSidebar === true;
   const detailsId = `plugin-details-${plugin.id}`;
   return (
-    <article className={`bd-card plugin-card${expanded ? ' is-expanded' : ' is-collapsed'}`} data-plugin-card={plugin.id}>
+    <article className="bd-card plugin-card plugin-store-card" data-plugin-card={plugin.id}>
       <header className="plugin-card-head">
         <div className="plugin-title-block">
           <div className="plugin-title-row">
@@ -716,33 +680,23 @@ function PluginCard(props: {
               {enabledGlobal ? '全局已启用' : enabledBotCount > 0 ? `${enabledBotCount} 个 Bot 已启用` : '未启用'}
             </span>
           </div>
-          <p>
-            <code>{plugin.id}</code>
-            <span>{plugin.packageName}@{plugin.version}</span>
-            {depIds.length > 0 ? <span>依赖 {depIds.join(', ')}</span> : null}
-          </p>
         </div>
-        <button
-          type="button"
-          className="btn-link plugin-expand-button"
-          data-plugin-expand={plugin.id}
-          aria-expanded={expanded}
-          aria-controls={detailsId}
-          onClick={() => setExpanded(current => !current)}
-        >
-          {expanded ? '收起详情' : '展开详情'}
-        </button>
       </header>
-      <PluginCapabilitySummary
-        plugin={plugin}
-        globalEnabled={enabledGlobal}
-        enabledBotCount={enabledBotCount}
-        botCount={props.bots.length}
-        expanded={expanded}
-        detailsId={detailsId}
-        onToggle={() => setExpanded(current => !current)}
-      />
-      {expanded ? (
+      {plugin.audience ? <div className="plugin-store-audience"><span>{plugin.audience}</span></div> : null}
+      {description ? <p className="plugin-store-description">{description}</p> : null}
+      <footer className="plugin-store-footer">
+        <span className="plugin-muted">v{plugin.version}</span>
+        <button type="button" className="btn-link" data-plugin-expand={plugin.id} onClick={() => setExpanded(true)}>管理</button>
+      </footer>
+      <ModalDialog open={expanded} onClose={() => setExpanded(false)} className="plugin-store-dialog" aria-label={title}>
+        <header className="plugin-store-dialog-head">
+          <div><h2>{title}</h2></div>
+          <button type="button" className="btn-link plugin-store-close" aria-label="关闭" title="关闭" onClick={() => setExpanded(false)}>×</button>
+        </header>
+        <div className="plugin-store-introduction">
+          {plugin.audience ? <div className="plugin-store-audience"><span>{plugin.audience}</span></div> : null}
+          {description ? <p>{description}</p> : null}
+        </div>
         <div className="plugin-card-expanded" id={detailsId}>
           <PluginBotSettings
             plugin={plugin}
@@ -753,6 +707,18 @@ function PluginCard(props: {
             globalTogglePending={globalTogglePending}
             onToggle={props.onToggle}
           />
+          <DashboardActions plugin={plugin} />
+          <details className="plugin-advanced" key={expanded ? 'open' : 'closed'}>
+            <summary>高级设置</summary>
+            <div className="plugin-card-body">
+              <InfoRows rows={[
+                { label: '插件 ID', content: <InlineCode>{plugin.id}</InlineCode> },
+                { label: '软件包', content: <InlineCode>{plugin.packageName}</InlineCode> },
+                { label: '版本', content: plugin.version },
+                { label: '来源', content: installedLocally(plugin) ? '本地安装' : 'npm 安装' },
+                ...(depIds.length ? [{ label: '依赖', content: depIds.join(', ') }] : []),
+              ]} />
+            </div>
           {hasDashboard ? (
             <div className="plugin-card-controls">
               <label className="toggle-row plugin-pin-toggle">
@@ -773,8 +739,13 @@ function PluginCard(props: {
           ) : null}
           <PluginActionArea plugin={plugin} busy={props.busy} onServiceAction={props.onServiceAction} />
           <div className="plugin-card-body"><PluginTabs plugin={plugin} /></div>
+          </details>
+          <footer className="plugin-store-dialog-foot">
+            {props.marketEntry?.package === plugin.packageName ? <button type="button" className="btn-link" disabled={props.busy} onClick={() => { setExpanded(false); props.onPrepare(); }}>检查更新</button> : null}
+            <button type="button" className="btn-link plugin-store-danger" disabled={props.busy} onClick={() => { setExpanded(false); props.onUninstall(); }}>卸载插件</button>
+          </footer>
         </div>
-      ) : null}
+      </ModalDialog>
     </article>
   );
 }
@@ -801,6 +772,43 @@ function PluginManagementPage(): React.JSX.Element {
   const [pendingToggles, setPendingToggles] = useState<Map<string, boolean>>(() => new Map());
   const [pendingPins, setPendingPins] = useState<Map<string, boolean>>(() => new Map());
   const [feedback, setFeedback] = useState<PluginFeedback | null>(null);
+  const [view, setView] = useState<'installed' | 'discover'>(() => location.hash.includes('view=discover') ? 'discover' : 'installed');
+  const [query, setQuery] = useState('');
+  const [source, setSource] = useState('all');
+  const [catalog, setCatalog] = useState<{ items: PluginMarketEntry[]; stale: boolean; available: boolean } | null>(null);
+  const [catalogError, setCatalogError] = useState('');
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [selected, setSelected] = useState<PluginMarketEntry | null>(null);
+  const [plan, setPlan] = useState<PluginInstallPlan | null>(null);
+  const [remove, setRemove] = useState<ManagedPlugin | null>(null);
+  const [operation, setOperation] = useState('');
+  const [notice, setNotice] = useState('');
+  const operationRef = useRef(false);
+  const [focusedPlugin, setFocusedPlugin] = useState<string | null>(null);
+
+  const marketRequest = useCallback(async (action: string, body: unknown) => {
+    const csrf = document.querySelector<HTMLMetaElement>('meta[name="botmux-csrf"]')?.content || '';
+    const response = await fetch(`/api/plugins/market/${action}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-csrf': csrf }, body: JSON.stringify(body),
+    });
+    const value = await response.json();
+    if (!response.ok || value.ok === false) throw new Error(value.error || `HTTP ${response.status}`);
+    return value;
+  }, []);
+  const loadCatalog = useCallback(async (force = false) => {
+    setCatalogLoading(true);
+    setCatalogError('');
+    try {
+      const result = force ? await marketRequest('refresh', {}) : await (async () => {
+        const response = await fetch('/api/plugins/market');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        return data;
+      })();
+      setCatalog(result);
+    } catch (err) { setCatalogError(err instanceof Error ? err.message : '插件目录暂不可用'); }
+    finally { setCatalogLoading(false); }
+  }, [marketRequest]);
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -815,6 +823,27 @@ function PluginManagementPage(): React.JSX.Element {
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void loadCatalog(); }, [loadCatalog]);
+  useEffect(() => {
+    if (!focusedPlugin || !payload) return;
+    const element = document.querySelector<HTMLElement>(`[data-plugin-expand="${CSS.escape(focusedPlugin)}"]`);
+    if (element) { element.click(); element.focus(); setFocusedPlugin(null); }
+  }, [focusedPlugin, payload, query, source, view]);
+
+  const perform = useCallback(async (label: string, action: () => Promise<void>) => {
+    if (operationRef.current) return;
+    operationRef.current = true;
+    setOperation(label);
+    setNotice('');
+    try { await action(); }
+    catch (err) { setFeedback({ title: '插件操作未完成', message: err instanceof Error ? err.message : '请刷新已安装列表核对结果' }); }
+    finally { operationRef.current = false; setOperation(''); }
+  }, []);
+  const prepare = (entry: PluginMarketEntry) => void perform('正在核验版本…', async () => {
+    const result = await marketRequest('prepare', { id: entry.id });
+    setSelected(null);
+    setPlan(result.plan);
+  });
 
   const setPluginBusy = useCallback((pluginId: string, busy: boolean) => {
     setBusyPluginIds(current => updateSet(current, pluginId, busy));
@@ -871,42 +900,121 @@ function PluginManagementPage(): React.JSX.Element {
   }
 
   const enabledGlobalCount = payload.plugins.filter(plugin => pluginEnabledInScope(plugin, 'global', pendingToggles)).length;
+  const search = query.trim().toLocaleLowerCase();
+  const matches = (...values: Array<string | undefined>) => values.join(' ').toLocaleLowerCase().includes(search);
+  const installed = payload.plugins.filter(plugin => (
+    matches(plugin.id, plugin.displayName, plugin.packageName, plugin.description, plugin.audience)
+    && (source === 'all' || (source === 'local' ? installedLocally(plugin) : !installedLocally(plugin)))
+  ));
+  const discovered = (catalog?.items ?? []).filter(entry => matches(entry.id, entry.displayName, entry.description, entry.package));
+  const openInstalled = (id: string) => { setSelected(null); setView('installed'); setQuery(''); setSource('all'); setFocusedPlugin(id); };
   return (
-    <section className="page plugin-management-page">
+    <section className="page plugin-management-page plugin-market-page" data-native-plugin-center>
       <div className="page-heading">
         <div>
           <h1>插件</h1>
-          <p>卡片默认展示启用范围与能力摘要；展开后可管理单个 Bot、Service 和详细能力。全局启用对所有 Bot 生效，改动在新启动的 CLI 会话中生效。</p>
+          <p>{payload.plugins.length} 个已安装 · {enabledGlobalCount} 个全局启用</p>
         </div>
         <div className="plugin-heading-actions">
-          <button type="button" className="btn-link" data-plugin-refresh disabled={refreshing} onClick={() => void load()}>
-            {refreshing ? '刷新中...' : '刷新'}
-          </button>
+          <RefreshIconButton label="刷新插件" data-plugin-refresh disabled={refreshing || catalogLoading || !!operation} busy={refreshing || catalogLoading} onClick={() => { void load(); void loadCatalog(true); }} />
         </div>
       </div>
-      <div className="plugin-summary-grid">
-        <div className="bd-card plugin-summary-card"><span>已安装</span><strong>{payload.plugins.length}</strong></div>
-        <div className="bd-card plugin-summary-card"><span>全局启用</span><strong data-plugin-summary-enabled>{enabledGlobalCount}</strong></div>
+      <div className="plugin-store-toolbar">
+        <div className="plugin-store-tabs" role="tablist" aria-label="插件视图">
+          <button type="button" role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'is-active' : ''} onClick={() => setView('installed')}>已安装 <span>{payload.plugins.length}</span></button>
+          <button type="button" role="tab" aria-selected={view === 'discover'} className={view === 'discover' ? 'is-active' : ''} onClick={() => setView('discover')}>发现</button>
+        </div>
+        <input type="search" aria-label="搜索插件" placeholder="搜索插件" value={query} onChange={event => setQuery(event.currentTarget.value)} />
+        {view === 'installed' ? <select aria-label="安装来源" value={source} onChange={event => setSource(event.currentTarget.value)}>
+          <option value="all">全部来源</option><option value="local">本地安装</option><option value="npm">npm 安装</option>
+        </select> : <a className="plugin-link" href="https://github.com/botmux-ai/plugin-market" target="_blank" rel="noreferrer">插件目录</a>}
       </div>
-      {payload.plugins.length === 0 ? (
-        <div className="bd-card empty">暂无已安装插件。用 <code>botmux plugin install</code> 安装后会出现在这里。</div>
-      ) : (
-        <div className="plugin-card-list">
-          {payload.plugins.map(plugin => (
+      {error ? <div className="plugin-warning" role="alert">{error}</div> : null}
+      {notice || operation ? <div className="plugin-store-notice" role="status">{operation || notice}</div> : null}
+      {view === 'installed' ? (
+        <div className="plugin-store-grid">
+          {installed.map(plugin => (
             <PluginCard
               key={plugin.id}
               plugin={plugin}
               bots={payload.bots}
               pendingToggles={pendingToggles}
               pendingPin={pendingPins.get(plugin.id)}
-              busy={busyPluginIds.has(plugin.id)}
+              busy={busyPluginIds.has(plugin.id) || !!operation}
               onToggle={(scope, enabled) => void handleToggle(plugin.id, scope, enabled)}
               onPin={pinned => void handlePin(plugin.id, pinned)}
               onServiceAction={action => void handleServiceAction(plugin.id, action)}
+              marketEntry={catalog?.items.find(entry => entry.id === plugin.id)}
+              onPrepare={() => { const entry = catalog?.items.find(item => item.id === plugin.id); if (entry) prepare(entry); }}
+              onUninstall={() => setRemove(plugin)}
             />
           ))}
+          {installed.length === 0 ? <div className="plugin-empty-state">没有匹配的已安装插件</div> : null}
         </div>
-      )}
+      ) : <>
+        {catalogError || catalog?.stale ? <div className="plugin-warning" role="alert">{catalogError || (catalog?.available ? '目录暂不可达，正在显示最近读取的目录' : '插件目录暂不可达')}</div> : null}
+        <div className="plugin-store-grid">
+          {discovered.map(entry => {
+            const existing = payload.plugins.find(item => item.id === entry.id);
+            return <article className="bd-card plugin-store-card" key={entry.id} data-market-plugin={entry.id}>
+              <header className="plugin-card-head"><div className="plugin-title-block">
+                <div className="plugin-title-row"><h2>{entry.displayName}</h2>{existing ? <span className="plugin-status plugin-status-ok">已安装</span> : null}</div>
+                <p className="plugin-store-package">{entry.package}</p>
+              </div></header>
+              <p className="plugin-store-description">{entry.description}</p>
+              <div className="plugin-store-tags"><Tags values={entry.categories} /></div>
+              <footer className="plugin-store-footer"><span className="plugin-muted">目录收录</span>
+                <button type="button" className="btn-link" disabled={!!operation} onClick={() => setSelected(entry)}>查看详情</button>
+              </footer>
+            </article>;
+          })}
+          {catalogLoading && !catalog ? <div className="plugin-empty-state">正在读取插件目录…</div> : null}
+          {catalog && !catalogLoading && discovered.length === 0 ? <div className="plugin-empty-state">没有匹配的插件</div> : null}
+        </div>
+      </>}
+      <ModalDialog open={!!selected} onClose={() => setSelected(null)} className="plugin-store-dialog" aria-label={selected?.displayName || '插件详情'}>
+        {selected ? <>
+          <header className="plugin-store-dialog-head"><div><h2>{selected.displayName}</h2><p className="plugin-muted">{selected.package}</p></div>
+            <button type="button" className="btn-link plugin-store-close" aria-label="关闭" onClick={() => setSelected(null)}>×</button></header>
+          <div className="plugin-store-dialog-body">
+            <p>{selected.description}</p><Tags values={selected.categories} />
+            <InfoRows rows={[{ label: '兼容声明', content: selected.compatibility.botmux }, { label: '来源', content: '社区插件目录（非安全认证）' }]} />
+            <div className="plugin-action-links"><a className="btn-link" href={selected.docs || selected.repo} target="_blank" rel="noreferrer">开发文档</a><a className="btn-link" href={selected.repo} target="_blank" rel="noreferrer">源代码</a></div>
+          </div>
+          <footer className="plugin-store-dialog-foot">
+            {payload.plugins.some(item => item.id === selected.id) ? <button type="button" className="btn-link primary" onClick={() => openInstalled(selected.id)}>管理已安装插件</button> : <button type="button" className="btn-link primary" disabled={!!operation} onClick={() => prepare(selected)}>{operation || '安装插件'}</button>}
+          </footer>
+        </> : null}
+      </ModalDialog>
+      <ModalDialog open={!!plan} onRequestClose={() => { if (!operation) setPlan(null); }} onClose={() => { if (!operation) setPlan(null); }} backdropClose={false} className="plugin-store-dialog" aria-label="确认安装">
+        {plan ? <>
+          <header className="plugin-store-dialog-head"><h2>确认安装</h2></header>
+          <div className="plugin-store-dialog-body">
+            <InfoRows rows={[{ label: '软件包', content: plan.packageName }, { label: '固定版本', content: plan.version }, { label: 'SHA-512', content: <code className="plugin-store-integrity">{plan.integrity}</code> }]} />
+            <div className="plugin-warning">插件启用后以本机用户权限运行，可访问本机资源。目录收录不代表安全认证。安装完成后不会自动启用。</div>
+          </div>
+          <footer className="plugin-store-dialog-foot">
+            <button type="button" className="btn-link" disabled={!!operation} onClick={() => setPlan(null)}>取消</button>
+            <button type="button" className="btn-link primary" disabled={!!operation} onClick={() => void perform('正在安装…', async () => {
+              await marketRequest('install', { nonce: plan.nonce, confirm: true });
+              const id = plan.id; setPlan(null); await load(); openInstalled(id); setNotice('安装完成');
+            })}>{operation || '信任并安装'}</button>
+          </footer>
+        </> : null}
+      </ModalDialog>
+      <ModalDialog open={!!remove} onRequestClose={() => { if (!operation) setRemove(null); }} onClose={() => { if (!operation) setRemove(null); }} backdropClose={false} className="plugin-store-dialog" aria-label="确认卸载">
+        {remove ? <>
+          <header className="plugin-store-dialog-head"><h2>卸载 {remove.displayName || remove.id}</h2></header>
+          <div className="plugin-store-dialog-body"><p>将删除插件文件和配置。请先关闭全部启用范围并停止后台服务。</p><p className="plugin-muted">{remove.packageName}@{remove.version}</p></div>
+          <footer className="plugin-store-dialog-foot">
+            <button type="button" className="btn-link" disabled={!!operation} onClick={() => setRemove(null)}>取消</button>
+            <button type="button" className="btn-link plugin-store-danger" disabled={!!operation} onClick={() => void perform('正在卸载…', async () => {
+              await marketRequest('uninstall', { id: remove.id, packageName: remove.packageName, version: remove.version, expectedState: remove.stateHash, confirm: true });
+              setRemove(null); await load(); window.dispatchEvent(new Event(PLUGIN_PINS_CHANGED_EVENT)); setNotice('已卸载插件');
+            })}>{operation || '确认卸载'}</button>
+          </footer>
+        </> : null}
+      </ModalDialog>
       <FeedbackDialog feedback={feedback} onClose={() => setFeedback(null)} />
     </section>
   );
