@@ -75,6 +75,7 @@
 | 嫌实时卡片吵 | `disableStreamingCard`、`hiddenStreamingCardButtons` |
 | 一轮只用一张卡显示进度和答复 | `replyCardMode: "unified"` |
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
+| 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
 | 盯住告警群，有告警就自动处理 | 群消息监听（见[群消息监听](#message-listener)） |
 | 额度用完自动交给另一个 bot | `quotaFallbackBot` |
 | 不让 botmux 往 prompt 里塞任何东西 | `promptInjection: "none"` |
@@ -658,6 +659,14 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 - 不经过 shell，要用管道、重定向就写成 `bash -c '…'`；只带最少的环境变量（不含应用密钥）。
 - stdin 收到 JSON：`{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`；也可以读环境变量 `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID`。
 - 10 分钟没结束会被强制结束。
+
+### 上线欢迎语（`welcomeMessage`） {#welcome-message}
+
+填一段文字，机器人首次成功上线后会私聊主管理员（见 `ownerOpenId`）一次。用 `botmux setup add` / `botmux setup edit` 的 `--welcome-message "…"` 或 `--welcome-message-file <文件>` 设置，edit 传 `--welcome-message -` 清空；Dashboard 里暂时不能改。`--welcome-message` 的值始终按原文发送，以 `@` 开头也不会当成文件路径。
+
+- 发送记录在 daemon 数据目录的 `welcome-sent/<AppID>.json`，发过之后重启不再发，改欢迎语内容也不会重发。删掉这个文件可以让它重发，但距上次发送不到 1 小时的会被飞书去重。
+- 发送失败、还解析不到主管理员时不影响启动，下次启动重试。
+- core-only（`apiOnly`）bot 和多副本部署（`BOTMUX_COORDINATION_MODE=primary`，各副本不共享发送记录）不发送，daemon 日志里会写明原因。
 
 ## 群消息监听 {#message-listener}
 

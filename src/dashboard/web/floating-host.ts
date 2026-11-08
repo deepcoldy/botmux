@@ -7,3 +7,8 @@
 export function floatingPortalHost(anchor: Element | null, fallback: HTMLElement): Element {
   return anchor?.closest('dialog[open]') ?? fallback;
 }
+
+/** {@link floatingPortalHost} with the page body as fallback, typed for a Base UI Portal `container`. */
+export function floatingPortalContainer(anchor: Element | null): HTMLElement {
+  return floatingPortalHost(anchor, document.body) as HTMLElement;
+}

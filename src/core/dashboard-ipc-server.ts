@@ -7,7 +7,7 @@ import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } 
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
-import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexConfigPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
+import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexAgentsPath, hostCodexConfigPath, isolatedCodexAgentsPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
@@ -9110,6 +9110,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     chatManagerEnabled: cardPrefs.chatManagerEnabled,
+    groupSecretaryEnabled: cardPrefs.groupSecretaryEnabled,
     autoStartExcludedChats: cardPrefs.autoStartExcludedChats,
     groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
     groupJoinCommand: cardPrefs.groupJoinCommand,
@@ -9258,6 +9259,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     chatManagerEnabled?: unknown;
+    groupSecretaryEnabled?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
     senderTagHideEmail?: unknown;
@@ -9277,6 +9279,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     chatManagerEnabled?: boolean;
+    groupSecretaryEnabled?: boolean;
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
     senderTagHideEmail?: boolean;
@@ -9364,6 +9367,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (typeof body.chatManagerEnabled === 'boolean') patch.chatManagerEnabled = body.chatManagerEnabled;
+  if (typeof body.groupSecretaryEnabled === 'boolean') patch.groupSecretaryEnabled = body.groupSecretaryEnabled;
   if (body.autoStartExcludedChats !== undefined) {
     if (!Array.isArray(body.autoStartExcludedChats) || body.autoStartExcludedChats.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id.trim()))) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auto_start_excluded_chats' });
@@ -10924,14 +10928,16 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
 }));
 
-// GET /api/bot-codex-config — where this bot's isolated Codex config.toml lives
-// (`<BOT_HOME>/codex/config.toml`, seeded ONCE from ~/.codex/config.toml by the
-// worker) and whether new sessions use it. Paths only, never file contents.
+// GET /api/bot-codex-config — where this bot's isolated Codex config.toml and
+// AGENTS.md live (`<BOT_HOME>/codex/`, seeded ONCE from ~/.codex by the worker)
+// and whether new sessions use them. Paths only, never file contents.
 ipcRoute('GET', '/api/bot-codex-config', requireBoundBot(async (_req, res) => {
   let cfg;
   try { cfg = getBot(cachedLarkAppId).config; } catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
   const path = isolatedCodexConfigPath(config.session.dataDir, cachedLarkAppId);
   const hostPath = hostCodexConfigPath();
+  const agentsPath = isolatedCodexAgentsPath(config.session.dataDir, cachedLarkAppId);
+  const hostAgentsPath = hostCodexAgentsPath();
   jsonRes(res, 200, {
     ok: true,
     isolated: botUsesIsolatedCodexHome(cfg),
@@ -10939,11 +10945,16 @@ ipcRoute('GET', '/api/bot-codex-config', requireBoundBot(async (_req, res) => {
     exists: existsSync(path),
     hostPath,
     hostExists: existsSync(hostPath),
+    agentsPath,
+    agentsExists: existsSync(agentsPath),
+    hostAgentsPath,
+    hostAgentsExists: existsSync(hostAgentsPath),
   });
 }));
 
 // POST /api/bot-codex-config/resync — back the per-bot config.toml up to
-// `config.toml.bak-<timestamp>` and replace it with the host copy (both 0600).
+// `config.toml.bak-<timestamp>` and replace it with the host copy (both 0600);
+// AGENTS.md likewise when the host has one.
 // Only for bots whose new sessions use the isolated CODEX_HOME; running
 // sessions keep the config their Codex already loaded.
 ipcRoute('POST', '/api/bot-codex-config/resync', requireBoundBot(async (_req, res) => {

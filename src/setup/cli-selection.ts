@@ -312,13 +312,21 @@ export function parseWrapperCli(wrapperCli: string): string[] {
   return wrapperCli.trim().split(/\s+/).filter(Boolean);
 }
 
+/** 识别启动器用的前缀 token：首 token 只取文件名，写成绝对路径（`/opt/aiden/bin/aiden x claude`）
+ *  与写成命令名一样识别为 aiden / cjadk / ttadk。只用于判断，spawn 仍用 {@link parseWrapperCli} 的原始首 token。 */
+export function wrapperIdentityTokens(wrapperCli: string | undefined): string[] {
+  const tokens = parseWrapperCli(wrapperCli ?? '');
+  if (tokens[0]) tokens[0] = tokens[0].slice(tokens[0].lastIndexOf('/') + 1);
+  return tokens;
+}
+
 /** wrapper 前缀首 token 是否为 aiden 网关（`aiden x <cli>`）。aiden 会拦截底层 CLI
  *  的 config 透传参数——`aiden x claude` 拒收 `--settings`、`aiden x codex` 自 1.8.38
  *  起直接报错拒收 `-c`；此外 aiden 自身已注入 codex 的 `--dangerously-bypass-hook-trust`，
  *  botmux 再透传一份会让 codex 收到两次而报错——故转发前要剥掉这几项 botmux 注入的参数
  *  （见 {@link stripWrapperUnsafeArgs}）。 */
-function isAidenWrapper(tokens: ReadonlyArray<string>): boolean {
-  return tokens[0] === 'aiden';
+function isAidenWrapper(identity: ReadonlyArray<string>): boolean {
+  return identity[0] === 'aiden';
 }
 
 /** wrapper 前缀首 token 是否为 cjadk 装配启动器（`cjadk <agent>`）。cjadk 的 `code` 子命令
@@ -326,8 +334,8 @@ function isAidenWrapper(tokens: ReadonlyArray<string>): boolean {
  *  `-c shell_environment_policy.set.BOTMUX_*=…`（绑到 cjadk 的 --command，当成"要运行的命令"
  *  → 报 `… is not installed. Please install it first.`）——故 cjadk codex 转发前要把它改写成
  *  codex 的长形式 `--config`（见 {@link rewriteCjadkCodexConfigArgs}）。 */
-function isCjadkWrapper(tokens: ReadonlyArray<string>): boolean {
-  return tokens[0] === 'cjadk';
+function isCjadkWrapper(identity: ReadonlyArray<string>): boolean {
+  return identity[0] === 'cjadk';
 }
 
 /**
@@ -551,13 +559,12 @@ export function rewriteCjadkCodexConfigArgs(args: ReadonlyArray<string>): string
 
 /** 该前缀是否为 ttadk 网关（`ttadk <子命令> …`）。 */
 export function isTtadkWrapper(wrapperCli: string | undefined): boolean {
-  return !!wrapperCli && parseWrapperCli(wrapperCli)[0] === 'ttadk';
+  return wrapperIdentityTokens(wrapperCli)[0] === 'ttadk';
 }
 
 /** ttadk 该子命令是否接受 `-m <model>`（CoCo 等 requiresManagedModel=false 的不接受）。非 ttadk 前缀返回 false。 */
 export function ttadkAcceptsModel(wrapperCli: string | undefined): boolean {
-  if (!wrapperCli) return false;
-  const tokens = parseWrapperCli(wrapperCli);
+  const tokens = wrapperIdentityTokens(wrapperCli);
   return tokens[0] === 'ttadk' && !!tokens[1] && !TTADK_NO_MODEL_SUBCOMMANDS.has(tokens[1]);
 }
 
@@ -632,7 +639,7 @@ function buildTtadkLaunch(
   binResolver: (bin: string) => string,
   ttadkModel: string | undefined,
 ): { bin: string; args: string[] } {
-  return { bin: binResolver('ttadk'), args: [...ttadkPrefixArgs(tokens, ttadkModel), ...cliArgs] };
+  return { bin: binResolver(tokens[0]), args: [...ttadkPrefixArgs(tokens, ttadkModel), ...cliArgs] };
 }
 
 /**
@@ -667,7 +674,7 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  */
 export function wrapperLaunchEnv(wrapperCli: string | undefined): Record<string, string> | undefined {
   if (!wrapperCli?.trim()) return undefined;
-  if (parseWrapperCli(wrapperCli)[0] === 'cjadk') return { CJADK_INTERACTIVE: '0' };
+  if (isCjadkWrapper(wrapperIdentityTokens(wrapperCli))) return { CJADK_INTERACTIVE: '0' };
   return undefined;
 }
 
@@ -679,8 +686,9 @@ export function buildWrappedLaunch(
 ): WrappedLaunch {
   const tokens = parseWrapperCli(wrapperCli);
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
-  if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
-  if (tokens[0] === 'aiden' && tokens[1] === 'x' && tokens[2] === 'codex') {
+  const identity = wrapperIdentityTokens(wrapperCli);
+  if (identity[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
+  if (identity[0] === 'aiden' && identity[1] === 'x' && identity[2] === 'codex') {
     const { reasoningEffort, shellConfigs, forwardedArgs } = rewriteAidenCodexArgs(cliArgs);
     // The PATH shim is required whenever something must reach the REAL codex
     // past Aiden's argv gate: a per-session reasoning effort, or shell-env
@@ -730,8 +738,8 @@ export function buildWrappedLaunch(
     };
   }
   let forwarded: string[];
-  if (isAidenWrapper(tokens)) forwarded = stripWrapperUnsafeArgs(cliArgs);
-  else if (isCjadkWrapper(tokens)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs);
+  if (isAidenWrapper(identity)) forwarded = stripWrapperUnsafeArgs(cliArgs);
+  else if (isCjadkWrapper(identity)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs);
   else forwarded = [...cliArgs];
   return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwarded] };
 }
@@ -753,7 +761,8 @@ export function decorateResumeForWrapper(
   if (!wrapperCli || !wrapperCli.trim()) return cmd;
   const rest = cmd.replace(/^\S+\s*/, ''); // 去掉首个 token（底层 bin 名）
   if (isTtadkWrapper(wrapperCli)) {
-    const prefix = ['ttadk', ...ttadkPrefixArgs(parseWrapperCli(wrapperCli), opts.ttadkModel)].join(' ');
+    const tokens = parseWrapperCli(wrapperCli);
+    const prefix = [tokens[0], ...ttadkPrefixArgs(tokens, opts.ttadkModel)].join(' ');
     return `${prefix} ${rest}`.trimEnd();
   }
   return `${wrapperCli.trim()} ${rest}`.trimEnd();

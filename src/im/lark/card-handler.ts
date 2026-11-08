@@ -94,6 +94,7 @@ import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactE
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
+import { holdPurgeClickRollback } from '../../services/image-purge-recovery.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
@@ -409,6 +410,34 @@ function voiceSummaryInstruction(locale?: Locale): string {
 function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
   if (!ds.worker || ds.worker.killed) return true;
   return ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited';
+}
+
+/** Snapshot of the turn state a purge click overwrites. Restoring it is only
+ *  sound while the rejected continuation is still the session's latest input. */
+function captureTurnStateBeforePurgeClick(ds: DaemonSession): () => void {
+  const live = {
+    suppressRecoveryCard: ds.suppressRecoveryCard,
+    lastUserPrompt: ds.lastUserPrompt,
+    lastCliInput: ds.lastCliInput,
+    lastCliInputTurnId: ds.lastCliInputTurnId,
+    lastCodexAppInput: ds.lastCodexAppInput,
+    currentTurnTitle: ds.currentTurnTitle,
+    currentImageKey: ds.currentImageKey,
+  };
+  const persisted = {
+    lastUserPrompt: ds.session.lastUserPrompt,
+    lastCliInput: ds.session.lastCliInput,
+    lastCliInputTurnId: ds.session.lastCliInputTurnId,
+    lastCodexAppInput: ds.session.lastCodexAppInput,
+  };
+  const { lastScreenStatus, streamCardPending } = ds;
+  return () => {
+    Object.assign(ds, live);
+    Object.assign(ds.session, persisted);
+    // Worker screen updates own these after the click; only undo the click's marks.
+    if (ds.lastScreenStatus === 'working') ds.lastScreenStatus = lastScreenStatus;
+    if (ds.streamCardPending) ds.streamCardPending = streamCardPending;
+  };
 }
 
 function isLegacySelfHealAction(actionType?: string): boolean {
@@ -4336,6 +4365,90 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           ),
         },
       };
+    }
+
+    if (actionType === 'purge_images_continue' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      // Same gates as retry_turn, plus the /restart gate set: the worker action
+      // rewrites the transcript and respawns --resume, which shared-adopt and
+      // remote backends must never do.
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) },
+        };
+      }
+      if (isSharedAdoptSession(ds) || isRemoteBackendSession(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
+      }
+      if (sessionCliId(ds) !== 'claude-code') {
+        return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
+      }
+      if (hasProtectedSessionMutationOwnership(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      const failedTurn = ds.session.lastFailedTurn;
+      if (!failedTurn) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_missing', undefined, locDs) } };
+      }
+      const clickedTurnId = value?.turn_id;
+      if (!clickedTurnId || clickedTurnId !== failedTurn.turnId) {
+        logger.info(
+          `[${tag(ds)}] purge_images_continue from stale card (clicked=${clickedTurnId?.slice(0, 8) ?? 'none'} `
+          + `current=${failedTurn.turnId.slice(0, 8)}) — refused`,
+        );
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
+      }
+      const cooldownMs = retryCooldownRemaining(failedTurn);
+      if (cooldownMs > 0) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.retry_turn_cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, locDs),
+          },
+        };
+      }
+      const continueInput = { content: buildTurnContinuePrompt() };
+      // Same turnId handling as retry_turn: never reuse failedTurn.turnId — that
+      // om_ id is a committed ordinary turn the worker would dedupe before the
+      // purge branch.
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
+      let accepted = false;
+      try {
+        // No live worker: nothing to purge-and-respawn. Reject rather than a
+        // plain fork that would replay the poisoned transcript.
+        if (ds.worker && !ds.worker.killed) {
+          accepted = sendWorkerInput(ds, continueInput, retryTurnId, { purgeUndersizedImages: true });
+        }
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] purge_images_continue failed before acceptance: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      // The worker may still decline (or fail the purge after stopping the CLI)
+      // and reject this turn; that rejection undoes the click.
+      const restoreTurnState = captureTurnStateBeforePurgeClick(ds);
+      const retryReceipt = markRetryAttempt(ds.session);
+      holdPurgeClickRollback(ds, retryTurnId, { ...(retryReceipt ? { receipt: retryReceipt } : {}), restoreTurnState });
+      rememberLastCliInput(ds, failedTurn.userPrompt, continueInput, retryTurnId);
+      sessionStore.updateSession(ds.session);
+      ds.lastScreenStatus = 'working';
+      ds.streamCardPending = true;
+      ds.currentTurnTitle = (failedTurn.userPrompt || ds.currentTurnTitle || ds.session.title
+        || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
+      logger.info(
+        `[${tag(ds)}] purge_images_continue accepted for turn ${failedTurn.turnId.slice(0, 8)} `
+        + `(attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`,
+      );
+      return { toast: { type: 'success', content: t('card.action.purge_images_started', undefined, locDs) } };
     }
 
     // Safe keys on the "CLI is stuck on a blocking page" card. Deliberately
