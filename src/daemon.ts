@@ -1042,9 +1042,10 @@ import {
   publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
   clearAgentAttention,
+  markPassthroughActivity,
   stampHumanActivity,
 } from './core/session-activity.js';
-import { holdLastTurnThrough, isMaintenanceTurnId, noteTurnStarted } from './core/turn-outcome.js';
+import { noteTurnStarted } from './core/turn-outcome.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
@@ -25403,9 +25404,7 @@ function deliverPassthroughToExistingSession(
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
     beginNewTurn(ds, commandContent, turnId);
-    const activityAt = Date.now();
-    if (isMaintenanceTurnId(turnId)) holdLastTurnThrough(ds, activityAt);
-    markSessionActivity(ds, activityAt);
+    markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
   }

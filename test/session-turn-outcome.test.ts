@@ -31,7 +31,9 @@ import {
   classifyTurnOutcome,
   holdLastTurnThrough,
   isMaintenanceTurnId,
+  isTurnOutcomeExcluded,
   noteDiagnosticFinal,
+  noteFinalOutputReceipt,
   noteFinalReplyText,
   noteLateFinalReply,
   noteTurnStarted,
@@ -41,7 +43,8 @@ import {
 import { messages as zhMessages } from '../src/i18n/zh.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { onSessionTaskEvent, type SessionTaskEvent } from '../src/core/session-task-events.js';
-import { publishAttentionPatch } from '../src/core/session-activity.js';
+import { markPassthroughActivity, publishAttentionPatch } from '../src/core/session-activity.js';
+import { activeManualColumn, deriveKanbanColumn } from '../src/dashboard/web/kanban-model.js';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'turn-outcome-'));
 afterAll(() => rmSync(dataDir, { recursive: true, force: true }));
@@ -341,6 +344,68 @@ describe('holdLastTurnThrough', () => {
     ds.lastMessageAt = clock - 5;
     expect(holdLastTurnThrough(ds, clock)).toBeUndefined();
     expect(h.writes).toEqual([]);
+  });
+});
+
+describe('noteFinalOutputReceipt', () => {
+  const completedWithoutReceipt = (ds: DaemonSession) => recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+    recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+  });
+
+  it('a reply on the final channel upgrades the same turn with its first line', async () => {
+    const ds = makeDs('s-receipt');
+    await completedWithoutReceipt(ds);
+    clock += 1_000;
+    noteFinalOutputReceipt(ds, 't1', { text: '## 结论：可以合入\n细节' }, { now, dataDir });
+    expect(ds.session.lastTurn).toEqual({ turnId: 't1', outcome: 'delivered', at: clock, summary: '结论：可以合入' });
+  });
+
+  it('a failure card on the final channel is not the final reply', async () => {
+    const ds = makeDs('s-receipt-failed');
+    await completedWithoutReceipt(ds);
+    noteFinalOutputReceipt(ds, 't1', { turnFailed: true, text: '执行失败：额度已用完' }, { now, dataDir });
+    expect(ds.session.lastTurn).toMatchObject({ turnId: 't1', outcome: 'no_output' });
+  });
+
+  it('the empty-completion diagnostic is noted as a diagnostic, not as the reply', async () => {
+    const ds = makeDs('s-receipt-diag');
+    noteFinalOutputReceipt(ds, 't1', { emptyCompletedNotice: true, text: '本轮已完成，但没有匹配到最终回复' }, { now, dataDir });
+    expect(await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    })).toMatchObject({ outcome: 'no_output' });
+  });
+});
+
+describe('isTurnOutcomeExcluded', () => {
+  it('auto-compact and HTTP-caller turns do not count; ordinary chat turns do', () => {
+    const ds = makeDs('s-excluded', { idleAutoCompact: { enabled: true, inFlight: { turnId: 'om_idle_compact', at: clock } } });
+    Object.assign(ds, {
+      idleAutoCompactDispatchedTurnId: 'om_dispatched_compact',
+      pendingWaitPromises: new Map([['http_wait', {}]]),
+      asyncTriggerResults: new Map([['http_async', {}]]),
+      settledHttpTerminalTurns: new Set(['http_settled']),
+    });
+    for (const turnId of ['auto-compact:lx1', 'om_idle_compact', 'om_dispatched_compact', 'http_wait', 'http_async', 'http_settled']) {
+      expect(isTurnOutcomeExcluded(ds, turnId), turnId).toBe(true);
+    }
+    expect(isTurnOutcomeExcluded(ds, 'om_chat')).toBe(false);
+    expect(isTurnOutcomeExcluded(makeDs('s-plain'), 'om_chat')).toBe(false);
+  });
+});
+
+describe('markPassthroughActivity', () => {
+  it('an auto-compact passthrough keeps the delivered result and a manual column; a real command does not', () => {
+    const ds = makeDs('s-passthrough', { lastTurn: { turnId: 't1', outcome: 'delivered', at: clock - 10 } });
+    const row = () => ({
+      status: 'idle', lastMessageAt: ds.lastMessageAt, lastTurn: ds.session.lastTurn, kanbanColumn: 'todo', kanbanColumnAt: clock - 5,
+    });
+    markPassthroughActivity(ds, 'auto-compact:idle:lx1', clock);
+    expect(ds.session.lastMessageAt).toBe(new Date(clock).toISOString());
+    expect(deriveSessionTaskStatus(row()).kind).toBe('delivered');
+    expect(deriveKanbanColumn(row())).toBe('todo');
+    markPassthroughActivity(ds, 'om_model', clock + 1_000);
+    expect(deriveSessionTaskStatus(row()).kind).toBe('idle');
+    expect(activeManualColumn(row())).toBeNull();
   });
 });
 

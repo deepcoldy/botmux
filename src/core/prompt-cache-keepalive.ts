@@ -11,11 +11,16 @@
  * would restart the per-bot idle-suspend clock and reset the ping budget. So the
  * screen-status hook below recognises an in-flight keep-alive and restores the
  * idle stretch's original `idleSinceAt`; any other busy edge ends the stretch.
+ * Its idle→busy edge is not a new round either: worker-pool leaves
+ * `busySinceAt` unset for it, so a raised hand or a manual board column
+ * survives the ping.
  */
 import type { DaemonSession } from './types.js';
 import type { BotConfig } from '../bot-registry.js';
 import { readGlobalConfig } from '../global-config.js';
 import { readStatuslineSnapshot } from '../services/statusline-snapshot.js';
+import { dashboardEventBus } from './dashboard-events.js';
+import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
 import {
   KEEPALIVE_IN_FLIGHT_STALE_MS,
   buildPromptCacheKeepalivePrompt,
@@ -120,9 +125,26 @@ export function notePromptCacheKeepaliveResult(ds: DaemonSession, injected: bool
   }
 }
 
-/** A real turn started: the idle stretch (and its ping budget) is over. */
-export function resetPromptCacheKeepalive(ds: DaemonSession): void {
+/** A keep-alive prompt was typed and its busy period has not ended yet. */
+export function promptCacheKeepaliveInFlight(ds: DaemonSession, now = Date.now()): boolean {
+  const since = ds.promptCacheKeepalive?.inFlightSince;
+  return since !== undefined && now - since < KEEPALIVE_IN_FLIGHT_STALE_MS;
+}
+
+/**
+ * A real turn started: the idle stretch (and its ping budget) is over. If the
+ * keep-alive's busy period is still on screen, it now belongs to the real turn;
+ * its edge left `busySinceAt` unset and no new edge is coming, so stamp it here.
+ */
+export function resetPromptCacheKeepalive(ds: DaemonSession, now = Date.now()): void {
+  const keepaliveTyped = ds.promptCacheKeepalive?.inFlightSince !== undefined;
   ds.promptCacheKeepalive = undefined;
+  if (!keepaliveTyped || ds.busySinceAt !== undefined || !BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '')) return;
+  ds.busySinceAt = now;
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: ds.session.sessionId, patch: { busySinceAt: now } },
+  });
 }
 
 /**
@@ -138,8 +160,7 @@ export function notePromptCacheKeepaliveScreenStatus(
 ): void {
   const state = ds.promptCacheKeepalive;
   if (!state || prev === ds.lastScreenStatus) return;
-  const inFlight = state.inFlightSince !== undefined && now - state.inFlightSince < KEEPALIVE_IN_FLIGHT_STALE_MS;
-  if (!inFlight) {
+  if (!promptCacheKeepaliveInFlight(ds, now)) {
     if (ds.lastScreenStatus !== 'idle') ds.promptCacheKeepalive = undefined;
     return;
   }
