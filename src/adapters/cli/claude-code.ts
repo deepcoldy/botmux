@@ -824,6 +824,9 @@ function findJsonlAcrossProjectsRoot(
      *  Only safe for boolean "did the prompt land" checks: the matched
      *  subagent path must NOT be pinned as the watched session jsonl. */
     includeSubagentTranscripts?: boolean;
+    /** Also match queued_command attachments. Same restriction: boolean
+     *  checks only, never pin the match. */
+    includeQueuedCommandAttachments?: boolean;
   },
 ): string | null {
   if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
@@ -1467,10 +1470,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // drift like worker thinking `-foo-bar/` while Claude actually appends
         // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
         // fallback so a stale historical match can't suppress the warning.
-        // Subagent transcripts are included here (boolean use only — the
-        // matched path is never pinned): a prompt delivered while a Task tool
-        // agent is running lands in <sid>/subagents/*.jsonl, and the session
-        // jsonl gains no user event until the agent reports back.
+        // Subagent transcripts and queued_command attachments are included
+        // here only (boolean use — the matched path is never pinned): while
+        // the TUI views a subagent, a prompt is recorded solely in
+        // <sid>/subagents/*.jsonl, as a queued_command attachment written at
+        // the agent's next step when it is still running.
         const searchPath = currentPath ?? pty.claudeJsonlPath;
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
@@ -1478,6 +1482,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
           includeSubagentTranscripts: true,
+          includeQueuedCommandAttachments: true,
         });
         return !!matched;
       };

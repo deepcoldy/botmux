@@ -1419,6 +1419,83 @@ describe('claude-code writeInput submission confirmation', () => {
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
   });
 
+  it('recheck confirms a prompt queued to a running subagent without pinning its transcript', async () => {
+    // While the TUI views a running Task/Agent subagent, Claude hands the
+    // prompt to that agent and records it only in <sid>/subagents/*.jsonl,
+    // as a queued_command attachment written once the agent takes its next
+    // step — typically after the in-band confirm budget has run out.
+    const cwd = '/tmp/recheck-subagent';
+    const sessionId = '5ab5ab5a-5ab5-45ab-85ab-5ab5ab5ab5ab';
+    const pinnedPath = makeJsonlForSession('recheck-subagent', sessionId, cwd);
+    writeClaudePidFile(31341, { sessionId, cwd });
+    const subagentDir = join(dirname(pinnedPath), sessionId, 'subagents');
+    mkdirSync(subagentDir, { recursive: true });
+    const content = 'please also cover the retry path in the new test';
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: pinnedPath,
+      cliPid: 31341,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(),
+    };
+
+    const result = await adapter.writeInput(pty, content);
+    expect(result).toMatchObject({ submitted: false });
+    const recheck = (result as any)?.recheck as () => boolean;
+    expect(recheck()).toBe(false);
+
+    writeFileSync(join(subagentDir, 'agent-a0123456789abcdef.jsonl'), JSON.stringify({
+      isSidechain: true,
+      agentId: 'a0123456789abcdef',
+      type: 'attachment',
+      timestamp: new Date().toISOString(),
+      attachment: { type: 'queued_command', prompt: content, origin: { kind: 'human' }, isMeta: true },
+    }) + '\n');
+    expect(recheck()).toBe(true);
+    expect(pty.claudeJsonlPath).toBe(pinnedPath);
+  });
+
+  it('in-band confirmation never pins a transcript on a queued_command record', async () => {
+    // Only the boolean recheck accepts queued_command records. The in-band
+    // dir fallback and the last-resort fan-out pin what they match, so a
+    // sibling pane's queued prompt with the same text must not move the bridge.
+    const cwd = '/tmp/inband-queued-command';
+    const sessionId = '6ac6ac6a-6ac6-46ac-86ac-6ac6ac6ac6ac';
+    const pinnedPath = makeJsonlForSession('inband-queued-command', sessionId, cwd);
+    writeClaudePidFile(31342, { sessionId, cwd });
+    const siblingPath = join(dirname(pinnedPath), '7bd7bd7b-7bd7-47bd-87bd-7bd7bd7bd7bd.jsonl');
+    const content = 'please also cover the retry path in the sibling pane';
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let wroteSibling = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: pinnedPath,
+      cliPid: 31342,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteSibling) return;
+        wroteSibling = true;
+        writeFileSync(siblingPath, JSON.stringify({
+          type: 'attachment',
+          timestamp: new Date().toISOString(),
+          attachment: { type: 'queued_command', prompt: content, commandMode: 'prompt', origin: { kind: 'human' } },
+        }) + '\n');
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, content);
+    expect(result).toMatchObject({ submitted: false });
+    expect(pty.claudeJsonlPath).toBe(pinnedPath);
+    // Positive control: the record is visible to the boolean recheck.
+    expect(((result as any)?.recheck as () => boolean)()).toBe(true);
+    expect(pty.claudeJsonlPath).toBe(pinnedPath);
+  });
+
   it('extractMessageContentForFingerprint strips envelopes and metadata to isolate user payload', () => {
     const prompt = `<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>
 

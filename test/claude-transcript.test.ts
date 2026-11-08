@@ -688,28 +688,63 @@ describe('findJsonlContainingFingerprint', () => {
     expect(findJsonlContainingFingerprint(projectDir, 'please run the bridge tests')).toBe(userPane);
   });
 
-  // Regression: a prompt submitted while a Task tool agent is running is
-  // delivered to the subagent and recorded as a user event in
-  // <projectDir>/<sid>/subagents/agent-*.jsonl ("The user sent a new message
-  // while you were working: …"). The session jsonl the bridge watches gets no
-  // user event until the agent reports back, so a top-level-only fingerprint
-  // scan produced a false submit_unconfirmed even though the prompt ran.
-  it('finds a prompt delivered to a running Task subagent only when subagent scan is enabled', () => {
-    const sid = '11111111-2222-3333-4444-555555555555';
+  // Regression: while the TUI views a Task/Agent subagent, a submitted prompt
+  // goes to that agent and is recorded only in
+  // <projectDir>/<sid>/subagents/agent-*.jsonl; the session jsonl the bridge
+  // watches gets nothing, so a top-level-only fingerprint scan produced a
+  // false submit_unconfirmed although the prompt landed. Record shapes below
+  // are the ones Claude Code 2.1.319 wrote in a live run: a stopped agent is
+  // resumed with a meta user record, a running agent gets a queued_command
+  // attachment once it takes its next step.
+  const SID = '11111111-2222-3333-4444-555555555555';
+
+  function writeSubagentJsonl(
+    records: object[],
+    { sid = SID, name = 'agent-aaaaaaaa.jsonl', mtimeSec = 2_000_000 } = {},
+  ): string {
     const subDir = join(projectDir, sid, 'subagents');
     mkdirSync(subDir, { recursive: true });
-    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
-    const ev = {
-      type: 'user',
-      isMeta: true,
-      timestamp: '2026-09-17T03:39:54.000Z',
-      message: {
-        role: 'user',
-        content: 'The user sent a new message while you were working: 那先提交&push 一波把',
-      },
-    };
-    writeFileSync(subagent, JSON.stringify(ev) + '\n');
-    utimesSync(subagent, 2_000_000, 2_000_000);
+    const full = join(subDir, name);
+    writeFileSync(full, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    utimesSync(full, mtimeSec, mtimeSec);
+    return full;
+  }
+
+  function writeTopLevelJsonl(name: string, records: object[], mtimeSec = 2_000_000): string {
+    return writeJsonl(name, records.map((r) => JSON.stringify(r)).join('\n') + '\n', mtimeSec);
+  }
+
+  const resumedAgentMessage = (text: string, timestamp = '2026-11-08T07:35:42.818Z') => ({
+    isSidechain: true,
+    agentId: 'a0123456789abcdef',
+    type: 'user',
+    message: {
+      role: 'user',
+      content: `The user sent a new message while you were working:\n${text}\n\n`
+        + 'This is how Claude Code surfaces messages the user sends mid-turn.',
+    },
+    isMeta: true,
+    timestamp,
+    origin: { kind: 'human' },
+  });
+
+  const queuedCommand = (
+    prompt: string,
+    attachment: Record<string, unknown>,
+    timestamp = '2026-11-08T07:36:04.465Z',
+  ) => ({
+    type: 'attachment',
+    timestamp,
+    attachment: { type: 'queued_command', prompt, source_uuid: 'b1d1e0c4-0000-4000-8000-000000000001', ...attachment },
+  });
+  const runningAgentMessage = (text: string, timestamp?: string) => ({
+    isSidechain: true,
+    agentId: 'a0123456789abcdef',
+    ...queuedCommand(text, { origin: { kind: 'human' }, isMeta: true }, timestamp),
+  });
+
+  it('finds a prompt forwarded to a stopped subagent only when subagent scan is enabled', () => {
+    const subagent = writeSubagentJsonl([resumedAgentMessage('那先提交&push 一波把')]);
 
     expect(findJsonlContainingFingerprint(projectDir, '那先提交&push 一波把')).toBeNull();
     expect(findJsonlContainingFingerprint(projectDir, '那先提交&push 一波把', {
@@ -717,45 +752,151 @@ describe('findJsonlContainingFingerprint', () => {
     })).toBe(subagent);
   });
 
+  it('finds a prompt queued to a running subagent only with the queued_command opt-in', () => {
+    const fp = 'please also cover the retry path';
+    const subagent = writeSubagentJsonl([runningAgentMessage(fp)]);
+
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      includeSubagentTranscripts: true,
+      includeQueueOperations: true,
+    })).toBeNull();
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      includeQueuedCommandAttachments: true,
+    })).toBeNull();
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      includeSubagentTranscripts: true,
+      includeQueuedCommandAttachments: true,
+    })).toBe(subagent);
+  });
+
+  it('does not accept queued_command records a subagent gets from its parent agent or as task notifications', () => {
+    const fp = 'please also cover the retry path';
+    writeSubagentJsonl([
+      queuedCommand(`coordinator says: ${fp}`, { origin: { kind: 'coordinator' }, isMeta: true }),
+      queuedCommand(`<task-notification>${fp}</task-notification>`, {
+        commandMode: 'task-notification',
+        origin: { kind: 'task-notification' },
+      }),
+    ]);
+
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      includeSubagentTranscripts: true,
+      includeQueuedCommandAttachments: true,
+    })).toBeNull();
+  });
+
+  it('matches top-level queued_command prompts with the opt-in but never task notifications', () => {
+    const fp = 'please also cover the retry path';
+    writeTopLevelJsonl('notified.jsonl', [
+      queuedCommand(`<task-notification>${fp}</task-notification>`, {
+        commandMode: 'task-notification',
+        origin: { kind: 'task-notification' },
+      }),
+    ], 3_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      includeQueuedCommandAttachments: true,
+    })).toBeNull();
+
+    const typedAhead = writeTopLevelJsonl('typed-ahead.jsonl', [
+      queuedCommand(fp, { commandMode: 'prompt', origin: { kind: 'human' } }),
+    ]);
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      includeQueuedCommandAttachments: true,
+    })).toBe(typedAhead);
+  });
+
+  it('keeps queued_command records out of scans that do not opt in', () => {
+    // Shape of the worker session-switch scan and the confirmSubmit pin
+    // fallback: a match there re-pins the bridge, so a sibling pane's queued
+    // human prompt must not count.
+    const fp = 'please also cover the retry path';
+    const watched = writeTopLevelJsonl('watched.jsonl', [
+      { type: 'user', timestamp: '2026-11-08T07:30:00.000Z', message: { role: 'user', content: 'earlier prompt' } },
+    ]);
+    const sibling = writeTopLevelJsonl('sibling.jsonl', [
+      queuedCommand(fp, { commandMode: 'prompt', origin: { kind: 'human' } }),
+    ], 3_000_000);
+    const workerScan = {
+      excludePath: watched,
+      includeQueueOperations: true,
+      minEventTimestampMs: Date.parse('2026-11-08T07:35:00.000Z'),
+    };
+
+    expect(findJsonlContainingFingerprint(projectDir, fp, workerScan)).toBeNull();
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      ...workerScan,
+      includeQueuedCommandAttachments: true,
+    })).toBe(sibling);
+  });
+
+  it('applies the event timestamp floor to subagent queued_command records', () => {
+    const fp = 'please also cover the retry path';
+    const subagent = writeSubagentJsonl([runningAgentMessage(fp, '2026-11-08T07:36:04.465Z')]);
+    const opts = { includeSubagentTranscripts: true, includeQueuedCommandAttachments: true };
+
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      ...opts,
+      minEventTimestampMs: Date.parse('2026-11-08T07:36:00.000Z'),
+    })).toBe(subagent);
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      ...opts,
+      minEventTimestampMs: Date.parse('2026-11-08T07:37:00.000Z'),
+    })).toBeNull();
+  });
+
   it('does not treat the initial subagent task instruction as forwarded delivery', () => {
-    const sid = '11111111-2222-3333-4444-555555555555';
-    const subDir = join(projectDir, sid, 'subagents');
-    mkdirSync(subDir, { recursive: true });
-    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
     const submittedFingerprint = 'review the exact submission marker';
-    writeFileSync(subagent, [
-      JSON.stringify({
+    writeSubagentJsonl([
+      {
         type: 'user',
         isSidechain: true,
         timestamp: '2026-09-17T03:39:54.000Z',
         message: { role: 'user', content: `Initial agent task: ${submittedFingerprint}` },
-      }),
-      JSON.stringify({
-        type: 'user',
-        isSidechain: true,
-        isMeta: true,
-        timestamp: '2026-09-17T03:39:55.000Z',
-        message: { role: 'user', content: 'The user sent a new message while you were working: unrelated follow-up' },
-      }),
-    ].join('\n') + '\n');
-    utimesSync(subagent, 2_000_000, 2_000_000);
+      },
+      resumedAgentMessage('unrelated follow-up', '2026-09-17T03:39:55.000Z'),
+    ]);
 
     expect(findJsonlContainingFingerprint(projectDir, submittedFingerprint, {
       includeSubagentTranscripts: true,
+      includeQueuedCommandAttachments: true,
     })).toBeNull();
   });
 
+  it('accepts only meta user records from a human in a subagent transcript', () => {
+    const fp = 'review the exact submission marker';
+    writeSubagentJsonl([
+      // Parent agent (coordinator) message and task notification: meta, not human.
+      { type: 'user', isSidechain: true, isMeta: true, origin: { kind: 'coordinator' }, message: { role: 'user', content: `coordinator says: ${fp}` } },
+      { type: 'user', isSidechain: true, isMeta: true, origin: { kind: 'task-notification' }, message: { role: 'user', content: `<task-notification>${fp}</task-notification>` } },
+      // System reminder: meta without origin.
+      { type: 'user', isSidechain: true, isMeta: true, message: { role: 'user', content: `<system-reminder>${fp}</system-reminder>` } },
+      // Human origin but not meta: not a forwarded message.
+      { type: 'user', isSidechain: true, origin: { kind: 'human' }, message: { role: 'user', content: `task: ${fp}` } },
+    ]);
+
+    expect(findJsonlContainingFingerprint(projectDir, fp, {
+      includeSubagentTranscripts: true,
+      includeQueuedCommandAttachments: true,
+    })).toBeNull();
+  });
+
+  it('does not match queue-operation records in subagent transcripts', () => {
+    const fp = 'queued follow-up for Claude';
+    writeSubagentJsonl([{ type: 'queue-operation', operation: 'enqueue', content: fp }]);
+    const opts = {
+      includeQueueOperations: true,
+      includeSubagentTranscripts: true,
+      includeQueuedCommandAttachments: true,
+    };
+    expect(findJsonlContainingFingerprint(projectDir, fp, opts)).toBeNull();
+
+    // Positive control: the same record still counts in a top-level file.
+    const topLevel = writeTopLevelJsonl('queued.jsonl', [{ type: 'queue-operation', operation: 'enqueue', content: fp }]);
+    expect(findJsonlContainingFingerprint(projectDir, fp, opts)).toBe(topLevel);
+  });
+
   it('respects minMtimeMs for otherwise eligible forwarded subagent messages', () => {
-    const sid = '11111111-2222-3333-4444-555555555555';
-    const subDir = join(projectDir, sid, 'subagents');
-    mkdirSync(subDir, { recursive: true });
-    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
-    writeFileSync(subagent, JSON.stringify({
-      type: 'user',
-      isMeta: true,
-      message: { role: 'user', content: 'repeatable short prompt' },
-    }) + '\n');
-    utimesSync(subagent, 1_000_000, 1_000_000);
+    const subagent = writeSubagentJsonl([resumedAgentMessage('repeatable short prompt')], { mtimeSec: 1_000_000 });
 
     // Positive control: without the mtime floor, this forwarded event matches.
     expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
@@ -768,23 +909,8 @@ describe('findJsonlContainingFingerprint', () => {
   });
 
   it('does not descend into non-session-named subdirectories', () => {
-    const forwardedEvent = (content: string) => JSON.stringify({
-      type: 'user',
-      isMeta: true,
-      message: { role: 'user', content },
-    }) + '\n';
-    const rogue = join(projectDir, 'some-other-folder', 'subagents');
-    mkdirSync(rogue, { recursive: true });
-    const rogueFile = join(rogue, 'agent-x.jsonl');
-    writeFileSync(rogueFile, forwardedEvent('fingerprint-in-nested-folder'));
-    utimesSync(rogueFile, 2_000_000, 2_000_000);
-
-    const sid = '11111111-2222-3333-4444-555555555555';
-    const validSubDir = join(projectDir, sid, 'subagents');
-    mkdirSync(validSubDir, { recursive: true });
-    const validFile = join(validSubDir, 'agent-control.jsonl');
-    writeFileSync(validFile, forwardedEvent('valid-session-folder-control'));
-    utimesSync(validFile, 2_000_000, 2_000_000);
+    writeSubagentJsonl([resumedAgentMessage('fingerprint-in-nested-folder')], { sid: 'some-other-folder', name: 'agent-x.jsonl' });
+    const validFile = writeSubagentJsonl([resumedAgentMessage('valid-session-folder-control')], { name: 'agent-control.jsonl' });
 
     // Positive control: the same forwarded-event shape is eligible under a
     // UUID-named session directory.

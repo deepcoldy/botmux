@@ -1852,17 +1852,26 @@ export interface JsonlFingerprintSearchOptions {
    *  fingerprint match like the original behaviour. */
   acceptCandidate?: (path: string) => boolean;
   /** Also scan Task/Agent subagent transcripts at
-   *  `<projectDir>/<sessionId>/subagents/*.jsonl`. A prompt submitted while a
-   *  Task tool agent is running is delivered to that subagent and recorded in
-   *  ITS jsonl ("The user sent a new message while you were working: …"), not
-   *  in the session jsonl the bridge is watching — the top-level-only scan
-   *  then reports a false submit_unconfirmed even though the prompt landed
-   *  and ran. Only `<uuid>/subagents/` is descended (one level), matching
-   *  Claude Code's on-disk layout, so unrelated nested directories are not
-   *  walked. Callers that PIN the matched path as the new bridge target must
-   *  leave this off: a subagent jsonl must never replace the session jsonl as
-   *  the watched transcript. */
+   *  `<projectDir>/<sessionId>/subagents/*.jsonl`. While the TUI is viewing a
+   *  subagent, Claude Code hands a submitted prompt to THAT agent and records
+   *  it only in its jsonl — the session jsonl the bridge is watching gets no
+   *  record of it, so the top-level-only scan reports a false
+   *  submit_unconfirmed although the prompt landed. Subagent candidates only
+   *  accept the records Claude writes for a human message forwarded to the
+   *  agent (see jsonlTailMatchFingerprint). Only `<uuid>/subagents/` is
+   *  descended (one level), matching Claude Code's on-disk layout, so
+   *  unrelated nested directories are not walked. Callers that PIN the matched
+   *  path as the new bridge target must leave this off: a subagent jsonl must
+   *  never replace the session jsonl as the watched transcript. */
   includeSubagentTranscripts?: boolean;
+  /** Also match `attachment(queued_command)` records (text in
+   *  `attachment.prompt`), except task notifications. A prompt handed to a
+   *  RUNNING subagent is only ever written this way, once the agent takes its
+   *  next step. Independent of includeSubagentTranscripts, which only widens
+   *  the file set: this widens what counts as a submit record in every
+   *  scanned file, so callers that pin the matched path or treat a match as
+   *  session-switch evidence must leave it off. */
+  includeQueuedCommandAttachments?: boolean;
 }
 
 /** True when the event carries a parseable timestamp at or after `floorMs`.
@@ -1955,8 +1964,9 @@ const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 
 /** Tail-scan one jsonl file for the fingerprint. Mirrors the event-decoding
  *  rules used everywhere else: role:user text (pure tool_result events
- *  skipped), optionally queue-operation enqueue, whitespace-normalised
- *  substring match, with a per-event timestamp guard. Returns:
+ *  skipped), optionally queue-operation enqueue and queued_command
+ *  attachments, whitespace-normalised substring match, with a per-event
+ *  timestamp guard. Returns:
  *  - 'match' when a fingerprint-bearing event was found,
  *  - 'veto' when a match was found but acceptCandidate rejected the file,
  *  - 'none' otherwise. */
@@ -2002,13 +2012,13 @@ function jsonlTailMatchFingerprint(
         const role = ev.message?.role ?? ev.type;
         let text = '';
         if (role === 'user') {
-          // A subagent transcript starts with its task instruction as a normal
-          // user event. That instruction was not delivered by this submission,
-          // so it must not confirm the submit merely because it contains the
-          // same fingerprint. Claude marks messages forwarded to an already
-          // running subagent as meta user events; require that boundary rather
-          // than matching arbitrary subagent input.
-          if (requireForwardedSubagentMessage && ev.isMeta !== true) continue;
+          // A subagent transcript opens with its task instruction and also
+          // gets meta user records that no human sent (system reminders, task
+          // notifications, messages from the parent agent), any of which may
+          // quote the same text. Only a human message forwarded to the agent
+          // proves this submission landed: Claude writes it (when the message
+          // resumes a stopped agent) with isMeta and origin.kind 'human'.
+          if (requireForwardedSubagentMessage && !(ev.isMeta === true && ev.origin?.kind === 'human')) continue;
           // Skip pure tool_result events — see jsonlContainsFingerprint
           // for the full rationale; in short, tool_result content is
           // log output, not user input, and would false-match short
@@ -2017,10 +2027,23 @@ function jsonlTailMatchFingerprint(
           text = stringifyUserContent(ev.message?.content);
         } else if (
           opts.includeQueueOperations &&
+          // Subagent candidates accept only the forwarded-human shapes.
+          !requireForwardedSubagentMessage &&
           ev.type === 'queue-operation' &&
           ev.operation === 'enqueue'
         ) {
           text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+        } else if (
+          opts.includeQueuedCommandAttachments &&
+          ev.type === 'attachment' &&
+          ev.attachment?.type === 'queued_command' &&
+          ev.attachment.commandMode !== 'task-notification'
+        ) {
+          // A running subagent also receives queued_command records from its
+          // parent agent (origin 'coordinator') and task notifications.
+          if (requireForwardedSubagentMessage && ev.attachment.origin?.kind !== 'human') continue;
+          const prompt = ev.attachment.prompt;
+          text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
         } else {
           continue;
         }
@@ -2072,7 +2095,7 @@ export function findJsonlContainingFingerprint(
         continue;
       }
       // Subagent transcripts: <projectDir>/<session-uuid>/subagents/*.jsonl.
-      // A prompt submitted while a Task tool agent is running lands in the
+      // A prompt submitted while the TUI views a subagent lands in the
       // SUBAGENT's jsonl, not the session jsonl. Only this exact shape is
       // descended (one level) — see SESSION_SUBDIR_RE.
       if (!st.isDirectory() || !opts.includeSubagentTranscripts) continue;
