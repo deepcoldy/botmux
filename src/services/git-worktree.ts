@@ -11,7 +11,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, join, parse, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
@@ -133,7 +133,7 @@ export function slugFromWorktreeText(text: string | undefined | null): string | 
 
 /**
  * Where a new worktree directory `dirName` for `repo` goes: next to `repo`,
- * or, with the global `worktreeRoot` setting pointing at an existing
+ * or, with the global `worktreeRoot` setting pointing at an existing writable
  * directory (e.g. to keep worktrees off a small system disk), at that same
  * spot mirrored under the root — `/src/app` gets `<root>/src/<dirName>` — so
  * clones sharing a name never collide and {@link resolveDeletedWorktreeOrigin}
@@ -154,8 +154,9 @@ let warnedUnusableRoot: string | undefined;
 /**
  * The configured `worktreeRoot` with symlinks resolved, so lock files and
  * recorded paths match the realpath cleanup computes; `undefined` when unset
- * or not an existing directory — `mkdir -p` would otherwise quietly re-create
- * the path of an unmounted disk on the system disk.
+ * or not an existing writable directory — `mkdir -p` would otherwise quietly
+ * re-create the path of an unmounted disk on the system disk, and a disk
+ * remounted read-only would fail every new worktree.
  */
 function usableWorktreeRoot(): string | undefined {
   const configured = readGlobalConfig().worktreeRoot;
@@ -163,15 +164,16 @@ function usableWorktreeRoot(): string | undefined {
   try {
     const root = realpathSync(expandHomePath(configured));
     if (statSync(root).isDirectory()) {
+      accessSync(root, fsConstants.W_OK);
       warnedUnusableRoot = undefined;
       return root;
     }
   } catch {
-    // Missing or unreadable: same fallback as a non-directory.
+    // Missing, unreadable or not writable: same fallback as a non-directory.
   }
   if (warnedUnusableRoot !== configured) {
     warnedUnusableRoot = configured;
-    logger.warn(`[git-worktree] worktreeRoot ${configured} is not an existing directory; creating worktrees next to their repo`);
+    logger.warn(`[git-worktree] worktreeRoot ${configured} is not an existing writable directory; creating worktrees next to their repo`);
   }
   return undefined;
 }
