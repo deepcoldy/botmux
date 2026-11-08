@@ -645,6 +645,7 @@ import {
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
+import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
 import {
   ClaudeTranscriptTurnEnd,
   claudeTranscriptLatestTurnState,
@@ -2728,6 +2729,19 @@ function seedAndTrustClaudeState(
 }
 
 const IDLE_PROBE_INTERVAL_MS = 3_500;
+/**
+ * Bounded fallback for an unbounded viewport busy-marker veto. After a defer
+ * episode lasts this long WITH the composer visible and the screen frozen, a
+ * lingering busy glyph is treated as stale and prompt-ready is released. The
+ * env overrides exist only for deterministic worker tests; production uses the
+ * conservative defaults (≥5 probe intervals, well above transient flicker).
+ */
+const BUSY_READY_FALLBACK_MS = Number(process.env.BOTMUX_TEST_BUSY_READY_FALLBACK_MS) || 17_500;
+const BUSY_STABLE_SCREEN_MS = Number(process.env.BOTMUX_TEST_BUSY_STABLE_SCREEN_MS) || 7_000;
+const busyReadyFallbackGate = new BusyReadyFallbackGate(() => ({
+  fallbackMs: BUSY_READY_FALLBACK_MS,
+  stableScreenMs: BUSY_STABLE_SCREEN_MS,
+}));
 let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 /** This worker re-attached a CLI that survived the previous worker, and that
@@ -22630,7 +22644,12 @@ function stopBusyPatternIdleProbe(): void {
 }
 
 function scheduleBusyPatternIdleProbe(source: string): void {
+  // A re-entrant schedule while a probe timer is already armed belongs to the
+  // same busy episode; only a genuinely fresh schedule restarts the bounded
+  // fallback clock so the bound cannot be pushed out forever by re-entry.
+  const continuing = busyPatternIdleProbeTimer !== null;
   stopBusyPatternIdleProbe();
+  if (!continuing) busyReadyFallbackGate.reset();
   if ((!cliAdapter?.busyPattern && !cliAdapter?.isSessionBusy) || !backend) return;
   if (!cliAdapter?.isSessionBusy) {
     if (!canCaptureBusyPatternScreen(backend)) return;
@@ -22642,6 +22661,7 @@ function scheduleBusyPatternIdleProbe(source: string): void {
     if (!backend || isPromptReady) return;
     if (probeBusyPatternIdle(source, backend)) return;
     if (!isPromptReady) {
+      if (maybeForceReadyOnStaleBusyMarker(source, backend)) return;
       busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);
       busyPatternIdleProbeTimer.unref?.();
     }
@@ -22649,6 +22669,54 @@ function scheduleBusyPatternIdleProbe(source: string): void {
 
   busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);
   busyPatternIdleProbeTimer.unref?.();
+}
+
+/**
+ * Bounded release for a viewport busy marker that outlives the turn it
+ * describes. Called only from the busy-pattern re-probe loop after
+ * probeBusyPatternIdle() still deferred. Returns true when it forced
+ * prompt-ready (and stopped the loop). It never overrides structured
+ * session-state busy and only acts on positive composer evidence while the
+ * screen is frozen, so a genuinely working CLI keeps deferring. */
+function maybeForceReadyOnStaleBusyMarker(source: string, be: SessionBackend): boolean {
+  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  // The structured session-state store is authoritative: never force readiness
+  // while it reports active work, even if the viewport glyph looks stale.
+  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
+    sessionId,
+    cliSessionId: currentCliSid,
+    isCliProcessAlive: cliProcessAliveProbe(be),
+    getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
+      ? () => captureBackendScreen(be) : undefined,
+  })) {
+    return false;
+  }
+  if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
+  let content = '';
+  try {
+    content = captureBackendScreen(be);
+  } catch (err: any) {
+    log(`${source} bounded busy fallback screen capture failed: ${err.message}`);
+    return false;
+  }
+  if (!content) return false;
+  // Positive idle evidence only: the real input composer must be on screen.
+  const readyPatternVisible = !!cliAdapter.readyPattern
+    && cliAdapter.readyPattern.test(stripAnsiScreenText(content));
+  const observation = {
+    now: Date.now(),
+    screenRevision: backendScreenRevision,
+    readyPatternVisible,
+    sessionStateBusy: false,
+    cliAlive: cliProcessAliveFromBackend(be),
+  };
+  busyReadyFallbackGate.observe(observation);
+  if (!busyReadyFallbackGate.shouldForceReady(observation)) return false;
+  log(`${source}: busy marker lingered past the bounded fallback window with the composer visible `
+    + 'and the screen frozen; releasing prompt ready');
+  busyReadyFallbackGate.reset();
+  markPromptReady();
+  return true;
 }
 
 /** Resolve the actual worker argv boundary before handing it to the adapter. */
