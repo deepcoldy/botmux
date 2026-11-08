@@ -516,7 +516,7 @@ import {
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
 import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, setPromptSubmittedObserver, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -830,7 +830,7 @@ import {
 } from './workflows/v3/daemon-run.js';
 import { v3ActionActor, v3ActionRecord, v3ReasonRequiredProblem } from './workflows/v3/action-provenance.js';
 import { handNodeToHuman } from './workflows/v3/external-control.js';
-import { createWorkflowMainWake, workflowMainWakeSessionState } from './core/workflow-main-wake.js';
+import { createWorkflowMainWake, workflowMainWakeAcceptanceReported, workflowMainWakeSessionState } from './core/workflow-main-wake.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3RerunGrantCard, buildV3RevisionCard } from './im/lark/v3-revision-card.js';
 import {
@@ -7156,6 +7156,13 @@ const workflowMainWake = createWorkflowMainWake({
   // The cascade's idle evidence (cli-idle-wait); until restore re-attached
   // the CLIs that survived a restart, every session counts as busy.
   sessionState: (sessionId) => workflowMainWakeSessionState(findActiveBySessionId(sessionId), { sessionsRestored }),
+  // The worker's native input receipts and Claude Code's UserPromptSubmit
+  // hook tell when the CLI took a wake's text.
+  provesInputAcceptance: (sessionId) => {
+    const ds = findActiveBySessionId(sessionId);
+    return !!ds && workflowMainWakeAcceptanceReported(ds, getBot(ds.larkAppId).config.cliId);
+  },
+  inputWritten: (sessionId, turnId) => findActiveBySessionId(sessionId)?.replyExecutionStarts?.has(JSON.stringify([turnId, null])) === true,
   deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: workflowSelfAppId(), activeSessions }, internal),
   drive: (runId) => v3GateRunner.driveDetached(runId),
   listRunIds: () => {
@@ -7167,6 +7174,7 @@ const workflowMainWake = createWorkflowMainWake({
   },
   warn: (message) => logger.warn(message),
 });
+setPromptSubmittedObserver((sessionId) => workflowMainWake.onPromptSubmitted(sessionId));
 
 /** The directory a main-topic node the main bot runs itself would meet: its
  *  main session's, found by the same lookup the node's delivery makes (the
@@ -33123,6 +33131,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // Cover the frozen background now so an in-flight follow-up, a worker
       // replacement or a daemon restart before the terminal cannot repeat it.
       if (ds.session.workerGeneration !== context.workerGeneration) return;
+      workflowMainWake.onInputAccepted(ds.session.sessionId, receipt.turnId);
       const knownNative = ds.session.cliSessionId;
       // A receipt naming a different established native conversation is not
       // this session's evidence; a provisional first turn may learn its id here.

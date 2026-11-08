@@ -822,6 +822,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - 何时扫描：每次驱动 run 结束时（`onDriveEnd`）、主会话回到 idle 时、轮询时；daemon 冷启动时扫描本 bot 拥有的全部 run，补上崩溃或重启前没来得及签发的唤醒（受阻的 run 冷启动时不会被重新驱动，单靠驱动钩子会漏）。同一 run 的扫描串行，同一事件在本进程内不会并发投递。
 - **检查点暂停与放行**（`src/workflows/v3/checkpoint-hold.ts`）：运行时每一拍从 journal 推出「当前、未放行的检查点完成」，依赖它的节点不派发、不解析条件边、不判跳过，`one_success` 的提前放行也不取消落败者（取消是被挡住的那个节点的决定，主 Bot 看完结果可能还要用落败者）——与待确认修改的暂停同一处。放行写一条 `checkpointReleased { nodeId, instanceId?, attemptId, eventSeq, reason }`，重放可得、重启不丢，旧版本读到会跳过。放行时机：
   - 唤醒回合结束 → `wakeTurnEnded`，然后重新驱动。「结束」指该回合自己的 turn terminal；没有 terminal 的 CLI 兜底看屏幕：先看到**屏幕所属回合就是这条唤醒**的 working，之后会话变 idle 才算。排在别的回合（人的消息、上一条唤醒）后面、还没开始的唤醒，不会被前一个回合的结束放行；
+    能确认 CLI 收下输入的主会话，「结束」还要求**先确认 CLI 收下了这条唤醒**。worker 在写入那一刻就把屏幕记在这条唤醒名下，CLI 若没提交（文字停在输入框），worker 看到的 idle、以及此时收到的 terminal 都不算结束：记一次告警，继续等确认，确认之后的下一次 idle 或 terminal 才放行；一直等不到就到 60 分钟上限按 `holdTimeout` 放行（告警 + 节点卡超时文案），不重发唤醒。确认来源：① worker 的 `native_input_consumed`（Claude 系 transcript 里出现整条唤醒的 user 记录；Codex 的 history 行或 app-server turn/start 确认），按 turnId 精确对应；② Claude Code 的 UserPromptSubmit hook claim。hook 是会话级信号，只认 daemon 已看到这条唤醒写入（`turn_execution_started`）之后的那次，排在别人回合后面的唤醒不会被前一个回合的 hook 认领。适用范围：Claude 系（claude-code、seed、relay、genius）和 codex，接管（adopt）的会话除外；其它 CLI 没有这类信号，维持上面的旧规则。确认只在内存里，daemon 重启后按下面「重启找回」处理；
   - 承接唤醒的会话被关闭、或它的 CLI 停了（worker 退出且没有新的在起）→ `wakeSessionEnded`，在下一次扫描/轮询时放行（不必等满上限）；会话还在首启（选目录、开场输入未起 CLI）不算停；
   - 唤醒投递不出去（重试用完、或记录已写但回合没起来）→ `wakeNotDelivered`；
   - 安全上限：完成后 60 分钟仍未放行 → `holdTimeout`（覆盖主会话长时间忙、唤醒回合卡住等情况）；

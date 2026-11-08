@@ -2509,6 +2509,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_
   });
 });
 
+let promptSubmittedObserver: ((sessionId: string) => void) | null = null;
+
+/** Daemon injects who hears that a session's CLI submitted its input box
+ *  (an authenticated UserPromptSubmit hook claim). */
+export function setPromptSubmittedObserver(observer: ((sessionId: string) => void) | null): void {
+  promptSubmittedObserver = observer;
+}
+
 /**
  * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
  *
@@ -2546,6 +2554,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
         /* best-effort notification: callback suppresses unhandled 'error' event on dead IPC */
       });
     } catch { /* IPC gone */ }
+  }
+  if (ds?.session.status === 'active') {
+    try { promptSubmittedObserver?.(params.sessionId); } catch { /* never fails the claim */ }
   }
   // 权威 turnId：daemon 当前这轮的 turnId（worker 发布的 managed_turn_origin）。
   // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。

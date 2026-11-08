@@ -23,6 +23,7 @@ import {
   WORKFLOW_CHECKPOINT_HOLD_MAX_MS,
   WORKFLOW_MAIN_WAKE_MAX_RETRIES,
   WORKFLOW_MAIN_WAKE_POLL_MS,
+  workflowMainWakeAcceptanceReported,
   workflowMainWakeSessionState,
   type WorkflowMainWakeDeliveryControls,
   type WorkflowMainWakeDeps,
@@ -770,17 +771,31 @@ describe('checkpoint: the dependants wait for the main bot', () => {
   }
   type MainSession = ReturnType<typeof mainSession>;
 
-  /** The issuer over a BotRun (no envelope needed) and one main session. */
+  /** The issuer over a BotRun (no envelope needed) and one main session.
+   *  `reportsInput`: the session's CLI reports taking an input (Claude Code,
+   *  Codex); otherwise it is one with no such signal. */
   function cpIssuer(
     run: { base: string; dag: V3Dag },
-    opts: { accept?: Verdict; clock?: { t: number }; session?: MainSession; loadRun?: WorkflowMainWakeDeps['loadRun'] } = {},
+    opts: {
+      accept?: Verdict; clock?: { t: number }; session?: MainSession; loadRun?: WorkflowMainWakeDeps['loadRun'];
+      reportsInput?: boolean;
+    } = {},
   ) {
     const session = opts.session ?? mainSession();
     const deliveries: TriggerRequest[] = [];
     const drives: string[] = [];
     const warnings: string[] = [];
     const timers: Array<() => void> = [];
+    /** Turns the worker wrote to the CLI: each one it started. */
+    const written = new Set<string>();
+    const start = (turnId: string | undefined) => {
+      session.worker.active = turnId;
+      if (turnId) written.add(turnId);
+    };
     const wake = createWorkflowMainWake({
+      ...(opts.reportsInput
+        ? { provesInputAcceptance: () => true, inputWritten: (_sessionId: string, turnId: string) => written.has(turnId) }
+        : {}),
       baseDir: () => run.base,
       selfLarkAppId: () => BINDING.larkAppId,
       loadRun: opts.loadRun ?? (() => ({ dag: run.dag })),
@@ -793,7 +808,7 @@ describe('checkpoint: the dependants wait for the main bot', () => {
         if (opts.accept === 'refuse') return { ok: false, errorCode: 'session_not_runnable', error: 'pending_repo' };
         internal.beforeDispatch({ sessionId: 'sess-main', workerGeneration: 1 });
         if (session.worker.active) session.worker.queue.push(internal.stableTurnId);
-        else session.worker.active = internal.stableTurnId;
+        else start(internal.stableTurnId);
         return { ok: true, action: 'delivered', triggerId: internal.stableTurnId };
       },
       drive: (runId) => { drives.push(runId); },
@@ -808,29 +823,36 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       for (const fn of timers.splice(0)) fn();
       await settled();
     };
-    /** A screen update, carrying the turn the worker is on. */
-    const screen = (status: string) => {
+    /** A screen update, carrying the turn the worker is on — or none (the
+     *  working state the worker forces when the CLI's prompt hook runs). */
+    const screen = (status: string, shown: { turnless?: true } = {}) => {
       const prevStatus = session.ds.lastScreenStatus;
       session.ds.lastScreenStatus = status;
       wake.onScreenStatus('sess-main', {
         status,
         ...(prevStatus ? { prevStatus } : {}),
-        ...(session.worker.active ? { turnId: session.worker.active } : {}),
+        ...(session.worker.active && !shown.turnless ? { turnId: session.worker.active } : {}),
       });
     };
     /** The running turn reaches its terminal; the next queued one starts. */
     const endTurn = () => {
       const ended = session.worker.active;
-      session.worker.active = session.worker.queue.shift();
+      start(session.worker.queue.shift());
       if (ended) wake.onTurnEnded('sess-main', ended);
       return ended;
     };
     /** A person's message reaches the worker as a turn of its own. */
     const personTurn = (turnId = 'om_person') => {
       if (session.worker.active) session.worker.queue.push(turnId);
-      else session.worker.active = turnId;
+      else start(turnId);
     };
-    return { wake, session, deliveries, drives, warnings, timers, tick, settled, screen, endTurn, personTurn };
+    /** The worker proves the CLI took this turn's text (native_input_consumed). */
+    const inputTaken = (turnId: string) => wake.onInputAccepted('sess-main', turnId);
+    /** The CLI submits its input box (UserPromptSubmit hook). */
+    const promptSubmitted = () => wake.onPromptSubmitted('sess-main');
+    return {
+      wake, session, deliveries, drives, warnings, timers, tick, settled, screen, endTurn, personTurn, inputTaken, promptSubmitted,
+    };
   }
   type Verdict = 'dispatch' | 'refuse';
 
@@ -1015,6 +1037,127 @@ describe('checkpoint: the dependants wait for the main bot', () => {
     clock2.t = other.cp.at + WORKFLOW_CHECKPOINT_HOLD_MAX_MS;
     await issuer2.tick();
     expect(other.run.of('checkpointReleased')).toEqual([expect.objectContaining({ reason: 'holdTimeout' })]);
+  });
+
+  describe('on a CLI that reports taking input, the wake turn ends only after the CLI took the wake\'s text', () => {
+    it('such a CLI: the Claude family and Codex, the session\'s own or its bot\'s — not an adopted pane, not a CLI without the signal', () => {
+      const ds = (session: Record<string, unknown>) =>
+        ({ session: { sessionId: 'sess-main', status: 'active', ...session } }) as unknown as DaemonSession;
+      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'claude-code' }), 'cursor')).toBe(true);
+      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'seed' }), 'cursor')).toBe(true);
+      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'codex' }), 'cursor')).toBe(true);
+      expect(workflowMainWakeAcceptanceReported(ds({}), 'codex')).toBe(true);
+      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'cursor' }), 'claude-code')).toBe(false);
+      expect(workflowMainWakeAcceptanceReported(ds({ cliId: 'codex-app' }), 'claude-code')).toBe(false);
+      expect(workflowMainWakeAcceptanceReported(
+        ds({ cliId: 'claude-code', adoptedFrom: { cliId: 'claude-code' } }), 'claude-code',
+      )).toBe(false);
+      expect(workflowMainWakeAcceptanceReported(undefined, 'claude-code')).toBe(false);
+    });
+
+    it('written but not submitted: the idle prompt and a terminal release nothing; once the CLI takes it, the end of that run releases it, once', async () => {
+      const { run, executor, cp } = await heldRun('cp-unsubmitted');
+      const m = cpIssuer(run, { reportsInput: true });
+      await m.wake.scan(run.dag.runId);
+      const wakeTurn = mintWorkflowEventTurnId(run.dag.runId, cp.eventSeq);
+      expect(m.session.worker.active).toBe(wakeTurn);
+      // The text sits in the CLI's input box. The worker shows the turn as
+      // running from its write on, then reads the idle prompt as its end.
+      m.screen('working');
+      m.screen('idle');
+      m.wake.onTurnEnded('sess-main', wakeTurn);
+      await m.tick();
+      expect(released(run)).toEqual([]);
+      expect(m.warnings).toEqual([expect.stringContaining('before the main session\'s CLI took its text')]);
+      await run.drive(executor);
+      expect(dispatchedTo(executor, 'b')).toBe(0);
+      // Minutes later the CLI submits it, runs it, and goes idle.
+      m.promptSubmitted();
+      expect(released(run)).toEqual([]);
+      m.screen('working', { turnless: true });
+      expect(released(run)).toEqual([]);
+      m.screen('idle');
+      expect(released(run)).toEqual(['a:wakeTurnEnded']);
+      // Its terminal, late, and later idle edges release nothing more.
+      m.wake.onTurnEnded('sess-main', wakeTurn);
+      m.screen('working');
+      m.screen('idle');
+      expect(released(run)).toEqual(['a:wakeTurnEnded']);
+      expect(m.drives).toEqual([run.dag.runId]);
+      expect(m.deliveries).toHaveLength(1);
+      expect(m.warnings).toHaveLength(1);
+      await run.drive(executor);
+      expect(dispatchedTo(executor, 'b')).toBe(1);
+    });
+
+    it('the transcript proof: a terminal after it releases, once; one read off the idle prompt before it does not, the real one after it does', async () => {
+      const first = await heldRun('cp-proof');
+      const m = cpIssuer(first.run, { reportsInput: true });
+      await m.wake.scan(first.run.dag.runId);
+      const wakeTurn = m.session.worker.active!;
+      m.screen('working');
+      m.inputTaken(wakeTurn);
+      m.endTurn();
+      m.wake.onTurnEnded('sess-main', wakeTurn);
+      expect(released(first.run)).toEqual(['a:wakeTurnEnded']);
+      expect(m.drives).toEqual([first.run.dag.runId]);
+      expect(m.warnings).toEqual([]);
+
+      const late = await heldRun('cp-proof-late');
+      const l = cpIssuer(late.run, { reportsInput: true });
+      await l.wake.scan(late.run.dag.runId);
+      const lateTurn = l.session.worker.active!;
+      l.screen('working');
+      l.screen('idle');
+      l.wake.onTurnEnded('sess-main', lateTurn);
+      l.inputTaken('om_person'); // another turn's input proves nothing about the wake
+      l.wake.onTurnEnded('sess-main', lateTurn);
+      expect(released(late.run)).toEqual([]);
+      l.inputTaken(lateTurn);
+      expect(released(late.run)).toEqual([]);
+      l.screen('working');
+      l.endTurn();
+      expect(released(late.run)).toEqual(['a:wakeTurnEnded']);
+    });
+
+    it('the prompt hook is the session\'s: one for the turn a wake is queued behind proves nothing about the wake', async () => {
+      const { run, cp } = await heldRun('cp-hook-queued');
+      const m = cpIssuer(run, { reportsInput: true });
+      m.personTurn();
+      await m.wake.scan(run.dag.runId);
+      expect(m.session.worker.queue).toEqual([mintWorkflowEventTurnId(run.dag.runId, cp.eventSeq)]);
+      m.promptSubmitted(); // the person's message
+      m.screen('working');
+      m.screen('idle');
+      m.endTurn(); // the wake is written now
+      m.screen('working');
+      m.screen('idle');
+      expect(released(run)).toEqual([]);
+      m.promptSubmitted();
+      m.screen('working', { turnless: true });
+      m.screen('idle');
+      expect(released(run)).toEqual(['a:wakeTurnEnded']);
+    });
+
+    it('never taken: held to the cap, then let go as holdTimeout — said out loud', async () => {
+      const { run, executor, cp } = await heldRun('cp-never-taken');
+      const clock = { t: cp.at };
+      const m = cpIssuer(run, { reportsInput: true, clock });
+      await m.wake.scan(run.dag.runId);
+      m.screen('working');
+      m.screen('idle');
+      m.endTurn();
+      clock.t = cp.at + WORKFLOW_CHECKPOINT_HOLD_MAX_MS - 1;
+      await m.tick();
+      expect(released(run)).toEqual([]);
+      clock.t = cp.at + WORKFLOW_CHECKPOINT_HOLD_MAX_MS;
+      await m.tick();
+      expect(released(run)).toEqual(['a:holdTimeout']);
+      expect(m.warnings.join('\n')).toContain('without the main bot\'s review (holdTimeout)');
+      expect(m.deliveries).toHaveLength(1);
+      await run.drive(executor);
+      expect(dispatchedTo(executor, 'b')).toBe(1);
+    });
   });
 
   it('the session that took the wake is closed, or its CLI stops, mid-review: released at the next poll, said out loud', async () => {
