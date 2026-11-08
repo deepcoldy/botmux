@@ -384,6 +384,55 @@ describe('Open Platform payload helpers', () => {
     });
     expect(buildSafeSettingPayload('cli_x').redirectURL).toEqual(['http://127.0.0.1:9768/callback']);
   });
+
+  it('tenant-only 名字进 user 桶时落 missingUserScopes 且不借用 tenant 目录 ID', () => {
+    const entries = extractOpenPlatformScopeEntries({
+      data: { appScopeList: [{ id: 101, name: 'spark:app:read' }], userScopeList: [] },
+    });
+    expect(mapManifestScopesToOpenPlatformIds({ scopes: { user: ['spark:app:read'] } }, entries)).toEqual({
+      tenantScopeIds: [],
+      userScopeIds: [],
+      missingTenantScopes: [],
+      missingUserScopes: ['spark:app:read'],
+    });
+  });
+
+  it('user-only 名字进 tenant 桶时落 missingTenantScopes 且不借用 user 目录 ID', () => {
+    const entries = extractOpenPlatformScopeEntries({
+      data: { appScopeList: [], userScopeList: [{ scopeId: '202', scopeName: 'offline_access' }] },
+    });
+    expect(mapManifestScopesToOpenPlatformIds({ scopes: { tenant: ['offline_access'] } }, entries)).toEqual({
+      tenantScopeIds: [],
+      userScopeIds: [],
+      missingTenantScopes: ['offline_access'],
+      missingUserScopes: [],
+    });
+  });
+
+  it('同名 scope 在两个桶各取各的 ID，未标桶的目录项两边都可用', () => {
+    const entries = extractOpenPlatformScopeEntries({
+      data: {
+        appScopeList: [{ id: 101, name: 'im:message' }],
+        userScopeList: [{ scopeId: '202', scopeName: 'im:message' }],
+      },
+    });
+    expect(mapManifestScopesToOpenPlatformIds(
+      { scopes: { tenant: ['im:message'], user: ['im:message'] } },
+      entries,
+    )).toMatchObject({ tenantScopeIds: ['101'], userScopeIds: ['202'] });
+
+    const unbucketed = extractOpenPlatformScopeEntries({ data: { list: [{ id: 303, name: 'docs:doc' }] } });
+    expect(unbucketed).toEqual([{ id: '303', name: 'docs:doc', bucket: undefined }]);
+    expect(mapManifestScopesToOpenPlatformIds(
+      { scopes: { tenant: ['docs:doc'], user: ['docs:doc'] } },
+      unbucketed,
+    )).toEqual({
+      tenantScopeIds: ['303'],
+      userScopeIds: ['303'],
+      missingTenantScopes: [],
+      missingUserScopes: [],
+    });
+  });
 });
 
 describe('filterScopeManifest — 只申请缺失项，避免全量 manifest 过度申请', () => {

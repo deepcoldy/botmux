@@ -493,5 +493,27 @@ describe('parseSetupCommand --extra-scopes-file', () => {
     expect(() => parseSetupCommand(['list', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
     expect(() => parseSetupCommand(['edit', 'botmux-0', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
     expect(() => parseSetupCommand(['remove', 'botmux-0', '--yes', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['list', '--extra-scopes-file', '-'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--extra-scopes-file=-'])).toThrow(/仅适用于 add 或 configure/);
+  });
+
+  it('configure 传 - 表示清除记下的路径，add 不接受', () => {
+    expect(parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file', '-']))
+      .toMatchObject({ action: 'configure', extraScopesFile: null });
+    expect(parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file=-']))
+      .toMatchObject({ action: 'configure', extraScopesFile: null });
+    expect(() => parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--extra-scopes-file', '-']))
+      .toThrow(/只用于 configure/);
+  });
+
+  it('add --brand lark 不接受（Lark 没有开放平台自动配置，追加清单不会生效）', () => {
+    expect(() => parseSetupCommand([
+      'add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--brand', 'Lark',
+      '--open-platform-auto', '--extra-scopes-file', 's.json',
+    ])).toThrow(/Lark/);
+    expect(parseSetupCommand([
+      'add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--brand', 'feishu',
+      '--open-platform-auto', '--extra-scopes-file', 's.json',
+    ])).toMatchObject({ extraScopesFile: 's.json' });
   });
 });

@@ -49,7 +49,8 @@ export type SetupCommand =
   | { action: 'help' }
   | { action: 'list'; json: boolean }
   | { action: 'add'; json: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; flags: SetupBotFlags; extraScopesFile?: string }
-  | { action: 'configure'; json: boolean; selector: string; switchAccount: boolean; extraScopesFile?: string }
+  /** extraScopesFile：undefined 是没传，null 是 `--extra-scopes-file -`（清除已记录的路径）。 */
+  | { action: 'configure'; json: boolean; selector: string; switchAccount: boolean; extraScopesFile?: string | null }
   | { action: 'edit'; json: boolean; selector: string; flags: SetupBotFlags }
   | { action: 'remove'; json: boolean; selector: string; yes: boolean };
 
@@ -108,11 +109,12 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
       owner 可用完整邮箱、手机号、union_id on_xxx，或该应用自己签发的
       open_id ou_xxx；写盘前会用凭证校验，失败不写盘。
 
-  botmux setup configure <进程名|AppID> [--switch-account] [--extra-scopes-file <json>] [--json]
+  botmux setup configure <进程名|AppID> [--switch-account] [--extra-scopes-file <json|->] [--json]
       对已添加的机器人重跑开放平台权限、长连接事件、redirect 与发版。
       用于 add 返回 partial 后继续，不会重复创建应用；成功后自动尝试上线。
       登录账号不对时加 --switch-account 明确重新扫码。
-      不传 --extra-scopes-file 时沿用 add / 上次 configure 记下的追加权限清单。
+      不传 --extra-scopes-file 时沿用 add / 上次 configure 记下的追加权限清单
+      （文件读不了只警告、本次只申请内置清单，不改写配置）；传 - 清除记下的清单。
 
   botmux setup edit <进程名|AppID> [字段选项...]
       按字段修改机器人（如 botmux setup edit botmux-0 --cli codex）。
@@ -154,18 +156,20 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --open-platform-auto       add 成功后执行开放平台自动配置（默认跳过；
                              --create-app 时默认开启）
   --no-open-platform-auto    跳过开放平台权限/发版自动配置
-  --extra-scopes-file <json> add / configure 时在内置权限清单之外追加申请的权限。
+  --extra-scopes-file <json> add / configure 时在内置权限清单之外追加申请的权限（仅飞书租户）。
                              格式同内置清单 {"scopes":{"tenant":[],"user":[]}}，
-                             或 {"scopes":[{"scope":"x:y"}]}（列表项视为 user 权限）。
+                             或 {"scopes":[{"scope":"x:y"}]}（列表项一律按 user 权限
+                             申请，tenant 权限请用前一种分桶格式）。
                              权限名先做语法校验；当前租户目录里没有的权限会被
                              跳过并在结果 skippedScopes 中列出，不中断流程。
-                             文件路径会记到该机器人配置，configure 重跑时沿用。
+                             文件路径会记到该机器人配置，configure 重跑时沿用；
+                             configure 传 - 清除记下的路径。
 `;
 
 function parseBotFieldFlags(
   tokens: string[],
   opts: { allowFields: boolean; action: string },
-): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; extraScopesFile?: string; positional: string[] } {
+): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; extraScopesFile?: string | null; positional: string[] } {
   const flags: SetupBotFlags = {};
   const positional: string[] = [];
   let json = false;
@@ -175,7 +179,7 @@ function parseBotFieldFlags(
   let switchAccount = false;
   let openPlatformAuto = false;
   let openPlatformAutoSpecified = false;
-  let extraScopesFile: string | undefined;
+  let extraScopesFile: string | null | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -196,7 +200,7 @@ function parseBotFieldFlags(
         else i++;
       }
       if (!value?.trim()) throw new Error('--extra-scopes-file 缺少文件路径。查看用法：botmux setup help');
-      extraScopesFile = value.trim();
+      extraScopesFile = value.trim() === '-' ? null : value.trim();
       continue;
     }
 
@@ -252,8 +256,8 @@ function isSettingWrapperCli(raw: string | undefined): boolean {
   return !!value && value !== '-';
 }
 
-function rejectExtraScopes(extraScopesFile: string | undefined): void {
-  if (extraScopesFile) throw new Error('--extra-scopes-file 仅适用于 add 或 configure。');
+function rejectExtraScopes(extraScopesFile: string | null | undefined): void {
+  if (extraScopesFile !== undefined) throw new Error('--extra-scopes-file 仅适用于 add 或 configure。');
 }
 
 /** 解析 `botmux setup` 的脚本化子命令 argv。非法输入抛 Error（message 面向用户）。 */
@@ -290,9 +294,15 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
     if (compatibilityMode && flags.appName?.trim()) {
       throw new Error('兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
     }
+    if (extraScopesFile === null) {
+      throw new Error('add 没有已记录的追加权限清单可清除；--extra-scopes-file - 只用于 configure。');
+    }
     const effectiveOpenPlatformAuto = openPlatformAutoSpecified ? openPlatformAuto : createApp;
     if (extraScopesFile && !effectiveOpenPlatformAuto) {
       throw new Error('--extra-scopes-file 需要开放平台自动配置（--create-app 默认开启，或显式 --open-platform-auto）。');
+    }
+    if (extraScopesFile && flags.brand?.trim().toLowerCase() === 'lark') {
+      throw new Error('Lark 租户不支持开放平台自动配置，--extra-scopes-file 不会生效；请在开放平台「权限管理」手动添加这些权限。');
     }
     return {
       action: 'add',
@@ -322,7 +332,7 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
     }
     if (positional.length === 0) throw new Error('configure 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`configure 只接受一个机器人标识: ${positional.join(' ')}`);
-    return { action: 'configure', json, selector: positional[0], switchAccount, ...(extraScopesFile ? { extraScopesFile } : {}) };
+    return { action: 'configure', json, selector: positional[0], switchAccount, ...(extraScopesFile !== undefined ? { extraScopesFile } : {}) };
   }
 
   if (action === 'edit') {

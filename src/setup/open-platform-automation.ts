@@ -540,13 +540,13 @@ export function mapManifestScopesToOpenPlatformIds(
   manifest: ScopeManifest,
   catalog: OpenPlatformScopeEntry[],
 ): MappedScopeIds {
-  const tenant = uniqueStrings(manifest.scopes?.tenant ?? []);
-  const user = uniqueStrings(manifest.scopes?.user ?? []);
+  const tenant = mapScopeIds(uniqueStrings(manifest.scopes?.tenant ?? []), catalog, 'tenant');
+  const user = mapScopeIds(uniqueStrings(manifest.scopes?.user ?? []), catalog, 'user');
   return {
-    tenantScopeIds: mapScopeIds(tenant, catalog, 'tenant').ids,
-    userScopeIds: mapScopeIds(user, catalog, 'user').ids,
-    missingTenantScopes: mapScopeIds(tenant, catalog, 'tenant').missing,
-    missingUserScopes: mapScopeIds(user, catalog, 'user').missing,
+    tenantScopeIds: tenant.ids,
+    userScopeIds: user.ids,
+    missingTenantScopes: tenant.missing,
+    missingUserScopes: user.missing,
   };
 }
 
@@ -3420,10 +3420,10 @@ function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bu
   const ids: string[] = [];
   const missing: string[] = [];
   for (const scopeName of scopeNames) {
+    // 不跨桶借 ID：tenant / user 是两份授权，只在对侧目录出现的名字算本桶缺失。
     const matched =
       catalog.find(entry => entry.name === scopeName && entry.bucket === bucket) ??
-      catalog.find(entry => entry.name === scopeName && entry.bucket === undefined) ??
-      catalog.find(entry => entry.name === scopeName);
+      catalog.find(entry => entry.name === scopeName && entry.bucket === undefined);
     if (matched) ids.push(matched.id);
     else missing.push(scopeName);
   }
