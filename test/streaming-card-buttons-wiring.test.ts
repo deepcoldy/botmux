@@ -149,6 +149,9 @@ describe('stripComments comment handling', () => {
     const source = [
       "const a = 1; // line comment after a comma",
       "const b = 2; /* block comment after a comma */",
+      "/**",
+      " * multi-line doc",
+      " */",
       "function f() {",
       "  g(",
       "    'http://example.com/path', // line comment next to ')'",
@@ -167,6 +170,7 @@ describe('stripComments comment handling', () => {
     expect(stripped).not.toContain("line comment next to ')'");
     expect(stripped).not.toContain('comment inside an empty catch block');
     expect(stripped).not.toContain('a comment on its own line');
+    expect(stripped).not.toContain('multi-line doc');
     // …while code and slashes that live inside string/template/regex survive.
     expect(stripped).toContain('http://example.com/path');
     expect(stripped).toContain('template // not a comment');
