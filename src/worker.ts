@@ -25207,6 +25207,8 @@ async function spawnCli(
     disableCliBypass: cfg.disableCliBypass === true,
     // 已探测的 CLI 版本：给「新版本才有的 flag」做门控（见 SpawnContext.cliVersion）。
     cliVersion: cfg.cliVersion,
+    // 网关 wrapper 在前面时版本探测只覆盖宿主二进制，门控 flag 无法证明可被内核接受。
+    wrapperCli: cfg.wrapperCli,
     settingsEnv: perBotSettingsEnv,
     settingsFilePath: perBotSettingsFilePath,
     codexBrowser: cfg.codexBrowser,

@@ -151,6 +151,14 @@ describe('opencode2 buildArgs resume', () => {
     expect(args).toEqual([]);
   });
 
+  it('omits --auto when a wrapper fronts the CLI (probed host version says nothing about the pinned kernel)', () => {
+    const adapter = createOpenCode2Adapter();
+    const args = adapter.buildArgs({
+      sessionId: BOTMUX_SESSION_ID, resume: false, wrapperCli: 'ttadk opencode',
+    });
+    expect(args).toEqual([]);
+  });
+
   it('does not inject --prompt (next-17135 only fills the composer, never submits)', () => {
     const db = openDb();
     seedSession(db, { id: 'ses_x' });

@@ -982,6 +982,7 @@ import {
 } from './managed-origin-capability.js';
 import { truncateUtf16WellFormed } from '../utils/unicode.js';
 import { recentCliUpgrade } from './cli-version-history.js';
+import { ensureCliVersion } from './cli-version-probe.js';
 import {
   inspectRecordedSessionWorker,
   readWorkerProcessStart,
@@ -16500,6 +16501,21 @@ function forkWorkerPrepared(
     ds.session.terminalCardEpoch = randomUUID();
     sessionStore.updateSession(ds.session);
   }
+  // 生效安装（含 /cli 按会话选择、冷恢复冻结的异 CLI）的版本：daemon 只探测过 bot
+  // 级安装，键缺失时在这里按需补探，避免版本门控 flag（opencode v1 的 --auto）在
+  // 这些入口因 'unknown' 被静默跳过。失败回落 'unknown'，不阻断建会话。
+  const effectiveCliVersion = ensureCliVersion({
+    cliId: agentCfg.cliId,
+    cliRuntime: agentCfg.cliRuntime,
+    cliPathOverride: agentCfg.cliPathOverride,
+  }, getCurrentCliVersion);
+  if (effectiveCliVersion !== 'unknown') {
+    setCurrentCliVersion(effectiveCliVersion, runtimeInstallationKey({
+      cliId: agentCfg.cliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    }));
+  }
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -16522,11 +16538,7 @@ function forkWorkerPrepared(
     // opencode v1 的 --auto 到 1.17.12 才落地）。没探测过就是 'unknown'，
     // adapter 必须按「不支持」处理 —— 传未知 flag 会让老版本打帮助退出 1，
     // 再被 daemon 的自动重启放大成 crash-loop。
-    cliVersion: getCurrentCliVersion(runtimeInstallationKey({
-      cliId: agentCfg.cliId,
-      cliRuntime: agentCfg.cliRuntime,
-      cliPathOverride: agentCfg.cliPathOverride,
-    })),
+    cliVersion: effectiveCliVersion,
     wrapperCli: agentCfg.wrapperCli,
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
@@ -16862,11 +16874,7 @@ function forkWorkerPrepared(
   ds.spawnedAt = Date.now();
   // master: per-runtime-key CLI version (the init send already happened above via
   // the tracked-delivery if/else — do NOT re-send initMsg here).
-  ds.cliVersion = getCurrentCliVersion(runtimeInstallationKey({
-    cliId: agentCfg.cliId,
-    cliRuntime: agentCfg.cliRuntime,
-    cliPathOverride: agentCfg.cliPathOverride,
-  }));
+  ds.cliVersion = effectiveCliVersion;
   // #597: init has been dispatched. A later child 'error' event is ambiguous
   // (init may already be executing), so only synchronous failures before this
   // point are safe to compensate; clear the pre-init compensation handle.
@@ -24355,12 +24363,13 @@ export function forkAdoptWorker(
     // Same live-read pattern as the primary init: adopt re-forks gate on the
     // adopted CLI id.
     noProgressNotify: isCodexAppCliId(adoptedCliId) ? botCfg.noProgressNotify : undefined,
-    // 同主 init：adopt 重新 fork 时带上已探测版本（按 adopt 的 CLI id 取）。
-    cliVersion: getCurrentCliVersion(runtimeInstallationKey({
+    // 同主 init：adopt 重新 fork 时带上已探测版本（按 adopt 的 CLI id 取）；
+    // daemon 未探过该生效安装时由 ensureCliVersion 按需补探，失败回落 'unknown'。
+    cliVersion: ensureCliVersion({
       cliId: adoptedCliId,
       cliRuntime: agentCfg.cliRuntime,
       cliPathOverride: agentCfg.cliPathOverride,
-    })),
+    }, getCurrentCliVersion),
     codexRpcInput: resolveCodexRpcInput(adoptedCliId, botCfg.codexRpcInput, config.codexRpcInputDefault),
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
     // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited

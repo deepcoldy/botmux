@@ -496,8 +496,12 @@ export interface OpenCodeLikeAdapterOptions {
 
 /**
  * 版本门控：`>= min` 返回 true。版本未知 / 解析失败 / 主次版本缺失一律 false
- * （= 当作不支持），调用方据此保持旧 argv。只比较 major.minor.patch，
- * 允许 `v` 前缀和 `-beta.1` 这类预发布后缀。
+ * （= 当作不支持），调用方据此保持旧 argv。只比较 major.minor.patch 数字 core，
+ * 允许 `v` 前缀；`-beta.1` / `+build` 这类后缀在比较前被剥掉，所以
+ * `1.17.12-rc.1` 与 `1.17.12` 同序 —— 本函数**不能表达 pre-release 门槛**
+ * （拿 `0.0.0-beta-x` 当 min 会对一切数字版本恒真）。当前唯一门槛是正式版
+ * `1.17.12`（opencode 1.x 不发预发布标签），够用；将来要对 beta 构建做门控，
+ * 改用 `src/core/update-check.ts` 的 `compareVersions`（按 semver 处理预发布序）。
  */
 function versionAtLeast(version: string | undefined, min: string): boolean {
   const parse = (value: string): number[] | null => {
@@ -533,14 +537,15 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     authPaths: [...(runtime.authPaths ?? [runtime.dataRoot])],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model, disableCliBypass, cliVersion }) {
+    buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model, disableCliBypass, cliVersion, wrapperCli }) {
       const args: string[] = [...(runtime.startupArgs ?? [])];
       // 权限确认放行：不传 `--auto` 时，OpenCode 的默认 `ask`（V1 是
       // external_directory / .env 等）会停在 TUI 里等确认，而飞书侧完全看不到，
       // 整个 turn 静默卡死。`disableCliBypass` 显式打开时保持现状让人工把关；
       // 声明了最低版本的 flag 还要版本够新（探测不到就不加，见
-      // autoApproveMinVersion）。
-      if (runtime.autoApproveArg && !disableCliBypass
+      // autoApproveMinVersion）。配了 wrapper（如 ttadk 网关）时版本探测只覆盖
+      // 宿主二进制、证明不了网关 pin 的内核支持该 flag，宁可不加也不赌 help+exit 1。
+      if (runtime.autoApproveArg && !disableCliBypass && !wrapperCli?.trim()
         && (!runtime.autoApproveMinVersion || versionAtLeast(cliVersion, runtime.autoApproveMinVersion))) {
         args.push(runtime.autoApproveArg);
       }

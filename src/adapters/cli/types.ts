@@ -301,12 +301,20 @@ export interface CliAdapter {
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Version of the CLI binary this spawn will run ("1.17.11", "2.1.4", …), as
-     *  last probed by the daemon (`getCurrentCliVersion`). Adapters use it to gate
-     *  flags that only newer releases accept — passing an unknown flag makes some
-     *  CLIs print help and exit 1, which the daemon amplifies into a crash loop.
-     *  Missing or "unknown" means "not probed": adapters must then behave as if the
-     *  flag is unsupported (keep the old argv) rather than guess. */
+     *  last probed by the daemon (`getCurrentCliVersion` / `ensureCliVersion`).
+     *  Adapters use it to gate flags that only newer releases accept — passing an
+     *  unknown flag makes some CLIs print help and exit 1, which the daemon
+     *  amplifies into a crash loop. Missing or "unknown" means "not probed":
+     *  adapters must then behave as if the flag is unsupported (keep the old
+     *  argv) rather than guess. The value is a spawn-time snapshot: in-worker
+     *  restarts replay the whole init message and never re-probe, so an upgrade
+     *  or downgrade only takes effect on the next cold worker, not a restart. */
     cliVersion?: string;
+    /** Wrapper command in front of the real CLI (e.g. `ttadk opencode`). The version
+     *  probe only sees the host binary on PATH, not whatever kernel the wrapper pins,
+     *  so a version-gated flag cannot be proven acceptable here: adapters whose gate
+     *  exists to avoid an unknown-flag crash must omit the flag when a wrapper is set. */
+    wrapperCli?: string;
     /** Codex App only: restricted local browser extension bridge. */
     codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`

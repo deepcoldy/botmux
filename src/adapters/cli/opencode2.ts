@@ -58,14 +58,15 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => ['~/.config/opencode/plugins'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, wrapperCli }) {
       const args: string[] = [];
       // 权限确认放行：V2 的 base policy 里 `read *.env` 默认是 ask，托管态下
       // 没人看得见 TUI 弹窗，turn 会静默卡死。`--auto` 只放行「本来要 ask」的
       // 动作，配置里显式 deny 仍然生效；与 copilot `--allow-all-tools`、
       // claude `--dangerously-skip-permissions` 同一约定，`disableCliBypass`
-      // 显式打开时不注入。
-      if (!disableCliBypass) {
+      // 显式打开时不注入。配了 wrapper（如 ttadk 网关）时宿主侧无法证明网关 pin
+      // 的内核支持该 flag（早期 2.x nightly 会 unknown-flag 退出），同样不注入。
+      if (!disableCliBypass && !wrapperCli?.trim()) {
         args.push('--auto');
       }
       // 注意：没有 --model —— V2 TUI 顶层不接受该标志（传了直接打帮助退出）。

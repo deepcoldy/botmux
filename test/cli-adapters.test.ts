@@ -2155,6 +2155,27 @@ describe('opencode buildArgs', () => {
     expect(mimo.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '2.1.4' })).toEqual(['--trust']);
   });
 
+  it('omits --auto when a wrapper fronts the CLI, even on a new enough version', () => {
+    // 版本探测只覆盖宿主 opencode，证明不了 ttadk 等网关 pin 的内核支持 --auto；
+    // 未知 flag 会让内核 help+exit 1 并被放大成 crash-loop，所以 wrapper 存在即否决，
+    // 优先级高于版本门控（真值表第一行）。
+    for (const wrapperCli of ['ttadk opencode', '  ttadk opencode  ']) {
+      const args = adapter.buildArgs({
+        sessionId: 'sess-6', resume: false, cliVersion: '1.19.1', wrapperCli,
+      });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('still injects --auto without a wrapper so the guard does not hit the main path', () => {
+    for (const wrapperCli of [undefined, '', '   ']) {
+      const args = adapter.buildArgs({
+        sessionId: 'sess-6', resume: false, cliVersion: '1.19.1', wrapperCli,
+      });
+      expect(args).toEqual(['--auto']);
+    }
+  });
+
   it('passes initialPrompt via --prompt flag', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, initialPrompt: 'hello world' });
     expect(args).toContain('--prompt');
